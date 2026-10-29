@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Pass that strips effect tokens from an ExportedProgram: rewrites with_effects calls into
+# plain calls, drops token arguments of invoke_subgraph, removes token inputs/outputs from
+# graphs and the graph signature. Operates in place. No import-time side effects.
 import operator
 
 import torch
@@ -16,6 +20,10 @@ from .graph_signature import (
 
 
 def _get_custom_obj_for_node(node, inputs_to_lifted_custom_objs, constants):
+    # [FUNCTION DOC] HELPER: returns the script object (custom class instance) behind a node. Reads the
+    # node's meta value, which must be a CustomObjArgument (else AssertionError). Returns its
+    # fake value if present, else looks up the node name in the lifted-custom-obj mapping and
+    # returns the entry from constants; raises RuntimeError if neither is available.
     """Extract the custom object from a node's arguments."""
     custom_obj_node = node
     custom_obj_meta = custom_obj_node.meta["val"]  # type: ignore[union-attr]
@@ -35,6 +43,16 @@ def _get_custom_obj_for_node(node, inputs_to_lifted_custom_objs, constants):
 def _replace_with_effects_node(
     node, ep, inputs_to_lifted_custom_objs, output_tokens, input_tokens, module
 ):
+    # [FUNCTION DOC] HELPER: replaces one with_effects node (token, func, args...) in module's graph
+    # with a direct call to func. Records the token node in input_tokens if it is a placeholder,
+    # and the token getitem users feeding the graph output in output_tokens (both lists mutated).
+    # Copies node meta (dropping the token level of unbacked bindings), then rewires getitem
+    # users: for one return the user is replaced by the new node; for several returns indices
+    # shift down by one; for none the new node must have no users and meta val is None.
+    # Raises AssertionError if func is not an OpOverload/HigherOrderOperator, a user is not
+    # a getitem, or the no-return invariants fail. The old node is left for dead code removal.
+    # KNOWN ISSUE: the single-return branch leaves the token getitem users in place,
+    # relying on later dead code elimination; the computed schema is only used for return count.
     """Replace a with_effects node with the underlying function call."""
     # Get the input nodes
     token_node, func, *node_args = node.args
@@ -109,6 +127,11 @@ def _replace_with_effects_node(
 
 
 def _replace_invoke_subgraph_node(node, module, output_tokens, input_tokens):
+    # [FUNCTION DOC] HELPER: for an invoke_subgraph node whose referenced submodule is marked
+    # has_with_effects, removes the token operand from node args (in place), records a placeholder
+    # token in input_tokens, shifts getitem user indices down by one and records token getitems
+    # feeding the graph output in output_tokens. Does nothing if the submodule has no effects.
+    # Raises AssertionError if the first arg is not a get_attr node.
     """Replace an invoke_subgraph node to remove the token argument."""
     if node.args[0].op != "get_attr":
         raise AssertionError(
@@ -135,6 +158,14 @@ def _replace_invoke_subgraph_node(node, module, output_tokens, input_tokens):
 
 
 def _remove_effect_tokens(ep: ExportedProgram) -> ExportedProgram:
+    # [FUNCTION DOC]
+    # Mutates and returns ep. First marks every GraphModule containing with_effects nodes. Then,
+    # under the signature replace hook, for each GraphModule rewrites with_effects and
+    # invoke_subgraph nodes, trims token entries from the output node, eliminates dead code,
+    # erases token placeholders and recompiles. Finally drops TOKEN input/output specs from
+    # the graph signature. Raises AssertionError if the output has fewer args than tokens,
+    # a token spec arg is not a TokenArgument, or token input/output counts differ.
+    # KNOWN ISSUE: the token count check happens after the signature was already modified.
     """
     Removes the existence of tokens from the exported program, including:
     - Removes the input and output tokens

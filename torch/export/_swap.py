@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Utilities to unlift an ExportedProgram into a GraphModule and swap previously traced
+# submodules (identified by fully qualified name) for eager modules, replacing each
+# module's subgraph with pytree unflatten, call_module and flatten nodes, then removing
+# redundant pytree conversions between consecutive module calls.
+# Import-time side effect: creates the module logger.
 import logging
 import operator
 import types
@@ -19,6 +25,9 @@ log = logging.getLogger(__name__)
 
 
 def _get_getitem_users(node: torch.fx.Node) -> set[torch.fx.Node]:
+    # [FUNCTION DOC] HELPER: returns the set of nodes that consume the getitem users of node. Output
+    # node users are skipped; any other user that is not an operator getitem call raises
+    # AssertionError.
     node_users = list(node.users.keys())
     getitem_users = set()
     for user in node_users:
@@ -34,6 +43,13 @@ def _get_getitem_users(node: torch.fx.Node) -> set[torch.fx.Node]:
 
 
 def _try_remove_connecting_pytrees(curr_module_node: torch.fx.Node) -> None:
+    # [FUNCTION DOC] HELPER: given a call_module node, tries to bypass the flatten/unflatten pair
+    # between it and the next module call. Requires a single flatten user, a single unflatten
+    # consumer whose arguments are exactly the module's outputs in order, and a single
+    # call_module consumer; if so rewires that module to take the current module's output
+    # directly. Otherwise logs at debug level and returns without change. Raises AssertionError
+    # if the node does not have exactly one user or that user is not a flatten-spec call.
+    # Mutates the graph; returns nothing.
     """
     We want to try to remove extraneous pytree flatten/unflatten calls between modules
     calls. Instead of having the following:
@@ -161,6 +177,10 @@ def _try_remove_connecting_pytrees(curr_module_node: torch.fx.Node) -> None:
 
 
 def _remove_extraneous_pytrees(gm: torch.fx.GraphModule) -> None:
+    # [FUNCTION DOC] HELPER: for every call_module node other than the guards function, attempts the
+    # pytree removal above, then eliminates dead code. Mutates gm's graph; returns nothing.
+    # KNOWN ISSUE: the removal helper asserts a single user, so a module call with several users
+    # or an output user would raise instead of being skipped.
     """
     Remove extraneous pytree flatten/unflatten calls.
 
@@ -182,6 +202,11 @@ def _construct_inputs(
     signature: ModuleCallSignature,
     node_name_map: dict[str, torch.fx.Node],
 ) -> tuple[list[torch.fx.Node], dict[str, torch.fx.Node]]:
+    # [FUNCTION DOC] HELPER: builds the inputs for a swapped module call. Maps each signature input to a
+    # graph node by name (None for constant None or unknown/unused inputs), inserts a pytree
+    # unflatten node using the signature input spec, and getitem nodes to get the positional
+    # arguments and keyword arguments. Returns (list of arg nodes, mapping of kwarg name to
+    # node). Raises AssertionError unless the spec is a tuple of an args tuple and kwargs dict.
     tree_unflatten_args: list[torch.fx.Node | None] = []
     for input_ in signature.inputs:
         if isinstance(input_, ConstantArgument) and input_.value is None:
@@ -237,6 +262,8 @@ def _insert_call_module(
     module_to_swap: torch.nn.Module,
     name: str,
 ) -> torch.fx.Node:
+    # [FUNCTION DOC] HELPER: registers module_to_swap as a submodule of gm at the given name and adds a
+    # call_module node with the given positional and keyword argument nodes. Returns the new node.
     from .unflatten import _assign_attr, _AttrKind
 
     _assign_attr(module_to_swap, gm, name, _AttrKind.MODULE)
@@ -251,6 +278,10 @@ def _deconstruct_outputs(
     node_name_map: dict[str, torch.fx.Node],
     orig_outputs: tuple[torch.fx.Node, ...],
 ) -> None:
+    # [FUNCTION DOC] HELPER: inserts a flatten-spec node over the module call's result using the signature
+    # output spec, then for each original output node of the replaced subgraph redirects all
+    # its uses to the matching getitem of the flattened result (copying meta) and records the
+    # new node in node_name_map under the old node's name. Mutates gm and node_name_map.
     from .unflatten import _generate_flatten_spec
 
     flatten_node = _generate_flatten_spec(gm, module_node, signature.out_spec)
@@ -268,6 +299,13 @@ def _swap_module_helper(
     modules_to_swap: dict[str, torch.nn.Module],
     module_call_graph: dict[str, ModuleCallSignature],
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] HELPER: core swap routine. Legalizes gm, groups nodes by the first nn_module_stack
+    # path found in modules_to_swap, and for each group fuses the nodes into a subgraph, inserts
+    # unflatten + call_module + flatten nodes for the replacement eager module (using the
+    # signature in module_call_graph), and erases the old nodes. Then legalizes again, removes
+    # extraneous pytrees and recompiles. Returns the mutated gm.
+    # KNOWN ISSUE: the fused submodule and original inputs are computed but unused; nodes in
+    # one partition are only matched by exact path (duplicate module calls unhandled, see TODO).
     log.debug("Starting graph:")
     log.debug(gm.graph)
 
@@ -368,6 +406,11 @@ def _swap_module_helper(
 def _fix_input_output_signature(
     gm: torch.fx.GraphModule, signature: ModuleCallSignature
 ) -> None:
+    # [FUNCTION DOC] HELPER: moves pytree handling from the graph module's codegen into graph nodes.
+    # Resets the codegen to the default, adds placeholders per forward argument name (generated
+    # as positional and keyword names from the input spec if absent; AssertionError if spec is
+    # malformed), turns old placeholders into getitem nodes over a flatten of the new ones,
+    # and inserts an unflatten of the outputs using the output spec. Recompiles gm.
     """
     Given the unlifted module from calling ep.module(), we want to remove the
     pytree processing from the graph module's PyTreeCodeGen and instead make it
@@ -429,6 +472,14 @@ def _fix_input_output_signature(
 def _swap_modules(
     ep: ExportedProgram, modules_to_swap: dict[str, torch.nn.Module]
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC]
+    # Unlifts ep into a GraphModule, disables input validation, prunes dead code, moves pytree
+    # handling into the graph using the root module call signature, attaches the module call
+    # graph, rebinds train/eval, then swaps in the eager modules from modules_to_swap (fqn to
+    # module). Returns the new GraphModule. Raises AssertionError if unlifting does not give a
+    # GraphModule.
+    # KNOWN ISSUE: docstring documents a run_with_interpreter argument that does not exist.
+    # The first isinstance check runs after the graph is already used, so it comes too late.
     """
     Unlifts the given ExportedProgram into a fx.GraphModule, and then swaps
     previously traced modules with new eager modules specified. Returns a

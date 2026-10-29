@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# While-loop based replacements for the LSTM and GRU decompositions, plus context managers
+# that temporarily install them in the global decomposition table and the op's python
+# kernel registry so exported graphs use a while_loop instead of an unrolled python loop.
+# No import-time side effects beyond imports.
 import contextlib
 from collections.abc import Generator
 
@@ -8,6 +13,9 @@ from torch._higher_order_ops.while_loop import while_loop
 
 
 def _clone_tensors_that_alias(tensors):
+    # [FUNCTION DOC] HELPER: given an iterable of optional tensors, returns a tuple of the same length
+    # where any tensor whose memory overlaps an earlier kept tensor is replaced by a clone.
+    # None entries pass through unchanged. Needed because while_loop rejects aliased inputs.
     # Flattened RNN weights can share storage. while_loop rejects aliased
     # closure inputs, and these weights are read-only inside the loop.
     cloned_tensors = []
@@ -24,6 +32,13 @@ def _clone_tensors_that_alias(tensors):
 
 
 def one_layer_while_loop_lstm(inp, hidden, params, has_biases, reverse=False):
+    # [FUNCTION DOC]
+    # Runs one LSTM layer (one direction) over a sequence using the while_loop higher order op.
+    # Args: inp (seq, batch, input) tensor; hidden pair (h, c); params list (input-hidden weight,
+    # hidden-hidden weight, optional two biases, optional projection weight); has_biases flag;
+    # reverse flag to flip the time axis before and after. Input projection is precomputed for
+    # all steps; the loop applies the lstm cell per step and writes each output into a buffer.
+    # Returns (output sequence, (final h, final c)). No side effects.
     """
     1 layer fn for while loop LSTM
 
@@ -63,9 +78,13 @@ def one_layer_while_loop_lstm(inp, hidden, params, has_biases, reverse=False):
     )
 
     def cond_fn(i, out, hx, cx):
+        # [FUNCTION DOC] HELPER: loop condition; true while the step counter is below the sequence length.
         return i < precomputed_input.size(0)
 
     def body_fn(idx, out, hx, cx):
+        # [FUNCTION DOC] HELPER: one loop step. Converts the counter to an int constrained as a valid
+        # index, applies the lstm cell to that step's precomputed input, writes the new hidden
+        # into a clone of the output buffer, returns (counter + 1, output, hx, cx).
         # Extract the integer value from idx and constrain it for data-dependent indexing
         i = idx.item()
         torch._check_is_size(i)
@@ -99,6 +118,12 @@ def lstm_while_loop_impl(
     bidirectional,
     batch_first,
 ):
+    # [FUNCTION DOC]
+    # Replacement implementation of the aten lstm op built from while_loop layers. Takes the
+    # same arguments as the op (input, (h0, c0), flat weight list, bias flag, layer count,
+    # dropout, train flag, bidirectional flag, batch_first flag). Raises AssertionError if hx
+    # does not hold exactly two states. Delegates layer stacking to the decomposition RNN helper.
+    # Returns (output, h_n, c_n) with states stacked along a new first dimension.
     """
     LSTM implementation using while_loop for export compatibility.
 
@@ -141,6 +166,12 @@ def lstm_while_loop_impl(
 
 
 def one_layer_while_loop_gru(inp, hidden, params, has_biases, reverse=False):
+    # [FUNCTION DOC]
+    # Runs one GRU layer (one direction) over a sequence using the while_loop higher order op.
+    # Args: inp (seq, batch, input) tensor; hidden state tensor; params list (input-hidden weight,
+    # hidden-hidden weight, optional two biases); has_biases flag; reverse flag to flip time.
+    # Input projection is precomputed; the loop applies the gru cell per step.
+    # Returns (output sequence, final hidden). No side effects.
     """
     1 layer fn for while loop GRU
 
@@ -173,9 +204,13 @@ def one_layer_while_loop_gru(inp, hidden, params, has_biases, reverse=False):
     )
 
     def cond_fn(i, out, cur_hidden):
+        # [FUNCTION DOC] HELPER: loop condition; true while the step counter is below the sequence length.
         return i < precomputed_input.size(0)
 
     def body_fn(idx, out, cur_hidden):
+        # [FUNCTION DOC] HELPER: one loop step. Converts the counter to a constrained int index, applies the
+        # gru cell to that step's precomputed input, stores the new hidden into a clone of the
+        # output buffer, returns (counter + 1, output, hidden).
         # Extract the integer value from idx and constrain it for data-dependent indexing
         i = idx.item()
         torch._check_is_size(i)
@@ -206,6 +241,11 @@ def gru_while_loop_impl(
     bidirectional,
     batch_first,
 ):
+    # [FUNCTION DOC]
+    # Replacement implementation of the aten gru op built from while_loop layers. Takes the
+    # same arguments as the op (input, hidden tensor, flat weight list, bias flag, layer count,
+    # dropout, train flag, bidirectional flag, batch_first flag). Delegates layer stacking to
+    # the decomposition RNN helper. Returns (output, h_n) with h_n stacked on a new first dim.
     """
     GRU implementation using while_loop for export compatibility.
 
@@ -248,6 +288,10 @@ def gru_while_loop_impl(
 def _register_rnn_while_loop_decomposition(
     rnn_op, rnn_impl
 ) -> Generator[None, None, None]:
+    # [FUNCTION DOC] HELPER: context manager. Saves the current post-autograd decomposition and the
+    # CompositeImplicitAutograd python kernel of rnn_op, installs rnn_impl in both, yields, and on
+    # exit (even on error) restores the saved entries or removes the ones it added.
+    # Mutates the global decomposition table and the op's py_kernels mapping.
     """
     Generic context manager for registering while_loop-based RNN decompositions.
 
@@ -294,6 +338,9 @@ def _register_rnn_while_loop_decomposition(
 
 @contextlib.contextmanager
 def register_lstm_while_loop_decomposition() -> Generator[None, None, None]:
+    # [FUNCTION DOC]
+    # Context manager: while active, the aten lstm input overload uses the while_loop based
+    # implementation. Global registries are restored on exit. No arguments, yields nothing.
     """
     Context manager that temporarily registers the while_loop-based LSTM decomposition.
 
@@ -324,6 +371,9 @@ def register_lstm_while_loop_decomposition() -> Generator[None, None, None]:
 
 @contextlib.contextmanager
 def register_gru_while_loop_decomposition() -> Generator[None, None, None]:
+    # [FUNCTION DOC]
+    # Context manager: while active, the aten gru input overload uses the while_loop based
+    # implementation. Global registries are restored on exit. No arguments, yields nothing.
     """
     Context manager that temporarily registers the while_loop-based GRU decomposition.
 

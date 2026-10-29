@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Debugging utilities that use the garbage collector's referrer graph to detect fake
+# tensors that leaked out of non-strict export tracing. Contains small predicates and
+# find_legit_leaks_from_referrers. No import-time side effects beyond imports and
+# defining the _SKIP_TYPES constant.
 import gc
 import types
 import typing
@@ -34,20 +39,26 @@ _SKIP_TYPES = (
 
 
 def _is_globals_or_locals(obj: typing.Any) -> bool:
+    # [FUNCTION DOC] HELPER: True if obj is this module's globals mapping or the current locals mapping.
     # These comparisons only make sense within this frame; still cheap to check.
     return obj is globals() or obj is locals()
 
 
 def _is_tracked_fake(obj: typing.Any) -> TypeIs[TrackedFake]:
+    # [FUNCTION DOC] HELPER: type guard, True if obj is a TrackedFake instance.
     return isinstance(obj, TrackedFake)
 
 
 def _is_gm_meta_like_dict(d: dict, o: typing.Any) -> bool:
+    # [FUNCTION DOC] HELPER: True if the dict d has an entry under the key "val" that is the very
+    # object o (identity), i.e. it looks like an fx node meta mapping holding the fake.
     # Hope gm.meta was a custom dict we can assert on
     return d.get("val") is o
 
 
 def _dict_is_attr_of_tracked_fake(d: dict) -> bool:
+    # [FUNCTION DOC] HELPER: queries the garbage collector for referrers of d and returns True if
+    # any is a TrackedFake whose instance attribute dict is exactly d; otherwise False.
     """
     Python 3.10 quirk: sometimes the referrer is obj.__dict__ instead of obj.
     Check if this dict is exactly the __dict__ of a TrackedFake.
@@ -63,6 +74,12 @@ def _dict_is_attr_of_tracked_fake(d: dict) -> bool:
 
 
 def find_legit_leaks_from_referrers(active_fakes: weakref.WeakSet) -> weakref.WeakSet:
+    # [FUNCTION DOC]
+    # Takes a weak set of live fake tensors and returns a new weak set containing those that are
+    # still referenced by something that is not ignorable. Ignored referrers: the temporary list
+    # made here, globals/locals mappings, frames, modules, TrackedFake objects, node-meta-like
+    # dicts holding the fake under "val", and attribute dicts of TrackedFake. Any other referrer
+    # (including other dicts) marks the fake as leaked. Relies on gc internals; debug use only.
     legit_leak: weakref.WeakSet = weakref.WeakSet()
 
     # This is so that we don't falsely flag generator to be holding fake tensor

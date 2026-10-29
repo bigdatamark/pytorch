@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Helpers that restore original FQNs, ordering and parameter/buffer registration on a traced
+# GraphModule so its state dict matches the original module. No import-time side effects.
 """
 State dict utilities for torch.export.
 
@@ -16,6 +19,8 @@ import torch.fx
 def _get_underlying_module(
     module_or_method: torch.nn.Module | Callable[..., Any],
 ) -> torch.nn.Module:
+    # [FUNCTION DOC] HELPER: returns the argument if it is an nn.Module, or the owning module of a bound
+    # method; raises TypeError otherwise.
     """Extract the underlying nn.Module from either a module or a bound method.
 
     Args:
@@ -42,6 +47,12 @@ def _get_underlying_module(
 def _clear_traced_params_buffers(
     traced_module: torch.fx.GraphModule, const_keys: Sequence[str]
 ) -> None:
+    # [FUNCTION DOC] HELPER: for each key in const_keys, removes the entry from the traced module's buffer
+    # registry and re-assigns the same object as an attribute (tensors get re-registered as
+    # buffers by module rules). Mutates traced_module. Raises AssertionError if a key is not
+    # among its buffers.
+    # KNOWN ISSUE: docstring says it clears params/buffers, but only buffer entries are handled;
+    # a constant that is a parameter would raise.
     """Remove all parameters and buffers from traced module before restoring.
 
     For constants (parameters/buffers that don't need FQN mapping), this function
@@ -69,6 +80,13 @@ def _restore_state_dict(
     original_module: torch.nn.Module | Callable[..., Any],
     traced_module: torch.fx.GraphModule,
 ) -> None:
+    # [FUNCTION DOC]
+    # Mutates traced_module in place so its parameters/buffers carry the original module's FQNs
+    # in the original order. Matches tensors by object identity: renames matched ones, adds
+    # original ones missing from the traced module, treats unmatched traced ones as constants
+    # (see _clear_traced_params_buffers), rewrites get_attr node targets to new names and
+    # recompiles. original_module may be a module or bound method (TypeError otherwise).
+    # Returns nothing.
     """
     Restores the state dict of the traced module to match the original module exactly.
 
