@@ -1,3 +1,8 @@
+# [MODULE DOC] Core symbolic node implementation. Defines SymNode, the type-erased wrapper around a sympy expression (plus hint, constant and FX node) that backs SymInt, SymFloat and SymBool;
+# DynamicInt, a user-facing int subclass marking dynamic integers for torch.compile; tables mapping operation names to python operators and sympy builders; and factory functions that
+# generate the SymNode operation methods and install magic methods (dunder operators) on SymInt, SymFloat, SymBool and DynamicInt. Import-time side effects: the metaprogramming loops at the
+# bottom of the file mutate SymNode, SymInt, SymFloat, SymBool, DynamicInt and this module (adding methods and helper functions), and a logger plus an artifact logger are created.
+# Sympy is only imported lazily inside functions so importing this module stays cheap.
 from __future__ import annotations
 
 
@@ -74,6 +79,7 @@ def _to_symtype(t: type[float]) -> type[SymFloat]: ...
 @overload
 def _to_symtype(t: type) -> type: ...
 def _to_symtype(t: type) -> type:
+    # [FUNCTION DOC] HELPER: Maps the python builtin types bool, int and float to SymBool, SymInt and SymFloat; any other type is returned unchanged.
     if t is bool:
         return SymBool
     if t is int:
@@ -87,6 +93,10 @@ def _to_symtype(t: type) -> type:
 # 1. Set variables to be equal when we do equality
 # 2. Specialize on 0/1 when we do subtraction
 class SymNode:
+    # [CLASS DOC] Type-erased symbolic scalar used by SymInt, SymFloat and SymBool to perform actual operations; end users do not touch it and it defines no magic methods.
+    # State: _expr (the sympy expression, read through the expr property which applies the shape env replacements), shape_env, pytype (int, float or bool), _hint (a concrete example value from the traced run or None),
+    # constant (a literal value known to be invariant, else None), fx_node (FX node when translation validation is enabled, otherwise a falsy value) and the _optimized_summation flag.
+    # Most operation methods (add, mul, eq, ...) are thin public wrappers around private methods installed at import time by _make_node_magic and _make_node_sizes_strides.
     """
     This is a type erased SymInt/SymFloat which we use to do actual operations.
     End users don't touch this.  Magic methods are NOT defined on this object.
@@ -111,6 +121,9 @@ class SymNode:
         fx_node: object = None,
         optimized_summation: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Creates the node. hint may be a concrete value of matching type (a mismatch raises AssertionError), None (the hint is computed from the expression when no free unbacked symbols exist) or the _NO_HINT sentinel (no hint, skip computation).
+        # When translation validation is enabled the given hint is also checked against the recomputed one and a difference raises AssertionError. constant and fx_node are stored; fx_node is only kept when translation validation is on.
+        # KNOWN ISSUE: when translation validation is disabled fx_node becomes a falsy value that can be False or None-like rather than always None, so checks for a not-None fx_node can be misleading.
         self._expr = expr
         self.shape_env = shape_env
         self.pytype = pytype
@@ -146,6 +159,8 @@ class SymNode:
         # in sync, so we've deleted it for now.)
 
         def compute_hint() -> HintType | SymInt | SymFloat | SymBool:
+            # [FUNCTION DOC] HELPER: Computes a hint for the expression by static evaluation in the shape env. Returns None if the expression has free unbacked symbols or no value is determined; otherwise converts the result to pytype unless it is already a symbolic type.
+            # Raises RuntimeError if there is no shape env.
             from torch.fx.experimental.symbolic_shapes import has_free_unbacked_symbols
 
             # This occasionally gets exercised by, e.g.,
@@ -191,11 +206,14 @@ class SymNode:
         self.fx_node = tx_validation_en and fx_node
 
     def with_shape_env(self, shape_env: ShapeEnv) -> SymNode:
+        # [FUNCTION DOC] Returns a new SymNode with the same expression, type, hint, constant and FX node but bound to the given shape_env; used when replaying recorded events.
+        # KNOWN ISSUE: the optimized_summation flag is not carried over to the new node.
         return SymNode(
             self._expr, shape_env, self.pytype, self._hint, self.constant, self.fx_node
         )
 
     def _value_eq(self, other: SymNode) -> bool:
+        # [FUNCTION DOC] HELPER: Structural equality on expression, pytype, hint, constant and fx_node; the shape_env is deliberately ignored.
         # Purposely don't include the shape_env in the eq.
         return (
             self._expr == other._expr  # type: ignore[bad-return]
@@ -206,11 +224,14 @@ class SymNode:
         )
 
     def _value_hash(self) -> int:
+        # [FUNCTION DOC] HELPER: Hash consistent with _value_eq; the shape_env is deliberately excluded.
         # Purposely don't include the shape_env in the hash.
         return hash((self._expr, self.pytype, self._hint, self.constant, self.fx_node))
 
     @property
     def expr(self) -> sympy.Basic:
+        # [FUNCTION DOC] Property returning the sympy expression. Plain ints and sympy numbers are returned as is. Otherwise the shape env replacement mapping is applied to the stored expression, with the result cached per replacements version counter.
+        # Raises AssertionError if the expression is not a number and there is no shape env.
         # is_Number is a class attribute, equivalent to isinstance of
         # sympy.Number without needing sympy imported here. Deliberately not
         # is_number, which walks the whole expression tree uncached: _expr is
@@ -236,12 +257,15 @@ class SymNode:
 
     @property
     def hint(self) -> HintType | SymInt | SymFloat | SymBool:
+        # [FUNCTION DOC] Property returning the stored hint (concrete value, symbolic value or None).
         return self._hint
 
     def has_hint(self) -> bool:
+        # [FUNCTION DOC] Returns True if a hint is available.
         return self._hint is not None
 
     def maybe_as_int(self) -> int | None:
+        # [FUNCTION DOC] Returns the expression as a python int if it is a number, otherwise None.
         if self.expr.is_number:
             return int(self.expr)
         else:
@@ -249,6 +273,7 @@ class SymNode:
 
     # NB: This does conversions, not sure if this is good or not
     def maybe_as_float(self) -> float | None:
+        # [FUNCTION DOC] Returns the expression as a python float if it is a sympy Float, otherwise None (integers are not converted).
         import sympy
 
         if isinstance(self.expr, sympy.Float):
@@ -257,6 +282,7 @@ class SymNode:
             return None
 
     def maybe_as_bool(self) -> bool | None:
+        # [FUNCTION DOC] Returns True or False if the expression is the sympy true or false constant, otherwise None.
         import sympy
 
         if self.expr is sympy.true:
@@ -267,15 +293,19 @@ class SymNode:
             return None
 
     def is_int(self) -> bool:
+        # [FUNCTION DOC] Returns True if the node's python type is int.
         return self.pytype is int
 
     def is_float(self) -> bool:
+        # [FUNCTION DOC] Returns True if the node's python type is float.
         return self.pytype is float
 
     def is_bool(self) -> bool:
+        # [FUNCTION DOC] Returns True if the node's python type is bool.
         return self.pytype is bool
 
     def is_nested_int(self) -> bool:
+        # [FUNCTION DOC] Returns True if the hint is a SymInt whose node is a nested int; nodes without a hint are never nested ints.
         # Unbacked SymInts cannot be nested int today
         return (
             self._hint is not None
@@ -284,6 +314,7 @@ class SymNode:
         )
 
     def wrap_int(self, num: int) -> SymNode:
+        # [FUNCTION DOC] Creates a constant integer node (sympy integer, hint, constant and FX node all equal to num) sharing this node's shape_env. Raises AssertionError if num is not exactly an int.
         if type(num) is not int:
             raise AssertionError(f"Expected int, got {type(num)}")
         import sympy
@@ -293,6 +324,7 @@ class SymNode:
         )
 
     def wrap_float(self, num: float) -> SymNode:
+        # [FUNCTION DOC] Creates a constant float node sharing this node's shape_env. Raises AssertionError if num is not exactly a float.
         if type(num) is not float:
             raise AssertionError(f"Expected float, got {type(num)}")
         import sympy
@@ -302,6 +334,7 @@ class SymNode:
         )
 
     def wrap_bool(self, num: bool) -> SymNode:
+        # [FUNCTION DOC] Creates a constant bool node (sympy true or false) sharing this node's shape_env. Raises AssertionError if num is not exactly a bool.
         if type(num) is not bool:
             raise AssertionError(f"Expected bool, got {type(num)}")
         import sympy
@@ -316,15 +349,19 @@ class SymNode:
         )
 
     def clone(self) -> SymNode:
+        # [FUNCTION DOC] Returns this same node (nodes are immutable, so no copy is made).
         return self
 
     def str(self) -> builtins.str:
+        # [FUNCTION DOC] Returns the string form of the (replacement-applied) expression.
         return f"{self.expr}"
 
     def __str__(self) -> builtins.str:
+        # [FUNCTION DOC] Returns the same string as the str method.
         return self.str()
 
     def __repr__(self) -> builtins.str:
+        # [FUNCTION DOC] Returns a debug string listing the raw expression, shape_env, pytype and, when present, hint, constant and fx_node.
         rep = [
             f"SymNode({self._expr}, shape_env={self.shape_env}, pytype={self.pytype}",
         ]
@@ -337,177 +374,228 @@ class SymNode:
         return ", ".join(rep) + ")"
 
     def _graph_repr(self) -> builtins.str:
+        # [FUNCTION DOC] HELPER: String used by GraphModule code generation to print this node in a graph; same as the str method.
         # Representation used by GraphModule to create a pythonic version of a graph
         return self.str()
 
     # These methods call the metaprogrammed methods, they're hand written
     # here so we get good stack traces
     def abs(self) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._abs()  # type: ignore[attr-defined]
 
     def pos(self) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._pos()  # type: ignore[attr-defined]
 
     def round(self, ndigits: int | None = None) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._round(ndigits)  # type: ignore[attr-defined]
 
     def trunc(self) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._trunc()  # type: ignore[attr-defined]
 
     def add(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._add(other)  # type: ignore[attr-defined]
 
     def sub(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._sub(other)  # type: ignore[attr-defined]
 
     def mul(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._mul(other)  # type: ignore[attr-defined]
 
     def mod(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._mod(other)  # type: ignore[attr-defined]
 
     def float_pow(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._float_pow(other)  # type: ignore[attr-defined]
 
     def pow_by_natural(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._pow_by_natural(other)  # type: ignore[attr-defined]
 
     def and_(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._and_(other)  # type: ignore[attr-defined]
 
     def or_(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._or_(other)  # type: ignore[attr-defined]
 
     def xor(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._xor(other)  # type: ignore[attr-defined]
 
     def float_truediv(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._float_truediv(other)  # type: ignore[attr-defined]
 
     def int_truediv(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._int_truediv(other)  # type: ignore[attr-defined]
 
     def int_floordiv(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._int_floordiv(other)  # type: ignore[attr-defined]
 
     def lshift(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._lshift(other)  # type: ignore[attr-defined]
 
     def rshift(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._rshift(other)  # type: ignore[attr-defined]
 
     def sym_not(self) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._sym_not()  # type: ignore[attr-defined]
 
     def eq(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._eq(other)  # type: ignore[attr-defined]
 
     def ne(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._ne(other)  # type: ignore[attr-defined]
 
     def gt(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._gt(other)  # type: ignore[attr-defined]
 
     def lt(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._lt(other)  # type: ignore[attr-defined]
 
     def le(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._le(other)  # type: ignore[attr-defined]
 
     def ge(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._ge(other)  # type: ignore[attr-defined]
 
     def floor(self) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._floor()  # type: ignore[attr-defined]
 
     def is_integer(self) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._is_integer()  # type: ignore[attr-defined]
 
     def sym_float(self) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._sym_float()  # type: ignore[attr-defined]
 
     def sym_int(self) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._sym_int()  # type: ignore[attr-defined]
 
     def ceil(self) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._ceil()  # type: ignore[attr-defined]
 
     def neg(self) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._neg()  # type: ignore[attr-defined]
 
     def sym_min(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._sym_min(other)  # type: ignore[attr-defined]
 
     def sym_max(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._sym_max(other)  # type: ignore[attr-defined]
 
     def sym_ite(self, then_val: SymNode, else_val: SymNode) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._sym_ite(then_val, else_val)  # type: ignore[attr-defined]
 
     def is_contiguous(self, sizes: list[SymNode], strides: list[SymNode]) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._is_contiguous(sizes, strides)  # type: ignore[attr-defined]
 
     def is_channels_last_contiguous_2d(
         self, sizes: list[SymNode], strides: list[SymNode]
     ) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._is_channels_last_contiguous_2d(sizes, strides)  # type: ignore[attr-defined]
 
     def is_channels_last_contiguous_3d(
         self, sizes: list[SymNode], strides: list[SymNode]
     ) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._is_channels_last_contiguous_3d(sizes, strides)  # type: ignore[attr-defined]
 
     def is_channels_last_strides_2d(
         self, sizes: list[SymNode], strides: list[SymNode]
     ) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._is_channels_last_strides_2d(sizes, strides)  # type: ignore[attr-defined]
 
     def is_channels_last_strides_3d(
         self, sizes: list[SymNode], strides: list[SymNode]
     ) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._is_channels_last_strides_3d(sizes, strides)  # type: ignore[attr-defined]
 
     def is_non_overlapping_and_dense_indicator(
         self, sizes: list[SymNode], strides: list[SymNode]
     ) -> SymNode:
+        # [FUNCTION DOC] Thin public wrapper that delegates to the dynamically installed private method with a leading underscore, kept so stack traces are readable. Takes and returns SymNode values.
         return self._is_non_overlapping_and_dense_indicator(sizes, strides)  # type: ignore[attr-defined]
 
     # Make C++ happy
     def sym_or(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] HELPER: Alias used by C++; same as the or_ operation.
         return self.or_(other)
 
     def sym_and(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] HELPER: Alias used by C++; same as the and_ operation.
         return self.and_(other)
 
     # Integer bitwise ops
     def bitwise_and(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] HELPER: Wrapper delegating to the installed private bitwise and method.
         return self._bitwise_and(other)  # type: ignore[attr-defined]
 
     def bitwise_or(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] HELPER: Wrapper delegating to the installed private bitwise or method.
         return self._bitwise_or(other)  # type: ignore[attr-defined]
 
     def bitwise_xor(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] HELPER: Wrapper delegating to the installed private bitwise xor method.
         return self._bitwise_xor(other)  # type: ignore[attr-defined]
 
     # There is no int_truediv available from C++
     def truediv(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] HELPER: Alias used by C++ (no integer true division is bound there); same as float_truediv.
         return self.float_truediv(other)
 
     def floordiv(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] HELPER: Alias for int_floordiv.
         return self.int_floordiv(other)
 
     # We didn't bind integer pow in C++
     def pow(self, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] HELPER: Alias used by C++ (integer pow is not bound there); same as float_pow.
         return self.float_pow(other)
 
     def is_non_overlapping_and_dense(
         self, sizes: list[SymNode], strides: list[SymNode]
     ) -> SymNode:
+        # [FUNCTION DOC] HELPER: Returns an equality node comparing the non-overlapping-and-dense indicator of the sizes and strides to the constant 1.
         return self.is_non_overlapping_and_dense_indicator(sizes, strides).eq(
             to_node(self, 1)
         )  # type: ignore[attr-defined]
 
     def int_(self) -> int:
+        # [FUNCTION DOC] Returns the python int value of this node by guarding on it (a guard may be installed); the python backtrace is used rather than a file and line.
         return self.guard_int("", 0)  # NB: uses Python backtrace
 
     # This one is currently done by hand, but if we add other variadic
@@ -515,6 +603,8 @@ class SymNode:
     # some load bearing logic is directly in torch.sym_sum
 
     def sym_sum(self, args: list[SymNode]) -> SymNode:
+        # [FUNCTION DOC] Builds a node for the sum of all argument nodes (integers only; the result type is always int). In proxy tracing mode it dispatches to torch.sym_sum and wraps the result. Otherwise the expression is the sympy sum, the hint is the sum of hints if all are available, else no hint, and an FX call node is recorded in the shape env.
+        # Raises RuntimeError if there is no shape env. Load-bearing logic also lives in torch.sym_sum.
         import sympy
 
         # Inner impl
@@ -554,12 +644,14 @@ class SymNode:
         return SymNode(out, self.shape_env, int, out_hint, fx_node=fx_node)
 
     def evaluate(self, size_oblivious: bool = False) -> bool | int | float:
+        # [FUNCTION DOC] Evaluates this node through the shape env (installing guards as needed) and returns a python bool, int or float; with size_oblivious set, unbacked size-like symbols are treated as at least 2. Raises RuntimeError if there is no shape env.
         if self.shape_env is None:
             raise RuntimeError("shape_env is required to evaluate")
         return self.shape_env.evaluate_sym_node(self, size_oblivious)
 
     # You can manually trigger a guard with this function
     def guard_int(self, file: builtins.str, line: int) -> int:
+        # [FUNCTION DOC] Forces a concrete int by evaluating and guarding on the node. The file and line arguments are currently unused. Logs a warning and re-raises if the value cannot be converted to int.
         # TODO: use the file/line for some useful diagnostic on why a
         # guard occurred
         r = self.evaluate()
@@ -570,6 +662,7 @@ class SymNode:
             raise
 
     def guard_float(self, file: builtins.str, line: int) -> float:
+        # [FUNCTION DOC] Forces a concrete float by evaluating and guarding on the node. The file and line arguments are currently unused. Logs a warning and re-raises if conversion fails.
         # TODO: use the file/line for some useful diagnostic on why a
         # guard occurred
         r = self.evaluate()
@@ -580,6 +673,7 @@ class SymNode:
             raise
 
     def guard_bool(self, file: builtins.str, line: int) -> bool:
+        # [FUNCTION DOC] Forces a concrete bool by evaluating and guarding on the node. The file and line arguments are currently unused. Logs a warning and re-raises if conversion fails.
         # TODO: use the file/line for some useful diagnostic on why a
         # guard occurred
         r = self.evaluate()
@@ -590,6 +684,8 @@ class SymNode:
             raise
 
     def expect_true(self, file: builtins.str, line: int) -> bool:
+        # [FUNCTION DOC] Asserts that the node is true. If it has a hint, no free unbacked symbols and deferred runtime asserts are not preferred, a regular guard is installed and the bool returned; otherwise the shape env records a deferred runtime assert (or a guard if it can) tagged with file and line.
+        # Raises RuntimeError if there is no shape env.
         from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 
         if self.shape_env is None:
@@ -610,6 +706,7 @@ class SymNode:
         )
 
     def statically_known_true(self, file: builtins.str, line: int) -> bool:
+        # [FUNCTION DOC] Returns whether the boolean node is statically known to be true without installing guards. Raises AssertionError if the node is not bool typed. The file and line arguments are unused.
         from torch.fx.experimental.symbolic_shapes import statically_known_true
 
         if not self.is_bool():
@@ -617,6 +714,7 @@ class SymNode:
         return statically_known_true(SymBool(self))
 
     def guard_size_oblivious(self, file: builtins.str, line: int) -> bool:
+        # [FUNCTION DOC] Like guard_bool but evaluates in size-oblivious mode (see docstring). Logs a warning and re-raises if the result cannot be converted to bool. The file and line arguments are unused.
         """
         Like guard_bool, but if we encounter unbacked symbols, if those symbols
         are size-like, we will treat them as >= 2 for the purposes of the analysis.
@@ -637,6 +735,7 @@ class SymNode:
             raise
 
     def guard_or_false(self, file: builtins.str, line: int) -> bool:
+        # [FUNCTION DOC] Returns the result of guard_or_false on this boolean node: the statically known value if there is one, otherwise False, without guarding. Raises AssertionError if not bool typed.
         from torch.fx.experimental.symbolic_shapes import guard_or_false
 
         if not self.is_bool():
@@ -644,6 +743,7 @@ class SymNode:
         return guard_or_false(SymBool(self))
 
     def guard_or_true(self, file: builtins.str, line: int) -> bool:
+        # [FUNCTION DOC] Returns the result of guard_or_true on this boolean node: the statically known value if there is one, otherwise True, without guarding. Raises AssertionError if not bool typed.
         from torch.fx.experimental.symbolic_shapes import guard_or_true
 
         if not self.is_bool():
@@ -651,26 +751,33 @@ class SymNode:
         return guard_or_true(SymBool(self))
 
     def bool_(self) -> bool:
+        # [FUNCTION DOC] Python truthiness conversion; guards on the node and returns a bool.
         return self.guard_bool("", 0)
 
     def is_symbolic(self) -> bool:
+        # [FUNCTION DOC] Always returns True for SymNode (as opposed to constant nodes of other implementations).
         return True
 
     def nested_int(self) -> None:
+        # [FUNCTION DOC] Returns None; ordinary SymNodes are never nested ints.
         return None
 
     def is_constant(self) -> bool:
+        # [FUNCTION DOC] Always returns False; SymNode instances are never treated as constants by user-level magic methods.
         return False
 
 
 class _DynamicScalar:
+    # [CLASS DOC] HELPER: Abstract base for dynamic scalar user types. Constructing it directly raises TypeError; only subclasses such as DynamicInt may be created.
     def __new__(cls, *args: object) -> Self:
+        # [FUNCTION DOC] HELPER: Raises TypeError when the class itself is instantiated, otherwise defers to the next base class constructor.
         if cls is _DynamicScalar:
             raise TypeError("_DynamicScalar is an abstract base class, use DynamicInt.")
         return super().__new__(cls, *args)
 
 
 class DynamicInt(_DynamicScalar, int):
+    # [CLASS DOC] User API for marking an integer as dynamic when passed to a function compiled with torch.compile; behaves as a normal int in eager mode. Arithmetic results that are integers are re-wrapped as DynamicInt, with magic methods installed at import time by _make_user_magic. Value is stored as the underlying int.
     """
     User API for marking dynamic integers in `torch.compile`.
     Intended to be compatible with both compile and eager mode.
@@ -683,25 +790,30 @@ class DynamicInt(_DynamicScalar, int):
     """
 
     def __new__(cls, val: int) -> Self:
+        # [FUNCTION DOC] Creates a DynamicInt from val. Raises AssertionError if val is not an int.
         if not isinstance(val, int):
             raise AssertionError(f"Expected int, got {type(val)}")
         obj = super().__new__(cls, int(val))
         return obj
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns text of the form DynamicInt followed by the value in parentheses.
         return f"DynamicInt({self.real})"
 
     def __floordiv__(
         self, other: int
     ) -> DynamicInt:  # // was casting to int without these overrides?
+        # [FUNCTION DOC] Floor division returning a DynamicInt, with this value as the dividend.
         return DynamicInt(self.real // other)
 
     def __rfloordiv__(self, other: int) -> DynamicInt:
+        # [FUNCTION DOC] Reflected floor division returning a DynamicInt, with this value as the divisor.
         return DynamicInt(other // self.real)
 
     def __pow__(  # pyrefly: ignore[bad-override]
         self, other: int, modulo: int | None = None
     ) -> DynamicInt | float:
+        # [FUNCTION DOC] Power with an optional modulo. Returns a DynamicInt if the result is an int, otherwise (for example a negative exponent) the plain float result.
         if modulo is not None:
             result = pow(self.real, other, modulo)
         else:
@@ -713,6 +825,7 @@ class DynamicInt(_DynamicScalar, int):
         return result
 
     def __rpow__(self, other: int, modulo: int | None = None) -> DynamicInt | float:
+        # [FUNCTION DOC] Reflected power (other raised to this value) with optional modulo; returns a DynamicInt for int results, else the plain result.
         if modulo is not None:
             result = pow(other, self.real, modulo)
         else:
@@ -778,7 +891,9 @@ unary_magic_methods = {
 
 # Adding math ops: sqrt, cos, sin, ...
 def _get_sym_node_fn(name: str) -> Callable[[SymNode], SymNode]:
+    # [FUNCTION DOC] HELPER: Factory returning a function that calls the private SymNode method for the given math operation name (such as sqrt or sin) on its argument node; used to add the public math methods to SymNode.
     def fn(self: SymNode) -> SymNode:
+        # [FUNCTION DOC] HELPER: Calls the private method for the math operation on the given node and returns the resulting node.
         return getattr(self, f"_sym_{name}")()
 
     return fn
@@ -861,24 +976,28 @@ always_bool_magic_methods = {
 
 
 def _sympy_float_truediv(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the sympy float true division expression (FloatTrueDiv) of a and b.
     from torch.utils._sympy.functions import FloatTrueDiv
 
     return FloatTrueDiv(a, b)
 
 
 def _sympy_int_truediv(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the sympy integer true division expression (IntTrueDiv) of a and b.
     from torch.utils._sympy.functions import IntTrueDiv
 
     return IntTrueDiv(a, b)
 
 
 def _sympy_floordiv(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the sympy floor division expression (FloorDiv) of a and b.
     from torch.utils._sympy.functions import FloorDiv
 
     return FloorDiv(a, b)
 
 
 def _sympy_mod(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds a sympy modulo of a and b: the C-style Mod if both are known non-negative, otherwise PythonMod.
     from torch.utils._sympy.functions import Mod, PythonMod
 
     if a.is_nonnegative and b.is_nonnegative:
@@ -888,42 +1007,49 @@ def _sympy_mod(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
 
 
 def _sympy_pow_by_natural(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the sympy power-by-natural-exponent expression of a and b.
     from torch.utils._sympy.functions import PowByNatural
 
     return PowByNatural(a, b)
 
 
 def _sympy_float_pow(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the sympy float power expression of a and b.
     from torch.utils._sympy.functions import FloatPow
 
     return FloatPow(a, b)
 
 
 def _sympy_and(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the sympy logical And of a and b.
     import sympy
 
     return sympy.And(a, b)
 
 
 def _sympy_or(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the sympy logical Or of a and b.
     import sympy
 
     return sympy.Or(a, b)
 
 
 def _sympy_xor(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the sympy logical Xor of a and b.
     import sympy
 
     return sympy.Xor(a, b)
 
 
 def _sympy_lshift(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the left shift expression (LShift) of a by b.
     from torch.utils._sympy.functions import LShift
 
     return LShift(a, b)
 
 
 def _sympy_rshift(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the right shift expression (RShift) of a by b.
     from torch.utils._sympy.functions import RShift
 
     return RShift(a, b)
@@ -932,6 +1058,7 @@ def _sympy_rshift(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
 def _binary_search_insert_arg(
     ordered_args: list[sympy.Basic], new_arg: sympy.Basic
 ) -> list[sympy.Basic] | None:
+    # [FUNCTION DOC] HELPER: Inserts new_arg into the sorted list ordered_args using binary search with sympy's ordering. Returns the new list, or None if new_arg is already present. May mutate and return the input list (fast paths build new lists).
     """
     If new_arg is found in ordered_args None is returned, else the new
     ordered_args with new_arg inserted
@@ -971,6 +1098,7 @@ def _optimized_add(
     lhs_is_optimized_summation: bool = False,
     rhs_is_optimized_summation: bool = False,
 ) -> tuple[bool, sympy.Basic]:
+    # [FUNCTION DOC] HELPER: Adds two sympy expressions using the optimized-summation scheme: when operands are sums of unique symbols, builds the ordered sum directly without sympy simplification. Returns a pair of (whether the result is again a sum of unique symbols, resulting expression). Falls back to the ordinary sympy Add.
     """
     Custom optimization for Add used to optimize incremental binary summations of certain properties. The idea
     is when we know the expression is a summation of unique symbols all we need to know is the correct order of symbols,
@@ -985,6 +1113,7 @@ def _optimized_add(
     from sympy.core.basic import _args_sortkey as sortkey
 
     def make_optimized(ordered_args: list[sympy.Basic]) -> tuple[bool, sympy.Basic]:
+        # [FUNCTION DOC] HELPER: Builds a sympy Add directly from an already ordered argument list, bypassing postprocessing, and returns the pair (True, expression). Raises AssertionError if the list is None.
         if ordered_args is None:
             raise AssertionError("ordered_args is None")
         # Use _from_args directly to bypass _exec_constructor_postprocessors
@@ -1037,18 +1166,21 @@ def _optimized_add(
 
 
 def _bitwise_and(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the bitwise and expression of a and b.
     from torch.utils._sympy.functions import BitwiseFn_bitwise_and
 
     return BitwiseFn_bitwise_and(a, b)
 
 
 def _bitwise_or(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the bitwise or expression of a and b.
     from torch.utils._sympy.functions import BitwiseFn_bitwise_or
 
     return BitwiseFn_bitwise_or(a, b)
 
 
 def _bitwise_xor(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the bitwise xor expression of a and b.
     from torch.utils._sympy.functions import BitwiseFn_bitwise_xor
 
     return BitwiseFn_bitwise_xor(a, b)
@@ -1076,6 +1208,7 @@ reflectable_magic_methods = {
 
 
 def _floor_ceil_helper(a: sympy.Basic, fn: Callable[..., sympy.Basic]) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Shared floor/ceil simplifier: folds a product of an integral float coefficient and an integer expression, and integral float or integer constants, to exact integers; otherwise applies fn to a.
     import sympy
 
     if isinstance(a, sympy.Mul):
@@ -1094,6 +1227,7 @@ def _floor_ceil_helper(a: sympy.Basic, fn: Callable[..., sympy.Basic]) -> sympy.
 
 
 def _sympy_floor(a: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the integer floor (FloorToInt) of a.
     from torch.utils._sympy.functions import FloorToInt
 
     return FloorToInt(a)
@@ -1102,66 +1236,77 @@ def _sympy_floor(a: sympy.Basic) -> sympy.Basic:
 # NB: this is Python trunc semantics which returns an int.  Do NOT use this to
 # represent torch.trunc (which is float to float)
 def _sympy_trunc(a: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the integer truncation (TruncToInt) of a, with python trunc semantics (float to int).
     from torch.utils._sympy.functions import TruncToInt
 
     return TruncToInt(a)
 
 
 def _sympy_ceil(a: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the integer ceiling (CeilToInt) of a.
     from torch.utils._sympy.functions import CeilToInt
 
     return CeilToInt(a)
 
 
 def _sympy_eq(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the sympy equality relation of a and b.
     import sympy
 
     return sympy.Eq(a, b)
 
 
 def _sympy_ne(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the sympy inequality relation of a and b.
     import sympy
 
     return sympy.Ne(a, b)
 
 
 def _sympy_gt(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the sympy greater-than relation of a and b.
     import sympy
 
     return sympy.Gt(a, b)
 
 
 def _sympy_lt(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the sympy less-than relation of a and b.
     import sympy
 
     return sympy.Lt(a, b)
 
 
 def _sympy_le(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the sympy less-or-equal relation of a and b.
     import sympy
 
     return sympy.Le(a, b)
 
 
 def _sympy_ge(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the sympy greater-or-equal relation of a and b.
     import sympy
 
     return sympy.Ge(a, b)
 
 
 def _sympy_min(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the symbolic minimum (Min) of a and b.
     from torch.utils._sympy.functions import Min
 
     return Min(a, b)
 
 
 def _sympy_max(a: sympy.Basic, b: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the symbolic maximum (Max) of a and b.
     from torch.utils._sympy.functions import Max
 
     return Max(a, b)
 
 
 def _sympy_ite(a: sympy.Basic, t: sympy.Basic, f: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds a conditional expression choosing t where a holds, else f (a sympy Piecewise).
     import sympy
 
     return sympy.Piecewise((t, a), (f, True))
@@ -1171,7 +1316,9 @@ current_module = sys.modules[__name__]
 
 
 def _get_sym_math_fn(name: str) -> Callable[[sympy.Basic], sympy.Basic]:
+    # [FUNCTION DOC] HELPER: Factory returning a function that applies the opaque unary function for the given math operation name from the sympy functions module to its argument.
     def fn(a: sympy.Basic) -> sympy.Basic:
+        # [FUNCTION DOC] HELPER: Builds the opaque unary function expression for the enclosing operation name applied to a.
         import torch.utils._sympy.functions
 
         return getattr(torch.utils._sympy.functions, f"OpaqueUnaryFn_{name}")(a)
@@ -1189,6 +1336,7 @@ del fn, name, priv_sympy_name  # type: ignore[possibly-undefined]
 
 
 def _sympy_abs(a: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds the sympy absolute value of a.
     import sympy
 
     return sympy.Abs(a)
@@ -1197,6 +1345,7 @@ def _sympy_abs(a: sympy.Basic) -> sympy.Basic:
 def _sympy_round(
     number: sympy.Basic, ndigits: sympy.Basic | None = None
 ) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds a round-to-int expression when ndigits is None, otherwise a round to ndigits decimal places.
     from torch.utils._sympy.functions import RoundDecimal, RoundToInt
 
     if ndigits is None:
@@ -1206,6 +1355,7 @@ def _sympy_round(
 
 
 def _sympy_sym_float(a: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Converts a to a symbolic float (ToFloat), avoiding multiplication by 1.0 so that zero is not misreported as integral.
     from torch.utils._sympy.functions import ToFloat
 
     # NB: Cannot use a * 1.0 here, because 0 * 1.0 is 0 which incorrectly
@@ -1214,6 +1364,7 @@ def _sympy_sym_float(a: sympy.Basic) -> sympy.Basic:
 
 
 def _sympy_is_integer(a: sympy.Basic) -> sympy.Basic:
+    # [FUNCTION DOC] HELPER: Builds a boolean expression that is true when a equals its own floor, that is when a has an integral value.
     import sympy
 
     from torch.utils._sympy.functions import ToFloat
@@ -1255,6 +1406,7 @@ del name, sym_name, math_op_names, current_module  # type: ignore[possibly-undef
 def sympy_is_contiguous(
     sizes: list[sympy.Basic], strides: list[sympy.Basic]
 ) -> sympy.Basic:
+    # [FUNCTION DOC] Builds the sympy condition for sizes and strides describing a contiguous (row-major) tensor, using the default decreasing dimension order.
     dim = len(sizes)
     return sympy_is_contiguous_generic(sizes, strides, list(range(dim - 1, -1, -1)))
 
@@ -1262,6 +1414,7 @@ def sympy_is_contiguous(
 def sympy_is_contiguous_generic(
     sizes: list[sympy.Basic], strides: list[sympy.Basic], dim_order: list[int]
 ) -> sympy.Basic:
+    # [FUNCTION DOC] Builds the sympy condition that sizes and strides form a contiguous layout for the given dimension order (innermost last in the order list): each dimension must have size 1 or the expected stride, or the tensor must have some zero size. Returns false if dim_order length differs from the number of dimensions.
     import sympy
 
     dim = len(sizes)
@@ -1288,18 +1441,21 @@ def sympy_is_contiguous_generic(
 def sympy_is_channels_last_contiguous_2d(
     sizes: list[sympy.Basic], strides: list[sympy.Basic]
 ) -> sympy.Basic:
+    # [FUNCTION DOC] Builds the condition for a 4-dimensional channels-last contiguous layout (dimension order 1, 3, 2, 0).
     return sympy_is_contiguous_generic(sizes, strides, [1, 3, 2, 0])
 
 
 def sympy_is_channels_last_contiguous_3d(
     sizes: list[sympy.Basic], strides: list[sympy.Basic]
 ) -> sympy.Basic:
+    # [FUNCTION DOC] Builds the condition for a 5-dimensional channels-last contiguous layout (dimension order 1, 4, 3, 2, 0).
     return sympy_is_contiguous_generic(sizes, strides, [1, 4, 3, 2, 0])
 
 
 def sympy_is_channels_last_strides_generic(
     sizes: list[sympy.Basic], strides: list[sympy.Basic], dim_order: list[int]
 ) -> sympy.Basic:
+    # [FUNCTION DOC] Builds the condition that strides follow a channels-last pattern for the given dimension order, mirroring the C++ check: nonzero sizes, non-decreasing strides in order, and special cases that default ambiguous layouts to the contiguous format. Returns false if dim_order length differs from the number of dimensions.
     import sympy
 
     from torch.utils._sympy.functions import Max
@@ -1342,18 +1498,21 @@ def sympy_is_channels_last_strides_generic(
 def sympy_is_channels_last_strides_2d(
     sizes: list[sympy.Basic], strides: list[sympy.Basic]
 ) -> sympy.Basic:
+    # [FUNCTION DOC] Builds the condition for 4-dimensional channels-last strides.
     return sympy_is_channels_last_strides_generic(sizes, strides, [1, 3, 2, 0])
 
 
 def sympy_is_channels_last_strides_3d(
     sizes: list[sympy.Basic], strides: list[sympy.Basic]
 ) -> sympy.Basic:
+    # [FUNCTION DOC] Builds the condition for 5-dimensional channels-last strides.
     return sympy_is_channels_last_strides_generic(sizes, strides, [1, 4, 3, 2, 0])
 
 
 def _sympy_is_non_overlapping_and_dense_indicator(
     sizes: list[sympy.Basic], strides: list[sympy.Basic]
 ) -> sympy.Basic:
+# [FUNCTION DOC] HELPER: Builds the IsNonOverlappingAndDenseIndicator expression from all sizes followed by all strides.
     from torch.utils._sympy.functions import IsNonOverlappingAndDenseIndicator
 
     return IsNonOverlappingAndDenseIndicator(*sizes, *strides)
@@ -1372,6 +1531,8 @@ sizes_strides_methods = {
 
 
 def to_node(self: SymNode, num: object) -> SymNode:
+    # [FUNCTION DOC] Converts num to a SymNode: symbolic values give their node, python bool, int or float values are wrapped as constant nodes using self, and anything else returns NotImplemented so Python tries the reflected operator.
+    # KNOWN ISSUE: the declared return type is SymNode but NotImplemented can be returned.
     if isinstance(num, SymTypes):
         return num.node
     elif type(num) is bool:
@@ -1387,6 +1548,7 @@ def to_node(self: SymNode, num: object) -> SymNode:
 
 
 def wrap_node(x: SymNode) -> SymInt | SymFloat | SymBool | int | float | bool:
+    # [FUNCTION DOC] Converts a SymNode into the user-level value: a plain python constant if the node has one, else a SymInt, SymFloat or SymBool according to its type. Raises AssertionError for unknown types.
     # TODO: let C++ also take advantage of this
     if isinstance(x, SymNode) and x.constant is not None:
         return x.constant
@@ -1401,10 +1563,13 @@ def wrap_node(x: SymNode) -> SymInt | SymFloat | SymBool | int | float | bool:
 
 
 def method_to_operator(method: str) -> Callable[..., object]:
+    # [FUNCTION DOC] Returns the python operator or function registered for the given magic method name. Raises KeyError for unknown names.
     return METHOD_TO_OPERATOR[method]
 
 
 def _make_node_magic(method: str, func: Callable[..., sympy.Basic]) -> None:
+    # [FUNCTION DOC] HELPER: Installs on SymNode the private method for one magic operation. func (the sympy builder) is wrapped in a small cache. Depending on the method name it installs the unary, sym_ite, round or binary implementation, which compute the sympy expression, hint, type and FX node, or dispatch to the proxy tensor mode when tracing.
+    # Mutates the SymNode class.
     func = lru_cache(256)(func)
 
     if method in magic_methods_on_operator_with_trailing_underscore:
@@ -1413,6 +1578,7 @@ def _make_node_magic(method: str, func: Callable[..., sympy.Basic]) -> None:
         method_attr = method
 
     def uninteresting_files() -> set[str]:
+        # [FUNCTION DOC] HELPER: Returns the set of source file names to ignore when picking user stack frames: dynamo and torch internals, this module, the dynamo guard files and the string pseudo file.
         import torch
 
         mods = [
@@ -1430,8 +1596,10 @@ def _make_node_magic(method: str, func: Callable[..., sympy.Basic]) -> None:
         )
 
     def capture_provenance(fn: Callable[..., SymNode]) -> Callable[..., SymNode]:
+        # [FUNCTION DOC] HELPER: Decorator for the operation implementations. Calls the wrapped function with self and optionally other and, when structured dtrace logging is on, logs an expression_created event with the method, result, argument strings and ids and user/framework stacks.
         @functools.wraps(fn)
         def wrapper(self: SymNode, other: SymNode | None = None) -> SymNode:
+            # [FUNCTION DOC] HELPER: Runs the wrapped implementation (one or two node arguments), emits the optional trace event and returns the resulting node.
             if other is None:
                 result = fn(self)
             else:
@@ -1443,6 +1611,7 @@ def _make_node_magic(method: str, func: Callable[..., sympy.Basic]) -> None:
                     arguments = [self]
 
                 def get_id(sym_node: SymNode) -> int | None:
+                    # [FUNCTION DOC] HELPER: Returns the id of a node for provenance logging, or None for constants, the result node itself, and literal numbers or booleans.
                     # We don't want to return an ID if the input is a constant
                     import sympy
 
@@ -1477,6 +1646,7 @@ def _make_node_magic(method: str, func: Callable[..., sympy.Basic]) -> None:
 
     @capture_provenance
     def binary_magic_impl(self: SymNode, other: SymNode) -> SymNode:
+        # [FUNCTION DOC] HELPER: Binary operation implementation: computes the result hint from the operand hints, dispatches in proxy tracing mode, otherwise builds the sympy expression (special cases for modulo using value ranges, optimized addition, and cheap unevaluated relations against unbacked symbols), picks the result type, records an FX call node and returns a new SymNode. Logs a warning and re-raises if building the expression fails. Raises AssertionError if other is not a SymNode and RuntimeError without a shape env.
         from torch.fx.experimental.proxy_tensor import (
             get_proxy_mode,
             handle_sym_dispatch,
@@ -1605,6 +1775,8 @@ def _make_node_magic(method: str, func: Callable[..., sympy.Basic]) -> None:
 
     @capture_provenance
     def unary_magic_impl(self: SymNode) -> SymNode:
+        # [FUNCTION DOC] HELPER: Unary operation implementation: dispatches in proxy tracing mode, otherwise builds the sympy expression for the method, computes hint and result type (int for ceil, floor, trunc style methods, bool for predicates, float for float methods), records an FX node and returns a new SymNode. Raises RuntimeError without a shape env.
+        # KNOWN ISSUE: the check compares against the method name ceiling, which is never registered (the method is named ceil), so floor division simplification only applies to floor.
         from torch.fx.experimental.proxy_tensor import (
             get_proxy_mode,
             handle_sym_dispatch,
@@ -1649,6 +1821,7 @@ def _make_node_magic(method: str, func: Callable[..., sympy.Basic]) -> None:
         def sym_ite_impl(
             pred_node: SymNode, then_node: SymNode, else_node: SymNode
         ) -> SymNode:
+            # [FUNCTION DOC] HELPER: Implementation of the conditional select operation: the hint follows the predicate hint, proxy mode dispatches to the symbolic ite, otherwise a sympy conditional is built, an FX node recorded and a node with the type of the then branch returned. Raises RuntimeError without a shape env.
             from torch.fx.experimental.proxy_tensor import (
                 get_proxy_mode,
                 handle_sym_dispatch,
@@ -1699,6 +1872,7 @@ def _make_node_magic(method: str, func: Callable[..., sympy.Basic]) -> None:
     elif method == "round":
 
         def round_impl(self: SymNode, ndigits: int | None = None) -> SymNode:
+            # [FUNCTION DOC] HELPER: Implementation of rounding with optional digits: proxy mode dispatches the builtin round; otherwise builds the round expression, result type is int when ndigits is None else the node type, hint from rounding the hint, and an FX node is recorded (ndigits only passed when not None). Raises RuntimeError without a shape env.
             from torch.fx.experimental.proxy_tensor import (
                 get_proxy_mode,
                 handle_sym_dispatch,
@@ -1749,11 +1923,13 @@ def _make_node_magic(method: str, func: Callable[..., sympy.Basic]) -> None:
 
 
 def _make_node_sizes_strides(method: str, func: Callable[..., sympy.Basic]) -> None:
+    # [FUNCTION DOC] HELPER: Installs on SymNode the private method for a sizes-and-strides predicate (contiguity, channels-last checks, non-overlapping-and-dense indicator), and registers a user-level function of the same name in this module if none exists yet. Mutates SymNode and this module.
     # NB: don't LRU cache, lots of arguments
 
     def sizes_strides_impl(
         self: SymNode, sizes: list[SymNode], strides: list[SymNode]
     ) -> SymNode:
+        # [FUNCTION DOC] HELPER: Evaluates the predicate over lists of size and stride nodes: proxy mode dispatches to the module-level function; otherwise builds the expression, hint (only if all hints are known) and returns a node of type int for indicator methods, else bool. Logs and re-raises on expression failure.
         from torch.fx.experimental.proxy_tensor import (
             get_proxy_mode,
             handle_sym_dispatch,
@@ -1809,6 +1985,7 @@ def _make_node_sizes_strides(method: str, func: Callable[..., sympy.Basic]) -> N
     def sizes_strides_user(
         sizes: list[object], strides: list[object]
     ) -> SymInt | SymFloat | SymBool | int | float | bool:
+        # [FUNCTION DOC] HELPER: User-level entry point for the predicate: if any size or stride is a SymInt, delegates to that node's method and wraps the result; for the non-overlapping-and-dense indicator with plain values uses the eval function; otherwise evaluates the sympy condition on concrete values and returns a bool.
         import sympy
 
         from torch.fx.experimental.symbolic_shapes import (
@@ -1850,6 +2027,7 @@ for method, func in sizes_strides_methods.items():
 
 
 def _make_user_magic(method: str, user_type: type) -> None:
+    # [FUNCTION DOC] HELPER: Installs the user-level operator for a magic method on the given user type (SymInt, SymFloat or SymBool) and, for SymInt, on DynamicInt. Handles unary, unary non-magic, conditional select, round and binary (plus reflected) operations, promoting operand types and unwrapping constants. Mutates the classes.
     # User magic takes care of wrapping the other operand into a node,
     # so that our internal logic can assume everything is nodes
     if method in magic_methods_on_operator_with_trailing_underscore:
@@ -1860,6 +2038,8 @@ def _make_user_magic(method: str, user_type: type) -> None:
     def get_constant(
         x: SymInt | int | SymFloat | float | SymBool | bool,
     ) -> int | float | bool:
+        # [FUNCTION DOC] HELPER: Returns the python value of a constant operand: plain values as is, SymInt and SymBool through guarding on their node. Raises AssertionError otherwise.
+        # KNOWN ISSUE: SymFloat is not handled, although is_constant may report a SymFloat as constant, so that case raises AssertionError.
         if isinstance(x, (int, float, bool)):
             return x
         if isinstance(x, SymInt):
@@ -1869,6 +2049,7 @@ def _make_user_magic(method: str, user_type: type) -> None:
         raise AssertionError("expect to be called with constant SymBools")
 
     def is_constant(x: SymInt | int | SymFloat | float | SymBool | bool) -> bool:
+        # [FUNCTION DOC] HELPER: Returns True for plain python numbers and for symbolic values whose node reports constant; False otherwise.
         if isinstance(x, (int, float, bool)):
             return True
         if isinstance(x, (SymInt, SymFloat, SymBool)):
@@ -1904,6 +2085,7 @@ def _make_user_magic(method: str, user_type: type) -> None:
     if method in bool_becomes_int_magic_methods:
 
         def promote(x: object) -> Any:
+            # [FUNCTION DOC] HELPER: Used when bools become ints: converts a SymBool to a SymInt of its integer value and a plain bool to an int; other values pass through.
             """Implements True+True=2, which works in python but not sympy"""
             if isinstance(x, SymBool):
                 return SymInt(x.node.wrap_int(int(x)))
@@ -1914,9 +2096,11 @@ def _make_user_magic(method: str, user_type: type) -> None:
     else:
 
         def promote(x: object) -> Any:
+            # [FUNCTION DOC] HELPER: Identity promotion for methods that do not convert bools to ints.
             return x
 
     def promote2(self: object, other: object) -> tuple[Any, Any]:
+        # [FUNCTION DOC] HELPER: Applies float promotion to a pair of operands for arithmetic and comparison methods: if either is a float or SymFloat, the other is converted to a symbolic float. Other methods return the operands unchanged.
         # TODO: Remove eq and other relations from this list.
         # CPython has fancy implementations for these to get as much precision
         # as possible instead of just promoting to float64 and praying, so we
@@ -1959,12 +2143,14 @@ def _make_user_magic(method: str, user_type: type) -> None:
     # implementing wrap_bool in ConstantSymNodeImpl), but we're not doing that
     # today for no particular reason.
     def unary_magic_impl(self: object) -> Any:
+        # [FUNCTION DOC] HELPER: User-level unary operator: promotes the operand, evaluates the python operator directly for constants, otherwise calls the node method and wraps the result.
         self = promote(self)
         if is_constant(self):
             return (method_to_operator(method))(get_constant(self))
         return wrap_node(getattr(self.node, method_attr)())
 
     def binary_magic_impl(self: object, other: object) -> Any:
+        # [FUNCTION DOC] HELPER: User-level binary operator: returns NotImplemented for unsupported operand types, promotes types, evaluates the python operator for a constant self, converts other to a node and returns the wrapped result (a plain constant if the result is constant).
         if not isinstance(other, (int, float, bool, SymInt, SymFloat, SymBool)):
             return NotImplemented
         sym_node_log.debug("MAGIC %s %s %s", method, self, other)
@@ -1982,6 +2168,7 @@ def _make_user_magic(method: str, user_type: type) -> None:
         return get_constant(ret) if is_constant(ret) else ret
 
     def rbinary_magic_impl(self: object, other: object) -> Any:
+        # [FUNCTION DOC] HELPER: User-level reflected binary operator: same as the binary version but with the operands swapped, so the node method is called on the converted other operand.
         if not isinstance(other, (int, float, bool, SymInt, SymFloat, SymBool)):
             return NotImplemented
         self = promote(self)
@@ -1998,6 +2185,7 @@ def _make_user_magic(method: str, user_type: type) -> None:
         return get_constant(ret) if is_constant(ret) else ret
 
     def setattrs(user_type: type, attr: str, symnode_impl: object) -> None:
+        # [FUNCTION DOC] HELPER: Registers the implementation as attribute attr on user_type and, for SymInt, a wrapper on DynamicInt that unwraps DynamicInt arguments, calls the int method of the same name, and re-wraps int (non-bool) results as DynamicInt.
         """
         Registers the SymNode magic method on SymInt/Float/Bool,
         and optionally registers a corresponding wrapped method on DynamicInt.
@@ -2008,6 +2196,7 @@ def _make_user_magic(method: str, user_type: type) -> None:
 
         # DynamicInt impl
         def dynamic_int_impl(*args: object) -> Any:
+            # [FUNCTION DOC] HELPER: DynamicInt wrapper: unwraps DynamicInt arguments, calls the int method and re-wraps integer results (excluding bool) as DynamicInt.
             args = [  # pyrefly: ignore[bad-assignment]
                 x.real if isinstance(x, DynamicInt) else x for x in args
             ]
@@ -2029,6 +2218,7 @@ def _make_user_magic(method: str, user_type: type) -> None:
         def sym_ite_magic_impl(
             pred: SymBool, then_val: object, else_val: object
         ) -> Any:
+            # [FUNCTION DOC] HELPER: User-level conditional select: converts both branches to nodes (returning NotImplemented if not possible), requires equal types (AssertionError otherwise), and returns the wrapped result, or a constant if the result is constant.
             pred_node = pred.node
             then_node = to_node(pred_node, then_val)
             else_node = to_node(pred_node, else_val)
@@ -2054,6 +2244,7 @@ def _make_user_magic(method: str, user_type: type) -> None:
     elif method == "round":
 
         def round_magic_impl(self: SymFloat, ndigits: int | None = None) -> Any:
+            # [FUNCTION DOC] HELPER: User-level rounding: returns the builtin round of the constant for constants, otherwise calls the node method with ndigits and wraps the result.
             if is_constant(self):
                 return builtins.round(get_constant(self), ndigits)
 

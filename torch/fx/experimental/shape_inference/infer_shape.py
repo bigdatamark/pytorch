@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Entry point for experimental symbolic shape inference over an FX GraphModule.
+# infer_shape repeatedly traces the graph with fake tensors whose dimensions are
+# symbolic, using error messages from failed attempts to solve for symbol values
+# (see infer_symbol_values). mksym creates a symbolic integer from a ShapeEnv.
+# No import-time side effects beyond imports.
 import copy
 from collections import defaultdict
 
@@ -23,6 +29,17 @@ def infer_shape(
 ) -> (
     tuple[torch.fx.GraphModule, list[torch.Tensor], FakeTensorMode, IntLikeType] | None
 ):
+    # [FUNCTION DOC]
+    # Tries to make gm traceable with symbolic fake inputs shaped like input_tensors. It
+    # creates a fresh ShapeEnv and fake mode, allocates one symbol for the shared leading
+    # (batch) dimension plus one per remaining dimension of the flattened inputs, and
+    # loops up to twice that count: build symbolic inputs, trace gm with make_fx in
+    # symbolic pre-dispatch mode and on a RuntimeError or ValueError feed the message to
+    # infer_symbol_values to refine the symbol values. Returns (gm, input_tensors, fake_mode,
+    # the batch symbol) on success, or None when attempts run out.
+    # KNOWN ISSUE: the docstring-like string says the input graph is modified, but gm is
+    # not changed here; the failure paths in each handler are guarded by a pointless truthiness check
+    # on the exception, and the first symbol is shared by all inputs, assuming equal batch size.
     # Prepare environments
     shape_env = ShapeEnv()
     fake_mode = FakeTensorMode(shape_env=shape_env, allow_non_fake_inputs=True)
@@ -94,6 +111,8 @@ def infer_shape(
 def mksym(
     shape_env: ShapeEnv, value: int, source: LocalSource, dynamic_dim: DimDynamic
 ) -> IntLikeType:
+    # [FUNCTION DOC] Creates a symbol in shape_env with the given hint value, source and
+    # dynamism setting, and wraps it into a symbolic integer node with the same hint and source.
     return shape_env.create_symintnode(
         shape_env.create_symbol(
             value,

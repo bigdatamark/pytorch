@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# AST-based source rewriting so that FX symbolic tracing can handle constructs it
+# otherwise cannot: assert statements become calls to the traceable torch._assert and
+# annotated assignments become calls to an annotate function. Provides AST_Rewriter,
+# RewritingTracer (a Tracer that rewrites its root before tracing) and the private
+# _rewrite helper. No import-time side effects beyond imports.
 import ast
 import copy
 import functools
@@ -14,6 +20,10 @@ from torch.fx.graph import Graph
 
 
 class AST_Rewriter(ast.NodeTransformer):
+    # [CLASS DOC]
+    # NodeTransformer that rewrites the source of a function (typically a forward method)
+    # into an FX-traceable equivalent. Stateless; rewrite is the entry point and the
+    # visit_Assert and visit_AnnAssign methods define the node replacements.
     """
     Take a FunctionType object representing a `forward` method, then
     perform an AST rewrite to swap out nodes that are not symbolically
@@ -30,6 +40,13 @@ class AST_Rewriter(ast.NodeTransformer):
     # suitable for dynamo tracing anyways.
     @torch._dynamo.disable
     def rewrite(self, fn: FunctionType) -> FunctionType:
+        # [FUNCTION DOC]
+        # Gets and dedents the source of fn, parses it, applies the node transformations,
+        # compiles and executes the result in a copy of fn's globals, and returns the single
+        # newly defined function rebuilt to use fn's original globals. Raises AssertionError if
+        # executing the code does not define exactly one new global name; source lookup
+        # errors from inspect propagate. Mutates only the copied globals mapping. Disabled
+        # for dynamo tracing.
         # Normalize the source lines
         sourcelines, _ = inspect.getsourcelines(fn)
         sourcelines = normalize_source_lines(sourcelines)
@@ -54,6 +71,8 @@ class AST_Rewriter(ast.NodeTransformer):
         def change_func_globals(
             f: FunctionType, globals: dict[str, object]
         ) -> FunctionType:
+            # [FUNCTION DOC] HELPER: Returns a copy of function f bound to the given globals
+            # mapping, preserving name, defaults, closure, wrapper metadata and keyword defaults.
             """Based on https://stackoverflow.com/a/13503277/2988730 (@unutbu)"""
             # __globals__ is a private member of the function class
             # so we have to copy the function, f, all of its member, except f.__globals__
@@ -72,6 +91,11 @@ class AST_Rewriter(ast.NodeTransformer):
         return change_func_globals(fn_compiled, globals=fn.__globals__)
 
     def visit_Assert(self, node: ast.Assert) -> ast.Expr:
+        # [FUNCTION DOC]
+        # Replaces an assert statement with an expression statement calling torch._assert
+        # with the test and the message (an empty string constant when no message is given).
+        # Returns the new node with the original location. Raises AssertionError if the
+        # internally parsed template is not a call expression.
         """
         Swap out the Assert node (Python's `assert`) with a callsite to the
         symbolically-traceable torch._assert function
@@ -94,6 +118,12 @@ class AST_Rewriter(ast.NodeTransformer):
         return ast.copy_location(expr_wrapper, node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.Assign:
+        # [FUNCTION DOC]
+        # Replaces an annotated assignment with a plain assignment of a call to a name
+        # annotate, passing the assigned value and the annotation expression.
+        # KNOWN ISSUE: an annotation without a value (node.value is None) is not handled and
+        # yields an invalid argument; no location is copied to the new node (callers rely on
+        # fix_missing_locations); the docstring example output shows a different tuple form.
         """
         Swap out Python's AnnAssign with an Assign node where the annotation function is called.
         Example:
@@ -114,24 +144,36 @@ class AST_Rewriter(ast.NodeTransformer):
 
 
 class RewritingTracer(Tracer):
+    # [CLASS DOC]
+    # Tracer that first rewrites the root module or function's source using AST_Rewriter
+    # (via _rewrite), then traces the rewritten object with the standard Tracer logic.
     def trace(
         self,
         root: torch.nn.Module | Callable[..., Any],
         concrete_args: dict[str, Any] | None = None,
     ) -> Graph:
+        # [FUNCTION DOC] Rewrites root with _rewrite and traces it, forwarding concrete_args;
+        # returns the resulting Graph.
         return super().trace(_rewrite(root), concrete_args)
 
 
 def _rewrite(
     fn: torch.nn.Module | Callable[..., Any],
 ) -> torch.nn.Module | Callable[..., Any]:
+    # [FUNCTION DOC] HELPER: For a Module, returns a new module hierarchy (shallow copies of
+    # attributes, recursively rewriting submodules) whose forward methods are rewritten;
+    # for any other callable returns the rewritten function. Does not modify the input.
     if isinstance(fn, torch.nn.Module):
         # Rewrite this module's `forward` as well as the `forward`s of
         # all of this module's recursive descendants. Return the new,
         # rewritten module hierarchy.
         def rewrite_module(m: torch.nn.Module) -> torch.nn.Module:
+            # [FUNCTION DOC] HELPER: Builds a new Module subclass instance copying m's
+            # attributes with a rewritten forward; submodule attributes are rewritten recursively.
             class RewrittenModule(torch.nn.Module):
+                # [CLASS DOC] HELPER: Dynamically created Module copy of an original module; its forward is replaced after class creation.
                 def __init__(self, orig: torch.nn.Module) -> None:
+                    # [FUNCTION DOC] HELPER: Copies every entry of orig's attribute dictionary, recursively rewriting Module values.
                     super().__init__()
                     for k, v in orig.__dict__.items():
                         if isinstance(v, torch.nn.Module):

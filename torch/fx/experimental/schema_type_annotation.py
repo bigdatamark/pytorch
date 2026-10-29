@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Provides AnnotateTypesWithSchema, an FX Transformer that fills in the type field of
+# graph nodes using Python signature return annotations (torch.nn.functional calls and
+# torch.nn module forwards) and TorchScript type inference for get_attr values.
+# No import-time side effects beyond imports.
 import inspect
 from typing import Any
 
@@ -15,6 +20,10 @@ __all__ = ["AnnotateTypesWithSchema"]
 
 
 class AnnotateTypesWithSchema(Transformer):
+    # [CLASS DOC]
+    # Transformer that re-emits a GraphModule while setting node.type where it is unset.
+    # State: three booleans (annotate_functionals, annotate_modules, annotate_get_attrs)
+    # that enable each kind of annotation. Existing node types are never overwritten.
     """
     Use Python function signatures to annotate types for `Nodes` within an FX graph.
     This pulls out Python function signatures for:
@@ -40,6 +49,8 @@ class AnnotateTypesWithSchema(Transformer):
         annotate_modules: bool = True,
         annotate_get_attrs: bool = True,
     ) -> None:
+        # [FUNCTION DOC] Initializes the transformer for module and stores the three flags
+        # selecting functional calls, module calls and get_attr nodes for annotation.
         super().__init__(module)
         self.annotate_functionals = annotate_functionals
         self.annotate_modules = annotate_modules
@@ -48,6 +59,12 @@ class AnnotateTypesWithSchema(Transformer):
     def call_function(
         self, target: Target, args: tuple[Argument, ...], kwargs: dict[str, Any]
     ) -> Proxy:
+        # [FUNCTION DOC] Runs the normal call_function transform and, when annotate_functionals
+        # is set and the target belongs to torch.nn.functional, sets the result node's type
+        # (if unset) to the target's return annotation. For boolean-dispatched functions
+        # the true branch signature is used only if both branches have the same return
+        # annotation; otherwise no annotation is added. Returns the result proxy.
+        # Raises AssertionError if a boolean-dispatched target is a string.
         python_ret_type = None
         if self.annotate_functionals and target.__module__ == "torch.nn.functional":
             target_for_analysis = target
@@ -80,6 +97,10 @@ class AnnotateTypesWithSchema(Transformer):
     def call_module(
         self, target: Target, args: tuple[Argument, ...], kwargs: dict[str, Any]
     ) -> Proxy:
+        # [FUNCTION DOC] Runs the normal call_module transform and, when annotate_modules is
+        # set and the submodule's class is exactly the torch.nn class of the same name, sets
+        # the result node's type (if unset) to the return annotation of its forward.
+        # Returns the result proxy. Raises AssertionError if target is not a string.
         python_ret_type = None
         if not isinstance(target, str):
             raise AssertionError(f"Expected str target, got {type(target)}")
@@ -100,6 +121,11 @@ class AnnotateTypesWithSchema(Transformer):
         args: tuple[Argument, ...],
         kwargs: dict[str, Any],
     ) -> Proxy:
+        # [FUNCTION DOC] Runs the normal get_attr transform and, when annotate_get_attrs is
+        # set, resolves the dotted target path on the module, asks TorchScript to infer the
+        # attribute's type, and if successful sets the node type (if unset) to the Python
+        # equivalent. Raises AssertionError for a non-string target and RuntimeError if a
+        # path component does not exist. Returns the proxy.
         attr_proxy = super().get_attr(target, args, kwargs)
 
         if self.annotate_get_attrs:
@@ -126,6 +152,9 @@ class AnnotateTypesWithSchema(Transformer):
         return attr_proxy
 
     def _extract_python_return_type(self, target: Target) -> Any | None:
+        # [FUNCTION DOC] HELPER: Returns the return annotation of the callable target, or
+        # None if its signature cannot be inspected or has no annotation. Raises
+        # AssertionError if target is not callable.
         """
         Given a Python call target, try to extract the Python return annotation
         if it is available, otherwise return None
