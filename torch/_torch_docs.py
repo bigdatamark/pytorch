@@ -1,4 +1,12 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Attaches documentation strings to the native functions and Tensor-free
+# functions exposed by torch._C (e.g. abs, add, matmul, ...). It defines two helpers
+# (parse_kwargs, merge_dicts), shared mappings of common argument descriptions
+# (common_args, reduceops_common_args, factory_common_args, sparse_support_notes,
+# etc.), then calls add_docstr (torch._C._add_docstr) about 470 times, once per
+# function, with a long docstring text.
+# Import-time side effect: mutates the __doc__ of many torch._C builtins; it
+# requires torch._C to already be importable.
 """Adds docstrings to functions defined in the torch._C module."""
 
 import re
@@ -8,6 +16,10 @@ from torch._C import _add_docstr as add_docstr
 
 
 def parse_kwargs(desc):
+    # [FUNCTION DOC] Parses an indented multi-line argument description into a mapping
+    # from argument name to its full description text. Splits the text at newlines
+    # followed by exactly four spaces, strips each section, drops empty sections,
+    # and keys each section by its first space-separated word. Pure; no side effects.
     r"""Map a description of args to a dictionary of {argname: description}.
 
     Input:
@@ -26,6 +38,8 @@ def parse_kwargs(desc):
 
 
 def merge_dicts(*dicts):
+    # [FUNCTION DOC] Merges any number of mappings into a new one; later mappings
+    # override earlier ones on duplicate keys. Inputs are not mutated.
     """Merge dictionaries into a single dictionary."""
     return {x: d[x] for d in dicts for x in d}
 
