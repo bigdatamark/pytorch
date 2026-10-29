@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 # Owner(s): ["oncall: r2p"]
 
+# [MODULE DOC] Unit tests for torch.distributed.elastic.agent.server.api: WorkerState, WorkerGroup,
+# _RoleInstanceInfo, event construction and recording, metrics, and SimpleElasticAgent behavior
+# (rendezvous, rank assignment, restarts, run loop) using a fake TestAgent subclass and a static
+# rendezvous. Only the unittest classes and small helpers are defined; nothing runs at import. The
+# __main__ guard raises an error because the file is not wired into discover_tests.
+
 import functools
 
 # Copyright (c) Facebook, Inc. and its affiliates.
@@ -38,11 +44,16 @@ from torch.distributed.elastic.utils.distributed import get_free_port
 
 
 def do_nothing():
+    # [FUNCTION DOC] HELPER: Empty worker entrypoint used as the fn of WorkerSpec in tests; does
+    # nothing and returns None.
     pass
 
 
 class WorkerStateTest(unittest.TestCase):
+    # [CLASS DOC] Tests for the WorkerState enum helpers.
     def test_is_running(self):
+        # [FUNCTION DOC] Iterates every WorkerState and checks is_running is true only for HEALTHY
+        # and UNHEALTHY.
         for state in WorkerState:
             if state == WorkerState.HEALTHY or state == WorkerState.UNHEALTHY:
                 self.assertTrue(WorkerState.is_running(state))
@@ -51,7 +62,11 @@ class WorkerStateTest(unittest.TestCase):
 
 
 class WorkerGroupTest(unittest.TestCase):
+    # [CLASS DOC] Tests for WorkerGroup construction from a WorkerSpec.
     def test_worker_group_constructor(self):
+        # [FUNCTION DOC] Builds a WorkerGroup from a 4-process spec and checks state is INIT, there
+        # are 4 workers with local ranks 0..3, global_rank and world_size are -1 and id is None
+        # before rendezvous, and group_rank and store are None.
         spec = WorkerSpec(
             role="test_trainer",
             local_world_size=4,
@@ -85,7 +100,10 @@ class WorkerGroupTest(unittest.TestCase):
 
 
 class RoleInstanceInfoTest(unittest.TestCase):
+    # [CLASS DOC] Tests for _RoleInstanceInfo ordering, serialization and role boundary search.
     def test_compare(self):
+        # [FUNCTION DOC] Checks compare orders by role name first and then by rank, returning 1 or
+        # -1 accordingly.
         agent_role1 = _RoleInstanceInfo("role", 1, 10)
         agent_role2 = _RoleInstanceInfo("role", 2, 10)
         self.assertEqual(1, _RoleInstanceInfo.compare(agent_role2, agent_role1))
@@ -97,6 +115,8 @@ class RoleInstanceInfoTest(unittest.TestCase):
         self.assertEqual(-1, _RoleInstanceInfo.compare(agent_role1, agent_role2))
 
     def test_serde(self):
+        # [FUNCTION DOC] Round-trips a _RoleInstanceInfo through serialize and deserialize and
+        # checks role, rank and local_world_size are preserved.
         agent_role = _RoleInstanceInfo("role", 1, 10)
         str_data = agent_role.serialize()
         actual_agent_role = _RoleInstanceInfo.deserialize(str_data)
@@ -107,6 +127,8 @@ class RoleInstanceInfoTest(unittest.TestCase):
         )
 
     def test_find_boundaries(self):
+        # [FUNCTION DOC] Checks find_role_boundaries returns the inclusive start and end index (0
+        # and 2) of the 'trainer' entries in a list sorted by role.
         role_infos = [
             _RoleInstanceInfo("trainer", 1, 1),
             _RoleInstanceInfo("trainer", 2, 2),
@@ -122,18 +144,27 @@ class RoleInstanceInfoTest(unittest.TestCase):
 
 
 class TestAgent(SimpleElasticAgent):
+    # [CLASS DOC] HELPER: Minimal SimpleElasticAgent for tests with fake workers. Counts calls to
+    # _stop_workers and _start_workers in public counters; _monitor_workers must be mocked by the
+    # test; _shutdown is a no-op.
     def __init__(self, spec):
+        # [FUNCTION DOC] HELPER: Initializes the base agent with the spec and zeroes the
+        # stop_workers_call_count and start_workers_call_count counters.
         super().__init__(spec)
         self.stop_workers_call_count = 0
         self.start_workers_call_count = 0
 
     def _stop_workers(self, worker_group: WorkerGroup) -> None:
+        # [FUNCTION DOC] HELPER: Fake stop: clears group_rank and group_world_size on the worker
+        # group (simulating lost rendezvous info) and increments stop_workers_call_count.
         # workers are fake, nothing to stop; just clear the rdzv info
         worker_group.group_rank = None
         worker_group.group_world_size = None
         self.stop_workers_call_count += 1
 
     def _start_workers(self, worker_group: WorkerGroup) -> dict[int, Any]:
+        # [FUNCTION DOC] HELPER: Fake start: increments start_workers_call_count and returns a
+        # mapping from each worker's local rank to its global rank, used as the worker id.
         # crate fake workers; make worker id equal to global rank
         ids = {}
         for worker in worker_group.workers:
@@ -142,13 +173,19 @@ class TestAgent(SimpleElasticAgent):
         return ids
 
     def _monitor_workers(self, worker_group: WorkerGroup) -> RunResult:
+        # [FUNCTION DOC] HELPER: Always raises NotImplementedError; tests are expected to patch
+        # this method.
         raise NotImplementedError("mock this method")
 
     def _shutdown(self):
+        # [FUNCTION DOC] HELPER: No-op replacement for the agent shutdown hook.
         pass
 
 
 def monres(state: WorkerState):
+    # [FUNCTION DOC] HELPER: Builds a RunResult for the given WorkerState: SUCCEEDED gets return
+    # value 0 for rank 0 and no failures; UNHEALTHY or FAILED gets a ProcessFailure (rank 0, pid
+    # 999, exit code 1) for rank 0; any other state gets a bare RunResult with that state.
     if state == WorkerState.SUCCEEDED:
         return RunResult(state=state, return_values={0: 0}, failures={})
     elif state in {WorkerState.UNHEALTHY, WorkerState.FAILED}:
@@ -159,7 +196,12 @@ def monres(state: WorkerState):
 
 
 class RecordWorkerEventsTest(unittest.TestCase):
+    # [CLASS DOC] Tests _record_worker_events, which emits one event per worker. setUp builds an
+    # agent over a mocked spec with a 2-worker group.
     def setUp(self):
+        # [FUNCTION DOC] Creates a MagicMock spec with role, entrypoint name, run id, backend and
+        # max_restarts 3, a TestAgent and a WorkerGroup (world size 2, group rank 1) holding two
+        # Workers with ids 0 and 1 attached to the agent.
         super().setUp()
         self.spec = MagicMock()
         self.spec.role = "test_role"
@@ -205,6 +247,9 @@ class RecordWorkerEventsTest(unittest.TestCase):
 
     @patch("torch.distributed.elastic.agent.server.api.record")
     def test_record_worker_events_success(self, mock_record):
+        # [FUNCTION DOC] With the record function patched, a SUCCEEDED result must yield two worker
+        # events with state SUCCEEDED, no raw_error, and exit_code and worker_pid metadata of
+        # [None].
         # Create a RunResult with successful workers
         result = RunResult(
             state=WorkerState.SUCCEEDED,
@@ -231,6 +276,9 @@ class RecordWorkerEventsTest(unittest.TestCase):
 
     @patch("torch.distributed.elastic.agent.server.api.record")
     def test_record_worker_events_failure(self, mock_record):
+        # [FUNCTION DOC] With a FAILED result containing a failure only for rank 0, two events are
+        # recorded: rank 0 as FAILED with a raw_error JSON string and exit code 1 / pid 1000, and
+        # rank 1 as TERMINATED with no error and None exit code and pid.
         # Create failures with error data
         failure0 = ProcessFailure(
             local_rank=0, pid=1000, exitcode=1, error_file="error0.json"
@@ -277,7 +325,11 @@ class RecordWorkerEventsTest(unittest.TestCase):
 
 
 class ConstructEventTest(unittest.TestCase):
+    # [CLASS DOC] Tests SimpleElasticAgent._construct_event metadata for agent and worker events.
     def setUp(self):
+        # [FUNCTION DOC] Builds a mocked spec, a TestAgent with 2 remaining restarts and total
+        # execution time 42, a WorkerGroup (size 2, rank 1) and a Worker (global rank 5, id 12345)
+        # for the tests.
         super().setUp()
         # Create minimal spec and agent for testing
         self.spec = MagicMock()
@@ -304,6 +356,10 @@ class ConstructEventTest(unittest.TestCase):
         self.worker.id = 12345
 
     def test_construct_event_agent_success(self):
+        # [FUNCTION DOC] An AGENT-source SUCCEEDED event is named
+        # torchelastic.worker.status.SUCCEEDED and carries run id, group rank, role, backend, total
+        # run time, agent_restarts (max minus remaining = 1), no global rank, worker id, raw error
+        # or duration, and JSON metadata with group_world_size and entry_point.
         # Test constructing an agent success event
         event = self.agent._construct_event(state="SUCCEEDED", source=EventSource.AGENT)
 
@@ -333,6 +389,9 @@ class ConstructEventTest(unittest.TestCase):
         self.assertEqual(md_dict["entry_point"], "test_entrypoint")
 
     def test_construct_event_worker_failure(self):
+        # [FUNCTION DOC] A WORKER-source FAILED event with a raw_error and exit_code carries the
+        # worker's global rank and stringified id, the raw error, and JSON metadata with
+        # local_rank, role_rank, role_world_size and exit_code lists.
         # Test constructing a worker failure event with raw error
         raw_error = json.dumps(
             {"error_message": "Test error", "traceback": "stack trace"}
@@ -370,6 +429,7 @@ class ConstructEventTest(unittest.TestCase):
         self.assertEqual(md_dict["exit_code"], [1])
 
     def test_construct_event_with_duration(self):
+        # [FUNCTION DOC] A duration_ms argument is stored unchanged in the event metadata.
         # Test constructing an event with duration_ms
         event = self.agent._construct_event(
             state="RENDEZVOUS", source=EventSource.AGENT, duration_ms=123.45
@@ -379,6 +439,10 @@ class ConstructEventTest(unittest.TestCase):
         self.assertEqual(event.metadata["duration_ms"], 123.45)
 
     def test_construct_event_worker_no_error(self):
+        # [FUNCTION DOC] A worker event without error info has raw_error None and carries rank, id
+        # and role metadata.
+        # KNOWN ISSUE: the final assertion checks that exit_code is not in a list containing None,
+        # not in the metadata dict, so it is vacuous.
         # Test constructing a worker event without error info
         event = self.agent._construct_event(
             state="HEALTHY", source=EventSource.WORKER, worker=self.worker
@@ -401,6 +465,9 @@ class ConstructEventTest(unittest.TestCase):
 
 
 class SimpleElasticAgentTest(unittest.TestCase):
+    # [CLASS DOC] Tests of SimpleElasticAgent logic (metrics, exit barrier, rendezvous, worker
+    # init/restart, run loop, rank assignment, events) using TestAgent and a single-node static
+    # rendezvous.
     def _get_worker_spec(
         self,
         max_restarts=1,
@@ -410,6 +477,10 @@ class SimpleElasticAgentTest(unittest.TestCase):
         local_addr=None,
         event_log_handler="null",
     ):
+        # [FUNCTION DOC] HELPER: Builds a WorkerSpec using a static rendezvous handler on a free
+        # local port (127.0.0.1 or local_addr), single node with rank 0 and a fresh uuid run id.
+        # Takes max_restarts, monitor_interval, role, local_world_size, local_addr and
+        # event_log_handler; returns the spec.
         run_id = str(uuid.uuid4().int)
         port = get_free_port()
         if local_addr is None:
@@ -440,6 +511,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
         return spec
 
     def test_agent_constructor(self):
+        # [FUNCTION DOC] A new agent's worker group is in INIT state and remaining restarts equal
+        # the spec's max_restarts.
         spec = self._get_worker_spec(max_restarts=1)
         agent = TestAgent(spec)
         worker_group = agent.get_worker_group()
@@ -448,6 +521,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
 
     @patch("torch.distributed.elastic.agent.server.api.put_metric")
     def test_record_flakiness_metric(self, put_metric_mock):
+        # [FUNCTION DOC] With put_metric patched, the flakiness metric is 0 with no restarts used,
+        # and 63 with max_restarts 10 and 3 remaining.
         spec = self._get_worker_spec(max_restarts=1)
         agent = TestAgent(spec)
         agent._record_flakiness_metric()
@@ -459,6 +534,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
 
     @patch("torch.distributed.elastic.agent.server.api.put_metric")
     def test_record_flakiness_metric_zero_restarts(self, put_metric_mock):
+        # [FUNCTION DOC] With max_restarts 0 the flakiness metric is reported as 0 (no division by
+        # zero).
         spec = self._get_worker_spec(max_restarts=1)
         spec.max_restarts = 0
         agent = TestAgent(spec)
@@ -467,6 +544,7 @@ class SimpleElasticAgentTest(unittest.TestCase):
 
     @patch("torch.distributed.elastic.agent.server.api.put_metric")
     def test_record_flakiness_metric_user_exception(self, put_metric_mock):
+        # [FUNCTION DOC] Passing the user-exception flag makes the flakiness metric 100.
         spec = self._get_worker_spec(max_restarts=1)
         agent = TestAgent(spec)
         agent._record_flakiness_metric(True)
@@ -479,6 +557,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
     def test_invoke_run(
         self, shutdown_mock, record_events_mock, record_metrics_mock, invoke_run_mock
     ):
+        # [FUNCTION DOC] Patches the agent internals and checks run calls _invoke_run,
+        # _record_metrics, _record_worker_events and _shutdown exactly once each.
         spec = self._get_worker_spec(max_restarts=1)
         agent = TestAgent(spec)
         agent.run()
@@ -488,6 +568,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
         shutdown_mock.assert_called_once()
 
     def test_exit_barrier_sets_and_clears_flag(self):
+        # [FUNCTION DOC] Checks _in_exit_barrier is true while the (patched) store barrier runs and
+        # false after _exit_barrier returns.
         """Verify _in_exit_barrier is set before barrier and cleared after."""
         spec = self._get_worker_spec(max_restarts=0)
         agent = TestAgent(spec)
@@ -512,6 +594,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
         self.assertFalse(agent._in_exit_barrier)
 
     def test_exit_barrier_clears_flag_on_timeout(self):
+        # [FUNCTION DOC] Checks _in_exit_barrier is cleared even when the patched barrier raises,
+        # and that _exit_barrier does not propagate the error.
         """Verify _in_exit_barrier is cleared even if barrier times out."""
         spec = self._get_worker_spec(max_restarts=0)
         agent = TestAgent(spec)
@@ -530,6 +614,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
 
     @patch("torch.distributed.elastic.agent.server.api.put_metric")
     def test_record_metrics_success_no_retries(self, put_metric_mock):
+        # [FUNCTION DOC] A successful empty RunResult with no restarts used records the
+        # run_success_no_retries metric as 1.
         spec = self._get_worker_spec(max_restarts=1)
         agent = TestAgent(spec)
         group_result = RunResult({}, {})
@@ -539,6 +625,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
 
     @patch("torch.distributed.elastic.agent.server.api.put_metric")
     def test_record_metrics_success_with_retries(self, put_metric_mock):
+        # [FUNCTION DOC] A successful result after some restarts were used records
+        # run_success_with_retries as 1.
         spec = self._get_worker_spec(max_restarts=10)
         agent = TestAgent(spec)
         agent._remaining_restarts = 2
@@ -549,6 +637,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
 
     @patch("torch.distributed.elastic.agent.server.api.put_metric")
     def test_record_metrics_failed_with_retries(self, put_metric_mock):
+        # [FUNCTION DOC] A FAILED result while restarts were used records run_failed_with_retries
+        # as 1.
         spec = self._get_worker_spec(max_restarts=10)
         agent = TestAgent(spec)
         agent._remaining_restarts = 2
@@ -561,6 +651,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
 
     @patch("torch.distributed.elastic.agent.server.api.put_metric")
     def test_record_metrics_failed_no_retries(self, put_metric_mock):
+        # [FUNCTION DOC] A FAILED result with all restarts remaining records run_failed_no_retries
+        # as 1.
         spec = self._get_worker_spec(max_restarts=10)
         agent = TestAgent(spec)
         group_result = RunResult(
@@ -577,6 +669,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
         failed_with_retries=0,
         failed_no_retries=0,
     ):
+        # [FUNCTION DOC] HELPER: Returns the four expected put_metric calls (success/failed,
+        # with/no retries) for role test_trainer, using the given counts as values.
         calls = [
             call("workers.test_trainer.run_success_with_retries", success_with_retries),
             call("workers.test_trainer.run_success_no_retries", success_no_retries),
@@ -586,6 +680,9 @@ class SimpleElasticAgentTest(unittest.TestCase):
         return calls
 
     def test_rendezvous(self):
+        # [FUNCTION DOC] After _rendezvous on a single-node agent, group size is 1, group rank 0,
+        # master address is the fq hostname with a positive port, and each worker's world size and
+        # global rank follow local_world_size * group size / rank, covering all ranks.
         hostname = _get_fq_hostname()
         spec = self._get_worker_spec(max_restarts=1, local_addr=hostname)
         agent = TestAgent(spec)
@@ -613,6 +710,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
             self.assertSetEqual(set(range(w.world_size)), rank_set)
 
     def test_rendezvous_default_master_addr(self):
+        # [FUNCTION DOC] Master address defaults to the fully qualified hostname and the port is
+        # positive.
         hostname = _get_fq_hostname()
         spec = self._get_worker_spec(max_restarts=1, local_addr=hostname)
         agent = TestAgent(spec)
@@ -623,6 +722,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
         self.assertGreater(worker_group.master_port, 0)
 
     def test_rendezvous_master_addr_with_local_addr(self):
+        # [FUNCTION DOC] When the spec sets local_addr to 127.0.0.1 the master address equals it
+        # rather than the hostname.
         spec_local_addr = "127.0.0.1"
         spec = self._get_worker_spec(max_restarts=1, local_addr=spec_local_addr)
         agent = TestAgent(spec)
@@ -636,6 +737,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
     @patch.object(TestAgent, "_construct_event")
     @patch("torch.distributed.elastic.agent.server.api.record")
     def test_initialize_workers(self, mock_record, mock_construct_event):
+        # [FUNCTION DOC] _initialize_workers moves the group to HEALTHY, gives each worker id equal
+        # to its global rank, builds 10 events and records them with the 'null' event log handler.
         spec = self._get_worker_spec(max_restarts=1)
         agent = TestAgent(spec)
         worker_group = agent.get_worker_group()
@@ -655,6 +758,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
     @patch.object(TestAgent, "_construct_event")
     @patch("torch.distributed.elastic.agent.server.api.record")
     def test_initialize_workers_with_new_spec(self, mock_record, mock_construct_event):
+        # [FUNCTION DOC] Same as the initialization test but with event_log_handler
+        # framework_logger, which must be the handler passed to record.
         spec = self._get_worker_spec(
             max_restarts=1, event_log_handler="framework_logger"
         )
@@ -674,6 +779,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
         self.assertEqual(second_arg, "framework_logger")
 
     def test_restart_workers(self):
+        # [FUNCTION DOC] Calls _restart_workers three times; each leaves the group HEALTHY with
+        # rank, world size and worker ids assigned, and start and stop counts each equal 3.
         spec = self._get_worker_spec()
         agent = TestAgent(spec)
         worker_group = agent.get_worker_group()
@@ -708,6 +815,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
     )
     @patch.object(TestAgent, "_record_worker_events")
     def test_run_happy_path(self, record_events_mock, mock_monitor_workers):
+        # [FUNCTION DOC] Monitor returns HEALTHY twice then SUCCEEDED; run completes without
+        # consuming any restart and records worker events once.
         # worker starts
         # is always healthy
         # then succeeds
@@ -723,6 +832,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
 
     @patch.object(TestAgent, "_initialize_workers", side_effect=RuntimeError())
     def test_run_initialization_failure(self, mock_initialize_workers):
+        # [FUNCTION DOC] If _initialize_workers raises RuntimeError, run propagates it and the
+        # group state stays INIT.
         spec = self._get_worker_spec()
         agent = TestAgent(spec)
         worker_group = agent._worker_group
@@ -733,6 +844,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
         self.assertEqual(WorkerState.INIT, worker_group.state)
 
     def test_run_max_retries_exceeded(self):
+        # [FUNCTION DOC] For FAILED and UNHEALTHY monitor results, run retries until restarts are
+        # exhausted: final state FAILED, 0 remaining restarts and max_restarts + 1 monitor calls.
         for restartable_state in [
             monres(WorkerState.FAILED),
             monres(WorkerState.UNHEALTHY),
@@ -765,6 +878,9 @@ class SimpleElasticAgentTest(unittest.TestCase):
     def test_run_membership_change(
         self, record_events_mock, mock_num_nodes_waiting, mock_monitor_workers
     ):
+        # [FUNCTION DOC] With waiting nodes reported by the rendezvous handler (1, 1, 0) and one
+        # allowed restart, run restarts the group on membership change and ends SUCCEEDED,
+        # recording events once.
         spec = self._get_worker_spec(max_restarts=1, monitor_interval=0.1)
         agent = TestAgent(spec)
         worker_group = agent._worker_group
@@ -777,6 +893,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
         TestAgent, "_monitor_workers", return_value=monres(WorkerState.UNKNOWN)
     )
     def test_run_unknown_state(self, mock_monitor_workers):
+        # [FUNCTION DOC] An UNKNOWN monitor state makes run raise immediately: one monitor call,
+        # state UNKNOWN and no restarts consumed.
         # when the state is unknown we exit immediately; no retries
         spec = self._get_worker_spec(max_restarts=100, monitor_interval=0.1)
         agent = TestAgent(spec)
@@ -790,6 +908,10 @@ class SimpleElasticAgentTest(unittest.TestCase):
         self.assertEqual(spec.max_restarts, agent._remaining_restarts)
 
     def get_worker_assigned(self, store, role_infos_len, info) -> list[Worker]:
+        # [FUNCTION DOC] HELPER: Runs _assign_worker_ranks for one role-instance entry (index,
+        # info) against a shared store, using a fresh spec with that role and local world size.
+        # Returns a list of tuples (local_rank, role_rank, global_rank, world_size,
+        # role_world_size) per worker.
         i, role_info = info
         spec = self._get_worker_spec(
             max_restarts=3,
@@ -813,6 +935,10 @@ class SimpleElasticAgentTest(unittest.TestCase):
         ]
 
     def test_assign_worker_ranks(self):
+        # [FUNCTION DOC] Runs five concurrent agents (via a thread pool) with different roles and
+        # sizes sharing a HashStore, and checks the exact per-worker rank tuples: global ranks
+        # 0..14 in agent order, role ranks grouped per role (world size 15, role world size 9 or
+        # 6).
         role_infos = [
             _RoleInstanceInfo("parameter_server", 0, 4),
             _RoleInstanceInfo("trainer", 1, 1),
@@ -859,6 +985,10 @@ class SimpleElasticAgentTest(unittest.TestCase):
         )
 
     def test_assign_worker_ranks_indentical(self):
+        # [FUNCTION DOC] With TORCH_ELASTIC_WORKER_IDENTICAL set to 1, five identical trainer
+        # agents get role ranks equal to global ranks over a world of 20.
+        # KNOWN ISSUE: sets the environment variable globally and resets it to 0 at the end rather
+        # than removing it, and does not restore it if an assertion fails.
         os.environ["TORCH_ELASTIC_WORKER_IDENTICAL"] = "1"
         role_infos = [
             _RoleInstanceInfo("trainer", 0, 4),
@@ -912,6 +1042,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
         os.environ["TORCH_ELASTIC_WORKER_IDENTICAL"] = "0"
 
     def test_get_event(self):
+        # [FUNCTION DOC] get_event_succeeded returns an AGENT event with static rendezvous backend,
+        # state SUCCEEDED and the spec role.
         spec = self._get_worker_spec(max_restarts=1)
         agent = TestAgent(spec)
         event = agent.get_event_succeeded()
@@ -921,6 +1053,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
         self.assertEqual(spec.role, event.metadata["role"])
 
     def test_get_worker_status_event(self):
+        # [FUNCTION DOC] A WORKER SUCCEEDED event constructed with 2 restarts used has backend
+        # static, role from the spec and agent_restarts 2.
         spec = self._get_worker_spec(max_restarts=4)
         agent = TestAgent(spec)
         agent._remaining_restarts = spec.max_restarts - 2
@@ -938,6 +1072,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
     @patch("torch.distributed.elastic.agent.server.api.put_metric")
     @patch.object(TestAgent, "_invoke_run")
     def test_agent_process_signal_exception(self, invoke_run, _):
+        # [FUNCTION DOC] If _invoke_run raises SignalException for SIGTERM, run re-raises it and
+        # _shutdown is called with the signal value.
         spec = self._get_worker_spec(max_restarts=0)
         agent = TestAgent(spec)
         invoke_run.side_effect = SignalException(
@@ -952,6 +1088,8 @@ class SimpleElasticAgentTest(unittest.TestCase):
     @patch("torch.distributed.elastic.agent.server.api.put_metric")
     @patch.object(TestAgent, "_invoke_run")
     def test_agent_process_handler_graceful_exception(self, invoke_run, _):
+        # [FUNCTION DOC] If _invoke_run raises RendezvousGracefulExitError, run returns normally
+        # after calling _shutdown.
         spec = self._get_worker_spec(max_restarts=0)
         agent = TestAgent(spec)
         invoke_run.side_effect = RendezvousGracefulExitError()
