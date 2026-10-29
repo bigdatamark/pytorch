@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Distance modules for torch.nn: PairwiseDistance (p-norm distance between paired vectors)
+# and CosineSimilarity (cosine of the angle between paired vectors). Each is a thin
+# Module wrapper around the matching torch.nn.functional call. Exports both names via
+# __all__. No import-time side effects beyond imports.
 import torch.nn.functional as F
 from torch import Tensor
 
@@ -8,6 +13,11 @@ __all__ = ["PairwiseDistance", "CosineSimilarity"]
 
 
 class PairwiseDistance(Module):
+    # [CLASS DOC]
+    # Module computing the p-norm distance between corresponding vectors of two inputs.
+    # State: norm (the norm degree, constructor argument p), eps (small value added to the
+    # difference for numerical stability), keepdim (whether the reduced vector dimension is kept).
+    # No parameters or buffers. forward delegates to the functional pairwise distance.
     r"""
     Computes the pairwise distance between input vectors, or between columns of input matrices.
 
@@ -49,12 +59,19 @@ class PairwiseDistance(Module):
     def __init__(
         self, p: float = 2.0, eps: float = 1e-6, keepdim: bool = False
     ) -> None:
+        # [FUNCTION DOC]
+        # Stores p as the attribute norm, plus eps and keepdim, after initializing the Module base.
+        # Args: p (norm degree, default 2.0), eps (default 1e-6), keepdim (default False). No validation is done.
         super().__init__()
         self.norm = p
         self.eps = eps
         self.keepdim = keepdim
 
     def forward(self, x1: Tensor, x2: Tensor) -> Tensor:
+        # [FUNCTION DOC]
+        # Returns the functional pairwise distance of x1 and x2 using the stored norm, eps and keepdim.
+        # Inputs are same-shaped (or broadcastable) tensors; output reduces the last dimension
+        # (kept as size one when keepdim is true). Shape errors come from the functional call.
         """
         Runs the forward pass.
         """
@@ -62,6 +79,10 @@ class PairwiseDistance(Module):
 
 
 class CosineSimilarity(Module):
+    # [CLASS DOC]
+    # Module computing cosine similarity between two tensors along a given dimension.
+    # State: dim (dimension reduced over, default 1), eps (lower bound on the norm product
+    # to avoid division by zero, default 1e-8). No parameters or buffers.
     r"""Returns cosine similarity between :math:`x_1` and :math:`x_2`, computed along `dim`.
 
     .. math ::
@@ -89,11 +110,16 @@ class CosineSimilarity(Module):
     eps: float
 
     def __init__(self, dim: int = 1, eps: float = 1e-8) -> None:
+        # [FUNCTION DOC]
+        # Stores dim and eps after initializing the Module base. No validation is done.
         super().__init__()
         self.dim = dim
         self.eps = eps
 
     def forward(self, x1: Tensor, x2: Tensor) -> Tensor:
+        # [FUNCTION DOC]
+        # Returns the functional cosine similarity of x1 and x2 along the stored dim with the stored eps.
+        # The output has the input shape with dimension dim removed. Shape errors come from the functional call.
         """
         Runs the forward pass.
         """

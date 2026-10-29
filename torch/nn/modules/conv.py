@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Convolution modules for torch.nn: Conv1d/2d/3d, ConvTranspose1d/2d/3d and their Lazy variants that
+# infer in_channels from the first input. Shared logic lives in the private bases _ConvNd and
+# _ConvTransposeNd and the lazy mixin. Each forward delegates to the matching torch.nn.functional
+# convolution. Also defines the convolution_notes mapping of reusable docstring text used when building
+# class docstrings. Import-time side effects: builds those docstrings (using reproducibility notes).
 import math
 from typing import Literal
 from typing_extensions import deprecated
@@ -53,6 +59,11 @@ convolution_notes = {
 
 
 class _ConvNd(Module):
+    # [CLASS DOC] HELPER: Shared base of all convolution modules.
+    # State: in_channels, out_channels, kernel_size, stride, padding (string or tuple), dilation, transposed,
+    # output_padding, groups, padding_mode, weight (Parameter), bias (Parameter or None) and
+    # _reversed_padding_repeated_twice (padding list in the order expected by the functional pad).
+    # Subclasses supply the dimension-specific _conv_forward/forward.
     __constants__ = [
         "stride",
         "padding",
@@ -100,6 +111,12 @@ class _ConvNd(Module):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Validates arguments, stores them, and allocates and initializes parameters.
+        # Weight shape is (out_channels, in_channels per group, kernel dims), or (in_channels, out_channels per
+        # group, kernel dims) when transposed; bias is a vector of out_channels or registered as None.
+        # Precomputes the pad list (symmetric split for the same-padding string, with the extra element on the right).
+        # Raises ValueError for non-positive groups, channels not divisible by groups, an unknown padding string,
+        # same padding with stride other than one, or an unknown padding mode. Calls reset_parameters.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         if groups <= 0:
@@ -180,6 +197,9 @@ class _ConvNd(Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        # [FUNCTION DOC] HELPER: Re-initializes weight with Kaiming uniform (slope root five) and bias uniformly within a
+        # bound of one over the root of the fan-in (zero if fan-in is zero), without recording gradients.
+        # A non-contiguous weight is initialized in a contiguous temporary and copied back.
         # Use torch.no_grad() to allow in-place modification of weights/bias
         with torch.no_grad():
             # Check if the weight tensor is in channels_last_3d format to ensure numerical consistency
@@ -201,6 +221,8 @@ class _ConvNd(Module):
                 init.uniform_(self.bias, -bound, bound)
 
     def extra_repr(self):
+        # [FUNCTION DOC] HELPER: Builds the repr text with channels, kernel size and stride, adding padding, dilation,
+        # output padding, groups, bias=False and padding mode only when they differ from defaults.
         s = "{in_channels}, {out_channels}, kernel_size={kernel_size}, stride={stride}"
         if self.padding != (0,) * len(self.padding):
             s += ", padding={padding}"
@@ -217,12 +239,17 @@ class _ConvNd(Module):
         return s.format(**self.__dict__)
 
     def __setstate__(self, state):
+        # [FUNCTION DOC] HELPER: Restores pickled state and defaults padding_mode to zeros for old checkpoints lacking it.
         super().__setstate__(state)
         if not hasattr(self, "padding_mode"):
             self.padding_mode = "zeros"
 
 
 class Conv1d(_ConvNd):
+    # [CLASS DOC]
+    # One-dimensional convolution over (N, C, L) or (C, L) input. Inherits all state from _ConvNd;
+    # scalar hyperparameters are expanded to one-element tuples. Non-zero padding modes are implemented by
+    # explicitly padding then convolving without padding. The class docstring is assembled at import time.
     __doc__ = (
         r"""Applies a 1D convolution over an input signal composed of several input
     planes.
@@ -341,6 +368,10 @@ class Conv1d(_ConvNd):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Normalizes kernel size, stride, padding (strings kept) and dilation to tuples and calls the base
+        # constructor with non-transposed settings and zero output padding. Args as in the class docstring;
+        # raises ValueError for invalid groups, channels, padding or padding mode (from the base).
         factory_kwargs = {"device": device, "dtype": dtype}
         # we create new variables below to make mypy happy since kernel_size has
         # type Union[int, Tuple[int]] and kernel_size_ has type Tuple[int]
@@ -364,6 +395,8 @@ class Conv1d(_ConvNd):
         )
 
     def _conv_forward(self, input: Tensor, weight: Tensor, bias: Tensor | None):
+        # [FUNCTION DOC] HELPER: Convolves with the given weight and bias. For non-zero padding modes pads the input
+        # first with that mode and convolves with zero padding; otherwise uses the stored padding. Returns the output tensor.
         if self.padding_mode != "zeros":
             return F.conv1d(
                 F.pad(
@@ -382,10 +415,16 @@ class Conv1d(_ConvNd):
         )
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC]
+        # Applies the convolution using the module weight and bias; returns the output tensor.
         return self._conv_forward(input, self.weight, self.bias)
 
 
 class Conv2d(_ConvNd):
+    # [CLASS DOC]
+    # Two-dimensional convolution over (N, C, H, W) or (C, H, W) input. Inherits all state from _ConvNd;
+    # scalar hyperparameters are expanded to pairs. Non-zero padding modes pad explicitly then convolve.
+    # The class docstring is assembled at import time.
     __doc__ = (
         r"""Applies a 2D convolution over an input signal composed of several input
     planes.
@@ -523,6 +562,10 @@ class Conv2d(_ConvNd):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Normalizes kernel size, stride, padding (strings kept) and dilation to pairs and calls the base
+        # constructor with non-transposed settings and zero output padding. Raises ValueError for invalid
+        # groups, channels, padding or padding mode (from the base).
         factory_kwargs = {"device": device, "dtype": dtype}
         kernel_size_ = _pair(kernel_size)
         stride_ = _pair(stride)
@@ -544,6 +587,8 @@ class Conv2d(_ConvNd):
         )
 
     def _conv_forward(self, input: Tensor, weight: Tensor, bias: Tensor | None):
+        # [FUNCTION DOC] HELPER: Two-dimensional counterpart of the one-dimensional version: pads with the padding mode first
+        # when it is not zeros, then convolves with the given weight and bias; returns the output tensor.
         if self.padding_mode != "zeros":
             return F.conv2d(
                 F.pad(
@@ -562,10 +607,16 @@ class Conv2d(_ConvNd):
         )
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC]
+        # Applies the convolution using the module weight and bias; returns the output tensor.
         return self._conv_forward(input, self.weight, self.bias)
 
 
 class Conv3d(_ConvNd):
+    # [CLASS DOC]
+    # Three-dimensional convolution over (N, C, D, H, W) or (C, D, H, W) input. Inherits all state from _ConvNd;
+    # scalar hyperparameters are expanded to triples. Non-zero padding modes pad explicitly then convolve.
+    # The class docstring is assembled at import time.
     __doc__ = (
         r"""Applies a 3D convolution over an input signal composed of several input
     planes.
@@ -693,6 +744,10 @@ class Conv3d(_ConvNd):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Normalizes kernel size, stride, padding (strings kept) and dilation to triples and calls the base
+        # constructor with non-transposed settings and zero output padding. Raises ValueError for invalid
+        # groups, channels, padding or padding mode (from the base).
         factory_kwargs = {"device": device, "dtype": dtype}
         kernel_size_ = _triple(kernel_size)
         stride_ = _triple(stride)
@@ -714,6 +769,8 @@ class Conv3d(_ConvNd):
         )
 
     def _conv_forward(self, input: Tensor, weight: Tensor, bias: Tensor | None):
+        # [FUNCTION DOC] HELPER: Three-dimensional counterpart: pads with the padding mode first when not zeros, then convolves
+        # with the given weight and bias; returns the output tensor.
         if self.padding_mode != "zeros":
             return F.conv3d(
                 F.pad(
@@ -732,10 +789,14 @@ class Conv3d(_ConvNd):
         )
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC]
+        # Applies the convolution using the module weight and bias; returns the output tensor.
         return self._conv_forward(input, self.weight, self.bias)
 
 
 class _ConvTransposeNd(_ConvNd):
+    # [CLASS DOC] HELPER: Shared base of transposed convolutions. Same state as _ConvNd (weight shaped with in_channels first).
+    # Only zeros padding mode is supported. Provides _output_padding to resolve an optional requested output size.
     def __init__(
         self,
         in_channels,
@@ -752,6 +813,7 @@ class _ConvTransposeNd(_ConvNd):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Raises ValueError unless padding_mode is zeros, then forwards all arguments to the _ConvNd constructor.
         if padding_mode != "zeros":
             raise ValueError(
                 f'Only "zeros" padding mode is supported for {self.__class__.__name__}'
@@ -785,6 +847,11 @@ class _ConvTransposeNd(_ConvNd):
         num_spatial_dims: int,
         dilation: list[int] | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC] HELPER: Computes the per-dimension extra output padding. With no requested output_size returns the stored
+        # output padding as a list. Otherwise accepts output_size with only spatial entries or with batch/channel entries
+        # included (batch only if input has one), computes the minimum possible output size per dimension from input
+        # size, stride, padding, dilation and kernel, allows up to stride minus one more, and returns requested minus
+        # minimum per dimension. Raises ValueError for a wrong length or an out-of-range size.
         if output_size is None:
             ret = _single(self.output_padding)  # converting to list if was not already
         else:
@@ -830,6 +897,9 @@ class _ConvTransposeNd(_ConvNd):
 
 
 class ConvTranspose1d(_ConvTransposeNd):
+    # [CLASS DOC]
+    # One-dimensional transposed convolution (fractionally strided) over (N, C, L) or (C, L) input. State from
+    # _ConvNd with transposed set and output_padding stored. Supports an optional output_size at call time.
     __doc__ = (
         r"""Applies a 1D transposed convolution operator over an input image
     composed of several input planes.
@@ -956,6 +1026,10 @@ class ConvTranspose1d(_ConvTransposeNd):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Normalizes kernel size, stride, padding, dilation and output padding to one-element tuples and calls the
+        # base constructor in transposed mode. Note the argument order puts dilation after bias. Raises ValueError for
+        # invalid groups, channels or a padding mode other than zeros.
         factory_kwargs = {"device": device, "dtype": dtype}
         kernel_size = _single(kernel_size)
         stride = _single(stride)
@@ -978,6 +1052,11 @@ class ConvTranspose1d(_ConvTransposeNd):
         )
 
     def forward(self, input: Tensor, output_size: list[int] | None = None) -> Tensor:
+        # [FUNCTION DOC]
+        # Transposed convolution of input, optionally targeting output_size (list of ints, spatial or full size).
+        # Resolves the output padding, then calls the functional transposed convolution; returns the output tensor.
+        # Raises ValueError if padding mode is not zeros or output_size is invalid; AssertionError if padding is not a tuple.
+        # KNOWN ISSUE: padding_mode is already rejected in the constructor, so the first check is redundant.
         if self.padding_mode != "zeros":
             raise ValueError(
                 "Only `zeros` padding mode is supported for ConvTranspose1d"
@@ -1010,6 +1089,9 @@ class ConvTranspose1d(_ConvTransposeNd):
 
 
 class ConvTranspose2d(_ConvTransposeNd):
+    # [CLASS DOC]
+    # Two-dimensional transposed convolution over (N, C, H, W) or (C, H, W) input. State from _ConvNd with
+    # transposed set and output_padding stored. Supports an optional output_size at call time.
     __doc__ = (
         r"""Applies a 2D transposed convolution operator over an input image
     composed of several input planes.
@@ -1145,6 +1227,9 @@ class ConvTranspose2d(_ConvTransposeNd):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Normalizes kernel size, stride, padding, dilation and output padding to pairs and calls the base constructor
+        # in transposed mode. Raises ValueError for invalid groups, channels or a padding mode other than zeros.
         factory_kwargs = {"device": device, "dtype": dtype}
         kernel_size = _pair(kernel_size)
         stride = _pair(stride)
@@ -1167,6 +1252,11 @@ class ConvTranspose2d(_ConvTransposeNd):
         )
 
     def forward(self, input: Tensor, output_size: list[int] | None = None) -> Tensor:
+        # [FUNCTION DOC]
+        # Transposed convolution of input, optionally targeting output_size (list of ints, spatial or full size).
+        # Resolves the output padding, then calls the functional transposed convolution; returns the output tensor.
+        # Raises ValueError if padding mode is not zeros or output_size is invalid; AssertionError if padding is not a tuple.
+        # KNOWN ISSUE: the docstring lists the arguments under an Attributes heading.
         """
         Performs the forward pass.
 
@@ -1208,6 +1298,9 @@ class ConvTranspose2d(_ConvTransposeNd):
 
 
 class ConvTranspose3d(_ConvTransposeNd):
+    # [CLASS DOC]
+    # Three-dimensional transposed convolution over (N, C, D, H, W) or (C, D, H, W) input. State from _ConvNd with
+    # transposed set and output_padding stored. Supports an optional output_size at call time.
     __doc__ = (
         r"""Applies a 3D transposed convolution operator over an input image composed of several input
     planes.
@@ -1337,6 +1430,9 @@ class ConvTranspose3d(_ConvTransposeNd):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Normalizes kernel size, stride, padding, dilation and output padding to triples and calls the base constructor
+        # in transposed mode. Raises ValueError for invalid groups, channels or a padding mode other than zeros.
         factory_kwargs = {"device": device, "dtype": dtype}
         kernel_size = _triple(kernel_size)
         stride = _triple(stride)
@@ -1359,6 +1455,10 @@ class ConvTranspose3d(_ConvTransposeNd):
         )
 
     def forward(self, input: Tensor, output_size: list[int] | None = None) -> Tensor:
+        # [FUNCTION DOC]
+        # Transposed convolution of input, optionally targeting output_size (list of ints, spatial or full size).
+        # Resolves the output padding, then calls the functional transposed convolution; returns the output tensor.
+        # Raises ValueError if padding mode is not zeros or output_size is invalid; AssertionError if padding is not a tuple.
         if self.padding_mode != "zeros":
             raise ValueError(
                 "Only `zeros` padding mode is supported for ConvTranspose3d"
@@ -1407,12 +1507,15 @@ class ConvTranspose3d(_ConvTransposeNd):
 # `_ConvTransposeNd` is really not a mixin anymore (but multiple inheritance as
 # above would still work).
 class _ConvTransposeMixin(_ConvTransposeNd):
+    # [CLASS DOC] HELPER: Deprecated backward-compatibility alias class deriving from _ConvTransposeNd.
+    # Instantiation emits a FutureWarning.
     @deprecated(
         "`_ConvTransposeMixin` is a deprecated internal class. "
         "Please consider using public APIs.",
         category=FutureWarning,
     )
     def __init__(self, *args, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Deprecated constructor; forwards all arguments unchanged to the base constructor.
         super().__init__(*args, **kwargs)
 
 
@@ -1422,6 +1525,10 @@ class _ConvTransposeMixin(_ConvTransposeNd):
 
 
 class _LazyConvXdMixin(LazyModuleMixin):
+    # [CLASS DOC] HELPER: Mixin giving convolutions lazy initialization. Before the first call, weight (and bias) are
+    # uninitialized parameters and in_channels is zero. On first call (via the lazy-module hook) in_channels is inferred
+    # from the input, parameters are materialized and initialized, and the module turns into its non-lazy class.
+    # Subclasses define the number of spatial dimensions.
     groups: int
     transposed: bool
     in_channels: int
@@ -1431,6 +1538,8 @@ class _LazyConvXdMixin(LazyModuleMixin):
     bias: UninitializedParameter
 
     def reset_parameters(self) -> None:
+        # [FUNCTION DOC] HELPER: Re-initializes parameters only when they are materialized and in_channels is nonzero;
+        # otherwise does nothing (so construction does not touch uninitialized parameters).
         # has_uninitialized_params is defined in parent class and it is using a protocol on self
         if not self.has_uninitialized_params() and self.in_channels != 0:  # type: ignore[misc]
             # "type:ignore[..]" is required because mypy thinks that "reset_parameters" is undefined
@@ -1440,6 +1549,10 @@ class _LazyConvXdMixin(LazyModuleMixin):
 
     # Signature of "initialize_parameters" is incompatible with the definition in supertype LazyModuleMixin
     def initialize_parameters(self, input: Tensor, *args, **kwargs) -> None:  # type: ignore[override]
+        # [FUNCTION DOC] HELPER: If parameters are uninitialized: infers in_channels from the input, checks it is divisible
+        # by groups, materializes weight (and bias if present) with the proper shapes (transposed layout when applicable)
+        # and initializes them. Raises ValueError if in_channels is not divisible by groups, RuntimeError (from the
+        # channel helper) for a wrong input rank, and AssertionError if parameters are not uninitialized.
         # defined by parent class but using a protocol
         if self.has_uninitialized_params():  # type: ignore[misc]
             self.in_channels = self._get_in_channels(input)
@@ -1471,6 +1584,8 @@ class _LazyConvXdMixin(LazyModuleMixin):
 
     # Function to extract in_channels from first input.
     def _get_in_channels(self, input: Tensor) -> int:
+        # [FUNCTION DOC] HELPER: Returns the channel count of the input, which is dimension zero for unbatched input and
+        # dimension one for batched input. Raises RuntimeError if the rank is neither.
         num_spatial_dims = self._get_num_spatial_dims()
         num_dims_no_batch = num_spatial_dims + 1  # +1 for channels dim
         num_dims_batch = num_dims_no_batch + 1
@@ -1485,11 +1600,15 @@ class _LazyConvXdMixin(LazyModuleMixin):
     # Function to return the number of spatial dims expected for inputs to the module.
     # This is expected to be implemented by subclasses.
     def _get_num_spatial_dims(self) -> int:
+        # [FUNCTION DOC] HELPER: Abstract; subclasses return the number of spatial dimensions. Raises NotImplementedError.
         raise NotImplementedError
 
 
 # LazyConv1d defines weight as a Tensor but derived class defines it as UninitializedParameter
 class LazyConv1d(_LazyConvXdMixin, Conv1d):  # type: ignore[misc]
+    # [CLASS DOC]
+    # Lazy one-dimensional convolution: in_channels is inferred on first call; weight and bias start uninitialized
+    # and the module then becomes a Conv1d (cls_to_become).
     r"""A :class:`torch.nn.Conv1d` module with lazy initialization of the ``in_channels`` argument.
 
     The ``in_channels`` argument of the :class:`Conv1d` is inferred from the ``input.size(1)``.
@@ -1533,6 +1652,10 @@ class LazyConv1d(_LazyConvXdMixin, Conv1d):  # type: ignore[misc]
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Calls the Conv1d constructor with zero in_channels and zero out_channels and no bias, then replaces weight
+        # and optionally bias by uninitialized parameters and sets out_channels.
+        # KNOWN ISSUE: out_channels divisibility by groups is not validated because it is set after base construction.
         factory_kwargs = {"device": device, "dtype": dtype}
         # pyrefly: ignore [bad-argument-type]
         super().__init__(
@@ -1557,11 +1680,15 @@ class LazyConv1d(_LazyConvXdMixin, Conv1d):  # type: ignore[misc]
             self.bias = UninitializedParameter(**factory_kwargs)
 
     def _get_num_spatial_dims(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns one.
         return 1
 
 
 # LazyConv2d defines weight as a Tensor but derived class defines it as UninitializedParameter
 class LazyConv2d(_LazyConvXdMixin, Conv2d):  # type: ignore[misc]
+    # [CLASS DOC]
+    # Lazy two-dimensional convolution: in_channels is inferred on first call; weight and bias start uninitialized
+    # and the module then becomes a Conv2d (cls_to_become).
     r"""A :class:`torch.nn.Conv2d` module with lazy initialization of the ``in_channels`` argument.
 
     The ``in_channels`` argument of the :class:`Conv2d` that is inferred from the ``input.size(1)``.
@@ -1605,6 +1732,10 @@ class LazyConv2d(_LazyConvXdMixin, Conv2d):  # type: ignore[misc]
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Calls the Conv2d constructor with zero in_channels and zero out_channels and no bias, then replaces weight
+        # and optionally bias by uninitialized parameters and sets out_channels.
+        # KNOWN ISSUE: out_channels divisibility by groups is not validated.
         factory_kwargs = {"device": device, "dtype": dtype}
         # pyrefly: ignore [bad-argument-type]
         super().__init__(
@@ -1629,11 +1760,15 @@ class LazyConv2d(_LazyConvXdMixin, Conv2d):  # type: ignore[misc]
             self.bias = UninitializedParameter(**factory_kwargs)
 
     def _get_num_spatial_dims(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns two.
         return 2
 
 
 # LazyConv3d defines weight as a Tensor but derived class defines it as UninitializedParameter
 class LazyConv3d(_LazyConvXdMixin, Conv3d):  # type: ignore[misc]
+    # [CLASS DOC]
+    # Lazy three-dimensional convolution: in_channels is inferred on first call; weight and bias start uninitialized
+    # and the module then becomes a Conv3d (cls_to_become).
     r"""A :class:`torch.nn.Conv3d` module with lazy initialization of the ``in_channels`` argument.
 
     The ``in_channels`` argument of the :class:`Conv3d` that is inferred from
@@ -1678,6 +1813,10 @@ class LazyConv3d(_LazyConvXdMixin, Conv3d):  # type: ignore[misc]
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Calls the Conv3d constructor with zero in_channels and zero out_channels and no bias, then replaces weight
+        # and optionally bias by uninitialized parameters and sets out_channels.
+        # KNOWN ISSUE: out_channels divisibility by groups is not validated.
         factory_kwargs = {"device": device, "dtype": dtype}
         # pyrefly: ignore [bad-argument-type]
         super().__init__(
@@ -1702,11 +1841,15 @@ class LazyConv3d(_LazyConvXdMixin, Conv3d):  # type: ignore[misc]
             self.bias = UninitializedParameter(**factory_kwargs)
 
     def _get_num_spatial_dims(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns three.
         return 3
 
 
 # LazyConvTranspose1d defines weight as a Tensor but derived class defines it as UninitializedParameter
 class LazyConvTranspose1d(_LazyConvXdMixin, ConvTranspose1d):  # type: ignore[misc]
+    # [CLASS DOC]
+    # Lazy one-dimensional transposed convolution: in_channels is inferred on first call; the module then becomes a
+    # ConvTranspose1d (cls_to_become).
     r"""A :class:`torch.nn.ConvTranspose1d` module with lazy initialization of the ``in_channels`` argument.
 
     The ``in_channels`` argument of the :class:`ConvTranspose1d` that is inferred from
@@ -1749,6 +1892,10 @@ class LazyConvTranspose1d(_LazyConvXdMixin, ConvTranspose1d):  # type: ignore[mi
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Calls the ConvTranspose1d constructor with zero channels and no bias, then replaces weight and optionally bias
+        # by uninitialized parameters and sets out_channels.
+        # KNOWN ISSUE: out_channels divisibility by groups is not validated.
         factory_kwargs = {"device": device, "dtype": dtype}
         # pyrefly: ignore [bad-argument-type]
         super().__init__(
@@ -1774,11 +1921,15 @@ class LazyConvTranspose1d(_LazyConvXdMixin, ConvTranspose1d):  # type: ignore[mi
             self.bias = UninitializedParameter(**factory_kwargs)
 
     def _get_num_spatial_dims(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns one.
         return 1
 
 
 # LazyConvTranspose2d defines weight as a Tensor but derived class defines it as UninitializedParameter
 class LazyConvTranspose2d(_LazyConvXdMixin, ConvTranspose2d):  # type: ignore[misc]
+    # [CLASS DOC]
+    # Lazy two-dimensional transposed convolution: in_channels is inferred on first call; the module then becomes a
+    # ConvTranspose2d (cls_to_become).
     r"""A :class:`torch.nn.ConvTranspose2d` module with lazy initialization of the ``in_channels`` argument.
 
     The ``in_channels`` argument of the :class:`ConvTranspose2d` is inferred from
@@ -1821,6 +1972,10 @@ class LazyConvTranspose2d(_LazyConvXdMixin, ConvTranspose2d):  # type: ignore[mi
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Calls the ConvTranspose2d constructor with zero channels and no bias, then replaces weight and optionally bias
+        # by uninitialized parameters and sets out_channels.
+        # KNOWN ISSUE: out_channels divisibility by groups is not validated.
         factory_kwargs = {"device": device, "dtype": dtype}
         # pyrefly: ignore [bad-argument-type]
         super().__init__(
@@ -1846,11 +2001,15 @@ class LazyConvTranspose2d(_LazyConvXdMixin, ConvTranspose2d):  # type: ignore[mi
             self.bias = UninitializedParameter(**factory_kwargs)
 
     def _get_num_spatial_dims(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns two.
         return 2
 
 
 # LazyConvTranspose3d defines weight as a Tensor but derived class defines it as UninitializedParameter
 class LazyConvTranspose3d(_LazyConvXdMixin, ConvTranspose3d):  # type: ignore[misc]
+    # [CLASS DOC]
+    # Lazy three-dimensional transposed convolution: in_channels is inferred on first call; the module then becomes a
+    # ConvTranspose3d (cls_to_become).
     r"""A :class:`torch.nn.ConvTranspose3d` module with lazy initialization of the ``in_channels`` argument.
 
     The ``in_channels`` argument of the :class:`ConvTranspose3d` is inferred from
@@ -1893,6 +2052,10 @@ class LazyConvTranspose3d(_LazyConvXdMixin, ConvTranspose3d):  # type: ignore[mi
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Calls the ConvTranspose3d constructor with zero channels and no bias, then replaces weight and optionally bias
+        # by uninitialized parameters and sets out_channels.
+        # KNOWN ISSUE: out_channels divisibility by groups is not validated.
         factory_kwargs = {"device": device, "dtype": dtype}
         # pyrefly: ignore [bad-argument-type]
         super().__init__(
@@ -1918,4 +2081,5 @@ class LazyConvTranspose3d(_LazyConvXdMixin, ConvTranspose3d):  # type: ignore[mi
             self.bias = UninitializedParameter(**factory_kwargs)
 
     def _get_num_spatial_dims(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns three.
         return 3

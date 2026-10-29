@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Dropout regularization modules for torch.nn: Dropout, Dropout1d/2d/3d (channel-wise),
+# AlphaDropout and FeatureAlphaDropout (SELU-preserving variants), all built on the shared
+# private base _DropoutNd which validates and stores the probability. Each forward delegates
+# to the matching torch.nn.functional function using the module training flag.
+# No import-time side effects beyond imports.
 import torch.nn.functional as F
 from torch import Tensor
 
@@ -15,11 +21,16 @@ __all__ = [
 
 
 class _DropoutNd(Module):
+    # [CLASS DOC] HELPER: Shared base for dropout modules.
+    # State: p (drop probability, validated to lie in the closed range zero to one) and inplace flag.
+    # Subclasses implement forward by calling a functional dropout; extra_repr reports p and inplace.
     __constants__ = ["p", "inplace"]
     p: float
     inplace: bool
 
     def __init__(self, p: float = 0.5, inplace: bool = False) -> None:
+        # [FUNCTION DOC] HELPER: Validates that p is within zero and one inclusive and stores p and inplace.
+        # Raises ValueError with a message naming the offending value when p is out of range.
         super().__init__()
         if p < 0 or p > 1:
             raise ValueError(
@@ -29,10 +40,15 @@ class _DropoutNd(Module):
         self.inplace = inplace
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns a string with the p and inplace values for the module repr.
         return f"p={self.p}, inplace={self.inplace}"
 
 
 class Dropout(_DropoutNd):
+    # [CLASS DOC]
+    # Element-wise dropout: during training zeroes each element independently with probability p
+    # and scales survivors by one over one minus p; in eval mode it is the identity.
+    # State inherited from _DropoutNd (p, inplace). Accepts tensors of any shape.
     r"""During training, randomly zeroes some of the elements of the input tensor with probability :attr:`p`.
 
     The zeroed elements are chosen independently for each forward call and are sampled from a Bernoulli distribution.
@@ -67,6 +83,9 @@ class Dropout(_DropoutNd):
     """
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC]
+        # Applies functional dropout to the input using p, the module training flag and inplace.
+        # Returns a tensor of the same shape (the input itself when inplace). Random mask drawn from the global RNG.
         """
         Runs the forward pass.
         """
@@ -74,6 +93,10 @@ class Dropout(_DropoutNd):
 
 
 class Dropout1d(_DropoutNd):
+    # [CLASS DOC]
+    # Channel-wise dropout for one-dimensional feature maps: each whole channel is zeroed
+    # independently with probability p during training. Expects (N, C, L) or (C, L) input.
+    # State inherited from _DropoutNd (p, inplace).
     r"""Randomly zero out entire channels.
 
     A channel is a 1D feature map,
@@ -115,6 +138,9 @@ class Dropout1d(_DropoutNd):
     """
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC]
+        # Applies functional 1D channel dropout using p, the training flag and inplace.
+        # Returns a tensor of the same shape. Random mask drawn from the global RNG.
         """
         Runs the forward pass.
         """
@@ -122,6 +148,11 @@ class Dropout1d(_DropoutNd):
 
 
 class Dropout2d(_DropoutNd):
+    # [CLASS DOC]
+    # Channel-wise dropout for two-dimensional feature maps: each whole channel is zeroed
+    # independently with probability p during training. Expects (N, C, H, W); a three-dimensional
+    # input is treated as batched 1D channels for historical reasons, per the docstring.
+    # State inherited from _DropoutNd (p, inplace).
     r"""Randomly zero out entire channels.
 
     A channel is a 2D feature map,
@@ -170,6 +201,9 @@ class Dropout2d(_DropoutNd):
     """
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC]
+        # Applies functional 2D channel dropout using p, the training flag and inplace.
+        # Returns a tensor of the same shape. Random mask drawn from the global RNG.
         """
         Runs the forward pass.
         """
@@ -177,6 +211,10 @@ class Dropout2d(_DropoutNd):
 
 
 class Dropout3d(_DropoutNd):
+    # [CLASS DOC]
+    # Channel-wise dropout for three-dimensional feature maps: each whole channel is zeroed
+    # independently with probability p during training. Expects (N, C, D, H, W) or (C, D, H, W).
+    # State inherited from _DropoutNd (p, inplace).
     r"""Randomly zero out entire channels.
 
     A channel is a 3D feature map,
@@ -218,6 +256,9 @@ class Dropout3d(_DropoutNd):
     """
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC]
+        # Applies functional 3D channel dropout using p, the training flag and inplace.
+        # Returns a tensor of the same shape. Random mask drawn from the global RNG.
         """
         Runs the forward pass.
         """
@@ -225,6 +266,11 @@ class Dropout3d(_DropoutNd):
 
 
 class AlphaDropout(_DropoutNd):
+    # [CLASS DOC]
+    # Alpha dropout that keeps zero mean and unit variance for SELU-activated inputs: dropped
+    # elements are set to the negative saturation value, then the result is scaled and shifted.
+    # Identity in eval mode. Accepts any shape. State inherited from _DropoutNd (p, inplace).
+    # KNOWN ISSUE: the inplace flag is stored but forward does not pass it to the functional call.
     r"""Applies Alpha Dropout over the input.
 
     Alpha Dropout is a type of Dropout that maintains the self-normalizing
@@ -263,6 +309,9 @@ class AlphaDropout(_DropoutNd):
     """
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC]
+        # Applies functional alpha dropout using p and the training flag; returns a tensor of the same shape.
+        # KNOWN ISSUE: the inplace attribute is ignored here.
         """
         Runs the forward pass.
         """
@@ -270,6 +319,11 @@ class AlphaDropout(_DropoutNd):
 
 
 class FeatureAlphaDropout(_DropoutNd):
+    # [CLASS DOC]
+    # Alpha dropout applied to entire channels (feature maps) instead of single elements,
+    # keeping SELU self-normalizing statistics. Expects (N, C, D, H, W) or (C, D, H, W) per the docstring.
+    # State inherited from _DropoutNd (p, inplace).
+    # KNOWN ISSUE: the inplace flag is stored but forward does not pass it to the functional call.
     r"""Randomly masks out entire channels.
 
     A channel is a feature map,
@@ -317,6 +371,9 @@ class FeatureAlphaDropout(_DropoutNd):
     """
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC]
+        # Applies functional feature alpha dropout using p and the training flag; returns a tensor of the same shape.
+        # KNOWN ISSUE: the inplace attribute is ignored here.
         """
         Runs the forward pass.
         """

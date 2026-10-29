@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Container modules for torch.nn: Sequential (chains submodules, output feeds next input),
+# ModuleList and ModuleDict (list/dict storage of registered submodules, no forward),
+# ParameterList and ParameterDict (list/dict storage of registered parameters or arbitrary objects),
+# and the deprecated Container. Exports these via __all__. All containers store entries as
+# attributes keyed by string index or name so Module machinery sees them.
+# No import-time side effects beyond imports and type variable definitions.
 from __future__ import annotations
 
 import operator
@@ -33,6 +40,8 @@ _V = TypeVar("_V")
 
 # Copied from torch.nn.modules.module, required for a custom __repr__ for ModuleList
 def _addindent(s_, numSpaces):
+# [FUNCTION DOC] HELPER: Indents every line after the first of the string s_ by numSpaces spaces and
+# returns the result; a single-line string is returned unchanged. Used by ModuleList repr.
     s = s_.split("\n")
     # don't do anything for single-line stuff
     if len(s) == 1:
@@ -50,13 +59,24 @@ def _addindent(s_, numSpaces):
     category=FutureWarning,
 )
 class Container(Module):
+    # [CLASS DOC]
+    # Deprecated container (emits a FutureWarning when instantiated). Behaves like a plain Module
+    # whose constructor registers each keyword argument as a named submodule.
     def __init__(self, **kwargs: Any) -> None:
+        # [FUNCTION DOC]
+        # Initializes the Module base, then registers every keyword argument value as a submodule
+        # under its keyword name via add_module (which validates the value type).
         super().__init__()
         for key, value in kwargs.items():
             self.add_module(key, value)
 
 
 class Sequential(Module):
+    # [CLASS DOC]
+    # Ordered chain of submodules. State: the _modules mapping from string keys (decimal indices
+    # or user-given names from an ordered mapping) to modules, in insertion order. forward feeds the input
+    # through each module in order and returns the last output. Supports list-like indexing,
+    # slicing, deletion, concatenation, repetition and append/insert/extend; deletion renumbers keys.
     r"""A sequential container.
 
     Modules will be added to it in the order they are passed in the
@@ -113,6 +133,10 @@ class Sequential(Module):
     def __init__(self, arg: OrderedDict[str, Module]) -> None: ...
 
     def __init__(self, *args):
+        # [FUNCTION DOC]
+        # Builds the container from either one ordered mapping (keys become module names) or any number
+        # of positional modules (named by their decimal position). Registers each via add_module,
+        # which raises TypeError for non-Module values.
         super().__init__()
         if len(args) == 1 and isinstance(args[0], OrderedDict):
             for key, module in args[0].items():
@@ -122,6 +146,9 @@ class Sequential(Module):
                 self.add_module(str(idx), module)
 
     def _get_item_by_idx(self, iterator: Iterable[_V], idx: int) -> _V:
+        # [FUNCTION DOC] HELPER: Returns the idx-th element of the given iterator, supporting negative indices.
+        # Raises IndexError when idx is outside the range of the container length; idx must be integer-like
+        # (operator index conversion raises TypeError otherwise).
         """Get the idx-th item of the iterator."""
         size = len(self)
         idx = operator.index(idx)
@@ -138,16 +165,28 @@ class Sequential(Module):
 
     @_copy_to_script_wrapper
     def __getitem__(self, idx: slice | int) -> Sequential | Module:
+        # [FUNCTION DOC]
+        # Indexing: a slice returns a new container of the same class holding the selected modules
+        # (keeping their existing keys); an integer returns the module at that position (negative allowed).
+        # Raises IndexError for out-of-range integers.
         if isinstance(idx, slice):
             return self.__class__(OrderedDict(list(self._modules.items())[idx]))
         else:
             return self._get_item_by_idx(self._modules.values(), idx)
 
     def __setitem__(self, idx: int, module: Module) -> None:
+        # [FUNCTION DOC]
+        # Replaces the module at integer position idx, keeping its existing key, by setting the attribute.
+        # Raises IndexError if out of range. Returns None.
         key: str = self._get_item_by_idx(self._modules.keys(), idx)
         return setattr(self, key, module)
 
     def __delitem__(self, idx: slice | int) -> None:
+        # [FUNCTION DOC]
+        # Deletes the module(s) at an integer position or slice, then rebuilds the mapping so keys are
+        # renumbered as consecutive decimal strings.
+        # KNOWN ISSUE: renumbering discards any custom names given via an ordered mapping.
+        # Raises IndexError for out-of-range integers.
         if isinstance(idx, slice):
             for key in list(self._modules.keys())[idx]:
                 delattr(self, key)
@@ -162,9 +201,14 @@ class Sequential(Module):
 
     @_copy_to_script_wrapper
     def __len__(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the number of contained modules.
         return len(self._modules)
 
     def __add__(self, other) -> Sequential:
+        # [FUNCTION DOC]
+        # Concatenation: returns a new Sequential containing the modules of self then other (modules are shared,
+        # not copied; keys renumbered). Raises ValueError if other is not a Sequential.
         if isinstance(other, Sequential):
             ret = Sequential()
             for layer in self:
@@ -179,6 +223,9 @@ class Sequential(Module):
             )
 
     def pop(self, key: int | slice) -> Module:
+        # [FUNCTION DOC]
+        # Removes and returns the module(s) selected by an integer or slice key (a slice returns a Sequential).
+        # Side effect: deletes from the container and renumbers. Raises IndexError when out of range.
         """
         Pop ``key`` from self.
         """
@@ -187,6 +234,9 @@ class Sequential(Module):
         return v
 
     def __iadd__(self, other) -> Self:
+        # [FUNCTION DOC]
+        # In-place concatenation: appends the modules of other (a Sequential) after the existing ones using
+        # consecutive numeric keys, and returns self. Raises ValueError if other is not a Sequential.
         if isinstance(other, Sequential):
             offset = len(self)
             for i, module in enumerate(other):
@@ -199,6 +249,9 @@ class Sequential(Module):
             )
 
     def __mul__(self, other: int) -> Sequential:
+        # [FUNCTION DOC]
+        # Repetition: returns a new Sequential made of the modules repeated other times (same module objects,
+        # numeric keys). Raises TypeError if other is not an int and ValueError if it is not positive.
         if not isinstance(other, int):
             raise TypeError(
                 f"unsupported operand type(s) for *: {type(self)} and {type(other)}"
@@ -217,9 +270,14 @@ class Sequential(Module):
             return combined
 
     def __rmul__(self, other: int) -> Sequential:
+        # [FUNCTION DOC]
+        # Reflected repetition; same as multiplication by the integer.
         return self.__mul__(other)
 
     def __imul__(self, other: int) -> Self:
+        # [FUNCTION DOC]
+        # In-place repetition: extends self so the original modules appear other times in total (same module
+        # objects), returns self. Raises TypeError if other is not an int, ValueError if not positive.
         if not isinstance(other, int):
             raise TypeError(
                 f"unsupported operand type(s) for *: {type(self)} and {type(other)}"
@@ -239,12 +297,16 @@ class Sequential(Module):
 
     @_copy_to_script_wrapper
     def __dir__(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Returns attribute names for dir(), omitting the numeric module keys.
         keys = super().__dir__()
         keys = [key for key in keys if not key.isdigit()]
         return keys
 
     @_copy_to_script_wrapper
     def __iter__(self) -> Iterator[Module]:
+        # [FUNCTION DOC]
+        # Returns an iterator over the contained modules in order.
         return iter(self._modules.values())
 
     # NB: We can't really type check this function as the type of input
@@ -252,6 +314,9 @@ class Sequential(Module):
     # TestScript.test_sequential_intermediary_types).  Cannot annotate
     # with Any as TorchScript expects a more precise type
     def forward(self, input):
+        # [FUNCTION DOC]
+        # Runs the input through each contained module in order, passing each output as the next input,
+        # and returns the final output (the input itself if the container is empty). Input type is unconstrained.
         """
         Runs the forward pass.
         """
@@ -260,6 +325,9 @@ class Sequential(Module):
         return input
 
     def append(self, module: Module) -> Self:
+        # [FUNCTION DOC]
+        # Appends module under the next numeric key (the current length) and returns self.
+        # Raises TypeError via add_module if module is not a Module.
         r"""Append a given module to the end.
 
         Args:
@@ -281,6 +349,11 @@ class Sequential(Module):
         return self
 
     def insert(self, index: int, module: Module) -> Self:
+        # [FUNCTION DOC]
+        # Inserts module at index (negative counts from the end; index equal to the length appends),
+        # shifting later entries up by rewriting keys, and returns self.
+        # Raises AssertionError if module is not a Module and IndexError if index is out of range.
+        # KNOWN ISSUE: raises AssertionError for a type error and writes to the mapping directly, bypassing add_module.
         """
         Inserts a module into the Sequential container at the specified index.
 
@@ -313,6 +386,8 @@ class Sequential(Module):
         return self
 
     def extend(self, sequential: Iterable[Module]) -> Self:
+        # [FUNCTION DOC]
+        # Appends each module from the given iterable in order and returns self.
         """
         Extends the current Sequential container with layers from another Sequential container.
 
@@ -339,6 +414,11 @@ class Sequential(Module):
 
 
 class ModuleList(Module):
+    # [CLASS DOC]
+    # List-like container of registered submodules. State: the _modules mapping from decimal string
+    # index to module, in order. Supports integer and slice indexing, deletion (renumbers), iteration,
+    # concatenation, append/insert/extend/pop and a repr that collapses runs of identical modules.
+    # Has no forward; calling it falls back to the Module unimplemented-forward error.
     r"""Holds submodules in a list.
 
     :class:`~torch.nn.ModuleList` can be indexed like a regular Python list, but
@@ -365,11 +445,15 @@ class ModuleList(Module):
     _modules: dict[str, Module]  # type: ignore[assignment]
 
     def __init__(self, modules: Iterable[Module] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Initializes the Module base and, if modules is given, extends the list with them.
         super().__init__()
         if modules is not None:
             self += modules
 
     def _get_abs_string_index(self, idx):
+        # [FUNCTION DOC] HELPER: Converts an integer index (negative allowed) to its non-negative string key.
+        # Raises IndexError if out of range.
         """Get the absolute index for the list of modules."""
         idx = operator.index(idx)
         if not (-len(self) <= idx < len(self)):
@@ -386,16 +470,24 @@ class ModuleList(Module):
 
     @_copy_to_script_wrapper
     def __getitem__(self, idx: int | slice) -> Module | ModuleList:
+        # [FUNCTION DOC]
+        # A slice returns a new ModuleList (same class) of the selected modules; an integer returns the
+        # module at that position. Raises IndexError for out-of-range integers.
         if isinstance(idx, slice):
             return self.__class__(list(self._modules.values())[idx])
         else:
             return self._modules[self._get_abs_string_index(idx)]
 
     def __setitem__(self, idx: int, module: Module) -> None:
+        # [FUNCTION DOC]
+        # Replaces the module at the given position (negative allowed). Raises IndexError if out of range.
         idx = self._get_abs_string_index(idx)
         return setattr(self, str(idx), module)
 
     def __delitem__(self, idx: int | slice) -> None:
+        # [FUNCTION DOC]
+        # Deletes the module(s) at an integer position or slice, then rebuilds the mapping so keys are
+        # consecutive decimal strings. Raises IndexError for out-of-range integers.
         if isinstance(idx, slice):
             for k in range(len(self._modules))[idx]:
                 delattr(self, str(k))
@@ -409,22 +501,35 @@ class ModuleList(Module):
 
     @_copy_to_script_wrapper
     def __len__(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the number of contained modules.
         return len(self._modules)
 
     @_copy_to_script_wrapper
     def __iter__(self) -> Iterator[Module]:
+        # [FUNCTION DOC]
+        # Returns an iterator over the modules in order.
         return iter(self._modules.values())
 
     def __iadd__(self, modules: Iterable[Module]) -> Self:
+        # [FUNCTION DOC]
+        # In-place concatenation via extend; returns self.
         return self.extend(modules)
 
     def __add__(self, other: Iterable[Module]) -> ModuleList:
+        # [FUNCTION DOC]
+        # Returns a new ModuleList holding the modules of self followed by those of the other iterable
+        # (same module objects).
         combined = ModuleList()
         for i, module in enumerate(chain(self, other)):
             combined.add_module(str(i), module)
         return combined
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC]
+        # Builds the repr: one line per module, with consecutive modules whose reprs are equal merged into a
+        # single line showing an index range and a repeat count. Returns just the name plus empty
+        # parentheses when the list is empty.
         """Return a custom repr for ModuleList that compresses repeated module representations."""
         list_of_reprs = [repr(item) for item in self]
         if len(list_of_reprs) == 0:
@@ -460,11 +565,17 @@ class ModuleList(Module):
 
     @_copy_to_script_wrapper
     def __dir__(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Returns attribute names for dir(), omitting the numeric module keys.
         keys = super().__dir__()
         keys = [key for key in keys if not key.isdigit()]
         return keys
 
     def insert(self, index: int, module: Module) -> None:
+        # [FUNCTION DOC]
+        # Inserts module before position index by shifting later entries up one key.
+        # KNOWN ISSUE: no bounds or negative-index handling and no module type check (writes the mapping
+        # directly, bypassing add_module); a negative or too-large index gives inconsistent keys.
         r"""Insert a given module before a given index in the list.
 
         Args:
@@ -476,6 +587,9 @@ class ModuleList(Module):
         self._modules[str(index)] = module
 
     def append(self, module: Module) -> Self:
+        # [FUNCTION DOC]
+        # Appends module under the next numeric key and returns self. Raises TypeError via add_module
+        # if module is not a Module.
         r"""Append a given module to the end of the list.
 
         Args:
@@ -485,11 +599,17 @@ class ModuleList(Module):
         return self
 
     def pop(self, key: int | slice) -> Module:
+        # [FUNCTION DOC]
+        # Removes and returns the module(s) at an integer or slice key (a slice returns a ModuleList).
+        # Raises IndexError when out of range.
         v = self[key]
         del self[key]
         return v
 
     def extend(self, modules: Iterable[Module]) -> Self:
+        # [FUNCTION DOC]
+        # Appends every module from an iterable in order and returns self.
+        # Raises TypeError if the argument is not iterable.
         r"""Append modules from a Python iterable to the end of the list.
 
         Args:
@@ -509,6 +629,10 @@ class ModuleList(Module):
 
 
 class ModuleDict(Module):
+    # [CLASS DOC]
+    # Ordered dictionary of registered submodules keyed by string. State: the _modules mapping, in
+    # insertion order. Supports item get/set/delete, membership, iteration over keys, keys/items/values,
+    # pop, clear and update. Has no forward; calling it falls back to the Module unimplemented-forward error.
     r"""Holds submodules in a dictionary.
 
     :class:`~torch.nn.ModuleDict` can be indexed like a regular Python dictionary,
@@ -552,37 +676,55 @@ class ModuleDict(Module):
     _modules: dict[str, Module]  # type: ignore[assignment]
 
     def __init__(self, modules: Mapping[str, Module] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Initializes the Module base and, if modules is given, merges it in via update.
         super().__init__()
         if modules is not None:
             self.update(modules)
 
     @_copy_to_script_wrapper
     def __getitem__(self, key: str) -> Module:
+        # [FUNCTION DOC]
+        # Returns the module stored under key. Raises KeyError if absent.
         return self._modules[key]
 
     def __setitem__(self, key: str, module: Module) -> None:
+        # [FUNCTION DOC]
+        # Registers module under key via add_module (validates type and key; may raise TypeError or KeyError).
         self.add_module(key, module)
 
     def __delitem__(self, key: str) -> None:
+        # [FUNCTION DOC]
+        # Removes the entry for key from the mapping. Raises KeyError if absent.
         del self._modules[key]
 
     @_copy_to_script_wrapper
     def __len__(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the number of stored modules.
         return len(self._modules)
 
     @_copy_to_script_wrapper
     def __iter__(self) -> Iterator[str]:
+        # [FUNCTION DOC]
+        # Returns an iterator over the keys.
         return iter(self._modules)
 
     @_copy_to_script_wrapper
     def __contains__(self, key: str) -> bool:
+        # [FUNCTION DOC]
+        # Returns whether key is present.
         return key in self._modules
 
     def clear(self) -> None:
+        # [FUNCTION DOC]
+        # Removes all entries.
         """Remove all items from the ModuleDict."""
         self._modules.clear()
 
     def pop(self, key: str) -> Module:
+        # [FUNCTION DOC]
+        # Removes key and returns its module. Raises KeyError if absent.
         r"""Remove key from the ModuleDict and return its module.
 
         Args:
@@ -594,20 +736,31 @@ class ModuleDict(Module):
 
     @_copy_to_script_wrapper
     def keys(self) -> container_abcs.KeysView[str]:
+        # [FUNCTION DOC]
+        # Returns a view of the keys.
         r"""Return an iterable of the ModuleDict keys."""
         return self._modules.keys()
 
     @_copy_to_script_wrapper
     def items(self) -> container_abcs.ItemsView[str, Module]:
+        # [FUNCTION DOC]
+        # Returns a view of the key and module pairs.
         r"""Return an iterable of the ModuleDict key/value pairs."""
         return self._modules.items()
 
     @_copy_to_script_wrapper
     def values(self) -> container_abcs.ValuesView[Module]:
+        # [FUNCTION DOC]
+        # Returns a view of the modules.
         r"""Return an iterable of the ModuleDict values."""
         return self._modules.values()
 
     def update(self, modules: Mapping[str, Module]) -> None:
+        # [FUNCTION DOC]
+        # Merges modules into the dict, overwriting existing keys. Accepts a mapping (order of its iteration
+        # is kept) or an iterable of key and module pairs. Raises TypeError if the argument or an element is not
+        # iterable, ValueError if a pair does not have length two.
+        # KNOWN ISSUE: the element TypeError message lacks a space before the type name.
         r"""Update the :class:`~torch.nn.ModuleDict` with key-value pairs from a mapping, overwriting existing keys.
 
         .. note::
@@ -650,6 +803,11 @@ class ModuleDict(Module):
 
 
 class ParameterList(Module):
+    # [CLASS DOC]
+    # List-like container of parameters or arbitrary objects. State: _size (element count) and
+    # attributes named by decimal index holding each element; tensors that are not Parameters are
+    # wrapped as Parameters on insertion so they are registered. Supports indexing, slicing (returns a
+    # new list sharing elements), iteration, append/extend. Calling it raises an error.
     r"""Holds parameters in a list.
 
     :class:`~torch.nn.ParameterList` can be used like a regular Python
@@ -680,12 +838,16 @@ class ParameterList(Module):
     """
 
     def __init__(self, values: Iterable[Any] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Initializes the Module base, sets the size to zero and, if values is given, extends with them.
         super().__init__()
         self._size = 0
         if values is not None:
             self += values
 
     def _get_abs_string_index(self, idx):
+        # [FUNCTION DOC] HELPER: Converts an integer index (negative allowed) to its non-negative string key.
+        # Raises IndexError if out of range. (Its docstring wrongly says it concerns modules.)
         """Get the absolute index for the list of modules."""
         idx = operator.index(idx)
         if not (-len(self) <= idx < len(self)):
@@ -702,6 +864,9 @@ class ParameterList(Module):
     def __getitem__(self: T, idx: slice) -> T: ...
 
     def __getitem__(self, idx):
+        # [FUNCTION DOC]
+        # A slice returns a new container of the same class with the selected elements appended; an integer
+        # returns the element at that position. Raises IndexError for out-of-range integers.
         if isinstance(idx, slice):
             start, stop, step = idx.indices(len(self))
             out = self.__class__()
@@ -713,6 +878,9 @@ class ParameterList(Module):
             return getattr(self, str(idx))
 
     def __setitem__(self, idx: int, param: Any) -> None:
+        # [FUNCTION DOC]
+        # Sets the element at an existing position, wrapping plain tensors into Parameter. Raises
+        # IndexError if out of range. Single place where wrapping happens for all insertion paths.
         # Note that all other function that add an entry to the list part of
         # the ParameterList end up here. So this is the only place where we need
         # to wrap things into Parameter if needed.
@@ -724,20 +892,32 @@ class ParameterList(Module):
         return setattr(self, str(idx), param)
 
     def __len__(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the stored element count.
         return self._size
 
     def __iter__(self) -> Iterator[Any]:
+        # [FUNCTION DOC]
+        # Returns an iterator over the elements in order.
         return iter(self[i] for i in range(len(self)))
 
     def __iadd__(self, parameters: Iterable[Any]) -> Self:
+        # [FUNCTION DOC]
+        # In-place concatenation via extend; returns self.
         return self.extend(parameters)
 
     def __dir__(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Returns attribute names for dir(), omitting the numeric keys.
         keys = super().__dir__()
         keys = [key for key in keys if not key.isdigit()]
         return keys
 
     def append(self, value: Any) -> Self:
+        # [FUNCTION DOC]
+        # Appends value (wrapping plain tensors into Parameter) and returns self.
+        # Side effect: increments the size before assigning.
+        # KNOWN ISSUE: if assignment fails, the size has already been increased.
         """Append a given value at the end of the list.
 
         Args:
@@ -749,6 +929,9 @@ class ParameterList(Module):
         return self
 
     def extend(self, values: Iterable[Any]) -> Self:
+        # [FUNCTION DOC]
+        # Appends each value from an iterable in order and returns self. Raises TypeError if the argument
+        # is not iterable or is itself a tensor.
         """Append values from a Python iterable to the end of the list.
 
         Args:
@@ -767,6 +950,9 @@ class ParameterList(Module):
         return self
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC]
+        # Builds a multi-line description with one line per element: for tensors the kind (Parameter or
+        # Tensor), dtype, size and device when on an accelerator; otherwise the object type name.
         """
         Return the extra representation of the module.
         """
@@ -794,10 +980,17 @@ class ParameterList(Module):
         return tmpstr
 
     def __call__(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Always raises RuntimeError, since the container is not callable.
         raise RuntimeError("ParameterList should not be called.")
 
 
 class ParameterDict(Module):
+    # [CLASS DOC]
+    # Ordered dictionary of parameters or arbitrary objects keyed by string. State: _keys (insertion-ordered
+    # set of keys); values are stored as attributes named by key; plain tensors are wrapped as Parameters
+    # on assignment. Supports item access, deletion, iteration (also reversed), copy, setdefault, pop, popitem,
+    # get, update, fromkeys, union operators. Calling it raises an error.
     r"""Holds parameters in a dictionary.
 
     ParameterDict can be indexed like a regular Python dictionary, but Parameters it
@@ -837,12 +1030,16 @@ class ParameterDict(Module):
     """
 
     def __init__(self, parameters: Any = None) -> None:
+        # [FUNCTION DOC]
+        # Initializes the Module base, creates an empty key set and, if parameters is given, merges it via update.
         super().__init__()
         self._keys: dict[str, None] = {}
         if parameters is not None:
             self.update(parameters)
 
     def _key_to_attr(self, key: str) -> str:
+        # [FUNCTION DOC] HELPER: Validates that key is a string and returns it as the attribute name.
+        # Raises TypeError for non-string keys.
         if not isinstance(key, str):
             raise TypeError(
                 "Index given to ParameterDict cannot be used as a key as it is "
@@ -854,10 +1051,16 @@ class ParameterDict(Module):
             return key
 
     def __getitem__(self, key: str) -> Any:
+        # [FUNCTION DOC]
+        # Returns the value stored under key. Raises TypeError for a non-string key and AttributeError if absent.
         attr = self._key_to_attr(key)
         return getattr(self, attr)
 
     def __setitem__(self, key: str, value: Any) -> None:
+        # [FUNCTION DOC]
+        # Stores value under key, wrapping plain tensors into Parameter, and records the key.
+        # Single place where wrapping happens for all insertion paths. Raises TypeError for a non-string key.
+        # KNOWN ISSUE: the key is recorded before it is validated, so a non-string key is left in the key set after the error.
         # Note that all other function that add an entry to the dictionary part of
         # the ParameterDict end up here. So this is the only place where we need
         # to wrap things into Parameter if needed.
@@ -870,29 +1073,43 @@ class ParameterDict(Module):
         setattr(self, attr, value)
 
     def __delitem__(self, key: str) -> None:
+        # [FUNCTION DOC]
+        # Removes key and its stored value. Raises KeyError if the key is unknown.
         del self._keys[key]
         attr = self._key_to_attr(key)
         delattr(self, attr)
 
     def __len__(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the number of keys.
         return len(self._keys)
 
     def __iter__(self) -> Iterator[str]:
+        # [FUNCTION DOC]
+        # Returns an iterator over the keys in insertion order.
         return iter(self._keys)
 
     def __reversed__(self) -> Iterator[str]:
+        # [FUNCTION DOC]
+        # Returns an iterator over the keys in reverse insertion order.
         return reversed(self._keys)
 
     def copy(self) -> ParameterDict:
+        # [FUNCTION DOC]
+        # Returns a new ParameterDict with the same keys and values (same objects), preserving order.
         """Return a copy of this :class:`~torch.nn.ParameterDict` instance."""
         # We have to use an OrderedDict because the ParameterDict constructor
         # behaves differently on plain dict vs OrderedDict
         return ParameterDict(OrderedDict((k, self[k]) for k in self._keys))
 
     def __contains__(self, key: str) -> bool:
+        # [FUNCTION DOC]
+        # Returns whether key is present.
         return key in self._keys
 
     def setdefault(self, key: str, default: Any | None = None) -> Any:
+        # [FUNCTION DOC]
+        # Returns the value for key; if absent, first stores default (wrapped if a tensor) and returns it.
         """Set the default for a key in the Parameterdict.
 
         If key is in the ParameterDict, return its value.
@@ -908,11 +1125,15 @@ class ParameterDict(Module):
         return self[key]
 
     def clear(self) -> None:
+        # [FUNCTION DOC]
+        # Removes all entries.
         """Remove all items from the ParameterDict."""
         for k in self._keys.copy():
             del self[k]
 
     def pop(self, key: str) -> Any:
+        # [FUNCTION DOC]
+        # Removes key and returns its value. Raises KeyError if absent.
         r"""Remove key from the ParameterDict and return its parameter.
 
         Args:
@@ -923,6 +1144,9 @@ class ParameterDict(Module):
         return v
 
     def popitem(self) -> tuple[str, Any]:
+        # [FUNCTION DOC]
+        # Removes and returns the most recently inserted key and value pair as a tuple.
+        # Raises KeyError if empty.
         """Remove and return the last inserted `(key, parameter)` pair from the ParameterDict."""
         k, _ = self._keys.popitem()
         # We need the key in the _keys to be able to access/del
@@ -932,6 +1156,8 @@ class ParameterDict(Module):
         return k, val
 
     def get(self, key: str, default: Any | None = None) -> Any:
+        # [FUNCTION DOC]
+        # Returns the value for key if present, otherwise default (None unless given).
         r"""Return the parameter associated with key if present. Otherwise return default if provided, None if not.
 
         Args:
@@ -943,6 +1169,8 @@ class ParameterDict(Module):
     def fromkeys(
         self, keys: Iterable[str], default: Any | None = None
     ) -> ParameterDict:
+        # [FUNCTION DOC]
+        # Returns a new ParameterDict with every given key mapped to default; does not use self's contents.
         r"""Return a new ParameterDict with the keys provided.
 
         Args:
@@ -952,18 +1180,30 @@ class ParameterDict(Module):
         return ParameterDict((k, default) for k in keys)
 
     def keys(self) -> container_abcs.KeysView[str]:
+        # [FUNCTION DOC]
+        # Returns a view of the keys in insertion order.
         r"""Return an iterable of the ParameterDict keys."""
         return self._keys.keys()
 
     def items(self) -> Iterable[tuple[str, Any]]:
+        # [FUNCTION DOC]
+        # Returns a lazy iterator of key and value pairs in insertion order.
         r"""Return an iterable of the ParameterDict key/value pairs."""
         return ((k, self[k]) for k in self._keys)
 
     def values(self) -> Iterable[Any]:
+        # [FUNCTION DOC]
+        # Returns a lazy iterator of the values in insertion order.
         r"""Return an iterable of the ParameterDict values."""
         return (self[k] for k in self._keys)
 
     def update(self, parameters: Mapping[str, Any] | ParameterDict) -> None:
+        # [FUNCTION DOC]
+        # Merges parameters into the dict, overwriting existing keys. Ordered mappings and ParameterDict keep
+        # their order; other mappings are inserted in sorted key order; other iterables must yield key and
+        # value pairs. Raises TypeError if the argument or an element is not iterable, ValueError if a pair
+        # does not have length two.
+        # KNOWN ISSUE: the element TypeError message lacks a space before the type name.
         r"""Update the :class:`~torch.nn.ParameterDict` with key-value pairs from ``parameters``, overwriting existing keys.
 
         .. note::
@@ -1005,6 +1245,10 @@ class ParameterDict(Module):
                 self[p[0]] = p[1]  # type: ignore[assignment]
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC]
+        # Builds a multi-line description with one line per item: kind (Parameter or Tensor), type name,
+        # size and device when on an accelerator; otherwise the object type name.
+        # KNOWN ISSUE: uses the legacy type name where ParameterList.extra_repr uses the dtype.
         child_lines = []
         for k, p in self.items():
             if isinstance(p, torch.Tensor):
@@ -1028,18 +1272,26 @@ class ParameterDict(Module):
         return tmpstr
 
     def __call__(self, input):
+        # [FUNCTION DOC]
+        # Always raises RuntimeError, since the container is not callable.
         raise RuntimeError("ParameterDict should not be called.")
 
     def __or__(self, other: ParameterDict) -> ParameterDict:
+        # [FUNCTION DOC]
+        # Returns a copy of self updated with other (other values win).
         copy = self.copy()
         copy.update(other)
         return copy
 
     def __ror__(self, other: ParameterDict) -> ParameterDict:
+        # [FUNCTION DOC]
+        # Returns a copy of other updated with self (self values win).
         copy = other.copy()
         copy.update(self)
         return copy
 
     def __ior__(self, other: ParameterDict) -> Self:
+        # [FUNCTION DOC]
+        # Updates self in place with other and returns self.
         self.update(other)
         return self
