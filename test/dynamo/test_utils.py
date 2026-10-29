@@ -1,4 +1,11 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for Dynamo utility and logging helpers: tolerance-based output comparison,
+#   cleanup hooks, graph-break counting, traced-code queries, record-function data, reinplace
+#   counters, compilation-metrics events (timings, node shapes, parameter counts, IR counts,
+#   provenance, feature usage, config snapshots), accelerator sync in the timing helper, and JSON
+#   scrubbing of inductor and functorch configs for logging.
+# Defines a small linear model used by the tests, a Windows-detection flag, and instantiates
+#   device-generic tests for one class at import time (allowing XPU).
 import dataclasses
 import json
 import os
@@ -28,7 +35,13 @@ _IS_WINDOWS = sys.platform == "win32"
 
 
 class TestUtils(TestCase):
+    # [CLASS DOC] Tests for assorted helpers in the Dynamo utils module: cleanup hooks, output
+    #   comparison, graph-break counting, traced code lookup, profiler record-function logging,
+    #   reinplace counters, and config logging.
     def test_cleanup_hook_tolerates_missing_name(self):
+        # [FUNCTION DOC] A cleanup hook must not raise when the installed global was already
+        #   removed from its scope (as happens at interpreter shutdown), and in the normal path
+        #   calling it removes the installed global from the scope.
         # During interpreter shutdown the scope's module __dict__ may already be
         # cleared before the weakref callback fires the hook. The hook must not
         # raise KeyError (which would surface as an "Exception ignored in
@@ -44,6 +57,8 @@ class TestUtils(TestCase):
         self.assertNotIn("myglobal", scope)
 
     def test_nan(self):
+        # [FUNCTION DOC] The same-output comparison treats two NaN tensors as equal when
+        #   equal-NaN is requested, given a double-precision reference.
         a = torch.Tensor([float("nan")])
         b = torch.Tensor([float("nan")])
         fp64_ref = torch.DoubleTensor([5.0])
@@ -51,6 +66,9 @@ class TestUtils(TestCase):
         self.assertTrue(res)
 
     def test_same_iou_for_bool_propagates_to_instances(self):
+        # [FUNCTION DOC] The comparison on arbitrary objects with a boolean tensor attribute: one
+        #   mask element differs, so the default comparison reports a mismatch while the
+        #   IoU-for-bool option reports a match.
         Instances = type("Instances", (), {})
         ref = Instances()
         res = Instances()
@@ -62,6 +80,9 @@ class TestUtils(TestCase):
         self.assertTrue(utils.same(ref, res, use_iou_for_bool=True))
 
     def test_larger_multiplier_for_smaller_tensor(self):
+        # [FUNCTION DOC] For tensors with a medium element count, a result off by factor 2 passes
+        #   within the tolerance but factor 4 fails by default; the larger-multiplier option
+        #   accepts factor 4 and still rejects factor 9.
         """
         Tensor numel between (10, 500]
         """
@@ -91,6 +112,9 @@ class TestUtils(TestCase):
         )
 
     def test_larger_multiplier_for_even_smaller_tensor(self):
+        # [FUNCTION DOC] For a one-element tensor, factor 2 passes within the tolerance but
+        #   factor 7 fails by default; the larger-multiplier option accepts factor 7 but still
+        #   rejects factor 20.
         """
         Tensor numel <=10
         """
@@ -124,12 +148,20 @@ class TestUtils(TestCase):
         }
     )
     def test_graph_break_counting(self):
+        # [FUNCTION DOC] Verifies the graph-break count recorded in compilation events (collected
+        #   by patching the event logger): a clean model has zero breaks, a function with one
+        #   data-dependent branch under the inductor backend shows one break (also one when
+        #   recompiled after reset, not two), and a function with two nested branches shows two.
+        #   Runs with compilation-metric logging enabled.
         """
         Run a compilation that includes a graph break and validate that the
         graph break counter is incremented.
         """
 
         def run_forward_backward():
+            # [FUNCTION DOC] HELPER: Compile the module-level linear model, run it forward on a
+            #   random input requiring grad, compute a mean-squared-error loss against a fixed
+            #   target, and run backward.
             model = torch.compile(TestModel())  # noqa: UNSPECIFIED_BACKEND
             x = torch.rand([3], requires_grad=True)
             output = model(x)
@@ -140,10 +172,15 @@ class TestUtils(TestCase):
 
         @torch.compile(backend="eager")
         def add(x, y):
+            # [FUNCTION DOC] HELPER: Eager-backend compiled function returning the sum of its two
+            #   arguments.
             return x + y
 
         @torch.compile(backend="eager")
         def break_it(x):
+            # [FUNCTION DOC] HELPER: Eager-backend compiled function with a data-dependent branch
+            #   on the sum of the input; each branch adds or subtracts a scalar item, causing a
+            #   graph break.
             y = x.sum()
             if y > 0:
                 return x + y.item()
@@ -151,6 +188,9 @@ class TestUtils(TestCase):
 
         @torch.compile(backend="eager")
         def break_it2(x):
+            # [FUNCTION DOC] HELPER: Eager-backend compiled function with two nested
+            #   data-dependent branches, each using a scalar item (multiply, add or subtract),
+            #   causing two graph breaks.
             y = x.sum()
             if y > 0:
                 if y > 1:
@@ -183,6 +223,12 @@ class TestUtils(TestCase):
             self.assertEqual(compilation_events[-1].num_graph_breaks, 2)
 
     def test_traced_code_query(self):
+        # [FUNCTION DOC] Checks the traced-code query inside a custom backend: records file names
+        #   of traced code lists for a function with no inlining (only this file), with
+        #   successful inlining of a helper from a sibling utils file (both files in one list),
+        #   with a graph break during inlining and nested graph breaks disabled (two separate
+        #   lists, one per file), and with an empty graph (no list recorded). Imports the helpers
+        #   with a fallback for running outside a package.
         try:
             from .utils import add, break_it
         except ImportError:
@@ -191,12 +237,16 @@ class TestUtils(TestCase):
         traced_code_lists = []
 
         def get_filenames(traced_code_lists):
+            # [FUNCTION DOC] HELPER: Convert each list of code objects into a list of their file
+            #   names.
             return [
                 [code.co_filename for code in code_list]
                 for code_list in traced_code_lists
             ]
 
         def my_backend(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: Backend that appends the currently traced code list to an
+            #   enclosing list and returns the graph forward function.
             from torch._dynamo.utils import get_traced_code
 
             nonlocal traced_code_lists
@@ -206,6 +256,8 @@ class TestUtils(TestCase):
         # === no inlining ===
         @torch.compile(backend=my_backend)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function compiled with the recording backend: doubles the
+            #   input (no inlining).
             return x * 2
 
         x = torch.randn(3)
@@ -216,6 +268,8 @@ class TestUtils(TestCase):
         # === successful inlining ===
         @torch.compile(backend=my_backend)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function compiled with the recording backend: calls an
+            #   imported helper add then doubles the result.
             return add(x) * 2
 
         x = torch.randn(3)
@@ -228,6 +282,9 @@ class TestUtils(TestCase):
         @torch._dynamo.disable_nested_graph_breaks
         @torch.compile(backend=my_backend)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function compiled with the recording backend and nested
+            #   graph breaks disabled: adds one, calls an imported helper that graph-breaks, and
+            #   doubles the result.
             z = x + 1
             y = break_it(z)
             return y * 2
@@ -240,6 +297,8 @@ class TestUtils(TestCase):
         # === empty graph ===
         @torch.compile(backend=my_backend)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function compiled with the recording backend that returns
+            #   its input unchanged (empty graph).
             return x
 
         x = torch.randn(3)
@@ -248,6 +307,10 @@ class TestUtils(TestCase):
         self.assertEqual(traced_code_lists, [])
 
     def test_add_record_function_data(self):
+        # [FUNCTION DOC] Checks that adding record-function data logs nothing to the profiler
+        #   record-function context when the profiler is disabled, or when enabled but no
+        #   key-value data is given, and with data and an enabled profiler calls it once with a
+        #   name plus a formatted key=value list.
         with (
             mock.patch("torch.autograd.profiler._is_profiler_enabled", False),
             mock.patch("torch.autograd.profiler.record_function") as mock_rf,
@@ -274,6 +337,12 @@ class TestUtils(TestCase):
             mock_rf.assert_called_once_with("test_event_data: key1=value1, key2=value2")
 
     def test_reinplace_counters_use_trigger_name_not_enum_value(self):
+        # [FUNCTION DOC] Verifies that the reinplace counters build their dictionary keys from
+        #   the trigger name rather than the enum value: after adding missed tensors and bytes
+        #   for one trigger, keys with the trigger name exist with the right values; after
+        #   clearing and using another trigger, only the new name-based key exists; no key
+        #   containing the numeric enum value exists. Clears counters at start and between
+        #   phases.
         """Test that ReinplaceCounters uses trigger.name in dictionary keys instead of the enum value"""
         from torch._dynamo.utils import ReinplaceCounters, ReInplaceTrigger
 
@@ -334,6 +403,9 @@ class TestUtils(TestCase):
         )
 
     def test_get_dynamo_config_for_logging_ignores_logging_functions(self):
+        # [FUNCTION DOC] The config snapshot prepared for logging is a JSON string that parses to
+        #   a dictionary and omits the ignore-logging-functions option even when it is set to a
+        #   set of functions.
         with dynamo_config.patch(ignore_logging_functions={print}):
             result = utils._get_dynamo_config_for_logging()
             parsed = json.loads(result)
@@ -343,25 +415,37 @@ class TestUtils(TestCase):
 
 
 class TestModel(torch.nn.Module):
+    # [CLASS DOC] HELPER: Tiny module with a single linear layer from 3 inputs to 1 output,
+    #   compiled by several tests.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Create the linear layer.
         super().__init__()
         self.linear = torch.nn.Linear(3, 1)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Apply the linear layer to the input.
         return self.linear(x)
 
 
 class TestDynamoTimed(TestCase):
+    # [CLASS DOC] Tests of compilation metrics produced around timed compile phases; they capture
+    #   the events passed to a patched compilation-event logger after compiling a small model
+    #   forward and backward.
     """
     Test utilities surrounding dynamo_timed.
     """
 
     def setUp(self):
+        # [FUNCTION DOC] Run the base setup, then reset recompile user contexts when that
+        #   function exists.
         super().setUp()
         if hasattr(torch._dynamo, "reset_recompile_user_contexts"):
             torch._dynamo.reset_recompile_user_contexts()
 
     def run_forward_backward(self):
+        # [FUNCTION DOC] HELPER: Compile the module-level linear model, run it forward on a
+        #   random input requiring grad, compute a mean-squared-error loss against a fixed
+        #   target, and run backward.
         model = torch.compile(TestModel())  # noqa: UNSPECIFIED_BACKEND
         x = torch.rand([3], requires_grad=True)
         output = model(x)
@@ -371,10 +455,15 @@ class TestDynamoTimed(TestCase):
         loss.backward()
 
     def warmup(self):
+        # [FUNCTION DOC] HELPER: Warm up process-global caches by compiling and running a small
+        #   add function with the inductor backend, then reset the frame count and clear the
+        #   structured-logging overhead record.
         # Helper to make sure any process-global lru_caches (e.g., torch_key())
         # have already executed. Just compile something.
         @torch.compile(backend="inductor")
         def add(x, y):
+            # [FUNCTION DOC] HELPER: Inductor-compiled function returning the sum of its two
+            #   arguments.
             return x + y
 
         add(torch.rand([10]), torch.rand([10]))
@@ -384,6 +473,9 @@ class TestDynamoTimed(TestCase):
     @dynamo_config.patch({"log_compilation_metrics": True})
     @inductor_config.patch({"force_disable_caches": True})
     def test_stack_trace(self):
+        # [FUNCTION DOC] Runs a forward-backward compile with metrics logging and caches
+        #   disabled, collects the stack trace of each compilation event, and asserts that the
+        #   combined text mentions this test's name.
         self.warmup()
 
         compilation_events = []
@@ -410,6 +502,9 @@ class TestDynamoTimed(TestCase):
     @dynamo_config.patch({"log_compilation_metrics": True})
     @inductor_config.patch({"force_disable_caches": True})
     def test_graph_node_shapes(self):
+        # [FUNCTION DOC] Runs a forward-backward compile with metrics logging and caches disabled
+        #   and asserts that the first event records the graph node names mapped to their shapes
+        #   exactly as expected for the linear model (bias, weight, input, output).
         self.warmup()
 
         compilation_events = []
@@ -427,6 +522,10 @@ class TestDynamoTimed(TestCase):
     @dynamo_config.patch({"log_compilation_metrics": True})
     @inductor_config.patch({"force_disable_caches": True})
     def test_log_dynamo_start(self):
+        # [FUNCTION DOC] Runs a warm-up compile, then asserts that the Dynamo start log for a
+        #   sample function's code object returns stack strings whose last entry contains the
+        #   code's first line number, its name and this file name, and that there is more than
+        #   one entry.
         import torch._dynamo.convert_frame as convert_frame
 
         self.warmup()
@@ -434,6 +533,8 @@ class TestDynamoTimed(TestCase):
 
         # Dummy code object
         def sample_func():
+            # [FUNCTION DOC] HELPER: Empty function whose code object is passed to the start-log
+            #   function.
             pass
 
         code = sample_func.__code__
@@ -460,9 +561,15 @@ class TestDynamoTimed(TestCase):
     @dynamo_config.patch({"log_compilation_metrics": True})
     @inductor_config.patch({"force_disable_caches": True})
     def test_exception_stack_trace(self):
+        # [FUNCTION DOC] A full-graph compile of a function calling the print builtin raises the
+        #   unsupported-operation error with a message about print; the logged compilation event
+        #   must contain a non-empty exception stack trace whose first entry includes that
+        #   message.
         from torch._dynamo.exc import Unsupported
 
         def backward(grad_output):
+            # [FUNCTION DOC] HELPER: Function that prints a message (not traceable) and returns
+            #   its argument.
             print("graph break!")  # This should trigger a Dynamo error
             return grad_output
 
@@ -507,6 +614,14 @@ class TestDynamoTimed(TestCase):
     @mock.patch("time.time_ns", return_value=100000)
     @dynamo_config.patch(specialize_float=False)
     def test_dynamo_timed(self, mock_time, mock_time_ns):
+        # [FUNCTION DOC] Single-compile test of the timing instrumentation, skipped on several
+        #   platforms and builds due to an open issue. With mocked clocks (all durations zero),
+        #   checks the compilation time metrics mapping, the time-spent summary, and the full
+        #   dictionaries of the forward and backward compilation events against expected text,
+        #   with variants for Windows. Config-dependent entries (garbage collection) are filtered
+        #   from expectations. Takes the mocked clock arguments, which are not otherwise used.
+        # The expected output contains no source line numbers, so comment insertion does not
+        #   affect it.
         """
         Run a compilation that includes a forward and a backward and validate
         various recorded metrics. This test could be broken into several, but the
@@ -524,6 +639,9 @@ class TestDynamoTimed(TestCase):
             compilation_events = [arg[0][0] for arg in log_event.call_args_list]
 
         def filter_expected(s: str) -> str:
+            # [FUNCTION DOC] HELPER: Evaluate an expected-dictionary text, drop
+            #   garbage-collection entries (and null the gc time) if garbage collection after
+            #   compile is disabled in config, and return its pretty-printed form.
             d = eval(s)
             if not dynamo_config.run_gc_after_compile:
                 d.pop("gc", None)
@@ -1120,7 +1238,10 @@ class TestDynamoTimed(TestCase):
     )
     @compiler_config.patch({"job_id": "test_job_id"})
     def test_compiler_config(self):
+        # [FUNCTION DOC] With a job id set in the compiler config, a compiled function's first
+        #   compilation event carries a compiler config string including that job id.
         def test1(x):
+            # [FUNCTION DOC] HELPER: Function returning the square of its input.
             return x * x
 
         compilation_events = []
@@ -1138,6 +1259,10 @@ class TestDynamoTimed(TestCase):
         }
     )
     def test_ir_count(self):
+        # [FUNCTION DOC] The IR count recorded in the compilation event matches a
+        #   per-Python-version expected value for two functions (one with an extra
+        #   multiplication); the test also asserts that the running Python version is one of the
+        #   supported listed versions.
         # Different python versions have different potential IR counts.
         version = (sys.version_info[0], sys.version_info[1])
         self.assertIn(version, ((3, 10), (3, 11), (3, 12), (3, 13), (3, 14), (3, 15)))
@@ -1151,6 +1276,8 @@ class TestDynamoTimed(TestCase):
         }[version]
 
         def test1(x):
+            # [FUNCTION DOC] HELPER: Function computing the square of the doubled input through
+            #   intermediate variables.
             y = x + x
             z = y * y
             return z
@@ -1162,6 +1289,7 @@ class TestDynamoTimed(TestCase):
         self.assertEqual(compilation_events[0].ir_count, first)
 
         def test2(x):
+            # [FUNCTION DOC] HELPER: Function returning the doubled input.
             y = x + x
             return y
 
@@ -1180,6 +1308,9 @@ class TestDynamoTimed(TestCase):
         {"trace.enabled": True, "trace.provenance_tracking_level": 1},
     )
     def test_inductor_provenance(self):
+        # [FUNCTION DOC] With inductor tracing and provenance tracking enabled, compiling a
+        #   traced linear module yields an event whose inductor provenance equals the expected
+        #   set containing a single JSON string for the matrix-multiply extern kernel.
         module = torch.nn.Linear(6, 66)
         graph_module = torch.fx.symbolic_trace(module)
 
@@ -1195,11 +1326,15 @@ class TestDynamoTimed(TestCase):
     @dynamo_config.patch({"log_compilation_metrics": True})
     @inductor_config.patch({"force_disable_caches": True})
     def test_dynamic_shape_feature_use(self):
+        # [FUNCTION DOC] The feature-usage record in the second compilation event shows automatic
+        #   dynamic shapes enabled by default after calling with a different size, and disabled
+        #   when that option is turned off in config.
         compilation_events = []
         with mock.patch("torch._dynamo.utils.log_compilation_event") as log_event:
 
             @torch.compile()  # noqa: UNSPECIFIED_BACKEND
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function returning the square of its input.
                 return x * x
 
             f(torch.randn(4))
@@ -1219,6 +1354,7 @@ class TestDynamoTimed(TestCase):
 
             @torch.compile()  # noqa: UNSPECIFIED_BACKEND
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function returning the square of its input.
                 return x * x
 
             f(torch.randn(4))
@@ -1232,15 +1368,24 @@ class TestDynamoTimed(TestCase):
 
     @dynamo_config.patch({"log_compilation_metrics": True})
     def test_num_params(self):
+        # [FUNCTION DOC] Checks parameter number, byte and count metrics in compilation events: a
+        #   conv model (520 elements, 2 parameters), a wrapper holding two such models (1040, 4),
+        #   a sequential with a shared layer (counted once per distinct parameter: 40 elements, 4
+        #   parameters), and layers sharing one weight (24 elements, 3 parameters). Bytes are
+        #   four times elements.
         import torch.nn as nn
         import torch.nn.functional as F
 
         class ModelSimple(nn.Module):
+            # [CLASS DOC] HELPER: Module with one convolution layer (1 to 20 channels, kernel 5)
+            #   followed by relu.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the convolution layer.
                 super().__init__()
                 self.conv1 = nn.Conv2d(1, 20, 5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the convolution then relu.
                 return F.relu(self.conv1(x))
 
         self.assertEqual([x.numel() for x in ModelSimple().parameters()], [500, 20])
@@ -1255,12 +1400,16 @@ class TestDynamoTimed(TestCase):
         self.assertEqual(compilation_events[0].param_count, 2)
 
         class ModelWrapped(nn.Module):
+            # [CLASS DOC] HELPER: Module holding two simple conv models and summing their
+            #   outputs.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create two simple conv model submodules.
                 super().__init__()
                 self.m1 = ModelSimple()
                 self.m2 = ModelSimple()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the sum of the two submodule outputs.
                 return self.m1(x) + self.m2(x)
 
         compilation_events = []
@@ -1299,7 +1448,13 @@ class TestDynamoTimed(TestCase):
 
 
 class TestTimedSync(TestCase):
+    # [CLASS DOC] Device-generic tests (instantiated per device at import) of the timing helper's
+    #   accelerator synchronization.
     def test_timed_syncs_on_accelerator(self, device):
+        # [FUNCTION DOC] On non-CPU devices, the timing helper on a traced identity module with
+        #   one repetition must call the accelerator synchronize function exactly twice (once
+        #   before the loop, once per iteration); skipped on CPU. The synchronize function is
+        #   patched to record calls.
         if torch.device(device).type == "cpu":
             self.skipTest("sync only triggered for non-CPU devices")
 
@@ -1322,16 +1477,22 @@ instantiate_device_type_tests(TestTimedSync, globals(), allow_xpu=True)
 
 
 class TestInductorConfigParsingForLogging(TestCase):
+    # [CLASS DOC] Tests of the function that converts the inductor config into a JSON string for
+    #   compilation metrics logging.
     """
     Test for parsing inductor config for logging in CompilationMetrics.
     """
 
     class TestObject:
+        # [CLASS DOC] HELPER: Simple object with two attributes; not used by any test in this
+        #   file.
         def __init__(self, a, b):
+            # [FUNCTION DOC] HELPER: Store the two arguments.
             self.a = a
             self.b = b
 
     def test_inductor_config_jsonify(self):
+        # [FUNCTION DOC] The real inductor config converts to a string that contains a trace key.
         """
         Sanity check if the actual inductor config is parsed correctly
         """
@@ -1342,6 +1503,11 @@ class TestInductorConfigParsingForLogging(TestCase):
 
     @mock.patch("torch._dynamo.utils.torch._inductor.config")
     def test_inductor_config_parsing_non_conforming_items(self, mocked_inductor_config):
+        # [FUNCTION DOC] With the inductor config object patched, checks scrubbing:
+        #   unserializable values nested in dicts and lists become a placeholder text and keys
+        #   sorted; a mapping with a non-string key yields an empty JSON object; a non-mapping
+        #   config gives a not-serializable message; a missing config gives none. Takes the
+        #   patched mock config.
         """
         Test if the inductor config is parsed correctly when the config is
             - None
@@ -1392,7 +1558,11 @@ class TestInductorConfigParsingForLogging(TestCase):
 
 
 class TestFunctorchConfigParsingForLogging(TestCase):
+    # [CLASS DOC] Tests of the function that converts the functorch config into a JSON string for
+    #   compilation metrics logging.
     def test_functorch_config_jsonify(self):
+        # [FUNCTION DOC] The functorch config string parses as JSON and includes the activation
+        #   memory budget with value 1.0.
         functorch_config_json = utils._functorch_config_for_logging()
         self.assertIsInstance(functorch_config_json, str)
         parsed = json.loads(functorch_config_json)
@@ -1400,6 +1570,8 @@ class TestFunctorchConfigParsingForLogging(TestCase):
         self.assertEqual(parsed["activation_memory_budget"], 1.0)
 
     def test_functorch_config_blocklist(self):
+        # [FUNCTION DOC] The functorch config string leaves out the type-checking flag and the
+        #   private ignore-list entry.
         functorch_config_json = utils._functorch_config_for_logging()
         parsed = json.loads(functorch_config_json)
         self.assertNotIn("TYPE_CHECKING", parsed)
@@ -1407,18 +1579,25 @@ class TestFunctorchConfigParsingForLogging(TestCase):
 
     @mock.patch("torch._dynamo.utils.torch._functorch.config")
     def test_functorch_config_none(self, mocked_config):
+        # [FUNCTION DOC] When reading a copy of the functorch config raises AttributeError, the
+        #   logging function returns none. Takes the patched mock config.
         mocked_config.get_config_copy.side_effect = AttributeError
         result = utils._functorch_config_for_logging()
         self.assertIsNone(result)
 
     @mock.patch("torch._dynamo.utils.torch._functorch.config")
     def test_functorch_config_runtime_error(self, mocked_config):
+        # [FUNCTION DOC] When reading a copy of the functorch config raises RuntimeError, the
+        #   logging function returns none. Takes the patched mock config.
         mocked_config.get_config_copy.side_effect = RuntimeError
         result = utils._functorch_config_for_logging()
         self.assertIsNone(result)
 
     @mock.patch("torch._dynamo.utils.justknobs_check", return_value=False)
     def test_functorch_config_jk_disabled(self, mocked_jk):
+        # [FUNCTION DOC] When the just-knobs check is patched to return false, the logging
+        #   function returns none and the check was consulted once with the functorch-config
+        #   logging knob name. Takes the patched mock.
         result = utils._functorch_config_for_logging()
         self.assertIsNone(result)
         mocked_jk.assert_called_once_with("pytorch/dynamo:log_functorch_config")
