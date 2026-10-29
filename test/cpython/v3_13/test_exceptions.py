@@ -1,3 +1,13 @@
+# [MODULE DOC] Dynamo-patched copy of the CPython 3.13 test_exceptions tests (built-in
+# exception types and semantics). Covers raising/catching every builtin exception, SyntaxError
+# messages and error offsets, exception attributes and pickling, __notes__, tracebacks,
+# chaining (__cause__/__context__), cleanup of the "except ... as" name and exception state
+# (reference leaks checked through weakrefs), generator interaction with sys.exception,
+# recursion errors, MemoryError handling, NameError/AttributeError/ImportError details,
+# AssertionError locations, SyntaxError constructors, and PEP 626 line numbers. Many tests
+# rely on CPython internals (test.support, _testcapi, subprocesses). Import-time side effects:
+# installs RedirectImportFinder on sys.meta_path and tries to import _testcapi (falls back to
+# a default INT_MAX if unavailable). Running the file as a script calls run_tests.
 # ======= BEGIN Dynamo patch =======
 # Owner(s): ["module: dynamo"]
 
@@ -34,7 +44,15 @@ redirect_imports = (
 )
 
 class RedirectImportFinder(importlib.abc.MetaPathFinder):
+    # [CLASS DOC] HELPER: Import hook (meta path finder) that maps selected "test.<name>"
+    # module names listed in redirect_imports to the top-level module "<name>" so the copied
+    # CPython tests can import their helpers. Stateless; one instance is placed on
+    # sys.meta_path.
     def find_spec(self, fullname, path, target=None):
+        # [FUNCTION DOC] HELPER: For a module name in redirect_imports, strips the "test."
+        # prefix, imports that top-level module, registers it in sys.modules under the
+        # original name, and returns its spec. Returns None for other names or if the import
+        # fails (ImportError). Side effect: mutates sys.modules and triggers an import.
         # Check if the import is the problematic one
         if fullname in redirect_imports:
             try:
@@ -87,24 +105,41 @@ except ImportError:
 
 
 class NaiveException(Exception):
+    # [CLASS DOC] HELPER: Exception subclass whose constructor takes one argument and stores
+    # it as attribute x without calling the base constructor; used to check attribute
+    # handling/pickling.
     def __init__(self, x):
+        # [FUNCTION DOC] HELPER: Stores the single argument x on the instance as attribute x.
         self.x = x
 
 class SlottedNaiveException(Exception):
+    # [CLASS DOC] HELPER: Like NaiveException but declares __slots__ with only x, so the
+    # instance keeps the attribute in a slot; used for the same attribute/pickle checks.
     __slots__ = ('x',)
     def __init__(self, x):
+        # [FUNCTION DOC] HELPER: Stores the single argument x in the x slot.
         self.x = x
 
 class BrokenStrException(Exception):
+    # [CLASS DOC] HELPER: Exception whose string conversion always fails by raising a plain
+    # Exception; used to test error handling paths that stringify exceptions.
     def __str__(self):
+        # [FUNCTION DOC] HELPER: Always raises Exception with the message "str() is broken".
         raise Exception("str() is broken")
 
 # XXX This is not really enough, each *operation* should be tested!
 
 
 class ExceptionTests(__TestCase):
+    # [CLASS DOC] Main test case for builtin exception behavior (raising, attributes,
+    # pickling, notes, tracebacks, chaining, cleanup, generator exception state, recursion and
+    # MemoryError handling, unraisable/unhandled output). Mostly stateless; some tests use the
+    # TESTFN file or subprocesses. Several tests are marked cpython_only or resource-gated.
 
     def raise_catch(self, exc, excname):
+        # [FUNCTION DOC] HELPER: Raises and catches the exception class exc twice with message
+        # "spam" and checks both string forms are equal and that exc.__name__ equals excname.
+        # Runs inside a subTest. Asserts via the test case; returns nothing.
         with self.subTest(exc=exc, excname=excname):
             try:
                 raise exc("spam")
@@ -119,6 +154,13 @@ class ExceptionTests(__TestCase):
 
     @torch._dynamo.error_on_graph_break(False)
     def testRaising(self):
+        # [FUNCTION DOC] Walks through the builtin exception classes with raise_catch and
+        # exercises several concrete triggers: getattr on a missing attribute, EOFError from
+        # marshal.loads of empty bytes, OSError opening a missing file, ImportError,
+        # IndexError, KeyError, NameError, OverflowError (repeated doubling of an int),
+        # SyntaxError via exec, TabError via compile, SystemExit via sys.exit, TypeError,
+        # ValueError, ZeroDivisionError. Side effects: creates and removes the TESTFN file and
+        # temporarily replaces sys.stdin. Dynamo graph breaks allowed.
         self.raise_catch(AttributeError, "AttributeError")
         self.assertRaises(AttributeError, getattr, sys, "undefined_attribute")
 
@@ -204,10 +246,15 @@ class ExceptionTests(__TestCase):
 
     @torch._dynamo.error_on_graph_break(False)
     def testSyntaxErrorMessage(self):
+        # [FUNCTION DOC] Checks that compiling certain fragments (continue outside a loop, a
+        # bad f-string expression) raises SyntaxError with exactly the expected message text.
         # make sure the right exception message is raised for each of
         # these code fragments
 
         def ckmsg(src, msg):
+            # [FUNCTION DOC] HELPER: Compiles source src and fails the test unless it raises
+            # SyntaxError whose msg equals msg (also fails if no error is raised). Runs in a
+            # subTest.
             with self.subTest(src=src, msg=msg):
                 try:
                     compile(src, '<fragment>', 'exec')
@@ -229,7 +276,14 @@ class ExceptionTests(__TestCase):
 
     @torch._dynamo.error_on_graph_break(False)
     def testSyntaxErrorMissingParens(self):
+        # [FUNCTION DOC] Checks the "Missing parentheses in call to print/exec" messages for
+        # old style statements, that similar-looking invalid syntax gets a plain "invalid
+        # syntax" message, and that IndentationError and TabError subclasses keep their own
+        # messages.
         def ckmsg(src, msg, exception=SyntaxError):
+            # [FUNCTION DOC] HELPER: Compiles src and asserts it raises the given exception
+            # class (default SyntaxError) with message msg; fails the test if nothing is
+            # raised.
             try:
                 compile(src, '<fragment>', 'exec')
             except exception as e:
@@ -270,6 +324,10 @@ class ExceptionTests(__TestCase):
         ckmsg(s, "inconsistent use of tabs and spaces in indentation", TabError)
 
     def check(self, src, lineno, offset, end_lineno=None, end_offset=None, encoding='utf-8'):
+        # [FUNCTION DOC] HELPER: Compiles source src (str or bytes) and asserts a SyntaxError
+        # whose lineno and offset equal the given values; end_lineno/end_offset are compared
+        # only when given. If the error has text, the matching source line (decoded with
+        # encoding for bytes) must be contained in it.
         with self.subTest(source=src, lineno=lineno, offset=offset):
             with self.assertRaises(SyntaxError) as cm:
                 compile(src, '<fragment>', 'exec')
@@ -287,10 +345,16 @@ class ExceptionTests(__TestCase):
                 self.assertIn(line, cm.exception.text)
 
     def test_error_offset_continuation_characters(self):
+        # [FUNCTION DOC] Checks the error position reported for a source ending in a line
+        # continuation character.
         check = self.check
         check('"\\\n"(1 for c in I,\\\n\\', 2, 2)
 
     def testSyntaxErrorOffset(self):
+        # [FUNCTION DOC] Table of source fragments with expected SyntaxError line/offset (and
+        # end positions in some cases), grouped by the component that reports them: parser,
+        # compile, tokenizer, symtable and future handling. Uses the check helper for each
+        # case.
         check = self.check
         check('def fact(x):\n\treturn x!\n', 2, 10)
         check('1 +\n', 1, 4)
@@ -394,24 +458,41 @@ class ExceptionTests(__TestCase):
     @support.requires_resource('cpu')
     @support.bigmemtest(INT_MAX, memuse=2, dry_run=False)
     def testMemoryErrorBigSource(self, size):
+        # [FUNCTION DOC] Builds a source whose second line is padded to size bytes and checks
+        # that compiling it raises OverflowError with "Parser column offset overflow". Skipped
+        # when int is as large as the platform's maximum size; needs the cpu resource and
+        # large memory.
         src = b"if True:\n%*s" % (size, b"pass")
         with self.assertRaisesRegex(OverflowError, "Parser column offset overflow"):
             compile(src, '<fragment>', 'exec')
 
     @cpython_only
     def testSettingException(self):
+        # [FUNCTION DOC] Checks C-level exception raising (via _testcapi.raise_exception) when
+        # the exception class cannot be instantiated: a failing constructor yields
+        # RuntimeError or TypeError with a traceback pointing at the expected frames, and a
+        # non-exception class yields SystemError. Skipped parts need _testcapi.
         # test that setting an exception at the C level works even if the
         # exception object can't be constructed.
 
         class BadException(Exception):
+            # [CLASS DOC] HELPER: Exception class whose constructor always raises
+            # RuntimeError.
             def __init__(self_):
+                # [FUNCTION DOC] HELPER: Raises RuntimeError("can't instantiate
+                # BadException").
                 raise RuntimeError("can't instantiate BadException")
 
         class InvalidException:
+            # [CLASS DOC] HELPER: Plain class that is not an exception; used to provoke
+            # SystemError.
             pass
 
         @unittest.skipIf(_testcapi is None, "requires _testcapi")
         def test_capi1():
+            # [FUNCTION DOC] HELPER: Raising BadException with flag 1 must give TypeError
+            # whose traceback frame is this function in test_exceptions.py; otherwise fails
+            # the test.
             try:
                 _testcapi.raise_exception(BadException, 1)
             except TypeError as err:
@@ -423,6 +504,8 @@ class ExceptionTests(__TestCase):
 
         @unittest.skipIf(_testcapi is None, "requires _testcapi")
         def test_capi2():
+            # [FUNCTION DOC] HELPER: Raising BadException with flag 0 must give RuntimeError
+            # whose traceback points to BadException.__init__ called from this function.
             try:
                 _testcapi.raise_exception(BadException, 0)
             except RuntimeError as err:
@@ -437,6 +520,8 @@ class ExceptionTests(__TestCase):
 
         @unittest.skipIf(_testcapi is None, "requires _testcapi")
         def test_capi3():
+            # [FUNCTION DOC] HELPER: Asserts that raising a non-exception class from C raises
+            # SystemError.
             self.assertRaises(SystemError, _testcapi.raise_exception,
                               InvalidException, 1)
 
@@ -445,6 +530,9 @@ class ExceptionTests(__TestCase):
         test_capi3()
 
     def test_WindowsError(self):
+        # [FUNCTION DOC] On platforms where WindowsError exists, checks it is an alias of
+        # OSError and the mapping of Windows error codes to errno, winerror, strerror,
+        # filename and str output; does nothing (passes) when WindowsError is undefined.
         try:
             WindowsError
         except NameError:
@@ -486,6 +574,8 @@ class ExceptionTests(__TestCase):
     @unittest.skipUnless(sys.platform == 'win32',
                          'test specific to Windows')
     def test_windows_message(self):
+        # [FUNCTION DOC] Windows only: an unknown Windows error code set through ctypes must
+        # produce an OSError message formatted as hexadecimal "Windows Error 0x...".
         """Should fill in unknown error code in Windows error message"""
         ctypes = import_module('ctypes')
         # this error code has no message, Python formats it as hexadecimal
@@ -494,6 +584,14 @@ class ExceptionTests(__TestCase):
             ctypes.pythonapi.PyErr_SetFromWindowsErr(code)
 
     def testAttributes(self):
+        # [FUNCTION DOC] Table driven check of exception attributes: for each (class, args,
+        # kwargs, expected attributes) tuple, builds the exception and compares repr of each
+        # attribute, that the class module is builtins (except the Naive classes), and that
+        # the attribute values survive a pickle round trip for every protocol (AttributeError
+        # obj is not pickled and is expected to be None). Failed construction prints the case
+        # to stderr and continues.
+        # KNOWN ISSUE: a construction failure only prints to stderr (the re-raise is commented
+        #   out), so that case is silently skipped instead of failing the test.
         # test that exception attributes are happy
 
         exceptionList = [
@@ -633,6 +731,8 @@ class ExceptionTests(__TestCase):
                                              (e, checkArgName))
 
     def test_setstate(self):
+        # [FUNCTION DOC] Checks Exception.__setstate__: it merges dict entries into the
+        # instance attributes, can reset args, and leaves other attributes untouched.
         e = Exception(42)
         e.blah = 53
         self.assertEqual(e.args, (42,))
@@ -651,11 +751,17 @@ class ExceptionTests(__TestCase):
         self.assertEqual(e.b, 2)
 
     def test_invalid_setstate(self):
+        # [FUNCTION DOC] __setstate__ with a non-dict argument must raise TypeError "state is
+        # not a dictionary".
         e = Exception(42)
         with self.assertRaisesRegex(TypeError, "state is not a dictionary"):
             e.__setstate__(42)
 
     def test_notes(self):
+        # [FUNCTION DOC] Checks add_note and __notes__ for BaseException, Exception and
+        # ValueError: notes accumulate in a list, a non-str note raises TypeError, deleting
+        # __notes__ resets it, and add_note raises TypeError if __notes__ was replaced with a
+        # non-list value.
         for e in [BaseException(1), Exception(2), ValueError(3)]:
             with self.subTest(e=e):
                 self.assertFalse(hasattr(e, '__notes__'))
@@ -683,6 +789,8 @@ class ExceptionTests(__TestCase):
                 self.assertEqual(e.__notes__, 42)
 
     def testWithTraceback(self):
+        # [FUNCTION DOC] with_traceback returns the same exception object with __traceback__
+        # set, for BaseException, a builtin subclass and a user subclass.
         try:
             raise IndexError(4)
         except Exception as e:
@@ -697,6 +805,8 @@ class ExceptionTests(__TestCase):
         self.assertEqual(e.__traceback__, tb)
 
         class MyException(Exception):
+            # [CLASS DOC] HELPER: Empty Exception subclass used to check with_traceback on
+            # user classes.
             pass
 
         e = MyException().with_traceback(tb)
@@ -704,6 +814,8 @@ class ExceptionTests(__TestCase):
         self.assertEqual(e.__traceback__, tb)
 
     def testInvalidTraceback(self):
+        # [FUNCTION DOC] Assigning a non-traceback to __traceback__ must raise TypeError
+        # mentioning "__traceback__ must be a traceback".
         try:
             Exception().__traceback__ = 5
         except TypeError as e:
@@ -712,6 +824,8 @@ class ExceptionTests(__TestCase):
             self.fail("No exception raised")
 
     def test_invalid_setattr(self):
+        # [FUNCTION DOC] Invalid values for args, __traceback__, __cause__ and __context__
+        # must raise TypeError with the specific messages.
         TE = TypeError
         exc = Exception()
         msg = "'int' object is not iterable"
@@ -724,6 +838,8 @@ class ExceptionTests(__TestCase):
         self.assertRaisesRegex(TE, msg, setattr, exc, '__context__', 1)
 
     def test_invalid_delattr(self):
+        # [FUNCTION DOC] Deleting args, __traceback__, __cause__ or __context__ must raise
+        # TypeError "may not be deleted".
         TE = TypeError
         try:
             raise IndexError(4)
@@ -737,6 +853,7 @@ class ExceptionTests(__TestCase):
         self.assertRaisesRegex(TE, msg, delattr, exc, '__context__')
 
     def testNoneClearsTracebackAttr(self):
+        # [FUNCTION DOC] Setting __traceback__ to None clears a previously set traceback.
         try:
             raise IndexError(4)
         except Exception as e:
@@ -748,6 +865,8 @@ class ExceptionTests(__TestCase):
         self.assertEqual(e.__traceback__, None)
 
     def testChainingAttrs(self):
+        # [FUNCTION DOC] Fresh exceptions (builtin and user-defined subclass) have __context__
+        # and __cause__ equal to None.
         e = Exception()
         self.assertIsNone(e.__context__)
         self.assertIsNone(e.__cause__)
@@ -757,6 +876,8 @@ class ExceptionTests(__TestCase):
         self.assertIsNone(e.__cause__)
 
         class MyException(OSError):
+            # [CLASS DOC] HELPER: Empty OSError subclass used to check default chaining
+            # attributes.
             pass
 
         e = MyException()
@@ -764,6 +885,8 @@ class ExceptionTests(__TestCase):
         self.assertIsNone(e.__cause__)
 
     def testChainingDescriptors(self):
+        # [FUNCTION DOC] Checks __suppress_context__ semantics: it starts false, becomes true
+        # when __cause__ or __context__ is assigned, and can be assigned explicitly.
         try:
             raise Exception()
         except Exception as exc:
@@ -782,12 +905,18 @@ class ExceptionTests(__TestCase):
         self.assertFalse(e.__suppress_context__)
 
     def testKeywordArgs(self):
+        # [FUNCTION DOC] Builtin exceptions reject keyword arguments with TypeError, while a
+        # user subclass with its own constructor may accept them.
         # test that builtin exception don't take keyword args,
         # but user-defined subclasses can if they want
         self.assertRaises(TypeError, BaseException, a=1)
 
         class DerivedException(BaseException):
+            # [CLASS DOC] HELPER: BaseException subclass taking a fancy_arg keyword in its
+            # constructor.
             def __init__(self, fancy_arg):
+                # [FUNCTION DOC] HELPER: Calls the base constructor with no args and stores
+                # fancy_arg.
                 BaseException.__init__(self)
                 self.fancy_arg = fancy_arg
 
@@ -796,11 +925,16 @@ class ExceptionTests(__TestCase):
 
     @no_tracing
     def testInfiniteRecursion(self):
+        # [FUNCTION DOC] Unbounded recursion (also through a try/except that does not match)
+        # must raise RecursionError. Runs with tracing disabled.
         def f():
+            # [FUNCTION DOC] HELPER: Recurses forever by calling itself.
             return f()
         self.assertRaises(RecursionError, f)
 
         def g():
+            # [FUNCTION DOC] HELPER: Recurses forever inside a try that catches only
+            # ValueError.
             try:
                 return g()
             except ValueError:
@@ -808,12 +942,16 @@ class ExceptionTests(__TestCase):
         self.assertRaises(RecursionError, g)
 
     def test_str(self):
+        # [FUNCTION DOC] Both exception classes and instances (with one or two args) have a
+        # non-empty string form.
         # Make sure both instances and classes have a str representation.
         self.assertTrue(str(Exception))
         self.assertTrue(str(Exception('a')))
         self.assertTrue(str(Exception('a', 'b')))
 
     def test_exception_cleanup_names(self):
+        # [FUNCTION DOC] The name bound by "except ... as e" is removed after the handler, so
+        # e is not in locals and reading it raises UnboundLocalError.
         # Make sure the local variable bound to the exception instance by
         # an "except" statement is only visible inside the except block.
         try:
@@ -825,6 +963,8 @@ class ExceptionTests(__TestCase):
             e
 
     def test_exception_cleanup_names2(self):
+        # [FUNCTION DOC] Same cleanup as above but the name is explicitly deleted inside the
+        # handler, which must not break the implicit cleanup.
         # Make sure the cleanup doesn't break if the variable is explicitly deleted.
         try:
             raise Exception()
@@ -836,16 +976,26 @@ class ExceptionTests(__TestCase):
             e
 
     def testExceptionCleanupState(self):
+        # [FUNCTION DOC] Verifies that references held by an exception (value and traceback)
+        # are released when the handler ends, by checking via weakref that the referenced
+        # object dies. Covers except with and without "as", bare except, break out of handler,
+        # handler raising another exception, a re-raise inside finally, and an exception-
+        # swallowing context manager.
         # Make sure exception state is cleaned up as soon as the except
         # block is left. See #2507
 
         class MyException(Exception):
+            # [CLASS DOC] HELPER: Exception that keeps a reference to obj in attribute obj.
             def __init__(self, obj):
+                # [FUNCTION DOC] HELPER: Stores obj on the instance.
                 self.obj = obj
         class MyObj:
+            # [CLASS DOC] HELPER: Empty class; instances are tracked with weak references.
             pass
 
         def inner_raising_func():
+            # [FUNCTION DOC] HELPER: Reads the enclosing variable obj into a local and raises
+            # MyException carrying obj, so both the exception and traceback reference it.
             # Create some references in exception value and traceback
             local_ref = obj
             raise MyException(obj)
@@ -942,9 +1092,12 @@ class ExceptionTests(__TestCase):
 
         # Inside an exception-silencing "with" block
         class Context:
+            # [CLASS DOC] HELPER: Context manager whose exit swallows every exception.
             def __enter__(self):
+                # [FUNCTION DOC] HELPER: Returns self.
                 return self
             def __exit__ (self, exc_type, exc_value, exc_tb):
+                # [FUNCTION DOC] HELPER: Returns True, suppressing any exception.
                 return True
         obj = MyObj()
         wr = weakref.ref(obj)
@@ -957,9 +1110,12 @@ class ExceptionTests(__TestCase):
         self.assertIsNone(obj)
 
     def test_exception_target_in_nested_scope(self):
+        # [FUNCTION DOC] Regression test (issue 4617): the exception target name used in a
+        # nested function must compile and run; the NameError for an undefined name is caught.
         # issue 4617: This used to raise a SyntaxError
         # "can not delete variable 'e' referenced in nested scope"
         def print_error():
+            # [FUNCTION DOC] HELPER: Reads the enclosing variable e (no result is used).
             e
         try:
             something
@@ -968,9 +1124,13 @@ class ExceptionTests(__TestCase):
             # implicit "del e" here
 
     def test_generator_leaking(self):
+        # [FUNCTION DOC] A generator's handled exception must not leak into the caller's
+        # sys.exception, both outside and inside an exception handler of the caller.
         # Test that generator exception state doesn't leak into the calling
         # frame
         def yield_raise():
+            # [FUNCTION DOC] HELPER: Generator that yields sys.exception inside a handler
+            # twice, then once more after the handler ends (None).
             try:
                 raise KeyError("caught")
             except KeyError:
@@ -998,8 +1158,11 @@ class ExceptionTests(__TestCase):
             self.assertIsInstance(sys.exception(), TypeError)
 
     def test_generator_leaking2(self):
+        # [FUNCTION DOC] Issue 12475: finishing a generator started inside a handler must
+        # leave the caller's sys.exception as None.
         # See issue 12475.
         def g():
+            # [FUNCTION DOC] HELPER: Generator that yields once.
             yield
         try:
             raise RuntimeError
@@ -1013,9 +1176,13 @@ class ExceptionTests(__TestCase):
         self.assertIsNone(sys.exception())
 
     def test_generator_leaking3(self):
+        # [FUNCTION DOC] Issue 23353: throwing into a generator saves and restores the
+        # caller's exception state.
         # See issue #23353.  When gen.throw() is called, the caller's
         # exception state should be save and restored.
         def g():
+            # [FUNCTION DOC] HELPER: Generator that yields sys.exception after catching a
+            # thrown ZeroDivisionError.
             try:
                 yield
             except ZeroDivisionError:
@@ -1032,9 +1199,13 @@ class ExceptionTests(__TestCase):
         self.assertIsNone(sys.exception())
 
     def test_generator_leaking4(self):
+        # [FUNCTION DOC] Issue 23353: when a generator raises, the caller's exception state is
+        # still restored properly (not left as the caller's earlier TypeError).
         # See issue #23353.  When an exception is raised by a generator,
         # the caller's exception state should still be restored.
         def g():
+            # [FUNCTION DOC] HELPER: Generator that catches ZeroDivisionError, yields
+            # sys.exception, then re-raises.
             try:
                 1/0
             except ZeroDivisionError:
@@ -1059,7 +1230,11 @@ class ExceptionTests(__TestCase):
         self.assertIsNone(sys.exception())
 
     def test_generator_doesnt_retain_old_exc(self):
+        # [FUNCTION DOC] Generator must not retain the exception that was active when it was
+        # created.
         def g():
+            # [FUNCTION DOC] HELPER: Generator that asserts the active exception is
+            # RuntimeError when resumed in the first step and None afterwards.
             self.assertIsInstance(sys.exception(), RuntimeError)
             yield
             self.assertIsNone(sys.exception())
@@ -1071,10 +1246,15 @@ class ExceptionTests(__TestCase):
         self.assertRaises(StopIteration, next, it)
 
     def test_generator_finalizing_and_sys_exception(self):
+        # [FUNCTION DOC] Issue 7173: finalizing a generator after it ran inside an exception
+        # handler must not leave sys.exception set.
         # See #7173
         def simple_gen():
+            # [FUNCTION DOC] HELPER: Generator yielding the single value 1.
             yield 1
         def run_gen():
+            # [FUNCTION DOC] HELPER: Starts simple_gen inside a handler of a raised
+            # RuntimeError and returns its first value.
             gen = simple_gen()
             try:
                 raise RuntimeError
@@ -1085,15 +1265,24 @@ class ExceptionTests(__TestCase):
         self.assertIsNone(sys.exception())
 
     def _check_generator_cleanup_exc_state(self, testfunc):
+        # [FUNCTION DOC] HELPER: Issue 12791 check. Starts a generator that holds an exception
+        # referencing a tracked object, applies testfunc to it (throw, close, delete, next or
+        # send), then drops all references and asserts through a weakref that the object was
+        # freed.
         # Issue #12791: exception state is cleaned up as soon as a generator
         # is closed (reference cycles are broken).
         class MyException(Exception):
+            # [CLASS DOC] HELPER: Exception that keeps a reference to obj.
             def __init__(self, obj):
+                # [FUNCTION DOC] HELPER: Stores obj on the instance.
                 self.obj = obj
         class MyObj:
+            # [CLASS DOC] HELPER: Empty class whose instance is tracked by a weak reference.
             pass
 
         def raising_gen():
+            # [FUNCTION DOC] HELPER: Generator that raises and catches MyException(obj) and
+            # yields once while the handler is active.
             try:
                 raise MyException(obj)
             except MyException:
@@ -1110,7 +1299,9 @@ class ExceptionTests(__TestCase):
         self.assertIsNone(obj)
 
     def test_generator_throw_cleanup_exc_state(self):
+        # [FUNCTION DOC] Cleanup check where the generator is finished by throw().
         def do_throw(g):
+            # [FUNCTION DOC] HELPER: Throws RuntimeError into g and swallows it.
             try:
                 g.throw(RuntimeError())
             except RuntimeError:
@@ -1118,17 +1309,26 @@ class ExceptionTests(__TestCase):
         self._check_generator_cleanup_exc_state(do_throw)
 
     def test_generator_close_cleanup_exc_state(self):
+        # [FUNCTION DOC] Cleanup check where the generator is finished by close().
         def do_close(g):
+            # [FUNCTION DOC] HELPER: Closes generator g.
             g.close()
         self._check_generator_cleanup_exc_state(do_close)
 
     def test_generator_del_cleanup_exc_state(self):
+        # [FUNCTION DOC] Cleanup check where the generator is finished by dropping the last
+        # reference.
         def do_del(g):
+            # [FUNCTION DOC] HELPER: Rebinds the local name only; the caller releases the
+            # generator.
             g = None
         self._check_generator_cleanup_exc_state(do_del)
 
     def test_generator_next_cleanup_exc_state(self):
+        # [FUNCTION DOC] Cleanup check where the generator is finished by next().
         def do_next(g):
+            # [FUNCTION DOC] HELPER: Calls next on g and expects StopIteration, failing the
+            # test otherwise.
             try:
                 next(g)
             except StopIteration:
@@ -1138,7 +1338,10 @@ class ExceptionTests(__TestCase):
         self._check_generator_cleanup_exc_state(do_next)
 
     def test_generator_send_cleanup_exc_state(self):
+        # [FUNCTION DOC] Cleanup check where the generator is finished by send(None).
         def do_send(g):
+            # [FUNCTION DOC] HELPER: Sends None to g and expects StopIteration, failing
+            # otherwise.
             try:
                 g.send(None)
             except StopIteration:
@@ -1148,10 +1351,17 @@ class ExceptionTests(__TestCase):
         self._check_generator_cleanup_exc_state(do_send)
 
     def test_3114(self):
+        # [FUNCTION DOC] Bug 3114: an object whose finalizer reads sys.exception must see no
+        # dangling exception; after the exception holding it is dropped the finalizer must
+        # have recorded None.
         # Bug #3114: in its destructor, MyObject retrieves a pointer to
         # obsolete and/or deallocated objects.
         class MyObject:
+            # [CLASS DOC] HELPER: Object whose finalizer stores the current sys.exception into
+            # the enclosing variable e.
             def __del__(self):
+                # [FUNCTION DOC] HELPER: Sets the enclosing variable e to the current handled
+                # exception.
                 nonlocal e
                 e = sys.exception()
         e = ()
@@ -1163,11 +1373,17 @@ class ExceptionTests(__TestCase):
         self.assertIsNone(e)
 
     def test_raise_does_not_create_context_chain_cycle(self):
+        # [FUNCTION DOC] Raising an exception whose context chain already contains the active
+        # one must not create a cycle; builds a context chain of three exceptions, re-raises
+        # the oldest and checks the resulting chain is reordered without a loop.
         class A(Exception):
+            # [CLASS DOC] HELPER: Empty Exception subclass A.
             pass
         class B(Exception):
+            # [CLASS DOC] HELPER: Empty Exception subclass B.
             pass
         class C(Exception):
+            # [CLASS DOC] HELPER: Empty Exception subclass C.
             pass
 
         # Create a context chain:
@@ -1203,9 +1419,13 @@ class ExceptionTests(__TestCase):
         self.assertIsNone(b.__context__)
 
     def test_no_hang_on_context_chain_cycle1(self):
+        # [FUNCTION DOC] Issue 25782: an exception whose __context__ is itself must not make
+        # raising hang; the new exception's context is the self-referencing one.
         # See issue 25782. Cycle in context chain.
 
         def cycle():
+            # [FUNCTION DOC] HELPER: Raises ValueError, makes it its own context, then raises
+            # TypeError.
             try:
                 raise ValueError(1)
             except ValueError as ex:
@@ -1222,13 +1442,18 @@ class ExceptionTests(__TestCase):
         self.assertIs(exc.__context__.__context__, exc.__context__)
 
     def test_no_hang_on_context_chain_cycle2(self):
+        # [FUNCTION DOC] Issue 25782: a context chain with a cycle at its head must not hang
+        # when the last exception is raised; the cyclic links are preserved.
         # See issue 25782. Cycle at head of context chain.
 
         class A(Exception):
+            # [CLASS DOC] HELPER: Empty Exception subclass A.
             pass
         class B(Exception):
+            # [CLASS DOC] HELPER: Empty Exception subclass B.
             pass
         class C(Exception):
+            # [CLASS DOC] HELPER: Empty Exception subclass C.
             pass
 
         # Context cycle:
@@ -1258,17 +1483,24 @@ class ExceptionTests(__TestCase):
         self.assertIs(a.__context__, c)
 
     def test_no_hang_on_context_chain_cycle3(self):
+        # [FUNCTION DOC] Issue 25782: a longer context chain (five exceptions) containing a
+        # cycle must not hang; the links are checked afterwards.
         # See issue 25782. Longer context chain with cycle.
 
         class A(Exception):
+            # [CLASS DOC] HELPER: Empty Exception subclass A.
             pass
         class B(Exception):
+            # [CLASS DOC] HELPER: Empty Exception subclass B.
             pass
         class C(Exception):
+            # [CLASS DOC] HELPER: Empty Exception subclass C.
             pass
         class D(Exception):
+            # [CLASS DOC] HELPER: Empty Exception subclass D.
             pass
         class E(Exception):
+            # [CLASS DOC] HELPER: Empty Exception subclass E.
             pass
 
         # Context cycle:
@@ -1305,6 +1537,8 @@ class ExceptionTests(__TestCase):
         self.assertIs(a.__context__, c)
 
     def test_context_of_exception_in_try_and_finally(self):
+        # [FUNCTION DOC] An exception raised in a finally block gets the pending exception
+        # from the try body as its __context__.
         try:
             try:
                 te = TypeError(1)
@@ -1319,6 +1553,8 @@ class ExceptionTests(__TestCase):
         self.assertIs(exc.__context__, te)
 
     def test_context_of_exception_in_except_and_finally(self):
+        # [FUNCTION DOC] Exception raised in finally after one raised in an except block: the
+        # chain is finally exception -> except exception -> original.
         try:
             try:
                 te = TypeError(1)
@@ -1337,6 +1573,8 @@ class ExceptionTests(__TestCase):
         self.assertIs(exc.__context__.__context__, te)
 
     def test_context_of_exception_in_else_and_finally(self):
+        # [FUNCTION DOC] Exception raised in finally after one raised in the else block:
+        # finally exception has the else exception as context.
         try:
             try:
                 pass
@@ -1355,6 +1593,10 @@ class ExceptionTests(__TestCase):
         self.assertIs(exc.__context__, ve)
 
     def test_unicode_change_attributes(self):
+        # [FUNCTION DOC] Issue 7309 regression: mutating start, end, reason and encoding on
+        # UnicodeEncodeError, UnicodeDecodeError and UnicodeTranslateError (including a huge
+        # int reason and a start beyond end) must not crash, and str output follows the new
+        # attributes.
         # See issue 7309. This was a crasher.
 
         u = UnicodeEncodeError('baz', 'xxxxx', 1, 5, 'foo')
@@ -1392,6 +1634,8 @@ class ExceptionTests(__TestCase):
         self.assertEqual(str(u), "can't translate characters in position 1000-4: 965230951443685724997")
 
     def test_unicode_errors_no_object(self):
+        # [FUNCTION DOC] Issue 21134: Unicode error instances created through __new__ without
+        # initialization stringify to an empty string.
         # See issue #21134.
         klasses = UnicodeEncodeError, UnicodeDecodeError, UnicodeTranslateError
         for klass in klasses:
@@ -1399,6 +1643,9 @@ class ExceptionTests(__TestCase):
 
     @skipIfTorchDynamo("slow test")
     def test_unicode_error_str_does_not_crash(self):
+        # [FUNCTION DOC] Loops over many start/end/object-length combinations and checks that
+        # converting Unicode encode, decode and translate errors to str never crashes and
+        # always returns a string. Skipped under Dynamo as slow.
         # Test that str(UnicodeError(...)) does not crash.
         # See https://github.com/python/cpython/issues/123378.
 
@@ -1423,12 +1670,19 @@ class ExceptionTests(__TestCase):
 
     @no_tracing
     def test_badisinstance(self):
+        # [FUNCTION DOC] Bug 2542: when the subclass check on an except clause class raises,
+        # that error is ignored and the real KeyError handler still runs. Also checks
+        # unbounded recursion produces a RecursionError mentioning "maximum recursion depth
+        # exceeded". Tracing is disabled and stderr is captured.
         # Bug #2542: if issubclass(e, MyException) raises an exception,
         # it should be ignored
         class Meta(type):
+            # [CLASS DOC] HELPER: Metaclass whose subclass check always raises ValueError.
             def __subclasscheck__(cls, subclass):
+                # [FUNCTION DOC] HELPER: Always raises ValueError.
                 raise ValueError()
         class MyException(Exception, metaclass=Meta):
+            # [CLASS DOC] HELPER: Exception class using the failing metaclass Meta.
             pass
 
         with captured_stderr() as stderr:
@@ -1444,6 +1698,8 @@ class ExceptionTests(__TestCase):
                 self.fail("Should have raised KeyError")
 
         def g():
+            # [FUNCTION DOC] HELPER: Recurses infinitely and returns the RecursionError it
+            # catches.
             try:
                 return g()
             except RecursionError as e:
@@ -1456,9 +1712,14 @@ class ExceptionTests(__TestCase):
     @cpython_only
     @support.requires_resource('cpu')
     def test_trashcan_recursion(self):
+        # [FUNCTION DOC] Bpo-33930: builds a chain of one million bound method objects and
+        # frees it to exercise deep destruction (trashcan) without crashing. CPython only; CPU
+        # resource.
         # See bpo-33930
 
         def foo():
+            # [FUNCTION DOC] HELPER: Builds the long chain of method objects, then drops it on
+            # return.
             o = object()
             for x in range(1_000_000):
                 # Create a big chain of method objects that will trigger
@@ -1470,6 +1731,9 @@ class ExceptionTests(__TestCase):
 
     @cpython_only
     def test_recursion_normalizing_exception(self):
+        # [FUNCTION DOC] Issue 22898: runs a subprocess script that throws into a generator at
+        # the recursion limit; expects exit code 1, RecursionError and ResourceWarning on
+        # stderr and "Done." on stdout (no abort). CPython only; needs _testinternalcapi.
         import_module("_testinternalcapi")
         # Issue #22898.
         # Test that a RecursionError is raised when tstate->recursion_depth is
@@ -1528,6 +1792,9 @@ class ExceptionTests(__TestCase):
     @unittest.skipIf(_testcapi is None, "requires _testcapi")
     @force_not_colorized
     def test_recursion_normalizing_infinite_exception(self):
+        # [FUNCTION DOC] Issue 30697: runs a subprocess raising a C-level infinitely recursing
+        # exception; expects exit code 1, the RecursionError message on stderr and "Done." on
+        # stdout. Needs _testcapi; CPython only; colorized output disabled.
         # Issue #30697. Test that a RecursionError is raised when
         # maximum recursion depth has been exceeded when creating
         # an exception
@@ -1546,8 +1813,13 @@ class ExceptionTests(__TestCase):
 
 
     def test_recursion_in_except_handler(self):
+        # [FUNCTION DOC] Checks that deep recursion from within, after, or around an except
+        # handler raises RecursionError (with a recursion limit set 10 above the current
+        # depth) and that the original recursion limit is always restored.
 
         def set_relative_recursion_limit(n):
+            # [FUNCTION DOC] HELPER: Finds the smallest accepted recursion limit by raising it
+            # until sys.setrecursionlimit stops failing, then sets the limit n above that.
             depth = 1
             while True:
                 try:
@@ -1559,12 +1831,15 @@ class ExceptionTests(__TestCase):
             sys.setrecursionlimit(depth+n)
 
         def recurse_in_except():
+            # [FUNCTION DOC] HELPER: Recurses infinitely from inside an except handler.
             try:
                 1/0
             except:
                 recurse_in_except()
 
         def recurse_after_except():
+            # [FUNCTION DOC] HELPER: Handles an error, then recurses infinitely after the
+            # handler.
             try:
                 1/0
             except:
@@ -1572,6 +1847,8 @@ class ExceptionTests(__TestCase):
             recurse_after_except()
 
         def recurse_in_body_and_except():
+            # [FUNCTION DOC] HELPER: Recurses infinitely both in the try body and in its
+            # handler.
             try:
                 recurse_in_body_and_except()
             except:
@@ -1598,6 +1875,9 @@ class ExceptionTests(__TestCase):
     @unittest.skipIf(support.Py_TRACE_REFS, 'cannot test Py_TRACE_REFS build')
     @unittest.skipIf(_testcapi is None, "requires _testcapi")
     def test_recursion_normalizing_with_no_memory(self):
+        # [FUNCTION DOC] Issue 30697: subprocess run with simulated memory exhaustion at deep
+        # recursion; expects failure with MemoryError mentioned in stderr. CPython only;
+        # skipped on reference-tracing builds or without _testcapi.
         # Issue #30697. Test that in the abort that occurs when there is no
         # memory left and the size of the Python frames stack is greater than
         # the size of the list of preallocated MemoryError instances, the
@@ -1621,11 +1901,16 @@ class ExceptionTests(__TestCase):
     @cpython_only
     @unittest.skipIf(_testcapi is None, "requires _testcapi")
     def test_MemoryError(self):
+        # [FUNCTION DOC] The shared preallocated MemoryError raised by C code must not
+        # accumulate duplicate traceback entries: two raises give identical formatted
+        # tracebacks.
         # PyErr_NoMemory always raises the same exception instance.
         # Check that the traceback is not doubled.
         import traceback
         from _testcapi import raise_memoryerror
         def raiseMemError():
+            # [FUNCTION DOC] HELPER: Triggers a C-level MemoryError and returns the formatted
+            # traceback.
             try:
                 raise_memoryerror()
             except MemoryError as e:
@@ -1641,6 +1926,9 @@ class ExceptionTests(__TestCase):
     @cpython_only
     @unittest.skipIf(_testcapi is None, "requires _testcapi")
     def test_exception_with_doc(self):
+        # [FUNCTION DOC] Checks _testcapi.make_exception_with_doc: an undotted name raises
+        # SystemError; the result is a type subclassing Exception; doc, base class (single or
+        # tuple) and attribute dictionary arguments are honored.
         doc2 = "This is a test docstring."
         doc4 = "This is another test docstring."
 
@@ -1664,6 +1952,7 @@ class ExceptionTests(__TestCase):
 
         # test with explicit base tuple
         class C(object):
+            # [CLASS DOC] HELPER: Plain object subclass used as an extra base class.
             pass
         error4 = _testcapi.make_exception_with_doc("_testcapi.error4", doc4,
                                                    (error3, C))
@@ -1681,13 +1970,19 @@ class ExceptionTests(__TestCase):
     @cpython_only
     @unittest.skipIf(_testcapi is None, "requires _testcapi")
     def test_memory_error_cleanup(self):
+        # [FUNCTION DOC] Issue 5437: the preallocated MemoryError must not keep traceback
+        # objects alive; a weakly referenced local in the failing function is freed after the
+        # handler ends.
         # Issue #5437: preallocated MemoryError instances should not keep
         # traceback objects alive.
         from _testcapi import raise_memoryerror
         class C:
+            # [CLASS DOC] HELPER: Empty class whose instance is tracked by a weak reference.
             pass
         wr = None
         def inner():
+            # [FUNCTION DOC] HELPER: Creates a tracked object, stores a weak reference to it
+            # in the enclosing variable wr, then triggers a MemoryError from C.
             nonlocal wr
             c = C()
             wr = weakref.ref(c)
@@ -1704,11 +1999,16 @@ class ExceptionTests(__TestCase):
 
     @no_tracing
     def test_recursion_error_cleanup(self):
+        # [FUNCTION DOC] Same cleanup check as for MemoryError but with RecursionError from
+        # unbounded recursion; tracing disabled.
         # Same test as above, but with "recursion exceeded" errors
         class C:
+            # [CLASS DOC] HELPER: Empty class whose instance is tracked by a weak reference.
             pass
         wr = None
         def inner():
+            # [FUNCTION DOC] HELPER: Records a weak reference to a new object in wr and
+            # recurses forever.
             nonlocal wr
             c = C()
             wr = weakref.ref(c)
@@ -1724,15 +2024,21 @@ class ExceptionTests(__TestCase):
         self.assertEqual(wr(), None)
 
     def test_errno_ENOTDIR(self):
+        # [FUNCTION DOC] Issue 12802: listing a regular file as a directory raises OSError
+        # with errno ENOTDIR.
         # Issue #12802: "not a directory" errors are ENOTDIR even on Windows
         with self.assertRaises(OSError) as cm:
             os.listdir(__file__)
         self.assertEqual(cm.exception.errno, errno.ENOTDIR, cm.exception)
 
     def test_unraisable(self):
+        # [FUNCTION DOC] Issue 22836: an exception raised in __del__ is reported as unraisable
+        # with the __del__ function as the object and a traceback attached.
         # Issue #22836: PyErr_WriteUnraisable() should give sensible reports
         class BrokenDel:
+            # [CLASS DOC] HELPER: Class whose finalizer always raises ValueError.
             def __del__(self):
+                # [FUNCTION DOC] HELPER: Raises ValueError("del is broken").
                 exc = ValueError("del is broken")
                 # The following line is included in the traceback report:
                 raise exc
@@ -1746,6 +2052,10 @@ class ExceptionTests(__TestCase):
             self.assertIsNotNone(cm.unraisable.exc_traceback)
 
     def test_unhandled(self):
+        # [FUNCTION DOC] Checks the report from the default excepthook for ValueError and for
+        # an exception whose str fails: it contains file name, source line, type name, message
+        # (or the "<exception str() failed>" marker) and ends with a newline. stderr is
+        # captured.
         # Check for sensible reporting of unhandled exceptions
         for exc_type in (ValueError, BrokenStrException):
             with self.subTest(exc_type):
@@ -1772,6 +2082,9 @@ class ExceptionTests(__TestCase):
     @unittest.skipIf(support.Py_TRACE_REFS, 'cannot test Py_TRACE_REFS build')
     @unittest.skipIf(_testcapi is None, "requires _testcapi")
     def test_memory_error_in_PyErr_PrintEx(self):
+        # [FUNCTION DOC] Issue 30817: for allocation-failure points 1 to 19 runs a subprocess
+        # that simulates memory exhaustion and expects exit code 1 or 120 and MemoryError in
+        # stderr. CPython only; needs _testcapi; skipped on reference-tracing builds.
         code = """if 1:
             import _testcapi
             class C(): pass
@@ -1788,14 +2101,21 @@ class ExceptionTests(__TestCase):
             self.assertIn(b'MemoryError', err)
 
     def test_yield_in_nested_try_excepts(self):
+        # [FUNCTION DOC] Issue 25612: a coroutine yielding inside a nested handler, then
+        # thrown an unrelated exception, must re-raise the original MainError via a bare
+        # raise.
         #Issue #25612
         class MainError(Exception):
+            # [CLASS DOC] HELPER: Empty Exception subclass raised first.
             pass
 
         class SubError(Exception):
+            # [CLASS DOC] HELPER: Empty Exception subclass thrown into the generator.
             pass
 
         def main():
+            # [FUNCTION DOC] HELPER: Generator that raises MainError, yields inside the
+            # handler within an inner try catching SubError, then re-raises with a bare raise.
             try:
                 raise MainError()
             except MainError:
@@ -1811,8 +2131,12 @@ class ExceptionTests(__TestCase):
             coro.throw(SubError())
 
     def test_generator_doesnt_retain_old_exc2(self):
+        # [FUNCTION DOC] Issue 28884: a generator must not retain the caller's active
+        # exception when resumed after yielding from its own handler (sys.exception is None).
         #Issue 28884#msg282532
         def g():
+            # [FUNCTION DOC] HELPER: Generator yielding from within a handler, then asserting
+            # no active exception and yielding again.
             try:
                 raise ValueError
             except ValueError:
@@ -1829,8 +2153,11 @@ class ExceptionTests(__TestCase):
         self.assertEqual(next(gen), 2)
 
     def test_raise_in_generator(self):
+        # [FUNCTION DOC] Issue 25612: a bare raise inside a generator resumed in the caller's
+        # handler re-raises the caller's ZeroDivisionError.
         #Issue 25612#msg304117
         def g():
+            # [FUNCTION DOC] HELPER: Generator that yields 1 then does a bare raise.
             yield 1
             raise
             yield 2
@@ -1845,6 +2172,10 @@ class ExceptionTests(__TestCase):
 
     @unittest.skipUnless(__debug__, "Won't work if __debug__ is False")
     def test_assert_shadowing(self):
+        # [FUNCTION DOC] Rebinding the module global AssertionError to TypeError must not
+        # change which exception an assert statement raises; the global is deleted afterwards.
+        # Skipped when asserts are disabled. Side effect: temporarily creates and deletes a
+        # module global.
         # Shadowing AssertionError would cause the assert statement to
         # misbehave.
         global AssertionError
@@ -1860,6 +2191,9 @@ class ExceptionTests(__TestCase):
             self.fail('Expected exception')
 
     def test_memory_error_subclasses(self):
+        # [FUNCTION DOC] Bpo-41654: creating and discarding a MemoryError subclass instance
+        # must not corrupt the MemoryError freelist; raises plain MemoryError repeatedly
+        # afterwards with garbage collection.
         # bpo-41654: MemoryError instances use a freelist of objects that are
         # linked using the 'dict' attribute when they are inactive/dead.
         # Subclasses of MemoryError should not participate in the freelist
@@ -1869,6 +2203,7 @@ class ExceptionTests(__TestCase):
         # succeeds, proving that the freelist is not corrupted.
 
         class TestException(MemoryError):
+            # [CLASS DOC] HELPER: Empty MemoryError subclass.
             pass
 
         try:
@@ -1891,6 +2226,9 @@ class ExceptionTests(__TestCase):
 
     @unittest.skipIf(_testcapi is None, "requires _testcapi")
     def test_memory_error_in_subinterp(self):
+        # [FUNCTION DOC] Gh-109894: a subprocess runs an allocation too large for a
+        # subinterpreter; expects a clean exit with MemoryError reported on stderr. Needs
+        # _testcapi.
         # gh-109894: subinterpreters shouldn't count on last resort memory error
         # when MemoryError is raised through PyErr_NoMemory() call,
         # and should preallocate memory errors as does the main interpreter.
@@ -1906,15 +2244,24 @@ class ExceptionTests(__TestCase):
 
 
 class NameErrorTests(__TestCase):
+    # [CLASS DOC] Tests for NameError details: the name attribute, traceback reporting when
+    # the failure happens inside assertRaisesRegex, and class-body self reference. Stateless.
     def test_name_error_has_name(self):
+        # [FUNCTION DOC] A NameError for an undefined variable exposes the variable name in
+        # the name attribute.
         try:
             bluch
         except NameError as exc:
             self.assertEqual("bluch", exc.name)
 
     def test_issue45826(self):
+        # [FUNCTION DOC] Bpo-45826 regression: when assertRaisesRegex fails because the
+        # NameError message does not match, the default excepthook output must still mention
+        # the real missing name. Fails the test if the assertion helper does not fail.
         # regression test for bpo-45826
         def f():
+            # [FUNCTION DOC] HELPER: Expects NameError matching "aaa" but references undefined
+            # name aab.
             with self.assertRaisesRegex(NameError, 'aaa'):
                 aab
 
@@ -1929,7 +2276,12 @@ class NameErrorTests(__TestCase):
         self.assertIn("aab", err.getvalue())
 
     def test_issue45826_focused(self):
+        # [FUNCTION DOC] Focused bpo-45826 case: with the traceback cleared on a caught
+        # NameError and a ZeroDivisionError raised afterwards, the excepthook output still
+        # contains both the missing name and the new exception type.
         def f():
+            # [FUNCTION DOC] HELPER: Catches NameError for an undefined name, clears its
+            # traceback and raises ZeroDivisionError.
             try:
                 nonsense
             except BaseException as E:
@@ -1946,8 +2298,14 @@ class NameErrorTests(__TestCase):
         self.assertIn("ZeroDivisionError", err.getvalue())
 
     def test_gh_111654(self):
+        # [FUNCTION DOC] Gh-111654: referencing the class name inside its own body raises
+        # NameError.
         def f():
+            # [FUNCTION DOC] HELPER: Defines a class whose body references the class name
+            # before it is bound.
             class TestClass:
+                # [CLASS DOC] HELPER: Class whose body references its own (not yet bound)
+                # name.
                 TestClass
 
         self.assertRaises(NameError, f)
@@ -1956,7 +2314,10 @@ class NameErrorTests(__TestCase):
 
 
 class AttributeErrorTests(__TestCase):
+    # [CLASS DOC] Tests for AttributeError name and obj attributes. Stateless.
     def test_attributes(self):
+        # [FUNCTION DOC] AttributeError name and obj default to None and can be set via
+        # keyword arguments.
         # Setting 'attr' should not be a problem.
         exc = AttributeError('Ouch!')
         self.assertIsNone(exc.name)
@@ -1968,7 +2329,10 @@ class AttributeErrorTests(__TestCase):
         self.assertIs(exc.obj, sentinel)
 
     def test_getattr_has_name_and_obj(self):
+        # [FUNCTION DOC] A failed attribute lookup (normal access or direct object attribute
+        # access) sets name to the missing attribute and obj to the instance.
         class A:
+            # [CLASS DOC] HELPER: Class with a blech attribute set to None.
             blech = None
 
         obj = A()
@@ -1984,8 +2348,12 @@ class AttributeErrorTests(__TestCase):
             self.assertEqual(obj, exc.obj)
 
     def test_getattr_has_name_and_obj_for_method(self):
+        # [FUNCTION DOC] Calling a missing method sets name and obj on the AttributeError as
+        # well.
         class A:
+            # [CLASS DOC] HELPER: Class with a blech method.
             def blech(self):
+                # [FUNCTION DOC] HELPER: Method that returns nothing.
                 return
 
         obj = A()
@@ -1999,8 +2367,12 @@ class AttributeErrorTests(__TestCase):
 
 
 class ImportErrorTests(__TestCase):
+    # [CLASS DOC] Tests for ImportError attributes (msg, name, path), keyword validation,
+    # reset via re-running the constructor, and copy/pickle support.
 
     def test_attributes(self):
+        # [FUNCTION DOC] ImportError accepts optional name and path keywords and stores them;
+        # any other keyword raises TypeError "unexpected keyword argument".
         # Setting 'name' and 'path' should not be a problem.
         exc = ImportError('test')
         self.assertIsNone(exc.name)
@@ -2035,6 +2407,8 @@ class ImportErrorTests(__TestCase):
             ImportError('test', invalid='keyword', another=True)
 
     def test_reset_attributes(self):
+        # [FUNCTION DOC] Calling the constructor again without arguments resets args, msg,
+        # name and path to empty/None.
         exc = ImportError('test', name='name', path='path')
         self.assertEqual(exc.args, ('test',))
         self.assertEqual(exc.msg, 'test')
@@ -2049,6 +2423,8 @@ class ImportErrorTests(__TestCase):
         self.assertEqual(exc.path, None)
 
     def test_non_str_argument(self):
+        # [FUNCTION DOC] Issue 15778: ImportError built from a bytes argument stringifies the
+        # same as the bytes object's str (BytesWarning ignored).
         # Issue #15778
         with check_warnings(('', BytesWarning), quiet=True):
             arg = b'abc'
@@ -2056,6 +2432,8 @@ class ImportErrorTests(__TestCase):
             self.assertEqual(str(arg), str(exc))
 
     def test_copy_pickle(self):
+        # [FUNCTION DOC] Pickle (every protocol), copy and deepcopy of an ImportError keep
+        # args, msg, name and path.
         for kwargs in (dict(),
                        dict(name='somename'),
                        dict(path='somepath'),
@@ -2076,6 +2454,10 @@ class ImportErrorTests(__TestCase):
 
 
 def run_script(source):
+    # [FUNCTION DOC] HELPER: Writes source (str, dedented, or bytes as-is) to the TESTFN file,
+    # runs it in a subprocess with warnings as errors-display and utf8 mode, expecting a
+    # failing exit status, and returns the decoded stderr as a list of lines. Side effect:
+    # creates TESTFN (callers must unlink it).
     if isinstance(source, str):
         with open(TESTFN, 'w', encoding='utf-8') as testfile:
             testfile.write(dedent(source))
@@ -2086,11 +2468,18 @@ def run_script(source):
     return err.decode('utf-8').splitlines()
 
 class AssertionErrorTests(__TestCase):
+    # [CLASS DOC] Tests for the location highlighting printed with AssertionError tracebacks,
+    # run via subprocess scripts. Each test cleans up the TESTFN file in tearDown.
     def tearDown(self):
+        # [FUNCTION DOC] Removes the TESTFN file written by run_script.
         unlink(TESTFN)
 
     @force_not_colorized
     def test_assertion_error_location(self):
+        # [FUNCTION DOC] Runs failing assert statements (plain, with message, bytes sources
+        # with different encodings or BOM, multi-line asserts) and checks the last three
+        # stderr lines: source line, caret range under the failing expression, and the
+        # AssertionError message. Colorized output disabled.
         cases = [
             ('assert None',
                 [
@@ -2189,6 +2578,9 @@ class AssertionErrorTests(__TestCase):
 
     @force_not_colorized
     def test_multiline_not_highlighted(self):
+        # [FUNCTION DOC] For multi-line asserts where the failing expression spans lines,
+        # checks the traceback shows the source lines without a caret marker line. Colorized
+        # output disabled.
         cases = [
             ("""
              assert (
@@ -2221,10 +2613,16 @@ class AssertionErrorTests(__TestCase):
 
 @support.force_not_colorized_test_class
 class SyntaxErrorTests(__TestCase):
+    # [CLASS DOC] Tests SyntaxError reporting: how offsets are rendered by the excepthook,
+    # subclass handling, encodings, string versus file sources, and constructor attributes.
+    # Class decorated to disable colorized output. maxDiff is unlimited.
     maxDiff = None
 
     @force_not_colorized
     def test_range_of_offsets(self):
+        # [FUNCTION DOC] Raises SyntaxError with many start/end offset combinations (normal
+        # range, negative, zero, reversed, past line end) and checks the caret line printed by
+        # the excepthook for each (no carets when the start offset is not positive).
         cases = [
             # Basic range from 2->7
             (("bad.py", 1, 2, "abcdefg", 1, 7),
@@ -2315,7 +2713,9 @@ class SyntaxErrorTests(__TestCase):
                     the_exception = exc
 
     def test_subclass(self):
+        # [FUNCTION DOC] A user subclass of SyntaxError is printed with the same caret layout.
         class MySyntaxError(SyntaxError):
+            # [CLASS DOC] HELPER: Empty SyntaxError subclass.
             pass
 
         try:
@@ -2330,6 +2730,9 @@ class SyntaxErrorTests(__TestCase):
 """, err.getvalue())
 
     def test_encodings(self):
+        # [FUNCTION DOC] Checks source line and caret rendering for scripts with a cp437
+        # coding declaration, and for a tokenizer error with an ascii declaration. Registers
+        # cleanup of TESTFN.
         self.addCleanup(unlink, TESTFN)
         source = (
             '# -*- coding: cp437 -*-\n'
@@ -2346,6 +2749,8 @@ class SyntaxErrorTests(__TestCase):
         self.assertEqual(err[-2], '    ^')
 
     def test_non_utf8(self):
+        # [FUNCTION DOC] A script containing a non-UTF-8 byte fails with a "Non-UTF-8 code
+        # starting with" SyntaxError message. Registers cleanup of TESTFN.
         # Check non utf-8 characters
         self.addCleanup(unlink, TESTFN)
         err = run_script(b"\x89")
@@ -2354,7 +2759,12 @@ class SyntaxErrorTests(__TestCase):
 
     @torch._dynamo.error_on_graph_break(False)
     def test_string_source(self):
+        # [FUNCTION DOC] Compiling strings (str, bytes, BOM, latin1 declaration, long
+        # comments) with a misplaced return gives SyntaxError with expected message, no text,
+        # offset 1 and end offset 12 (line 2 for the latin1 case).
         def try_compile(source):
+            # [FUNCTION DOC] HELPER: Compiles source and returns the SyntaxError it must
+            # raise.
             with self.assertRaises(SyntaxError) as cm:
                 compile(source, '<string>', 'exec')
             return cm.exception
@@ -2396,6 +2806,9 @@ class SyntaxErrorTests(__TestCase):
         self.assertEqual(exc.end_offset, 12)
 
     def test_file_source(self):
+        # [FUNCTION DOC] Same misplaced return cases run as script files: checks the printed
+        # source line, caret line and message, and that very long lines are truncated as
+        # expected. Registers cleanup of TESTFN.
         self.addCleanup(unlink, TESTFN)
         err = run_script('return "ä"')
         self.assertEqual(err[-3:], [
@@ -2434,6 +2847,8 @@ class SyntaxErrorTests(__TestCase):
         self.assertEqual(err[-3][:100], '    return "ä" # ' + 'ä'*83)
 
     def test_attributes_new_constructor(self):
+        # [FUNCTION DOC] The six-item location tuple form of the constructor populates
+        # filename, lineno, offset, text, end_lineno and end_offset, plus msg.
         args = ("bad.py", 1, 2, "abcdefg", 1, 100)
         the_exception = SyntaxError("bad bad", args)
         filename, lineno, offset, error, end_lineno, end_offset = args
@@ -2446,6 +2861,8 @@ class SyntaxErrorTests(__TestCase):
         self.assertEqual("bad bad", the_exception.msg)
 
     def test_attributes_old_constructor(self):
+        # [FUNCTION DOC] The four-item location tuple form populates filename, lineno, offset
+        # and text, leaving end_lineno and end_offset None.
         args = ("bad.py", 1, 2, "abcdefg")
         the_exception = SyntaxError("bad bad", args)
         filename, lineno, offset, error = args
@@ -2458,6 +2875,8 @@ class SyntaxErrorTests(__TestCase):
         self.assertEqual("bad bad", the_exception.msg)
 
     def test_incorrect_constructor(self):
+        # [FUNCTION DOC] Location tuples with the wrong length or wrong item types raise
+        # TypeError.
         args = ("bad.py", 1, 2)
         self.assertRaises(TypeError, SyntaxError, "bad bad", args)
 
@@ -2469,7 +2888,11 @@ class SyntaxErrorTests(__TestCase):
 
 
 class TestInvalidExceptionMatcher(__TestCase):
+    # [CLASS DOC] Tests that matching exception handlers with invalid types is rejected.
     def test_except_star_invalid_exception_type(self):
+        # [FUNCTION DOC] An except clause naming a non-class value, alone or inside a tuple,
+        # raises TypeError when an exception is being matched.
+        # KNOWN ISSUE: the name says except-star but the code uses plain except clauses.
         with self.assertRaises(TypeError):
             try:
                 raise ValueError
@@ -2484,8 +2907,13 @@ class TestInvalidExceptionMatcher(__TestCase):
 
 
 class PEP626Tests(__TestCase):
+    # [CLASS DOC] PEP 626 tests: line numbers in traceback frames after exceptions in various
+    # constructs, using relative line numbers from each function's first line.
 
     def lineno_after_raise(self, f, *expected):
+        # [FUNCTION DOC] HELPER: Calls f, expecting an exception, and walks the traceback past
+        # this frame collecting each frame's line number relative to its code's first line
+        # (None if the line is missing); asserts the tuple of lines equals expected.
         try:
             f()
         except Exception as ex:
@@ -2504,13 +2932,18 @@ class PEP626Tests(__TestCase):
         self.assertEqual(tuple(lines), expected)
 
     def test_lineno_after_raise_simple(self):
+        # [FUNCTION DOC] Line number after a simple failing statement is the failing line.
         def simple():
+            # [FUNCTION DOC] HELPER: Divides by zero, with a statement after it.
             1/0
             pass
         self.lineno_after_raise(simple, 1)
 
     def test_lineno_after_raise_in_except(self):
+        # [FUNCTION DOC] An exception raised inside an except block reports the line within
+        # the block.
         def in_except():
+            # [FUNCTION DOC] HELPER: Fails in the try body, then fails again in the handler.
             try:
                 1/0
             except:
@@ -2519,7 +2952,9 @@ class PEP626Tests(__TestCase):
         self.lineno_after_raise(in_except, 4)
 
     def test_lineno_after_other_except(self):
+        # [FUNCTION DOC] An exception not matched by the handler reports the try-body line.
         def other_except():
+            # [FUNCTION DOC] HELPER: Division by zero in a try with a non-matching handler.
             try:
                 1/0
             except TypeError as ex:
@@ -2527,7 +2962,10 @@ class PEP626Tests(__TestCase):
         self.lineno_after_raise(other_except, 3)
 
     def test_lineno_in_named_except(self):
+        # [FUNCTION DOC] An exception raised inside a named handler reports the line within
+        # the handler.
         def in_named_except():
+            # [FUNCTION DOC] HELPER: Fails in the try body and again in the "as" handler.
             try:
                 1/0
             except Exception as ex:
@@ -2536,7 +2974,10 @@ class PEP626Tests(__TestCase):
         self.lineno_after_raise(in_named_except, 4)
 
     def test_lineno_in_try(self):
+        # [FUNCTION DOC] An exception in a try body with a finally clause reports the try-body
+        # line.
         def in_try():
+            # [FUNCTION DOC] HELPER: Division by zero in a try body with a finally clause.
             try:
                 1/0
             finally:
@@ -2544,7 +2985,10 @@ class PEP626Tests(__TestCase):
         self.lineno_after_raise(in_try, 4)
 
     def test_lineno_in_finally_normal(self):
+        # [FUNCTION DOC] An exception raised in a finally block after normal try completion
+        # reports the line within finally.
         def in_finally_normal():
+            # [FUNCTION DOC] HELPER: Empty try, then failing finally block.
             try:
                 pass
             finally:
@@ -2553,7 +2997,10 @@ class PEP626Tests(__TestCase):
         self.lineno_after_raise(in_finally_normal, 4)
 
     def test_lineno_in_finally_except(self):
+        # [FUNCTION DOC] An exception raised in finally after the try body already failed
+        # reports the line within finally.
         def in_finally_except():
+            # [FUNCTION DOC] HELPER: Failing try body followed by a failing finally block.
             try:
                 1/0
             finally:
@@ -2562,32 +3009,47 @@ class PEP626Tests(__TestCase):
         self.lineno_after_raise(in_finally_except, 4)
 
     def test_lineno_after_with(self):
+        # [FUNCTION DOC] Line number of a failure inside a with block using a no-op context
+        # manager.
         class Noop:
+            # [CLASS DOC] HELPER: No-op context manager.
             def __enter__(self):
+                # [FUNCTION DOC] HELPER: Returns self.
                 return self
             def __exit__(self, *args):
+                # [FUNCTION DOC] HELPER: Does nothing and does not suppress exceptions.
                 pass
         def after_with():
+            # [FUNCTION DOC] HELPER: Fails inside a with block using Noop.
             with Noop():
                 1/0
                 pass
         self.lineno_after_raise(after_with, 2)
 
     def test_missing_lineno_shows_as_none(self):
+        # [FUNCTION DOC] Replacing the line table of a function's code with a table without
+        # line information makes the reported line None.
         def f():
+            # [FUNCTION DOC] HELPER: Divides by zero.
             1/0
         self.lineno_after_raise(f, 1)
         f.__code__ = f.__code__.replace(co_linetable=b'\xf8\xf8\xf8\xf9\xf8\xf8\xf8')
         self.lineno_after_raise(f, None)
 
     def test_lineno_after_raise_in_with_exit(self):
+        # [FUNCTION DOC] When a context manager's exit itself raises while an exception is
+        # propagating, two frames at the same relative line are reported.
         class ExitFails:
+            # [CLASS DOC] HELPER: Context manager whose exit always raises ValueError.
             def __enter__(self):
+                # [FUNCTION DOC] HELPER: Returns self.
                 return self
             def __exit__(self, *args):
+                # [FUNCTION DOC] HELPER: Raises ValueError.
                 raise ValueError
 
         def after_with():
+            # [FUNCTION DOC] HELPER: Fails inside a with block using ExitFails.
             with ExitFails():
                 1/0
         self.lineno_after_raise(after_with, 1, 1)
