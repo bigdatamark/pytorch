@@ -1,4 +1,14 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Unit tests for Inductor overlap scheduling and collective bucketing. Graphs are
+# traced with make_fx under FakeTensorMode on a fake process group, then run through
+# OverlapPreservingBucketer, ManualOverlapPreservingBucketer, OverlapScheduler or
+# schedule_overlap_bucketing and the resulting FX graph is checked (FileCheck, node counts,
+# hiding nodes, exposed time). Also covers the profile-guided runtime estimator (synthetic
+# Chrome trace files), foreach pre-bucketing, FSDP pre-bucketing, comm saturation model and
+# BitsetAncestors. Import-time side effects: only reads the device type via get_devtype; test
+# classes are gated on an accelerator dist backend and GPU availability.
+# KNOWN ISSUE: the module repeats imports of torch, torch._dynamo, torch._dynamo.logging and
+# torch._dynamo.test_case and carries a second Owner comment; harmless duplicates.
 import json
 import os
 import tempfile
@@ -54,6 +64,12 @@ import torch._dynamo.test_case
 
 @requires_accelerator_dist_backend(["nccl", "xccl"])
 def build_collective_info(graph, hiding_annotations):
+    # [FUNCTION DOC] HELPER: Builds the mapping from collective start node to a CollectiveInfo
+    # for a traced graph. Each wait_tensor call node whose first argument is an FX node
+    # defines a start/wait pair. hiding_annotations maps a start node to one hiding node or a
+    # list/OrderedSet of hiding nodes (missing means none). Uses fixed fake numbers: size 64
+    # bytes, estimated time 1.0 ms, exposed time 0.0 ms if any hiding node else 1.0 ms.
+    # Returns the dict; the graph is not modified.
     """
     Build CollectiveInfo dict from manual hiding annotations.
 
@@ -105,12 +121,18 @@ def build_collective_info(graph, hiding_annotations):
 @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
 @instantiate_parametrized_tests
 class TestOverlapPreservingBucketing(InductorTestCase):
+    # [CLASS DOC] Test case for the overlap-preserving bucketer: checks which independent,
+    # nested or interleaved all_gather, all_reduce and reduce_scatter collectives get merged,
+    # in several bucket modes. Needs a fake process group (world size 2) created in setUpClass.
     """
     Unit tests for overlap-preserving bucketing pass.
     """
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class setup: calls the base setUpClass, then initializes a default
+        # process group on the fake backend (rank 0, world size 2, in-memory FakeStore) and
+        # sets the class attribute device to cuda.
         super().setUpClass()
         from torch.testing._internal.distributed.fake_pg import FakeStore
 
@@ -120,10 +142,14 @@ class TestOverlapPreservingBucketing(InductorTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Class teardown: calls the base tearDownClass, then destroys the
+        # default process group.
         super().tearDownClass()
         dist.destroy_process_group()
 
     def test_can_bucket_independent_collectives(self):
+        # [FUNCTION DOC] Two all_gathers, each with its own hiding mm, are independent, so the
+        # bucketer merges them: the final graph has at least one all_gather_into_tensor_out node.
         """
         Test that independent collectives with separate hiding nodes CAN bucket.
 
@@ -132,6 +158,8 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         """
 
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Traced body: two all_gather_into_tensor starts, two
+            # independent mm calls, then two waits; returns the sum of all results.
             group_name = "0"
             group_size = 1
 
@@ -199,6 +227,9 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         )
 
     def test_cant_bucket_nested_hiding_intervals(self):
+        # [FUNCTION DOC] Nested hiding intervals (ag2 starts, is hidden and waited inside
+        # ag1's interval) must prevent bucketing: the graph still has at least two
+        # all_gather_into_tensor entries after the pass.
         """
         Test that nested hiding intervals prevent bucketing.
 
@@ -209,6 +240,8 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         """
 
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Traced body: ag1 start, ag2 start, mm2, wait on ag2, mm1
+            # consuming the ag2 result, wait on ag1; returns a sum.
             group_name = "0"
             group_size = 1
 
@@ -287,6 +320,12 @@ class TestOverlapPreservingBucketing(InductorTestCase):
 
     @parametrize("final_mm_hidden", (True, False))
     def test_cant_bucket_ag_with_rs_hiding_interval_between(self, final_mm_hidden):
+        # [FUNCTION DOC] Parametrized by final_mm_hidden. Graph is all_gather, reduce_scatter,
+        # all_gather each hidden by an mm. The reduce_scatter is annotated as hidden only when
+        # final_mm_hidden is true; in that case its hiding interval sits between the
+        # all_gathers and they must stay separate (two all_gather_into_tensor nodes),
+        # otherwise they merge into one all_gather_into_tensor_out. In both cases the three mm
+        # nodes must keep their order.
         """
         Test that all_gathers can't bucket when a reduce_scatter's hiding interval is between them.
 
@@ -307,6 +346,9 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         """
 
         def func(a, b, c):
+            # [FUNCTION DOC] HELPER: Traced body: all_gather on the default group name with
+            # mm1, reduce_scatter with mm2, then a second all_gather with mm3; returns the sum
+            # and the three mm results.
             group_name = dist.distributed_c10d._get_default_group().group_name
             group_size = 1
 
@@ -397,6 +439,9 @@ class TestOverlapPreservingBucketing(InductorTestCase):
             ).run(graph_str)
 
     def test_can_bucket_all_reduce(self):
+        # [FUNCTION DOC] Two all_reduce collectives hidden by separate mms are bucketed
+        # (internode-only restriction turned off): the graph shows one cat, one all_reduce and
+        # a split_with_sizes, and both mm nodes remain.
         """
         Test that all_reduce operations CAN bucket together.
 
@@ -405,6 +450,8 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         """
 
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Traced body: two all_reduce starts, two mm calls, two
+            # waits; returns a sum.
             group_name = "0"
 
             # Start both all_reduce operations
@@ -470,6 +517,11 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         ).check_count("%mm", 2).run(graph_str)
 
     def test_manual_bucket_splits_dependent_all_reduce(self):
+        # [FUNCTION DOC] Regression test for the manual bucketer: four sum all_reduces share
+        # one bucket key but two depend on the others (sumexp feeds result). Checks that
+        # _split_independent_collectives returns exactly two buckets (the independent sumexps,
+        # and the dependent results), then that manual_bucket_collectives runs without a
+        # cycle, graph lint passes, and the graph ends with two all_reduce and two cat nodes.
         """Bucketing must split dependent same-key all_reduces, not fuse them.
 
         Reproduces the loss-parallel cross-entropy pattern with two independent
@@ -485,6 +537,9 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         """
 
         def func(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Traced body: two independent waited all_reduces (sumexp),
+            # each result plus another input feeds a second waited all_reduce; returns the sum
+            # of both results.
             group_name = "0"
             ar = torch.ops._c10d_functional.all_reduce
             wait = torch.ops._c10d_functional.wait_tensor
@@ -546,6 +601,10 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         self.assertEqual(len(cats), 2)
 
     def test_no_cross_type_bucketing_ar_and_rs(self):
+        # [FUNCTION DOC] all_reduce and reduce_scatter with the same group, reduce op and
+        # dtype must not be merged across types. With no hiding at all, the bucketer
+        # (internode restriction off) ends with exactly one all_reduce and one
+        # reduce_scatter_tensor node.
         """
         Test that all_reduce and reduce_scatter on the same PG with
         matching reduce_op and dtype are NOT bucketed together.
@@ -556,6 +615,8 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         """
 
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Traced body: two all_reduce and two reduce_scatter_tensor
+            # starts (group size 2), all waited; returns a sum.
             group_name = "0"
             group_size = 2
 
@@ -623,12 +684,16 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         self.assertEqual(len(rs_nodes), 1)
 
     def test_reduce_scatter_coalesced_mode(self):
+        # [FUNCTION DOC] In coalesced bucket mode two reduce_scatters become a
+        # reduce_scatter_tensor_coalesced call with no cat node in the graph.
         """
         Test that 'coalesced' bucket mode uses reduce_scatter_tensor_coalesced
         instead of cat + single reduce_scatter.
         """
 
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Traced body: two reduce_scatter_tensor calls with waits;
+            # returns a sum.
             group_name = "0"
             group_size = 2
 
@@ -675,12 +740,17 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         self.assertNotIn("cat.default", graph_str)
 
     def test_all_gather_coalesced_mode_falls_back(self):
+        # [FUNCTION DOC] Coalesced bucket mode only applies to reduce_scatter, so two
+        # all_gathers fall back to default bucketing: the graph has a cat node and no
+        # all_gather_into_tensor_coalesced.
         """
         Test that 'coalesced' bucket mode falls back to default bucketing
         for all_gather (coalesced is only supported for reduce_scatter).
         """
 
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Traced body: two all_gather_into_tensor calls with waits;
+            # returns a sum.
             group_name = "0"
             group_size = 2
 
@@ -728,6 +798,9 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         self.assertNotIn("all_gather_into_tensor_coalesced", graph_str)
 
     def test_reduce_scatter_coalesced_mode_single_rs(self):
+        # [FUNCTION DOC] In coalesced mode a single reduce_scatter (one wait) must not crash;
+        # the group has one element so nothing is merged and the reduce_scatter_tensor remains
+        # in the graph.
         """
         Test that 'coalesced' bucket mode correctly identifies the collective
         start node even when there is only a single reduce_scatter (so only
@@ -736,6 +809,8 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         """
 
         def func(a):
+            # [FUNCTION DOC] HELPER: Traced body: one reduce_scatter_tensor with its wait;
+            # returns the sum.
             group_name = "0"
             group_size = 2
 
@@ -780,6 +855,8 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         self.assertIn("reduce_scatter_tensor", graph_str)
 
     def test_can_bucket_multidtype_collectives(self):
+        # [FUNCTION DOC] Float32 and bfloat16 all_gathers, each hidden by its own mm, are
+        # merged in the custom_ops_multidtype bucket mode into a single all_gather_into_tensor_out.
         """
         Test that all_gathers with different dtypes CAN bucket together.
 
@@ -789,6 +866,8 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         """
 
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Traced body: all_gather of a float32 and of a bfloat16
+            # input, two mm calls (second on float-converted input), two waits; returns a sum.
             group_name = "0"
             group_size = 1
 
@@ -864,6 +943,9 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         )
 
     def test_can_bucket_with_multiple_hiding_nodes(self):
+        # [FUNCTION DOC] Collectives with overlapping multiple hiding nodes (ag1 by mm1,mm2;
+        # ag2 by mm2,mm3) can bucket. Also asserts the hiding_nodes sets recorded in
+        # collective_info, then expects one all_gather_into_tensor_out and exactly three mm calls.
         """
         Test that collectives with multiple hiding nodes CAN bucket.
 
@@ -877,6 +959,8 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         """
 
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Traced body: two all_gather starts, three mm calls (third
+            # on a sum of inputs), two waits; returns a sum.
             group_name = "0"
             group_size = 1
 
@@ -953,6 +1037,10 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         )
 
     def test_can_bucket_with_convert_dtype_as_hiding_nodes(self):
+        # [FUNCTION DOC] Uses dtype-conversion nodes as hiding nodes in custom_ops_multidtype
+        # mode: ag1 (hidden by a convert) stays separate and ag2/ag3 (hidden by an mm) are
+        # merged. FileCheck expects an unbucketed all_gather, a wait_tensor, then
+        # pre_bucket_all_gather and all_gather_into_tensor_out.
         """
         Test that all_gathers can bucket when convert_element_type ops ARE the hiding nodes.
 
@@ -964,6 +1052,9 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         """
 
         def func(a, b, c):
+            # [FUNCTION DOC] HELPER: Traced body: all_gather of a, convert b to float16, wait,
+            # two more all_gathers (b converted and c), an mm on the first result, waits;
+            # returns the four results.
             group_name = "0"
             group_size = 1
 
@@ -1042,6 +1133,10 @@ class TestOverlapPreservingBucketing(InductorTestCase):
 
     @torch._inductor.config.patch(deterministic=True)
     def test_deterministic_mode_no_benchmark_error(self):
+        # [FUNCTION DOC] With inductor deterministic config patched on, running
+        # schedule_overlap_bucketing on a traced graph (all_gather, gemm and pointwise
+        # compute) must not raise; compute estimation falls back to analytical instead of
+        # benchmarking. Only checks absence of an error.
         """
         Test that deterministic mode doesn't error when running overlap scheduling.
 
@@ -1053,6 +1148,8 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         )
 
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Traced body: all_gather of a, mm of a and b plus one,
+            # then wait; returns the sum of the pointwise result and gathered tensor.
             group_name = "0"
             group_size = 1
 
@@ -1077,6 +1174,10 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         schedule_overlap_bucketing(gm)
 
     def test_assume_bucketed_latency_exceeds_exposed_time(self):
+        # [FUNCTION DOC] Runs schedule_overlap_bucketing with a custom runtime estimator whose
+        # latency-only estimate (override_size zero) for all_gather is larger than the full
+        # estimate, which could make the latency subtraction go negative. Passes if scheduling
+        # completes without error; no assertion.
         """
         When assume_bucketing_reduces_latency is True and two same-type
         collectives are in-flight, the latency subtraction in
@@ -1091,6 +1192,8 @@ class TestOverlapPreservingBucketing(InductorTestCase):
         )
 
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Traced body: all_gather ag1, an mm, a second all_gather
+            # ag2, both waited; returns a sum.
             group_name = "0"
             group_size = 1
 
@@ -1114,6 +1217,8 @@ class TestOverlapPreservingBucketing(InductorTestCase):
             gm = make_fx(func)(a, b)
 
         def custom_runtime(node: fx.Node, override_size: int | None) -> float | None:
+            # [FUNCTION DOC] HELPER: Fake runtime estimator: all_gather returns 10.0 when
+            # override_size is zero else 3.0; mm nodes return 5.0; anything else 0.0.
             if "all_gather" in str(node.target):
                 if override_size == 0:
                     return 10.0  # latency only
@@ -1132,12 +1237,19 @@ class TestOverlapPreservingBucketing(InductorTestCase):
 @requires_accelerator_dist_backend(["nccl", "xccl"])
 @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
 class TestCrossPGOverlap(InductorTestCase):
+    # [CLASS DOC] Test case for scheduling across two different process groups. setUpClass
+    # creates the default fake group plus two extra groups (pg1, pg2) over ranks 0 and 1 and
+    # stores their names.
     """
     Tests for cross-PG overlap scheduling.
     """
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class setup: calls the base setUpClass, then initializes a default
+        # process group on the fake backend (rank 0, world size 2, in-memory FakeStore) and
+        # sets the class attribute device to cuda. Also creates two new groups over ranks 0
+        # and 1 and stores them and their group names as pg1, pg2, pg1_name, pg2_name.
         super().setUpClass()
         from torch.testing._internal.distributed.fake_pg import FakeStore
 
@@ -1153,12 +1265,18 @@ class TestCrossPGOverlap(InductorTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Class teardown: calls the base tearDownClass, then destroys the two
+        # extra groups and then the default process group.
         super().tearDownClass()
         dist.destroy_process_group(cls.pg1)
         dist.destroy_process_group(cls.pg2)
         dist.destroy_process_group()
 
     def test_cross_pg_prefetch_during_exposed_wait(self):
+        # [FUNCTION DOC] With OverlapScheduler (no bucketing, analytical collective estimator,
+        # long 10.0 collective estimate), the second all_gather on PG2 should be started
+        # during the exposed wait of the first on PG1. Expects both starts before the first
+        # wait_tensor and the overlap_scheduling_exposed counter equal to 1.
         """
         Test that ag2 on PG2 gets prefetched during exposed wait of ag1 on PG1.
         """
@@ -1166,6 +1284,8 @@ class TestCrossPGOverlap(InductorTestCase):
         pg2_name = self.pg2_name
 
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Traced body: all_gather on PG1, wait, mm of the result,
+            # all_gather on PG2, wait, mm; returns the sum of the mms.
             group_size = 1
 
             # First collective on PG1
@@ -1204,6 +1324,7 @@ class TestCrossPGOverlap(InductorTestCase):
         )
 
         def custom_runtime(node: fx.Node, override_size: int | None) -> float | None:
+            # [FUNCTION DOC] HELPER: Fake runtime estimator: 10.0 for all_gather nodes, else 0.0.
             if "all_gather" in str(node.target):
                 return 10.0  # Long collective to ensure exposed wait
             return 0.0
@@ -1230,6 +1351,10 @@ class TestCrossPGOverlap(InductorTestCase):
         self.assertEqual(counters["inductor"]["overlap_scheduling_exposed"], 1)
 
     def test_two_queue_scheduling_off_path_nodes(self):
+        # [FUNCTION DOC] Two-queue scheduling: off-path reduce_scatters (results only waited
+        # at the end) must stay interspersed with compute instead of drifting past the last
+        # mm. Runs schedule_overlap_bucketing with a fake estimator and asserts some
+        # reduce_scatter start precedes the last mm in the resulting order.
         """
         Test that off-path nodes (reduce_scatters whose results don't block compute)
         are scheduled near their original position rather than drifting to the end.
@@ -1239,6 +1364,9 @@ class TestCrossPGOverlap(InductorTestCase):
         """
 
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Traced body: an on-path all_gather feeding mm1, then
+            # reduce_scatter of mm1, mm2, reduce_scatter of mm2, mm3, with both reduce_scatter
+            # waits at the end.
             group_name = "0"
             group_size = 2
 
@@ -1279,6 +1407,8 @@ class TestCrossPGOverlap(InductorTestCase):
         )
 
         def custom_runtime(node: fx.Node, override_size: int | None) -> float | None:
+            # [FUNCTION DOC] HELPER: Fake runtime estimator: 1.0 for all_gather or
+            # reduce_scatter nodes, else 0.0.
             if "all_gather" in str(node.target) or "reduce_scatter" in str(node.target):
                 return 1.0
             return 0.0
@@ -1307,6 +1437,10 @@ class TestCrossPGOverlap(InductorTestCase):
         {"test_configs.assume_bucketing_reduces_latency": False}
     )
     def test_prefetch_prioritizes_larger_hidden_time(self):
+        # [FUNCTION DOC] With assume_bucketing_reduces_latency off and at most one collective
+        # in flight (tiny memory limit), the scheduler must prefetch the collective that can
+        # use more of the mm's overlap window: the large all_gather is hidden by the mm
+        # (exposed time 0.0), the small one is not (exposed 1.0), total exposed time 1.0.
         """
         When multiple future collectives have the same semantic priority, choose
         the one that can consume more of the current overlap window first.
@@ -1314,6 +1448,8 @@ class TestCrossPGOverlap(InductorTestCase):
         group_name = self.pg1_name
 
         def func(a, b, c):
+            # [FUNCTION DOC] HELPER: Traced body: an mm, two all_gathers of different inputs
+            # (small and large by estimator), both waited; returns a sum.
             group_size = 1
             mm = torch.mm(a, a)
 
@@ -1343,6 +1479,8 @@ class TestCrossPGOverlap(InductorTestCase):
         )
 
         def custom_runtime(node: fx.Node, override_size: int | None) -> float | None:
+            # [FUNCTION DOC] HELPER: Fake runtime estimator: 1.0 for ag_small, 8.0 for
+            # ag_large, 8.0 for the mm node, else 0.0.
             if node is ag_small:
                 return 1.0
             if node is ag_large:
@@ -1383,10 +1521,16 @@ class TestCrossPGOverlap(InductorTestCase):
 @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
 @instantiate_parametrized_tests
 class TestFusibleNodeOverlap(InductorTestCase):
+    # [CLASS DOC] Test case checking that non-matmul fusible compute (pointwise chains, fusion
+    # regions) is counted as hiding nodes for collectives. Uses a fake process group of world
+    # size 2.
     """Test that fusible nodes are used for overlapping with collectives."""
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class setup: calls the base setUpClass, then initializes a default
+        # process group on the fake backend (rank 0, world size 2, in-memory FakeStore) and
+        # sets the class attribute device to cuda.
         super().setUpClass()
         from torch.testing._internal.distributed.fake_pg import FakeStore
 
@@ -1396,13 +1540,20 @@ class TestFusibleNodeOverlap(InductorTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Class teardown: calls the base tearDownClass, then destroys the
+        # default process group.
         super().tearDownClass()
         dist.destroy_process_group()
 
     def test_fusible_nodes_hide_collective(self):
+        # [FUNCTION DOC] OverlapScheduler without a custom estimator should treat a pointwise
+        # add/mul/sub chain as hiding the all_gather: the collective's hiding_nodes is non-
+        # empty and the graph order is all_gather, add, mul, sub, wait_tensor.
         """Test that fusible (non-mm) nodes can hide collectives."""
 
         def func(a):
+            # [FUNCTION DOC] HELPER: Traced body: all_gather start, three chained pointwise
+            # ops, then wait; returns the sum of the gathered result and the pointwise result.
             group_name = "0"
             group_size = 1
 
@@ -1452,9 +1603,14 @@ class TestFusibleNodeOverlap(InductorTestCase):
         ).check("wait_tensor").run(graph_str)
 
     def test_fusion_regions_hide_collective(self):
+        # [FUNCTION DOC] Same as the fusible-node test but with enable_fusion_regions=True:
+        # the scheduler constructed up front already knows the collective; after run the
+        # hiding_nodes is non-empty and the graph order is all_gather, add, mul, sub, wait_tensor.
         """Test that fusion regions can hide collectives when enabled."""
 
         def func(a):
+            # [FUNCTION DOC] HELPER: Traced body: all_gather start, three chained pointwise
+            # ops, then wait; returns a sum.
             group_name = "0"
             group_size = 1
 
@@ -1501,10 +1657,16 @@ class TestFusibleNodeOverlap(InductorTestCase):
 
     @parametrize("enable_fusion_regions", [False, True])
     def test_precomputed_estimations_via_custom_runtime(self, enable_fusion_regions):
+        # [FUNCTION DOC] Parametrized by enable_fusion_regions. Precomputes estimations with
+        # gather_node_runtime_estimations and feeds them to OverlapScheduler through a custom
+        # estimator that looks nodes up in the mapping. Expects the final graph to still have
+        # all_gather then wait_tensor and exactly one collective in collective_info.
         """Pre-computed estimations from gather_node_runtime_estimations can be
         fed into OverlapScheduler via custom_runtime_estimation wrapping a dict."""
 
         def func(a):
+            # [FUNCTION DOC] HELPER: Traced body: all_gather start, two pointwise ops, wait;
+            # returns a sum.
             group_name = "0"
             group_size = 1
             ag = torch.ops._c10d_functional.all_gather_into_tensor(
@@ -1551,6 +1713,9 @@ class TestFusibleNodeOverlap(InductorTestCase):
 @requires_accelerator_dist_backend(["nccl", "xccl"])
 @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
 class TestOverlapSchedulingFixes(InductorTestCase):
+    # [CLASS DOC] Regression tests for specific overlap scheduling bugs (self-dependency
+    # cycles with dtype conversion, fusion regions with bucketing, graphsafe rng state). Fake
+    # process group world size 16.
     """
     Test cases for specific bug fixes in overlap scheduling.
     These tests would fail without their corresponding fixes.
@@ -1558,6 +1723,9 @@ class TestOverlapSchedulingFixes(InductorTestCase):
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class setup: calls the base setUpClass, then initializes a default
+        # process group on the fake backend (rank 0, world size 16, in-memory FakeStore) and
+        # sets the class attribute device to cuda.
         super().setUpClass()
         from torch.testing._internal.distributed.fake_pg import FakeStore
 
@@ -1567,10 +1735,16 @@ class TestOverlapSchedulingFixes(InductorTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Class teardown: calls the base tearDownClass, then destroys the
+        # default process group.
         super().tearDownClass()
         dist.destroy_process_group()
 
     def test_no_self_dependency_cycle_with_dtype_conversion(self):
+        # [FUNCTION DOC] Regression test: bucketing four all_gathers whose inputs are dtype
+        # conversions with timeline dependencies must not create self-dependencies. Runs
+        # OverlapScheduler with bucketing and overlap deps enabled and fusion regions off, and
+        # checks run completes and graph lint passes.
         """
         Test that bucketing collectives with dtype conversion doesn't create
         self-dependency cycles.
@@ -1585,6 +1759,8 @@ class TestOverlapSchedulingFixes(InductorTestCase):
         """
 
         def func(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Traced body: four convert-to-bfloat16 plus all_gather
+            # pairs (group size 16) with an mm between them, then four waits; returns a sum.
             group_name = dist.distributed_c10d._get_default_group().group_name
             group_size = 16
 
@@ -1651,9 +1827,15 @@ class TestOverlapSchedulingFixes(InductorTestCase):
         result.graph.lint()
 
     def test_no_cycle_with_fusion_regions_and_bucketing(self):
+        # [FUNCTION DOC] Regression test: OverlapScheduler with bucketing, overlap deps and
+        # fusion regions enabled over a graph with all_gathers and fusible pointwise chains
+        # must finish without a cycle and pass graph lint.
         """Test that fusion regions + bucketing doesn't create cycles."""
 
         def func(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Traced body: converted all_gathers ag1 and ag2, a
+            # pointwise chain, their waits, two more converted all_gathers, another pointwise
+            # chain, and waits; returns a sum.
             group_name = dist.distributed_c10d._get_default_group().group_name
             group_size = 16
 
@@ -1726,6 +1908,11 @@ class TestOverlapSchedulingFixes(InductorTestCase):
         result.graph.lint()
 
     def test_no_cycle_from_dtype_convert_timeline_deps(self):
+        # [FUNCTION DOC] Regression test for transfer_erased_node_deps in
+        # AugmentedGraphHelper: builds a traced graph of two converted all_gathers, adds an
+        # extra dependency of one convert on the first all_gather start, creates replacement
+        # pre_bucket, new_start and new_wait nodes where new_start takes pre_bucket as its out
+        # kwarg, transfers dependencies from the erased nodes, and asserts the helper has no cycle.
         """
         Test that transfer_erased_node_deps doesn't create cycles when
         convert_element_type nodes with timeline deps get fused into a
@@ -1739,6 +1926,8 @@ class TestOverlapSchedulingFixes(InductorTestCase):
         from torch._inductor.augmented_graph_helper import AugmentedGraphHelper
 
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Traced body: two converted all_gathers with waits;
+            # returns a sum.
             group_name = dist.distributed_c10d._get_default_group().group_name
             group_size = 16
 
@@ -1803,6 +1992,10 @@ class TestOverlapSchedulingFixes(InductorTestCase):
         )
 
     def test_graphsafe_rng_state_with_insert_overlap_deps(self):
+        # [FUNCTION DOC] Checks schedule_overlap_bucketing with insert_overlap_deps on a graph
+        # containing a graphsafe rng-state mm and an all_gather: after scheduling, the
+        # generator placeholder's user must be control_deps, and the graph must still lower in
+        # a GraphLowering run under the fake mode. Initializes CUDA.
         from torch._inductor.fx_passes.control_dependencies import control_deps
         from torch._inductor.fx_passes.overlap_scheduling import (
             schedule_overlap_bucketing,
@@ -1814,6 +2007,9 @@ class TestOverlapSchedulingFixes(InductorTestCase):
         torch.cuda.init()
 
         def func(a, b, rng_state):
+            # [FUNCTION DOC] HELPER: Traced body: all_gather of a, an mm run with rng state
+            # through graphsafe_run_with_rng_state, wait; returns the sum of the rng result
+            # and gathered tensor.
             ag = torch.ops._c10d_functional.all_gather_into_tensor(a, 1, "0")
             rng = graphsafe_run_with_rng_state(
                 torch.ops.aten.mm.default, a, b, rng_state=rng_state
@@ -1831,6 +2027,8 @@ class TestOverlapSchedulingFixes(InductorTestCase):
         def custom_runtime_estimation(
             node: fx.Node, override_size: int | None
         ) -> float | None:
+            # [FUNCTION DOC] HELPER: Fake runtime estimator: returns 10.0 for the graphsafe
+            # rng run and all_gather call nodes, otherwise None (no estimate).
             if node.op != "call_function":
                 return None
             if node.target is graphsafe_run_with_rng_state:
@@ -1863,10 +2061,15 @@ class TestOverlapSchedulingFixes(InductorTestCase):
 
 
 class TestForeachGroupsUnit(InductorTestCase):
+    # [CLASS DOC] Test case for the foreach grouping helper used in all_gather pre-bucketing.
     """Unit tests for _compute_foreach_groups and _pre_bucket_all_gather foreach optimization."""
 
     @unittest.skipIf(not HAS_GPU, "Requires GPU")
     def test_foreach_groups_correctness(self):
+        # [FUNCTION DOC] On GPU, builds float32/float16/float32 tensors, checks
+        # _compute_foreach_groups returns a non-None grouping containing a -1 delimiter for
+        # mixed dtypes, and that _pre_bucket_all_gather gives the same values with and without
+        # the groups.
         """Test that foreach grouping computes correct groups and copies data correctly."""
         from torch._inductor.fx_passes.bucketing import (
             _ALL_DTYPES,
@@ -1897,7 +2100,11 @@ class TestForeachGroupsUnit(InductorTestCase):
 
 
 class TestNodeRuntimeEstimationUnit(InductorTestCase):
+    # [CLASS DOC] Test case for node runtime estimation logging helpers.
     def test_compute_estimation_logging_handles_symbolic_scalar_meta(self):
+        # [FUNCTION DOC] Builds a small graph whose placeholder has an unbacked symbolic int
+        # as its value and calls _log_compute_estimations on the add node; passes if it does
+        # not raise.
         from torch._inductor.fx_passes.node_runtime_estimation import (
             _log_compute_estimations,
         )
@@ -1921,6 +2128,13 @@ def _make_pge_trace(
     sdpa_ops=None,
     pg_config=None,
 ):
+    # [FUNCTION DOC] HELPER: Builds a minimal Chrome-trace-style dict for the profile-guided
+    # estimator. collectives (dicts with name, dur, optional pg_name, ranks, group_size,
+    # nelems, out_nelems, dtype), matmuls (shapes, dur, optional strides, dtypes) and sdpa_ops
+    # (input_dims, dur, optional op_name, strides, dtypes) become kernel events; ops get a
+    # cpu_op event linked to the kernel by a running External id. Returns a dict with
+    # traceEvents and distributedInfo whose pg_config is pg_config or a default group 0 over
+    # ranks 0 and 1.
     """Build a minimal Chrome Trace JSON dict for PGE testing."""
     events = []
     eid = 1000
@@ -2006,6 +2220,8 @@ def _make_pge_trace(
 
 
 def _load_pge_profile(data):
+    # [FUNCTION DOC] HELPER: Writes the trace dict as JSON to a temporary file, loads it into
+    # a new ProfileData and returns it; the file is always deleted afterwards.
     """Write trace dict to a temp file and load via ProfileData."""
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         json.dump(data, f)
@@ -2020,7 +2236,14 @@ def _load_pge_profile(data):
 
 
 class TestProfileGuidedEstimation(TestCase):
+    # [CLASS DOC] Test case for ProfileData loading and lookup.
     def test_profile_loading_and_lookup(self):
+        # [FUNCTION DOC] Registers a custom library op, builds a synthetic trace with two all-
+        # reduce timings, one mm and one custom op, loads it, and checks lookup_collective
+        # (known sizes, interpolation, other ranks, unknown collective) and lookup_op results
+        # (aten mm, unknown shape gives None, custom op). Then builds a ProfileGuidedEstimator
+        # from the saved trace and checks it estimates at least one node of the traced custom
+        # op graph.
         """Load a trace with collectives, aten ops, and a custom op; verify lookups."""
         with torch.library._scoped_library("test_pge", "DEF") as lib:
             lib.define("my_op(Tensor x, Tensor w) -> Tensor")
@@ -2151,6 +2374,9 @@ class TestProfileGuidedEstimation(TestCase):
 @requires_accelerator_dist_backend(["nccl", "xccl"])
 @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
 class TestCoalescedCollectiveOverlap(InductorTestCase):
+    # [CLASS DOC] Test case for overlap scheduling with coalesced collectives, whose single
+    # start node returns a list and has several getitem-based waits. Fake process group world
+    # size 8.
     """
     Tests for coalesced collective support in overlap scheduling.
 
@@ -2162,6 +2388,9 @@ class TestCoalescedCollectiveOverlap(InductorTestCase):
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class setup: calls the base setUpClass, then initializes a default
+        # process group on the fake backend (rank 0, world size 8, in-memory FakeStore) and
+        # sets the class attribute device to cuda.
         super().setUpClass()
         from torch.testing._internal.distributed.fake_pg import FakeStore
 
@@ -2171,14 +2400,21 @@ class TestCoalescedCollectiveOverlap(InductorTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Class teardown: calls the base tearDownClass, then destroys the
+        # default process group.
         super().tearDownClass()
         dist.destroy_process_group()
 
     def _make_coalesced_rs_graph(self, num_tensors=3):
+        # [FUNCTION DOC] HELPER: Traces a graph with an mm, a reduce_scatter_tensor_coalesced
+        # over flattened num_tensors inputs (8x8 ones), a wait for each output and a final mm;
+        # returns the traced module.
         """Create an FX graph with a coalesced reduce_scatter and surrounding compute."""
         group_name = dist.distributed_c10d._get_default_group().group_name
 
         def func(*inputs):
+            # [FUNCTION DOC] HELPER: Traced body: mm of first input, coalesced reduce_scatter
+            # of the flattened inputs, a wait per output, another mm; returns a sum.
             # Compute before collective
             mm1 = torch.mm(inputs[0], inputs[0])
 
@@ -2203,6 +2439,9 @@ class TestCoalescedCollectiveOverlap(InductorTestCase):
         return traced
 
     def test_identify_collectives_coalesced(self):
+        # [FUNCTION DOC] OverlapScheduler construction on a coalesced graph (three tensors)
+        # must register exactly one collective_info entry, while wait_to_start has three waits
+        # all mapping to the same single start node.
         """
         _identify_collectives should register one CollectiveInfo per coalesced
         collective, not overwrite for each wait.
@@ -2212,6 +2451,8 @@ class TestCoalescedCollectiveOverlap(InductorTestCase):
         traced = self._make_coalesced_rs_graph(num_tensors=3)
 
         def custom_runtime(node, override_size):
+            # [FUNCTION DOC] HELPER: Fake runtime estimator: 5.0 for reduce_scatter nodes,
+            # else 0.1.
             if "reduce_scatter" in str(node.target):
                 return 5.0
             return 0.1
@@ -2236,6 +2477,8 @@ class TestCoalescedCollectiveOverlap(InductorTestCase):
         self.assertEqual(len(starts), 1)
 
     def test_overlap_scheduler_coalesced_runs(self):
+        # [FUNCTION DOC] Full OverlapScheduler.run on a coalesced graph (four tensors) must
+        # not crash and the result still contains reduce_scatter_tensor_coalesced and wait_tensor.
         """
         Full overlap scheduler run with coalesced collectives should not crash.
         Previously crashed with assertion errors in _handle_wait and
@@ -2246,6 +2489,8 @@ class TestCoalescedCollectiveOverlap(InductorTestCase):
         traced = self._make_coalesced_rs_graph(num_tensors=4)
 
         def custom_runtime(node, override_size):
+            # [FUNCTION DOC] HELPER: Fake runtime estimator: 5.0 for reduce_scatter nodes,
+            # else 0.1.
             if "reduce_scatter" in str(node.target):
                 return 5.0
             return 0.1
@@ -2268,6 +2513,8 @@ class TestCoalescedCollectiveOverlap(InductorTestCase):
         self.assertIn("wait_tensor", graph_str)
 
     def test_gather_node_runtime_estimations_coalesced(self):
+        # [FUNCTION DOC] gather_node_runtime_estimations on a coalesced graph must yield
+        # exactly one reduce_scatter estimation key rather than one per wait.
         """
         gather_node_runtime_estimations should estimate coalesced collectives
         exactly once (not once per wait).
@@ -2279,6 +2526,8 @@ class TestCoalescedCollectiveOverlap(InductorTestCase):
         traced = self._make_coalesced_rs_graph(num_tensors=3)
 
         def custom_runtime(node, override_size):
+            # [FUNCTION DOC] HELPER: Fake runtime estimator: 5.0 for reduce_scatter nodes,
+            # else None.
             if "reduce_scatter" in str(node.target):
                 return 5.0
             return None
@@ -2296,6 +2545,8 @@ class TestCoalescedCollectiveOverlap(InductorTestCase):
         self.assertEqual(len(rs_estimations), 1)
 
     def test_estimate_fx_collective_size_coalesced(self):
+        # [FUNCTION DOC] estimate_fx_collective_size must return a positive size for a
+        # coalesced reduce_scatter node whose meta value is a list of tensors.
         """
         estimate_fx_collective_size should handle coalesced collectives
         whose output meta is a list of tensors, not a single tensor.
@@ -2317,10 +2568,15 @@ class TestCoalescedCollectiveOverlap(InductorTestCase):
 @requires_accelerator_dist_backend(["nccl", "xccl"])
 @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
 class TestProfileGuidedEstimatorIntegration(InductorTestCase):
+    # [CLASS DOC] Integration test case for ProfileGuidedEstimator called on nodes of traced
+    # graphs. Fake process group world size 2.
     """Integration tests: ProfileGuidedEstimator.__call__ on traced FX graphs."""
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class setup: calls the base setUpClass, then initializes a default
+        # process group on the fake backend (rank 0, world size 2, in-memory FakeStore) and
+        # sets the class attribute device to cuda.
         super().setUpClass()
         from torch.testing._internal.distributed.fake_pg import FakeStore
 
@@ -2330,10 +2586,16 @@ class TestProfileGuidedEstimatorIntegration(InductorTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Class teardown: calls the base tearDownClass, then destroys the
+        # default process group.
         super().tearDownClass()
         dist.destroy_process_group()
 
     def test_estimator_call_on_fx_graph(self):
+        # [FUNCTION DOC] Writes a synthetic trace matching the default group ranks (an all-
+        # reduce of 200 and an mm of 50 in trace units), builds a ProfileGuidedEstimator,
+        # traces an all_reduce plus mm graph and checks the estimator returns a positive
+        # estimate for the collective and about 0.05 for the mm. Deletes the temp trace file.
         """ProfileGuidedEstimator returns estimates for collective and mm nodes in a traced graph."""
         group_name = dist.distributed_c10d._get_default_group().group_name
         pg_ranks = tuple(sorted(dist.get_process_group_ranks(dist.group.WORLD)))
@@ -2370,6 +2632,8 @@ class TestProfileGuidedEstimatorIntegration(InductorTestCase):
             estimator = ProfileGuidedEstimator(trace_path)
 
             def func(a, b):
+                # [FUNCTION DOC] HELPER: Traced body: all_reduce of a, wait, mm of b with
+                # itself; returns their sum.
                 ar = torch.ops._c10d_functional.all_reduce(a, "sum", group_name)
                 ar_out = torch.ops._c10d_functional.wait_tensor(ar)
                 mm = torch.mm(b, b)
@@ -2405,8 +2669,13 @@ class TestProfileGuidedEstimatorIntegration(InductorTestCase):
 @requires_accelerator_dist_backend()
 @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
 class TestPreBucketingFsdpCollectives(InductorTestCase):
+    # [CLASS DOC] Test case for pre-bucketing of FSDP collectives and the comm saturation
+    # model. Fake process group world size 64.
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class setup: calls the base setUpClass, then initializes a default
+        # process group on the fake backend (rank 0, world size 64, in-memory FakeStore) and
+        # sets the class attribute device to cuda.
         super().setUpClass()
         from torch.testing._internal.distributed.fake_pg import FakeStore
 
@@ -2416,10 +2685,15 @@ class TestPreBucketingFsdpCollectives(InductorTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Class teardown: calls the base tearDownClass, then destroys the
+        # default process group.
         super().tearDownClass()
         dist.destroy_process_group()
 
     def test_saturation_model(self):
+        # [FUNCTION DOC] Checks compute_min_saturation_bytes: zero for a group of one, at
+        # least the interconnect profile floor for 16 ranks, strictly increasing from 16 to 64
+        # to 128 ranks, and between 50 MB and 200 MB for 8 ranks (NVLink).
         """IB floor activates for small groups; NVLink uses formula; monotonic."""
         from torch._inductor.comm_analysis import (
             compute_min_saturation_bytes,
@@ -2448,6 +2722,9 @@ class TestPreBucketingFsdpCollectives(InductorTestCase):
         self.assertLess(sat_nv, 200 * _MB)
 
     def test_pre_bucketing_only_merges_fsdp_collectives(self):
+        # [FUNCTION DOC] pre_bucket_fsdp_collectives with a large cap merges the two
+        # all_gathers on the default (FSDP) group into one while the all_gather on a different
+        # TP group name is left untouched; counts by group before and after.
         """Pre-bucketing merges FSDP all-gathers but leaves TP all-gathers alone."""
         from torch._inductor.fx_passes.bucketing import is_all_gather_into_tensor
         from torch._inductor.fx_passes.fsdp import (
@@ -2459,6 +2736,9 @@ class TestPreBucketingFsdpCollectives(InductorTestCase):
         tp_group = "tp_test_group"
 
         def func(fsdp_p1, fsdp_p2, tp_a1, tp_a2):
+            # [FUNCTION DOC] HELPER: Traced body: two all_gathers on the default group (size
+            # 64) with waits and a third all_gather of the sum of two inputs on a TP group
+            # (size 8) with wait; returns the three waited results.
             ag1 = torch.ops._c10d_functional.all_gather_into_tensor(
                 fsdp_p1, 64, fsdp_group
             )
@@ -2479,6 +2759,8 @@ class TestPreBucketingFsdpCollectives(InductorTestCase):
             )
 
         def count_ag(group):
+            # [FUNCTION DOC] HELPER: Counts all_gather_into_tensor nodes in the traced graph
+            # with the given group name.
             return sum(
                 1
                 for n in traced.graph.nodes
@@ -2494,6 +2776,8 @@ class TestPreBucketingFsdpCollectives(InductorTestCase):
         self.assertEqual(count_ag(tp_group), 1)  # TP untouched
 
     def test_pre_bucketing_handles_dtype_cast(self):
+        # [FUNCTION DOC] Parameters cast to bfloat16 before all_gather are still treated as
+        # FSDP: pre_bucket_fsdp_collectives merges the two all_gathers into one.
         """Parameter -> dtype cast -> all_gather is identified as FSDP."""
         from torch._inductor.fx_passes.bucketing import is_all_gather_into_tensor
         from torch._inductor.fx_passes.fsdp import (
@@ -2504,6 +2788,8 @@ class TestPreBucketingFsdpCollectives(InductorTestCase):
         fsdp_group = dist.distributed_c10d._get_default_group().group_name
 
         def func(p1, p2):
+            # [FUNCTION DOC] HELPER: Traced body: all_gathers of two inputs cast to bfloat16
+            # on the default group, waits; returns both results.
             ag1 = torch.ops._c10d_functional.all_gather_into_tensor(
                 p1.to(torch.bfloat16), 64, fsdp_group
             )
@@ -2521,6 +2807,8 @@ class TestPreBucketingFsdpCollectives(InductorTestCase):
             )
 
         def count_ag(group):
+            # [FUNCTION DOC] HELPER: Counts all_gather_into_tensor nodes in the traced graph
+            # with the given group name.
             return sum(
                 1
                 for n in traced.graph.nodes
@@ -2535,9 +2823,13 @@ class TestPreBucketingFsdpCollectives(InductorTestCase):
 
 
 class TestBitsetAncestors(TestCase):
+    # [CLASS DOC] Test case for BitsetAncestors (transitive ancestor index over FX nodes) on a
+    # small diamond graph and a long chain.
     """Tests for BitsetAncestors -- int-bitset transitive ancestor sets."""
 
     def _make_graph(self):
+        # [FUNCTION DOC] HELPER: Builds an FX graph with placeholder a, b=relu(a), c=neg(a),
+        # d=add(b,c), e=abs(d); returns the graph and the list of nodes a to e.
         """Build a small diamond graph for testing.
 
         Graph topology (edges go downward):
@@ -2559,6 +2851,8 @@ class TestBitsetAncestors(TestCase):
         return g, [a, b, c, d, e]
 
     def test_membership(self):
+        # [FUNCTION DOC] is_ancestor is true along dependency paths (a to b,c,d,e; b,c to d; d
+        # to e) and false for siblings b/c and for reversed direction.
         from torch._inductor.fx_passes.utils import BitsetAncestors
 
         g, [a, b, c, d, e] = self._make_graph()
@@ -2578,6 +2872,7 @@ class TestBitsetAncestors(TestCase):
         self.assertFalse(ancestors.is_ancestor(e, a))
 
     def test_empty_ancestors(self):
+        # [FUNCTION DOC] The root node has no ancestors: iter_ancestors on it yields nothing.
         from torch._inductor.fx_passes.utils import BitsetAncestors
 
         g, [a, b, c, d, e] = self._make_graph()
@@ -2586,6 +2881,7 @@ class TestBitsetAncestors(TestCase):
         self.assertEqual(list(ancestors.iter_ancestors(a)), [])
 
     def test_iteration(self):
+        # [FUNCTION DOC] iter_ancestors on d yields exactly a, b and c.
         from torch._inductor.fx_passes.utils import BitsetAncestors
 
         g, [a, b, c, d, e] = self._make_graph()
@@ -2598,6 +2894,7 @@ class TestBitsetAncestors(TestCase):
         self.assertIn(c, d_ancestors)
 
     def test_len(self):
+        # [FUNCTION DOC] Counts of iter_ancestors results: a has 0, b has 1, d has 3, e has 4.
         from torch._inductor.fx_passes.utils import BitsetAncestors
 
         g, [a, b, c, d, e] = self._make_graph()
@@ -2609,6 +2906,8 @@ class TestBitsetAncestors(TestCase):
         self.assertEqual(len(list(ancestors.iter_ancestors(e))), 4)
 
     def test_has_dep(self):
+        # [FUNCTION DOC] has_dep is symmetric: true for a and d in both orders, false for the
+        # unrelated b and c.
         from torch._inductor.fx_passes.utils import BitsetAncestors
 
         g, [a, b, c, d, e] = self._make_graph()
@@ -2620,6 +2919,8 @@ class TestBitsetAncestors(TestCase):
         self.assertFalse(ancestors.has_dep(c, b))
 
     def test_intersection(self):
+        # [FUNCTION DOC] The bitwise AND of the ancestor bit sets of d and e has three bits
+        # set (a, b, c).
         """Verifies bitwise AND of ancestor sets matches expected common ancestors."""
         from torch._inductor.fx_passes.utils import BitsetAncestors
 
@@ -2630,6 +2931,8 @@ class TestBitsetAncestors(TestCase):
         self.assertEqual(common_bits.bit_count(), 3)
 
     def test_extra_inputs(self):
+        # [FUNCTION DOC] Extra input edges (e depending on c) are included: c and a are both
+        # ancestors of e.
         """Extra edges beyond the FX graph (e.g. hiding-interval deps)."""
         from torch._inductor.fx_passes.utils import BitsetAncestors
         from torch.utils._ordered_set import OrderedSet
@@ -2642,6 +2945,8 @@ class TestBitsetAncestors(TestCase):
         self.assertTrue(ancestors.is_ancestor(a, e))
 
     def test_linear_chain(self):
+        # [FUNCTION DOC] Builds a 100-node linear chain and checks ancestor counts are 0, 50
+        # and 99 for nodes 0, 50 and 99, and is_ancestor holds forward only.
         """N-node linear chain: node i's ancestors are 0..i-1."""
         from torch._inductor.fx_passes.utils import BitsetAncestors
 

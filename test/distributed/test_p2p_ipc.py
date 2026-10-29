@@ -3,6 +3,11 @@
 # To run:
 # python test/distributed/test_p2p_ipc.py
 
+# [MODULE DOC] Multi-process tests for CUDA peer-to-peer IPC tensor sharing: rank 0
+# allocates a tensor, exports it with reduce_tensor, other ranks rebuild it from the
+# handle and observe rank 0's writes. Includes an expandable-segments variant (fabric
+# handle path). Needs CUDA P2P access (test class is gated by requires_cuda_p2p_access).
+# Importing only resolves the "cuda" device module; no other import-time side effects.
 import os
 import unittest
 from contextlib import contextmanager
@@ -24,6 +29,9 @@ device_module = torch.get_device_module(device_type)
 
 @contextmanager
 def _scoped_env(key: str, value: str):
+    # [FUNCTION DOC] HELPER: Context manager that sets environment variable key to value,
+    # yields, and in a finally step restores the prior value (or removes the variable if
+    # it was previously unset). Mutates os.environ for the process during the context.
     """Set an env var for the duration of the context, then restore it."""
     prior = os.environ.get(key)
     os.environ[key] = value
@@ -38,11 +46,19 @@ def _scoped_env(key: str, value: str):
 
 @requires_cuda_p2p_access()
 class P2PIpcTest(MultiProcContinuousTest):
+    # [CLASS DOC] Continuous multi-process test case (one process per rank, gloo backend
+    # for control traffic, one CUDA device per rank) that checks cross-process CUDA IPC
+    # sharing of tensors. Rank 0 is the producer; other ranks are consumers. Only runs
+    # when CUDA P2P access is available. tearDownClass resets the allocator settings.
     @classmethod
     def backend_str(cls):
+        # [FUNCTION DOC] Returns the process-group backend name used by the harness: gloo.
         return "gloo"
 
     def _init_device(self, *, allocate: bool = True) -> None:
+        # [FUNCTION DOC] HELPER: Sets the current CUDA device to this rank's device. If
+        # allocate is true, also allocates a one-element tensor to initialize the
+        # allocator/context; if false, avoids any allocation (see comment below).
         # init and pin the process to the device. When `allocate` is False, we
         # only set the device without triggering a CUDA allocation. This is
         # required for the expandable_segments IPC regression test: if the
@@ -55,6 +71,7 @@ class P2PIpcTest(MultiProcContinuousTest):
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] Property: the CUDA device whose index equals this process's rank.
         return torch.device(device_type, self.rank)
 
     def _test_p2p_ipc_impl(
@@ -64,6 +81,14 @@ class P2PIpcTest(MultiProcContinuousTest):
         consumer_prealloc: bool = True,
         free_producer_segment: bool = False,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Shared body of the IPC tests. Rank 0 allocates a random
+        # float tensor and broadcasts its reduce_tensor result; consumers (all other ranks,
+        # or only rank 1 when free_producer_segment) rebuild it with the rank substituted
+        # as the device index argument. After a barrier rank 0 fills the tensor with ones,
+        # and rank 0 plus consumers assert exact equality with ones. With
+        # free_producer_segment the consumer drops its tensor, then rank 0 drops its tensor
+        # and metadata and calls ipc_collect and empty_cache. Ends with a barrier.
+        # Non-consumer ranks (when single consumer) only take part in barriers.
         """
         Core P2P IPC test implementation.
 
@@ -142,6 +167,8 @@ class P2PIpcTest(MultiProcContinuousTest):
         torch.distributed.barrier()
 
     def test_p2p_ipc(self) -> None:
+        # [FUNCTION DOC] Runs the shared IPC check with defaults (regular allocator, 2333
+        # elements, consumers pre-allocate, no producer free).
         """Test P2P IPC with regular cudaMalloc allocations."""
         self._test_p2p_ipc_impl()
 
@@ -155,6 +182,12 @@ class P2PIpcTest(MultiProcContinuousTest):
         TEST_WITH_ROCM, "expandable_segments mode is not supported on ROCm"
     )
     def test_p2p_ipc_expandable_segments(self) -> None:
+        # [FUNCTION DOC] Runs the shared IPC check with expandable segments on: sets env
+        # TORCH_CUDA_EXPANDABLE_SEGMENTS_IPC=1 (scoped), enables the expandable_segments
+        # allocator setting and empties the cache, then uses a 2M-element float tensor,
+        # no consumer pre-allocation, and producer segment freeing. Skipped unless
+        # TEST_CONFIG is h100-fabric, and on ROCm. Leaves expandable segments enabled
+        # until tearDownClass.
         """
         Test P2P IPC with expandable segments enabled. Exercises the
         SHAREABLE_CUDA_EXPANDABLE_SEGMENT path in ExpandableSegment::share /
@@ -188,6 +221,8 @@ class P2PIpcTest(MultiProcContinuousTest):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Disables the expandable_segments allocator setting, then defers
+        # to the base class teardown.
         torch.cuda.memory._set_allocator_settings("expandable_segments:False")
         super().tearDownClass()
 
