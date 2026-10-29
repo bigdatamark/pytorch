@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Implementation of the TorchScript tracing frontend: trace, trace_module, is_tracing, the traced module wrappers, the trace checker, and the ONNX-only graph tracing helper.
+# Import-time side effects: reads the PYTORCH_JIT_TIME, PYTORCH_JIT_DISABLE and PYTORCH_JIT_STATS environment variables, installs warning filters that ignore tracer warnings from library code outside the JIT, and switches the C++ tracer warning hook to use Python warnings.
+# Holds a module level _trace_module_map used while tracing modules.
 """Tracing.
 
 This module contains functionality to support the JIT's tracing frontend, notably:
@@ -44,7 +47,10 @@ P = ParamSpec("P")
 
 
 def _create_interpreter_name_lookup_fn(frames_up=1):
+    # [FUNCTION DOC] HELPER: Builds a lookup function that maps a tensor to the name of a local variable that holds it in a caller frame (frames_up levels above the lookup caller).
+    # The returned function walks up the stack, scans the frame locals for a tensor that is identical to the query, and returns its name (empty string for "self" or when not found). Raises a runtime error if frames cannot be inspected.
     def _get_interpreter_name_for_var(var):
+        # [FUNCTION DOC] HELPER: Inner lookup used by the tracer to name graph values: finds the local variable name bound to the given tensor in the selected caller frame; returns an empty string if none. Raises a runtime error if frame inspection fails.
         frame = inspect.currentframe()
         if not frame:
             raise RuntimeError("failed to inspect frame")
@@ -67,6 +73,8 @@ def _create_interpreter_name_lookup_fn(frames_up=1):
 
 
 def _unique_state_dict(module, keep_vars=False):
+    # [FUNCTION DOC] HELPER: Returns a state dict of the module with duplicate tensors (same object identity) removed, keeping the first key seen.
+    # Values are the raw parameters/buffers when keep_vars is true, otherwise detached copies. The result has the same mapping type as the module state dict.
     # since Parameter.detach() always creates a new torch.Tensor instance,
     # id(v) doesn't work with it. So we always get the Parameter or Buffer
     # as values, and deduplicate the params using Parameters and Buffers
@@ -85,6 +93,9 @@ def _unique_state_dict(module, keep_vars=False):
 
 
 class ONNXTracedModule(torch.nn.Module):
+    # [CLASS DOC] Module wrapper used by the ONNX exporter path (_get_trace_graph) that traces an inner module or callable and returns the graph plus outputs.
+    # State: inner (the traced callable), strict, and private flags for force-outplace and for returning cloned inputs and input states.
+    # Its forward flattens tensor inputs, traces the inner call, and returns (graph, outputs) with optional inputs or input states appended.
     def __init__(
         self,
         inner,
@@ -93,6 +104,7 @@ class ONNXTracedModule(torch.nn.Module):
         return_inputs=False,
         return_inputs_states=False,
     ):
+        # [FUNCTION DOC] Stores the inner module or callable and the tracing options (strict, force_outplace, return_inputs, return_inputs_states). If inner is a Module its parameters are registered automatically as a submodule.
         super().__init__()
         # inner may be a Module, or it may be an arbitrary callable
         # If it's a Module, we get its parameters automatically, which lets
@@ -104,6 +116,9 @@ class ONNXTracedModule(torch.nn.Module):
         self._return_inputs_states = return_inputs_states
 
     def forward(self, *args: torch.Tensor):
+        # [FUNCTION DOC] Traces the inner callable on the given tensor arguments.
+        # Flattens the args, collects the unique full module state (needed for batch norm export), and runs the C++ graph-creation-by-tracing on a wrapper that rebuilds the structured inputs and calls inner.
+        # Returns (graph, first output), plus cloned inputs or the input states when the corresponding flag is set. Side effect: runs the inner module once.
         in_vars, in_desc = _flatten(args)
         # NOTE: use full state, because we need it for BatchNorm export
         # This differs from the compiler path, which doesn't support it at the moment.
@@ -114,6 +129,8 @@ class ONNXTracedModule(torch.nn.Module):
         outs = []
 
         def wrapper(*args):
+            # [FUNCTION DOC] HELPER: Function handed to the tracer. Checks every flattened input is a tensor (runtime error otherwise), rebuilds the original argument structure, optionally records cloned inputs / input states, calls inner and appends the result to the enclosing outs list.
+            # Returns the single flattened output tensor or a tuple of flattened outputs.
             in_args: list[torch.Tensor] = []
             for i in range(len(in_vars)):
                 if not isinstance(args[i], torch.Tensor):
@@ -154,7 +171,10 @@ class ONNXTracedModule(torch.nn.Module):
 
 
 def _clone_inputs(args):
+    # [FUNCTION DOC] HELPER: Deep-clones a nested structure of tensors for use as trace-check inputs. Tensors are detached, cloned (preserving memory format except for mkldnn), re-marked with the same requires_grad, and their grad is cloned too. Returns the structure with the same nesting.
     def clone_input(a):
+        # [FUNCTION DOC] HELPER: Clones one input: None stays None; a tensor is detached, cloned and given the original requires_grad (with its grad cloned); anything else is cloned with its clone method.
+        # KNOWN ISSUE: the grad branch clones v.grad (the new tensor, whose grad is None) rather than a.grad, so the original grad is never copied.
         if a is None:
             return None
         elif isinstance(a, torch.Tensor):
@@ -184,6 +204,9 @@ _JIT_STATS = os.environ.get("PYTORCH_JIT_STATS", False)
 
 @contextlib.contextmanager
 def _time(trace_name, name, time=True):
+    # [FUNCTION DOC] HELPER: Context manager that times the enclosed block with CUDA events on the current stream and prints "trace_name name time: ms" afterwards.
+    # It is a no-op (just yields) unless CUDA is available and timing was requested through the time argument or PYTORCH_JIT_TIME.
+    # KNOWN ISSUE: the condition skips timing only when both the env flag and the time argument are false, so the default time=True enables timing whenever CUDA exists.
     if (not _JIT_TIME and not time) or not torch.cuda.is_available():
         yield
         return
@@ -200,6 +223,10 @@ def _time(trace_name, name, time=True):
 
 
 def verify(model, args, loss_fn=torch.sum, devices=None):
+    # [FUNCTION DOC] Checks that a compiled (legacy CompiledFunction) model matches its uncompiled run, including gradients.
+    # Runs forward and backward uncompiled (forcing a fresh trace, with RNG state forked), restores the module state, runs the compiled version, and compares outputs and gradients.
+    # Raises TypeError if the model is not a compiled function, ValueError if a multi-output model uses the default loss, RuntimeError if the compiled path is not used or results differ. Mutates the model state (saved and reloaded).
+    # KNOWN ISSUE: refers to the legacy torch.jit.compile / CompiledFunction API, which appears no longer available, so this is likely dead code.
     """
     Verify that a JIT compiled model has the same behavior as its uncompiled version along with its backwards pass.
 
@@ -247,6 +274,8 @@ def verify(model, args, loss_fn=torch.sum, devices=None):
         saved_state = copy.deepcopy(model.state_dict())
 
     def run_fwd_bwd(args, force_trace=False, assert_compiled=False):
+        # [FUNCTION DOC] HELPER: Runs the model forward and backward once for verify. Optionally clears the cache (force_trace) or asserts the compiled cache was hit.
+        # Returns (detached output clones, detached gradient clones with respect to inputs and parameters). Raises on default-loss misuse or failed compiled use.
         params = list(model.parameters()) if is_module else []
         in_vars, _ = _flatten((args, params))
         # We use a special API to reset the trace and compile it from scratch.
@@ -291,17 +320,21 @@ def verify(model, args, loss_fn=torch.sum, devices=None):
 
 
 def _verify_equal(xs, ys):
+    # [FUNCTION DOC] HELPER: Raises a runtime error if any pair of corresponding tensors differs by more than 1e-6 in max absolute difference.
     for x, y in zip(xs, ys):
         if x.sub(y).abs().max() > 1e-6:
             raise RuntimeError("JIT and real computation mismatch")
 
 
 def indent(s):
+    # [FUNCTION DOC] HELPER: Returns the string with a tab prepended to each line (lines joined by newlines).
     return "\n".join(["\t" + line for line in s.splitlines()])
 
 
 class TracingCheckError(Exception):
+    # [CLASS DOC] Exception raised when trace checking finds a problem. The message (kept in the message attribute) combines an optional extra message, a graph-difference report and a tensor-constant-difference report.
     def __init__(self, graph_diff_error, tensor_compare_error, extra_msg=None):
+        # [FUNCTION DOC] Builds the combined error message from graph_diff_error, tensor_compare_error (each optional, indented when present) and extra_msg, stores it in message and passes it to the base exception.
         self.message = "Tracing failed sanity checks!\n"
         if extra_msg is not None:
             self.message += extra_msg + "\n"
@@ -331,6 +364,9 @@ def _check_trace(
     _module_class,
     example_inputs_is_kwarg=False,
 ):
+    # [FUNCTION DOC] HELPER: Verifies a traced function or module against fresh traces and the original Python function on user-provided check inputs (with gradients disabled).
+    # For each check input it retraces (via trace_module or trace, with checking disabled), compares outputs of the trace, the Python function and the repeated trace using tolerances, emits TracerWarning on mismatches, and compares canonicalized graphs and tensor constants.
+    # Raises TracingCheckError if running a variant fails or if the graphs/constants differ. Args mirror trace options; is_trace_module selects trace_module-style inputs.
     # Note: tracing is independent of optimizations, which consume the trace
     for inputs in check_inputs:
         if isinstance(inputs, torch.Tensor):
@@ -384,6 +420,8 @@ def _check_trace(
             check_mod_func = check_mod
 
         def graph_diagnostic_info():
+            # [FUNCTION DOC] HELPER: Canonicalizes and inlines the traced graph and the check graph (erasing shape info and mangled names) and compares them.
+            # Returns (graph diff report or None, tensor constant mismatch report or None); the report names the first diverging node with source locations, and constants are compared with assert_close.
             mod_canonicalized = torch._C._jit_pass_canonicalize(traced_func.graph)
             torch._C._jit_pass_inline(mod_canonicalized)
             torch._C._jit_pass_erase_shape_information(mod_canonicalized)
@@ -470,9 +508,11 @@ def _check_trace(
             return graph_diff_errors, tensor_compare_errors
 
         def wrap_retval(x):
+            # [FUNCTION DOC] HELPER: Wraps a non-tuple value in a one-element tuple; returns tuples unchanged.
             return x if isinstance(x, tuple) else (x,)
 
         def run_mod_and_filter_tensor_outputs(mod, inputs, running_what):
+            # [FUNCTION DOC] HELPER: Runs a module with a clone of the inputs (or keyword inputs) and returns only the tensor outputs as a list. Any exception is converted into a TracingCheckError carrying graph diagnostics and a message naming running_what.
             try:
                 if isinstance(inputs, dict) and example_inputs_is_kwarg:
                     outs = wrap_retval(mod(**inputs))
@@ -492,6 +532,7 @@ def _check_trace(
         has_warned = [False]
 
         def maybe_warn_nondeterministic():
+            # [FUNCTION DOC] HELPER: On its first call only, warns (TracerWarning) if the traced graph contains nondeterministic nodes, listing up to 20 of them and suggesting eval mode or disabling trace checking.
             if has_warned[0]:
                 return
             has_warned[0] = True
@@ -515,6 +556,8 @@ def _check_trace(
                 )
 
         def compare_outputs(original, reference, match_what):
+            # [FUNCTION DOC] HELPER: Compares two lists of tensors pairwise with assert_close, converting quantized, mkldnn and complex tensors, and handling mps and nested tensors specially.
+            # On mismatch it warns via TracerWarning (and a nondeterminism warning) and continues. Returns True only if all outputs match.
             all_ok = True
             for i, (orig, ref) in enumerate(zip(original, reference)):
                 try:
@@ -601,8 +644,10 @@ def _check_trace(
 
 
 class TracerWarning(Warning):
+    # [CLASS DOC] Warning category emitted by the tracer for constructs that may produce an incorrect trace and for trace-check mismatches.
     @staticmethod
     def ignore_lib_warnings():
+        # [FUNCTION DOC] Installs global warning filters ignoring TracerWarning from modules outside the JIT and the CUDA fuser warning. Static; modifies the global warnings filter list.
         # We ignore warnings from all submodules excluding the JIT, because we need them e.g. for _check_trace
         warnings.filterwarnings(
             "ignore", category=TracerWarning, module="torch.(?!jit)"
@@ -617,6 +662,7 @@ torch._C._tracer_warn_use_python()
 
 
 def make_tuple(example_inputs):
+    # [FUNCTION DOC] Normalizes example inputs: a tensor or dict becomes a one-element tuple, other non-tuple iterables are converted to a tuple, tuples are returned as is.
     if isinstance(example_inputs, (torch.Tensor, dict)):
         return (example_inputs,)
     # done primarily so that weird iterables fail here and not pybind11 code
@@ -626,6 +672,7 @@ def make_tuple(example_inputs):
 
 
 def make_module(mod, _module_class, _compilation_unit):
+    # [FUNCTION DOC] Returns a ScriptModule for the given module: an existing ScriptModule is returned unchanged; a module with exported methods is compiled to a script module; otherwise it is wrapped in _module_class (default TopLevelTracedModule) with the given compilation unit.
     if isinstance(mod, ScriptModule):
         return mod
     elif torch._jit_internal.module_has_exports(mod):
@@ -640,6 +687,7 @@ def make_module(mod, _module_class, _compilation_unit):
 
 
 def wrap_check_inputs(check_inputs):
+    # [FUNCTION DOC] Wraps each check input in a dict keyed by forward, or returns None when check_inputs is None.
     if check_inputs is None:
         return None
 
@@ -647,6 +695,8 @@ def wrap_check_inputs(check_inputs):
 
 
 def analyze_ts_result_with_export_result(export, trace):
+    # [FUNCTION DOC] Compares the flattened results of an export run and a traced run. Returns False on any mismatch of layout, type, dtype or values (allclose), and True otherwise; mkldnn layouts and fake tensors short circuit to True.
+    # KNOWN ISSUE: the early True for mkldnn or fake tensors skips comparison of remaining elements.
     import torch.utils._pytree as pytree
 
     flat_export = pytree.tree_leaves(export)
@@ -689,6 +739,9 @@ def _trace_impl(
     example_kwarg_inputs=None,
     _store_inputs=True,
 ):
+    # [FUNCTION DOC] HELPER: Core of trace. Returns the input unchanged (with a warning) for a ScriptModule; dispatches modules and bound forward methods to trace_module; otherwise traces a plain function into a ScriptFunction using positional or keyword example inputs.
+    # Optionally runs _check_trace on check_inputs or the example inputs and records the original function on the result for dynamo inlining.
+    # Raises RuntimeError if inputs are missing, AttributeError for other bound module methods. The optimize argument is unused.
     if isinstance(func, torch.jit.ScriptModule):
         # it is hard to trace it because the forward method on ScriptModule is already defined, so it
         # would result in an error.
@@ -817,21 +870,25 @@ def _trace_impl(
 
 
 class _ExportType(str, Enum):
+    # [CLASS DOC] HELPER: String enum naming export strategies (direct export, trace and export, source to source).
     DIRECT_EXPORT = "DIRECT_EXPORT"
     TRACE_AND_EXPORT = "TRACE_AND_EXPORT"
     SOURCE_TO_SOURCE = "SOURCE_TO_SOURCE"
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns the enum value string.
         return self.value
 
 
 class _ExportOutcome(str, Enum):
+    # [CLASS DOC] HELPER: String enum of export result states (success, failed to export, failed to run, accuracy error).
     SUCCESS = "SUCCESS"
     FAILED_TO_EXPORT = "FAILED_TO_EXPORT"
     FAILED_TO_RUN = "FAILED_TO_RUN"
     ACCURACY_ERROR = "ACCURACY_ERROR"
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns the enum value string.
         return self.value
 
 
@@ -849,6 +906,9 @@ def trace(
     example_kwarg_inputs=None,
     _store_inputs=True,
 ):
+    # [FUNCTION DOC] Public entry point to trace a function or module into a ScriptFunction/ScriptModule (deprecated).
+    # Emits a FutureWarning (stronger on Python 3.14+), returns func unchanged if the JIT is disabled, warns that optimize has no effect, delegates to _trace_impl and logs TorchScript usage.
+    # Args: example inputs or keyword inputs, check_trace/check_inputs/check_tolerance, strict, and private options. Returns the traced object.
     r"""
     Trace a function and return an executable  or :class:`ScriptFunction` that will be optimized using just-in-time compilation.
 
@@ -1054,6 +1114,10 @@ def trace_module(
     example_inputs_is_kwarg=False,
     _store_inputs=True,
 ):
+    # [FUNCTION DOC] Traces several named methods of a module into one ScriptModule (deprecated).
+    # Args: mod, inputs mapping method name to example inputs, plus checking options. Warns with FutureWarning; returns mod if JIT is disabled. For each method it creates the method from a trace (keyword inputs are validated against argument names, raising NameError) and optionally runs _check_trace.
+    # Temporarily sets the module level _trace_module_map to map submodules to qualified names and restores it afterwards. Raises AttributeError if mod is not a Module or inputs is not a dict.
+    # KNOWN ISSUE: the deprecation text mentions trace_method rather than trace_module.
     """
     Trace a module and return an executable :class:`ScriptModule` that will be optimized using just-in-time compilation.
 
@@ -1169,6 +1233,7 @@ def trace_module(
         trace_module_map: dict[Any, Any] = {}
 
         def register_submods(mod, prefix):
+            # [FUNCTION DOC] HELPER: Recursively records each child module in the trace module map under its dotted qualified name rooted at the module prefix.
             for name, child in mod.named_children():
                 submod_qualname = prefix + "." + name
                 trace_module_map[child] = submod_qualname
@@ -1259,6 +1324,7 @@ def trace_module(
 
 
 def is_tracing():
+    # [FUNCTION DOC] Returns True when called during torch.jit.trace tracing and False otherwise (always False when scripting).
     """Return a boolean value.
 
     Returns ``True`` in tracing (if a function is called during the
@@ -1270,9 +1336,15 @@ def is_tracing():
 
 
 class TracedModule(ScriptModule):
+    # [CLASS DOC] ScriptModule wrapper produced by tracing a module. It copies the original module's parameters, buffers, script objects and (recursively traced) submodules into a temporary module, compiles it, and delegates attribute access to the compiled module.
+    # State: _name (original class name) and _actual_script_module. Calling forward directly on a traced submodule is an error.
     _disable_script_meta = True
 
     def __init__(self, orig, id_set=None, _compilation_unit=None):
+        # [FUNCTION DOC] Builds a traced module from orig (must be an nn.Module, else assertion error).
+        # Copies training flag, parameters, buffers and script objects into a temporary module with an overridden qualified name, wraps submodules via make_module, rejects parameter sharing (ValueError) and backward hooks (ValueError), then creates the script module and removes the standard attributes from self.
+        # The id_set and _compilation_unit arguments are effectively unused (id_set is overwritten).
+        # KNOWN ISSUE: the id_set parameter is immediately replaced by a fresh set.
         # XXX: orig can be a nn.Module or a function!
         super().__init__()
         if not isinstance(orig, torch.nn.Module):
@@ -1287,6 +1359,7 @@ class TracedModule(ScriptModule):
         # we have a special case that will look up this attribute to override whatever qualname
         # we would get from the python type system
         class QualnameWrapper(torch.nn.Module):
+            # [CLASS DOC] HELPER: Empty Module subclass whose _jit_override_qualname attribute is set to the original module type's qualified name so the compiled type keeps the original name.
             pass
 
         QualnameWrapper._jit_override_qualname = torch._jit_internal._qualified_name(  # type: ignore[attr-defined]
@@ -1296,6 +1369,7 @@ class TracedModule(ScriptModule):
         tmp_module = QualnameWrapper()
 
         def check_unique(param):
+            # [FUNCTION DOC] HELPER: Records a parameter or buffer in id_set; raises ValueError if it was seen before (parameter sharing unsupported).
             if param in id_set:
                 raise ValueError(
                     "TracedModules don't support parameter sharing between modules"
@@ -1343,29 +1417,36 @@ class TracedModule(ScriptModule):
             delattr(self, name)
 
     def forward(self, *args, **kwargs):
+        # [FUNCTION DOC] Always raises RuntimeError: traced submodules cannot be called directly.
         raise RuntimeError("Trace submodules cannot be called.")
 
     def __getattr__(self, attr):
+        # [FUNCTION DOC] Attribute lookup: before the inner script module exists, uses default lookup; afterwards delegates to the wrapped script module.
         if "_actual_script_module" not in self.__dict__:
             return super().__getattr__(attr)
         return getattr(self._actual_script_module, attr)
 
     def __setattr__(self, attr, value):
+        # [FUNCTION DOC] Attribute assignment: before the inner script module exists, uses default behavior; afterwards sets the attribute on the wrapped script module.
         if "_actual_script_module" not in self.__dict__:
             return super().__setattr__(attr, value)
         setattr(self._actual_script_module, attr, value)
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the original module class name.
         return self._name
 
     def extra_repr(self):
+        # [FUNCTION DOC] Returns a repr fragment with the original module name.
         return f"original_name={self._name}"
 
 
 class TopLevelTracedModule(TracedModule):
+    # [CLASS DOC] Top-level traced module whose forward is a cached forward descriptor that runs the compiled forward method.
     forward: Callable[..., Any] = _CachedForward()  # type: ignore[assignment]
 
     def _reconstruct(self, cpp_module):
+        # [FUNCTION DOC] HELPER: Rebuilds the wrapped script module around the given C++ module (used when loading or copying); delegates to the inner module and mutates it.
         """
         Re-construct an instance of TopLevelTracedModule using an instance of a C++ module.
 
@@ -1376,8 +1457,11 @@ class TopLevelTracedModule(TracedModule):
 
 
 def _script_if_tracing(fn: Callable[P, R]) -> Callable[P, R]:
+    # [FUNCTION DOC] Decorator that makes fn run as plain Python normally but compile it with the script compiler when called during tracing.
+    # Returns a wrapper preserving fn metadata, with the original function stored on it and a marker attribute set.
     @functools.wraps(fn)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        # [FUNCTION DOC] HELPER: Calls fn directly when not tracing; when tracing, scripts the original function and calls the compiled version.
         if not is_tracing():
             # Not tracing, don't do anything
             return fn(*args, **kwargs)
@@ -1400,6 +1484,8 @@ def _get_trace_graph(
     return_inputs=False,
     _return_inputs_states=False,
 ):
+    # [FUNCTION DOC] HELPER: Internal API for the ONNX exporter: traces f on args (non-tuple wrapped in a tuple) via ONNXTracedModule and returns its result tuple (graph, outputs, and optionally inputs or input states).
+    # Args: f, args, kwargs (default none), strict, force-outplace and return flags.
     """Return a tuple on tracing a function or model.
 
     .. warning::

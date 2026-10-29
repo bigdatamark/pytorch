@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Python reference implementations of symbolic shape functions for TorchScript operators.
+# Each function takes operand sizes as lists of ints (plus scalar args) and returns the output size list (or a tuple of lists), raising an assertion error on invalid shapes.
+# At import time the module scripts selected functions with the JIT, runs inline/peephole/constant-propagation passes, and registers them in the global mappings keyed by operator schema string (shape_compute_graph_mapping, bounded_compute_graph_mapping).
+# Generated C++ files depend on this file (see torchgen shape_functions generator); the functions must remain TorchScript-compatible.
 import math
 from collections.abc import Callable
 from typing import Any, Optional, Union
@@ -26,6 +30,9 @@ import torch
 
 
 def broadcast(a: list[int], b: list[int]):
+    # [FUNCTION DOC] Computes the broadcast of two size lists using right-aligned, numpy-style rules.
+    # Args: a, b size lists. Returns a new list whose length is the larger rank; each entry is the non-1 size of the two (missing leading dims count as 1).
+    # Raises an assertion error when two sizes differ and neither is 1.
     dimsA = len(a)
     dimsB = len(b)
     ndim = max(dimsA, dimsB)
@@ -50,14 +57,19 @@ def broadcast(a: list[int], b: list[int]):
 
 
 def broadcast_three(a: list[int], b: list[int], c: list[int]):
+    # [FUNCTION DOC] Broadcasts three size lists together by broadcasting the first two and then the result with the third. Returns the resulting list; raises on incompatible sizes.
     return broadcast(broadcast(a, b), c)
 
 
 def broadcast_one_three(a: list[int], b: Any, c: list[int]):
+    # [FUNCTION DOC] Broadcast of the first and third size lists; the second argument is ignored (a non-tensor operand such as a scalar). Used for ops like where with a scalar in the middle.
     return broadcast(a, c)
 
 
 def adaptive_avg_pool2d(self: list[int], out: list[int]):
+    # [FUNCTION DOC] Output size of 2D adaptive average pooling.
+    # Args: self is the input size (3 or 4 dims), out is the two-element target spatial size. Returns the leading dims of self (all but the last two) followed by the entries of out.
+    # Raises an assertion error if out does not have length 2, self rank is not 3 or 4, or any non-batch dim of self is zero.
     if len(out) != 2:
         raise AssertionError(f"Expected out to have length 2, but got {len(out)}")
     if not (len(self) == 3 or len(self) == 4):
@@ -77,6 +89,7 @@ def adaptive_avg_pool2d(self: list[int], out: list[int]):
 
 
 def _copy(self: list[int]):
+    # [FUNCTION DOC] HELPER: Returns a new list with the same elements as the input list (shallow copy, used to avoid aliasing).
     out: list[int] = []
     for elem in self:
         out.append(elem)
@@ -84,10 +97,13 @@ def _copy(self: list[int]):
 
 
 def unary(self: list[int]):
+    # [FUNCTION DOC] Shape function for elementwise/unary-like ops: returns a copy of the input size list.
     return _copy(self)
 
 
 def broadcast_inplace(a: list[int], b: list[int]):
+    # [FUNCTION DOC] Shape function for in-place binary ops: b must broadcast to a without changing a's shape.
+    # Returns a copy of a. Raises an assertion error if b has more dims than a or any size of b differs from a's and is not 1.
     dimsA = len(a)
     dimsB = len(b)
     if dimsB > dimsA:
@@ -108,6 +124,9 @@ def broadcast_inplace(a: list[int], b: list[int]):
 
 
 def expand(self: list[int], sizes: list[int]):
+    # [FUNCTION DOC] Output size of expanding self to the requested sizes.
+    # Args: self is the input size list, sizes the target sizes where -1 keeps the existing size (only allowed for dims that exist in self). Leading new dims take the target size; existing dims must be 1 or equal to the target.
+    # Returns the expanded size list (a copy of sizes when sizes is empty). Raises an assertion error if sizes has fewer dims than self, -1 is used on a new dim, or a non-1 size mismatches.
     if len(sizes) < len(self):
         raise AssertionError(
             f"Expected len(sizes) ({len(sizes)}) >= len(self) ({len(self)})"
@@ -137,10 +156,14 @@ def expand(self: list[int], sizes: list[int]):
 
 
 def expand_one_unused(self: list[int], sizes: list[int], inp0: Any):
+    # [FUNCTION DOC] Wrapper of expand for the schema with an extra trailing argument (the implicit flag); that argument is ignored.
     return expand(self, sizes)
 
 
 def infer_size_impl(shape: list[int], numel: int) -> list[int]:
+    # [FUNCTION DOC] HELPER: Resolves a target shape that may contain one -1 against a total element count.
+    # Args: shape requested sizes, numel number of elements. Returns a copy of shape with the -1 replaced by numel divided by the product of the other sizes.
+    # Raises an assertion error if more than one -1, any size below -1, or numel is incompatible with the shape.
     newsize = 1
     infer_dim: Optional[int] = None
     for dim in range(len(shape)):
@@ -164,6 +187,7 @@ def infer_size_impl(shape: list[int], numel: int) -> list[int]:
 
 
 def numel(sizes: list[int]):
+    # [FUNCTION DOC] Returns the product of all entries of a size list (1 for an empty list).
     numel = 1
     for elem in sizes:
         numel *= elem
@@ -171,16 +195,21 @@ def numel(sizes: list[int]):
 
 
 def view(self: list[int], sizes: list[int]):
+    # [FUNCTION DOC] Output size of view: resolves sizes (which may contain one -1) against the number of elements of self. Raises if the shape is invalid.
     return infer_size_impl(sizes, numel(self))
 
 
 def view_one_unused(self: list[int], sizes: list[int], *, implicit: bool = False):
+    # [FUNCTION DOC] Wrapper of view for the expand-like schema with a keyword-only implicit flag, which is ignored.
     return view(self, sizes)
 
 
 def sum_mean_dim(
     self: list[int], opt_dims: Optional[list[int]], keep_dim: bool, dt: Any
 ):
+    # [FUNCTION DOC] Output size of sum/mean reductions over a list of dims.
+    # Args: self size, opt_dims dims to reduce (None or empty means all dims), keep_dim whether reduced dims stay as size 1, dt unused dtype. Dims may be negative and are wrapped.
+    # Returns the reduced size list. Raises if a dim is out of range.
     out: list[int] = []
     if opt_dims is None or len(opt_dims) == 0:
         dims: list[int] = list(range(len(self)))
@@ -201,12 +230,14 @@ def sum_mean_dim(
 
 
 def max_dim(self: list[int], dim: int, keep_dim: bool):
+    # [FUNCTION DOC] Output sizes of max over one dim: returns the same reduced size twice (values and indices).
     out = sum_mean_dim(self, [dim], keep_dim, None)
     return out, out
 
 
 # note: python already rounds down towards negative infinity on integer division, special arithmetic not needed
 def div_rtn(x: int, y: int):
+    # [FUNCTION DOC] HELPER: Integer floor division of x by y (Python floor semantics already match round-toward-negative-infinity).
     return x // y
 
 
@@ -219,6 +250,9 @@ def pooling_output_shape_pad_lr(
     dilation: int,
     ceil_mode: bool,
 ):
+    # [FUNCTION DOC] HELPER: Output length of a pooling window along one dimension with separate left and right padding.
+    # Args: input size, kernel size, pad_l, pad_r, stride, dilation, ceil_mode. Uses floor division (with stride-1 added when ceil_mode), plus 1; in ceil_mode drops the last window if it would start entirely in the right padding.
+    # Returns the int output size.
     outputSize = (
         div_rtn(
             inputSize
@@ -245,6 +279,7 @@ def pooling_output_shape(
     dilation: int,
     ceil_mode: bool,
 ):
+    # [FUNCTION DOC] HELPER: Output length along one dimension for symmetric padding pad_l; delegates to the pad_lr variant. Raises an assertion error when stride is zero.
     if stride == 0:
         raise AssertionError("stride should not be zero")
     return pooling_output_shape_pad_lr(
@@ -268,6 +303,9 @@ def pool2d_shape_check(
     outputHeight: int,
     outputWidth: int,
 ):
+    # [FUNCTION DOC] HELPER: Validates 2D pooling parameters; returns nothing.
+    # Raises an assertion error if kernel, stride or dilation are not positive, the input is not a valid non-empty 3D/4D shape, padding exceeds half the kernel, or the computed output size is less than 1.
+    # KNOWN ISSUE: the nInputPlane, inputHeight, inputWidth and dilation-dependent arguments are accepted but largely unused.
     ndim = len(input)
 
     if not (kW > 0 and kH > 0):
@@ -308,6 +346,9 @@ def max_pool2d(
     dilation: list[int],
     ceil_mode: bool,
 ):
+    # [FUNCTION DOC] Output size of 2D max pooling.
+    # Args: input (3D or 4D) size, kernel_size/stride/padding/dilation lists of 1 or 2 ints (stride may be empty and then defaults to the kernel size), ceil_mode.
+    # Returns [channels, out_h, out_w] or [batch, channels, out_h, out_w]. Raises an assertion error for wrong list lengths, wrong input rank, or invalid pooling parameters.
     if not (len(kernel_size) == 1 or len(kernel_size) == 2):
         raise AssertionError(
             "max_pool2d: kernel_size must either be a single int, or a tuple of two ints"
@@ -383,6 +424,7 @@ def max_pool2d_with_indices(
     dilation: list[int],
     ceil_mode: bool,
 ):
+    # [FUNCTION DOC] Output sizes for max_pool2d with indices: the same pooled size returned twice (values and indices).
     out = max_pool2d(input, kernel_size, stride, padding, dilation, ceil_mode)
     return (out, out)
 
@@ -392,6 +434,9 @@ def upsample_nearest2d(
     output_size: Optional[list[int]],
     scale_factors: Optional[list[float]],
 ):
+    # [FUNCTION DOC] Output size of nearest-neighbor 2D upsampling of a 4D input.
+    # Exactly one of output_size (two ints) or scale_factors (two floats, multiplied with the spatial dims and truncated to int) must be given. Returns batch, channels, new height, new width.
+    # Raises an assertion error if both or neither are given or lengths are not 2.
     out: list[int] = []
     out.append(input[0])
     out.append(input[1])
@@ -427,6 +472,7 @@ def upsample_nearest2d(
 
 
 def mm(self: list[int], mat2: list[int]):
+    # [FUNCTION DOC] Output size of matrix multiplication of two 2D sizes: [self rows, mat2 cols]. Raises an assertion error if either is not 2D or the inner dims differ.
     if len(self) != 2:
         raise AssertionError(f"self must be a matrix (got {len(self)} dimensions)")
     if len(mat2) != 2:
@@ -440,6 +486,7 @@ def mm(self: list[int], mat2: list[int]):
 
 
 def dot(self: list[int], tensor: list[int]):
+    # [FUNCTION DOC] Output size of a 1D dot product: an empty list (scalar). Raises an assertion error if either input is not 1D or lengths differ.
     if not (len(self) == 1 and len(tensor) == 1):
         raise AssertionError(
             f"Expected 1D tensors for dot, got len(self)={len(self)}, "
@@ -454,6 +501,7 @@ def dot(self: list[int], tensor: list[int]):
 
 
 def mv(self: list[int], vec: list[int]):
+    # [FUNCTION DOC] Output size of matrix-vector product: one-element list with the matrix rows. Raises an assertion error if shapes are not 2D and 1D or inner dims mismatch.
     if not (len(self) == 2 and len(vec) == 1):
         raise AssertionError(
             f"Expected 2D matrix and 1D vector, got len(self)={len(self)}, "
@@ -468,6 +516,7 @@ def mv(self: list[int], vec: list[int]):
 
 
 def unsqueeze(li: list[int], dim: int):
+    # [FUNCTION DOC] Returns a copy of li with a size-1 dim inserted at dim (negative dim wrapped against rank + 1). Raises if dim is out of range.
     dim = maybe_wrap_dim(dim, len(li) + 1)
     out = _copy(li)
     out.insert(dim, 1)
@@ -475,6 +524,7 @@ def unsqueeze(li: list[int], dim: int):
 
 
 def squeeze_nodim(li: list[int]):
+    # [FUNCTION DOC] Returns the size list with all size-1 dims removed.
     out: list[int] = []
     for i in range(len(li)):
         if li[i] != 1:
@@ -483,6 +533,7 @@ def squeeze_nodim(li: list[int]):
 
 
 def squeeze(li: list[int], dim: int):
+    # [FUNCTION DOC] Returns the size list with dim removed if its size is 1 (otherwise unchanged). Negative dim is wrapped; raises if out of range.
     out: list[int] = []
     wrapped_dim = maybe_wrap_dim(dim, len(li))
     for i in range(len(li)):
@@ -495,6 +546,8 @@ def squeeze(li: list[int], dim: int):
 
 
 def squeeze_dims(li: list[int], dims: list[int]):
+    # [FUNCTION DOC] Returns the size list with every listed dim removed where its size is 1; empty dims returns the input list itself (not a copy). Negative dims are wrapped.
+    # KNOWN ISSUE: with empty dims it returns the input list itself (aliasing) instead of a copy or the all-squeeze result.
     if len(dims) == 0:
         return li
     wrapped_dims = _copy(dims)
@@ -511,6 +564,8 @@ def squeeze_dims(li: list[int], dims: list[int]):
 
 
 def index_select(self: list[int], dim: int, index: list[int]):
+    # [FUNCTION DOC] Output size of index_select: self with the size of dim replaced by the number of elements of index. Raises an assertion error if index has more than one dim or dim is invalid.
+    # KNOWN ISSUE: the check on dim (equal 0 or less than rank) is weak because maybe_wrap_dim already validated it.
     dim = maybe_wrap_dim(dim, len(self))
     numel = multiply_integers(index)
     if len(index) > 1:
@@ -535,6 +590,8 @@ def embedding(
     scale_grad_by_freq: bool = False,
     sparse: bool = False,
 ):
+    # [FUNCTION DOC] Output size of an embedding lookup: for 1D indices uses index_select on weight along dim 0, otherwise the indices size followed by the embedding dim weight[1].
+    # Raises an assertion error if weight is not 2D. padding_idx, scale_grad_by_freq and sparse do not affect the shape.
     if len(weight) != 2:
         raise AssertionError(f"Expected weight to be 2D, but got {len(weight)}D")
     if len(indices) == 1:
@@ -545,12 +602,16 @@ def embedding(
 
 
 def max_int():
+    # [FUNCTION DOC] HELPER: Returns the largest signed 64-bit integer, used as the "unbounded" slice end sentinel.
     return 9223372036854775807
 
 
 def slice(
     self: list[int], dim: int, start: Optional[int], end: Optional[int], step: int
 ):
+    # [FUNCTION DOC] Output size of slicing one dim.
+    # Args: self size, dim, optional start/end (None means from 0 / to the end; the max-int sentinel start becomes 0), step. Negative indexes are shifted by the dim size and clamped to the valid range.
+    # Returns a copy of self with dim set to ceil of the slice length over step. Raises an assertion error for 0-D input or non-positive step.
     ndim = len(self)
     if ndim == 0:
         raise AssertionError("Cannot slice a 0-dimensional tensor")
@@ -580,12 +641,14 @@ def slice(
 
 
 def check_cat_no_zero_dim(tensors: list[list[int]]):
+    # [FUNCTION DOC] HELPER: Raises an assertion error if any size list in tensors has zero dimensions.
     for tensor in tensors:
         if len(tensor) <= 0:
             raise AssertionError("Cannot concatenate tensor with 0 dimensions")
 
 
 def legacy_cat_wrap_dim(dim: int, tensor_sizes: list[list[int]]):
+    # [FUNCTION DOC] HELPER: Wraps dim for cat using the first tensor that is not the legacy empty tensor (one dim of size 0); if all are empty returns dim unchanged.
     out_dim: Optional[int] = None
     for size in tensor_sizes:
         if not (len(size) == 1 and size[0] == 0):
@@ -597,12 +660,14 @@ def legacy_cat_wrap_dim(dim: int, tensor_sizes: list[list[int]]):
 
 
 def should_skip(tensor: list[int]):
+    # [FUNCTION DOC] HELPER: True if the size is the legacy empty tensor (one dim of size zero), which cat ignores.
     return numel(tensor) == 0 and len(tensor) == 1
 
 
 def check_cat_shape_except_dim(
     first: list[int], second: list[int], dimension: int, index: int
 ):
+    # [FUNCTION DOC] HELPER: Checks two sizes have equal rank and equal sizes in every dim except dimension. Raises an assertion error otherwise. The index argument is unused.
     first_dims = len(first)
     second_dims = len(second)
     if first_dims != second_dims:
@@ -620,6 +685,9 @@ def check_cat_shape_except_dim(
 
 
 def cat(tensors: list[list[int]], dim: int):
+    # [FUNCTION DOC] Output size of concatenation along dim.
+    # Wraps dim, skips legacy empty tensors, checks all other sizes match, and sums sizes along dim. Returns [0] if every input is skipped.
+    # Raises an assertion error for 0-D inputs, an empty list, or mismatched shapes.
     check_cat_no_zero_dim(tensors)
     dim = legacy_cat_wrap_dim(dim, tensors)
     if len(tensors) <= 0:
@@ -645,6 +713,7 @@ def cat(tensors: list[list[int]], dim: int):
 
 
 def stack(tensors: list[list[int]], dim: int):
+    # [FUNCTION DOC] Output size of stacking: unsqueezes each input at dim and then concatenates along dim.
     unsqueezed_tensors: list[list[int]] = []
     for tensor in tensors:
         unsqueezed = unsqueeze(tensor, dim)
@@ -653,6 +722,7 @@ def stack(tensors: list[list[int]], dim: int):
 
 
 def select(self: list[int], dim: int, index: int):
+    # [FUNCTION DOC] Output size of selecting one index along dim: self without dim. Raises an assertion error for 0-D input or an out-of-bounds index.
     ndim = len(self)
     if ndim == 0:
         raise AssertionError("Cannot select from a 0-dimensional tensor")
@@ -672,6 +742,9 @@ def select(self: list[int], dim: int, index: int):
 
 
 def matmul(tensor1: list[int], tensor2: list[int]):
+    # [FUNCTION DOC] Output size of general matmul following the usual 1D/2D/batched rules (dot, mv, vector-matrix, mm, or broadcasted batch dims plus matrix dims).
+    # Raises an assertion error if either input is 0-D or inner dimensions mismatch.
+    # KNOWN ISSUE: in the batched case the inner dimensions are not checked against each other and the 1D x 2D case relies on mm for validation.
     dim_tensor1 = len(tensor1)
     dim_tensor2 = len(tensor2)
     if dim_tensor1 == 1 and dim_tensor2 == 1:
@@ -713,6 +786,7 @@ def matmul(tensor1: list[int], tensor2: list[int]):
 
 
 def t(self: list[int]):
+    # [FUNCTION DOC] Output size of 2D transpose: reversed sizes (0D and 1D unchanged). Raises an assertion error for more than 2 dims.
     if len(self) > 2:
         raise AssertionError(
             f"Expected tensor to have <= 2 dimensions, but got {len(self)}"
@@ -728,6 +802,7 @@ def t(self: list[int]):
 
 
 def transpose(self: list[int], dim0: int, dim1: int):
+    # [FUNCTION DOC] Output size after swapping dim0 and dim1 (negative dims wrapped). Returns a copy of self if they are equal.
     ndims = len(self)
     dim0 = maybe_wrap_dim(dim0, ndims)
     dim1 = maybe_wrap_dim(dim1, ndims)
@@ -745,6 +820,7 @@ def transpose(self: list[int], dim0: int, dim1: int):
 
 
 def linear(input: list[int], weight: list[int], bias: Optional[list[int]]):
+    # [FUNCTION DOC] Output size of a linear layer: matmul of input with the transposed weight. If bias is given it must broadcast to the output without changing it, else an assertion error is raised.
     out = matmul(input, t(weight))
     if bias is not None:
         if broadcast(bias, out) != out:
@@ -755,10 +831,13 @@ def linear(input: list[int], weight: list[int], bias: Optional[list[int]]):
 
 
 def addmm(self: list[int], mat1: list[int], mat2: list[int], beta: Any, alpha: Any):
+    # [FUNCTION DOC] Output size of addmm: broadcast of self with the matrix product of mat1 and mat2. beta and alpha are unused.
     return broadcast(self, mm(mat1, mat2))
 
 
 def check_non_negative(array: list[int]) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if any element of the list is negative, else False.
+    # KNOWN ISSUE: the name is the opposite of the behavior; it reports the presence of a negative value.
     # TODO: look into rewriting with early return and getting loop unrolling to fire
     non_negative = False
     for val in array:
@@ -776,6 +855,9 @@ def check_shape_forward(
     dilation: list[int],
     groups: int,
 ):
+    # [FUNCTION DOC] HELPER: Validates convolution arguments (non-transposed); returns nothing.
+    # Raises an assertion error for negative padding or stride, weight rank differing from input rank, groups not dividing out channels, input channels not matching weight channels times groups, a bad bias shape, or padded input smaller than the dilated kernel.
+    # KNOWN ISSUE: the bias check requires a one-element list equal to the out channels; the stride-zero case is not rejected here.
     k = len(input)
     weight_dim = len(weight_sizes)
 
@@ -830,6 +912,7 @@ def conv_output_size(
     dilation: list[int],
     groups: int,
 ):
+    # [FUNCTION DOC] HELPER: Output size of a non-transposed convolution: batch, out channels, then per spatial dim floor((in + 2*pad - dilated kernel)/stride)+1. Validates with check_shape_forward first.
     check_shape_forward(
         input_size, weight_size, bias, stride, padding, dilation, groups
     )
@@ -860,6 +943,7 @@ def conv1d(
     dilation: list[int],
     groups: int,
 ):
+    # [FUNCTION DOC] Output size of conv1d; asserts 3D input and weight, then delegates to conv_output_size.
     if len(weight) != 3:
         raise AssertionError(f"Expected 3D weight for conv1d, got {len(weight)}D")
     if len(input) != 3:
@@ -876,6 +960,7 @@ def conv2d(
     dilation: list[int],
     groups: int,
 ):
+    # [FUNCTION DOC] Output size of conv2d; asserts 4D input and weight, then delegates to conv_output_size.
     if len(weight) != 4:
         raise AssertionError(f"Expected 4D weight for conv2d, got {len(weight)}D")
     if len(input) != 4:
@@ -889,6 +974,7 @@ def conv_backwards(
     weight: list[int],
     biases: Optional[list[int]],
 ):
+    # [FUNCTION DOC] Output sizes of convolution backward: copies of input and weight sizes and a one-element list with the number of channels of grad_output (bias gradient is always produced).
     # Bias gradient is always generated regardless of if biases is supplied
     return _copy(input), _copy(weight), [grad_output[1]]
 
@@ -903,6 +989,8 @@ def conv_transpose2d_input(
     groups: int = 1,
     dilation: Optional[list[int]] = None,
 ) -> list[int]:
+    # [FUNCTION DOC] Output size of transposed 2D convolution. Defaults: stride [1, 1], padding [0, 0], output_padding [0, 0], dilation [1, 1].
+    # Returns batch, weight[1]*groups, then per spatial dim (in-1)*stride - 2*pad + dilation*(k-1) + output_padding + 1. No validation is done; bias is unused.
     if stride is None:
         stride = [1, 1]
     if padding is None:
@@ -943,6 +1031,8 @@ def conv_forwards(
     output_padding: list[int],
     groups: int,
 ) -> list[int]:
+    # [FUNCTION DOC] Output size for the generic convolution op, transposed or not. Empty dilation or output_padding lists mean 1 and 0 respectively.
+    # Returns batch, out channels (weight[1]*groups if transposed, else weight[0]), then spatial sizes by the transposed or regular formula. Does not validate inputs.
     has_dilation = len(dilation) > 0
     has_output_padding = len(output_padding) > 0
     dim = len(input)
@@ -990,6 +1080,7 @@ def _conv_forwards(
     cudnn_enabled: bool,
     allow_tf32: bool,
 ) -> list[int]:
+    # [FUNCTION DOC] HELPER: Shape function for the _convolution op; ignores the benchmark, deterministic, cudnn_enabled and allow_tf32 flags and delegates to conv_forwards.
     return conv_forwards(
         input,
         weight,
@@ -1014,6 +1105,7 @@ def batch_norm(
     eps: float,
     cudnn_enabled: bool,
 ):
+    # [FUNCTION DOC] Output size of batch norm: a copy of the input size (all other arguments unused).
     out: list[int] = []
     for elem in input:
         out.append(elem)
@@ -1029,6 +1121,7 @@ def conv3d(
     dilation: list[int],
     groups: int,
 ):
+    # [FUNCTION DOC] Output size of conv3d; asserts 5D input and weight, then delegates to conv_output_size.
     if len(weight) != 5:
         raise AssertionError(f"Expected 5D weight for conv3d, got {len(weight)}D")
     if len(input) != 5:
@@ -1037,6 +1130,8 @@ def conv3d(
 
 
 def maybe_wrap_dim(dim: int, dim_post_expr: int, wrap_scalar: bool = True):
+    # [FUNCTION DOC] Wraps a possibly negative dim into [0, dim_post_expr). A rank of zero or less is treated as 1 when wrap_scalar is true.
+    # Raises an assertion error if the rank is non-positive and wrap_scalar is false, or if dim is outside [-rank, rank-1]. Returns the wrapped int.
     if dim_post_expr <= 0:
         if not wrap_scalar:
             raise AssertionError(
@@ -1055,11 +1150,13 @@ def maybe_wrap_dim(dim: int, dim_post_expr: int, wrap_scalar: bool = True):
 
 
 def zero_dim_tensor(input: Any):
+    # [FUNCTION DOC] Shape function returning an empty size list (a 0-D tensor); the argument is ignored.
     out: list[int] = []
     return out
 
 
 def multiply_integers(li: list[int]):
+    # [FUNCTION DOC] HELPER: Returns the product of the ints in the list (1 if empty).
     out = 1
     for elem in li:
         out = out * elem
@@ -1067,6 +1164,7 @@ def multiply_integers(li: list[int]):
 
 
 def arange_end(end: number, inp0: Any, inp1: Any, inp2: Any, inp3: Any):
+    # [FUNCTION DOC] Output size of arange(end): a one-element list with ceil(end). Raises an assertion error if end is negative. Other arguments are unused option placeholders.
     if end < 0:
         raise AssertionError(f"Expected end ({end}) >= 0")
     return [int(math.ceil(end))]
@@ -1075,6 +1173,8 @@ def arange_end(end: number, inp0: Any, inp1: Any, inp2: Any, inp3: Any):
 def arange_start(
     start: number, end: number, inp0: Any, inp1: Any, inp2: Any, inp3: Any
 ):
+    # [FUNCTION DOC] Output size of arange(start, end): one element with ceil(end - start). Raises an assertion error if end is negative or less than start.
+    # KNOWN ISSUE: requiring end to be non-negative rejects valid negative ranges such as start below end below zero.
     if end < 0:
         raise AssertionError(f"Expected end ({end}) >= 0")
     if end < start:
@@ -1085,6 +1185,7 @@ def arange_start(
 def arange_start_step(
     start: number, end: number, step: number, inp0: Any, inp1: Any, inp2: Any, inp3: Any
 ):
+    # [FUNCTION DOC] Output size of arange(start, end, step): one element with ceil((end - start)/step). Raises an assertion error if step is zero, or the direction of step conflicts with start and end.
     if step == 0:
         raise AssertionError("step must not be zero")
     if step < 0:
@@ -1101,6 +1202,7 @@ def arange_start_step(
 
 
 def permute(input: list[int], dims: list[int]):
+    # [FUNCTION DOC] Output size of permute: input sizes reordered by dims (negative dims wrapped). Raises an assertion error if lengths differ or a dim repeats.
     if len(input) != len(dims):
         raise AssertionError(
             f"Expected len(input) ({len(input)}) == len(dims) ({len(dims)})"
@@ -1122,6 +1224,8 @@ def permute(input: list[int], dims: list[int]):
 
 
 def movedim(self: list[int], source: list[int], destination: list[int]) -> list[int]:
+    # [FUNCTION DOC] Output size of movedim with lists of source and destination dims: builds a full permutation placing the moved dims at their destinations and the rest in order, then applies permute.
+    # Returns self itself when it has at most one dim. Raises if dims are out of range or duplicated.
     self_dim = len(self)
     if self_dim <= 1:
         return self
@@ -1155,6 +1259,8 @@ def movedim(self: list[int], source: list[int], destination: list[int]) -> list[
 
 
 def flatten(input: list[int], start_dim: int, end_dim: int):
+    # [FUNCTION DOC] Output size of flatten from start_dim to end_dim inclusive (negative dims wrapped): dims in the range are merged into their product.
+    # Returns [1] for a 0-D input and a copy when start_dim equals end_dim. Raises an assertion error if start_dim > end_dim.
     start_dim = maybe_wrap_dim(start_dim, len(input))
     end_dim = maybe_wrap_dim(end_dim, len(input))
     if start_dim > end_dim:
@@ -1182,14 +1288,17 @@ def flatten(input: list[int], start_dim: int, end_dim: int):
 
 
 def nonzero_lower_bound(input: list[int]):
+    # [FUNCTION DOC] Lower bound of the nonzero output size: zero rows by rank columns.
     return [0, len(input)]
 
 
 def nonzero_upper_bound(input: list[int]):
+    # [FUNCTION DOC] Upper bound of the nonzero output size: number of elements rows by rank columns.
     return [numel(input), len(input)]
 
 
 def _reduce_along_dim(self: list[int], dim: int, keepdim: bool):
+    # [FUNCTION DOC] HELPER: Size after reducing one dim (negative wrapped): the dim is dropped, or kept as 1 if keepdim.
     dim = maybe_wrap_dim(dim, len(self))
     out: list[int] = []
     for i, self_dim in enumerate(self):
@@ -1204,12 +1313,14 @@ def _reduce_along_dim(self: list[int], dim: int, keepdim: bool):
 def argmax(
     self: list[int], dim: Optional[int] = None, keepdim: bool = False
 ) -> list[int]:
+    # [FUNCTION DOC] Output size of argmax: an empty list when dim is None, else the size reduced along dim (kept as 1 if keepdim).
     if dim is None:
         return []
     return _reduce_along_dim(self, dim, keepdim)
 
 
 def bmm(self: list[int], mat2: list[int]) -> list[int]:
+    # [FUNCTION DOC] Output size of batched matrix multiply: [batch, self rows, mat2 cols]. Raises an assertion error if either input is not 3D or the batch or contracting dims mismatch.
     if len(self) != 3:
         raise AssertionError(f"bmm only supports 3D tensors, got {len(self)}D")
     if len(mat2) != 3:
@@ -1226,10 +1337,12 @@ def bmm(self: list[int], mat2: list[int]) -> list[int]:
 
 
 def _shape_as_tensor(self: list[int]) -> list[int]:
+    # [FUNCTION DOC] HELPER: Output size of the shape-as-tensor op: a one-element list holding the rank of the input.
     return [len(self)]
 
 
 def topk(self: list[int], k: int, dim: int = -1) -> tuple[list[int], list[int]]:
+    # [FUNCTION DOC] Output sizes of topk: values and indices share one size, equal to self with dim replaced by k (empty for 0-D input). Raises an assertion error if k exceeds the size of dim.
     if len(self) == 0:
         result: list[int] = []
     else:
@@ -1245,6 +1358,10 @@ def topk(self: list[int], k: int, dim: int = -1) -> tuple[list[int], list[int]]:
 def nll_loss_forward(
     self: list[int], target: list[int], weight: Optional[list[int]], reduction: int
 ) -> tuple[list[int], list[int]]:
+    # [FUNCTION DOC] Output sizes of nll_loss_forward as (output, total_weight).
+    # Input must be 1D or 2D with matching batch size with target; weight if given must be a list with n_classes. With reduction 0 (none) and 2D input the output is [batch], otherwise scalar (empty list); total_weight is always scalar.
+    # Raises an assertion error on rank, batch or weight mismatches.
+    # KNOWN ISSUE: the weight check compares a length-1 list to n_classes, which is inconsistent with a weight tensor of size n_classes.
     # This is taken shamelessly from the meta function in LossNLL.cpp
     self_dim = len(self)
     target_dim = len(target)
@@ -1274,6 +1391,8 @@ def nll_loss_forward(
 def native_layer_norm(
     input: list[int], normalized_shape: list[int]
 ) -> tuple[list[int], list[int], list[int]]:
+    # [FUNCTION DOC] Output sizes of native layer norm: (copy of input, mean size, rstd size), where the statistics size keeps the leading unnormalized dims and sets normalized dims to 1.
+    # Raises an assertion error if normalized_shape has more dims than input.
     reduction_shape: list[int] = []
     num_unreduced_dimensions = len(input) - len(normalized_shape)
     if num_unreduced_dimensions < 0:
@@ -1296,6 +1415,7 @@ def native_batch_norm(
     running_var: Optional[list[int]],
     training: bool,
 ) -> tuple[list[int], list[int], list[int]]:
+    # [FUNCTION DOC] Output sizes of native batch norm: (copy of input, save_mean, save_invstd); the statistics have size [channels] in training and [0] otherwise.
     if training:
         _size = [input[1]]
     else:
@@ -1310,6 +1430,7 @@ def _batch_norm_with_update(
     running_mean: Optional[list[int]],
     running_var: Optional[list[int]],
 ) -> tuple[list[int], list[int], list[int], list[int]]:
+    # [FUNCTION DOC] HELPER: Output sizes of batch norm with update: copy of input, two statistics of size [channels], and a [0] reserve tensor.
     _size = [input[1]]
     return _copy(input), _size, _size, [0]
 
@@ -1322,6 +1443,7 @@ def cross_entropy_loss(
     ignore_index: int = -100,
     label_smoothing: float = 0.0,
 ) -> list[int]:
+    # [FUNCTION DOC] Output size of cross entropy loss: the first result of nll_loss_forward on the same arguments. ignore_index and label_smoothing do not affect the shape.
     result_shape = nll_loss_forward(self, target, weight, reduction)[0]
     return result_shape
 
@@ -1352,6 +1474,8 @@ script_func_map: dict[Callable, ScriptFn] = {}
 
 
 def process_func(func: Callable):
+    # [FUNCTION DOC] HELPER: Scripts a shape function with the JIT, inlines it, and runs peephole and constant-propagation passes twice on its graph.
+    # Results are cached in script_func_map keyed by the function (global mutation). Returns the scripted function.
     if func not in script_func_map:
         scripted_func = torch.jit.script(func)
 
@@ -1366,6 +1490,7 @@ def process_func(func: Callable):
 
 
 def add_shape_compute_mapping(operator_schema: str, func: Callable):
+    # [FUNCTION DOC] Registers a shape function for an operator schema string: processes func via process_func and stores it in the global shape_compute_graph_mapping, replacing any prior entry.
     global shape_compute_graph_mapping
 
     shape_compute_graph_mapping[operator_schema] = process_func(func)
@@ -1374,6 +1499,7 @@ def add_shape_compute_mapping(operator_schema: str, func: Callable):
 def add_bounded_compute_mapping(
     operator_schema: str, lower_bound_func: Callable, upper_bound_func: Callable
 ):
+    # [FUNCTION DOC] Registers a pair of lower-bound and upper-bound shape functions for an operator schema, storing the processed scripted functions as a tuple in bounded_compute_graph_mapping.
     # Adds a shape compute function for both upper and lower bounds
     fns = (process_func(lower_bound_func), process_func(upper_bound_func))
     bounded_compute_graph_mapping[operator_schema] = fns
