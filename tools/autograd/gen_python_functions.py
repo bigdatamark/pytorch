@@ -1,3 +1,12 @@
+# [MODULE DOC] Code generator for the Python C-API bindings of ATen ops. Reads native function
+# and deprecated-signature yaml files, builds Python signatures (plus deprecated ones), groups
+# out/non-out overloads, orders ambiguous overloads, and fills C++ templates to write the
+# python_variable_methods, python_torch/nn/fft/linalg/nested/sparse/special_functions files, the
+# python_return_types files (named-tuple types) and python_enum_tag.cpp.
+# Contents: skip lists, module predicates, the gen entry point, file writers, return-type
+# generation, per-op method implementation / forward declaration / method table emitters, and the
+# overload sorting logic. Import-time side effects: none besides imports and building templates.
+#
 # Generates Python bindings for ATen functions
 #
 # The bindings are generated as methods on python_variable or functions on the
@@ -201,6 +210,9 @@ SKIP_PYTHON_BINDINGS_SIGNATURES = [
 
 @with_native_function
 def should_generate_py_binding(f: NativeFunction) -> bool:
+    # [FUNCTION DOC] Decides whether an op gets a Python binding. Returns False for fully
+    # code-generated ops (except view_copy ones), for names matching any skip regex, and for
+    # schemas whose full text equals an entry of the skip-signature list; True otherwise.
     # NativeFunctions that are entirely code-generated should not get python bindings
     # because these codegen implementations are often inefficient. A handful of
     # view_copy style ops were exposed accidentally when they were handwritten and now
@@ -222,42 +234,52 @@ def should_generate_py_binding(f: NativeFunction) -> bool:
 
 
 def get_pycname(name: BaseOperatorName) -> str:
+    # [FUNCTION DOC] HELPER: Returns the C++ binding function name: THPVariable_ plus the name.
     return f"THPVariable_{name}"
 
 
 def is_noarg(overloads: Sequence[PythonSignatureNativeFunctionPair]) -> bool:
+    # [FUNCTION DOC] HELPER: True if there is exactly one overload and it takes no arguments.
     return len(overloads) == 1 and overloads[0].signature.arguments_count() == 0
 
 
 def is_py_variable_method(f: NativeFunction) -> bool:
+    # [FUNCTION DOC] HELPER: True if the op has no python module and has a method variant.
     return f.python_module is None and Variant.method in f.variants
 
 
 def is_py_torch_function(f: NativeFunction) -> bool:
+    # [FUNCTION DOC] HELPER: True if the op has no python module and has a function variant.
     return f.python_module is None and Variant.function in f.variants
 
 
 def is_py_nn_function(f: NativeFunction) -> bool:
+    # [FUNCTION DOC] HELPER: True if the op's python module is nn.
     return f.python_module == "nn"
 
 
 def is_py_fft_function(f: NativeFunction) -> bool:
+    # [FUNCTION DOC] HELPER: True if the op's python module is fft.
     return f.python_module == "fft"
 
 
 def is_py_linalg_function(f: NativeFunction) -> bool:
+    # [FUNCTION DOC] HELPER: True if the op's python module is linalg.
     return f.python_module == "linalg"
 
 
 def is_py_nested_function(f: NativeFunction) -> bool:
+    # [FUNCTION DOC] HELPER: True if the op's python module is nested.
     return f.python_module == "nested"
 
 
 def is_py_sparse_function(f: NativeFunction) -> bool:
+    # [FUNCTION DOC] HELPER: True if the op's python module is sparse.
     return f.python_module == "sparse"
 
 
 def is_py_special_function(f: NativeFunction) -> bool:
+    # [FUNCTION DOC] HELPER: True if the op's python module is special.
     return f.python_module == "special"
 
 
@@ -277,6 +299,12 @@ def gen(
     *,
     symint: bool = True,
 ) -> None:
+    # [FUNCTION DOC] Entry point of the generator. Parses the native and tags yaml files, drops ops
+    # that should not be bound, loads method and function signatures (including deprecated ones),
+    # and writes the binding files into out: Tensor methods, torch functions in three shards, then
+    # nn, fft, linalg, nested, sparse and special modules, the return-type source and header, and
+    # the tag enum file. symint selects symbolic-int signatures. Side effects: writes files.
+    # KNOWN ISSUE: the nested module call does not forward symint, unlike every other call.
     fm = FileManager(install_dir=out, template_dir=template_path, dry_run=False)
     native_functions = parse_native_yaml(
         native_yaml_path, tags_yaml_path
@@ -381,6 +409,8 @@ def gen(
     valid_tags = parse_tags_yaml(tags_yaml_path)
 
     def gen_tags_enum() -> dict[str, str]:
+        # [FUNCTION DOC] HELPER: Returns the template environment with the text of one enum value
+        # line per valid tag, in sorted tag order.
         return {
             "enum_of_valid_tags": (
                 "".join(
@@ -396,6 +426,8 @@ def group_filter_overloads(
     pairs: Sequence[PythonSignatureNativeFunctionPair],
     pred: Callable[[NativeFunction], bool],
 ) -> dict[BaseOperatorName, list[PythonSignatureNativeFunctionPair]]:
+    # [FUNCTION DOC] HELPER: Keeps the pairs whose native function satisfies pred and groups them
+    # into a mapping from base operator name to the list of its pairs, preserving input order.
     grouped: dict[BaseOperatorName, list[PythonSignatureNativeFunctionPair]] = (
         defaultdict(list)
     )
@@ -415,6 +447,10 @@ def create_python_bindings(
     method: bool,
     symint: bool = True,
 ) -> None:
+    # [FUNCTION DOC] Writes one binding source file from the template of the same name. For each
+    # op (sorted by name) accepted by pred it emits the implementation, the method table entry,
+    # forward declarations and an ops header include. module is the python module name or None for
+    # Tensor methods; method selects method versus function style. Side effects: writes a file.
     """Generates Python bindings to ATen functions"""
     py_methods: list[str] = []
     ops_headers: list[str] = []
@@ -452,6 +488,9 @@ def create_python_return_type_bindings(
     pred: Callable[[NativeFunction], bool],
     filename: str,
 ) -> None:
+    # [FUNCTION DOC] Writes the return-types source file: for each op (sorted by name) accepted by
+    # pred, the definitions of named-tuple type getters and their registration calls. Ops without
+    # named returns contribute empty text. Side effects: writes a file from the template.
     """
     Generate function to initialize and return named tuple for native functions
     which returns named tuple and registration invocations in `python_return_types.cpp`.
@@ -491,6 +530,9 @@ def create_python_return_type_bindings_header(
     pred: Callable[[NativeFunction], bool],
     filename: str,
 ) -> None:
+    # [FUNCTION DOC] Writes the return-types header file: for each op (sorted by name) accepted by
+    # pred, declarations of the named-tuple type getter functions. Ops without named returns
+    # contribute empty text. Side effects: writes a file from the template.
     """
     Generate function to initialize and return named tuple for native functions
     which returns named tuple and relevant entry for the map in `python_return_types.cpp`.
@@ -528,17 +570,24 @@ def create_python_bindings_sharded(
     num_shards: int,
     symint: bool = True,
 ) -> None:
+    # [FUNCTION DOC] Sharded variant of the binding file writer: groups accepted ops by base name
+    # and writes the file split into num_shards pieces keyed by base name, each piece holding its
+    # ops' headers, forward declarations, implementations and method table entries.
+    # Side effects: writes num_shards files via FileManager. Returns nothing.
     """Generates Python bindings to ATen functions"""
     grouped = group_filter_overloads(pairs, pred)
 
     def key_func(
         kv: tuple[BaseOperatorName, list[PythonSignatureNativeFunctionPair]],
     ) -> str:
+        # [FUNCTION DOC] HELPER: Sharding key: the base operator name of a grouped entry.
         return kv[0].base
 
     def env_func(
         kv: tuple[BaseOperatorName, list[PythonSignatureNativeFunctionPair]],
     ) -> dict[str, list[str]]:
+        # [FUNCTION DOC] HELPER: Builds the template environment for one grouped entry: lists with
+        # its ops header include, forward declarations, implementation and method table entry.
         name, fn_pairs = kv
         return {
             "ops_headers": [f"#include <ATen/ops/{name.base}.h>"],
@@ -571,8 +620,12 @@ def load_signatures(
     skip_deprecated: bool = False,
     pyi: bool = False,
 ) -> Sequence[PythonSignatureNativeFunctionPair]:
+    # [FUNCTION DOC] Builds Python signature / native function pairs for all given functions
+    # (method or function style, optionally for stub generation) and appends the pairs derived from
+    # the deprecated yaml file unless skip_deprecated is set. Reads the deprecated file.
     @with_native_function
     def gen_signature_pairs(f: NativeFunction) -> PythonSignatureNativeFunctionPair:
+        # [FUNCTION DOC] HELPER: Pairs the function with its computed Python signature.
         return PythonSignatureNativeFunctionPair(
             signature=signature(f, method=method, pyi=pyi),
             function=f,
@@ -592,6 +645,12 @@ def load_deprecated_signatures(
     method: bool,
     pyi: bool,
 ) -> list[PythonSignatureNativeFunctionPair]:
+    # [FUNCTION DOC] Reads the deprecated yaml file and, for each entry, finds every original ATen
+    # overload (same name, with _out suffix stripped for out forms) whose argument types and alias
+    # annotations match the call arguments, then makes a deprecated-signature pair for each match.
+    # Constant argument "1" is treated as a Scalar. Returns the new pairs. Raises an error for an
+    # unknown call argument or when no native function matches an entry. Side effect: reads a file.
+    # KNOWN ISSUE: the out-suffix removal replaces every occurrence of the text, not only the end.
     # The deprecated.yaml doesn't have complete type information, we need
     # find and leverage the original ATen signature (to which it delegates
     # the call) to generate the full python signature.
@@ -632,6 +691,9 @@ def load_deprecated_signatures(
         def is_schema_compatible(
             aten_schema: FunctionSchema,
         ) -> bool:
+            # [FUNCTION DOC] HELPER: True if the ATen schema matches the deprecated entry: each
+            # supplied call argument has equal type and alias annotation, every remaining ATen
+            # argument has a default, and the returns are equal in count and value.
             arguments: Iterable[Argument]
             if is_out:
                 arguments = itertools.chain(
@@ -707,6 +769,8 @@ def load_deprecated_signatures(
 
 @with_native_function
 def gen_structseq_typename_key(f: NativeFunction) -> str:
+    # [FUNCTION DOC] HELPER: Returns a key identifying the named-tuple type of an op: the C++ op
+    # name joined by underscores with its return field names.
     name = cpp.name(f.func)
     fieldnames = structseq_fieldnames(f.func.returns)
     return "_".join([name] + fieldnames)
@@ -715,6 +779,9 @@ def gen_structseq_typename_key(f: NativeFunction) -> str:
 def emit_structseq_call(
     overloads: Sequence[PythonSignatureNativeFunctionPair],
 ) -> tuple[list[str], dict[str, str]]:
+    # [FUNCTION DOC] For the overloads that return named fields, emits one static declaration per
+    # distinct named-tuple type, initialized from the generated getter. Returns (declarations,
+    # mapping from type key to the declared variable name).
     """
     Generate block of named tuple type def inits, and add typeref snippets
     to declarations that use them
@@ -746,6 +813,10 @@ static PyTypeObject* {typename} = generated::get_{name}_structseq();"""
 def generate_return_type_definition_and_registrations(
     overloads: Sequence[PythonSignatureNativeFunctionPair],
 ) -> tuple[list[str], list[str]]:
+    # [FUNCTION DOC] For overloads with named return fields, emits the C++ definition of the
+    # struct-sequence getter (lazily initialized once, with the custom repr) and a registration
+    # call per distinct type key. Returns (definitions, registrations); empty if no overload
+    # has named returns.
     """
     Generate block of function in `python_return_types.cpp` to initialize
     and return named tuple for a native function which returns named tuple
@@ -797,6 +868,8 @@ PyTypeObject* get_{name}_structseq() {{
 def generate_return_type_declarations(
     overloads: Sequence[PythonSignatureNativeFunctionPair],
 ) -> list[str]:
+    # [FUNCTION DOC] For overloads with named return fields, emits one getter declaration per
+    # distinct type key. Returns the list of declarations; empty if none have named returns.
     """
     Generate block of function declarations in `python_return_types.h` to initialize
     and return named tuple for a native function.
@@ -910,6 +983,11 @@ def method_impl(
     method: bool,
     symint: bool = True,
 ) -> str:
+    # [FUNCTION DOC] Returns the C++ text of the Python binding function for all overloads of an
+    # op. Chooses the no-argument, single-overload or multi-overload template; groups and orders
+    # overloads, emits their signature strings and dispatch code, the torch-function override
+    # check, tracing flag, maximum argument count and error-handling wrappers. Method style
+    # unpacks self; non-method style passes a null self.
     """
     Generate a python binding for all overloads of an op.
     """
@@ -974,6 +1052,10 @@ def method_impl(
 def gen_has_torch_function_check(
     name: BaseOperatorName, module: str | None, *, noarg: bool, method: bool
 ) -> str:
+    # [FUNCTION DOC] Returns the C++ snippet that diverts to the __torch_function__ handler. For a
+    # no-argument method it checks self directly; for a no-argument function it returns empty
+    # text. Otherwise it checks the parsed arguments and passes the module object matching module
+    # (or the Tensor class when module is None). Raises a lookup error for an unknown module name.
     if noarg:
         if method:
             return f"""\
@@ -1024,6 +1106,9 @@ def emit_dispatch_case(
     *,
     symint: bool = True,
 ) -> str:
+    # [FUNCTION DOC] Returns the dispatch code for one grouped signature. With an out variant it
+    # branches at run time on whether the output argument was passed, calling the out or non-out
+    # dispatch; otherwise it emits only the non-out dispatch.
     """
     Emit dispatch code for a single parsed signature. This corresponds to either
     a single native function, or a pair that differ only in output params. In the
@@ -1064,6 +1149,8 @@ def forward_decls(
     *,
     method: bool,
 ) -> tuple[str, ...]:
+    # [FUNCTION DOC] Returns forward declarations of the binding function: none for methods; for
+    # functions one declaration with the signature matching the no-argument or argument form.
     if method:
         return ()
 
@@ -1096,6 +1183,11 @@ def method_def(
     *,
     method: bool,
 ) -> str:
+    # [FUNCTION DOC] Returns the method table entry text for the op: name, function pointer
+    # (wrapped to return not-implemented for dunder methods, and cast for the keyword form), and
+    # call flags (no-args only for no-argument methods, static for the torch module).
+    # KNOWN ISSUE: no-argument non-method functions get the keyword flags without the cast while
+    # their declared function takes only self and args.
     """
     Generate method def entry.
     """
@@ -1127,6 +1219,10 @@ def method_def(
 def group_overloads(
     overloads: Sequence[PythonSignatureNativeFunctionPair], *, symint: bool = True
 ) -> Sequence[PythonSignatureGroup]:
+    # [FUNCTION DOC] Groups overloads by signature text ignoring outputs, pairing each out variant
+    # with its non-out base, then returns the groups ordered by sort_overloads. Raises an error
+    # for a duplicated definition, or an out schema lacking a non-out counterpart (the message
+    # lists candidate non-out signatures).
     bases: dict[str, PythonSignatureNativeFunctionPair] = {}
     outplaces: dict[str, PythonSignatureNativeFunctionPair] = {}
 
@@ -1229,9 +1325,16 @@ def group_overloads(
 def sort_overloads(
     grouped_overloads: Sequence[PythonSignatureGroup], *, symint: bool = True
 ) -> Sequence[PythonSignatureGroup]:
+    # [FUNCTION DOC] Orders signature groups so that more specific overloads are tried first. Sorts
+    # by signature text, builds a partial order (a signature is lower priority if each argument
+    # type is equal or lower priority, e.g. Scalar below Tensor, and not all equal), then does a
+    # topological sort. Returns the ordered list; input order is kept if no relations exist.
     # NB: Smaller here means lower priority
 
     def is_arg_smaller(t1: Type, t2: Type) -> bool:
+        # [FUNCTION DOC] HELPER: True if type t1 has lower parse priority than t2 by the fixed
+        # rules (Scalar below Tensor, int list below int, tensor list last, symbolic-int list
+        # below int list, int and symbolic int below Tensor).
         return (
             str(t1) == "Scalar"
             and str(t2) == "Tensor"
@@ -1259,6 +1362,8 @@ def sort_overloads(
         )
 
     def is_smaller(s1: PythonSignature, s2: PythonSignature) -> bool:
+        # [FUNCTION DOC] HELPER: True if s1 is lower priority than s2: same argument count (outputs
+        # skipped), every argument type equal or smaller, and not all types equal.
         """Returns True if s1 < s2 in the partial order."""
         args1, args2 = s1.arguments(skip_outputs=True), s2.arguments(skip_outputs=True)
         if len(args1) != len(args2):
@@ -1319,12 +1424,19 @@ def emit_single_dispatch(
     *,
     symint: bool = True,
 ) -> str:
+    # [FUNCTION DOC] Returns the C++ dispatch code for one native function under Python signature
+    # ps. structseq_typenames maps named-tuple type keys to declared variable names.
     """
     Emit dispatch code for a single native function.
     """
 
     @with_native_function
     def go(f: NativeFunction) -> str:
+        # [FUNCTION DOC] HELPER: Builds the dispatch text: a schema comment, argument init code,
+        # a lambda that releases the GIL and calls the target, and the call with converted parser
+        # outputs. Void ops return None (in-place foreach ops return the input list); others wrap
+        # the result, as a named tuple when applicable. Sets requires_grad on the result when the
+        # signature has tensor options. Raises an error if an in-place foreach lacks a list self.
         # header comments
         if isinstance(ps, PythonSignatureDeprecated):
             schema_comment = f"// [deprecated] aten::{ps.deprecated_schema}"

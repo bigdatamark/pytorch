@@ -1,3 +1,11 @@
+# [MODULE DOC] Code generator for ADInplaceOrViewType.cpp, the kernels at the ADInplaceOrView
+# dispatch key. For each op that uses the derived-autograd strategy, in-place and out variants get
+# a redispatch below this key followed by version-counter increments, and view ops get a redispatch
+# followed by wrapping the result as an autograd view (with replay and reverse-replay lambdas).
+# Contents: code templates, tables of view functions, small helpers for unpacking arguments, body
+# emitters, and gen_inplace_or_view_type which writes the sharded output file.
+# Import-time side effects: none besides imports and building the templates.
+#
 # Generates ADInplaceOrViewType.h/cpp
 #
 # NOTE: If any changes are being made to the ADInplaceOrView codegen please also check
@@ -253,11 +261,13 @@ TMP_VAR = "_tmp"
 #        comment in codegen/model.py there saying these concepts are not well defined.
 #        Thus we put a version that commonly used by autograd codegen here.
 def is_tensor_type(t: Type) -> bool:
+    # [FUNCTION DOC] HELPER: True if the type is tensor-like and not list-like (a single tensor).
     # TODO: Should handle optional here?
     return t.is_tensor_like() and t.is_list_like() is None
 
 
 def is_tensor_list_type(t: Type) -> bool:
+    # [FUNCTION DOC] HELPER: True if the type is tensor-like and list-like (a list of tensors).
     # TODO: Should handle optional here?
     return t.is_tensor_like() and t.is_list_like() is not None
 
@@ -269,11 +279,14 @@ auto${ref} ${arg_name}_ = unpack${suffix}(${arg_name}, "${arg_name}", ${arg_pos}
 
 
 def unpacked_name(arg_name: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the argument name with a trailing underscore appended.
     return arg_name + "_"
 
 
 # e.g. select.int -> select_copy_int_inverse()
 def inverse_view_name(f: NativeFunction) -> str:
+    # [FUNCTION DOC] HELPER: Builds the name of the inverse of a view op: root name plus _copy,
+    # then the overload name if non-empty (prefixed by an underscore), then _inverse.
     copy_variant = f"{f.root_name}_copy"
     overload = f"{f.func.name.overload_name}"
     if overload != "":
@@ -282,6 +295,9 @@ def inverse_view_name(f: NativeFunction) -> str:
 
 
 def extract_bindings(f: NativeFunction) -> list[Binding]:
+    # [FUNCTION DOC] HELPER: Returns the flat list of C++ bindings for the function's arguments in
+    # schema order, using symbolic-int types, non-faithful signature, no defaults dropped and no
+    # tensor-options grouping.
     return [
         r
         for a in f.func.schema_order_arguments()
@@ -298,6 +314,12 @@ def extract_bindings(f: NativeFunction) -> list[Binding]:
 
 @with_native_function
 def unpack_args(f: NativeFunction) -> tuple[list[str], list[Binding]]:
+    # [FUNCTION DOC] Produces C++ statements that unpack non-optional tensor and tensor-list
+    # arguments (checked by name and position) and the matching bindings that use the unpacked
+    # names. Nullable and non-tensor arguments pass through unchanged. Returns (statements,
+    # bindings). Raises an error for a self argument or a tensor-options argument.
+    # KNOWN ISSUE: the branch for nullable tensors and the optional suffix are unreachable since
+    # nullable arguments are skipped earlier; the reference flag is thus true for single tensors.
     body: list[str] = []
     unpacked_bindings: list[Binding] = []
 
@@ -336,10 +358,14 @@ def unpack_args(f: NativeFunction) -> tuple[list[str], list[Binding]]:
 
 
 def get_base_name(f: NativeFunction) -> str:
+    # [FUNCTION DOC] HELPER: Returns the base operator name (without overload or inplace suffix).
     return f.func.name.name.base  # TODO: should be str(f.func.name.name)?
 
 
 def get_view_info(f: NativeFunction) -> str | None:
+    # [FUNCTION DOC] Returns the name of the input that the op's output is a view of, looked up by
+    # base name in the view-functions table; ops in the returns-views-of-input set default to
+    # self. Returns None if the op is not a view op.
     base_name = get_base_name(f)
     view_info = VIEW_FUNCTIONS.get(base_name)
     if view_info is None and base_name in RETURNS_VIEWS_OF_INPUT:
@@ -350,6 +376,11 @@ def get_view_info(f: NativeFunction) -> str | None:
 def emit_view_func(
     f: NativeFunction, bindings: list[Binding], view_idx: str | None = None
 ) -> str:
+    # [FUNCTION DOC] Emits the C++ that sets up the view-replay and reverse-replay lambdas used
+    # when as_strided is unsupported or the view changes metadata. Arguments other than self are
+    # closed over by value (array refs copied to vectors, optional ints materialized to a value).
+    # view_idx is an extra trailing argument for multi-output views. Returns the C++ text.
+    # Raises TypeError if an argument has a type outside the known simple view-argument types.
     """Generate an additional lambda function to recover views in backward when as_strided is not supported.
     See Note [View + Inplace update for base tensor] and [View + Inplace update for view tensor] for more details.
     """
@@ -450,6 +481,12 @@ def emit_view_func(
 def emit_view_body(
     fn: NativeFunctionWithDifferentiabilityInfo, var: str
 ) -> tuple[str, str]:
+    # [FUNCTION DOC] Builds the C++ that wraps the redispatch result held in variable var as an
+    # autograd view. Returns (setup statements, right-hand-side expression). With no
+    # differentiable outputs the view is non-differentiable; with one Tensor or Tensor list output
+    # the view is created with replay lambdas and a creation meta chosen by inference and grad
+    # mode (list outputs iterate per element). Raises TypeError if view info is not a string and
+    # RuntimeError for non-tensor outputs or multiple differentiable outputs.
     # See NOTE [ Autograd View Variables ] in variable.h for details.
     f = fn.func
     base_name = get_base_name(f)
@@ -480,6 +517,9 @@ def emit_view_body(
 
         # See Note [ View + Inplace detection]
         def get_creation_meta_in_mode(original: str) -> str:
+            # [FUNCTION DOC] HELPER: Returns a C++ conditional expression choosing the inference
+            # mode creation meta if inference mode is on, else the given meta when grad mode is
+            # enabled, else the no-grad-mode meta.
             creation_meta_with_grad_mode = f"(at::GradMode::is_enabled() ? {original} : CreationMeta::NO_GRAD_MODE)"
             return f"InferenceMode::is_enabled() ? CreationMeta::INFERENCE_MODE : {creation_meta_with_grad_mode}"
 
@@ -520,11 +560,17 @@ def emit_view_body(
 
 
 def modifies_arguments(f: NativeFunction) -> bool:
+    # [FUNCTION DOC] HELPER: True if the op is an in-place or out variant.
     return f.func.kind() in [SchemaKind.inplace, SchemaKind.out]
 
 
 @with_native_function_with_differentiability_info
 def emit_inplace_or_view_body(fn: NativeFunctionWithDifferentiabilityInfo) -> list[str]:
+    # [FUNCTION DOC] Returns the list of C++ statements for the kernel body. In-place/out ops
+    # redispatch below this key (using the plumbed dispatch key set) and then bump the version
+    # counter of each returned tensor. View ops redispatch into a temporary, wrap it as a view and
+    # assign it to the return values. Appends a return statement if the op has returns.
+    # Raises an error if a non-mutating op has no view info.
     f = fn.func
     inplace_view_body: list[str] = []
 
@@ -573,6 +619,8 @@ def emit_inplace_or_view_body(fn: NativeFunctionWithDifferentiabilityInfo) -> li
 
 @with_native_function
 def gen_formals(f: NativeFunction) -> str:
+    # [FUNCTION DOC] HELPER: Returns the C++ formal parameter list text: a dispatch key set first,
+    # then each schema-order argument as type and name using symbolic-int types.
     return ", ".join(
         # code-generated autograd kernels plumb and recompute dispatch keys directly through the kernel for performance.
         # See Note [Plumbing Keys Through The Dispatcher] for details.
@@ -588,6 +636,8 @@ def gen_formals(f: NativeFunction) -> str:
 def inplace_or_view_method_definition(
     fn: NativeFunctionWithDifferentiabilityInfo,
 ) -> str | None:
+    # [FUNCTION DOC] Returns the C++ kernel definition text for the op, or None when the op is
+    # neither a view nor a mutating op with returns (mutating ops without returns get no support).
     f = fn.func
     if get_view_info(f) is None and (
         # For functions that modify their inputs but don't return them,
@@ -608,6 +658,8 @@ def inplace_or_view_method_definition(
 def inplace_or_view_method_registration(
     fn: NativeFunctionWithDifferentiabilityInfo,
 ) -> str | None:
+    # [FUNCTION DOC] Returns the C++ registration line of the op's kernel for the ADInplaceOrView
+    # key, or None under the same condition as the definition (no kernel is generated).
     f = fn.func
     if get_view_info(f) is None and (
         not modifies_arguments(f) or len(f.func.returns) == 0
@@ -621,6 +673,8 @@ def inplace_or_view_method_registration(
 
 
 def use_derived(fn: NativeFunctionWithDifferentiabilityInfo) -> bool:
+    # [FUNCTION DOC] HELPER: True if the op is not manually written autograd code and its dispatch
+    # strategy is use_derived.
     f = fn.func
     name = cpp.name(f.func)
     return name not in MANUAL_AUTOGRAD and dispatch_strategy(fn) == "use_derived"
@@ -629,6 +683,8 @@ def use_derived(fn: NativeFunctionWithDifferentiabilityInfo) -> bool:
 def gen_inplace_or_view_type_env(
     fn: NativeFunctionWithDifferentiabilityInfo,
 ) -> dict[str, list[str]]:
+    # [FUNCTION DOC] Builds the template environment for one op: lists for the ops header include,
+    # kernel definition and wrapper registration, each empty when the op gets no kernel.
     definition = inplace_or_view_method_definition(fn)
     registration = inplace_or_view_method_registration(fn)
 
@@ -654,6 +710,9 @@ def gen_inplace_or_view_type(
     fns_with_infos: list[NativeFunctionWithDifferentiabilityInfo],
     template_path: str,
 ) -> None:
+    # [FUNCTION DOC] Writes ADInplaceOrViewType.cpp into out, split into two shards keyed by root
+    # op name, from the ops in fns_with_infos that use derived autograd. The yaml paths are
+    # unused here. Side effects: writes files via FileManager. Returns nothing.
     # NOTE: see Note [Sharded File] at the top of the VariableType.cpp
     # template regarding sharding of the generated files.
 

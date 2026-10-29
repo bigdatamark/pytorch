@@ -1,3 +1,12 @@
+# [MODULE DOC] Code generator for the C++ autograd backward Node subclasses (grad_fn classes).
+# From the per-operator differentiability info it fills C++ code templates to produce
+# Functions.h/Functions.cpp (Node subclasses with apply, saved-variable fields, release logic and
+# compiled-autograd hooks) and python_functions.h/.cpp (sharded Python type objects and property
+# getters exposing saved values as _saved_* and _raw_saved_* attributes).
+# Main contents: many C++ CodeTemplate constants, get_infos_with_derivatives_list,
+# gen_autograd_functions_lib, gen_autograd_functions_python and process_function.
+# Import-time side effects: none besides imports and building the templates.
+#
 # Generates C++ autograd functions for the derivatives of ATen operations
 #
 # This writes two files:
@@ -520,6 +529,9 @@ UNTRACEABLE_FUNCTIONS = VIEW_FUNCTIONS
 def get_infos_with_derivatives_list(
     differentiability_infos: dict[FunctionSchema, dict[str, DifferentiabilityInfo]],
 ) -> list[DifferentiabilityInfo]:
+    # [FUNCTION DOC] Flattens the nested mapping (schema -> dispatch key name -> info) into one
+    # list of DifferentiabilityInfo and keeps only entries that have at least one argument with a
+    # derivative. Pure; no side effects.
     diff_info_list = [
         info
         for diffinfo_dict in differentiability_infos.values()
@@ -534,6 +546,10 @@ def gen_autograd_functions_lib(
     differentiability_infos: dict[FunctionSchema, dict[str, DifferentiabilityInfo]],
     template_path: str,
 ) -> None:
+    # [FUNCTION DOC] Generates Functions.h and Functions.cpp in the out directory from the
+    # templates in template_path. Renders a declaration and a definition for every info that has
+    # derivatives (via process_function) and writes both files with a generated-comment header.
+    # Side effects: writes two files through FileManager. Returns nothing.
     """Functions.h and Functions.cpp body
 
     These contain the auto-generated subclasses of torch::autograd::Node
@@ -567,6 +583,10 @@ def gen_autograd_functions_python(
     differentiability_infos: dict[FunctionSchema, dict[str, DifferentiabilityInfo]],
     template_path: str,
 ) -> None:
+    # [FUNCTION DOC] Generates the Python binding files for grad_fn classes in the out directory:
+    # python_functions.h (forward declarations and calls of five shard initializer functions) and
+    # python_functions.cpp split into five shards keyed by the info name, each holding type
+    # registrations plus property tables and getters. Side effects: writes files. Returns nothing.
     fm = FileManager(install_dir=out, template_dir=template_path, dry_run=False)
     num_shards = 5
     fm.write(
@@ -610,6 +630,12 @@ def gen_autograd_functions_python(
 
 
 def process_function(info: DifferentiabilityInfo, template: CodeTemplate) -> str:
+    # [FUNCTION DOC] Renders the given C++ template for one backward Node described by info.
+    # Builds index ranges for differentiable inputs, one saved field per saved input/output
+    # (with release, unpack, getter and compiled-autograd collect/before/after snippets chosen by
+    # C++ type), the derivative bodies, thread-lock and retain-variables support, and the
+    # apply-functional signature and schema. Returns the substituted text. Raises an error if a
+    # saved type looks like a non-owning reference or a vector of tensors is not a foreach output.
     saved_variables: list[str] = []
     release_variables: list[str] = []
     saved_list_sizes: list[str] = []
@@ -644,6 +670,11 @@ def process_function(info: DifferentiabilityInfo, template: CodeTemplate) -> str
         input_name_to_idx[arg.name] = idx
 
     def save_var(var: SavedAttribute, is_output: bool) -> None:
+        # [FUNCTION DOC] HELPER: Registers one saved attribute by appending to the enclosing
+        # lists: field declaration, release and unpack code, asserts, Python getter definitions
+        # and getset entries, compiled-args and before/after hooks, and apply-functional argument
+        # and reference type. Handling depends on the C++ type; unknown types without a misc
+        # getter get no Python property. Raises an error for suspected non-owning references.
         name = var.nctype.name
         type = var.nctype.type
         should_append_getsetdef = True
@@ -936,6 +967,11 @@ static PyObject* THP${op}_${name}_getter(THPCppFunction *self, void *_unused) {
         derivative: Derivative,
         args_with_derivatives: Sequence[Binding],
     ) -> tuple[bool, str]:
+        # [FUNCTION DOC] HELPER: Emits the C++ code for one derivative entry. For a single output
+        # variable it wraps the formula so undefined grads yield an empty tensor when the input is
+        # a Tensor (unless not_implemented), using the foreach template for _foreach_ ops. For
+        # several variables it builds the needs-grad condition, optional grad_input_mask and range
+        # copies. Returns a pair: whether the any-grad-defined check was used, and the code text.
         formula = derivative.formula
         var_names = derivative.var_names
 
