@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Gloo-backend c10d tests. DistributedDataParallelSingleProcessTest trains a module
+# with DistributedDataParallel in a single-rank gloo group and compares against a plain copy (cpu,
+# cuda and an LSTM regression case). TestDistributedNNFunctionsGloo runs the shared
+# torch.distributed.nn collective helpers from test_c10d_spawn with gloo plus gloo-only
+# gather/scatter and a subgroup broadcast test. The nn test class is skipped under dev-dbg-asan.
+# Running as a script calls run_tests.
 
 import copy
 import os
@@ -23,7 +29,13 @@ from torch.testing._internal.common_utils import (
 
 
 class DistributedDataParallelSingleProcessTest(TestCase):
+    # [CLASS DOC] Single-process (rank 0, world size 1) test case that checks
+    # DistributedDataParallel over a gloo FileStore process group gives the same parameters as the
+    # same module trained without DDP. State: rank, world_size and the temporary file used by the
+    # store.
     def setUp(self):
+        # [FUNCTION DOC] Runs the base setUp, sets rank 0 and world size 1, and creates a
+        # temporary file (not deleted on close) that is kept in an attribute for the file store.
         super().setUp()
         self.rank = 0
         self.world_size = 1
@@ -31,12 +43,19 @@ class DistributedDataParallelSingleProcessTest(TestCase):
             self.file = f
 
     def tearDown(self):
+        # [FUNCTION DOC] Removes the temporary store file, ignoring OSError. KNOWN ISSUE: does not
+        # call the base tearDown and does not destroy the process group initialized by _test_base.
         try:
             os.remove(self.file.name)
         except OSError:
             pass
 
     def _test_base(self, net, inp, check_allclose=True):
+        # [FUNCTION DOC] HELPER: Inits a single-rank gloo group on a FileStore and wraps a deep
+        # copy of the net in DistributedDataParallel (device id is the current cuda device when
+        # the first input is cuda). Trains both the original and the DDP copy for ten steps with
+        # Adam (lr 0.001) on the same inputs, summing outputs as the loss. Asserts the parameters
+        # are allclose before training, and after training when check_allclose is true.
         store = c10d.FileStore(self.file.name, self.world_size)
         c10d.init_process_group(
             backend="gloo", store=store, rank=self.rank, world_size=self.world_size
@@ -73,16 +92,24 @@ class DistributedDataParallelSingleProcessTest(TestCase):
 
     @requires_gloo()
     def test_cpu(self):
+        # [FUNCTION DOC] Runs the DDP comparison on a small linear layer with cpu input (needs
+        # gloo).
         self._test_base(nn.Linear(2, 2), [torch.randn(30, 2)])
 
     @requires_gloo()
     @skip_but_pass_in_sandcastle_if(not TEST_CUDA, "At least 1 CUDA GPUS needed")
     def test_cuda(self):
+        # [FUNCTION DOC] Runs the DDP comparison on a small linear layer on cuda device 0 (needs
+        # gloo; skipped-but-passing without CUDA).
         self._test_base(nn.Linear(2, 2).to(0), [torch.randn(30, 2).to(0)])
 
     @requires_gloo()
     @skip_but_pass_in_sandcastle_if(not TEST_CUDA, "At least 1 CUDA GPUS needed")
     def test_rnn(self):
+        # [FUNCTION DOC] Regression test for issue 36268: builds a 3-layer LSTM plus linear loss
+        # module on cuda device 0 and runs the DDP comparison without the final parameter
+        # closeness check (known pre-existing parameter inconsistency, issue 37079). Needs gloo
+        # and CUDA.
         # This test is inspired by the bug reported in
         # https://github.com/pytorch/pytorch/issues/36268
         BATCH_SIZE = 12  # Divisible by 2, 3, 4
@@ -93,7 +120,11 @@ class DistributedDataParallelSingleProcessTest(TestCase):
         SEQ_LEN = 100
 
         class Net(nn.Module):
+            # [CLASS DOC] HELPER: Module with an LSTM (batch first) followed by a linear layer
+            # whose forward returns an MSE loss against the target.
             def __init__(self, input_dim, hidden_dim, output_dim, hidden_layers):
+                # [FUNCTION DOC] HELPER: Stores the dimensions and builds the LSTM and the output
+                # linear layer.
                 super().__init__()
                 self.input_dim = input_dim
                 self.hidden_dim = hidden_dim
@@ -106,6 +137,8 @@ class DistributedDataParallelSingleProcessTest(TestCase):
                 self.h2o = nn.Linear(hidden_dim, output_dim)
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Flattens the LSTM parameters, runs the LSTM on x, maps
+                # all hidden states through the linear layer and returns the MSE loss against y.
                 self.lstm.flatten_parameters()
                 h_t, _ = self.lstm(x)
                 output = self.h2o(h_t)
@@ -127,6 +160,9 @@ class DistributedDataParallelSingleProcessTest(TestCase):
 if not TEST_WITH_DEV_DBG_ASAN:
 
     class TestDistributedNNFunctionsGloo(TestDistributedNNFunctions):
+        # [CLASS DOC] Gloo variant of the shared distributed.nn functional test case (2 spawned
+        # processes). Common-op tests only select the "gloo" backend; extra tests cover gather,
+        # scatter and a broadcast on a subgroup. Defined only when not under dev-dbg-asan.
         # Test Common Ops First.
         @requires_gloo()
         @skip_if_lt_x_gpu(2)
@@ -134,6 +170,8 @@ if not TEST_WITH_DEV_DBG_ASAN:
             not _torch_dist_nn_available, "torch.distributed.nn is not available"
         )
         def test_broadcast(self):
+            # [FUNCTION DOC] Shared helper for nn broadcast on "gloo": init a 2-rank group on cuda
+            # devices, check forward values and gradients. Needs 2 GPUs and torch.distributed.nn.
             self._test_broadcast("gloo")
 
         @requires_gloo()
@@ -141,6 +179,11 @@ if not TEST_WITH_DEV_DBG_ASAN:
             not _torch_dist_nn_available, "torch.distributed.nn is not available"
         )
         def test_broadcast_subgroup_with_nonzero_global_src(self):
+            # [FUNCTION DOC] Inits a 2-rank gloo group, then creates a subgroup holding only
+            # global rank 1. On rank 1 only, runs the nn broadcast of a cpu tensor with global
+            # source rank 1 on that subgroup, backpropagates, and checks the gradient is all ones.
+            # Rank 0 does nothing after creating the group. Needs gloo and torch.distributed.nn;
+            # no GPU required.
             store = c10d.FileStore(self.file_name, self.world_size)
             c10d.init_process_group(
                 store=store,
@@ -162,6 +205,8 @@ if not TEST_WITH_DEV_DBG_ASAN:
             not _torch_dist_nn_available, "torch.distributed.nn is not available"
         )
         def test_reduce(self):
+            # [FUNCTION DOC] Shared helper for nn reduce on "gloo": init a 2-rank group on cuda
+            # devices, check forward values and gradients. Needs 2 GPUs and torch.distributed.nn.
             self._test_reduce("gloo")
 
         @requires_gloo()
@@ -170,6 +215,9 @@ if not TEST_WITH_DEV_DBG_ASAN:
             not _torch_dist_nn_available, "torch.distributed.nn is not available"
         )
         def test_allreduce(self):
+            # [FUNCTION DOC] Shared helper for nn all_reduce on "gloo": init a 2-rank group on
+            # cuda devices, check forward values and gradients. Needs 2 GPUs and
+            # torch.distributed.nn.
             self._test_allreduce("gloo")
 
         @requires_gloo()
@@ -178,6 +226,9 @@ if not TEST_WITH_DEV_DBG_ASAN:
             not _torch_dist_nn_available, "torch.distributed.nn is not available"
         )
         def test_all_gather(self):
+            # [FUNCTION DOC] Shared helper for nn all_gather on "gloo": init a 2-rank group on
+            # cuda devices, check forward values and gradients. Needs 2 GPUs and
+            # torch.distributed.nn.
             self._test_all_gather("gloo")
 
         @requires_gloo()
@@ -186,6 +237,9 @@ if not TEST_WITH_DEV_DBG_ASAN:
             not _torch_dist_nn_available, "torch.distributed.nn is not available"
         )
         def test_all_to_all(self):
+            # [FUNCTION DOC] Shared helper for nn all_to_all on "gloo": init a 2-rank group on
+            # cuda devices, check forward values and gradients. Needs 2 GPUs and
+            # torch.distributed.nn.
             self._test_all_to_all("gloo")
 
         @requires_gloo()
@@ -194,6 +248,9 @@ if not TEST_WITH_DEV_DBG_ASAN:
             not _torch_dist_nn_available, "torch.distributed.nn is not available"
         )
         def test_all_to_all_single(self):
+            # [FUNCTION DOC] Shared helper for nn all_to_all_single on "gloo": init a 2-rank group
+            # on cuda devices, check forward values and gradients. Needs 2 GPUs and
+            # torch.distributed.nn.
             self._test_all_to_all_single("gloo")
 
         # Test Ops only supported in GLOO.
@@ -203,6 +260,10 @@ if not TEST_WITH_DEV_DBG_ASAN:
             not _torch_dist_nn_available, "torch.distributed.nn is not available"
         )
         def test_gather(self):
+            # [FUNCTION DOC] Inits a 2-rank gloo group and runs the nn gather to destination rank
+            # 1 on cuda tensors of ones plus rank. On rank 1 checks the i-th gathered tensor is
+            # ones plus i; on rank 0 checks the returned tensors are zeros. Backpropagates the
+            # sine of the stacked sum and checks the gradient is the cosine of three.
             store = c10d.FileStore(self.file_name, self.world_size)
             # This is required because these functions calls directly to the .dist and needs
             # the world to be initialized
@@ -234,6 +295,11 @@ if not TEST_WITH_DEV_DBG_ASAN:
             not _torch_dist_nn_available, "torch.distributed.nn is not available"
         )
         def test_scatter(self):
+            # [FUNCTION DOC] Inits a 2-rank gloo group and runs the nn scatter with source rank 1
+            # of two cuda tensors (ones, ones plus one). Checks rank 0 receives the first and rank
+            # 1 the second, backpropagates the sine sum, and checks gradients: on rank 1 the
+            # cosines of one and two for the two inputs, and on rank 0 its input gradient is
+            # zeros.
             store = c10d.FileStore(self.file_name, self.world_size)
             # This is required because these functions calls directly to the .dist and needs
             # the world to be initialized
