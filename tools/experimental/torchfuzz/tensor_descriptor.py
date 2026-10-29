@@ -1,10 +1,16 @@
 # mypy: ignore-errors
+# [MODULE DOC] Formats tensor and scalar specs as short descriptor strings used in comments of
+# generated programs. Contains one function; no import-time side effects.
 """Utility functions for generating tensor descriptors in code comments."""
 
 from torchfuzz.tensor_fuzzer import ScalarSpec, Spec, TensorSpec
 
 
 def format_tensor_descriptor(spec: Spec) -> str:
+    # [FUNCTION DOC] Return a descriptor string for a spec. A scalar spec gives only its dtype
+    # (with the torch prefix removed). A tensor spec gives size, stride, dtype and the device name
+    # taken from the active device info (imported lazily to avoid a cycle with codegen). Any other
+    # spec type yields the text unknown_spec. No side effects.
     """
     Format a tensor or scalar spec as a descriptor comment.
 

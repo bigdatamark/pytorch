@@ -1,4 +1,10 @@
 # mypy: ignore-errors
+# [MODULE DOC] Random tensor and scalar generation for the fuzzer. Defines the global fuzzer
+# configuration class, the TensorSpec and ScalarSpec named tuples and the Spec alias, functions
+# that fuzz dtypes, sizes and strides (contiguous, transposed, gapped, overlapping, dense but
+# non-contiguous and so on), functions that materialize strided tensors and Python scalars from
+# specs using seeded, state-preserving random generation, and a spec compatibility check. No
+# import-time side effects beyond imports.
 import random
 from typing import NamedTuple, TypeAlias
 
@@ -7,6 +13,11 @@ import torch
 
 # Global configuration for tensor fuzzing
 class FuzzerConfig:
+    # [CLASS DOC] Holder of process-wide class attributes (never instantiated) that control tensor
+    # fuzzing: whether generated values are random or constant, and whether complex dtypes are
+    # avoided. Read by the tensor and scalar generators; callers mutate it directly.
+    # KNOWN ISSUE: the comment on the first attribute says false means zeros, but the generator
+    # fills with ones in that case.
     """Global configuration for tensor fuzzing behavior."""
 
     use_real_values: bool = True  # If False, use zeros; if True, use random values
@@ -14,6 +25,8 @@ class FuzzerConfig:
 
 
 class TensorSpec(NamedTuple):
+    # [CLASS DOC] Immutable description of a tensor: size tuple, stride tuple and dtype. Used as
+    # the type of values flowing between operators in the generated graph.
     """Specification for a tensor argument."""
 
     size: tuple[int, ...]
@@ -22,6 +35,8 @@ class TensorSpec(NamedTuple):
 
 
 class ScalarSpec(NamedTuple):
+    # [CLASS DOC] Immutable description of a Python scalar: a dtype and an optional constant. When
+    # the constant is set it is used verbatim instead of a random value; default is none.
     """Specification for a scalar argument."""
 
     dtype: torch.dtype
@@ -34,6 +49,9 @@ Spec: TypeAlias = TensorSpec | ScalarSpec
 
 
 def fuzz_torch_tensor_type(template: str = "default") -> torch.dtype:
+    # [FUNCTION DOC] Return a random dtype chosen uniformly from the supported dtypes of the named
+    # template (the template is built lazily to avoid an import cycle with codegen). Consumes
+    # global random state. Errors from building the template propagate.
     """
     Fuzzes PyTorch tensor data types by randomly selecting and returning different dtypes.
 
@@ -53,6 +71,12 @@ def fuzz_torch_tensor_type(template: str = "default") -> torch.dtype:
 
 
 def fuzz_tensor_size(max_dims: int = 3, max_size_per_dim: int = 30) -> tuple[int, ...]:
+    # [FUNCTION DOC] Return a random shape tuple. The dimension count is uniform from 0 to
+    # max_dims (zero gives the empty tuple). Each dimension is 0 with probability 0.05, 1 with
+    # probability 0.15, otherwise uniform from 2 to max_size_per_dim. Consumes global random
+    # state.
+    # KNOWN ISSUE: the docstring states defaults of 6 and 100 and a 10 percent singleton chance,
+    # but the actual defaults are 3 and 30 and the singleton chance is 15 percent.
     """
     Fuzzes PyTorch tensor sizes by generating random tensor shapes.
 
@@ -97,6 +121,14 @@ def fuzz_tensor_size(max_dims: int = 3, max_size_per_dim: int = 30) -> tuple[int
 
 
 def fuzz_valid_stride(size: tuple[int, ...]) -> tuple[int, ...]:
+    # [FUNCTION DOC] Return a stride tuple for the given size (empty for an empty size). One of
+    # eight styles is chosen uniformly: contiguous (listed twice, so more likely), transposed
+    # (two strides swapped), gapped (about 30 percent of non-empty dimensions scaled by 2 to 5),
+    # all ones, dense but non-contiguous (via the helper), overlapping (about 40 percent of
+    # dimensions larger than 1 given stride zero), and sparse (every dimension larger than 1
+    # scaled by 10 to 100). Consumes global random state.
+    # KNOWN ISSUE: the dense non-contiguous and transposed styles can coincide with the
+    # contiguous layout, e.g. when swapped dimensions have size 1.
     """
     Fuzzes PyTorch tensor strides by generating valid stride patterns for a given size.
 
@@ -188,6 +220,9 @@ def fuzz_valid_stride(size: tuple[int, ...]) -> tuple[int, ...]:
 
 
 def _compute_contiguous_strides(size: tuple[int, ...]) -> list[int]:
+    # [FUNCTION DOC] HELPER: Return the row-major strides list for a size tuple: the last
+    # dimension has stride 1 and each earlier stride is the product of later sizes, where a
+    # zero-sized dimension contributes nothing to the running product. Pure.
     """
     Helper function to compute standard contiguous strides for a given size.
 
@@ -211,6 +246,15 @@ def _compute_contiguous_strides(size: tuple[int, ...]) -> list[int]:
 
 
 def _compute_non_contiguous_dense_strides(size: tuple[int, ...]) -> list[int]:
+    # [FUNCTION DOC] HELPER: Return a dense, non-overlapping stride list for the size. For zero or
+    # one dimension it equals the contiguous strides. Otherwise a pattern is chosen at random:
+    # column-major (strides accumulate left to right), a permuted order (dimensions ranked by
+    # size, with zero-sized last), or middle-out (strides assigned starting at the middle
+    # dimension and alternating left and right). Zero-sized dimensions do not grow the running
+    # product. Consumes global random state.
+    # KNOWN ISSUE: the permuted pattern shuffles indices but then sorts them by size, so the
+    # result depends only on the sizes (ties keep the shuffled order); it is not a uniformly
+    # random permutation. Result may equal the contiguous layout.
     """
     Helper function to compute non-contiguous but dense strides (e.g., column-major order).
 
@@ -304,6 +348,9 @@ def _compute_non_contiguous_dense_strides(size: tuple[int, ...]) -> list[int]:
 def _compute_storage_size_needed(
     size: tuple[int, ...], strides: tuple[int, ...]
 ) -> int:
+    # [FUNCTION DOC] HELPER: Return the number of storage elements needed to back a strided view:
+    # 1 for an empty size, otherwise 1 plus the sum over dimensions larger than 1 of the
+    # (size minus one) times the absolute stride. Pure.
     """Compute minimum storage size needed for given shape and strides."""
     if not size:
         return 1
@@ -323,6 +370,15 @@ def fuzz_tensor(
     dtype: torch.dtype | None = None,
     seed: int | None = None,
 ) -> tuple[torch.Tensor, int]:
+    # [FUNCTION DOC] Return a pair of (tensor, seed used). A missing seed is drawn at random. A
+    # local generator seeded with it replaces the global Python random state, and the torch seed
+    # is set, so missing size, dtype (default template) and stride are drawn reproducibly; both
+    # global states are restored afterwards, even on error. An empty size returns a scalar tensor
+    # of ones. Otherwise a flat buffer of the needed storage size is filled: standard normal
+    # values for floats, normal real and imaginary parts for complex, random bits for bool,
+    # random integers from -100 (0 for unsigned types) up to 99 for integers, or ones when the
+    # config disables real values; the result is a strided view of that buffer.
+    # KNOWN ISSUE: the empty-size shortcut returns ones regardless of the real-values config.
     """
     Create a tensor with fuzzed size, stride, and dtype.
 
@@ -417,6 +473,9 @@ def fuzz_tensor_simple(
     dtype: torch.dtype | None = None,
     seed: int | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Call the full tensor generator and return only the tensor, dropping the seed.
+    # KNOWN ISSUE: the docstring says that no seed means the current random state is used, but
+    # the underlying function draws a fresh random seed instead.
     """
     Convenience function that returns just the tensor without the seed.
 
@@ -436,6 +495,12 @@ def fuzz_tensor_simple(
 def fuzz_non_contiguous_dense_tensor(
     size: tuple[int, ...] | None = None, dtype: torch.dtype | None = None
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Return a tensor whose layout is dense and non-overlapping but intended to be
+    # non-contiguous. Missing dtype and size are fuzzed. Zero or one dimension just gives an
+    # ordinary fuzzed tensor. Otherwise one of three patterns is picked: the dense helper twice
+    # (column-major and permuted) or a swap of the last two contiguous strides. Consumes global
+    # random state.
+    # KNOWN ISSUE: the result can still be contiguous (e.g. swapped dimensions of size 1).
     """
     Specifically generates tensors that are non-contiguous but dense and non-overlapping.
 
@@ -482,6 +547,12 @@ def fuzz_non_contiguous_dense_tensor(
 
 
 def fuzz_scalar(spec, seed: int | None = None) -> float | int | bool | complex:
+    # [FUNCTION DOC] Return a Python scalar for a scalar spec. A set constant is returned as is.
+    # Otherwise, using a temporarily seeded global generator (state restored afterwards) when a
+    # seed is given, or the current state if not: floats are uniform in -10 to 10, complex values
+    # have such real and imaginary parts, bool is a random choice, other types are integers from
+    # -10 to 10. Raises ValueError for complex dtypes when the config avoids complex.
+    # KNOWN ISSUE: integers can be negative even for unsigned dtypes.
     """
     Create a Python scalar value from a ScalarSpec.
 

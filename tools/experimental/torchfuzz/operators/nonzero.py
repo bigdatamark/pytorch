@@ -1,3 +1,7 @@
+# [MODULE DOC] Fuzzer operator for torch.nonzero. Defines NonzeroOperator, which produces 2D int64
+# outputs (count, ndim) by generating code that builds a bool tensor with exactly the requested
+# number of True entries. No import-time side effects besides imports; the operator is picked up
+# by the registry through module introspection.
 """Nonzero operator implementation."""
 
 import torch
@@ -6,17 +10,25 @@ from torchfuzz.tensor_fuzzer import Spec, TensorSpec
 
 
 class NonzeroOperator(Operator):
+    # [CLASS DOC] Operator that produces the index matrix of nonzero elements. Stateless apart from
+    # the registry name "nonzero" set in the base class. Output shape is (k, d): k nonzero entries
+    # of a d-dimensional input. Key methods: can_produce, fuzz_inputs_specs, codegen.
     """Operator for finding nonzero elements in a tensor."""
 
     def __init__(self):
+        # [FUNCTION DOC] Initialize the operator with the registry name "nonzero".
         super().__init__("nonzero")
 
     @property
     def torch_op_name(self) -> str | None:
+        # [FUNCTION DOC] Property returning the fully-qualified torch op name, the string
+        # "torch.nonzero".
         """Return the torch operation name."""
         return "torch.nonzero"
 
     def can_produce(self, output_spec: Spec) -> bool:
+        # [FUNCTION DOC] Return True only if output_spec is a tensor spec with int64 dtype and
+        # exactly two dimensions. Pure check, no side effects, no exceptions.
         """Nonzero produces a tensor with shape (n_nonzero, n_dims).
 
         We can deterministically synthesize inputs to match any 2D int64 output
@@ -30,6 +42,9 @@ class NonzeroOperator(Operator):
         )
 
     def fuzz_inputs_specs(self, output_spec: Spec, num_inputs: int = 1) -> list[Spec]:
+        # [FUNCTION DOC] Build the single input spec: a bool tensor with as many dimensions as the
+        # output's second size entry (all sizes and strides 1, or a scalar shape when zero).
+        # num_inputs is ignored. Raises ValueError if output_spec is not a tensor spec.
         """Generate input spec for nonzero operation.
 
         The actual values will be synthesized in codegen to achieve the target size.
@@ -50,6 +65,12 @@ class NonzeroOperator(Operator):
     def codegen(
         self, output_name: str, input_names: list[str], output_spec: Spec
     ) -> str:
+        # [FUNCTION DOC] Return the source text assigning output_name. The text allocates a
+        # zero-filled bool tensor of shape (k, 1, ...) on the device of the given input, marks the
+        # first k flattened entries True, then calls torch.nonzero. Raises ValueError unless there
+        # is exactly one input name and the output is a 2D tensor spec.
+        # KNOWN ISSUE: when k is larger than one and d is zero the flattened tensor has a single
+        # element, so the result cannot have k rows; the requested shape is not guaranteed there.
         """Generate code for nonzero using synthesized input to match target size.
 
         No data-dependent conditionals/guards. Constructs an input with exactly

@@ -1,4 +1,10 @@
 # mypy: ignore-errors
+# [MODULE DOC] Random operation-graph generator for the fuzzer. Defines a cached, template-filtered
+# view of the operator registry, data classes for graph nodes and graphs (with topological
+# ordering and dependency queries), functions that pick a random spec, pick an operator able to
+# produce a spec, and recursively build a whole graph for a target spec. Module state: a cache of
+# the operator registry and a counter for unique argument names. Import-time side effects: none
+# beyond imports.
 
 import random
 from dataclasses import dataclass
@@ -22,6 +28,9 @@ _CACHED_OPERATORS = None
 
 
 def _get_cached_operators():
+    # [FUNCTION DOC] HELPER: Return the mapping of operator names to operators from the registry,
+    # fetching it on first use and caching it in a module-level variable thereafter (so later
+    # registrations are not seen).
     """Get cached operators, initializing if necessary."""
     global _CACHED_OPERATORS
     if _CACHED_OPERATORS is None:
@@ -32,6 +41,12 @@ def _get_cached_operators():
 def _get_template_filtered_operators(
     template: str = "default", supported_ops: list[str] | None = None
 ):
+    # [FUNCTION DOC] HELPER: Build the template object by name and return the mapping of operators
+    # allowed for it. The allowed list is the explicit supported_ops argument if non-empty, else
+    # the template's list; if both are empty every cached operator is returned. Otherwise an
+    # operator is kept if it has no torch op name, if its torch op name equals an allowed entry,
+    # or if either its registry name or an allowed entry is a substring of the other. Every
+    # returned operator that has a set_template method receives the template (mutation).
     """Get operators filtered by template's supported_ops, with user override.
 
     If supported_ops is provided, it takes precedence and is used to filter the
@@ -92,6 +107,9 @@ def _get_template_filtered_operators(
 
 @dataclass
 class OperationNode:
+    # [CLASS DOC] Data class for one node of the operation graph: its unique id, operation name,
+    # the input specs the operation needs, the output spec it produces, the ids of the nodes that
+    # supply its inputs, and its depth in the generation tree. Leaf nodes have no input nodes.
     """
     Represents a node in the operation graph.
 
@@ -112,12 +130,15 @@ class OperationNode:
     depth: int
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Return a one-line description: node id, operation name, output spec and
+        # depth.
         """String representation for debugging."""
         return (
             f"{self.node_id}: {self.op_name} -> {self.output_spec} (depth {self.depth})"
         )
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Return a constructor-style description listing all fields of the node.
         """Detailed representation for debugging."""
         return (
             f"OperationNode(node_id='{self.node_id}', op_name='{self.op_name}', "
@@ -128,6 +149,10 @@ class OperationNode:
 
 @dataclass
 class OperationGraph:
+    # [CLASS DOC] Data class for a directed acyclic graph of operation nodes. Fields: mapping of
+    # node id to node, the id of the root (output) node, and the target spec the root must
+    # produce. Invariant checked at construction: the root id exists in the mapping. Provides
+    # topological ordering, leaf lookup and transitive dependency lookup.
     """
     Represents a graph of operations.
 
@@ -142,11 +167,16 @@ class OperationGraph:
     target_spec: Spec
 
     def __post_init__(self):
+        # [FUNCTION DOC] Raise ValueError if the root node id is not a key of the node mapping.
         """Validate the graph structure after initialization."""
         if self.root_node_id not in self.nodes:
             raise ValueError(f"Root node {self.root_node_id} not found in nodes")
 
     def get_topological_order(self) -> list[str]:
+        # [FUNCTION DOC] Return all node ids ordered so each node follows the nodes it takes
+        # inputs from, using a depth-first traversal over every node in insertion order (so
+        # disconnected parts are included). Input ids not present in the mapping are skipped.
+        # Raises ValueError if a cycle is found. Does not modify the graph.
         """
         Get nodes in topological order (dependencies before dependents).
 
@@ -158,6 +188,9 @@ class OperationGraph:
         result = []
 
         def visit(node_id: str):
+            # [FUNCTION DOC] HELPER: Depth-first visit that appends node_id to the result after
+            # its inputs; skips finished nodes and raises ValueError when revisiting a node that
+            # is still in progress (cycle). Mutates the enclosing visited sets and result list.
             if node_id in temp_visited:
                 raise ValueError(f"Cycle detected involving node {node_id}")
             if node_id in visited:
@@ -183,15 +216,23 @@ class OperationGraph:
         return result
 
     def get_leaf_nodes(self) -> list[str]:
+        # [FUNCTION DOC] Return the ids of nodes whose input node list is empty, in mapping order.
         """Get all leaf nodes (nodes with no inputs)."""
         return [node_id for node_id, node in self.nodes.items() if not node.input_nodes]
 
     def get_node_dependencies(self, node_id: str) -> list[str]:
+        # [FUNCTION DOC] Return the ids of all nodes the given node depends on, found by a
+        # depth-first walk over input node ids. Ids are appended as they are encountered, so a
+        # node reachable by several paths can appear more than once (expansion of a node is done
+        # once). An id not in the mapping yields an empty list.
+        # KNOWN ISSUE: the docstring says transitive closure, but duplicates are possible.
         """Get all nodes that this node depends on (transitive closure)."""
         visited = set()
         dependencies = []
 
         def collect_deps(current_id: str):
+            # [FUNCTION DOC] HELPER: Recursively expand a node once, appending each of its input
+            # ids to the enclosing dependency list before descending into it. Ignores unknown ids.
             if current_id in visited or current_id not in self.nodes:
                 return
             visited.add(current_id)
@@ -205,6 +246,8 @@ class OperationGraph:
         return dependencies
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Return a multi-line description: a header with root and target, then one
+        # line per node in topological order showing its input node ids when it has any.
         """String representation for debugging."""
         lines = [
             f"OperationGraph (root: {self.root_node_id}, target: {self.target_spec})"
@@ -217,6 +260,12 @@ class OperationGraph:
 
 
 def fuzz_spec(template: str = "default") -> Spec:
+    # [FUNCTION DOC] Return a random spec. First tries the named template's own spec generator;
+    # on any exception it falls back to a random dtype for the template and, with probability
+    # 0.2, a scalar spec, else a tensor spec with random size and a valid stride. Consumes global
+    # random state.
+    # KNOWN ISSUE: the broad exception handler also hides real errors raised inside the
+    # template's generator, silently switching to the fallback distribution.
     """
     Generate a random Spec (either TensorSpec or ScalarSpec) using template's distribution preferences.
 
@@ -258,6 +307,17 @@ def fuzz_op(
     template: str = "default",
     supported_ops: list[str] | None = None,
 ) -> tuple[str, list[Spec]]:
+    # [FUNCTION DOC] Choose an operator able to produce target_spec and return its name with the
+    # input specs it needs. Steps: get the template-filtered operators; keep those whose
+    # can_produce accepts the spec, iterating in sorted name order and then shuffling with the
+    # global random generator; split into leaf (constant, arg) and other operators. At depth 0
+    # only leaf operators are drawn (or a fresh unique arg name if none exist). At higher depth,
+    # when stack_size is below 10 or depth exceeds 7 and non-leaf operators exist, pick non-leaf
+    # with probability 0.8, else leaf; otherwise draw over all. Draws are weighted by each
+    # operator's get_weight. A missing operator falls back to a fresh arg name. Raises ValueError
+    # if no operator can produce the spec. Consumes random state and may mutate operators.
+    # KNOWN ISSUE: the final fallback returns the plain name arg (not a unique arg_N name).
+    # KNOWN ISSUE: the docstring does not list the template and supported_ops parameters.
     """
     Given an output specification, returns an operation that can
     produce a tensor with that layout using the operator class system.
@@ -397,6 +457,9 @@ _next_arg_id = 0
 
 
 def _get_arg_args_specs(target_spec: Spec) -> tuple[str, list[Spec]]:
+    # [FUNCTION DOC] HELPER: Return a fresh operation name made of the arg prefix and the next
+    # value of a module-level counter (which it increments), plus an empty input spec list. The
+    # target spec is unused.
     """Get argument specifications for arg operation."""
     global _next_arg_id
 
@@ -415,6 +478,13 @@ def fuzz_operation_graph(
     template: str = "default",
     supported_ops: list[str] | None = None,
 ) -> OperationGraph:
+    # [FUNCTION DOC] Build an operation graph whose root produces target_spec. If a seed is given,
+    # seed the Python and torch random generators and reset the argument counter. Then
+    # recursively create nodes: choose an operation for a spec, give it a new sequential node
+    # id, create nodes for each of its input specs at one lower depth (not below zero) and a
+    # growing stack size, and record the node. Finally verify the root's output spec is compatible
+    # with the target. Raises ValueError on an incompatible root or when no operator can produce
+    # some spec. Side effects: global random seeds and the argument counter.
     """
     Generate a graph of operations that produces the target specification.
 
@@ -448,6 +518,9 @@ def fuzz_operation_graph(
     nodes: dict[str, OperationNode] = {}
 
     def _generate_node(spec: Spec, depth: int, stack_size: int = 0) -> str:
+        # [FUNCTION DOC] HELPER: Pick an operation for spec, allocate the next node id, recurse
+        # into each input spec, store the finished node in the enclosing mapping, and return its
+        # id. Updates the enclosing node counter and mapping.
         """
         Generate a node for the given spec and return its node_id.
         """
