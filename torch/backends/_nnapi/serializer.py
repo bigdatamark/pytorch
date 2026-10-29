@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Serializer converting a frozen TorchScript model into the binary NNAPI model format.
+# Contains NNAPI constant tables (operand, operation and fuse codes), small Operand/shape helpers,
+# and _NnapiSerializer, which maps supported aten/quantized ops to NNAPI operands and operations
+# and also emits TorchScript lines that compute flexible (load-time dynamic) shapes.
+# Import-time side effect: creates the logger named nnapi_serialize.
 import array
 import enum
 import functools
@@ -19,6 +24,7 @@ LOG = logging.getLogger("nnapi_serialize")
 
 
 class NNAPI_OperandCode:
+    # [CLASS DOC] HELPER: Constants mirroring the NNAPI operand type codes (scalars, tensors, quantized tensor variants).
     FLOAT32 = 0
     INT32 = 1
     UINT32 = 2
@@ -35,6 +41,7 @@ class NNAPI_OperandCode:
 
 
 class NNAPI_OperationCode:
+    # [CLASS DOC] HELPER: Constants mirroring the NNAPI operation codes (ADD, CONV_2D, ... RESIZE_NEAREST_NEIGHBOR).
     ADD = 0
     AVERAGE_POOL_2D = 1
     CONCATENATION = 2
@@ -133,6 +140,7 @@ class NNAPI_OperationCode:
 
 
 class NNAPI_FuseCode:
+    # [CLASS DOC] HELPER: Constants for NNAPI fused activation codes (none, relu, relu1, relu6).
     FUSED_NONE = 0
     FUSED_RELU = 1
     FUSED_RELU1 = 2
@@ -140,6 +148,7 @@ class NNAPI_FuseCode:
 
 
 class OperandValueSourceType:
+    # [CLASS DOC] HELPER: Constants for where an operand's constant value lives: immediate bytes, numbered buffer or numbered memory.
     IMMEDIATE = 0
     NUMBERED_BUFFER = 2
     NUMBERED_MEMORY = 3
@@ -150,14 +159,18 @@ class OperandValueSourceType:
 # AT_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_QINTS.
 # TODO: Expose these directly to Python to avoid maintaining this list.
 class TorchScalarTypes(enum.Enum):
+    # [CLASS DOC] HELPER: Enum of the PyTorch scalar type codes referenced explicitly in models (only QUINT8); must match the C++ scalar type list.
     QUINT8 = 13
 
 
 def approx_equal(lhs, rhs, tolerance=1e-6):
+    # [FUNCTION DOC] HELPER: Return whether two numbers differ by at most tolerance times the smaller of the two (relative comparison).
     return abs(lhs - rhs) <= tolerance * min(lhs, rhs)
 
 
 def tensor_size(op_type, dims):
+    # [FUNCTION DOC] HELPER: Compute the byte size of a tensor operand from its NNAPI operand code and dimension list (item size times product of dims).
+    # Raises a lookup error for operand codes without a known item size.
     ITEM_SIZES = {
         NNAPI_OperandCode.TENSOR_FLOAT32: 4,
         NNAPI_OperandCode.TENSOR_INT32: 4,
@@ -172,12 +185,14 @@ def tensor_size(op_type, dims):
 
 
 def change_element(tup, index, value):
+    # [FUNCTION DOC] HELPER: Return a copy of a tuple with the element at the given index replaced by value; the input is not mutated.
     ls = list(tup)
     ls[index] = value
     return tuple(ls)
 
 
 class ConvPoolArgs2d(NamedTuple):
+    # [CLASS DOC] HELPER: Named tuple of 2D convolution or pooling parameters: kernel, stride, four paddings (top, bottom, left, right), dilation and group.
     """Configuration arguments for a convolution."""
 
     kernel_h: int
@@ -194,6 +209,8 @@ class ConvPoolArgs2d(NamedTuple):
 
 
 class DimOrder(enum.Enum):
+    # [CLASS DOC] HELPER: Enum of how an operand's NNAPI layout relates to the tracked PyTorch NCHW shape: presumed contiguous, channels last (NHWC),
+    # scalar or vector, or unknown constant. The numeric values are also used by prepare.py as memory format codes.
     PRESUMED_CONTIGUOUS = 0
     CHANNELS_LAST = 1
     SCALAR_OR_VECTOR = 2
@@ -201,6 +218,8 @@ class DimOrder(enum.Enum):
 
 
 class Operand(NamedTuple):
+    # [CLASS DOC] HELPER: Named tuple describing an NNAPI operand: operand type code, PyTorch-order shape (0 means load-time dynamic dim, -1 runtime
+    # dynamic dim), dimension order, and quantization scale and zero point. Method use_nchw reports whether the NNAPI layout equals the PyTorch layout.
     """Representation of an NNAPI operand."""
 
     # NNAPI operand type.  One of NNAPI_OperandCode.
@@ -225,6 +244,7 @@ class Operand(NamedTuple):
     zero_point: int
 
     def use_nchw(self):
+        # [FUNCTION DOC] HELPER: Return True for presumed-contiguous operands, False for channels-last; raises a generic exception for any other dim order.
         if self.dim_order is DimOrder.PRESUMED_CONTIGUOUS:
             return True
         if self.dim_order is DimOrder.CHANNELS_LAST:
@@ -233,6 +253,8 @@ class Operand(NamedTuple):
 
 
 def broadcast_shapes(shape1, shape2):
+    # [FUNCTION DOC] HELPER: Compute the broadcast of two non-empty shapes of equal rank, returning a tuple. Dimensions of size 1 take the other size;
+    # mismatched sizes raise an exception. Different ranks raise an exception (not supported yet). Raises AssertionError for empty shapes.
     if len(shape1) <= 0:
         raise AssertionError(f"shape1 must have length > 0, got {len(shape1)}")
     if len(shape2) <= 0:
@@ -268,6 +290,9 @@ def broadcast_shapes(shape1, shape2):
 
 
 def get_conv_pool_shape(image_shape, args, out_ch, transpose):
+    # [FUNCTION DOC] HELPER: Compute the NCHW output shape of a conv/pool/transposed-conv given the image shape, ConvPoolArgs2d, output channels and a transpose flag.
+    # Raises an exception if dilation is not 1. Zero (flexible) input height or width yields zero output size.
+    # KNOWN ISSUE: the transposed width computation subtracts pad_l twice instead of pad_l and pad_r (likely a typo).
     batch, _in_c, in_h, in_w = image_shape
 
     # TODO: Handle dilation
@@ -292,6 +317,8 @@ def get_conv_pool_shape(image_shape, args, out_ch, transpose):
 
 
 def fix_shape(shape, dim_order):
+    # [FUNCTION DOC] HELPER: Convert a PyTorch shape to the actual NNAPI operand shape for a dim order: unchanged for contiguous, scalar/vector (must have rank
+    # 0 or 1) and unknown constants; for channels-last move the channel dim to the end. Raises on an unknown dim order.
     # Return the actual shape that an operand should have in NNAPI,
     # given a PyTorch shape and dimension order.  This is where we
     # convert from PyTorch's "always NCHW" shape to explicit NHWC.
@@ -312,6 +339,8 @@ def fix_shape(shape, dim_order):
 
 
 def reverse_map_dim(dim_order, d):
+    # [FUNCTION DOC] HELPER: Map a dimension index as seen by NNAPI back to the original PyTorch dimension index (identity except channels-last, which uses a fixed permutation).
+    # Raises AssertionError for other dim orders.
     # Return the original PyTorch dimension position for a given dimension.
     # d should be the dimension that NNAPI will see.
     # reverse_map_dim(PRESUMED_CONTIGUOUS, x) == x
@@ -324,13 +353,19 @@ def reverse_map_dim(dim_order, d):
 
 
 def flex_name(op_id, dim):
+    # [FUNCTION DOC] HELPER: Return the generated local variable name holding the computed flexible size for a given operand id and dimension.
     # Return the local variable name for the computed flexible size
     # for a given op and dimension.
     return f"s_{op_id}_{dim}"
 
 
 class _NnapiSerializer:
+    # [CLASS DOC] HELPER: Walks a frozen TorchScript graph and builds an NNAPI model description. State: operands, constant values and their data,
+    # operations and flattened operation args, input and output operand ids, mappings from JIT values to operand ids, constants, tensor sequences and
+    # cached immediates, used weights, and generated lines that compute flexible shapes at load time. Entry point is serialize_model, which dispatches
+    # each graph node through ADDER_MAP to an add_* handler and returns the packed int32 model plus metadata. Unsupported node kinds raise exceptions.
     def __init__(self, config, use_int16_for_qint16=False):
+        # [FUNCTION DOC] HELPER: Initialize empty serializer state; use_int16_for_qint16 lets int16 tensors stand in for NNAPI 16-bit quantized types. The config argument is accepted but unused.
         self.operands = []
         self.values = []
         self.operations = []
@@ -353,12 +388,14 @@ class _NnapiSerializer:
             config = {}
 
     def get_next_operand_id(self):
+        # [FUNCTION DOC] HELPER: Return the id the next appended operand will get (current operand count).
         return len(self.operands)
 
     # Add a tensor operand corresponding to a JIT Value.
     # Returns the NNAPI operand ID.  Can be looked up later with
     # get_tensor_operand_by_jitval.
     def add_tensor_operand(self, jitval, oper):
+        # [FUNCTION DOC] HELPER: Register an Operand for a JIT value and return its new operand id. Raises AssertionError if oper is not an Operand and an exception on a duplicate JIT value.
         if not isinstance(oper, Operand):
             raise AssertionError(f"expected Operand, got {type(oper)}")
         if jitval in self.jitval_operand_map:
@@ -373,6 +410,7 @@ class _NnapiSerializer:
     # Useful for cases where multiple NNAPI operands are required
     # to implement one JIT IR node.  Returns the NNAPI operand ID.
     def add_anonymous_tensor_operand(self, oper):
+        # [FUNCTION DOC] HELPER: Append an Operand not tied to any JIT value (for intermediate operands) and return its id. Raises AssertionError if oper is not an Operand.
         if not isinstance(oper, Operand):
             raise AssertionError(f"expected Operand, got {type(oper)}")
         operand_id = self.get_next_operand_id()
@@ -380,6 +418,9 @@ class _NnapiSerializer:
         return operand_id
 
     def torch_tensor_to_operand(self, tensor, dim_order):
+        # [FUNCTION DOC] HELPER: Build an Operand from a torch tensor and dim order, mapping dtype to an NNAPI operand code (float32, int32, quint8, qint32 with zero
+        # zero-point, and int16 only when use_int16_for_qint16 is set and the tensor carries an nnapi_dtype attribute with scale and zero point).
+        # Raises exceptions for unsupported dtypes or int16 misuse; raises AssertionError for a nonzero qint32 zero point.
         dtype = str(tensor.dtype).replace("torch.", "")
         scale = 0.0
         zero_point = 0
@@ -431,6 +472,8 @@ class _NnapiSerializer:
         )
 
     def add_tensor_operand_for_input(self, arg_idx, jitval, tensor):
+        # [FUNCTION DOC] HELPER: Register a model input tensor as an operand (channels last if the tensor has a true nnapi_nhwc attribute), append it to the input list
+        # and, for each zero-size dimension, record a shape computation line reading it from the runtime argument shape. Returns the operand id.
         dim_order = (
             DimOrder.CHANNELS_LAST
             if getattr(tensor, "nnapi_nhwc", False)
@@ -449,6 +492,8 @@ class _NnapiSerializer:
     def add_tensor_operand_for_weight(
         self, tensor, dim_order=DimOrder.UNKNOWN_CONSTANT
     ):
+        # [FUNCTION DOC] HELPER: Register a constant weight tensor as an operand whose data lives in a numbered buffer. Records the value source and a packed
+        # (buffer number, offset, size) entry; permutes channels-last weights to NHWC before storing in used_weights. Returns the operand id.
         toper = self.torch_tensor_to_operand(tensor, dim_order)
         operand_id = len(self.operands)
         self.operands.append(toper)
@@ -464,6 +509,8 @@ class _NnapiSerializer:
         return operand_id
 
     def add_immediate_operand(self, code, value, dims):
+        # [FUNCTION DOC] HELPER: Add (or reuse from a cache keyed by code and value) an immediate operand with inline bytes of the given type code and dims. Dims must be a tuple
+        # (AssertionError otherwise). Returns the operand id.
         if not isinstance(dims, tuple):
             raise AssertionError(f"dims must be a tuple, got {type(dims)}")
         cache_key = (code, value)
@@ -476,21 +523,25 @@ class _NnapiSerializer:
         return self.cached_immediates[cache_key]
 
     def add_immediate_int_scalar(self, value):
+        # [FUNCTION DOC] HELPER: Add a cached int32 scalar immediate operand; returns its operand id.
         return self.add_immediate_operand(
             NNAPI_OperandCode.INT32, struct.pack("i", value), ()
         )
 
     def add_immediate_float_scalar(self, value):
+        # [FUNCTION DOC] HELPER: Add a cached float32 scalar immediate operand; returns its operand id.
         return self.add_immediate_operand(
             NNAPI_OperandCode.FLOAT32, struct.pack("f", value), ()
         )
 
     def add_immediate_bool_scalar(self, value):
+        # [FUNCTION DOC] HELPER: Add a cached boolean scalar immediate operand; returns its operand id.
         return self.add_immediate_operand(
             NNAPI_OperandCode.BOOL, b"\x01" if value else b"\x00", ()
         )
 
     def add_immediate_int_vector(self, value):
+        # [FUNCTION DOC] HELPER: Add a cached int32 vector immediate operand from a sequence of ints; returns its operand id.
         return self.add_immediate_operand(
             NNAPI_OperandCode.TENSOR_INT32,
             array.array("i", value).tobytes(),
@@ -498,13 +549,16 @@ class _NnapiSerializer:
         )
 
     def has_operand_for_jitval(self, jitval):
+        # [FUNCTION DOC] HELPER: Return whether the JIT value already has an operand.
         return jitval in self.jitval_operand_map
 
     def get_tensor_operand_by_jitval(self, jitval):
+        # [FUNCTION DOC] HELPER: Return the (operand id, Operand) pair for a JIT value; raises a lookup error if none exists.
         operand_id = self.jitval_operand_map[jitval]
         return (operand_id, self.operands[operand_id])
 
     def get_tensor_operand_by_jitval_fixed_size(self, jitval):
+        # [FUNCTION DOC] HELPER: Like get_tensor_operand_by_jitval but raises an exception if any dimension is zero (load-time flexible); logs a warning for runtime-flexible (negative) dims.
         op_id, oper = self.get_tensor_operand_by_jitval(jitval)
         for s in oper.shape:
             if s == 0:
@@ -521,6 +575,7 @@ class _NnapiSerializer:
     def get_tensor_operand_or_constant(
         self, jitval, dim_order=DimOrder.PRESUMED_CONTIGUOUS
     ):
+        # [FUNCTION DOC] HELPER: Return (id, Operand) for a JIT value, or if it has no operand, treat it as a constant tensor and register it as a weight operand with the given dim order.
         operand_id = self.jitval_operand_map.get(jitval)
         if operand_id is None:
             _, value = self.get_constant_value(jitval, "TensorType")
@@ -528,25 +583,30 @@ class _NnapiSerializer:
         return (operand_id, self.operands[operand_id])
 
     def get_tensor_operand_for_weight(self, jitval):
+        # [FUNCTION DOC] HELPER: Look up a JIT value as a TensorType constant and register it as a weight operand; returns (id, Operand).
         _, value = self.get_constant_value(jitval, "TensorType")
         operand_id = self.add_tensor_operand_for_weight(value)
         return (operand_id, self.operands[operand_id])
 
     def add_operation(self, opcode, inputs, outputs):
+        # [FUNCTION DOC] HELPER: Record an NNAPI operation as (opcode, input count, output count) and append its input and output operand ids to the flattened argument list.
         self.operations.append((opcode, len(inputs), len(outputs)))
         self.operation_args.extend(inputs + outputs)
 
     def add_tensor_sequence(self, jitval, values):
+        # [FUNCTION DOC] HELPER: Remember the list of operand values for a JIT list/tuple value; AssertionError if already recorded.
         if jitval in self.tensor_sequences:
             raise AssertionError(f"jitval {jitval!r} already in tensor_sequences")
         self.tensor_sequences[jitval] = values
 
     def add_constant_value(self, jitval, ctype, value):
+        # [FUNCTION DOC] HELPER: Record a constant (type, value) for a JIT value; AssertionError if already recorded.
         if jitval in self.constants:
             raise AssertionError(f"jitval {jitval!r} already in constants")
         self.constants[jitval] = (ctype, value)
 
     def get_constant_value(self, jitval, typekind=None):
+        # [FUNCTION DOC] HELPER: Return the (type, value) record for a constant JIT value. Raises an exception if missing or if a typekind is given and the type kind differs.
         record = self.constants.get(jitval)
         if record is None:
             raise Exception(  # noqa: TRY002
@@ -560,6 +620,9 @@ class _NnapiSerializer:
         return record
 
     def operand_to_template_torchscript(self, op_id, oper, shape=None):
+        # [FUNCTION DOC] HELPER: Return TorchScript source text that builds an empty template tensor for an operand (zeros for float32/int32, expanded quantized zeros
+        # for quint8, int16 zeros for 16-bit quant types when allowed). Shape defaults to the operand's; zero dims refer to computed flex variables, -1 dims become 0.
+        # Raises exceptions for unknown dim values or unsupported types; raises AssertionError on rank mismatch of an explicit shape.
         """Return a TorchScript expression to build a template for a given operand."""
         if shape is None:
             shape = oper.shape
@@ -614,14 +677,17 @@ class _NnapiSerializer:
         )
 
     def forward_operand_shape(self, out_op_id, out_dim, in_op_id, in_dim):
+        # [FUNCTION DOC] HELPER: Record that an output dimension's flexible size equals that of an input operand's dimension.
         self.compute_operand_shape(out_op_id, out_dim, flex_name(in_op_id, in_dim))
 
     def compute_operand_shape(self, op_id, dim, expr):
+        # [FUNCTION DOC] HELPER: Append a generated line assigning the flexible-size variable for (operand, dim) from the given expression text.
         self.flexible_shape_computation_lines.append(
             f"{flex_name(op_id, dim)} = {expr}"
         )
 
     def transpose_to_nhwc(self, in_id, oper):
+        # [FUNCTION DOC] HELPER: Insert a TRANSPOSE operation converting an operand with H,W of 1,1 to channels-last; returns (new operand id, new Operand). Raises an exception otherwise.
         if oper.shape[2:] != (1, 1):
             raise Exception(  # noqa: TRY002
                 "Automatic transpose only supported for H,W == 1,1"
@@ -642,6 +708,8 @@ class _NnapiSerializer:
 
     # Transpose inputs as necessary to allow broadcasting.
     def transpose_for_broadcast(self, in0_id, in0_oper, in1_id, in1_oper):
+        # [FUNCTION DOC] HELPER: Make two operands' dim orders agree for broadcasting, preferring NHWC: inserts a transpose on the contiguous one when orders are
+        # contiguous vs channels-last. Returns (id0, oper0, id1, oper1). Raises an exception for other mismatches.
         if in0_oper.dim_order == in1_oper.dim_order:
             return in0_id, in0_oper, in1_id, in1_oper
 
@@ -657,6 +725,7 @@ class _NnapiSerializer:
         )
 
     def get_size_arg(self, jitval):
+        # [FUNCTION DOC] HELPER: Return the constant list of ints for a JIT value; raises an exception for non-list types, AssertionError if the elements are not ints.
         ctype, value = self.get_constant_value(jitval)
         if ctype.kind() == "ListType":
             if ctype.getElementType().kind() != "IntType":
@@ -669,6 +738,8 @@ class _NnapiSerializer:
         )
 
     def get_conv_pool_args_2d_from_pack(self, kernel_size, packed_config):
+        # [FUNCTION DOC] HELPER: Decode a packed quantized conv config tensor (2D marker, strides, paddings, dilations, output padding, group) into ConvPoolArgs2d.
+        # Raises AssertionError if the marker/length is wrong or output padding is nonzero.
         pc = [i.item() for i in packed_config]
         if pc[0] != 2:
             raise AssertionError(f"expected pc[0] == 2, got {pc[0]}")
@@ -692,6 +763,7 @@ class _NnapiSerializer:
     def get_conv_pool_args_2d_from_jit(
         self, kernel_size, stride, padding, dilation=None, group=None
     ):
+        # [FUNCTION DOC] HELPER: Build ConvPoolArgs2d from JIT constant values for stride, padding and optional dilation (default 1,1) and group (None if absent).
         strides = self.get_size_arg(stride)
         paddings = self.get_size_arg(padding)
         if dilation is None:
@@ -709,6 +781,8 @@ class _NnapiSerializer:
     def get_conv_pool_args_2d_common(
         self, kernel_size, strides, paddings, dilations, group_num
     ):
+        # [FUNCTION DOC] HELPER: Validate that kernel, strides, paddings and dilations each have 2 entries (AssertionError otherwise), expand paddings to four
+        # values (top, bottom, left, right) and return ConvPoolArgs2d.
         kernels = list(kernel_size)
 
         if len(kernels) != 2:
@@ -729,6 +803,10 @@ class _NnapiSerializer:
         )
 
     def serialize_model(self, model, inputs, return_shapes=None):
+        # [FUNCTION DOC] Serialize a frozen scripted model into NNAPI binary form. Adds boolean immediates, registers the inputs from example tensors, processes every
+        # graph node via add_node, then registers return values (a tensor or tuple of tensors; others raise an exception; optional return_shapes override output template shapes).
+        # Packs header, operand descriptors, values, operations, dimensions and value data, appending shape-computation lines for zero-sized dims and the output template return lines.
+        # Returns (int32 array of the model, used weights, input dim order codes, output dim order codes, shape computation lines, return value count; negative meaning single tensor).
         self.add_immediate_bool_scalar(False)
         self.add_immediate_bool_scalar(True)
 
@@ -853,6 +931,7 @@ class _NnapiSerializer:
         )
 
     def serialize_values(self):
+        # [FUNCTION DOC] HELPER: Pack each recorded value as (operand index, source type, length) and pad its data with zero bytes to a multiple of 4. Returns (list of headers, list of padded data).
         serialized_values = []
         serialized_value_data = []
         if len(self.values) != len(self.value_data):
@@ -875,6 +954,7 @@ class _NnapiSerializer:
 
     @staticmethod
     def serialize_ints(ints):
+        # [FUNCTION DOC] HELPER: Static method packing an iterable of ints into bytes as native 32-bit integers.
         return array.array("i", ints).tobytes()
 
     ADDER_MAP = {
@@ -951,6 +1031,7 @@ class _NnapiSerializer:
     }
 
     def add_node(self, node):
+        # [FUNCTION DOC] HELPER: Dispatch a graph node to its handler in ADDER_MAP by node kind; raises an exception for unsupported kinds.
         adder = self.ADDER_MAP.get(node.kind())
         if not adder:
             raise Exception(  # noqa: TRY002
@@ -959,11 +1040,14 @@ class _NnapiSerializer:
         adder(self, node)
 
     def _identity(self, node):
+        # [FUNCTION DOC] HELPER: Handle ops that pass data through (e.g. detach) by mapping the output JIT value to the input's operand id.
         in_id, _in_oper = self.get_tensor_operand_by_jitval(node.inputsAt(0))
         jitval = node.outputsAt(0)
         self.jitval_operand_map[jitval] = in_id
 
     def add_getattr(self, node):
+        # [FUNCTION DOC] HELPER: Handle a GetAttr node on a module constant: looks up the attribute by name on the stored object and records it as a constant for the output.
+        # Raises AssertionError if the node shape is wrong or the object is not a module type.
         if node.inputsSize() != 1:
             raise AssertionError(
                 f"expected node.inputsSize() == 1, got {node.inputsSize()}"
@@ -984,6 +1068,7 @@ class _NnapiSerializer:
         self.add_constant_value(output, ctype, value)
 
     def add_constant_node(self, node):
+        # [FUNCTION DOC] HELPER: Handle a Constant node: convert the output to a Python value and record it as a constant. Raises AssertionError if the node has inputs or not exactly one output.
         if node.inputsSize() != 0:
             raise AssertionError(
                 f"expected node.inputsSize() == 0, got {node.inputsSize()}"
@@ -998,6 +1083,8 @@ class _NnapiSerializer:
         self.add_constant_value(output, ctype, value)
 
     def add_list_construct(self, node):
+        # [FUNCTION DOC] HELPER: Handle a ListConstruct node. If all inputs are known constants, record the output as a constant list; if all are tensors, record a tensor sequence.
+        # Raises AssertionError if the node does not have exactly one output, and an exception if the inputs are neither all constants nor all tensors.
         if node.outputsSize() != 1:
             raise AssertionError(
                 f"expected node.outputsSize() == 1, got {node.outputsSize()}"
@@ -1029,6 +1116,7 @@ class _NnapiSerializer:
             )
 
     def add_tuple_construct(self, node):
+        # [FUNCTION DOC] HELPER: Handle a TupleConstruct node by recording its inputs as a tensor sequence for the output. Raises AssertionError unless there is one output.
         if node.outputsSize() != 1:
             raise AssertionError(
                 f"expected node.outputsSize() == 1, got {node.outputsSize()}"
@@ -1038,6 +1126,8 @@ class _NnapiSerializer:
         self.add_tensor_sequence(output, values)
 
     def add_unsqueeze(self, node):
+        # [FUNCTION DOC] HELPER: Handle unsqueeze: input must be fixed-size and presumed contiguous (AssertionError otherwise); inserts a size-1 dim (negative dims count from the end)
+        # and emits an EXPAND_DIMS operation with the dim as an int immediate.
         if node.inputsSize() != 2:
             raise AssertionError(
                 f"expected node.inputsSize() == 2, got {node.inputsSize()}"
@@ -1071,10 +1161,13 @@ class _NnapiSerializer:
         self.add_operation(NNAPI_OperationCode.EXPAND_DIMS, inputs, outputs)
 
     def add_to(self, node):
+        # [FUNCTION DOC] HELPER: Handle device-move casts (cpu/gpu) as an identity on the operand.
         # Handle to("cpu") / to("gpu") case
         self._identity(node)
 
     def add_reshape(self, node):
+        # [FUNCTION DOC] HELPER: Handle reshape with a constant int-list target shape. Non-contiguous (NHWC) inputs are allowed only for a two-element target ending in -1; otherwise raises an exception.
+        # The output shape is inferred using a dummy tensor, output is presumed contiguous, and a RESHAPE operation is emitted. Raises AssertionError on malformed nodes or types.
         if node.inputsSize() != 2:
             raise AssertionError(
                 f"expected node.inputsSize() == 2, got {node.inputsSize()}"
@@ -1118,6 +1211,8 @@ class _NnapiSerializer:
         self.add_operation(NNAPI_OperationCode.RESHAPE, inputs, outputs)
 
     def add_flatten(self, node):
+        # [FUNCTION DOC] HELPER: Handle flatten over a dimension range using a RESHAPE operation. NHWC inputs are allowed only if channels are 1 or height and width are 1.
+        # Flexible (zero) dims inside the flattened range, or more than one flexible remaining dim, raise exceptions; flexible output dims are forwarded from the input.
         if node.inputsSize() != 3:
             raise AssertionError(
                 f"expected node.inputsSize() == 3, got {node.inputsSize()}"
@@ -1180,6 +1275,8 @@ class _NnapiSerializer:
         self.add_operation(NNAPI_OperationCode.RESHAPE, inputs, outputs)
 
     def add_slice(self, node):
+        # [FUNCTION DOC] HELPER: Handle slice along a constant dim with constant start, stop and step (None becomes defaults, negatives are normalized). A full-range slice is an identity;
+        # slicing a flexible dim or start >= stop raises an exception. Emits a STRIDED_SLICE with begin, end, strides and masks (end mask marks flexible dims).
         if node.inputsSize() != 5:
             raise AssertionError(
                 f"expected node.inputsSize() == 5, got {node.inputsSize()}"
@@ -1261,6 +1358,7 @@ class _NnapiSerializer:
         self.add_operation(NNAPI_OperationCode.STRIDED_SLICE, inputs, outputs)
 
     def add_size(self, node):
+        # [FUNCTION DOC] HELPER: Handle size of a fixed-size tensor at a constant dim by recording the resulting integer as a constant for the output (no NNAPI operation emitted).
         if node.inputsSize() != 2:
             raise AssertionError(
                 f"expected node.inputsSize() == 2, got {node.inputsSize()}"
@@ -1277,6 +1375,8 @@ class _NnapiSerializer:
         self.add_constant_value(output, output.type(), res)
 
     def add_cat(self, node):
+        # [FUNCTION DOC] HELPER: Handle cat of a tensor sequence along a constant dim. Requires all inputs to have the same operand type, dim order and shape outside the concat dim
+        # (AssertionError otherwise); sums the sizes along the dim, maps the dim to NNAPI order for channels-last, computes flexible output sizes, and emits CONCATENATION.
         if node.inputsSize() != 2:
             raise AssertionError(
                 f"expected node.inputsSize() == 2, got {node.inputsSize()}"
@@ -1350,6 +1450,8 @@ class _NnapiSerializer:
         self.add_operation(NNAPI_OperationCode.CONCATENATION, inputs, outputs)
 
     def add_mean(self, node):
+        # [FUNCTION DOC] HELPER: Handle mean over a constant list of dims with a constant keepdim flag and a None dtype. Maps dims for channels-last; for channels-last without keepdim requires
+        # height and width to be reduced and makes the output contiguous. Emits a MEAN operation. AssertionError on unexpected node structure or types.
         if node.inputsSize() != 4:
             raise AssertionError(
                 f"expected node.inputsSize() == 4, got {node.inputsSize()}"
@@ -1415,6 +1517,8 @@ class _NnapiSerializer:
         self.add_operation(NNAPI_OperationCode.MEAN, inputs, outputs)
 
     def add_quantize(self, node):
+        # [FUNCTION DOC] HELPER: Handle quantize_per_tensor. Input must be channels-last (else exception) and the target type must be quint8; produces a quant8 asymmetric operand with
+        # the given constant scale and zero point and emits QUANTIZE.
         if node.inputsSize() != 4:
             raise AssertionError(
                 f"expected node.inputsSize() == 4, got {node.inputsSize()}"
@@ -1455,6 +1559,7 @@ class _NnapiSerializer:
         self.add_operation(NNAPI_OperationCode.QUANTIZE, inputs, outputs)
 
     def add_dequantize(self, node):
+        # [FUNCTION DOC] HELPER: Handle dequantize by emitting DEQUANTIZE and producing a float32 operand with the same shape and dim order and zero scale and zero point.
         if node.inputsSize() != 1:
             raise AssertionError(
                 f"expected node.inputsSize() == 1, got {node.inputsSize()}"
@@ -1480,6 +1585,8 @@ class _NnapiSerializer:
         self.add_operation(NNAPI_OperationCode.DEQUANTIZE, inputs, outputs)
 
     def add_pointwise_simple_unary_op(self, node, opcode):
+        # [FUNCTION DOC] HELPER: Handle a one-input elementwise op (relu, logistic) with the given NNAPI opcode. Output keeps the input operand; for logistic on quant8 the scale is forced to 1/256
+        # with zero point 0. Flexible input dims are forwarded to the output.
         if node.inputsSize() != 1:
             raise AssertionError(
                 f"expected node.inputsSize() == 1, got {node.inputsSize()}"
@@ -1514,6 +1621,9 @@ class _NnapiSerializer:
         self.add_operation(opcode, inputs, outputs)
 
     def _do_add_binary(self, node, opcode, fuse_code, *, qparams=None):
+        # [FUNCTION DOC] HELPER: Shared implementation of binary broadcast ops. Both inputs must be tensor values; at least one must already be an operand (the other may be a constant
+        # converted to a weight using its dim order); operand types must match (AssertionError) and two constants raise an exception. Aligns dim orders, broadcasts shapes,
+        # applies optional (scale, zero point) qparams to the output, forwards or asserts flexible dims, and emits the opcode with a fuse-code immediate.
         """Helper for pointwise binary broadcast ops with superfluous extra args."""
         if node.outputsSize() != 1:
             raise AssertionError(
@@ -1581,6 +1691,7 @@ class _NnapiSerializer:
         self.add_operation(opcode, inputs, outputs)
 
     def add_pointwise_simple_binary_broadcast_op(self, node, opcode, fuse_code):
+        # [FUNCTION DOC] HELPER: Handle mul/div style binary ops with exactly two inputs (AssertionError otherwise) via _do_add_binary.
         if node.inputsSize() != 2:
             raise AssertionError(
                 f"expected node.inputsSize() == 2, got {node.inputsSize()}"
@@ -1588,6 +1699,7 @@ class _NnapiSerializer:
         self._do_add_binary(node, opcode, fuse_code)
 
     def add_add_sub_op(self, node, opcode, fuse_code):
+        # [FUNCTION DOC] HELPER: Handle add/sub with three inputs; the alpha constant must equal 1 (exception otherwise), then delegates to _do_add_binary.
         if node.inputsSize() != 3:
             raise AssertionError(
                 f"expected node.inputsSize() == 3, got {node.inputsSize()}"
@@ -1602,6 +1714,7 @@ class _NnapiSerializer:
         self._do_add_binary(node, opcode, fuse_code)
 
     def add_qadd(self, node, opcode, fuse_code):
+        # [FUNCTION DOC] HELPER: Handle quantized add/mul with four inputs; reads the output scale and zero point constants and delegates to _do_add_binary with those qparams.
         if node.inputsSize() != 4:
             raise AssertionError(
                 f"expected node.inputsSize() == 4, got {node.inputsSize()}"
@@ -1613,6 +1726,7 @@ class _NnapiSerializer:
         self._do_add_binary(node, opcode, fuse_code, qparams=(scale, zero_point))
 
     def add_softmax(self, node):
+        # [FUNCTION DOC] HELPER: Handle softmax over a constant dim: output has the input's operand (flexible dims forwarded), and SOFTMAX is emitted with beta 1.0 and the dim.
         if node.inputsSize() != 3:
             raise AssertionError(
                 f"expected node.inputsSize() == 3, got {node.inputsSize()}"
@@ -1639,6 +1753,7 @@ class _NnapiSerializer:
         self.add_operation(NNAPI_OperationCode.SOFTMAX, inputs, outputs)
 
     def add_hardtanh(self, node):
+        # [FUNCTION DOC] HELPER: Handle hardtanh by mapping constant bounds (-1, 1) to RELU1 or (0, 6) to RELU6; other bounds raise an exception. Input must be fixed-size.
         if node.inputsSize() != 3:
             raise AssertionError(
                 f"expected node.inputsSize() == 3, got {node.inputsSize()}"
@@ -1672,6 +1787,8 @@ class _NnapiSerializer:
         self.add_operation(opcode, inputs, outputs)
 
     def add_prelu_op(self, node):
+        # [FUNCTION DOC] HELPER: Handle prelu with a constant 1-D weight. Per-channel weights (more than one element) require a channels-last input (exception otherwise);
+        # dims 0 and 1 must be fixed size, later flexible dims are forwarded. Emits PRELU.
         if node.inputsSize() != 2:
             raise AssertionError(
                 f"expected node.inputsSize() == 2, got {node.inputsSize()}"
@@ -1726,6 +1843,8 @@ class _NnapiSerializer:
         self.add_operation(NNAPI_OperationCode.PRELU, inputs, outputs)
 
     def add_pool2d_node(self, node, opcode):
+        # [FUNCTION DOC] HELPER: Handle 2D pooling (e.g. max pool) with the given NNAPI opcode; stride defaults to the kernel. Dilation other than 1 raises an exception; the image must be
+        # 4-D and fixed size. Computes the output shape and emits the opcode with paddings, strides, kernel sizes, no fusion and a layout flag.
         if node.inputsSize() != 6:
             raise AssertionError(
                 f"expected node.inputsSize() == 6, got {node.inputsSize()}"
@@ -1778,6 +1897,8 @@ class _NnapiSerializer:
         self.add_operation(opcode, inputs, outputs)
 
     def add_avg_pool2d(self, node):
+        # [FUNCTION DOC] HELPER: Handle avg_pool2d requiring count_include_pad true and no divisor override (exception otherwise). Computes the output shape, handles flexible
+        # input sizes via _handle_conv_pool_flexible_input, and emits AVERAGE_POOL_2D.
         if node.inputsSize() != 7:
             raise AssertionError(
                 f"expected node.inputsSize() == 7, got {node.inputsSize()}"
@@ -1841,6 +1962,8 @@ class _NnapiSerializer:
         self.add_operation(NNAPI_OperationCode.AVERAGE_POOL_2D, inputs, outputs)
 
     def add_adaptive_avg_pool2d(self, node):
+        # [FUNCTION DOC] HELPER: Handle adaptive_avg_pool2d only for output size (1, 1) (exception otherwise), implemented as AVERAGE_POOL_2D whose kernel covers the entire spatial extent.
+        # Input must be 4-D and fixed size.
         if node.inputsSize() != 2:
             raise AssertionError(
                 f"expected node.inputsSize() == 2, got {node.inputsSize()}"
@@ -1896,6 +2019,9 @@ class _NnapiSerializer:
         self.add_operation(NNAPI_OperationCode.AVERAGE_POOL_2D, inputs, outputs)
 
     def add_upsample_nearest2d(self, node):
+        # [FUNCTION DOC] HELPER: Handle upsample_nearest2d (3- or 4-arg form) with either a constant output size or constant scale factors (one value is repeated for both dims);
+        # both or neither given raises an exception. Flexible batch or channels are rejected; flexible spatial dims get computed shape lines. Emits RESIZE_NEAREST_NEIGHBOR.
+        # Many AssertionErrors guard types and lengths of the constants.
         if not (node.inputsSize() == 3 or node.inputsSize() == 4):
             raise AssertionError(
                 f"expected node.inputsSize() == 3 or 4, got {node.inputsSize()}"
@@ -2047,6 +2173,7 @@ class _NnapiSerializer:
         self.add_operation(NNAPI_OperationCode.RESIZE_NEAREST_NEIGHBOR, inputs, outputs)
 
     def add_addmm(self, node):
+        # [FUNCTION DOC] HELPER: Handle addmm; beta and alpha constants must equal 1 (exception otherwise). Delegates to add_addmm_or_linear with the weight transposed.
         if node.inputsSize() != 5:
             raise AssertionError(
                 f"expected node.inputsSize() == 5, got {node.inputsSize()}"
@@ -2071,6 +2198,7 @@ class _NnapiSerializer:
         self.add_addmm_or_linear(node, True, jit_input, jit_weight, jit_bias)
 
     def add_linear(self, node):
+        # [FUNCTION DOC] HELPER: Handle linear with three inputs (input, weight, bias); delegates to add_addmm_or_linear without transposing the weight.
         if node.inputsSize() != 3:
             raise AssertionError(
                 f"expected node.inputsSize() == 3, got {node.inputsSize()}"
@@ -2086,6 +2214,8 @@ class _NnapiSerializer:
     def add_addmm_or_linear(
         self, node, transpose_weight, jit_input, jit_weight, jit_bias
     ):
+        # [FUNCTION DOC] HELPER: Emit a fully-connected layer. Input must be 2-D, bias 1-D, weight a 2-D constant tensor (made contiguous, transposed first when requested) registered as a weight operand.
+        # Output shape is (batch, out features); a flexible batch dim is forwarded from the input.
         input_id, input_oper = self.get_tensor_operand_by_jitval(jit_input)
         bias_id, bias_oper = self.get_tensor_operand_for_weight(jit_bias)
 
@@ -2131,6 +2261,9 @@ class _NnapiSerializer:
         self.add_operation(NNAPI_OperationCode.FULLY_CONNECTED, inputs, outputs)
 
     def add_qlinear(self, node):
+        # [FUNCTION DOC] HELPER: Handle quantized linear with a packed LinearPackedParamsBase weight. Input must be 2-D and fixed size; weight must be per-tensor affine and is converted from qint8
+        # to quint8 by shifting by 128. Bias is requantized to qint32 with scale input*weight and zero point 0. The effective multiplier (input*weight/output scale) must be in (0, 1) or an
+        # exception/AssertionError is raised. Emits FULLY_CONNECTED producing a quantized output.
         if node.inputsSize() != 4:
             raise AssertionError(
                 f"expected node.inputsSize() == 4, got {node.inputsSize()}"
@@ -2236,6 +2369,7 @@ class _NnapiSerializer:
         self.add_operation(NNAPI_OperationCode.FULLY_CONNECTED, inputs, outputs)
 
     def get_optional_bias(self, jit_bias, weight_tensor, transpose=False):
+        # [FUNCTION DOC] HELPER: Return (bias operand id, Operand) for a bias value; if the bias constant is None, create a zero bias weight sized to the output channels (axis depends on transpose), else register the given tensor as a weight.
         ctype, _value = self.get_constant_value(jit_bias)
         if ctype.kind() == "NoneType":
             bias_idx = 1 if transpose else 0
@@ -2249,6 +2383,7 @@ class _NnapiSerializer:
             return self.get_tensor_operand_for_weight(jit_bias)
 
     def add_conv2d(self, node):
+        # [FUNCTION DOC] HELPER: Handle aten conv2d with seven inputs: reads the constant weight, optional bias, stride, padding, dilation and groups, then delegates to add_conv2d_common (non-transposed, no fusion, zero output quantization).
         if node.inputsSize() != 7:
             raise AssertionError(
                 f"expected node.inputsSize() == 7, got {node.inputsSize()}"
@@ -2287,6 +2422,7 @@ class _NnapiSerializer:
         )
 
     def add_conv_underscore(self, node):
+        # [FUNCTION DOC] HELPER: Handle the internal convolution op with thirteen inputs, honoring the constant transpose flag; delegates to add_conv2d_common without fusion and with zero quantization params.
         if node.inputsSize() != 13:
             raise AssertionError(
                 f"expected node.inputsSize() == 13, got {node.inputsSize()}"
@@ -2332,6 +2468,7 @@ class _NnapiSerializer:
         )
 
     def add_log_softmax(self, node):
+        # [FUNCTION DOC] HELPER: Handle log_softmax over a constant dim on a fixed-size input; output keeps the input shape. Emits LOG_SOFTMAX with beta 1.
         if node.inputsSize() != 3:
             raise AssertionError(
                 f"expected node.inputsSize() == 3, got {node.inputsSize()}"
@@ -2360,6 +2497,8 @@ class _NnapiSerializer:
         self.add_operation(NNAPI_OperationCode.LOG_SOFTMAX, inputs, outputs)
 
     def add_qconv2d(self, node, fuse_code, transpose=False):
+        # [FUNCTION DOC] HELPER: Handle quantized conv2d (optionally relu-fused or transposed) with a packed Conv2dPackedParamsBase weight (pack version must be "2"; bias required). Converts qint8 weights to
+        # quint8, requantizes bias to qint32, checks the multiplier is in (0, 1) (exception if >= 1, AssertionError if <= 0), then delegates to add_conv2d_common with the output scale, zero point and fuse code.
         if node.inputsSize() != 4:
             raise AssertionError(
                 f"expected node.inputsSize() == 4, got {node.inputsSize()}"
@@ -2454,6 +2593,9 @@ class _NnapiSerializer:
         transpose,
         fuse_code,
     ):
+        # [FUNCTION DOC] HELPER: Emit a convolution. Group 1 gives full convolution (CONV_2D or TRANSPOSE_CONV_2D), group equal to input channels gives depthwise (multiplier must be 1); other groups raise an exception.
+        # Weights are permuted into NNAPI order, operand types are validated (float32, or quant8 with an int32 bias whose scale is the product of input and weight scales), then paddings, strides, fuse code
+        # and layout flag are passed as immediates. Computes the output shape and handles flexible inputs. Raises AssertionError on consistency violations and an exception on unsupported types.
         image_id, image_oper = self.get_tensor_operand_by_jitval(jit_image)
         in_c = image_oper.shape[1]
 
@@ -2591,6 +2733,8 @@ class _NnapiSerializer:
         self.add_operation(opcode, inputs, outputs)
 
     def _handle_conv_pool_flexible_input(self, out_id, jit_image, args, transpose):
+        # [FUNCTION DOC] HELPER: Generate shape computation lines for convolution/pooling outputs when the input has flexible (zero) dims: batch is forwarded, flexible channels raise an exception,
+        # and flexible height or width are computed with the (transposed or standard) output size formula.
         image_id, image_oper = self.get_tensor_operand_by_jitval(jit_image)
         batch, in_ch, in_h, in_w = image_oper.shape
 
@@ -2630,6 +2774,8 @@ class _NnapiSerializer:
 def serialize_model(
     module, inputs, *, config=None, return_shapes=None, use_int16_for_qint16=False
 ):
+    # [FUNCTION DOC] Module-level convenience: create an _NnapiSerializer with the optional config and int16 flag and serialize the scripted module for the given example inputs,
+    # returning the same tuple as the serializer method (model int32 array, weights, input and output dim orders, shape computation lines, return value count). return_shapes optionally fixes output template shapes.
     """Convert to NNAPI and serialize torchscript module.
 
     Parameters:

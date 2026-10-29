@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Preprocessing backend for lowering a TorchScript module to Core ML.
+# Defines simple spec helpers (TensorSpec, CompileSpec), enum-like constant classes for
+# scalar types, compute units and quantization modes, and preprocess(), which converts
+# a scripted module with coremltools and returns the serialized model, hash and JSON
+# metadata. Imports coremltools at import time (it must be installed); no other side effects.
 import hashlib
 import json
 
@@ -15,6 +20,7 @@ CT_METADATA_SOURCE = "com.github.apple.coremltools.source"
 
 
 class ScalarType:
+    # [CLASS DOC] Enum-like holder of integer codes for scalar types (Float, Double, Int, Long, Undefined) used in tensor specs.
     Float = 0
     Double = 1
     Int = 2
@@ -33,18 +39,21 @@ torch_to_mil_types = {
 
 
 class CoreMLComputeUnit:
+    # [CLASS DOC] Enum-like holder of string names for Core ML compute units: cpu only, cpu and gpu, or all.
     CPU = "cpuOnly"
     CPUAndGPU = "cpuAndGPU"
     ALL = "all"
 
 
 class CoreMLQuantizationMode:
+    # [CLASS DOC] Enum-like holder of string names for weight quantization modes: linear, linear_symmetric, none.
     LINEAR = "linear"
     LINEAR_SYMMETRIC = "linear_symmetric"
     NONE = "none"
 
 
 def TensorSpec(shape, dtype=ScalarType.Float):
+    # [FUNCTION DOC] Build a tensor spec as a (shape, dtype) pair; dtype defaults to the Float code. No validation.
     return (shape, dtype)
 
 
@@ -57,6 +66,9 @@ def CompileSpec(
     mlmodel_export_path=None,
     convert_to=None,
 ):
+    # [FUNCTION DOC] Build a compile spec as a plain 7-tuple, in order: inputs, outputs, backend, allow_low_precision,
+    # quantization_mode, mlmodel_export_path, convert_to. Defaults: CPU backend, low precision allowed, no quantization.
+    # Performs no validation; the tuple is consumed by preprocess.
     return (
         inputs,
         outputs,
@@ -69,6 +81,7 @@ def CompileSpec(
 
 
 def _check_enumerated_shape(shape):
+    # [FUNCTION DOC] HELPER: Return True only if every element of the shape is a list or tuple (i.e. the shape is a set of enumerated shapes), else False.
     for s in shape:
         if not isinstance(s, (list, tuple)):
             return False
@@ -76,6 +89,8 @@ def _check_enumerated_shape(shape):
 
 
 def _convert_to_mil_type(shape, dtype, name: str):
+    # [FUNCTION DOC] HELPER: Build a coremltools TensorType named name from a shape and scalar-type code.
+    # An enumerated shape is wrapped in EnumeratedShapes. Raises KeyError if dtype is not a supported type (e.g. Undefined).
     mil_shape = shape
     if _check_enumerated_shape(shape):
         mil_shape = ct.EnumeratedShapes(shape)
@@ -85,6 +100,11 @@ def _convert_to_mil_type(shape, dtype, name: str):
 
 
 def preprocess(script_module: torch._C.ScriptObject, compile_spec: dict[str, tuple]):
+    # [FUNCTION DOC] Convert a scripted module to a Core ML model. Reads the forward entry of compile_spec
+    # (a CompileSpec tuple), names inputs input_N, converts via coremltools, optionally quantizes weights to 8 bits.
+    # Raises AssertionError if the model's output count differs from output_specs. Prints the model and, if an export
+    # path is given, saves the .mlmodel file there. Returns a dict with the serialized spec bytes ("model"), its
+    # sha256 hex digest ("hash") and a JSON string ("extra") holding inputs, outputs, config and tool-version metadata.
     spec = compile_spec["forward"]
     (
         input_specs,
