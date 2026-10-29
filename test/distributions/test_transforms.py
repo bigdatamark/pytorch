@@ -1,4 +1,9 @@
 # Owner(s): ["module: distributions"]
+# [MODULE DOC] pytest-style tests for torch.distributions.transforms. Builds module-level lists
+# of transform instances (cache size 1, cache size 0, plus identity) and the inverse of each, and
+# checks inverse involution, equality, caching, forward/inverse round trips, shapes, jacobians
+# against autograd, jit tracing, composition event dims, TransformedDistribution shapes and
+# sampling, pickling and monotonic sign. Import time creates random transforms and base dists.
 
 import io
 from numbers import Number
@@ -41,6 +46,10 @@ from torch.testing._internal.common_utils import run_tests
 
 
 def get_transforms(cache_size):
+    # [FUNCTION DOC] HELPER: Build a fixed list of transform instances, all using the given
+    # cache_size where the class accepts it (ReshapeTransform and CumulativeDistributionTransform
+    # do not receive it). Covers elementwise, cholesky, simplex, composed, reshape and independent
+    # transforms with random parameters, then appends the inverse of each. Returns the list.
     transforms = [
         AbsTransform(cache_size=cache_size),
         ExpTransform(cache_size=cache_size),
@@ -98,6 +107,10 @@ def get_transforms(cache_size):
 
 
 def reshape_transform(transform, shape):
+    # [FUNCTION DOC] HELPER: Return a version of the transform whose affine loc/scale (also inside
+    # compose parts and inverses) are expanded, or reshaped if expansion fails, to the given shape
+    # so that jacobian tests can squash batch dims. Scalar-number affine transforms and other
+    # transform types are returned unchanged. Cache size is preserved.
     # Needed to squash batch dims for testing jacobian
     if isinstance(transform, AffineTransform):
         if isinstance(transform.loc, Number):
@@ -128,6 +141,9 @@ def reshape_transform(transform, shape):
 
 # Generate pytest ids
 def transform_id(x):
+    # [FUNCTION DOC] HELPER: pytest id function. Returns a string naming the transform class (or
+    # Inv(<inner class>) for inverse transforms) plus its cache size. Raises AssertionError if the
+    # argument is not a Transform.
     if not isinstance(x, Transform):
         raise AssertionError(f"Expected Transform, got {type(x)}")
     name = (
@@ -139,6 +155,11 @@ def transform_id(x):
 
 
 def generate_data(transform):
+    # [FUNCTION DOC] HELPER: Seed the RNG with 1 and produce a random input tensor valid for the
+    # transform's domain: unwraps independent transforms, uses in_shape/out_shape for reshape
+    # transforms (or the inverse), and otherwise picks data by domain (real, vector, positive,
+    # interval, simplex, corr_cholesky, lower_cholesky, positive_definite). Raises ValueError for
+    # unsupported domains. Side effect: reseeds the global RNG.
     torch.manual_seed(1)
     while isinstance(transform, IndependentTransform):
         transform = transform.base_transform
@@ -204,6 +225,7 @@ ALL_TRANSFORMS = (
 
 @pytest.mark.parametrize("transform", ALL_TRANSFORMS, ids=transform_id)
 def test_inv_inv(transform, ids=transform_id):
+    # [FUNCTION DOC] Check that inverting a transform twice returns the very same object.
     if transform.inv.inv is not transform:
         raise AssertionError("Expected transform.inv.inv is transform")
 
@@ -211,6 +233,8 @@ def test_inv_inv(transform, ids=transform_id):
 @pytest.mark.parametrize("x", TRANSFORMS_CACHE_INACTIVE, ids=transform_id)
 @pytest.mark.parametrize("y", TRANSFORMS_CACHE_INACTIVE, ids=transform_id)
 def test_equality(x, y):
+    # [FUNCTION DOC] Check that transforms compare equal only to themselves (identity), and that
+    # the identity transform equals its own inverse.
     if x is y:
         if x != y:
             raise AssertionError("Expected x == y when x is y")
@@ -223,6 +247,9 @@ def test_equality(x, y):
 
 @pytest.mark.parametrize("transform", ALL_TRANSFORMS, ids=transform_id)
 def test_with_cache(transform):
+    # [FUNCTION DOC] Check that with_cache(1) yields a cache size of 1 and that calling the
+    # transform twice on the same input returns the identical cached output tensor. Skips if the
+    # transform is not implemented.
     if transform._cache_size == 0:
         transform = transform.with_cache(1)
     if transform._cache_size != 1:
@@ -240,6 +267,10 @@ def test_with_cache(transform):
 @pytest.mark.parametrize("transform", ALL_TRANSFORMS, ids=transform_id)
 @pytest.mark.parametrize("test_cached", [True, False])
 def test_forward_inverse(transform, test_cached):
+    # [FUNCTION DOC] Round-trip test of forward then inverse (cached or on a cloned output to
+    # bypass the cache). Checks domain validity, output shapes against forward_shape and
+    # inverse_shape, then for bijective transforms that the inverse recovers x, otherwise that
+    # forward of the inverse recovers y (atol 1e-4). Skips on NotImplementedError.
     x = generate_data(transform).requires_grad_()
     if not transform.domain.check(x).all():
         raise AssertionError("Input data are not valid for domain")
@@ -293,6 +324,8 @@ def test_forward_inverse(transform, test_cached):
 
 
 def test_compose_transform_shapes():
+    # [FUNCTION DOC] Check event_dim of individual transforms and of compositions (the maximum of
+    # the parts' event dims).
     transform0 = ExpTransform()
     transform1 = SoftmaxTransform()
     transform2 = LowerCholeskyTransform()
@@ -356,6 +389,8 @@ base_dist2 = Normal(torch.zeros(3, 4, 4), torch.ones(3, 4, 4))
     ],
 )
 def test_transformed_distribution_shapes(batch_shape, event_shape, dist):
+    # [FUNCTION DOC] Check the given distribution has the expected batch and event shapes, that
+    # rsample works and that log_prob does not crash (skips if not implemented).
     if dist.batch_shape != batch_shape:
         raise AssertionError(
             f"Expected batch_shape {batch_shape}, got {dist.batch_shape}"
@@ -373,9 +408,12 @@ def test_transformed_distribution_shapes(batch_shape, event_shape, dist):
 
 @pytest.mark.parametrize("transform", TRANSFORMS_CACHE_INACTIVE, ids=transform_id)
 def test_jit_fwd(transform):
+    # [FUNCTION DOC] Trace the forward transform with the JIT and compare its output on fresh
+    # data with the eager result (atol 1e-5). Skips if tracing raises NotImplementedError.
     x = generate_data(transform).requires_grad_()
 
     def f(x):
+        # [FUNCTION DOC] HELPER: Apply the forward transform to x.
         return transform(x)
 
     try:
@@ -391,9 +429,12 @@ def test_jit_fwd(transform):
 
 @pytest.mark.parametrize("transform", TRANSFORMS_CACHE_INACTIVE, ids=transform_id)
 def test_jit_inv(transform):
+    # [FUNCTION DOC] Trace the inverse transform with the JIT and compare with eager output on
+    # fresh data (atol 1e-5). Skips if tracing raises NotImplementedError.
     y = generate_data(transform.inv).requires_grad_()
 
     def f(y):
+        # [FUNCTION DOC] HELPER: Apply the inverse transform to y.
         return transform.inv(y)
 
     try:
@@ -409,9 +450,12 @@ def test_jit_inv(transform):
 
 @pytest.mark.parametrize("transform", TRANSFORMS_CACHE_INACTIVE, ids=transform_id)
 def test_jit_jacobian(transform):
+    # [FUNCTION DOC] Trace forward plus log_abs_det_jacobian with the JIT and compare with eager
+    # output on fresh data (atol 1e-5). Skips if tracing raises NotImplementedError.
     x = generate_data(transform).requires_grad_()
 
     def f(x):
+        # [FUNCTION DOC] HELPER: Return log_abs_det_jacobian of the transform at x and its output.
         y = transform(x)
         return transform.log_abs_det_jacobian(x, y)
 
@@ -428,6 +472,11 @@ def test_jit_jacobian(transform):
 
 @pytest.mark.parametrize("transform", ALL_TRANSFORMS, ids=transform_id)
 def test_jacobian(transform):
+    # [FUNCTION DOC] Compare log_abs_det_jacobian with the log absolute determinant of the
+    # jacobian computed by autograd. Checks the result shape; reshape transforms must give zero;
+    # event_dim 0 transforms must have diagonal jacobians; others use the jacobian (with special
+    # handling for corr_cholesky and stick-breaking) reduced to batched square matrices and
+    # slogdet. Skips on NotImplementedError.
     x = generate_data(transform)
     try:
         y = transform(x)
@@ -500,6 +549,9 @@ def test_jacobian(transform):
     "event_dims", [(0,), (1,), (2, 3), (0, 1, 2), (1, 2, 0), (2, 0, 1)], ids=str
 )
 def test_compose_affine(event_dims):
+    # [FUNCTION DOC] Compose affine transforms with the given event dims and check the composed
+    # domain/codomain event_dim and the support event_dim of TransformedDistributions built on
+    # Normal and Dirichlet bases equal the maximum (at least 1 for Dirichlet).
     transforms = [
         AffineTransform(torch.zeros((1,) * e), 1, event_dim=e) for e in event_dims
     ]
@@ -534,6 +586,9 @@ def test_compose_affine(event_dims):
 
 @pytest.mark.parametrize("batch_shape", [(), (6,), (5, 4)], ids=str)
 def test_compose_reshape(batch_shape):
+    # [FUNCTION DOC] Compose several reshape transforms and check event dims, the output shape
+    # for the given batch shape, and the batch/event shape and support event_dim of a
+    # TransformedDistribution over them.
     transforms = [
         ReshapeTransform((), ()),
         ReshapeTransform((2,), (1, 2)),
@@ -576,6 +631,10 @@ def test_compose_reshape(batch_shape):
 def test_transformed_distribution(
     base_batch_dim, base_event_dim, transform_dim, num_transforms, sample_shape
 ):
+    # [FUNCTION DOC] Build a TransformedDistribution from a base dist of varying batch/event
+    # dims and a prefix of an affine and two reshape transforms. Expects ValueError when the base
+    # has too few dims; otherwise checks sample shape, that at least 90 percent of sampled values
+    # are unique, and log_prob shapes for full and partial samples.
     shape = torch.Size([2, 3, 4, 5])
     base_dist = Normal(0, 1)
     base_dist = base_dist.expand(shape[4 - base_batch_dim - base_event_dim :])
@@ -626,6 +685,8 @@ def test_transformed_distribution(
 
 
 def test_save_load_transform():
+    # [FUNCTION DOC] Check that a TransformedDistribution can be saved and loaded (with
+    # safe_globals) after log_prob populated the cache, and that log_prob matches afterwards.
     # Evaluating `log_prob` populates the `_inv` cache, which can
     # contain reference cycles. Here, we check that `__getstate__`
     # drops the cache, and that we can evaluate the density after loading.
@@ -645,6 +706,8 @@ def test_save_load_transform():
 
 @pytest.mark.parametrize("transform", ALL_TRANSFORMS, ids=transform_id)
 def test_transform_sign(transform: Transform):
+    # [FUNCTION DOC] Check that the transform's sign property matches the sign of the autograd
+    # derivative at generated data. Skips if sign is not implemented.
     try:
         sign = transform.sign
     except NotImplementedError:

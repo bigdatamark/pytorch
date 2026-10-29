@@ -1,4 +1,6 @@
 # Owner(s): ["module: distributions"]
+# [MODULE DOC] pytest test for tril_matrix_to_vec and vec_to_tril_matrix in
+# torch.distributions.utils. Runs the common test runner when executed directly.
 
 import pytest
 
@@ -17,6 +19,9 @@ from torch.testing._internal.common_utils import run_tests
     ],
 )
 def test_tril_matrix_to_vec(shape):
+    # [FUNCTION DOC] For random matrices of several shapes and each diagonal offset from minus n
+    # to n minus 1, check that packing the lower triangle into a vector and unpacking it recovers
+    # the tril-masked matrix. Raises AssertionError otherwise.
     mat = torch.randn(shape)
     n = mat.shape[-1]
     for diag in range(-n, n):
