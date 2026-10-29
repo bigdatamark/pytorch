@@ -1,3 +1,14 @@
+# [MODULE DOC] Pytest configuration plugin for the PyTorch test suite (conftest). Adds
+# command line and ini options (stepcurrent: --sc, --scs, --rs; --use-main-module;
+# --hw-classification; sharding options; a rerun-aware junit xml writer under
+# --junit-xml-reruns). Implements hooks and plugin classes: LogXMLReruns and
+# _NodeReporterReruns (junit xml with rerun and escaped skip reasons),
+# HardwareClassificationPytestPlugin (filters tests), StepcurrentPlugin (resume from the
+# last running test), a terminal summary for reruns, per-test duration in verbose output,
+# filtering to disabled tests when rerunning them, and automatic multigpu markers. Much of
+# the xml code is copied and adapted from _pytest.junitxml. Import-time side effects:
+# creates the stash key xml_key and falls back to a no-op parse_cmd_line_args if torch
+# lacks it.
 import copy
 import functools
 import json
@@ -28,6 +39,8 @@ except ImportError:
     # main / PR's tests are sometimes run against the previous day's nightly which won't
     # have this function.
     def parse_cmd_line_args():
+        # [FUNCTION DOC] HELPER: No-op fallback used when torch.testing does not provide
+        # parse_cmd_line_args (older nightlies).
         pass
 
 
@@ -46,6 +59,11 @@ STEPCURRENT_CACHE_DIR = "cache/stepcurrent"
 
 
 def pytest_addoption(parser: Parser) -> None:
+    # [FUNCTION DOC] Pytest hook registering options: stepcurrent flags (--scs skip, --sc,
+    # --rs run single), --use-main-module, --junit-xml-reruns and --junit-prefix-reruns with
+    # matching ini entries for suite name, logging, passing-test logs, duration and xml
+    # family, the --hw-classification filter (upper-cased names), and the shard options from
+    # the shard plugin. Mutates the parser; returns nothing.
     group = parser.getgroup("general")
     group.addoption("--scs", action="store", default=None, dest="stepcurrent_skip")
     group.addoption("--sc", action="store", default=None, dest="stepcurrent")
@@ -107,13 +125,21 @@ def pytest_addoption(parser: Parser) -> None:
 
 
 class HardwareClassificationPytestPlugin:
+    # [CLASS DOC] Pytest plugin that keeps only tests whose class matches the requested
+    # hardware classifications. State: hw_classification, a set of enum values, or None for no
+    # filtering. Key method: pytest_collection_modifyitems.
     """Pytest plugin to filter collected tests by hw_classification."""
 
     def __init__(self, hw_classification):
+        # [FUNCTION DOC] Stores the resolved hardware classification set (see
+        # _resolve_hw_classification).
         self.hw_classification = self._resolve_hw_classification(hw_classification)
 
     @staticmethod
     def _resolve_hw_classification(hw_classification):
+        # [FUNCTION DOC] HELPER: Maps the given classification names to the HardwareClassification
+        # enum and returns them as a set, or None if no names were given. Raises KeyError for an
+        # unknown name.
         if hw_classification is None:
             return None
         from torch.testing._internal.common_utils import HardwareClassification
@@ -121,6 +147,9 @@ class HardwareClassificationPytestPlugin:
         return {HardwareClassification[name] for name in hw_classification}
 
     def pytest_collection_modifyitems(self, items):
+        # [FUNCTION DOC] Pytest hook that, when a classification is set, replaces the collected
+        # items in place with those accepted by the shared torch filter helper (class looked up
+        # from each item). Does nothing when no classification was requested.
         if self.hw_classification is None:
             return
         import torch.testing._internal.common_utils as _cu
@@ -136,6 +165,11 @@ class HardwareClassificationPytestPlugin:
 
 
 def pytest_configure(config: Config) -> None:
+    # [FUNCTION DOC] Pytest hook run at startup. Parses the torch command line args; registers
+    # the rerun-aware xml logger (not on xdist workers) when a path was given; maps the skip
+    # and run-single options onto the stepcurrent option and registers StepcurrentPlugin when
+    # any is set; registers the shard plugin when num_shards is set, and the hardware
+    # classification plugin when requested.
     parse_cmd_line_args()
 
     xmlpath = config.option.xmlpath_reruns
@@ -168,6 +202,8 @@ def pytest_configure(config: Config) -> None:
 
 
 def pytest_unconfigure(config: Config) -> None:
+    # [FUNCTION DOC] Pytest hook run at exit; removes and unregisters the rerun xml logger if
+    # one was registered.
     xml = config.stash.get(xml_key, None)
     if xml:
         del config.stash[xml_key]
@@ -175,10 +211,16 @@ def pytest_unconfigure(config: Config) -> None:
 
 
 class _NodeReporterReruns(_NodeReporter):
+    # [CLASS DOC] Junit xml node reporter that differs from the base in how content is
+    # written: content is escaped and written as a tag only when non-empty, and skip reasons
+    # are escaped. Created by LogXMLReruns.node_reporter.
     def _prepare_content(self, content: str, header: str) -> str:
+        # [FUNCTION DOC] HELPER: Returns the content unchanged (no header prefix or wrapping).
         return content
 
     def _write_content(self, report: TestReport, content: str, jheader: str) -> None:
+        # [FUNCTION DOC] HELPER: Appends an xml element named after the header with the escaped
+        # content as text to this node; does nothing for empty content.
         if content == "":
             return
         tag = ET.Element(jheader)
@@ -186,6 +228,10 @@ class _NodeReporterReruns(_NodeReporter):
         self.append(tag)
 
     def append_skipped(self, report: TestReport) -> None:
+        # [FUNCTION DOC] Records a skipped test in the xml node. For expected failures delegates
+        # to the base class. Otherwise unpacks the file, line and reason from the report
+        # (AssertionError if the location is not a tuple), strips the skipped prefix and adds an
+        # escaped skipped element with the details, then writes captured output.
         # Referenced from the below
         # https://github.com/pytest-dev/pytest/blob/2178ee86d7c1ee93748cfb46540a6e40b4761f2d/src/_pytest/junitxml.py#L236C6-L236C6
         # Modified to escape characters not supported by xml in the skip reason.  Everything else should be the same.
@@ -210,10 +256,18 @@ class _NodeReporterReruns(_NodeReporter):
 
 
 class LogXMLReruns(LogXML):
+    # [CLASS DOC] Junit xml log writer that also records reruns. Extends the pytest xml logger
+    # and uses _NodeReporterReruns for per-test nodes. Key methods: append_rerun,
+    # pytest_runtest_logreport and node_reporter.
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Passes all arguments to the base class constructor unchanged.
         super().__init__(*args, **kwargs)
 
     def append_rerun(self, reporter: _NodeReporter, report: TestReport) -> None:
+        # [FUNCTION DOC] Adds a rerun entry for a report to the reporter: a skipped note for
+        # unexpectedly passing xfail tests, otherwise a rerun element with the escaped crash
+        # message (or the long representation text) and full representation. Raises AssertionError
+        # if longrepr is None.
         if hasattr(report, "wasxfail"):
             reporter._add_simple("skipped", "xfail-marked test passes unexpectedly")
         else:
@@ -230,6 +284,9 @@ class LogXMLReruns(LogXML):
             reporter._add_simple("rerun", message, str(report.longrepr))
 
     def pytest_runtest_logreport(self, report: TestReport) -> None:
+        # [FUNCTION DOC] Pytest hook handling a test report: runs the base handling, records
+        # reruns for reports with the rerun outcome, and rewrites the skip reason of skipped
+        # reports to include the node id (mutating the report location tuple).
         super().pytest_runtest_logreport(report)
         if report.outcome == "rerun":
             reporter = self._opentestcase(report)
@@ -241,6 +298,11 @@ class LogXMLReruns(LogXML):
                 report.longrepr = (fspath, lineno, reason)
 
     def node_reporter(self, report: TestReport | str) -> _NodeReporterReruns:
+        # [FUNCTION DOC] Returns the node reporter for a report or node id, creating and
+        # registering it in the ordered list on first use. The cache key is the node id plus the
+        # xdist worker node.
+        # KNOWN ISSUE: per the existing TODO the key handling breaks with the each distribution
+        # mode.
         nodeid: str | TestReport = getattr(report, "nodeid", report)
         # Local hack to handle xdist report order.
         workernode = getattr(report, "node", None)
@@ -263,6 +325,10 @@ class LogXMLReruns(LogXML):
 # both hookwrapper and tryfirst to make sure this runs before pytest's
 @pytest.hookimpl(hookwrapper=True, tryfirst=True)
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    # [FUNCTION DOC] Pytest hook wrapper (runs first) that prints a RERUNS section before the
+    # normal terminal summary when traceback style is not disabled: crash lines for line
+    # style, else full failure headlines and summaries for each rerun report. Writes to the
+    # terminal; then yields.
     # prints stack traces for reruns
     if terminalreporter.config.option.tbstyle != "no":
         reports = terminalreporter.getreports("rerun")
@@ -283,6 +349,9 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_pycollect_makemodule(module_path, parent) -> Module:
+    # [FUNCTION DOC] Pytest hook that, when --use-main-module is set, builds the module
+    # collector with its imported object replaced by the main module and returns it. Returns
+    # None otherwise so pytest falls back to the default.
     if parent.config.getoption("--use-main-module"):
         mod = Module.from_parent(parent, path=module_path)
         mod._getobj = MethodType(lambda x: sys.modules["__main__"], mod)
@@ -291,6 +360,9 @@ def pytest_pycollect_makemodule(module_path, parent) -> Module:
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_report_teststatus(report, config):
+    # [FUNCTION DOC] Pytest hook wrapper that appends the test duration in seconds to the
+    # verbose status text of each test report (any phase). Non-test-report objects are left
+    # alone.
     # Add the test time to the verbose output, unfortunately I don't think this
     # includes setup or teardown
     pluggy_result = yield
@@ -305,6 +377,10 @@ def pytest_report_teststatus(report, config):
 
 @pytest.hookimpl(trylast=True)
 def pytest_collection_modifyitems(items: list[Any]) -> None:
+    # [FUNCTION DOC] Pytest hook (runs last). Only active when the rerun-disabled-tests
+    # environment variable is 1 and a disabled tests file exists: reads the json list of
+    # disabled test names, parses name and class from each, and replaces the collected items
+    # in place with copies of just the disabled ones. Returns nothing.
     """
     This hook is used when rerunning disabled tests to get rid of all skipped tests
     instead of running and skipping them N times. This avoids flooding the console
@@ -356,6 +432,11 @@ def pytest_collection_modifyitems(items: list[Any]) -> None:
 def _spawns_multiple_processes(
     cls: type | None,
 ) -> TypeGuard["type[MultiProcessTestCase | MultiProcContinuousTest] | None"]:
+    # [FUNCTION DOC] HELPER: Returns whether a test class spawns several processes (so it
+    # needs many GPUs): true when the class is None (ambiguity), false when torch.distributed
+    # is not available, else whether it subclasses MultiProcessTestCase or
+    # MultiProcContinuousTest.
+    # KNOWN ISSUE: annotated as a type guard although it returns a plain answer.
     """
     A distributed test needs multiple GPUs iff its class spawns multiple
     processes. This is encoded by the base class: MultiProcessTestCase and
@@ -382,6 +463,8 @@ def _spawns_multiple_processes(
 
 
 def pytest_itemcollected(item: Any) -> None:
+    # [FUNCTION DOC] Pytest hook run per collected item: adds the multigpu marker when the
+    # item class spawns multiple processes (or is unknown), so CI can select by marker.
     """
     Auto-apply the `multigpu` marker based on the resolved test class. Runs
     per-item during collection, before pytest applies `-m` deselection, so the
@@ -393,9 +476,18 @@ def pytest_itemcollected(item: Any) -> None:
 
 
 class StepcurrentPlugin:
+    # [CLASS DOC] Pytest plugin that saves the currently running test id in the pytest cache
+    # and, on the next run, skips everything before it (or only runs that test). State:
+    # config, the cache, the lastrun cache key and value, initial value, skip and run_single
+    # flags, a status string and the cache key recording that a failing xml was made. Hooks
+    # report a status line and update the cache.
     # Modified fromo _pytest/stepwise.py in order to save the currently running
     # test instead of the last failed test
     def __init__(self, config: Config) -> None:
+        # [FUNCTION DOC] Reads the stepcurrent name from options, computes cache keys, loads the
+        # last run test id (None if missing) and initial value, stores skip and run_single flags,
+        # and resets the made-failing-xml cache flag to false. Raises AssertionError if the cache
+        # plugin is disabled.
         self.config = config
         self.report_status = ""
         if config.cache is None:
@@ -412,6 +504,10 @@ class StepcurrentPlugin:
         self.cache.set(self.made_failing_xml_location, False)
 
     def pytest_collection_modifyitems(self, config: Config, items: list[Any]) -> None:
+        # [FUNCTION DOC] Pytest hook that finds the item matching the last run id and deselects
+        # all items before it (also that item when the skip flag is set; in run-single mode all
+        # later items as well) via the deselected hook, mutating the items list. Sets a status
+        # message; does nothing when no previous run exists or the id is not found.
         if not self.lastrun:
             self.report_status = "Cannot find last run test, not skipping"
             return
@@ -440,15 +536,22 @@ class StepcurrentPlugin:
             config.hook.pytest_deselected(items=deselected)
 
     def pytest_report_collectionfinish(self) -> str | None:
+        # [FUNCTION DOC] Pytest hook returning the status line to print after collection when
+        # verbosity is not negative and a status exists, else None.
         if self.config.getoption("verbose") >= 0 and self.report_status:
             return f"stepcurrent: {self.report_status}"
         return None
 
     def pytest_runtest_protocol(self, item, nextitem) -> None:
+        # [FUNCTION DOC] Pytest hook that records the id of the item about to run as the last run,
+        # both on the plugin and in the cache. Returns None so pytest continues its normal
+        # protocol.
         self.lastrun = item.nodeid
         self.cache.set(self.lastrun_location, self.lastrun)
 
     def pytest_sessionfinish(self, session, exitstatus):
+        # [FUNCTION DOC] Pytest hook at session end: on success restores the cache entry to the
+        # value read at startup; on failure sets the made-failing-xml flag in the cache.
         if exitstatus == 0:
             self.cache.set(self.lastrun_location, self.initial_val)
         if exitstatus != 0:

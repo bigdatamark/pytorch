@@ -1,3 +1,11 @@
+# [MODULE DOC] Implementation-parity check between Python torch.nn.functional functions and
+# the C++ torch::nn::functional counterparts. From test parameter dicts (common_nn) it builds
+# per-device test params, generates a C++ forward-test function per functional from a string
+# template, compiles all of them together inline, and registers unit tests on a test class.
+# Each test runs the Python functional, serializes its inputs, runs the C++ one on them and
+# compares the saved outputs. Main entry points: write_test_to_test_class and build_cpp_tests.
+# The template constant has no import-time side effects; importing pulls in cpp_api_parity
+# helpers.
 # The purpose of this test is to check that we have implementation parity between
 # a Python `torch.nn.functional` function and its corresponding C++ `torch::nn::functional`
 # function. Concretely, this test does the following:
@@ -74,6 +82,10 @@ void ${functional_variant_name}_test_forward(
 
 
 def run_forward(unit_test_class, test_params):
+    # [FUNCTION DOC] Runs the Python functional of a test once and returns its output. Takes the
+    # input, target and extra_args entries from the arg dict, moves them to the test device (input
+    # tensors also get requires_grad set), seeds the RNG with 0 so random functionals match C++,
+    # then calls the constructed functional with the combined inputs. unit_test_class is unused.
     device = test_params.device
 
     inputs = set_python_tensors_requires_grad(
@@ -98,6 +110,12 @@ def run_forward(unit_test_class, test_params):
 
 
 def test_forward(unit_test_class, test_params):
+    # [FUNCTION DOC] Runs one parity test for a functional variant. Recreates an empty temp
+    # folder, computes the Python output, saves the serialized arguments, looks up the compiled
+    # C++ test function by variant name on the test class module, runs it to write the C++ output
+    # file, loads that output and asserts equality with the Python output using the test class
+    # assertEqual (failure message from generate_error_msg). Removes the temp folder at the end
+    # (only on success).
     functional_variant_name = test_params.functional_variant_name
     cpp_tmp_folder = test_params.cpp_tmp_folder
     # Remove the temporary folder if it exists already
@@ -119,6 +137,9 @@ def test_forward(unit_test_class, test_params):
     )
 
     def run_cpp_test_fn_and_check_output():
+        # [FUNCTION DOC] HELPER: Runs the C++ test function with the argument file and
+        # an output path, loads the saved result and asserts it equals the Python output
+        # from the enclosing scope.
         forward_output_file_path = compute_temp_file_path(
             cpp_tmp_folder, functional_variant_name, "forward_output"
         )
@@ -140,7 +161,14 @@ def test_forward(unit_test_class, test_params):
 
 
 def compute_functional_name(test_params_dict):
+    # [FUNCTION DOC] Returns the snake-case Python functional name for a test params dict. Uses
+    # the options-args entry when present (strips the namespace prefix and the options suffix from
+    # the name before the opening parenthesis, then converts camel case) else the function-call
+    # entry (text before the parenthesis without the namespace prefix). Raises RuntimeError if
+    # neither entry exists.
     def camel_case_to_snake_case(camel_case_str):
+        # [FUNCTION DOC] HELPER: Converts a camel case string to snake case, lower-
+        # cased, inserting an underscore before each capital except at the start.
         return re.sub(r"(?<!^)(?=[A-Z])", "_", camel_case_str).lower()
 
     if "cpp_options_args" in test_params_dict:
@@ -164,6 +192,10 @@ def compute_functional_name(test_params_dict):
 
 
 def compute_cpp_function_call(test_params_dict, arg_dict, functional_name):
+    # [FUNCTION DOC] Returns the C++ call expression for a functional. If the params dict has an
+    # explicit function-call entry it is returned unchanged; if it has options args, builds a call
+    # of the functional name with all input, target and extra argument names followed by the
+    # options. Raises RuntimeError if neither entry is present.
     if "cpp_function_call" in test_params_dict:
         return test_params_dict["cpp_function_call"]
     elif "cpp_options_args" in test_params_dict:
@@ -186,6 +218,12 @@ def compute_cpp_function_call(test_params_dict, arg_dict, functional_name):
 
 
 def process_test_params_for_functional(test_params_dict, device, test_instance_class):
+    # [FUNCTION DOC] Builds the TorchNNFunctionalTestParams for one device from a params dict:
+    # creates the test instance, derives the functional name, checks the test name starts with the
+    # test prefix (else AssertionError), makes the variant name by dropping that prefix and adding
+    # the device suffix for non-cpu devices, computes the arg dict and C++ call, reads the
+    # optional parity flag (default true), and allocates a new temporary folder (a side effect on
+    # disk).
     test_instance = test_instance_class(**test_params_dict)
     functional_name = compute_functional_name(test_params_dict)
     if not test_instance.get_name().startswith("test_"):
@@ -215,6 +253,13 @@ def process_test_params_for_functional(test_params_dict, device, test_instance_c
 def write_test_to_test_class(
     unit_test_class, test_params_dict, test_instance_class, parity_table, devices
 ):
+    # [FUNCTION DOC] Validates one functional test params dict and registers a unit test per
+    # device on unit_test_class. Raises AssertionError if it is not a functional test, if neither
+    # or both of the options-args and function-call entries exist, if torch.nn.functional lacks
+    # the function or the parity table lacks its entry. For each device it builds params, deletes
+    # the freshly made temp folder, stores the params in the class map keyed by unit test name,
+    # wraps a test function with decorate_test_fn (cuda flag, impl-parity flag from the table and
+    # the params dict, device) and adds it to the class.
     if not is_torch_nn_functional_test(test_params_dict):
         raise AssertionError("Expected torch.nn.functional test")
 
@@ -270,6 +315,8 @@ def write_test_to_test_class(
         unit_test_class.functional_test_params_map[unit_test_name] = test_params
 
         def test_fn(self):
+            # [FUNCTION DOC] HELPER: Generated unit test body; looks up the stored params
+            # for the running test method name and runs the forward parity check.
             test_forward(
                 unit_test_class=self,
                 test_params=unit_test_class.functional_test_params_map[
@@ -291,6 +338,9 @@ def write_test_to_test_class(
 
 
 def generate_test_cpp_sources(test_params, template):
+    # [FUNCTION DOC] Returns the C++ source text for one test by substituting the variant name,
+    # the argument construction statements (joined with semicolons and newlines) and the function
+    # call into the template. The forward argument symbols from the helper are ignored.
     (
         cpp_args_construction_stmts,
         _,
@@ -306,6 +356,10 @@ def generate_test_cpp_sources(test_params, template):
 
 # Build all C++ tests together, instead of once per test.
 def build_cpp_tests(unit_test_class, print_cpp_source=False):
+    # [FUNCTION DOC] Compiles all registered functional tests together into one inline C++ module
+    # (once, not per test), using the common harness, sample functional source and a source per
+    # params entry. Optionally prints the full source. Stores the compiled module on the test
+    # class and returns nothing. Raises AssertionError if the params map is empty.
     if len(unit_test_class.functional_test_params_map) <= 0:
         raise AssertionError(
             "Expected functional_test_params_map to have at least one entry"

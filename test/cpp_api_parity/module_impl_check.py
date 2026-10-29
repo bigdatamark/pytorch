@@ -1,3 +1,11 @@
+# [MODULE DOC] Implementation-parity check between Python torch.nn modules and the C++
+# torch::nn modules. From test parameter dicts (common_nn) it builds per-device test params,
+# generates a C++ forward-and-backward test function per module from a string template,
+# compiles all of them together inline, and registers unit tests on a test class. Each test
+# runs forward and backward in Python, saves the traced module (parameters and buffers) and
+# arguments, runs the C++ module loaded from them, and compares forward output and parameter
+# gradients (dense and sparse). Main entry points: write_test_to_test_class and
+# build_cpp_tests. No import-time side effects.
 # The purpose of this test is to check that we have implementation parity between
 # a Python `torch.nn` module and its corresponding C++ `torch::nn` module. Concretely,
 # this test does the following:
@@ -104,6 +112,16 @@ void ${module_variant_name}_test_forward_backward(
 
 
 def run_python_forward_backward(unit_test_class, test_params):
+    # [FUNCTION DOC] Runs forward and backward for a Python module test. Builds the module from
+    # the test instance constructor and args on the test device, prepares inputs from the input,
+    # target and extra_args entries (input tensors require grad), seeds the RNG with 0, runs
+    # forward, then replaces the module forward with an identity so it can be traced to a script
+    # module that carries only parameters and buffers. Backward is taken on the output sum
+    # (absolute value for complex outputs). Returns the script module, the Python output and a
+    # mapping from parameter-gradient key (suffix grad, or grad_indices and grad_values for
+    # sparse) to tensor. unit_test_class is unused.
+    # KNOWN ISSUE: a parameter with no gradient makes the sparse check fail with an attribute
+    # error.
     device = test_params.device
     module = test_params.test_instance.constructor(
         *test_params.test_instance.constructor_args
@@ -155,6 +173,12 @@ def run_python_forward_backward(unit_test_class, test_params):
 
 
 def test_forward_backward(unit_test_class, test_params):
+    # [FUNCTION DOC] Runs one parity test for a module variant. Recreates an empty temp folder,
+    # runs the Python pass, saves the traced module and serialized arguments, fetches the compiled
+    # C++ test function by variant name from the test class, runs it, loads the saved C++ forward
+    # output and gradient dictionary, and asserts through the test class that the outputs, the
+    # number of gradient entries and each gradient match, with descriptive messages. Removes the
+    # temp folder at the end (only on success).
     module_variant_name = test_params.module_variant_name
     cpp_tmp_folder = test_params.cpp_tmp_folder
     # Remove the temporary folder if it exists already
@@ -180,6 +204,11 @@ def test_forward_backward(unit_test_class, test_params):
     cpp_test_fn = getattr(unit_test_class.module_impl_check_cpp_module, cpp_test_name)
 
     def run_cpp_test_fn_and_check_output():
+        # [FUNCTION DOC] HELPER: Calls the C++ test with the four file paths, loads its
+        # outputs (gradient dictionary loading allows the restore_type_tag pickle global)
+        # and performs all equality assertions against the Python results from the
+        # enclosing scope. Raises AssertionError if a gradient key suffix cannot be
+        # recognised.
         forward_output_file_path = compute_temp_file_path(
             cpp_tmp_folder, module_variant_name, "forward_output"
         )
@@ -250,6 +279,9 @@ def test_forward_backward(unit_test_class, test_params):
 
 
 def compute_module_name(test_params_dict):
+    # [FUNCTION DOC] Returns the torch.nn module name for a test params dict: the text before the
+    # first underscore of the fullname entry when present and non-empty, otherwise the module_name
+    # entry (None if absent).
     fullname = test_params_dict.get("fullname", None)
     if fullname:
         module_name = fullname.split("_")[0]
@@ -259,6 +291,13 @@ def compute_module_name(test_params_dict):
 
 
 def process_test_params_for_module(test_params_dict, device, test_instance_class):
+    # [FUNCTION DOC] Builds the TorchNNModuleTestParams for one device from a params dict. Fills
+    # in the constructor entry (default: the torch.nn class by name) by mutating the passed dict,
+    # creates the test instance, checks the test name starts with the test prefix (else
+    # AssertionError), builds the variant name with a device suffix for non-cpu devices, requires
+    # a C++ constructor args entry when constructor args exist (else AssertionError), computes the
+    # arg dict, reads the optional parity flag (default true) and allocates a temporary folder.
+    # KNOWN ISSUE: the error text lacks a line break between the dict dump and the next sentence.
     module_name = compute_module_name(test_params_dict)
     test_params_dict["constructor"] = test_params_dict.get(
         "constructor", getattr(torch.nn, module_name)
@@ -298,6 +337,12 @@ def process_test_params_for_module(test_params_dict, device, test_instance_class
 def write_test_to_test_class(
     unit_test_class, test_params_dict, test_instance_class, parity_table, devices
 ):
+    # [FUNCTION DOC] Validates one module test params dict and registers a unit test per device on
+    # unit_test_class. Raises AssertionError if it is a functional test, if torch.nn lacks the
+    # module, or if the parity table has no entry for it. For each device it builds params,
+    # deletes the freshly made temp folder, stores the params in the class map keyed by unit test
+    # name, wraps a test function with decorate_test_fn (cuda flag, impl-parity flag from the
+    # table and the params dict, device) and adds it to the class.
     if is_torch_nn_functional_test(test_params_dict):
         raise AssertionError("Expected non-functional test")
 
@@ -329,6 +374,8 @@ def write_test_to_test_class(
         unit_test_class.module_test_params_map[unit_test_name] = test_params
 
         def test_fn(self):
+            # [FUNCTION DOC] HELPER: Generated unit test body; looks up the stored params for
+            # the running test method name and runs the forward and backward parity check.
             test_forward_backward(
                 unit_test_class=self,
                 test_params=unit_test_class.module_test_params_map[
@@ -348,6 +395,10 @@ def write_test_to_test_class(
 
 
 def generate_test_cpp_sources(test_params, template):
+    # [FUNCTION DOC] Returns the C++ source text for one test by substituting the variant name,
+    # qualified module name, argument construction statements (joined with semicolons and
+    # newlines), constructor args (wrapped in parentheses unless empty), forward argument symbols
+    # (comma joined) and device into the template.
     device = test_params.device
 
     cpp_constructor_args = test_params.cpp_constructor_args
@@ -372,6 +423,10 @@ def generate_test_cpp_sources(test_params, template):
 
 # Build all C++ tests together, instead of once per test.
 def build_cpp_tests(unit_test_class, print_cpp_source=False):
+    # [FUNCTION DOC] Compiles all registered module tests together into one inline C++ module
+    # (once, not per test), using the common harness, sample module source and a source per params
+    # entry. Optionally prints the full source. Stores the compiled module on the test class and
+    # returns nothing. Raises AssertionError if the params map is empty.
     if len(unit_test_class.module_test_params_map) <= 0:
         raise AssertionError(
             "Expected module_test_params_map to have at least one entry"

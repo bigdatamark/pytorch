@@ -1,3 +1,8 @@
+# [MODULE DOC] Parser for the C++/Python API parity tracker Markdown file.
+# Defines the ParityStatus named tuple (has_impl_parity, has_doc_parity
+# booleans) and one function that turns the tracker tables into a nested
+# mapping. The bare string after the tuple is only a format description, not a
+# real docstring. No import-time side effects.
 from collections import namedtuple
 
 
@@ -33,7 +38,20 @@ Dict[package_name]
 
 
 def parse_parity_tracker_table(file_path):
+    # [FUNCTION DOC] Reads the tracker file at file_path and returns a mapping
+    # from package name to a mapping from API name to ParityStatus. Text is split
+    # on the two-hash marker; content before the first marker is ignored. For each
+    # package the first non-blank line is the name, the next two lines (table
+    # header and separator) are skipped, and every remaining non-blank line is a
+    # three-column row separated by vertical bars. Raises RuntimeError for a
+    # duplicated package name or a Yes/No value that is neither; a row with a
+    # wrong column count raises ValueError. KNOWN ISSUE: splitting on the two-hash
+    # marker also breaks on deeper headings or any text containing it, and a
+    # package with fewer than three lines yields no rows silently.
     def parse_parity_choice(str):
+        # [FUNCTION DOC] HELPER: Converts the text Yes to true and No to false. Raises
+        # RuntimeError for any other value. The parameter name shadows the builtin
+        # str.
         if str in ["Yes", "No"]:
             return str == "Yes"
         else:

@@ -1,3 +1,9 @@
+# [MODULE DOC] Script that prints a C++ header of baseline parameter trajectories for
+# optimizers. For each optimizer in the OPTIMIZERS table (LBFGS, Adam, AdamW, Adagrad,
+# RMSprop, SGD variants) it trains a small seeded sigmoid network in float64 for a number of
+# iterations on a fixed input, sampling the parameters every few steps, and prints C++ source
+# defining functions in namespace expected_parameters. Options: iterations and sample-every
+# (command line flags). Output to stdout, progress to stderr. No import-time side effects.
 """Script to generate baseline values from PyTorch optimization algorithms"""
 
 import argparse
@@ -62,6 +68,9 @@ OPTIMIZERS = {
 
 
 def weight_init(module):
+    # [FUNCTION DOC] HELPER: Module-apply hook. For linear modules, re-initializes all parameters
+    # (weights and bias) in place with a uniform distribution scaled by one over the square root
+    # of the input feature count. Other modules are ignored.
     if isinstance(module, torch.nn.Linear):
         stdev = 1.0 / math.sqrt(module.weight.size(1))
         for p in module.parameters():
@@ -69,6 +78,11 @@ def weight_init(module):
 
 
 def run(optimizer_name, iterations, sample_every):
+    # [FUNCTION DOC] HELPER: Trains a seeded 2-3-1 sigmoid network in float64 with the named
+    # optimizer (key in OPTIMIZERS; raises KeyError otherwise) for the given iterations, on a
+    # fixed 3x2 input, minimizing the output sum. Every sample_every steps appends the flattened
+    # parameter arrays. Returns the list of samples. The step closure is a dummy returning a
+    # constant tensor.
     torch.manual_seed(0)
     model = torch.nn.Sequential(
         torch.nn.Linear(2, 3),
@@ -91,6 +105,7 @@ def run(optimizer_name, iterations, sample_every):
         loss.backward()
 
         def closure():
+            # [FUNCTION DOC] HELPER: Dummy step closure; returns a constant tensor holding 10.
             return torch.tensor([10.0])
 
         optimizer.step(closure)
@@ -104,6 +119,9 @@ def run(optimizer_name, iterations, sample_every):
 
 
 def emit(optimizer_parameter_map):
+    # [FUNCTION DOC] HELPER: Prints the C++ header text for a mapping from optimizer name to a
+    # list of samples (each a list of parameter arrays): a generated-file marker line, then one
+    # C++ function per optimizer returning nested vectors of tensors. Writes to stdout only.
     # Don't write generated with an @ in front, else this file is recognized as generated.
     print("// @{} from {}".format("generated", __file__))
     print(HEADER)
@@ -122,6 +140,8 @@ def emit(optimizer_parameter_map):
 
 
 def main():
+    # [FUNCTION DOC] HELPER: Entry point. Parses the command line options, runs every optimizer
+    # while logging progress to stderr, then emits the C++ baseline text to stdout.
     parser = argparse.ArgumentParser(
         "Produce optimization output baseline from PyTorch"
     )

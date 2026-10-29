@@ -1,3 +1,8 @@
+# [MODULE DOC] Script that prints a C++ header of baseline weight values for initializers.
+# For each initializer (Xavier and Kaiming, uniform and normal) it seeds the RNG, builds three
+# linear layers (7->15, 15->15, 15->2), initializes their weights and prints C++ source defining
+# functions in namespace expected_parameters that return the values as tensors. Output goes to
+# stdout and progress to stderr; run as a script. No import-time side effects beyond definitions.
 """Script to generate baseline values from PyTorch initialization algorithms"""
 
 import sys
@@ -26,6 +31,9 @@ INITIALIZERS = {
 
 
 def emit(initializer_parameter_map):
+    # [FUNCTION DOC] HELPER: Prints the C++ header text for a mapping from initializer name to a
+    # list of weight arrays: a generated-file marker line, then one C++ function per initializer
+    # returning nested vectors of tensors built from the flattened values. Writes to stdout only.
     # Don't write generated with an @ in front, else this file is recognized as generated.
     print("// @{} from {}".format("generated", __file__))
     print(HEADER)
@@ -44,6 +52,9 @@ def emit(initializer_parameter_map):
 
 
 def run(initializer):
+    # [FUNCTION DOC] HELPER: Seeds the RNG with 0, creates three linear layers, applies the named
+    # initializer (key in INITIALIZERS) to each weight and returns the three weights as numpy
+    # arrays. Raises KeyError for an unknown name.
     torch.manual_seed(0)
 
     layer1 = torch.nn.Linear(7, 15)
@@ -63,6 +74,8 @@ def run(initializer):
 
 
 def main():
+    # [FUNCTION DOC] HELPER: Entry point. Runs every initializer, logging progress to stderr, then
+    # emits the C++ baseline text to stdout.
     initializer_parameter_map = {}
     for initializer in INITIALIZERS:
         sys.stderr.write(f"Evaluating {initializer} ...\n")

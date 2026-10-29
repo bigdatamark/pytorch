@@ -1,4 +1,13 @@
 # Owner(s): ["module: complex"]
+# [MODULE DOC] Tests that ComplexTensor (a tensor subclass storing real and imaginary
+# parts separately) behaves like native complex tensors. Defines SKIPS (op/variant
+# pairs to skip, with reasons) and EXTRA_KWARGS (per op/dtype/variant comparison
+# tolerances), both keyed by Descriptor and consumed by utils.TestCase. Test classes:
+# TestComplexTensor (forward consistency vs native complex, plus a few direct subclass
+# checks), TestComplexBwdGradients (gradcheck on complex128) and, when
+# torch.distributed is available, TestComplexDistributed (same ops on DTensor).
+# Device-generic classes are instantiated at import time into this module; running as
+# a script calls run_tests.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -128,6 +137,10 @@ EXTRA_KWARGS = {
 
 
 class TestComplexTensor(TestCase):
+    # [CLASS DOC] Op-info driven and direct tests comparing ComplexTensor results against
+    # native complex tensors. Default dtype checking is enabled. Methods: test_consistency
+    # and test_maybe_error (per op, device and complex dtype) and three direct tests of
+    # the subclass API.
     _default_dtype_check_enabled = True
 
     @ops(
@@ -136,13 +149,23 @@ class TestComplexTensor(TestCase):
         allowed_dtypes=list(COMPLEX_DTYPES),
     )
     def test_consistency(self, device, dtype, op: OpInfo):
+        # [FUNCTION DOC] For every implemented op and supported complex dtype, checks that
+        # running the op on ComplexTensor inputs matches native complex results (or raises the
+        # same kind of error).
         self.check_consistency(device, dtype, op, Variant.Op)
 
     @ops(force_test_op_db, allowed_dtypes=list(COMPLEX_DTYPES))
     def test_maybe_error(self, device, dtype, op: OpInfo):
+        # [FUNCTION DOC] Same consistency check as test_consistency, but for ops on the
+        # forced-test list, which may legitimately error; results and error types are compared
+        # and dtypes are not restricted to the supported set.
         self.check_consistency(device, dtype, op, Variant.Op)
 
     def test_get_set_components(self):
+        # [FUNCTION DOC] Checks the real and imaginary properties of a ComplexTensor built
+        # from an interleaved complex64 tensor, then assigns new values through both setters
+        # (integer inputs are expected to be stored as float32) and checks the interleaved
+        # result equals the matching complex tensor.
         from torch._subclasses.complex_tensor import ComplexTensor
 
         c = ComplexTensor.from_interleaved(
@@ -158,6 +181,9 @@ class TestComplexTensor(TestCase):
         self.assertEqual(c, torch.tensor([5 + 7j, 6 + 8j], dtype=torch.complex64))
 
     def test_mul_inplace_complex(self):
+        # [FUNCTION DOC] Checks that in-place multiplication of a ComplexTensor by another
+        # ComplexTensor returns the same object and that its interleaved form equals the
+        # native complex product.
         from torch._subclasses.complex_tensor import ComplexTensor
 
         a = torch.tensor([1 + 2j, 3 + 4j], dtype=torch.complex64)
@@ -171,6 +197,8 @@ class TestComplexTensor(TestCase):
         self.assertEqual(xa.as_interleaved(), expected)
 
     def test_ne_real_operand(self):
+        # [FUNCTION DOC] Checks that elementwise not-equal between a real tensor and a
+        # ComplexTensor gives the same boolean result as with the native complex tensor.
         from torch._subclasses.complex_tensor import ComplexTensor
 
         r = torch.tensor([1.0, 3.0, 5.0])
@@ -182,6 +210,9 @@ class TestComplexTensor(TestCase):
 
 @unMarkDynamoStrictTest
 class TestComplexBwdGradients(TestCase):
+    # [CLASS DOC] Gradient tests for ComplexTensor ops with strict-Dynamo marking removed.
+    # Default dtype checking is enabled. Method test_fn_grad runs gradcheck per
+    # implemented op on complex128.
     _default_dtype_check_enabled = True
 
     @ops(
@@ -190,6 +221,9 @@ class TestComplexBwdGradients(TestCase):
         allowed_dtypes=[torch.complex128],
     )
     def test_fn_grad(self, device: str, dtype: torch.dtype, op: OpInfo) -> None:
+        # [FUNCTION DOC] Runs gradcheck (including batched grad and forward AD) for the op
+        # with ComplexTensor inputs; skipped ops come from SKIPS via the shared helper.
+        # Returns nothing.
         self.check_grad(device, dtype, op)
 
 
@@ -202,8 +236,14 @@ if dist.is_available():
 
     @unMarkDynamoStrictTest
     class TestComplexDistributed(TestCase, MultiProcessTestCase):
+        # [CLASS DOC] Multi-process test case checking ComplexTensor ops wrapped in DTensor.
+        # Defined only when torch.distributed is available. Method test_distributed runs the
+        # consistency check with the distributed variant.
         @ops(implemented_op_db, allowed_dtypes=list(COMPLEX_DTYPES))
         def test_distributed(self, device, dtype, op: OpInfo):
+            # [FUNCTION DOC] For every implemented op and complex dtype, compares native complex
+            # results with results on DTensor-wrapped ComplexTensor inputs (distributed variant of
+            # the consistency check).
             self.check_consistency(device, dtype, op, Variant.Distributed)
 
     instantiate_device_type_tests(TestComplexDistributed, globals())

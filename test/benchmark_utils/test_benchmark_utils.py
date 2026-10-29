@@ -1,4 +1,12 @@
 # Owner(s): ["module: unknown"]
+# [MODULE DOC] Unit tests for torch.utils.benchmark (Timer, Measurement, Compare, Fuzzer
+# and the Callgrind wrapper). Real timing tests are minimal; most tests use a mock timer
+# class with deterministic noise so the printed measurements can be checked against
+# inline expected strings. Callgrind formatting tests use stored artifacts from
+# callgrind_artifacts.json next to this file (CALLGRIND_ARTIFACTS holds its path).
+# Provides generate_callgrind_artifacts (manual regeneration helper) and
+# load_callgrind_artifacts (builds CallgrindStats objects from the json). Running as a
+# script calls run_tests. No import-time side effects beyond definitions.
 
 import collections
 import json
@@ -30,6 +38,13 @@ CALLGRIND_ARTIFACTS: str = os.path.join(
 
 
 def generate_callgrind_artifacts() -> None:
+    # [FUNCTION DOC] HELPER: Manual tool that regenerates the callgrind artifact json file.
+    # Collects callgrind stats for two small statements (creating a scalar tensor and a one
+    # element tensor, 1000 iterations each), converts each function count list to strings of
+    # count and function with the current user's directory replaced by a placeholder user,
+    # and writes the mapping with six keys (baseline, no-data and with-data, inclusive and
+    # exclusive) to CALLGRIND_ARTIFACTS. Prints a notice. Slow, non-deterministic and needs
+    # valgrind; never called by the tests.
     """Regenerate `callgrind_artifacts.json`
 
     Unlike the expect tests, regenerating callgrind counts will produce a
@@ -51,6 +66,8 @@ def generate_callgrind_artifacts() -> None:
     user = os.getenv("USER")
 
     def to_entry(fn_counts):
+        # [FUNCTION DOC] HELPER: Turns a list of count and function pairs into strings of the
+        # form count then function, with the user directory in the function path anonymized.
         return [f"{c} {fn.replace(f'/{user}/', '/test_user/')}" for c, fn in fn_counts]
 
     artifacts = {
@@ -70,6 +87,11 @@ def load_callgrind_artifacts() -> tuple[
     benchmark_utils.CallgrindStats,
     benchmark_utils.CallgrindStats,
 ]:
+    # [FUNCTION DOC] HELPER: Reads callgrind_artifacts.json and rebuilds two CallgrindStats
+    # objects (for a no-data and a with-data tensor creation statement; 1000 runs per
+    # measurement, debug symbols flag true, no raw output) that share the baseline counts.
+    # Returns them as a tuple. Raises AssertionError if an entry string does not match the
+    # count-then-function pattern.
     """Hermetic artifact to unit test Callgrind wrapper.
 
     In addition to collecting counts, this wrapper provides some facilities for
@@ -88,6 +110,10 @@ def load_callgrind_artifacts() -> tuple[
     def to_function_counts(
         count_strings: list[str], inclusive: bool
     ) -> benchmark_utils.FunctionCounts:
+        # [FUNCTION DOC] HELPER: Parses each string into a function count (integer count
+        # and function name), sorts them in descending order and returns a
+        # FunctionCounts marked inclusive or exclusive. Raises AssertionError when a
+        # string does not match the expected pattern.
         data: list[benchmark_utils.FunctionCount] = []
         for cs in count_strings:
             # Storing entries as f"{c} {fn}" rather than [c, fn] adds some work
@@ -139,14 +165,27 @@ def load_callgrind_artifacts() -> tuple[
 
 
 class MyModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Trivial module whose forward adds one; used as a global in
+    # callgrind tests (and expected not to be importable in the subprocess unless a setup is
+    # given).
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Returns the input plus one.
         return x + 1
 
 
 class TestBenchmarkUtils(TestCase):
+    # [CLASS DOC] Test case for the benchmark utilities. Contains a helper for expect-style
+    # assertions, a nested deterministic mock timer class (_MockTimer) with class level
+    # constants for noise and per-statement costs, and tests for timing, callgrind
+    # collection and manipulation, table comparison and the fuzzer.
     def regularizeAndAssertExpectedInline(
         self, x: Any, expect: str, indent: int = 12
     ) -> None:
+        # [FUNCTION DOC] HELPER: Asserts that the string form of x (or x itself if it is a
+        # string) matches an inline expected string after normalizing object addresses to a
+        # fixed placeholder. Multi-line values are indented to line up with the call site
+        # (default 12 spaces). Uses the expect test mechanism with a frame skip of one so that
+        # expectations are located at the caller.
         x_str: str = re.sub(
             "object at 0x[0-9a-fA-F]+>",
             "object at 0xXXXXXXXXXXXX>",
@@ -159,6 +198,11 @@ class TestBenchmarkUtils(TestCase):
         self.assertExpectedInline(x_str, expect, skip=1)
 
     def test_timer(self):
+        # [FUNCTION DOC] Smoke test for the real Timer: timeit, blocked_autorange and
+        # adaptive_autorange return float medians, and a multi-line statement with multi-line
+        # setup can be timed.
+        # KNOWN ISSUE: the final assertion re-checks the first sample instead of the median of
+        # the multi-line timer, so that case is effectively untested for its value.
         timer = benchmark_utils.Timer(
             stmt="torch.ones(())",
         )
@@ -192,6 +236,9 @@ class TestBenchmarkUtils(TestCase):
     @unittest.skipIf(IS_SANDCASTLE, "C++ timing is OSS only.")
     @unittest.skipIf(True, "Failing on clang, see 74398")
     def test_timer_tiny_fast_snippet(self):
+        # [FUNCTION DOC] C++ timing smoke test: times a tiny C++ snippet with the default timer
+        # and expects a float median. Always skipped (hard-coded skip for a clang failure) and
+        # marked slow.
         timer = benchmark_utils.Timer(
             "auto x = 1;(void)x;",
             timer=timeit.default_timer,
@@ -204,6 +251,9 @@ class TestBenchmarkUtils(TestCase):
     @unittest.skipIf(IS_SANDCASTLE, "C++ timing is OSS only.")
     @unittest.skipIf(True, "Failing on clang, see 74398")
     def test_cpp_timer(self):
+        # [FUNCTION DOC] C++ timer test: times a C++ statement that needs both a global setup
+        # define and a per-run setup, checking the median is a float. Always skipped (hard-coded
+        # skip for a clang failure) and marked slow.
         timer = benchmark_utils.Timer(
             """
                 #ifndef TIMER_GLOBAL_CHECK
@@ -221,6 +271,10 @@ class TestBenchmarkUtils(TestCase):
         self.assertIsInstance(t.median, float)
 
     class _MockTimer:
+        # [CLASS DOC] HELPER: Deterministic stand-in for the timeit-based timer used by the
+        # benchmark Timer. Class constants set the random seed, timer overhead and noise, and a
+        # table of mean costs per statement. Each instance owns a seeded random generator, so
+        # results are reproducible.
         _seed = 0
 
         _timer_noise_level = 0.05
@@ -235,13 +289,22 @@ class TestBenchmarkUtils(TestCase):
         )
 
         def __init__(self, stmt, setup, timer, globals):
+            # [FUNCTION DOC] HELPER: Seeds a random generator from the class seed and looks
+            # up the mean cost of the statement in the cost table (raises KeyError for an
+            # unknown statement). Setup, timer and globals arguments are accepted and
+            # ignored.
             self._random_state = np.random.RandomState(seed=self._seed)
             self._mean_cost = dict(self._function_costs)[stmt]
 
         def sample(self, mean, noise_level):
+            # [FUNCTION DOC] HELPER: Draws a normally distributed sample around the mean
+            # with the given relative noise, never lower than 5 nanoseconds.
             return max(self._random_state.normal(mean, mean * noise_level), 5e-9)
 
         def timeit(self, number):
+            # [FUNCTION DOC] HELPER: Returns the simulated elapsed time of running the
+            # statement number times: noisy timer overhead twice plus the noisy statement
+            # cost times number.
             return sum(
                 [
                     # First timer invocation
@@ -254,10 +317,17 @@ class TestBenchmarkUtils(TestCase):
             )
 
     def test_adaptive_timer(self):
+        # [FUNCTION DOC] Tests blocked_autorange and adaptive_autorange against the mock timers
+        # with fixed expected output (printed measurement, mean, median, counts) for several
+        # statements, a mock cuda variant with higher timer cost, and the printed form of
+        # multi-line statements with labels, sub labels, setup, description and thread count.
         class MockTimer(benchmark_utils.Timer):
+            # [CLASS DOC] HELPER: Benchmark Timer wired to the mock timer class.
             _timer_cls = self._MockTimer
 
         class _MockCudaTimer(self._MockTimer):
+            # [CLASS DOC] HELPER: Mock timer with a high timer overhead (like a cuda
+            # synchronize) and a lower cost for the expensive function.
             # torch.cuda.synchronize is much more expensive than
             # just timeit.default_timer
             _timer_cost = 10e-6
@@ -270,6 +340,7 @@ class TestBenchmarkUtils(TestCase):
             )
 
         class MockCudaTimer(benchmark_utils.Timer):
+            # [CLASS DOC] HELPER: Benchmark Timer wired to the mock cuda timer class.
             _timer_cls = _MockCudaTimer
 
         m = MockTimer("pass").blocked_autorange(min_run_time=10)
@@ -498,6 +569,12 @@ class TestBenchmarkUtils(TestCase):
     @unittest.skipIf(IS_SANDCASTLE, "Valgrind is OSS only.")
     @unittest.skipIf(TEST_WITH_ASAN, "fails on asan")
     def test_collect_callgrind(self):
+        # [FUNCTION DOC] Tests the Callgrind collection of the Timer (needs valgrind; slow).
+        # Checks the error for globals not wrapped in the copy helper, the error when a module
+        # class cannot be imported in the subprocess, then collects counts for a scripted
+        # function plus module and integer globals, and checks counts are positive and
+        # repeatable within 10000 instructions across 20 repeats, and that the wrapper singleton
+        # has no JIT bindings module.
         with self.assertRaisesRegex(
             ValueError,
             r"`collect_callgrind` requires that globals be wrapped "
@@ -520,6 +597,7 @@ class TestBenchmarkUtils(TestCase):
 
         @torch.jit.script
         def add_one(x):
+            # [FUNCTION DOC] HELPER: Scripted function returning its input plus one.
             return x + 1
 
         timer = benchmark_utils.Timer(
@@ -580,6 +658,10 @@ class TestBenchmarkUtils(TestCase):
     @unittest.skipIf(IS_SANDCASTLE, "Valgrind is OSS only.")
     @unittest.skipIf(True, "Failing on clang, see 74398")
     def test_collect_cpp_callgrind(self):
+        # [FUNCTION DOC] Callgrind test for C++ statements: counts must be positive, identical
+        # across runs, and unaffected by denoising; with many repeats a tuple of stats is
+        # returned and counts are roughly stable. Always skipped (hard-coded skip for a clang
+        # failure) and marked slow.
         timer = benchmark_utils.Timer(
             "x += 1;",
             setup="torch::Tensor x = torch::ones({1});",
@@ -613,6 +695,10 @@ class TestBenchmarkUtils(TestCase):
         self.assertGreater(max(counts.values()), 1, repr(counts))
 
     def test_manipulate_callgrind_stats(self):
+        # [FUNCTION DOC] Tests manipulating stored callgrind stats (no valgrind needed): wide
+        # line width output stays within 160 columns, delta equals subtracting stats, and the
+        # standardized, counts, stats, filter, transform and subtraction results print as
+        # expected inline strings.
         stats_no_data, stats_with_data = load_callgrind_artifacts()
 
         # Mock `torch.set_printoptions(linewidth=160)`
@@ -634,6 +720,8 @@ class TestBenchmarkUtils(TestCase):
         )
 
         def custom_transforms(fn: str):
+            # [FUNCTION DOC] HELPER: Normalizes a function name by stripping include and
+            # build path prefixes and shortening the libsupc++ path; returns the new string.
             fn = re.sub(re.escape("/usr/include/c++/8/bits/"), "", fn)
             fn = re.sub(r"build/../", "", fn)
             fn = re.sub(".+" + re.escape("libsupc++"), "libsupc++", fn)
@@ -852,6 +940,11 @@ class TestBenchmarkUtils(TestCase):
         )
 
     def test_compare(self):
+        # [FUNCTION DOC] Tests the Compare table. Builds simulated results for three functions
+        # over five sizes using mock timers (the third only for square sizes), checks the table
+        # text, then after significant figure trimming, then with column-wise and row-wise
+        # coloring (compared with escape sequence strings). When the expect accept mode is on,
+        # prints replacement strings for the two colored cases.
         # Simulate several approaches.
         costs = (
             # overhead_optimized_fn()
@@ -872,24 +965,31 @@ class TestBenchmarkUtils(TestCase):
 
         # overhead_optimized_fn()
         class _MockTimer_0(self._MockTimer):
+            # [CLASS DOC] HELPER: Mock timer with costs growing linearly with element count
+            # for the overhead optimized function.
             _function_costs = tuple(
                 (f"fn({i}, {j})", costs[0][0] + costs[0][1] * i * j) for i, j in sizes
             )
 
         class MockTimer_0(benchmark_utils.Timer):
+            # [CLASS DOC] HELPER: Benchmark Timer wired to the first mock timer.
             _timer_cls = _MockTimer_0
 
         # compute_optimized_fn()
         class _MockTimer_1(self._MockTimer):
+            # [CLASS DOC] HELPER: Mock timer with costs for the compute optimized function.
             _function_costs = tuple(
                 (f"fn({i}, {j})", costs[1][0] + costs[1][1] * i * j) for i, j in sizes
             )
 
         class MockTimer_1(benchmark_utils.Timer):
+            # [CLASS DOC] HELPER: Benchmark Timer wired to the second mock timer.
             _timer_cls = _MockTimer_1
 
         # special_case_fn()
         class _MockTimer_2(self._MockTimer):
+            # [CLASS DOC] HELPER: Mock timer for the special case function, defined only for
+            # square sizes.
             _function_costs = tuple(
                 (f"fn({i}, {j})", costs[2][0] + costs[2][1] * i * j)
                 for i, j in sizes
@@ -897,6 +997,7 @@ class TestBenchmarkUtils(TestCase):
             )
 
         class MockTimer_2(benchmark_utils.Timer):
+            # [CLASS DOC] HELPER: Benchmark Timer wired to the third mock timer.
             _timer_cls = _MockTimer_2
 
         results = []
@@ -930,6 +1031,8 @@ class TestBenchmarkUtils(TestCase):
                 )
 
         def rstrip_lines(s: str) -> str:
+            # [FUNCTION DOC] HELPER: Strips trailing whitespace from every line of the
+            # string and returns the rejoined text.
             # VSCode will rstrip the `expected` string literal whether you like
             # it or not. So we have to rstrip the compare table as well.
             return "\n".join([i.rstrip() for i in s.splitlines(keepends=False)])
@@ -991,6 +1094,8 @@ class TestBenchmarkUtils(TestCase):
         )
 
         def print_new_expected(s: str) -> None:
+            # [FUNCTION DOC] HELPER: Prints a string as an indented triple quoted block with
+            # escaped characters, for pasting into the expected values. Writes to stdout.
             print(f'{"":>12}"""\\', end="")
             for l in s.splitlines(keepends=False):
                 print("\n" + textwrap.indent(repr(l)[1:-1], " " * 12), end="")
@@ -1014,6 +1119,9 @@ class TestBenchmarkUtils(TestCase):
         IS_WINDOWS and os.getenv("VC_YEAR") == "2019", "Random seed only accepts int32"
     )
     def test_fuzzer(self):
+        # [FUNCTION DOC] Checks that a seeded Fuzzer with one log-uniform integer parameter and
+        # one tensor produces two reproducible tensors matching hard-coded values within
+        # tolerance. Skipped on Windows with a specific compiler year due to seed range limits.
         fuzzer = benchmark_utils.Fuzzer(
             parameters=[
                 benchmark_utils.FuzzedParameter(

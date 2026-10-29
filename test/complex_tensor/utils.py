@@ -1,3 +1,12 @@
+# [MODULE DOC] Shared helpers for the ComplexTensor tests. Provides
+# COMPLEX_DTYPES, the Variant enum (Op, GradCheck, Distributed), Descriptor (a
+# frozen record naming op, variant, device type, dtype, used to look up skips and
+# tolerances with None as wildcard), and a TestCase subclass with consistency and
+# gradient checkers. Also builds the op-info lists at import time: complex_op_db,
+# implemented_op_db, force_test_op_db, and the set of ops without tests.
+# Import-time side effect: emits a UserWarning listing implemented ops that have
+# no matching op-info. Skips and tolerances are imported lazily from
+# test_complex_tensor (package-relative or top-level).
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
@@ -35,12 +44,17 @@ BINARY_NONLINEAR_CUDA_TOL = {"rtol": 5e-6, "atol": 2e-5}
 
 
 class Variant(Enum):
+    # [CLASS DOC] Kinds of check: Op (plain tensor ops), GradCheck (gradient check)
+    # and Distributed (DTensor-wrapped inputs). No methods.
     Op = auto()
     GradCheck = auto()
     Distributed = auto()
 
 
 def _as_local(arg: DTensor | Any) -> torch.Tensor | Any:
+    # [FUNCTION DOC] HELPER: Returns the full local tensor if the argument is a
+    # DTensor (and distributed is available), otherwise returns the argument
+    # unchanged.
     if not (dist.is_available() and isinstance(arg, dist.tensor.DTensor)):
         return arg
 
@@ -48,6 +62,8 @@ def _as_local(arg: DTensor | Any) -> torch.Tensor | Any:
 
 
 def _as_complex_dtensor(arg: torch.Tensor | Any) -> torch.Tensor | Any:
+    # [FUNCTION DOC] HELPER: Converts a tensor to a ComplexTensor and wraps it as a
+    # DTensor from local data; non-tensor arguments are returned unchanged.
     if not isinstance(arg, torch.Tensor):
         return arg
 
@@ -62,12 +78,19 @@ TRANSFORM_FUNCS = {
 
 @dataclass(frozen=True, kw_only=True)
 class Descriptor:
+    # [CLASS DOC] Frozen keyword-only record identifying a test case: op overload
+    # packet, variant (may be None), and optional device type and dtype (None means
+    # any). Hashable, so it is used as a key in the skip and tolerance tables. Key
+    # method: matches.
     op: OpOverloadPacket
     variant: Variant | None
     device_type: str | None = field(default=None)
     dtype: torch.dtype | None = field(default=None)
 
     def matches(self, other: Descriptor) -> bool:
+        # [FUNCTION DOC] Returns true if every field of this descriptor equals the other's
+        # or is None on at least one side (None acts as a wildcard); returns false if the
+        # field sets differ or any non-None pair differs.
         fields1 = fields(self)
         fields2 = fields(other)
         if fields1 != fields2:
@@ -83,6 +106,10 @@ class Descriptor:
 
 
 class TestCase(PytorchTestCase):
+    # [CLASS DOC] Base test case for ComplexTensor tests, extending the PyTorch test
+    # case. Holds no state. Methods: assertSameResult (compare two callables),
+    # conditional_skip and get_extra_kwargs (table lookups), check_consistency
+    # (forward comparison) and check_grad (gradcheck).
     def assertSameResult(
         self,
         expected: Callable[[], Any],
@@ -90,6 +117,13 @@ class TestCase(PytorchTestCase):
         *args,
         **kwargs,
     ) -> None:
+        # [FUNCTION DOC] Calls both zero-argument callables, capturing any exception. If
+        # only the actual one raises, that exception is re-raised; if only the expected
+        # one raises, fails the test on the type mismatch. If neither raised, asserts the
+        # results have the same tree structure and compares each leaf (converted to
+        # interleaved complex and gathered if DTensor) with assertEqual, forwarding extra
+        # args and kwargs such as tolerances.
+        # KNOWN ISSUE: when both callables raise, the exception types are not compared.
         try:
             result_e = expected()
             exception_e = None
@@ -129,6 +163,9 @@ class TestCase(PytorchTestCase):
                 self.assertEqual(value_e, value_a, *args, **kwargs)
 
     def conditional_skip(self, desc: Descriptor) -> None:
+        # [FUNCTION DOC] Skips the running test (skipTest with the reason) if any entry of
+        # the SKIPS table matches the descriptor. Lazily imports the table from
+        # test_complex_tensor.
         try:
             from .test_complex_tensor import SKIPS
         except ImportError:
@@ -138,6 +175,10 @@ class TestCase(PytorchTestCase):
                 self.skipTest(reason)
 
     def get_extra_kwargs(self, desc: Descriptor) -> dict[str, Any]:
+        # [FUNCTION DOC] Returns the comparison kwargs (rtol and atol mapping) for a
+        # descriptor: the first matching EXTRA_KWARGS entry, else a looser tolerance for
+        # binary nonlinear ops on cuda in the op or distributed variants, else an empty
+        # mapping.
         try:
             from .test_complex_tensor import EXTRA_KWARGS
         except ImportError:
@@ -159,6 +200,11 @@ class TestCase(PytorchTestCase):
     def check_consistency(
         self, device: str, dtype: torch.dtype, op: OpInfo, variant: Variant
     ) -> None:
+        # [FUNCTION DOC] Compares ComplexTensor and native complex execution of an op for
+        # all sample inputs. variant must be Op or Distributed, else AssertionError.
+        # Builds a descriptor, applies skips and tolerances, converts each sample with the
+        # variant's transform, and asserts that both calls give the same result or error.
+        # Returns nothing.
         if variant not in {Variant.Op, Variant.Distributed}:
             raise AssertionError(
                 f"`check_consistency` called with the wrong `variant`: {variant}"
@@ -179,6 +225,8 @@ class TestCase(PytorchTestCase):
         for sample_input in sample_inputs:
 
             def expected(sample_input=sample_input):
+                # [FUNCTION DOC] HELPER: Runs the op on the native sample input (captured by
+                # default argument).
                 return op(
                     sample_input.input,
                     *sample_input.args,
@@ -188,6 +236,8 @@ class TestCase(PytorchTestCase):
             subclass_sample = sample_input.transform(transform_fn)
 
             def actual(subclass_sample=subclass_sample):
+                # [FUNCTION DOC] HELPER: Runs the op on the transformed sample (captured by
+                # default argument).
                 return op(
                     subclass_sample.input,
                     *subclass_sample.args,
@@ -197,6 +247,11 @@ class TestCase(PytorchTestCase):
             self.assertSameResult(expected, actual, **kwargs)
 
     def check_grad(self, device: str, dtype: torch.dtype, op: OpInfo) -> None:
+        # [FUNCTION DOC] Gradient-checks an op with ComplexTensor inputs. Applies skips
+        # for the grad variant, generates samples requiring grad, converts complex tensors
+        # to ComplexTensor (without the no-grad transform, to keep requires_grad), builds
+        # a wrapper function (list-input ops are handled separately) and runs gradcheck
+        # with batched grad and forward AD, raising on failure.
         desc = Descriptor(
             op=get_overload_packet_from_name(op.name),
             device_type=torch.device(device).type,
@@ -222,6 +277,8 @@ class TestCase(PytorchTestCase):
                 input_list = list(args)
 
                 def func(*t: torch.Tensor):
+                    # [FUNCTION DOC] HELPER: Calls the op on the positional tensors with the
+                    # captured keyword args.
                     return op(*t, **kwargs)
             else:
                 # For ops like `stack` and `cat`, we need to specify
@@ -229,6 +286,9 @@ class TestCase(PytorchTestCase):
                 input_list = list(args[0])
 
                 def func(*t: torch.Tensor):
+                    # [FUNCTION DOC] HELPER: Calls the op with the tensors regrouped as a list
+                    # first argument (for ops like stack and cat) plus the remaining captured
+                    # positional and keyword args.
                     return op(list(t), *args[1:], **kwargs)
 
             # Do the actual gradcheck
@@ -252,6 +312,8 @@ complex_op_db = tuple(
 
 
 def get_overload_packet_from_name(name: str) -> OpOverloadPacket:
+    # [FUNCTION DOC] Returns the first op overload packet named name found by scanning
+    # all torch.ops namespaces. Raises RuntimeError if no namespace has it.
     for domain_name in torch.ops:
         op_namespace = getattr(torch.ops, domain_name)
         op: OpOverloadPacket | None = getattr(op_namespace, name, None)
