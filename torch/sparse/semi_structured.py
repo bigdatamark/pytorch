@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Semi-structured (2:4) sparse tensor support for CUDA tensors, as Tensor subclasses.
+# Defines SparseSemiStructuredTensor (abstract base), CUTLASS and cuSPARSELt backend subclasses,
+# the public to_sparse_semi_structured converter, and lazy registration of the custom ops
+# semi_structured::cutlass_mm and semi_structured::cusparselt_mm.
+# Import-time effects: only defines classes/globals; the config namedtuple is created here. Op
+# registration and the dispatch table are deferred until first use to keep import torch cheap.
 import warnings
 from collections import namedtuple
 from collections.abc import Callable
@@ -40,6 +46,14 @@ _SEMI_STRUCTURED_SPARSE_CONFIG = namedtuple(
 
 
 class SparseSemiStructuredTensor(torch.Tensor):
+    # [CLASS DOC] Abstract wrapper-subclass holding a 2:4 compressed matrix: packed values,
+    # optional metadata,
+    # and optional transposed copies (packed_t, meta_t) plus a compressed swizzled bitmask.
+    # Also records cuSPARSELt options (fuse_transpose_cusparselt, alg_id_cusparselt). Class-level
+    # state: _FORCE_CUTLASS, _FUSE_TRANSPOSE, _PROTOTYPE_WARNING_SHOWN, and the SPARSE_DISPATCH
+    # mapping from aten overload packets to handlers. Only ops in that mapping are supported
+    # (torch function overrides are disabled; everything goes through torch dispatch).
+    # Subclasses must define BACKEND, _DTYPE_SHAPE_CONSTRAINTS, from_dense and _mm.
     """
     This class implements semi-structured sparsity as a Tensor subclass.
 
@@ -89,6 +103,13 @@ class SparseSemiStructuredTensor(torch.Tensor):
         alg_id_cusparselt: int = 0,
         requires_grad: bool = False,
     ):
+        # [FUNCTION DOC] Builds the wrapper subclass from compressed parts; shape is the
+        # logical dense shape.
+        # Device, dtype and layout come from packed, or from packed_t if packed is None.
+        # Raises ValueError if both packed and packed_t are None.
+        # Side effects: on the first construction (class flag unset) emits a prototype UserWarning,
+        # loads the dispatch table, and registers the class with dynamo as allowed in graph.
+        # Stores all parts and the cuSPARSELt options as attributes on the new tensor.
         """
         Create a new instance of the tensor subclass from the compressed sparse representation.
 
@@ -162,6 +183,9 @@ class SparseSemiStructuredTensor(torch.Tensor):
         return tensor
 
     def __repr__(self) -> str:  # type: ignore[override]
+        # [FUNCTION DOC] Returns a short string with the class name and logical shape; raises
+        # AssertionError if
+        # the tensor has no shape attribute.
         if not hasattr(self, "shape"):
             raise AssertionError("tensor has no shape attribute")
         return f"{self.__class__.__name__}(shape={self.shape})"
@@ -169,6 +193,9 @@ class SparseSemiStructuredTensor(torch.Tensor):
     def __tensor_flatten__(
         self,
     ) -> tuple[list[str], tuple[torch.Size, bool, int, bool]]:
+        # [FUNCTION DOC] Tensor-subclass flatten protocol: returns the names of non-None inner
+        # tensor slots and a
+        # tuple of metadata (shape, fuse_transpose_cusparselt, alg_id_cusparselt, requires_grad).
         inner_tensors = list(
             filter(lambda x: getattr(self, x) is not None, self.__slots__)
         )
@@ -188,6 +215,9 @@ class SparseSemiStructuredTensor(torch.Tensor):
         outer_size,
         outer_stride,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Inverse of the flatten protocol: rebuilds an instance from the inner
+        # tensor mapping and the
+        # metadata tuple; missing slots become None. outer_size and outer_stride are ignored.
         shape, fuse_transpose_cusparselt, alg_id_cusparselt, requires_grad = tensor_meta
         # pyrefly: ignore [no-matching-overload]
         return cls(
@@ -208,6 +238,9 @@ class SparseSemiStructuredTensor(torch.Tensor):
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args, kwargs) -> Any:  # type: ignore[override]
+        # [FUNCTION DOC] Dispatch hook: looks up the op's overload packet in SPARSE_DISPATCH
+        # and calls the handler
+        # with (func, types, args, kwargs). Raises NotImplementedError for any unsupported op.
         if func._overloadpacket not in cls.SPARSE_DISPATCH:
             raise NotImplementedError(
                 f"{cls.__name__} only supports a specific set of operations, "
@@ -217,6 +250,10 @@ class SparseSemiStructuredTensor(torch.Tensor):
 
     @classmethod
     def _load_dispatch_table(cls, custom_dispatch_table=None) -> None:
+        # [FUNCTION DOC] HELPER: Populates the class SPARSE_DISPATCH mapping (aten op to
+        # handler) if it is unset,
+        # then merges the optional custom_dispatch_table over it. If the mapping already exists,
+        # does nothing, including ignoring the custom table. Mutates class state; returns None.
         """
         Loads the op overload sparse dispatch table for the current class.
         """
@@ -243,6 +280,10 @@ class SparseSemiStructuredTensor(torch.Tensor):
 
     @classmethod
     def _validate_device_dim_dtype_shape(cls, original_tensor: torch.Tensor) -> None:
+        # [FUNCTION DOC] HELPER: Checks a dense tensor can be compressed: must be CUDA, 2-D,
+        # contiguous, of a dtype in
+        # _DTYPE_SHAPE_CONSTRAINTS, and both dims at least and a multiple of the sparse minimums.
+        # Raises RuntimeError describing the first violated condition; returns None.
         """
         Assert that the given tensor is valid for semi-structured sparse compression.
         """
@@ -285,6 +326,9 @@ class SparseSemiStructuredTensor(torch.Tensor):
             )
 
     def to_dense(self):  # type:ignore[override]
+        # [FUNCTION DOC] Default dense conversion: multiplies the sparse tensor by an identity
+        # matrix of the column
+        # count, using the same dtype and device. Returns the dense 2-D tensor.
         col = self.shape[-1]
         return torch.mm(self, torch.eye(col, dtype=self.dtype, device=self.device))
 
@@ -294,6 +338,9 @@ class SparseSemiStructuredTensor(torch.Tensor):
         original_tensor: torch.Tensor,
         alg_id: int = _DEFAULT_ALG_ID,
     ) -> "SparseSemiStructuredTensor":
+        # [FUNCTION DOC] Abstract: backend subclasses compress original_tensor (using alg_id)
+        # into an instance.
+        # Base version always raises NotImplementedError.
         raise NotImplementedError
 
     def _mm(
@@ -303,6 +350,9 @@ class SparseSemiStructuredTensor(torch.Tensor):
         bias: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Abstract: backend subclasses multiply this sparse matrix by dense B
+        # (optional bias).
+        # Base version always raises NotImplementedError.
         raise NotImplementedError
 
 
@@ -311,6 +361,11 @@ def to_sparse_semi_structured(
     transposed: bool = False,
     alg_id: int = SparseSemiStructuredTensor._DEFAULT_ALG_ID,
 ) -> SparseSemiStructuredTensor:
+    # [FUNCTION DOC] Public converter: picks the CUTLASS subclass if _FORCE_CUTLASS is set,
+    # otherwise the
+    # cuSPARSELt subclass, and returns its from_dense result for original_tensor and alg_id.
+    # If transposed is true, only emits a FutureWarning (the argument has no other effect).
+    # KNOWN ISSUE: docstring says Raises None, but from_dense validation raises RuntimeError.
     """
     This function converts a dense tensor into a sparse semi-structured tensor.
     It will return a SparseSemiStructuredTensor, a subclass of torch.Tensor.
@@ -378,6 +433,11 @@ def to_sparse_semi_structured(
 
 
 class SparseSemiStructuredTensorCUTLASS(SparseSemiStructuredTensor):
+    # [CLASS DOC] CUTLASS backend: values are in packed and indices in a separate meta tensor;
+    # the dense
+    # min-shape table covers int8, float16, bfloat16 and float32. Matmul goes through the
+    # lazily registered cutlass_mm custom op. Supports training-style pruning with transposed
+    # copies via prune_dense_static_sort.
     """
     This class implements semi-structured sparsity for the CUTLASS backend.
 
@@ -403,6 +463,10 @@ class SparseSemiStructuredTensorCUTLASS(SparseSemiStructuredTensor):
         original_tensor: torch.Tensor,
         alg_id: int = SparseSemiStructuredTensor._DEFAULT_ALG_ID,
     ) -> "SparseSemiStructuredTensorCUTLASS":
+        # [FUNCTION DOC] Validates the dense tensor, converts it to packed values and meta with
+        # the CUTLASS
+        # conversion routine, and returns an instance preserving shape and requires_grad.
+        # alg_id is unused. Raises RuntimeError on invalid input.
         cls._validate_device_dim_dtype_shape(original_tensor)
         (
             sparse_tensor_cutlass,
@@ -420,6 +484,10 @@ class SparseSemiStructuredTensorCUTLASS(SparseSemiStructuredTensor):
         )
 
     def to_dense(self):  # type: ignore[override]
+        # [FUNCTION DOC] Converts back to dense: uses the CUTLASS reverse conversion when meta
+        # is 2-D, else falls
+        # back to the base multiply-by-identity path. Raises AssertionError if meta or packed
+        # is None.
         if self.meta is None or self.packed is None:
             raise AssertionError("meta and packed must not be None")
         return (
@@ -435,6 +503,11 @@ class SparseSemiStructuredTensorCUTLASS(SparseSemiStructuredTensor):
     def prune_dense_static_sort(
         cls, original_tensor: torch.Tensor, algorithm=""
     ) -> "SparseSemiStructuredTensor":
+        # [FUNCTION DOC] Prunes a dense tensor to 2:4 over 4x4 tiles via the tile op (CUTLASS
+        # layout), producing
+        # packed, meta, packed_t, meta_t and the compressed swizzled bitmask, and returns an
+        # instance
+        # with requires_grad False. The algorithm string selects the tile pruning algorithm.
         """
         This function takes in a unpruned dense tensor and runs a (branchless) static sort across a 4x4 tile.
 
@@ -517,6 +590,12 @@ class SparseSemiStructuredTensorCUTLASS(SparseSemiStructuredTensor):
         should_transpose_dense: bool = False,
         **kwargs,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Sparse @ dense B (plus optional bias) via cutlass_mm. Raises
+        # ValueError if B is itself
+        # sparse; NotImplementedError if either operand is not 2-D or packed/meta are missing.
+        # Registers the custom op on first use. Uses dense min-shape constraints keyed by B dtype.
+        # KNOWN ISSUE: constraints are looked up by B.dtype, so an unsupported dtype gives a
+        # KeyError.
         if isinstance(B, SparseSemiStructuredTensor):
             raise ValueError(
                 "`SparseSemiStructuredTensor @ SparseSemiStructuredTensor` is not supported by the hardware"
@@ -546,6 +625,11 @@ class SparseSemiStructuredTensorCUTLASS(SparseSemiStructuredTensor):
 
 
 class SparseSemiStructuredTensorCUSPARSELT(SparseSemiStructuredTensor):
+    # [CLASS DOC] cuSPARSELt backend: values and metadata are stored together in one packed
+    # tensor (meta
+    # stays None), with packed_t for a transposed copy. Supports float8_e4m3fn, int8, float16
+    # and bfloat16, optional transpose fusion and an algorithm id. Matmul goes through the
+    # lazily registered cusparselt_mm custom op.
     """
     The cuSPARSELt backend expects the specified elements and the metadata to be stored in a single tensor:
     packed = [ specified elements of original tensor | metadata ]
@@ -571,6 +655,10 @@ class SparseSemiStructuredTensorCUSPARSELT(SparseSemiStructuredTensor):
         original_tensor: torch.Tensor,
         alg_id: int = SparseSemiStructuredTensor._DEFAULT_ALG_ID,
     ) -> "SparseSemiStructuredTensorCUSPARSELT":
+        # [FUNCTION DOC] Validates the dense tensor, compresses it with the cuSPARSELt compress
+        # op, and returns an
+        # instance carrying the class-level fuse-transpose flag and alg_id. Raises RuntimeError
+        # on invalid input.
         cls._validate_device_dim_dtype_shape(original_tensor)
         # pyrefly: ignore [no-matching-overload]
         return cls(
@@ -589,6 +677,11 @@ class SparseSemiStructuredTensorCUSPARSELT(SparseSemiStructuredTensor):
     def prune_dense_static_sort(
         cls, original_tensor: torch.Tensor, algorithm=""
     ) -> "SparseSemiStructuredTensor":
+        # [FUNCTION DOC] Prunes a dense tensor to 2:4 over 4x4 tiles with the cuSPARSELt
+        # layout, then reshapes
+        # packed and packed_t to 2-D (rows by remaining), and returns an instance with the bitmask.
+        # KNOWN ISSUE: the docstring example refers to packed_cutlass names; and a TODO notes the
+        # metadata layout is unverified.
         """
         This function does the same thing as described in SparseSemiStructuredCUTLASS, but uses the cuSPARSELt metadata
         layout and sparse matmul.
@@ -658,6 +751,13 @@ class SparseSemiStructuredTensorCUSPARSELT(SparseSemiStructuredTensor):
         should_transpose_dense: bool = False,
         **kwargs,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Sparse @ dense B (plus optional bias) via cusparselt_mm. Raises
+        # ValueError if B is sparse;
+        # NotImplementedError for non-2-D operands, dtype mismatch of B or bias with self, float8
+        # inputs, or missing packed. Registers the custom op on first use.
+        # KNOWN ISSUE: should_transpose_dense is passed for both the fuse_transpose and the
+        # should_transpose_dense arguments, ignoring fuse_transpose_cusparselt; the bias error
+        # message reports B dtype as the bias dtype.
         if isinstance(B, SparseSemiStructuredTensor):
             raise ValueError(
                 "`SparseSemiStructuredTensor @ SparseSemiStructuredTensor` is not supported by the hardware"
@@ -709,6 +809,10 @@ _cutlass_mm_registered = False
 
 
 def _ensure_cutlass_mm_registered():
+    # [FUNCTION DOC] HELPER: One-time lazy registration of the semi_structured::cutlass_mm
+    # custom op, with a
+    # fake (shape-only) implementation and a decomposition under FunctionalTensorMode. Guarded by
+    # a module-global flag set before registering; later calls return immediately.
     """Lazily register the cutlass_mm custom op.
 
     Registration is deferred to avoid importing torch.library at module load
@@ -731,6 +835,10 @@ def _ensure_cutlass_mm_registered():
         min_cols: int,
         should_transpose_dense: bool,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Pads dense up to the min-row/column multiples, optionally
+        # transposes it, runs the
+        # CUTLASS sparse mm (or addmm with bias), then trims padding to out_features and the real
+        # column count. Returns a contiguous result, transposed back if should_transpose_dense.
         m, n = dense.shape
         to_pad_m = (-m) % min_rows
         to_pad_n = (-n) % min_cols
@@ -764,6 +872,9 @@ def _ensure_cutlass_mm_registered():
         min_cols: int,
         transpose_dense: bool,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Fake implementation: returns an empty tensor of the output
+        # shape (transposed layout
+        # if transpose_dense) with dense dtype and device.
         out_cols = dense.shape[0] if transpose_dense else dense.shape[1]
         output_shape = (
             (out_cols, out_features) if transpose_dense else (out_features, out_cols)
@@ -785,6 +896,9 @@ def _ensure_cutlass_mm_registered():
     # ATen ops with proper meta registrations and are fully serializable, so export
     # consumers benefit from seeing the underlying ops rather than an opaque custom op.
     def _cutlass_mm_decomp(mode, _op, types, args, kwargs):
+        # [FUNCTION DOC] HELPER: Decomposition for FunctionalTensorMode: returns NotImplemented
+        # if unrecognized tensor
+        # types are present, else runs the implementation under the mode.
         if _has_unrecognized_tensor_types(types):
             return NotImplemented
         with mode:
@@ -797,6 +911,9 @@ _cusparselt_mm_registered = False
 
 
 def _ensure_cusparselt_mm_registered():
+    # [FUNCTION DOC] HELPER: One-time lazy registration of the semi_structured::cusparselt_mm
+    # custom op and its
+    # fake implementation, guarded by a module-global flag; later calls return immediately.
     """Lazily register the cusparselt_mm custom op."""
     global _cusparselt_mm_registered
     if _cusparselt_mm_registered:
@@ -817,6 +934,10 @@ def _ensure_cusparselt_mm_registered():
         alg_id: int,
         should_transpose_dense: bool = False,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Pads dense to the min-shape multiples, optionally transposes
+        # it, runs the cuSPARSELt
+        # sparse mm with bias, fuse_transpose and alg_id, then narrows away padding. Returns a
+        # contiguous tensor when padded, otherwise the raw result.
         m, n = dense.shape
         to_pad_m = (-m) % min_rows
         to_pad_n = (-n) % min_cols
@@ -852,6 +973,9 @@ def _ensure_cusparselt_mm_registered():
         alg_id: int,
         should_transpose_dense: bool,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Fake implementation: returns an empty tensor shaped by
+        # fuse_transpose and
+        # should_transpose_dense, with dense dtype and device.
         out_cols = dense.shape[0] if should_transpose_dense else dense.shape[1]
         output_shape = (
             (out_cols, out_features) if fuse_transpose else (out_features, out_cols)

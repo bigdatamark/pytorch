@@ -1,3 +1,8 @@
+# [PACKAGE DOC] torch.special: SciPy-style special functions. Exposes ops implemented in the
+# C++ _special bindings (entr, erf family, gamma family, bessel, orthogonal polynomials, zeta,
+# softmax/logsumexp, ndtr and others) and attaches documentation strings to each through
+# _add_docstr, using shared argument text from torch._torch_docs. Import-time side effect:
+# docstrings are set on the bound functions. Public names are listed in __all__.
 import torch
 from torch._C import _add_docstr, _special  # type: ignore[attr-defined]
 from torch._torch_docs import common_args, multi_dim_common
