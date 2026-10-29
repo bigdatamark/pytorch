@@ -1,4 +1,8 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for inductor fusion region detection in
+# torch._inductor.fx_passes.fusion_regions (build_fusion_regions, estimate_fused_node_costs,
+# is_fusible_node). Graphs are traced with make_fx under fake tensor mode on a CUDA device, so the
+# whole test class is skipped when CUDA is unavailable. HAS_GPU is computed at import time.
 
 """Tests for fusion region detection."""
 
@@ -17,13 +21,19 @@ HAS_GPU = torch.cuda.is_available()
 
 @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
 class TestFusionRegionDetection(InductorTestCase):
+    # [CLASS DOC] GPU-only tests that fusible pointwise ops are grouped into regions, that matmul
+    # and fallback ops are excluded, that regions never span a non-fusible op, and that fused cost
+    # estimation is consistent and leaves the graph untouched. Attribute device is set in setUp.
     """Tests for fusion region detection and grouping."""
 
     def setUp(self):
+        # [FUNCTION DOC] Runs the base setup, then sets the device attribute to cuda.
         super().setUp()
         self.device = "cuda"
 
     def test_fusion_region_grouping(self):
+        # [FUNCTION DOC] Traces a chain of add, mul and sub on a fake tensor and checks the three
+        # nodes map to the identical region object in the mapping from build_fusion_regions.
         """Test that connected fusible ops are grouped into regions."""
         from torch._inductor.fx_passes.fusion_regions import build_fusion_regions
 
@@ -47,6 +57,8 @@ class TestFusionRegionDetection(InductorTestCase):
         self.assertIs(region_of[mul_node], region_of[sub_node])
 
     def test_mm_not_in_fusion_region(self):
+        # [FUNCTION DOC] Traces pointwise ops around a matrix multiply and checks the matmul node
+        # is absent from the region mapping.
         """Test that mm ops are not included in fusion regions."""
         from torch._inductor.fx_passes.fusion_regions import build_fusion_regions
 
@@ -59,6 +71,10 @@ class TestFusionRegionDetection(InductorTestCase):
         self.assertNotIn(mm_node, region_of)
 
     def test_strict_local_fusion_no_cross_mm(self):
+        # [FUNCTION DOC] Traces a graph where an add feeds a later div, with a matmul between them
+        # in topological order. Checks both nodes are in regions but in different region objects,
+        # i.e. a region is not allowed to cross a non-fusible node even if its members are data-
+        # connected.
         """Test that fusion regions don't cross non-fusible (mm) boundaries.
 
         Pattern:
@@ -74,6 +90,9 @@ class TestFusionRegionDetection(InductorTestCase):
         from torch._inductor.fx_passes.fusion_regions import build_fusion_regions
 
         def model(a, y):
+            # [FUNCTION DOC] HELPER: Model computing two pointwise chains separated by a matrix
+            # multiply of the second input; returns the end of the first chain, the matmul and the
+            # end of the second.
             b = a + 1
             b2 = b - 1
             c = y @ y  # mm boundary
@@ -106,6 +125,10 @@ class TestFusionRegionDetection(InductorTestCase):
 
     @xfailIfNoAcceleratorTriton
     def test_estimate_fused_node_costs(self):
+        # [FUNCTION DOC] Expected-failure without an accelerator Triton. Builds regions and fused
+        # costs, then checks: every region node has a cost entry, the graph gains no call_module
+        # nodes, some nodes have zero cost (only internal reads and writes) and some positive, and
+        # the sum of fused costs is at most the sum of per-node roofline runtime estimates.
         """Test that fused costs correctly exclude internal I/O."""
         from torch._inductor.fx_passes.fusion_regions import (
             build_fusion_regions,
@@ -113,6 +136,8 @@ class TestFusionRegionDetection(InductorTestCase):
         )
 
         def model(a, b):
+            # [FUNCTION DOC] HELPER: Model with a three-node pointwise chain, a matmul, a second
+            # pointwise chain on its result, and an independent third chain on the other input.
             # region 1: 3-node chain, middle node has only internal I/O
             x = a + 1  # reads a (ext), writes to neg (int)
             x = -x  # reads add (int), writes to mul (int) -> cost=0
@@ -153,6 +178,9 @@ class TestFusionRegionDetection(InductorTestCase):
         self.assertLessEqual(fused_total, individual_total)
 
     def test_is_fusible_node(self):
+        # [FUNCTION DOC] Traces add, matmul and QR decomposition. Checks is_fusible_node is true
+        # for the pointwise add, and false for the matmul (it has flop counting) and the QR op
+        # (fallback kernel).
         """Test is_fusible_node correctly classifies ops."""
         from torch._inductor.fx_passes.fusion_regions import is_fusible_node
 
@@ -161,6 +189,8 @@ class TestFusionRegionDetection(InductorTestCase):
             traced = make_fx(lambda a: torch.linalg.qr(torch.mm(a + 1, a)))(a)
 
         def find_node(target):
+            # [FUNCTION DOC] HELPER: Returns the first call_function node in the traced graph with
+            # the given target, or none if there is no such node.
             for n in traced.graph.nodes:
                 if n.op == "call_function" and n.target == target:
                     return n
@@ -183,6 +213,9 @@ class TestFusionRegionDetection(InductorTestCase):
 
     @xfailIfNoAcceleratorTriton
     def test_fused_costs_does_not_mutate_graph(self):
+        # [FUNCTION DOC] Expected-failure without an accelerator Triton. Captures the readable text
+        # of the traced graph, builds regions and estimates fused costs, then checks the text is
+        # unchanged.
         """estimate_fused_node_costs must not mutate the graph."""
         from torch._inductor.fx_passes.fusion_regions import (
             build_fusion_regions,
@@ -190,6 +223,9 @@ class TestFusionRegionDetection(InductorTestCase):
         )
 
         def model(a, b):
+            # [FUNCTION DOC] HELPER: Model with pointwise ops, a matmul, more pointwise ops, and a
+            # separate chain on the second input; returns the final value of the first chain and
+            # both of the second.
             x = a + 1
             x = x * 2
             x = torch.mm(x, a)
@@ -218,6 +254,10 @@ class TestFusionRegionDetection(InductorTestCase):
 
     @xfailIfNoAcceleratorTriton
     def test_fused_costs_handles_forced_bad_region(self):
+        # [FUNCTION DOC] Expected-failure without an accelerator Triton. Forces one region
+        # containing all the neg, relu and abs nodes of a graph even though a matmul separates them
+        # (an invalid grouping), and checks estimate_fused_node_costs still returns one non-
+        # negative cost per node.
         """estimate_fused_node_costs works for any region_of mapping."""
         from torch._inductor.fx_passes.fusion_regions import estimate_fused_node_costs
 
@@ -225,6 +265,8 @@ class TestFusionRegionDetection(InductorTestCase):
             t = torch.randn(64, 64, device=self.device)
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Function applying neg, relu, a matmul, a view, then neg
+                # and abs, and adding the relu result to the final value.
                 a = x.neg()
                 b = a.relu()
                 mm_out = torch.mm(b, x)
