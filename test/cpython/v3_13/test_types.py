@@ -4,6 +4,16 @@
 # ruff: noqa
 # flake8: noqa
 
+# [MODULE DOC] Dynamo-patched copy of the CPython 3.13 test_types suite for built-in types. Test
+# classes (all derived from the Dynamo CPythonTestCase) cover: basic truth values, arithmetic
+# and string/number formatting (TypesTests), the vertical-bar union type (UnionTests),
+# types.MappingProxyType (MappingProxyTests), types.new_class / prepare_class / resolve_bases /
+# get_original_bases (ClassCreationTests), types.SimpleNamespace, types.coroutine wrapping
+# (CoroutineTests), types.FunctionType defaults (FunctionTests) and static-type slot inheritance
+# across subinterpreters (SubinterpreterTests). Import-time side effects: imports the CPython
+# test support package, defines a no_rerun stand-in decorator, a module-level TypeVar T and two
+# tiny classes (Example, Forward). Running the file as a script calls run_tests.
+
 # Test copied from
 # https://raw.githubusercontent.com/python/cpython/refs/tags/v3.13.5/Lib/test/test_types.py
 
@@ -16,7 +26,10 @@ from torch.testing._internal.common_utils import run_tests
 
 # Dummy decorator for CPython test compatibility
 def no_rerun(reason):
+    # [FUNCTION DOC] HELPER: Stand-in for the CPython no_rerun decorator factory. Takes a reason
+    # string (ignored) and returns a decorator that hands back the decorated test unchanged.
     def decorator(func):
+        # [FUNCTION DOC] HELPER: Identity decorator; returns the function it receives.
         return func
     return decorator
 
@@ -51,18 +64,31 @@ import typing
 T = typing.TypeVar("T")
 
 class Example:
+    # [CLASS DOC] HELPER: Empty plain class used as an arbitrary non-type operand in
+    # the union operator tests.
     pass
 
+# [CLASS DOC] HELPER: Empty class whose name is the target of the string forward reference
+# "Forward" resolved by the forward-reference union test.
 class Forward: ...
 
 def clear_typing_caches():
+    # [FUNCTION DOC] HELPER: Runs every cache-clearing callback registered in the
+    # typing module (typing._cleanups), so that cached generic/union objects are
+    # rebuilt afresh. No return value.
     for f in typing._cleanups:
         f()
 
 
 class TypesTests(CPythonTestCase):
+    # [CLASS DOC] Tests of core built-in value behavior: truthiness, boolean and comparison
+    # operators, int/float edge cases, string operations and slicing, and the format mini
+    # language for ints and floats, plus type objects of descriptors and special singletons.
 
     def test_truth_values(self):
+        # [FUNCTION DOC] Checks that None, 0, 0.0, empty string and empty dict are false while
+        # non-zero numbers, non-empty strings and dicts, functions, classes, modules and plain
+        # instances are true. Fails the test with a message on any mismatch.
         if None: self.fail('None is true instead of false')
         if 0: self.fail('0 is true instead of false')
         if 0.0: self.fail('0.0 is true instead of false')
@@ -71,7 +97,9 @@ class TypesTests(CPythonTestCase):
         if not 1.0: self.fail('1.0 is false instead of true')
         if not 'x': self.fail('\'x\' is false instead of true')
         if not {'x': 1}: self.fail('{\'x\': 1} is false instead of true')
+        # [FUNCTION DOC] HELPER: Empty function used only as a truthy object.
         def f(): pass
+        # [CLASS DOC] HELPER: Empty class used only as a truthy object (class and instance).
         class C: pass
         x = C()
         if not f: self.fail('f is false instead of true')
@@ -80,12 +108,16 @@ class TypesTests(CPythonTestCase):
         if not x: self.fail('x is false instead of true')
 
     def test_boolean_ops(self):
+        # [FUNCTION DOC] Checks the logical operators or, and, not on small integers, failing
+        # with a message if any evaluates to the wrong truth value.
         if 0 or 0: self.fail('0 or 0 is true instead of false')
         if 1 and 1: pass
         else: self.fail('1 and 1 is false instead of true')
         if not 1: self.fail('not 1 is true instead of false')
 
     def test_comparisons(self):
+        # [FUNCTION DOC] Checks chained comparisons for ints, floats and strings (ordering and
+        # equality chains) and the identity test for None.
         if 0 < 1 <= 1 == 1 >= 1 > 0 != 1: pass
         else: self.fail('int comparisons failed')
         if 0.0 < 1.0 <= 1.0 == 1.0 >= 1.0 > 0.0 != 1.0: pass
@@ -96,11 +128,16 @@ class TypesTests(CPythonTestCase):
         else: self.fail('identity test failed')
 
     def test_float_constructor(self):
+        # [FUNCTION DOC] Checks that the float constructor raises ValueError for an
+        # empty string and for strings with an embedded NUL character (also when
+        # digit separators are present).
         self.assertRaises(ValueError, float, '')
         self.assertRaises(ValueError, float, '5\0')
         self.assertRaises(ValueError, float, '5_5\0')
 
     def test_zero_division(self):
+        # [FUNCTION DOC] Checks that float and int true division, floor division and modulo by
+        # zero each raise ZeroDivisionError.
         try: 5.0 / 0.0
         except ZeroDivisionError: pass
         else: self.fail("5.0 / 0.0 didn't raise ZeroDivisionError")
@@ -126,6 +163,9 @@ class TypesTests(CPythonTestCase):
         else: self.fail("5 % 0 didn't raise ZeroDivisionError")
 
     def test_numeric_types(self):
+        # [FUNCTION DOC] Checks int/float cross-type equality, that int() and float()
+        # without arguments return zero, and that int() truncates toward zero for
+        # positive and negative floats.
         if 0 != 0.0 or 1 != 1.0 or -1 != -1.0:
             self.fail('int/float value not equal')
         # calling built-in types without argument must return 0
@@ -137,7 +177,14 @@ class TypesTests(CPythonTestCase):
         else: self.fail('float() does not work properly')
 
     def test_float_to_string(self):
+        # [FUNCTION DOC] Checks exponent formatting in scientific notation for floats: every
+        # two digit exponent from -99 to 99 and sample three digit exponents, via both the
+        # format method and percent formatting, plus the general-format percent codes with
+        # and without alternate form.
         def test(f, result):
+            # [FUNCTION DOC] HELPER: Asserts that scientific-notation formatting of the
+            # float f, through its format method and through percent formatting, equals
+            # the expected string result.
             self.assertEqual(f.__format__('e'), result)
             self.assertEqual('%e' % f, result)
 
@@ -163,6 +210,10 @@ class TypesTests(CPythonTestCase):
         self.assertEqual('%#g' % 1.0, '1.00000')
 
     def test_normal_integers(self):
+        # [FUNCTION DOC] Checks integer behavior: small-int caching of 256, basic sums and
+        # comparisons, multiplication commutativity, that products near the machine word limits
+        # stay the single int type, that sys.maxsize arithmetic yields ints, and that negative
+        # shift counts raise ValueError.
         # Ensure the first 256 integers are shared
         a = 256
         b = 128*2
@@ -220,6 +271,8 @@ class TypesTests(CPythonTestCase):
         else: self.fail('int negative shift >>')
 
     def test_floats(self):
+        # [FUNCTION DOC] Checks basic float addition and ordering comparisons including negative
+        # operands, failing the test on a wrong result.
         if 12.0 + 24.0 != 36.0: self.fail('float op')
         if 12.0 + (-24.0) != -12.0: self.fail('float op')
         if (-12.0) + 24.0 != 12.0: self.fail('float op')
@@ -228,6 +281,9 @@ class TypesTests(CPythonTestCase):
         if not -24.0 < -12.0: self.fail('float op')
 
     def test_strings(self):
+        # [FUNCTION DOC] Checks string length, concatenation, repetition (including by zero),
+        # min, max, membership, a long-string percent formatting case, and extended slicing with
+        # positive/negative steps and out-of-range bounds.
         if len('') != 0: self.fail('len(\'\')')
         if len('a') != 1: self.fail('len(\'a\')')
         if len('abcdef') != 6: self.fail('len(\'abcdef\')')
@@ -253,11 +309,20 @@ class TypesTests(CPythonTestCase):
         self.assertEqual(a[-100:100:2], '02468')
 
     def test_type_function(self):
+        # [FUNCTION DOC] Checks that calling type with two or four arguments raises TypeError.
         self.assertRaises(TypeError, type, 1, 2)
         self.assertRaises(TypeError, type, 1, 2, 3, 4)
 
     def test_int__format__(self):
+        # [FUNCTION DOC] Table-driven check of integer format specs: decimal, character, sign
+        # and alignment flags, hex/octal/binary with upper case and the alternate prefix form,
+        # zero padding, thousands separators, fill/align characters, and very large ints. Also
+        # checks the error cases (precision, sign or comma or hash with the character type,
+        # non-string spec, unknown type letters raise ValueError or TypeError) and that float
+        # type letters convert the int to a float first.
         def test(i, format_spec, result):
+            # [FUNCTION DOC] HELPER: Asserts that i is an exact int and format_spec an exact
+            # str, and that formatting i with format_spec gives the expected result string.
             # just make sure we have the unified type for integers
             self.assertIs(type(i), int)
             self.assertIs(type(format_spec), str)
@@ -427,6 +492,9 @@ class TypesTests(CPythonTestCase):
 
     @run_with_locale('LC_NUMERIC', 'en_US.UTF8', '')
     def test_float__format__locale(self):
+        # [FUNCTION DOC] Under the en_US locale (skipped by the decorator if unavailable),
+        # checks that the float format code n matches locale-aware grouping from the locale
+        # module for a range of magnitudes and precisions.
         # test locale support for __format__ code 'n'
 
         for i in range(-10, 10):
@@ -436,6 +504,10 @@ class TypesTests(CPythonTestCase):
 
     @run_with_locale('LC_NUMERIC', 'en_US.UTF8', '')
     def test_int__format__locale(self):
+        # [FUNCTION DOC] Under the en_US locale, checks that the integer format code n
+        # matches locale-aware grouping for a descending series of large ints, and that
+        # width padding with n gives the same length regardless of the value for left,
+        # right and centered alignment.
         # test locale support for __format__ code 'n' for integers
 
         x = 123456789012345678901234567890
@@ -454,7 +526,13 @@ class TypesTests(CPythonTestCase):
             self.assertEqual(len(format(0, cfmt)), len(format(x, cfmt)))
 
     def test_float__format__(self):
+        # [FUNCTION DOC] Table-driven check of float format specs: f, e, g, E, G and percent
+        # types, default and empty specs, sign flags, zero padding with and without commas, very
+        # large values, alternate form (hash), and fill/align characters. Also asserts that
+        # non-string specs raise TypeError and integer-only type codes raise ValueError.
         def test(f, format_spec, result):
+            # [FUNCTION DOC] HELPER: Asserts that the float f formatted with format_spec, via
+            # both the format method and the format builtin, equals the expected string result.
             self.assertEqual(f.__format__(format_spec), result)
             self.assertEqual(format(f, format_spec), result)
 
@@ -602,6 +680,8 @@ class TypesTests(CPythonTestCase):
         test(12345.6, "*=20", '*************12345.6')
 
     def test_format_spec_errors(self):
+        # [FUNCTION DOC] Checks that format raises ValueError for absurdly long width or
+        # precision digit strings and for a comma used with the x, X, o, b, n or s type codes.
         # int, float, and string all share the same format spec
         # mini-language parser.
 
@@ -621,10 +701,14 @@ class TypesTests(CPythonTestCase):
             self.assertRaises(ValueError, format, 0, ',' + code)
 
     def test_internal_sizes(self):
+        # [FUNCTION DOC] Checks that object has a positive basic size and
+        # tuple a positive item size.
         self.assertGreater(object.__basicsize__, 0)
         self.assertGreater(tuple.__itemsize__, 0)
 
     def test_slot_wrapper_types(self):
+        # [FUNCTION DOC] Checks that slot wrappers of object and int (init, str, lt) are
+        # instances of types.WrapperDescriptorType.
         self.assertIsInstance(object.__init__, types.WrapperDescriptorType)
         self.assertIsInstance(object.__str__, types.WrapperDescriptorType)
         self.assertIsInstance(object.__lt__, types.WrapperDescriptorType)
@@ -633,18 +717,25 @@ class TypesTests(CPythonTestCase):
     @unittest.skipIf(MISSING_C_DOCSTRINGS,
                      "Signature information for builtins requires docstrings")
     def test_dunder_get_signature(self):
+        # [FUNCTION DOC] Skipped when C docstrings are missing. Checks that the
+        # signature of the descriptor get method has the parameters instance and owner
+        # and that owner defaults to None.
         sig = inspect.signature(object.__init__.__get__)
         self.assertEqual(list(sig.parameters), ["instance", "owner"])
         # gh-93021: Second parameter is optional
         self.assertIs(sig.parameters["owner"].default, None)
 
     def test_method_wrapper_types(self):
+        # [FUNCTION DOC] Checks that bound slot methods of an object and an int are instances
+        # of types.MethodWrapperType.
         self.assertIsInstance(object().__init__, types.MethodWrapperType)
         self.assertIsInstance(object().__str__, types.MethodWrapperType)
         self.assertIsInstance(object().__lt__, types.MethodWrapperType)
         self.assertIsInstance((42).__lt__, types.MethodWrapperType)
 
     def test_method_descriptor_types(self):
+        # [FUNCTION DOC] Checks the types of unbound and bound builtin methods and class methods
+        # against types.MethodDescriptorType, BuiltinMethodType and ClassMethodDescriptorType.
         self.assertIsInstance(str.join, types.MethodDescriptorType)
         self.assertIsInstance(list.append, types.MethodDescriptorType)
         self.assertIsInstance(''.join, types.BuiltinMethodType)
@@ -655,6 +746,9 @@ class TypesTests(CPythonTestCase):
         self.assertIsInstance(int.__new__, types.BuiltinMethodType)
 
     def test_method_descriptor_crash(self):
+        # [FUNCTION DOC] Regression test for gh-132747: for several C-implemented methods paired
+        # with matching instances, calling the default get with only an instance (owner omitted)
+        # must return a builtin method object without crashing. Uses subTest per pair.
         # gh-132747: The default __get__() implementation in C was unable
         # to handle a second argument of None when called from Python
         import _io
@@ -674,15 +768,20 @@ class TypesTests(CPythonTestCase):
                 self.assertIsInstance(bound, types.BuiltinMethodType)
 
     def test_ellipsis_type(self):
+        # [FUNCTION DOC] Checks that Ellipsis is an instance of types.EllipsisType.
         self.assertIsInstance(Ellipsis, types.EllipsisType)
 
     def test_notimplemented_type(self):
+        # [FUNCTION DOC] Checks that NotImplemented is an instance of types.NotImplementedType.
         self.assertIsInstance(NotImplemented, types.NotImplementedType)
 
     def test_none_type(self):
+        # [FUNCTION DOC] Checks that None is an instance of types.NoneType.
         self.assertIsInstance(None, types.NoneType)
 
     def test_traceback_and_frame_types(self):
+        # [FUNCTION DOC] Raises and catches an OSError, then checks that its traceback and the
+        # traceback's frame are instances of types.TracebackType and types.FrameType.
         try:
             raise OSError
         except OSError as e:
@@ -691,9 +790,15 @@ class TypesTests(CPythonTestCase):
         self.assertIsInstance(exc.__traceback__.tb_frame, types.FrameType)
 
     def test_capsule_type(self):
+        # [FUNCTION DOC] Checks that the datetime C API capsule is an
+        # instance of types.CapsuleType.
         self.assertIsInstance(_datetime.datetime_CAPI, types.CapsuleType)
 
     def test_call_unbound_crash(self):
+        # [FUNCTION DOC] Regression test for GH-131998: runs a small program in a fresh
+        # interpreter (assert_python_ok) that calls a specialized function three times with a
+        # list instance and then unbound with the list type; the program must exit successfully
+        # (the TypeError is swallowed) instead of crashing.
         # GH-131998: The specialized instruction would get tricked into dereferencing
         # a bound "self" that didn't exist if subsequently called unbound.
         code = """if True:
@@ -713,8 +818,16 @@ class TypesTests(CPythonTestCase):
 
 
 class UnionTests(CPythonTestCase):
+    # [CLASS DOC] Tests of the union operator (vertical bar) on types: construction, flattening
+    # and de-duplication, hashing, isinstance/issubclass, parameter substitution,
+    # pickling/copying, repr, and interplay with typing constructs and generic aliases.
 
     def test_or_types_operator(self):
+        # [FUNCTION DOC] Checks the union operator across builtins, None, typing aliases
+        # and generics: equality with typing.Union, flattening of nested unions,
+        # de-duplication, symmetry of order, TypeError for non-type operands, unordered
+        # comparisons raising TypeError, and tolerance of a typing.Union whose args
+        # attribute is a list rather than a tuple.
         self.assertEqual(int | str, typing.Union[int, str])
         self.assertNotEqual(int | list, typing.Union[int, str])
         self.assertEqual(str | int, typing.Union[int, str])
@@ -779,14 +892,22 @@ class UnionTests(CPythonTestCase):
         self.assertEqual(x, y)
 
     def test_hash(self):
+        # [FUNCTION DOC] Checks that a union hashes the same regardless of operand order and
+        # equals the hash of the equivalent typing.Union.
         self.assertEqual(hash(int | str), hash(str | int))
         self.assertEqual(hash(int | str), hash(typing.Union[int, str]))
 
     def test_union_of_unhashable(self):
+        # [FUNCTION DOC] Checks unions of classes whose metaclass disables hashing: construction
+        # works and exposes both args, but hashing any such union raises TypeError.
         class UnhashableMeta(type):
+            # [CLASS DOC] HELPER: Metaclass that sets the hash slot to None so
+            # its classes are unhashable.
             __hash__ = None
 
+        # [CLASS DOC] HELPER: Empty class with the unhashable metaclass.
         class A(metaclass=UnhashableMeta): ...
+        # [CLASS DOC] HELPER: Empty class with the unhashable metaclass.
         class B(metaclass=UnhashableMeta): ...
 
         self.assertEqual((A | B).__args__, (A, B))
@@ -803,6 +924,9 @@ class UnionTests(CPythonTestCase):
             hash(union3)
 
     def test_instancecheck_and_subclasscheck(self):
+        # [FUNCTION DOC] For built-in unions and typing.Union objects, checks
+        # isinstance and issubclass for member types (including bool as an int
+        # subclass), None, and abstract base classes.
         for x in (int | str, typing.Union[int, str]):
             with self.subTest(x=x):
                 self.assertIsInstance(1, x)
@@ -830,6 +954,9 @@ class UnionTests(CPythonTestCase):
                 self.assertFalse(issubclass(list, x))
 
     def test_instancecheck_and_subclasscheck_order(self):
+        # [FUNCTION DOC] Checks evaluation order with a type variable: unions where a real type
+        # comes before the TypeVar answer isinstance/issubclass, while those with the TypeVar
+        # first (or for types matching neither) raise TypeError.
         T = typing.TypeVar('T')
 
         will_resolve = (
@@ -860,22 +987,34 @@ class UnionTests(CPythonTestCase):
                     isinstance(object(), x)
 
     def test_bad_instancecheck(self):
+        # [FUNCTION DOC] Checks that an error raised by a member metaclass instance check
+        # propagates, while earlier matching members still succeed.
         class BadMeta(type):
+            # [CLASS DOC] HELPER: Metaclass whose instance check always divides by zero.
             def __instancecheck__(cls, inst):
+                # [FUNCTION DOC] HELPER: Raises ZeroDivisionError unconditionally.
                 1/0
         x = int | BadMeta('A', (), {})
         self.assertTrue(isinstance(1, x))
         self.assertRaises(ZeroDivisionError, isinstance, [], x)
 
     def test_bad_subclasscheck(self):
+        # [FUNCTION DOC] Same as the instance check test but for subclass checks: a
+        # member metaclass subclass check error propagates as ZeroDivisionError,
+        # earlier matches still succeed.
         class BadMeta(type):
+            # [CLASS DOC] HELPER: Metaclass whose subclass check always divides by zero.
             def __subclasscheck__(cls, sub):
+                # [FUNCTION DOC] HELPER: Raises ZeroDivisionError unconditionally.
                 1/0
         x = int | BadMeta('A', (), {})
         self.assertTrue(issubclass(int, x))
         self.assertRaises(ZeroDivisionError, issubclass, list, x)
 
     def test_or_type_operator_with_TypeVar(self):
+        # [FUNCTION DOC] Checks that a TypeVar combined with a class via the union operator
+        # equals the typing.Union form in both orders, and that substituting a type
+        # variable yields that type.
         TV = typing.TypeVar('T')
         self.assertEqual(TV | str, typing.Union[TV, str])
         self.assertEqual(str | TV, typing.Union[str, TV])
@@ -883,7 +1022,12 @@ class UnionTests(CPythonTestCase):
         self.assertIs((TV | int)[int], int)
 
     def test_union_args(self):
+        # [FUNCTION DOC] Checks the args tuple of many unions: flattening, order of first
+        # appearance, de-duplication, mixing with typing.Union, and None placed on either side
+        # of various argument kinds (generic aliases, callables, hashables, TypeVars).
         def check(arg, expected):
+            # [FUNCTION DOC] HELPER: Clears typing caches then asserts that
+            # arg.__args__ equals expected.
             clear_typing_caches()
             self.assertEqual(arg.__args__, expected)
 
@@ -913,6 +1057,9 @@ class UnionTests(CPythonTestCase):
                 check(None | x, (type(None), x))
 
     def test_union_parameter_chaining(self):
+        # [FUNCTION DOC] Checks that type parameters propagate through unions and
+        # generic aliases: substitution on a union, parameters tuple of nested generics,
+        # and partial substitution.
         T = typing.TypeVar("T")
         S = typing.TypeVar("S")
 
@@ -924,7 +1071,12 @@ class UnionTests(CPythonTestCase):
         self.assertEqual((list[T] | list[S])[int, int], list[int])
 
     def test_union_parameter_substitution(self):
+        # [FUNCTION DOC] Checks substituting a TypeVar inside a three-way union with many kinds
+        # of arguments (builtins, typing aliases, callables, literals, other unions, NewType,
+        # another TypeVar), comparing result and (when typed) the result type.
         def eq(actual, expected, typed=True):
+            # [FUNCTION DOC] HELPER: Asserts actual equals expected and, if typed is true, that
+            # both have exactly the same type.
             self.assertEqual(actual, expected)
             if typed:
                 self.assertIs(type(actual), type(expected))
@@ -955,6 +1107,8 @@ class UnionTests(CPythonTestCase):
         eq(x[S], int | S | bytes)
 
     def test_union_pickle(self):
+        # [FUNCTION DOC] Checks that a union containing a generic alias over a TypeVar
+        # round-trips through pickle at every protocol with equal args and parameters.
         orig = list[T] | int
         for proto in range(pickle.HIGHEST_PROTOCOL + 1):
             s = pickle.dumps(orig, proto)
@@ -964,6 +1118,8 @@ class UnionTests(CPythonTestCase):
             self.assertEqual(loaded.__parameters__, orig.__parameters__)
 
     def test_union_copy(self):
+        # [FUNCTION DOC] Checks that shallow and deep copies of a union keep
+        # equality, args and parameters.
         orig = list[T] | int
         for copied in (copy.copy(orig), copy.deepcopy(orig)):
             self.assertEqual(copied, orig)
@@ -971,16 +1127,25 @@ class UnionTests(CPythonTestCase):
             self.assertEqual(copied.__parameters__, orig.__parameters__)
 
     def test_union_parameter_substitution_errors(self):
+        # [FUNCTION DOC] Checks that substituting with too many arguments into a
+        # one-parameter union raises TypeError.
         T = typing.TypeVar("T")
         x = int | T
         with self.assertRaises(TypeError):
             x[int, str]
 
     def test_or_type_operator_with_forward(self):
+        # [FUNCTION DOC] Checks unions mixing a TypeVar with a string forward reference in both
+        # orders: after substitution, the resolved type hints of annotated functions give the
+        # substituted type and the real Forward class.
         T = typing.TypeVar('T')
         ForwardAfter = T | 'Forward'
         ForwardBefore = 'Forward' | T
+        # [FUNCTION DOC] HELPER: Placeholder function annotated with the
+        # forward-after union, no body.
         def forward_after(x: ForwardAfter[int]) -> None: ...
+        # [FUNCTION DOC] HELPER: Placeholder function annotated with the
+        # forward-before union, no body.
         def forward_before(x: ForwardBefore[int]) -> None: ...
         self.assertEqual(typing.get_args(typing.get_type_hints(forward_after)['x']),
                          (int, Forward))
@@ -988,34 +1153,48 @@ class UnionTests(CPythonTestCase):
                          (int, Forward))
 
     def test_or_type_operator_with_Protocol(self):
+        # [FUNCTION DOC] Checks that a Protocol class combined with a class by the union
+        # operator equals the typing.Union of the two.
         class Proto(typing.Protocol):
+            # [CLASS DOC] HELPER: Minimal Protocol with one method returning int.
             def meth(self) -> int:
+                # [FUNCTION DOC] HELPER: Protocol member declaration with no implementation.
                 ...
         self.assertEqual(Proto | str, typing.Union[Proto, str])
 
     def test_or_type_operator_with_Alias(self):
+        # [FUNCTION DOC] Checks union with bare and typing alias list
+        # types against a plain class.
         self.assertEqual(list | str, typing.Union[list, str])
         self.assertEqual(typing.List | str, typing.Union[typing.List, str])
 
     def test_or_type_operator_with_NamedTuple(self):
+        # [FUNCTION DOC] Checks union of a namedtuple class with a class.
         NT = namedtuple('A', ['B', 'C', 'D'])
         self.assertEqual(NT | str, typing.Union[NT, str])
 
     def test_or_type_operator_with_TypedDict(self):
+        # [FUNCTION DOC] Checks union of a TypedDict class with a class.
         class Point2D(typing.TypedDict):
+            # [CLASS DOC] HELPER: TypedDict with integer fields x and y
+            # and a string field label.
             x: int
             y: int
             label: str
         self.assertEqual(Point2D | str, typing.Union[Point2D, str])
 
     def test_or_type_operator_with_NewType(self):
+        # [FUNCTION DOC] Checks union of a NewType with a class.
         UserId = typing.NewType('UserId', int)
         self.assertEqual(UserId | str, typing.Union[UserId, str])
 
     def test_or_type_operator_with_IO(self):
+        # [FUNCTION DOC] Checks union of typing.IO with a class.
         self.assertEqual(typing.IO | str, typing.Union[typing.IO, str])
 
     def test_or_type_operator_with_SpecialForm(self):
+        # [FUNCTION DOC] Checks union with special forms: Any, NoReturn, Optional (which
+        # flattens to include None) and an existing typing.Union.
         self.assertEqual(typing.Any | str, typing.Union[typing.Any, str])
         self.assertEqual(typing.NoReturn | str, typing.Union[typing.NoReturn, str])
         self.assertEqual(typing.Optional[int] | str, typing.Union[typing.Optional[int], str])
@@ -1023,6 +1202,9 @@ class UnionTests(CPythonTestCase):
         self.assertEqual(typing.Union[int, bool] | str, typing.Union[int, bool, str])
 
     def test_or_type_operator_with_Literal(self):
+        # [FUNCTION DOC] Checks union of Literal types: argument tuples preserve order and keep
+        # distinct values that compare equal (0 vs False, 1 vs True, int vs IntEnum), while
+        # truly identical Literals collapse.
         Literal = typing.Literal
         self.assertEqual((Literal[1] | Literal[2]).__args__,
                          (Literal[1], Literal[2]))
@@ -1037,6 +1219,8 @@ class UnionTests(CPythonTestCase):
 
         import enum
         class Ints(enum.IntEnum):
+            # [CLASS DOC] HELPER: Integer enumeration with members A=0 and
+            # B=1 for the Literal tests.
             A = 0
             B = 1
 
@@ -1052,6 +1236,9 @@ class UnionTests(CPythonTestCase):
                          (Literal[1], Literal[Ints.B]))
 
     def test_or_type_repr(self):
+        # [FUNCTION DOC] Checks the text form of unions: members joined by a vertical
+        # bar, None shown as None, nested unions flattened, and generic alias members
+        # shown with their arguments.
         self.assertEqual(repr(int | str), "int | str")
         self.assertEqual(repr((int | str) | list), "int | str | list")
         self.assertEqual(repr(int | (str | list)), "int | str | list")
@@ -1060,9 +1247,15 @@ class UnionTests(CPythonTestCase):
         self.assertEqual(repr(int | typing.GenericAlias(list, int)), "int | list[int]")
 
     def test_or_type_operator_with_genericalias(self):
+        # [FUNCTION DOC] Checks unions of generic aliases (including a user GenericAlias
+        # subclass): equality with typing.Union, de-duplication, order-insensitivity,
+        # repr, propagation of ZeroDivisionError from a member whose equality raises,
+        # and TypeError when instance or subclass checks are done against unions
+        # containing parameterized generics.
         a = list[int]
         b = list[str]
         c = dict[float, str]
+        # [CLASS DOC] HELPER: Empty subclass of types.GenericAlias.
         class SubClass(types.GenericAlias): ...
         d = SubClass(list, float)
         # equivalence with typing.Union
@@ -1075,7 +1268,9 @@ class UnionTests(CPythonTestCase):
                          "list[int] | list[str] | dict[float, str] | list[float]")
 
         class BadType(type):
+            # [CLASS DOC] HELPER: Metaclass whose equality method always divides by zero.
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: Raises ZeroDivisionError unconditionally.
                 return 1 / 0
 
         bt = BadType('bt', (), {})
@@ -1094,10 +1289,17 @@ class UnionTests(CPythonTestCase):
                     issubclass(int, type_)
 
     def test_or_type_operator_with_bad_module(self):
+        # [FUNCTION DOC] Regression test for issue 44483: builds metaclass-based fake TypeVar
+        # and special-form classes whose module attribute raises ZeroDivisionError, and
+        # checks that or-ing a string with their instances raises TypeError or
+        # ZeroDivisionError without crashing.
         class BadMeta(type):
+            # [CLASS DOC] HELPER: Metaclass named TypeVar whose module property
+            # raises ZeroDivisionError.
             __qualname__ = 'TypeVar'
             @property
             def __module__(self):
+                # [FUNCTION DOC] HELPER: Property getter that raises ZeroDivisionError.
                 1 / 0
         TypeVar = BadMeta('TypeVar', (), {})
         _SpecialForm = BadMeta('_SpecialForm', (), {})
@@ -1109,6 +1311,10 @@ class UnionTests(CPythonTestCase):
 
     @cpython_only
     def test_or_type_operator_reference_cycle(self):
+        # [FUNCTION DOC] CPython-only. Skips unless the interpreter has a total reference count
+        # (debug build). Creates 30 unions holding a TypeVar that refers back to the union,
+        # deletes them, runs the garbage collector and asserts the reference count grew by at
+        # most 15, detecting leaks.
         if not hasattr(sys, 'gettotalrefcount'):
             self.skipTest('Cannot get total reference count.')
         gc.collect()
@@ -1126,10 +1332,16 @@ class UnionTests(CPythonTestCase):
 
 
 class MappingProxyTests(CPythonTestCase):
+    # [CLASS DOC] Tests of types.MappingProxyType, a read-only view over a mapping. The class
+    # attribute mappingproxy is the type under test, so subclasses can swap in another factory.
     mappingproxy = types.MappingProxyType
 
     def test_constructor(self):
+        # [FUNCTION DOC] Checks that the proxy can wrap dicts, dict subclasses and ChainMap
+        # (and compares equal to them), and that wrapping non-mappings such as an int, tuple
+        # or list raises TypeError.
         class userdict(dict):
+            # [CLASS DOC] HELPER: Empty dict subclass.
             pass
 
         mapping = {'x': 1, 'y': 2}
@@ -1144,6 +1356,9 @@ class MappingProxyTests(CPythonTestCase):
         self.assertRaises(TypeError, self.mappingproxy, ["a", "list"])
 
     def test_methods(self):
+        # [FUNCTION DOC] Checks the exact set of public and special attributes the proxy
+        # adds over the base object (item access, iteration, length, union operators,
+        # reversed, copy, get, views).
         attrs = set(dir(self.mappingproxy({}))) - set(dir(object()))
         self.assertEqual(attrs, {
              '__contains__',
@@ -1163,6 +1378,8 @@ class MappingProxyTests(CPythonTestCase):
         })
 
     def test_get(self):
+        # [FUNCTION DOC] Checks item lookup and get with and without defaults, and
+        # KeyError for a missing key.
         view = self.mappingproxy({'a': 'A', 'b': 'B'})
         self.assertEqual(view['a'], 'A')
         self.assertEqual(view['b'], 'B')
@@ -1172,8 +1389,13 @@ class MappingProxyTests(CPythonTestCase):
         self.assertEqual(view.get('xxx', 42), 42)
 
     def test_missing(self):
+        # [FUNCTION DOC] Checks that the proxy honors a missing-key hook of the wrapped dict
+        # subclass for item access but that get and membership do not use it.
         class dictmissing(dict):
+            # [CLASS DOC] HELPER: Dict subclass whose missing-key hook
+            # returns a text naming the key.
             def __missing__(self, key):
+                # [FUNCTION DOC] HELPER: Returns the text "missing=" followed by the key.
                 return "missing=%s" % key
 
         view = self.mappingproxy(dictmissing(x=1))
@@ -1186,35 +1408,52 @@ class MappingProxyTests(CPythonTestCase):
         self.assertFalse('y' in view)
 
     def test_customdict(self):
+        # [FUNCTION DOC] Checks that the proxy delegates every operation to the wrapped object's
+        # own overrides (membership, item access, iteration, length, copy, get, keys, items,
+        # values) rather than to the underlying dict storage.
         class customdict(dict):
+            # [CLASS DOC] HELPER: Dict subclass overriding membership, iteration,
+            # length, copy, keys, items, values, item access and get with recognizable
+            # constant or tagged results.
             def __contains__(self, key):
+                # [FUNCTION DOC] HELPER: True for the key "magic", otherwise defers
+                # to the dict implementation.
                 if key == 'magic':
                     return True
                 else:
                     return dict.__contains__(self, key)
 
             def __iter__(self):
+                # [FUNCTION DOC] HELPER: Returns an iterator over a single fixed key.
                 return iter(('iter',))
 
             def __len__(self):
+                # [FUNCTION DOC] HELPER: Returns the constant 500.
                 return 500
 
             def copy(self):
+                # [FUNCTION DOC] HELPER: Returns the constant text "copy".
                 return 'copy'
 
             def keys(self):
+                # [FUNCTION DOC] HELPER: Returns the constant text "keys".
                 return 'keys'
 
             def items(self):
+                # [FUNCTION DOC] HELPER: Returns the constant text "items".
                 return 'items'
 
             def values(self):
+                # [FUNCTION DOC] HELPER: Returns the constant text "values".
                 return 'values'
 
             def __getitem__(self, key):
+                # [FUNCTION DOC] HELPER: Returns the stored value prefixed with "getitem=".
                 return "getitem=%s" % dict.__getitem__(self, key)
 
             def get(self, key, default=None):
+                # [FUNCTION DOC] HELPER: Returns the stored value (or a description of the
+                # default when the key is absent) prefixed with "get=".
                 return "get=%s" % dict.get(self, key, 'default=%r' % default)
 
         custom = customdict({'key': 'value'})
@@ -1234,6 +1473,9 @@ class MappingProxyTests(CPythonTestCase):
         self.assertEqual(view.values(), 'values')
 
     def test_chainmap(self):
+        # [FUNCTION DOC] Checks a proxy over a ChainMap: membership, lookup, sorted
+        # iteration, length, that copy returns a distinct ChainMap equal to the original,
+        # get, and keys/items/values.
         d1 = {'x': 1}
         d2 = {'y': 2}
         mapping = collections.ChainMap(d1, d2)
@@ -1258,6 +1500,7 @@ class MappingProxyTests(CPythonTestCase):
         self.assertEqual(tuple(sorted(view.values())), (1, 2))
 
     def test_contains(self):
+        # [FUNCTION DOC] Checks membership tests on a proxy over a dict built from fromkeys.
         view = self.mappingproxy(dict.fromkeys('abc'))
         self.assertTrue('a' in view)
         self.assertTrue('b' in view)
@@ -1265,6 +1508,8 @@ class MappingProxyTests(CPythonTestCase):
         self.assertFalse('xxx' in view)
 
     def test_views(self):
+        # [FUNCTION DOC] Checks that keys, values and items views taken from a proxy are live:
+        # they are empty at first and reflect an item added later to the underlying dict.
         mapping = {}
         view = self.mappingproxy(mapping)
         keys = view.keys()
@@ -1279,6 +1524,8 @@ class MappingProxyTests(CPythonTestCase):
         self.assertEqual(list(items), [('key', 'value')])
 
     def test_len(self):
+        # [FUNCTION DOC] Checks that the proxy length equals the length of the wrapped dict
+        # for sizes zero through five.
         for expected in range(6):
             data = dict.fromkeys('abcde'[:expected])
             self.assertEqual(len(data), expected)
@@ -1286,6 +1533,8 @@ class MappingProxyTests(CPythonTestCase):
             self.assertEqual(len(view), expected)
 
     def test_iterators(self):
+        # [FUNCTION DOC] Checks that iterating the proxy and its keys/values/items views yields
+        # the same elements as the wrapped dict.
         keys = ('x', 'y')
         values = (1, 2)
         items = tuple(zip(keys, values))
@@ -1296,6 +1545,9 @@ class MappingProxyTests(CPythonTestCase):
         self.assertEqual(set(view.items()), set(items))
 
     def test_reversed(self):
+        # [FUNCTION DOC] Checks that reversing a proxy yields keys in reverse insertion order
+        # using the live dict (a key deleted after creating the proxy is not seen), and that
+        # exhausting the reverse iterator raises StopIteration.
         d = {'a': 1, 'b': 2, 'foo': 0, 'c': 3, 'd': 4}
         mp = self.mappingproxy(d)
         del d['foo']
@@ -1304,6 +1556,8 @@ class MappingProxyTests(CPythonTestCase):
         self.assertRaises(StopIteration, next, r)
 
     def test_copy(self):
+        # [FUNCTION DOC] Checks that copying a proxy returns a plain dict equal to the original
+        # that is independent of later changes to the original while the proxy still sees them.
         original = {'key1': 27, 'key2': 51, 'key3': 93}
         view = self.mappingproxy(original)
         copy = view.copy()
@@ -1314,6 +1568,10 @@ class MappingProxyTests(CPythonTestCase):
         self.assertEqual(copy['key1'], 27)
 
     def test_union(self):
+        # [FUNCTION DOC] Checks the union (or) operator on proxies: non-mapping operands and
+        # in-place or raise TypeError; with a dict, results are new dicts (proxy on left or
+        # right) with the right operand winning conflicts, and neither the proxy source nor
+        # the other dict is modified.
         mapping = {'a': 0, 'b': 1, 'c': 2}
         view = self.mappingproxy(mapping)
         with self.assertRaises(TypeError):
@@ -1330,8 +1588,13 @@ class MappingProxyTests(CPythonTestCase):
         self.assertDictEqual(other, {'c': 3, 'p': 0})
 
     def test_hash(self):
+        # [FUNCTION DOC] Checks that a proxy over an unhashable dict raises TypeError
+        # when hashed, and a proxy over a dict subclass with a custom hash method
+        # hashes the same as that dict.
         class HashableDict(dict):
+            # [CLASS DOC] HELPER: Dict subclass with a fixed constant hash value.
             def __hash__(self):
+                # [FUNCTION DOC] HELPER: Returns the constant integer 3844817361.
                 return 3844817361
         view = self.mappingproxy({'a': 1, 'b': 2})
         self.assertRaises(TypeError, hash, view)
@@ -1341,30 +1604,48 @@ class MappingProxyTests(CPythonTestCase):
 
 
 class ClassCreationTests(CPythonTestCase):
+    # [CLASS DOC] Tests of the dynamic class creation helpers in the types module: new_class,
+    # prepare_class, resolve_bases and get_original_bases, and metaclass resolution rules.
+    # Provides the nested Meta metaclass as a shared fixture.
 
     class Meta(type):
+        # [CLASS DOC] HELPER: Metaclass fixture. Its prepare hook returns a namespace
+        # holding y = 1 plus any keyword arguments it was given; its init and new
+        # drop extra keyword arguments.
         def __init__(cls, name, bases, ns, **kw):
+            # [FUNCTION DOC] HELPER: Initializes the class while
+            # discarding extra keyword arguments.
             super().__init__(name, bases, ns)
         @staticmethod
         def __new__(mcls, name, bases, ns, **kw):
+            # [FUNCTION DOC] HELPER: Creates the class via the parent
+            # new, ignoring extra keywords.
             return super().__new__(mcls, name, bases, ns)
         @classmethod
         def __prepare__(mcls, name, bases, **kw):
+            # [FUNCTION DOC] HELPER: Builds the namespace through the parent prepare, sets y to
+            # 1, adds all keyword arguments, and returns it.
             ns = super().__prepare__(name, bases)
             ns["y"] = 1
             ns.update(kw)
             return ns
 
     def test_new_class_basics(self):
+        # [FUNCTION DOC] Checks that new_class with only a name creates a class with that name
+        # whose bases are just object.
         C = types.new_class("C")
         self.assertEqual(C.__name__, "C")
         self.assertEqual(C.__bases__, (object,))
 
     def test_new_class_subclass(self):
+        # [FUNCTION DOC] Checks that new_class with int as a base gives a subclass of int.
         C = types.new_class("C", (int,))
         self.assertTrue(issubclass(C, int))
 
     def test_new_class_meta(self):
+        # [FUNCTION DOC] Checks that new_class with a metaclass and extra keywords creates
+        # classes whose type is the metaclass, with the keyword and prepared attributes set, and
+        # does not mutate the keyword dict between two calls.
         Meta = self.Meta
         settings = {"metaclass": Meta, "z": 2}
         # We do this twice to make sure the passed in dict isn't mutated
@@ -1375,8 +1656,11 @@ class ClassCreationTests(CPythonTestCase):
             self.assertEqual(C.z, 2)
 
     def test_new_class_exec_body(self):
+        # [FUNCTION DOC] Checks that the exec_body callback receives the class namespace and can
+        # add attributes to it, in combination with a custom metaclass and keywords.
         Meta = self.Meta
         def func(ns):
+            # [FUNCTION DOC] HELPER: Callback that stores x = 0 in the given namespace.
             ns["x"] = 0
         C = types.new_class("C", (), {"metaclass": Meta, "z": 2}, func)
         self.assertIsInstance(C, Meta)
@@ -1385,8 +1669,12 @@ class ClassCreationTests(CPythonTestCase):
         self.assertEqual(C.z, 2)
 
     def test_new_class_metaclass_keywords(self):
+        # [FUNCTION DOC] Checks that when the metaclass is a plain function, it
+        # receives the name, bases, namespace and remaining keyword arguments and its
+        # return value is the result.
         #Test that keywords are passed to the metaclass:
         def meta_func(name, bases, ns, **kw):
+            # [FUNCTION DOC] HELPER: Metaclass stand-in that returns its arguments as a tuple.
             return name, bases, ns, kw
         res = types.new_class("X",
                               (int, object),
@@ -1394,14 +1682,19 @@ class ClassCreationTests(CPythonTestCase):
         self.assertEqual(res, ("X", (int, object), {}, {"x": 0}))
 
     def test_new_class_defaults(self):
+        # [FUNCTION DOC] Checks new_class with explicitly empty keywords and no body callback
+        # gives default name and bases.
         # Test defaults/keywords:
         C = types.new_class("C", (), {}, None)
         self.assertEqual(C.__name__, "C")
         self.assertEqual(C.__bases__, (object,))
 
     def test_new_class_meta_with_base(self):
+        # [FUNCTION DOC] Checks new_class called entirely with keyword arguments (name, bases,
+        # kwds, exec_body) combining a base class, a metaclass and a body callback.
         Meta = self.Meta
         def func(ns):
+            # [FUNCTION DOC] HELPER: Callback that stores x = 0 in the given namespace.
             ns["x"] = 0
         C = types.new_class(name="C",
                             bases=(int,),
@@ -1414,9 +1707,14 @@ class ClassCreationTests(CPythonTestCase):
         self.assertEqual(C.z, 2)
 
     def test_new_class_with_mro_entry(self):
+        # [FUNCTION DOC] Checks that a non-class base object with a bases-resolution hook is
+        # replaced by the classes it returns, and that original bases and MRO reflect that.
+        # [CLASS DOC] HELPER: Empty class returned by the bases-resolution hook.
         class A: pass
         class C:
+            # [CLASS DOC] HELPER: Non-class object type whose hook replaces it with class A.
             def __mro_entries__(self, bases):
+                # [FUNCTION DOC] HELPER: Returns a one-element tuple holding class A.
                 return (A,)
         c = C()
         D = types.new_class('D', (c,), {})
@@ -1425,6 +1723,9 @@ class ClassCreationTests(CPythonTestCase):
         self.assertEqual(D.__mro__, (D, A, object))
 
     def test_new_class_with_mro_entry_genericalias(self):
+        # [FUNCTION DOC] Checks that typing and builtin generic aliases passed as bases are
+        # resolved (list with Generic for the typing form, plain list for the builtin form)
+        # while the original bases are preserved.
         L1 = types.new_class('L1', (typing.List[int],), {})
         self.assertEqual(L1.__bases__, (list, typing.Generic))
         self.assertEqual(L1.__orig_bases__, (typing.List[int],))
@@ -1436,10 +1737,16 @@ class ClassCreationTests(CPythonTestCase):
         self.assertEqual(L2.__mro__, (L2, list, object))
 
     def test_new_class_with_mro_entry_none(self):
+        # [FUNCTION DOC] Checks that a hook returning an empty tuple removes
+        # its object from the bases.
+        # [CLASS DOC] HELPER: Empty class used as a real base.
         class A: pass
+        # [CLASS DOC] HELPER: Empty class used as a real base.
         class B: pass
         class C:
+            # [CLASS DOC] HELPER: Non-class object type whose hook returns an empty tuple.
             def __mro_entries__(self, bases):
+                # [FUNCTION DOC] HELPER: Returns an empty tuple.
                 return ()
         c = C()
         D = types.new_class('D', (A, c, B), {})
@@ -1448,49 +1755,85 @@ class ClassCreationTests(CPythonTestCase):
         self.assertEqual(D.__mro__, (D, A, B, object))
 
     def test_new_class_with_mro_entry_error(self):
+        # [FUNCTION DOC] Checks that a hook returning a non-tuple (a class itself) makes
+        # new_class raise TypeError.
+        # [CLASS DOC] HELPER: Empty class.
         class A: pass
         class C:
+            # [CLASS DOC] HELPER: Object type whose hook wrongly returns a
+            # class instead of a tuple.
             def __mro_entries__(self, bases):
+                # [FUNCTION DOC] HELPER: Returns class A (not a tuple), which is invalid.
                 return A
         c = C()
         with self.assertRaises(TypeError):
             types.new_class('D', (c,), {})
 
     def test_new_class_with_mro_entry_multiple(self):
+        # [FUNCTION DOC] Checks that two hook objects each expanding to two bases are spliced in
+        # order, giving the four bases in sequence.
+        # [CLASS DOC] HELPER: Empty class.
         class A1: pass
+        # [CLASS DOC] HELPER: Empty class.
         class A2: pass
+        # [CLASS DOC] HELPER: Empty class.
         class B1: pass
+        # [CLASS DOC] HELPER: Empty class.
         class B2: pass
         class A:
+            # [CLASS DOC] HELPER: Object type whose hook expands to A1 and A2.
             def __mro_entries__(self, bases):
+                # [FUNCTION DOC] HELPER: Returns a tuple of A1 and A2.
                 return (A1, A2)
         class B:
+            # [CLASS DOC] HELPER: Object type whose hook expands to B1 and B2.
             def __mro_entries__(self, bases):
+                # [FUNCTION DOC] HELPER: Returns a tuple of B1 and B2.
                 return (B1, B2)
         D = types.new_class('D', (A(), B()), {})
         self.assertEqual(D.__bases__, (A1, A2, B1, B2))
 
     def test_new_class_with_mro_entry_multiple_2(self):
+        # [FUNCTION DOC] Checks expansion of hook objects mixed with a real class between them:
+        # the resulting bases keep order, with three expanded, one plain, then two expanded.
+        # [CLASS DOC] HELPER: Empty class.
         class A1: pass
+        # [CLASS DOC] HELPER: Empty class.
         class A2: pass
+        # [CLASS DOC] HELPER: Empty class.
         class A3: pass
+        # [CLASS DOC] HELPER: Empty class.
         class B1: pass
+        # [CLASS DOC] HELPER: Empty class.
         class B2: pass
         class A:
+            # [CLASS DOC] HELPER: Object type whose hook expands to A1, A2, A3.
             def __mro_entries__(self, bases):
+                # [FUNCTION DOC] HELPER: Returns a tuple of A1, A2 and A3.
                 return (A1, A2, A3)
         class B:
+            # [CLASS DOC] HELPER: Object type whose hook expands to B1 and B2.
             def __mro_entries__(self, bases):
+                # [FUNCTION DOC] HELPER: Returns a tuple of B1 and B2.
                 return (B1, B2)
+        # [CLASS DOC] HELPER: Empty class used as a plain middle base.
         class C: pass
         D = types.new_class('D', (A(), C, B()), {})
         self.assertEqual(D.__bases__, (A1, A2, A3, C, B1, B2))
 
     def test_get_original_bases(self):
+        # [FUNCTION DOC] Checks types.get_original_bases: for plain classes it returns the
+        # direct bases, for generic subclasses the unresolved generic alias bases, for multiple
+        # inheritance the actual bases, for NamedTuple and TypedDict (class and call form) the
+        # typing helper as first base, and raises TypeError for a non-class argument.
         T = typing.TypeVar('T')
+        # [CLASS DOC] HELPER: Empty class.
         class A: pass
+        # [CLASS DOC] HELPER: Generic class over T.
         class B(typing.Generic[T]): pass
+        # [CLASS DOC] HELPER: Subclass of B parameterized with int.
         class C(B[int]): pass
+        # [CLASS DOC] HELPER: Subclass of B with str plus float.
         class D(B[str], float): pass
 
         self.assertEqual(types.get_original_bases(A), (object,))
@@ -1499,28 +1842,40 @@ class ClassCreationTests(CPythonTestCase):
         self.assertEqual(types.get_original_bases(int), (object,))
         self.assertEqual(types.get_original_bases(D), (B[str], float))
 
+        # [CLASS DOC] HELPER: Subclass of list parameterized by T.
         class E(list[T]): pass
+        # [CLASS DOC] HELPER: Subclass of list parameterized by int.
         class F(list[int]): pass
 
         self.assertEqual(types.get_original_bases(E), (list[T],))
         self.assertEqual(types.get_original_bases(F), (list[int],))
 
+        # [CLASS DOC] HELPER: Generic base class.
         class FirstBase(typing.Generic[T]): pass
+        # [CLASS DOC] HELPER: Generic base class.
         class SecondBase(typing.Generic[T]): pass
+        # [CLASS DOC] HELPER: Subclass of FirstBase[int].
         class First(FirstBase[int]): pass
+        # [CLASS DOC] HELPER: Subclass of SecondBase[int].
         class Second(SecondBase[int]): pass
+        # [CLASS DOC] HELPER: Plain multiple-inheritance subclass of First and Second.
         class G(First, Second): pass
         self.assertEqual(types.get_original_bases(G), (First, Second))
 
+        # [CLASS DOC] HELPER: Generic class over T.
         class First_(typing.Generic[T]): pass
+        # [CLASS DOC] HELPER: Generic class over T.
         class Second_(typing.Generic[T]): pass
+        # [CLASS DOC] HELPER: Subclass of both unparameterized generic classes.
         class H(First_, Second_): pass
         self.assertEqual(types.get_original_bases(H), (First_, Second_))
 
         class ClassBasedNamedTuple(typing.NamedTuple):
+            # [CLASS DOC] HELPER: Class-syntax NamedTuple with an int field x.
             x: int
 
         class GenericNamedTuple(typing.NamedTuple, typing.Generic[T]):
+            # [CLASS DOC] HELPER: Generic class-syntax NamedTuple with a field x of type T.
             x: T
 
         CallBasedNamedTuple = typing.NamedTuple("CallBasedNamedTuple", [("x", int)])
@@ -1537,9 +1892,11 @@ class ClassCreationTests(CPythonTestCase):
         )
 
         class ClassBasedTypedDict(typing.TypedDict):
+            # [CLASS DOC] HELPER: Class-syntax TypedDict with an int field x.
             x: int
 
         class GenericTypedDict(typing.TypedDict, typing.Generic[T]):
+            # [CLASS DOC] HELPER: Generic class-syntax TypedDict with a field x of type T.
             x: T
 
         CallBasedTypedDict = typing.TypedDict("CallBasedTypedDict", {"x": int})
@@ -1562,13 +1919,23 @@ class ClassCreationTests(CPythonTestCase):
 
     # Many of the following tests are derived from test_descr.py
     def test_prepare_class(self):
+        # [FUNCTION DOC] Checks prepare_class: with bases whose most derived metaclass is
+        # the custom A (even though type is passed explicitly), it returns that metaclass,
+        # the namespace built by its prepare hook, and an empty keyword dict (the
+        # metaclass key is consumed).
         # Basic test of metaclass derivation
         expected_ns = {}
         class A(type):
+            # [CLASS DOC] HELPER: Metaclass with a prepare hook returning the
+            # shared expected namespace.
             def __new__(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Delegates to the base type
+                # constructor with the same arguments.
                 return type.__new__(*args, **kwargs)
 
             def __prepare__(*args):
+                # [FUNCTION DOC] HELPER: Returns the shared expected namespace
+                # dict, ignoring arguments.
                 return expected_ns
 
         B = types.new_class("B", (object,))
@@ -1581,32 +1948,54 @@ class ClassCreationTests(CPythonTestCase):
         self.assertEqual(len(kwds), 0)
 
     def test_bad___prepare__(self):
+        # [FUNCTION DOC] Checks that a prepare hook returning None makes class creation raise
+        # TypeError with a message naming the metaclass (or a placeholder when the metaclass is
+        # not a type) and stating a mapping must be returned.
         # __prepare__() must return a mapping.
         class BadMeta(type):
+            # [CLASS DOC] HELPER: Metaclass whose prepare hook returns None (invalid).
             @classmethod
             def __prepare__(*args):
+                # [FUNCTION DOC] HELPER: Returns None, which is not a mapping.
                 return None
         with self.assertRaisesRegex(TypeError,
                                     r'^BadMeta\.__prepare__\(\) must '
                                     r'return a mapping, not NoneType$'):
             class Foo(metaclass=BadMeta):
+                # [CLASS DOC] HELPER: Class whose creation is expected to fail;
+                # never successfully built.
                 pass
         # Also test the case in which the metaclass is not a type.
         class BadMeta:
+            # [CLASS DOC] HELPER: Non-type metaclass object type whose
+            # prepare hook returns None.
             @classmethod
             def __prepare__(*args):
+                # [FUNCTION DOC] HELPER: Returns None, which is not a mapping.
                 return None
         with self.assertRaisesRegex(TypeError,
                                     r'^<metaclass>\.__prepare__\(\) must '
                                     r'return a mapping, not NoneType$'):
             class Bar(metaclass=BadMeta()):
+                # [CLASS DOC] HELPER: Class whose creation is expected to fail;
+                # never successfully built.
                 pass
 
     def test_resolve_bases(self):
+        # [FUNCTION DOC] Checks types.resolve_bases: replaces hook objects by their
+        # returned classes, honors a hook that returns nothing when its class is already
+        # present, leaves real classes alone, and returns the very same tuple object
+        # when nothing needs resolving.
+        # [CLASS DOC] HELPER: Empty class.
         class A: pass
+        # [CLASS DOC] HELPER: Empty class.
         class B: pass
         class C:
+            # [CLASS DOC] HELPER: Object type whose hook returns nothing when A is
+            # among the bases, otherwise A.
             def __mro_entries__(self, bases):
+                # [FUNCTION DOC] HELPER: Returns an empty tuple if A is among
+                # bases, else a tuple holding A.
                 if A in bases:
                     return ()
                 return (A,)
@@ -1625,27 +2014,44 @@ class ClassCreationTests(CPythonTestCase):
             self.assertIs(types.resolve_bases(bases), bases)
 
     def test_resolve_bases_with_mro_entry(self):
+        # [FUNCTION DOC] Checks resolve_bases on a typing list alias (gives list plus Generic)
+        # and on a builtin list alias (gives list).
         self.assertEqual(types.resolve_bases((typing.List[int],)),
                          (list, typing.Generic))
         self.assertEqual(types.resolve_bases((list[int],)), (list,))
 
     def test_metaclass_derivation(self):
+        # [FUNCTION DOC] Regression test for issue 1294232: with metaclasses AMeta and BMeta (a
+        # subclass), checks that the most derived metaclass is chosen regardless of base order
+        # or an explicit weaker metaclass, that its prepare hook runs (marker attribute
+        # present), and that the call order of new methods is recorded in the list new_calls.
         # issue1294232: correct metaclass calculation
         new_calls = []  # to check the order of __new__ calls
         class AMeta(type):
+            # [CLASS DOC] HELPER: Base metaclass recording its call in new_calls; prepare
+            # returns an empty namespace.
             def __new__(mcls, name, bases, ns):
+                # [FUNCTION DOC] HELPER: Appends the marker AMeta to
+                # new_calls then builds the class.
                 new_calls.append('AMeta')
                 return super().__new__(mcls, name, bases, ns)
             @classmethod
             def __prepare__(mcls, name, bases):
+                # [FUNCTION DOC] HELPER: Returns a fresh empty namespace dict.
                 return {}
 
         class BMeta(AMeta):
+            # [CLASS DOC] HELPER: Derived metaclass recording its call
+            # and tagging the namespace.
             def __new__(mcls, name, bases, ns):
+                # [FUNCTION DOC] HELPER: Appends the marker BMeta to new_calls
+                # then defers to the parent.
                 new_calls.append('BMeta')
                 return super().__new__(mcls, name, bases, ns)
             @classmethod
             def __prepare__(mcls, name, bases):
+                # [FUNCTION DOC] HELPER: Gets the namespace from the parent prepare, adds a
+                # marker key set to true, and returns it.
                 ns = super().__prepare__(name, bases)
                 ns['BMeta_was_here'] = True
                 return ns
@@ -1684,13 +2090,18 @@ class ClassCreationTests(CPythonTestCase):
         self.assertIn('BMeta_was_here', E.__dict__)
 
     def test_metaclass_override_function(self):
+        # [FUNCTION DOC] Checks that when the given metaclass is a plain function there is no
+        # metaclass calculation: the function's return value is used for any base combination,
+        # including a base with a custom metaclass.
         # Special case: the given metaclass isn't a class,
         # so there is no metaclass calculation.
         class A(metaclass=self.Meta):
+            # [CLASS DOC] HELPER: Class created with the shared Meta metaclass fixture.
             pass
 
         marker = object()
         def func(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Returns a fixed marker object whatever the arguments.
             return marker
 
         X = types.new_class("X", (), {"metaclass": func})
@@ -1701,25 +2112,39 @@ class ClassCreationTests(CPythonTestCase):
         self.assertIs(marker, Z)
 
     def test_metaclass_override_callable(self):
+        # [FUNCTION DOC] Checks metaclass calculation when the metaclass is a class not derived
+        # from type: tracks prepare and new call order in lists, verifies the most derived such
+        # metaclass wins, and that mixing it with type or with plain objects such as int
+        # instances raises TypeError.
         # The given metaclass is a class,
         # but not a descendant of type.
         new_calls = []  # to check the order of __new__ calls
         prepare_calls = []  # to track __prepare__ calls
         class ANotMeta:
+            # [CLASS DOC] HELPER: Non-type "metaclass" recording its prepare and new calls.
             def __new__(mcls, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: Records ANotMeta in new_calls
+                # and creates a bare instance.
                 new_calls.append('ANotMeta')
                 return super().__new__(mcls)
             @classmethod
             def __prepare__(mcls, name, bases):
+                # [FUNCTION DOC] HELPER: Records ANotMeta in prepare_calls and
+                # returns an empty namespace.
                 prepare_calls.append('ANotMeta')
                 return {}
 
         class BNotMeta(ANotMeta):
+            # [CLASS DOC] HELPER: Derived non-type "metaclass" recording its calls.
             def __new__(mcls, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: Records BNotMeta in new_calls and
+                # defers to the parent new.
                 new_calls.append('BNotMeta')
                 return super().__new__(mcls)
             @classmethod
             def __prepare__(mcls, name, bases):
+                # [FUNCTION DOC] HELPER: Records BNotMeta in prepare_calls and
+                # defers to the parent prepare.
                 prepare_calls.append('BNotMeta')
                 return super().__prepare__(name, bases)
 
@@ -1785,29 +2210,44 @@ class ClassCreationTests(CPythonTestCase):
             X = types.new_class("X", (int(), C))
 
     def test_one_argument_type(self):
+        # [FUNCTION DOC] Checks that only the type builtin itself accepts the
+        # single-argument form: calling a metaclass subclass (or a class whose metaclass
+        # derives from it) with one argument raises TypeError with the message about exactly
+        # 3 arguments. Also checks type of 5 is int.
         expected_message = 'type.__new__() takes exactly 3 arguments (1 given)'
 
         # Only type itself can use the one-argument form (#27157)
         self.assertIs(type(5), int)
 
         class M(type):
+            # [CLASS DOC] HELPER: Empty metaclass deriving from type.
             pass
         with self.assertRaises(TypeError) as cm:
             M(5)
         self.assertEqual(str(cm.exception), expected_message)
 
         class N(type, metaclass=M):
+            # [CLASS DOC] HELPER: Empty type subclass whose own metaclass is M.
             pass
         with self.assertRaises(TypeError) as cm:
             N(5)
         self.assertEqual(str(cm.exception), expected_message)
 
     def test_metaclass_new_error(self):
+        # [FUNCTION DOC] Regression test for bpo-44232: a metaclass constructor raising an
+        # error for any class but Model must have its exception reported properly when type
+        # creates a class whose winning metaclass differs from the called one; expects
+        # RuntimeWarning to propagate.
         # bpo-44232: The C function type_new() must properly report the
         # exception when a metaclass constructor raises an exception and the
         # winner class is not the metaclass.
         class ModelBase(type):
+            # [CLASS DOC] HELPER: Metaclass that creates the class with an empty namespace and
+            # raises RuntimeWarning for any class name other than Model.
             def __new__(cls, name, bases, attrs):
+                # [FUNCTION DOC] HELPER: Builds the class via the parent new with an empty
+                # namespace; raises RuntimeWarning including the name when the name is not
+                # Model; otherwise returns the class.
                 super_new = super().__new__
                 new_class = super_new(cls, name, bases, {})
                 if name != "Model":
@@ -1815,14 +2255,19 @@ class ClassCreationTests(CPythonTestCase):
                 return new_class
 
         class Model(metaclass=ModelBase):
+            # [CLASS DOC] HELPER: Class created with the ModelBase metaclass.
             pass
 
         with self.assertRaises(RuntimeWarning):
             type("SouthPonies", (Model,), {})
 
     def test_tuple_subclass_as_bases(self):
+        # [FUNCTION DOC] Regression test for gh-132176: creating a class with a tuple
+        # subclass instance as the bases argument must not crash and the stored bases
+        # keep the tuple subclass type.
         # gh-132176: it used to crash on using
         # tuple subclass for as base classes.
+        # [CLASS DOC] HELPER: Empty tuple subclass used as the bases container.
         class TupleSubclass(tuple): pass
 
         typ = type("typ", TupleSubclass((int, object)), {})
@@ -1831,9 +2276,18 @@ class ClassCreationTests(CPythonTestCase):
 
 
 class SimpleNamespaceTests(CPythonTestCase):
+    # [CLASS DOC] Tests of types.SimpleNamespace: construction, attribute get/set/delete, the
+    # underlying dict, repr (including recursive), equality, pickling, copy.replace, subclassing
+    # and comparison with look-alike objects.
 
     def test_constructor(self):
+        # [FUNCTION DOC] Checks the constructor with keyword arguments, a mapping, a sequence of
+        # pairs, a mapping subclass, or combinations (keywords override), preserving insertion
+        # order, and the errors: too many positional arguments, non-iterable or non-pair items
+        # (TypeError or ValueError), non-string keys and unhashable keys (TypeError).
         def check(ns, expected):
+            # [FUNCTION DOC] HELPER: Asserts the namespace dict has the expected size, content,
+            # key order and attribute values.
             self.assertEqual(len(ns.__dict__), len(expected))
             self.assertEqual(vars(ns), expected)
             # check order
@@ -1879,6 +2333,7 @@ class SimpleNamespaceTests(CPythonTestCase):
             types.SimpleNamespace([[[], 2]])  # non-hashable key
 
     def test_unbound(self):
+        # [FUNCTION DOC] Checks the vars of an empty namespace and of one with two attributes.
         ns1 = vars(types.SimpleNamespace())
         ns2 = vars(types.SimpleNamespace(x=1, y=2))
 
@@ -1886,6 +2341,8 @@ class SimpleNamespaceTests(CPythonTestCase):
         self.assertEqual(ns2, {'y': 2, 'x': 1})
 
     def test_underlying_dict(self):
+        # [FUNCTION DOC] Checks that the attribute dict stays valid after its namespace is
+        # deleted and equals the original keyword data.
         ns1 = types.SimpleNamespace()
         ns2 = types.SimpleNamespace(x=1, y=2)
         ns3 = types.SimpleNamespace(a=True, b=False)
@@ -1897,6 +2354,8 @@ class SimpleNamespaceTests(CPythonTestCase):
         self.assertEqual(mapping, dict(a=True, b=False))
 
     def test_attrget(self):
+        # [FUNCTION DOC] Checks attribute reads and that a missing
+        # attribute raises AttributeError.
         ns = types.SimpleNamespace(x=1, y=2, w=3)
 
         self.assertEqual(ns.x, 1)
@@ -1906,6 +2365,7 @@ class SimpleNamespaceTests(CPythonTestCase):
             ns.z
 
     def test_attrset(self):
+        # [FUNCTION DOC] Checks that assigning new attributes updates the underlying dict.
         ns1 = types.SimpleNamespace()
         ns2 = types.SimpleNamespace(x=1, y=2, w=3)
         ns1.a = 'spam'
@@ -1917,6 +2377,8 @@ class SimpleNamespaceTests(CPythonTestCase):
         self.assertEqual(ns2.__dict__, dict(x=1, y=2, w=3, z=4, theta=None))
 
     def test_attrdel(self):
+        # [FUNCTION DOC] Checks that deleting a missing attribute raises AttributeError, and
+        # that existing attributes can be deleted, re-added and removed again.
         ns1 = types.SimpleNamespace()
         ns2 = types.SimpleNamespace(x=1, y=2, w=3)
 
@@ -1938,6 +2400,8 @@ class SimpleNamespaceTests(CPythonTestCase):
         self.assertEqual(vars(ns1), {})
 
     def test_repr(self):
+        # [FUNCTION DOC] Checks the repr shows the class name "namespace" with attributes in
+        # insertion order, including underscore names and string quoting.
         ns1 = types.SimpleNamespace(x=1, y=2, w=3)
         ns2 = types.SimpleNamespace()
         ns2.x = "spam"
@@ -1948,6 +2412,8 @@ class SimpleNamespaceTests(CPythonTestCase):
         self.assertEqual(repr(ns2), "{name}(x='spam', _y=5)".format(name=name))
 
     def test_equal(self):
+        # [FUNCTION DOC] Checks that namespaces with equal attributes are equal
+        # and differing ones are not.
         ns1 = types.SimpleNamespace(x=1)
         ns2 = types.SimpleNamespace()
         ns2.x = 1
@@ -1957,6 +2423,8 @@ class SimpleNamespaceTests(CPythonTestCase):
         self.assertNotEqual(ns2, types.SimpleNamespace())
 
     def test_nested(self):
+        # [FUNCTION DOC] Checks that namespaces can hold other namespaces and attribute
+        # chains resolve through them.
         ns1 = types.SimpleNamespace(a=1, b=2)
         ns2 = types.SimpleNamespace()
         ns3 = types.SimpleNamespace(x=ns1)
@@ -1971,6 +2439,8 @@ class SimpleNamespaceTests(CPythonTestCase):
         self.assertEqual(ns3.x.a, 1)
 
     def test_recursive(self):
+        # [FUNCTION DOC] Checks that self-referential and mutually referential namespaces
+        # can be built and traversed.
         ns1 = types.SimpleNamespace(c='cookie')
         ns2 = types.SimpleNamespace()
         ns3 = types.SimpleNamespace(x=1)
@@ -1986,6 +2456,8 @@ class SimpleNamespaceTests(CPythonTestCase):
         self.assertEqual(ns2.spam.spam, ns2)
 
     def test_recursive_repr(self):
+        # [FUNCTION DOC] Checks that repr of recursive namespaces abbreviates the repeated
+        # namespace with an ellipsis rather than recursing forever.
         ns1 = types.SimpleNamespace(c='cookie')
         ns2 = types.SimpleNamespace()
         ns3 = types.SimpleNamespace(x=1)
@@ -2000,6 +2472,8 @@ class SimpleNamespaceTests(CPythonTestCase):
         self.assertEqual(repr(ns2), repr2)
 
     def test_as_dict(self):
+        # [FUNCTION DOC] Checks that a namespace is not a mapping: length, iteration, membership
+        # and item access all raise TypeError.
         ns = types.SimpleNamespace(spam='spamspamspam')
 
         with self.assertRaises(TypeError):
@@ -2012,7 +2486,10 @@ class SimpleNamespaceTests(CPythonTestCase):
             ns['spam']
 
     def test_subclass(self):
+        # [FUNCTION DOC] Checks that a subclass of SimpleNamespace constructs instances of its
+        # own type with the given attributes.
         class Spam(types.SimpleNamespace):
+            # [CLASS DOC] HELPER: Empty SimpleNamespace subclass.
             pass
 
         spam = Spam(ham=8, eggs=9)
@@ -2021,6 +2498,8 @@ class SimpleNamespaceTests(CPythonTestCase):
         self.assertEqual(vars(spam), {'ham': 8, 'eggs': 9})
 
     def test_pickle(self):
+        # [FUNCTION DOC] Checks that a namespace pickles and unpickles to an equal object at
+        # every pickle protocol; a TypeError during pickling is re-raised naming the protocol.
         ns = types.SimpleNamespace(breakfast="spam", lunch="spam")
 
         for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
@@ -2034,6 +2513,9 @@ class SimpleNamespaceTests(CPythonTestCase):
             self.assertEqual(ns, ns_roundtrip, pname)
 
     def test_replace(self):
+        # [FUNCTION DOC] Checks copy.replace on a namespace: result is an equal but
+        # distinct SimpleNamespace, independent of the original, and keyword
+        # arguments override attributes.
         ns = types.SimpleNamespace(x=11, y=22)
 
         ns2 = copy.replace(ns)
@@ -2051,7 +2533,10 @@ class SimpleNamespaceTests(CPythonTestCase):
         self.assertEqual(vars(copy.replace(ns, x=1, y=2)), {'x': 1, 'y': 2})
 
     def test_replace_subclass(self):
+        # [FUNCTION DOC] Checks that copy.replace on a subclass instance keeps the subclass type
+        # and applies keyword overrides.
         class Spam(types.SimpleNamespace):
+            # [CLASS DOC] HELPER: Empty SimpleNamespace subclass.
             pass
 
         spam = Spam(ham=8, eggs=9)
@@ -2061,9 +2546,14 @@ class SimpleNamespaceTests(CPythonTestCase):
         self.assertEqual(vars(spam2), {'ham': 5, 'eggs': 9})
 
     def test_fake_namespace_compare(self):
+        # [FUNCTION DOC] Regression test for issue 24257: a string subclass that claims to be a
+        # SimpleNamespace via its class attribute must compare unequal (no SystemError) and
+        # ordering comparisons must raise TypeError.
         # Issue #24257: Incorrect use of PyObject_IsInstance() caused
         # SystemError.
         class FakeSimpleNamespace(str):
+            # [CLASS DOC] HELPER: String subclass whose class attribute
+            # impersonates SimpleNamespace.
             __class__ = types.SimpleNamespace
         self.assertFalse(types.SimpleNamespace() == FakeSimpleNamespace())
         self.assertTrue(types.SimpleNamespace() != FakeSimpleNamespace())
@@ -2078,7 +2568,12 @@ class SimpleNamespaceTests(CPythonTestCase):
 
 
 class CoroutineTests(CPythonTestCase):
+    # [CLASS DOC] Tests of the types.coroutine decorator: argument validation, pass-through of
+    # async functions and non-generator results, duck-typed generator/coroutine objects, and the
+    # generator wrapper object it creates.
     def test_wrong_args(self):
+        # [FUNCTION DOC] Checks that decorating a non-callable (None, int, plain object) raises
+        # TypeError mentioning that a callable is expected.
         samples = [None, 1, object()]
         for sample in samples:
             with self.assertRaisesRegex(TypeError,
@@ -2086,17 +2581,23 @@ class CoroutineTests(CPythonTestCase):
                 types.coroutine(sample)
 
     def test_non_gen_values(self):
+        # [FUNCTION DOC] Checks that decorated functions returning non-generator values (a
+        # string or an awaitable) return them unchanged, also when decorated twice.
         @types.coroutine
         def foo():
+            # [FUNCTION DOC] HELPER: Returns the string "spam".
             return 'spam'
         self.assertEqual(foo(), 'spam')
 
         class Awaitable:
+            # [CLASS DOC] HELPER: Awaitable whose await method returns an empty tuple.
             def __await__(self):
+                # [FUNCTION DOC] HELPER: Returns an empty tuple (an empty iterator source).
                 return ()
         aw = Awaitable()
         @types.coroutine
         def foo():
+            # [FUNCTION DOC] HELPER: Returns the outer awaitable instance aw.
             return aw
         self.assertIs(aw, foo())
 
@@ -2105,9 +2606,14 @@ class CoroutineTests(CPythonTestCase):
         self.assertIs(aw, foo())
 
     def test_async_def(self):
+        # [FUNCTION DOC] Checks that decorating an async def function returns the same
+        # function with unchanged code flags, and that decorating a plain function returning
+        # that coroutine yields the coroutine with the same flags (repeatedly decorated,
+        # coroutine closed each time).
         # Test that types.coroutine passes 'async def' coroutines
         # without modification
 
+        # [FUNCTION DOC] HELPER: Empty async function used as a native coroutine.
         async def foo(): pass
         foo_code = foo.__code__
         foo_flags = foo.__code__.co_flags
@@ -2117,6 +2623,7 @@ class CoroutineTests(CPythonTestCase):
         self.assertIs(decorated_foo.__code__, foo_code)
 
         foo_coro = foo()
+        # [FUNCTION DOC] HELPER: Returns the pre-built coroutine foo_coro.
         def bar(): return foo_coro
         for _ in range(2):
             bar = types.coroutine(bar)
@@ -2126,41 +2633,73 @@ class CoroutineTests(CPythonTestCase):
             coro.close()
 
     def test_duck_coro(self):
+        # [FUNCTION DOC] Checks that an object with coroutine methods (send, throw, close,
+        # await) is returned as-is by the decorated function and is its own awaitable iterator.
         class CoroLike:
+            # [CLASS DOC] HELPER: Duck-typed coroutine with send,
+            # throw, close and await methods.
+            # [FUNCTION DOC] HELPER: Do-nothing send.
             def send(self): pass
+            # [FUNCTION DOC] HELPER: Do-nothing throw.
             def throw(self): pass
+            # [FUNCTION DOC] HELPER: Do-nothing close.
             def close(self): pass
+            # [FUNCTION DOC] HELPER: Returns the object itself.
             def __await__(self): return self
 
         coro = CoroLike()
         @types.coroutine
         def foo():
+            # [FUNCTION DOC] HELPER: Returns the outer duck-typed coroutine object.
             return coro
         self.assertIs(foo(), coro)
         self.assertIs(foo().__await__(), coro)
 
     def test_duck_corogen(self):
+        # [FUNCTION DOC] Same as the duck coroutine test but for an object that also supports
+        # iteration (iter and next): returned unchanged and awaits itself.
         class CoroGenLike:
+            # [CLASS DOC] HELPER: Duck object that is both coroutine-like and an iterator.
+            # [FUNCTION DOC] HELPER: Do-nothing send.
             def send(self): pass
+            # [FUNCTION DOC] HELPER: Do-nothing throw.
             def throw(self): pass
+            # [FUNCTION DOC] HELPER: Do-nothing close.
             def close(self): pass
+            # [FUNCTION DOC] HELPER: Returns the object itself.
             def __await__(self): return self
+            # [FUNCTION DOC] HELPER: Returns the object itself.
             def __iter__(self): return self
+            # [FUNCTION DOC] HELPER: Do-nothing next.
             def __next__(self): pass
 
         coro = CoroGenLike()
         @types.coroutine
         def foo():
+            # [FUNCTION DOC] HELPER: Returns the outer duck object.
             return coro
         self.assertIs(foo(), coro)
         self.assertIs(foo().__await__(), coro)
 
     def test_duck_gen(self):
+        # [FUNCTION DOC] Uses a mock generator-like object to check the generator wrapper: it is
+        # wrapped in types._GeneratorWrapper and is its own await and iterator, proxies name,
+        # qualified name and generator/coroutine state attributes (raising AttributeError until
+        # the mock has them), forwards close, send, next and throw with all argument forms,
+        # propagates exceptions, rejects bad argument counts without calling the mock, is not
+        # double wrapped, and supports weak references.
         class GenLike:
+            # [CLASS DOC] HELPER: Interface spec for the generator mock (send,
+            # throw, close, iter, next).
+            # [FUNCTION DOC] HELPER: Do-nothing send.
             def send(self): pass
+            # [FUNCTION DOC] HELPER: Do-nothing throw.
             def throw(self): pass
+            # [FUNCTION DOC] HELPER: Do-nothing close.
             def close(self): pass
+            # [FUNCTION DOC] HELPER: Do-nothing iter.
             def __iter__(self): pass
+            # [FUNCTION DOC] HELPER: Do-nothing next.
             def __next__(self): pass
 
         # Setup generator mock object
@@ -2171,6 +2710,7 @@ class CoroutineTests(CPythonTestCase):
         self.assertIsInstance(gen, collections.abc.Generator)
         self.assertIs(gen, iter(gen))
 
+        # [FUNCTION DOC] HELPER: Returns the mock generator object gen.
         @types.coroutine
         def foo(): return gen
 
@@ -2252,6 +2792,7 @@ class CoroutineTests(CPythonTestCase):
         self.assertFalse(gen.send.called)
 
         # Test that we do not double wrap
+        # [FUNCTION DOC] HELPER: Returns the already wrapped object.
         @types.coroutine
         def bar(): return wrapper
         self.assertIs(wrapper, bar())
@@ -2261,7 +2802,14 @@ class CoroutineTests(CPythonTestCase):
         self.assertIs(ref(), wrapper)
 
     def test_duck_functional_gen(self):
+        # [FUNCTION DOC] Uses a hand-written generator emulation that yields a future-like
+        # value and returns twice the sent value, wraps it with the decorator and awaits it
+        # from a native coroutine: the first send gives the yielded value, sending 20
+        # finishes with result 140.
         class Generator:
+            # [CLASS DOC] HELPER: Clumsy iterator emulating a generator that yields
+            # a value, receives a number, and returns it doubled. Stores a step
+            # counter and the value to yield.
             """Emulates the following generator (very clumsy):
 
               def gen(fut):
@@ -2269,13 +2817,20 @@ class CoroutineTests(CPythonTestCase):
                   return result * 2
             """
             def __init__(self, fut):
+                # [FUNCTION DOC] HELPER: Stores the value to yield and resets
+                # the step counter to zero.
                 self._i = 0
                 self._fut = fut
             def __iter__(self):
+                # [FUNCTION DOC] HELPER: Returns the object itself.
                 return self
             def __next__(self):
+                # [FUNCTION DOC] HELPER: Equivalent to sending None.
                 return self.send(None)
             def send(self, v):
+                # [FUNCTION DOC] HELPER: Step 0 returns the stored value (requires None sent);
+                # step 1 raises StopIteration carrying double the sent value; later steps raise
+                # StopIteration. Always increments the step counter.
                 try:
                     if self._i == 0:
                         assert v is None
@@ -2287,12 +2842,16 @@ class CoroutineTests(CPythonTestCase):
                 finally:
                     self._i += 1
             def throw(self, tp, *exc):
+                # [FUNCTION DOC] HELPER: Marks the emulation as finished (step 100) and
+                # re-raises the given exception type unless it is GeneratorExit.
                 self._i = 100
                 if tp is not GeneratorExit:
                     raise tp
             def close(self):
+                # [FUNCTION DOC] HELPER: Closes by throwing GeneratorExit.
                 self.throw(GeneratorExit)
 
+        # [FUNCTION DOC] HELPER: Returns a new emulated generator for the value "spam".
         @types.coroutine
         def foo(): return Generator('spam')
 
@@ -2300,6 +2859,8 @@ class CoroutineTests(CPythonTestCase):
         self.assertIsInstance(wrapper, types._GeneratorWrapper)
 
         async def corofunc():
+            # [FUNCTION DOC] HELPER: Awaits the wrapped generator and
+            # returns the result plus 100.
             return await foo() + 100
         coro = corofunc()
 
@@ -2312,10 +2873,17 @@ class CoroutineTests(CPythonTestCase):
             self.fail('StopIteration was expected')
 
     def test_gen(self):
+        # [FUNCTION DOC] Checks the wrapper around a real generator: wrapper awaits to the
+        # generator itself, name/code/state attributes match, values and return value propagate
+        # through next and send (return value arrives in StopIteration), throw works, and
+        # double decoration is stable.
         def gen_func():
+            # [FUNCTION DOC] HELPER: Generator yielding 1 then 2 and
+            # returning the value sent in.
             yield 1
             return (yield 2)
         gen = gen_func()
+        # [FUNCTION DOC] HELPER: Returns the shared generator object gen.
         @types.coroutine
         def foo(): return gen
         wrapper = foo()
@@ -2344,14 +2912,19 @@ class CoroutineTests(CPythonTestCase):
         self.assertIs(foo().__await__(), gen)
 
     def test_returning_itercoro(self):
+        # [FUNCTION DOC] Checks that a decorated generator function returns a
+        # coroutine-like object and that a function returning it is passed through
+        # unchanged, also when decorated again.
         @types.coroutine
         def gen():
+            # [FUNCTION DOC] HELPER: Generator that yields once.
             yield
 
         gencoro = gen()
 
         @types.coroutine
         def foo():
+            # [FUNCTION DOC] HELPER: Returns the shared generator coroutine gencoro.
             return gencoro
 
         self.assertIs(foo(), gencoro)
@@ -2361,6 +2934,10 @@ class CoroutineTests(CPythonTestCase):
         self.assertIs(foo(), gencoro)
 
     def test_genfunc(self):
+        # [FUNCTION DOC] Checks that decorating a generator function returns the same function,
+        # marks its code with the iterable-coroutine flag (not the coroutine flag), also for
+        # created generators, and is idempotent.
+        # [FUNCTION DOC] HELPER: One-line generator function yielding once.
         def gen(): yield
         self.assertIs(types.coroutine(gen), gen)
         self.assertIs(types.coroutine(types.coroutine(gen)), gen)
@@ -2375,10 +2952,15 @@ class CoroutineTests(CPythonTestCase):
         self.assertIs(types.coroutine(gen), gen)
 
     def test_wrapper_object(self):
+        # [FUNCTION DOC] Checks the wrapper object: its repr mentions GeneratorWrapper, equals
+        # str, and its attribute list includes the await, iter, next, coroutine and generator
+        # state attributes and send, close, throw.
         def gen():
+            # [FUNCTION DOC] HELPER: Generator yielding once.
             yield
         @types.coroutine
         def coro():
+            # [FUNCTION DOC] HELPER: Returns a new generator from gen.
             return gen()
 
         wrapper = coro()
@@ -2391,8 +2973,13 @@ class CoroutineTests(CPythonTestCase):
 
 
 class FunctionTests(CPythonTestCase):
+    # [CLASS DOC] Tests of constructing types.FunctionType with explicit defaults.
     def test_function_type_defaults(self):
+        # [FUNCTION DOC] Checks that a function built from a code object with positional
+        # defaults and keyword-only defaults has those defaults, can be called with them (result
+        # 6), and that passing None for both leaves them None.
         def ex(a, /, b, *, c):
+            # [FUNCTION DOC] HELPER: Returns the sum a + b + c.
             return a + b + c
 
         func = types.FunctionType(
@@ -2410,7 +2997,11 @@ class FunctionTests(CPythonTestCase):
         self.assertEqual(func.__kwdefaults__, None)
 
     def test_function_type_wrong_defaults(self):
+        # [FUNCTION DOC] Checks that passing a non-tuple for the defaults argument
+        # (argument 4) or a non-dict for keyword defaults (argument 6) raises TypeError
+        # naming that argument number.
         def ex(a, /, b, *, c):
+            # [FUNCTION DOC] HELPER: Returns the sum a + b + c.
             return a + b + c
 
         with self.assertRaisesRegex(TypeError, 'arg 4'):
@@ -2424,9 +3015,14 @@ class FunctionTests(CPythonTestCase):
 
 
 class SubinterpreterTests(CPythonTestCase):
+    # [CLASS DOC] Tests that need subinterpreter support: compares the representation of static
+    # type slot wrappers between the main interpreter and a subinterpreter.
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class fixture. Binds the module-level name interpreters from the test
+        # support package, raising SkipTest if subinterpreter support is unavailable, imports
+        # the channels module and then runs the base setup.
         global interpreters
         try:
             from test.support import interpreters
@@ -2438,6 +3034,11 @@ class SubinterpreterTests(CPythonTestCase):
     @cpython_only
     @no_rerun('channels (and queues) might have a refleak; see gh-122199')
     def test_static_types_inherited_slots(self):
+        # [FUNCTION DOC] CPython-only, not rerun on refleaks. For every builtin type and slot
+        # wrapper builds a script that sends the slot's repr over a channel, runs the script in
+        # the main interpreter, records the results, runs the same script in a new
+        # subinterpreter, and asserts each result equals the main interpreter's (subTest per
+        # type and slot). The assert in the loop verifies the message identity of the main run.
         rch, sch = interpreters.channels.create()
 
         slots = []

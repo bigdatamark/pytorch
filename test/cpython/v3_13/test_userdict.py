@@ -4,6 +4,12 @@
 # ruff: noqa
 # flake8: noqa
 
+# [MODULE DOC] Dynamo-patched copy of the CPython 3.13 UserDict test. Runs the shared mapping
+# conformance suite (mapping_tests.TestHashMappingProtocol) against collections.UserDict and
+# adds UserDict specific checks (constructors, copy, update, __missing__ handling). At import
+# time it installs a meta path finder that redirects "test.*" imports to top-level modules and
+# defines module-level sample dictionaries d0..d5 used as expected values.
+
 # Test copied from
 # https://raw.githubusercontent.com/python/cpython/refs/tags/v3.13.5/Lib/test/test_userdict.py
 
@@ -31,7 +37,14 @@ redirect_imports = (
 )
 
 class RedirectImportFinder(importlib.abc.MetaPathFinder):
+    # [CLASS DOC] HELPER: Import hook that maps selected "test.xxx" module names (those listed
+    # in redirect_imports) onto the standalone top-level module "xxx". Stateless; installed
+    # at the front of sys.meta_path by this module.
     def find_spec(self, fullname, path, target=None):
+        # [FUNCTION DOC] HELPER: For a name in redirect_imports, imports the same name without
+        # the "test." prefix, registers that module in sys.modules under the original name
+        # (side effect) and returns its spec. Returns None (defers to other finders) if the
+        # name is not listed or the standalone import fails with ImportError.
         # Check if the import is the problematic one
         if fullname in redirect_imports:
             try:
@@ -66,9 +79,18 @@ d4 = {"one": None, "two": None}
 d5 = {"one": 1, "two": 1}
 
 class UserDictTest(mapping_tests.TestHashMappingProtocol):
+    # [CLASS DOC] Runs the generic hashable-mapping protocol tests with type2test set to
+    # collections.UserDict, and adds UserDict specific tests (test_all, test_init,
+    # test_update, test_missing).
     type2test = collections.UserDict
 
     def test_all(self):
+        # [FUNCTION DOC] Broad walk through the UserDict API: constructors (empty, from a
+        # mapping, keyword arguments, item pairs, both, and a keyword named dict), fromkeys,
+        # str/repr, equality and length, item get/set/delete (missing key raises KeyError),
+        # clear, copy (including a subclass copy not sharing data), keys/items/values,
+        # membership, update, get, iteration, setdefault, pop (default and KeyError) and
+        # popitem (KeyError when empty). Compares against the module-level dicts d0..d5.
         # Test constructors
         u = collections.UserDict()
         u0 = collections.UserDict(d0)
@@ -135,6 +157,10 @@ class UserDictTest(mapping_tests.TestHashMappingProtocol):
         self.assertEqual(u2b, u2c)
 
         class MyUserDict(collections.UserDict):
+            # [CLASS DOC] HELPER: Trivial UserDict subclass used to test that copy of a
+            # subclass instance produces independent data.
+            # [FUNCTION DOC] HELPER: Prints this mapping to standard output (one-line def, so the
+            # block sits above it).
             def display(self): print(self)
 
         m2 = MyUserDict(u2)
@@ -196,6 +222,10 @@ class UserDictTest(mapping_tests.TestHashMappingProtocol):
         self.assertRaises(KeyError, t.popitem)
 
     def test_init(self):
+        # [FUNCTION DOC] Checks the UserDict constructor: keyword names such as self, other
+        # and iterable are accepted as ordinary keys, a keyword named dict is stored as a key
+        # (even alongside a positional mapping), and invalid calls (non-mapping argument,
+        # two positional arguments, no instance) raise TypeError.
         for kw in 'self', 'other', 'iterable':
             self.assertEqual(list(collections.UserDict(**{kw: 42}).items()),
                              [(kw, 42)])
@@ -210,6 +240,9 @@ class UserDictTest(mapping_tests.TestHashMappingProtocol):
         self.assertRaises(TypeError, collections.UserDict.__init__)
 
     def test_update(self):
+        # [FUNCTION DOC] Checks UserDict.update with keywords named self, dict, other and
+        # iterable (each stored as a plain key), and that a non-mapping argument, two
+        # positional arguments, or a call without an instance raise TypeError.
         for kw in 'self', 'dict', 'other', 'iterable':
             d = collections.UserDict()
             d.update(**{kw: 42})
@@ -219,6 +252,11 @@ class UserDictTest(mapping_tests.TestHashMappingProtocol):
         self.assertRaises(TypeError, collections.UserDict.update)
 
     def test_missing(self):
+        # [FUNCTION DOC] Checks __missing__ handling: UserDict itself defines none; a
+        # subclass defining it returns its value for absent keys without adding them (D);
+        # one that raises propagates that error with the key as argument (E); setting it as
+        # an instance attribute has no effect and a plain KeyError is raised (F); a subclass
+        # without it raises KeyError carrying the key (G).
         # Make sure UserDict doesn't have a __missing__ method
         self.assertEqual(hasattr(collections.UserDict, "__missing__"), False)
         # Test several cases:
@@ -227,7 +265,9 @@ class UserDictTest(mapping_tests.TestHashMappingProtocol):
         # (F) subclass sets __missing__ instance variable (no effect)
         # (G) subclass doesn't define __missing__ at all
         class D(collections.UserDict):
+            # [CLASS DOC] HELPER: UserDict subclass whose missing-key hook returns 42.
             def __missing__(self, key):
+                # [FUNCTION DOC] HELPER: Returns the constant 42 for any absent key.
                 return 42
         d = D({1: 2, 3: 4})
         self.assertEqual(d[1], 2)
@@ -236,7 +276,9 @@ class UserDictTest(mapping_tests.TestHashMappingProtocol):
         self.assertNotIn(2, d.keys())
         self.assertEqual(d[2], 42)
         class E(collections.UserDict):
+            # [CLASS DOC] HELPER: UserDict subclass whose missing-key hook raises.
             def __missing__(self, key):
+                # [FUNCTION DOC] HELPER: Raises RuntimeError with the missing key as argument.
                 raise RuntimeError(key)
         e = E()
         try:
@@ -246,7 +288,11 @@ class UserDictTest(mapping_tests.TestHashMappingProtocol):
         else:
             self.fail("e[42] didn't raise RuntimeError")
         class F(collections.UserDict):
+            # [CLASS DOC] HELPER: UserDict subclass that sets a missing-key hook on the
+            # instance, which must be ignored by lookups.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Assigns an instance attribute named __missing__ (a
+                # function returning None) and then runs the normal UserDict initializer.
                 # An instance variable __missing__ should have no effect
                 self.__missing__ = lambda key: None
                 collections.UserDict.__init__(self)
@@ -258,6 +304,7 @@ class UserDictTest(mapping_tests.TestHashMappingProtocol):
         else:
             self.fail("f[42] didn't raise KeyError")
         class G(collections.UserDict):
+            # [CLASS DOC] HELPER: Plain UserDict subclass with no customization.
             pass
         g = G()
         try:
