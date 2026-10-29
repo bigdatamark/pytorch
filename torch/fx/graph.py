@@ -1,3 +1,12 @@
+# [MODULE DOC] Core of torch.fx: defines the Graph container (a doubly linked list of
+# Node objects with node-creation, insertion-point, erase, lint, dead-code
+# elimination and code-generation APIs), the CodeGen classes that turn a Graph
+# into Python source text (including pytree, boxed and export variants), the
+# PythonCode result record, and helpers for unique name allocation and
+# stack-trace parsing. Public exports are PythonCode, CodeGen and Graph.
+# Import-time side effects: registers a fixed set of custom builtins (inf, nan,
+# NoneType, torch, device, fx_pytree, pytree) in module-level tables that
+# reserve those names, and builds module-level regexes and color helpers.
 from __future__ import annotations
 
 import builtins
@@ -75,6 +84,9 @@ TransformCodeFunc = Callable[[list[str]], list[str]]
 
 
 class _CustomBuiltin(NamedTuple):
+    # [CLASS DOC] HELPER: Named tuple pairing an import statement string with the
+    # object it produces. Entries are stored in the module-level custom builtins
+    # table and are added to the globals of every generated graph.
     """Additional objs that we add to every graph's globals.
 
     The repr() for some standard library objects is not valid Python code without
@@ -96,6 +108,10 @@ _custom_builtins: dict[str, _CustomBuiltin] = {}
 
 
 def _register_custom_builtin(name: str, import_str: str, obj: object) -> None:
+# [FUNCTION DOC] HELPER: Registers a custom builtin under the given name. Stores
+# the import string and object in the module-level custom builtins mapping and
+# also records the object in the illegal names table so generated variable
+# names never shadow it. Mutates global state; returns nothing.
     _custom_builtins[name] = _CustomBuiltin(import_str, obj)
     _illegal_names[name] = obj
 
@@ -110,10 +126,15 @@ _register_custom_builtin("pytree", "import torch.utils._pytree as pytree", pytre
 
 
 def _is_magic(x: str) -> bool:
+# [FUNCTION DOC] HELPER: Returns true if the string both starts and ends with a
+# double underscore (a magic/dunder name).
     return x.startswith("__") and x.endswith("__")
 
 
 def _snake_case(s: str) -> str:
+# [FUNCTION DOC] HELPER: Converts a name to snake case by inserting an
+# underscore between a lowercase letter and a following uppercase letter, then
+# lowercasing everything. Returns the new string; no side effects.
     """
     Transforms the given string ``s`` to a Python-style variable name
 
@@ -145,6 +166,11 @@ _torch_but_not_dynamo = re.compile(
 
 
 def _is_from_torch(obj: object) -> bool:
+# [FUNCTION DOC] HELPER: Decides whether an object belongs to the torch package
+# (excluding torch._dynamo and torch._inductor submodules). Uses the object's
+# module name when present; otherwise falls back to checking whether the
+# object's name resolves to the same object in torch or torch.nn.functional
+# (the name torch itself is excluded). Returns a bool.
     module_name = getattr(obj, "__module__", None)
     if module_name is not None:
         return _torch_but_not_dynamo(module_name) is not None
@@ -160,6 +186,11 @@ def _is_from_torch(obj: object) -> bool:
 
 
 class _Namespace:
+    # [CLASS DOC] HELPER: Allocates unique Python identifier names and remembers
+    # which object each name was given to. State: a mapping from object to name, a
+    # set of used names, and a per-base-name counter used to pick numeric suffixes.
+    # Invariants: an object gets one name, names are unique, and generated names do
+    # not shadow builtins or keywords unless the object is that builtin.
     """A context for associating names uniquely with objects.
 
     The following invariants are enforced:
@@ -169,11 +200,21 @@ class _Namespace:
     """
 
     def __init__(self) -> None:
+    # [FUNCTION DOC] HELPER: Initializes empty object-to-name mapping, used-name
+    # set and base-name counter mapping.
         self._obj_to_name: dict[object, str] = {}
         self._used_names: set[str] = set()
         self._base_count: dict[str, int] = {}
 
     def create_name(self, candidate: str, obj: object | None) -> str:
+    # [FUNCTION DOC] Returns a unique valid identifier based on the candidate string.
+    # If obj is not None and already has a name, that name is returned. Otherwise
+    # illegal characters are replaced by underscores, an empty result becomes
+    # "_unnamed", a leading digit gets an underscore prefix, and a numeric suffix
+    # is appended or incremented until the name is unused and does not collide with
+    # an illegal (builtin or keyword) name that belongs to a different object. The
+    # name is recorded as used and, when obj is given, associated with obj.
+    # Raises AssertionError if the sanitized candidate still fails the name regex.
         """Create a unique name.
 
         Arguments:
@@ -225,6 +266,11 @@ class _Namespace:
         return candidate
 
     def associate_name_with_obj(self, name: str, obj: object) -> None:
+    # [FUNCTION DOC] Binds a given name to an object in the object-to-name mapping.
+    # Raises AssertionError if the object already has a different name.
+    # KNOWN ISSUE: The conflict check compares names by identity rather than
+    # equality, so an equal but distinct string object is rejected; also the name
+    # is not added to the used-name set, contrary to the uniqueness intent.
         """Associate a unique name with an object.
 
         Neither `name` nor `obj` should be associated already.
@@ -234,6 +280,9 @@ class _Namespace:
             raise AssertionError("obj is already associated")
 
     def _rename_object(self, obj: object, name: str) -> None:
+    # [FUNCTION DOC] HELPER: Overwrites the recorded name of an already tracked
+    # object and marks the new name as used (the old name stays marked used).
+    # Raises AssertionError if the object is not tracked.
         if obj not in self._obj_to_name:
             raise AssertionError(f"Object {obj} is not in _obj_to_name")
         self._obj_to_name[obj] = name
@@ -243,6 +292,12 @@ class _Namespace:
 @compatibility(is_backward_compatible=True)
 @dataclass
 class PythonCode:
+    # [CLASS DOC] Dataclass holding the result of Python code generation for a
+    # Graph. Fields: src (source text of the forward function definition, preceded
+    # by any wrap statements), globals (mapping of names available when executing
+    # the source), _lineno_map (optional mapping from generated line number to the
+    # index of the originating node, or None for unmapped lines), and
+    # _prologue_start (line number where the function prologue begins).
     """
     Represents all the information necessary to exec or save a graph as Python code.
     """
@@ -259,6 +314,10 @@ class PythonCode:
 
 
 def _format_target(base: str, target: str) -> str:
+# [FUNCTION DOC] HELPER: Builds an attribute-access expression string by
+# appending each dot-separated element of the target to the base expression.
+# Elements that are not valid identifiers are accessed through a getattr call
+# with the element as a quoted string instead.
     elems = target.split(".")
     r = base
     for e in elems:
@@ -270,11 +329,17 @@ def _format_target(base: str, target: str) -> str:
 
 
 class _InsertPoint:
+    # [CLASS DOC] HELPER: Context manager used by Graph.inserting_before and
+    # inserting_after. On construction it swaps the graph's node-insertion function
+    # for the supplied one; on exit it restores the original. Enter does nothing.
     def __init__(self, graph: Graph, new_insert: Callable[..., None]) -> None:
+        # [FUNCTION DOC] HELPER: Stores the graph, saves the graph's current insertion
+        # callback and installs new_insert in its place (mutates the graph).
         self.graph = graph
         self.orig_insert, graph._insert = graph._insert, new_insert
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] HELPER: Enter hook; does nothing.
         pass
 
     def __exit__(
@@ -283,13 +348,20 @@ class _InsertPoint:
         value: BaseException | None,
         tb: types.TracebackType | None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Exit hook; restores the graph's saved insertion
+        # callback. Does not suppress exceptions.
         self.graph._insert = self.orig_insert
 
 
 class _node_list:
+    # [CLASS DOC] HELPER: Lightweight view over a Graph's linked list of nodes that
+    # supports length and forward or reversed iteration. State: the owning graph
+    # and a direction ("_next" or "_prev") that selects the iteration order.
     def __init__(
         self, graph: Graph, direction: Literal["_prev", "_next"] = "_next"
     ) -> None:
+        # [FUNCTION DOC] HELPER: Stores the graph and direction. Raises AssertionError
+        # if direction is not "_next" or "_prev".
         if direction not in ("_next", "_prev"):
             raise AssertionError(
                 f"direction must be '_next' or '_prev', got {direction}"
@@ -298,6 +370,7 @@ class _node_list:
         self.direction = direction
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns the number of nodes in the graph.
         return self.graph._len
 
     # TODO: These should return Iterator[Node], but doing so causes ~350
@@ -306,13 +379,20 @@ class _node_list:
     # node.op checks (e.g. `if node.op == "call_module": node.target`
     # should be str but pyrefly doesn't support that narrowing).
     def __iter__(self) -> Iterator[Any]:
+        # [FUNCTION DOC] HELPER: Returns a native node iterator over the graph's nodes,
+        # starting from the root sentinel, in this view's direction.
         return _NodeIter(self.graph._root, self.direction == "_prev")
 
     def __reversed__(self) -> Iterator[Any]:
+        # [FUNCTION DOC] HELPER: Returns a node iterator in the opposite direction of
+        # this view.
         return _NodeIter(self.graph._root, self.direction == "_next")
 
 
 class _PyTreeInfo(NamedTuple):
+    # [CLASS DOC] HELPER: Named tuple of pytree information used by the pytree
+    # codegen: original argument names, the input tree spec and the optional output
+    # tree spec.
     """
     Contains extra info stored when we're using Pytrees
     """
@@ -324,6 +404,8 @@ class _PyTreeInfo(NamedTuple):
 
 @dataclass(frozen=True)
 class _ParsedStackTrace:
+    # [CLASS DOC] HELPER: Immutable record of the innermost parsed stack frame:
+    # file, line number (as text), function name and source line of code.
     """
     Represents the top-most frame of a parsed stack trace
     """
@@ -334,6 +416,8 @@ class _ParsedStackTrace:
     code: str
 
     def get_summary_str(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns a one-line human-readable summary of the frame
+        # containing file, line number, function name and code.
         return f"File: {self.file}:{self.lineno} in {self.name}, code: {self.code}"
 
 
@@ -341,6 +425,13 @@ class _ParsedStackTrace:
 def _parse_stack_trace(
     stack_trace: str, filter_fn: Callable[[str, str, str], bool] | None = None
 ) -> _ParsedStackTrace | None:
+# [FUNCTION DOC] HELPER: Parses a stack trace string and returns the innermost
+# frame (searching from the end, skipping the last line) that matches the
+# "File, line, in name" format, as a _ParsedStackTrace whose code is the line
+# after the match. If filter_fn is given, frames for which it returns false
+# (called with file, name, code) are skipped. Returns None if the trace is None
+# or no frame matches.
+# KNOWN ISSUE: The parameter is typed as str but None is explicitly handled.
     if stack_trace is None:
         return None
     pattern = re.compile(r"^File \"(.+)\", line (\d+), in (.+)$")
@@ -365,18 +456,33 @@ def _parse_stack_trace(
 
 @compatibility(is_backward_compatible=False)
 class CodeGen:
+    # [CLASS DOC] Default code generator that turns a Graph's nodes into Python
+    # source for a forward function. Subclasses customize the function signature,
+    # return statement, input/output processing and extra globals. State:
+    # _body_transformer (optional callable that rewrites the list of body lines)
+    # and _func_name (name of the generated function, default "forward"). The class
+    # attribute _sym_repr is an override hook for printing symbolic values. Key
+    # methods: gen_fn_def, generate_output, process_inputs, process_outputs,
+    # additional_globals and _gen_python_code.
     # This is an override hook so we can customize the SymNode printer.
     _sym_repr: Callable[[torch.types.PySymType], str] = lambda x: repr(x)
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Initializes the optional body transformer to None and
+        # the generated function name to "forward".
         self._body_transformer: TransformCodeFunc | None = None
         self._func_name: str = "forward"
 
     def _format_multiline_args(self, args: list[str]) -> str:
+        # [FUNCTION DOC] HELPER: Returns the arguments each rendered on its own
+        # indented line with a trailing comma, concatenated into one string.
         """Helper to format function arguments in expanded multiline format."""
         return "".join(self._format_single_arg(arg) for arg in args)
 
     def _format_single_arg(self, arg: str) -> str:
+        # [FUNCTION DOC] HELPER: Formats one argument as an indented line with a
+        # trailing comma. If the argument contains an embedded comment marker, the
+        # comment is moved after the comma.
         """Helper to format a single argument with optional comment."""
         if "#" in arg:
             arg_part, comment_part = arg.split("#", 1)
@@ -385,6 +491,8 @@ class CodeGen:
             return f"    {arg},\n"
 
     def _get_delimiters(self, container: Sequence[object]) -> tuple[str, str]:
+        # [FUNCTION DOC] HELPER: Returns parentheses for a tuple container and square
+        # brackets for anything else, as a pair of strings.
         """Helper to get opening and closing delimiters for containers."""
         return ("(", ")") if isinstance(container, tuple) else ("[", "]")
 
@@ -395,6 +503,10 @@ class CodeGen:
         prefix: str = "",
         repr_fn: Callable[[object], str] | None = None,
     ) -> str:
+        # [FUNCTION DOC] HELPER: Renders a sequence as a multi-line literal text with
+        # the given prefix, one item per line rendered by repr_fn (default repr) and
+        # followed by an optional description comment taken from descs. Uses
+        # parentheses for tuples and brackets otherwise. Returns the string.
         """Helper to format containers (lists/tuples) in multiline format."""
         ldelim, rdelim = self._get_delimiters(items)
         desc_trailers = self._get_desc_trailers(items, descs)
@@ -413,6 +525,11 @@ class CodeGen:
     def _get_desc_trailers(
         self, items: Sequence[object], descs: Sequence[str] | None
     ) -> list[str]:
+        # [FUNCTION DOC] HELPER: Returns a list of trailing comment strings, one per
+        # item: empty strings when descs is None, otherwise a comment with each
+        # description.
+        # KNOWN ISSUE: With descs given, the result length follows descs rather than
+        # items, so a length mismatch silently truncates the zip in the caller.
         """Helper to generate description trailers for items."""
         if descs is None:
             return [""] * len(items)
@@ -421,6 +538,10 @@ class CodeGen:
     def _call_method_with_signature_check(
         self, method: Callable[..., Any], *args: Any, **kwargs: Any
     ) -> Any:
+        # [FUNCTION DOC] HELPER: Calls the given method, passing only those keyword
+        # arguments that appear in the method's signature (found via inspection) so
+        # older subclass overrides without newer keywords still work. Returns the
+        # method's result.
         """Helper to call a method with optional parameters based on signature."""
         sig = inspect.signature(method)
         # Filter kwargs to only include parameters that exist in the method signature
@@ -434,6 +555,13 @@ class CodeGen:
         *,
         expanded_def: bool = False,
     ) -> str:
+        # [FUNCTION DOC] Builds the function definition line of the generated code from
+        # the list of free variable strings, the return annotation text and an
+        # expanded_def flag. If the first free variable is not "self", "self" is
+        # inserted at the front (mutating the caller's list). With expanded_def each
+        # argument is placed on its own line; otherwise a single-line definition is
+        # returned. Uses the generator's function name.
+        # KNOWN ISSUE: The docstring example omits the automatically added self argument.
         """
         Given the free variables and a return annotation, generates the beginning of the FX function.
         By default, `gen_fn_def(['a', 'b'], '') == 'def {self._func_name}(a, b):'`
@@ -458,6 +586,11 @@ class CodeGen:
         descs: Sequence[str] | None = None,
         repr_fn: Callable[[object], str] | None = None,
     ) -> str:
+        # [FUNCTION DOC] Builds the return statement text for the generated function.
+        # If descs is given and the output is a list or tuple, returns a multi-line
+        # container literal with per-item description comments; otherwise a single
+        # line returning the representation of the output. repr_fn (default repr)
+        # renders values. The result is not indented.
         """
         Given the output arguments, generates the return statement of the FX function.
         Note: The returned statement should not be indented.
@@ -472,6 +605,8 @@ class CodeGen:
             return f"return {repr_fn(output_args)}"
 
     def process_inputs(self, *args: Any) -> Any:
+        # [FUNCTION DOC] Maps user inputs to the arguments the graph function takes;
+        # the default returns the inputs unchanged.
         """
         Transforms the inputs so that the graph can take them as arguments, as
         non-default codegen may result in the inputs to the function being
@@ -483,6 +618,8 @@ class CodeGen:
         return args
 
     def process_outputs(self, outputs: Any) -> Any:
+        # [FUNCTION DOC] Maps graph outputs back to the codegen's output form; the
+        # default returns them unchanged.
         """
         Transforms the outputs of the graph to be identical to the codegen.
 
@@ -491,6 +628,8 @@ class CodeGen:
         return outputs
 
     def additional_globals(self) -> list[tuple[str, Any]]:
+        # [FUNCTION DOC] Returns extra (identifier, value) pairs to add to the globals
+        # of the generated code; the default returns an empty list.
         """
         If your codegen uses extra global values, add tuples of (identifier,reference to the value) here.
         For example, return ['List', typing.List] if you need ``List`` in the global context.
@@ -512,6 +651,19 @@ class CodeGen:
         record_func: bool = False,
         additional_meta: list[str] | None = None,
     ) -> PythonCode:
+        # [FUNCTION DOC] Generates a PythonCode object for the given nodes. Inputs: the
+        # node list, the root module expression name, a name allocator, and flags for
+        # verbose annotations, stride and device annotations, colored output, expanded
+        # argument definitions, profiler record markers and extra node meta keys to
+        # print. Environment variables FX_GRAPH_SHOW_STRIDE, FX_GRAPH_SHOW_DEVICE and
+        # FX_GRAPH_SHOW_META force the corresponding options on. For each node it emits
+        # a line (placeholders become function arguments), frees values after their last
+        # use, optionally emits stack-trace summaries, and tracks external objects as
+        # globals. The body may be rewritten by the body transformer, then the prologue
+        # is created through gen_fn_def, counter markers are stripped while building a
+        # line-to-node-index map, and the source is assembled with optional wrap
+        # statements. Raises NotImplementedError for an unknown node op and
+        # AssertionError for malformed node targets or global name conflicts.
         free_vars: list[str] = []
         body: list[str] = []
         globals_: dict[str, Any] = {}
@@ -528,6 +680,11 @@ class CodeGen:
         include_meta = os.environ.get("FX_GRAPH_SHOW_META", "0") == "1"
 
         def add_global(name_hint: str, obj: Any) -> str:
+        # [FUNCTION DOC] HELPER: Registers an external object as a global of the
+        # generated code and returns the name to use. Torch objects (except
+        # torch.device) are referenced by their fully qualified name; others get a
+        # unique name from the namespace and are stored in the globals mapping.
+        # Raises AssertionError if the name is already bound to a different object.
             """Add an obj to be tracked as a global.
 
             We call this for names that reference objects external to the
@@ -560,6 +717,10 @@ class CodeGen:
             add_global(name, obj)
 
         def type_repr(o: object) -> str:
+        # [FUNCTION DOC] HELPER: Returns source text for a type annotation. Handles the
+        # empty tuple, union types, and generic aliases (including tensor type
+        # dimensions) recursively, registering needed origin types as globals; other
+        # types are registered as globals under their type name.
             if o == ():
                 # Empty tuple is used for empty tuple type annotation Tuple[()]
                 return "()"
@@ -608,6 +769,12 @@ class CodeGen:
             blue = _identity
 
         def _get_repr(arg: object) -> str:
+        # [FUNCTION DOC] HELPER: Returns source text for a node argument value. Nodes
+        # use their repr; named tuples, operator objects and enums are registered as
+        # globals; complex numbers with unsafe components use a constructor call;
+        # tensors print as size and dtype only; tuples, lists and slices are rendered
+        # recursively; opaque constants register their types; anything else uses repr
+        # (colored blue when coloring is on).
             if isinstance(arg, Node):  # first because common
                 return repr(arg)
             elif isinstance(arg, tuple) and hasattr(arg, "_fields"):
@@ -662,6 +829,9 @@ class CodeGen:
         def _format_args(
             args: tuple[Argument, ...], kwargs: dict[str, Argument]
         ) -> str:
+        # [FUNCTION DOC] HELPER: Joins positional and keyword arguments into one
+        # comma-separated string, keyword arguments written with spaces around the
+        # equals sign.
             res = [_get_repr(a) for a in args]
             res.extend([f"{k} = {_get_repr(v)}" for k, v in kwargs.items()])
             return ", ".join(res)
@@ -674,6 +844,9 @@ class CodeGen:
         user_to_last_uses: dict[Node, list[Node]] = {}
 
         def register_last_uses(n: Node, user: Node) -> None:
+        # [FUNCTION DOC] HELPER: Records user as the last user of node n if n has no
+        # recorded last use yet (nodes are visited in reverse order). Mutates the two
+        # last-use mappings.
             if n not in node_to_last_use:
                 node_to_last_use[n] = user
                 user_to_last_uses.setdefault(user, []).append(n)
@@ -683,6 +856,12 @@ class CodeGen:
                 register_last_uses(input_node, node)
 
         def delete_unused_values(user: Node) -> None:
+        # [FUNCTION DOC] HELPER: Appends the end-of-line text for a node, including a
+        # statement that sets values to None after their last use. Placeholders emit
+        # nothing, output emits a newline, and a node with no users is also cleared
+        # right after execution. Mutates the body list.
+        # KNOWN ISSUE: Appends the node itself to the list stored in the last-use
+        # mapping, so the stored list is mutated.
             """
             Delete values after their last use. This ensures that values that are
             not used in the remainder of the code are freed and the memory usage
@@ -712,6 +891,11 @@ class CodeGen:
         prev_summary_str = None
 
         def append_stacktrace_summary(node: Node) -> None:
+        # [FUNCTION DOC] HELPER: For non-placeholder and non-output nodes, appends a
+        # comment block to the body summarizing extra meta values, custom annotations
+        # (values truncated to 40 characters), recompute tags and the parsed stack
+        # trace location. Skips the block if identical to the previously emitted one.
+        # Updates the nonlocal previous-summary state.
             """
             Append a summary of the stacktrace to the generated code. This is
             useful for debugging.
@@ -773,9 +957,18 @@ class CodeGen:
                     body.append(summary_str)
 
         def stringify_shape(shape: Iterable[object]) -> str:
+        # [FUNCTION DOC] HELPER: Formats a shape as a bracketed comma-separated string.
             return f"[{', '.join([str(x) for x in shape])}]"
 
         def emit_node(node: Node) -> None:
+        # [FUNCTION DOC] HELPER: Appends the source line(s) for one node to the body
+        # and updates function-level state. In verbose mode the type annotation is
+        # replaced with dtype/shape details from node meta (tensors, DTensors, symbolic
+        # ints, tensor metadata). Handles each op: placeholder adds a free variable,
+        # call_method, call_function (operator pretty printing, in-place operators,
+        # getattr, boxed argument handling, wrapped functions), call_module, get_attr
+        # and output (return annotation and return statement). Raises AssertionError
+        # for wrongly typed targets and NotImplementedError for unknown ops.
             maybe_type_annotation = (
                 "" if node.type is None else f" : {type_repr(node.type)}"
             )
@@ -801,6 +994,8 @@ class CodeGen:
                 )
 
                 def _tensor_annotation(t: torch.Tensor) -> str:
+                # [FUNCTION DOC] HELPER: Returns a colored annotation string combining the
+                # abbreviated dtype, shape, and optional stride and device of a tensor.
                     stride = stringify_shape(t.stride()) if include_stride else ""
                     device = _device_annotation(t.device) if include_device else ""
                     return (
@@ -1127,6 +1322,9 @@ class CodeGen:
 #    Since we can't access .graph within the FX forward, we need to copy the attribute to the module.
 # 3. We currently can't register the pytree imports with `add_global` - not sure why.
 class _BoxedCodeGen(CodeGen):
+    # [CLASS DOC] HELPER: CodeGen variant using the boxed calling convention: the
+    # generated function takes a single list argument, unpacks placeholder values
+    # from it and clears it so inputs can be freed early.
     """
     CodeGen subclass that generates code using the "boxed" calling convention.
 
@@ -1142,6 +1340,10 @@ class _BoxedCodeGen(CodeGen):
         *,
         expanded_def: bool = False,
     ) -> str:
+        # [FUNCTION DOC] HELPER: Generates the function definition for the boxed
+        # convention: signature with self and a single list parameter, followed by
+        # lines that extract the placeholder values and clear the list. Returns the
+        # definition text.
         """
         Generate function definition for boxed calling convention.
 
@@ -1169,15 +1371,29 @@ class _BoxedCodeGen(CodeGen):
 
 
 class _PyTreeCodeGen(CodeGen):
+    # [CLASS DOC] HELPER: CodeGen variant that flattens structured (pytree) inputs
+    # and unflattens outputs. State: pytree_info (original argument names, input
+    # spec and optional output spec). The generated function takes flat positional
+    # arguments and rebuilds them with the input spec; the return value is rebuilt
+    # with the output spec when one exists.
     def __init__(self, pytree_info: _PyTreeInfo) -> None:
+        # [FUNCTION DOC] HELPER: Initializes the base codegen and stores the pytree info.
         super().__init__()
         self.pytree_info: _PyTreeInfo = pytree_info
 
     def process_inputs(self, *inputs: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Flattens the user's positional and keyword inputs into
+        # a flat list of leaves and returns it.
         flat_args = pytree.arg_tree_leaves(*inputs)
         return flat_args
 
     def process_outputs(self, out: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Rebuilds the structured output from a flat result
+        # using the stored output spec. A non-sequence result is first wrapped in a
+        # list. Returns the result unchanged when there is no pytree info or no output
+        # spec.
+        # KNOWN ISSUE: The later check for a missing output spec can never trigger
+        # because the same condition already returned earlier.
         if self.pytree_info is None or self.pytree_info.out_spec is None:
             return out
         if not isinstance(out, (list, tuple)):
@@ -1187,6 +1403,10 @@ class _PyTreeCodeGen(CodeGen):
         return pytree.tree_unflatten(out, self.pytree_info.out_spec)
 
     def _format_annotations(self, free_vars: list[str], expanded_def: bool) -> str:
+        # [FUNCTION DOC] HELPER: Returns text declaring the annotated free variables as
+        # separate annotation-only statements: empty if no variable has an annotation,
+        # one per line when expanded_def is set, otherwise a single semicolon-separated
+        # line.
         """Helper to format annotations for variables in pytree codegen."""
         if not free_vars:
             return ""
@@ -1204,6 +1424,12 @@ class _PyTreeCodeGen(CodeGen):
     def gen_var_bindings(
         self, fn_args: list[str], free_vars: list[str], expanded_def: bool
     ) -> str:
+        # [FUNCTION DOC] HELPER: Builds the lines inside the generated function that
+        # bind the flat free variables from the nested inputs using the input spec.
+        # When the input spec is an (args, keyword args) pair, the keyword mapping is
+        # rebuilt from the original argument names and the context keys. Annotations are
+        # split into a separate statement because a combined annotated unpacking is not
+        # valid Python. Returns the text to append after the definition line.
         in_spec = self.pytree_info.in_spec
         # when kwargs is present, in_spec is tuple(args, kwargs)
         has_args_kwargs_tuple = (
@@ -1247,6 +1473,11 @@ class _PyTreeCodeGen(CodeGen):
         *,
         expanded_def: bool = False,
     ) -> str:
+        # [FUNCTION DOC] Builds the definition of the generated function for the
+        # pytree convention. Without pytree info it defers to the base class.
+        # Otherwise it uses the original argument names as the signature (inserting self
+        # into free_vars when the original arguments began with self) and, if there are
+        # free variables, appends the pytree variable-binding lines. Returns the text.
         # Given a user function/model:
         #   myargs = [myargs0, myargs1]
         #   mykwargs = {'mykwargs0': ..., 'mykwargs1': ...}
@@ -1286,6 +1517,10 @@ class _PyTreeCodeGen(CodeGen):
         descs: Sequence[str] | None = None,
         repr_fn: Callable[[object], str] | None = None,
     ) -> str:
+        # [FUNCTION DOC] Builds the return statement. When an output spec exists, the
+        # result is wrapped in a call that unflattens the values using the stored output
+        # spec of the module, either on a single line or as a multi-line container with
+        # descriptions. Otherwise defers to the base class.
         if repr_fn is None:
             repr_fn = repr
         if self.pytree_info and self.pytree_info.out_spec:
@@ -1306,6 +1541,11 @@ class _PyTreeCodeGen(CodeGen):
 
 
 class _ExportCodeGen(_PyTreeCodeGen):
+    # [CLASS DOC] HELPER: Pytree codegen used for exported programs. Adds
+    # shuffle graph modules that reorder flattened inputs and outputs. State:
+    # in_shuffle_graph, out_shuffle_graph, tree_leaf_names, root (optional
+    # module passed as the first input) and a transient flat_args stored between
+    # process_inputs and process_outputs.
     def __init__(
         self,
         pytree_info: _PyTreeInfo,
@@ -1314,6 +1554,8 @@ class _ExportCodeGen(_PyTreeCodeGen):
         tree_leaf_names: list[str],
         root: torch.nn.Module | None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Initializes the pytree codegen and stores the shuffle
+        # graphs, leaf names and optional root module.
         super().__init__(pytree_info)
         self.in_shuffle_graph = in_shuffle_graph
         self.out_shuffle_graph = out_shuffle_graph
@@ -1321,6 +1563,9 @@ class _ExportCodeGen(_PyTreeCodeGen):
         self.root = root
 
     def process_inputs(self, *inputs: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Flattens the inputs, prepends the root module when
+        # present, remembers the flat inputs on the instance and returns the result of
+        # running the input shuffle graph on them.
         flat_args = super().process_inputs(*inputs)
         if self.root is not None:
             flat_args = (self.root, *flat_args)
@@ -1328,18 +1573,26 @@ class _ExportCodeGen(_PyTreeCodeGen):
         return self.in_shuffle_graph(*flat_args)
 
     def process_outputs(self, out: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Runs the output shuffle graph on the remembered flat
+        # inputs plus the given outputs, deletes the remembered inputs and unflattens the
+        # result via the base class. Fails if process_inputs was not called first.
         flat_outs = self.out_shuffle_graph(*self.flat_args, *out)
         del self.flat_args
         ret = super().process_outputs(flat_outs)
         return ret
 
     def gen_fn_def(self, *args: Any, **kwargs: Any) -> str:
+        # [FUNCTION DOC] HELPER: Pass-through to the base class definition generator.
         fn_def = super().gen_fn_def(*args, **kwargs)
         return fn_def
 
     def gen_var_bindings(
         self, fn_args: list[str], free_vars: list[str], expanded_def: bool
     ) -> str:
+        # [FUNCTION DOC] HELPER: Builds the lines that flatten the input structure into
+        # the leaf names and then call the input shuffle graph to produce the free
+        # variables. The root module is included in the flattened tuple when present.
+        # Returns the text.
         without_annotation = [x.split(":")[0].split("#")[0] for x in free_vars]
         fn_signature: str = f"{', '.join(fn_args)}"
         if self.root is not None:
@@ -1349,6 +1602,9 @@ class _ExportCodeGen(_PyTreeCodeGen):
     {", ".join(without_annotation)}, = self._in_shuffle_graph({", ".join(self.tree_leaf_names)})"""
 
     def generate_output(self, output_args: Argument, *args: Any, **kwargs: Any) -> str:
+        # [FUNCTION DOC] HELPER: Builds a return statement that calls the output shuffle
+        # graph with the leaf names and the output values, then unflattens the result
+        # using the output spec. Raises TypeError if the outputs are not a list or tuple.
         if not isinstance(output_args, (list, tuple)):
             raise TypeError(
                 f"Expected list or tuple for output_args, got {type(output_args)}"
@@ -1358,29 +1614,43 @@ class _ExportCodeGen(_PyTreeCodeGen):
 
 
 class _FindNodesLookupTable:
+    # [CLASS DOC] HELPER: Side table owned by a Graph for fast node lookup by op
+    # and target. State: a mapping from (op, target) key to an insertion-ordered
+    # set of nodes. Only call_function nodes use their real target in the key; all
+    # other ops use no target.
     """
     Side table for the graph for the purpose of doing fast queries
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the empty lookup table.
         self.table: dict[tuple[str, Target | None], dict[Node, None]] = defaultdict(
             dict
         )
 
     def _key(self, node: Node) -> tuple[str, Target | None]:
+        # [FUNCTION DOC] HELPER: Returns the table key for a node: its op and, for
+        # call_function only, its target.
         return (node.op, node.target if node.op == "call_function" else None)
 
     def __contains__(self, node: Node) -> bool:
+        # [FUNCTION DOC] HELPER: Returns whether the node is in the table.
         return node in self.table[self._key(node)]
 
     def insert(self, node: Node) -> None:
+        # [FUNCTION DOC] HELPER: Adds the node to the table.
         self.table[self._key(node)][node] = None
 
     def remove(self, node: Node) -> None:
+        # [FUNCTION DOC] HELPER: Removes the node from the table; raises KeyError if absent.
         self.table[self._key(node)].pop(node)
 
     # TODO: should return list[Node], see _node_list.__iter__ comment
     def find_nodes(self, *, op: str, target: Target | None = None) -> list[Any]:
+        # [FUNCTION DOC] HELPER: Returns the nodes for an op and optional target. For
+        # call_function the target is required (AssertionError otherwise) and nodes are
+        # returned in insertion order. For other ops, all nodes of the op are returned
+        # when target is None, else only those whose target compares equal.
         if op == "call_function":
             if target is None:
                 raise AssertionError("target must not be None for call_function op")
@@ -1395,6 +1665,15 @@ class _FindNodesLookupTable:
 
 @compatibility(is_backward_compatible=True)
 class Graph:
+    # [CLASS DOC] Main FX intermediate representation: an ordered, doubly linked
+    # list of Node objects that together form a function, with a sentinel root
+    # node. State: _root, _len (node count), a name allocator, the owning module
+    # and tracer class/extras, the active CodeGen, saved code-object fields, a
+    # find-nodes lookup table and the current insertion callback. Provides node
+    # creation helpers (placeholder, get_attr, call_module, call_method,
+    # call_function, output, symbolic size helpers), insertion-point context
+    # managers, erase_node, node_copy and graph_copy, dead code elimination, lint
+    # validation, Python code generation and tabular printing.
     """
     ``Graph`` is the main data structure used in the FX Intermediate Representation.
     It consists of a series of ``Node`` s, each representing callsites (or other
@@ -1449,6 +1728,10 @@ class Graph:
         tracer_cls: type[Tracer] | None = None,
         tracer_extras: dict[str, Any] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Constructs an empty Graph: creates the root sentinel node, an
+        # empty name allocator, the default CodeGen and the lookup table, and records
+        # the optional owning module and tracer class/extras. New nodes are inserted
+        # before the root (appended).
         """
         Construct an empty Graph.
         """
@@ -1467,14 +1750,19 @@ class Graph:
     @property
     def owning_module(self) -> GraphModule | None:
         return self._owning_module
+        # [FUNCTION DOC] Returns the module that owns this graph, or None.
 
     @owning_module.setter
     def owning_module(self, mod: GraphModule | None) -> None:
         self._owning_module = mod
+        # [FUNCTION DOC] Sets the owning module (mutates the graph).
 
     @property
     def nodes(self) -> _node_list:
         """
+        # [FUNCTION DOC] Returns a live view over the graph's nodes that iterates in
+        # order and, via reversed, in the opposite order. Safe against mutation during
+        # iteration.
         Get the list of Nodes that constitute this Graph.
 
         Note that this ``Node`` list representation is a doubly-linked list. Mutations
@@ -1490,6 +1778,8 @@ class Graph:
     @compatibility(is_backward_compatible=False)
     def output_node(self) -> Node:
         output_node = next(iter(reversed(self.nodes)))
+        # [FUNCTION DOC] Returns the last node of the graph, which must be the output
+        # node. Raises AssertionError if it is not an output op.
         if output_node.op != "output":
             raise AssertionError(f"Expected output node, got op={output_node.op}")
         return output_node
@@ -1499,6 +1789,10 @@ class Graph:
     def find_nodes(
         self, *, op: str, target: Target | None = None, sort: bool = True
     ) -> list[Any]:
+        # [FUNCTION DOC] Fast query of nodes by op and optional target through the
+        # lookup table. The target is required for call_function (AssertionError
+        # otherwise). Returns a list, sorted into graph order when sort is true.
+        # KNOWN ISSUE: The docstring says it returns an iterable; it returns a list.
         """
         Allows for fast query of nodes
 
@@ -1525,6 +1819,12 @@ class Graph:
     def graph_copy(
         self, g: Graph, val_map: dict[Node, Node], return_output_node: bool = False
     ) -> Argument | None:
+        # [FUNCTION DOC] Copies the nodes of graph g into this graph at the current
+        # insertion point, skipping nodes already present in val_map, and records the
+        # mapping from source nodes to new nodes in val_map (mutated). Stops at g's
+        # output node without copying it and returns the mapped output value, or a pair
+        # of value and the original output node when return_output_node is set. Returns
+        # None if g has no output node.
         """
         Copy all nodes from a given graph into ``self``.
 
@@ -1551,6 +1851,12 @@ class Graph:
         return None
 
     def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Graph:
+        # [FUNCTION DOC] Deep copies the graph iteratively (avoiding deep recursion)
+        # using graph_copy, copies the codegen and re-creates the output node with its
+        # type and a shallow copy of its meta. memo is used as the node mapping.
+        # KNOWN ISSUE: An empty memo passed by the caller is replaced by a new mapping,
+        # so the caller's memo is not populated in that case. Owning module, tracer
+        # extras and code fields are not copied.
         """
         Explicitly implement __deepcopy__ to prevent excessive recursion depth
         from the default implementation. This uses graph_copy to copy the nodes
@@ -1591,6 +1897,15 @@ class Graph:
         name: str | None = None,
         type_expr: Any | None = None,
     ) -> Node:
+        # [FUNCTION DOC] Creates a Node and inserts it at the current insertion point.
+        # Missing args become an empty tuple and missing kwargs an empty immutable
+        # mapping; AssertionError is raised if args is not a tuple or kwargs not a dict.
+        # Warns when raw symbolic scalars appear in the arguments of a call node. The
+        # node name is made unique via the graph namespace (based on the name or on the
+        # target). Owning-module creation hooks are called before the node is registered
+        # in the namespace, inserted, added to the lookup table and counted. Returns
+        # the new node.
+        # KNOWN ISSUE: The docstring does not document the target parameter.
         """
         Create a ``Node`` and add it to the ``Graph`` at the current insert-point.
         Note that the current insert-point can be set via :meth:`Graph.inserting_before`
@@ -1662,6 +1977,8 @@ class Graph:
 
     @compatibility(is_backward_compatible=False)
     def process_inputs(self, *args: Any) -> Any:
+        # [FUNCTION DOC] Converts user inputs into graph arguments through the active
+        # codegen.
         """
         Processes args so that they can be passed to the FX graph.
         """
@@ -1669,10 +1986,17 @@ class Graph:
 
     @compatibility(is_backward_compatible=False)
     def process_outputs(self, out: Any) -> Any:
+        # [FUNCTION DOC] Converts graph outputs into user-facing outputs through the
+        # active codegen.
         return self._codegen.process_outputs(out)
 
     @compatibility(is_backward_compatible=True)
     def erase_node(self, to_erase: Node) -> None:
+        # [FUNCTION DOC] Removes a node from the graph. Raises RuntimeError if the node
+        # still has users or belongs to another graph; warns and returns if already
+        # erased. Otherwise calls owning-module erase hooks, removes the node from the
+        # lookup table, unlinks it, marks it erased, decrements the count and clears its
+        # arguments so its inputs' user sets are updated.
         """
         Erases a ``Node`` from the ``Graph``. Throws an exception if
         there are still users of that node in the ``Graph``.
@@ -1714,6 +2038,12 @@ class Graph:
 
     @compatibility(is_backward_compatible=True)
     def inserting_before(self, n: Node | None = None) -> _InsertPoint:
+        # [FUNCTION DOC] Sets the insertion point so new nodes go immediately before
+        # node n, and returns a context manager that restores the previous insertion
+        # point on exit. The change takes effect immediately even without a with
+        # statement. If n is None, inserts before the beginning of the graph (by
+        # delegating to inserting_after with the root sentinel). Raises AssertionError
+        # if n belongs to a different graph.
         """Set the point at which create_node and companion methods will insert into the graph.
         When used within a 'with' statement, this will temporarily set the insert point and
         then restore it when the with statement exits::
@@ -1739,6 +2069,13 @@ class Graph:
 
     @compatibility(is_backward_compatible=True)
     def inserting_after(self, n: Node | None = None) -> _InsertPoint:
+        # [FUNCTION DOC] Sets the insertion point so new nodes go immediately after
+        # node n, and returns a context manager that restores the previous insertion
+        # point on exit. If n is None, inserts at the start of the graph (by delegating
+        # to inserting_before with the root sentinel). Raises AssertionError if n
+        # belongs to a different graph.
+        # KNOWN ISSUE: The docstring describes n as the node before which to insert;
+        # the code inserts after it.
         """Set the point at which create_node and companion methods will insert into the graph.
         When used within a 'with' statement, this will temporarily set the insert point and
         then restore it when the with statement exits::
@@ -1769,6 +2106,10 @@ class Graph:
         type_expr: Any | None = None,
         default_value: Any = inspect.Signature.empty,
     ) -> Node:
+        # [FUNCTION DOC] Creates a placeholder node (a function input) named name at the
+        # current insertion point. If a default value is supplied (anything other than
+        # the signature empty marker, so None is allowed) it is stored as the single
+        # positional argument of the node. Returns the new node via create_node.
         """
         Insert a ``placeholder`` node into the Graph. A ``placeholder`` represents
         a function input.
@@ -1797,6 +2138,10 @@ class Graph:
 
     @compatibility(is_backward_compatible=True)
     def get_attr(self, qualified_name: str, type_expr: Any | None = None) -> Node:
+        # [FUNCTION DOC] Creates a get_attr node that fetches the attribute at the given
+        # dotted qualified name from the module hierarchy. If the graph has an owning
+        # module and no submodule, parameter or buffer exists at that path, emits a
+        # warning (the node is still created). Returns the new node.
         """
         Insert a ``get_attr`` node into the Graph. A ``get_attr`` ``Node`` represents the
         fetch of an attribute from the ``Module`` hierarchy.
@@ -1824,6 +2169,9 @@ class Graph:
         def _get_attr_reference_exists(
             mod: torch.nn.Module, qualified_name: str
         ) -> bool:
+            # [FUNCTION DOC] HELPER: Returns true if the dotted name resolves on the module
+            # to a submodule, parameter or registered buffer. Warns and returns false if the
+            # parent path cannot be fetched; returns false for missing or other attributes.
             module_path, _, name = qualified_name.rpartition(".")
 
             try:
@@ -1871,6 +2219,13 @@ class Graph:
         kwargs: dict[str, Argument] | None = None,
         type_expr: Any | None = None,
     ) -> Node:
+        # [FUNCTION DOC] Creates a call_module node that calls the submodule with the
+        # given qualified name, with optional positional arguments (without self),
+        # keyword arguments and type annotation. With an owning module, a warning is
+        # intended when the submodule does not exist. Returns the new node.
+        # KNOWN ISSUE: The existence check compares the result of get_submodule with
+        # None, but get_submodule raises an error for a missing path instead of
+        # returning None, so the warning never fires and the error propagates.
         """
         Insert a ``call_module`` ``Node`` into the ``Graph``. A ``call_module`` node
         represents a call to the forward() function of a ``Module`` in the ``Module``
@@ -1924,6 +2279,9 @@ class Graph:
         kwargs: dict[str, Argument] | None = None,
         type_expr: Any | None = None,
     ) -> Node:
+        # [FUNCTION DOC] Creates a call_method node that calls the named method on the
+        # first element of args (which must include the receiver). Optional keyword
+        # arguments and type annotation. Returns the new node.
         """
         Insert a ``call_method`` ``Node`` into the ``Graph``. A ``call_method`` node
         represents a call to a given method on the 0th element of ``args``.
@@ -1964,6 +2322,9 @@ class Graph:
         type_expr: Any | None = None,
         name: str | None = None,
     ) -> Node:
+        # [FUNCTION DOC] Creates a call_function node that calls the given callable
+        # with optional positional and keyword arguments, type annotation and node name.
+        # Returns the new node.
         """
         Insert a ``call_function`` ``Node`` into the ``Graph``. A ``call_function`` node
         represents a call to a Python callable, specified by ``the_function``.
@@ -1999,6 +2360,10 @@ class Graph:
 
     @staticmethod
     def _get_tensor_meta_val(tensor_node: Node) -> tuple[Any, str]:
+        # [FUNCTION DOC] HELPER: Reads the example value stored on a node, preferring
+        # the "val" meta entry and falling back to "example_value". Returns a pair of
+        # the value and the key used; if neither is present returns no value and the key
+        # "val".
         """Read the example tensor stored on ``tensor_node`` under either
         ``meta['val']`` (export / proxy_tensor convention) or
         ``meta['example_value']`` (dynamo convention).
@@ -2016,6 +2381,10 @@ class Graph:
 
     @compatibility(is_backward_compatible=False)
     def create_size_node(self, tensor_node: Node, dim: int) -> Node:
+        # [FUNCTION DOC] Emits a call to the symbolic size operator for dimension dim of
+        # the tensor node at the current insertion point. If the tensor node has an
+        # example value, its size in that dimension is stored in the new node's meta
+        # under the same key convention. Returns the new node.
         """Create an FX node for ``tensor_node.size(dim)``."""
         val, key = self._get_tensor_meta_val(tensor_node)
         node = self.call_function(torch.ops.aten.sym_size.int, (tensor_node, dim))
@@ -2025,6 +2394,9 @@ class Graph:
 
     @compatibility(is_backward_compatible=False)
     def create_stride_node(self, tensor_node: Node, dim: int) -> Node:
+        # [FUNCTION DOC] Emits a call to the symbolic stride operator for dimension dim
+        # of the tensor node and, when an example value exists, records the stride in
+        # the new node's meta using the same key convention. Returns the new node.
         """Create an FX node for ``tensor_node.stride(dim)``."""
         val, key = self._get_tensor_meta_val(tensor_node)
         node = self.call_function(torch.ops.aten.sym_stride.int, (tensor_node, dim))
@@ -2034,6 +2406,9 @@ class Graph:
 
     @compatibility(is_backward_compatible=False)
     def create_storage_offset_node(self, tensor_node: Node) -> Node:
+        # [FUNCTION DOC] Emits a call to the symbolic storage offset operator for the
+        # tensor node and, when an example value exists, records the offset in the new
+        # node's meta. Returns the new node.
         """Create an FX node for ``tensor_node.storage_offset()``."""
         val, key = self._get_tensor_meta_val(tensor_node)
         node = self.call_function(
@@ -2050,6 +2425,14 @@ class Graph:
         keypath: tuple[object, ...],
         lower_symint: Callable[[torch.SymInt], Node | int],
     ) -> Node:
+        # [FUNCTION DOC] HELPER: Replays a keypath from a node's unbacked symbol bindings
+        # as graph operations starting at the producer node, to recover the bound
+        # symbolic integer. Handles method keys (size, stride, storage offset, or
+        # generic method calls, optionally followed by an index), sequence indexing,
+        # integer conversion, divide-by (floor division, with a symbolic divisor
+        # lowered by the lower_symint callback) and inner tensor attribute access.
+        # Returns the final node. Raises AssertionError for an unknown key kind. Adds
+        # nodes to the graph.
         """Walk an ``unbacked_bindings`` keypath, emitting FX ops on this
         graph to recover the bound SymInt from ``producer``'s result.
 
@@ -2110,6 +2493,18 @@ class Graph:
     def materialize_symints(
         self, values: Sequence[torch.SymInt | int]
     ) -> list[Node | int]:
+        # [FUNCTION DOC] Materializes symbolic integers (or plain integers) as FX
+        # values. Plain integers and constant symbolic ints are returned as ints. For
+        # other symbolic ints, finds nodes in the graph that produce each free symbol
+        # (symbolic placeholders directly, tensor placeholder shapes through size
+        # queries with optional division by a constant factor, and unbacked symbols
+        # through the recorded unbacked bindings), then emits new nodes at the current
+        # insertion point that recompute the expression, caching shared
+        # sub-expressions. New nodes get example values in their meta. Returns a list
+        # the same length as the input of nodes or ints. Raises TypeError for values
+        # that are neither symbolic int nor int, and AssertionError when a symbol has
+        # no producer or a backed symbol only appears in non-placeholder nodes.
+        # Mutates the graph.
         """Materialize a list of ``SymInt``/``int`` values as FX subgraphs rooted
         at existing nodes in this graph whose meta produces the referenced
         symbols (typically SymInt placeholders or other sym ops).
@@ -2168,12 +2563,16 @@ class Graph:
         # key would lock onto one convention and silently miss symbols on
         # the others; reading per-node with fallback handles both.
         def _node_val(n: Node) -> Any:
+        # [FUNCTION DOC] HELPER: Returns a node's example value from the "val" meta
+        # entry, falling back to "example_value".
             val = n.meta.get("val")
             if val is not None:
                 return val
             return n.meta.get("example_value")
 
         def _set_node_val(n: Node, val: Any) -> None:
+        # [FUNCTION DOC] HELPER: Stores a value in the node's "val" meta entry, and also
+        # in "example_value" if any input node of it has that entry.
             """Set ``n.meta['val']`` and, if any of ``n``'s input nodes carry
             ``"example_value"``, mirror it there too so the new node matches
             the surrounding graph's meta-key convention."""
@@ -2202,6 +2601,10 @@ class Graph:
         sym_to_binding: dict[sympy.Symbol, tuple[Node, tuple[object, ...]]] = {}
 
         def _record_shape_source(expr: sympy.Expr, node: Node, dim: int) -> None:
+        # [FUNCTION DOC] HELPER: Records a tensor placeholder dimension as a source for a
+        # shape expression: a bare symbol with divisor 1, or a symbol times a positive
+        # integer constant with that divisor. Other expressions are ignored. Only the
+        # first source for a symbol is kept (mutates the sources mapping).
             """Register ``(node, dim)`` as a recoverable source for ``expr``.
 
             - bare ``Symbol``: divisor = 1.
@@ -2248,11 +2651,20 @@ class Graph:
         )
 
         def _arg_meta_val(a: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Returns the example value of a node argument, or the
+        # argument itself when it is not a node.
             if isinstance(a, torch.fx.Node):
                 return _node_val(a)
             return a
 
         def _sympy_interp_cached(expr: sympy.Expr) -> Any:
+        # [FUNCTION DOC] HELPER: Converts a sympy expression into a proxy, building graph
+        # nodes through the reference analysis and caching results by expression. Leaf
+        # terms are interpreted directly; composite expressions are interpreted
+        # recursively. For new proxies it tries to compute an example value by calling
+        # the node target on example argument values, logging at debug level and
+        # skipping on type, value or attribute errors. Returns a proxy or a plain
+        # constant.
             # Common expressions cached in expr_to_proxy
             if expr in expr_to_proxy:
                 return expr_to_proxy[expr]
@@ -2287,6 +2699,8 @@ class Graph:
             return result
 
         def _lower_symint_divisor(d: torch.SymInt) -> Node | int:
+        # [FUNCTION DOC] HELPER: Lowers a symbolic divisor to an FX node (when it becomes
+        # a proxy) or to a plain constant.
             r = _sympy_interp_cached(d.node.expr)
             return r.node if isinstance(r, torch.fx.Proxy) else r
 
@@ -2301,6 +2715,12 @@ class Graph:
         #     keypath tells us how to recover the SymInt from the node's
         #     result (e.g. .size(i), .stride(i), storage_offset()).
         def _ensure_produced(sym: sympy.Symbol) -> None:
+        # [FUNCTION DOC] HELPER: Ensures a proxy exists for the symbol, creating one if
+        # needed and storing it in the cache. For shape symbols it emits a size query
+        # (followed by floor division when the divisor is not 1) and records example
+        # values. For unbacked symbols it first ensures symbols in any symbolic divisor
+        # and then replays the binding keypath. Raises AssertionError for a backed
+        # symbol found only in bindings, or for a symbol with no known producer.
             if sym in expr_to_proxy:
                 return
             if sym in sym_size_sources:
@@ -2379,6 +2799,8 @@ class Graph:
 
     @compatibility(is_backward_compatible=False)
     def materialize_symint(self, value: torch.SymInt | int) -> Node | int:
+        # [FUNCTION DOC] Convenience wrapper that materializes a single value and
+        # returns the resulting node or int.
         """Single-value convenience wrapper around :meth:`materialize_symints`."""
         return self.materialize_symints([value])[0]
 
@@ -2386,6 +2808,14 @@ class Graph:
     def node_copy(
         self, node: Node, arg_transform: Callable[[Node], Argument] = lambda x: x
     ) -> Node:
+        # [FUNCTION DOC] Copies a node from another graph into this one at the current
+        # insertion point. The arg_transform callable maps argument nodes (in args and
+        # kwargs) to the corresponding values in this graph. The copy keeps the op,
+        # target, name candidate and type, and gets a shallow copy of the meta mapping.
+        # Returns the new node. Raises AssertionError if the transformed args or kwargs
+        # change container type.
+        # KNOWN ISSUE: The docstring example constructs a graph with a lowercase
+        # function name rather than the Graph class.
         """
         Copy a node from one graph into another. ``arg_transform`` needs to transform arguments from
         the graph of node to the graph of self. Example::
@@ -2424,6 +2854,9 @@ class Graph:
     def output(  # pyrefly: ignore[unannotated-return]
         self, result: Argument, type_expr: Any | None = None
     ):
+        # [FUNCTION DOC] Creates the output node (the return statement) with the given
+        # result value and optional type annotation at the current insertion point.
+        # Returns the new node.
         """
         Insert an ``output`` ``Node`` into the ``Graph``. An ``output`` node represents
         a ``return`` statement in Python code. ``result`` is the value that should
@@ -2446,6 +2879,10 @@ class Graph:
         )
 
     def _target_to_str(self, target: Target | None) -> str:
+        # [FUNCTION DOC] HELPER: Derives a node-name candidate from a target. For
+        # callables uses the function name; for strings, magic double-underscore names
+        # have the underscores stripped. The result is converted to snake case. Raises
+        # AssertionError if the target is neither callable nor a string.
         if callable(target):
             op = target.__name__
         else:
@@ -2470,6 +2907,15 @@ class Graph:
         record_func: bool = False,
         additional_meta: list[str] | None = None,
     ) -> PythonCode:
+        # [FUNCTION DOC] Generates Python source for this graph using the active codegen.
+        # root_module is the expression name used to look up qualified targets
+        # (usually self). Optional keyword flags control verbose type annotations,
+        # stride and device annotations, colored output, one-argument-per-line
+        # definitions, profiler record markers and extra node meta keys to print.
+        # Creates a fresh name allocator so locals and globals share one namespace,
+        # temporarily overrides each node's repr to use names from it (restored
+        # afterwards even on error), and returns a PythonCode result.
+        # KNOWN ISSUE: The docstring documents only root_module and omits the keyword options.
         """
         Turn this ``Graph`` into valid Python code.
 
@@ -2512,10 +2958,15 @@ class Graph:
         # Tuple[Node, Node] by simply calling repr() on it. Node's __repr__ is
         # implemented cooperatively to allow this.
         def node_repr(n: Node) -> str:
+            # [FUNCTION DOC] HELPER: Returns the unique name for a node from the local
+            # namespace, used as the temporary repr function for nodes.
             return namespace.create_name(n.name, n)
 
         @contextmanager
         def override_node_repr(graph: Graph) -> Generator[None, None, None]:
+            # [FUNCTION DOC] HELPER: Context manager that sets every node's repr function to
+            # the namespace-based one, remembering the originals, and restores them on exit
+            # even if an error occurs.
             orig_repr_fns = {}
             for node in graph.nodes:
                 orig_repr_fns[node] = node._repr_fn
@@ -2553,6 +3004,9 @@ class Graph:
         record_func: bool = False,
         additional_meta: list[str] | None = None,
     ) -> PythonCode:
+        # [FUNCTION DOC] HELPER: Delegates code generation to the active codegen for this
+        # graph's nodes with the given options, and returns its PythonCode result. Exists
+        # as an overridable hook.
         return self._codegen._gen_python_code(
             self.nodes,
             root_module,
@@ -2567,6 +3021,12 @@ class Graph:
         )
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns a human-readable, multi-line text form of the graph: a
+        # header with the placeholder names and one indented line per node as formatted
+        # by the node (placeholders append their names to a list, which becomes the
+        # header parameters). Not machine readable.
+        # KNOWN ISSUE: The return-type text is never filled in, so the header never
+        # shows a return annotation.
         """
         Return a human-readable (not machine-readable) string representation
         of this Graph
@@ -2586,6 +3046,10 @@ class Graph:
 
     @compatibility(is_backward_compatible=True)
     def print_tabular(self) -> None:
+        # [FUNCTION DOC] Prints the graph as a table with opcode, name, target, args and
+        # kwargs columns. Requires the optional tabulate package; if it is missing,
+        # prints an installation hint and re-raises the ImportError. Writes to standard
+        # output.
         """
         Prints the intermediate representation of the graph in tabular
         format. Note that this API requires the ``tabulate`` module to be
@@ -2608,6 +3072,14 @@ class Graph:
 
     @compatibility(is_backward_compatible=True)
     def lint(self) -> None:
+        # [FUNCTION DOC] Checks that the graph is well formed. Raises RuntimeError if a
+        # node has an unknown opcode, belongs to another graph, is missing from the
+        # lookup table, uses an argument from another graph or defined later (not
+        # topological order), or reuses a name. If the graph has an owning module, also
+        # checks that call_function targets are callable (ValueError otherwise), other
+        # targets are strings (ValueError), and that dotted targets of get_attr and
+        # call_module nodes resolve on the module, with call_module targets being
+        # modules (RuntimeError). Returns nothing and does not mutate the graph.
         """
         Runs various checks on this Graph to make sure it is well-formed. In
         particular:
@@ -2619,6 +3091,9 @@ class Graph:
 
         # Check topo order
         def check_arg(arg: Node, n: Node | None = None) -> None:
+            # [FUNCTION DOC] HELPER: Raises RuntimeError if the argument node belongs to a
+            # different graph or has not yet been seen (used before definition); the message
+            # includes the optional user node and the graph text.
             context_str = f" of Node '{n}' " if n else " "
             if arg.graph is not self:
                 raise RuntimeError(
@@ -2690,6 +3165,15 @@ class Graph:
     def eliminate_dead_code(
         self, is_impure_node: Callable[[Node], bool] | None = None
     ) -> bool:
+        # [FUNCTION DOC] Removes nodes that have no users and no side effects, iterating
+        # from the last node to the first so removals expose more dead nodes. Impurity
+        # is decided by the supplied predicate or by the node's own impurity check
+        # (with random operations treated as impure unless an active tracing context
+        # with a non-fallback random setting says otherwise). Lints the graph first
+        # (raising if it is not topologically ordered), logs removed names, and also
+        # recursively eliminates dead code and recompiles in child graph modules that
+        # are referenced by get_attr nodes. Returns true if any graph changed. Mutates
+        # the graph.
         """
         Remove all dead code from the graph, based on each node's number of
         users, and whether the nodes have any side effects. The graph must be
@@ -2742,6 +3226,9 @@ class Graph:
             impure_random = torch._inductor.config.fallback_random
 
         def has_side_effect(node: Node) -> bool:
+            # [FUNCTION DOC] HELPER: Returns whether the node is impure, using the custom
+            # predicate if provided, else the node's own check with the random-impurity
+            # setting.
             if is_impure_node is not None:
                 return is_impure_node(node)
             return node.is_impure(impure_random)
@@ -2777,6 +3264,8 @@ class Graph:
 
     @compatibility(is_backward_compatible=False)
     def set_codegen(self, codegen: CodeGen) -> None:
+        # [FUNCTION DOC] Replaces the code generator used for Python code generation
+        # and for input and output processing.
         self._codegen = codegen
 
     @compatibility(is_backward_compatible=False)
@@ -2784,6 +3273,11 @@ class Graph:
         self,
         make_transformer: Callable[[TransformCodeFunc | None], TransformCodeFunc],
     ) -> contextlib.AbstractContextManager[None]:
+        # [FUNCTION DOC] Registers a body transformer for generated code. Calls
+        # make_transformer with the currently registered transformer (or None) and
+        # installs the result on the codegen immediately. Returns a context manager
+        # that, when exited, restores the previously registered transformer; the
+        # change persists if the return value is not used as a context manager.
         """Register a transformer function when python code is generated
 
         Args:
@@ -2857,6 +3351,8 @@ class Graph:
 
         @contextlib.contextmanager
         def on_generate_code_context_manager() -> Generator[None, None, None]:
+            # [FUNCTION DOC] HELPER: Context manager that restores the previous body
+            # transformer on exit, even if an error occurred.
             try:
                 yield
             finally:
@@ -2865,6 +3361,9 @@ class Graph:
         return on_generate_code_context_manager()
 
     def _clear_nodes(self) -> None:
+        # [FUNCTION DOC] HELPER: Clears the meta of every node and erases all nodes from
+        # last to first. Raises if a node still has users that remain, which is avoided by
+        # the reverse order. Mutates the graph.
         for node in reversed(self.nodes):
             node.meta.clear()
             self.erase_node(node)
@@ -2874,6 +3373,9 @@ class Graph:
 def _override_sym_repr(
     override: Callable[[torch.types.PySymType], str],
 ) -> Generator[None, None, None]:
+# [FUNCTION DOC] HELPER: Context manager that temporarily replaces the class-level
+# symbolic value printer of CodeGen with the given function and restores the
+# original afterwards, even on error. Mutates global class state.
     tmp = CodeGen._sym_repr
     try:
         CodeGen._sym_repr = override
@@ -2883,11 +3385,16 @@ def _override_sym_repr(
 
 
 def _identity(x: str) -> str:
+# [FUNCTION DOC] HELPER: Returns the string unchanged (used when coloring is off).
     return x
 
 
 def _make_color_fn(code: str) -> Callable[[str], str]:
+# [FUNCTION DOC] HELPER: Returns a function that wraps a string in the given
+# terminal color escape code followed by a reset code.
     def f(s: str) -> str:
+    # [FUNCTION DOC] HELPER: Wraps the string in the enclosing color code and a reset
+    # escape sequence.
         reset = "\033[0m"
         return f"{code}{s}{reset}"
 
