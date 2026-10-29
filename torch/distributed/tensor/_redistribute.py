@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Planning and execution of DTensor redistribution (changing a DTensor's placements
+# across a DeviceMesh). Contains: global switches for the planner (force graph-based min-cost plan;
+# disable transform merging) with context managers, _TransformInfo records describing one
+# per-mesh-dim collective step, a pass that merges consecutive same-type steps into flattened-mesh
+# collectives, greedy and Dijkstra-based planners over placement/shard-order states, a cached plan
+# generator, and the Redistribute autograd function that runs the plan with functional collectives.
+# Import-time side effects: creates a logger and module-level global flags/warning cache.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 import contextlib
 import dataclasses
@@ -55,6 +62,9 @@ _DISABLE_REDISTRIBUTE_TRANSFORM_OPTIMIZATION: bool = False
 
 
 def _redistribute_cost_sort_key(cost: FloatLikeType) -> float:
+    # [FUNCTION DOC] HELPER: Convert a (possibly symbolic) redistribution cost to a plain float for sorting.
+    # Floats pass through; symbolic floats with no free symbols are evaluated; otherwise the shape env hint
+    # overrides are substituted when they cover all symbols, else the optimization hint is used.
     if isinstance(cost, float):
         return cost
     if isinstance(cost, torch.SymFloat):
@@ -76,6 +86,9 @@ def _redistribute_cost_sort_key(cost: FloatLikeType) -> float:
 
 @contextlib.contextmanager
 def use_min_cost_redistribution_plan(enabled: bool = True):
+    # [FUNCTION DOC] Context manager that sets the global flag forcing the graph-based (True) or greedy (False)
+    # redistribution planner for the duration of the block, restoring the previous value on exit (even on
+    # error). Cached plans are not invalidated; clear the plan cache to see an effect on repeated specs.
     """
     Context manager to control the redistribution planning strategy for DTensor operations.
 
@@ -137,6 +150,8 @@ def use_min_cost_redistribution_plan(enabled: bool = True):
 
 @contextlib.contextmanager
 def disable_redistribute_transform_optimization(disabled: bool = True):
+    # [FUNCTION DOC] Context manager that sets the global flag disabling the transform-merging optimization
+    # (True by default) for the block, restoring the previous value on exit even if an error occurs.
     """
     Context manager to disable the transform optimization pass that merges
     consecutive same-type collectives into single flattened operations.
@@ -166,12 +181,16 @@ def disable_redistribute_transform_optimization(disabled: bool = True):
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class _TransformInfo:
+    # [CLASS DOC] HELPER: Frozen record of one redistribution step: the mesh dim it acts on, the (source,
+    # destination) placement pair, and the logical tensor shape seen on that mesh dim. Validated at creation.
     mesh_dim: int
     src_dst_placements: tuple[Placement, Placement]
     # logical_shape on this mesh dimension
     logical_shape: Sequence[IntLikeType]
 
     def __post_init__(self):
+        # [FUNCTION DOC] HELPER: Validate the record; raises an error if mesh_dim is negative or if source and
+        # destination placements are equal (a no-op step).
         if self.mesh_dim < 0:
             raise AssertionError
         if self.src_dst_placements[0] == self.src_dst_placements[1]:
@@ -180,6 +199,9 @@ class _TransformInfo:
             )
 
     def _comm_type_key(self) -> str | None:
+        # [FUNCTION DOC] HELPER: Classify the step by collective type: all_reduce (partial to replicate),
+        # reduce_scatter (partial to shard-like), all_gather (shard-like to replicate), all_to_all (shard-like
+        # to shard-like), or None for local ops needing no communication.
         """
         Return a key for grouping transforms by communication type.
 
@@ -202,6 +224,9 @@ class _TransformInfo:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class _FlattenedTransformInfo(_TransformInfo):
+    # [CLASS DOC] HELPER: A _TransformInfo that stands for several mergeable steps executed as one collective on
+    # a flattened DeviceMesh. Extra fields: the flattened mesh, the original mesh dims, and an optional
+    # avg_scale (product of sizes of average-reduced dims) to divide by after a sum collective.
     """
     Represents a flattened transform that combines multiple mesh dimensions
     into a single collective operation using a flattened DeviceMesh.
@@ -219,6 +244,7 @@ class _FlattenedTransformInfo(_TransformInfo):
     avg_scale: int | None = None
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Run the parent validation, then raise an error if avg_scale is set but not above 1.
         _TransformInfo.__post_init__(self)
         if self.avg_scale is not None:
             if not self.avg_scale > 1:
@@ -232,6 +258,10 @@ def _update_shard_order_and_placements(
     current_placements: list[Placement],
     shard_order_dict: dict[int, list[int]],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Apply one transform step to the running state, in place. Pops the matching mesh dims
+    # from the source shard dim's order list (raises ValueError if empty or mismatched), appends them to
+    # the destination shard dim's order list, and writes the destination placement to every affected mesh dim.
+    # Handles flattened steps by using their original mesh dims.
     """
     Update current_placements and shard_order_dict in-place to reflect the
     effect of a single transform step.
@@ -279,6 +309,9 @@ def _update_shard_order_and_placements(
 def _get_flattened_mesh_by_layout_impl(
     mesh: DeviceMesh, mesh_dims: tuple[int, ...]
 ) -> DeviceMesh | None:
+    # [FUNCTION DOC] HELPER: Find an existing flattened mesh of the root mesh whose layout equals the layout of the
+    # given mesh dims, using layout math only (no submesh creation). Returns None if the mesh has no dim
+    # names or no match exists.
     """
     Query for an explicitly created flattened mesh using layout comparison.
 
@@ -310,6 +343,9 @@ def _get_flattened_mesh_by_layout_impl(
 def _get_flattened_mesh_by_layout(
     mesh: DeviceMesh, mesh_dims: tuple[int, ...]
 ) -> DeviceMesh | None:
+    # [FUNCTION DOC] HELPER: Look up a flattened mesh for the given dims. Under tracing with compile_on_one_rank
+    # it returns the result through a custom device_mesh op (after a pre-check returning None when no match),
+    # otherwise calls the plain implementation. Returns a DeviceMesh or None.
     """
     Query for an explicitly created flattened mesh using layout comparison.
 
@@ -345,6 +381,11 @@ def _warn_flatten_optimization_not_possible(
     comm_type: str,
     reason: str,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Log a warning (once per mesh/dims/reason, tracked in a module-level set) that sequential
+    # collectives will run because flattening was not possible. Reasons: no_flattened_mesh,
+    # uneven_tensor_shape, non_ascending_mesh_dims; any other reason raises an error.
+    # KNOWN ISSUE: for uneven_tensor_shape the message is built with a trailing comma, so it is a tuple, not a string.
+    # KNOWN ISSUE: the docstring omits the non_ascending_mesh_dims reason.
     """
     Warn once per (mesh, dims, reason) about inability to flatten operations.
 
@@ -402,6 +443,11 @@ def _optimize_transform_infos(
     src_placements: tuple[Placement, ...],
     dst_placements: tuple[Placement, ...],
 ) -> list[_TransformInfo | _FlattenedTransformInfo]:
+    # [FUNCTION DOC] HELPER: Merge runs of consecutive same-type, mergeable (all_gather, all_reduce, reduce_scatter)
+    # steps with compatible placements into single flattened-mesh steps when a matching flattened mesh
+    # exists (and for reduce_scatter the dim is evenly divisible, with ascending order requirements).
+    # Returns the input unchanged if fewer than 2 steps or the global disable flag is set; otherwise a new
+    # list. Unmergeable runs emit a one-time warning and are kept as individual steps.
     """
     Optimize transform infos by merging consecutive same-type collectives into
     a single flattened operation when a matching flattened DeviceMesh exists.
@@ -435,12 +481,15 @@ def _optimize_transform_infos(
     MERGEABLE_COMM_TYPES = frozenset({"all_gather", "all_reduce", "reduce_scatter"})
 
     def is_mergeable(key: str | None) -> bool:
+        # [FUNCTION DOC] HELPER: True if the comm type key is one of the mergeable collective kinds.
         """Check if a comm type key represents a mergeable operation."""
         return key in MERGEABLE_COMM_TYPES
 
     def are_placements_mergeable(
         p1: tuple[Placement, Placement], p2: tuple[Placement, Placement]
     ) -> bool:
+        # [FUNCTION DOC] HELPER: True if two placement pairs can be merged: equal, or same destination with both sources
+        # partial using only sum or avg reductions.
         """
         Check if two src_dst_placements can be merged.
 
@@ -473,6 +522,11 @@ def _optimize_transform_infos(
     def try_create_flattened(
         infos: list[_TransformInfo],
     ) -> tuple[_FlattenedTransformInfo | None, str | None]:
+        # [FUNCTION DOC] HELPER: Try to build one flattened step from 2 or more same-type steps. Returns a pair
+        # (flattened step or None, failure reason or None). Reasons: too_few_transforms, non_ascending_mesh_dims,
+        # no_flattened_mesh, uneven_tensor_shape. Uses the outermost step's logical shape, and computes an
+        # avg_scale when avg partials are mixed in (merging to sum). Raises an error for unmergeable placements
+        # or unsupported comm types.
         """
         Try to create a flattened transform from 2+ same-type transforms.
 
@@ -650,6 +704,9 @@ def get_redistribute_planner(
     device_mesh: DeviceMesh,
     dtensor_meta: TensorMeta,
 ) -> "DTensorRedistributePlanner":
+    # [FUNCTION DOC] Return a DTensorRedistributePlanner for the mesh and tensor meta. While tracing a new planner is
+    # built each time; otherwise instances are cached in a module-level map keyed by a weak reference to the
+    # mesh plus the meta. Side effect: may insert into the planner cache.
     """
     Factory function to get or create a DTensorRedistributePlanner instance.
     This function provides transparent caching of planner instances based on
@@ -673,11 +730,17 @@ def get_redistribute_planner(
 
 
 def clear_redistribute_planner_cache() -> None:
+    # [FUNCTION DOC] Empty the module-level planner cache (side effect only).
     """Clear the cache of DTensorRedistributePlanner instances."""
     _planner_cache.clear()
 
 
 class DTensorRedistributePlanner:
+    # [CLASS DOC] Plans the sequence of collective steps that turns a local shard from one placement/shard-order
+    # state into another over a DeviceMesh. State is the mesh, the tensor meta, the tensor rank, and sets of
+    # strided-shard placements and partial reduce ops seen in the target (they gate which transitions are
+    # generated). Provides neighbor-state generation with costs, Dijkstra min-cost path search, and greedy
+    # planning. Prefer get_redistribute_planner over direct construction. Requires the current rank to be in the mesh.
     """
     This class is used to plan the collective calls to transform the local shard
     of the DTensor from its current spec to the target spec.
@@ -689,6 +752,8 @@ class DTensorRedistributePlanner:
 
     @dataclasses.dataclass(frozen=True, slots=True)
     class DistState:
+        # [CLASS DOC] HELPER: Hashable, immutable planner graph node: the placements tuple plus the shard order
+        # (tensor dim to ordered mesh dims). The hash is precomputed at construction; equality compares hash then fields.
         placements: tuple[Placement, ...]
         tensor_dim_to_mesh_dim: ShardOrder
         _hash: int | None = dataclasses.field(
@@ -696,15 +761,18 @@ class DTensorRedistributePlanner:
         )
 
         def __str__(self):
+            # [FUNCTION DOC] HELPER: Human-readable string of the placements annotated with shard order.
             return DTensorSpec.format_shard_order_str(
                 self.placements,
                 self.tensor_dim_to_mesh_dim,
             )
 
         def __repr__(self):
+            # [FUNCTION DOC] HELPER: Same as the string form.
             return self.__str__()
 
         def __post_init__(self):
+            # [FUNCTION DOC] HELPER: Precompute and store the hash in the frozen instance.
             # precompute hash after all attributes are set
             object.__setattr__(
                 self,
@@ -713,9 +781,11 @@ class DTensorRedistributePlanner:
             )
 
         def __hash__(self) -> int:
+            # [FUNCTION DOC] HELPER: Return the cached hash, computing it if missing.
             return self._hash if self._hash is not None else self._compute_hash()
 
         def _compute_hash(self) -> int:
+            # [FUNCTION DOC] HELPER: Hash of the pair (placements, shard order).
             return hash(
                 (
                     self.placements,
@@ -724,6 +794,7 @@ class DTensorRedistributePlanner:
             )
 
         def __eq__(self, other: object) -> bool:
+            # [FUNCTION DOC] HELPER: Equal only to another DistState with the same hash, placements and shard order.
             if not isinstance(other, DTensorRedistributePlanner.DistState):
                 return False
             if self._hash != other._hash:
@@ -737,6 +808,7 @@ class DTensorRedistributePlanner:
             )
 
     def _to_tuple(self, x):
+        # [FUNCTION DOC] HELPER: Recursively convert nested lists/tuples into nested tuples; other values returned as is.
         """Convert a nested list structure to a nested tuple structure."""
         if isinstance(x, list | tuple):
             return tuple(self._to_tuple(item) for item in x)
@@ -744,6 +816,8 @@ class DTensorRedistributePlanner:
 
     @staticmethod
     def _dict_to_ShardOrder(x: dict[int, list[int]]) -> ShardOrder:
+        # [FUNCTION DOC] HELPER: Convert a mapping from tensor dim to mesh dim list into a ShardOrder tuple, sorted by
+        # tensor dim and omitting empty lists.
         """Convert dict to ShardOrder"""
         return tuple(
             ShardOrderEntry(tensor_dim=key, mesh_dims=tuple(value))
@@ -753,6 +827,7 @@ class DTensorRedistributePlanner:
 
     @staticmethod
     def _ShardOrder_to_dict(x: ShardOrder) -> dict[int, list[int]]:
+        # [FUNCTION DOC] HELPER: Convert a ShardOrder into a default-list mapping from tensor dim to list of mesh dims.
         """Convert ShardOrder to dict with tensor dim as key"""
         tensor_mesh_dim_dict = defaultdict(list)
         for entry in x:
@@ -767,6 +842,10 @@ class DTensorRedistributePlanner:
         src_shard_order: ShardOrder | None = None,
         use_strided_shard_as_shard_order: bool = False,
     ) -> str:
+        # [FUNCTION DOC] Render a transform plan as a string of state transitions starting from the source placements
+        # and shard order (derived if None; normalized from strided shards if requested), applying each step in
+        # turn. Uses an arrow for normal steps and a longer arrow for flattened steps. Raises an error if the
+        # placement count differs from mesh ndim. Pure apart from computation.
         """
         Generate a string representation of the sequence of state transitions
         (placements and shard orders) as described by the given transform_info.
@@ -838,6 +917,8 @@ class DTensorRedistributePlanner:
         device_mesh: DeviceMesh,
         dtensor_meta: TensorMeta,
     ) -> None:
+        # [FUNCTION DOC] Store the mesh and meta, derive tensor rank, init empty target-tracking sets and install the
+        # cost callback. Raises an error if the current rank is not in the mesh or meta is None.
         """
         Initialize DTensorRedistributePlanner.
 
@@ -859,6 +940,8 @@ class DTensorRedistributePlanner:
     def setup_cost_callbacks(
         self,
     ) -> None:
+        # [FUNCTION DOC] Define and store cost_function, which prices a one-step transition between two DistStates by
+        # converting both to DTensorSpec and calling one_step_redistribute_cost. Mutates self.
         """
         Set up the cost function for different collective operations.
         Uses communication time estimation based on actual tensor sizes and
@@ -868,6 +951,7 @@ class DTensorRedistributePlanner:
         def state_to_spec(
             state: DTensorRedistributePlanner.DistState,
         ) -> DTensorSpec:
+            # [FUNCTION DOC] HELPER: Build a DTensorSpec from a DistState using the planner's mesh and meta.
             return DTensorSpec(
                 mesh=self.device_mesh,
                 placements=state.placements,
@@ -877,6 +961,7 @@ class DTensorRedistributePlanner:
             )
 
         def cost_function(src_state, dst_state):
+            # [FUNCTION DOC] HELPER: Cost of redistributing between two states for a single step.
             return one_step_redistribute_cost(
                 state_to_spec(src_state), state_to_spec(dst_state)
             )
@@ -888,6 +973,12 @@ class DTensorRedistributePlanner:
         placements: tuple[Placement, ...],
         tensor_mesh_dim_tuple: ShardOrder,
     ) -> dict["DTensorRedistributePlanner.DistState", float]:
+        # [FUNCTION DOC] Enumerate all states reachable from the given placements and shard order in one collective step,
+        # mapped to their step cost. Covers shard-to-shard (all-to-all), shard-to-replicate, partial-to-replicate,
+        # replicate-to-shard, partial-to-shard, replicate-to-partial (only target reduce ops, skipping mixed partial
+        # types except sum with avg), strided-shard to replicate, and replicate-to-strided-shard (only if the
+        # target has strided shards). Only the last mesh dim of a tensor dim's order may move. Returns a mapping.
+        # Temporarily mutates then restores an internal order mapping.
         # We map tensor dimensions to device mesh axes, similar to JAX-style
         # sharding representation. Notation:
         # S(<tensor_dim>)[<list_of_device_dims>] means tensor dimension
@@ -1180,6 +1271,9 @@ class DTensorRedistributePlanner:
     def _get_shard_to_partial_target_states(
         self, current_state: DistState, dst_state: DistState
     ) -> dict[DistState, float]:
+        # [FUNCTION DOC] HELPER: Explicit-only transitions from Shard to Partial(sum) where the destination state asks for
+        # that partial on the mesh dim and the shard is last in order. Each is a local step with weight 0.0.
+        # Returns a mapping of next state to weight.
         """Generate explicit-only Shard -> Partial("sum") target steps.
 
         Zero weight means no communication; allocation and copy costs are omitted.
@@ -1215,6 +1309,10 @@ class DTensorRedistributePlanner:
     def find_min_cost_path(
         self, src_state: DistState, dst_state: DistState
     ) -> list["DTensorRedistributePlanner.DistState"]:
+        # [FUNCTION DOC] Dijkstra search for the lowest-cost list of states from src_state to dst_state, expanding via
+        # get_next_state (and Shard to Partial edges toward the destination). Uses a heap keyed by a
+        # non-guarding cost hint with a tie-break counter. Returns the path of states.
+        # Raises an error if the destination is unreachable.
         """
         Find the min cost path from src_state to dst_state using Dijkstra's
         algorithm.
@@ -1284,6 +1382,10 @@ class DTensorRedistributePlanner:
         mesh_dim: int,
         full_tensor_shape: tuple[int, ...],
     ) -> list[IntLikeType]:
+        # [FUNCTION DOC] Compute the logical tensor shape seen by a collective on mesh_dim given a source state: start from
+        # the full shape and, for every other mesh dim sharding a tensor dim (Shard or _StridedShard), shrink that
+        # dim to the local shard size for this rank's coordinate. Raises an error on empty mesh-dim lists and
+        # ValueError for other placement types. Returns a list of sizes.
         new_logical_shape: list[IntLikeType] = list(full_tensor_shape)
         for entry in src_state.tensor_dim_to_mesh_dim:
             tensor_dim = entry.tensor_dim
@@ -1317,12 +1419,18 @@ class DTensorRedistributePlanner:
         dst_spec: DTensorSpec,
         full_tensor_shape: tuple[int, ...],
     ) -> list[_TransformInfo]:
+        # [FUNCTION DOC] Plan transform steps using the graph search. Normalizes both specs to placements plus shard order,
+        # records target strided shards and partial reduce ops on the planner (mutates self), finds the min-cost
+        # state path, and for each consecutive state pair emits a _TransformInfo for the single changed mesh dim
+        # with its logical shape. Raises an error if several mesh dims change in one step. Returns a list.
         # TODO(zpcore): Temporary workaround for backward compatibility where
         # _StridedShard was used to encode device shard order. We should migrate
         # to explicit `shard_order` instead.
         def _try_normalize_spec(
             spec: DTensorSpec,
         ) -> tuple[tuple[Placement, ...], ShardOrder]:
+            # [FUNCTION DOC] HELPER: Return (placements, shard order) for a spec, decoding strided shards when requested;
+            # raises ValueError if shard order is missing and decoding is not requested.
             if spec.use_strided_shard_as_shard_order:
                 new_placements, shard_order = (
                     DTensorSpec._normalize_placements_into_shard_order(
@@ -1389,6 +1497,10 @@ class DTensorRedistributePlanner:
         src_spec: DTensorSpec,
         dst_spec: DTensorSpec,
     ) -> list[_TransformInfo]:
+        # [FUNCTION DOC] Plan transform steps greedily. A 1D mesh yields at most one direct step. Otherwise it computes the
+        # per-mesh-dim logical shapes, then (if the source has multiple shards) walks mesh dims inner to outer
+        # replicating dims whose nested sharding is misaligned with the target, and finally walks outer to inner
+        # adding a step wherever current and target placements differ. Returns the list of _TransformInfo.
         """
         Generate the transform infos from the source placements to the target placements.
 
@@ -1518,6 +1630,10 @@ def _gen_transform_infos_non_cached(
     dst_spec: DTensorSpec,
     use_graph_based_transform: bool | None = None,
 ) -> list[_TransformInfo]:
+    # [FUNCTION DOC] HELPER: Choose a planner strategy and return the transform steps from the source to the destination
+    # spec. Graph-based is forced for non-default shard order or strided shards, else the global flag, else
+    # the argument (default greedy). Falls back to greedy if a strided shard cannot be decoded. Raises an error
+    # when the source tensor meta is missing. Uses the (possibly cached) planner.
     device_mesh = src_spec.device_mesh
     src_shard_order = src_spec.shard_order
     dst_shard_order = dst_spec.shard_order
@@ -1578,6 +1694,7 @@ def _gen_transform_infos(
     dst_spec: DTensorSpec,
     use_graph_based_transform: bool | None = None,
 ) -> list[_TransformInfo]:
+    # [FUNCTION DOC] HELPER: Cached (memoized) wrapper over the non-cached transform generator.
     return _gen_transform_infos_non_cached(
         src_spec,
         dst_spec,
@@ -1595,6 +1712,13 @@ def redistribute_local_tensor(
     # True if user explicitly called DTensor.redistribute()
     is_explicit: bool = False,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Redistribute a local tensor from the current spec to the target spec by running the planned collectives.
+    # Raises NotImplementedError for different meshes, ValueError if the strided-shard flag is unset, and
+    # RuntimeError/ValueError for unsupported placement pairs; mixed partial types are rejected. Returns the
+    # input unchanged if this rank is not in the mesh. Plans (uncached when tracing), optimizes via flattening,
+    # optionally records debug-mode info, then applies each step (reduce, all-gather, chunk, new-shard-dim,
+    # partition, strided-shard conversions), skipping no-op or single-chunk steps and applying average scaling
+    # for merged partials. Waits on async results unless async_op is true. Returns the resulting tensor.
     """
     This redistribute the local tensor (torch.Tensor) from the current DTensorSpec to
     the target DTensorSpec, which involves the necessary collective calls to transform
@@ -1851,6 +1975,10 @@ def _redistribute_backward(
     op_dtype: torch.dtype,
     async_op: bool = False,
 ):
+    # [FUNCTION DOC] HELPER: Shared backward redistribution. Casts the gradient to op_dtype if needed (rebuilding specs with
+    # that dtype), then maps the previous spec so that any target Partial becomes Replicate when the current
+    # placement is shard-like or replicate (the gradient is not turned back into partial). Redistributes, casts
+    # the result to out_dtype, and returns (output tensor, new DTensorSpec with the normalized placements).
     """
     Common function for redistributing a distributed tensor during backward
     and twice-backward backpropagation steps.
@@ -1938,17 +2066,22 @@ def _redistribute_backward(
 
 
 class _BackwardDtypeConfig(TypedDict):
+    # [CLASS DOC] HELPER: Typed mapping of backward dtype settings: op_dtype (collective dtype) and out_dtype (returned gradient dtype).
     op_dtype: torch.dtype  # dtype the backward collective runs at
     out_dtype: torch.dtype  # dtype the returned gradient is cast to
 
 
 class _DtypeConfig(TypedDict):
+    # [CLASS DOC] HELPER: Typed mapping of dtype settings: op_dtype and out_dtype for the forward, plus nested backward_options.
     op_dtype: torch.dtype  # forward: dtype the collective runs at
     out_dtype: torch.dtype  # forward: dtype of the output tensor
     backward_options: _BackwardDtypeConfig
 
 
 class Redistribute(torch.autograd.Function):
+    # [CLASS DOC] Autograd function that redistributes a DTensor to new placements on a mesh. Forward runs the planned
+    # collectives (casting dtypes as configured); backward delegates to NestedRedistribute so the gradient is
+    # redistributed back to the original spec and the operation is twice differentiable.
     @staticmethod
     def forward(  # type: ignore[override]
         # pyre-fixme[2]: Parameter must be annotated.
@@ -1959,6 +2092,10 @@ class Redistribute(torch.autograd.Function):
         async_op: bool,
         dtype_config: _DtypeConfig,
     ):
+        # [FUNCTION DOC] Redistribute the input DTensor to the given placements. Saves async_op, backward dtypes and the
+        # current spec on ctx. Casts the local tensor to op_dtype if needed, redistributes only if placements
+        # differ (explicit mode), casts to out_dtype, and wraps the result as a DTensor preserving requires_grad.
+        # Returns the new DTensor.
         ctx.async_op = async_op
         bwd = dtype_config["backward_options"]
         ctx.bwd_op_dtype = bwd["op_dtype"]
@@ -2026,6 +2163,8 @@ class Redistribute(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: "dtensor.DTensor"):  # type: ignore[override]
+        # [FUNCTION DOC] Backward: apply NestedRedistribute to the gradient to return it to the original spec using the saved
+        # backward dtypes. Returns the gradient for input and None for the four other arguments.
         output_dtensor = NestedRedistribute.apply(
             grad_output,
             ctx.current_spec,
@@ -2043,6 +2182,9 @@ class Redistribute(torch.autograd.Function):
 
 
 class NestedRedistribute(torch.autograd.Function):
+    # [CLASS DOC] Autograd function for the redistribution of gradients, making Redistribute twice differentiable.
+    # Its forward runs during the first backward pass and its backward during the second; triple backward
+    # is not supported.
     """
     This class is used to make the redistribution of a DTensor twice-differentiable.
     This is called during the `Redistribute.forward`.
@@ -2063,6 +2205,9 @@ class NestedRedistribute(torch.autograd.Function):
         op_dtype: torch.dtype,
         out_dtype: torch.dtype,
     ):
+        # [FUNCTION DOC] Forward (first backward pass): save async_op, original dtype and op_dtype on ctx, redistribute the
+        # gradient via _redistribute_backward, save the resulting spec, and return the result as a DTensor
+        # preserving requires_grad.
         # Persist op_dtype so the double-backward reuses the same collective
         # dtype one level down.
         ctx.async_op = async_op
@@ -2090,6 +2235,8 @@ class NestedRedistribute(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad2_output: "dtensor.DTensor"):  # type: ignore[override]
+        # [FUNCTION DOC] Backward (second backward pass): apply NestedRedistribute again to the incoming gradient using the saved
+        # spec, async flag, op_dtype and original dtype. Returns the gradient plus None for the five other arguments.
         previous_spec = ctx.current_spec
         # Reuse the same op_dtype one level down; pin out_dtype to the dtype
         # of the grad we received at this level, since that's what the node
