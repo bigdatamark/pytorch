@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Public dynamic-shape specification API for torch.export: Dim (named dims, hints AUTO/DYNAMIC/STATIC and
+# derived dims), dims, internal constraint dataclasses, utilities to normalize and validate a dynamic_shapes spec
+# against args/kwargs, convert it to constraints and equalities for the shape env, ShapesCollection and
+# AdditionalInputs helpers, and refine_dynamic_shapes_from_suggested_fixes. Import-time side effects: creates a
+# module logger and the Constraint type alias.
 import dataclasses
 import inspect
 import logging
@@ -46,6 +51,8 @@ log = logging.getLogger(__name__)
 
 
 class _DimHintType(Enum):
+    # [CLASS DOC] HELPER: Enumeration of dynamic shape hint kinds: AUTO (infer static or dynamic), STATIC (always
+    # specialized) and DYNAMIC (error if specialized).
     """
     Enum for dynamic shape hints.
     - AUTO means automatic inference of shape (static or dynamic).
@@ -60,6 +67,9 @@ class _DimHintType(Enum):
 
 @dataclasses.dataclass
 class _DimHint:
+    # [CLASS DOC] HELPER: Dataclass for a dimension hint: type, optional min and max bounds, and _factory flag. The
+    # unbounded hints on Dim are factories (flag true) that can be called once with bounds to give a non-factory
+    # hint (flag false); calling a non-factory hint raises TypeError.
     """
     Internal class for dynamic shape hints.
     - min and max are optional.
@@ -76,17 +86,22 @@ class _DimHint:
 
     @staticmethod
     def AUTO():
+        # [FUNCTION DOC] HELPER: Returns a new unbounded factory hint of kind AUTO.
         return _DimHint(_DimHintType.AUTO)
 
     @staticmethod
     def DYNAMIC():
+        # [FUNCTION DOC] HELPER: Returns a new unbounded factory hint of kind DYNAMIC.
         return _DimHint(_DimHintType.DYNAMIC)
 
     @staticmethod
     def STATIC():
+        # [FUNCTION DOC] HELPER: Returns a new unbounded factory hint of kind STATIC.
         return _DimHint(_DimHintType.STATIC)
 
     def __call__(self, min=None, max=None) -> "_DimHint":
+        # [FUNCTION DOC] HELPER: Returns a new non-factory hint of the same kind with the given bounds. Raises TypeError if
+        # self is not a factory, and AssertionError if a bound is negative or min exceeds max.
         if not self._factory:
             raise TypeError(f"'{type(self)}' object is not callable")
         if min is not None and min < 0:
@@ -98,6 +113,7 @@ class _DimHint:
         return _DimHint(self.type, min=min, max=max, _factory=False)
 
     def __repr__(self):
+        # [FUNCTION DOC] HELPER: Returns text of the form DimHint(KIND, min=.., max=..) listing only bounds that are set.
         parts = [self.type.name]
         if self.min is not None:
             parts.append(f"min={self.min}")
@@ -107,6 +123,10 @@ class _DimHint:
 
 
 class Dim:
+    # [CLASS DOC] Public way to mark input dimensions as dynamic. Class attributes AUTO, DYNAMIC and STATIC are hint
+    # factories. An instance is a named dimension with attributes __name__, min (default 0) and max (default infinity)
+    # and supports increasing linear derivation by adding or subtracting an int and multiplying by a positive int,
+    # yielding _DerivedDim. Instances are used inside dynamic_shapes specs.
     """
     The ``Dim`` class allows users to specify dynamism in their exported
     programs. By marking a dimension with a ``Dim``, the compiler associates the
@@ -175,6 +195,8 @@ class Dim:
     STATIC = _DimHint.STATIC()
 
     def __init__(self, name: str, *, min: int | None = None, max: int | None = None):
+        # [FUNCTION DOC] Creates a named Dim with the given bounds (min defaults to 0, max to infinity). Raises
+        # AssertionError if max is not greater than min or the name is not a valid identifier.
         from torch.utils._sympy.numbers import int_oo
 
         _min = 0 if min is None else min
@@ -190,6 +212,7 @@ class Dim:
         self.max = _max
 
     def __add__(self, other) -> "Dim":
+        # [FUNCTION DOC] Returns a derived Dim for this plus an int. Raises NotImplementedError for a non-int operand.
         # e.g., dim + 1
         if type(other) is not int:
             raise NotImplementedError(
@@ -199,9 +222,11 @@ class Dim:
         return self._derive(lambda x: x + other)
 
     def __radd__(self, other) -> "Dim":
+        # [FUNCTION DOC] Reflected addition; same as adding.
         return self + other
 
     def __sub__(self, other) -> "Dim":
+        # [FUNCTION DOC] Returns a derived Dim for this minus an int. Raises NotImplementedError for a non-int operand.
         # e.g., dim - 1
         if type(other) is not int:
             raise NotImplementedError(
@@ -211,12 +236,14 @@ class Dim:
         return self._derive(lambda x: x - other)
 
     def __rsub__(self, other) -> "Dim":
+        # [FUNCTION DOC] Always raises NotImplementedError, since negation is not an increasing operation.
         raise NotImplementedError(
             f"Attempted to negate {self.__name__}. "
             "(Only increasing linear operations with integer coefficients are supported.)"
         )
 
     def __mul__(self, other) -> "Dim":
+        # [FUNCTION DOC] Returns a derived Dim for this times a positive int. Raises NotImplementedError otherwise.
         # e.g., dim * 2
         if type(other) is not int or other <= 0:
             raise NotImplementedError(
@@ -226,18 +253,23 @@ class Dim:
         return self._derive(lambda x: x * other)
 
     def __rmul__(self, other) -> "Dim":
+        # [FUNCTION DOC] Reflected multiplication; same as multiplying.
         return self * other
 
     def _derived_name(self, fn) -> str:
+        # [FUNCTION DOC] HELPER: Returns the string form of fn applied to the symbolic variable named like this Dim.
         from sympy import sympify
 
         return str(fn(sympify(self.__name__)))
 
     def _derive(self, fn) -> "Dim":
+        # [FUNCTION DOC] HELPER: Builds a _DerivedDim named by _derived_name whose root is self and function is fn.
         return _DerivedDim(self._derived_name(fn), self, fn)
 
     @staticmethod
     def _readable(name: str, min_: int, max_: int) -> str:
+        # [FUNCTION DOC] HELPER: Formats a constructor-like text for a Dim, omitting min when it equals 2 and max when infinite.
+        # KNOWN ISSUE: omitting a min of 2 (not the real default 0) can print a repr that does not round-trip.
         from torch.utils._sympy.numbers import int_oo
 
         if min_ == 2:
@@ -253,6 +285,7 @@ class Dim:
         return f"Dim('{name}', min={min_}, max={max_})"
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns the readable constructor-like text for this Dim.
         return Dim._readable(self.__name__, self.min, self.max)
 
 
@@ -260,6 +293,8 @@ _Dim = Dim  # TODO(pianpwk): remove after it's no longer internally breaking
 
 
 class _StaticDim(Dim):
+    # [CLASS DOC] HELPER: Dim for a statically known size: __name__ is the string of the value, and min and max both
+    # equal value. Used only internally for static constraints.
     """
     Class for static :func:`Dim` types.
 
@@ -268,19 +303,24 @@ class _StaticDim(Dim):
     """
 
     def __init__(self, value: int):
+        # [FUNCTION DOC] HELPER: Stores the value and its string name; does not call the Dim constructor.
         self.__name__ = str(value)
         self.value = value
 
     @property
     def min(self):  # type: ignore[override]
+        # [FUNCTION DOC] HELPER: Property returning the static value.
         return self.value  # type: ignore[attr-defined]
 
     @property
     def max(self):  # type: ignore[override]
+        # [FUNCTION DOC] HELPER: Property returning the static value.
         return self.value  # type: ignore[attr-defined]
 
 
 class _DerivedDim(Dim):
+    # [CLASS DOC] HELPER: Dim defined as an increasing linear function of a regular root Dim. State: __name__ (symbolic
+    # expression text), root (never itself derived) and fn. Range is computed by mapping fn over the root range.
     """
     Class for derived :func:`Dim` types.
 
@@ -297,12 +337,16 @@ class _DerivedDim(Dim):
     """
 
     def __init__(self, name: str, root: Dim, fn: Callable):
+        # [FUNCTION DOC] HELPER: Stores name, root Dim and function fn.
         self.__name__ = name
         self.root = root
         self.fn = fn
 
     @property
     def min(self):  # type: ignore[override]
+        # [FUNCTION DOC] HELPER: Property computing the lower bound by applying fn to the root min (negative infinity passes
+        # through). Raises AssertionError if the result is negative.
+        # KNOWN ISSUE: root min is compared to negative infinity with an identity check, which is unlikely to be true.
         # assume that self.fn is an increasing function
         # TODO(avik): use sympy value range analysis instead?
         from sympy import Integer
@@ -324,6 +368,8 @@ class _DerivedDim(Dim):
 
     @property
     def max(self):  # type: ignore[override]
+        # [FUNCTION DOC] HELPER: Property computing the upper bound by applying fn to the root max (infinity passes through).
+        # Raises AssertionError if the result exceeds the largest allowed int minus one.
         # assume that self.fn is an increasing function
         # TODO(avik): use sympy value range analysis instead?
         from sympy import Integer
@@ -344,6 +390,7 @@ class _DerivedDim(Dim):
         return int(_max_symint)
 
     def _derive(self, fn):
+        # [FUNCTION DOC] HELPER: Derives a further Dim by composing fn with this fn on the same root, so nesting works.
         # We support nesting, e.g., 2*dim + 1.
         # This is implemented by composing operations on the same root.
         # As a consequence, roots are always regular Dims (i.e., not derived Dims).
@@ -354,12 +401,14 @@ class _DerivedDim(Dim):
         )
 
     def __repr__(self):
+        # [FUNCTION DOC] HELPER: Returns the derived expression text (the name).
         return self.__name__
 
 
 def dims(
     *names: str, min: int | None = None, max: int | None = None
 ) -> tuple[Dim, ...]:
+    # [FUNCTION DOC] Creates one Dim per given name, all with the same min and max, and returns them as a tuple.
     """
     Util to create multiple :func:`Dim` types.
 
@@ -371,6 +420,7 @@ def dims(
 
 @dataclasses.dataclass
 class _ConstraintTarget:
+    # [CLASS DOC] HELPER: Dataclass identifying an input tensor dimension: t_id (tensor id) and dim (index).
     """
     This represents input tensor dimensions.
     """
@@ -381,6 +431,8 @@ class _ConstraintTarget:
 
 @dataclasses.dataclass
 class _Constraint(_ConstraintTarget):
+    # [CLASS DOC] HELPER: Constraint target with a Dim name and a constraint_range (min/max bounds). Comparison
+    # operators return clones with narrowed bounds; truth-value use raises, so chained comparisons are rejected.
     """
     This represents a Dim describing a constraint target.
 
@@ -392,6 +444,8 @@ class _Constraint(_ConstraintTarget):
     constraint_range: "StrictMinMaxConstraint"
 
     def _clone_with_range(self, lower=0, upper=None):
+        # [FUNCTION DOC] HELPER: Returns a new _Constraint whose range is the intersection of the current one with the
+        # given lower and upper (upper defaults to infinity). Does not mutate self.
         # Import sympy locally
         from torch.fx.experimental.symbolic_shapes import StrictMinMaxConstraint
         from torch.utils._sympy.numbers import int_oo
@@ -412,18 +466,23 @@ class _Constraint(_ConstraintTarget):
         )
 
     def __ge__(self, lower):
+        # [FUNCTION DOC] HELPER: Returns a clone requiring at least lower.
         return self._clone_with_range(lower=lower)
 
     def __gt__(self, lower):
+        # [FUNCTION DOC] HELPER: Returns a clone requiring at least lower plus one.
         return self._clone_with_range(lower=lower + 1)
 
     def __le__(self, upper):
+        # [FUNCTION DOC] HELPER: Returns a clone requiring at most upper.
         return self._clone_with_range(upper=upper)
 
     def __lt__(self, upper):
+        # [FUNCTION DOC] HELPER: Returns a clone requiring at most upper minus one.
         return self._clone_with_range(upper=upper - 1)
 
     def __bool__(self):
+        # [FUNCTION DOC] HELPER: Always raises TypeError, to reject compound comparisons and logical connectives.
         # NOTE(avik): We do not support compound expressions like a <= x <= b.
         # This is because Python implicitly desugars them into bool(a <= x) and bool(x <= b),
         # and moreover, enforces that any overload of __bool__ must return True or False.
@@ -436,6 +495,7 @@ class _Constraint(_ConstraintTarget):
 
     @property
     def serializable_spec(self):
+        # [FUNCTION DOC] HELPER: Property giving a plain mapping with t_id, dim, min and max, safe to save on the graph module.
         # We need a serialization compatible format of the constraint so that it
         # can be savedin the graph module w/o breaking the module serialization.
         # The saved constraints will be used directly for the post-exporting pass
@@ -453,6 +513,8 @@ class _Constraint(_ConstraintTarget):
 
 @dataclasses.dataclass
 class _PhantomRoot:
+    # [CLASS DOC] HELPER: Dataclass for the root of a derived Dim that does not itself size any input dim. Fields name,
+    # constraint_range and val are used to create a symbol that derived dims are expressed over.
     """
     This represents the root of a derived Dim where the root does not directly
     specify the shape of any input dimension, but the derived Dim does.
@@ -471,6 +533,8 @@ class _PhantomRoot:
 
 @dataclasses.dataclass
 class _DerivedConstraint(_ConstraintTarget):
+    # [CLASS DOC] HELPER: Constraint target for a derived Dim with name, constraint_range, root (a constraint target
+    # or phantom root) and fn. Has no ordering operators.
     """
     This represents a derived Dim, whose root is either a regular constraint target
     (which directly specifies the shape of some input dimension) or a phantom root
@@ -487,6 +551,7 @@ class _DerivedConstraint(_ConstraintTarget):
 
     @property
     def serializable_spec(self):
+        # [FUNCTION DOC] HELPER: Property with the same format as _Constraint.serializable_spec.
         # same as _Constraint.serializable_spec
         return {
             "t_id": self.t_id,
@@ -498,6 +563,8 @@ class _DerivedConstraint(_ConstraintTarget):
 
 @dataclasses.dataclass
 class _RelaxedConstraint(_ConstraintTarget):
+    # [CLASS DOC] HELPER: Constraint target for a dimension marked AUTO or DYNAMIC; bounds and relations are left to be
+    # inferred, so equality findings against other constraints must not raise violations.
     """
     This represents a dim marked with Dim.AUTO/DYNAMIC (i.e. mark_dynamic() or maybe_mark_dynamic()),
     which leaves relations & min/max ranges for inference, instead of requiring explicit specification.
@@ -507,6 +574,7 @@ class _RelaxedConstraint(_ConstraintTarget):
 
     @property
     def serializable_spec(self):
+        # [FUNCTION DOC] HELPER: Property giving a mapping with only t_id and dim.
         return {
             "t_id": self.t_id,
             "dim": self.dim,
@@ -518,6 +586,8 @@ Constraint = _Constraint | _DerivedConstraint | _RelaxedConstraint
 
 @dataclasses.dataclass
 class _IntWrapper:
+    # [CLASS DOC] HELPER: Wraps an integer input (val) so dynamism marks on it can be recorded while parsing
+    # dynamic_shapes. The dynamism field is excluded from the constructor and starts as None.
     """
     Dummy wrapper class to wrap around integer inputs so that when we parse the
     dynamic_shapes structure, we can mark if any of the integers were marked as
@@ -539,6 +609,11 @@ def _process_equalities(
     phantom_symbols: dict[str, "Symbol"],
     relaxed_sources: set["Source"],
 ):
+    # [FUNCTION DOC] HELPER: Updates the passed-in mutable collections for one constraint. Looks up the input sources of
+    # the constraint target (returns if there are none) and pairs the first with the rest. For a named constraint, pairs
+    # it with the sources of the earlier target using the same name (or records the name). For a derived constraint,
+    # resolves its root (an input source or a phantom symbol created in the shape env and cached by name) and appends
+    # a (source, root, fn) derived equality. For a relaxed constraint, records the source as relaxed. Returns None.
     """
     Updates `source_pairs`, `derived_equalities`, and `phantom_symbols` (which become
     fields of `EqualityConstraint`) based on a given input `constraint`.
@@ -594,6 +669,11 @@ def _tree_map_with_path(
     *dynamic_shapes: Any,
     tree_name: str | None = None,
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Maps func over the leaves of tree together with one or more dynamic_shapes trees, passing the
+    # key path. Built-in containers behave like the standard map; user classes registered with pytree are flattened and
+    # recursed into. On a pytree structural mismatch error, re-derives a readable UserError naming the first differing
+    # path between tree (called tree_name) and dynamic_shapes; other errors are re-raised. Raises AssertionError if
+    # a mismatch is reported without dynamic_shapes or tree_name.
     """
     Customized tree_map for mapping pytrees to dynamic_shapes.
 
@@ -614,6 +694,8 @@ def _tree_map_with_path(
     """
 
     def is_leaf(t):
+        # [FUNCTION DOC] HELPER: Treats anything whose node type is not a built-in container as a leaf (primitives, tensors
+        # and user pytree classes).
         # BUILTIN_TYPES is a subset of SUPPORTED_NODES, the latter being all types
         # registered with pytree. Types *not* in BUILTIN_TYPES include primitive types
         # (int, float, str, bool, None, torch.Tensor), which are not in SUPPORTED_NODES,
@@ -621,6 +703,7 @@ def _tree_map_with_path(
         return _get_node_type(t) not in BUILTIN_TYPES
 
     def f(path, t, *dynamic_shapes):
+        # [FUNCTION DOC] HELPER: Leaf handler: flattens and recurses for user-registered pytree classes, otherwise calls func.
         typ = _get_node_type(t)
         # typ is not in BUILTIN_TYPES
         if typ in SUPPORTED_NODES:
@@ -651,6 +734,8 @@ def _tree_map_with_path(
                 ) from None
 
             def _key(type_, context, i):
+                # [FUNCTION DOC] HELPER: Returns the pytree key (mapping key or sequence index) of child i for a dict, list or
+                # tuple spec. Raises AssertionError for other types or a non-None context on list and tuple.
                 # derive a PyTree key given the type, context, and child # of a TreeSpec
                 if type_ is dict:
                     return MappingKey(context[i])
@@ -663,6 +748,7 @@ def _tree_map_with_path(
                 raise AssertionError(f"Did not expect type {type_}")
 
             def raise_mismatch_error(msg):
+                # [FUNCTION DOC] HELPER: Raises a UserError (invalid input) stating the structures of tree and dynamic_shapes differ.
                 from torch._dynamo.exc import UserError, UserErrorType
 
                 raise UserError(
@@ -674,6 +760,8 @@ def _tree_map_with_path(
             def _compare(
                 treespec: TreeSpec, other_treespec: TreeSpec, path: KeyPath
             ) -> None:
+                # [FUNCTION DOC] HELPER: Recursively compares two TreeSpecs and raises a mismatch error at the first difference in
+                # type, element count or dict keys (dict key order is ignored). Returns None when no mismatch is found.
                 # raise an error at the point where tree and dynamic_shapes differ,
                 # including the path to that point and the reason for the difference
                 rendered_path = keystr(path)
@@ -729,6 +817,8 @@ _DynamicShapesSpec = dict[str, Any] | tuple[Any, ...] | list[Any]
 def _signature(
     f: ExportedProgram | torch.nn.Module | Callable[..., Any],
 ) -> inspect.Signature:
+    # [FUNCTION DOC] HELPER: Returns the call signature of f: for an ExportedProgram, of its module; for a Module, of its forward;
+    # otherwise of the callable itself.
     if isinstance(f, ExportedProgram):
         f = f.module()
     return (
@@ -743,6 +833,8 @@ def _combine_args_from_signature(
     args: tuple[Any, ...],
     kwargs: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Binds args and kwargs (None means empty) to the signature and returns the mapping of parameter
+    # names to values. Raises TypeError if the arguments do not bind.
     kwargs = kwargs if kwargs is not None else {}
     return signature.bind(*args, **kwargs).arguments
 
@@ -752,6 +844,7 @@ def _combine_args(
     args: tuple[Any, ...],
     kwargs: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Returns the parameter-name to value mapping obtained by binding args and kwargs to the signature of f.
     # combine args and kwargs following the signature of f, as it happens
     # in the body of f when called with *args, **kwargs
     return _combine_args_from_signature(_signature(f), args, kwargs)
@@ -761,6 +854,7 @@ _MISSING = object()
 
 
 def _var_keyword_param_name(signature: inspect.Signature) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns the name of the variadic keyword parameter of the signature, or None if there is none.
     for name, param in signature.parameters.items():
         if param.kind == inspect.Parameter.VAR_KEYWORD:
             return name
@@ -772,6 +866,8 @@ def _variadic_kwargs_info(
     args: tuple[Any, ...],
     kwargs: dict[str, Any] | None,
 ) -> tuple[inspect.Signature, dict[str, Any], str | None, dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Returns a 4-tuple: signature of f, bound argument mapping, name of the variadic keyword parameter
+    # (or None), and the dict of extra keyword values bound to it (empty if there is no such parameter or it is not a dict).
     signature = _signature(f)
     combined_args = _combine_args_from_signature(signature, args, kwargs)
     var_keyword_name = _var_keyword_param_name(signature)
@@ -789,6 +885,8 @@ def _colliding_variadic_kwarg_names(
     args: tuple[Any, ...],
     var_kwargs: dict[str, Any],
 ) -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns the sorted names of variadic keyword arguments that collide with names generated for
+    # positional inputs (plain parameter names, or the variadic positional name with an index suffix).
     positional_names = set()
     arg_i = 0
     for param in signature.parameters.values():
@@ -816,6 +914,10 @@ def _normalize_dynamic_shapes(
     args: tuple[Any, ...],
     kwargs: dict[str, Any] | None,
 ) -> _DynamicShapesSpec | None:
+    # [FUNCTION DOC] HELPER: Rewrites a dynamic_shapes spec so shapes for variadic keyword arguments sit nested under the
+    # variadic keyword parameter name. Returns the spec unchanged if it is empty, there are no extra keywords or it is
+    # not a dict. Raises UserError for names colliding with positional inputs, top-level/nested duplicates, or a nested
+    # entry that is not a dict. Does not mutate the input spec.
     """
     Normalize call-like dynamic shape specs for **kwargs to the signature-shaped
     structure used by the rest of dynamic shapes processing.
@@ -895,6 +997,11 @@ def _combine_args_for_tracing(
     kwargs: dict[str, Any] | None,
     dynamic_shapes: Any,
 ) -> tuple[dict[Any, Any], Any]:
+    # [FUNCTION DOC] HELPER: Pairs inputs with their dynamic shapes by name for tracing. With no dynamic_shapes returns the
+    # combined args and the spec. Otherwise flattens variadic positional arguments to indexed names, adds keyword
+    # arguments (looking variadic ones up under the variadic keyword name), and returns (arguments, shapes) as dicts
+    # keyed by unique names, or index-keyed dict and tuple if names repeat or the spec is not a dict.
+    # KNOWN ISSUE: if dynamic_shapes is a non-dict non-sequence value, it is returned alongside the combined args as is.
     if not dynamic_shapes:
         return _combine_args(f, args, kwargs), dynamic_shapes
 
@@ -951,6 +1058,9 @@ def _combine_args_for_tracing(
 
 
 class ShapesCollection:
+    # [CLASS DOC] Builder for a dynamic_shapes spec keyed by tensor (or _IntWrapper) identity. State: _shapes, a mapping
+    # from object id to the shape spec assigned. dynamic_shapes() later maps these onto the structure of the real
+    # args, so users need not replicate nested input structure. Only the Dim-based spec format is produced.
     """
     Builder for dynamic_shapes.
     Used to assign dynamic shape specifications to tensors that appear in inputs.
@@ -995,9 +1105,12 @@ class ShapesCollection:
     """
 
     def __init__(self):
+        # [FUNCTION DOC] Creates an empty collection.
         self._shapes = {}
 
     def __setitem__(self, t, shape):
+        # [FUNCTION DOC] Records shape for the tensor or _IntWrapper t by identity. Raises AssertionError if t is of another
+        # type or if a different shape was already assigned to the same object. The shape is not validated here.
         if not isinstance(t, (torch.Tensor, _IntWrapper)):
             raise AssertionError(
                 f"Cannot assign shape to non-tensor or non-_IntWrapper type {type(t)}"
@@ -1016,15 +1129,21 @@ class ShapesCollection:
             self._shapes[id(t)] = shape
 
     def __getitem__(self, t):
+        # [FUNCTION DOC] Returns the shape recorded for t by identity, first inserting and returning an empty dict if absent.
+        # Side effect: a read of an unknown object adds an entry (which dynamic_shapes later treats as assigned).
         t_id = id(t)
         if t_id not in self._shapes:
             self._shapes[t_id] = {}
         return self._shapes[t_id]
 
     def __len__(self):
+        # [FUNCTION DOC] Returns the number of objects that have recorded shapes.
         return len(self._shapes)
 
     def dynamic_shapes(self, m, args, kwargs=None):
+        # [FUNCTION DOC] Binds args and kwargs to the signature of m and maps the combined structure to a dynamic_shapes tree,
+        # placing each recorded spec at its tensor and None elsewhere. Raises ValueError if any recorded object is not found
+        # in the args (for example if it was copied or sits in a class not registered with pytree).
         """
         Generates the :func:`dynamic_shapes` pytree structure according to :func:`args` and :func:`kwargs`.
         """
@@ -1032,6 +1151,7 @@ class ShapesCollection:
         t_ids = set()
 
         def find_shape(path, t):
+            # [FUNCTION DOC] HELPER: Returns the recorded spec for leaf t (marking it as seen) or None if none was recorded.
             t_id = id(t)
             if t_id in self._shapes:
                 t_ids.add(t_id)
@@ -1051,6 +1171,9 @@ class ShapesCollection:
 
 
 class AdditionalInputs:
+    # [CLASS DOC] Infers dynamic_shapes from extra representative inputs. State: _examples, a list of (args, kwargs)
+    # pairs. Integers and tensor dims that differ between the original and additional inputs are marked dynamic, those
+    # that agree are static; verify() checks the additional inputs against an exported program.
     """
     Infers dynamic_shapes based on additional inputs.
 
@@ -1081,9 +1204,12 @@ class AdditionalInputs:
     """
 
     def __init__(self):
+        # [FUNCTION DOC] Creates an instance with no additional examples.
         self._examples = []
 
     def add(self, args, kwargs=None):
+        # [FUNCTION DOC] Appends one example input. Raises AssertionError if args is not exactly a tuple or kwargs is neither
+        # None nor exactly a dict.
         """
         Additional input :func:`args` and :func:`kwargs`.
         """
@@ -1097,6 +1223,9 @@ class AdditionalInputs:
         self._examples.append((args, kwargs))
 
     def dynamic_shapes(self, m, args, kwargs=None):
+        # [FUNCTION DOC] Computes the dynamic_shapes tree by reducing every input (original plus additional examples) to its
+        # tensor shapes or value and merging them: an int that differs becomes Dim.DYNAMIC, equal ones become None. Raises
+        # ValueError if corresponding leaves differ in type, or non-int leaves differ in value. Returns the merged tree.
         """
         Infers a :func:`dynamic_shapes` pytree structure by merging shapes of the
         original input :func:`args` and :func:`kwargs` and of each additional input
@@ -1112,6 +1241,8 @@ class AdditionalInputs:
         ]
 
         def _mark_dynamism(v, *other_vs):
+            # [FUNCTION DOC] HELPER: Merges one leaf across examples: returns Dim.DYNAMIC for an int (not bool) that differs in
+            # any example, None if all agree, and raises ValueError for type mismatches or differing non-int values.
             if not all(type(v) is type(other) for other in other_vs):
                 raise ValueError(
                     "The following inputs were found to have differing types, "
@@ -1139,6 +1270,8 @@ class AdditionalInputs:
         )
 
     def verify(self, ep):
+        # [FUNCTION DOC] Checks every additional example against the input constraints of the module made from ep. Raises
+        # if an example violates them. Returns None.
         """
         Verifies that an exported program is valid for each additional input.
         """
@@ -1151,6 +1284,7 @@ class AdditionalInputs:
 
 
 def _warn_on_None_dynamic_shape_dimension():
+    # [FUNCTION DOC] HELPER: Logs a warning that a None dynamic shape dimension is deprecated in favor of Dim.STATIC.
     msg = (
         "Using None as a dynamic shape dimension is deprecated. "
         "Please use Dim.STATIC instead"
@@ -1163,6 +1297,10 @@ def _check_dynamic_shapes(
     combined_args: dict[str, Any],
     dynamic_shapes: dict[str, Any] | tuple[Any] | list[Any] | None,
 ):
+    # [FUNCTION DOC] HELPER: Validates a dynamic_shapes spec against combined_args (name to value mapping). Returns early for
+    # None or empty specs. Checks that a dict spec has exactly the argument names as keys (raising UserError with hints
+    # for a single enclosed dict), then walks the structure checking each leaf spec; mismatches raise UserError or
+    # ValueError. Positional (tuple or list) specs are matched to the values in order. No mutation.
     """
     Checks the dynamic_shapes specification for correctness,
     using combined args + kwargs as reference for inputs structure.
@@ -1177,6 +1315,8 @@ def _check_dynamic_shapes(
     bounds: dict[str, tuple[int, int]] = {}
 
     def check_same_bounds(dim):
+        # [FUNCTION DOC] HELPER: Records min and max of a named Dim in the enclosing mapping, and raises a UserError if the
+        # same name was seen earlier with different bounds.
         if dim.__name__ in bounds:
             min_, max_ = bounds[dim.__name__]
             if dim.min != min_ or dim.max != max_:
@@ -1191,6 +1331,9 @@ def _check_dynamic_shapes(
             bounds[dim.__name__] = (dim.min, dim.max)
 
     def check_symbols(path, tensor, shape):
+        # [FUNCTION DOC] HELPER: Validates the shape spec (a dict of index to dim, or a sequence with the tensor's rank) for one
+        # tensor: each dim must be a Dim (bounds checked), None (deprecation warning), an int or a hint, otherwise a UserError
+        # is raised; a wrong length or a spec of another kind (not None) also raises UserError.
         if isinstance(shape, dict):
             for i, dim in shape.items():
                 if isinstance(dim, Dim):
@@ -1270,6 +1413,8 @@ def _check_dynamic_shapes(
             )
 
     def check_shape(path, t, dynamic_shape):
+        # [FUNCTION DOC] HELPER: Checks the spec for one input leaf: tensors go through symbol validation; integer wrappers accept
+        # None, ints or hints and reject named Dims (ValueError); any other leaf must have a None spec or UserError is raised.
         if isinstance(t, torch.Tensor):
             check_symbols(path, t, dynamic_shape)
         elif isinstance(t, _IntWrapper):
@@ -1301,6 +1446,11 @@ def _process_dynamic_shapes(
     combined_args: dict[str, Any],
     dynamic_shapes: dict[str, Any] | tuple[Any] | list[Any] | None,
 ) -> list[Constraint]:
+    # [FUNCTION DOC] HELPER: Turns a dynamic_shapes spec into a list of constraints on the input tensor dimensions of
+    # combined_args. Named and static dims become _Constraint, derived dims become _DerivedConstraint (rooted at an input
+    # dim or a phantom root computed from the tensor size), hints become _RelaxedConstraint. Side effects: clears and then
+    # sets Dynamo dynamic/static marks on every tensor and sets the dynamism of _IntWrapper inputs. Returns [] for empty
+    # specs. Raises UserError if a derived root value cannot be solved.
     """
     Reads the dynamic_shapes specification and produces a list of constraints.
     """
@@ -1321,6 +1471,10 @@ def _process_dynamic_shapes(
     constraints: list[Constraint] = []
 
     def to_constraint(dim, tensor, i):
+        # [FUNCTION DOC] HELPER: Builds the constraint for one tensor dim: derived dims give a _DerivedConstraint with a root
+        # (existing input constraint target, or a new cached phantom root whose value is solved from the tensor size; phantom
+        # derived constraints are remembered for later fix-up), static dims and named dims give a _Constraint with the
+        # corresponding range.
         import sympy
 
         from torch.fx.experimental.symbolic_shapes import StrictMinMaxConstraint
@@ -1328,6 +1482,8 @@ def _process_dynamic_shapes(
         from torch.utils._sympy.value_ranges import ValueRanges
 
         def root_value():
+            # [FUNCTION DOC] HELPER: Solves for the integer value of the derived dim's root from the actual tensor size. Raises
+            # UserError (constraint violation) if no integer solution exists.
             # given tensor.shape[i] is the value of dim = fn(root),
             # find the value of root
             symbol = sympy.Symbol(dim.root.__name__, integer=True)
@@ -1407,7 +1563,11 @@ def _process_dynamic_shapes(
         return constraint
 
     def _parse_tensor_dim(tensor, idx, dim) -> None:
+        # [FUNCTION DOC] HELPER: Handles one dimension spec: an int or Dim yields a recorded constraint (ints become static dims);
+        # a hint marks the tensor dimension (maybe-dynamic, static or dynamic) in Dynamo and records a relaxed constraint;
+        # None marks it static.
         def _create_static_dim(tensor, i, value):
+            # [FUNCTION DOC] HELPER: Returns a _StaticDim for value; tensor and i are unused.
             return _StaticDim(value)
 
         if isinstance(dim, (int, Dim)):
@@ -1427,6 +1587,8 @@ def _process_dynamic_shapes(
             torch._dynamo.mark_static(tensor, idx)
 
     def update_symbols(path, tensor, shape):
+        # [FUNCTION DOC] HELPER: Resets all Dynamo dynamic/static marks on the tensor (mutating it), then parses each dimension
+        # of the spec (dict by index, sequence by position, or None meaning all dims static).
         # clean out decorators from user side, or previous export call
         # we also delete these attributes in non_strict_utils.py/make_constraints()
         tensor._dynamo_weak_dynamic_indices = set()
@@ -1446,6 +1608,8 @@ def _process_dynamic_shapes(
                 _parse_tensor_dim(tensor, i, None)
 
     def assoc_shape(path, t, dynamic_shape):
+        # [FUNCTION DOC] HELPER: Leaf callback: for a tensor, updates symbols from its spec; for an _IntWrapper, stores the spec as
+        # its dynamism (mutation); other leaves are ignored.
         if isinstance(t, torch.Tensor):
             update_symbols(path, t, dynamic_shape)
         elif isinstance(t, _IntWrapper):
@@ -1479,6 +1643,8 @@ def _process_dynamic_shapes(
 def _get_dim_name_mapping(
     dynamic_shapes: dict[str, Any] | tuple[Any] | list[Any] | None,
 ):
+    # [FUNCTION DOC] HELPER: Returns a mapping from Dim name to Dim object for all Dim leaves of the spec, including the roots
+    # of derived dims; ints and None are skipped. Raises AssertionError for other leaf types that are not hints.
     name_to_dim = {}
     for dim in tree_iter(dynamic_shapes, is_leaf=lambda x: isinstance(x, Dim)):
         if dim is None:
@@ -1500,6 +1666,12 @@ def refine_dynamic_shapes_from_suggested_fixes(
     msg: str,
     dynamic_shapes: dict[str, Any] | tuple[Any] | list[Any],
 ) -> dict[str, Any] | tuple[Any] | list[Any]:
+    # [FUNCTION DOC] Parses the Suggested fixes section of a constraint violation message (name = Dim(...), name = int, or
+    # name = expression) and returns a new dynamic_shapes spec with those fixes applied: refined ranges, specialized
+    # ints, and derived dims (cached so each is created once). Raises UserError if the message has no suggested fixes,
+    # and AssertionError for unsupported fix kinds or unknown names. Does not mutate the input spec.
+    # KNOWN ISSUE: min and max are parsed with separate regular expressions on the whole text, so unusual formatting
+    # of the suggested Dim call may be missed silently.
     """
     When exporting with :func:`dynamic_shapes`, export may fail with a ConstraintViolation error if the specification
     doesn't match the constraints inferred from tracing the model. The error message may provide suggested fixes -
@@ -1593,6 +1765,9 @@ def refine_dynamic_shapes_from_suggested_fixes(
     derived_dim_cache: dict[str, _DerivedDim] = {}
 
     def apply_fixes(path, dim, dummy):
+        # [FUNCTION DOC] HELPER: Leaf callback returning the replacement for dim: None or int unchanged; a Dim named in the fixes is
+        # replaced by its fix (int, Dim, or a derived dim built from the root with scale and offset and cached); a derived
+        # dim whose root was fixed is recomputed (cached); anything else is returned unchanged. The dummy argument is unused.
         if dim is None or isinstance(dim, int):  # not dynamic
             return dim
         elif dim.__name__ in shape_fixes:  # directly fix

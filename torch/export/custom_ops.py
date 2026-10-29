@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Registers custom operators in the "export" library namespace used by torch.export, currently
+# export::access_subclass_inner_tensor, and provides a helper for calling custom autograd functions by name.
+# Import-time side effects: creates a FRAGMENT Library for namespace export, defines the op schema, and
+# registers Autograd and Python dispatch implementations for it.
 import importlib
 
 import torch
@@ -18,6 +22,9 @@ lib.define(
 def _access_subclass_inner_tensor(
     src_subclass_tensor: torch.Tensor, attr: str
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Implementation of export::access_subclass_inner_tensor. Returns the attribute named attr
+    # of a traceable wrapper tensor subclass instance. Raises AssertionError if the input is not a traceable wrapper
+    # subclass, and RuntimeError if the attribute is missing or is not a tensor. No side effects.
     from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
     if not is_traceable_wrapper_subclass(src_subclass_tensor):
@@ -34,6 +41,9 @@ def _access_subclass_inner_tensor(
 
 
 def _call_custom_autograd_function_in_pre_dispatch(function_cls_name, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Resolves a dotted string naming an autograd Function class (module path then class name),
+    # imports the module, and returns the result of calling the class apply method with the given args and kwargs.
+    # Raises AssertionError if the class has no apply method; import or attribute errors propagate.
     """
     Import a custom autograd function by string name and call it. This is pretty bad
     because:

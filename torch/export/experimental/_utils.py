@@ -1,3 +1,5 @@
+# [MODULE DOC] HELPER: Code generators that produce the text of a C++ main.cpp driver and a CMakeLists file for
+# standalone AOTInductor packages. Exports nothing publicly (empty __all__). Import-time side effect: creates a logger.
 import logging
 
 import torch
@@ -14,6 +16,11 @@ def _get_main_cpp_file(
     example_inputs_map: dict[str, int] | None,
     device_type: str,
 ) -> str:
+    # [FUNCTION DOC] HELPER: Returns C++ source text for main.cpp. It includes headers (CUDA or HIP ones by device_type),
+    # per-model AOTInductor headers, and a main that creates the device, constructs and loads each model's constants,
+    # and, only if example_inputs_map (model name to input count) is given, loads pickled input tensors from files,
+    # runs each model, prints and saves outputs. Errors are caught in the generated code and return 1. Pure text building.
+    # KNOWN ISSUE: the docstring documents a cuda argument that does not exist and mis-types example_inputs_map.
     """
     Generates a main.cpp file for AOTInductor standalone models in the specified package.
 
@@ -189,6 +196,9 @@ def _get_main_cpp_file(
 
 
 def _get_make_file(package_name: str, model_names: list[str], device_type: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns CMakeLists text that builds an executable from main.cpp, adds each model's
+    # subdirectory, finds Torch (when test_configs.use_libtorch is set) and CUDA or HIP packages, defines USE_CUDA,
+    # USE_HIP or USE_XPU per device_type, and links torch, the model libraries and device libraries. Pure text building.
     ib = IndentedBuffer()
 
     ib.writelines(

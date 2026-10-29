@@ -1,3 +1,7 @@
+# [MODULE DOC] Experimental export utilities: helpers to copy a graph module and signature, strip redundant detach
+# nodes, build a forward/backward exported program, lazily export a method on first call (_sticky_export), and
+# _ExportPackage, a collection of exported methods/overloads that can be AOTInductor-compiled and packaged.
+# Public __all__ is empty. Import-time side effects: defines a ParamSpec and a TypeVar only.
 import copy
 import dataclasses
 import functools
@@ -24,6 +28,9 @@ __all__ = []  # type: ignore[var-annotated]
 def _copy_graph_module_and_signature(
     ep: torch.export.ExportedProgram,
 ) -> tuple[torch.fx.GraphModule, torch.export.graph_signature.ExportGraphSignature]:
+    # [FUNCTION DOC] HELPER: Deep-copies the graph module and graph signature of an ExportedProgram and returns both.
+    # Afterwards, placeholder node names in every submodule graph are reset to the original names (deepcopy may
+    # rename them). Raises AssertionError if placeholder counts differ. Does not modify ep.
     # copy.deepcopy lets the objects override __deepcopy__ methods with graph_copy() and node_copy(),
     # and this can break placeholder names in some particular cases.
     # For example, node copying will avoid Python keywords like 'input', suffixing and renaming to 'input_1'.
@@ -50,6 +57,9 @@ def _copy_graph_module_and_signature(
 def _remove_detach_pass(
     gm: torch.fx.GraphModule, sig: torch.export.graph_signature.ExportGraphSignature
 ) -> None:
+    # [FUNCTION DOC] HELPER: In place, collapses chains of two consecutive aten detach calls in gm into one, by redirecting
+    # users of the second detach to the first (processed in reverse node order, with the signature replace hook active).
+    # Then removes dead code and recompiles gm. Returns nothing.
     with gm._set_replace_hook(sig.get_replace_hook()):
         for node in list(reversed(gm.graph.nodes)):
             if node.op != "call_function":
@@ -68,6 +78,9 @@ def _remove_detach_pass(
 def _export_forward_backward(
     ep: torch.export.ExportedProgram, joint_loss_index: int = 0
 ) -> torch.export.ExportedProgram:
+    # [FUNCTION DOC] HELPER: Decomposes an ExportedProgram with core aten decompositions (training/joint graph with
+    # the loss output at joint_loss_index, custom triton ops left alone), copies the graph module and signature,
+    # removes redundant detach nodes, and returns the updated ExportedProgram. Unstable API.
     """
     WARNING: This API is highly unstable and will be subject to change in the future.
     """
@@ -96,6 +109,12 @@ def _sticky_export(
     ]
     | None = None,
 ) -> typing.Callable[_InputT, _RetT]:
+    # [FUNCTION DOC] HELPER: Given a bound method forward_func, returns a wrapper that on first call exports the owning
+    # model with torch.export using the call args and, if provided, dynamic shapes from dynamic_shapes_callback(args),
+    # stores the exported module on the wrapper, and runs it. During export the model forward is temporarily restored
+    # to the original to avoid recursion, then set back to the wrapper. Mutates model.forward.
+    # KNOWN ISSUE: only the first call exports; later calls re-export again because forward is re-patched to the
+    # wrapper rather than the exported module, so the export is repeated on every call.
     """
     Lazily export the model on first forward call.
     Usage:
@@ -106,6 +125,8 @@ def _sticky_export(
 
     @functools.wraps(forward_func)
     def wrapper(*args: _InputT.args, **kwargs: _InputT.kwargs) -> _RetT:
+        # [FUNCTION DOC] HELPER: Exports the model (see _sticky_export) and returns the result of calling the exported module
+        # on the given arguments. Restores model.forward to the wrapper even if export fails (the error propagates).
         # Unpatch forward to avoid recursion during export
         model.forward = types.MethodType(original_forward, model)
 
@@ -132,11 +153,16 @@ def _sticky_export(
 
 @dataclasses.dataclass
 class _ExportMethod:
+    # [CLASS DOC] HELPER: Dataclass holding one exported method: overloads maps overload name to ExportedProgram,
+    # and fallbacks is an ordered list of ExportedPrograms used when no overload matches.
     overloads: dict[str, torch.export.ExportedProgram]
     fallbacks: list[torch.export.ExportedProgram]
 
 
 class _ExportPackage:
+    # [CLASS DOC] Experimental collection of exported methods. State: methods, a mapping from method name to
+    # _ExportMethod. Registers callables via _exporter (exports lazily on call), and can AOTInductor-compile and
+    # package all overloads via _compiled_and_package.
     """
     An export package is a collection of torch.export()-ed PyTorch models consisting of
     a list of exported methods and their corresponding overloads. ExportPackage is introduced
@@ -191,6 +217,7 @@ class _ExportPackage:
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Creates an empty package with no methods.
         self.methods: dict[str, _ExportMethod] = {}
 
     def _exporter(
@@ -200,6 +227,14 @@ class _ExportPackage:
         *,
         fallback: str = "once",
     ) -> typing.Callable[_InputT, _RetT]:
+        # [FUNCTION DOC] HELPER: Registers an empty _ExportMethod under the given method name and returns a wrapper of fn
+        # (an optimized module if fn is a Module) that exports on call: the first overload spec that does not raise
+        # AssertionError decides dynamic shapes and its export is cached; otherwise it exports a fallback, honoring the
+        # fallback policy (once: error on a second fallback; error: no fallbacks allowed; other values raise RuntimeError).
+        # The returned wrapper gains a _define_overload attribute. Mutates self.methods. Raises AssertionError if fn already
+        # has that attribute.
+        # KNOWN ISSUE: the docstring text 'Overloads should' is truncated, and it refers to define_overload and exporter
+        # without underscore prefixes.
         """
         A function/module decorator that sets up a callable to be exported later invoked.
         By default the exporter will only trigger torch.export for once and error on
@@ -281,6 +316,10 @@ class _ExportPackage:
 
         @functools.wraps(fn)
         def _exporter_context(*args, **kwargs):  # type: ignore[no-untyped-def]
+            # [FUNCTION DOC] HELPER: Runs the wrapped callable through export. Tries each registered overload spec in order
+            # (spec gets the module as first arg when fn is a Module); on the first that does not raise AssertionError,
+            # exports (cached by overload name) and runs the exported module. If none match, applies the fallback policy,
+            # exports without dynamic shapes, appends to fallbacks and runs it. Raises RuntimeError on policy violation.
             import torch.export._wrapper_utils
 
             model: torch.nn.Module
@@ -333,6 +372,8 @@ class _ExportPackage:
         def _define_overload(
             overload: str, spec: typing.Callable[_InputT, typing.Any]
         ) -> typing.Any:
+            # [FUNCTION DOC] HELPER: Registers spec under the overload name and returns the exporter wrapper for chaining.
+            # Raises AssertionError if the name already exists, spec is not callable, or the name is not a valid identifier.
             if overload in specs:
                 raise AssertionError(f"Overload '{overload}' already exists in specs")
             if not callable(spec):
@@ -355,6 +396,8 @@ class _ExportPackage:
     def _method_overloads(
         self,
     ) -> typing.Iterator[tuple[str, torch.export.ExportedProgram]]:
+        # [FUNCTION DOC] HELPER: Property returning a generator over all overloads of all methods, yielding pairs of the
+        # string method:overload and its ExportedProgram. Fallbacks are not included.
         for method, method_data in self.methods.items():
             for overload, ep in method_data.overloads.items():
                 yield f"{method}:{overload}", ep
@@ -365,6 +408,12 @@ class _ExportPackage:
         standalone: bool = False,
         package_example_inputs: bool = False,
     ) -> None:
+        # [FUNCTION DOC] HELPER: AOTInductor-compiles every overload (names with colon replaced by double underscore) and
+        # writes a package archive to f. If standalone is true, additionally extracts the archive next to its path,
+        # optionally saves example input tensors as files when package_example_inputs is true, and writes CMakeLists.txt and
+        # main.cpp there. Raises AssertionError on mixed non-cpu device types or an unexpected path type. I/O side effects.
+        # KNOWN ISSUE: device_type is overwritten per overload, so the last overload with example inputs wins; the
+        # mixing check is only per overload.
         options: dict[str, typing.Any] = {
             "aot_inductor.package": True,
             "aot_inductor.package_cpp_only": True,

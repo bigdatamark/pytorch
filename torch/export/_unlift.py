@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Implements "unlifting" of an ExportedProgram into a callable GraphModule: lifted parameters, buffers,
+# constants and custom objects become get_attr nodes, mutated outputs are turned back into in-place copy operations,
+# a pytree codegen with the original input/output specs is installed, and optionally a _guards_fn submodule that
+# asserts shape/value guards on inputs is inserted. Also holds the input tree-spec matching and input-constraint
+# pre-hook logic and the GuardsFn module class. No import-time side effects beyond imports.
 import copy
 import inspect
 import math
@@ -38,15 +43,20 @@ from .exported_program import (
 
 
 def eq_spec(self: pytree.TreeSpec, other: pytree.TreeSpec) -> bool:
+    # [FUNCTION DOC] Returns True if two pytree TreeSpecs have the same structure, treating container types that lose
+    # information in tracing (such as torch.Size versus tuple) as equal, and ignoring key order of dict contexts.
+    # Compares recursively on type, context, child count and children. Pure.
     """
     Refinement of TreeSpec.__eq__ where, e.g., torch.Size(...) matches tuple(...).
     See _pytree_subclasses_that_lose_info in proxy_tensor.py for more details.
     """
 
     def _normalize_type(t):
+        # [FUNCTION DOC] HELPER: Maps a type to its string form after substituting types that lose info under tracing.
         return str(_pytree_subclasses_that_lose_info.get(t, t))
 
     def _match_normalized_structure(a, b):
+        # [FUNCTION DOC] HELPER: Recursive structural comparison of two TreeSpecs as described for eq_spec; returns bool.
         if a is b:
             return True
         if _normalize_type(a.type) != _normalize_type(b.type):
@@ -68,6 +78,8 @@ def eq_spec(self: pytree.TreeSpec, other: pytree.TreeSpec) -> bool:
 
 
 def _check_inputs_match(args, kwargs, in_spec: pytree.TreeSpec) -> list:
+    # [FUNCTION DOC] HELPER: Reorders kwargs to match in_spec, flattens (args, kwargs) with key paths, and returns the
+    # list of (path, leaf) pairs. Raises ValueError if the resulting tree spec does not match in_spec per eq_spec.
     reordered_kwargs = reorder_kwargs(kwargs, in_spec)
     flat_args_with_path, received_spec = pytree.tree_flatten_with_path(
         (args, reordered_kwargs)
@@ -87,6 +99,8 @@ def _check_inputs_match(args, kwargs, in_spec: pytree.TreeSpec) -> list:
 
 
 def _force_ep_signature_match(ep_guards_code: list[str], input_paths):
+    # [FUNCTION DOC] HELPER: Returns a new list of guard strings where each placeholder of the form flat_args index is
+    # replaced by the user input path text of the corresponding entry in input_paths. Inputs are not mutated.
     # TODO (tmanlaibaatar)
     # This is band-aid solution to export new tracer replacing
     # shape env sources to flat_args. The real fix should be replacing
@@ -110,6 +124,9 @@ def _force_ep_signature_match(ep_guards_code: list[str], input_paths):
 
 
 def _force_gm_signature_match(ep_guards_code: list[str], signature):
+    # [FUNCTION DOC] HELPER: Reconciles variadic-argument naming between guard strings and the unlifted module signature:
+    # where a guard refers to a name indexed by a number and the signature has a parameter named name_number, rewrites
+    # the guard to the flat parameter name. Returns the new list of guard strings.
     """
     The signature of the originally exported module may not match
     the signature of the unlifted graph module extracted from the
@@ -148,6 +165,12 @@ def _convert_guards_code_to_fn(
     guards_code: list[str],
     paths_of_placeholders: list[pytree.KeyPath],
 ):
+    # [FUNCTION DOC] HELPER: Turns guard expression strings into a GuardsFn module. Source references are replaced by
+    # positional flat args for the executable code and by user paths for the error message; each guard becomes an
+    # assert call that fails with a message naming the guard. The generated source is executed (exec) in a namespace
+    # with sympy interpreter globals, math and inf; the function is installed as forward (Dynamo may trace through
+    # it) and the module is marked impure so dead code elimination keeps it. If normalizing a message hits
+    # RecursionError, warns and uses the raw string. Returns the GuardsFn instance.
     """
     Generates Python code given guards code and paths of placeholders.
     We assume that, based on source information,
@@ -233,6 +256,8 @@ def _convert_guards_code_to_fn(
 
 @torch._dynamo.disable
 def _check_input_constraints_for_module(self, args, kwargs):
+    # [FUNCTION DOC] HELPER: Validates inputs against the module in_spec and, via the graph placeholders and the module
+    # range_constraints, checks input constraints; raises on mismatch. Excluded from Dynamo compilation.
     flat_args_with_path = _check_inputs_match(args, kwargs, self._in_spec)
     _check_input_constraints_for_graph(
         self.graph.find_nodes(op="placeholder"),
@@ -242,6 +267,9 @@ def _check_input_constraints_for_module(self, args, kwargs):
 
 
 def _check_input_constraints_pre_hook(self, args, kwargs):
+    # [FUNCTION DOC] HELPER: Forward pre-hook (with kwargs) for the stateful graph module. Does nothing if validate_inputs
+    # is false. If a _guards_fn exists, only checks that the input tree structure matches. Otherwise, unless Dynamo is
+    # compiling, runs the full input constraint check. Returns None; raises ValueError or constraint errors on mismatch.
     # preserve current behavior for clients that do not want any validation
     if not self.validate_inputs:
         return
@@ -264,6 +292,10 @@ def _unlift_inputs_as_getattr(
     gm: torch.fx.GraphModule,
     lifted_inputs: Sequence[str | None],
 ) -> tuple[dict[str, torch.fx.Node], dict[str, torch.fx.Node]]:
+    # [FUNCTION DOC] HELPER: For each placeholder, if the matching lifted_inputs entry is a name, replaces the placeholder
+    # with a get_attr node of that name (copying meta and recording node-source provenance) and erases it; otherwise
+    # keeps it as a user input. Returns two mappings: lifted attribute name to new get_attr node, and user input name
+    # to placeholder. Mutates gm. Raises AssertionError if lengths differ.
     """
     Unlift inputs referring to params/buffers/constants as getattr nodes in the
     graph
@@ -311,6 +343,10 @@ def _insert_copy_for_mutations(
     unlifted_name_to_node: dict[str, torch.fx.Node],
     input_name_to_node: dict[str, torch.fx.Node],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Rewrites the output node of gm so only user outputs are returned. For each output whose
+    # mutated_outputs entry names a buffer or input, inserts an in-place copy_ of that output into the unlifted
+    # node, and the copy takes the place of the output. Mutates gm. Raises AssertionError on length mismatch and
+    # RuntimeError if a named target is found in neither mapping.
     """
     Find the all the buffers and inputs that were mutated and insert copy_
     operators to reflect mutations.
@@ -369,6 +405,8 @@ def _get_codegen(
     out_spec: pytree.TreeSpec | None,
     forward_arg_names: list[str] | None = None,
 ) -> _PyTreeCodeGen:
+    # [FUNCTION DOC] HELPER: Builds a pytree codegen holding the in/out specs and argument names. Names come from
+    # forward_arg_names if given, else positional names (plus kwarg names) derived from in_spec. Returns the codegen.
     """
     Create the codegen for the graph module based on the in/out specs
     """
@@ -404,6 +442,8 @@ def _unlift(
     out_spec: pytree.TreeSpec | None,
     forward_arg_names: list[str] | None = None,
 ):
+    # [FUNCTION DOC] HELPER: Unlifts gm in place: converts lifted inputs to get_attr nodes, restores mutation copies,
+    # installs the pytree codegen from in_spec, out_spec and forward_arg_names, lints and recompiles. Returns gm.
     """
     Args:
         lifted_inputs: A list matching the graph module's input nodes. For
@@ -437,6 +477,9 @@ def _register_attrs_to_new_gm(
     state_dict: dict[str, Any],
     constants: dict[str, Any],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Assigns buffers (non-persistent ones read from constants, others from state_dict), parameters,
+    # and lifted custom objects and tensor constants onto new_gm using the signature's names. Mutates new_gm.
+    # KNOWN ISSUE: the comment about aliased constants notes they are not tracked here; aliasing is fixed later.
     non_persistent_buffers = set(graph_signature.non_persistent_buffers)
     for name in graph_signature.buffers:
         if name in non_persistent_buffers:
@@ -473,16 +516,21 @@ def _register_attrs_to_new_gm(
 
 
 class _StatefulGraphModuleFactory(type):
+    # [CLASS DOC] HELPER: Metaclass that blocks direct construction of _StatefulGraphModule; only the _create
+    # classmethod-like factory method may instantiate it.
     """
     Metaclass that ensures a private constructor for _StatefulGraphModule
     """
 
     def __call__(cls, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Always raises TypeError saying the class has no public constructor.
         raise TypeError(
             f"{cls.__module__}.{cls.__qualname__} has no public constructor. "
         )
 
     def _create(cls, root, graph, range_constraints=None):
+        # [FUNCTION DOC] HELPER: Bypasses the blocked constructor and builds an instance via the type call with root, graph
+        # and range_constraints.
         return super().__call__(
             root,
             graph,
@@ -491,7 +539,11 @@ class _StatefulGraphModuleFactory(type):
 
 
 class _StatefulGraphModule(torch.fx.GraphModule, metaclass=_StatefulGraphModuleFactory):
+    # [CLASS DOC] HELPER: GraphModule carrying export state: range_constraints (list or mapping) and validate_inputs
+    # flag (default true) consulted by the input check pre-hook. Create it only via the private factory.
     def __init__(self, root, graph, range_constraints=None):
+        # [FUNCTION DOC] HELPER: Initializes the GraphModule, stores range_constraints (empty list if falsy) and sets
+        # validate_inputs to true.
         super().__init__(root, graph)
         # Need to fix up non-persistent buffers.
         self.range_constraints = range_constraints or []
@@ -503,6 +555,12 @@ def _create_stateful_graph_module(
     range_constraints,
     ep: ExportedProgram,
 ) -> _StatefulGraphModule:
+    # [FUNCTION DOC] HELPER: Wraps plain_graph_module in a _StatefulGraphModule, registers forward pre-hooks (enable
+    # nn.Module-typed graph inputs, then input constraint check) and a forward hook that always undoes the enabling.
+    # Then repairs state that fx loses: detaches (with a warning) lifted tensor constants and constants requiring
+    # grad (keeping aliases consistent), re-registers lifted tensor constants and ep.constants as constants, and
+    # restores non-persistent buffers. Returns the module.
+    # KNOWN ISSUE: the first warning text is missing a comma/space ('gradient. but') versus the second warning.
     stateful_gm = _StatefulGraphModule._create(
         plain_graph_module,
         plain_graph_module.graph,
@@ -602,6 +660,8 @@ def _create_stateful_graph_module(
 
 
 def _get_input_paths(example_inputs, signature):
+    # [FUNCTION DOC] HELPER: Binds example args and kwargs to signature (applying defaults) and returns the pytree key
+    # paths of all leaves of the bound arguments, in order.
     """
     Generate paths of placeholders, needed for generating the guards function.
 
@@ -618,6 +678,7 @@ def _get_input_paths(example_inputs, signature):
 
 
 def _replace_sources(result_str: str, flat_input_paths: list[Any]):
+    # [FUNCTION DOC] HELPER: Returns result_str with flat_args index source references replaced by user input path text.
     """
     Given user specified input paths, maybe fix up the guard string
     to reflect user path instead of tracer path.
@@ -637,6 +698,12 @@ def _get_input_guards_for_graph(
     range_constraints: dict[sympy.Symbol, ValueRanges],
     paths_for_placeholders: list[pytree.KeyPath],
 ):
+    # [FUNCTION DOC] HELPER: Builds guard expression strings mirroring input constraint checks: equality for specialized
+    # int, float (including nan and infinities), str and tensor dims; lower and upper bounds for dynamic dims within
+    # range_constraints; equality between inputs sharing a symbol; and equations for derived dims solved from a
+    # known source. Returns the list of guard strings. Does not mutate inputs.
+    # KNOWN ISSUE: the int check is a separate if rather than part of the elif chain, so an int placeholder is still
+    # tested by the float branch chain (harmless); bool values count as int.
     """
     Guards generated by the tracer include conditions observed in code, but
     do not include some additional checks we typically do in export.
@@ -660,6 +727,9 @@ def _get_input_guards_for_graph(
     sources: dict[sympy.Expr, str] = {}
 
     def handle_symint(expr, src):
+        # [FUNCTION DOC] HELPER: Records guards for a symbolic expression sourced at src: defers single-symbol expressions for
+        # later solving, emits equality with the first source if seen before, else records the source and adds lower
+        # (above 2) and upper (finite) bound guards. Mutates the enclosing lists and mapping.
         if len(expr.free_symbols) == 1:
             # complex equations (e.g., involving derived dims) need to
             # handled later, since we may not have enough information
@@ -746,6 +816,8 @@ def _get_input_guards_for_graph(
 
 
 def _ok_to_generate_guards_fn():
+    # [FUNCTION DOC] HELPER: Walks the call stack and returns False if any frame filename contains a listed client name
+    # (executorch, modai, on_device_ai, torchao), which cannot handle call-module guard nodes; otherwise True.
     patterns = [
         "executorch",
         "modai",
@@ -768,6 +840,13 @@ def _ok_to_generate_guards_fn():
 def _unlift_exported_program_lifted_states(
     ep: ExportedProgram, check_guards=True
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Converts an ExportedProgram into a runnable GraphModule with the original calling convention. Works
+    # on a copy of the graph and a shallow copy of the program (removing effect tokens unless the dialect is
+    # TRAINING), registers state, unlifts inputs/mutations, tags nodes with source provenance, wraps in a stateful
+    # module, and, when check_guards is true, the environment allows it, and example inputs exist, builds guards from
+    # range constraints plus the program guards and inserts a call to a _guards_fn submodule after the placeholders.
+    # Raises AssertionError if call_spec in_spec is None. Returns the module.
+    # KNOWN ISSUE: the local list ep_guards built with _replace_sources is never used (dead code).
     check_guards = check_guards and _ok_to_generate_guards_fn()
 
     source_node_dict = {
@@ -896,9 +975,12 @@ def _unlift_exported_program_lifted_states(
 
 
 class GuardsFn(torch.nn.Module):
+    # [CLASS DOC] Module holding the generated guard-checking function; _convert_guards_code_to_fn replaces its
+    # forward instance attribute with the generated function. Marked impure when instantiated there.
     """
     Module class for guard functions.
     """
 
     def forward(self, *args):
+        # [FUNCTION DOC] Placeholder that accepts any arguments and does nothing; replaced per instance by generated code.
         pass
