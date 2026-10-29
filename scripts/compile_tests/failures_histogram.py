@@ -1,3 +1,9 @@
+# [MODULE DOC] Command line script that prints a histogram of skip reasons for Dynamo tests
+# that fail relative to eager, using CI test reports downloaded for a commit. Groups skipped
+# testcases by a normalized reason, with a sample repro command, optionally listing all tests
+# or formatting each group as a GitHub issue body.
+# KNOWN ISSUE: download_reports is imported from common but is defined in download_reports.py,
+# and the main block asks for configs dynamo311 and eager311 that are not in CONFIGS.
 import argparse
 import re
 
@@ -19,6 +25,8 @@ https://docs.github.com/en/github-cli/github-cli/quickstart
 
 
 def skip_reason(testcase):
+    # [FUNCTION DOC] Returns the message attribute of the first skipped element in the
+    # testcase. Raises AssertionError if there is none.
     for child in testcase.iter():
         if child.tag != "skipped":
             continue
@@ -27,6 +35,10 @@ def skip_reason(testcase):
 
 
 def skip_reason_normalized(testcase):
+    # [FUNCTION DOC] Takes the first skipped element's message, keeps its first line and the
+    # text before the first closing angle bracket, and masks volatile parts (hex addresses,
+    # MagicMock ids, issue numbers, torch.Size contents, qualified class names) so similar
+    # reasons group together. Raises AssertionError if no skipped element exists.
     for child in testcase.iter():
         if child.tag != "skipped":
             continue
@@ -46,6 +58,8 @@ def skip_reason_normalized(testcase):
 
 
 def get_failures(testcases):
+    # [FUNCTION DOC] Groups the skipped testcases by normalized skip reason. Returns a list of
+    # (count, reason, testcases) tuples sorted in descending order (most common first).
     skipped = [t for t in testcases if skipped_test(t)]
     skipped_dict = {}
     for s in skipped:
@@ -61,15 +75,23 @@ def get_failures(testcases):
 
 
 def repro(testcase):
+    # [FUNCTION DOC] Returns a shell command string that reruns the testcase under Dynamo with
+    # pytest, selecting by its file and name attributes.
     return f"PYTORCH_TEST_WITH_DYNAMO=1 pytest {testcase.attrib['file']} -v -k {testcase.attrib['name']}"
 
 
 def all_tests(testcase):
+    # [FUNCTION DOC] Returns the testcase identifier as file, double colon, class name, dot,
+    # test name.
     return f"{testcase.attrib['file']}::{testcase.attrib['classname']}.{testcase.attrib['name']}"
 
 
 # e.g. "17c5f69852/eager", "17c5f69852/dynamo"
 def failures_histogram(eager_dir, dynamo_dir, verbose=False, format_issues=False):
+    # [FUNCTION DOC] Computes which tests fail under Dynamo (via compute_pass_rate on the two
+    # report directories), groups their skip reasons, and prints to stdout a header, one row
+    # per reason (count, reason, sample repro, plus all test names if verbose; or a formatted
+    # issue body if format_issues), and the total count.
     fail_keys = compute_pass_rate(eager_dir, dynamo_dir)
     xmls = open_test_results(dynamo_dir)
 
@@ -106,6 +128,10 @@ def failures_histogram(eager_dir, dynamo_dir, verbose=False, format_issues=False
 
 
 def as_issue(count, msg, repro, tests):
+    # [FUNCTION DOC] Formats a markdown GitHub issue body for one skip reason: failing test
+    # count and message, the repro command, instructions to remove the skip first, and a
+    # collapsible list of all failing test names (tests is a list of strings). Returns the
+    # string; does not print.
     tests = "\n".join(tests)
     result = f"""
 {"-" * 50}

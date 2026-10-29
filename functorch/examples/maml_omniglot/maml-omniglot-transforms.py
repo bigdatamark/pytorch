@@ -14,6 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC] Example script: MAML few-shot Omniglot classification using torch.func
+# transforms: functional_call and grad for the inner loop, and vmap to adapt all tasks of a
+# meta batch in parallel. Contains main, loss_for_task, train, test and plot.
+# Import-time side effects: selects the Agg matplotlib backend and the bmh plot style.
+# KNOWN ISSUE: the docstring below mentions higher, which is not used here.
 """
 This example shows how to use higher to do Model Agnostic Meta Learning (MAML)
 for few-shot Omniglot classification.
@@ -49,6 +54,11 @@ plt.style.use("bmh")
 
 
 def main():
+    # [FUNCTION DOC] Script entry point. Parses n-way, k-shot support/query sizes, device,
+    # meta batch size and seed; seeds torch (and CUDA if available) and numpy; builds the
+    # OmniglotNShot loader (data under /tmp/omniglot-data) and a conv net with batch norm that
+    # does not track running stats; then runs 100 epochs of train, test and plot with an Adam
+    # meta-optimizer.
     argparser = argparse.ArgumentParser()
     argparser.add_argument("--n-way", "--n_way", type=int, help="n way", default=5)
     argparser.add_argument(
@@ -120,11 +130,17 @@ def main():
 # Trains a model for n_inner_iter using the support and returns a loss
 # using the query.
 def loss_for_task(net, n_inner_iter, x_spt, y_spt, x_qry, y_qry):
+    # [FUNCTION DOC] Inner loop for one task, written to be mapped by vmap over tasks. Starting
+    # from the net's parameters, takes n_inner_iter SGD steps (learning rate 0.1) on the
+    # support data using grad of a functional_call loss, then evaluates the adapted weights on
+    # the query data. Returns (query cross entropy loss, query accuracy fraction) as tensors.
     params = dict(net.named_parameters())
     buffers = dict(net.named_buffers())
     querysz = x_qry.size(0)
 
     def compute_loss(new_params, buffers, x, y):
+        # [FUNCTION DOC] HELPER: Cross entropy loss of the closed-over net run functionally
+        # with the given params and buffers mappings on inputs x and labels y.
         logits = functional_call(net, (new_params, buffers), x)
         loss = F.cross_entropy(logits, y)
         return loss
@@ -145,6 +161,10 @@ def loss_for_task(net, n_inner_iter, x_spt, y_spt, x_qry, y_qry):
 
 
 def train(db, net, device, meta_opt, epoch, log):
+    # [FUNCTION DOC] One meta-training epoch. For each batch of tasks, maps loss_for_task over
+    # the tasks with vmap (5 inner steps), sums the query losses and backpropagates into the
+    # net parameters, then steps meta_opt. Prints progress every 4 batches and appends a train
+    # record (epoch, loss, acc, mode, time) to the log list. The device argument is unused.
     n_train_iter = db.x_train.shape[0] // db.batchsz
 
     for batch_idx in range(n_train_iter):
@@ -187,6 +207,10 @@ def train(db, net, device, meta_opt, epoch, log):
 
 
 def test(db, net, device, epoch, log):
+    # [FUNCTION DOC] Evaluates on test tasks. For each task (sequentially, no vmap), adapts the
+    # net params with 5 inner SGD steps on the support set using autograd.grad, then measures
+    # query loss and accuracy. Prints mean loss and accuracy percent and appends a test record
+    # to the log list. The device argument is unused.
     # Crucially in our testing procedure here, we do *not* fine-tune
     # the model during testing for simplicity.
     # Most research papers using MAML for this task do an extra
@@ -238,6 +262,9 @@ def test(db, net, device, epoch, log):
 
 
 def plot(log):
+    # [FUNCTION DOC] Plots train and test accuracy against epoch from the log list of records
+    # and saves the figure to maml-accs.png in the current directory (overwritten each call).
+    # Prints a status line; closes the figure.
     # Generally you should pull your plotting code out of your training
     # script but we are doing it here for brevity.
     df = pd.DataFrame(log)

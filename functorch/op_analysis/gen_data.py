@@ -1,3 +1,9 @@
+# [MODULE DOC] Script that produces CSV-like analysis files of ATen operator coverage
+# (vmap.txt and decompositions.txt) by categorizing every op in native_functions.yaml.
+# Import-time side effects: runs immediately on import. Needs a modified PyTorch build exposing
+# dispatch registrations, native_functions.yaml at a relative path, and input files
+# annotated_ops, run_ops.txt, count_ops.txt, run_decompositions.txt and public_api in the
+# current directory; writes the two output files there.
 import csv
 from collections import defaultdict
 
@@ -7,6 +13,9 @@ import torch
 
 
 def get_ops_for_key(key):
+    # [FUNCTION DOC] Returns the set of ATen operator names registered for a dispatch key (all
+    # registrations when key is None). Only entries containing the aten:: prefix are kept, with
+    # the first six characters removed and whitespace stripped.
     # Needs modified PyTorch C++ code to work
     if key is None:
         ops = torch._C._dispatch_get_registrations_for_dispatch_key()
@@ -21,6 +30,13 @@ def get_ops_for_key(key):
 
 
 def gen_data(special_op_lists, analysis_name):
+    # [FUNCTION DOC] Loads native_functions.yaml and the annotated_ops file, derives name,
+    # full name and return type for each op, labels each op with a category (see annotate_ops),
+    # and writes one comma-separated line per op to the file analysis_name: full name, category,
+    # whether it is composite implicit autograd, then the result of each predicate function in
+    # special_op_lists. Reads files relative to the current directory; I/O errors propagate.
+    # KNOWN ISSUE: the unique op list and overload bookkeeping (uniq_ops, overload_types, cnt)
+    # are built but never used.
     all_ops = get_ops_for_key(None)
     composite_ops = get_ops_for_key("CompositeImplicitAutograd")
     noncomposite_ops = all_ops - composite_ops
@@ -54,6 +70,10 @@ def gen_data(special_op_lists, analysis_name):
         uniq_ops.append(op)
 
     def annotate_ops(ops, is_unique):
+        # [FUNCTION DOC] HELPER: Sets a meta label on each op mapping in place, using the first
+        # matching rule: inplace, out (only when not is_unique), conv, pool, backward, private,
+        # batch_norm, non_tensor, backend, or core (with the annotation if known, else unknown).
+        # Returns a mapping of category to count.
         categorization = defaultdict(int)
         for op in ops:
             if op["name"][-1] == "_":
@@ -119,10 +139,13 @@ def gen_data(special_op_lists, analysis_name):
 
 
 def name_check(lst):
+    # [FUNCTION DOC] HELPER: Returns a predicate that tells whether an op's name is in lst.
     return lambda x: x["name"] in lst
 
 
 def full_name_check(lst):
+    # [FUNCTION DOC] HELPER: Returns a predicate that tells whether an op's full (overload
+    # qualified) name is in lst.
     return lambda x: x["full_name"] in lst
 
 
@@ -131,12 +154,16 @@ gen_data([full_name_check(get_ops_for_key("FuncTorchBatched"))], "vmap.txt")
 
 
 def remove_suffix(input_string, suffix):
+    # [FUNCTION DOC] HELPER: Returns input_string without the trailing suffix if it ends with
+    # a non-empty suffix; otherwise returns it unchanged.
     if suffix and input_string.endswith(suffix):
         return input_string[: -len(suffix)]
     return input_string
 
 
 def remove_prefix(input_string, prefix):
+    # [FUNCTION DOC] HELPER: Returns input_string without the leading prefix if it starts with
+    # a non-empty prefix; otherwise returns it unchanged.
     if prefix and input_string.startswith(prefix):
         return input_string[len(prefix) :]
     return input_string
@@ -150,6 +177,8 @@ if True:
         opinfo_counts = defaultdict(int, dict(zip(opinfo_ops, opinfo_counts)))
 
     def count_fn(x):
+        # [FUNCTION DOC] HELPER: Looks up the OpInfo test count for the op's full name (zero
+        # when absent). Note counts are kept as the strings read from count_ops.txt.
         return opinfo_counts[x["full_name"]]
 
     with open("run_decompositions.txt") as f:
@@ -159,6 +188,9 @@ if True:
         ref_api = [i.strip() for i in f]
 
     def has_ref_impl(x):
+        # [FUNCTION DOC] HELPER: True if the op has a reference implementation listed in the
+        # public_api file. Strips linalg_ and special_ prefixes from the name, then checks the
+        # bare name and the name under nn.functional, fft, special and linalg namespaces.
         name = x["name"]
         for prefix in ["linalg_", "special_"]:
             name = remove_prefix(name, prefix)

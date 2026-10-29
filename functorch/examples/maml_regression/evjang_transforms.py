@@ -1,3 +1,9 @@
+# [MODULE DOC] Example script: MAML on sine-wave regression using torch.func transforms. Same
+# model as the plain version (an MLP given as a list of raw parameter tensors), but the inner
+# gradient uses grad and tasks are processed in parallel with vmap. Import-time side
+# effects: selects the Agg matplotlib backend, creates global parameters and an Adam
+# optimizer, runs 20000 meta training iterations (printing loss every 100), adapts to a test
+# task, and writes maml-sine.png and losses.png to the current directory.
 # Eric Jang originally wrote an implementation of MAML in JAX
 # (https://github.com/ericjang/maml-jax).
 # We translated his implementation from JAX to PyTorch.
@@ -17,6 +23,9 @@ mpl.use("Agg")
 
 
 def net(params, x):
+    # [FUNCTION DOC] Forward pass of a 1-40-40-1 MLP with ReLU activations. params is a
+    # sequence of six tensors (weight and bias per layer); x has shape batch by 1. Returns the
+    # output of shape batch by 1. Note the argument order is params first, then x.
     x = F.linear(x, params[0], params[1])
     x = F.relu(x)
 
@@ -44,6 +53,7 @@ params = [
 
 
 def mse_loss(x, y):
+    # [FUNCTION DOC] Mean of the squared elementwise differences between x and y (scalar).
     return torch.mean((x - y) ** 2)
 
 
@@ -56,6 +66,10 @@ num_tasks = 4
 
 
 def sample_tasks(outer_batch_size, inner_batch_size):
+    # [FUNCTION DOC] Samples outer_batch_size sine tasks (random amplitude in 0.1 to 0.5 and
+    # phase in 0 to pi) and draws two independent batches of inner_batch_size points in -5 to
+    # 5 from each. Returns (x1, y1, x2, y2) tensors with a leading task dimension: batch 1 is
+    # for the inner update, batch 2 for the outer loss. Uses the numpy global random state.
     # Select amplitude and phase for the task
     As = []
     phases = []
@@ -64,6 +78,9 @@ def sample_tasks(outer_batch_size, inner_batch_size):
         phases.append(np.random.uniform(low=0.0, high=np.pi))
 
     def get_batch():
+        # [FUNCTION DOC] HELPER: Draws one batch of random inputs per task and the matching
+        # sine outputs using the enclosing amplitudes and phases. Returns (xs, ys) float
+        # tensors of shape tasks by inner_batch_size by 1.
         xs, ys = [], []
         for A, phase in zip(As, phases):
             x = np.random.uniform(low=-5.0, high=5.0, size=(inner_batch_size, 1))
@@ -82,7 +99,12 @@ for it in range(20000):
     opt.zero_grad()
 
     def get_loss_for_task(x1, y1, x2, y2):
+        # [FUNCTION DOC] HELPER: Meta loss for one task, written to be mapped by vmap. Takes
+        # one SGD step (step size alpha) on the global params using grad of the inner loss on
+        # (x1, y1), then returns the mean squared error of the adapted network on (x2, y2).
         def inner_loss(params, x1, y1):
+            # [FUNCTION DOC] HELPER: Mean squared error of the network with the given params
+            # on inputs x1 against targets y1.
             f = net(params, x1)
             loss = mse_loss(f, y1)
             return loss

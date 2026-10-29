@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
+# [MODULE DOC] Example script: trains a torchvision model on CIFAR10 with differentially
+# private SGD, using torch.func (vmap + grad_and_value + functional_call) to compute
+# per-sample gradients, then clipping and noising them. Run as a script (main); command
+# line options are defined in parse_args. Import-time side effects: configures root logging
+# to stdout via basicConfig and sets the "ddp" logger to INFO. Needs torchvision, numpy, tqdm.
 """
 Runs CIFAR10 training with differential privacy.
 """
@@ -33,16 +38,25 @@ logger.setLevel(level=logging.INFO)
 
 
 def save_checkpoint(state, is_best, filename="checkpoint.tar"):
+    # [FUNCTION DOC] Saves the state object to the given file with torch.save. If is_best is
+    # true, also copies that file to model_best.pth.tar in the current directory.
+    # Side effects: writes files to disk. I/O errors propagate.
     torch.save(state, filename)
     if is_best:
         shutil.copyfile(filename, "model_best.pth.tar")
 
 
 def accuracy(preds, labels):
+    # [FUNCTION DOC] Returns the fraction of positions where the predicted class equals the
+    # label. Both inputs are numpy arrays of the same shape; the result is a numpy scalar.
     return (preds == labels).mean()
 
 
 def compute_norms(sample_grads):
+    # [FUNCTION DOC] Computes the per-example L2 norm over all parameters' gradients.
+    # sample_grads is a sequence of tensors whose first dimension is the batch. Each is
+    # flattened per example and normed, then the per-parameter norms are combined with an L2
+    # norm. Returns (norms tensor of shape batch, batch_size).
     batch_size = sample_grads[0].shape[0]
     norms = [
         sample_grad.view(batch_size, -1).norm(2, dim=-1) for sample_grad in sample_grads
@@ -54,6 +68,11 @@ def compute_norms(sample_grads):
 def clip_and_accumulate_and_add_noise(
     model, max_per_sample_grad_norm=1.0, noise_multiplier=1.0
 ):
+    # [FUNCTION DOC] DP-SGD gradient post-processing. Reads the grad_sample attribute of each
+    # model parameter, clips each example's gradient to max_per_sample_grad_norm, sums over
+    # the batch, adds Gaussian noise (stddev = max norm * noise_multiplier), divides by the
+    # batch size, and stores the result in the parameter's grad. Deletes grad_sample.
+    # Raises AttributeError if a parameter lacks grad_sample. Mutates the model in place.
     sample_grads = tuple(param.grad_sample for param in model.parameters())
 
     # step 0: compute the norms
@@ -83,6 +102,11 @@ def clip_and_accumulate_and_add_noise(
 
 
 def train(args, model, train_loader, optimizer, epoch, device):
+    # [FUNCTION DOC] Runs one epoch of DP training. For each batch, computes per-sample
+    # gradients with vmap over grad_and_value of a functional_call, stores them as
+    # grad_sample on the parameters, clips and noises them (args.max_per_sample_grad_norm,
+    # args.sigma), steps the optimizer and zeroes grads. Prints running loss/accuracy every
+    # args.print_freq batches. Returns the epoch wall time as a timedelta.
     start_time = datetime.now()
 
     criterion = nn.CrossEntropyLoss()
@@ -101,6 +125,9 @@ def train(args, model, train_loader, optimizer, epoch, device):
         # We use the `grad` operator to compute forward+backward on a single example,
         # and finally `vmap` to do forward+backward on multiple examples.
         def compute_loss_and_output(weights, image, target):
+            # [FUNCTION DOC] HELPER: Forward pass on a single example (adds a batch dim of
+            # one) through the closed-over model with the given weights mapping. Returns
+            # (loss, logits without batch dim); intended to be wrapped by grad_and_value.
             images = image.unsqueeze(0)
             targets = target.unsqueeze(0)
             output = functional_call(model, weights, images)
@@ -164,6 +191,9 @@ def train(args, model, train_loader, optimizer, epoch, device):
 
 
 def test(args, model, test_loader, device):
+    # [FUNCTION DOC] Evaluates the model on the test loader without gradients (model put in
+    # eval mode). Prints mean loss and mean batch accuracy; returns the mean accuracy.
+    # The args parameter is unused.
     model.eval()
     criterion = nn.CrossEntropyLoss()
     losses = []
@@ -190,6 +220,13 @@ def test(args, model, test_loader, device):
 
 
 def main():
+    # [FUNCTION DOC] Script entry point. Parses arguments, optionally builds a secure RNG
+    # generator (torchcsprng; raises ImportError if missing), builds CIFAR10 loaders
+    # (downloads data), a torchvision model with GroupNorm, and the chosen optimizer
+    # (SGD, RMSprop, Adam; raises NotImplementedError otherwise). Trains/tests each epoch with
+    # optional cosine LR schedule, saves checkpoints, and logs timing/accuracy metrics.
+    # KNOWN ISSUE: the train batch size is sample_rate * dataset size with no shuffling, and
+    # several parsed options (resume, evaluate, seed, delta, log-dir) are never used.
     args = parse_args()
 
     if args.debug >= 1:
@@ -311,6 +348,11 @@ def main():
 
 
 def parse_args():
+    # [FUNCTION DOC] Builds the command line parser for this script (workers, epochs,
+    # learning rate, optimizer, sigma, clipping norm, device, architecture, etc.) and
+    # returns the parsed namespace from sys.argv. Exits on invalid arguments.
+    # KNOWN ISSUE: help strings for sigma and max-per-sample-grad_norm state defaults that
+    # differ from the actual defaults (1.5 and 10.0).
     parser = argparse.ArgumentParser(description="PyTorch CIFAR10 DP Training")
     parser.add_argument(
         "-j",

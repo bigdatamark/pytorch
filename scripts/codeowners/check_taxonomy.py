@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Validates the grouped review-surface taxonomy embedded in the CODEOWNERS file:
+# parses the declared hierarchy and the grouped path rules, checks every git-tracked path is
+# covered, and reports uncovered, duplicate, stale, ineffective and order-inconsistent rules.
+# Run as a script; with --lintrunner it emits a JSON lint message instead of a report.
+# No import-time side effects.
 """Check that the proposed CODEOWNERS review surfaces cover every tracked path."""
 
 import argparse
@@ -18,6 +23,9 @@ GROUP_PREFIX = "# ["
 
 @dataclass(frozen=True)
 class TaxonomyPattern:
+    # [CLASS DOC] Immutable record of one taxonomy rule: the review-surface group name, the
+    # path (without leading slash; a trailing slash means a directory), and the 1-based line
+    # number in CODEOWNERS. Hashable so it can be placed in sets.
     """A grouped taxonomy rule at its actual CODEOWNERS source position."""
 
     group: str
@@ -27,6 +35,10 @@ class TaxonomyPattern:
 
 @dataclass
 class Report:
+    # [CLASS DOC] Result of the coverage analysis: tracked path count, number of patterns, set
+    # of groups that are the effective owner of some path, lists of uncovered paths, mappings
+    # of overridden and duplicated paths to their patterns, stale (never matching) and
+    # ineffective (always overridden) patterns, and source-order mismatch messages.
     tracked: int
     pattern_count: int
     groups: set[str]
@@ -39,6 +51,10 @@ class Report:
 
 
 def parse_declared_groups(codeowners: Path) -> list[str]:
+    # [FUNCTION DOC] Reads the CODEOWNERS file and returns the group names listed in the
+    # hierarchy block (comment lines of the form dash, label, colon, comma separated names)
+    # between the hierarchy and rules markers. Raises ValueError if a marker is missing, a
+    # group is declared twice, or no groups are found.
     """Parse the review surfaces declared by the hierarchy."""
     lines = codeowners.read_text().splitlines()
     try:
@@ -60,6 +76,9 @@ def parse_declared_groups(codeowners: Path) -> list[str]:
 
 
 def is_valid_owner(owner: str) -> bool:
+    # [FUNCTION DOC] HELPER: True if owner is a plausible user or org/team handle (at sign then
+    # one or two slash separated parts of letters, digits, dash, underscore, dot) or an email
+    # with exactly one at sign and non-empty local and domain parts.
     """Check the syntax of a GitHub user, team, or email CODEOWNER."""
     if owner.startswith("@"):
         parts = owner[1:].split("/")
@@ -75,6 +94,12 @@ def is_valid_owner(owner: str) -> bool:
 
 
 def parse_patterns(codeowners: Path) -> tuple[list[TaxonomyPattern], list[str]]:
+    # [FUNCTION DOC] Parses the grouped rules after the rules marker. Group headers are
+    # bracketed comment lines; rule lines are active (start with a slash, must have valid
+    # owners) or commented out (comment then slash). Returns (patterns in file order with
+    # leading slash removed, group names in order). Raises ValueError for a missing marker,
+    # repeated group, rule before any group, missing or invalid owners, wildcard or root
+    # paths, unrecognized lines, or no patterns at all.
     """Parse grouped rules while preserving their actual CODEOWNERS order."""
     lines = codeowners.read_text().splitlines()
     try:
@@ -126,6 +151,8 @@ def parse_patterns(codeowners: Path) -> tuple[list[TaxonomyPattern], list[str]]:
 
 
 def tracked_paths(repo: Path) -> list[str]:
+    # [FUNCTION DOC] Runs git ls-tree on HEAD in the given repo and returns the sorted list of
+    # all committed file paths. Raises CalledProcessError if git fails.
     """List paths committed in HEAD, including submodule entries."""
     output = subprocess.run(
         ["git", "-C", repo, "ls-tree", "-r", "-z", "--name-only", "HEAD"],
@@ -136,6 +163,12 @@ def tracked_paths(repo: Path) -> list[str]:
 
 
 def analyze(paths: list[str], patterns: list[TaxonomyPattern]) -> Report:
+    # [FUNCTION DOC] For each path, finds matching patterns (the exact path or any ancestor
+    # directory with trailing slash). No match means uncovered. The effective pattern is the
+    # longest match; it is compared to the match defined latest in the file, and a difference
+    # is a source-order mismatch (later rule would override a more specific one). Also
+    # collects duplicate patterns, stale patterns that match nothing, and ineffective ones
+    # that match but are never the effective one. Returns a Report; pure computation.
     """Measure coverage and verify that source order preserves specificity."""
     patterns_by_path: dict[str, list[TaxonomyPattern]] = defaultdict(list)
     for pattern in patterns:
@@ -193,6 +226,9 @@ def analyze(paths: list[str], patterns: list[TaxonomyPattern]) -> Report:
 
 
 def print_report(report: Report) -> None:
+    # [FUNCTION DOC] Prints counts and a coverage percentage to stdout, followed by a section
+    # listing entries for each non-empty failure category (uncovered, duplicate, stale,
+    # ineffective, source-order mismatches).
     """Print the coverage summary and each integrity failure."""
     covered = report.tracked - len(report.uncovered)
     percentage = 100 * covered / report.tracked if report.tracked else 100.0
@@ -235,6 +271,8 @@ def print_report(report: Report) -> None:
 
 
 def emit_lint_error(description: str) -> None:
+    # [FUNCTION DOC] Prints one JSON object to stdout (flushed) describing an error-severity
+    # lint message for the CODEOWNERS file with the given description.
     """Emit a lintrunner-compatible taxonomy error."""
     print(
         json.dumps(
@@ -255,6 +293,11 @@ def emit_lint_error(description: str) -> None:
 
 
 def main() -> int:
+    # [FUNCTION DOC] Entry point. Finds the git repo root, parses CODEOWNERS and analyzes
+    # coverage. On parse errors returns 2 after printing to stderr (or, with --lintrunner,
+    # emits a lint message and returns 0). Otherwise prints the report (not in lintrunner mode)
+    # plus missing or undeclared group notes. In lintrunner mode emits one summary lint error
+    # if any problem exists and returns 0; otherwise returns 1 if there were problems, else 0.
     """Run the taxonomy coverage check for the current Git repository."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--lintrunner", action="store_true")

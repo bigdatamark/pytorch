@@ -14,6 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC] Example script: MAML few-shot Omniglot classification implemented with the
+# third-party higher library (baseline for the functorch versions). Contains main, train,
+# test, plot and a Flatten module. Import-time side effects: selects the Agg matplotlib
+# backend and the bmh plot style. Requires higher, pandas, matplotlib and the support loader.
 """
 This example shows how to use higher to do Model Agnostic Meta Learning (MAML)
 for few-shot Omniglot classification.
@@ -48,6 +52,10 @@ plt.style.use("bmh")
 
 
 def main():
+    # [FUNCTION DOC] Script entry point. Parses n-way, k-shot support/query sizes, device,
+    # meta batch size and seed; seeds torch (and CUDA if available) and numpy; builds the
+    # OmniglotNShot loader (data under /tmp/omniglot-data) and a small conv net; then runs
+    # 100 epochs of train, test and plot with an Adam meta-optimizer.
     argparser = argparse.ArgumentParser()
     argparser.add_argument("--n-way", "--n_way", type=int, help="n way", default=5)
     argparser.add_argument(
@@ -118,6 +126,11 @@ def main():
 
 
 def train(db, net, device, meta_opt, epoch, log):
+    # [FUNCTION DOC] One meta-training epoch. For each batch of tasks, adapts a functional copy
+    # of net with 5 inner SGD steps on the support set (higher.innerloop_ctx), computes the
+    # query loss and accuracy, and backpropagates through the unrolled steps; then steps
+    # meta_opt. Prints progress every 4 batches and appends a train record (epoch, loss, acc,
+    # mode, time) to the log list. The device argument is unused.
     net.train()
     n_train_iter = db.x_train.shape[0] // db.batchsz
 
@@ -193,6 +206,11 @@ def train(db, net, device, meta_opt, epoch, log):
 
 
 def test(db, net, device, epoch, log):
+    # [FUNCTION DOC] Evaluates on test tasks: for each task, adapts a functional copy of net
+    # with 5 inner SGD steps on the support set (no higher-order grads tracked), then measures
+    # query loss and accuracy without fine-tuning the real net. Prints the mean loss and
+    # accuracy percent and appends a test record to the log list. The device argument is
+    # unused. KNOWN ISSUE: net is left in train mode (batch norm uses batch statistics).
     # Crucially in our testing procedure here, we do *not* fine-tune
     # the model during testing for simplicity.
     # Most research papers using MAML for this task do an extra
@@ -248,6 +266,9 @@ def test(db, net, device, epoch, log):
 
 
 def plot(log):
+    # [FUNCTION DOC] Plots train and test accuracy against epoch from the log list of records
+    # and saves the figure to maml-accs.png in the current directory (overwritten each call).
+    # Prints a status line; closes the figure.
     # Generally you should pull your plotting code out of your training
     # script but we are doing it here for brevity.
     df = pd.DataFrame(log)
@@ -271,7 +292,10 @@ def plot(log):
 # Won't need this after this PR is merged in:
 # https://github.com/pytorch/pytorch/pull/22245
 class Flatten(nn.Module):
+    # [CLASS DOC] HELPER: Stateless module that flattens all non-batch dimensions of its input.
     def forward(self, input):
+        # [FUNCTION DOC] Returns the input viewed as a 2-D tensor (batch, features). Requires a
+        # compatible memory layout.
         return input.view(input.size(0), -1)
 
 

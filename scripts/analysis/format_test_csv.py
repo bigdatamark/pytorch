@@ -1,3 +1,9 @@
+# [MODULE DOC] Command line script (runs at import) that converts a pytest CSV report into a
+# minimal CSV on stdout: a first row with the current git commit hash and the optional log
+# URL, then one row (test name, first line of message) per failed or errored test. Arguments:
+# optional --log-url and a positional input file. Runs git rev-parse HEAD via subprocess.
+# KNOWN ISSUE: the two message replace calls discard their results, so the message is never
+# cleaned.
 """
 This script takes a pytest CSV file produced by pytest --csv foo.csv
 and summarizes it into a more minimal CSV that is good for uploading

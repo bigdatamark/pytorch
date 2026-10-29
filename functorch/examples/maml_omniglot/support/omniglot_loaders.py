@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [MODULE DOC] Omniglot dataset support for the MAML examples: Omniglot (a map-style Dataset
+# that downloads and indexes the image files), find_classes and index_classes helpers, and
+# OmniglotNShot, which builds cached N-way K-shot support/query batches as tensors.
+# No import-time side effects beyond imports; download and file writes happen when the
+# classes are instantiated.
 # These Omniglot loaders are from Jackie Loong's PyTorch MAML implementation:
 #     https://github.com/dragen1860/MAML-Pytorch
 #     https://github.com/dragen1860/MAML-Pytorch/blob/master/omniglot.py
@@ -30,6 +35,12 @@ import torch.utils.data as data
 
 
 class Omniglot(data.Dataset):
+    # [CLASS DOC] Map-style dataset over the Omniglot character images stored under
+    # root/processed. State: root, transform, target_transform, all_items (list of
+    # (filename, class path, directory) tuples) and idx_classes (mapping from class path to
+    # integer label). Items are (transformed image path, integer label). Class attributes give
+    # the download URLs and folder names. Raises RuntimeError at construction if the data is
+    # missing and download is false.
     urls = [
         "https://github.com/brendenlake/omniglot/raw/master/python/images_background.zip",
         "https://github.com/brendenlake/omniglot/raw/master/python/images_evaluation.zip",
@@ -49,6 +60,10 @@ class Omniglot(data.Dataset):
     """
 
     def __init__(self, root, transform=None, target_transform=None, download=False):
+        # [FUNCTION DOC] Stores the root and transforms, downloads the dataset if it is absent
+        # and download is true (raises RuntimeError if absent and download is false), then scans
+        # the processed folder to build all_items and the class-to-label mapping idx_classes.
+        # Side effects: file system and network I/O, prints counts.
         self.root = root
         self.transform = transform
         self.target_transform = target_transform
@@ -65,6 +80,10 @@ class Omniglot(data.Dataset):
         self.idx_classes = index_classes(self.all_items)
 
     def __getitem__(self, index):
+        # [FUNCTION DOC] Returns (image, target) for the item at index. The image starts as the
+        # full file path string of the item and is passed through transform if set (the
+        # transform is what opens the file); the target is the integer class label, passed
+        # through target_transform if set.
         filename = self.all_items[index][0]
         img = str.join("/", [self.all_items[index][2], filename])
 
@@ -77,9 +96,12 @@ class Omniglot(data.Dataset):
         return img, target
 
     def __len__(self):
+        # [FUNCTION DOC] Number of image items found in the processed folder.
         return len(self.all_items)
 
     def _check_exists(self):
+        # [FUNCTION DOC] HELPER: True if both the images_evaluation and images_background
+        # folders exist under the processed folder of root.
         return os.path.exists(
             os.path.join(self.root, self.processed_folder, "images_evaluation")
         ) and os.path.exists(
@@ -87,6 +109,12 @@ class Omniglot(data.Dataset):
         )
 
     def download(self):
+        # [FUNCTION DOC] Downloads the two Omniglot zip archives to root/raw and extracts them
+        # into root/processed. Does nothing if the data already exists. Creates the folders
+        # (an already-existing folder is tolerated; other OS errors propagate). Prints
+        # progress; network and file errors propagate.
+        # KNOWN ISSUE: imports urllib but uses urllib.request without importing it, which can
+        # fail with AttributeError unless another module imported urllib.request earlier.
         import urllib
         import zipfile
 
@@ -119,6 +147,10 @@ class Omniglot(data.Dataset):
 
 
 def find_classes(root_dir):
+    # [FUNCTION DOC] HELPER: Walks root_dir recursively and returns a list of
+    # (file name, class path made of the last two directory names, containing directory)
+    # tuples for every file whose name ends with png. Prints the item count.
+    # Assumes forward-slash separated paths.
     retour = []
     for root, dirs, files in os.walk(root_dir):
         for f in files:
@@ -131,6 +163,9 @@ def find_classes(root_dir):
 
 
 def index_classes(items):
+    # [FUNCTION DOC] HELPER: Assigns consecutive integer labels (in first-seen order) to the
+    # distinct class paths found in the second field of each item; returns that mapping.
+    # Prints the class count.
     idx = {}
     for i in items:
         if i[1] not in idx:
@@ -140,7 +175,17 @@ def index_classes(items):
 
 
 class OmniglotNShot:
+    # [CLASS DOC] Episodic N-way K-shot sampler over Omniglot. State: x (all character images),
+    # x_train (first 1200 classes) and x_test (the rest), batchsz (tasks per batch), n_way,
+    # k_shot, k_query, resize, device, indexes (read position per split), datasets and
+    # datasets_cache (ten pre-sampled batches per split, regenerated when exhausted).
+    # Invariant: k_shot + k_query <= 20 images per class. Key methods: load_data_cache, next.
     def __init__(self, root, batchsz, n_way, k_shot, k_query, imgsz, device=None):
+        # [FUNCTION DOC] Loads the cached omniglot.npy array from root, or builds it by
+        # downloading the dataset, resizing images to imgsz and saving it (file and network
+        # I/O). Splits classes into train (first 1200) and test, records the sampling
+        # parameters, and pre-fills the batch caches for both splits. Raises AssertionError if
+        # k_shot plus k_query exceeds 20. Prints status lines.
         """
         Different from mnistNShot, the
         :param root:
@@ -230,6 +275,9 @@ class OmniglotNShot:
         }
 
     def normalization(self):
+        # [FUNCTION DOC] Standardizes x_train and x_test using the training mean and standard
+        # deviation, then recomputes and stores mean, std, max and min of the normalized
+        # training data. Mutates the instance. Not called anywhere in this file.
         """
         Normalizes our data, to have a mean of 0 and sdt of 1
         """
@@ -249,6 +297,12 @@ class OmniglotNShot:
     # print("after norm:", "mean", self.mean, "max", self.max, "min", self.min, "std", self.std)
 
     def load_data_cache(self, data_pack):
+        # [FUNCTION DOC] Samples 10 batches of episodes from data_pack (classes by 20 images).
+        # Each batch has batchsz tasks; each task picks n_way distinct classes and
+        # k_shot + k_query distinct images per class, split into support and query sets, with
+        # labels 0..n_way-1, shuffled within the set. Returns a list of 10 items, each a list
+        # [support images, support labels, query images, query labels] of tensors moved to the
+        # device. Uses the numpy global random state.
         """
         Collects several batches data for N-shot learning
         :param data_pack: [cls_num, 20, 84, 84, 1]
@@ -320,6 +374,9 @@ class OmniglotNShot:
         return data_cache
 
     def next(self, mode="train"):
+        # [FUNCTION DOC] Returns the next cached batch for the split named mode and advances its
+        # read index; when the cache is exhausted, resets the index and resamples the cache
+        # first. Raises KeyError for a mode other than train or test (val has no data).
         """
         Gets next batch from the dataset with name.
         :param mode: The name of the splitting (one of "train", "val", "test")

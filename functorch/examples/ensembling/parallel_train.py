@@ -1,3 +1,8 @@
+# [MODULE DOC] Example script: shows that eager-mode vmap can train an ensemble of models in
+# parallel (adapted from a JAX tutorial). Trains a two-layer MLP on a synthetic two-spiral
+# dataset, first a single model then two models via vmap over a functional SGD step.
+# Import-time side effects: parses command line arguments (--device), builds the dataset,
+# the global model and loss, and runs the whole training demo (step4, step6) printing losses.
 import argparse
 import math
 
@@ -36,6 +41,10 @@ DEVICE = args.device
 
 
 def make_spirals(n_samples, noise_std=0.0, rotations=1.0):
+    # [FUNCTION DOC] Generates a two-class spiral dataset on the global DEVICE. Each sample
+    # gets a random sign (class) and a radius/angle along the spiral, plus Gaussian noise
+    # scaled by noise_std. Returns (points of shape n_samples by 2, long labels of n_samples).
+    # Uses the global random number generator.
     ts = torch.linspace(0, 1, n_samples, device=DEVICE)
     rs = ts**0.5
     thetas = rs * rotations * 2 * math.pi
@@ -59,7 +68,12 @@ points, labels = make_spirals(100, noise_std=0.05)
 
 # Step 2: Define two-layer MLP and loss function
 class MLPClassifier(nn.Module):
+    # [CLASS DOC] Two-layer MLP classifier for 2-D inputs: a linear layer to hidden_dim, ReLU,
+    # a linear layer to n_classes, and log-softmax output (suitable for NLL loss).
+    # State: hidden_dim, n_classes, and submodules fc1, fc2.
     def __init__(self, hidden_dim=32, n_classes=2):
+        # [FUNCTION DOC] Stores the sizes and creates the fc1 (2 to hidden_dim) and fc2
+        # (hidden_dim to n_classes) linear layers.
         super().__init__()
         self.hidden_dim = hidden_dim
         self.n_classes = n_classes
@@ -68,6 +82,8 @@ class MLPClassifier(nn.Module):
         self.fc2 = nn.Linear(self.hidden_dim, self.n_classes)
 
     def forward(self, x):
+        # [FUNCTION DOC] Maps a batch of 2-D points to per-class log probabilities
+        # (last dimension is the class dimension).
         x = self.fc1(x)
         x = F.relu(x)
         x = self.fc2(x)
@@ -80,7 +96,13 @@ model = MLPClassifier().to(DEVICE)
 
 
 def train_step_fn(weights, batch, targets, lr=0.2):
+    # [FUNCTION DOC] One functional SGD step. Computes loss and gradients of the global model
+    # (run via functional_call with the given weights mapping) on the batch, and returns
+    # (loss, new weights mapping with each weight reduced by lr times its gradient). Does not
+    # mutate the inputs; vmap-compatible so it can train many models at once.
     def compute_loss(weights, batch, targets):
+        # [FUNCTION DOC] HELPER: Runs the global model with the given weights on the batch
+        # and returns the global loss_fn value against targets.
         output = functional_call(model, weights, batch)
         loss = loss_fn(output, targets)
         return loss
@@ -100,6 +122,9 @@ def train_step_fn(weights, batch, targets, lr=0.2):
 # Step 4: Let's verify this actually trains.
 # We should see the loss decrease.
 def step4():
+    # [FUNCTION DOC] HELPER: Trains the single global model for 2000 steps on the global
+    # points and labels, printing the loss every 100 steps. Sets the module-global weights
+    # to the latest weights mapping. The model's own parameters are not updated.
     global weights
     for i in range(2000):
         loss, weights = train_step_fn(dict(model.named_parameters()), points, labels)
@@ -114,6 +139,8 @@ step4()
 
 
 def init_fn(num_models):
+    # [FUNCTION DOC] Creates num_models freshly initialized MLPClassifier instances on DEVICE
+    # and returns their parameters stacked along a new leading dimension as a mapping.
     models = [MLPClassifier().to(DEVICE) for _ in range(num_models)]
     params, _ = stack_module_state(models)
     return params
@@ -125,6 +152,8 @@ def init_fn(num_models):
 
 
 def step6():
+    # [FUNCTION DOC] HELPER: Trains two models at once for 2000 steps by mapping the train step
+    # over the stacked weights (shared data), printing the per-model losses every 200 steps.
     parallel_train_step_fn = vmap(train_step_fn, in_dims=(0, None, None))
     batched_weights = init_fn(num_models=2)
     for i in range(2000):

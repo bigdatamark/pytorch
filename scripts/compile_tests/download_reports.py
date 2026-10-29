@@ -1,3 +1,7 @@
+# [MODULE DOC] Downloads Dynamo/eager CI test report archives for a commit from GitHub Actions
+# artifacts: uses the gh CLI to find the pull workflow run and its jobs, the HUD artifact
+# listing to get zip URLs, and wget and unzip to fetch and extract them. CONFIGS maps config
+# names to the CI job names whose reports are needed. No import-time side effects.
 import json
 import os
 import pprint
@@ -29,9 +33,17 @@ CONFIGS = {
 
 
 def download_reports(commit_sha, configs=("dynamo39", "dynamo313", "eager313")):
+    # [FUNCTION DOC] Ensures test reports for the given configs exist locally under a
+    # directory named tmp_test_reports plus the commit, one subdirectory per config. If all
+    # exist, returns without downloading. Otherwise looks up the workflow run via gh, checks
+    # all required jobs are present (assertion error if not), lists artifacts from the HUD
+    # API, and downloads and unzips each missing job's report. Returns the list of
+    # per-config directory paths. Side effects: network, subprocesses, directory creation;
+    # unknown config names fail an assertion.
     log_dir = "tmp_test_reports_" + commit_sha
 
     def subdir_path(config):
+        # [FUNCTION DOC] HELPER: Path of the local directory for the given config's reports.
         return f"{log_dir}/{config}"
 
     for config in configs:
@@ -74,6 +86,10 @@ def download_reports(commit_sha, configs=("dynamo39", "dynamo313", "eager313")):
     ).json()
 
     def download_report(job_name, subdir):
+        # [FUNCTION DOC] HELPER: Finds the artifact whose name starts with test-reports- and
+        # ends with the job's id plus .zip, downloads it into subdir with wget, and unzips it
+        # into a directory named like the zip without extension. Raises AssertionError if no
+        # artifact matches; subprocess failures raise.
         job_id = workflow_jobs[job_name]
         for listing in listings:
             name = listing["name"]
@@ -106,6 +122,9 @@ def download_reports(commit_sha, configs=("dynamo39", "dynamo313", "eager313")):
 
 
 def parse_workflow_jobs(output):
+    # [FUNCTION DOC] Parses the bytes output of the gh run view command, returning a mapping of
+    # job name to job id string for each line of the form name in duration (ID number).
+    # Other lines are ignored.
     result = {}
     lines = output.decode().split("\n")
     for line in lines:

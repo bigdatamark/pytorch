@@ -1,3 +1,7 @@
+# [MODULE DOC] Example script: fits a small MLP to Lennard-Jones energies and forces, where
+# the predicted forces come from the network's Jacobian computed with vmap and jacrev.
+# Import-time side effects: builds the training data and model and runs a 400-epoch Adam
+# training loop, printing the loss every 20 epochs.
 # This example was adapted from https://github.com/muhrin/milad
 # It is licensed under the GLPv3 license. You can find a copy of it
 # here: https://www.gnu.org/licenses/gpl-3.0.en.html .
@@ -13,10 +17,14 @@ epsilon = 4.0
 
 
 def lennard_jones(r):
+    # [FUNCTION DOC] Lennard-Jones potential energy at distance r, using the global sigma and
+    # epsilon. Works elementwise on tensors.
     return epsilon * ((sigma / r) ** 12 - (sigma / r) ** 6)
 
 
 def lennard_jones_force(r):
+    # [FUNCTION DOC] Magnitude of the Lennard-Jones force at distance r (the negative
+    # analytic derivative of the potential), using global sigma and epsilon. Elementwise.
     """Get magnitude of LJ force"""
     return -epsilon * ((-12 * sigma**12 / r**13) + (6 * sigma**6 / r**7))
 
@@ -48,6 +56,10 @@ model = nn.Sequential(
 
 
 def make_prediction(model, drs):
+    # [FUNCTION DOC] Predicts energies and force vectors for displacement vectors drs (N by 3).
+    # Energy is the model output on the vector norms; the force is the negative derivative of
+    # the model w.r.t. its input (jacrev under vmap) times the unit direction.
+    # Returns (energies of shape N by 1, forces of shape N by 3).
     norms = torch.norm(drs, dim=1).reshape(-1, 1)
     energies = model(norms)
 
@@ -57,6 +69,8 @@ def make_prediction(model, drs):
 
 
 def loss_fn(energies, forces, predicted_energies, predicted_forces):
+    # [FUNCTION DOC] Combined loss: mean squared error on energies plus 0.01 times the mean
+    # squared error on forces divided by 3. Returns a scalar tensor.
     return (
         mse_loss(energies, predicted_energies)
         + 0.01 * mse_loss(forces, predicted_forces) / 3
