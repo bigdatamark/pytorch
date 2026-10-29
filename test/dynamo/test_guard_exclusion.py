@@ -1,4 +1,9 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for the automatic dynamic exclusion guard feature of Dynamo.
+# When a dimension or integer input becomes dynamic after a recompile, the new graph
+# gets an exclusion guard that rejects the previously seen static values, so inputs
+# fall back to the older, more specialized graph. Contains a graph-tracking backend
+# and one TestCase. No import-time side effects other than imports.
 import torch
 import torch._dynamo
 import torch._dynamo.testing
@@ -6,17 +11,26 @@ from torch._dynamo.test_case import run_tests, TestCase
 
 
 class GraphTracker:
+    # [CLASS DOC] Compiler backend callable that wraps each compiled graph and records which
+    # graph (numbered by compilation order) ran on each call.
+    # State: graphs holds every GraphModule received; call_log holds the graph id per call.
     """Backend that tracks which compiled graph (by compilation order) handles each call."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Initializes empty lists for graphs and call_log.
         self.graphs = []
         self.call_log = []
 
     def __call__(self, gm, example_inputs):
+        # [FUNCTION DOC] Backend entry point. Assigns the next graph id, stores the GraphModule,
+        # and returns a wrapper that appends the id to call_log and then runs the graph forward
+        # with the same arguments. The example inputs are ignored.
         graph_id = len(self.graphs)
         self.graphs.append(gm)
 
         def wrapper(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Records the captured graph id in call_log, then returns the
+            # result of running the graph forward on the given positional and keyword arguments.
             self.call_log.append(graph_id)
             return gm.forward(*args, **kwargs)
 
@@ -24,20 +38,30 @@ class GraphTracker:
 
     @property
     def frame_count(self):
+        # [FUNCTION DOC] Property returning the number of graphs compiled so far (the length of
+        # the graphs list).
         return len(self.graphs)
 
     def reset(self):
+        # [FUNCTION DOC] Clears both graphs and call_log in place.
         self.graphs.clear()
         self.call_log.clear()
 
 
 @torch._dynamo.config.patch(automatic_dynamic_exclusion_guard=True)
 class TestGuardExclusion(TestCase):
+    # [CLASS DOC] Tests that exclusion guards generated under automatic dynamic shapes
+    # route inputs to the most specialized compiled graph. The class decorator enables
+    # the automatic_dynamic_exclusion_guard config for every test. Each test compiles with
+    # a GraphTracker backend and checks frame_count and the last call_log entry.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Runs the base setUp and resets Dynamo state so each test starts
+        # with an empty cache.
         super().setUp()
         torch._dynamo.reset()
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Runs the base tearDown and resets Dynamo state.
         super().tearDown()
         torch._dynamo.reset()
 
@@ -45,6 +69,9 @@ class TestGuardExclusion(TestCase):
         automatic_dynamic_shapes=True, assume_static_by_default=True
     )
     def test_automatic_dynamic_exclusive_guard_basic(self):
+        # [FUNCTION DOC] Static graph for shape 3x4, then dim 0 becomes dynamic at 5x4; checks
+        # size 7 reuses the dynamic graph without recompiling and that size 3 goes back to the
+        # static graph. Also checks all three outputs equal the eager doubling of the inputs.
         """
         1. [3, 4] -> Graph 0 (static)
         2. [5, 4] -> Graph 1 (dim 0 dynamic), exclusion rejects dim0==3
@@ -53,6 +80,7 @@ class TestGuardExclusion(TestCase):
         """
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Function under test; returns the input doubled.
             return x * 2
 
         tracker = GraphTracker()
@@ -87,6 +115,9 @@ class TestGuardExclusion(TestCase):
         automatic_dynamic_shapes=True, assume_static_by_default=True
     )
     def test_accumulated_exclusion_does_not_shadow_intermediate_graph(self):
+        # [FUNCTION DOC] Shapes 3x4, 5x4, 3x19 produce three graphs. Verifies that the exclusion
+        # of the last graph rejects only dim 1 equal to 4 (independently of dim 0), so 5x4
+        # routes to graph 1 and 3x4 still routes to graph 0.
         """
         Tensor accumulation: dims become dynamic one at a time.
         1. func(3, 4)  -> Graph 0: static (3, 4)
@@ -97,6 +128,7 @@ class TestGuardExclusion(TestCase):
         """
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Function under test; returns the input doubled.
             return x * 2
 
         tracker = GraphTracker()
@@ -143,6 +175,10 @@ class TestGuardExclusion(TestCase):
         automatic_dynamic_shapes=True, assume_static_by_default=True
     )
     def test_4d_progressive_dynamism_cascading(self):
+        # [FUNCTION DOC] Four dimensional tensor whose dims become dynamic one per recompile
+        # (dims 0, 1, 2), giving four graphs. Checks each probe shape routes to the most
+        # specialized graph, that a fully new shape lands on graph 3, and that no extra
+        # recompiles occur.
         """
         4D tensor where dims become dynamic one at a time across recompilations.
         Each new graph is more general, and exclusion guards ensure inputs cascade
@@ -155,6 +191,7 @@ class TestGuardExclusion(TestCase):
         """
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Function under test; returns the sum of all input elements.
             return x.sum()
 
         tracker = GraphTracker()
@@ -209,6 +246,10 @@ class TestGuardExclusion(TestCase):
         automatic_dynamic_shapes=True, assume_static_by_default=True
     )
     def test_5d_two_rounds_of_dynamism(self):
+        # [FUNCTION DOC] Five dimensional tensor with two dynamism rounds (dim 0, then dim 2),
+        # giving three graphs. Checks routing for original, dim 0 changed, and both changed
+        # shapes, and that dim 0 equal to its old static value with dim 2 changed still goes to
+        # graph 2 because that graph holds no exclusion on dim 0. No extra recompiles.
         """
         5D tensor with two rounds of automatic_dynamic. Verify inputs route
         to the most specialized graph after each round.
@@ -219,6 +260,7 @@ class TestGuardExclusion(TestCase):
         """
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Function under test; returns the input doubled.
             return x * 2
 
         tracker = GraphTracker()
@@ -264,6 +306,9 @@ class TestGuardExclusion(TestCase):
         automatic_dynamic_shapes=True, assume_static_by_default=True
     )
     def test_many_entries_wrong_graph_selection(self):
+        # [FUNCTION DOC] Builds four graphs by making dims 0, 1, 2 of a four dimensional tensor
+        # dynamic in turn, then runs a table of shapes and checks each hits the expected graph,
+        # so the most general graph does not shadow earlier ones. No extra recompiles.
         """
         Convoluted scenario: 4D tensor, three rounds of dynamism creating 4 graphs.
         Without exclusion guards, the most general graph would shadow all others.
@@ -280,6 +325,7 @@ class TestGuardExclusion(TestCase):
         """
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Function under test; returns relu of the input.
             return x.relu()
 
         tracker = GraphTracker()
@@ -314,6 +360,10 @@ class TestGuardExclusion(TestCase):
         automatic_dynamic_shapes=True, assume_static_by_default=True
     )
     def test_multi_dim_dynamic_and_semantics(self):
+        # [FUNCTION DOC] When dims 0, 2 and 3 turn dynamic together, the exclusion rejects only
+        # inputs matching all excluded values at once. Checks the exact original shape goes to
+        # graph 0, while partially matching shapes and a new shape stay on graph 1 with no
+        # recompile.
         """
         When multiple dims become dynamic at once, AND semantics is critical.
         Graph 0: (4, 3, 234, 5) static
@@ -325,6 +375,7 @@ class TestGuardExclusion(TestCase):
         """
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Function under test; returns the input doubled.
             return x * 2
 
         tracker = GraphTracker()
@@ -361,6 +412,8 @@ class TestGuardExclusion(TestCase):
         automatic_dynamic_shapes=True, assume_static_by_default=True
     )
     def test_integer_input_exclusion_basic(self):
+        # [FUNCTION DOC] An integer argument that turns dynamic gets an exclusion on its old
+        # value: 3 uses graph 0, 5 compiles graph 1, and 3 again returns to graph 0.
         """
         Integer inputs that become dynamic should also get exclusion guards.
         1. foo(x, 3) -> Graph 0: static n=3
@@ -369,6 +422,7 @@ class TestGuardExclusion(TestCase):
         """
 
         def foo(x, n):
+            # [FUNCTION DOC] HELPER: Function under test; multiplies the tensor by the integer.
             return x * n
 
         tracker = GraphTracker()
@@ -395,6 +449,9 @@ class TestGuardExclusion(TestCase):
         automatic_dynamic_shapes=True, assume_static_by_default=True
     )
     def test_integer_input_exclusion_accumulation(self):
+        # [FUNCTION DOC] Integer analogue of the accumulation test: two integer arguments turn
+        # dynamic one after the other (three graphs). Checks 5,4 goes to graph 1, and 3,4 goes
+        # to graph 0, so the second exclusion is independent of the first.
         """
         Same accumulation scenario as the tensor test but with integer inputs.
         1. foo(x, 3, 4)  -> Graph 0: static (3, 4)
@@ -405,6 +462,7 @@ class TestGuardExclusion(TestCase):
         """
 
         def foo(x, n, m):
+            # [FUNCTION DOC] HELPER: Function under test; returns tensor times n plus m.
             return x * n + m
 
         tracker = GraphTracker()
@@ -442,6 +500,9 @@ class TestGuardExclusion(TestCase):
         automatic_dynamic_shapes=True, assume_static_by_default=True
     )
     def test_two_tensor_inputs_exclusion(self):
+        # [FUNCTION DOC] Two tensor inputs with dim 1 dynamic in both. The exclusion combines all
+        # excluded values and rejects only when all match. Checks partial matches stay on graph
+        # 1 without recompiling, and both matching goes to graph 0.
         """
         Multi-tensor exclusion: all pairs are flattened and guarded with
         not-all semantics. The guard rejects only when ALL excluded values
@@ -457,6 +518,7 @@ class TestGuardExclusion(TestCase):
         """
 
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: Function under test; returns the sum of both tensors.
             return x.sum() + y.sum()
 
         tracker = GraphTracker()
@@ -492,6 +554,10 @@ class TestGuardExclusion(TestCase):
         automatic_dynamic_shapes=True, assume_static_by_default=True
     )
     def test_multi_tensor_and_scalar_accumulation(self):
+        # [FUNCTION DOC] Two 3-dim tensors and three integers made dynamic stepwise (5 graphs).
+        # Verifies each step only keeps the exclusion for the newest transition, and that
+        # probing with older values falls down the chain of graphs 4 to 0, while all-new values
+        # use graph 4. No recompiles during verification.
         """
         3-dim tensors + 3 scalar inputs with cascading accumulation.
         Each step transitions one input while the rest stay the same,
@@ -505,6 +571,7 @@ class TestGuardExclusion(TestCase):
         """
 
         def foo(x, y, n, m, k):
+            # [FUNCTION DOC] HELPER: Function under test; combines tensor sums with the integers.
             return x.sum() * n + y.sum() * m + k
 
         tracker = GraphTracker()

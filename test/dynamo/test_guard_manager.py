@@ -1,4 +1,11 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for the Dynamo guard manager layer: leaf guards and the C++ guard manager
+# tree (root, getattr, getitem, dict, framelocals, type, lambda and tuple iterator accessors) from
+# torch._C._dynamo.guards, plus guard-manager tree properties observed through a testing hook
+# (type propagation, tag safety, recursive dict tags, duplicate guard removal), Source clone, and
+# the per-guard check specs in GUARD_VALUE_DISPATCH. Import-time side effects: defines
+# module-level aliases to the C++ guard classes, a module-level tensor x and a weak reference to
+# it, and a module-level Pair instance global_pair.
 import abc
 import functools
 import gc
@@ -41,7 +48,10 @@ default_mgr_enum = torch._dynamo.guards.GuardManagerType.GUARD_MANAGER
 
 
 class Pair:
+    # [CLASS DOC] HELPER: Simple holder with two public attributes, x and y. Used as a
+    # module-level global object (global_pair) that the globals test guards on.
     def __init__(self, x, y):
+        # [FUNCTION DOC] HELPER: Stores the two arguments as attributes x and y.
         self.x = x
         self.y = y
 
@@ -50,40 +60,61 @@ global_pair = Pair(torch.randn(4), 1)
 
 
 def id_type(x):
+    # [FUNCTION DOC] HELPER: Returns the integer id of the type of the given object, as expected
+    # by type match guards.
     return id(type(x))
 
 
 def equals_match(x, expected):
+    # [FUNCTION DOC] HELPER: Returns whether the value equals expected. Meant to be bound to
+    # expected with a partial and used as a lambda guard body.
     return x == expected
 
 
 def equals_match_verbose_code_parts(expected):
+    # [FUNCTION DOC] HELPER: Returns a one-element list holding a human readable description of
+    # the equality check, used as verbose code parts for lambda guards.
     return [f"x == {expected}"]
 
 
 def ge_match(x, expected):
+    # [FUNCTION DOC] HELPER: Returns whether the value is greater than or equal to expected.
     return x >= expected
 
 
 def ge_match_verbose_code_parts(expected):
+    # [FUNCTION DOC] HELPER: Returns a description string for the greater-or-equal check.
+    # KNOWN ISSUE: returns a plain string while the sibling helpers return a list of strings.
     return f"expected >= {expected}"
 
 
 def less_match(x, expected):
+    # [FUNCTION DOC] HELPER: Returns whether the value is strictly less than expected.
     return x < expected
 
 
 def less_match_verbose_code_parts(expected):
+    # [FUNCTION DOC] HELPER: Returns a one-element list with a description of the less-than check,
+    # used as verbose code parts.
     return [f"expected < {expected}"]
 
 
 class GuardManagerTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Unit tests that build leaf guards and guard managers directly through the C++
+    # bindings (no compilation) and check pass/fail behavior, plus a few end to end tests that use
+    # a guard manager testing hook during torch.compile.
     def test_cpp_shape_guard_missing_windows_compiler_falls_back(self):
+        # [FUNCTION DOC] On a mocked Windows platform with a missing C++ compiler named in the CXX
+        # environment variable, compiles a function with a dynamic input under the C++ symbolic
+        # shape guard config and the eager backend. Verifies compilation falls back and the result
+        # equals eager execution. Clears several compiler caches first; patches module state and
+        # environment during the compile only.
         from torch._inductor.codecache import CppCodeCache
         from torch._inductor.cpp_builder import check_compiler_exist_windows
         from torch._inductor.cpu_vec_isa import valid_vec_isa_list
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function being compiled; returns the sine of its input.
             return x.sin()
 
         CppCodeCache.cache_clear()
@@ -102,6 +133,11 @@ class GuardManagerTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(actual, fn(x))
 
     def test_guard_debug_info_user_stack(self):
+        # [FUNCTION DOC] Builds a GuardDebugInfo carrying a user stack summary of two frames and
+        # checks result, verbose parts, executed guard count and the stack entries (file name,
+        # line number, function name). Also builds one without a stack.
+        # KNOWN ISSUE: the final assertion is a tautology (None or not None), so the missing stack
+        # case is never really verified.
         """Test that GuardDebugInfo can store user stack trace information."""
         import traceback
 
@@ -137,6 +173,10 @@ class GuardManagerTests(torch._dynamo.test_case.TestCase):
         )
 
     def test_global_state_guard(self):
+        # [FUNCTION DOC] Creates a GLOBAL_STATE guard and checks it passes, fails under a changed
+        # default dtype and under flipped deterministic algorithms mode (checking the exact
+        # verbose debug string each time), and passes again after restoring. Restores the
+        # deterministic mode in a finally block.
         root = RootGuardManager()
         guard = guards.GLOBAL_STATE(root, ["global_state_check"], None)
         self.assertTrue(guard(None))
@@ -174,6 +214,9 @@ user_stack=None)
         self.assertTrue(guard.check_verbose(None).result)
 
     def test_global_state_reason(self):
+        # [FUNCTION DOC] Captures a GlobalStateGuard with grad enabled, then under no_grad checks
+        # the check method returns False and the reason names grad_mode.
+        # KNOWN ISSUE: the local variable named guards shadows the imported guards module name.
         with torch.enable_grad():
             guards = GlobalStateGuard()
         with torch.no_grad():
@@ -181,6 +224,9 @@ user_stack=None)
             self.assertEqual(guards.reason(), "grad_mode ")
 
     def test_global_state_reason_autocast_cache(self):
+        # [FUNCTION DOC] Captures a GlobalStateGuard with the autocast cache enabled, disables the
+        # cache, and checks the guard fails with the specific reason autocast_cache_enabled.
+        # Restores the previous cache flag in a finally block.
         # Test that autocast_cache_enabled is reported specifically
         old_cache = torch.is_autocast_cache_enabled()
         try:
@@ -193,6 +239,8 @@ user_stack=None)
             torch.set_autocast_cache_enabled(old_cache)
 
     def test_python_lambda_leaf_guard(self):
+        # [FUNCTION DOC] Creates a LAMBDA_GUARD from a partial of the equality helper expecting 5
+        # and checks it accepts 5 and rejects 4 and a string.
         root = RootGuardManager()
         const_guard = guards.LAMBDA_GUARD(
             root,
@@ -205,6 +253,8 @@ user_stack=None)
         self.assertFalse(const_guard("foo"))
 
     def test_type_guard(self):
+        # [FUNCTION DOC] Creates TYPE_MATCH guards for int, dict and a locally defined class, and
+        # checks each accepts instances of that exact type and rejects other types.
         root = RootGuardManager()
         foo = 4
         guard = guards.TYPE_MATCH(root, id_type(foo), ["type(x) == int"], None)
@@ -221,7 +271,9 @@ user_stack=None)
         self.assertFalse(guard("foo"))
 
         class Foo:
+            # [CLASS DOC] HELPER: Local class with attributes x and y used to test type matching.
             def __init__(self, x, y):
+                # [FUNCTION DOC] HELPER: Stores the arguments as attributes x and y.
                 self.x = x
                 self.y = y
 
@@ -234,10 +286,15 @@ user_stack=None)
         self.assertFalse(guard("foo"))
 
     def test_fake_script_type_match_guard(self):
+        # [FUNCTION DOC] Creates a FAKE_SCRIPT_TYPE_MATCH guard for a real class wrapped by
+        # FakeScriptObject. Checks it accepts both the fake wrapper and the real object, and
+        # rejects a wrapper around a different type, a plain different object, and an int.
         class Real:
+            # [CLASS DOC] HELPER: Empty class standing for the real wrapped type.
             pass
 
         class Other:
+            # [CLASS DOC] HELPER: Empty class standing for a different type.
             pass
 
         root = RootGuardManager()
@@ -262,6 +319,8 @@ user_stack=None)
         self.assertFalse(guard(5))
 
     def test_id_guard(self):
+        # [FUNCTION DOC] Creates ID_MATCH guards for an int and a dict, checking they accept only
+        # the very same object (an equal but distinct dict is rejected).
         root = RootGuardManager()
         foo = 4
         guard = guards.ID_MATCH(root, id(foo), ["id(x) == id(foo)"], None)
@@ -278,6 +337,8 @@ user_stack=None)
         self.assertFalse(guard(5))
 
     def test_equals_guard(self):
+        # [FUNCTION DOC] Creates EQUALS_MATCH guards for an int, a tuple, a list and a type
+        # object, checking equal values pass and different values or types fail.
         root = RootGuardManager()
         foo = 4
         guard = guards.EQUALS_MATCH(root, foo, ["x == 4"], None)
@@ -309,6 +370,10 @@ user_stack=None)
         self.assertFalse(guard(float))
 
     def test_default_device_guard(self):
+        # [FUNCTION DOC] Creates a DEFAULT_DEVICE guard and checks it passes for the cpu default.
+        # If no accelerator is available the test is skipped after that; otherwise sets the
+        # default device to the current accelerator and checks the guard now fails, resetting the
+        # default device to none in a finally block.
         root = RootGuardManager()
         foo = 1
         guard = guards.DEFAULT_DEVICE(root, ["cpu device"], None)
@@ -325,6 +390,8 @@ user_stack=None)
             torch.set_default_device(None)
 
     def test_length_check_guard(self):
+        # [FUNCTION DOC] Creates a LENGTH_CHECK guard for a list of three elements and checks it
+        # accepts that list and rejects an empty list.
         root = RootGuardManager()
         foo = [1, 2, 3]
         guard = guards.LENGTH_CHECK(root, len(foo), ["len(x) == len(foo)"], None)
@@ -332,16 +399,22 @@ user_stack=None)
         self.assertFalse(guard([]))
 
     def test_no_hasattr_guard(self):
+        # [FUNCTION DOC] Creates a NO_HASATTR guard for the attribute foo and checks it passes for
+        # an object lacking it and fails for an object that has it.
         root = RootGuardManager()
 
         class Bar:
+            # [CLASS DOC] HELPER: Local class whose instances have only the attribute bar.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Sets the attribute bar to 2.
                 self.bar = 2
 
         bar = Bar()
 
         class Foo:
+            # [CLASS DOC] HELPER: Local class whose instances have only the attribute foo.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Sets the attribute foo to 2.
                 self.foo = 2
 
         foo = Foo()
@@ -351,12 +424,18 @@ user_stack=None)
         self.assertFalse(guard(foo))
 
     def test_tensor_aliasing_guard(self):
+        # [FUNCTION DOC] Installs an object aliasing guard between the x and y attribute managers
+        # of a root manager. Verifies each manager holds exactly one leaf guard of the aliasing
+        # type and both are the same object. A holder with aliased tensors passes; one with two
+        # distinct tensors fails.
         guard_manager = RootGuardManager()
 
         a = torch.randn(3, 4)
 
         class Foo:
+            # [CLASS DOC] HELPER: Local holder with attributes x and y.
             def __init__(self, x, y):
+                # [FUNCTION DOC] HELPER: Stores the arguments as attributes x and y.
                 self.x = x
                 self.y = y
 
@@ -384,6 +463,8 @@ user_stack=None)
         self.assertFalse(guard_manager.check(f_locals_unaliased))
 
     def test_dict_version_guard(self):
+        # [FUNCTION DOC] Creates a DICT_VERSION guard from a dict. It accepts only that same dict
+        # object while unmodified: a copy fails, and after mutating the dict the guard fails.
         root = RootGuardManager()
         foo = {"a": 1, "b": 2}
         guard = guards.DICT_VERSION(root, foo, ["x.version == foo.version"], None)
@@ -396,6 +477,10 @@ user_stack=None)
         self.assertFalse(guard({}))
 
     def test_dynamic_indices_guard(self):
+        # [FUNCTION DOC] Creates a dimension dynamic marking guard expecting dynamic indices 0 and
+        # 1 and forbidding the static indices attribute. Checks a tensor without marking passes,
+        # the exact set passes, a subset passes, a different set fails, and a tensor carrying the
+        # forbidden attribute fails.
         root = RootGuardManager()
 
         # Test with expected attr: _dynamo_dynamic_indices = {0, 1}
@@ -438,6 +523,10 @@ user_stack=None)
         self.assertFalse(guard(x))
 
     def test_dimension_marking_guard_dependent_attrs(self):
+        # [FUNCTION DOC] Tests the dependent attribute feature of the dimension marking guard:
+        # shape ids are compared only when the gating unbacked indices attribute is present.
+        # Checks no gate passes, matching ids pass, mismatching ids fail, missing ids fail when a
+        # value is expected, and a missing attribute passes when none was expected.
         root = RootGuardManager()
 
         # Test dependent_attrs: _dynamo_shape_ids is checked only when
@@ -494,6 +583,10 @@ user_stack=None)
         self.assertTrue(guard2(y))
 
     def test_tensor_match_guard(self):
+        # [FUNCTION DOC] Adds a tensor match guard for a 4x4 tensor to a root manager. Checks the
+        # same and another 4x4 tensor pass (also with the verbose check), and a transposed tensor
+        # fails with a stride mismatch message in the first verbose part.
+        # KNOWN ISSUE: the test contains a leftover debug print of the first verbose part.
         guard_manager = RootGuardManager()
         x = torch.randn(4, 4)
         size = list(x.size())
@@ -523,12 +616,18 @@ user_stack=None)
         )
 
     def test_no_tensor_aliasing_guard(self):
+        # [FUNCTION DOC] Installs a no tensor aliasing guard over the x, y and z attribute
+        # managers. Verifies a shared leaf guard on all three, that a holder with the same tensor
+        # three times fails, with three distinct tensors passes (twice, showing internal state is
+        # cleared between checks), and with one tensor in x and z fails.
         guard_manager = RootGuardManager()
 
         a = torch.randn(3, 4)
 
         class Foo:
+            # [CLASS DOC] HELPER: Local holder with attributes x, y and z.
             def __init__(self, x, y, z):
+                # [FUNCTION DOC] HELPER: Stores the arguments as attributes x, y and z.
                 self.x = x
                 self.y = y
                 self.z = z
@@ -579,6 +678,8 @@ user_stack=None)
         self.assertFalse(guard_manager.check_verbose(f_locals_unaliased).result)
 
     def test_weakref_alive_guard(self):
+        # [FUNCTION DOC] Creates a NOT_NONE guard, checks it passes for a live weakly referenced
+        # tensor, then deletes the tensor and checks it fails for the dead reference result.
         root = RootGuardManager()
         x = torch.rand(3, 4)
         weakref_x = weakref.ref(x)
@@ -589,6 +690,11 @@ user_stack=None)
         self.assertFalse(guard(weakref_x()))
 
     def test_call_function_no_args_guard(self):
+        # [FUNCTION DOC] Skips if no accelerator exists. Otherwise builds an EQUALS_MATCH guard
+        # from the current accelerator's device index (or 0) and checks it accepts 0 and rejects 1
+        # and 2.
+        # KNOWN ISSUE: the name suggests a call-function guard but an equality guard on a constant
+        # is used, and it assumes the device index is 0.
         if not torch.accelerator.is_available():
             self.skipTest("Accelerator is not available")
 
@@ -602,6 +708,9 @@ user_stack=None)
         self.assertFalse(guard(2))
 
     def test_guard_manager_leaf_guard(self):
+        # [FUNCTION DOC] Adds a type match guard and two lambda guards (at least 5,
+        # below 10) to a root manager. Checks 3 leaf guards, no accessors, and that 6
+        # passes while 4 and a string fail.
         guard_manager = RootGuardManager()
         guard_manager.add_type_match_guard(id_type(5), ["type(x) == int"], None)
         guard_manager.add_lambda_guard(
@@ -621,8 +730,14 @@ user_stack=None)
         self.assertFalse(guard_manager.check("foo"))
 
     def test_attr_guard_manager(self):
+        # [FUNCTION DOC] Builds a root manager with a type guard and getattr managers for x and y,
+        # each with an equality lambda guard. Checks the leaf guard count, two getattr accessors,
+        # one leaf guard on each child, and that matching object passes while a different one and
+        # a string fail.
         class Foo:
+            # [CLASS DOC] HELPER: Local holder with attributes x and y.
             def __init__(self, x, y):
+                # [FUNCTION DOC] HELPER: Stores the arguments as attributes x and y.
                 self.x = x
                 self.y = y
 
@@ -674,6 +789,9 @@ user_stack=None)
         self.assertFalse(guard_manager.check("foo"))
 
     def test_item_guard_manager(self):
+        # [FUNCTION DOC] Same as the attribute manager test but for a list: getitem managers for
+        # indices 0 and 1 with equality lambda guards. Checks structure (getitem accessors, one
+        # leaf guard each) and that the same list passes while another list and a string fail.
         foo = [1, 2]
         guard_manager = RootGuardManager()
         guard_manager.add_type_match_guard(id_type(foo), ["type(x) == Foo"], None)
@@ -719,6 +837,9 @@ user_stack=None)
         self.assertFalse(guard_manager.check("foo"))
 
     def test_framelocals_accessor(self):
+        # [FUNCTION DOC] Builds a root manager with a type guard and framelocals managers for keys
+        # a and b (at slots 0 and 1) with equality guards. Checks the matching dict passes and a
+        # dict with a different value for b fails.
         foo = {
             "a": 1,
             "b": 2,
@@ -737,7 +858,12 @@ user_stack=None)
         self.assertFalse(guards_manager.check({"a": 1, "b": 3}))
 
     def test_framelocals_guard_e2e(self):
+        # [FUNCTION DOC] Compiles a function with the eager backend, runs it twice (second time
+        # with the fail on recompile stance) and checks results agree. Then inspects the cache
+        # entry's guard manager string and checks accessors for x, y and z are framelocals
+        # accessors with slots 0, 1 and 2.
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Function being compiled; adds x, y and the entry 0 of z.
             return x + y + z[0]
 
         opt_fn = torch.compile(fn, backend="eager")
@@ -764,6 +890,9 @@ user_stack=None)
         )
 
     def test_dict_getitem_accessor(self):
+        # [FUNCTION DOC] Like the framelocals accessor test but uses dict getitem
+        # managers with keys a and b under a type guard, checking the same dict passes
+        # and a changed value fails.
         foo = {
             "a": 1,
             "b": 2,
@@ -782,6 +911,10 @@ user_stack=None)
         self.assertFalse(guards_manager.check({"a": 1, "b": 3}))
 
     def test_globals(self):
+        # [FUNCTION DOC] Builds a guard on the module level global_pair object by reaching it
+        # through a globals dict manager and a getitem manager, with a lambda guard checking its
+        # fields' types. Passes first, then fails after the test sets the y field to a string.
+        # Side effect: leaves the global Pair object modified.
         global global_pair, Pair
         guard_manager = RootGuardManager()
         gpair_mgr = guard_manager.globals_dict_manager(
@@ -801,13 +934,23 @@ user_stack=None)
         self.assertFalse(guard_manager.check(global_pair))
 
     def test_type_manager(self):
+        # [FUNCTION DOC] Uses a type manager on an instance of a locally defined subclass and
+        # getattr and getitem managers to guard on the type's method resolution order: its length
+        # (3 expected) and the class attribute a of the base class. Checks accessor types and that
+        # the check passes.
+        # KNOWN ISSUE: comments say length 2 and entry 0, but the code guards length 3
+        # and entry 1.
         guard_manager = RootGuardManager()
 
         class A:
+            # [CLASS DOC] HELPER: Base class with class attribute a equal to 4.
             a = 4
 
         class B(A):
+            # [CLASS DOC] HELPER: Subclass of A used as the type being guarded.
             def mul(self, x):
+                # [FUNCTION DOC] HELPER: Never called; its body would call a
+                # nonexistent parent method.
                 super().mul(x)
 
         foo = B()
@@ -851,6 +994,10 @@ user_stack=None)
         self.assertTrue(guard_manager.check(f_locals))
 
     def test_tuple_iterator_getitem(self):
+        # [FUNCTION DOC] Advances a tuple iterator by one element, then guards the remaining
+        # length (5) and the element at offset 2 of the iterator (value 4) using a tuple iterator
+        # getitem manager. Checks a non-iterator fails, the iterator passes, and an iterator over
+        # a shorter tuple fails gracefully.
         a = (1, 2, 3, 4, 5, 6)
         foo = iter(a)
         next(foo)  # foo points at index=1
@@ -875,6 +1022,9 @@ user_stack=None)
         self.assertFalse(guard_manager.check(b_foo))
 
     def test_global_weakref(self):
+        # [FUNCTION DOC] Guards a global weak reference named weakref_x through the globals dict
+        # manager and a lambda guard requiring a tensor. Passes while the module level tensor is
+        # alive. Side effect: deletes the module global x, after which the check must fail.
         guard_manager = RootGuardManager()
         globals_manager = guard_manager.globals_dict_manager(
             globals(), "", None, default_mgr_enum
@@ -895,6 +1045,10 @@ user_stack=None)
         self.assertFalse(guard_manager.check(None))
 
     def test_lambda_manager(self):
+        # [FUNCTION DOC] Uses a lambda manager that selects entry 2 of the input and guards it
+        # equals 3, checking a tuple passes. Then installs a lambda manager whose function raises
+        # an error and checks the check returns False and the verbose result is False with the
+        # error text in the first verbose part.
         a = (1, 1, 3, 4, 5, 6)
 
         guard_manager = RootGuardManager()
@@ -914,6 +1068,7 @@ user_stack=None)
         guard_manager = RootGuardManager()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Always raises an AssertionError with the message Test.
             raise AssertionError("Test")
             return x
 
@@ -925,6 +1080,8 @@ user_stack=None)
         self.assertTrue("Test" in debug_info.verbose_code_parts[0])
 
     def test_dict_contains_guard(self):
+        # [FUNCTION DOC] Creates DICT_CONTAINS guards requiring key a to be present and key c to
+        # be absent, checking the expected accept and reject outcomes for several dicts.
         root = RootGuardManager()
         foo = {"a": 1, "b": 2}
         guard = guards.DICT_CONTAINS(root, True, "a", ["has a"], None)
@@ -941,9 +1098,15 @@ user_stack=None)
         self.assertTrue(guard({}))
 
     def test_dict_guard_manager(self):
+        # [FUNCTION DOC] Exercises a dictionary guard manager obtained as a child of a getitem
+        # manager. Checks only ID_MATCH leaf guards are allowed and arbitrary leaf guards or
+        # accessors raise RuntimeError, a dict of different length fails, key and value managers
+        # can be added for entries 0 and 1 (including nested dict manager), only two key/value
+        # managers exist, and changing a guarded value or removing an entry makes the check fail.
         root = RootGuardManager()
 
         def nothing():
+            # [FUNCTION DOC] HELPER: Empty function used as a dictionary key.
             pass
 
         f_locals = {
@@ -1025,12 +1188,18 @@ user_stack=None)
         self.assertFalse(root.check(f_locals))
 
     def test_clone(self):
+        # [FUNCTION DOC] Compiles a function with a testing hook that clones the guard manager.
+        # The hook checks a clone keeping all guards fails once a guarded list changes, and a
+        # clone filtered to skip guards whose source mentions foo passes where the original fails.
         try:
             from .utils import install_guard_manager_testing_hook
         except ImportError:
             from utils import install_guard_manager_testing_hook
 
         def hook(guard_wrapper, f_locals, builder):
+            # [FUNCTION DOC] HELPER: Testing hook run once guards are built. Clones the root
+            # manager with a keep-all filter and with a filter that drops foo guards, and asserts
+            # the expected check outcomes after mutating the foo entry in the frame locals.
             root = guard_wrapper.root
 
             # Check full cloning works as expected
@@ -1049,6 +1218,8 @@ user_stack=None)
             self.assertTrue(cloned_root.check(f_locals))
 
         class Bar:
+            # [CLASS DOC] HELPER: Local class with class attributes x equal to 4 and a random
+            # tensor y.
             x = 4
             y = torch.randn(4)
 
@@ -1056,6 +1227,8 @@ user_stack=None)
         bar = Bar()
 
         def fn(x, foo, bar):
+            # [FUNCTION DOC] HELPER: Function being compiled; combines input, first item of foo
+            # and bar attributes.
             return x + foo[0] + bar.x * bar.y
 
         x = torch.randn(4)
@@ -1064,6 +1237,10 @@ user_stack=None)
             opt_fn(x, foo, bar)
 
     def test_diff_guard_manager(self):
+        # [FUNCTION DOC] Compiles a function twice with different foo values under a hook that
+        # tests the diff guard root of the guard wrapper. Verifies the full root and the diff root
+        # agree on tensor changes, and that after a foo change the diff root passes on the first
+        # compile and fails on the second (it now includes foo guards).
         try:
             from .utils import install_guard_manager_testing_hook
         except ImportError:
@@ -1071,6 +1248,9 @@ user_stack=None)
         counter = 0
 
         def hook(guard_wrapper, f_locals, builder):
+            # [FUNCTION DOC] HELPER: Testing hook. Compares root and diff guard root checks as the
+            # frame locals are mutated; uses a counter in the enclosing scope, incremented per
+            # call, to choose the expected diff root outcome for foo changes.
             nonlocal counter
             root = guard_wrapper.root
             diff_guard_root = guard_wrapper.diff_guard_root
@@ -1099,13 +1279,18 @@ user_stack=None)
             counter += 1
 
         class Bar:
+            # [CLASS DOC] HELPER: Local class with instance attributes x equal to 4 and random
+            # tensor y.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Sets x to 4 and y to a random 4 element tensor.
                 self.x = 4
                 self.y = torch.randn(4)
 
         bar = Bar()
 
         def fn(x, foo, bar):
+            # [FUNCTION DOC] HELPER: Function being compiled; combines input, first item of foo
+            # and bar attributes.
             return x + foo[0] + bar.x * bar.y
 
         x = torch.randn(4)
@@ -1119,10 +1304,18 @@ user_stack=None)
 
 
 class TypePropagationTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Tests that guard managers know the type and immutability of the guarded values,
+    # using the testing hook during compilation.
     @torch._dynamo.config.patch(skip_tensor_guards_with_matching_dict_tags=True)
     def test_basic_types(self):
+        # [FUNCTION DOC] With tensor guard skipping on matching dict tags enabled, compiles a
+        # function reading dict items, a tensor and a module. In the hook, checks guarded types
+        # (dict for foo.x and foo.z, module for mod) and immutability flags for the dict item and
+        # tensor attribute.
         class Foo:
+            # [CLASS DOC] HELPER: Local class with a dict x, a tensor y and an empty dict z.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the attributes x, y and z.
                 self.x = {"a": 2}
                 self.y = torch.randn(4)
                 self.z = {}
@@ -1132,6 +1325,8 @@ class TypePropagationTests(torch._dynamo.test_case.TestCase):
         mod = torch.nn.Linear(4, 4)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function being compiled; adds input, dict item, tensor and a
+            # linear module output.
             return x + foo.x["a"] + foo.y + mod(x)
 
         try:
@@ -1140,6 +1335,8 @@ class TypePropagationTests(torch._dynamo.test_case.TestCase):
             from utils import install_guard_manager_testing_hook
 
         def hook(guard_wrapper, f_locals, builder):
+            # [FUNCTION DOC] HELPER: Testing hook asserting guard manager type and immutability
+            # queries for sources foo.x, its item a, foo.y, foo.z and mod.
             from torch._dynamo.source import AttrSource, DictGetItemSource, LocalSource
 
             foo_source = LocalSource("foo")
@@ -1180,15 +1377,23 @@ class TypePropagationTests(torch._dynamo.test_case.TestCase):
 
 
 class DuplicateGuardTest(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Tests that duplicate guards are deduplicated in the final guard manager.
     def test_duplicate_guard(self):
+        # [FUNCTION DOC] Compiles a function that tests the same attribute presence twice, for an
+        # absent and a present attribute. The hook asserts the guard text contains exactly one
+        # NO_HASATTR guard.
         class Foo:
+            # [CLASS DOC] HELPER: Local class with attributes x and bar, but not y.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Sets x and bar to 4.
                 self.x = 4
                 self.bar = 4
 
         foo = Foo()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function being compiled; repeats attribute checks, applying
+            # sine or cosine, then adds foo.x.
             if hasattr(foo, "y"):
                 x = torch.sin(x)
             if hasattr(foo, "y"):
@@ -1206,6 +1411,8 @@ class DuplicateGuardTest(torch._dynamo.test_case.TestCase):
             from utils import install_guard_manager_testing_hook
 
         def hook(guard_wrapper, f_locals, builder):
+            # [FUNCTION DOC] HELPER: Testing hook; asserts one occurrence of
+            # NO_HASATTR in guards text.
             guard_str = str(guard_wrapper)
             self.assertEqual(guard_str.count("NO_HASATTR"), 1)
 
@@ -1215,32 +1422,53 @@ class DuplicateGuardTest(torch._dynamo.test_case.TestCase):
 
 
 class RecursiveDictTagTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Base test class that enables the recursive dict tags config for guards around
+    # each test and restores it afterward. State: _prev holds the saved config value.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Runs the parent setUp, saves the current recursive dict tag
+        # config value and sets the config to True.
         super().setUp()
         self._prev = torch._dynamo.config.use_recursive_dict_tags_for_guards
         torch._dynamo.config.use_recursive_dict_tags_for_guards = True
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Runs the parent tearDown and restores the saved config value.
         super().tearDown()
         torch._dynamo.config.use_recursive_dict_tags_for_guards = self._prev
 
 
 class TagSafetyChecks(RecursiveDictTagTests):
+    # [CLASS DOC] Tests which guarded values the guard manager marks as tag safe, and which are
+    # tag safe roots, with recursive dict tags enabled.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Runs the parent setUp, then again saves the current config value
+        # and sets it to True.
+        # KNOWN ISSUE: the parent setUp already set the config, so this saves True over the real
+        # original value, and the config is left True after tests (never fully restored).
         super().setUp()
         self._prev = torch._dynamo.config.use_recursive_dict_tags_for_guards
         torch._dynamo.config.use_recursive_dict_tags_for_guards = True
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Runs the parent tearDown, then restores the config to the value
+        # saved by this class's setUp (see the known issue in setUp).
         super().tearDown()
         torch._dynamo.config.use_recursive_dict_tags_for_guards = self._prev
 
     def test_immutable_tag_safe(self):
+        # [FUNCTION DOC] Compiles a function using attributes of an object with an arbitrary
+        # object, tensor, int, tuple of ints and tuple holding an object. The hook checks getattr
+        # accessor names, then that tag safety is False for the object and mixed tuple, True for
+        # int and int tuple, tensor depends on the skip tensor guards config, and none are roots.
         class Bar:
+            # [CLASS DOC] HELPER: Empty class whose instances are not tag safe.
             pass
 
         class Foo:
+            # [CLASS DOC] HELPER: Local class with attributes a (object), b (tensor), c (int), d
+            # (tuple of ints) and e (tuple with an object).
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates attributes a through e.
                 self.a = Bar()
                 self.b = torch.randn(4)
                 self.c = 3
@@ -1250,6 +1478,8 @@ class TagSafetyChecks(RecursiveDictTagTests):
         foo = Foo()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function being compiled; reads all attributes of foo with
+            # branches on a and e second item.
             if foo.a:
                 x = torch.sin(x)
             x = x * foo.b + foo.c + foo.d[0] + foo.d[1] + foo.e[0]
@@ -1263,6 +1493,8 @@ class TagSafetyChecks(RecursiveDictTagTests):
             from utils import install_guard_manager_testing_hook
 
         def hook(guard_wrapper, f_locals, builder):
+            # [FUNCTION DOC] HELPER: Testing hook asserting is_tag_safe and is_tag_safe_root for
+            # the manager of foo and each of its attributes.
             from torch._dynamo.source import AttrSource, LocalSource
 
             foo_source = LocalSource("foo")
@@ -1312,8 +1544,14 @@ class TagSafetyChecks(RecursiveDictTagTests):
             opt_fn(torch.randn(4, 4))
 
     def test_dict_tag_safe(self):
+        # [FUNCTION DOC] Compiles a function reading nested dict entries (safe dict, unsafe dict
+        # holding an object, and a terminal dict). The hook checks the tag safety of the outer
+        # dict (False), safe sub dict (True), unsafe sub dict (False), terminal dict (True) and
+        # the nested dict inside the safe one (True), and none is a tag safe root.
         class Foo:
+            # [CLASS DOC] HELPER: Local class with an int attribute a, put in the unsafe dict.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Sets a to 4.
                 self.a = 4
 
         foo = Foo()
@@ -1339,6 +1577,8 @@ class TagSafetyChecks(RecursiveDictTagTests):
         }
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function being compiled; reads many nested dict entries and
+            # the attribute of the object, branching on the terminal dict.
             x = x + outer_dict["safe"]["const"]
 
             x = x + outer_dict["safe"]["tup"][0]
@@ -1360,6 +1600,8 @@ class TagSafetyChecks(RecursiveDictTagTests):
             from utils import install_guard_manager_testing_hook
 
         def hook(guard_wrapper, f_locals, builder):
+            # [FUNCTION DOC] HELPER: Testing hook checking is_tag_safe and is_tag_safe_root for
+            # the outer dict and four nested dict sources.
             from torch._dynamo.source import DictGetItemSource, LocalSource
 
             outer_source = LocalSource("outer_dict")
@@ -1407,31 +1649,49 @@ class TagSafetyChecks(RecursiveDictTagTests):
             opt_fn(torch.randn(4, 4))
 
     def test_nn_module_tag_safe(self):
+        # [FUNCTION DOC] Compiles a function calling an nn.Module with abstract base metaclass
+        # mixin that contains a submodule inspecting a method signature. The hook checks the
+        # module manager is both tag safe and a tag safe root.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: nn.Module with a class attribute c, attribute a and
+            # a check method.
             c = 2
 
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Calls the parent constructor and sets a to 4.
                 super().__init__()
                 self.a = 4
 
             def check(self, x):
+                # [FUNCTION DOC] HELPER: Method that ignores its input and returns True.
                 return True
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Inspects the signature parameters of check and returns
+                # the input plus a and c.
                 inspect.signature(self.check).parameters.items()
                 return x + self.a + self.c
 
         foo = Foo()
 
         class Env(metaclass=abc.ABCMeta):  # noqa: B024
+            # [CLASS DOC] HELPER: Empty class with the abstract base metaclass, used
+            # as a mixin base.
             pass
 
         class Baz(torch.nn.Module, Env):
+            # [CLASS DOC] HELPER: nn.Module mixed with Env that wraps the Foo module
+            # as attribute foo.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Calls the parent constructor and stores the
+                # outer Foo module.
                 super().__init__()
                 self.foo = foo
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies sine to the input if the text of the
+                # class method resolution order contains Foo (a check on the class),
+                # then applies the foo submodule.
                 if "Foo" in str(type(self).__mro__):
                     x = torch.sin(x)
                 return self.foo(x)
@@ -1439,6 +1699,7 @@ class TagSafetyChecks(RecursiveDictTagTests):
         baz = Baz()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function being compiled; adds the module output to the input.
             x = x + baz(x)
             return x
 
@@ -1448,6 +1709,8 @@ class TagSafetyChecks(RecursiveDictTagTests):
             from utils import install_guard_manager_testing_hook
 
         def hook(guard_wrapper, f_locals, builder):
+            # [FUNCTION DOC] HELPER: Testing hook asserting the baz module manager is tag safe and
+            # a tag safe root.
             from torch._dynamo.source import LocalSource
 
             baz_source = LocalSource("baz")
@@ -1462,22 +1725,32 @@ class TagSafetyChecks(RecursiveDictTagTests):
             opt_fn(torch.randn(4, 4))
 
     def test_nn_module_tag_overridden_getattr_safe(self):
+        # [FUNCTION DOC] Same as the module tag test but with a module that overrides the
+        # attribute lookup hook to provide attribute a. Checks the module is still tag safe and a
+        # tag safe root.
         class Baz(torch.nn.Module, metaclass=abc.ABCMeta):
+            # [CLASS DOC] HELPER: nn.Module with abstract metaclass whose attribute lookup returns
+            # 5 for the name a and defers to the parent otherwise.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Calls the parent constructor and sets norm to 2.
                 super().__init__()
                 self.norm = 2
 
             def __getattr__(self, key):
+                # [FUNCTION DOC] HELPER: Returns 5 for the key a, else delegates to
+                # the parent lookup.
                 if key == "a":
                     return 5
                 return super().__getattr__(key)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input plus attribute a plus norm.
                 return x + self.a + self.norm
 
         baz = Baz()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function being compiled; adds the module output to the input.
             x = x + baz(x)
             return x
 
@@ -1487,6 +1760,8 @@ class TagSafetyChecks(RecursiveDictTagTests):
             from utils import install_guard_manager_testing_hook
 
         def hook(guard_wrapper, f_locals, builder):
+            # [FUNCTION DOC] HELPER: Testing hook asserting the baz module manager is tag safe and
+            # a tag safe root.
             from torch._dynamo.source import LocalSource
 
             baz_source = LocalSource("baz")
@@ -1502,19 +1777,31 @@ class TagSafetyChecks(RecursiveDictTagTests):
 
 
 class RecursiveDictGuardTests(RecursiveDictTagTests):
+    # [CLASS DOC] Tests when recursive dict tag matching gets disabled on a guard manager.
     def test_disabling(self):
+        # [FUNCTION DOC] Runs three scenarios, each with a fresh compile and a testing hook.
+        # First, a failing guard on a second module disables dict tag matching, while a dict tag
+        # mismatch with guards passing only adds an entry. Second, a dict tag mismatch with
+        # passing guards (after reassigning an attribute) disables it. Third, a pointer cache size
+        # limit of 1 disables it when a second module needs saving. Uses torch.compiler.reset
+        # between scenarios.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: nn.Module with attribute a equal to 4.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Calls the parent constructor and sets a to 4.
                 super().__init__()
                 self.a = 4
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input plus a.
                 return x + self.a
 
         mod = Mod()
         mod_to_fail = Mod()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function being compiled; returns the module
+            # applied to the input.
             return mod(x)
 
         x = torch.randn(4, 4)
@@ -1525,6 +1812,9 @@ class RecursiveDictGuardTests(RecursiveDictTagTests):
             from utils import install_guard_manager_testing_hook
 
         def basic_hook_test(guard_wrapper, f_locals, builder):
+            # [FUNCTION DOC] HELPER: Testing hook for scenario one. Checks tag safety, repeated
+            # passing checks, a second module with passing guards, then a failing guard that
+            # disables recursive dict tag matching.
             from torch._dynamo.source import LocalSource
 
             mod_source = LocalSource("mod")
@@ -1558,6 +1848,9 @@ class RecursiveDictGuardTests(RecursiveDictTagTests):
         mod_to_fail = Mod()
 
         def disable_on_dict_tag_match_failure(guard_wrapper, f_locals, builder):
+            # [FUNCTION DOC] HELPER: Testing hook for scenario two. After repeated passing checks,
+            # modifies and restores an attribute, which changes the dict tag, and expects the
+            # check to pass but disable recursive dict tag matching.
             from torch._dynamo.source import LocalSource
 
             mod_source = LocalSource("mod")
@@ -1589,6 +1882,9 @@ class RecursiveDictGuardTests(RecursiveDictTagTests):
         mod_to_fail = Mod()
 
         def max_size_test(guard_wrapper, f_locals, builder):
+            # [FUNCTION DOC] HELPER: Testing hook for scenario three. Under a size
+            # limit of one saved pointer, a check with a second module that passes
+            # disables the dict tag matching.
             from torch._dynamo.source import LocalSource
 
             mod_source = LocalSource("mod")
@@ -1617,7 +1913,10 @@ class RecursiveDictGuardTests(RecursiveDictTagTests):
 
 
 class SourceCloneTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Tests for the clone method of Source objects with an optional transform.
     def test_clone_identity_transform(self):
+        # [FUNCTION DOC] Clones a local, attribute and getitem source with an identity transform
+        # and checks the clone's name is unchanged.
         """Identity transform should produce a source with the same name."""
         from torch._dynamo.source import AttrSource, GetItemSource, LocalSource
 
@@ -1630,6 +1929,8 @@ class SourceCloneTests(torch._dynamo.test_case.TestCase):
             self.assertEqual(cloned.name, source.name)
 
     def test_clone_no_transform(self):
+        # [FUNCTION DOC] Checks that cloning a local source without a transform returns the same
+        # object, and cloning an attribute source gives an equal name.
         from torch._dynamo.source import AttrSource, LocalSource
 
         local = LocalSource("x")
@@ -1640,6 +1941,9 @@ class SourceCloneTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(cloned_attr.name, attr.name)
 
     def test_clone_parameterized_deep_chain(self):
+        # [FUNCTION DOC] Builds a chain of local, attribute, getitem, attribute sources and clones
+        # with a transform replacing the local source by another local, checking the resulting
+        # name. Then does the same for a dict getitem source with a const dict key source.
         """Replace leaf sources deep in a chain via a find->replace dictionary."""
         from torch._dynamo.source import (
             AttrSource,
@@ -1658,6 +1962,8 @@ class SourceCloneTests(torch._dynamo.test_case.TestCase):
         replacements = {local: LocalSource("y")}
 
         def transform(s):
+            # [FUNCTION DOC] HELPER: Returns the replacement for a source from the enclosing
+            # mapping, or the source itself if absent.
             return replacements.get(s, s)
 
         cloned = attr2.clone(transform)
@@ -1673,6 +1979,9 @@ class SourceCloneTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(cloned.name, "L['other'][list(dict.keys(L['other']))[0]]")
 
     def test_clone_dict_get_item_source_with_constant_key(self):
+        # [FUNCTION DOC] Clones a dict getitem source with a constant key, with and without a
+        # transform, checking the same name, and that the transform replacing the local gives the
+        # new name.
         from torch._dynamo.source import DictGetItemSource, LocalSource
 
         local = LocalSource("d")
@@ -1683,6 +1992,8 @@ class SourceCloneTests(torch._dynamo.test_case.TestCase):
         replacement = LocalSource("other_d")
 
         def replace_local(s):
+            # [FUNCTION DOC] HELPER: Returns the replacement local source for the local named d,
+            # otherwise the unchanged source.
             if isinstance(s, LocalSource) and s.local_name == "d":
                 return replacement
             return s
@@ -1691,6 +2002,8 @@ class SourceCloneTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(cloned.name, "L['other_d']['key']")
 
     def test_clone_dict_get_item_source_with_source_key(self):
+        # [FUNCTION DOC] Clones a dict getitem source whose key is itself a source with the
+        # identity transform and checks the name is preserved.
         from torch._dynamo.source import (
             ConstDictKeySource,
             DictGetItemSource,
@@ -1705,6 +2018,8 @@ class SourceCloneTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(cloned.name, source.name)
 
     def test_clone_dict_subclass_get_item_source(self):
+        # [FUNCTION DOC] Clones a dict subclass getitem source with and without a transform and
+        # checks the name is preserved.
         from torch._dynamo.source import DictSubclassGetItemSource, LocalSource
 
         local = LocalSource("d")
@@ -1717,6 +2032,8 @@ class SourceCloneTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(cloned.name, source.name)
 
     def test_clone_get_item_source(self):
+        # [FUNCTION DOC] Clones a getitem source with and without a transform and checks the name
+        # is preserved.
         from torch._dynamo.source import GetItemSource, LocalSource
 
         local = LocalSource("lst")
@@ -1730,19 +2047,28 @@ class SourceCloneTests(torch._dynamo.test_case.TestCase):
 
 
 class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Tests the check specs in GUARD_VALUE_DISPATCH. Each test gets the spec for a
+    # guard kind, computes metadata from a sample value with the metadata function, and verifies
+    # the evaluation function accepts or rejects other values.
     """Tests for the GuardCheckSpec get_metadata_fn/eval_fn handlers on GuardBuilder."""
 
     def _get_handler(self, name):
+        # [FUNCTION DOC] HELPER: Returns the entry of GUARD_VALUE_DISPATCH for the
+        # given guard name.
         from torch._dynamo.guards import GUARD_VALUE_DISPATCH
 
         return GUARD_VALUE_DISPATCH[name]
 
     def _make_guard(self, create_fn):
+        # [FUNCTION DOC] HELPER: Builds a guard on a local source named x using the given guard
+        # creation function.
         from torch._dynamo.source import LocalSource
 
         return LocalSource("x").make_guard(create_fn)
 
     def test_type_match(self):
+        # [FUNCTION DOC] TYPE_MATCH spec: metadata is the value's type; evaluation accepts values
+        # of that type and rejects others.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(GuardBuilder.TYPE_MATCH)
@@ -1754,6 +2080,8 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn("hello", expected))
 
     def test_constant_match(self):
+        # [FUNCTION DOC] CONSTANT_MATCH spec: metadata equals the value; evaluation accepts an
+        # equal value and rejects a different one.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(GuardBuilder.CONSTANT_MATCH)
@@ -1765,6 +2093,8 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn(99, expected))
 
     def test_equals_match(self):
+        # [FUNCTION DOC] EQUALS_MATCH spec: accepts a list equal to the sample and rejects a
+        # shorter one.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(GuardBuilder.EQUALS_MATCH)
@@ -1775,6 +2105,8 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn([1, 2], expected))
 
     def test_id_match(self):
+        # [FUNCTION DOC] ID_MATCH spec: metadata is the object itself; only the same
+        # object passes.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(GuardBuilder.ID_MATCH)
@@ -1787,6 +2119,7 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn(object(), expected))
 
     def test_class_match(self):
+        # [FUNCTION DOC] CLASS_MATCH spec: metadata is the class; only that class passes.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(GuardBuilder.CLASS_MATCH)
@@ -1798,6 +2131,8 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn(list, expected))
 
     def test_module_match(self):
+        # [FUNCTION DOC] MODULE_MATCH spec: metadata is the module object; only that module
+        # passes, a differently named module fails.
         import types
 
         from torch._dynamo.guards import GuardBuilder
@@ -1814,6 +2149,8 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn(other, expected))
 
     def test_builtin_match(self):
+        # [FUNCTION DOC] BUILTIN_MATCH spec: metadata is the builtin function; only
+        # that builtin passes.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(GuardBuilder.BUILTIN_MATCH)
@@ -1825,12 +2162,15 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn(print, expected))
 
     def test_hasattr_present(self):
+        # [FUNCTION DOC] HASATTR spec for attribute weight present: metadata is the name paired
+        # with True; an object with the attribute passes, one without fails.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(functools.partial(GuardBuilder.HASATTR, attr="weight"))
         handler = self._get_handler("HASATTR")
 
         class Obj:
+            # [CLASS DOC] HELPER: Class with class attribute weight.
             weight = 1.0
 
         expected = handler.get_metadata_fn(guard, Obj())
@@ -1838,17 +2178,21 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertTrue(handler.eval_fn(Obj(), expected))
 
         class Empty:
+            # [CLASS DOC] HELPER: Empty class without the attribute.
             pass
 
         self.assertFalse(handler.eval_fn(Empty(), expected))
 
     def test_hasattr_absent(self):
+        # [FUNCTION DOC] HASATTR spec for attribute bias absent: metadata is the name paired with
+        # False; the object passes until the attribute is added, then fails.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(functools.partial(GuardBuilder.HASATTR, attr="bias"))
         handler = self._get_handler("HASATTR")
 
         class Obj:
+            # [CLASS DOC] HELPER: Class with class attribute weight only.
             weight = 1.0
 
         obj = Obj()
@@ -1860,6 +2204,8 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn(obj, expected))
 
     def test_sequence_length(self):
+        # [FUNCTION DOC] SEQUENCE_LENGTH spec: metadata is the length 3; lists and tuples of
+        # length 3 pass, shorter ones fail.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(GuardBuilder.SEQUENCE_LENGTH)
@@ -1872,6 +2218,8 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn([1], expected))
 
     def test_dict_contains(self):
+        # [FUNCTION DOC] DICT_CONTAINS spec for key a: metadata is the key; dicts containing it
+        # pass, others fail.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(functools.partial(GuardBuilder.DICT_CONTAINS, key="a"))
@@ -1884,6 +2232,8 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn({"b": 1}, expected))
 
     def test_dict_not_contains(self):
+        # [FUNCTION DOC] DICT_NOT_CONTAINS spec for key a: metadata is the key; dicts lacking it
+        # pass, dicts containing it fail.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(
@@ -1898,6 +2248,8 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn({"a": 1}, expected))
 
     def test_not_present_in_generic_dict(self):
+        # [FUNCTION DOC] NOT_PRESENT_IN_GENERIC_DICT spec for attribute hidden: metadata is the
+        # attribute name; an object passes until that attribute is set on it.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(
@@ -1906,6 +2258,7 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         handler = self._get_handler("NOT_PRESENT_IN_GENERIC_DICT")
 
         class Obj:
+            # [CLASS DOC] HELPER: Empty class whose instances get attributes set by the test.
             pass
 
         obj = Obj()
@@ -1916,12 +2269,15 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn(obj, expected))
 
     def test_closure_match(self):
+        # [FUNCTION DOC] CLOSURE_MATCH spec: metadata is the function's code object; the function
+        # passes and a function with different code fails.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(GuardBuilder.CLOSURE_MATCH)
         handler = self._get_handler("CLOSURE_MATCH")
 
         def fn():
+            # [FUNCTION DOC] HELPER: Returns 42; the sample function.
             return 42
 
         expected = handler.get_metadata_fn(guard, fn)
@@ -1929,11 +2285,14 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertTrue(handler.eval_fn(fn, expected))
 
         def other_fn():
+            # [FUNCTION DOC] HELPER: Returns 99; a function with different code.
             return 99
 
         self.assertFalse(handler.eval_fn(other_fn, expected))
 
     def test_tensor_match(self):
+        # [FUNCTION DOC] TENSOR_MATCH spec: metadata equals the extracted tensor metadata. Tensors
+        # with same shape and dtype pass; different shape, different dtype, or a non tensor fail.
         from torch._dynamo.guards import extract_tensor_metadata, GuardBuilder
 
         guard = self._make_guard(GuardBuilder.TENSOR_MATCH)
@@ -1951,6 +2310,8 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn(42, expected))
 
     def test_empty_nn_module_hooks_dict(self):
+        # [FUNCTION DOC] EMPTY_NN_MODULE_HOOKS_DICT spec: metadata is none; an empty dict passes,
+        # a dict with a hook fails.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(GuardBuilder.EMPTY_NN_MODULE_HOOKS_DICT)
@@ -1962,6 +2323,8 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn({"hook": lambda: None}, expected))
 
     def test_bool_match(self):
+        # [FUNCTION DOC] BOOL_MATCH spec: the metadata captures the sampled boolean; the same
+        # boolean passes and the opposite fails, checked for both True and False.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(GuardBuilder.BOOL_MATCH)
@@ -1976,6 +2339,8 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn(True, expected_false))
 
     def test_none_match(self):
+        # [FUNCTION DOC] NONE_MATCH spec: metadata is none; only none passes, 0 and the empty
+        # string fail.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(GuardBuilder.NONE_MATCH)
@@ -1988,12 +2353,15 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn("", expected))
 
     def test_function_match(self):
+        # [FUNCTION DOC] FUNCTION_MATCH spec: metadata is the function; only that function passes,
+        # a lambda or a builtin fails.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(GuardBuilder.FUNCTION_MATCH)
         handler = self._get_handler("FUNCTION_MATCH")
 
         def my_fn():
+            # [FUNCTION DOC] HELPER: Returns 42; the sample function.
             return 42
 
         expected = handler.get_metadata_fn(guard, my_fn)
@@ -2003,6 +2371,8 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn(torch.add, expected))
 
     def test_weakref_alive(self):
+        # [FUNCTION DOC] WEAKREF_ALIVE spec: it receives the dereferenced value, metadata is none.
+        # A live referent passes; after deleting it the dereferenced value is none and fails.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(GuardBuilder.WEAKREF_ALIVE)
@@ -2012,6 +2382,7 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         # weakref itself. A live referent resolves to the object; a dead
         # one resolves to None.
         class C:
+            # [CLASS DOC] HELPER: Empty class whose instance is weakly referenced.
             pass
 
         obj = C()
@@ -2024,6 +2395,8 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn(ref(), expected))
 
     def test_set_contains(self):
+        # [FUNCTION DOC] SET_CONTAINS spec for key a: metadata is the key; sets containing it
+        # pass, others fail.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(functools.partial(GuardBuilder.SET_CONTAINS, key="a"))
@@ -2036,6 +2409,8 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn({"b", "c"}, expected))
 
     def test_set_not_contains(self):
+        # [FUNCTION DOC] SET_NOT_CONTAINS spec for key z: metadata is the key; sets lacking it
+        # pass, sets containing it fail.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(
@@ -2050,6 +2425,8 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn({"a", "z"}, expected))
 
     def test_not_none_match(self):
+        # [FUNCTION DOC] NOT_NONE_MATCH spec: metadata is none; any non-none value
+        # passes, none fails.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(GuardBuilder.NOT_NONE_MATCH)
@@ -2062,6 +2439,8 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn(None, expected))
 
     def test_dispatch_key_set_match(self):
+        # [FUNCTION DOC] DISPATCH_KEY_SET_MATCH spec: metadata is the raw representation of the
+        # dispatch key set; another tensor's identical key set passes.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(GuardBuilder.DISPATCH_KEY_SET_MATCH)
@@ -2076,6 +2455,8 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertTrue(handler.eval_fn(dks2, expected))
 
     def test_tuple_iterator_len(self):
+        # [FUNCTION DOC] TUPLE_ITERATOR_LEN spec: metadata is the remaining length 3; an iterator
+        # over three items passes, over one item fails.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(GuardBuilder.TUPLE_ITERATOR_LEN)
@@ -2088,6 +2469,8 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn(iter((1,)), expected))
 
     def test_range_iterator_match(self):
+        # [FUNCTION DOC] RANGE_ITERATOR_MATCH spec: a fresh iterator over an identical range
+        # passes; ranges with a different start or step fail.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(GuardBuilder.RANGE_ITERATOR_MATCH)
@@ -2100,6 +2483,8 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn(iter(range(1, 10, 3)), expected))
 
     def test_nn_module(self):
+        # [FUNCTION DOC] NN_MODULE spec: metadata is the module object; only that same module
+        # passes, an identically built other module fails.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(GuardBuilder.NN_MODULE)
@@ -2112,6 +2497,8 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         self.assertFalse(handler.eval_fn(torch.nn.Linear(3, 4), expected))
 
     def test_mapping_keys_check(self):
+        # [FUNCTION DOC] MAPPING_KEYS_CHECK spec on a read-only mapping proxy: metadata is the
+        # list of keys; a proxy with the same keys passes, different keys fail.
         import types
 
         from torch._dynamo.guards import GuardBuilder
@@ -2136,11 +2523,17 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         "RSS-based leak detection is unreliable under sanitizers.",
     )
     def test_clone_manager_memory_leak(self):
+        # [FUNCTION DOC] Linux only test, skipped under sanitizers. Clones a root guard manager
+        # many times with a keep-all filter and checks resident memory growth over 10000 clones
+        # stays under 1 MB. Does warmup clones and runs garbage collection around measurements.
         def get_mem():
+            # [FUNCTION DOC] HELPER: Returns resident memory in bytes, read from the process statm
+            # file times the page size.
             with open("/proc/self/statm") as f:
                 return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
 
         def clone_filter(mgr):
+            # [FUNCTION DOC] HELPER: Clone filter accepting every manager; ignores its argument.
             return True
 
         root = RootGuardManager()
@@ -2166,6 +2559,8 @@ class GuardCheckSpecTests(torch._dynamo.test_case.TestCase):
         )
 
     def test_dict_keys_match(self):
+        # [FUNCTION DOC] DICT_KEYS_MATCH spec: metadata is the list of keys in order; a dict with
+        # the same keys passes, fewer or different keys fail.
         from torch._dynamo.guards import GuardBuilder
 
         guard = self._make_guard(GuardBuilder.DICT_KEYS_MATCH)
