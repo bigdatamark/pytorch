@@ -1,5 +1,14 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
+# [MODULE DOC] Triton-based kernels and helpers for sparse BSR (block compressed row) tensors.
+# Provides argument checking helpers, batch/grid slicing utilities for launching kernels in
+# chunks within CUDA grid limits, scatter_mm (scattered block matrix products with three
+# indices-data formats), bsr_scatter_mm, bsr_dense_addmm, and, only when triton is
+# available, sampled_addmm, bsr_dense_mm, bsr_softmax and a sparse-mask attention routine.
+# When triton is missing, those triton-only names are bound to None at import time.
+# Import-time side effects: reads the environment variable
+# TORCH_SPARSE_BSR_SCATTER_MM_LRU_CACHE_SIZE (default 2) into a module constant, and imports
+# triton when has_triton reports it is usable.
 import math
 import os
 import weakref
@@ -18,11 +27,16 @@ TORCH_SPARSE_BSR_SCATTER_MM_LRU_CACHE_SIZE = int(
 
 
 def check(cond, msg):
+    # [FUNCTION DOC] HELPER: Raise a ValueError carrying msg when cond is falsy; otherwise do
+    # nothing.
     if not cond:
         raise ValueError(msg)
 
 
 def check_bsr_layout(f_name, t):
+    # [FUNCTION DOC] HELPER: Validate that tensor t uses the sparse BSR layout; raises
+    # ValueError
+    # (mentioning f_name) otherwise.
     check(
         t.layout == torch.sparse_bsr,
         f"{f_name}(): only BSR sparse format is supported for the sparse argument.",
@@ -30,6 +44,9 @@ def check_bsr_layout(f_name, t):
 
 
 def check_device(f_name, t, device):
+    # [FUNCTION DOC] HELPER: Validate that t lives on the given device and that the device type
+    # is
+    # cuda or xpu; raises ValueError (mentioning f_name) otherwise.
     check(
         t.device == device and t.device.type in ("cuda", "xpu"),
         f"{f_name}(): all inputs are expected to be on the same GPU device.",
@@ -37,6 +54,9 @@ def check_device(f_name, t, device):
 
 
 def check_mm_compatible_shapes(f_name, lhs, rhs):
+    # [FUNCTION DOC] HELPER: Validate that lhs and rhs are both at least 2-D and that the last
+    # dimension of lhs equals the second-to-last dimension of rhs. Batch dimensions are not
+    # checked. Raises ValueError with f_name in the message on failure.
     check(
         lhs.dim() >= 2 and rhs.dim() >= 2,
         f"{f_name}(): all inputs involved in the matrix product are expected to be at least 2D, "
@@ -54,6 +74,13 @@ def check_mm_compatible_shapes(f_name, lhs, rhs):
 
 
 def check_dtype(f_name, t, dtype, *additional_dtypes):
+    # [FUNCTION DOC] HELPER: Validate that t has exactly the dtype given and that this dtype is
+    # one
+    # of half, bfloat16, float32 or one of the dtypes in the additional dtypes tuple.
+    # Raises ValueError otherwise.
+    # KNOWN ISSUE: additional_dtypes is a varargs tuple but is unpacked again when building the
+    # allowed set, so only the first tuple argument is honored, and the error message prints the
+    # raw varargs tuple.
     check(
         t.dtype == dtype
         and t.dtype
@@ -65,13 +92,22 @@ def check_dtype(f_name, t, dtype, *additional_dtypes):
 
 
 def check_blocksize(f_name, blocksize):
+    # [FUNCTION DOC] HELPER: Validate a BSR blocksize: it must have two entries, each at least
+    # 16
+    # and a power of two (triton block loads need this). Raises AssertionError when the length
+    # is
+    # not 2 and ValueError when the sizes are incompatible.
     if len(blocksize) != 2:
         raise AssertionError(f"blocksize must have length 2, got {len(blocksize)}")
 
     def is_power_of_two(v):
+        # [FUNCTION DOC] HELPER: Return True when v has at most one bit set (note this also
+        # accepts 0).
         return not (v & (v - 1))
 
     def is_compatible_blocksize(b):
+        # [FUNCTION DOC] HELPER: Return True only if every entry of b is at least 16 and a
+        # power of two.
         res = True
         for blocksize in b:
             # Triton loads only blocks which are at least 16 and powers of 2.
@@ -86,6 +122,10 @@ def check_blocksize(f_name, blocksize):
 
 
 def make_triton_contiguous(t):
+    # [FUNCTION DOC] HELPER: Return t unchanged when its smallest stride is at most 1, otherwise
+    # return a contiguous copy. Avoids slow element-wise loads in triton kernels for tensors
+    # whose
+    # strides are all larger than one.
     """Return input as a triton-contiguous tensor.
 
     A triton-contiguous tensor is defined as a tensor that has strides
@@ -105,6 +145,10 @@ def make_triton_contiguous(t):
 
 
 def broadcast_batch_dims(f_name, *tensors):
+    # [FUNCTION DOC] HELPER: Return the broadcast shape of the batch dimensions (all but the
+    # last
+    # two) of the given tensors. Raises ValueError mentioning f_name when they are not
+    # broadcastable. Does not modify the inputs.
     try:
         return torch.broadcast_shapes(*(t.shape[:-2] for t in tensors))
     except Exception:
@@ -112,6 +156,10 @@ def broadcast_batch_dims(f_name, *tensors):
 
 
 def slicer(dim, slice_range, *tensors):
+    # [FUNCTION DOC] HELPER: Generator that yields, for each tensor, a view restricted to
+    # slice_range along dimension dim (all other dimensions kept whole).
+    # KNOWN ISSUE: indexes with a list of slices instead of a tuple, which newer PyTorch
+    # versions may reject or treat differently; the function appears unused in this module.
     for t in tensors:
         slices = [slice(None)] * t.dim()
         slices[dim] = slice_range
@@ -119,6 +167,10 @@ def slicer(dim, slice_range, *tensors):
 
 
 def multidim_slicer(dims, slices, *tensors):
+    # [FUNCTION DOC] HELPER: Generator that yields, for each tensor, a view where dimension
+    # dims[i]
+    # is restricted to slices[i]; entries whose dimension is None are skipped and unlisted
+    # dimensions are kept whole. Dims and slices are paired up to the shorter length.
     for t in tensors:
         s = [slice(None)] * t.dim()
         for d, d_slice in zip(dims, slices, strict=False):
@@ -128,12 +180,24 @@ def multidim_slicer(dims, slices, *tensors):
 
 
 def ptr_stride_extractor(*tensors):
+    # [FUNCTION DOC] HELPER: Generator that flattens tensors into a kernel argument stream: for
+    # each
+    # tensor yields the tensor itself followed by each of its strides in order.
     for t in tensors:
         yield t
         yield from t.stride()
 
 
 def grid_partitioner(full_grid, grid_blocks, tensor_dims_map):
+    # [FUNCTION DOC] HELPER: Generator that splits a launch grid into chunks no larger than
+    # grid_blocks per dimension. full_grid and grid_blocks have at most 3 entries
+    # (AssertionError
+    # otherwise). For every chunk it yields the chunk's grid size (reversed to CUDA axis order)
+    # followed by views of each tensor in tensor_dims_map sliced to that chunk, using the
+    # mapping
+    # of tensor to per-grid-dimension tensor dimension (None means not sliced). Chunks are
+    # visited
+    # with the leftmost grid dimension varying slowest.
     if len(full_grid) < 0 or len(full_grid) > 3:
         raise AssertionError(f"full_grid length must be 0-3, got {len(full_grid)}")
     if len(grid_blocks) < 0 or len(grid_blocks) > 3:
@@ -142,10 +206,16 @@ def grid_partitioner(full_grid, grid_blocks, tensor_dims_map):
     import itertools
 
     def generate_grid_points():
+        # [FUNCTION DOC] HELPER: Generator yielding, per grid dimension, the range of chunk
+        # start
+        # offsets from 0 to the full size in steps of the chunk size.
         for fg, mg in zip(full_grid, grid_blocks, strict=False):
             yield range(0, fg, mg)
 
     def generate_sliced_tensors(slices):
+        # [FUNCTION DOC] HELPER: Generator yielding, for each tensor in tensor_dims_map, the
+        # view
+        # sliced by the given per-dimension slices.
         for t, t_dims in tensor_dims_map.items():
             yield next(multidim_slicer(t_dims, slices, t))
 
@@ -162,6 +232,11 @@ def grid_partitioner(full_grid, grid_blocks, tensor_dims_map):
 
 
 def launch_kernel(kernel, tensor_dims_map, full_grid, grid_blocks=None):
+    # [FUNCTION DOC] Run kernel over the full grid, partitioned so that no chunk exceeds CUDA
+    # launch limits. grid_blocks gives optional per-dimension caps (None entries use the CUDA
+    # maximum, values are clamped to between 1 and the maximum); when grid_blocks is None the
+    # CUDA maximum is used for all dimensions. For each chunk calls kernel with the chunk's grid
+    # and the sliced tensors; returns nothing. Side effects are those of the kernel launches.
     # cuda_max_grid = (2 ** 31 - 1, 2 ** 16 - 1, 2 ** 16 - 1)
     cuda_max_grid = (2147483647, 65535, 65535)[::-1]
     if grid_blocks is None:
@@ -169,6 +244,8 @@ def launch_kernel(kernel, tensor_dims_map, full_grid, grid_blocks=None):
     else:
 
         def valid_grid_dim(g, mg):
+        # [FUNCTION DOC] HELPER: Return mg when g is None, otherwise g clamped to the range
+        # 1..mg.
             if g is None:
                 return mg
             else:
@@ -187,6 +264,12 @@ def launch_kernel(kernel, tensor_dims_map, full_grid, grid_blocks=None):
 
 
 def prepare_inputs(bsr, *dense_tensors):
+    # [FUNCTION DOC] Normalize a BSR tensor and dense tensors for kernels with a flat batch
+    # dimension. Adds a fake leading batch dimension, makes values and dense tensors
+    # triton-contiguous, broadcasts all batch dimensions to a common shape and flattens them
+    # into
+    # one. Returns crow_indices, col_indices, values, then each dense tensor, in that order.
+    # Results may be views or copies of the inputs.
     # Introduce fake batch dimension if not present for convenience.
     crow_indices = bsr.crow_indices().unsqueeze(0)
     col_indices = bsr.col_indices().unsqueeze(0)
@@ -201,6 +284,9 @@ def prepare_inputs(bsr, *dense_tensors):
     # Broadcast batch dimensions and squash.
     # The result can be either a view or a copy.
     def batch_broadcast_and_squash(t, batch_dims, invariant_dims):
+        # [FUNCTION DOC] HELPER: Broadcast t to the batch dims followed by the invariant dims
+        # and
+        # flatten all batch dims into a single leading dimension.
         return t.broadcast_to(batch_dims + invariant_dims).flatten(
             0, len(batch_dims) - 1
         )
@@ -222,6 +308,9 @@ def prepare_inputs(bsr, *dense_tensors):
 
 
 def broadcast_batch_dims_bsr(f_name, bsr, *tensors):
+    # [FUNCTION DOC] Return a new BSR tensor equal to bsr with its batch dimensions broadcast
+    # against those of the other tensors. Index and value tensors are broadcast views; raises
+    # ValueError (via broadcast_batch_dims) when batch dimensions are incompatible.
     batch_shape = broadcast_batch_dims(f_name, bsr, *tensors)
 
     crow_indices = bsr.crow_indices().broadcast_to(batch_shape + (-1,))
@@ -235,6 +324,10 @@ def broadcast_batch_dims_bsr(f_name, bsr, *tensors):
 
 # NOTE: this function will ALWAYS create a view
 def tile_to_blocksize(t, blocksize):
+    # [FUNCTION DOC] Reshape a tensor of shape (*, m, n) into a tiled view (*, m/b0, n/b1, b0,
+    # b1)
+    # where blocksize is (b0, b1). Always returns a view (the underlying view operation fails if
+    # that is impossible); m and n are assumed divisible by the block sizes.
     *rest, m, n = t.shape
     new_shape = rest + [
         m // blocksize[0],
@@ -248,6 +341,10 @@ def tile_to_blocksize(t, blocksize):
 
 
 def as1Dbatch(tensor):
+    # [FUNCTION DOC] Return tensor as a 3-D tensor: prepends size-1 dimensions when it has fewer
+    # than three, and flattens leading dimensions into one when it has more. Raises
+    # AssertionError
+    # if the result is not 3-D.
     """Return tensor as 3D tensor by either prepending new dimensions to
     the tensor shape (when ``tensor.ndim < 3``), or by collapsing
     starting dimensions into the first dimension (when ``tensor.ndim >
@@ -265,6 +362,20 @@ def as1Dbatch(tensor):
 
 
 def scatter_mm(blocks, others, indices_data, *, accumulators=None):
+    # [FUNCTION DOC] Scattered batched matrix multiplication, dispatching on indices_data[0],
+    # which
+    # names the format: scatter_mm, bsr_strided_mm, or bsr_strided_mm_compressed (anything else
+    # raises NotImplementedError). blocks must be 3-D (P, Ms, Ks). Accumulates products of
+    # blocks
+    # and slices of others into accumulators, creating a zeroed accumulators tensor when None,
+    # and
+    # returns it (viewed in the original batch shape for the strided formats). Uses the triton
+    # kernels when available and all block dims are multiples of 16, otherwise a slow Python
+    # loop.
+    # Shape mismatches raise AssertionError. Mutates accumulators in place when provided.
+    # KNOWN ISSUE: in the pure Python fallback of the scatter_mm format, accumulators already
+    # holding values are added to (not zeroed), while the bsr_strided_mm fallback zeroes them
+    # first, so the formats treat pre-filled accumulators inconsistently.
     """Scattered matrix multiplication of tensors.
 
     A scattered matrix multiplication is defined as a series of matrix
@@ -528,6 +639,14 @@ def scatter_mm_meta(
     num_stages=None,
     **extra,
 ):
+    # [FUNCTION DOC] Choose triton launch parameters (TILE_M, TILE_N, GROUP_SIZE, num_stages,
+    # num_warps, SPLIT_N) for scatter_mm of an (M, K) by (K, N) product with (Ms, Ks) blocks. If
+    # no parameter is given, first tries tuned values from get_meta for the current device, then
+    # a hard-coded table for square sizes 256..4096 (tuned for one GPU model), then heuristics
+    # for
+    # any missing value. Returns a mapping of the parameters plus any extra keyword arguments.
+    # Raises AssertionError if the resulting tile or split sizes are inconsistent with M, N, K,
+    # Ms, Ks.
     if {TILE_M, TILE_N, SPLIT_N, num_warps, num_stages, GROUP_SIZE} == {None}:
         device_name = _get_device_name()
         meta = get_meta(
@@ -775,6 +894,16 @@ def bsr_dense_addmm_meta(
     _version=0,
     **extra,
 ):
+    # [FUNCTION DOC] Choose triton launch parameters (SPLIT_N, GROUP_SIZE_ROW, num_stages,
+    # num_warps) for bsr_dense_addmm. When none of them is given, looks up tuned values via
+    # get_meta keyed on the problem sizes, block sizes, and beta/alpha special cases, trying
+    # fallbacks (sparsity 0.5, input dtype only, and matching entries with a different N whose
+    # split can be adapted). If nothing is found a warning is emitted once, and defaults are
+    # used.
+    # Returns a mapping of the parameters plus extra keyword arguments. _version lets callers
+    # discard stored tuning results.
+    # KNOWN ISSUE: in the approximate-match loop, the loop keeps overwriting meta for every
+    # matching entry, so the last compatible entry in sorted order wins rather than the best.
     # Specifying _version is useful for situations when one wants to
     # discard existing triton kernel tuning results, say, in testing
     # bsr_dense_addmm_meta functionality.
@@ -857,6 +986,16 @@ def bsr_dense_addmm_meta(
 
 
 class TensorAsKey:
+    # [CLASS DOC] Wrapper that lets tensors act as dictionary keys by memory identity instead of
+    # by tensor object identity. State: a weak reference to the wrapped tensor, a key tuple
+    # built
+    # from data pointer, storage offset, shape, stride and dtype (for strided tensors) or from
+    # the
+    # two index tensors (for compressed sparse layouts), and the precomputed hash of the key.
+    # Two wrappers are equal when their keys are equal, and dead referents only equal
+    # themselves.
+    # Only integer tensors are supported as strided keys; negative/conjugate bits are not
+    # tracked.
     """A light-weight wrapper of a tensor that enables storing tensors as
     keys with efficient memory reference based comparison as an
     approximation to data equality based keys.
@@ -880,7 +1019,17 @@ class TensorAsKey:
     """
 
     def __init__(self, obj):
+        # [FUNCTION DOC] Build the key from the tensor obj (strided: its own memory description;
+        # CSR/BSR: crow and col indices; CSC/BSC: ccol and row indices) and store a weak
+        # reference and
+        # the hash. Raises NotImplementedError for other layouts and AssertionError for floating
+        # point or complex strided tensors.
         def get_tensor_key(obj):
+            # [FUNCTION DOC] HELPER: Return a tuple describing the memory view of obj (data
+            # pointer,
+            # storage offset, shape, stride, dtype); raises AssertionError for floating point
+            # or complex
+            # dtypes.
             # Warning: TensorAsKey does not track negative nor
             # conjugate bits of its input object because in the use
             # case of wrapping compressed/plain indices of compressed
@@ -920,9 +1069,13 @@ class TensorAsKey:
         self._hash = hash(self.key)
 
     def __hash__(self):
+        # [FUNCTION DOC] Return the precomputed hash of the key.
         return self._hash
 
     def __eq__(self, other):
+        # [FUNCTION DOC] Compare with another TensorAsKey by key; returns False for other
+        # types, and
+        # for wrappers whose referent is dead returns whether they are the same object.
         if not isinstance(other, TensorAsKey):
             return False
         if self.obj is None or other.obj is None:
@@ -933,6 +1086,7 @@ class TensorAsKey:
 
     @property
     def obj(self):
+        # [FUNCTION DOC] Property: the wrapped tensor if still alive, otherwise None.
         """Return object if alive, otherwise None."""
         return self._obj_ref()
 
@@ -941,6 +1095,16 @@ class TensorAsKey:
 def _bsr_scatter_mm_indices_data(
     indices_format, M, K, N, Ms, Ks, nbatches, SPLIT_N, compressed_sparse_tensor_as_key
 ):
+    # [FUNCTION DOC] HELPER: Cached (lru_cache, size from the module constant) builder of the
+    # index
+    # tensors for scatter_mm, for the BSR tensor held by compressed_sparse_tensor_as_key. By
+    # indices_format returns a tuple whose first item is the format name: for
+    # bsr_strided_mm_compressed, (c_indices, r_offsets, q_offsets); for bsr_strided_mm,
+    # (c_indices, r_offsets, p_offsets, q_offsets); for scatter_mm, (c_indices, pq_offsets),
+    # built
+    # by Python loops over nonzero blocks. Raises ValueError for unknown formats and
+    # AssertionError
+    # if the referenced tensor has been freed. Index tensors are int32 on the BSR's device.
     bsr = compressed_sparse_tensor_as_key.obj
     if bsr is None:
         raise AssertionError("compressed_sparse_tensor_as_key.obj is None")
@@ -1038,6 +1202,13 @@ def _bsr_scatter_mm_indices_data(
 def bsr_scatter_mm_indices_data(
     bsr, other, indices_format="bsr_strided_mm_compressed", **meta_input
 ):
+    # [FUNCTION DOC] Compute the indices data tuple for scatter_mm of a 2-D BSR tensor with a
+    # strided tensor other. Obtains launch parameters from scatter_mm_meta (extra keyword
+    # arguments override), then returns the cached index tuple; for the two strided formats the
+    # parameter mapping is appended as the last item (with the is_compressed flag set).
+    # Raises AssertionError if bsr is batched, has dense dimensions, or its column count does
+    # not
+    # match other.
     """Computes indices data for :func:`scatter_mm` used in BSR and
     strided tensor matrix multiplication.
     """
@@ -1072,6 +1243,18 @@ def bsr_scatter_mm_indices_data(
 
 
 def bsr_scatter_mm(bsr, other, indices_data=None, out=None):
+    # [FUNCTION DOC] Multiply a 2-D BSR tensor by a strided tensor via scatter_mm, returning a
+    # strided result of shape (batch of other, rows of bsr, columns of other). Uses the
+    # compressed
+    # strided indices data by default; the out tensor is allocated when None and written in
+    # place.
+    # An empty bsr yields zeros. Raises AssertionError for bad dimensions and
+    # NotImplementedError
+    # for unknown formats.
+    # KNOWN ISSUE: the variables named Ms, Ks, Ns hold the whole matrix sizes (rows, columns of
+    # bsr and columns of other), not block sizes; the scatter_mm branch also uses blocksize[0]
+    # for
+    # both block dimensions, so only square blocks are handled correctly.
     """BSR @ strided -> strided"""
 
     if bsr.ndim != 2:
@@ -1160,6 +1343,10 @@ def _int_bsr_dense_addmm(
     max_grid: tuple[int | None, int | None, int | None] | None = None,
     meta: dict | None = None,
 ):
+    # [FUNCTION DOC] HELPER: Wrapper around bsr_dense_addmm that, for int8 dense inputs without
+    # an
+    # out tensor, allocates an int32 output of the broadcast batch shape so integer products do
+    # not overflow, then forwards all arguments to bsr_dense_addmm and returns its result.
     if out is None and dense.dtype is torch.int8:
         f_name = "_int_bsr_dense_addmm"
         crow_indices = bsr.crow_indices()
@@ -1201,6 +1388,18 @@ def bsr_dense_addmm(
     max_grid: tuple[int | None, int | None, int | None] | None = None,
     meta: dict | None = None,
 ):
+    # [FUNCTION DOC] Compute out = beta * input + left_alpha * (alpha * (bsr @ dense)) *
+    # right_alpha for a (possibly batched) BSR tensor and a dense tensor, using the triton
+    # kernel.
+    # left_alpha and right_alpha are optional row/column scale tensors (treated as ones when
+    # None). Returns out (allocated if None, written in place). When the sparse matrix is empty
+    # or alpha or a dimension is zero, returns beta * input without launching a kernel. meta may
+    # supply kernel parameters, otherwise chosen by bsr_dense_addmm_meta; max_grid caps the grid
+    # per dimension. Temporary copies made by prepare_inputs for out are copied back. No input
+    # checks are performed (skip_checks is unused here). Raises ValueError for non-broadcastable
+    # batch dimensions.
+    # KNOWN ISSUE: a todo about input checks is unimplemented, and the later check that alpha is
+    # nonzero can never trigger because zero alpha returns early.
     """Compute
 
       out = beta * input + left_alpha.reshape(-1, 1) * (alpha * (bsr @ dense)) * right_alpha.reshape(1, -1)
@@ -1336,6 +1535,9 @@ def bsr_dense_addmm(
         raise AssertionError("alpha must not be 0")
 
     def kernel(grid, *sliced_tensors):
+        # [FUNCTION DOC] HELPER: Launch the BSR addmm triton kernel on one grid chunk with the
+        # sliced
+        # tensors and the enclosing scalar arguments.
         # pyrefly: ignore [unsupported-operation]
         _bsr_strided_addmm_kernel[grid](
             *ptr_stride_extractor(*sliced_tensors),
@@ -1403,6 +1605,13 @@ if has_triton():
         acc_dtype: tl.constexpr,
         allow_tf32: tl.constexpr,
     ):
+        # [FUNCTION DOC] HELPER: Triton kernel computing the sampled matrix product mat1 @ mat2
+        # only at
+        # the nonzero blocks of a BSR pattern: each program handles one block row of one batch,
+        # loops over its nonzero blocks and over tiles of the inner dimension k, accumulates in
+        # acc_dtype, scales by alpha (plus beta times the existing values unless IS_BETA_ZERO),
+        # and
+        # stores results into the values array. Rows with no nonzero blocks return immediately.
         batch_pid = tl.program_id(axis=1)
         row_block_pid = tl.program_id(axis=0)
 
@@ -1542,6 +1751,15 @@ if has_triton():
         allow_tf32: tl.constexpr,
         GROUP_SIZE_ROW: tl.constexpr,
     ):
+        # [FUNCTION DOC] HELPER: Triton kernel multiplying a BSR matrix by a strided matrix:
+        # each
+        # program computes one output block (swizzled by GROUP_SIZE_ROW for locality),
+        # accumulating
+        # products over the nonzero blocks of its block row and storing the result. Rows with no
+        # nonzero blocks are skipped, leaving output untouched.
+        # KNOWN ISSUE: dense and output column offsets use the row_block arange for the column
+        # dimension, which is only correct when BLOCKSIZE_ROW equals BLOCKSIZE_COL; the kernel
+        # appears unused in this module.
         batch_pid = tl.program_id(axis=2)
         row_block_pid = tl.program_id(axis=0)
         col_block_pid = tl.program_id(axis=1)
@@ -1642,6 +1860,13 @@ if has_triton():
         mat2,
         max_grid,
     ):
+        # [FUNCTION DOC] HELPER: Launch the sampled addmm kernel over the batches and block
+        # rows of the
+        # BSR parts (values, crow_indices, col_indices) with mat1 and mat2 already tiled,
+        # choosing
+        # the accumulator dtype (float32 with tf32 for half types, float64 otherwise). Writes
+        # into
+        # values in place; max_grid optionally caps the launch grid.
         n_batches = values.size(0)
         n_block_rows = crow_indices.size(-1) - 1
 
@@ -1665,6 +1890,7 @@ if has_triton():
             allow_tf32 = False
 
         def kernel(grid, *sliced_tensors):
+            # [FUNCTION DOC] HELPER: Launch the sampled addmm kernel for one grid chunk.
             _sampled_addmm_kernel[grid](
                 alpha,
                 beta,
@@ -1692,6 +1918,16 @@ if has_triton():
         skip_checks: bool = False,
         max_grid: tuple[int | None, int | None, int | None] | None = None,
     ):
+        # [FUNCTION DOC] Compute the sampled addmm: beta * input + alpha * (mat1 @ mat2)
+        # evaluated only
+        # at the nonzero blocks of the BSR tensor input (a boolean mask input requires beta
+        # equal to
+        # 0). Returns a BSR tensor with the same sparsity pattern as input (written into out if
+        # given). Unless skip_checks is set, validates layout, device, dtype, shapes, and out.
+        # Raises
+        # ValueError on failed checks. Returns early with a copy for empty inputs and scales by
+        # beta
+        # for zero alpha or empty inner dimension.
         f_name = "sampled_addmm"
 
         check_bsr_layout(f_name, input)
@@ -1777,6 +2013,15 @@ if has_triton():
         max_grid: tuple[int | None, int | None, int | None] | None = None,
         meta: dict | None = None,
     ):
+        # [FUNCTION DOC] Multiply a BSR tensor by a dense tensor via bsr_dense_addmm with alpha
+        # 1 and
+        # beta 0. Unless skip_checks is set, validates layout, device, dtype (half, bfloat16,
+        # float32
+        # or int8), shapes, block size (power of two, at least 16), that dense columns divide
+        # by 16,
+        # and that out is row- or column-major with the right shape; ValueError otherwise.
+        # Allocates
+        # out if needed, and returns zeros when the BSR is empty.
         f_name = "bsr_dense_mm"
         m, _kl = bsr.shape[-2:]
         if not skip_checks:
@@ -1837,6 +2082,14 @@ if has_triton():
         MAX_ROW_NNZ: tl.constexpr,
         TILE: tl.constexpr,
     ):
+        # [FUNCTION DOC] HELPER: Triton kernel computing softmax in place over the stored
+        # values of
+        # one row inside a BSR matrix, ignoring absent entries. Each program handles one batch,
+        # block
+        # row and row inside the block; works in tiles of TILE elements with three passes (row
+        # maximum, denominator, normalized write-back) over up to MAX_ROW_NNZ elements. Empty
+        # block
+        # rows return immediately.
         batch_pid = tl.program_id(axis=2)
         row_block_offset_pid = tl.program_id(axis=1)
         row_block_pid = tl.program_id(axis=0)
@@ -1913,6 +2166,13 @@ if has_triton():
             )
 
     def bsr_softmax(input, max_row_nnz=None):
+        # [FUNCTION DOC] Row-wise softmax over the specified (nonzero) entries of a BSR tensor.
+        # Returns a new BSR tensor with the same indices (cloned) and softmax-normalized
+        # values; the
+        # input is not modified. Empty inputs return a clone. max_row_nnz bounds the number of
+        # values
+        # in a row (default derived from the column count) and is rounded to a power of two.
+        # Raises ValueError when the layout or dtype checks fail.
         f_name = "bsr_softmax"
 
         check_bsr_layout(f_name, input)
@@ -1958,6 +2218,7 @@ if has_triton():
         }
 
         def kernel(grid, *sliced_tensors):
+            # [FUNCTION DOC] HELPER: Launch the BSR softmax kernel on one grid chunk.
             _bsr_softmax_kernel[grid](
                 *ptr_stride_extractor(*sliced_tensors),
                 row_block,
@@ -1992,6 +2253,17 @@ if has_triton():
         is_causal: bool = False,
         scale: float | None = None,
     ):
+        # [FUNCTION DOC] Sparse attention: computes softmax(scale * query @ key^T masked by
+        # attn_mask)
+        # times value, where attn_mask is a BSR tensor defining which positions are computed.
+        # Pipeline: sampled_addmm, scaling, bsr_softmax, dropout on the values (in place), and
+        # bsr_dense_mm with value. Raises ValueError when is_causal is set, attn_mask is
+        # missing or
+        # not BSR, devices or dtypes mismatch, or the scale is zero. Returns the dense result.
+        # KNOWN ISSUE: the zero-scale condition mixes and/or without parentheses, so it reads as
+        # (no scale and empty feature dim) or (scale equals zero); this happens to work for the
+        # two
+        # intended cases but is easy to misread.
         f_name = "_scaled_dot_product_attention"
         check(not is_causal, f"{f_name}(): is_causal == True is not supported.")
         check(attn_mask is not None, f"{f_name}(): attn_mask == None is not supported.")
@@ -2060,6 +2332,16 @@ if has_triton():
         TILE_N: tl.constexpr,
         allow_tf32: tl.constexpr,
     ):
+        # [FUNCTION DOC] HELPER: Triton kernel for scatter_mm format scatter_mm: each program
+        # handles
+        # one group of (p, q) block pairs (delimited by pq_offsets) and one output tile;
+        # accumulates
+        # block products for the pairs of the group and stores the tile into the accumulator
+        # slice
+        # of that group. Groups with no pairs return immediately.
+        # KNOWN ISSUE: the tile column index is computed as pid modulo Ms (derived from M),
+        # where
+        # the number of tile columns would be expected, which looks wrong unless M equals N.
         Ms = M // TILE_M
 
         pid_t = tl.program_id(axis=0)
@@ -2111,6 +2393,12 @@ if has_triton():
         pq_indices: torch.Tensor,
         accumulators: torch.Tensor,
     ):
+        # [FUNCTION DOC] HELPER: Host side of the scatter_mm format: derives tile sizes from
+        # the block
+        # shape, picks the accumulator dtype (float32 for half types, float64 otherwise,
+        # raising KeyError
+        # for unsupported dtypes), and launches the kernel over groups and tiles. Writes into
+        # accumulators in place; returns nothing.
         _P, M, K = blocks.shape
         _Q, _, N = others.shape
 
@@ -2119,6 +2407,9 @@ if has_triton():
         )
 
         def grid(META):
+            # [FUNCTION DOC] HELPER: Return the launch grid size (groups, tiles, 1) for the
+            # given meta
+            # parameters.
             return (
                 pq_offsets.shape[0] - 1,
                 triton.cdiv(M, META["TILE_M"]) * triton.cdiv(N, META["TILE_N"]),
@@ -2188,6 +2479,15 @@ if has_triton():
         GROUP_SIZE: tl.constexpr,
         allow_tf32: tl.constexpr,
     ):
+        # [FUNCTION DOC] HELPER: Triton kernel behind the strided scatter_mm formats. Each
+        # program
+        # handles one (batch, output row offset) pair and one tile; in compressed mode it
+        # derives the
+        # block range and q offsets from c_indices and the output offset, otherwise it reads
+        # them from
+        # c_indices, p_offsets and q_offsets. Accumulates block products over the nonzero
+        # blocks and
+        # stores the tile at the output offset.
         Ns = N // SPLIT_N
         BLOCKS_M = Ms // TILE_M
         BLOCKS_N = Ns // TILE_N
@@ -2283,6 +2583,15 @@ if has_triton():
         accumulators: torch.Tensor,
         force_contiguous: bool = True,
     ):
+        # [FUNCTION DOC] HELPER: Host side of the strided scatter_mm formats. Validates shapes
+        # and unit
+        # strides of the index tensors (AssertionError otherwise), picks the accumulator dtype,
+        # makes
+        # blocks, others and accumulators contiguous when force_contiguous (works around illegal
+        # memory access errors for large non-contiguous arguments), launches the kernel and
+        # copies the
+        # result back into accumulators if a temporary was used. Mutates accumulators and meta
+        # (adds allow_tf32 when missing).
         SPLIT_N = meta["SPLIT_N"]
         _P, Ms, Ks = blocks.shape
         B, _K, N = others.shape
@@ -2294,6 +2603,9 @@ if has_triton():
             raise AssertionError(f"accumulators B ({B_}) != others B ({B})")
 
         def grid(META):
+            # [FUNCTION DOC] HELPER: Return the launch grid size (index count times batches,
+            # number of
+            # tiles) for the given meta parameters.
             return (
                 r_offsets.shape[0] * B,
                 triton.cdiv(Ms, META["TILE_M"]) * triton.cdiv(Ns, META["TILE_N"]),
@@ -2450,6 +2762,15 @@ if has_triton():
         GROUP_SIZE_ROW: tl.constexpr,
         SPLIT_N: tl.constexpr,
     ):
+        # [FUNCTION DOC] HELPER: Triton kernel for the BSR times strided addmm: each program
+        # computes
+        # one output block (swizzled for locality) as the sum over the nonzero blocks of its
+        # block
+        # row, then applies alpha, optional elementwise left_alpha and right_alpha scales and
+        # beta
+        # times input, and stores the result. The left/right alpha strides must be zero along
+        # the
+        # broadcast dimensions (AssertionError otherwise). Flags select which terms are skipped.
         # left/right_alpha tensors are originally (* + 1)-dimensional
         if left_alpha_tiled_col_stride != 0:
             raise AssertionError(
