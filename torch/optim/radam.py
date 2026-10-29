@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Rectified Adam (RAdam) optimizer. Defines the RAdam class, the functional radam entry point, and
+# single-tensor and multi-tensor (foreach) implementations. Exports RAdam and radam.
+# Import-time side effect: attaches the long documentation string to RAdam.
 r"""Implementation for the RAdam algorithm."""
 
 from typing import cast
@@ -29,6 +33,12 @@ __all__ = ["RAdam", "radam"]
 
 
 class RAdam(Optimizer):
+    # [CLASS DOC]
+    # RAdam optimizer: Adam with a variance rectification term; while the approximated length of
+    # the moving average is small (at most 5) it falls back to an un-adapted momentum update.
+    # Group options: lr, betas, eps, weight_decay, decoupled_weight_decay, foreach, maximize,
+    # capturable, differentiable. Per-parameter state: step (scalar tensor), exp_avg and
+    # exp_avg_sq. Sparse gradients are not supported. step() delegates to the functional radam.
     def __init__(
         self,
         params: ParamsT,
@@ -43,6 +53,10 @@ class RAdam(Optimizer):
         capturable: bool = False,
         differentiable: bool = False,
     ) -> None:
+        # [FUNCTION DOC]
+        # Validates arguments and builds the defaults mapping for the base constructor.
+        # Raises a ValueError for a multi-element tensor lr, negative lr, eps or weight_decay,
+        # or a beta outside the range from 0 (inclusive) to 1 (exclusive).
         if isinstance(lr, Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be 1-element")
         if not 0.0 <= lr:
@@ -70,6 +84,10 @@ class RAdam(Optimizer):
         super().__init__(params, defaults)
 
     def __setstate__(self, state):
+        # [FUNCTION DOC]
+        # Restores pickled state via the base class and fills in missing group options (foreach,
+        # maximize, differentiable, decoupled_weight_decay, capturable). Converts any non-tensor
+        # step in per-parameter state into a scalar tensor (on the parameter device if capturable).
         super().__setstate__(state)
         for group in self.param_groups:
             group.setdefault("foreach", None)
@@ -92,6 +110,10 @@ class RAdam(Optimizer):
     def _init_group(
         self, group, params_with_grad, grads, exp_avgs, exp_avg_sqs, state_steps
     ):
+        # [FUNCTION DOC] HELPER: For each parameter with a gradient in the group, appends it and
+        # its gradient, exp_avg, exp_avg_sq and step to the caller-supplied lists, lazily creating
+        # zeroed state. Raises a RuntimeError on sparse gradients. Returns true if any parameter
+        # is complex.
         has_complex = False
         for p in group["params"]:
             if p.grad is not None:
@@ -126,6 +148,10 @@ class RAdam(Optimizer):
 
     @_use_grad_for_differentiable
     def step(self, closure=None):
+        # [FUNCTION DOC]
+        # Performs one optimization step. Checks graph-capture health, optionally evaluates the
+        # closure with gradients enabled, then per group gathers state and calls the functional
+        # radam, updating parameters and state in place. Returns the closure loss or none.
         """Perform a single optimization step.
 
         Args:
@@ -271,6 +297,12 @@ def _single_tensor_radam(
     capturable: bool,
     has_complex: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Per-parameter RAdam update. Increments step, applies weight decay
+    # (decoupled shrinks the parameter, otherwise added to the gradient), updates both moving
+    # averages, computes bias corrections, the maximum and current SMA length, and the
+    # rectification term. If the SMA length exceeds 5 the step uses the rectified adaptive rate,
+    # otherwise only the bias-corrected first moment. Complex tensors are viewed as real.
+    # Raises an AssertionError if capturable and tensors are on unsupported devices.
     if not torch.jit.is_scripting():
         lr = _to_scalar(lr)
 
@@ -323,6 +355,8 @@ def _single_tensor_radam(
         rho_t = rho_inf - 2 * step * (beta2**step) / bias_correction2
 
         def _compute_rect():
+            # [FUNCTION DOC] HELPER: Returns the variance rectification factor, the square root of
+            # a ratio built from the current and maximum SMA lengths (closure variables).
             return (
                 (rho_t - 4)
                 * (rho_t - 2)
@@ -331,6 +365,8 @@ def _single_tensor_radam(
             ) ** 0.5
 
         def _compute_adaptive_lr():
+            # [FUNCTION DOC] HELPER: Returns the root of the second-moment bias correction divided
+            # by the root of exp_avg_sq plus eps (out-of-place when differentiable).
             exp_avg_sq_sqrt = exp_avg_sq.sqrt()
             if differentiable:
                 exp_avg_sq_sqrt = exp_avg_sq_sqrt.add(eps)
@@ -376,6 +412,12 @@ def _multi_tensor_radam(
     capturable: bool,
     has_complex: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Foreach (batched) RAdam update, same math as the single-tensor path,
+    # per device/dtype group. When capturable, SMA length, rectification and step sizes are
+    # computed with tensor ops (no host reads); otherwise with Python scalars. Does nothing for
+    # empty params. Raises an AssertionError if differentiable is set or if capturable and
+    # tensors are on unsupported devices.
+    # KNOWN ISSUE: the capturable device check excludes XLA; the single-tensor check allows it.
     if len(params) == 0:
         return
 
@@ -585,6 +627,11 @@ def radam(
     weight_decay: float,
     eps: float,
 ) -> None:
+    # [FUNCTION DOC]
+    # Functional RAdam entry point. Verifies that state_steps are tensors, resolves the foreach
+    # default, and dispatches to the multi-tensor or single-tensor implementation, which update
+    # params and state lists in place. Raises a RuntimeError for non-tensor state_steps or
+    # foreach under torch.jit scripting.
     r"""Functional API that performs RAdam algorithm computation.
 
     See :class:`~torch.optim.RAdam` for details.

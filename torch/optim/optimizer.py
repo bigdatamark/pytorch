@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Base Optimizer class plus shared helpers used by all torch.optim optimizers: step hooks (global
+# and per instance), state_dict/load_state_dict with hooks, zero_grad, param group management,
+# foreach/fused/capturable selection helpers, and shared argument documentation strings.
+# Exports Optimizer and the two global step hook registration functions.
+# Import-time side effects: creates the module-level global hook registries (ordered mappings)
+# and the singleton "required" marker.
 """Base optimizer."""
 
 import functools
@@ -46,9 +53,13 @@ _foreach_supported_types = [torch.Tensor, torch.nn.parameter.Parameter]
 
 
 class _RequiredParameter:
+    # [CLASS DOC] HELPER: Marker type with a single module-level instance named required. Used as
+    # a default value in an optimizer's defaults mapping to mean the option must be given
+    # explicitly in every param group. Holds no state.
     """Singleton class representing a required parameter for an Optimizer."""
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns the fixed text for the required marker.
         return "<required parameter>"
 
 
@@ -56,7 +67,13 @@ required = _RequiredParameter()
 
 
 def _use_grad_for_differentiable(func: Callable[_P, _T]) -> Callable[_P, _T]:
+    # [FUNCTION DOC] HELPER: Decorator for optimizer step methods. Returns a wrapper that, around
+    # the call, sets grad mode to the optimizer's differentiable default (so no_grad unless
+    # differentiable), forces a compiler graph break before and after, and restores the previous
+    # grad mode even on error. Copies metadata from the wrapped function.
     def _use_grad(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+        # [FUNCTION DOC] HELPER: The wrapper. Treats the first positional argument as the
+        # optimizer, switches grad mode, calls the wrapped step, and returns its result.
         import torch._dynamo
 
         self = cast(Optimizer, args[0])  # assume first positional arg is `self`
@@ -95,6 +112,8 @@ def _get_value(x: float) -> float: ...
 
 
 def _get_value(x: torch.Tensor | float) -> torch.Tensor | float:
+    # [FUNCTION DOC] HELPER: Returns x unchanged while compiling; otherwise converts a tensor to
+    # a Python number (faster than keeping a CPU tensor in eager) and returns numbers as is.
     # item is significantly faster than a cpu tensor in eager mode
     if not torch.jit.is_scripting() and torch.compiler.is_compiling():
         return x
@@ -105,6 +124,8 @@ def _get_value(x: torch.Tensor | float) -> torch.Tensor | float:
 def _stack_if_compiling(
     x: Sequence[torch.Tensor | float],
 ) -> torch.Tensor | Sequence[torch.Tensor | float]:
+    # [FUNCTION DOC] HELPER: While compiling, stacks the sequence of tensors into one tensor;
+    # otherwise returns the sequence unchanged.
     if not torch.jit.is_scripting() and torch.compiler.is_compiling():
         return torch.stack(cast(list[torch.Tensor], x))
     else:
@@ -114,6 +135,11 @@ def _stack_if_compiling(
 def _disable_dynamo_if_unsupported(
     single_tensor_fn: Callable[..., object] | None = None,
 ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    # [FUNCTION DOC] HELPER: Decorator factory for functional optimizer implementations. Registers
+    # the given single-tensor function in this module's globals (needed for TorchScript backward
+    # compatibility; global side effect). The returned decorator wraps a function so that, when
+    # compiling with non-capturable state_steps on cuda or xpu devices, it runs an un-compiled
+    # copy instead; otherwise it calls the function directly.
     # workaround for torchscript BC
     # it requires all called functions to be in the
     # global environment at the site at which the
@@ -122,6 +148,8 @@ def _disable_dynamo_if_unsupported(
         globals()[single_tensor_fn.__name__] = single_tensor_fn
 
     def wrapper(func: Callable[_P, _T]) -> Callable[_P, _T]:
+        # [FUNCTION DOC] HELPER: The decorator. Builds a dynamo-disabled copy of func, finds the
+        # position of its state_steps parameter if any, and returns the fallback-selecting wrapper.
         import inspect
 
         disabled_func = torch._disable_dynamo(func)
@@ -139,6 +167,9 @@ def _disable_dynamo_if_unsupported(
         # the capturable flag. If capturable=True, this is not a problem.
         @functools.wraps(func)
         def maybe_fallback(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+            # [FUNCTION DOC] HELPER: Calls the dynamo-disabled copy when compiling, capturable is
+            # false, and state_steps (positional or keyword) are non-empty on a cuda or xpu device;
+            # otherwise calls the original function. Returns the callee result.
             if torch.compiler.is_compiling() and (
                 not kwargs.get("capturable", False)
                 and has_state_steps
@@ -170,6 +201,10 @@ def _disable_dynamo_if_unsupported(
 def _default_to_fused_or_foreach(
     params: list[torch.Tensor], differentiable: bool, use_fused: bool = False
 ) -> tuple[bool, bool]:
+    # [FUNCTION DOC] HELPER: Chooses default implementations. Returns (fused, foreach) flags.
+    # Both false when scripting or differentiable. Fused requires use_fused and every param to be
+    # a plain tensor/Parameter, floating point, on a fused-capable device; foreach (only if not
+    # fused) requires plain tensors on foreach-capable devices. None entries are ignored.
     if torch.jit.is_scripting() or differentiable:
         return False, False
 
@@ -198,6 +233,9 @@ def _default_to_fused_or_foreach(
 def _device_dtype_check_for_fused(
     p: torch.Tensor, cuda_unsupported: bool = False
 ) -> None:
+    # [FUNCTION DOC] HELPER: Validates one parameter for the fused implementation. Raises a
+    # RuntimeError unless it is floating point and on a fused-supported device; cuda_unsupported
+    # removes cuda from the supported list. Returns nothing.
     fused_supported_devices = _get_fused_kernels_supported_devices()
     if cuda_unsupported:
         fused_supported_devices.remove("cuda")
@@ -211,6 +249,9 @@ def _device_dtype_check_for_fused(
 def _view_as_real(
     params: list[torch.Tensor], *state_and_grads: list[torch.Tensor]
 ) -> None:
+    # [FUNCTION DOC] HELPER: Replaces, in place in the given lists, each complex parameter and the
+    # entry at the same position in every other list with its real-valued view. Real entries are
+    # left alone.
     for i, p in enumerate(params):
         if torch.is_complex(p):
             params[i] = torch.view_as_real(params[i])
@@ -219,6 +260,8 @@ def _view_as_real(
 
 
 def _get_scalar_dtype(is_fused: bool | None = None) -> torch.dtype:
+    # [FUNCTION DOC] HELPER: Returns the dtype for scalar step counters: float32 if fused,
+    # else float64 when the default dtype is float64, else float32.
     if is_fused:
         return torch.float32
     return (
@@ -227,6 +270,8 @@ def _get_scalar_dtype(is_fused: bool | None = None) -> torch.dtype:
 
 
 def _get_capturable_supported_devices(supports_xla: bool = True) -> list[str]:
+    # [FUNCTION DOC] HELPER: Builds a new list of device type names allowed for capturable:
+    # cuda, xpu, hpu, the private-use backend name (skipped when scripting), and xla if allowed.
     r"""Return the device type list that supports capturable optimizer."""
     capturable_supported_devices = ["cuda", "xpu", "hpu"]
     if not torch.jit.is_scripting():
@@ -245,6 +290,8 @@ def _to_scalar(x: float) -> float: ...
 
 
 def _to_scalar(x: torch.Tensor | float) -> torch.Tensor | float:
+    # [FUNCTION DOC] HELPER: Squeezes a non-zero-dimension (one-element) tensor to a 0-d tensor;
+    # returns any other input unchanged.
     r"""This function converts a hyperparameter to a 0-dimension (scalar) tensor
     if it is a nonzero-dimensions 1-element tensor. If it is not a tensor, it is
     kept as is.
@@ -306,6 +353,9 @@ _maximize_doc = r"""maximize (bool, optional): maximize the objective with respe
 
 
 def register_optimizer_step_pre_hook(hook: GlobalOptimizerPreHook) -> RemovableHandle:
+    # [FUNCTION DOC]
+    # Adds hook to the global (all optimizers) step pre-hook registry, keyed by a new handle id.
+    # Mutates module-level state. Returns a handle whose remove method unregisters the hook.
     r"""Register a pre hook common to all optimizers.
 
     The hook should have the following signature::
@@ -326,6 +376,9 @@ def register_optimizer_step_pre_hook(hook: GlobalOptimizerPreHook) -> RemovableH
 
 
 def register_optimizer_step_post_hook(hook: GlobalOptimizerPostHook) -> RemovableHandle:
+    # [FUNCTION DOC]
+    # Adds hook to the global (all optimizers) step post-hook registry, keyed by a new handle id.
+    # Mutates module-level state. Returns a handle whose remove method unregisters the hook.
     r"""Register a post hook common to all optimizers.
 
     The hook should have the following signature::
@@ -356,6 +409,14 @@ T = TypeVar("T")
 
 
 class Optimizer:
+    # [CLASS DOC]
+    # Base class for all optimizers. State: defaults (mapping of option defaults), param_groups
+    # (list of mappings, each with a params list of tensors plus options and optional
+    # param_names), state (mapping from parameter tensor to per-parameter state), and six ordered
+    # hook registries (step pre/post, state_dict pre/post, load_state_dict pre/post).
+    # Invariants: a tensor belongs to at most one group; either all groups have names or none.
+    # Subclasses implement step. The constructor wraps the subclass step with profiling and hook
+    # calling. Key methods: add_param_group, state_dict, load_state_dict, zero_grad, and hooks.
     r"""Base class for all optimizers.
 
     .. warning::
@@ -394,6 +455,11 @@ class Optimizer:
     )
 
     def __init__(self, params: ParamsT, defaults: dict[str, Any]) -> None:
+        # [FUNCTION DOC]
+        # Stores defaults, creates the empty hook registries and empty state and param_groups,
+        # patches the subclass step with the profiling/hook wrapper, logs API usage, and adds
+        # each param group (a bare iterable of tensors becomes a single group).
+        # Raises a TypeError if params is a single tensor and a ValueError if params is empty.
         torch._C._log_api_usage_once("python.optimizer")
         self.defaults = defaults
         self._optimizer_step_pre_hooks = OrderedDict()
@@ -429,6 +495,8 @@ class Optimizer:
         self._warned_capturable_if_run_uncaptured = True
 
     def __getstate__(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Returns the pickle state: only defaults, state and param_groups (hooks
+        # are not pickled).
         return {
             "defaults": self.defaults,
             "state": self.state,
@@ -436,6 +504,9 @@ class Optimizer:
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
+        # [FUNCTION DOC] Restores attributes from the given mapping, recreates any missing hook
+        # registries as empty, re-patches the step method, and ensures the differentiable default
+        # exists (false). Also used by load_state_dict to install new state and param groups.
         self.__dict__.update(state)
         if "_optimizer_step_pre_hooks" not in self.__dict__:
             self._optimizer_step_pre_hooks = OrderedDict()
@@ -453,6 +524,8 @@ class Optimizer:
         self.defaults.setdefault("differentiable", False)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns text with the class name, then for each param group its index and
+        # its options (sorted by name, excluding the params list), one per line.
         format_string = self.__class__.__name__ + " ("
         for i, group in enumerate(self.param_groups):
             format_string += "\n"
@@ -465,6 +538,12 @@ class Optimizer:
 
     # Currently needed by Adam and AdamW
     def _accelerator_graph_capture_health_check(self) -> None:
+        # [FUNCTION DOC] HELPER: Does nothing while compiling. Otherwise, on a cuda or xpu
+        # accelerator: raises a RuntimeError if a graph capture is in progress but some group is
+        # not capturable; warns once if every group is capturable but no capture is happening.
+        # Side effect: sets the warned flag on the instance after warning.
+        # KNOWN ISSUE: the warned flag is initialized to true in the constructor, so the warning
+        # can never fire unless a subclass or caller resets it.
         # Note [torch.compile x capturable]
         # If we are compiling, we try to take the capturable path automatically by
         # setting the flag to True during tracing. Due to this, we skip all the checks
@@ -512,6 +591,8 @@ class Optimizer:
     )(_accelerator_graph_capture_health_check)
 
     def _optimizer_step_code(self) -> None:
+        # [FUNCTION DOC] HELPER: Intentionally empty marker called after every step so the
+        # profiler can hook into it and inspect the optimizer. Does nothing.
         """Entry point for `torch.profile.profiler`.
 
         When python tracing is enabled the profiler will hook into this
@@ -525,8 +606,15 @@ class Optimizer:
 
     @staticmethod
     def profile_hook_step(func: Callable[_P, R]) -> Callable[_P, R]:
+        # [FUNCTION DOC] Static decorator for step methods. Returns a wrapper that runs the step
+        # inside a profiler record scope named after the optimizer class, calling global then
+        # per-instance pre hooks (which may replace args and kwargs), the step, the profiler
+        # marker, then per-instance then global post hooks. Returns the step result.
         @functools.wraps(func)
         def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> R:
+            # [FUNCTION DOC] HELPER: The wrapper. Raises a RuntimeError if a pre hook returns
+            # something other than none or a pair of new args and new kwargs.
+            # KNOWN ISSUE: that error message names the step function, not the offending hook.
             self, *_ = args
             self = cast(Optimizer, self)
             profile_name = f"Optimizer.step#{self.__class__.__name__}.step"
@@ -568,6 +656,10 @@ class Optimizer:
         dict[tuple[None, None], tuple[TensorListList, Indices]]
         | dict[tuple[torch.device, torch.dtype], tuple[TensorListList, Indices]]
     ):
+        # [FUNCTION DOC] HELPER: Groups parallel lists of tensors by (device, dtype). While
+        # compiling, skips grouping and returns a single entry keyed by none holding the original
+        # lists and all indices. Otherwise defers to the shared utility; with_indices also returns
+        # original positions.
         """Group a list of lists of tensors by device and dtype.
 
         Skips this step if we are compiling since this will occur during inductor lowering.
@@ -578,6 +670,9 @@ class Optimizer:
             return _group_tensors_by_device_and_dtype(tensorlistlist, with_indices)  # type: ignore[return-value, arg-type]
 
     def _patch_step_function(self) -> None:
+        # [FUNCTION DOC] HELPER: Sets the profiler scope name used by zero_grad, and, once per
+        # class, replaces the class step with the profiling/hook wrapper and marks it hooked.
+        # Mutates the class (affects all instances).
         self._zero_grad_profile_name = (
             f"Optimizer.zero_grad#{self.__class__.__name__}.zero_grad"
         )
@@ -587,6 +682,8 @@ class Optimizer:
             self.__class__.step.hooked = True  # type: ignore[attr-defined]
 
     def register_step_pre_hook(self, hook: OptimizerPreHook) -> RemovableHandle:
+        # [FUNCTION DOC] Adds hook to this instance's step pre-hook registry. Returns a handle
+        # that removes it.
         r"""Register an optimizer step pre hook which will be called before optimizer step.
 
         It should have the following signature::
@@ -610,6 +707,8 @@ class Optimizer:
         return handle
 
     def register_step_post_hook(self, hook: OptimizerPostHook) -> RemovableHandle:
+        # [FUNCTION DOC] Adds hook to this instance's step post-hook registry. Returns a handle
+        # that removes it.
         r"""Register an optimizer step post hook which will be called after optimizer step.
 
         It should have the following signature::
@@ -633,6 +732,8 @@ class Optimizer:
     def register_state_dict_pre_hook(
         self, hook: Callable[["Optimizer"], None], prepend: bool = False
     ) -> RemovableHandle:
+        # [FUNCTION DOC] Adds hook to the state_dict pre-hook registry (called with the optimizer
+        # before state_dict runs); if prepend, moves it to the front. Returns a removal handle.
         r"""Register a state dict pre-hook which will be called before :meth:`~torch.optim.Optimizer.state_dict` is called.
 
         It should have the following signature::
@@ -667,6 +768,9 @@ class Optimizer:
         hook: Callable[["Optimizer", StateDict], StateDict | None],
         prepend: bool = False,
     ) -> RemovableHandle:
+        # [FUNCTION DOC] Adds hook to the state_dict post-hook registry (called with the optimizer
+        # and the produced state dict; may return a replacement); if prepend, moves it to the
+        # front. Returns a removal handle.
         r"""Register a state dict post-hook which will be called after :meth:`~torch.optim.Optimizer.state_dict` is called.
 
         It should have the following signature::
@@ -698,6 +802,11 @@ class Optimizer:
 
     @torch._disable_dynamo
     def state_dict(self) -> StateDict:
+        # [FUNCTION DOC]
+        # Builds a serializable snapshot with two entries: state and param_groups. Runs pre hooks,
+        # assigns each distinct parameter an integer id by order of first appearance across
+        # groups, replaces each group's params with those ids, re-keys the state mapping by id,
+        # then runs post hooks (a non-none hook result replaces the dict). Tensors are not copied.
         r"""Return the state of the optimizer as a :class:`dict`.
 
         It contains two entries:
@@ -758,6 +867,8 @@ class Optimizer:
         start_index = 0
 
         def pack_group(group: dict[str, Any]) -> dict[str, Any]:
+            # [FUNCTION DOC] HELPER: Returns a copy of one group with params replaced by integer
+            # ids, registering ids for not-yet-seen parameters and advancing the running counter.
             nonlocal start_index
             packed = {k: v for k, v in group.items() if k != "params"}
             param_mappings.update(
@@ -797,6 +908,11 @@ class Optimizer:
         param_groups: list[dict[str, Any]],
         key: str | None = None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Converts one loaded state tensor to match its parameter. Looks up
+        # the group containing param_id to learn its fused and capturable flags. For the step key,
+        # returns float32 on the parameter device if fused or capturable, else the value as is.
+        # Other values move to the parameter device, and to its dtype if the parameter is floating
+        # point. Raises an AssertionError if param_groups is none.
         # Floating-point types are a bit special here. They are the only ones
         # that are assumed to always match the type of params.
         # Make sure state['step'] is not casted https://github.com/pytorch/pytorch/issues/74424
@@ -826,6 +942,9 @@ class Optimizer:
         hook: Callable[["Optimizer", StateDict], StateDict | None],
         prepend: bool = False,
     ) -> RemovableHandle:
+        # [FUNCTION DOC] Adds hook to the load_state_dict pre-hook registry (called with the
+        # optimizer and a shallow copy of the input; a non-none result replaces it); if prepend,
+        # moves it to the front. Returns a removal handle.
         r"""Register a load_state_dict pre-hook which will be called before
         :meth:`~torch.optim.Optimizer.load_state_dict` is called. It should have the
         following signature::
@@ -863,6 +982,8 @@ class Optimizer:
     def register_load_state_dict_post_hook(
         self, hook: Callable[["Optimizer"], None], prepend: bool = False
     ) -> RemovableHandle:
+        # [FUNCTION DOC] Adds hook to the load_state_dict post-hook registry (called with the
+        # optimizer after loading); if prepend, moves it to the front. Returns a removal handle.
         r"""Register a load_state_dict post-hook which will be called after
         :meth:`~torch.optim.Optimizer.load_state_dict` is called. It should have the
         following signature::
@@ -898,6 +1019,13 @@ class Optimizer:
 
     @torch._disable_dynamo
     def load_state_dict(self, state_dict: StateDict) -> None:
+        # [FUNCTION DOC]
+        # Loads a snapshot produced by state_dict. Shallow-copies the input, runs pre hooks (which
+        # may replace it), checks the group count and each group's size match (raises a
+        # ValueError otherwise), maps saved parameter ids to this optimizer's tensors by order,
+        # copies state casting tensors to each parameter's device/dtype, keeps saved options for
+        # each group while retaining current params (and current param_names if the saved ones
+        # are absent), installs the result via the state setter, then runs post hooks.
         r"""Load the optimizer state.
 
         Args:
@@ -987,6 +1115,11 @@ class Optimizer:
             param_groups: list[dict[str, Any]],
             key: str | None = None,
         ) -> _T:
+            # [FUNCTION DOC] HELPER: Recursively rebuilds value: tensors are converted by the
+            # per-parameter policy, mappings and other iterables are rebuilt element by element,
+            # anything else is returned as is.
+            # KNOWN ISSUE: a string value is an iterable and would be rebuilt from its characters
+            # through the string type constructor, which does not give back the original string.
             r"""Make a deep copy of value, casting all tensors to device of param."""
             if isinstance(value, torch.Tensor):
                 return cast(
@@ -1031,6 +1164,8 @@ class Optimizer:
         def update_group(
             group: dict[str, Any], new_group: dict[str, Any]
         ) -> dict[str, Any]:
+            # [FUNCTION DOC] HELPER: Returns the saved group with its params (and param_names if
+            # the saved group lacks them) taken from the current group. Mutates new_group.
             new_group["params"] = group["params"]
             if "param_names" in group and "param_names" not in new_group:
                 new_group["param_names"] = group["param_names"]
@@ -1046,6 +1181,13 @@ class Optimizer:
 
     @torch._disable_dynamo
     def zero_grad(self, set_to_none: bool = True) -> None:
+        # [FUNCTION DOC]
+        # Clears gradients of all parameters in all groups, inside a profiler scope. If
+        # set_to_none, sets each grad to none. Otherwise detaches each grad and zeroes it; with
+        # foreach or fused defaults, dense grads are batched by device and dtype and zeroed with
+        # a single batched op per batch, while sparse grads are zeroed individually.
+        # KNOWN ISSUE: the batching decision reads the optimizer-level defaults, not per-group
+        # foreach or fused settings.
         r"""Reset the gradients of all optimized :class:`torch.Tensor` s.
 
         Args:
@@ -1115,6 +1257,8 @@ class Optimizer:
     def step(self, closure: Callable[[], float]) -> float: ...
 
     def step(self, closure: Callable[[], float] | None = None) -> float | None:
+        # [FUNCTION DOC] Abstract: subclasses override it to run one update and return the loss.
+        # The base version always raises NotImplementedError.
         r"""Perform a single optimization step to update parameter.
 
         Args:
@@ -1125,6 +1269,13 @@ class Optimizer:
 
     @torch._disable_dynamo
     def add_param_group(self, param_group: dict[str, Any]) -> None:
+        # [FUNCTION DOC]
+        # Validates and appends a group. Normalizes params to a list (single tensor wrapped;
+        # name/tensor pairs split into params and param_names), fills missing options from
+        # defaults, and mutates the given mapping. Raises a TypeError for a non-mapping group, a
+        # set of params, or non-tensor params; a ValueError for mixed named/unnamed params or
+        # groups, a non-leaf tensor (unless differentiable), a missing required option, or a
+        # tensor already in another group. Warns on duplicate tensors within the group.
         r"""Add a param group to the :class:`Optimizer` s `param_groups`.
 
         This can be useful when fine tuning a pre-trained network as frozen layers can be made

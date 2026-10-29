@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Stochastic gradient descent optimizer with optional momentum, dampening, Nesterov, weight decay.
+# Defines the SGD class, the functional sgd entry point, and single-tensor, multi-tensor (foreach)
+# and fused implementations. Exports SGD and sgd. No import-time side effects other than
+# attaching the long documentation string to SGD.
 r"""Implementation for Stochastic Gradient Descent optimizer."""
 
 from typing import cast
@@ -26,6 +31,12 @@ __all__ = ["SGD", "sgd"]
 
 
 class SGD(Optimizer):
+    # [CLASS DOC]
+    # Optimizer applying plain or momentum SGD to each parameter group. Per-parameter state holds
+    # only an optional momentum_buffer (created lazily at the first step when momentum is
+    # non-zero). Group options: lr, momentum, dampening, weight_decay, nesterov, maximize,
+    # foreach, differentiable, fused. step() collects tensors with gradients and delegates to
+    # the functional sgd, then writes the momentum buffers back into the state.
     def __init__(
         self,
         params: ParamsT,
@@ -40,6 +51,13 @@ class SGD(Optimizer):
         differentiable: bool = False,
         fused: bool | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Validates arguments and builds the defaults mapping, then calls the base constructor.
+        # Raises a ValueError for a multi-element tensor lr, negative lr, momentum or weight_decay,
+        # or nesterov without positive momentum and zero dampening.
+        # With fused, marks the optimizer as supporting AMP grad scaling and requests a one-time
+        # device/dtype check; raises a RuntimeError if combined with differentiable or foreach.
+        # KNOWN ISSUE: dampening is never range-checked, unlike momentum and weight_decay.
         if isinstance(lr, Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be 1-element")
         if lr < 0.0:
@@ -73,6 +91,10 @@ class SGD(Optimizer):
                 raise RuntimeError("`fused` and `foreach` cannot be `True` together.")
 
     def __setstate__(self, state):
+        # [FUNCTION DOC]
+        # Restores pickled state via the base class, then fills in options missing from old
+        # checkpoints in every param group: nesterov, maximize, differentiable and fused default
+        # to false, foreach to none. Mutates param_groups in place.
         super().__setstate__(state)
         for group in self.param_groups:
             group.setdefault("nesterov", False)
@@ -82,6 +104,10 @@ class SGD(Optimizer):
             group.setdefault("fused", False)
 
     def _init_group(self, group, params, grads, momentum_buffer_list):
+        # [FUNCTION DOC] HELPER: Gathers, for one group, every parameter that has a gradient into
+        # the caller-supplied lists params and grads; when momentum is non-zero also appends each
+        # parameter's saved momentum buffer (or none). For fused groups, performs the device/dtype
+        # check once. Returns true if any gradient is sparse.
         has_sparse_grad = False
 
         for p in group["params"]:
@@ -104,6 +130,11 @@ class SGD(Optimizer):
 
     @_use_grad_for_differentiable
     def step(self, closure=None):
+        # [FUNCTION DOC]
+        # Performs one optimization step over all param groups. If a closure is given it is run
+        # with gradients enabled to compute the loss. Per group, gathers tensors, calls the
+        # functional sgd, and stores updated momentum buffers into the state. Parameters are
+        # updated in place. Returns the closure loss or none.
         """Perform a single optimization step.
 
         Args:
@@ -268,6 +299,12 @@ def sgd(
     nesterov: bool,
     maximize: bool,
 ) -> None:
+    # [FUNCTION DOC]
+    # Functional SGD entry point. Resolves foreach/fused defaults (fused is never chosen
+    # automatically, foreach is chosen when eligible), then dispatches to the multi-tensor, fused
+    # or single-tensor implementation, which update params and momentum_buffer_list in place.
+    # Raises a RuntimeError if foreach or fused is requested under torch.jit scripting.
+    # Returns nothing.
     r"""Functional API that performs SGD algorithm computation.
 
     See :class:`~torch.optim.SGD` for details.
@@ -334,6 +371,11 @@ def _single_tensor_sgd(
     maximize: bool,
     has_sparse_grad: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Reference per-parameter SGD loop. Negates gradients if maximize, adds
+    # weight decay, updates or creates the momentum buffer (first buffer is a copy of the
+    # gradient, later ones use dampening), applies Nesterov if enabled, then subtracts lr times
+    # the result from the parameter in place. Supports tensor lr and weight_decay. Raises an
+    # AssertionError if grad_scale or found_inf is given.
     if grad_scale is not None or found_inf is not None:
         raise AssertionError("Expected grad_scale and found_inf to be None")
 
@@ -394,6 +436,11 @@ def _multi_tensor_sgd(
     maximize: bool,
     has_sparse_grad: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Foreach (batched) SGD. Groups tensors by device and dtype, then per
+    # group applies maximize, weight decay, momentum buffer creation/update and Nesterov using
+    # batched ops, and updates parameters in place; sparse gradients fall back to a per-tensor
+    # loop. New momentum buffers are written back to the caller's momentum_buffer_list.
+    # Does nothing for empty params. Raises an AssertionError if grad_scale or found_inf is given.
     if grad_scale is not None or found_inf is not None:
         raise AssertionError("Expected grad_scale and found_inf to be None")
 
@@ -491,6 +538,11 @@ def _fused_sgd(
     maximize: bool,
     has_sparse_grad: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Fused SGD using the single fused kernel per device/dtype group.
+    # Does nothing for empty params; raises a RuntimeError for sparse gradients. On the first step
+    # with momentum, allocates uninitialized momentum buffers (kernel fills them) and tells the
+    # kernel it is the first step. grad_scale and found_inf are moved to each group's device.
+    # Updates params and buffers in place.
     if not params:
         return
     if has_sparse_grad:

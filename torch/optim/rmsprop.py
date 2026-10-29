@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# RMSprop optimizer. Defines the RMSprop class, the functional rmsprop entry point, and
+# single-tensor and multi-tensor (foreach) implementations. Exports RMSprop and rmsprop.
+# Import-time side effect: attaches the long documentation string to RMSprop.
 r"""Implementation for the RMSprop algorithm."""
 
 from typing import cast
@@ -28,6 +32,13 @@ __all__ = ["RMSprop", "rmsprop"]
 
 
 class RMSprop(Optimizer):
+    # [CLASS DOC]
+    # RMSprop optimizer: scales gradients by the root of a moving average of squared gradients,
+    # optionally centered (subtracting the squared mean gradient) and with momentum.
+    # Group options: lr, alpha, eps, weight_decay, momentum, centered, capturable, foreach,
+    # maximize, differentiable. Per-parameter state: step (scalar tensor), square_avg, and
+    # optionally momentum_buffer (if momentum > 0) and grad_avg (if centered).
+    # Sparse gradients are not supported. step() delegates to the functional rmsprop.
     def __init__(
         self,
         params: ParamsT,
@@ -42,6 +53,10 @@ class RMSprop(Optimizer):
         maximize: bool = False,
         differentiable: bool = False,
     ) -> None:
+        # [FUNCTION DOC]
+        # Validates arguments and builds the defaults mapping for the base constructor.
+        # Raises a ValueError for a multi-element tensor lr, or a negative lr, eps, momentum,
+        # weight_decay or alpha.
         if isinstance(lr, Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be 1-element")
         if not 0.0 <= lr:
@@ -70,6 +85,10 @@ class RMSprop(Optimizer):
         super().__init__(params, defaults)
 
     def __setstate__(self, state):
+        # [FUNCTION DOC]
+        # Restores pickled state via the base class and fills in missing group options (momentum,
+        # centered, foreach, maximize, differentiable, capturable). Converts any non-tensor step
+        # in per-parameter state into a scalar tensor (on the parameter device when capturable).
         super().__setstate__(state)
         for group in self.param_groups:
             group.setdefault("momentum", 0)
@@ -100,6 +119,10 @@ class RMSprop(Optimizer):
         grad_avgs,
         state_steps,
     ):
+        # [FUNCTION DOC] HELPER: For each parameter with a gradient in the group, appends it and
+        # its gradient, square_avg and step (plus momentum_buffer if momentum > 0 and grad_avg if
+        # centered) to the caller-supplied lists, lazily creating zeroed state. Raises a
+        # RuntimeError on sparse gradients. Returns true if any parameter is complex.
         has_complex = False
         for p in group["params"]:
             if p.grad is None:
@@ -143,6 +166,10 @@ class RMSprop(Optimizer):
 
     @_use_grad_for_differentiable
     def step(self, closure=None):
+        # [FUNCTION DOC]
+        # Performs one optimization step. Checks graph-capture health, optionally evaluates the
+        # closure with gradients enabled, then per group gathers state and calls the functional
+        # rmsprop, updating parameters and state in place. Returns the closure loss or none.
         """Perform a single optimization step.
 
         Args:
@@ -281,6 +308,12 @@ def _single_tensor_rmsprop(
     capturable: bool,
     has_complex: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Per-parameter RMSprop update. Increments step, negates gradient if
+    # maximize, adds weight decay, updates the square average with exponential decay alpha,
+    # computes the denominator as sqrt of the (optionally centered) average plus eps, then either
+    # accumulates a momentum buffer and subtracts lr times it, or subtracts lr times grad over
+    # denominator. Complex tensors are viewed as real. Raises an AssertionError if capturable
+    # and tensors are on unsupported devices.
     if not torch.jit.is_scripting():
         lr = _to_scalar(lr)
 
@@ -358,6 +391,10 @@ def _multi_tensor_rmsprop(
     capturable: bool,
     has_complex: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Foreach (batched) RMSprop update with the same math as the
+    # single-tensor path, applied per device/dtype group. With a tensor lr under capturable it
+    # avoids host scalar extraction. Does nothing for empty params. Raises an AssertionError if
+    # differentiable is set or if capturable and tensors are on unsupported devices.
     if len(params) == 0:
         return
 
@@ -498,6 +535,12 @@ def rmsprop(
     momentum: float,
     centered: bool,
 ) -> None:
+    # [FUNCTION DOC]
+    # Functional RMSprop entry point. Verifies (outside compilation) that state_steps are
+    # tensors, resolves the foreach default, and dispatches to the multi-tensor or
+    # single-tensor implementation, which update params and state lists in place.
+    # Raises a RuntimeError for non-tensor state_steps or foreach under torch.jit scripting.
+    # KNOWN ISSUE: the docstring refers to the class as RMSProp, but the class is named RMSprop.
     r"""Functional API that performs rmsprop algorithm computation.
 
     See :class:`~torch.optim.RMSProp` for details.

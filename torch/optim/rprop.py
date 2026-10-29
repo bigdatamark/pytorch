@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Resilient backpropagation (Rprop) optimizer. Defines the Rprop class, the functional rprop entry
+# point, and single-tensor and multi-tensor (foreach) implementations. Exports Rprop and rprop.
+# Per-element step sizes grow when the gradient sign is unchanged and shrink when it flips.
+# Import-time side effect: attaches the long documentation string to Rprop.
 r"""Implementation for the Resilient backpropagation."""
 
 from typing import cast
@@ -28,6 +33,14 @@ __all__ = ["Rprop", "rprop"]
 
 
 class Rprop(Optimizer):
+    # [CLASS DOC]
+    # Rprop optimizer. Group options: lr (initial step size), etas (decrease, increase factors),
+    # step_sizes (min, max clamp), capturable, foreach, maximize, differentiable.
+    # Per-parameter state: step (scalar tensor counter), prev (previous gradient, zeros initially),
+    # step_size (per-element step size initialized to lr). Sparse gradients are not supported.
+    # step() gathers state per group and delegates to the functional rprop.
+    # KNOWN ISSUE: the class docstring calls (etaminus, etaplus) the increase and decrease
+    # factors respectively, but etaminus (below 1) decreases and etaplus (above 1) increases.
     def __init__(
         self,
         params: ParamsT,
@@ -40,6 +53,11 @@ class Rprop(Optimizer):
         maximize: bool = False,
         differentiable: bool = False,
     ) -> None:
+        # [FUNCTION DOC]
+        # Validates arguments and builds the defaults mapping for the base constructor.
+        # Raises a ValueError for a multi-element tensor lr, a negative lr, or etas not satisfying
+        # 0 < etaminus < 1 < etaplus.
+        # KNOWN ISSUE: step_sizes is stored without any validation (min <= max is not checked).
         if isinstance(lr, Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be 1-element")
         if not 0.0 <= lr:
@@ -59,6 +77,10 @@ class Rprop(Optimizer):
         super().__init__(params, defaults)
 
     def __setstate__(self, state):
+        # [FUNCTION DOC]
+        # Restores pickled state via the base class and fills in missing group options (foreach,
+        # maximize, differentiable, capturable). Converts any non-tensor step in per-parameter
+        # state into a scalar tensor (on the parameter device when capturable). Mutates in place.
         super().__setstate__(state)
         for group in self.param_groups:
             group.setdefault("foreach", None)
@@ -78,6 +100,11 @@ class Rprop(Optimizer):
                     )
 
     def _init_group(self, group, params, grads, prevs, step_sizes, state_steps):
+        # [FUNCTION DOC] HELPER: For each parameter with a gradient in the group, appends it and
+        # its gradient, prev, step_size and step state to the caller-supplied lists, lazily
+        # creating the state (zero step, zero prev, step_size filled with lr; complex params use
+        # lr for both parts). Raises a RuntimeError on sparse gradients. Returns true if any
+        # parameter is complex.
         has_complex = False
         for p in group["params"]:
             if p.grad is None:
@@ -117,6 +144,11 @@ class Rprop(Optimizer):
 
     @_use_grad_for_differentiable
     def step(self, closure=None):
+        # [FUNCTION DOC]
+        # Performs one optimization step. Checks graph-capture health, optionally evaluates the
+        # closure with gradients enabled, then for each group gathers state and calls the
+        # functional rprop, updating parameters and state in place. Returns the closure loss or
+        # none.
         """Perform a single optimization step.
 
         Args:
@@ -236,6 +268,12 @@ def _single_tensor_rprop(
     differentiable: bool,
     has_complex: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Per-parameter Rprop update. Increments step, compares the sign of
+    # grad times prev: same sign multiplies the step size by etaplus, flipped sign by etaminus,
+    # zero leaves it; step size is clamped to [min, max]. Where the sign flipped the gradient is
+    # zeroed, then the parameter moves by minus sign(grad) times step size and prev is set to
+    # the (possibly zeroed) gradient. Negates gradients if maximize; complex tensors are viewed
+    # as real. Raises an AssertionError if capturable and tensors are on unsupported devices.
     for i, param in enumerate(params):
         grad = grads[i]
         grad = grad if not maximize else -grad
@@ -307,6 +345,10 @@ def _multi_tensor_rprop(
     differentiable: bool,
     has_complex: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Foreach (batched) Rprop update, same math as the single-tensor path,
+    # applied per device/dtype group. Reuses the prev buffers to hold the current gradients.
+    # Does nothing for empty params. Raises an AssertionError if differentiable is set or if
+    # capturable and tensors are on unsupported devices.
     if len(params) == 0:
         return
 
@@ -429,6 +471,11 @@ def rprop(
     etaminus: float,
     etaplus: float,
 ) -> None:
+    # [FUNCTION DOC]
+    # Functional Rprop entry point. Verifies (outside compilation) that state_steps are tensors,
+    # resolves the foreach default, and dispatches to the multi-tensor or single-tensor
+    # implementation, which update params, prevs, step_sizes and state_steps in place.
+    # Raises a RuntimeError for non-tensor state_steps or foreach under torch.jit scripting.
     r"""Functional API that performs rprop algorithm computation.
 
     See :class:`~torch.optim.Rprop` for details.
