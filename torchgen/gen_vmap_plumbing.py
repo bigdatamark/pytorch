@@ -1,3 +1,6 @@
+# [MODULE DOC] Code generator for functorch vmap batching plumbing in C++.
+# Builds per-operator templates that unwrap batched tensors, call a batch rule, and rewrap
+# results, plus a header assembling all of them. No import-time side effects.
 from __future__ import annotations
 
 import textwrap
@@ -27,24 +30,32 @@ if TYPE_CHECKING:
 
 
 def is_tensor(typ: Type) -> bool:
+    # [FUNCTION DOC] HELPER: True if the type is exactly the base Tensor type.
     return isinstance(typ, BaseType) and typ.name == BaseTy.Tensor
 
 
 def is_optional_tensor(typ: Type) -> bool:
+    # [FUNCTION DOC] HELPER: True if the type is an optional wrapping a base Tensor.
     return isinstance(typ, OptionalType) and is_tensor(typ.elem)
 
 
 def is_tensor_list(typ: Type) -> bool:
+    # [FUNCTION DOC] HELPER: True if the type is a list whose element type is a base Tensor.
     return isinstance(typ, ListType) and is_tensor(typ.elem)
 
 
 def unwrap_tensor(name: str, cur_level_var: str) -> list[str]:
+    # [FUNCTION DOC] HELPER: Build C++ lines that unwrap a required tensor argument.
+    # Returns a list of source lines declaring name_value and name_bdim variables for the level.
     result = f"""\
     auto [{name}_value, {name}_bdim] = unwrapTensorAtLevel({name}, {cur_level_var});"""
     return textwrap.dedent(result).split("\n")
 
 
 def unwrap_optional_tensor(name: str, cur_level_var: str) -> list[str]:
+    # [FUNCTION DOC] HELPER: Build C++ lines that unwrap an optional tensor argument.
+    # Declares optional value and bdim variables and fills them only if the argument is set.
+    # Returns the generated source as a list of lines.
     result = f"""\
     std::optional<Tensor> {name}_value;
     std::optional<int64_t> {name}_bdim;
@@ -57,6 +68,10 @@ def unwrap_optional_tensor(name: str, cur_level_var: str) -> list[str]:
 def gen_unwraps(
     flat_arguments: Sequence[Argument], cur_level_var: str
 ) -> tuple[str, list[str]]:
+    # [FUNCTION DOC] HELPER: Generate unwrap code for all tensor and optional tensor arguments.
+    # Returns a pair: the joined unwrap C++ code, and the argument name list to pass to the
+    # batch rule, where each tensor-like argument is replaced by its value and bdim names.
+    # Other arguments, including tensor lists, are passed through by name.
     arg_names = [a.name for a in flat_arguments]
     arg_types = [a.type for a in flat_arguments]
 
@@ -85,6 +100,11 @@ def gen_unwraps(
 def gen_case_where_all_bdims_are_none(
     outer_sig: DispatcherSignature, schema: FunctionSchema, cur_level_var: str
 ) -> str:
+    # [FUNCTION DOC] HELPER: Generate the C++ early-return branch for the unbatched case.
+    # The branch is taken when no tensor argument is batched at the level.
+    # Builds a condition from all tensor-like arguments of the schema and, when it holds,
+    # calls the regular operator with arguments translated from the outer signature.
+    # Returns the C++ source of the if statement.
     conditions = []
     flat_args = schema.arguments.flat_all
     for arg in flat_args:
@@ -105,6 +125,10 @@ if ({" && ".join(conditions)}) {{
 def gen_returns(
     returns: tuple[Return, ...], cur_level_var: str, results_var: str
 ) -> str:
+    # [FUNCTION DOC] HELPER: Generate the C++ return statement that rewraps batch rule results.
+    # Tensors and tensor lists consume two tuple slots (value and bdim) and are made batched
+    # at the level; other returns consume one slot and pass through. A single result returns
+    # directly, otherwise a tuple is built. Returns the statement source text.
     idx = 0
     wrapped_returns = []
     for ret in returns:
@@ -129,14 +153,21 @@ def gen_returns(
 
 
 def accepts_at_least_one_tensor_input(schema: FunctionSchema) -> bool:
+    # [FUNCTION DOC] HELPER: True if any argument of the schema is tensor-like.
     return any(a.type.is_tensor_like() for a in schema.arguments.flat_all)
 
 
 def is_mutated_arg(argument: Argument) -> bool:
+    # [FUNCTION DOC] HELPER: True if the argument has an alias annotation marking it as written to.
     return argument.annotation is not None and argument.annotation.is_write
 
 
 def gen_vmap_inplace_plumbing(native_function: NativeFunction) -> str | None:
+    # [FUNCTION DOC] Generate vmap plumbing C++ for an in-place operator, or None if unsupported.
+    # Returns None unless exactly one argument is mutated, it is the first argument, there is
+    # at least one return, every return is a tensor or tensor list, and an input tensor exists.
+    # Raises an AssertionError if the schema is not of the in-place kind. Output code calls
+    # the batch rule and then returns the mutated first argument.
     # Assumptions:
     # - only one argument is being modified in-place
     # - the argument that is being modified in-place is the first argument
@@ -182,6 +213,9 @@ template <typename batch_rule_t, batch_rule_t batch_rule>
 
 
 def gen_vmap_plumbing_no_returns(native_function: NativeFunction) -> str:
+    # [FUNCTION DOC] Generate vmap plumbing C++ for an operator that has no returns.
+    # Same structure as the other plumbing but the batch rule result is not used or wrapped.
+    # Returns the generated C++ source text.
     schema = native_function.func
     sig = DispatcherSignature.from_schema(schema)
     cur_level_var = "cur_level"
@@ -203,6 +237,13 @@ template <typename batch_rule_t, batch_rule_t batch_rule>
 
 
 def gen_vmap_plumbing(native_function: NativeFunction) -> str | None:
+    # [FUNCTION DOC] Generate the batching plumbing C++ for one operator, or None if unsupported.
+    # Skips operators without tensor inputs, with non-tensor returns (except a few listed
+    # attention ops), in-place views, and non-functional, non-in-place kinds (out, mutable).
+    # No-return operators and in-place operators use their dedicated generators. Otherwise it
+    # unwraps inputs, calls the batch rule, and rewraps the results.
+    # KNOWN ISSUE: the comment about only Tensor returns sits above the tensor-input check and
+    # describes the later return check, which has an override list for a few attention ops.
     schema = native_function.func
     sig = DispatcherSignature.from_schema(schema)
     returns = schema.returns
@@ -256,13 +297,20 @@ template <typename batch_rule_t, batch_rule_t batch_rule>
 
 @dataclass(frozen=True)
 class ComputeBatchRulePlumbing:
+    # [CLASS DOC] Frozen callable wrapper that applies gen_vmap_plumbing to a native function.
+    # Stateless; used with mapMaybe so functions without plumbing are dropped.
     @method_with_native_function
     def __call__(self, f: NativeFunction) -> str | None:
+        # [FUNCTION DOC] Return the plumbing code for the function, or None if unsupported.
+        # The decorator sets the native function context for error reporting.
         result = gen_vmap_plumbing(f)
         return result
 
 
 def gen_all_vmap_plumbing(native_functions: Sequence[NativeFunction]) -> str:
+    # [FUNCTION DOC] Generate the full header text for all vmap plumbing.
+    # Concatenates the plumbing of every supported native function, skipping the others, and
+    # wraps it with a pragma once, includes, and the at::functorch namespace. Returns a string.
     body = "\n".join(list(mapMaybe(ComputeBatchRulePlumbing(), native_functions)))
     return f"""
 #pragma once
