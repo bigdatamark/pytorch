@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [PACKAGE DOC] torch.mps: Python interface to the MPS (Metal) backend on Apple GPUs. Provides
+# device count and availability checks, synchronization, RNG state/seed control through a lazily
+# fetched default generator, caching-allocator and memory statistics, a memory fraction limit,
+# runtime shader compilation and metallib loading, and a private host-alias storage helper.
+# Re-exports the Event class and the profiler submodule. Exports are listed in __all__.
+# Import-time side effect: reads the optional bad-fork hook from the C extension; no device work.
 r"""
 This package enables an interface for accessing MPS (Metal Performance Shaders) backend in Python.
 Metal is Apple's API for programming metal GPU (graphics processor unit). Using MPS means that increased
@@ -16,6 +22,8 @@ _default_mps_generator: torch._C.Generator = None  # type: ignore[assignment]
 
 # local helper function (not public or exported)
 def _get_default_mps_generator() -> torch._C.Generator:
+    # [FUNCTION DOC] HELPER: Returns the process-wide default MPS generator, fetching it from the
+    # C extension on first use and caching it in a module global.
     global _default_mps_generator
     if _default_mps_generator is None:
         _default_mps_generator = torch._C._mps_get_default_generator()
@@ -23,16 +31,21 @@ def _get_default_mps_generator() -> torch._C.Generator:
 
 
 def device_count() -> int:
+    # [FUNCTION DOC] Returns 1 if PyTorch was built with MPS and an MPS device is available, else
+    # 0 (at most one MPS device is reported).
     r"""Returns the number of available MPS devices."""
     return int(torch._C._has_mps and torch._C._mps_is_available())
 
 
 def synchronize() -> None:
+    # [FUNCTION DOC] Blocks until all work queued on the MPS device has completed.
     r"""Waits for all kernels in all streams on a MPS device to complete."""
     return torch._C._mps_deviceSynchronize()
 
 
 def get_rng_state(device: int | str | torch.device = "mps") -> Tensor:
+    # [FUNCTION DOC] Returns the state of the default MPS generator as a byte tensor.
+    # KNOWN ISSUE: the device argument is accepted but ignored; there is only one generator.
     r"""Returns the random number generator state as a ByteTensor.
 
     Args:
@@ -43,6 +56,9 @@ def get_rng_state(device: int | str | torch.device = "mps") -> Tensor:
 
 
 def set_rng_state(new_state: Tensor, device: int | str | torch.device = "mps") -> None:
+    # [FUNCTION DOC] Restores the default MPS generator from a byte tensor state (a contiguous
+    # copy is made first, so the input is not modified). Mutates generator state.
+    # KNOWN ISSUE: the device argument is accepted but ignored.
     r"""Sets the random number generator state.
 
     Args:
@@ -55,6 +71,9 @@ def set_rng_state(new_state: Tensor, device: int | str | torch.device = "mps") -
 
 
 def manual_seed(seed: int) -> None:
+    # [FUNCTION DOC] Seeds the default MPS generator with the integer seed (converted with int).
+    # Silently does nothing when PyTorch was built without MPS, because the global manual seed
+    # function calls it unconditionally. Mutates generator state.
     r"""Sets the seed for generating random numbers.
 
     Args:
@@ -71,11 +90,13 @@ def manual_seed(seed: int) -> None:
 
 
 def seed() -> None:
+    # [FUNCTION DOC] Seeds the default MPS generator with a non-deterministic random seed.
     r"""Sets the seed for generating random numbers to a random number."""
     _get_default_mps_generator().seed()
 
 
 def empty_cache() -> None:
+    # [FUNCTION DOC] Releases cached, unused memory held by the MPS allocator back to the system.
     r"""Releases all unoccupied cached memory currently held by the caching
     allocator so that those can be used in other GPU applications.
     """
@@ -83,6 +104,11 @@ def empty_cache() -> None:
 
 
 def set_per_process_memory_fraction(fraction) -> None:
+    # [FUNCTION DOC] Limits this process's MPS allocations to a fraction (0 to 2 inclusive) of the
+    # recommended maximum device memory; 0 means unlimited. Raises TypeError if fraction is not a
+    # float and ValueError if outside the range. Side effect: configures the allocator.
+    # KNOWN ISSUE: an int such as 0 is rejected with TypeError even though the docstring says
+    # passing 0 means unlimited; only a float works.
     r"""Set memory fraction for limiting process's memory allocation on MPS device.
     The allowed value equals the fraction multiplied by recommended maximum device memory
     (obtained from Metal API device.recommendedMaxWorkingSetSize).
@@ -108,6 +134,7 @@ def set_per_process_memory_fraction(fraction) -> None:
 
 
 def current_allocated_memory() -> int:
+    # [FUNCTION DOC] Returns bytes currently occupied by tensors (excluding allocator caches).
     r"""Returns the current GPU memory occupied by tensors in bytes.
 
     .. note::
@@ -118,6 +145,8 @@ def current_allocated_memory() -> int:
 
 
 def driver_allocated_memory() -> int:
+    # [FUNCTION DOC] Returns bytes allocated by the Metal driver for this process, including
+    # allocator caches and MPS framework allocations.
     r"""Returns total GPU memory allocated by Metal driver for the process in bytes.
 
     .. note::
@@ -128,6 +157,7 @@ def driver_allocated_memory() -> int:
 
 
 def recommended_max_memory() -> int:
+    # [FUNCTION DOC] Returns the recommended maximum GPU working set size in bytes reported by Metal.
     r"""Returns recommended max Working set size for GPU memory in bytes.
 
     .. note::
@@ -138,6 +168,10 @@ def recommended_max_memory() -> int:
 
 
 def compile_shader(source: str):
+    # [FUNCTION DOC] Compiles Metal shader source text and returns a library object whose kernels
+    # can be called from Python. Raises RuntimeError if the build lacks MPS shader compilation.
+    # Header includes in the source are expanded first, searching the include directory of the
+    # package. Side effect: compiles on the device.
     r"""Compiles compute shader from source and allows one to invoke kernels
     defined there from the comfort of Python runtime
     Example::
@@ -164,6 +198,11 @@ def compile_shader(source: str):
 
 
 def load_metallib(source):
+    # [FUNCTION DOC] Loads a precompiled Metal library from raw bytes (bytes or bytearray) or from
+    # a file path (str or path-like) and returns a shader library object. Raises RuntimeError if
+    # the matching native loader is missing, TypeError for other source types.
+    # KNOWN ISSUE: the bytes path looks up a native name spelled with three l letters
+    # (_mps_loadMetalllib), unlike the path variant (_mps_loadMetallibFromPath); verify it is intended.
     r"""Loads a precompiled Metal library (.metallib) and returns a shader
     library object that allows invoking kernels defined in it.
 
@@ -196,10 +235,15 @@ def load_metallib(source):
 
 
 def is_available() -> bool:
+    # [FUNCTION DOC] Returns True if at least one MPS device is available.
     return device_count() > 0
 
 
 def _host_alias_storage(storage: "torch.UntypedStorage") -> "torch.UntypedStorage":
+    # [FUNCTION DOC] HELPER: Returns a CPU storage sharing memory with the shared-mode Metal buffer
+    # behind the given MPS storage (zero-copy host access). The alias keeps the source alive.
+    # Raises (from the native layer) if the storage is not backed by such a buffer. Callers must
+    # synchronize before and after host access; no ordering is enforced here.
     r"""Returns a CPU :class:`torch.UntypedStorage` that aliases the
     host-visible contents of the MTLBuffer backing ``storage``.
 

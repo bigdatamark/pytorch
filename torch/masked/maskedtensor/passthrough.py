@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Registry and dispatcher for ATen ops that apply identically to the data and
+# the mask of a MaskedTensor (select, transpose, view, cat, stack, etc.). Main contents:
+# PASSTHROUGH_FNS list, _is_pass_through_fn, _apply_pass_through_fn. Exports nothing publicly.
+# Import-time side effect: none beyond resolving the listed torch.ops.aten overloads.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 """
 These are functions that should simply be applied to both mask and data.
@@ -39,10 +43,14 @@ PASSTHROUGH_FNS = [
 
 
 def _is_pass_through_fn(fn):
+    # [FUNCTION DOC] HELPER: Returns True if the given op is in the passthrough list.
     return fn in PASSTHROUGH_FNS
 
 
 def _apply_pass_through_fn(fn, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Runs fn twice, once with every MaskedTensor argument replaced by
+    # its data and once replaced by its mask, then wraps the two results into a new
+    # MaskedTensor (via _wrap_result, which handles tuples/lists of results). No mutation.
     data_args, data_kwargs = _map_mt_args_kwargs(args, kwargs, lambda x: x.get_data())
     result_data = fn(*data_args, **data_kwargs)
     mask_args, mask_kwargs = _map_mt_args_kwargs(args, kwargs, lambda x: x.get_mask())

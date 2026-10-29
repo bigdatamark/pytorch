@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines MaskedTensor, a torch.Tensor wrapper subclass pairing a data tensor with
+# a boolean mask of the same shape (strided, sparse COO or sparse CSR layout), plus the helper
+# is_masked_tensor and internal helpers for comparing tensors/masks, mapping over arguments,
+# wrapping results and pretty printing. Exports MaskedTensor and is_masked_tensor.
+# Import-time side effects: none beyond imports; creating a MaskedTensor emits a prototype warning.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 
 import warnings
@@ -16,6 +21,9 @@ __all__ = [
 
 
 def is_masked_tensor(obj: Any, /) -> TypeIs["MaskedTensor"]:
+    # [FUNCTION DOC] Returns True if obj is an instance of MaskedTensor, else False. No errors.
+    # KNOWN ISSUE: the docstring documents an argument named a, but the actual parameter is obj
+    # (positional-only).
     r"""Returns True if the input is a MaskedTensor, else False
 
     Args:
@@ -35,6 +43,13 @@ def is_masked_tensor(obj: Any, /) -> TypeIs["MaskedTensor"]:
 
 
 def _tensors_match(a, b, exact=True, rtol=1e-05, atol=1e-08):
+    # [FUNCTION DOC] HELPER: Compares two plain tensors for equality. Raises ValueError if either
+    # is a MaskedTensor or the layouts differ. Casts b to a's dtype if needed. Sparse COO compares
+    # values and indices, sparse CSR compares crow indices, col indices and values (recursively).
+    # Strided: requires equal number of dims and then exact equality, or closeness within rtol/atol
+    # when exact is false. Returns a bool.
+    # KNOWN ISSUE: the strided check compares only the number of dims before comparing values, so
+    # tensors of different shapes may raise a broadcasting error rather than return False.
     if is_masked_tensor(a) or is_masked_tensor(b):
         raise ValueError("Neither `a` nor `b` can be a MaskedTensor.")
     if a.layout != b.layout:
@@ -60,6 +75,8 @@ def _tensors_match(a, b, exact=True, rtol=1e-05, atol=1e-08):
 
 
 def _masks_match(a, b):
+    # [FUNCTION DOC] HELPER: If both arguments are MaskedTensors, returns whether their masks are
+    # exactly equal; if either is not a MaskedTensor, returns True (nothing to compare).
     if is_masked_tensor(a) and is_masked_tensor(b):
         mask_a = a.get_mask()
         mask_b = b.get_mask()
@@ -68,7 +85,15 @@ def _masks_match(a, b):
 
 
 def _map_mt_args_kwargs(args, kwargs, map_fn):
+    # [FUNCTION DOC] HELPER: Applies map_fn to every MaskedTensor found in args and kwargs,
+    # descending into lists and tuples; plain tensors and other values pass through unchanged.
+    # Returns a new list of args and a new mapping of kwargs. None kwargs is treated as empty.
+    # KNOWN ISSUE: the kwargs loop passes the stale loop variable a (the last positional arg)
+    # to the helper instead of the kwarg value, so every kwarg gets a mapped copy of the last
+    # positional argument (and raises NameError if there are no positional args).
     def _helper(a, map_fn):
+        # [FUNCTION DOC] HELPER: Maps a single value: MaskedTensor -> map_fn(value); Tensor ->
+        # itself; list/tuple -> recursively mapped container of the same kind; else unchanged.
         if is_masked_tensor(a):
             return map_fn(a)
         elif torch.is_tensor(a):
@@ -94,6 +119,9 @@ def _map_mt_args_kwargs(args, kwargs, map_fn):
 
 
 def _wrap_result(result_data, result_mask):
+    # [FUNCTION DOC] HELPER: Pairs result data with result mask into MaskedTensor(s). Lists and
+    # tuples are handled elementwise (zipped with the mask sequence); a tensor becomes a
+    # MaskedTensor; any other kind of value yields NotImplemented.
     if isinstance(result_data, list):
         return [_wrap_result(r, m) for (r, m) in zip(result_data, result_mask)]
     if isinstance(result_data, tuple):
@@ -105,6 +133,10 @@ def _wrap_result(result_data, result_mask):
 
 
 def _masked_tensor_str(data, mask, formatter):
+    # [FUNCTION DOC] HELPER: Recursively renders data and mask as a nested bracketed string for
+    # repr. Sparse inputs are densified first. 1-d: elements are formatted (floats via formatter),
+    # masked-out entries show as dashes, all right-aligned to a common width. Higher dims: each
+    # slice rendered recursively, indented and joined with newlines. Returns the string.
     if data.layout in {torch.sparse_coo, torch.sparse_csr}:
         data = data.to_dense()
         mask = mask.to_dense()
@@ -130,20 +162,33 @@ def _masked_tensor_str(data, mask, formatter):
 
 
 def _get_data(a):
+    # [FUNCTION DOC] HELPER: Returns the raw stored data of a MaskedTensor (not autograd
+    # wrapped), or the argument itself if it is not a MaskedTensor.
     if is_masked_tensor(a):
         return a._masked_data
     return a
 
 
 def _maybe_get_mask(a):
+    # [FUNCTION DOC] HELPER: Returns the mask of a MaskedTensor, or None for anything else.
     if is_masked_tensor(a):
         return a.get_mask()
     return None
 
 
 class MaskedTensor(torch.Tensor):
+    # [CLASS DOC] Tensor wrapper subclass that holds a data tensor and a boolean mask (True means
+    # the element is specified/valid). State: _masked_data and _masked_mask, cloned copies set in
+    # init. Invariants (checked by _validate_members): same type, layout and shape for data and
+    # mask, layout in strided/sparse COO/sparse CSR, bool mask, supported data dtype (float16/32/64,
+    # bool, int8/16/32/64), matching sparse indices. Operator behavior is routed through
+    # __torch_function__ and __torch_dispatch__ to tables in _ops_refs. Key methods: get_data,
+    # get_mask, to_tensor, is_sparse*, _from_values (differentiable constructor).
     @staticmethod
     def __new__(cls, data, mask, requires_grad=False):
+        # [FUNCTION DOC] Creates the wrapper tensor with data's size, device, dtype and layout.
+        # Raises TypeError if data or mask is a MaskedTensor or not a Tensor. Emits a UserWarning
+        # that the API is a prototype, and another if data requires grad. Returns the new wrapper.
         if is_masked_tensor(data) or not torch.is_tensor(data):
             raise TypeError("data must be a Tensor")
         if is_masked_tensor(mask) or not torch.is_tensor(mask):
@@ -178,6 +223,10 @@ class MaskedTensor(torch.Tensor):
         return torch.Tensor._make_wrapper_subclass(cls, data.size(), **kwargs)
 
     def _preprocess_data(self, data, mask):
+        # [FUNCTION DOC] HELPER: Normalizes and stores data and mask. Raises TypeError if layouts
+        # differ. For sparse COO both are coalesced; if nonzero counts differ, data is filtered
+        # by the mask via the sparse where helpers (same for CSR). Stores clones of both in the
+        # _masked_data and _masked_mask attributes.
         from .._ops import _sparse_coo_where, _sparse_csr_where
 
         if data.layout != mask.layout:
@@ -196,6 +245,9 @@ class MaskedTensor(torch.Tensor):
         self._masked_mask = mask.clone()
 
     def _validate_members(self):
+        # [FUNCTION DOC] HELPER: Checks invariants of the stored data and mask. Raises TypeError
+        # for differing tensor types, unsupported layout, non-bool mask or unsupported dtype;
+        # raises ValueError for differing sparse indices, number of dims or sizes.
         data = self._masked_data
         mask = self.get_mask()
         if type(data) is not type(mask):
@@ -235,33 +287,48 @@ class MaskedTensor(torch.Tensor):
             raise ValueError("data.size() must equal mask.size()")
 
     def __init__(self, data, mask, requires_grad=False):
+        # [FUNCTION DOC] Stores a normalized copy of data and mask, then validates them (errors
+        # as in _validate_members). requires_grad is consumed in __new__ and unused here.
         self._preprocess_data(data, mask)
         self._validate_members()
 
     @staticmethod
     def _from_values(data, mask):
+        # [FUNCTION DOC] HELPER: Differentiable constructor: applies an autograd function that
+        # builds a MaskedTensor from data and mask, passing the gradient straight to data (none
+        # for mask). Returns the MaskedTensor.
         """Differentiable constructor for MaskedTensor"""
 
         class Constructor(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd function wrapping MaskedTensor construction; forward
+            # builds the MaskedTensor and backward returns the incoming gradient for data and
+            # None for mask.
             @staticmethod
             # pyrefly: ignore [bad-override]
             def forward(ctx, data, mask):
+                # [FUNCTION DOC] HELPER: Returns a new MaskedTensor made from data and mask.
                 return MaskedTensor(data, mask)
 
             @staticmethod
             # pyrefly: ignore [bad-override]
             def backward(ctx, grad_output):
+                # [FUNCTION DOC] HELPER: Gradient is the output gradient for data, None for mask.
                 return grad_output, None
 
         result = Constructor.apply(data, mask)
         return result
 
     def _set_data_mask(self, data, mask):
+        # [FUNCTION DOC] HELPER: Replaces the stored data and mask directly (no cloning or
+        # coalescing) and re-validates; raises as _validate_members does. Mutates self.
         self._masked_data = data
         self._masked_mask = mask
         self._validate_members()
 
     def __repr__(self):  # type: ignore[override]
+        # [FUNCTION DOC] String form: for 0-dim shows the value (or dashes if masked out) and the
+        # mask value; otherwise a nested multi-line rendering of data with masked-out entries as
+        # dashes. Returns a string.
         formatter = "{0:8.4f}"
         if self.dim() == 0:
             scalar_data = self.get_data().item()
@@ -286,6 +353,11 @@ class MaskedTensor(torch.Tensor):
     # Seems like this needs to be defined before torch_dispatch to work
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Torch-function hook. If func has an entry in the function table of the
+        # _ops_refs module, calls that handler. Otherwise returns NotImplemented if any of the
+        # types is not a subclass relation of this class, else runs func with torch-function
+        # handling disabled and converts the result back to this class unless func is a
+        # default no-wrap function.
         kwargs = kwargs or {}
 
         from ._ops_refs import _MASKEDTENSOR_FUNCTION_TABLE
@@ -304,10 +376,14 @@ class MaskedTensor(torch.Tensor):
 
     @classmethod
     def unary(cls, fn, data, mask):
+        # [FUNCTION DOC] Builds a MaskedTensor from fn applied to data, reusing the given mask.
         return MaskedTensor(fn(data), mask)
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args, kwargs):  # type: ignore[override]
+        # [FUNCTION DOC] Dispatch hook. Looks up the overload packet of func in the dispatch table
+        # of the _ops_refs module and calls the handler. If missing, emits a warning asking for a
+        # feature request and returns NotImplemented.
         func = func.overloadpacket
 
         from ._ops_refs import _MASKEDTENSOR_DISPATCH_TABLE
@@ -326,23 +402,34 @@ class MaskedTensor(torch.Tensor):
         return NotImplemented
 
     def __lt__(self, other):
+        # [FUNCTION DOC] Elementwise less-than against a MaskedTensor or a plain value; the result
+        # is a MaskedTensor with the comparison of the data and this tensor's mask. Does not check
+        # that the masks match.
         if is_masked_tensor(other):
             return MaskedTensor(self.get_data() < _get_data(other), self.get_mask())
         return MaskedTensor(self.get_data() < other, self.get_mask())
 
     def to_tensor(self, value):
+        # [FUNCTION DOC] Returns a plain tensor: the data with masked-out positions filled with value.
         return self.get_data().masked_fill(~self.get_mask(), value)
 
     def get_data(self):
+        # [FUNCTION DOC] Returns the data tensor through an autograd function, so gradients flow
+        # back to this MaskedTensor as MaskedTensor gradients using this tensor's mask.
         class GetData(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd function exposing the stored data (detached) in forward
+            # and wrapping the incoming gradient with the mask in backward.
             @staticmethod
             # pyrefly: ignore [bad-override]
             def forward(ctx, self):
+                # [FUNCTION DOC] HELPER: Returns the stored data detached from autograd.
                 return self._masked_data.detach()
 
             @staticmethod
             # pyrefly: ignore [bad-override]
             def backward(ctx, grad_output):
+                # [FUNCTION DOC] HELPER: Returns grad_output if already a MaskedTensor, else
+                # wraps it with the mask of the enclosing MaskedTensor.
                 if is_masked_tensor(grad_output):
                     return grad_output
                 return MaskedTensor(grad_output, self.get_mask())
@@ -350,15 +437,19 @@ class MaskedTensor(torch.Tensor):
         return GetData.apply(self)
 
     def get_mask(self):
+        # [FUNCTION DOC] Returns the stored boolean mask tensor (not a copy).
         return self._masked_mask
 
     def is_sparse_coo(self):
+        # [FUNCTION DOC] True if the layout is sparse COO.
         return self.layout == torch.sparse_coo
 
     def is_sparse_csr(self):  # type: ignore[override]
+        # [FUNCTION DOC] True if the layout is sparse CSR.
         return self.layout == torch.sparse_csr
 
     # Update later to support more sparse layouts
     @property
     def is_sparse(self):  # type: ignore[override]
+        # [FUNCTION DOC] Property: True if the layout is sparse COO or sparse CSR.
         return self.is_sparse_coo() or self.is_sparse_csr()

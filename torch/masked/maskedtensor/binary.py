@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] MaskedTensor support for binary ATen ops (add, mul, comparisons, etc.).
+# Main contents: BINARY_NAMES and INPLACE_BINARY_NAMES, the shared _binary_helper that
+# applies an op to the data while requiring matching masks (with sparse COO/CSR handling),
+# wrapper factories, the NATIVE_*_MAP dispatch tables and _is_native_binary /
+# _apply_native_binary used by the MaskedTensor dispatch. Exports nothing publicly.
+# Import-time side effect: builds the dispatch maps by resolving torch.ops.aten overloads.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 
 import torch
@@ -73,6 +79,8 @@ INPLACE_BINARY_NAMES = [
 
 
 def _get_at_least_one_mask(a, b):
+    # [FUNCTION DOC] HELPER: Returns the mask of a if it is a MaskedTensor, else the mask of b.
+    # Raises TypeError if neither is a MaskedTensor, ValueError if their masks do not match.
     if not is_masked_tensor(a) and not is_masked_tensor(b):
         raise TypeError("At least one of `a` and `b` must be a MaskedTensor")
     if not _masks_match(a, b):
@@ -83,6 +91,13 @@ def _get_at_least_one_mask(a, b):
 
 
 def _binary_helper(fn, args, kwargs, inplace):
+    # [FUNCTION DOC] HELPER: Core implementation of a binary op on MaskedTensors. Takes the op,
+    # positional args (lhs, rhs, extras), kwargs (must be empty) and an inplace flag.
+    # Raises ValueError for kwargs, for non-matching masks, or for mismatched sparse indices/sizes;
+    # raises TypeError if an extra argument beyond lhs/rhs is a Tensor. Applies fn to the data
+    # (for sparse COO/CSR only to the values, rebuilding a sparse tensor with the lhs indices).
+    # Inplace: sets data and mask on args[0] and returns it. Otherwise returns a new MaskedTensor
+    # whose mask is the existing mask (expanded to the result shape for strided layout).
     if len(kwargs) != 0:
         raise ValueError("len(kwargs) must equal 0")
     for a in args[2:]:
@@ -159,18 +174,24 @@ def _binary_helper(fn, args, kwargs, inplace):
 
 
 def _torch_binary(fn_name):
+    # [FUNCTION DOC] HELPER: Looks up the aten op by name and returns a wrapper that applies it
+    # to MaskedTensor arguments through _binary_helper in out-of-place mode.
     fn = getattr(torch.ops.aten, fn_name)
 
     def binary_fn(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Out-of-place masked binary op; forwards to _binary_helper.
         return _binary_helper(fn, args, kwargs, inplace=False)
 
     return binary_fn
 
 
 def _torch_inplace_binary(fn_name):
+    # [FUNCTION DOC] HELPER: Like _torch_binary but the returned wrapper mutates the first
+    # MaskedTensor argument in place through _binary_helper.
     fn = getattr(torch.ops.aten, fn_name)
 
     def binary_fn(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: In-place masked binary op; forwards to _binary_helper.
         return _binary_helper(fn, args, kwargs, inplace=True)
 
     return binary_fn
@@ -189,10 +210,13 @@ NATIVE_INPLACE_BINARY_FNS = list(NATIVE_INPLACE_BINARY_MAP.keys())
 
 
 def _is_native_binary(fn):
+    # [FUNCTION DOC] HELPER: True if fn is a supported binary op (regular or in-place variant).
     return fn in NATIVE_BINARY_FNS or fn in NATIVE_INPLACE_BINARY_FNS
 
 
 def _apply_native_binary(fn, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Dispatches fn to its masked wrapper (regular map first, then
+    # in-place map) and returns the result; returns NotImplemented if fn is in neither map.
     if fn in NATIVE_BINARY_FNS:
         return NATIVE_BINARY_MAP[fn](*args, **kwargs)
     if fn in NATIVE_INPLACE_BINARY_FNS:

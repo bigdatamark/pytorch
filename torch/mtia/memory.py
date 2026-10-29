@@ -1,4 +1,8 @@
 # pyre-strict
+# [MODULE DOC] MTIA device memory statistics API: memory_stats, max_memory_allocated,
+# memory_allocated and reset_peak_memory_stats, each returning empty/zero results (or doing
+# nothing) when MTIA is not yet initialized. Re-exported by the parent package. No import-time
+# side effects.
 
 r"""This package adds support for device memory management implemented in MTIA."""
 
@@ -11,6 +15,8 @@ from ._utils import _get_device_index
 
 
 def memory_stats(device: Device = None) -> dict[str, Any]:
+    # [FUNCTION DOC] Returns the allocator statistics dictionary for the device (default current),
+    # or an empty dictionary if MTIA is not initialized.
     r"""Return a dictionary of MTIA memory allocator statistics for a given device.
 
     Args:
@@ -24,6 +30,10 @@ def memory_stats(device: Device = None) -> dict[str, Any]:
 
 
 def max_memory_allocated(device: Device = None) -> int:
+    # [FUNCTION DOC] Returns peak allocated bytes from the device-memory section of the stats,
+    # or 0 if MTIA is not initialized.
+    # KNOWN ISSUE: the lookup of the memory section defaults to the integer 0, so if the section
+    # is missing the following lookup fails with AttributeError instead of returning 0.
     r"""Return the maximum memory allocated in bytes for a given device.
 
     Args:
@@ -37,6 +47,9 @@ def max_memory_allocated(device: Device = None) -> int:
 
 
 def memory_allocated(device: Device = None) -> int:
+    # [FUNCTION DOC] Returns currently allocated bytes from the device-memory section of the
+    # stats, or 0 if MTIA is not initialized.
+    # KNOWN ISSUE: same default-of-integer problem as max_memory_allocated when the section is missing.
     r"""Return the current MTIA memory occupied by tensors in bytes for a given device.
 
     Args:
@@ -50,6 +63,8 @@ def memory_allocated(device: Device = None) -> int:
 
 
 def reset_peak_memory_stats(device: Device = None) -> None:
+    # [FUNCTION DOC] Resets the peak memory statistics of the device (default current); does
+    # nothing if MTIA is not initialized.
     r"""Reset the peak memory stats for a given device.
 
 

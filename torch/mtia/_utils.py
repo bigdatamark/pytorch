@@ -1,3 +1,5 @@
+# [MODULE DOC] Internal helper for the MTIA package: normalizing a device specification to an
+# integer index. No import-time side effects.
 from typing import Any
 
 import torch
@@ -6,6 +8,12 @@ import torch
 def _get_device_index(
     device: Any, optional: bool = False, allow_cpu: bool = False
 ) -> int:
+    # [FUNCTION DOC] HELPER: Resolves a device specification (None, int, string, torch.device or
+    # the mtia device context manager) to an index. None with optional returns the current device;
+    # ints pass through; strings are parsed; the context manager yields its stored index; a cpu
+    # device gives -1 when allowed. A device without an index uses the current device only if
+    # optional. Raises ValueError for cpu devices when not allowed, non-mtia/cpu types, or
+    # unresolvable specs when not optional.
     r"""Get the device index from :attr:`device`, which can be a torch.device object, a Python integer, or ``None``.
 
     If :attr:`device` is a torch.device object, returns the device index if it
