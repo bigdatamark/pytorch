@@ -1,4 +1,13 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines DeviceMesh, an N-dimensional layout of ranks of the default process group, and
+# the init_device_mesh factory. A mesh owns one ProcessGroup per dimension, supports slicing into
+# submeshes by dimension name, flattening/unflattening/concatenating dimensions, and acts as a
+# context manager that tracks the "current" mesh in a thread-local stack.
+# Exports (__all__): init_device_mesh, DeviceMesh.
+# Import-time side effects: if torch.distributed is unavailable, installs stub DeviceMesh and
+# init_device_mesh objects into the sys.modules entry of this module; otherwise registers the mesh
+# layout classes as safe globals for torch.serialization and creates the module-level _mesh_resources
+# thread-local environment. The opaque-type registration helper at the bottom is defined here too.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 import logging
 import os
@@ -28,9 +37,11 @@ if not is_available():
     # ``torch.distributed.init_device_mesh`` but cannot find them.
 
     class _DeviceMeshStub:
+        # [CLASS DOC] HELPER: Empty placeholder class exported as DeviceMesh when torch.distributed is not available.
         pass
 
     def _init_device_mesh_stub():
+        # [FUNCTION DOC] HELPER: Placeholder init_device_mesh used when torch.distributed is not available; does nothing.
         pass
 
     sys.modules["torch.distributed.device_mesh"].DeviceMesh = _DeviceMeshStub  # type: ignore[attr-defined]
@@ -75,6 +86,10 @@ else:
     torch.serialization.add_safe_globals([_FlatLayout, _MeshLayout])
 
     def _get_pg_from_name(mesh: "DeviceMesh", name: str) -> ProcessGroup:
+        # [FUNCTION DOC] HELPER: Look up a ProcessGroup by its group name for the given mesh.
+        # While compiling, reads the mesh's per-mesh group registry and raises RuntimeError if the name is
+        # missing (e.g. mesh was pickled before groups existed); otherwise resolves the name through the
+        # global c10d registry.
         """
         This method allows us to torch.compile through DeviceMesh and lift its
         PGs as inputs to the graph since all PGs will have a source from the
@@ -95,6 +110,10 @@ else:
             return _resolve_process_group(name)  # pyrefly: ignore[bad-argument-type]
 
     def _maybe_traced_group(mesh: "DeviceMesh", mesh_dim: int) -> ProcessGroup | None:
+        # [FUNCTION DOC] HELPER: Return the process group for a mesh dimension as an in-graph op result when tracing with
+        # compile_on_one_rank under an active proxy (make_fx) trace; return None in every other case
+        # (config off, Dynamo compiling, no proxy mode) so the caller takes the eager path. Imports the
+        # dtensor collective utils lazily so the op is registered.
         """Resolve the group via an in-graph op when tracing under CooR.
 
         Under compile_on_one_rank and an active make_fx/proxy trace, return the
@@ -129,16 +148,23 @@ else:
         return torch.ops._dtensor.mesh_get_process_group(mesh, mesh_dim)
 
     class _MeshEnv(threading.local):
+        # [CLASS DOC] HELPER: Thread-local environment for DeviceMesh. Holds mesh_stack, the stack of meshes entered
+        # via the context manager in the current thread, plus legacy helper methods kept for backward
+        # compatibility (root mesh lookup, devices/hosts counting, submesh listing).
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Initialize an empty per-thread mesh stack.
             self.mesh_stack: list[DeviceMesh] = []
 
         def get_current_mesh(self) -> "DeviceMesh":
+            # [FUNCTION DOC] HELPER: Return the innermost active mesh; raises RuntimeError if the stack is empty.
             if len(self.mesh_stack) == 0:
                 raise RuntimeError("No device mesh is currently active!")
             return self.mesh_stack[-1]
 
         # TODO: to remove it once we move all use cases into new API.
         def get_root_mesh(self, device_mesh: "DeviceMesh") -> "DeviceMesh":
+            # [FUNCTION DOC] HELPER: Deprecated. Emits a warning and returns the root mesh of the given mesh (the mesh
+            # itself if it is a root); a falsy mesh is returned unchanged.
             # If a mesh could not be found in the child_to_root_mapping, it is a root mesh itself.
             # A root mesh is not created through slicing.
             # We considers the root mesh of a root mesh is itself.
@@ -154,10 +180,12 @@ else:
 
         @staticmethod
         def num_devices_per_host(device_type: str) -> int:
+            # [FUNCTION DOC] HELPER: Return the number of devices on this host for the device type, using the device module's count.
             return _get_device_handle(device_type).device_count()
 
         @staticmethod
         def num_hosts(device_type: str) -> int:
+            # [FUNCTION DOC] HELPER: Return world size divided by devices per host; assumes homogeneous hardware.
             # ProcessGroup can't tell us this info so we have to infer it, assume
             # homogeneous hardware for now
             return get_world_size() // _MeshEnv.num_devices_per_host(device_type)
@@ -167,6 +195,8 @@ else:
         def _get_all_submeshes(
             self, device_mesh: "DeviceMesh", mesh_dim_name: str
         ) -> list["DeviceMesh"]:
+            # [FUNCTION DOC] HELPER: Deprecated. Emits a warning and delegates to the mesh's own method returning all
+            # submeshes along the named dimension.
             warnings.warn(
                 "This _get_all_submeshes API will be deprecated soon."
                 "Please use `_get_all_submeshes` inside DeviceMesh instead.",
@@ -177,6 +207,7 @@ else:
     _mesh_resources: _MeshEnv = _MeshEnv()
 
     def _get_device_handle(device_type: str = "cuda"):
+        # [FUNCTION DOC] HELPER: Return the torch submodule named by device_type (e.g. the cuda module), or None if it does not exist.
         """
         Get the module corresponding to the device_type which is cuda or cuda-like device.
         For example, when the device_type is cuda, the module `torch.cuda` is returned.
@@ -186,6 +217,16 @@ else:
         return getattr(torch, device_type, None)
 
     class DeviceMesh(CustomClassBase):
+            # [CLASS DOC] N-dimensional mesh of devices whose entries are global ranks of the default process group.
+            # State: a device type, a flat rank map tensor, a layout (sizes and strides) describing how the rank
+            # map is viewed as the mesh, optional dimension names, the current rank, the root mesh (set for
+            # submeshes and flattened meshes), per-dimension process group names, a registry of group objects,
+            # a mapping of flattened dimension names to flattened meshes (kept on the root), and a lazily
+            # cached hash. Invariants: the layout must be non-overlapping, the rank map 1-D and contiguous
+            # and large enough for the layout, and the mesh must fit within the world size. Creating a
+            # mesh with backends initializes the default group if needed, selects the device, and creates one
+            # group per dimension. Supports slicing by name, flattening, unflattening, concatenation, group and
+            # rank queries, equality/hash, pickling (without groups) and use as a context manager.
         """
         DeviceMesh represents a mesh of devices, where layout of devices could be
         represented as a n-d dimension array, and each value of the n-d dimensional
@@ -258,6 +299,13 @@ else:
             _rank_map: torch.Tensor | None = None,
             _root_mesh: "DeviceMesh | None" = None,
         ) -> None:
+            # [FUNCTION DOC] Build a mesh from an explicit mesh (tensor or array-like of ranks) or, for internal use, from a
+            # layout plus rank map (providing both forms raises TypeError; providing neither raises TypeError).
+            # Validates layout orthogonality, rank map shape/size (AssertionError) and that backend_override has
+            # one entry per dimension (ValueError). Unless the device type is xla, and if _init_backend is set,
+            # it sets up the world group and device, creates per-dimension process groups and records them in
+            # the (root's) registry; then records thread id for the threaded backend, the current rank and its
+            # coordinate in the mesh. Side effects: may call init_process_group, set the device, create groups.
             # no-op in OSS, logs API usage metrics in meta-internal runs
             torch._C._log_api_usage_once(
                 "torch.distributed.device_mesh.DeviceMesh.__init__"
@@ -382,6 +430,8 @@ else:
             mesh_tensor: torch.Tensor,
             rank: int,
         ) -> tuple[int, ...] | None:
+        # [FUNCTION DOC] HELPER: Return the coordinates of rank within mesh_tensor as a tuple, or None if the rank is not
+        # present. Raises AssertionError if the rank occurs more than once.
             """
             Compute the coordinates of a rank within a mesh tensor.
 
@@ -408,16 +458,20 @@ else:
             return tuple(coords)
 
         def _compute_coordinate_on_dim(self) -> tuple[int, ...] | None:
+            # [FUNCTION DOC] HELPER: Return the coordinates of the current rank in this mesh, or None if it is not a member.
             # calculate the coordinates of the current global rank on the mesh
             return self._compute_coordinates_from_mesh(self.mesh, self._rank)
 
         def __getstate__(self) -> dict:
+            # [FUNCTION DOC] HELPER: Pickle support: return a copy of the instance state without the process group registry (groups are not picklable).
             # Exclude _pg_registry from pickle since ProcessGroup objects can't be pickled
             state = self.__dict__.copy()
             state.pop("_pg_registry", None)
             return state
 
         def __setstate__(self, state: dict) -> None:
+            # [FUNCTION DOC] HELPER: Unpickle support: restore state, then rebuild the group registry by resolving each stored
+            # group name; a name that cannot be resolved only logs a warning.
             self.__dict__.update(state)
             # Reconstruct _pg_registry from _dim_group_names
             self._pg_registry = {}
@@ -437,6 +491,7 @@ else:
 
         @property
         def device_type(self) -> str:
+            # [FUNCTION DOC] Property: the device type string of the mesh.
             """Returns the device type of the mesh."""
             return self._device_type
 
@@ -445,6 +500,9 @@ else:
             full_mesh: torch.Tensor,
             current_rank: int | None = None,
         ) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Return the mesh tensor for the current rank from a full (possibly stacked) mesh: the
+            # only row if the first dimension has size one, otherwise the row containing current_rank (default:
+            # the global rank). Raises RuntimeError if the rank is not in the mesh.
             if full_mesh.size(0) == 1:
                 return full_mesh[0]
 
@@ -462,16 +520,23 @@ else:
 
         @property
         def mesh(self) -> torch.Tensor:
+            # [FUNCTION DOC] Property: the tensor of ranks laid out by the layout, reduced to the slice containing the current rank when needed.
             """Returns the tensor representing the layout of devices."""
             full_mesh = self._layout.remap_to_tensor(self._rank_map)
             return self._get_mesh_tensor_from_full_mesh(full_mesh)
 
         @property
         def mesh_dim_names(self) -> tuple[str, ...] | None:
+            # [FUNCTION DOC] Property: the tuple of dimension names, or None if the mesh has none.
             """Returns the names of mesh dimensions."""
             return self._mesh_dim_names
 
         def _setup_world_group_and_device(self):
+            # [FUNCTION DOC] HELPER: Ensure the default process group exists (initializing it if not), check the mesh is not
+            # larger than the world size (RuntimeError), and select the accelerator device for this process
+            # unless the user already did: uses LOCAL_RANK if set, otherwise warns and uses rank modulo devices
+            # per host (RuntimeError for non-homogeneous hosts). Skips device setup for the fake backend or
+            # when no devices exist. Returns the default group.
             default_initialized = is_initialized()
             if not default_initialized:
                 init_process_group()
@@ -538,6 +603,13 @@ else:
             dim_name: str,
             backend_override: BackendConfig,
         ) -> GroupName | None:
+            # [FUNCTION DOC] HELPER: Create the process group for one mesh dimension and return its group name, or None if the
+            # current rank is not part of it. Reuses the default group when the dimension spans the whole world
+            # with no backend override (creating a new group instead if CUDA is available but the default is
+            # gloo); uses split_group when the default group is eagerly bound to a device (or torchcomms is
+            # on) and the backend matches; otherwise loops over every subgroup calling new_group and keeps the
+            # one containing the current rank. Raises AssertionError if the rank is missing from its own group
+            # and RuntimeError if the rank lands in more than one group. Side effect: collective group creation.
             # Generate a 2D global mesh tensor for the current dim for PG creation.
             pg_ranks_by_dim = _MeshLayout([sub_layout]).remap_to_tensor(rank_map)
             backend, pg_options = backend_override
@@ -649,6 +721,9 @@ else:
             mesh_dim_names: tuple[str, ...] | None,
             backend_override: tuple[BackendConfig, ...],
         ) -> list[GroupName]:
+            # [FUNCTION DOC] HELPER: Create one process group per layout dimension (naming dimensions after mesh_dim_names or by
+            # index) and return the list of group names for the dimensions this rank belongs to. Raises
+            # AssertionError if only some dimensions yielded a group for this rank.
             # group_name associated with each mesh dimension, each
             # mesh dimension should have one sub-group per rank
             dim_group_names: list[GroupName | None] = []
@@ -672,19 +747,24 @@ else:
             return dim_non_none_group_names
 
         def _get_root_mesh(self) -> "DeviceMesh":
+            # [FUNCTION DOC] HELPER: Return the root mesh, or this mesh if it has no root set.
             return self._root_mesh if self._root_mesh else self
 
         def __enter__(self) -> "DeviceMesh":
+            # [FUNCTION DOC] Context manager entry: push this mesh onto the thread-local mesh stack and return it.
             # set this mesh as the current mesh in mesh env
             _mesh_resources.mesh_stack.append(self)
             return self
 
         # pyre-fixme[2]: Parameter must be annotated.
         def __exit__(self, exc_type, exc_value, exc_traceback) -> None:
+            # [FUNCTION DOC] Context manager exit: pop the top mesh off the thread-local stack; exceptions are not suppressed.
             # pop this mesh from mesh env
             _mesh_resources.mesh_stack.pop()
 
         def __repr__(self) -> str:
+            # [FUNCTION DOC] Return a string with dimension sizes (named if names exist), device type and strides; when the
+            # environment variable TORCH_DISTRIBUTED_DEBUG equals DETAIL, also includes the mesh tensor contents.
             device_mesh_repr = (
                 f"({', '.join(f'{k}={v}' for k, v in zip(self._mesh_dim_names, self._layout.top_level_sizes))})"
                 if self._mesh_dim_names
@@ -703,6 +783,7 @@ else:
             return f"{device_mesh_repr})"
 
         def _hash_key(self) -> tuple[Any, ...]:
+            # [FUNCTION DOC] HELPER: Return the tuple (rank map contents, layout, device type, dim names, thread id) used for hashing and equality-like identity.
             """Return the tuple used for hashing. Used by both __hash__ and _stable_hash."""
             return (
                 self._flatten_rank_map,
@@ -713,6 +794,7 @@ else:
             )
 
         def __hash__(self):
+            # [FUNCTION DOC] Return the cached hash, computing it lazily from the hash key tuple.
             # lazily compute hash
             self._hash = getattr(self, "_hash", None)
             if not self._hash:
@@ -720,6 +802,8 @@ else:
             return self._hash
 
         def __eq__(self, other: object) -> bool:
+            # [FUNCTION DOC] Equality: identical object, or another DeviceMesh with equal rank map contents, layout,
+            # device type, dim names and thread id; any non-mesh object compares unequal.
             if self is other:
                 return True
             if not isinstance(other, DeviceMesh):
@@ -733,6 +817,7 @@ else:
             )
 
         def _stable_hash(self) -> str:
+            # [FUNCTION DOC] HELPER: Return a stable hex digest (blake2b, 16 bytes) of the hash key's text form, for AOT autograd caching.
             """
             Return a stable hash for AOT autograd caching.
             [See note: Tensor subclass stable hashing for AOT autograd cache]
@@ -744,6 +829,10 @@ else:
             ).hexdigest()
 
         def __getitem__(self, mesh_dim_names: str | tuple[str, ...]) -> "DeviceMesh":
+            # [FUNCTION DOC] Slice the mesh by one dimension name or a tuple of names, returning a submesh with those
+            # dimensions in the given order (or self if the names equal all names). Raises RuntimeError if the
+            # mesh has no dimension names; name validation happens in the layout slicing helper. Temporarily
+            # disables fake tensor and proxy tracing while building the submesh, which reuses existing groups.
             """
             Slice the current DeviceMesh based on the mesh_dim_names given to create a submesh.
             The submesh created consists of the dimensions and the communicators indicated by
@@ -820,6 +909,10 @@ else:
                 return submesh
 
         def get_group(self, mesh_dim: int | str | None = None) -> ProcessGroup:
+            # [FUNCTION DOC] Return the ProcessGroup for a dimension given by name or index. With no argument it returns
+            # the only group of a 1-D mesh. Raises RuntimeError if groups were not initialized or if the mesh
+            # has more than one dimension and none was specified. Looks up flattened dimensions through the
+            # root mesh's flatten mapping, and may return an in-graph traced group when compiling on one rank.
             """
             Returns the single ProcessGroup specified by mesh_dim, or, if mesh_dim is not specified and the
             DeviceMesh is 1-dimensional, returns the only ProcessGroup in the mesh.
@@ -875,6 +968,7 @@ else:
                 )
 
         def get_all_groups(self) -> list[ProcessGroup]:
+            # [FUNCTION DOC] Return a list with the ProcessGroup of every mesh dimension, in order.
             """
             Returns a list of ProcessGroups for all mesh dimensions.
 
@@ -888,6 +982,10 @@ else:
             layout: _MeshLayout,
             submesh_dim_names: tuple[str, ...],
         ) -> "DeviceMesh":
+            # [FUNCTION DOC] HELPER: Build a submesh with the given layout and dimension names sharing the root mesh's rank
+            # map and root, without creating new groups. Picks the matching group names from this mesh (or from a
+            # flattened mesh in the root for flattened names) when the rank is in the mesh. Raises AssertionError
+            # if group names and dimension names disagree in length.
             with torch._dynamo.disable_nested_graph_breaks():
                 root_mesh = self._get_root_mesh()
                 slice_dim_group_name = []
@@ -929,6 +1027,10 @@ else:
             mesh_dim_name: str,
             backend_override: BackendConfig = (None, None),
         ) -> None:
+            # [FUNCTION DOC] HELPER: Flatten all dimensions of this mesh into one new dimension called mesh_dim_name and store
+            # it in the root mesh's flatten mapping. Raises ValueError if the name collides with an existing
+            # dimension name or with a previously flattened mesh of a different layout; an identical earlier
+            # flattened mesh makes this a no-op. Creates a new process group (optionally with backend override).
             """
             Creates a flattened mesh and stores it in the root mesh's _flatten_mapping.
             This is a helper method for _flatten() that performs the actual mesh creation.
@@ -971,6 +1073,8 @@ else:
             root_mesh._flatten_mapping[mesh_dim_name] = res_flattened_mesh
 
         def _get_root_mesh_dim(self) -> int | None:
+            # [FUNCTION DOC] HELPER: Return this 1-D submesh's dimension index in the root mesh, or None if it has no root/names.
+            # Raises AssertionError if the mesh has more than one dimension.
             """
             Returns the index of the mesh dim in the root mesh.
             The device_mesh passed in needs to be sliced out from the root mesh
@@ -986,6 +1090,7 @@ else:
             return None
 
         def _get_mesh_dim_by_name(self, mesh_dim_name: str) -> int:
+            # [FUNCTION DOC] HELPER: Return the index of a dimension name; raises KeyError if the mesh has no names or the name is unknown.
             if self._mesh_dim_names is None or len(self._mesh_dim_names) == 0:
                 raise KeyError(
                     "No `mesh_dim_names` found.",
@@ -1000,6 +1105,10 @@ else:
         def _get_slice_mesh_layout(
             self, mesh_dim_names: tuple[str, ...]
         ) -> _MeshLayout:
+            # [FUNCTION DOC] HELPER: Validate a tuple of dimension names for slicing and return the matching layout. Valid names
+            # are this mesh's own names plus, when slicing from the root, flattened-dimension names (the latter
+            # warns about upcoming deprecation). Raises KeyError for unknown names or when the chosen dimensions
+            # are not in ascending order of the original layout, and RuntimeError if the chosen dimensions overlap.
             """
             Validate whether the mesh_dim_names is valid for slicing the given device_mesh.
             If valid, return dim indexes of the slice mesh in the device mesh.
@@ -1071,6 +1180,9 @@ else:
 
         # TODO: to make this use case by other components public API in the future.
         def _get_all_submeshes(self, mesh_dim_name: str) -> list["DeviceMesh"]:
+            # [FUNCTION DOC] HELPER: Return one 1-D submesh per group along the named dimension (one for each set of ranks that
+            # communicate together), built without creating groups. Each submesh gets this dimension's group name
+            # only if the current rank is in its ranks, otherwise an empty list. Raises KeyError for a bad name.
             """
             Return all the submeshes of a given mesh dimension of the device mesh.
             """
@@ -1103,6 +1215,10 @@ else:
             *,
             mesh_dim_names: tuple[str, ...] | None = None,
         ) -> "DeviceMesh":
+            # [FUNCTION DOC] Static factory: wrap existing ProcessGroup objects in a DeviceMesh without creating groups. A single
+            # group gives a 1-D mesh from the group's ranks (ValueError if a provided mesh disagrees with them).
+            # A list of groups requires mesh and mesh_dim_names and mesh ndim equal to the number of groups, else
+            # ValueError (also for an empty list). Records the group names and registers the groups in the new mesh.
             """
             Constructs a :class:`DeviceMesh` with ``device_type`` from an
             existing :class:`ProcessGroup` or a list of existing :class:`ProcessGroup`.
@@ -1197,22 +1313,29 @@ else:
             if mesh_dim is not None:
                 return self._layout[mesh_dim].numel()
             return self._layout.numel()
+            # [FUNCTION DOC] Return the number of elements in the given dimension index, or the total number of devices if no dimension is given.
 
         @property
         def ndim(self) -> int:
             return len(self._layout)
+            # [FUNCTION DOC] Property: the number of mesh dimensions.
 
         @property
         def shape(self) -> tuple[int, ...]:
             return self._layout.top_level_sizes
+            # [FUNCTION DOC] Property: tuple of the size of each mesh dimension.
 
         def get_rank(self) -> int:
+            # [FUNCTION DOC] Return the current process's global rank in the default process group.
             """
             Returns the current global rank.
             """
             return get_rank()
 
         def get_local_rank(self, mesh_dim: int | str | None = None) -> int:
+            # [FUNCTION DOC] Return this process's rank within the group of the given mesh dimension (name or index). Raises
+            # RuntimeError if the mesh has more than one dimension and none is given; defaults to dimension 0
+            # for 1-D meshes. Raises AssertionError if the group is not a ProcessGroup.
             """
             Returns the local rank of the given mesh_dim of the DeviceMesh.
 
@@ -1257,6 +1380,8 @@ else:
             return not_none(get_rank(mesh_dim_group))
 
         def _is_current_rank_part_of_mesh(self) -> bool:
+            # [FUNCTION DOC] Return True if the current rank belongs to this mesh (its coordinate is known); non-member ranks
+            # skip DTensor work.
             """
             Return True if the current rank is part of this mesh.
 
@@ -1276,6 +1401,7 @@ else:
             return self._coordinate_on_dim is not None
 
         def get_coordinate(self) -> tuple[int, ...] | None:
+            # [FUNCTION DOC] Return this rank's coordinates in every mesh dimension as a tuple, or None if the rank is not in the mesh.
             """
             Return the relative indices of this rank relative to all
             dimensions of the mesh. If this rank is not part of the mesh, return None.
@@ -1283,6 +1409,10 @@ else:
             return self._coordinate_on_dim
 
         def _sym_get_coordinate(self, index: int) -> IntLikeType:
+            # [FUNCTION DOC] HELPER: Return this rank's coordinate along dimension index. In eager mode (or when not compiling
+            # on one rank under a fake mode with a shape environment) it reads the stored coordinate and raises
+            # AssertionError if the rank is not in the mesh. Otherwise it lifts the rank map to a constant and
+            # returns the result of a registered custom op that computes the coordinate symbolically.
             import torch.compiler.config as config
             from torch._guards import detect_fake_mode
 
@@ -1319,6 +1449,10 @@ else:
             | tuple[str, C10dBackend.Options]
             | None = None,
         ) -> "DeviceMesh":
+            # [FUNCTION DOC] HELPER: Flatten all dimensions into a single new 1-D mesh and return it (name defaults to the dim
+            # names joined by underscore; a 1-D mesh flattened to one of its own names returns itself). Raises
+            # RuntimeError if the mesh has no dimension names. An optional backend override is normalized and
+            # used when creating the flattened mesh's group. Side effect: stores it in the root's flatten mapping.
             """
             Returns a 1D DeviceMesh by flattening the current DeviceMesh.
 
@@ -1364,6 +1498,10 @@ else:
                 tuple[str | None, C10dBackend.Options | None], ...
             ] = ((None, None),),
         ) -> "DeviceMesh":
+            # [FUNCTION DOC] HELPER: Build a mesh where dimension dim is split into dimensions of sizes mesh_sizes named
+            # mesh_dim_names, sharing the root's rank map and root. Raises ValueError if the product of sizes
+            # differs from the dimension's size. If this mesh already has process groups, creates groups for the
+            # new dimensions (collective), splices their names in, and registers them in the root's registry.
             inner_layout = _MeshLayout.from_sizes_strides(tuple(mesh_sizes))
 
             if inner_layout.numel() != self._layout[dim].numel():
@@ -1420,6 +1558,11 @@ else:
             ]
             | None = None,
         ) -> "DeviceMesh":
+            # [FUNCTION DOC] HELPER: Split one dimension (given by index or name) into several named dimensions and return the new
+            # mesh. Raises ValueError for an out-of-range index or unknown name, and RuntimeError if
+            # mesh_sizes and mesh_dim_names lengths differ. Normalizes the optional per-dimension backend override
+            # (note: that helper consumes entries from the given mapping).
+            # KNOWN ISSUE: the docstring example mentions both "pp" and "cp" for the same new dimension name.
             """
             Returns a DeviceMesh by unflatten the current DeviceMesh.
 
@@ -1474,6 +1617,9 @@ else:
 
         @staticmethod
         def _concatenate(device_mesh_list: list["DeviceMesh"]) -> "DeviceMesh":
+            # [FUNCTION DOC] HELPER: Static method that joins the dimensions of several meshes (all derived from the same rank
+            # map) into one mesh, concatenating layouts, names and group names, without creating groups. Raises
+            # RuntimeError if rank maps differ or the combined layout overlaps. Every input needs dim names and groups.
             concat_dim_names: list[str] = []
             concat_axes: list[_FlatLayout] = []
             concat_dim_group_name: list[GroupName] = []
@@ -1512,6 +1658,12 @@ else:
         ndim: int,
         mesh_dim_names: tuple[str, ...] | None = None,
     ) -> Iterator[BackendConfig]:
+        # [FUNCTION DOC] HELPER: Generator turning a mapping of dimension index or name to a backend spec into one
+        # (backend name, options) pair per dimension; a string gives the name only, an options object gives
+        # options only, and a missing entry gives no override. Raises RuntimeError if both the index and name
+        # of a dimension are given or if unused keys remain.
+        # KNOWN ISSUE: it removes consumed keys from the caller's mapping (mutates the input), and the
+        # leftover-key error is only raised once the generator is fully consumed.
         if mesh_dim_names is None:
             mesh_dim_names = ()
         for dim_idx, dim_name in zip_longest(range(ndim), mesh_dim_names):
@@ -1551,6 +1703,10 @@ else:
         ]
         | None = None,
     ) -> DeviceMesh:
+        # [FUNCTION DOC] Create a DeviceMesh of the given shape with ranks 0..N-1 laid out in row-major order and one
+        # process group per dimension, creating the default group if needed. Raises RuntimeError for duplicate
+        # mesh_dim_names, a length mismatch between names and shape, or a device type that contains non-letters
+        # (e.g. an index). Optional backend_override maps dimension index or name to backend and/or options.
         """
         Initializes a `DeviceMesh` based on `device_type`, `mesh_shape`, and `mesh_dim_names` parameters.
 
@@ -1645,6 +1801,10 @@ def _device_mesh_reconstruct_fn(
     get_tracked_proxy: Callable[["CustomClassBase"], "torch.fx.Proxy | None"],
     tracer: Any,
 ) -> "torch.fx.Proxy | None":
+    # [FUNCTION DOC] HELPER: Reconstruct callback used by make_fx tracing for an untracked DeviceMesh submesh. Returns None
+    # for non-submeshes, meshes without dim names, or when no tracked mesh with the same root contains all the
+    # dim names; otherwise emits a custom-op call deriving the submesh from the tracked ancestor by dimension
+    # indices and returns its proxy. Raises AssertionError if the object is not a DeviceMesh.
     """Reconstruct a DeviceMesh submesh from a tracked ancestor mesh.
 
     Called by PythonKeyTracer when make_fx encounters a DeviceMesh that isn't
@@ -1710,6 +1870,10 @@ def _device_mesh_reconstruct_fn(
 
 
 def _register_distributed_opaque_types():
+    # [FUNCTION DOC] HELPER: One-time (idempotent, guarded by a module flag) registration of DeviceMesh as a symbolic opaque
+    # type for torch.compile, together with the process group opaque type. The member table says which
+    # attributes and methods are evaluated on the real object at compile time and which are inlined, and it
+    # supplies the guard values and the reconstruct callback. Side effect: modifies global registries.
     """
     Register DeviceMesh as an opaque type for torch.compile.
     This must happen before any custom ops that use DeviceMesh in their schema.
