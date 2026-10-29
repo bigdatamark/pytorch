@@ -1,4 +1,12 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for compiling distributed collectives with Dynamo, AOT and Inductor.
+# Covers: bucketing trace helpers on fake tensors with unbacked sizes, the simple_overlap
+# scheduler pass, multi-process NCCL/XCCL compile-vs-eager checks of functional collectives,
+# single-process Dynamo rewrites of torch.distributed collectives into functional ones,
+# generated-code checks for buffer reuse, bucketing, reordering and dedup, cross-rank
+# partitioner sync, and NCCL runtime estimation. Import-time side effect: registers the custom
+# op coalesced_all_gather in the test_inductor_collectives namespace (with a fake impl).
+# Runs via run_tests when executed directly.
 import datetime
 import functools
 import unittest
@@ -79,6 +87,10 @@ from torch.utils._python_dispatch import TorchDispatchMode
 def _coalesced_all_gather(
     inp: torch.Tensor, world_size: int, group_name: str
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: custom op body for the coalescing-manager test. Resolves the
+    # process group from its name, allocates a flat output of numel times world_size,
+    # all-gathers the input into it inside an async coalescing manager, waits on the manager and
+    # returns the flat output. Declared with no mutated arguments.
     group = c10d.distributed_c10d._resolve_process_group(group_name)
     out = inp.new_empty(inp.numel() * world_size)
     with c10d._coalescing_manager(group=group, device=inp.device, async_ops=True) as cm:
@@ -89,11 +101,20 @@ def _coalesced_all_gather(
 
 @_coalesced_all_gather.register_fake
 def _(inp, world_size, group_name):
+    # [FUNCTION DOC] HELPER: fake (meta) implementation of the coalesced all-gather op. Returns
+    # an uninitialized flat tensor of numel times world_size elements.
     return inp.new_empty(inp.numel() * world_size)
 
 
 class TestBucketingTrace(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Unit tests for the bucketing trace and node-replacement helpers in inductor
+    # fx_passes.bucketing, using fake tensors with hinted/unbacked symbolic sizes. No process
+    # group is needed.
     def _make_hinted_unbacked_chunked_fake_inputs(self, *, hint=None):
+        # [FUNCTION DOC] HELPER: builds two fake 2-D tensors whose first dim is half of a fresh
+        # unbacked symbolic int (inner dim 4), inside a FakeTensorMode with a new ShapeEnv. If a
+        # hint is given, it is registered as the optimization hint of the unbacked int. Returns
+        # the pair of fake tensors.
         fake_mode = FakeTensorMode(
             allow_non_fake_inputs=True,
             shape_env=ShapeEnv(),
@@ -105,6 +126,9 @@ class TestBucketingTrace(torch._dynamo.test_case.TestCase):
             return torch.empty(u // 2, 4), torch.empty(u // 2, 4)
 
     def test_trace_ignores_ambient_pending_unbacked_symbols(self):
+        # [FUNCTION DOC] Checks that the bucketing trace helper leaves unrelated pending
+        # unbacked symbols of the ambient shape env untouched: the symbol is still pending after
+        # tracing a simple add function, and the traced code contains the add op.
         fake_mode = FakeTensorMode(
             allow_non_fake_inputs=True,
             shape_env=ShapeEnv(),
@@ -119,6 +143,10 @@ class TestBucketingTrace(torch._dynamo.test_case.TestCase):
         FileCheck().check("aten.add").run(gm.code)
 
     def test_all_gather_bucket_trace_accepts_hinted_unbacked_chunk_numel(self):
+        # [FUNCTION DOC] Traces the all-gather merge function (custom-op variant) on two inputs
+        # with a hinted unbacked chunk size. Expects the generated code to contain the symbolic
+        # numel and the pre-bucket all-gather op, and the node shape metadata to contain the
+        # unbacked symbol and the expected derived size expression.
         x, y = self._make_hinted_unbacked_chunked_fake_inputs(hint=8)
 
         gm = bucketing_trace(
@@ -143,6 +171,9 @@ class TestBucketingTrace(torch._dynamo.test_case.TestCase):
         self.assertTrue(any("16*((u0//2))" in shape for shape in symbolic_shapes))
 
     def test_all_gather_bucket_trace_requires_unbacked_chunk_hint(self):
+        # [FUNCTION DOC] Same setup as the hinted case but without an optimization hint on the
+        # unbacked size: tracing the all-gather merge must raise a RuntimeError saying that
+        # collective bucketing requires hinted symbolic sizes.
         x, y = self._make_hinted_unbacked_chunked_fake_inputs()
 
         with self.assertRaisesRegex(
@@ -162,6 +193,10 @@ class TestBucketingTrace(torch._dynamo.test_case.TestCase):
             )
 
     def test_reduce_scatter_bucket_trace_preserves_hinted_unbacked_chunk_shapes(self):
+        # [FUNCTION DOC] Traces the reduce-scatter merge function (custom-op variant, sum,
+        # float32, cuda device) on hinted unbacked inputs. Checks the generated code has the
+        # symbolic numel and the pre-bucket reduce-scatter op, and the node shape metadata keeps
+        # the unbacked symbol and a size divided by four.
         x, y = self._make_hinted_unbacked_chunked_fake_inputs(hint=8)
 
         gm = bucketing_trace(
@@ -186,6 +221,10 @@ class TestBucketingTrace(torch._dynamo.test_case.TestCase):
         self.assertTrue(any("(u0//4)" in shape for shape in symbolic_shapes))
 
     def test_replacement_updates_layout_dependent_user_metadata(self):
+        # [FUNCTION DOC] Builds a graph of an as_strided node followed by a transpose, with fake
+        # values in node metadata. Replaces the as_strided node with a traced function that uses
+        # a different stride via the insert-trace-before-node helper, then checks that the
+        # downstream transpose node metadata was refreshed to the new strides (1, 8).
         graph = torch.fx.Graph()
         base = graph.placeholder("base")
         original = graph.call_function(
@@ -209,6 +248,8 @@ class TestBucketingTrace(torch._dynamo.test_case.TestCase):
         transposed.meta["val"] = transposed_val
 
         def replacement_fn(x):
+            # [FUNCTION DOC] HELPER: replacement function returning a single as_strided view of
+            # the input with shape (2, 4) and strides (8, 1).
             return [torch.as_strided(x, (2, 4), (8, 1), 0)]
 
         _insert_fn_trace_before_node(
@@ -224,25 +265,40 @@ class TestBucketingTrace(torch._dynamo.test_case.TestCase):
 
 
 class TestSimpleOverlap(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Tests the simple_overlap pass in inductor comms using fake scheduler nodes.
     def test_preserves_fake_dep_ordering(self):
+        # [FUNCTION DOC] Builds fake scheduler nodes (a sync collective, a compute node and an
+        # async collective that has a fake weak dependency on the sync collective's output).
+        # With memory tracking, async-collective detection and wait detection patched out,
+        # checks simple_overlap moves the async collective before the compute node while keeping
+        # it after the sync collective.
         class FakeBuffer:
+            # [CLASS DOC] HELPER: minimal buffer stand-in exposing a name via get_name.
             def __init__(self, name):
+                # [FUNCTION DOC] HELPER: stores the buffer name.
                 self.name = name
 
             def get_name(self):
+                # [FUNCTION DOC] HELPER: returns the stored buffer name.
                 return self.name
 
         class FakeSNode:
+            # [CLASS DOC] HELPER: minimal scheduler node stand-in with a name, a kind string,
+            # output buffers and a list of unmet dependencies.
             def __init__(self, name, kind, outputs, deps=()):
+                # [FUNCTION DOC] HELPER: stores name and kind, wraps each output name in a fake
+                # buffer and keeps the given dependencies as unmet_dependencies.
                 self.name = name
                 self.kind = kind
                 self.outputs = [FakeBuffer(output) for output in outputs]
                 self.unmet_dependencies = deps
 
             def get_outputs(self):
+                # [FUNCTION DOC] HELPER: returns the list of fake output buffers.
                 return self.outputs
 
             def get_name(self):
+                # [FUNCTION DOC] HELPER: returns the node name.
                 return self.name
 
         sync_coll = FakeSNode("sync_coll", "sync_collective", ["sync_out"])
@@ -255,6 +311,9 @@ class TestSimpleOverlap(torch._dynamo.test_case.TestCase):
         )
 
         def memory_tracking(snodes):
+            # [FUNCTION DOC] HELPER: replacement for the memory tracking initializer. Returns a
+            # tuple of zero peak memory, zeroed per-node tuples, zeroed memory records keyed by
+            # node, and three empty mappings, for any list of nodes.
             return (
                 0,
                 dict.fromkeys(snodes, (0, 0)),
@@ -282,6 +341,10 @@ class TestSimpleOverlap(torch._dynamo.test_case.TestCase):
 @requires_accelerator_dist_backend(["nccl", "xccl"])
 @instantiate_parametrized_tests
 class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
+    # [CLASS DOC] Multi-process (2 ranks) correctness tests comparing eager and compiled
+    # functional collectives (all-reduce, all-gather, reduce-scatter, all-to-all, broadcast,
+    # permute). Requires an accelerator with NCCL or XCCL. world_size is always 2; the device
+    # type comes from the current accelerator, falling back to cpu.
     """
     Run correctness checks in multi-proc runner, mark with minimum # GPUs to run under
     """
@@ -289,6 +352,8 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
     device = acc.type if (acc := torch.accelerator.current_accelerator()) else "cpu"
 
     def get_world_trs(self):
+        # [FUNCTION DOC] Returns the keyword arguments (empty tag, ranks list for all ranks,
+        # group size) used by legacy functional collective ops.
         return {
             "tag": "",
             "ranks": list(range(self.world_size)),
@@ -297,6 +362,7 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Returns the fixed world size 2 regardless of the number of GPUs.
         # hack: no matter whether we have 2 or 3 or 4 gpus, just run on 2
         # works around issue with skipif<2 and workers with unpredictable #s gpu
         return 2
@@ -304,11 +370,15 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @skip_if_lt_x_gpu(2)
     def test_broadcast_inductor(self):
+        # [FUNCTION DOC] Compiles a broadcast followed by wait_tensor with make_fx plus inductor
+        # and checks the result equals eager and equals rank 0's tensor on all ranks.
         """
         Testing if broadcast works correctly when using inductor
         """
 
         def example(tensor, src, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: functional broadcast from src then wait_tensor;
+            # returns result.
             res = torch.ops.c10d_functional.broadcast(
                 tensor, src, tag, ranks, group_size
             )
@@ -316,6 +386,7 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
             return res
 
         def compile(func, example_inputs):
+            # [FUNCTION DOC] HELPER: traces func with make_fx and compiles it with inductor.
             graph = make_fx(func)(*example_inputs)
             return inductor_compile_fx(graph, example_inputs)
 
@@ -339,11 +410,16 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @skip_if_lt_x_gpu(2)
     def test_allreduce_inductor(self):
+        # [FUNCTION DOC] Compiles a matmul, cat, all-reduce, matmul, wait, add pattern through
+        # inductor and compares with eager (tolerance 0.001) across two ranks.
         """
         This is matmul/cat/allreduce is a pattern we aim to optimize.
         """
 
         def matmul_cat_col(a, b, c, d, e, f, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: two matmuls concatenated, all-reduced (sum), a third matmul
+            # overlapping the collective, wait_tensor, then add of the repeated third product.
+            # Returns a one-tuple.
             x = torch.matmul(a, b)
             y = torch.matmul(c, d)
             z = torch.cat((x, y))
@@ -354,6 +430,7 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
             return (out,)
 
         def compile(func, example_inputs):
+            # [FUNCTION DOC] HELPER: traces func with make_fx and compiles it with inductor.
             graph = make_fx(func)(*example_inputs)
             return inductor_compile_fx(graph, example_inputs)
 
@@ -372,6 +449,9 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @skip_if_lt_x_gpu(2)
     def test_allreduce_inductor_cudagraph_trees(self):
+        # [FUNCTION DOC] Checks all_reduce works with cudagraph trees enabled: compiles with
+        # fullgraph, triton cudagraphs and cudagraph_trees for three input sizes, running each
+        # three times and comparing against the eager function.
         """
         Tests whether cudagraph trees support all_reduce from nccl
         """
@@ -380,12 +460,15 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
         # dist.all_reduce is an inplace op in eager mode but a functionanlized op in compiled mode.
         # so we define eager_func and func separately for the same semantic.
         def eager_func(x):
+            # [FUNCTION DOC] HELPER: eager reference (square, in-place all-reduce,
+            # silu, multiply).
             y = x * x
             dist.all_reduce(y, op=dist.ReduceOp.SUM)
             x = torch.nn.functional.silu(x)
             return x * y
 
         def func(x):
+            # [FUNCTION DOC] HELPER: compiled-side version with the same body as eager_func.
             y = x * x
             dist.all_reduce(y, op=dist.ReduceOp.SUM)
             x = torch.nn.functional.silu(x)
@@ -414,6 +497,10 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @skip_if_lt_x_gpu(2)
     def test_coalescing_manager_reduce_overhead(self):
+        # [FUNCTION DOC] Regression test: a custom op that all-gathers inside an async
+        # coalescing manager must work under reduce-overhead mode (cudagraphs). The gathered
+        # buffer is consumed by an add so it is an intermediate. Runs three warmup iterations,
+        # compares against the expected concatenation, then synchronizes the device.
         # An async coalescing manager around a fast-path collective used to
         # stash the gathered tensors on the discarded per-call Work, so
         # cm.wait() never freed them and reduce-overhead cudagraph capture
@@ -426,6 +513,7 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
             )
 
             def f(inp):
+                # [FUNCTION DOC] HELPER: calls the coalesced all-gather custom op and adds one.
                 gathered = torch.ops.test_inductor_collectives.coalesced_all_gather(
                     inp, self.world_size, group_name
                 )
@@ -447,6 +535,8 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
             torch.cuda.synchronize(device=self.device)
 
     def test_c10d_functional_tagged_pt2_compliant(self):
+        # [FUNCTION DOC] Checks that both the underscore and non-underscore all_reduce ops carry
+        # the pt2_compliant_tag tag.
         op = torch.ops._c10d_functional.all_reduce.default
         self.assertIn(torch.Tag.pt2_compliant_tag, op.tags)
         op = torch.ops.c10d_functional.all_reduce.default
@@ -455,7 +545,11 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @skip_if_lt_x_gpu(2)
     def test_eager_allreduce_inductor_wait(self):
+        # [FUNCTION DOC] Eager issues the all-reduce, inductor compiles only the wait and the
+        # following math; compares outputs with eager (tolerance 0.001). Also prints both.
         def eager_func(a, b, c, d, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: matmuls, cat and an un-waited all-reduce; returns the
+            # async result.
             x = torch.matmul(a, b)
             y = torch.matmul(c, d)
             z = torch.cat((x, y))
@@ -463,12 +557,15 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
             return ar
 
         def inductor_func(ar, e, f):
+            # [FUNCTION DOC] HELPER: third matmul, wait_tensor on the all-reduce result, add;
+            # returns tuple.
             g = torch.matmul(e, f)
             ar = torch.ops.c10d_functional.wait_tensor(ar)
             out = torch.add(ar, g.repeat(2, 1))
             return (out,)
 
         def compile(func, example_inputs):
+            # [FUNCTION DOC] HELPER: traces func with make_fx and compiles it with inductor.
             graph = make_fx(func)(*example_inputs)
             return inductor_compile_fx(graph, example_inputs)
 
@@ -494,7 +591,11 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @skip_if_lt_x_gpu(2)
     def test_inductor_allreduce_eager_wait(self):
+        # [FUNCTION DOC] Mirror of the previous test: inductor compiles the all-reduce, eager
+        # does the wait and the following math; outputs must match the all-eager result.
         def inductor_func(a, b, c, d, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: matmuls, cat and an un-waited all-reduce; returns the
+            # async result.
             x = torch.matmul(a, b)
             y = torch.matmul(c, d)
             z = torch.cat((x, y))
@@ -502,12 +603,15 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
             return ar
 
         def eager_func(ar, e, f):
+            # [FUNCTION DOC] HELPER: third matmul, wait_tensor on the all-reduce result, add;
+            # returns tuple.
             g = torch.matmul(e, f)
             ar = torch.ops.c10d_functional.wait_tensor(ar)
             out = torch.add(ar, g.repeat(2, 1))
             return (out,)
 
         def compile(func, example_inputs):
+            # [FUNCTION DOC] HELPER: traces func with make_fx and compiles it with inductor.
             graph = make_fx(func)(*example_inputs)
             return inductor_compile_fx(graph, example_inputs)
 
@@ -530,10 +634,18 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
     @skip_if_lt_x_gpu(2)
     @xfailIf(TEST_XPU)  # https://github.com/intel/torch-xpu-ops/issues/1728
     def test_eager_async_allreduce_inductor_wait(self):
+        # [FUNCTION DOC] Issues a real async all-reduce in eager and waits either in eager or in
+        # a compiled function. Checks the work registry size is 0 normally and 1 while a
+        # collective is in flight under the allow-inflight-as-graph-input context, that the
+        # compiled wait matches eager and generated code has wait_tensor, and that without the
+        # context the compiled wait cannot find the work so results differ. Marked as an
+        # expected failure on XPU.
         import torch.distributed as dist
         from torch._inductor.utils import run_and_get_code
 
         def all_reduce_non_functional_eager(x):
+            # [FUNCTION DOC] HELPER: squares x, runs async in-place all-reduce on it, checks the
+            # return is a Work object (raises AssertionError otherwise); returns (work, y).
             y = x * x
             work = dist.all_reduce(y, op=dist.ReduceOp.SUM, async_op=True)
             if not isinstance(work, torch.distributed.Work):
@@ -543,6 +655,8 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
             return work, y
 
         def all_reduce_wait(work, y):  # potentially compiled
+            # [FUNCTION DOC] HELPER: when compiling calls wait_tensor on y, otherwise waits on
+            # the work with a 10 second timeout; then returns y squared.
             if torch.compiler.is_dynamo_compiling():
                 torch.ops.c10d_functional.wait_tensor(y)
             else:
@@ -563,6 +677,9 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
             # thus will produce the wrong result that fails the unit test.
 
             def _run_loop_collective_wait(x, wait_fn, expected_registry_size):
+                # [FUNCTION DOC] HELPER: runs ten iterations of issue-collective then wait_fn,
+                # asserting the work registry size is 0 before issuing, the expected size after
+                # issuing and 0 after waiting. Returns the last (work, y, out).
                 for _ in range(10):
                     self.assertEqual(
                         torch._C._distributed_c10d._get_work_registry_size(), 0
@@ -617,7 +734,11 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
     @skip_if_lt_x_gpu(2)
     @patch.object(torch._inductor.config, "allow_buffer_reuse", True)
     def test_allreduce_input_buffer_reuse(self):
+        # [FUNCTION DOC] With buffer reuse enabled, compiles a function that all-reduces its
+        # input and also uses the input in a relu/matmul; compiled result must equal eager.
         def func(a, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: all-reduce (sum) of a, relu and matmul of a, adds
+            # them; one-tuple.
             ar = _functional_collectives.all_reduce(a, "sum", ranks, tag)
             c = torch.relu(a)
             d = torch.matmul(c, c)
@@ -634,7 +755,11 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @skip_if_lt_x_gpu(2)
     def test_permute_tensor(self):
+        # [FUNCTION DOC] Compiles permute_tensor with source/destination pairs [1, 0] and checks
+        # the output equals eager and the expected value (data from the previous rank).
         def func(tensor, src_dst_pairs, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: calls the functional permute_tensor on tensor with
+            # the pairs.
             return _functional_collectives.permute_tensor(
                 tensor, src_dst_pairs, ranks, tag
             )
@@ -662,12 +787,19 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
     @skip_if_lt_x_gpu(2)
     @patch.object(torch._inductor.config, "allow_buffer_reuse", True)
     def test_allgather_output_buffer_reuse(self):
+        # [FUNCTION DOC] With buffer reuse enabled, compiles an embedding model that all-gathers
+        # its output and chunk-concatenates it; result must equal eager.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with an embedding of 4 by 4 used by the
+            # all-gather test.
             def __init__(self, *args, **kwargs) -> None:
+                # [FUNCTION DOC] HELPER: constructs the module and its embedding layer.
                 super().__init__(*args, **kwargs)
                 self.emb = torch.nn.Embedding(4, 4)
 
             def forward(self, x, world_size, tag, ranks, group_size):
+                # [FUNCTION DOC] HELPER: embeds x, all-gathers along dim 0, chunks by world_size
+                # and concatenates the chunks along the last dim; returns the result.
                 y = self.emb(x)
                 last_dim = y.dim() - 1
                 res = _functional_collectives.all_gather_single(y, 0, ranks, tag)
@@ -685,7 +817,11 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @skip_if_lt_x_gpu(2)
     def test_allgather_scalar_tensor_input(self):
+        # [FUNCTION DOC] Compiles torch.distributed.all_gather of a scalar tensor into a list
+        # and compares with eager.
         def func(tensor, world_size):
+            # [FUNCTION DOC] HELPER: allocates world_size empty-like tensors, all-gathers into
+            # them, returns the list.
             tensor_list = [torch.empty_like(tensor) for _ in range(world_size)]
             torch.distributed.all_gather(tensor_list, tensor)
             return tensor_list
@@ -700,7 +836,11 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @skip_if_lt_x_gpu(2)
     def test_reduce_scatter_list_input(self):
+        # [FUNCTION DOC] Compiles (fullgraph) torch.distributed.reduce_scatter with a list input
+        # and checks the output equals the eager result.
         def func(output, inputs):
+            # [FUNCTION DOC] HELPER: reduce_scatter into output from the input list;
+            # returns output.
             torch.distributed.reduce_scatter(output, inputs)
             return output
 
@@ -719,12 +859,20 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @skip_if_lt_x_gpu(2)
     def test_allgather_contiguous_input(self):
+        # [FUNCTION DOC] Compiles a model that transposes, makes contiguous, and all-gathers an
+        # embedding output (result unused for the output); compares with eager.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with an embedding of 4 by 4 used by the
+            # contiguous test.
             def __init__(self, *args, **kwargs) -> None:
+                # [FUNCTION DOC] HELPER: constructs the module and its embedding layer.
                 super().__init__(*args, **kwargs)
                 self.emb = torch.nn.Embedding(4, 4)
 
             def forward(self, x, world_size, tag, ranks, group_size):
+                # [FUNCTION DOC] HELPER: embeds x, transposes in place and makes contiguous,
+                # all-gathers it (discarding the result), transposes back and returns the
+                # contiguous tensor.
                 y = self.emb(x)
                 last_dim = y.dim() - 1
                 y = y.transpose_(0, last_dim).contiguous()
@@ -743,11 +891,15 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @skip_if_lt_x_gpu(2)
     def test_allgather_into_tensor_inductor(self):
+        # [FUNCTION DOC] Compiles matmul followed by all_gather_into_tensor and wait_tensor via
+        # make_fx plus inductor and compares with eager.
         """
         This is matmul/cat/allreduce is a pattern we aim to optimize.
         """
 
         def example(a, b, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: matmul, functional all-gather into tensor, wait; returns
+            # a tuple.
             c = torch.matmul(a, b)
             ag = torch.ops.c10d_functional.all_gather_into_tensor(
                 c, tag, ranks, group_size
@@ -756,6 +908,7 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
             return (ag,)
 
         def compile(func, example_inputs):
+            # [FUNCTION DOC] HELPER: traces func with make_fx and compiles it with inductor.
             graph = make_fx(func)(*example_inputs)
             return inductor_compile_fx(graph, example_inputs)
 
@@ -774,7 +927,11 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @skip_if_lt_x_gpu(2)
     def test_reduce_scatter_tensor_inductor(self):
+        # [FUNCTION DOC] Compiles matmul followed by reduce_scatter_tensor (sum) and wait via
+        # make_fx plus inductor and compares with eager.
         def example(a, b, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: matmul, functional reduce-scatter (sum), wait; returns
+            # a tuple.
             c = torch.matmul(a, b)
             ag = torch.ops.c10d_functional.reduce_scatter_tensor(
                 c, "sum", tag, ranks, group_size
@@ -783,6 +940,7 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
             return (ag,)
 
         def compile(func, example_inputs):
+            # [FUNCTION DOC] HELPER: traces func with make_fx and compiles it with inductor.
             graph = make_fx(func)(*example_inputs)
             return inductor_compile_fx(graph, example_inputs)
 
@@ -802,6 +960,9 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
     @skip_if_lt_x_gpu(2)
     @patch.object(torch._dynamo.config, "capture_scalar_outputs", True)
     def test_all_to_all_single_inductor(self):
+        # [FUNCTION DOC] Compiles all_to_all_single with data-dependent split sizes from tolist
+        # under dynamic shapes. Checks generated code passes unbacked-symbol lists as the split
+        # sizes and that the output matches eager (tolerance 0.001).
         def example(
             inp,
             input_split_sizes_tensor,
@@ -811,6 +972,8 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
             ranks,
             group_size,
         ):
+            # [FUNCTION DOC] HELPER: converts the split-size tensors to lists, runs
+            # all_to_all_single, waits, and normalizes by the column sums.
             input_split_sizes = input_split_sizes_tensor.tolist()
             output_split_sizes = output_split_sizes_tensor.tolist()
             a2a = torch.ops.c10d_functional.all_to_all_single(
@@ -878,25 +1041,36 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
     @patch.object(torch._functorch.config, "activation_memory_budget", 0.01)
     @parametrize("override_with_ac", [False, True])
     def test_all_to_all_recompute_is_always_banned(self, override_with_ac):
+        # [FUNCTION DOC] Checks the partitioner never recomputes an all-to-all in backward when
+        # activation_memory_budget is tiny, unless the user wraps the region in activation
+        # checkpointing (parameter override_with_ac). Registers a custom op and an autograd
+        # function in a scoped library, compiles with aot_eager_decomp_partition, counts
+        # dispatched all_to_all_single ops during backward: 1 normally, 2 with checkpointing.
         @torch.library.custom_op("custom_ns::foo", mutates_args=())
         def foo(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: custom op adding one to its input.
             return x + 1
 
         @foo.register_fake
         def _(x):
+            # [FUNCTION DOC] HELPER: fake implementation returning an empty tensor like x.
             return torch.empty_like(x)
 
         def setup_context(ctx, inputs, output):
+            # [FUNCTION DOC] HELPER: autograd setup that saves the first input for backward.
             ctx.save_for_backward(inputs[0])
             return
 
         def backward(ctx, grad):
+            # [FUNCTION DOC] HELPER: autograd backward returning grad times the saved input.
             (x,) = ctx.saved_tensors
             return grad * x
 
         foo.register_autograd(backward, setup_context=setup_context)
 
         class AllToAllSingle(torch.autograd.Function):
+            # [CLASS DOC] HELPER: autograd function wrapping the functional all_to_all_single
+            # plus wait; backward runs the same collective with input and output splits swapped.
             @staticmethod
             def forward(
                 ctx,
@@ -907,6 +1081,8 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
                 ranks,
                 group_size: int,
             ) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: saves swapped split sizes and group size on ctx, runs
+                # the all-to-all on group "0" (tag and ranks are ignored) and waits.
                 ctx.output_split_sizes = input_split_sizes
                 ctx.input_split_sizes = output_split_sizes
                 ctx.group_size = group_size
@@ -921,6 +1097,8 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
 
             @staticmethod
             def backward(ctx, grad):
+                # [FUNCTION DOC] HELPER: runs all-to-all on the gradient with swapped splits and
+                # waits; returns the gradient followed by five None entries.
                 grad = torch.ops._c10d_functional.all_to_all_single.default(
                     grad,
                     ctx.output_split_sizes,
@@ -945,6 +1123,7 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
             ranks,
             group_size,
         ):
+            # [FUNCTION DOC] HELPER: applies the AllToAllSingle autograd function.
             out = AllToAllSingle.apply(
                 inp, output_split_sizes, input_split_sizes, tag, ranks, group_size
             )
@@ -952,11 +1131,15 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
 
         # simple mode to track how many collective ops we saw in the backward
         class TrackingMode(TorchDispatchMode):
+            # [CLASS DOC] HELPER: dispatch mode counting how many times each op is dispatched.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: initializes the mode and an empty op counter.
                 super().__init__()
                 self.ops_counter = Counter()
 
             def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                # [FUNCTION DOC] HELPER: runs the op, increments its counter and returns
+                # the result.
                 if kwargs is None:
                     kwargs = {}
                 rs = func(*args, **kwargs)
@@ -972,6 +1155,8 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
             ranks,
             group_size,
         ):
+            # [FUNCTION DOC] HELPER: converts split-size tensors to lists, calls the registered
+            # alltoall_autograd op and passes the result through the custom foo op.
             input_split_sizes = input_split_sizes_tensor.tolist()
             output_split_sizes = output_split_sizes_tensor.tolist()
             a2a = torch.ops.custom_ns.alltoall_autograd.default(
@@ -1027,6 +1212,8 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
             if override_with_ac:
 
                 def compiled_fn_wrapper(*args):
+                    # [FUNCTION DOC] HELPER: ignores its arguments and calls example on the
+                    # outer inputs; used as the function passed to activation checkpointing.
                     return example(*inputs, **trs)
 
                 out = torch.utils.checkpoint.checkpoint(
@@ -1058,7 +1245,12 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @skip_if_lt_x_gpu(2)
     def test_all_to_all_single_inductor_split_sizes_none(self):
+        # [FUNCTION DOC] Compiles all_to_all_single with no split sizes under dynamic shapes;
+        # checks generated code uses even-split symbolic lists (size divided by 2 form) and the
+        # output equals eager.
         def example(inp, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: all-to-all with None splits, wait, normalize by
+            # column sums.
             a2a = torch.ops.c10d_functional.all_to_all_single(
                 inp,
                 None,
@@ -1098,6 +1290,9 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @skip_if_lt_x_gpu(2)
     def test_async_collective_tensor_input_polymorphism(self):
+        # [FUNCTION DOC] Checks that alternating an AsyncCollectiveTensor input with its waited
+        # plain tensor does not trigger recompilation: six iterations compare against eager and
+        # the compile counter must show exactly one frame.
         # A compiled region whose input alternates between an AsyncCollectiveTensor
         # (the native all-gather output) and the resolved plain Tensor must not
         # recompile on the tensor-class guard: the two produce an equivalent
@@ -1109,6 +1304,7 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
 
             @torch.compile(backend=cnt, fullgraph=True)
             def step(x, w):
+                # [FUNCTION DOC] HELPER: compiled function returning the sum of x matmul w.
                 return (x @ w).sum()
 
             torch.manual_seed(1234)
@@ -1137,6 +1333,9 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @skip_if_lt_x_gpu(2)
     def test_async_collective_tensor_input_polymorphism_backward(self):
+        # [FUNCTION DOC] Backward counterpart of the polymorphism test: six iterations with a
+        # real all-gather output (alternately waited), checking the shard gradient equals a
+        # reference computed with an explicit wait, and exactly one compiled frame.
         # Backward through an ACT input (a real all-gather output) must match eager
         # across the ACT/Tensor alternation and not recompile on the class change.
         # Uses a real collective because grad flows through the all-gather autograd,
@@ -1147,6 +1346,7 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
 
             @torch.compile(backend=cnt, fullgraph=True)
             def step(x, w):
+                # [FUNCTION DOC] HELPER: compiled function returning the sum of x matmul w.
                 return (x @ w).sum()
 
             for i in range(6):
@@ -1178,11 +1378,15 @@ class TestCollectivesMultiProc(DynamoDistributedMultiProcTestCase):
     "No accelerator is available",
 )
 class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
+    # [CLASS DOC] Single-process tests of collective tracing and Inductor codegen on one rank.
+    # Skipped without an available accelerator and NCCL/XCCL backend.
     """
     Prefer single-proc test runner for basic tests as it is easier to work with.
     """
 
     def get_world_trs(self, world_size=1):
+        # [FUNCTION DOC] Returns tag, ranks and group_size keyword arguments for a group of the
+        # given world_size (default 1).
         return {
             "tag": "",
             "ranks": list(range(world_size)),
@@ -1192,7 +1396,11 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @torch._inductor.config.patch(debug=True)
     def test_inductor_single_op(self):
+        # [FUNCTION DOC] Compiles a single all-reduce plus wait and uses text checks on the
+        # generated code: one allocated buffer, in-place all-reduce and wait on it, and returned
+        # directly without extra copies.
         def func(inp, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: functional all-reduce (sum) then wait_tensor.
             ar = torch.ops.c10d_functional.all_reduce(
                 inp, "sum", tag, ranks, group_size
             )
@@ -1226,12 +1434,16 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
         }
     )
     def test_inductor_steal_buffer(self):
+        # [FUNCTION DOC] With simple overlap disabled, checks inductor lets the all-reduce
+        # mutate an intermediate that is not used again, and does not alias an unrelated output.
         """
         it's ok and optimal if inductor allreduce mutates the buffer of an intermediate
         that isn't going to be used again
         """
 
         def func(inp, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: all-reduce of inp plus 1, wait, and an unrelated ones
+            # plus 22.
             x = inp + 1
             ar = torch.ops.c10d_functional.all_reduce(x, "sum", tag, ranks, group_size)
             ar = torch.ops.c10d_functional.wait_tensor(ar)
@@ -1262,11 +1474,16 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
         {"aten_distributed_optimizations.enable_simple_overlap": False}
     )
     def _test_inductor_doesnt_mutate_shared(self):
+        # [FUNCTION DOC] HELPER: shared body for the two mutate-shared tests. Checks a reused
+        # intermediate is not mutated by the in-place all-reduce unless copied, via code text
+        # checks, and that compiled output matches eager.
         """
         make sure that an intermediate that's going to be reuse isn't mutated unless copied
         """
 
         def func(inp, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: all-reduce of x, reuses x for y, waits and builds an
+            # unrelated output.
             x = inp + 1
             ar = torch.ops.c10d_functional.all_reduce(x, "sum", tag, ranks, group_size)
             y = x + 2
@@ -1301,18 +1518,25 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @torch._inductor.config.patch({"debug": True, "triton.descriptive_names": False})
     def test_inductor_doesnt_mutate_shared(self):
+        # [FUNCTION DOC] Runs the shared mutate-shared check with debug on and descriptive
+        # kernel names off.
         self._test_inductor_doesnt_mutate_shared()
 
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @torch._inductor.config.patch({"debug": True, "triton.descriptive_names": False})
     @torch._inductor.config.patch("graph_partition", True)
     def test_inductor_doesnt_mutate_shared_graph_partition(self):
+        # [FUNCTION DOC] Same shared check with graph partitioning enabled, verifying the
+        # partition reorder keeps op order when all ops are on cuda.
         # checks graph partition reorder does not change relative order of ops
         # when all ops are on cuda
         self._test_inductor_doesnt_mutate_shared()
 
     def test_dynamo_trace_allreduce(self):
+        # [FUNCTION DOC] Dynamo traces functional all_reduce into one frame with two ops
+        # (all-reduce and wait); result matches eager.
         def func(inp):
+            # [FUNCTION DOC] HELPER: functional all-reduce on group "0".
             ar = _functional_collectives.all_reduce(inp, "sum", "0")
             return ar
 
@@ -1329,7 +1553,10 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
 
     @skipIfXpu  # https://github.com/intel/torch-xpu-ops/issues/1581
     def test_dynamo_trace_all_gather_tensor(self):
+        # [FUNCTION DOC] Dynamo traces functional all_gather_single into one frame with two ops;
+        # result matches eager. Skipped on XPU.
         def func(inp):
+            # [FUNCTION DOC] HELPER: functional all_gather_single on group "0".
             ar = _functional_collectives.all_gather_single(inp, 0, "0")
             return ar
 
@@ -1346,7 +1573,10 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
 
     @skipIfXpu  # https://github.com/intel/torch-xpu-ops/issues/1581
     def test_dynamo_trace_all_gather_tensor_pg(self):
+        # [FUNCTION DOC] Same as above but passing the world group object; fullgraph, one frame,
+        # two ops, result equals eager. Skipped on XPU.
         def func(inp, *, pg):
+            # [FUNCTION DOC] HELPER: functional all_gather_single using a process group object.
             ar = _functional_collectives.all_gather_single(inp, 0, pg)
             return ar
 
@@ -1363,7 +1593,12 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
 
     @skipIfXpu  # https://github.com/intel/torch-xpu-ops/issues/1581
     def test_dynamo_rewrite_dist_all_gather(self):
+        # [FUNCTION DOC] Checks Dynamo rewrites torch.distributed.all_gather_single to the
+        # functional collective: one frame, three ops (gather, wait, copy), outputs match.
+        # Raises AssertionError on mismatch. Skipped on XPU.
         def func(inp, out, *, pg):
+            # [FUNCTION DOC] HELPER: torch.distributed.all_gather_single into out from inp
+            # on pg.
             torch.distributed.all_gather_single(
                 out,
                 inp,
@@ -1394,7 +1629,10 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
 
     @skipIfXpu  # https://github.com/intel/torch-xpu-ops/issues/1581
     def test_dynamo_rewrite_dist_all_gather_list(self):
+        # [FUNCTION DOC] Checks Dynamo rewrites the list form of all_gather (fullgraph, one
+        # frame) and outputs equal eager. Skipped on XPU.
         def func(inp, out, *, pg):
+            # [FUNCTION DOC] HELPER: torch.distributed.all_gather into the output list.
             torch.distributed.all_gather(
                 out,
                 inp,
@@ -1421,9 +1659,12 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
 
     @skipIfXpu  # https://github.com/intel/torch-xpu-ops/issues/1581
     def test_dynamo_rewrite_dist_all_gather_args_match(self):
+        # [FUNCTION DOC] Like the all_gather rewrite test but with keyword argument names, to
+        # verify the rewrite matches parameter names: one frame, three ops, outputs equal.
         # Duplicated most of the structure from test_dynamo_rewrite_dist_all_gather
         # except uses kwargs to ensure rewrite has matching arg names
         def func(inp, out, *, pg):
+            # [FUNCTION DOC] HELPER: all_gather_single using keyword arguments, async_op False.
             torch.distributed.all_gather_single(
                 output_tensor=out,
                 input_tensor=inp,
@@ -1455,7 +1696,10 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
 
     @skipIfXpu  # https://github.com/intel/torch-xpu-ops/issues/1581
     def test_dynamo_rewrite_dist_reduce_scatter(self):
+        # [FUNCTION DOC] Checks Dynamo rewrites reduce_scatter_single: one frame, three ops
+        # (scatter, wait, copy) and outputs equal eager. Skipped on XPU.
         def func(inp, out, *, pg):
+            # [FUNCTION DOC] HELPER: torch.distributed.reduce_scatter_single of inp into out.
             torch.distributed.reduce_scatter_single(
                 out,
                 inp,
@@ -1486,7 +1730,11 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
 
     @skipIfXpu  # https://github.com/intel/torch-xpu-ops/issues/1581
     def test_dynamo_rewrite_dist_reduce_scatter_list(self):
+        # [FUNCTION DOC] Checks the list form of reduce_scatter is rewritten with fullgraph in
+        # one frame and the output matches eager. Skipped on XPU.
         def func(out, inp_list, *, pg):
+            # [FUNCTION DOC] HELPER: torch.distributed.reduce_scatter of out from the
+            # input list.
             torch.distributed.reduce_scatter(
                 out,
                 inp_list,
@@ -1511,7 +1759,12 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
 
     @skipIfXpu  # https://github.com/intel/torch-xpu-ops/issues/1581
     def test_dynamo_rewrite_dist_reduce_scatter_list_size_mismatch(self):
+        # [FUNCTION DOC] Checks reduce_scatter with an input element of a different size than
+        # the output raises an error mentioning every input_list element must match the output
+        # size when compiled with the eager backend. Skipped on XPU.
         def func(out, inp_list, *, pg):
+            # [FUNCTION DOC] HELPER: torch.distributed.reduce_scatter of out from the
+            # input list.
             torch.distributed.reduce_scatter(
                 out,
                 inp_list,
@@ -1529,7 +1782,11 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
 
     @skipIfXpu  # https://github.com/intel/torch-xpu-ops/issues/1581
     def test_dynamo_rewrite_dist_reduce_scatter_list_scalar(self):
+        # [FUNCTION DOC] Checks reduce_scatter works for 0-dim (scalar) tensors in fullgraph
+        # mode with one frame and eager-equal output. Skipped on XPU.
         def func(out, inp_list, *, pg):
+            # [FUNCTION DOC] HELPER: torch.distributed.reduce_scatter of out from the
+            # input list.
             torch.distributed.reduce_scatter(
                 out,
                 inp_list,
@@ -1561,7 +1818,12 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
         ],
     )
     def test_dynamo_rewrite_dist_allreduce(self, pg_mode):
+        # [FUNCTION DOC] Parameterized by how the group is passed (positional, positional None,
+        # keyword, keyword None, unspecified). Compiles all_reduce in fullgraph and checks one
+        # frame, three ops (all-reduce, wait, copy) and in-place result equal to eager.
         def func(tensor, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: calls torch.distributed.all_reduce on tensor, forwarding
+            # extra positional and keyword arguments.
             torch.distributed.all_reduce(
                 tensor,
                 *args,
@@ -1605,7 +1867,11 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
             raise AssertionError("Expected inputs_compiled to match inputs_eager")
 
     def test_dynamo_rewrite_dist_all_to_all_single(self):
+        # [FUNCTION DOC] Compiles all_to_all_single in fullgraph mode, checks one frame and
+        # output equal to the eager result.
         def func(output, input, pg):
+            # [FUNCTION DOC] HELPER: torch.distributed.all_to_all_single into output with
+            # group pg.
             torch.distributed.all_to_all_single(output, input, group=pg)
 
         counter = CompileCounter()
@@ -1637,9 +1903,15 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
         ],
     )
     def test_dynamo_rewrite_dist_allreduce_reduce_op(self, reduce_op):
+        # [FUNCTION DOC] Parameterized over reduce ops (sum, avg, product, min, max): compiles
+        # torch.distributed.all_reduce with a checking backend to verify the rewrite maps the op
+        # to the right functional reduce op string.
         from torch.distributed._functional_collectives import REDUCE_OP_TO_STR
 
         def verify_rewrite(gm, _):
+            # [FUNCTION DOC] HELPER: custom backend that finds all-reduce graph nodes, asserts
+            # exactly one exists and that its reduce op string equals the expected string for
+            # the parameter, then returns the graph module unchanged.
             ar_nodes = []
             for node in gm.graph.nodes:
                 if node.target in [
@@ -1673,7 +1945,12 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
         ],
     )
     def test_dynamo_get_world_group(self, source):
+        # [FUNCTION DOC] Parameterized over three ways to obtain the world group
+        # (GroupMember.WORLD, group.WORLD, default group getter); each must compile fullgraph
+        # with one all-reduce node in the graph.
         def func(tensor):
+            # [FUNCTION DOC] HELPER: obtains the world group by the parameterized route, then
+            # all-reduces the tensor on it.
             if source == "GroupMember.WORLD":
                 group = torch.distributed.GroupMember.WORLD
             elif source == "group.WORLD":
@@ -1689,6 +1966,8 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
             )
 
         def verify(gm, _):
+            # [FUNCTION DOC] HELPER: backend asserting exactly one functional all-reduce node
+            # exists; returns the graph module unchanged.
             ar_nodes = []
             for node in gm.graph.nodes:
                 if node.target in [
@@ -1705,7 +1984,10 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
 
     @skipIfXpu  # https://github.com/intel/torch-xpu-ops/issues/1581
     def test_dynamo_support_collective_op_with_async_op_False(self):
+        # [FUNCTION DOC] Checks an explicit async_op False collective compiles without a graph
+        # break: one frame, three ops, outputs equal eager. Skipped on XPU.
         def func(inp, out, *, pg):
+            # [FUNCTION DOC] HELPER: reduce_scatter_single with explicit async_op False.
             # user explicitly set the attribute `async_op` to False,
             # there should be no graph break
             torch.distributed.reduce_scatter_single(out, inp, group=pg, async_op=False)
@@ -1731,7 +2013,10 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
             raise AssertionError("Expected outputs to match correct_outputs")
 
     def test_dynamo_graphbreaks_unsupported_async_op(self):
+        # [FUNCTION DOC] Checks an async_op True collective is unsupported: Dynamo graph-breaks
+        # so the counter sees zero frames and zero ops, while outputs still equal eager.
         def func(inp, out, *, pg):
+            # [FUNCTION DOC] HELPER: async reduce_scatter_single then wait on the returned work.
             work = torch.distributed.reduce_scatter_single(
                 out, inp, group=pg, async_op=True
             )
@@ -1758,7 +2043,12 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
             raise AssertionError("Expected outputs to match correct_outputs")
 
     def test_dynamo_pg_var(self):
+        # [FUNCTION DOC] Checks Dynamo traces rank() and size() of a process group object in
+        # fullgraph mode: one frame, one op, output equals eager.
         def func(inp, *, pg):
+            # [FUNCTION DOC] HELPER: adds to inp the group rank plus (1 modulo group size).
+            # KNOWN ISSUE: modulo binds tighter than the add, so this is not (rank + 1)
+            # mod size.
             x = pg.rank() + 1 % pg.size()
             return inp + x
 
@@ -1780,7 +2070,10 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
 
     @skipIfXpu  # https://github.com/intel/torch-xpu-ops/issues/1581
     def test_dynamo_trace_reduce_scatter_tensor(self):
+        # [FUNCTION DOC] Dynamo traces functional reduce_scatter_single into one frame with two
+        # ops (scatter, wait); output equals eager. Skipped on XPU.
         def func(inp):
+            # [FUNCTION DOC] HELPER: functional reduce_scatter_single (sum) on group "0".
             ar = _functional_collectives.reduce_scatter_single(inp, "sum", 0, "0")
             return ar
 
@@ -1797,7 +2090,10 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
 
     @skipIfXpu  # https://github.com/intel/torch-xpu-ops/issues/1581
     def test_dynamo_trace_allgather_coalesced(self):
+        # [FUNCTION DOC] Dynamo traces the coalesced all-gather: one frame, three ops (the op
+        # plus two getitem unpacking nodes) and output equal to eager. Skipped on XPU.
         def func(inp, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: calls all_gather_into_tensor_coalesced on the input list.
             ar = torch.ops.c10d_functional.all_gather_into_tensor_coalesced(
                 inp, tag, ranks, group_size
             )
@@ -1821,6 +2117,8 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
             raise AssertionError("Expected out to match correct")
 
     def test_backwards(self):
+        # [FUNCTION DOC] Compiles all-reduce with the aot_eager backend, runs backward on the
+        # sum and checks output and input gradient equal the eager ones.
         """
         It's probably not that common to need backwards support for collectives.
 
@@ -1828,6 +2126,7 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
         """
 
         def func(inp):
+            # [FUNCTION DOC] HELPER: functional all-reduce (sum) on group "0".
             ar = _functional_collectives.all_reduce(inp, "sum", "0")
             return ar
 
@@ -1845,6 +2144,7 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
         self.assertTrue(same(input.grad, correct_input.grad))
 
     def test_meta(self):
+        # [FUNCTION DOC] Checks the meta-device all_reduce keeps the input size.
         x = torch.rand((2, 3, 4), device="meta")
         out = torch.ops.c10d_functional.all_reduce(x, "sum", **self.get_world_trs())
         self.assertEqual(x.size(), out.size())
@@ -1853,11 +2153,15 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @torch._inductor.config.patch({"debug": True, "triton.descriptive_names": False})
     def test_inductor_all_gather_coalesced(self):
+        # [FUNCTION DOC] Checks generated code for coalesced all-gather: buffers, in-place reuse
+        # and ordering via text checks; output equals eager. Skipped on XPU.
         """
         make sure that an intermediate that's going to be reuse isn't mutated unless copied
         """
 
         def func(inp, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: coalesced all-gather of two tensors with waits, plus an
+            # unrelated op.
             x = inp + 1
             tensor_list = torch.ops.c10d_functional.all_gather_into_tensor_coalesced(
                 [x, inp], tag, ranks, group_size
@@ -1901,11 +2205,15 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @torch._inductor.config.patch({"debug": True, "triton.descriptive_names": False})
     def test_inductor_reduce_scatter_coalesced(self):
+        # [FUNCTION DOC] Checks generated code for coalesced reduce-scatter via text checks of
+        # buffer reuse and op order; output equals eager. Skipped on XPU.
         """
         make sure that an intermediate that's going to be reuse isn't mutated unless copied
         """
 
         def func(inp, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: coalesced reduce-scatter of two tensors with waits, plus an
+            # unrelated op.
             x = inp + 1
             tensor_list = torch.ops.c10d_functional.reduce_scatter_tensor_coalesced(
                 [x, inp], "sum", tag, ranks, group_size
@@ -1948,6 +2256,10 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
     @skipIfXpu  # https://github.com/intel/torch-xpu-ops/issues/1581
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     def test_reorder_peak_memory(self):
+        # [FUNCTION DOC] Runs sink_waits plus a stats-capturing reorder pass with compute/comm
+        # overlap on; checks generated code and output, and the stats: one entry with zero
+        # initial exposure, limiting factor None and zero moves. Skipped on XPU.
+        # KNOWN ISSUE: the checks for buf2 and buf7 text appear partly commented out.
         """
         TODO(whc)
         - check each of the `limiting_factor` cases
@@ -1956,6 +2268,8 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
         """
 
         def func(inp, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: coalesced reduce-scatter of two tensors with waits, plus an
+            # unrelated op.
             x = inp + 1
             tensor_list = torch.ops.c10d_functional.reduce_scatter_tensor_coalesced(
                 [x, inp], "sum", tag, ranks, group_size
@@ -1975,6 +2289,8 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
         def _reorder_communication_preserving_peak_memory(
             snodes: list[BaseSchedulerNode],
         ) -> list[BaseSchedulerNode]:
+            # [FUNCTION DOC] HELPER: wraps the internal reorder helper, stores per-node stats in
+            # the enclosing variable and returns the reordered nodes.
             nonlocal node_stats
             (
                 reordered_snodes,
@@ -2032,7 +2348,13 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
     @unittest.skipIf(not SM80OrLater, "bfloat16")
     @parametrize("bucket_mode", ["default", "custom_ops"])
     def test_all_gather_bucket(self, bucket_mode):
+        # [FUNCTION DOC] Parameterized by bucket mode. Compiles with bucketing config, runtime
+        # estimation benchmark and cross-rank alignment on a fresh cache, then checks the
+        # generated code has all-gathers and no out-variant all-gather; output equals eager.
+        # Needs SM80 or later and uses cuda tensors directly.
         def func(x, w, ag_0, ag_1, ag_2, ag_3, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: unrelated matmul, casts, and four all-gathers with waits
+            # where one input depends on another all-gather result; returns outputs.
             # do some unrelated matmuls
             y = torch.mm(x, w)
 
@@ -2109,10 +2431,13 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
 
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     def test_all_gather_bucket_copy_cat_fusion(self):
+        # [FUNCTION DOC] Checks bucketed all-gather merge yields a single fused Triton kernel
+        # (counted by kernel definitions) rather than one copy kernel per input.
         """Bucketed all_gather merge uses copy_(cat(...)) which inductor fuses
         into 1 Triton kernel instead of N kernels from _foreach_copy_."""
 
         def func(ag_0, ag_1, ag_2, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: three independent all-gathers each followed by wait_tensor.
             group_name = (
                 torch.distributed.distributed_c10d._get_default_group().group_name
             )
@@ -2152,7 +2477,11 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @unittest.skipIf(not SM80OrLater, "bfloat16")
     def test_all_gather_bucket_path(self):
+        # [FUNCTION DOC] With bucketing enabled, checks two dependent all-gathers are not
+        # merged: exactly two wait_tensor calls remain in the generated code.
         def func(x, w, ag_0, ag_1, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: matmul, bf16 casts, a first all-gather, and a second
+            # all-gather whose input depends on the first one's output.
             # do some unrelated matmuls
             y = torch.mm(x, w)
 
@@ -2206,7 +2535,12 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
     @unittest.skipIf(not SM80OrLater, "bfloat16")
     @parametrize("bucket_mode", ["default", "custom_ops"])
     def test_reduce_scatter_bucket(self, bucket_mode):
+        # [FUNCTION DOC] Parameterized by bucket mode. For both func variants, compiles with
+        # reduce-scatter bucketing and checks exactly one reduce-scatter op appears and the
+        # output equals eager.
         def func(x, w, rs_0, rs_1, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: matmul, casts, two reduce-scatters (sum) and waits;
+            # returns outputs.
             # do some unrelated matmuls
             y = torch.mm(x, w)
 
@@ -2233,6 +2567,7 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
 
         # test "fsdp" mode to allow convert_element_type after wait
         def func2(x, w, rs_0, rs_1, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: calls func and casts both scatter outputs back to float32.
             y, rs_0_out, rs_1_out = func(x, w, rs_0, rs_1, tag, ranks, group_size)
             return y, rs_0_out.to(torch.float32), rs_1_out.to(torch.float32)
 
@@ -2276,7 +2611,11 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
 
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     def test_dedup_reduce_scatter(self):
+        # [FUNCTION DOC] With the dedup option on, checks the generated code contains exactly
+        # one reduce-scatter op and the output equals eager.
         def func(rs_0, rs_1, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: two reduce-scatters (avg) of different inputs, waits,
+            # adds results.
             group_name = (
                 torch.distributed.distributed_c10d._get_default_group().group_name
             )
@@ -2319,7 +2658,10 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
         "bucket_mode", ["all"]
     )  # "all" is just a placeholder, there is only one bucketmode
     def test_all_reduce_bucket(self, bucket_mode):
+        # [FUNCTION DOC] With all-reduce bucketing, checks exactly one in-place all-reduce in
+        # the generated code and an output equal to eager. Mode value is only a placeholder.
         def func(x, w, ar_0, ar_1, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: matmul and two independent all-reduces (sum) with waits.
             y = torch.mm(x, w)
 
             group_name = (
@@ -2375,7 +2717,10 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
     @unittest.skipIf(not SM80OrLater, "bfloat16")
     @parametrize("bucket_mode", ["custom_ops_multidtype"])
     def test_all_gather_bucket_multidtype(self, bucket_mode):
+        # [FUNCTION DOC] Multi-dtype custom-op bucketing: checks exactly one out-variant
+        # all-gather op, that output dtypes match the input dtypes, and output equals eager.
         def func(x, w, ag_0, ag_1, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: matmul and two all-gathers (different dtypes) with waits.
             # do some unrelated matmuls
             y = torch.mm(x, w)
 
@@ -2440,6 +2785,10 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
     @unittest.skipIf(not SM80OrLater, "bfloat16")
     @parametrize("bucket_mode", ["default", "custom_ops"])
     def test_reorder_peak_memory_bucketed(self, bucket_mode):
+        # [FUNCTION DOC] Simulates bucketed all-gathers and reduce-scatters of size two, runs
+        # reorder, sink-waits and reorder passes with memory lifecycle tracking in error mode.
+        # Checks codegen of memory checks, bucketed op counts, output equals eager, and that
+        # four stats entries were collected.
         """
         Simulate the case where a bucketing pass ran and grouped several inputs into one bucketed allgather.
         Ensure the whole bucketed group including copy-ops get moved together rather than the copy ops preventing the
@@ -2447,6 +2796,8 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
         """
 
         def func(x, w, ag_0, ag_1, ag_2, ag_3, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: matmuls, bf16 casts, pairs of all-gathers and
+            # reduce-scatters with waits, repeated twice; returns many outputs.
             # do some unrelated matmuls
             y = torch.mm(x, w)
 
@@ -2532,6 +2883,10 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
         def _reorder_communication_preserving_peak_memory(
             snodes: list[BaseSchedulerNode],
         ) -> list[BaseSchedulerNode]:
+            # [FUNCTION DOC] HELPER: with runtime estimation benchmarking, asserts every
+            # benchmarkable extern kernel node has a cache entry; with cross-rank alignment,
+            # asserts each node has an override runtime (raising AssertionError otherwise). Then
+            # runs the internal reorder helper, stores stats and returns reordered nodes.
             if torch._inductor.config.runtime_estimations_mms_benchmark:
                 cache = get_estimate_runtime_cache()
                 for snode in snodes:
@@ -2635,12 +2990,17 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
     @skipIfXpu  # https://github.com/intel/torch-xpu-ops/issues/1581
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     def test_reorder_respects_wait_dep(self):
+        # [FUNCTION DOC] Checks reordering respects a collective consuming another's waited
+        # output: order is gather, wait, gather, wait; output equals eager; two stats entries
+        # each with zero moves. Skipped on XPU.
         """
         Covers the case where the output of one collective feeds the input of another collective.
         e.g. TP + FSDP - all_gather(tp+dp sharded param on TP dim) -> allgather dp_sharded buffer on DP dim
         """
 
         def func(inp, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: two chained all-gathers where the second consumes the
+            # first wait.
             group_name = (
                 torch.distributed.distributed_c10d._get_default_group().group_name
             )
@@ -2663,6 +3023,8 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
         def _reorder_communication_preserving_peak_memory(
             snodes: list[BaseSchedulerNode],
         ) -> list[BaseSchedulerNode]:
+            # [FUNCTION DOC] HELPER: wraps the internal reorder helper, stores per-node stats in
+            # the enclosing variable and returns the reordered nodes.
             nonlocal node_stats
             (
                 reordered_snodes,
@@ -2708,24 +3070,34 @@ class TestCollectivesInductor(DynamoDistributedSingleProcTestCase):
 
 @requires_accelerator_dist_backend(["nccl", "xccl"])
 class TestSyncDecisionCrossRanks(MultiProcessTestCase):
+    # [CLASS DOC] Two-rank multi-process tests of cross-rank decisions (partitioner sync,
+    # runtime estimate alignment) and NCCL collective runtime estimation. Spawns worker
+    # processes in setUp.
     def setUp(self) -> None:
+        # [FUNCTION DOC] Runs the base setUp and spawns the worker processes.
         super().setUp()
         self._spawn_processes()
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Returns the fixed world size 2.
         return 2
 
     @property
     def ranks(self) -> list[int]:
+        # [FUNCTION DOC] Returns the list of ranks, 0 through world_size minus one.
         return list(range(self.world_size))
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] Returns the accelerator device for the current rank.
         device_type = torch.accelerator.current_accelerator().type
         return torch.device(f"{device_type}:{self.rank}")
 
     def _init_process_group(self) -> None:
+        # [FUNCTION DOC] HELPER: sets inductor store_cubin and debug flags, selects the rank's
+        # device, initializes the default process group with a file store and the default
+        # backend, and registers it under the name "default". Mutates global config.
         torch._inductor.config.triton.store_cubin = True
         torch._inductor.config.debug = True
 
@@ -2747,6 +3119,9 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
 
     @skip_if_lt_x_gpu(2)
     def test_sync_decision_cross_ranks(self):
+        # [FUNCTION DOC] Builds a graph with two all-gather plus wait pairs with differently
+        # shaped metadata, each rank saving a different wait; after cross-rank sync both ranks
+        # must end with the rank 0 choice.
         from torch._functorch.partitioners import _sync_decision_cross_ranks
 
         test_graph = torch.fx.Graph()
@@ -2782,6 +3157,8 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
 
     @skip_if_lt_x_gpu(2)
     def test_sync_decision_cross_ranks_different_inputs_skips_sync(self):
+        # [FUNCTION DOC] Graphs differ structurally across ranks (relu on rank 0, neg on rank
+        # 1), so the sync is skipped and each rank keeps its own saved values.
         # When ranks have structurally different graphs, has_same_nodes returns
         # False and the cross-rank sync is skipped, so each rank keeps its own
         # saved_values instead of converging to a single rank's decision.
@@ -2817,6 +3194,9 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
 
     @skip_if_lt_x_gpu(2)
     def test_sync_decision_cross_ranks_different_node_order(self):
+        # [FUNCTION DOC] Same topology but different node creation order across ranks. Checks
+        # the name-based hash differs, and that the sync still works: one saved value, and all
+        # ranks agree on its target.
         # Reproduces the cross-rank sync bug: when ranks have topologically
         # identical graphs but different node creation orders (from different
         # dict iteration orders in Dynamo tracing), the old name-based hash in
@@ -2911,6 +3291,9 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
 
     @skip_if_lt_x_gpu(2)
     def test_sync_decision_cross_ranks_invalid_node_error(self):
+        # [FUNCTION DOC] Same node names but different wiring across ranks. Syncs saved
+        # values and extracts the backward graph from them; verifies it does not hit the
+        # invalid node assertion.
         # Reproduces the "Node X was invalid, but is output" assertion error.
         #
         # When two ranks have isomorphic graphs with matching node names and
@@ -2999,6 +3382,10 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
 
     @skip_if_lt_x_gpu(2)
     def test_align_runtime_estimations_across_all_distributed_ranks(self):
+        # [FUNCTION DOC] Uses mock scheduler nodes with different runtimes per rank and checks
+        # that align_runtime_estimations_across_all_distributed_ranks sets every node's override
+        # runtime to the rank-independent value (asserted values 0.1, 0.3, 0.5, equal to rank
+        # 0's inputs).
         from torch._inductor.ir import ExternKernel
         from torch._inductor.scheduler import (
             BaseSchedulerNode,
@@ -3047,6 +3434,10 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
 
     @skip_if_lt_x_gpu(2)
     def test_all_gather_comm_analysis(self):
+        # [FUNCTION DOC] Initializes an NCCL group, then for static, unbacked and backed dynamic
+        # shapes checks all-gather node output sizes and that the NCCL runtime estimate (both
+        # with and without the nccl estimator) is positive.
+        # KNOWN ISSUE: hard-codes cuda and nccl and symbol names like s75 in expected sizes.
         store = c10d.FileStore(self.file_name, self.world_size)
         torch.cuda.set_device(self.rank)
         c10d.init_process_group(
@@ -3060,6 +3451,7 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
         group_size = group.size()
 
         def func(inp, group_size, group_name):
+            # [FUNCTION DOC] HELPER: two chained all-gathers with waits.
             ag_0_out = torch.ops._c10d_functional.all_gather_into_tensor(
                 inp, group_size, group_name
             )
@@ -3097,12 +3489,17 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
 
         # test for unbacked dynamic shape input estimation
         class TestModule(nn.Module):
+            # [CLASS DOC] HELPER: module that turns a scalar input into an unbacked dimension,
+            # builds an empty tensor and applies the chained collective function.
             def __init__(self, group_size, group_name):
+                # [FUNCTION DOC] HELPER: stores group size and name.
                 super().__init__()
                 self.group_size = group_size
                 self.group_name = group_name
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: reads a scalar item, allocates an empty tensor of that
+                # many rows and 4 columns and returns the collective function result.
                 u = x.item()
                 # Use u as a dimension of a new tensor:
                 y = torch.empty(u, 4, device=x.device)
@@ -3171,6 +3568,8 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
 
     @skip_if_lt_x_gpu(2)
     def test_reduce_scatter_comm_analysis(self):
+        # [FUNCTION DOC] Reduce-scatter version of the comm analysis test: static, unbacked and
+        # backed shapes checked against expected sizes, and estimates must be positive.
         store = c10d.FileStore(self.file_name, self.world_size)
         torch.cuda.set_device(self.rank)
         c10d.init_process_group(
@@ -3184,6 +3583,7 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
         group_size = group.size()
 
         def func(inp, group_size, group_name):
+            # [FUNCTION DOC] HELPER: two chained reduce-scatters (sum) with waits.
             rs_0_out = torch.ops._c10d_functional.reduce_scatter_tensor(
                 inp, "sum", group_size, group_name
             )
@@ -3221,12 +3621,17 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
 
         # test for unbacked dynamic shape input estimation
         class TestModule(nn.Module):
+            # [CLASS DOC] HELPER: module that turns a scalar input into an unbacked dimension,
+            # builds an empty tensor and applies the chained collective function.
             def __init__(self, group_size, group_name):
+                # [FUNCTION DOC] HELPER: stores group size and name.
                 super().__init__()
                 self.group_size = group_size
                 self.group_name = group_name
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: reads a scalar item, allocates an empty tensor of that
+                # many rows and 4 columns and returns the collective function result.
                 u = x.item()
                 # Use u as a dimension of a new tensor:
                 y = torch.empty(u, 4, device=x.device)
@@ -3294,6 +3699,8 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
 
     @skip_if_lt_x_gpu(2)
     def test_all_reduce_comm_analysis(self):
+        # [FUNCTION DOC] All-reduce version of the comm analysis test: checks node sizes for
+        # static, unbacked and backed shapes and that estimates are positive.
         store = c10d.FileStore(self.file_name, self.world_size)
         torch.cuda.set_device(self.rank)
         c10d.init_process_group(
@@ -3307,6 +3714,7 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
         group_size = group.size()
 
         def func(inp, group_size, group_name):
+            # [FUNCTION DOC] HELPER: two chained all-reduces (sum) with waits.
             ar_0_out = torch.ops._c10d_functional.all_reduce(inp, "sum", group_name)
             ar_0_wait = torch.ops.c10d_functional.wait_tensor(ar_0_out)
             ar_1_out = torch.ops._c10d_functional.all_reduce(
@@ -3342,12 +3750,17 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
 
         # test for unbacked dynamic shape input estimation
         class TestModule(nn.Module):
+            # [CLASS DOC] HELPER: module that turns a scalar input into an unbacked dimension,
+            # builds an empty tensor and applies the chained collective function.
             def __init__(self, group_size, group_name):
+                # [FUNCTION DOC] HELPER: stores group size and name.
                 super().__init__()
                 self.group_size = group_size
                 self.group_name = group_name
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: reads a scalar item, allocates an empty tensor of that
+                # many rows and 4 columns and returns the collective function result.
                 u = x.item()
                 # Use u as a dimension of a new tensor:
                 y = torch.empty(u, 4, device=x.device)
@@ -3412,6 +3825,9 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
 
     @skip_if_lt_x_gpu(2)
     def test_all_to_all_comm_analysis(self):
+        # [FUNCTION DOC] All-to-all version of the comm analysis test: node sizes for static,
+        # unbacked and backed shapes and a positive analytical estimate. The nccl estimator
+        # check is left commented out because kwargs with dynamic shapes are unsupported.
         store = c10d.FileStore(self.file_name, self.world_size)
         torch.cuda.set_device(self.rank)
         c10d.init_process_group(
@@ -3425,6 +3841,8 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
         group_size = group.size()
 
         def func(inp, group_size, group_name):
+            # [FUNCTION DOC] HELPER: two chained all_to_all_single calls with even split sizes
+            # and waits.
             chunk = inp.numel() // self.world_size
             split_sizes = [chunk] * self.world_size
             a2a_0_out = torch.ops._c10d_functional.all_to_all_single(
@@ -3472,12 +3890,17 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
 
         # test for unbacked dynamic shape input estimation
         class TestModule(nn.Module):
+            # [CLASS DOC] HELPER: module that turns a scalar input into an unbacked dimension,
+            # builds an empty tensor and applies the chained collective function.
             def __init__(self, group_size, group_name):
+                # [FUNCTION DOC] HELPER: stores group size and name.
                 super().__init__()
                 self.group_size = group_size
                 self.group_name = group_name
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: reads a scalar item, allocates an empty tensor of that
+                # many rows and 4 columns and returns the collective function result.
                 u = x.item()
                 # Use u as a dimension of a new tensor:
                 y = torch.empty(u, 4, device=x.device)
@@ -3545,6 +3968,8 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
     @skip_if_lt_x_gpu(2)
     @requires_gloo()
     def test_regression_use_nccl_estimate_with_gloo(self):
+        # [FUNCTION DOC] Regression test: with a gloo process group the runtime estimate must
+        # not fail hard; estimates with and without the nccl estimator are both positive.
         # Test checks that using nccl estimator option does not hard fail
         # with backends that does not support runtime estimations, e.g. gloo
         store = c10d.FileStore(self.file_name, self.world_size)
@@ -3559,6 +3984,7 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
         group_size = group.size()
 
         def func(inp, group_size, group_name):
+            # [FUNCTION DOC] HELPER: two chained all-gathers with waits.
             ag_0_out = torch.ops._c10d_functional.all_gather_into_tensor(
                 inp, group_size, group_name
             )
@@ -3592,6 +4018,10 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @unittest.skipIf(not SM80OrLater, "bfloat16")
     def test_schedule_overlap_benchmark(self):
+        # [FUNCTION DOC] Compiles a function with all-gathers, reduce-scatters and matmuls
+        # through a post-grad pass running overlap scheduling with benchmark-based estimation,
+        # bucketing and overlap deps. Only checks compilation completes. Sets the global
+        # post-grad custom pass config without restoring it.
         store = c10d.FileStore(self.file_name, self.world_size)
         torch.cuda.set_device(self.rank)
         c10d.init_process_group(
@@ -3605,6 +4035,8 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
         group_size = group.size()
 
         def func(x, w, ag_0, ag_1, ag_2, ag_3, group_size, group_name):
+            # [FUNCTION DOC] HELPER: matmuls, bf16 casts and chained all-gathers and
+            # reduce-scatters with waits; returns all outputs.
             # do some unrelated matmuls
             y = torch.mm(x, w)
 
@@ -3690,6 +4122,8 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
         def _pass(
             gm: torch.fx.Graph,
         ) -> torch.fx.GraphModule:
+            # [FUNCTION DOC] HELPER: applies overlap scheduling to the graph's owning module
+            # with benchmark estimation and returns the result.
             return schedule_overlap_bucketing(
                 gm.owning_module,
                 collective_bucketing=True,
@@ -3707,6 +4141,10 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
     @skip_if_lt_x_gpu(2)
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     def test_overlap_scheduling_device_put_sync(self):
+        # [FUNCTION DOC] Exercises overlap scheduling on an expert-parallel pattern that mixes
+        # an asynchronous and a synchronous device-to-CPU transfer feeding split sizes. A custom
+        # pass verifies all device_put nodes are non-blocking False; compiled output must match
+        # eager. Sets the global post-grad pass config.
         """
         Test that overlap scheduling handles async device_put correctly.
 
@@ -3737,6 +4175,8 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
         group_size = group.size()
 
         def overlap_pass(graph: torch.fx.Graph) -> torch.fx.GraphModule:
+            # [FUNCTION DOC] HELPER: runs overlap scheduling on the graph module, then raises
+            # AssertionError if any device_put node has non_blocking true; returns the result.
             """Custom pass that runs overlap scheduling and verifies device_put sync."""
             from torch._inductor.fx_passes.overlap_scheduling import (
                 schedule_overlap_bucketing,
@@ -3771,6 +4211,9 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
             return result
 
         def func(num_tokens_per_expert, routed_input, group_size, group_name):
+            # [FUNCTION DOC] HELPER: exchanges token counts with all_to_all, computes
+            # splits, copies them to CPU, converts to lists and routes the data with a
+            # second all_to_all.
             """
             Pattern from expert_parallel.py:
             1. Exchange token counts via all_to_all
@@ -3865,6 +4308,9 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
     @skip_if_lt_x_gpu(2)
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     def test_benchmark_collective_with_symint_args(self):
+        # [FUNCTION DOC] Compiles with dynamic shapes a function using all_to_all_single with
+        # symbolic splits, under overlap scheduling with benchmark estimation. Runs two sequence
+        # lengths; checks the benchmark path handles SymInt arguments.
         """
         Test that collective benchmarking handles SymInt non-tensor arguments.
 
@@ -3885,6 +4331,8 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
         HIDDEN = 64
 
         def func(x, w, group_size, group_name):
+            # [FUNCTION DOC] HELPER: pads the sequence to a multiple of group size, all-to-all
+            # with even splits, wait, then returns the sum of the product with w.
             seq = x.shape[0]
             pad = (-seq) % group_size
             x_padded = torch.nn.functional.pad(x, (0, 0, 0, pad))
@@ -3901,6 +4349,8 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
         )
 
         def _pass(gm):
+            # [FUNCTION DOC] HELPER: runs overlap scheduling with benchmark estimation on
+            # the module.
             return schedule_overlap_bucketing(
                 gm.owning_module,
                 collective_bucketing=True,
@@ -3919,6 +4369,8 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
 
 
 class TestNodeGroupNameResolution(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Tests resolution of group names given as strings or as graph nodes in the
+    # bucketing group-key helpers; no process group needed.
     """Unit tests for Node-typed group_name handling in bucketing.
 
     In compile-on-one-rank graphs, collective ops receive
@@ -3927,8 +4379,13 @@ class TestNodeGroupNameResolution(torch._dynamo.test_case.TestCase):
     """
 
     def _make_graph_with_pg_node(self, group_name_str: str):
+        # [FUNCTION DOC] HELPER: builds a graph with a placeholder whose metadata is a mock
+        # process group of the given name and a float32 input placeholder. Returns (graph,
+        # pg_node, input_node).
         class MockPG:
+            # [CLASS DOC] HELPER: mock process group exposing a group_name attribute.
             def __init__(self, name: str):
+                # [FUNCTION DOC] HELPER: stores the group name.
                 self.group_name = name
 
         graph = torch.fx.Graph()
@@ -3939,17 +4396,21 @@ class TestNodeGroupNameResolution(torch._dynamo.test_case.TestCase):
         return graph, pg_node, input_node
 
     def test_resolve_group_name_string(self):
+        # [FUNCTION DOC] Checks _resolve_group_name returns a plain string unchanged.
         from torch._inductor.fx_passes.bucketing import _resolve_group_name
 
         self.assertEqual(_resolve_group_name("pg0"), "pg0")
 
     def test_resolve_group_name_node(self):
+        # [FUNCTION DOC] Checks _resolve_group_name returns the mock group's name for a node.
         from torch._inductor.fx_passes.bucketing import _resolve_group_name
 
         graph, pg_node, _ = self._make_graph_with_pg_node("pg0")
         self.assertEqual(_resolve_group_name(pg_node), "pg0")
 
     def test_ag_group_key_with_node_group_name(self):
+        # [FUNCTION DOC] Checks the all-gather group key is (group name, dtype) when group name
+        # is a node.
         from torch._inductor.fx_passes.bucketing import _ag_group_key
 
         graph, pg_node, input_node = self._make_graph_with_pg_node("pg0")
@@ -3961,6 +4422,8 @@ class TestNodeGroupNameResolution(torch._dynamo.test_case.TestCase):
         self.assertEqual(_ag_group_key(ag_node), ("pg0", torch.float32))
 
     def test_rs_group_key_with_node_group_name(self):
+        # [FUNCTION DOC] Checks the reduce-scatter group key is (group name, reduce op, dtype)
+        # with a node group name.
         from torch._inductor.fx_passes.bucketing import _rs_group_key
 
         graph, pg_node, input_node = self._make_graph_with_pg_node("pg0")
@@ -3972,6 +4435,8 @@ class TestNodeGroupNameResolution(torch._dynamo.test_case.TestCase):
         self.assertEqual(_rs_group_key(rs_node), ("pg0", "sum", torch.float32))
 
     def test_ar_group_key_with_node_group_name(self):
+        # [FUNCTION DOC] Checks the all-reduce group key is (group name, reduce op, dtype) with
+        # a node group name.
         from torch._inductor.fx_passes.bucketing import _ar_group_key
 
         graph, pg_node, input_node = self._make_graph_with_pg_node("pg0")
@@ -3986,6 +4451,9 @@ class TestNodeGroupNameResolution(torch._dynamo.test_case.TestCase):
 def _build_graph_with_duplicate_rs(
     n_duplicates: int,
 ) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] HELPER: builds a graph module with the given number of placeholders (10 by
+    # 128 fake tensors), each reduce-scattered (avg, 2 ranks, group "0") and waited, then summed
+    # together with add. Node metadata holds fake values.
     fake_mode = torch._subclasses.FakeTensorMode()
     graph = torch.fx.Graph()
 
@@ -4019,23 +4487,32 @@ def _build_graph_with_duplicate_rs(
 
 
 class TestDedupReduceScatter(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Tests the dedup_fsdp_reduce_scatter pass using a fake 2-rank process group.
     def setUp(self):
+        # [FUNCTION DOC] Runs the base setUp and initializes a fake-backend process group
+        # if none.
         super().setUp()
         if not c10d.is_initialized():
             store = c10d.HashStore()
             c10d.init_process_group(backend="fake", store=store, rank=0, world_size=2)
 
     def tearDown(self):
+        # [FUNCTION DOC] Runs the base tearDown and destroys the process group if initialized.
         super().tearDown()
         if c10d.is_initialized():
             c10d.destroy_process_group()
 
     def _count_ops(self, gm, target):
+        # [FUNCTION DOC] HELPER: counts call_function nodes in the graph whose target is the
+        # given op.
         return sum(
             1 for n in gm.graph.nodes if n.op == "call_function" and n.target is target
         )
 
     def test_two_duplicate_rs(self):
+        # [FUNCTION DOC] Two duplicate reduce-scatters are fused into one reduce-scatter and
+        # wait, with the add moved before them (on pre-scatter shapes) and node metadata shapes
+        # updated; total graph nodes become six.
         from torch._inductor.fx_passes.fsdp import dedup_fsdp_reduce_scatter
 
         gm = _build_graph_with_duplicate_rs(2)
@@ -4069,6 +4546,8 @@ class TestDedupReduceScatter(torch._dynamo.test_case.TestCase):
         self.assertEqual(fn_nodes[2].meta["val"].shape, (5, 128))
 
     def test_four_duplicate_rs(self):
+        # [FUNCTION DOC] Four duplicates fuse into one reduce-scatter and wait; the three adds
+        # stay and precede them.
         from torch._inductor.fx_passes.fsdp import dedup_fsdp_reduce_scatter
 
         gm = _build_graph_with_duplicate_rs(4)
@@ -4094,6 +4573,8 @@ class TestDedupReduceScatter(torch._dynamo.test_case.TestCase):
         self.assertIs(fn_nodes[4].target, wait_target)
 
     def test_no_fusion_different_rs_args(self):
+        # [FUNCTION DOC] Checks reduce-scatters on different group names are not fused
+        # (two remain).
         from torch._inductor.fx_passes.fsdp import dedup_fsdp_reduce_scatter
 
         graph = torch.fx.Graph()
@@ -4128,6 +4609,7 @@ class TestDedupReduceScatter(torch._dynamo.test_case.TestCase):
         self.assertEqual(self._count_ops(gm, rs_target), 2)
 
     def test_no_fusion_nonlinear_reduce_op(self):
+        # [FUNCTION DOC] Checks reduce-scatters with a nonlinear reduce op (max) are not fused.
         from torch._inductor.fx_passes.fsdp import dedup_fsdp_reduce_scatter
 
         graph = torch.fx.Graph()
@@ -4165,6 +4647,7 @@ class TestDedupReduceScatter(torch._dynamo.test_case.TestCase):
         self.assertEqual(self._count_ops(gm, rs_target), 2)
 
     def test_no_fusion_wait_has_other_users(self):
+        # [FUNCTION DOC] Checks no fusion when one wait result has another user besides the add.
         from torch._inductor.fx_passes.fsdp import dedup_fsdp_reduce_scatter
 
         graph = torch.fx.Graph()
@@ -4204,6 +4687,8 @@ class TestDedupReduceScatter(torch._dynamo.test_case.TestCase):
         self.assertEqual(self._count_ops(gm, rs_target), 2)
 
     def test_no_fusion_different_dtypes(self):
+        # [FUNCTION DOC] Checks no fusion when the two reduce-scatter inputs have
+        # different dtypes.
         from torch._inductor.fx_passes.fsdp import dedup_fsdp_reduce_scatter
 
         graph = torch.fx.Graph()
