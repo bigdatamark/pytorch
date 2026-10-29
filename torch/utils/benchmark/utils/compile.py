@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Utilities to benchmark torch.compile backends: benchmark_compile times compilation and running
+# of one backend/mode, and bench_all tries eager plus every registered backend (and inductor
+# modes) and returns a markdown table. Import-time side effects: records the current float32
+# matmul precision, tries to import the optional tabulate package and, if missing, prints a
+# message and skips defining the benchmarking functions (the exported names then do not exist).
 from typing import Any, cast
 from collections.abc import Callable
 
@@ -26,6 +32,9 @@ except ModuleNotFoundError:
 
 if HAS_TABULATE:
     def _enable_tensor_cores() -> None:
+        # [FUNCTION DOC] HELPER: On a CUDA machine whose device capability is at least 8.0 and
+        # where TF32 matmul is off, sets the float32 matmul precision to high and prints a
+        # notice once per process. Mutates global torch settings.
         global _warned_tensor_cores
 
         if torch.cuda.is_available():
@@ -37,6 +46,7 @@ if HAS_TABULATE:
                     _warned_tensor_cores = True
 
     def _disable_tensor_cores() -> None:
+        # [FUNCTION DOC] HELPER: Restores the float32 matmul precision recorded at import time.
         torch.set_float32_matmul_precision(_default_float_32_precision)
 
     def bench_loop(
@@ -46,6 +56,13 @@ if HAS_TABULATE:
         optimizer: torch.optim.Optimizer | None = None,
         loss_fn: Callable | None = None,
     ):
+        # [FUNCTION DOC] HELPER: Times a model for num_iters iterations with a Timer and returns
+        # the mean milliseconds per iteration rounded to two decimals. Uses a training step
+        # statement (forward, loss, backward, optimizer step, zero grad) when both optimizer and
+        # loss function are given, otherwise inference only.
+        # KNOWN ISSUE: with an optimizer but no loss function the inference statement is used, so
+        # no training happens; and the optimizer-only case in bench_all is passed no loss function
+        # for the eager run.
         # Define the statement and setup for the benchmark
         if optimizer and loss_fn:
             # Training mode
@@ -82,6 +99,12 @@ if HAS_TABULATE:
         optimizer: torch.optim.Optimizer | None = None,
         loss_fn : torch.nn.Module | Callable | None = None,
     ):
+        # [FUNCTION DOC] Benchmarks one compile backend and mode. With a backend, resets dynamo,
+        # compiles the model with a frame-counting wrapper, times one iteration (compilation) and
+        # then num_iters iterations, raises internally if no or more than one compilation
+        # occurred, and on any failure prints the error and returns a pair of nones. Without a
+        # backend runs the model eagerly. Returns (compilation ms or none, running ms or none),
+        # each rounded to two decimals (a zero value becomes none).
         """
         Use this utility to benchmark torch.compile
         """
@@ -125,6 +148,14 @@ if HAS_TABULATE:
         optimizer: torch.optim.Optimizer | None = None,
         loss_fn : torch.nn.Module | Callable | None = None,
     ):
+        # [FUNCTION DOC] Benchmarks eager mode and every registered dynamo backend (all inductor
+        # modes plus the unset mode, skipping the default mode) and returns a github-style table
+        # string with columns for training or inference, backend, mode, compilation time and
+        # average running time. Enables tensor cores around inductor runs on CUDA. Prints
+        # progress notices and failures; resets dynamo repeatedly.
+        # KNOWN ISSUE: the eager run is not passed the loss function, and the non-inductor row
+        # builds its compilation text from a formatted string, so a missing time prints as
+        # "None ms" instead of a dash.
         """
         This is a simple utility that can be used to benchmark torch.compile
         In particular it ensures that your GPU is setup to use tensor cores if it supports its

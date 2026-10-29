@@ -1,5 +1,14 @@
 # mypy: allow-untyped-defs
 
+# [MODULE DOC]
+# Helpers for registering an out-of-tree backend on the PrivateUse1 dispatch key from Python.
+# Public API: rename_privateuse1_backend (give the backend a device name) and
+# generate_methods_for_privateuse1_backend (monkey patch Tensor, Module, PackedSequence and
+# storage classes with is_<name> properties and <name>() conversion methods).
+# Private helpers cover registration-once checks, device normalization, a dummy Python backend
+# module/hook/device guard, and a lookup of functions in the custom backend module.
+# Import-time side effect: defines the module-level global _privateuse1_backend_name.
+
 import torch
 from torch._C import _get_privateuse1_backend_name, _rename_privateuse1_backend
 from torch.overrides import handle_torch_function, has_torch_function_unary
@@ -18,6 +27,10 @@ _privateuse1_backend_name = "privateuseone"
 
 
 def _rename_profiler_activity(backend_name: str) -> None:
+    # [FUNCTION DOC] HELPER: Adds an upper-cased alias for the PrivateUse1 member on the
+    # profiler activity enum and overrides its repr, str and name so that the member shows the
+    # new backend name. Mutates the enum class globally (monkey patching). Takes the new backend
+    # name and returns nothing.
     """Mirror the privateuse1 rename in ProfilerActivity so users can write e.g.
     ProfilerActivity.<backend_name> instead of ProfilerActivity.PrivateUse1."""
     from torch._C._profiler import ProfilerActivity
@@ -30,11 +43,15 @@ def _rename_profiler_activity(backend_name: str) -> None:
     original_str = ProfilerActivity.__str__
 
     def custom_repr(self):
+        # [FUNCTION DOC] HELPER: Repr that shows the renamed alias for the PrivateUse1 member
+        # and defers to the original repr for every other member.
         if self == pu1:
             return f"<ProfilerActivity.{alias}: {pu1.value}>"
         return original_repr(self)
 
     def custom_str(self):
+        # [FUNCTION DOC] HELPER: Str that shows the renamed alias for the PrivateUse1 member
+        # and defers to the original str for every other member.
         if self == pu1:
             return f"ProfilerActivity.{alias}"
         return original_str(self)
@@ -47,6 +64,9 @@ def _rename_profiler_activity(backend_name: str) -> None:
 
 
 def _rename_device_type(backend_name: str) -> None:
+    # [FUNCTION DOC] HELPER: Same as the profiler activity rename but for the autograd
+    # DeviceType enum: adds an upper-cased alias for the PrivateUse1 member and overrides repr,
+    # str and name for it. Mutates the enum class globally; returns nothing.
     from torch._C._autograd import DeviceType
 
     alias = backend_name.upper()
@@ -57,11 +77,15 @@ def _rename_device_type(backend_name: str) -> None:
     original_str = DeviceType.__str__
 
     def custom_repr(self):
+        # [FUNCTION DOC] HELPER: Repr showing the renamed alias for the PrivateUse1 member;
+        # other members use the original repr.
         if self == pu1:
             return f"<DeviceType.{alias}: {pu1.value}>"
         return original_repr(self)
 
     def custom_str(self):
+        # [FUNCTION DOC] HELPER: Str showing the renamed alias for the PrivateUse1 member;
+        # other members use the original str.
         if self == pu1:
             return f"DeviceType.{alias}"
         return original_str(self)
@@ -74,6 +98,10 @@ def _rename_device_type(backend_name: str) -> None:
 
 
 def rename_privateuse1_backend(backend_name: str) -> None:
+    # [FUNCTION DOC] Renames the PrivateUse1 backend to the given name so it can be used as an
+    # ordinary device string. Calls the C++ rename (which errors if a rename already happened),
+    # stores the name in the module-level global, then renames the profiler activity and the
+    # autograd device type enum members. Side effects: global state and enum classes are mutated.
     r"""
     Rename the privateuse1 backend device to make it more convenient to use as a device name within PyTorch APIs.
 
@@ -140,6 +168,8 @@ def rename_privateuse1_backend(backend_name: str) -> None:
 
 
 def _check_register_once(module, attr) -> None:
+    # [FUNCTION DOC] HELPER: Raises a runtime error if the given object already has the named
+    # attribute, guarding against registering a custom backend method twice. Returns nothing.
     if hasattr(module, attr):
         raise RuntimeError(
             f"The custom device module of {module} has already been registered with {attr}"
@@ -149,7 +179,13 @@ def _check_register_once(module, attr) -> None:
 def _normalization_device(
     custom_backend_name: str, device: int | str | torch.device | None = None
 ) -> int:
+    # [FUNCTION DOC] HELPER: Converts a device given as nothing, string, torch.device or integer
+    # into an integer device index for the custom backend. A missing device or a device without
+    # index maps to the backend's current device. Raises a runtime error if a device object or
+    # string has a type different from the custom backend name. An integer is returned as is.
     def _get_current_device_index():
+        # [FUNCTION DOC] HELPER: Returns the current device index from the backend module in
+        # torch if it defines current_device, otherwise the default index zero.
         _get_device_index = "current_device"
         if hasattr(torch, custom_backend_name) and hasattr(
             getattr(torch, custom_backend_name), _get_device_index
@@ -181,8 +217,13 @@ def _normalization_device(
 
 
 def _generate_tensor_methods_for_privateuse1_backend(custom_backend_name: str) -> None:
+    # [FUNCTION DOC] HELPER: Attaches two members to torch.Tensor: an is_<name> property that
+    # tells whether the tensor lives on the custom backend, and a <name>() method that moves the
+    # tensor to the backend device. Raises a runtime error if either attribute already exists.
     @property  # type: ignore[misc]
     def wrap_tensor_backend(self: torch.Tensor) -> bool:
+        # [FUNCTION DOC] HELPER: Property body; true when the tensor's device type equals the
+        # custom backend name. Dispatches through the torch function protocol for subclasses.
         if has_torch_function_unary(self):
             # TODO mypy doesn't support @property, see: https://github.com/python/mypy/issues/6185
             return handle_torch_function(wrap_tensor_backend.__get__, (self,), self)  # type: ignore[attr-defined]
@@ -198,6 +239,11 @@ def _generate_tensor_methods_for_privateuse1_backend(custom_backend_name: str) -
         non_blocking=False,
         **kwargs,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Generated <name>() method on Tensor. Normalizes the optional
+        # device to an index on the custom backend and calls the regular tensor conversion with
+        # the extra keyword arguments. Returns the converted tensor (self if already there).
+        # KNOWN ISSUE: the torch function protocol path passes non_blocking as false instead of
+        # forwarding the caller's non_blocking value.
         r"""Perform Tensor device conversion. Call the to operator implementation.
 
         .. note::
@@ -234,6 +280,9 @@ def _generate_tensor_methods_for_privateuse1_backend(custom_backend_name: str) -
 
 
 def _generate_module_methods_for_privateuse1_backend(custom_backend_name: str) -> None:
+    # [FUNCTION DOC] HELPER: Attaches a <name>() method to torch.nn.Module that moves all
+    # parameters and buffers to the custom device. Raises a runtime error if Tensor lacks the
+    # corresponding method or if Module already has the attribute.
     # Generate Module attributes and methods depends on Tensor methods,
     # so we need to check whether Tensor methods is already registered.
     if not hasattr(torch.Tensor, custom_backend_name):
@@ -248,6 +297,8 @@ def _generate_module_methods_for_privateuse1_backend(custom_backend_name: str) -
         self: torch.nn.modules.module.T,
         device: int | torch.device | None = None,
     ) -> torch.nn.modules.module.T:  # pyrefly: ignore [invalid-type-var]
+        # [FUNCTION DOC] HELPER: Generated Module method; applies the tensor-level backend
+        # conversion to every parameter and buffer in place and returns the module.
         r"""Move all model parameters and buffers to the custom device.
 
         This also makes associated parameters and buffers different objects. So
@@ -270,6 +321,9 @@ def _generate_module_methods_for_privateuse1_backend(custom_backend_name: str) -
 def _generate_packed_sequence_methods_for_privateuse1_backend(
     custom_backend_name: str,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Attaches an is_<name> property and a <name>() method to
+    # PackedSequence. Raises a runtime error if Tensor lacks the matching members or if
+    # PackedSequence already has the attributes.
     # Generate PackedSequence Module attributes and methods depends on Tensor methods,
     # so we need to check whether Tensor methods is already registered.
     if not hasattr(torch.Tensor, f"is_{custom_backend_name}") or not hasattr(
@@ -285,6 +339,8 @@ def _generate_packed_sequence_methods_for_privateuse1_backend(
 
     @property  # type: ignore[misc]
     def wrap_tensor_backend(self: torch.nn.utils.rnn.PackedSequence) -> bool:
+        # [FUNCTION DOC] HELPER: Property body; true when the packed data tensor is on the
+        # custom backend.
         return self.data.device.type == custom_backend_name
 
     _check_register_once(torch.nn.utils.rnn.PackedSequence, f"is_{custom_backend_name}")
@@ -297,6 +353,10 @@ def _generate_packed_sequence_methods_for_privateuse1_backend(
     def wrap_module_to(
         self: torch.nn.utils.rnn.PackedSequence, *args, **kwargs
     ) -> torch.nn.utils.rnn.PackedSequence:
+        # [FUNCTION DOC] HELPER: Generated PackedSequence method. Probes with an empty tensor
+        # whether the given arguments already target the custom backend; if so forwards them to
+        # the regular conversion, otherwise forces the device keyword to the backend name first.
+        # Mutates the caller's keyword mapping. Returns the converted packed sequence.
         r"""Move all model parameters and buffers to the custom device.
 
         This also makes associated parameters and buffers different objects. So
@@ -326,10 +386,18 @@ def _generate_packed_sequence_methods_for_privateuse1_backend(
 def _generate_storage_methods_for_privateuse1_backend(
     custom_backend_name: str, unsupported_dtype: list[torch.dtype] | None = None
 ) -> None:
+    # [FUNCTION DOC] HELPER: Attaches is_<name> properties and <name>() conversion methods to the
+    # untyped storage base class and to TypedStorage. The typed conversion raises a runtime error
+    # for dtypes listed in unsupported_dtype. Raises a runtime error if any attribute already
+    # exists. Side effect: mutates the storage classes.
     # Attribute is registered in the _StorageBase class
     # and UntypedStorage obtains through inheritance.
     @property  # type: ignore[misc]
     def wrap_storage_backend(self: torch.storage._StorageBase) -> bool:
+        # [FUNCTION DOC] HELPER: Property body; true when the storage device type equals the
+        # custom backend name.
+        # KNOWN ISSUE: the docstring says it returns the internal untyped storage, but the code
+        # returns a boolean.
         r"""Return the internal :class:`torch.UntypedStorage`."""
         return self.device.type == custom_backend_name
 
@@ -339,6 +407,9 @@ def _generate_storage_methods_for_privateuse1_backend(
     )
 
     def wrap_storage_to(self, device=None, non_blocking=False):
+        # [FUNCTION DOC] HELPER: Generated storage method. Returns self if already on the target
+        # backend device; raises a runtime error for sparse storage; otherwise allocates a new
+        # untyped storage on the target device, copies the data into it and returns it.
         r"""Return a copy of this object in custom device memory.
 
         If this object is already in device memory and on the correct device, then
@@ -378,6 +449,8 @@ def _generate_storage_methods_for_privateuse1_backend(
 
     @property  # type: ignore[misc]
     def wrap_typed_storage_backend(self: torch.storage.TypedStorage) -> bool:
+        # [FUNCTION DOC] HELPER: Property body; emits the typed-storage deprecation warning and
+        # tells whether the underlying untyped storage is on the custom backend.
         torch.storage._warn_typed_storage_removal()
         return self._untyped_storage.device.type == custom_backend_name
 
@@ -391,6 +464,9 @@ def _generate_storage_methods_for_privateuse1_backend(
     def wrap_typed_storage_to(
         self: torch.storage.TypedStorage, device=None, non_blocking=False, **kwargs
     ) -> torch.storage.TypedStorage:
+        # [FUNCTION DOC] HELPER: Generated TypedStorage method. Warns about typed-storage
+        # removal, raises a runtime error if the dtype is unsupported, converts the underlying
+        # untyped storage via the backend method and wraps the result as a new typed storage.
         torch.storage._warn_typed_storage_removal()
         if unsupported_dtype and self.dtype in unsupported_dtype:
             raise RuntimeError(
@@ -413,6 +489,10 @@ def generate_methods_for_privateuse1_backend(
     for_storage: bool = False,
     unsupported_dtype: list[torch.dtype] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Looks up the renamed PrivateUse1 backend name and, depending on the flags,
+    # installs the Tensor, Module, storage and PackedSequence members for it. Returns nothing;
+    # raises a runtime error if members already exist or prerequisites are missing.
+    # KNOWN ISSUE: the docstring does not document for_packed_sequence, which defaults to true.
     r"""
     Automatically generate attributes and methods for the custom backend after rename privateuse1 backend.
 
@@ -463,6 +543,9 @@ def generate_methods_for_privateuse1_backend(
 
 
 def _get_custom_mod_func(func_name: str):
+    # [FUNCTION DOC] HELPER: Returns the named callable from the torch submodule registered for
+    # the renamed PrivateUse1 backend. Raises an assertion error if the name is not a string and
+    # a runtime error if the backend module or the function is missing.
     r"""
     Return the func named `func_name` defined in custom device module. If not defined,
     return `None`. And the func is registered with `torch.utils.rename_privateuse1_backend('foo')`
@@ -504,44 +587,65 @@ def _get_custom_mod_func(func_name: str):
 
 
 class _DummyBackendModule:
+    # [CLASS DOC] HELPER: Minimal stand-in backend module for a Python-only PrivateUse1 backend.
+    # Stateless; reports one always-available device with index zero and ignores seeding.
     def is_initialized(self) -> bool:
+        # [FUNCTION DOC] HELPER: Always reports the backend as initialized.
         return True
 
     def is_available(self) -> bool:
+        # [FUNCTION DOC] HELPER: Always reports the backend as available.
         return True
 
     def current_device(self) -> int:
+        # [FUNCTION DOC] HELPER: Always returns device index zero.
         return 0
 
     def _is_in_bad_fork(self) -> bool:
+        # [FUNCTION DOC] HELPER: Always reports not being in a bad fork.
         return False
 
     def manual_seed_all(self, seed: int) -> None:
+        # [FUNCTION DOC] HELPER: No-op; the seed is ignored.
         pass
 
     def device_count(self) -> int:
+        # [FUNCTION DOC] HELPER: Always reports a single device.
         return 1
 
 
 class _DummyPrivateUse1Hook(torch._C._acc.PrivateUse1Hooks):
+    # [CLASS DOC] HELPER: Default accelerator hooks object for a Python PrivateUse1 backend;
+    # reports the backend as built, available and having a primary context.
     def is_available(self) -> bool:
+        # [FUNCTION DOC] HELPER: Always true.
         return True
 
     def has_primary_context(self, dev_id) -> bool:
+        # [FUNCTION DOC] HELPER: Always true regardless of the device id.
         return True
 
     def is_built(self) -> bool:
+        # [FUNCTION DOC] HELPER: Always true.
         return True
 
 
 class _DummyDeviceGuard(torch._C._acc.DeviceGuard):
+    # [CLASS DOC] HELPER: Default device guard for a Python PrivateUse1 backend; only reports
+    # its device type.
     def type_(self):
+        # [FUNCTION DOC] HELPER: Returns the PrivateUse1 device type enum member.
         return torch._C._autograd.DeviceType.PrivateUse1
 
 
 def _setup_privateuseone_for_python_backend(
     rename=None, backend_module=None, hook=None, device_guard=None
 ) -> None:
+    # [FUNCTION DOC] HELPER: Experimental setup of PrivateUse1 as a Python backend. Optionally
+    # renames the backend, generates the default Tensor/Module/PackedSequence methods, fills in
+    # dummy backend module, hook and device guard when not supplied, registers the module under
+    # the backend name and registers the hook and guard with the C++ accelerator layer. The
+    # order of these steps matters. Side effects: global registration state changes.
     """This function will prepare the PrivateUse1 dispatch key to be used as a python backend.
 
     WARNING: this API is experimental and might change without notice.

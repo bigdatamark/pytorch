@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Runnable example that uses the sparse unary and binary op fuzzers with Timer to compare the
+# speed of float32 and float64 inputs of identical shape and layout, then prints the cases with
+# the smallest and largest relative difference. Defines the constant _MEASURE_TIME (seconds per
+# measurement). No import-time side effects beyond imports.
 """Example use of Timer and sparse op fuzzers to measure kernel performance.
 
 $ python -m examples.sparse.op_benchmark
@@ -15,6 +20,10 @@ import operator
 _MEASURE_TIME = 1.0
 
 def assert_dicts_equal(dict_0, dict_1) -> None:
+    # [FUNCTION DOC] HELPER: Sanity check that two parameter mappings agree on everything except
+    # the dtype entry, tolerating array values. Raises an assertion error on mismatch.
+    # KNOWN ISSUE: the key check compares the first mapping's keys with themselves, so it never
+    # fails; and the value check raises only when all values differ, not when any differs.
     """Builtin dict comparison will not compare numpy arrays.
 
     e.g.::
@@ -28,6 +37,11 @@ def assert_dicts_equal(dict_0, dict_1) -> None:
         raise AssertionError("dict values differ for keys other than 'dtype'")
 
 def run(n, stmt, fuzzer_cls) -> None:
+    # [FUNCTION DOC] Benchmarks one statement over n fuzzed sparse inputs, using the same seed
+    # for a float32 and a float64 fuzzer so shapes match. Times both, records each tensor's
+    # shape, sparse dimension count and coalesced flag, sorts by relative time difference, and
+    # prints the first and last ten rows with the faster dtype. Writes to standard output.
+    # KNOWN ISSUE: variables and labels say "int" but the second dtype is float64.
     float_iter = fuzzer_cls(seed=0, dtype=torch.float32).take(n)
     double_iter = fuzzer_cls(seed=0, dtype=torch.float64).take(n)
     raw_results = []
@@ -95,6 +109,8 @@ def run(n, stmt, fuzzer_cls) -> None:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Runs the dtype comparison for sparse sum, sparse softmax and an add with
+    # 100 samples each. Prints results; returns nothing.
     run(n=100, stmt="torch.sparse.sum(x, dim=0)", fuzzer_cls=UnaryOpSparseFuzzer)
     run(n=100, stmt="torch.sparse.softmax(x, dim=0)", fuzzer_cls=UnaryOpSparseFuzzer)
     run(n=100, stmt="x + y", fuzzer_cls=BinaryOpSparseFuzzer)

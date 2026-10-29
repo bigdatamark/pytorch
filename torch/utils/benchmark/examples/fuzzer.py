@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Runnable example of the Timer and Fuzzer APIs: fuzzes pairs of tensors with random shapes and
+# memory layouts, times an addition on each pair, and prints the best and worst cases per
+# element. No import-time side effects; running as a script calls main.
 """Example of the Timer and Fuzzer APIs:
 
 $ python -m examples.fuzzer
@@ -10,6 +14,10 @@ import torch.utils.benchmark as benchmark_utils
 
 
 def main() -> None:
+    # [FUNCTION DOC] Defines a seeded fuzzer producing two tensors with up to three fuzzed
+    # dimensions, takes 250 samples, times the sum of each pair, annotates each measurement with
+    # its element count, sorts by median time per element, and prints the rejection statistic
+    # plus the 15 best and 15 worst configurations. Prints to standard output; returns nothing.
     add_fuzzer = benchmark_utils.Fuzzer(
         parameters=[
             [
@@ -69,6 +77,7 @@ def main() -> None:
     print(f"Average attempts per valid config: {1. / (1. - add_fuzzer.rejection_rate):.1f}")
 
     def time_fn(m):
+        # [FUNCTION DOC] HELPER: Sort key; the measurement median divided by its element count.
         return m.median / m.metadata["numel"]
     measurements.sort(key=time_fn)
 

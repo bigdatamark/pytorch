@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines SpectralOpFuzzer, a Fuzzer producing a single tensor x for benchmarking FFT style
+# operators, favoring "regular" sizes (products of powers of 2, 3 and 5) that FFT libraries
+# handle fastest. Import-time side effect: builds and sorts the module-level list REGULAR_SIZES
+# from the size bounds MIN_DIM_SIZE and MAX_DIM_SIZE.
 import math
 
 import torch
@@ -12,6 +17,9 @@ MIN_DIM_SIZE = 16
 MAX_DIM_SIZE = 16 * 1024
 
 def power_range(upper_bound, base):
+    # [FUNCTION DOC] HELPER: Returns a lazy sequence of the powers of base from base to the zero
+    # power up to the largest power not exceeding upper_bound (by a floating point logarithm,
+    # which may be off by one at exact powers).
     return (base ** i for i in range(int(math.log(upper_bound, base)) + 1))
 
 # List of regular numbers from MIN_DIM_SIZE to MAX_DIM_SIZE
@@ -28,8 +36,15 @@ for i in power_range(MAX_DIM_SIZE, 2):
 REGULAR_SIZES.sort()
 
 class SpectralOpFuzzer(benchmark.Fuzzer):
+    # [CLASS DOC] Fuzzer preconfigured to produce a tensor x of 1 to 3 dimensions whose sizes are
+    # regular FFT sizes with a configurable probability, otherwise arbitrary loguniform sizes,
+    # with random strides. No state beyond the base Fuzzer.
     def __init__(self, *, seed: int, dtype=torch.float64,
                  cuda: bool = False, probability_regular: float = 1.0) -> None:
+        # [FUNCTION DOC] Configures the base Fuzzer. Keyword-only args: seed, dtype (default
+        # float64), whether to use the GPU, and the probability that each dimension size is
+        # drawn from the regular sizes (the remainder uses arbitrary sizes). The tensor allows
+        # at most 2 GB.
         super().__init__(
             parameters=[
                 # Dimensionality of x. (e.g. 1D, 2D, or 3D.)

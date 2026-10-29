@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Compiles C++ benchmark snippets: fills statement, setup and global setup into a C++ template
+# and builds it with the torch cpp extension loader, either as a Python module (timeit
+# template) or a standalone executable (callgrind template). Also provides back-testing shims
+# (compiler flags and compat valgrind bindings). Import-time side effects: creates a global lock,
+# computes the C++ flags (adding debug info, dropping warning flags) and include paths.
 """JIT C++ strings into executables."""
 import atexit
 import os
@@ -32,6 +38,8 @@ SOURCE_ROOT = os.path.split(os.path.abspath(__file__))[0]
 _BUILD_ROOT: str | None = None
 
 def _get_build_root() -> str:
+    # [FUNCTION DOC] HELPER: Lazily creates (once per process) a temporary build root directory,
+    # registers its removal at interpreter exit, caches it in a global and returns its path.
     global _BUILD_ROOT
     if _BUILD_ROOT is None:
         _BUILD_ROOT = _make_temp_dir(prefix="benchmark_utils_jit_build")
@@ -91,6 +99,9 @@ if CONDA_PREFIX is not None:
 
 COMPAT_CALLGRIND_BINDINGS: CallgrindModuleType | None = None
 def get_compat_bindings() -> CallgrindModuleType:
+    # [FUNCTION DOC] Builds (once, under the lock) and returns the compatibility valgrind
+    # bindings extension from its bundled C++ source, caching it in a module global. Used when
+    # the installed torch lacks native valgrind bindings.
     with LOCK:
         global COMPAT_CALLGRIND_BINDINGS
         if COMPAT_CALLGRIND_BINDINGS is None:
@@ -115,6 +126,11 @@ def _compile_template(
     src: str,
     is_standalone: bool
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Substitutes global setup, setup and statement text into the
+    # marker lines of the template source, writes it under a build directory named from a hash of
+    # the source (so identical code reuses the cached build), and builds it with the extension
+    # loader. Returns a loaded Python module, or the path of an executable when standalone.
+    # Writes files; the lock guards the file creation only.
     for before, after, indentation in (
         ("// GLOBAL_SETUP_TEMPLATE_LOCATION", global_setup, 0),
         ("// SETUP_TEMPLATE_LOCATION", setup, 4),
@@ -154,6 +170,8 @@ def _compile_template(
 
 
 def compile_timeit_template(*, stmt: str, setup: str, global_setup: str) -> TimeitModuleType:
+    # [FUNCTION DOC] Compiles the timeit C++ template with the given code into a Python module
+    # and returns it. Raises an assertion error if the result does not provide timeit.
     template_path: str = os.path.join(SOURCE_ROOT, "timeit_template.cpp")
     with open(template_path) as f:
         src: str = f.read()
@@ -165,6 +183,8 @@ def compile_timeit_template(*, stmt: str, setup: str, global_setup: str) -> Time
 
 
 def compile_callgrind_template(*, stmt: str, setup: str, global_setup: str) -> str:
+    # [FUNCTION DOC] Compiles the callgrind C++ template with the given code into a standalone
+    # executable and returns its path. Raises an assertion error if the result is not a string.
     template_path: str = os.path.join(SOURCE_ROOT, "valgrind_wrapper", "timer_callgrind_template.cpp")
     with open(template_path) as f:
         src: str = f.read()

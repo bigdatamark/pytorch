@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines UnaryOpFuzzer, a Fuzzer producing a single tensor x with random dimensionality, shape
+# (mixing arbitrary and power of two sizes) and strided layout, for benchmarking unary
+# operators. Module constants for dimension size bounds and power of two sizes are computed at
+# import time.
 import numpy as np
 import torch
 
@@ -14,7 +19,12 @@ _POW_TWO_SIZES = tuple(2 ** i for i in range(
 
 
 class UnaryOpFuzzer(Fuzzer):
+    # [CLASS DOC] Fuzzer preconfigured to produce a single tensor x of 1 to 3 dimensions plus
+    # step and random value parameters. No state beyond the base Fuzzer.
     def __init__(self, seed, dtype=torch.float32, cuda=False) -> None:
+        # [FUNCTION DOC] Configures the base Fuzzer with parameter distributions and the tensor
+        # specification. Args: seed for reproducibility, tensor dtype, and whether to allocate on
+        # the GPU. The tensor allows at most 2 GB.
         super().__init__(
             parameters=[
                 # Dimensionality of x. (e.g. 1D, 2D, or 3D.)

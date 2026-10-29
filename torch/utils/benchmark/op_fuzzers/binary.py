@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines BinaryOpFuzzer, a Fuzzer that generates pairs of tensors x and y for benchmarking
+# binary operators, with random dimensionality, shapes (mixing arbitrary and power of two
+# sizes), occasional singleton dimensions in y for broadcasting, and strided layouts.
+# Module constants give the minimum and maximum dimension size and the tuple of allowed power
+# of two sizes, computed at import time.
 import numpy as np
 import torch
 
@@ -14,7 +20,16 @@ _POW_TWO_SIZES = tuple(2 ** i for i in range(
 
 
 class BinaryOpFuzzer(Fuzzer):
+    # [CLASS DOC] Fuzzer preconfigured to produce tensors x and y (1 to 3 dimensions) with
+    # parameters for dimension sizes, step sizes and a random value. Sizes are mostly arbitrary
+    # loguniform values and sometimes powers of two; y reuses x's size or has size one per
+    # dimension. No state beyond the base Fuzzer.
     def __init__(self, seed, dtype=torch.float32, cuda=False) -> None:
+        # [FUNCTION DOC] Configures the base Fuzzer with the parameter distributions and the two
+        # fuzzed tensor specifications. Args: seed for reproducibility, tensor dtype, and whether
+        # to allocate on the GPU. Each tensor allows at most 2 GB.
+        # KNOWN ISSUE: tensor y is given the x step parameters, so y's strides copy x's and the
+        # declared y step parameters are never used.
         super().__init__(
             parameters=[
                 # Dimensionality of x and y. (e.g. 1D, 2D, or 3D.)

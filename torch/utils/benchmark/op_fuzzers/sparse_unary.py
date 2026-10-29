@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Defines UnaryOpSparseFuzzer (the only exported name), a Fuzzer that generates one sparse
+# tensor x with random dimensionality, sparse dimension count, shape (mixing arbitrary and power
+# of two sizes), density and coalesced flag, for benchmarking sparse unary operators. Module
+# constants for dimension size bounds and power of two sizes are computed at import time.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -20,7 +25,12 @@ _POW_TWO_SIZES = tuple(2 ** i for i in range(
 ))
 
 class UnaryOpSparseFuzzer(Fuzzer):
+    # [CLASS DOC] Fuzzer preconfigured to produce a single sparse tensor x. No state beyond the
+    # base Fuzzer.
     def __init__(self, seed: int | None, dtype: _dtype | None = None, cuda: bool = False) -> None:
+        # [FUNCTION DOC] Configures the base Fuzzer with parameter distributions and a sparse
+        # tensor specification. Args: seed (may be none), dtype (defaults to float32 when none),
+        # and whether to allocate on the GPU.
         if dtype is None:
             dtype = getattr(torch, 'float32', None)
         super().__init__(

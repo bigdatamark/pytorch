@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Runnable example that uses the unary and binary op fuzzers with Timer to compare the speed of
+# float and integer inputs of identical shape and layout for a few statements, then prints the
+# cases with the smallest and largest relative difference. Defines the module constant
+# _MEASURE_TIME (seconds per measurement). No import-time side effects beyond imports.
 """Example use of Timer and op fuzzers to measure kernel performance.
 
 $ python -m examples.op_benchmark
@@ -17,6 +22,10 @@ _MEASURE_TIME = 1.0
 
 
 def assert_dicts_equal(dict_0, dict_1) -> None:
+    # [FUNCTION DOC] HELPER: Sanity check that two parameter mappings agree on everything except
+    # the dtype entry, tolerating array values. Raises an assertion error on mismatch.
+    # KNOWN ISSUE: the key check compares the first mapping's keys with themselves, so it never
+    # fails; and the value check raises only when all values differ, not when any differs.
     """Builtin dict comparison will not compare numpy arrays.
 
     e.g.::
@@ -31,6 +40,11 @@ def assert_dicts_equal(dict_0, dict_1) -> None:
 
 
 def run(n, stmt, fuzzer_cls) -> None:
+    # [FUNCTION DOC] Benchmarks one statement over n fuzzed inputs, using the same seed for a
+    # float32 and an int32 fuzzer so shapes and strides match. For each sample it times both
+    # dtypes, records a description of each tensor's shape, dimension order and steps, then
+    # sorts by relative time difference and prints the first and last ten rows with which dtype
+    # was faster. Writes progress and results to standard output; returns nothing.
     float_iter = fuzzer_cls(seed=0, dtype=torch.float32).take(n)
     int_iter = fuzzer_cls(seed=0, dtype=torch.int32).take(n)
     raw_results = []
@@ -100,6 +114,8 @@ def run(n, stmt, fuzzer_cls) -> None:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Runs the float versus int comparison for a median, a square and an add
+    # statement with 100 samples each. Prints results; returns nothing.
     run(n=100, stmt="torch.median(x, dim=0)", fuzzer_cls=UnaryOpFuzzer)
     run(n=100, stmt="torch.square(x)", fuzzer_cls=UnaryOpFuzzer)
     run(n=100, stmt="x + y", fuzzer_cls=BinaryOpFuzzer)

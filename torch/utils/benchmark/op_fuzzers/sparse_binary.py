@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines BinaryOpSparseFuzzer, a Fuzzer that generates pairs of sparse tensors x and y with
+# random dimensionality, sparse dimension count, shapes (mixing arbitrary and power of two
+# sizes), density and coalesced flag, for benchmarking sparse binary operators. Module
+# constants for dimension size bounds and power of two sizes are computed at import time.
 import numpy as np
 import torch
 
@@ -14,7 +19,13 @@ _POW_TWO_SIZES = tuple(2 ** i for i in range(
 
 
 class BinaryOpSparseFuzzer(Fuzzer):
+    # [CLASS DOC] Fuzzer preconfigured to produce sparse tensors x and y that share dimension
+    # count, sparse dimension count, density and coalesced flag, and have identical sizes.
+    # No state beyond the base Fuzzer.
     def __init__(self, seed, dtype=torch.float32, cuda=False) -> None:
+        # [FUNCTION DOC] Configures the base Fuzzer with parameter distributions and the two
+        # sparse tensor specifications. Args: seed for reproducibility, tensor dtype, and
+        # whether to allocate on the GPU.
         super().__init__(
             parameters=[
                 # Dimensionality of x and y. (e.g. 1D, 2D, or 3D.)

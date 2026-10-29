@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Runnable example of the Timer and sparse Fuzzer APIs: fuzzes pairs of sparse tensors with
+# random shape, sparse dimension count, density and coalescing, times a sparse sum on each, and
+# prints the best and worst cases per nonzero element. No import-time side effects.
 """Example of the Timer and Sparse Fuzzer APIs:
 
 $ python -m examples.sparse.fuzzer
@@ -9,6 +13,10 @@ import sys
 import torch.utils.benchmark as benchmark_utils
 
 def main() -> None:
+    # [FUNCTION DOC] Defines a seeded fuzzer yielding two sparse tensors, takes 100 samples,
+    # times the sum of sparse sums of each pair, stores the nonzero count in each measurement's
+    # metadata, sorts by mean time per nonzero element and prints the rejection statistic plus
+    # the 10 best and 10 worst cases. Prints to standard output; returns nothing.
     add_fuzzer = benchmark_utils.Fuzzer(
         parameters=[
             [
@@ -83,6 +91,7 @@ def main() -> None:
     print(f"Average attempts per valid config: {1. / (1. - add_fuzzer.rejection_rate):.1f}")
 
     def time_fn(m):
+        # [FUNCTION DOC] HELPER: Sort key; the measurement mean divided by its nonzero count.
         return m.mean / m.metadata["nnz"]
 
     measurements.sort(key=time_fn)

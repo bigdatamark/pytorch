@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Random input generation for benchmarks. FuzzedParameter describes a random scalar (log
+# uniform, uniform or a discrete weighted choice), ParameterAlias lets one parameter copy
+# another, FuzzedTensor describes a tensor whose shape, strides and layout derive from
+# parameters, and Fuzzer repeatedly samples parameters (resampling until constraints hold) and
+# builds the tensors. Also helpers for dtype byte size and overflow-safe products.
+# No import-time side effects beyond defining names.
 import functools
 import itertools as it
 from typing import Any
@@ -21,6 +28,11 @@ _DISTRIBUTIONS = (
 
 
 class FuzzedParameter:
+    # [CLASS DOC] Specification of one random parameter: name, optional bounds, a distribution
+    # (loguniform, uniform, or a mapping from choices to probabilities) and a strict flag meaning
+    # the value is sampled once per generation call and kept across resampling retries. The
+    # distribution is validated on construction. Key method: sample draws a value using a numpy
+    # random state.
     """Specification for a parameter to be generated during fuzzing."""
     def __init__(
         self,
@@ -30,6 +42,8 @@ class FuzzedParameter:
         distribution: str | dict[Any, float] | None = None,
         strict: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Stores the name, bounds and strict flag and validates the distribution
+        # (via the check method, which may raise an assertion error).
         """
         Args:
             name:
@@ -79,9 +93,12 @@ class FuzzedParameter:
 
     @property
     def name(self):
+        # [FUNCTION DOC] The parameter name.
         return self._name
 
     def sample(self, state):
+        # [FUNCTION DOC] Draws one value from the configured distribution using the given numpy
+        # random state (advancing it). Returns the sampled number or chosen key.
         if self._distribution == "loguniform":
             return self._loguniform(state)
 
@@ -92,6 +109,11 @@ class FuzzedParameter:
             return self._custom_distribution(state)
 
     def _check_distribution(self, distribution):
+        # [FUNCTION DOC] HELPER: Validates and returns the distribution. A non-mapping must be a
+        # known name. A mapping must have no negative probabilities, must be normalized, and the
+        # bounds must be unset. Raises assertion errors on violations.
+        # KNOWN ISSUE: the normalization check is inverted: it raises when the probabilities sum
+        # to one within tolerance and passes when they do not.
         if not isinstance(distribution, dict):
             if distribution not in _DISTRIBUTIONS:
                 raise AssertionError(f"Unknown distribution: {distribution}")
@@ -108,6 +130,8 @@ class FuzzedParameter:
         return distribution
 
     def _loguniform(self, state):
+        # [FUNCTION DOC] HELPER: Samples uniformly in base-two log space between the bounds,
+        # converts back and truncates to an integer, then clamps to the bounds. Returns an int.
         import numpy as np
         output = int(2 ** state.uniform(
             low=np.log2(self._minval) if self._minval is not None else None,
@@ -120,11 +144,15 @@ class FuzzedParameter:
         return output
 
     def _uniform(self, state):
+        # [FUNCTION DOC] HELPER: Samples an inclusive random integer if both bounds are ints,
+        # otherwise a continuous uniform float between the bounds.
         if isinstance(self._minval, int) and isinstance(self._maxval, int):
             return int(state.randint(low=self._minval, high=self._maxval + 1))
         return state.uniform(low=self._minval, high=self._maxval)
 
     def _custom_distribution(self, state):
+        # [FUNCTION DOC] HELPER: Picks an index with the given probabilities and returns the key
+        # at that position, keeping the original key types.
         import numpy as np
         # If we directly pass the keys to `choice`, numpy will convert
         # them to numpy dtypes.
@@ -135,6 +163,12 @@ class FuzzedParameter:
 
 
 class ParameterAlias:
+    # [CLASS DOC] Marker placed as a choice in a custom distribution (or elsewhere) meaning
+    # "use the value of the named parameter". State: alias_to, the target parameter name.
+    # Resolved by the Fuzzer after sampling; chains are allowed, cycles are errors.
+    # KNOWN ISSUE: the docstring example uses a mapping with the same probability key twice, so
+    # only one entry would survive, and it maps probabilities to choices rather than choices to
+    # probabilities.
     """Indicates that a parameter should alias the value of another parameter.
 
     When used in conjunction with a custom distribution, this allows fuzzed
@@ -160,13 +194,18 @@ class ParameterAlias:
     Chains of alias' are allowed, but may not contain cycles.
     """
     def __init__(self, alias_to) -> None:
+        # [FUNCTION DOC] Stores the name of the parameter to alias.
         self.alias_to = alias_to
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form showing the alias target.
         return f"ParameterAlias[alias_to: {self.alias_to}]"
 
 
 def dtype_size(dtype):
+    # [FUNCTION DOC] HELPER: Returns the number of bytes per element of a torch dtype: one for
+    # bool, the bit width over eight for floating point and complex types, otherwise the integer
+    # type's bit width over eight.
     if dtype == torch.bool:
         return 1
     if dtype.is_floating_point or dtype.is_complex:
@@ -175,6 +214,8 @@ def dtype_size(dtype):
 
 
 def prod(values, base=1):
+    # [FUNCTION DOC] HELPER: Multiplies the values, converted to Python integers, starting from
+    # base, so large products cannot overflow. Returns an int.
     """np.prod can overflow, so for sizes the product should be done in Python.
 
     Even though np.prod type promotes to int64, it can still overflow in which
@@ -185,6 +226,12 @@ def prod(values, base=1):
 
 
 class FuzzedTensor:
+    # [CLASS DOC] Specification of a tensor generated from sampled parameters: name, size and
+    # optional steps (entries are literal ints or parameter names), contiguity probability,
+    # element-count and allocation-size limits, a parameter that truncates the number of
+    # dimensions, dtype, GPU flag and an optional custom constructor. Key methods: a constraint
+    # check on a parameter set and a builder that creates the (possibly permuted and strided)
+    # tensor plus a properties mapping.
     def __init__(
         self,
         name: str,
@@ -200,6 +247,8 @@ class FuzzedTensor:
         cuda=False,
         tensor_constructor: Callable | None = None
     ) -> None:
+        # [FUNCTION DOC] Stores the tensor specification.
+        # KNOWN ISSUE: the roll_parameter argument is accepted but never stored or used.
         """
         Args:
             name:
@@ -263,16 +312,26 @@ class FuzzedTensor:
 
     @property
     def name(self):
+        # [FUNCTION DOC] The tensor name.
         return self._name
 
     @staticmethod
     def default_tensor_constructor(size, dtype, **kwargs):
+        # [FUNCTION DOC] Default builder: random values in [0,1) on the CPU for floating point
+        # and complex dtypes, otherwise random integers from 1 to 126. Extra keyword arguments
+        # (the parameter values) are ignored. Returns the tensor.
         if dtype.is_floating_point or dtype.is_complex:
             return torch.rand(size=size, dtype=dtype, device="cpu")
         else:
             return torch.randint(1, 127, size=size, dtype=dtype, device="cpu")
 
     def _make_tensor(self, params, state):
+        # [FUNCTION DOC] HELPER: Builds the tensor for a parameter set: allocates the enlarged
+        # tensor via the constructor (moving it to the GPU if requested), with probability
+        # complementary to the contiguity probability reorders memory by permuting, making
+        # contiguous and permuting back, then slices by the steps. Returns the tensor and a
+        # properties mapping (element count, dimension order, steps, contiguity, dtype name).
+        # Consumes random numbers from the state.
         import numpy as np
         size, steps, allocation_size = self._get_size_and_steps(params)
         constructor = (
@@ -309,6 +368,10 @@ class FuzzedTensor:
         return tensor, properties
 
     def _get_size_and_steps(self, params):
+        # [FUNCTION DOC] HELPER: Resolves size and steps to concrete integers using the
+        # parameter values; the dimension count comes from the dim parameter if set, and entries
+        # are truncated or padded with ones to match. Returns (size, steps, allocation size where
+        # each entry is size times step).
         dim = (
             params[self._dim_parameter]
             if self._dim_parameter is not None
@@ -316,6 +379,8 @@ class FuzzedTensor:
         )
 
         def resolve(values, dim):
+            # [FUNCTION DOC] HELPER: Replaces parameter names by their values, then truncates or
+            # pads with ones to exactly dim entries; returns a tuple.
             """Resolve values into concrete integers."""
             values = tuple(params.get(i, i) for i in values)
             if len(values) > dim:
@@ -330,6 +395,10 @@ class FuzzedTensor:
         return size, steps, allocation_size
 
     def satisfies_constraints(self, params) -> bool:
+        # [FUNCTION DOC] True when the element count is within the min and max limits and the
+        # pre-slicing allocation in bytes is within the allocation limit (unset limits are
+        # ignored). Products use Python integers. Raises an assertion error if the count is
+        # negative.
         size, _, allocation_size = self._get_size_and_steps(params)
         # Product is computed in Python to avoid integer overflow.
         num_elements = prod(size)
@@ -339,6 +408,7 @@ class FuzzedTensor:
         allocation_bytes = prod(allocation_size, base=dtype_size(self._dtype))
 
         def nullable_greater(left, right):
+            # [FUNCTION DOC] HELPER: Greater-than that is false if either side is none.
             if left is None or right is None:
                 return False
             return left > right
@@ -351,6 +421,10 @@ class FuzzedTensor:
 
 
 class Fuzzer:
+    # [CLASS DOC] Generator of reproducible random inputs. State: seed, flattened tuples of
+    # parameters and tensors, user constraints, and counters of rejected and total parameter
+    # sets (exposed as rejection_rate). Key methods: take yields n samples of (tensors,
+    # tensor properties, parameters); sampling retries up to 1000 times to satisfy constraints.
     def __init__(
         self,
         parameters: list[FuzzedParameter | list[FuzzedParameter]],
@@ -358,6 +432,9 @@ class Fuzzer:
         constraints: list[Callable] | None = None,
         seed: int | None = None
     ) -> None:
+        # [FUNCTION DOC] Picks a random seed if none is given, flattens one level of nesting in
+        # the parameter and tensor lists, and raises a value error if any name is used both by a
+        # parameter and a tensor. Resets the rejection counters.
         """
         Args:
             parameters:
@@ -397,11 +474,18 @@ class Fuzzer:
 
     @staticmethod
     def _unpack(values, cls):
+        # [FUNCTION DOC] HELPER: Flattens a list whose items are either single instances of the
+        # class or iterables of them into one tuple.
         return tuple(it.chain.from_iterable(
             [[i] if isinstance(i, cls) else i for i in values]
         ))
 
     def take(self, n):
+        # [FUNCTION DOC] Generator producing n samples. First creates a random state from the
+        # seed and seeds the global torch generator from it (global side effect), then for each
+        # sample generates valid parameters and builds every tensor, yielding a mapping of name to
+        # tensor, a mapping of name to properties, and the parameters. May raise a value error if
+        # valid parameters cannot be found.
         import numpy as np
         state = np.random.RandomState(self._seed)
         torch.manual_seed(state.randint(low=0, high=2 ** 63, dtype=np.int64))
@@ -417,11 +501,18 @@ class Fuzzer:
 
     @property
     def rejection_rate(self):
+        # [FUNCTION DOC] Fraction of generated parameter sets that were rejected so far (zero
+        # before anything is generated).
         if not self._total_generated:
             return 0.
         return self._rejections / self._total_generated
 
     def _generate(self, state):
+        # [FUNCTION DOC] HELPER: Samples a full parameter set, retrying up to 1000 times. Strict
+        # parameters keep their first sampled value across retries; others are resampled. After
+        # resolving aliases, a candidate is rejected (counted) if any user constraint or tensor
+        # constraint fails. Returns the first accepted set; raises a value error after 1000
+        # failed attempts.
         strict_params: dict[str, float | int | ParameterAlias] = {}
         for _ in range(1000):
             candidate_params: dict[str, float | int | ParameterAlias] = {}
@@ -451,6 +542,9 @@ class Fuzzer:
 
     @staticmethod
     def _resolve_aliases(params):
+        # [FUNCTION DOC] HELPER: Returns a copy of the mapping in which every alias marker is
+        # replaced by the value of its target, looping until none remain. Raises a value error
+        # if a pass makes no progress (a cycle).
         params = dict(params)
         alias_count = sum(isinstance(v, ParameterAlias) for v in params.values())
 

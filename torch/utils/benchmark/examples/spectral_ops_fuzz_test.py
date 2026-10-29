@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Command line microbenchmark for the torch.fft transforms. Defines a table of benchmarks
+# (BENCHMARKS, with lookup BENCHMARK_MAP and names), runs each on the chosen devices with
+# fuzzed inputs from the spectral fuzzer, optionally writes a CSV of the timings, and prints a
+# Compare table. The script body runs only under the main guard; importing has no side effects
+# beyond defining names.
 """Microbenchmarks for the torch.fft module"""
 from argparse import ArgumentParser
 from collections import namedtuple
@@ -11,6 +17,9 @@ from torch.utils.benchmark.op_fuzzers.spectral import SpectralOpFuzzer
 
 
 def _dim_options(ndim):
+    # [FUNCTION DOC] HELPER: Returns the list of transform dimension choices to benchmark for a
+    # tensor of 1 to 3 dimensions (none meaning all dimensions, single axes, and axis pairs).
+    # Raises a value error for any other dimension count.
     if ndim == 1:
         return [None]
     elif ndim == 2:
@@ -22,6 +31,11 @@ def _dim_options(ndim):
 
 def run_benchmark(name: str, function: object, dtype: torch.dtype, seed: int, device: str, samples: int,
                   probability_regular: float):
+    # [FUNCTION DOC] Benchmarks one transform function over the given number of fuzzed inputs
+    # of the given dtype. For each sample and each dim choice it times the call (several thread
+    # counts on cpu, one on cuda) with a one second minimum run, attaches metadata (name,
+    # device, dim, shape and the fuzzed tensor properties) and collects the measurements.
+    # Returns the list of measurements.
     cuda = device == 'cuda'
     spectral_fuzzer = SpectralOpFuzzer(seed=seed, dtype=dtype, cuda=cuda,
                                        probability_regular=probability_regular)
@@ -64,6 +78,11 @@ BENCHMARK_NAMES = [b.name for b in BENCHMARKS]
 DEVICE_NAMES = ['cpu', 'cuda']
 
 def _output_csv(file, results) -> None:
+    # [FUNCTION DOC] HELPER: Writes a header and then one comma separated line per measurement
+    # (benchmark, device, threads, element count, shape, contiguity, dim, mean, median and
+    # interquartile range in microseconds) to the open file.
+    # KNOWN ISSUE: the shape string is computed only in the branch where dim is not iterable,
+    # so an iterable dim reuses a stale value or hits an unbound name on the first row.
     file.write('benchmark,device,num_threads,numel,shape,contiguous,dim,mean (us),median (us),iqr (us)\n')
     for measurement in results:
         metadata = measurement.metadata
