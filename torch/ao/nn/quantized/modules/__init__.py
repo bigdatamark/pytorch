@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [PACKAGE DOC] Package of quantized nn modules (Conv, Linear, BatchNorm, activations, embeddings, RNN,
+# normalization, dropout, functional wrappers). Imports torch.ao.nn.quantizable first to resolve its
+# lazy imports, re-exports the module classes listed in __all__, and itself defines Quantize and
+# DeQuantize, the modules that convert tensors between float and quantized representations.
 import torch
 
 # The quantized modules use `torch.nn` and `torch.ao.nn.quantizable`
@@ -79,6 +83,9 @@ __all__ = [
 
 
 class Quantize(torch.nn.Module):
+    # [CLASS DOC] Module that quantizes a float tensor per-tensor with fixed scale, zero_point and dtype.
+    # State: buffers scale (float) and zero_point (long), both one-element tensors, plus a plain dtype
+    # attribute. Built directly or from a float module with an observer via from_float.
     r"""Quantizes an incoming tensor
 
     Args:
@@ -106,6 +113,9 @@ class Quantize(torch.nn.Module):
     zero_point: torch.Tensor
 
     def __init__(self, scale, zero_point, dtype, factory_kwargs=None):
+        # [FUNCTION DOC] Stores scale and zero_point as one-element buffers (zero_point forced to long dtype,
+        # other factory kwargs such as device are shared) and records the target dtype. factory_kwargs is an
+        # optional mapping validated by torch.nn.factory_kwargs.
         factory_kwargs = torch.nn.factory_kwargs(factory_kwargs)
         super().__init__()
         self.register_buffer("scale", torch.tensor([scale], **factory_kwargs))
@@ -120,12 +130,17 @@ class Quantize(torch.nn.Module):
         self.dtype = dtype
 
     def forward(self, X):
+        # [FUNCTION DOC] Quantizes tensor X per-tensor using the stored scale, zero_point and dtype; returns
+        # the quantized tensor.
         return torch.quantize_per_tensor(
             X, float(self.scale), int(self.zero_point), self.dtype
         )
 
     @staticmethod
     def from_float(mod, use_precomputed_fake_quant=False):
+        # [FUNCTION DOC] Static method: builds a Quantize from a float module mod that was observed. Reads
+        # scale and zero_point from the module's activation_post_process observer and uses its dtype.
+        # Raises AssertionError if mod has no activation_post_process attribute.
         if not hasattr(mod, "activation_post_process"):
             raise AssertionError(
                 f"Module {type(mod).__name__} must have activation_post_process attribute"
@@ -138,10 +153,12 @@ class Quantize(torch.nn.Module):
         )
 
     def extra_repr(self):
+        # [FUNCTION DOC] HELPER: Returns a string describing scale, zero_point and dtype for the module repr.
         return f"scale={self.scale}, zero_point={self.zero_point}, dtype={self.dtype}"
 
 
 class DeQuantize(torch.nn.Module):
+    # [CLASS DOC] Stateless module that converts a quantized tensor back to a float tensor.
     r"""Dequantizes an incoming tensor
 
     Examples::
@@ -158,8 +175,10 @@ class DeQuantize(torch.nn.Module):
     """
 
     def forward(self, Xq):
+        # [FUNCTION DOC] Returns the dequantized (float) version of the quantized input tensor Xq.
         return Xq.dequantize()
 
     @staticmethod
     def from_float(mod, use_precomputed_fake_quant=False):
+        # [FUNCTION DOC] Static method: returns a new DeQuantize; mod and the flag are ignored.
         return DeQuantize()

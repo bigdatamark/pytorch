@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Functional interface for quantized tensors: pooling (avg, adaptive avg, max), convolutions
+# (1d/2d/3d), linear, interpolate and deprecated upsample variants, and activations (celu, leaky_relu,
+# hardtanh, hardswish, threshold, elu, hardsigmoid, clamp). Mostly thin wrappers that validate the input
+# is quantized and call torch.nn.functional or torch.ops.quantized kernels. No import-time side effects.
 r"""Functional interface (quantized)."""
 
 import warnings
@@ -49,6 +53,9 @@ def avg_pool2d(
     count_include_pad=True,
     divisor_override=None,
 ):
+    # [FUNCTION DOC] Average pooling over 2D regions of a quantized input; quantization parameters propagate
+    # to the output. Args mirror torch.nn.functional.avg_pool2d (kernel_size, stride, padding, ceil_mode,
+    # count_include_pad, divisor_override). Raises ValueError if input is not quantized.
     r"""
     Applies 2D average-pooling operation in :math:`kH \times kW` regions by step size
     :math:`sH \times sW` steps. The number of output features is equal to the number of
@@ -95,6 +102,8 @@ def avg_pool3d(
     count_include_pad=True,
     divisor_override=None,
 ):
+    # [FUNCTION DOC] Average pooling over 3D regions of a quantized input; delegates to the float functional
+    # avg_pool3d with the same arguments. Raises ValueError if input is not quantized.
     r"""
     Applies 3D average-pooling operation in :math:`kD \ times kH \times kW` regions by step size
     :math:`sD \times sH \times sW` steps. The number of output features is equal to the number of
@@ -131,6 +140,8 @@ def avg_pool3d(
 
 
 def adaptive_avg_pool2d(input: Tensor, output_size: BroadcastingList2[int]) -> Tensor:
+    # [FUNCTION DOC] Adaptive average pooling (2D) of a quantized input to output_size; returns the pooled
+    # quantized tensor. Raises ValueError if input is not quantized.
     r"""
     Applies a 2D adaptive average pooling over a quantized input signal composed
     of several quantized input planes.
@@ -151,6 +162,9 @@ def adaptive_avg_pool2d(input: Tensor, output_size: BroadcastingList2[int]) -> T
 
 
 def adaptive_avg_pool3d(input: Tensor, output_size: BroadcastingList2[int]) -> Tensor:
+    # [FUNCTION DOC] Adaptive average pooling of a quantized input to output_size via the float 3D adaptive
+    # pooling function. Raises ValueError if input is not quantized.
+    # KNOWN ISSUE: the output_size annotation is the 2-element broadcasting list type, not a 3D size.
     r"""
     Applies a 3D adaptive average pooling over a quantized input signal composed
     of several quantized input planes.
@@ -183,6 +197,10 @@ def conv1d(
     zero_point=0,
     dtype=torch.quint8,
 ):
+    # [FUNCTION DOC] Quantized 1D convolution. Validates arguments, expands stride/padding/dilation to
+    # two-element pairs, prepacks the weight and bias on every call and runs the quantized conv1d kernel with
+    # output scale and zero_point. Raises NotImplementedError if padding_mode is not "zeros", input is not
+    # quint8 or weight is not qint8; ValueError if input is not 3D. The dtype argument is unused.
     r"""
     Applies a 1D convolution over a quantized 1D input composed of several input
     planes.
@@ -256,6 +274,10 @@ def conv2d(
     zero_point=0,
     dtype=torch.quint8,
 ):
+    # [FUNCTION DOC] Quantized 2D convolution: validates modes and dtypes (zero padding, quint8 input, qint8
+    # weight), expands stride/padding/dilation to pairs, prepacks weight and bias and runs the quantized conv2d
+    # kernel with the output scale and zero_point. Raises NotImplementedError for unsupported mode or dtype;
+    # ValueError if input is not 4D. The dtype argument is unused.
     r"""
     Applies a 2D convolution over a quantized 2D input composed of several input
     planes.
@@ -329,6 +351,9 @@ def conv3d(
     zero_point=0,
     dtype=torch.quint8,
 ):
+    # [FUNCTION DOC] Quantized 3D convolution: same checks and flow as conv2d but for 5D input, expanding
+    # stride/padding/dilation to triples and using the conv3d kernels. Raises NotImplementedError for
+    # unsupported padding mode or dtypes; ValueError if input is not 5D. The dtype argument is unused.
     r"""
     Applies a 3D convolution over a quantized 3D input composed of several input
     planes.
@@ -396,6 +421,8 @@ def conv3d(
 def interpolate(
     input, size=None, scale_factor=None, mode="nearest", align_corners=None
 ):
+    # [FUNCTION DOC] Resizes a quantized input to size or by scale_factor using the float interpolate function
+    # (only nearest and bilinear modes work for quantized data). Raises ValueError if input is not quantized.
     r"""Down/up samples the input to either the given :attr:`size` or the given
     :attr:`scale_factor`
 
@@ -445,6 +472,9 @@ def linear(
     scale: float | None = None,
     zero_point: int | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Quantized linear layer: if scale or zero_point is None it is taken from the input's
+    # quantization parameters; weight and bias are prepacked on every call, then the quantized linear kernel
+    # runs. Returns a quantized tensor.
     r"""
     Applies a linear transformation to the incoming quantized data:
     :math:`y = xA^T + b`.
@@ -486,6 +516,9 @@ def max_pool1d(
     ceil_mode=False,
     return_indices=False,
 ):
+    # [FUNCTION DOC] Quantized 1D max pooling via the float functional max_pool1d (parameters propagate).
+    # Raises NotImplementedError if return_indices is true. A missing stride becomes an empty list so the
+    # kernel size is used.
     r"""Applies a 1D max pooling over a quantized input signal composed of
     several quantized input planes.
 
@@ -517,6 +550,8 @@ def max_pool2d(
     ceil_mode=False,
     return_indices=False,
 ):
+    # [FUNCTION DOC] Quantized 2D max pooling via the float functional max_pool2d; same behavior and error
+    # conditions as max_pool1d.
     r"""Applies a 2D max pooling over a quantized input signal composed of
     several quantized input planes.
 
@@ -540,6 +575,8 @@ def max_pool2d(
 
 
 def celu(input: Tensor, scale: float, zero_point: int, alpha: float = 1.0) -> Tensor:
+    # [FUNCTION DOC] Quantized CELU with output scale, zero_point and alpha, via the quantized celu kernel.
+    # Raises ValueError if input is not quantized.
     r"""celu(input, scale, zero_point, alpha=1.) -> Tensor
 
     Applies the quantized CELU function element-wise.
@@ -563,6 +600,9 @@ def leaky_relu(
     scale: float | None = None,
     zero_point: int | None = None,
 ):
+    # [FUNCTION DOC] Quantized leaky ReLU. If both scale and zero_point are given, writes into a new quantized
+    # output with those parameters (and raises AssertionError if inplace is also requested). Otherwise
+    # applies the op in place or out of place keeping input qparams. Returns the result tensor.
     r"""
     Quantized version of the.
     leaky_relu(input, negative_slope=0.01, inplace=False, scale, zero_point) -> Tensor
@@ -596,6 +636,8 @@ def leaky_relu(
 def hardtanh(
     input: Tensor, min_val: float = -1.0, max_val: float = 1.0, inplace: bool = False
 ) -> Tensor:
+    # [FUNCTION DOC] Quantized hardtanh clamped between min_val and max_val, in place if inplace. Raises
+    # ValueError if input is not quantized.
     r"""This is the quantized version of :func:`~torch.nn.functional.hardtanh`."""
     if not input.is_quantized:
         raise ValueError("Input to 'quantized.hardtanh' must be quantized!")
@@ -605,6 +647,8 @@ def hardtanh(
 
 
 def hardswish(input: Tensor, scale: float, zero_point: int) -> Tensor:
+    # [FUNCTION DOC] Quantized hardswish with output scale and zero_point via the quantized kernel. Raises
+    # ValueError if input is not quantized.
     r"""This is the quantized version of :func:`~torch.nn.functional.hardswish`.
 
     Args:
@@ -618,6 +662,8 @@ def hardswish(input: Tensor, scale: float, zero_point: int) -> Tensor:
 
 
 def threshold(input: Tensor, threshold: float, value: float) -> Tensor:
+    # [FUNCTION DOC] Quantized threshold: values not above the threshold are replaced by value. Raises
+    # ValueError if input is not quantized or if threshold or value is None.
     r"""Applies the quantized version of the threshold function element-wise:
 
     .. math::
@@ -638,6 +684,8 @@ def threshold(input: Tensor, threshold: float, value: float) -> Tensor:
 
 
 def elu(input: Tensor, scale: float, zero_point: int, alpha: float = 1.0) -> Tensor:
+    # [FUNCTION DOC] Quantized ELU with output scale, zero_point and alpha via the quantized kernel. Raises
+    # ValueError if input is not quantized.
     r"""This is the quantized version of :func:`~torch.nn.functional.elu`.
 
     Args:
@@ -652,6 +700,7 @@ def elu(input: Tensor, scale: float, zero_point: int, alpha: float = 1.0) -> Ten
 
 
 def hardsigmoid(input: Tensor, inplace: bool = False) -> Tensor:
+    # [FUNCTION DOC] Quantized hardsigmoid, in place if inplace. Raises ValueError if input is not quantized.
     r"""This is the quantized version of :func:`~torch.nn.functional.hardsigmoid`."""
     if not input.is_quantized:
         raise ValueError("Input to 'quantized.hardsigmoid' must be quantized!")
@@ -661,6 +710,8 @@ def hardsigmoid(input: Tensor, inplace: bool = False) -> Tensor:
 
 
 def clamp(input: Tensor, min_: float, max_: float) -> Tensor:
+    # [FUNCTION DOC] Clamps a quantized tensor between min_ and max_ using torch.clamp. Raises ValueError if
+    # input is not quantized.
     r"""float(input, min\_, max\_) -> Tensor
 
     Applies the clamp function element-wise.
@@ -677,6 +728,7 @@ def clamp(input: Tensor, min_: float, max_: float) -> Tensor:
 
 
 def upsample(input, size=None, scale_factor=None, mode="nearest", align_corners=None):
+    # [FUNCTION DOC] Deprecated alias of interpolate: emits a warning and returns the interpolated result.
     r"""Upsamples the input to either the given :attr:`size` or the given
     :attr:`scale_factor`
 
@@ -734,6 +786,7 @@ def upsample(input, size=None, scale_factor=None, mode="nearest", align_corners=
 
 
 def upsample_bilinear(input, size=None, scale_factor=None):
+    # [FUNCTION DOC] Deprecated: emits a warning and calls interpolate with bilinear mode and corner alignment on.
     r"""Upsamples the input, using bilinear upsampling.
 
     .. warning::
@@ -760,6 +813,7 @@ def upsample_bilinear(input, size=None, scale_factor=None):
 
 
 def upsample_nearest(input, size=None, scale_factor=None):
+    # [FUNCTION DOC] Deprecated: emits a warning and calls interpolate with nearest mode.
     r"""Upsamples the input, using nearest neighbours' pixel values.
 
     .. warning::

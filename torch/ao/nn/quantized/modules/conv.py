@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Quantized convolution and transposed-convolution modules (Conv1d/2d/3d, ConvTranspose1d/2d/3d)
+# built on a shared private base _ConvNd. Weights are stored prepacked in backend-specific packed params
+# and converted to and from quantized tensors for state dict, pickling and copying. Modules store output
+# scale/zero_point and are created from float, QAT or reference modules. No import-time side effects
+# beyond defining the supported padding mode set (zeros, reflect).
 r"""Quantized convolution modules."""
 
 from typing import ClassVar, Literal
@@ -29,6 +34,8 @@ _SUPPORTED_PADDING = {"zeros", "reflect"}
 
 
 def _reverse_repeat_padding(padding: list[int]) -> list[int]:
+# [FUNCTION DOC] HELPER: Converts per-dimension padding amounts into the flat list expected by pad:
+# dimensions are reversed and every amount is repeated twice (once per side). Returns a new list.
     _reversed_padding_repeated_twice: list[int] = []
     N = len(padding)
     for idx in range(N):
@@ -37,6 +44,11 @@ def _reverse_repeat_padding(padding: list[int]) -> list[int]:
 
 
 class _ConvNd(WeightedQuantizedModule):
+    # [CLASS DOC] HELPER: Shared base of the quantized conv modules (derived from WeightedQuantizedModule).
+    # State: in/out channels, kernel_size, stride, padding, dilation, transposed, output_padding, groups,
+    # padding_mode, plus scale and zero_point for the output and a prepacked weight/bias stored by
+    # subclasses via set_weight_bias. Handles repr, state dict (unpacked weight, bias, scale, zero_point),
+    # pickling, copying and the conversion classmethods. Subclasses must call _init instead of __init__.
     def __init__(
         self,
         in_channels,
@@ -51,6 +63,8 @@ class _ConvNd(WeightedQuantizedModule):
         device=None,
         dtype=None,
     ):
+        # [FUNCTION DOC] HELPER: Placeholder constructor that always raises NotImplementedError; subclasses define
+        # their own constructors and call _init (see the referenced PR note).
         # All subclasses have this signature - See PR #49702s
         raise NotImplementedError
 
@@ -70,6 +84,11 @@ class _ConvNd(WeightedQuantizedModule):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Real initializer for subclasses. Validates that out_channels is positive and
+        # that in_channels and out_channels are divisible by groups, and that padding_mode is supported, raising
+        # ValueError otherwise. Stores the hyperparameters, builds a default qint8 quantized weight (scale 1,
+        # zero point 0, shape depends on transposed) and a zero float bias if requested, packs them through
+        # set_weight_bias and sets scale 1.0 and zero_point 0. Device is applied to the weight and bias.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
 
@@ -120,15 +139,21 @@ class _ConvNd(WeightedQuantizedModule):
         self.zero_point = 0
 
     def set_weight_bias(self, qweight, bias_float):
+        # [FUNCTION DOC] HELPER: Abstract hook for subclasses to pack a quantized weight and float bias; raises NotImplementedError.
         raise NotImplementedError
 
     def bias(self):
+        # [FUNCTION DOC] HELPER: Abstract accessor for the bias; raises NotImplementedError.
         raise NotImplementedError
 
     def _weight_bias(self):
+        # [FUNCTION DOC] HELPER: Abstract accessor returning unpacked (weight, bias); raises NotImplementedError.
         raise NotImplementedError
 
     def extra_repr(self):
+        # [FUNCTION DOC] HELPER: Builds the repr string with channels, kernel size, stride, scale and zero point,
+        # adding padding, dilation, output_padding, groups only when non-default and noting bias=False when
+        # no bias exists. Formats using the module attribute mapping.
         s = (
             "{in_channels}, {out_channels}, kernel_size={kernel_size}"
             ", stride={stride}, scale={scale}, zero_point={zero_point}"
@@ -158,6 +183,8 @@ class _ConvNd(WeightedQuantizedModule):
     #   self
     #   |--- _packed_params : Conv2dPackedParamsBase or Conv3dPackedParamsBase
     def _save_to_state_dict(self, destination, prefix, keep_vars):
+        # [FUNCTION DOC] HELPER: Extends state dict saving with the unpacked weight and bias plus scale and
+        # zero_point as tensors under prefixed keys (packed weights are never serialized). Mutates destination.
         super()._save_to_state_dict(destination, prefix, keep_vars)
         (w, b) = self._weight_bias()
         destination[prefix + "weight"] = w
@@ -167,6 +194,8 @@ class _ConvNd(WeightedQuantizedModule):
 
     @torch.jit.export
     def __getstate__(self):
+        # [FUNCTION DOC] HELPER: Returns a tuple of the hyperparameters, unpacked weight and bias, scale,
+        # zero_point and training flag, used for pickling and copying. Exported for TorchScript.
         (w, b) = self._weight_bias()
         return (
             self.in_channels,
@@ -199,6 +228,9 @@ class _ConvNd(WeightedQuantizedModule):
         unexpected_keys,
         error_msgs,
     ):
+        # [FUNCTION DOC] HELPER: Reads and removes the prefixed weight, bias, scale and zero_point from state_dict,
+        # repacks the weight and bias, then runs the standard loading with strict checking disabled.
+        # Raises KeyError if an entry is missing.
         self.set_weight_bias(state_dict[prefix + "weight"], state_dict[prefix + "bias"])
         state_dict.pop(prefix + "weight")
         state_dict.pop(prefix + "bias")
@@ -218,6 +250,8 @@ class _ConvNd(WeightedQuantizedModule):
 
     @torch.jit.export
     def __setstate__(self, state):
+        # [FUNCTION DOC] HELPER: Restores attributes from the tuple produced by __getstate__ and repacks the
+        # weight and bias. Exported for TorchScript.
         self.in_channels = state[0]
         self.out_channels = state[1]
         self.kernel_size = state[2]
@@ -234,6 +268,8 @@ class _ConvNd(WeightedQuantizedModule):
         self.training = state[14]
 
     def __deepcopy__(self, memo):
+        # [FUNCTION DOC] HELPER: Deep copy support: creates a bare instance, initializes the Module base and restores
+        # the state obtained from __getstate__ (memo is unused). Returns the new instance.
         new_instance = type(self).__new__(type(self))
         torch.nn.Module.__init__(new_instance)
         state = self.__getstate__()
@@ -241,10 +277,16 @@ class _ConvNd(WeightedQuantizedModule):
         return new_instance
 
     def __copy__(self):
+        # [FUNCTION DOC] HELPER: Shallow copy is implemented as a full deep copy; returns the new instance.
         return self.__deepcopy__({})
 
     @classmethod
     def get_qconv(cls, mod, activation_post_process, weight_post_process=None):
+        # [FUNCTION DOC] Class method: builds a quantized conv of class cls from a float or QAT module mod. Runs the
+        # weight observer (taken from the module qconfig if not given) on mod's weight and requires it to have
+        # dtype qint8 (AssertionError otherwise), quantizes the weight, constructs the module using mod's
+        # hyperparameters, and packs the weight and bias. If an activation observer with non-float dtype is given
+        # its scale and zero point are stored as output qparams; otherwise (dynamic quantization) they stay default.
         r"""Creates a qconv object and returns it."""
         if weight_post_process is None:
             weight_post_process = mod.qconfig.weight()
@@ -280,6 +322,11 @@ class _ConvNd(WeightedQuantizedModule):
 
     @staticmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
+        # [FUNCTION DOC] Static helper (takes the target class explicitly) that converts a float or QAT conv. For a
+        # QAT module (has weight_fake_quant) it folds batch norm into the weight and bias when the module is the
+        # conv-bn type, requires an attached activation_post_process and uses the fake quant as weight observer.
+        # For a float module it requires the exact float type and a qconfig, unwraps fused relu/add modules to the
+        # inner conv and takes the weight observer from qconfig. Raises AssertionError on violations. Delegates to get_qconv.
         if hasattr(mod, "weight_fake_quant"):
             # assert type(mod) is cls.__QAT_MODULE, " nnq." + cls.__name__ + \
             # ".from_float only works for " + cls.__QAT_MODULE.__name__
@@ -321,6 +368,9 @@ class _ConvNd(WeightedQuantizedModule):
 
     @classmethod
     def from_reference(cls, ref_qconv, output_scale, output_zero_point):
+        # [FUNCTION DOC] Class method: builds a quantized conv from a reference quantized conv ref_qconv, copying its
+        # hyperparameters, device and dtype, taking its quantized weight and bias, and setting the given
+        # output_scale and output_zero_point. Returns the new module.
         r"""Create a (fbgemm/qnnpack) quantized module from a reference quantized module
         Args:
             ref_qconv (Module): a reference quantized  module, either produced by torch.ao.quantization
@@ -349,6 +399,9 @@ class _ConvNd(WeightedQuantizedModule):
 
 
 class Conv1d(_ConvNd):
+    # [CLASS DOC] Quantized 1D convolution (input quint8, weight packed qint8). Class attributes name the
+    # float module and the fused/QAT module types it can be converted from. Output qparams in scale and
+    # zero_point; the weight is held in _packed_params. Padding modes: zeros natively, reflect by explicit padding.
     r"""Applies a 1D convolution over a quantized input signal composed of
     several quantized input planes.
 
@@ -403,6 +456,8 @@ class Conv1d(_ConvNd):
         device=None,
         dtype=None,
     ):
+        # [FUNCTION DOC] Normalizes kernel_size, stride, padding (unless a string) and dilation to 1-tuples and
+        # calls the shared _init with transposed False and zero output padding.
         factory_kwargs = {"device": device, "dtype": dtype}
         kernel_size = _single(kernel_size)
         stride = _single(stride)
@@ -428,9 +483,13 @@ class Conv1d(_ConvNd):
         )
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name "QuantizedConv1d".
         return "QuantizedConv1d"
 
     def set_weight_bias(self, w: torch.Tensor, b: torch.Tensor | None) -> None:
+        # [FUNCTION DOC] Prepacks quantized weight w and optional float bias b with the conv1d prepack kernel and
+        # stores the result in _packed_params. For non-zero padding modes the packed padding is zero because
+        # padding is applied explicitly in forward.
         if self.padding_mode == "zeros":
             self._packed_params = torch.ops.quantized.conv1d_prepack(
                 w, b, self.stride, self.padding, self.dilation, self.groups
@@ -441,16 +500,22 @@ class Conv1d(_ConvNd):
             )
 
     def _weight_bias(self):
+        # [FUNCTION DOC] HELPER: Unpacks _packed_params and returns the (weight, bias) pair.
         w, b = torch.ops.quantized.conv1d_unpack(self._packed_params)
         return w, b
 
     def weight(self):
+        # [FUNCTION DOC] Returns the unpacked quantized weight tensor.
         return self._weight_bias()[0]
 
     def bias(self):
+        # [FUNCTION DOC] Returns the unpacked bias tensor (or None).
         return self._weight_bias()[1]
 
     def forward(self, input):
+        # [FUNCTION DOC] Runs the quantized 1D convolution. Raises ValueError if the input is not 3-dimensional.
+        # For non-zero padding modes the input is first padded explicitly using the first padding value.
+        # Returns a quantized tensor with the stored scale and zero_point.
         # Temporarily using len(shape) instead of ndim due to JIT issue
         # https://github.com/pytorch/pytorch/issues/23890
         if len(input.shape) != 3:
@@ -467,6 +532,7 @@ class Conv1d(_ConvNd):
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):  # type: ignore[override]
+        # [FUNCTION DOC] Class method: converts a float or QAT module via the shared _ConvNd conversion helper.
         r"""Creates a quantized module from a float module or qparams_dict.
 
         Args:
@@ -479,6 +545,8 @@ class Conv1d(_ConvNd):
 
 
 class Conv2d(_ConvNd):
+    # [CLASS DOC] Quantized 2D convolution (input quint8, weight packed qint8); class attributes name the
+    # float, QAT conv-bn, fused relu and add module types it converts from. Stores output scale/zero_point and _packed_params.
     r"""Applies a 2D convolution over a quantized input signal composed of
     several quantized input planes.
 
@@ -537,6 +605,8 @@ class Conv2d(_ConvNd):
         device=None,
         dtype=None,
     ):
+        # [FUNCTION DOC] Normalizes kernel_size, stride, padding and dilation to pairs and calls the shared _init
+        # with transposed False and zero output padding.
         factory_kwargs = {"device": device, "dtype": dtype}
         kernel_size = _pair(kernel_size)
         stride = _pair(stride)
@@ -560,9 +630,12 @@ class Conv2d(_ConvNd):
         )
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name "QuantizedConv2d".
         return "QuantizedConv2d"
 
     def set_weight_bias(self, w: torch.Tensor, b: torch.Tensor | None) -> None:
+        # [FUNCTION DOC] Prepacks quantized weight w and optional float bias b with the conv2d prepack kernel and
+        # stores the result in _packed_params. For non-zero padding modes the packed padding is zero.
         if self.padding_mode == "zeros":
             self._packed_params = torch.ops.quantized.conv2d_prepack(
                 w, b, self.stride, self.padding, self.dilation, self.groups
@@ -573,15 +646,20 @@ class Conv2d(_ConvNd):
             )
 
     def _weight_bias(self):
+        # [FUNCTION DOC] HELPER: Returns the (weight, bias) pair unpacked from the packed params.
         return self._packed_params.unpack()
 
     def weight(self):
+        # [FUNCTION DOC] Returns the unpacked quantized weight tensor.
         return self._weight_bias()[0]
 
     def bias(self):
+        # [FUNCTION DOC] Returns the unpacked bias tensor (or None).
         return self._weight_bias()[1]
 
     def forward(self, input):
+        # [FUNCTION DOC] Runs the quantized 2D convolution. Raises ValueError if the input is not 4-dimensional.
+        # For non-zero padding modes the input is explicitly padded first. Returns a quantized tensor with the stored qparams.
         # Temporarily using len(shape) instead of ndim due to JIT issue
         # https://github.com/pytorch/pytorch/issues/23890
         if len(input.shape) != 4:
@@ -597,6 +675,7 @@ class Conv2d(_ConvNd):
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):  # type: ignore[override]
+        # [FUNCTION DOC] Class method: converts a float or QAT module via the shared _ConvNd conversion helper.
         r"""Creates a quantized module from a float module or qparams_dict.
 
         Args:
@@ -609,6 +688,8 @@ class Conv2d(_ConvNd):
 
 
 class Conv3d(_ConvNd):
+    # [CLASS DOC] Quantized 3D convolution (input quint8, weight packed qint8); class attributes name the
+    # float, QAT conv-bn and fused relu module types it converts from. Reflect padding is not supported.
     r"""Applies a 3D convolution over a quantized input signal composed of
     several quantized input planes.
 
@@ -667,6 +748,8 @@ class Conv3d(_ConvNd):
         device=None,
         dtype=None,
     ):
+        # [FUNCTION DOC] Normalizes kernel_size, stride, padding and dilation to triples and calls the shared _init
+        # with transposed False and zero output padding. Raises AssertionError if padding_mode is reflect.
         if padding_mode == "reflect":
             raise AssertionError("Conv3d does not support reflection padding")
         factory_kwargs = {"device": device, "dtype": dtype}
@@ -692,9 +775,12 @@ class Conv3d(_ConvNd):
         )
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name "QuantizedConv3d".
         return "QuantizedConv3d"
 
     def set_weight_bias(self, w: torch.Tensor, b: torch.Tensor | None) -> None:
+        # [FUNCTION DOC] Prepacks quantized weight w and optional float bias b with the conv3d prepack kernel and
+        # stores the result in _packed_params. For non-zero padding modes the packed padding is zero.
         if self.padding_mode == "zeros":
             self._packed_params = torch.ops.quantized.conv3d_prepack(
                 w, b, self.stride, self.padding, self.dilation, self.groups
@@ -705,15 +791,20 @@ class Conv3d(_ConvNd):
             )
 
     def _weight_bias(self):
+        # [FUNCTION DOC] HELPER: Returns the (weight, bias) pair unpacked from the packed params.
         return self._packed_params.unpack()
 
     def weight(self):
+        # [FUNCTION DOC] Returns the unpacked quantized weight tensor.
         return self._weight_bias()[0]
 
     def bias(self):
+        # [FUNCTION DOC] Returns the unpacked bias tensor (or None).
         return self._weight_bias()[1]
 
     def forward(self, input):
+        # [FUNCTION DOC] Runs the quantized 3D convolution. Raises ValueError if the input is not 5-dimensional.
+        # For non-zero padding modes the input is explicitly padded first. Returns a quantized tensor with the stored qparams.
         # Temporarily using len(shape) instead of ndim due to JIT issue
         # https://github.com/pytorch/pytorch/issues/23890
         if len(input.shape) != 5:
@@ -729,6 +820,7 @@ class Conv3d(_ConvNd):
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):  # type: ignore[override]
+        # [FUNCTION DOC] Class method: converts a float or QAT module via the shared _ConvNd conversion helper.
         r"""Creates a quantized module from a float module or qparams_dict.
 
         Args:
@@ -744,6 +836,9 @@ class Conv3d(_ConvNd):
 
 
 class _ConvTransposeNd(_ConvNd):
+    # [CLASS DOC] HELPER: Shared base of the quantized transposed convolutions. Only zeros padding is allowed.
+    # Provides float conversion and reference conversion; subclasses supply the dimension specific packing,
+    # unpacking and forward, and name their float module type in _FLOAT_MODULE.
     _FLOAT_MODULE: ClassVar[type[nn.modules.conv._ConvNd]]
 
     def __init__(
@@ -762,6 +857,8 @@ class _ConvTransposeNd(_ConvNd):
         device=None,
         dtype=None,
     ):
+        # [FUNCTION DOC] HELPER: Raises ValueError if padding_mode is not zeros; otherwise forwards all arguments
+        # to the shared _init of the conv base.
         if padding_mode != "zeros":
             raise ValueError(
                 f'Only "zeros" padding mode is supported for {self.__class__.__name__}'
@@ -787,6 +884,8 @@ class _ConvTransposeNd(_ConvNd):
     def _input_padding(
         self, kernel_size: list[int], dilation: list[int], padding: list[int]
     ) -> list[int]:
+        # [FUNCTION DOC] HELPER: Computes per-dimension input padding as dilation times (kernel size minus one)
+        # minus padding for each dimension and returns it as a list. Not used by the code in this file.
         res = torch.jit.annotate(list[int], [])
         for kdx in range(len(kernel_size)):
             pad = dilation[kdx] * (kernel_size[kdx] - 1) - padding[kdx]
@@ -795,6 +894,11 @@ class _ConvTransposeNd(_ConvNd):
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):  # type: ignore[override]
+        # [FUNCTION DOC] Class method: converts a float transposed conv mod (exact type must equal the class's
+        # _FLOAT_MODULE and it needs a qconfig, else AssertionError). Runs the qconfig weight observer (must be
+        # qint8, else AssertionError), quantizes the weight, constructs the module from mod's hyperparameters and
+        # packs weight and bias. Activation scale and zero point are copied from the module's
+        # activation_post_process observer unless it is missing or float (dynamic quantization).
         r"""Creates a quantized module from a float module or qparams_dict.
         Args:
             mod (Module): a float module, either produced by torch.ao.quantization
@@ -846,6 +950,9 @@ class _ConvTransposeNd(_ConvNd):
 
     @staticmethod
     def from_reference(cls, ref_qconvt, output_scale, output_zero_point):  # type: ignore[override]
+        # [FUNCTION DOC] Static helper (takes the target class explicitly) that builds a quantized transposed conv
+        # from a reference module: copies hyperparameters, device and dtype, sets the reference's quantized
+        # weight and bias, and sets output_scale and output_zero_point. Returns the new module.
         r"""Create a (fbgemm/qnnpack) quantized module from a reference quantized module
         Args:
             ref_qconvt (Module): a reference quantized  module, either produced by torch.ao.quantization
@@ -875,6 +982,8 @@ class _ConvTransposeNd(_ConvNd):
 
 
 class ConvTranspose1d(_ConvTransposeNd):
+    # [CLASS DOC] Quantized 1D transposed convolution (documented as QNNPACK-engine only). Created directly
+    # or via from_reference; from_float is inherited from the shared base.
     r"""Applies a 1D transposed convolution operator over an input image
     composed of several input planes.
     For details on input arguments, parameters, and implementation see
@@ -935,6 +1044,8 @@ class ConvTranspose1d(_ConvTransposeNd):
         device=None,
         dtype=None,
     ):
+        # [FUNCTION DOC] Normalizes kernel_size, stride, padding, dilation and output_padding to 1-tuples and
+        # calls the transposed base initializer with transposed set to true.
         factory_kwargs = {"device": device, "dtype": dtype}
         kernel_size = _single(kernel_size)
         stride = _single(stride)
@@ -958,9 +1069,12 @@ class ConvTranspose1d(_ConvTransposeNd):
         )
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name "QuantizedConvTranspose1d".
         return "QuantizedConvTranspose1d"
 
     def set_weight_bias(self, w: torch.Tensor, b: torch.Tensor | None) -> None:
+        # [FUNCTION DOC] Prepacks weight w and optional bias b with the transposed conv1d prepack kernel (using
+        # stride, padding, output_padding, dilation and groups) and stores the packed params.
         self._packed_params = torch.ops.quantized.conv_transpose1d_prepack(
             w,
             b,
@@ -972,18 +1086,23 @@ class ConvTranspose1d(_ConvTransposeNd):
         )
 
     def _weight_bias(self):
+        # [FUNCTION DOC] HELPER: Returns the (weight, bias) pair unpacked by the transposed conv1d unpack kernel.
         w, b = torch.ops.quantized.conv_transpose1d_unpack(self._packed_params)
         return w, b
 
     def weight(self):
+        # [FUNCTION DOC] Returns the unpacked quantized weight tensor.
         (w, _) = self._weight_bias()
         return w
 
     def bias(self):
+        # [FUNCTION DOC] Returns the unpacked bias tensor (or None).
         (_, b) = self._weight_bias()
         return b
 
     def forward(self, input):
+        # [FUNCTION DOC] Runs the quantized transposed 1D convolution with the stored scale and zero_point.
+        # Raises ValueError if the input is not 3-dimensional.
         # Temporarily using len(shape) instead of ndim due to JIT issue
         # https://github.com/pytorch/pytorch/issues/23890
         if len(input.shape) != 3:
@@ -994,12 +1113,15 @@ class ConvTranspose1d(_ConvTransposeNd):
 
     @classmethod
     def from_reference(cls, ref_qconvt, output_scale, output_zero_point):  # type: ignore[override]
+        # [FUNCTION DOC] Class method: builds the module from a reference quantized module via the shared
+        # transposed-conv helper, with the given output scale and zero point.
         return _ConvTransposeNd.from_reference(
             cls, ref_qconvt, output_scale, output_zero_point
         )
 
 
 class ConvTranspose2d(_ConvTransposeNd):
+    # [CLASS DOC] Quantized 2D transposed convolution (QNNPACK or FBGEMM). Created directly or via from_reference.
     r"""Applies a 2D transposed convolution operator over an input image
     composed of several input planes.
     For details on input arguments, parameters, and implementation see
@@ -1058,6 +1180,8 @@ class ConvTranspose2d(_ConvTransposeNd):
         device=None,
         dtype=None,
     ):
+        # [FUNCTION DOC] Normalizes kernel_size, stride, padding, dilation and output_padding to pairs and calls
+        # the transposed base initializer with transposed set to true.
         factory_kwargs = {"device": device, "dtype": dtype}
         kernel_size = _pair(kernel_size)
         stride = _pair(stride)
@@ -1081,9 +1205,11 @@ class ConvTranspose2d(_ConvTransposeNd):
         )
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name "QuantizedConvTranspose2d".
         return "QuantizedConvTranspose2d"
 
     def set_weight_bias(self, w: torch.Tensor, b: torch.Tensor | None) -> None:
+        # [FUNCTION DOC] Prepacks weight w and optional bias b with the transposed conv2d prepack kernel and stores the packed params.
         self._packed_params = torch.ops.quantized.conv_transpose2d_prepack(
             w,
             b,
@@ -1095,18 +1221,23 @@ class ConvTranspose2d(_ConvTransposeNd):
         )
 
     def _weight_bias(self):
+        # [FUNCTION DOC] HELPER: Returns the (weight, bias) pair unpacked by the conv2d unpack kernel.
         w, b = torch.ops.quantized.conv2d_unpack(self._packed_params)
         return w, b
 
     def weight(self):
+        # [FUNCTION DOC] Returns the unpacked quantized weight tensor.
         (w, _) = self._weight_bias()
         return w
 
     def bias(self):
+        # [FUNCTION DOC] Returns the unpacked bias tensor (or None).
         (_, b) = self._weight_bias()
         return b
 
     def forward(self, input):
+        # [FUNCTION DOC] Runs the quantized transposed 2D convolution with the stored qparams. Raises ValueError if
+        # the input is not 4-dimensional.
         # Temporarily using len(shape) instead of ndim due to JIT issue
         # https://github.com/pytorch/pytorch/issues/23890
         if len(input.shape) != 4:
@@ -1117,12 +1248,15 @@ class ConvTranspose2d(_ConvTransposeNd):
 
     @classmethod
     def from_reference(cls, ref_qconvt, output_scale, output_zero_point):  # type: ignore[override]
+        # [FUNCTION DOC] Class method: builds the module from a reference quantized module via the shared
+        # transposed-conv helper, with the given output scale and zero point.
         return _ConvTransposeNd.from_reference(
             cls, ref_qconvt, output_scale, output_zero_point
         )
 
 
 class ConvTranspose3d(_ConvTransposeNd):
+    # [CLASS DOC] Quantized 3D transposed convolution (documented as FBGEMM-engine only). Created directly or via from_reference.
     r"""Applies a 3D transposed convolution operator over an input image
     composed of several input planes.
     For details on input arguments, parameters, and implementation see
@@ -1183,6 +1317,8 @@ class ConvTranspose3d(_ConvTransposeNd):
         device=None,
         dtype=None,
     ):
+        # [FUNCTION DOC] Normalizes kernel_size, stride, padding, dilation and output_padding to triples and calls
+        # the transposed base initializer with transposed set to true.
         factory_kwargs = {"device": device, "dtype": dtype}
         kernel_size = _triple(kernel_size)
         stride = _triple(stride)
@@ -1206,9 +1342,11 @@ class ConvTranspose3d(_ConvTransposeNd):
         )
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name "QuantizedConvTranspose3d".
         return "QuantizedConvTranspose3d"
 
     def set_weight_bias(self, w: torch.Tensor, b: torch.Tensor | None) -> None:
+        # [FUNCTION DOC] Prepacks weight w and optional bias b with the transposed conv3d prepack kernel and stores the packed params.
         self._packed_params = torch.ops.quantized.conv_transpose3d_prepack(
             w,
             b,
@@ -1220,18 +1358,23 @@ class ConvTranspose3d(_ConvTransposeNd):
         )
 
     def _weight_bias(self):
+        # [FUNCTION DOC] HELPER: Returns the (weight, bias) pair unpacked by the conv3d unpack kernel.
         w, b = torch.ops.quantized.conv3d_unpack(self._packed_params)
         return w, b
 
     def weight(self):
+        # [FUNCTION DOC] Returns the unpacked quantized weight tensor.
         (w, _) = self._weight_bias()
         return w
 
     def bias(self):
+        # [FUNCTION DOC] Returns the unpacked bias tensor (or None).
         (_, b) = self._weight_bias()
         return b
 
     def forward(self, input):
+        # [FUNCTION DOC] Runs the quantized transposed 3D convolution with the stored qparams. Raises ValueError if
+        # the input is not 5-dimensional.
         # Temporarily using len(shape) instead of ndim due to JIT issue
         # https://github.com/pytorch/pytorch/issues/23890
         if len(input.shape) != 5:
@@ -1242,6 +1385,8 @@ class ConvTranspose3d(_ConvTransposeNd):
 
     @classmethod
     def from_reference(cls, ref_qconvt, output_scale, output_zero_point):  # type: ignore[override]
+        # [FUNCTION DOC] Class method: builds the module from a reference quantized module via the shared
+        # transposed-conv helper, with the given output scale and zero point.
         return _ConvTransposeNd.from_reference(
             cls, ref_qconvt, output_scale, output_zero_point
         )

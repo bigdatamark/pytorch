@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Quantized embedding modules: EmbeddingPackedParams (holds the prepacked quantized weight
+# and handles its serialization), Embedding and EmbeddingBag (lookup and bag-reduction using quantized
+# kernels, for 8-bit or 4-bit packed weights). Provides conversion from float, QAT and reference modules.
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -11,9 +14,15 @@ __all__ = ["EmbeddingPackedParams", "Embedding", "EmbeddingBag"]
 
 
 class EmbeddingPackedParams(torch.nn.Module):
+    # [CLASS DOC] Container for the packed quantized embedding weight. State: dtype (quint8 or quint4x2) and
+    # _packed_weight (opaque prepacked tensor). State dict stores dtype and the unpacked weight under
+    # prefixed keys. forward is an identity placeholder. Version 1 of the serialization format.
     _version = 1
 
     def __init__(self, num_embeddings, embedding_dim, dtype=torch.quint8):
+        # [FUNCTION DOC] Records dtype and creates a default weight of ones scale / zero zero point per-channel
+        # (axis 0) quantized empty tensor of the given shape, which is packed through set_weight.
+        # Raises NotImplementedError if dtype is not quint8 or quint4x2.
         super().__init__()
         self.dtype = dtype
         if self.dtype in [torch.quint8, torch.quint4x2]:
@@ -34,6 +43,8 @@ class EmbeddingPackedParams(torch.nn.Module):
 
     @torch.jit.export
     def set_weight(self, weight: torch.Tensor) -> None:
+        # [FUNCTION DOC] Packs a quantized weight tensor with the embedding_bag prepack kernel and stores it in
+        # _packed_weight (exported for TorchScript). Raises NotImplementedError for unsupported dtypes.
         if self.dtype in [torch.quint8, torch.quint4x2]:
             self._packed_weight = torch.ops.quantized.embedding_bag_prepack(weight)
         else:
@@ -43,6 +54,8 @@ class EmbeddingPackedParams(torch.nn.Module):
 
     @torch.jit.export
     def _weight(self):
+        # [FUNCTION DOC] HELPER: Unpacks and returns the quantized weight from _packed_weight (exported for
+        # TorchScript). Raises NotImplementedError for unsupported dtypes.
         if self.dtype in [torch.quint8, torch.quint4x2]:
             return torch.ops.quantized.embedding_bag_unpack(self._packed_weight)
         else:
@@ -51,6 +64,7 @@ class EmbeddingPackedParams(torch.nn.Module):
             )
 
     def forward(self, x):
+        # [FUNCTION DOC] Identity placeholder; returns x unchanged.
         return x
 
     # Version 1
@@ -59,6 +73,7 @@ class EmbeddingPackedParams(torch.nn.Module):
     #   |--- dtype : torch.dtype
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
+        # [FUNCTION DOC] HELPER: Extends state dict saving with the dtype and the unpacked weight under prefixed keys.
         super()._save_to_state_dict(destination, prefix, keep_vars)
         destination[prefix + "dtype"] = self.dtype
         destination[prefix + "_packed_weight"] = self._weight()
@@ -73,6 +88,9 @@ class EmbeddingPackedParams(torch.nn.Module):
         unexpected_keys,
         error_msgs,
     ):
+        # [FUNCTION DOC] HELPER: Pops the prefixed dtype and weight entries from state_dict, sets dtype, repacks the
+        # weight with set_weight, then runs the standard loading with strict checking disabled.
+        # Raises KeyError if the entries are missing.
         self.dtype = state_dict[prefix + "dtype"]
         state_dict.pop(prefix + "dtype")
 
@@ -91,10 +109,14 @@ class EmbeddingPackedParams(torch.nn.Module):
         )
 
     def __repr__(self):
+        # [FUNCTION DOC] HELPER: Returns the repr of the unpacked weight tensor.
         return self._weight().__repr__()
 
 
 class Embedding(torch.nn.Module):
+    # [CLASS DOC] Quantized Embedding with a prepacked weight (stored in an EmbeddingPackedParams submodule
+    # named _packed_params). Attributes: num_embeddings, embedding_dim, dtype. Same interface as the float
+    # Embedding but forward only does lookups. Built from float/QAT modules (from_float) or reference modules (from_reference).
     r"""
     A quantized Embedding module with quantized packed weights as inputs.
     We adopt the same interface as `torch.nn.Embedding`, please see
@@ -131,6 +153,11 @@ class Embedding(torch.nn.Module):
         _weight: Optional[Tensor] = None,
         dtype=torch.quint8,
     ) -> None:
+        # [FUNCTION DOC] Stores sizes and dtype, builds the weight (a default per-channel quantized quint8 tensor
+        # when _weight is None, otherwise the supplied _weight whose shape must equal num_embeddings by
+        # embedding_dim, else AssertionError), and stores it packed. padding_idx, max_norm, norm_type,
+        # scale_grad_by_freq and sparse are accepted but unused.
+        # KNOWN ISSUE: with dtype quint4x2 and no _weight, the default weight is still created as quint8.
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
@@ -161,6 +188,8 @@ class Embedding(torch.nn.Module):
         self._packed_params.set_weight(qweight)
 
     def forward(self, indices: Tensor) -> Tensor:
+        # [FUNCTION DOC] Looks up the rows of the packed weight for the integer indices tensor using the 4-bit
+        # kernel if dtype is quint4x2, else the byte kernel; returns a float tensor.
         if self.dtype == torch.quint4x2:
             return torch.ops.quantized.embedding_4bit(
                 self._packed_params._packed_weight, indices
@@ -171,12 +200,15 @@ class Embedding(torch.nn.Module):
             )
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name "QuantizedEmbedding".
         return "QuantizedEmbedding"
 
     def __repr__(self):
+        # [FUNCTION DOC] HELPER: Returns a repr that hides the packed params submodule's repr.
         return _hide_packed_params_repr(self, EmbeddingPackedParams)
 
     def extra_repr(self):
+        # [FUNCTION DOC] HELPER: Returns a string with num_embeddings, embedding_dim, dtype and the weight's qscheme.
         extra_repr_str = (
             f"num_embeddings={self.num_embeddings}, embedding_dim={self.embedding_dim}, "
             f"dtype={self._packed_params.dtype}, qscheme={self.weight().qscheme()}"
@@ -185,13 +217,21 @@ class Embedding(torch.nn.Module):
         return extra_repr_str
 
     def set_weight(self, w: torch.Tensor) -> None:
+        # [FUNCTION DOC] Packs and stores the quantized weight tensor w in the packed params submodule.
         self._packed_params.set_weight(w)
 
     def weight(self):
+        # [FUNCTION DOC] Returns the unpacked quantized weight tensor.
         return self._packed_params._weight()
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
+        # [FUNCTION DOC] Class method: converts a float nn.Embedding (or a QAT Embedding when it has a weight fake
+        # quant) to a quantized Embedding. The weight observer comes from the fake quant, else from the module's
+        # qconfig weight factory, else from the default float-qparams weight-only qconfig. Runs the observer on the
+        # weight, quantizes it and stores it. Raises AssertionError if the module type is wrong, a qconfig is
+        # missing, the observer scheme is not per-channel affine with float qparams, or dtype is not quint8/quint4x2.
+        # KNOWN ISSUE: the new module is built without the observer dtype, so quint4x2 weights are packed under a quint8 default.
         r"""Create a quantized embedding module from a float module
 
         Args:
@@ -252,6 +292,8 @@ class Embedding(torch.nn.Module):
 
     @classmethod
     def from_reference(cls, ref_embedding):
+        # [FUNCTION DOC] Class method: builds a quantized Embedding from a reference embedding, reusing its
+        # sizes, padding_idx, max_norm, norm_type, scale_grad_by_freq, sparse, quantized weight and weight_dtype.
         qembedding = cls(
             ref_embedding.num_embeddings,
             ref_embedding.embedding_dim,
@@ -267,6 +309,8 @@ class Embedding(torch.nn.Module):
 
 
 class EmbeddingBag(Embedding):
+    # [CLASS DOC] Quantized EmbeddingBag derived from Embedding. Adds mode (reduction), pruned_weights (False),
+    # include_last_offset and dtype. forward reduces bags of indices using offsets with the byte or 4-bit kernels.
     r"""
     A quantized EmbeddingBag module with quantized packed weights as inputs.
     We adopt the same interface as `torch.nn.EmbeddingBag`, please see
@@ -304,6 +348,9 @@ class EmbeddingBag(Embedding):
         include_last_offset: bool = False,
         dtype=torch.quint8,
     ) -> None:
+        # [FUNCTION DOC] Initializes the Embedding base with sizes, optional weight and dtype, then stores mode,
+        # include_last_offset and dtype, and sets pruned_weights to False. max_norm, norm_type,
+        # scale_grad_by_freq and sparse are accepted but unused.
         super().__init__(num_embeddings, embedding_dim, _weight=_weight, dtype=dtype)
 
         self.mode = mode
@@ -318,6 +365,9 @@ class EmbeddingBag(Embedding):
         per_sample_weights: Optional[Tensor] = None,
         compressed_indices_mapping: Optional[Tensor] = None,
     ) -> Tensor:
+        # [FUNCTION DOC] Computes the bag reductions of the packed weight for indices and offsets, with optional
+        # per_sample_weights and compressed_indices_mapping, using the 4-bit kernel if dtype is quint4x2, else
+        # the byte kernel. Returns a float tensor with one row per bag.
         if self.dtype == torch.quint4x2:
             return torch.ops.quantized.embedding_bag_4bit(
                 self._packed_params._packed_weight,
@@ -344,10 +394,16 @@ class EmbeddingBag(Embedding):
             )
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: Returns the display name "QuantizedEmbeddingBag".
         return "QuantizedEmbeddingBag"
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
+        # [FUNCTION DOC] Class method: converts a float nn.EmbeddingBag (or a QAT module with a weight fake quant)
+        # to a quantized EmbeddingBag, using the same observer selection and weight quantization as the Embedding
+        # version, and passing max_norm, norm_type, scale_grad_by_freq, mode, sparse, include_last_offset and the
+        # observer dtype. Raises AssertionError for wrong module type, missing qconfig, a non float-qparams
+        # observer scheme or an unsupported dtype.
         r"""Create a quantized embedding_bag module from a float module
 
         Args:
@@ -410,6 +466,8 @@ class EmbeddingBag(Embedding):
 
     @classmethod
     def from_reference(cls, ref_embedding_bag):
+        # [FUNCTION DOC] Class method: builds a quantized EmbeddingBag from a reference module, reusing its sizes,
+        # reduction settings, quantized weight, include_last_offset and weight_dtype.
         qembedding_bag = cls(
             ref_embedding_bag.num_embeddings,
             ref_embedding_bag.embedding_dim,
