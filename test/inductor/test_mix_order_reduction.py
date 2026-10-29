@@ -1,5 +1,12 @@
 # Owner(s): ["module: inductor"]
 
+# [MODULE DOC] Inductor tests for the Triton "mix order reduction" optimization, which fuses an
+# inner (row) reduction and an outer (column) reduction over the same input into one kernel.
+# Contains a shared base class, tests of skip cases, numerics/metrics tests (including RMSNorm and
+# LayerNorm backward, TMA, dynamic shapes, mocked scheduler fusion checks), an over-fusion
+# regression test, CPU-runnable autotune heuristic tests, and a variant class that reruns all
+# tests with the config flag flipped. Most tests need a GPU. Import time has no side effects
+# besides the config-patching decorators; the main block runs tests only when a GPU exists.
 import unittest
 from unittest import mock
 from unittest.mock import patch
@@ -28,18 +35,27 @@ from torch.utils._triton import has_triton_tma_device
 
 
 class TestBase(TestCase):
+    # [CLASS DOC] HELPER: Base test case for this file. Resets inductor metrics and dynamo
+    # compilation metrics before every test, and offers a numeric comparison helper.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Per-test setup. Calls the parent setup, then clears the inductor
+        # metrics counters and the dynamo compilation metrics so tests can assert on fresh counts.
         super().setUp()
         metrics.reset()
         torch._dynamo.utils.clear_compilation_metrics()
 
     def check_numeric(self, f, args, tol=1e-3):
+        # [FUNCTION DOC] HELPER: Runs function f eagerly and compiled on the given arguments
+        # and asserts the results match under the dynamo comparison utility with tolerance
+        # tol (default 1e-3).
         ref = f(*args)
         act = torch.compile(f)(*args)
         self.assertTrue(same(ref, act, tol=tol))
 
 
 class SkipPatternTest(TestBase):
+    # [CLASS DOC] Documents cases where mix-order reduction must not be applied; each test checks
+    # the number of generated kernels or the mix-order metric stays at the unfused value.
     """
     Illustate the cases that we skip mix-order reduction. We skip in cases
     like when the outer reduction is followed by a pointwise that load
@@ -48,6 +64,9 @@ class SkipPatternTest(TestBase):
 
     @inductor_config.patch(split_reductions=False)
     def test_dimension_too_close(self):
+        # [FUNCTION DOC] Compiles a function doing a row sum and a column sum of a square 768 by
+        # 768 GPU tensor with split reductions disabled, and asserts two kernels were generated,
+        # i.e. the reductions were not fused because the two reduction sizes are too close.
         """
         Skip if the two reduction size are too close.
         We require one reduction dimension to be much larger so we can split
@@ -55,6 +74,8 @@ class SkipPatternTest(TestBase):
         """
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the sum over dim 1 and the sum over dim 0
+            # of the input.
             out1 = x.sum(dim=1)
             out2 = x.sum(dim=0)
             return out1, out2
@@ -74,6 +95,10 @@ class SkipPatternTest(TestBase):
 )
 @instantiate_parametrized_tests
 class MixOrderReductionTest(TestBase):
+    # [CLASS DOC] Main test suite for mix-order reduction. Class decorators disable cooperative
+    # reductions (they turn off split reductions needed here) and expand parametrized tests. The
+    # subclass NoMixOrderReductionTest reruns every test with the feature flag inverted, so most
+    # tests assert the metric equals the flag value, or skip when the feature is off.
     @parametrize(
         "name",
         [
@@ -87,12 +112,22 @@ class MixOrderReductionTest(TestBase):
     @parametrize("split_reductions", (False, True))
     @parametrize("shape", ((32768, 768), (32769, 768), (32, 1024, 768)))
     def test_mix_order_reduction(self, name, dtype, swap, split_reductions, shape):
+        # [FUNCTION DOC] Parametrized over reduction name (sum, prod, mean), dtype, operand order,
+        # split_reductions and shape. Compiles a function returning an inner-dim reduction and an
+        # outer-dim reduction (over dims 0, or 0 and 1 for 3D input), compares with eager (looser
+        # tolerance for bfloat16), and asserts the mix-order metric equals the config flag. Skips
+        # prod with 3D shapes because prod accepts only a single dim.
         # torch.prod does not accept tuple for dim argument
         if name == "prod" and len(shape) == 3:
             self.skipTest("Invalid combination")
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Closure computing the row-wise reduction and the outer
+            # reduction of x using reduction_fn from the enclosing scope, in an order
+            # controlled by swap.
             def outer_red():
+                # [FUNCTION DOC] HELPER: Reduces x over all leading dims (0 and 1 for 3D, 0 for
+                # 2D); raises AssertionError if x is neither 2D nor 3D.
                 if len(shape) == 3:
                     return reduction_fn(x, dim=(0, 1))
                 else:
@@ -126,6 +161,11 @@ class MixOrderReductionTest(TestBase):
         )
 
     def test_xmask(self):
+        # [FUNCTION DOC] Checks the x mask is correct in mix-order kernels: the input is a view of
+        # the first rows of a larger buffer whose extra row is filled with a huge value, and
+        # xblock initial size is 2, so reading beyond the rows would corrupt results. Compares
+        # compiled vs eager and asserts the mix-order metric equals the config flag. Skipped if
+        # the feature is disabled.
         """
         Make sure xmask is setup properly
         """
@@ -133,6 +173,7 @@ class MixOrderReductionTest(TestBase):
             self.skipTest("Mix order reduction not enabled")
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the sum over dim 0 and the sum over dim 1 of x.
             return x.sum(dim=0), x.sum(dim=1)
 
         M, N = 32768 + 1023, 768
@@ -161,10 +202,16 @@ class MixOrderReductionTest(TestBase):
         )
 
     def test_avoid_non_coalesced_access(self):
+        # [FUNCTION DOC] Verifies numerics of a case where one operand is a transposed view,
+        # then asserts that no mix-order reduction was generated, since forcing the x block
+        # to 1 would make accesses to the transposed tensor non-coalesced. Skipped if the
+        # feature is disabled.
         if not inductor_config.triton.mix_order_reduction:
             self.skipTest("Mix order reduction not enabled")
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Returns the last-dim sum of the sum of x and y, and the sum
+            # of x over dims 0 and 1.
             return (x + y).sum(dim=-1), x.sum(dim=(0, 1))
 
         x = torch.randn(128, 256, 768, device=GPU_TYPE)
@@ -181,6 +228,10 @@ class MixOrderReductionTest(TestBase):
 
     @inductor_config.patch(split_reductions=False)
     def test_fuse_non_contiguous_pointwise(self):
+        # [FUNCTION DOC] Regression test: a pointwise op using both a row reduction result and
+        # unreduced data of x is fused next to the reduction, which could break the contiguity
+        # invariant. Only checks numerics of the compiled function with split reductions off.
+        # Skipped if disabled.
         if not inductor_config.triton.mix_order_reduction:
             self.skipTest("Mix order reduction not enabled")
 
@@ -190,6 +241,8 @@ class MixOrderReductionTest(TestBase):
         # reduction, matching the shape/ordering pattern seen in the E2E failure.
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns a pointwise product of the row sum with the first
+            # column of x, and the column sum of x.
             # First reduction (contiguous on its own).
             r1 = x.sum(dim=1)
             # Pointwise depends on both reduced and unreduced data, so fusing it
@@ -205,6 +258,9 @@ class MixOrderReductionTest(TestBase):
 
     @inductor_config.patch(coordinate_descent_tuning=True)
     def test_XBLOCK_coordest_tuning(self):
+        # [FUNCTION DOC] With coordinate descent tuning enabled, checks numerics and that exactly
+        # one mix-order reduction kernel is generated, i.e. x block tuning is skipped for such
+        # kernels and compilation still works. Skipped if the feature is disabled.
         """
         We should skip XBLOCK coordinate descent tuning for
         mix order reduction.
@@ -213,6 +269,7 @@ class MixOrderReductionTest(TestBase):
             self.skipTest("Mix order reduction not enabled")
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the last-dim sum and the dim 0 sum of x.
             return x.sum(dim=-1), x.sum(dim=0)
 
         x = torch.randn(32768, 256, dtype=torch.float, device=GPU_TYPE)
@@ -221,6 +278,10 @@ class MixOrderReductionTest(TestBase):
 
     @inductor_config.patch(unroll_reductions_threshold=1)
     def test_3layer_split_reduction(self):
+        # [FUNCTION DOC] Uses a very tall, 2-column input and unroll threshold 1 to force a
+        # three-layer split reduction. Checks numerics and that the mix-order count is 1 only
+        # when cooperative reductions are enabled, otherwise 0 (mix order is not applied for more
+        # than two layers).
         """
         Use a larger M and smaller N to trigger a 3 layer split reduction.
         """
@@ -228,6 +289,7 @@ class MixOrderReductionTest(TestBase):
             self.skipTest("Mix order reduction not enabled")
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the last-dim sum and the dim 0 sum of x.
             return x.sum(dim=-1), x.sum(dim=0)
 
         M = 32768 * 1024 if torch.version.hip is not None else 32768 * 256
@@ -244,6 +306,10 @@ class MixOrderReductionTest(TestBase):
         )
 
     def test_independent_split_size(self):
+        # [FUNCTION DOC] Verifies the mix-order split size config is honored: for split sizes 8
+        # and 16 it resets dynamo, checks numerics and metric, compiles and fetches the
+        # generated code, and asserts the code contains the matching RSPLIT_SIZE kernel meta
+        # entry. Skipped if disabled.
         """
         Make sure mix order reduction can pick the split size it wants
         """
@@ -251,9 +317,13 @@ class MixOrderReductionTest(TestBase):
             self.skipTest("Mix order reduction not enabled")
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the last-dim sum and the dim 0 sum of x.
             return x.sum(dim=-1), x.sum(dim=0)
 
         def check_one_split_size(split_size):
+            # [FUNCTION DOC] HELPER: For one split size, resets dynamo, patches the split size
+            # config, checks numerics and the mix-order metric, and asserts the generated code
+            # mentions that RSPLIT_SIZE. Uses the input x from the enclosing test.
             torch._dynamo.reset()
 
             with inductor_config.patch(
@@ -275,7 +345,10 @@ class MixOrderReductionTest(TestBase):
 
     @inductor_config.patch(split_reductions=False)
     def test_non_contiguous_input(self):
+        # [FUNCTION DOC] Uses a permuted (non-contiguous) 3D input with split reductions off,
+        # checks compiled numerics, and asserts the mix-order metric equals the config flag.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the last-dim sum and the sum over dims 0 and 1 of x.
             return x.sum(dim=-1), x.sum(dim=[0, 1])
 
         x = torch.randn(1024, 32, 768, dtype=torch.float, device=GPU_TYPE).permute(
@@ -289,7 +362,13 @@ class MixOrderReductionTest(TestBase):
 
     @inductor_config.patch(split_reductions=False)
     def test_multi_workspace_allocation(self):
+        # [FUNCTION DOC] Compiles a function with two inputs of different shapes, each producing
+        # a row and a column sum, with split reductions off. Checks numerics and that the metric
+        # is 2 when the feature is on (one fused kernel per input, each needing its own
+        # workspace), else 0.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Returns the dim 0 sum and dim 1 sum of x followed by
+            # those of y.
             return x.sum(dim=0), x.sum(dim=1), y.sum(dim=0), y.sum(dim=1)
 
         x = torch.randn(4096 * 64, 32, device=GPU_TYPE)
@@ -328,6 +407,11 @@ class MixOrderReductionTest(TestBase):
         initial_xblock,
         add_1dim,
     ):
+        # [FUNCTION DOC] Parametrized RMSNorm forward/backward test (weight dtype, split
+        # reductions, shape, max autotune, initial xblock, extra singleton dim). Skips most max-
+        # autotune and extra-dim combinations to save resources. Compares input and weight grads
+        # of the compiled version against eager (tolerance 1e-2) and asserts the mix-order metric
+        # equals the flag. Needs about 16GB of device memory.
         # max_autotune can be slow and cost resource, trim down the tests
         # for max autotune
         if max_autotune and not (
@@ -343,6 +427,9 @@ class MixOrderReductionTest(TestBase):
             self.skipTest("Skip non-critical tests to save resources.")
 
         def f(x, w, eps):
+            # [FUNCTION DOC] HELPER: RMSNorm computed manually: casts x to float, scales by
+            # reciprocal root of the mean square plus eps, multiplies by w, and casts back to
+            # the original dtype.
             orig_dtype = x.dtype
 
             x = x.float()
@@ -351,6 +438,8 @@ class MixOrderReductionTest(TestBase):
             return y
 
         def fwd_bwd(f):
+            # [FUNCTION DOC] HELPER: Clears grads of x and w, runs f on x, w, eps, backpropagates
+            # dy and returns the grads of x and w. Uses x, w, eps and dy from the enclosing test.
             x.grad = None
             w.grad = None
             out = f(x, w, eps)
@@ -409,6 +498,12 @@ class MixOrderReductionTest(TestBase):
     # The 1M-row input plus its grads needs a fair amount of device memory.
     @largeTensorTest("16GB", device=GPU_TYPE, inductor=True)
     def test_rms_norm_bwd_tma(self, allow_multi_stages):
+        # [FUNCTION DOC] Regression test for stale xoffset with device-side TMA in the mix-
+        # order loop, using a 1M row input and bfloat16 tensors. Compares grads with eager,
+        # asserts the metric, and when the feature is on checks the backward code has the
+        # uses_tma and uses_device_tma meta entries and advances xoffset by XBLOCK.
+        # Parametrized by whether multi stages are allowed. Requires TMA support, 16GB of
+        # memory, tensor descriptors and aligned inputs.
         """
         Regression test for https://github.com/pytorch/pytorch/issues/186241.
 
@@ -425,12 +520,16 @@ class MixOrderReductionTest(TestBase):
             self.skipTest("Mix order reduction not enabled")
 
         def f(x, w, eps):
+            # [FUNCTION DOC] HELPER: RMSNorm computed manually in float and cast back to
+            # the input dtype.
             orig_dtype = x.dtype
             x = x.float()
             rsqrt = torch.rsqrt((x * x).sum(dim=-1) / x.shape[-1] + eps)
             return (x * rsqrt[:, None] * w).to(dtype=orig_dtype)
 
         def fwd_bwd(compiled_f):
+            # [FUNCTION DOC] HELPER: Clears grads, runs compiled_f on x, w, eps from the enclosing
+            # test, backpropagates dy and returns the grads of x and w.
             x.grad = None
             w.grad = None
             out = compiled_f(x, w, eps)
@@ -490,6 +589,11 @@ class MixOrderReductionTest(TestBase):
         }
     )
     def test_rms_norm_bwd_tma_small(self, allow_multi_stages, shape):
+        # [FUNCTION DOC] Smaller TMA variant of the stale xoffset regression test. The split size
+        # is pinned to 64 so each program loops several times. Runs for two shapes (one with row
+        # count not divisible by the block) and both multi-stage settings; compares grads, asserts
+        # the metric, and checks generated code for TMA markers and the xoffset advance when the
+        # feature is on.
         """
         Small, CI-friendly variant of test_rms_norm_bwd_tma (regression test for
         https://github.com/pytorch/pytorch/issues/186241).
@@ -503,12 +607,16 @@ class MixOrderReductionTest(TestBase):
             self.skipTest("Mix order reduction not enabled")
 
         def f(x, w, eps):
+            # [FUNCTION DOC] HELPER: RMSNorm computed manually in float and cast back to
+            # the input dtype.
             orig_dtype = x.dtype
             x = x.float()
             rsqrt = torch.rsqrt((x * x).sum(dim=-1) / x.shape[-1] + eps)
             return (x * rsqrt[:, None] * w).to(dtype=orig_dtype)
 
         def fwd_bwd(compiled_f):
+            # [FUNCTION DOC] HELPER: Clears grads, runs compiled_f on x, w, eps from the enclosing
+            # test, backpropagates dy and returns the grads of x and w.
             x.grad = None
             w.grad = None
             out = compiled_f(x, w, eps)
@@ -557,10 +665,17 @@ class MixOrderReductionTest(TestBase):
     @parametrize("split_reductions", (False, True))
     @parametrize("shape", ((32768, 768), (32769, 768)))
     def test_layer_norm_bwd_with_bias(self, wbdtype, split_reductions, shape):
+        # [FUNCTION DOC] Parametrized layer norm backward test with weight and bias of dtype
+        # wbdtype over float input. Compares x, weight and bias grads of compiled vs eager
+        # (tolerance 1e-2) and asserts the mix-order metric equals the config flag.
         def f(x, w, b, eps):
+            # [FUNCTION DOC] HELPER: Layer norm of x over the last dim with weight and bias
+            # cast to float.
             return F.layer_norm(x, x.shape[-1:], w.float(), b.float(), eps)
 
         def fwd_bwd(f):
+            # [FUNCTION DOC] HELPER: Clears grads of x, w, b, runs f, backpropagates dy and
+            # returns the three grads. Uses names from the enclosing test.
             x.grad = None
             w.grad = None
             b.grad = None
@@ -597,13 +712,22 @@ class MixOrderReductionTest(TestBase):
 
     @parametrize("dynamic_dims", ([0], [1], [0, 1]))
     def test_rms_norm_bwd_with_dynamic_shape(self, dynamic_dims):
+        # [FUNCTION DOC] RMSNorm backward with a 3D input marked dynamic on dims 0 and 1; note
+        # that the parametrized dynamic_dims argument is not used for marking here. Compares grads
+        # with eager and asserts the metric equals the flag. Skipped if the feature is disabled.
+        # KNOWN ISSUE: the dynamic_dims parameter is ignored; the marking always uses dims
+        # 0 and 1.
         if not inductor_config.triton.mix_order_reduction:
             self.skipTest("Mix order reduction not enabled")
 
         def f(x, w, eps):
+            # [FUNCTION DOC] HELPER: Functional RMS norm of x over the last dim with weight
+            # w and eps.
             return F.rms_norm(x, x.shape[-1:], weight=w, eps=eps)
 
         def fwd_bwd(f):
+            # [FUNCTION DOC] HELPER: Clears grads, runs f, backpropagates dy and returns grads of
+            # x and w.
             x.grad = None
             w.grad = None
             out = f(x, w, eps)
@@ -639,13 +763,20 @@ class MixOrderReductionTest(TestBase):
 
     @parametrize("dynamic_dims", ([0], [1], [0, 1]))
     def test_layer_norm_bwd_with_dynamic_shape(self, dynamic_dims):
+        # [FUNCTION DOC] Layer norm backward (no bias) on a 3D input marked dynamic on the
+        # parametrized dynamic_dims. Compares grads with eager and asserts the metric equals the
+        # flag. Skipped if the feature is disabled.
         if not inductor_config.triton.mix_order_reduction:
             self.skipTest("Mix order reduction not enabled")
 
         def f(x, w, eps):
+            # [FUNCTION DOC] HELPER: Functional layer norm of x over the last dim with weight
+            # w, no bias.
             return F.layer_norm(x, x.shape[-1:], weight=w, bias=None, eps=eps)
 
         def fwd_bwd(f):
+            # [FUNCTION DOC] HELPER: Clears grads, runs f, backpropagates dy and returns grads of
+            # x and w.
             x.grad = None
             w.grad = None
             out = f(x, w, eps)
@@ -677,10 +808,16 @@ class MixOrderReductionTest(TestBase):
     @parametrize("split_reductions", (False, True))
     @parametrize("shape", ((32768, 768), (32769, 768)))
     def test_layer_norm_bwd_no_bias(self, split_reductions, shape):
+        # [FUNCTION DOC] Layer norm backward without bias for two shapes and split
+        # reduction settings. Compares grads with eager (tolerance 1e-2) and asserts the
+        # metric equals the flag.
         def f(x, w, eps):
+            # [FUNCTION DOC] HELPER: Functional layer norm of x with weight w and no bias.
             return F.layer_norm(x, x.shape[-1:], w, bias=None, eps=eps)
 
         def fwd_bwd(f):
+            # [FUNCTION DOC] HELPER: Clears grads, runs f, backpropagates dy and returns grads of
+            # x and w.
             x.grad = None
             w.grad = None
             out = f(x, w, eps)
@@ -717,10 +854,17 @@ class MixOrderReductionTest(TestBase):
     @parametrize("split_reductions", (False, True))
     @parametrize("dtype", [torch.bfloat16, torch.float])
     def test_rms_norm_sharing_weights(self, split_reductions, dtype):
+        # [FUNCTION DOC] Applies RMS norm with one shared weight to three inputs, computes
+        # reference grads in float64 cast back to the dtype, and compares with grads from the
+        # compiled function (loose tolerance for bfloat16). Asserts three mix-order kernels were
+        # generated and that the backward wrapper code contains exactly one MixOrderReductionGrid,
+        # i.e. the weight kernel is shared. Skipped if the feature is disabled.
         if not inductor_config.triton.mix_order_reduction:
             self.skipTest("Mix order reduction not enabled")
 
         def f(xs, w, eps):
+            # [FUNCTION DOC] HELPER: Applies RMS norm with shared weight w to each tensor in xs
+            # and returns the list of outputs.
             ys = []
             for x in xs:
                 ys.append(F.rms_norm(x, x.shape[-1:], w, eps=eps))
@@ -771,10 +915,16 @@ class MixOrderReductionTest(TestBase):
     @parametrize("dtype", [torch.bfloat16, torch.float])
     @parametrize("has_bias", [False, True])
     def test_layer_norm_sharing_weights(self, split_reductions, dtype, has_bias):
+        # [FUNCTION DOC] Same as the RMS norm sharing test but with layer norm and optional bias.
+        # Compares outputs and x grads with tolerance by dtype (XPU gets a looser bfloat16 value),
+        # compares weight/bias grads only for float32, asserts three mix-order kernels and exactly
+        # one MixOrderReductionGrid in the backward wrapper. Skipped if the feature is disabled.
         if not inductor_config.triton.mix_order_reduction:
             self.skipTest("Mix order reduction not enabled")
 
         def f(xs, w, bias, eps):
+            # [FUNCTION DOC] HELPER: Applies layer norm with shared weight w and bias to each
+            # tensor in xs and returns the list of outputs.
             ys = []
             for x in xs:
                 ys.append(F.layer_norm(x, x.shape[-1:], w, bias=bias, eps=eps))
@@ -830,6 +980,12 @@ class MixOrderReductionTest(TestBase):
 
     @inductor_config.patch(split_reductions=False)
     def test_dont_fuse_nodes_that_introduce_producer_consumer_rel(self):
+        # [FUNCTION DOC] Builds a row sum, a column sum and a pointwise op over x plus the column
+        # sum. Checks numerics, that exactly one mix-order kernel exists, and that the pointwise
+        # op is not fused into it (which would make the inner reduction a producer of the outer
+        # one). Skipped if the feature is disabled.
+        # KNOWN ISSUE: the final assertion passes the kernel count as the message argument of the
+        # true check, so it always passes; it was probably meant to be an equality check.
         """
         The test constructs an inner reduction, an outer reduction and
         a pointwise kernel.
@@ -843,6 +999,8 @@ class MixOrderReductionTest(TestBase):
             self.skipTest("Mix order reduction not enabled")
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the dim 1 sum, and the dim 0 sum (keeping the
+            # dim) plus x.
             out1 = x.sum(dim=1)
             out2 = x.sum(dim=0, keepdim=True) + x
             return out1, out2
@@ -866,6 +1024,11 @@ class MixOrderReductionTest(TestBase):
         mock_get_numel_rnumel: mock.Mock,
         mock_is_split_reduction: mock.Mock,
     ):
+        # [FUNCTION DOC] Uses mocked scheduler nodes and patched MixOrderReduction helpers (mix
+        # orders present, constant sizes, not split) inside a dummy graph handler to check
+        # can_fuse: it returns False when non-strict mode is off and True when it is on. The mock
+        # arguments are the patched class methods injected by the decorators. Skipped if the
+        # feature is disabled.
         """
         This tests whether we can skip some non-critical checks
         when non_strict mode is on
@@ -940,6 +1103,11 @@ class MixOrderReductionTest(TestBase):
         mock_get_numel_rnumel: mock.Mock,
         mock_is_split_reduction: mock.Mock,
     ):
+        # [FUNCTION DOC] Same mock setup as the non-strict mode test, but the numel and rnumel
+        # are unbacked symbolic ints from the graph shape environment. Asserts can_fuse returns
+        # False with non-strict mode off, because data-dependent sizes cannot be checked. Mock
+        # arguments are the patched class methods injected by decorators. Skipped if the
+        # feature is disabled.
         if not inductor_config.triton.mix_order_reduction:
             self.skipTest("Mix order reduction not enabled")
 
@@ -990,10 +1158,15 @@ class MixOrderReductionTest(TestBase):
 
     @inductor_config.patch({"triton.mix_order_reduction_non_strict_mode": True})
     def test_no_recompile(self):
+        # [FUNCTION DOC] With non-strict mode on, compiles a row and column sum with a
+        # dynamic first dimension, checks results and one mix-order kernel, then calls with
+        # two other batch sizes and asserts the dynamo compilation metrics contain only one
+        # entry (no recompilation).
         if not inductor_config.triton.mix_order_reduction:
             self.skipTest("Mix order reduction not enabled")
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the dim 1 sum and the dim 0 sum of x.
             return x.sum(dim=1), x.sum(dim=0)
 
         x0 = torch.randn(2048, 1024, device=GPU_TYPE)
@@ -1014,6 +1187,10 @@ class MixOrderReductionTest(TestBase):
 
     @skipIfXpu(msg="https://github.com/intel/intel-xpu-backend-for-triton/issues/6398")
     def test_additive_rnumel(self):
+        # [FUNCTION DOC] Regression test for issue 176375: concatenates two inputs with dynamic
+        # second dims, multiplies with a sliced weight, adds the total sum, and returns two
+        # reductions, so the reduction size is an additive symbolic expression. Compares against
+        # eager and asserts the mix-order metric equals the flag. Skipped on XPU.
         """
         Fix https://github.com/pytorch/pytorch/issues/176375
         """
@@ -1024,6 +1201,8 @@ class MixOrderReductionTest(TestBase):
         torch._dynamo.mark_dynamic(y, 1)
 
         def f(x, y, w):
+            # [FUNCTION DOC] HELPER: Concatenates x and y along dim 1, scales by a weight slice
+            # matching the width, adds the global sum, and returns the dim 0 and dim 1 sums.
             z = torch.cat((x, y), dim=1)
 
             # Slice w_pool to match dynamic dim. This avoids a guard that would
@@ -1047,6 +1226,10 @@ class MixOrderReductionTest(TestBase):
 
     @recover_orig_fp32_precision
     def test_additive_num_splits(self):
+        # [FUNCTION DOC] Checks that an additive split count is parenthesized in generated code:
+        # runs a linear plus layer norm model on a dynamic-shape input, compares weight and bias
+        # grads of the compiled and eager models (tolerance 1e-3). Sets high matmul precision; the
+        # fp32 precision is restored by the decorator.
         """
         When the `num_splits` is an additive expression, a pair of
         parenthesis is required.
@@ -1056,6 +1239,8 @@ class MixOrderReductionTest(TestBase):
         norm = nn.LayerNorm(1000).to(GPU_TYPE)
 
         def model(x):
+            # [FUNCTION DOC] HELPER: Drops the last position along dim 1, flattens to rows of 1000
+            # and applies the linear layer and layer norm from the enclosing test.
             return norm(linear1(x[:, :-1].reshape(-1, 1000)))
 
         compiled_model = torch.compile(model)
@@ -1074,6 +1259,10 @@ class MixOrderReductionTest(TestBase):
 
     @largeTensorTest("36GB", device=GPU_TYPE, inductor=True)
     def test_out_of_shared_memory(self):
+        # [FUNCTION DOC] Regression test for issue 175250 (out of shared memory). Builds a
+        # compiled attention-like forward with dual RMS norms, QKV projections, rotary embeddings
+        # and repeated KV heads at a large sequence length, runs forward and backward, and asserts
+        # more than one mix-order kernel was generated. Skipped if disabled; needs 36GB of memory.
         """
         Fix https://github.com/pytorch/pytorch/issues/175250
         """
@@ -1087,11 +1276,15 @@ class MixOrderReductionTest(TestBase):
         SEQ_LEN = 8192 * 2
 
         def rotate_half(x):
+            # [FUNCTION DOC] HELPER: Splits the last dim in halves and returns the concatenation
+            # of the negated second half with the first half.
             x1 = x[..., : x.shape[-1] // 2]
             x2 = x[..., x.shape[-1] // 2 :]
             return torch.cat((-x2, x1), dim=-1)
 
         def apply_rotary_pos_emb(q, k, cos, sin):
+            # [FUNCTION DOC] HELPER: Applies rotary embeddings to q and k using cos and sin
+            # broadcast over the heads dim; returns the rotated q and k.
             cos = cos[:, None, :, :]
             sin = sin[:, None, :, :]
             return (q * cos) + (rotate_half(q) * sin), (k * cos) + (
@@ -1110,6 +1303,10 @@ class MixOrderReductionTest(TestBase):
             cos,
             sin,
         ):
+            # [FUNCTION DOC] HELPER: Compiled forward of the test model: splits the input into
+            # embeds and hidden halves, normalizes each, recombines, projects to q, k, v, applies
+            # rotary embeddings, repeats kv heads, does unfused matrix products and returns the
+            # output projection plus the residual.
             batch, seq_len, _ = x.shape
 
             # Eagle3 first layer: split concatenated [embeds, hidden] input
@@ -1158,6 +1355,8 @@ class MixOrderReductionTest(TestBase):
 
         # Block mask - simple causal only
         def causal_mask(_b, _h, q, kv):
+            # [FUNCTION DOC] HELPER: Causal mask predicate returning whether q index is at least
+            # kv index. It is not used elsewhere in the test.
             return q >= kv
 
         # Rotary embeddings (precomputed, no grad needed)
@@ -1196,6 +1395,11 @@ class MixOrderReductionTest(TestBase):
     @inductor_config.patch("triton.mix_order_reduction", True)
     @inductor_config.patch("triton.mix_order_reduction_non_strict_mode", True)
     def test_dimension_refactoring_mismatch(self):
+        # [FUNCTION DOC] Reproduces a mismatch between the dimension factorization seen during
+        # fusion and the one used by code generation after a reduction split (13 by 8472 RMSNorm
+        # backward). Runs forward/backward eagerly and compiled and compares grads (tolerance
+        # 1e-3). Skipped if the feature is disabled.
+        # KNOWN ISSUE: the final metric assertion is greater-or-equal zero, which always holds.
         """
         This reproduces an issue where `simplify_and_reorder()` produces a different
         dimension factorization than `_original_ranges` used during fusion decision.
@@ -1215,6 +1419,8 @@ class MixOrderReductionTest(TestBase):
         # - The feature dimension reduction (8472) gets split with factor 2
         # - Mix order reduction tries to fuse these, but groups don't match after split
         def f(x, w, eps):
+            # [FUNCTION DOC] HELPER: RMSNorm computed manually in float and cast back to
+            # the input dtype.
             orig_dtype = x.dtype
             x = x.float()
             # RMSNorm forward: y = x * rsqrt(mean(x^2) + eps) * w
@@ -1223,6 +1429,8 @@ class MixOrderReductionTest(TestBase):
             return y
 
         def fwd_bwd(compiled_f):
+            # [FUNCTION DOC] HELPER: Clears grads, runs compiled_f on x, w, eps from the enclosing
+            # test, backpropagates dy and returns the grads of x and w.
             x.grad = None
             w.grad = None
             out = compiled_f(x, w, eps)
@@ -1245,6 +1453,10 @@ class MixOrderReductionTest(TestBase):
         self.assertGreaterEqual(metrics.codegen_mix_order_reduction, 0)
 
     def test_keepdim_shape_mismatch(self):
+        # [FUNCTION DOC] Regression test for keepdim handling: a custom normalization module with
+        # parameters of shape one by hidden is run forward and backward eagerly and compiled,
+        # grads are compared (tolerance 1e-3), and at least one mix-order kernel must be
+        # generated. Skipped if the feature is disabled.
         """
         Test that MixOrderReduction correctly handles keepdim=True reductions.
 
@@ -1262,13 +1474,20 @@ class MixOrderReductionTest(TestBase):
         # Create a model that produces reductions with keepdim=True in the backward pass
         # This pattern is common in normalization layers like RMSNorm/LayerNorm
         class KeepDimReductionModel(nn.Module):
+            # [CLASS DOC] HELPER: Small normalization module (mean/variance normalize, then scale
+            # and shift) with weight and bias parameters shaped one by hidden_size, used to get
+            # keepdim reductions in the backward pass.
             def __init__(self, hidden_size):
+                # [FUNCTION DOC] HELPER: Initializes weight as ones and bias as zeros of shape
+                # one by hidden_size.
                 super().__init__()
                 # Using shape [1, hidden_size] to ensure keepdim=True in backward
                 self.weight = nn.Parameter(torch.ones(1, hidden_size))
                 self.bias = nn.Parameter(torch.zeros(1, hidden_size))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Normalizes x over the last dim using mean and biased
+                # variance (eps 1e-5), then applies the weight and bias; returns the result.
                 # x: [batch, hidden_size]
                 # Normalization-like operation that produces keepdim reductions in backward
                 mean = x.mean(dim=-1, keepdim=True)
@@ -1283,6 +1502,8 @@ class MixOrderReductionTest(TestBase):
         dy = torch.randn_like(x)
 
         def fwd_bwd(model, x, dy):
+            # [FUNCTION DOC] HELPER: Clears grads of x and model, runs model on x, backpropagates
+            # dy, and returns the grads of x, weight and bias.
             x.grad = None
             model.zero_grad()
             out = model(x)
@@ -1309,6 +1530,9 @@ class MixOrderReductionTest(TestBase):
         )
 
     def test_multi_dim_reduction_output_shape(self):
+        # [FUNCTION DOC] Regression test for issue 178080: compiles a function with a sum over
+        # dims 1 and 2 and a sum over dim 0 of a 3D tensor, and checks both output shapes and
+        # values match eager.
         """
         Regression test for https://github.com/pytorch/pytorch/issues/178080:
         two reductions over different dims in the same compiled function must
@@ -1319,6 +1543,8 @@ class MixOrderReductionTest(TestBase):
         """
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the sum over dims 1 and 2 and the sum over dim
+            # 0 of x.
             return x.sum(dim=(1, 2)), x.sum(dim=0)
 
         x = torch.randn(32768, 512, 2, device=GPU_TYPE)
@@ -1331,6 +1557,8 @@ class MixOrderReductionTest(TestBase):
 
 
 class OverFusionTest(TestBase):
+    # [CLASS DOC] Regression tests for over-fusion in mix-order reduction (issue 179423), where
+    # absorbing too many pointwise nodes creates kernels with too many loads.
     """
     Regression test for mix-order reduction over-fusion in transformer backward
     passes. When can_fuse_with absorbs too many pointwise nodes into a
@@ -1354,6 +1582,11 @@ class OverFusionTest(TestBase):
         }
     )
     def test_max_reads_limits_fusion(self):
+        # [FUNCTION DOC] Builds a three-block transformer (GQA attention with QK RMS norm, squared
+        # leaky relu MLP) in bfloat16, runs backward eagerly and compiled with the max reads limit
+        # set to 10 and caches disabled, compares input grads (tolerance 5e-2), and asserts mix-
+        # order kernels were still generated while some fusions were rejected. Skipped without a
+        # GPU or on XPU.
         """
         Verify that max_reads limits over-fusion in a transformer backward
         pass without disabling mix-order reduction entirely.
@@ -1371,7 +1604,11 @@ class OverFusionTest(TestBase):
         head_dim = dim // num_heads
 
         class Attention(nn.Module):
+            # [CLASS DOC] HELPER: Grouped-query attention module with q, k, v and output
+            # projections, QK RMS norm, repeated kv heads and causal scaled dot product attention.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates four bias-free linear layers (q, k, v, output
+                # projection) using dim, num_kv_heads and head_dim from the enclosing test.
                 super().__init__()
                 self.c_q = nn.Linear(dim, dim, bias=False)
                 self.c_k = nn.Linear(dim, num_kv_heads * head_dim, bias=False)
@@ -1379,6 +1616,9 @@ class OverFusionTest(TestBase):
                 self.proj = nn.Linear(dim, dim, bias=False)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Projects x to q, k, v, RMS-normalizes q and k,
+                # expands kv heads to match the query heads, applies causal attention and
+                # the output projection.
                 B, T, D = x.shape
                 q = self.c_q(x).reshape(B, T, num_heads, head_dim)
                 k = self.c_k(x).reshape(B, T, num_kv_heads, head_dim)
@@ -1396,7 +1636,11 @@ class OverFusionTest(TestBase):
                 return self.proj(y.transpose(1, 2).reshape(B, T, D))
 
         class Block(nn.Module):
+            # [CLASS DOC] HELPER: Transformer block with pre-norm attention and a pre-norm MLP
+            # using a squared leaky relu activation, both with residual connections.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates two RMS norms, an attention module and the two
+                # MLP linear layers.
                 super().__init__()
                 self.attn_norm = nn.RMSNorm(dim)
                 self.mlp_norm = nn.RMSNorm(dim)
@@ -1405,6 +1649,8 @@ class OverFusionTest(TestBase):
                 self.fc2 = nn.Linear(dim * 4, dim, bias=False)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the attention and MLP sub-layers with residual
+                # additions and returns the result.
                 x = x + self.attn(self.attn_norm(x))
                 h = self.mlp_norm(x)
                 x = x + self.fc2(F.leaky_relu(self.fc1(h), negative_slope=0.5).square())
@@ -1435,6 +1681,8 @@ class OverFusionTest(TestBase):
 
 
 class MixOrderReductionHeuristicTest(TestBase):
+    # [CLASS DOC] CPU-runnable tests of the NUM_STAGES choices in the mix-order persistent
+    # reduction autotune heuristic, run via the return-configs mode with no GPU.
     """
     CPU-runnable unit tests for the mix-order persistent_reduction autotuning
     heuristic. These exercise the config generation logic directly (via
@@ -1442,6 +1690,10 @@ class MixOrderReductionHeuristicTest(TestBase):
     """
 
     def test_uses_tma_tracks_emitted_descriptors(self):
+        # [FUNCTION DOC] For no, host and device TMA states, builds a TritonKernel without
+        # calling its constructor, sets the host descriptor mapping and the device TMA flag, and
+        # asserts the uses_tma property is true unless there is no TMA and uses_device_tma is
+        # true only for device.
         for source in (None, "host", "device"):
             with self.subTest(source=source):
                 kernel = object.__new__(TritonKernel)
@@ -1456,6 +1708,10 @@ class MixOrderReductionHeuristicTest(TestBase):
     def _gen_num_stages(
         self, *, tma, allow_multi_stages, device_tma=False, rsplit_size=256, rnumel=256
     ):
+        # [FUNCTION DOC] HELPER: Calls the persistent reduction heuristic in return-configs mode
+        # for a fake CPU device with the mix-order meta (split size, multi-stage permission,
+        # optional TMA flags) and the given rnumel. Asserts at least one config exists and returns
+        # the set of NUM_STAGES values in the configs.
         """
         Drive the mix-order branch of persistent_reduction and return the set of
         NUM_STAGES values across the generated configs.
@@ -1482,6 +1738,8 @@ class MixOrderReductionHeuristicTest(TestBase):
         return {c.kwargs["NUM_STAGES"] for c in configs}
 
     def test_num_stages_support_matrix(self):
+        # [FUNCTION DOC] Checks that with multi stages allowed, no TMA gives the stage set of just
+        # 3 and device TMA gives just 1.
         cases = (
             ("no TMA", False, False, {3}),
             ("device TMA", True, True, {1}),
@@ -1496,6 +1754,8 @@ class MixOrderReductionHeuristicTest(TestBase):
                 self.assertEqual(stages, expected)
 
     def test_num_stages_single_when_multi_stage_disabled(self):
+        # [FUNCTION DOC] Checks that with multi stages disallowed, the stage set is exactly 1 both
+        # with and without TMA.
         """
         When multi-staging is disabled, NUM_STAGES collapses to 1 regardless of
         whether TMA is active.
@@ -1505,6 +1765,8 @@ class MixOrderReductionHeuristicTest(TestBase):
             self.assertEqual(stages, {1}, f"tma={tma}: expected {{1}}, got {stages}")
 
     def test_device_tma_disables_multi_stages_across_shapes(self):
+        # [FUNCTION DOC] Checks that with device TMA the stage set is exactly 1 for a grid of
+        # split sizes and reduction sizes.
         for rsplit_size in (16, 64, 128, 256):
             for rnumel in (256, 1024, 8192, 16384):
                 stages = self._gen_num_stages(
@@ -1521,6 +1783,9 @@ class MixOrderReductionHeuristicTest(TestBase):
     "triton.mix_order_reduction", not inductor_config.triton.mix_order_reduction
 )
 class NoMixOrderReductionTest(MixOrderReductionTest):
+    # [CLASS DOC] Reruns all MixOrderReductionTest tests with the mix_order_reduction config
+    # set to the opposite of its default, so the feature-off (or on) path is covered.
+    # Defines nothing new.
     pass
 
 
