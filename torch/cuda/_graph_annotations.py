@@ -1,3 +1,10 @@
+# [MODULE DOC] Records user-supplied annotations for the kernel/memcpy/memset/event/host nodes created inside
+# mark_kernels / mark_stream scopes during CUDA graph capture, keyed by the driver toolsId of each node,
+# so they can later be merged into profiler traces. Uses cuda.bindings; everything silently becomes a no-op
+# when bindings or driver support (cudaGraphNodeGetToolsId) are missing or annotations are not enabled for
+# the current torch.cuda.graph capture. Holds module-level state (enabled flag, capture root graph id,
+# probe result, pending scopes, kernel annotation table, generation counter, thread-local region slot).
+# Import only tries to import cuda.bindings; no CUDA initialization happens at import.
 """Annotate CUDA graph kernel nodes during capture.
 
 During CUDA graph capture, ``mark_kernels`` records the current capture
@@ -100,6 +107,8 @@ _capture_root_graph_id: int | None = None
 
 
 def _set_annotations_enabled(enabled: bool) -> None:
+    # [FUNCTION DOC] HELPER: Sets the module-wide flag that turns annotation recording on or off for the current capture.
+    # Turning it off also clears the remembered capture root graph id.
     """Set whether annotation recording is active. Used by ``torch.cuda.graph``
     to scope annotations to a capture; not a public API."""
     global _annotations_enabled, _capture_root_graph_id
@@ -109,6 +118,8 @@ def _set_annotations_enabled(enabled: bool) -> None:
 
 
 def _graph_id(graph: Any) -> int:
+    # [FUNCTION DOC] HELPER: Returns the driver's unique integer id for a graph handle (stable over the graph lifetime,
+    # unlike the reusable pointer value). Raises on CUDA error via the bindings checker.
     """The driver's unique id for a ``cudaGraph_t``.
 
     Identifies a graph across its whole lifetime, unlike the handle itself: that is a
@@ -120,6 +131,9 @@ def _graph_id(graph: Any) -> int:
 
 
 def maybe_stamp_capture_root(stream: Any) -> None:
+    # [FUNCTION DOC] Called by torch.cuda.graph right after capture begins: resets then, if annotations are enabled and
+    # supported and the stream is actively capturing, stores the id of the top-level capture graph in module
+    # state (used to detect scopes inside conditional bodies). Returns None.
     """Record the top-level capture graph of the capture just begun on ``stream``.
 
     Called by ``torch.cuda.graph`` right after ``capture_begin``, while ``stream`` is
@@ -137,6 +151,9 @@ def maybe_stamp_capture_root(stream: Any) -> None:
 
 
 def _probe_tools_id() -> bool:
+    # [FUNCTION DOC] HELPER: Checks whether the toolsId query is usable. Returns False (with a warning) if cuda-bindings
+    # lacks the API, False (with an info log) if the driver reports it needs a newer driver, else True.
+    # Probes by calling with a null node and inspecting the returned error code.
     """Probe whether cudaGraphNodeGetToolsId is supported by the driver.
 
     Calls with a null node: cudaErrorInvalidValue means the API exists
@@ -173,6 +190,8 @@ def _probe_tools_id() -> bool:
 
 
 def _is_tools_id_unavailable() -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if toolsId is not usable (no cuda.bindings, or probe failed). Probes lazily on first
+    # call and caches the result in module state.
     """Return True if cudaGraphNodeGetToolsId is not usable."""
     global _tools_id_available
     if not _HAS_CUDA_BINDINGS:
@@ -184,6 +203,8 @@ def _is_tools_id_unavailable() -> bool:
 
 
 def is_available() -> bool:
+    # [FUNCTION DOC] Public check: True when a CUDA device exists and toolsId support is present. May probe the driver on
+    # first call (cached).
     r"""is_available() -> bool
 
     Return whether CUDA graph annotation recording is supported.
@@ -200,6 +221,8 @@ def is_available() -> bool:
 
 
 def _get_capture_state(stream: Any) -> _CaptureState | None:
+    # [FUNCTION DOC] HELPER: Queries the stream's capture info. Returns a pair of (graph being captured, list of current
+    # frontier dependency nodes) if capture is active, else None. Raises on CUDA error.
     """Return ``(graph, frontier)`` for an active capture, else ``None``."""
     status, _id, graph, _deps, _edge_data, _num_deps = _check_cuda_bindings(
         _cuda_runtime.cudaStreamGetCaptureInfo(  # pyrefly: ignore[missing-attribute]
@@ -215,6 +238,7 @@ def _get_capture_state(stream: Any) -> _CaptureState | None:
 
 
 def _get_root_nodes(graph: Any) -> list[Any]:
+    # [FUNCTION DOC] HELPER: Returns the list of root nodes of a graph using the two-step size-then-fetch query; empty list if none.
     """Return the current root nodes for the graph."""
     _, num_roots = _check_cuda_bindings(
         _cuda_runtime.cudaGraphGetRootNodes(  # pyrefly: ignore[missing-attribute]
@@ -232,6 +256,8 @@ def _get_root_nodes(graph: Any) -> list[Any]:
 
 
 def _get_dependent_nodes(node: Any) -> list[Any]:
+    # [FUNCTION DOC] HELPER: Returns the list of direct dependent nodes of a node using the two-step size-then-fetch query;
+    # empty list if none.
     """Return the direct dependents of a graph node."""
     _, _, num_dependents = _check_cuda_bindings(
         _cuda_runtime.cudaGraphNodeGetDependentNodes(  # pyrefly: ignore[missing-attribute]
@@ -249,6 +275,8 @@ def _get_dependent_nodes(node: Any) -> list[Any]:
 
 
 def _get_node_type(node: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Returns the node type enum via the driver API (the runtime query can fail for batch memory-op
+    # nodes).
     """Return graph node type without tripping runtime bugs on newer node kinds.
 
     The runtime ``cudaGraphNodeGetType`` can return ``cudaErrorUnknown`` (999)
@@ -266,6 +294,9 @@ def _collect_descendants(
     existing_direct_dependents: _ExistingDirectDependents | None = None,
     include_start_nodes: bool = False,
 ) -> dict[int, Any]:
+    # [FUNCTION DOC] HELPER: Depth-first walk of dependent edges from start_nodes. Skips edges listed in
+    # existing_direct_dependents (edges that existed at scope entry) and already-seen nodes. Returns a mapping
+    # from integer node key to node; start nodes are included only if include_start_nodes is set.
     """Walk dependent edges starting at ``start_nodes``.
 
     ``existing_direct_dependents`` maps each node in ``start_nodes`` to
@@ -308,6 +339,8 @@ _ANNOTATABLE_TYPES: set[Any] | None = None
 
 
 def _get_annotatable_types() -> set[Any]:
+    # [FUNCTION DOC] HELPER: Lazily builds and caches the set of driver node types that get annotated (kernel, memcpy, memset,
+    # batch mem op, event record, event wait, host).
     global _ANNOTATABLE_TYPES
     if _ANNOTATABLE_TYPES is None:
         node_types = _cuda_driver.CUgraphNodeType  # pyrefly: ignore[missing-attribute]
@@ -333,6 +366,8 @@ _NESTED_GRAPH_TYPES: set[Any] | None = None
 
 
 def _get_nested_graph_types() -> set[Any]:
+    # [FUNCTION DOC] HELPER: Lazily builds and caches the set of node types holding separate nested graphs (child graph,
+    # conditional) which the walk does not descend into.
     global _NESTED_GRAPH_TYPES
     if _NESTED_GRAPH_TYPES is None:
         node_types = _cuda_driver.CUgraphNodeType  # pyrefly: ignore[missing-attribute]
@@ -384,12 +419,15 @@ _REGION_TLS_KEY = "cuda_graph_annotation_region"
 
 
 def _current_region() -> dict[str, Any] | None:
+    # [FUNCTION DOC] HELPER: Returns the annotation dict of the current backward region from thread-local storage, or None.
     if torch._C._is_key_in_tls(_REGION_TLS_KEY):
         return torch._C._get_obj_in_tls(_REGION_TLS_KEY)
     return None
 
 
 def _enter_region(collapsed: dict[str, Any]) -> dict[str, Any] | None:
+    # [FUNCTION DOC] HELPER: Installs collapsed as the current region in thread-local storage and returns the previous region
+    # (or None) so it can be restored.
     """Install ``collapsed`` as the current region; return the previous one."""
     prev = _current_region()
     torch._C._stash_obj_in_tls(_REGION_TLS_KEY, collapsed)
@@ -397,6 +435,7 @@ def _enter_region(collapsed: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _exit_region(prev: dict[str, Any] | None) -> None:
+    # [FUNCTION DOC] HELPER: Restores the region saved by _enter_region: removes the slot if prev is None, else stores prev.
     if prev is None:
         torch._C._remove_obj_from_tls(_REGION_TLS_KEY)
     else:
@@ -417,6 +456,8 @@ _annotation_generation: int = 0
 
 
 class _KernelScope(NamedTuple):
+    # [CLASS DOC] HELPER: Immutable snapshot of capture state at scope entry: graph, frontier nodes, root node keys at entry
+    # (only recorded when the frontier is empty) and each frontier node's direct dependents at entry.
     """Capture-frontier snapshot taken at scope entry, consumed at scope exit."""
 
     graph: Any
@@ -426,6 +467,8 @@ class _KernelScope(NamedTuple):
 
 
 def _begin_kernel_scope() -> _KernelScope | None:
+    # [FUNCTION DOC] HELPER: Snapshots the current stream's capture state (graph, frontier, entry dependents, and root keys
+    # when the frontier is empty). Returns None if the current stream is not capturing.
     """Snapshot the current stream's capture frontier; ``None`` if not capturing."""
     stream = _cuda_runtime.cudaStream_t(  # pyrefly: ignore[missing-attribute]
         init_value=torch.cuda.current_stream().cuda_stream
@@ -445,6 +488,9 @@ def _begin_kernel_scope() -> _KernelScope | None:
 
 
 def _end_kernel_scope(scope: _KernelScope) -> list[int]:
+    # [FUNCTION DOC] HELPER: Finds nodes added since the snapshot (descendants of the frontier via new edges, or new roots when
+    # the frontier was empty), and returns the toolsIds of those whose type is annotatable. Emits a warning if
+    # the scope contains nested-graph nodes since their contents are not annotated.
     """Walk nodes captured since ``scope`` was begun; return their toolsIds."""
     if scope.frontier:
         scope_nodes = _collect_descendants(
@@ -490,6 +536,9 @@ def _end_kernel_scope(scope: _KernelScope) -> list[int]:
 
 
 class _BracketState(threading.local):
+    # [CLASS DOC] HELPER: Thread-local holder of a stack of open backward bracket entries for one hook pair, so concurrent
+    # executions on different threads do not interleave; prehook pushes, posthook pops (LIFO). A leaked entry
+    # from a failed node is harmless because later runs pop their own entries above it.
     """Per-thread stack of open backward brackets for one hook pair.
 
     Thread-local so concurrent executions of a retained node (separate
@@ -514,6 +563,7 @@ class _BracketState(threading.local):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Initializes the empty per-thread stack (runs once per thread on first access).
         # Entries are (scope, prev_region, merged_region) or _SKIPPED.
         self.stack: list[Any] = []
 
@@ -521,10 +571,14 @@ class _BracketState(threading.local):
 # Bracket-stack marker for "prehook did nothing": distinct from an entry with
 # scope=None, which means the region and creation hook were installed but no
 # capture was active (the posthook must still pop them).
+# HELPER: sentinel pushed on the bracket stack when the prehook did nothing.
 _SKIPPED: Any = object()
 
 
 def _freeze_region_hook(node: Any, generation: int) -> None:
+    # [FUNCTION DOC] HELPER: Node-creation hook. Does nothing for AccumulateGrad nodes, nodes already marked as hooked, or when
+    # no region is open. Otherwise marks the node as hooked in its metadata and attaches the backward hook pair
+    # capturing the current region and the given annotation generation.
     """Node creation hook: freeze the current region into ``node``'s bracket.
 
     Reads the region TLS slot and, if a region is open, installs the node's
@@ -553,6 +607,11 @@ def _freeze_region_hook(node: Any, generation: int) -> None:
 
 
 def _attach_backward_hooks(node: Any, frozen: dict[str, Any], generation: int) -> None:
+    # [FUNCTION DOC] HELPER: Registers a pre/post hook pair on an autograd node to bracket its backward execution. Prehook (skipped
+    # if generation is stale or toolsId unavailable): merges the frozen region over the live one, installs it,
+    # pushes a node creation hook, and snapshots capture state when annotations are enabled. Posthook: pops the
+    # state, restores region and creation hook, and if a scope was taken appends the merged annotation tagged
+    # with autograd_phase backward and the new toolsIds to the pending scopes. Mutates global pending state.
     """Register one pre/post hook pair bracketing ``node``'s backward execution.
 
     ``frozen`` is the region that was current when the node was created:
@@ -588,9 +647,12 @@ def _attach_backward_hooks(node: Any, frozen: dict[str, Any], generation: int) -
     state = _BracketState()
 
     def creation_hook(child: Any) -> None:
+        # [FUNCTION DOC] HELPER: Forwards newly created child nodes to the region freezing hook using the enclosing generation.
         _freeze_region_hook(child, generation)
 
     def prehook(_grad_outputs: Any) -> None:
+        # [FUNCTION DOC] HELPER: Backward prehook; see the enclosing function. Pushes either the skipped sentinel or a tuple of
+        # (scope or None, previous region, merged region) on this thread's stack.
         if generation != _annotation_generation or _is_tools_id_unavailable():
             state.stack.append(_SKIPPED)
             return
@@ -604,6 +666,8 @@ def _attach_backward_hooks(node: Any, frozen: dict[str, Any], generation: int) -
         state.stack.append((scope, prev, merged))
 
     def posthook(_grad_inputs: Any, _grad_outputs: Any) -> None:
+        # [FUNCTION DOC] HELPER: Backward posthook; pops the matching stack entry, undoes region and creation-hook installation, and
+        # records the toolsIds found since the prehook (if any) as a pending scope.
         if not state.stack:
             return
         entry = state.stack.pop()
@@ -625,6 +689,11 @@ def _attach_backward_hooks(node: Any, frozen: dict[str, Any], generation: int) -
 
 @contextmanager  # type: ignore[arg-type]
 def mark_kernels(annotation: str | dict[str, Any], *, backward: bool = True):
+    # [FUNCTION DOC] Context manager annotating GPU nodes captured within its scope. A string annotation becomes a mapping with
+    # a name key. Does nothing (just yields) when annotations are disabled/unavailable, the current stream is
+    # not capturing, or the scope is inside a conditional body (that case warns). Otherwise enters a region,
+    # optionally (backward true) installs a node creation hook so backward nodes get annotated, and on exit
+    # appends (annotation, toolsIds of new nodes) to the pending scopes. Warns when nested-graph nodes are present.
     r"""mark_kernels(annotation, *, backward=True)
 
     Context manager that annotates GPU work captured within its scope.
@@ -734,6 +803,7 @@ def mark_kernels(annotation: str | dict[str, Any], *, backward: bool = True):
     generation = _annotation_generation
 
     def creation_hook(node: Any) -> None:
+        # [FUNCTION DOC] HELPER: Forwards newly created autograd nodes to the region freezing hook using this scope's generation.
         _freeze_region_hook(node, generation)
 
     # Enter the region even when backward=False: the region must reflect the
@@ -755,6 +825,8 @@ def mark_kernels(annotation: str | dict[str, Any], *, backward: bool = True):
 
 
 def maybe_stamp_capture_graph_id(torch_cuda_graph: torch.cuda.CUDAGraph) -> None:
+    # [FUNCTION DOC] Called at capture end: if annotations are enabled and supported, stores the captured graph's driver id on the
+    # graph object as its capture id and clears its remapped exec id. No-op otherwise. Returns None.
     """Record the captured graph's id on the graph object for later remap.
 
     Called from ``capture_end`` in the window after capture ends and before the
@@ -781,6 +853,9 @@ def maybe_stamp_capture_graph_id(torch_cuda_graph: torch.cuda.CUDAGraph) -> None
 
 
 def resolve_pending_annotations() -> None:
+    # [FUNCTION DOC] Converts pending (annotation, toolsIds) scopes into the global annotation table: per toolsId, one annotation
+    # is stored as is, several are merged with first-recorded key winning (non-dict annotations become a name
+    # key). Exceptions are logged, not raised; pending scopes are always cleared.
     """Resolve pending scope toolsIds into kernel annotations."""
     if not _pending_scopes:
         return
@@ -811,6 +886,9 @@ def resolve_pending_annotations() -> None:
 
 
 def remap_to_exec_graph(torch_cuda_graph: torch.cuda.CUDAGraph) -> None:
+    # [FUNCTION DOC] Rekeys this graph's annotations from capture graph id (or previous exec id) to the current exec graph id,
+    # updating the global table in place and recording the exec id on the graph. No-op when there are no
+    # annotations, the graph has no capture id, or the keys already match.
     """Remap annotation keys from capture graph ID to exec graph ID.
 
     During capture, toolsId encodes the capture graph's ID in the upper
@@ -862,6 +940,8 @@ def _rekey_annotations(
     capture_graph_id: int,
     exec_graph_id: int,
 ) -> dict[int, list[Any]]:
+# [FUNCTION DOC] HELPER: Returns a new mapping where toolsIds whose upper 32 bits equal capture_graph_id are rewritten to use
+# exec_graph_id with the same lower node bits; other entries are kept; colliding lists are merged.
     """Rekey one graph's annotations from its capture id to its exec id.
 
     A toolsId packs the graph id in the upper 32 bits and the node id in the
@@ -885,6 +965,7 @@ def _rekey_annotations(
 
 
 def resolve_and_remap(torch_cuda_graph: torch.cuda.CUDAGraph) -> None:
+    # [FUNCTION DOC] Convenience: resolves pending scopes then remaps the given graph's annotations to its exec graph ids.
     """Resolve any pending scopes and remap one graph in a single call.
 
     Shorthand for ``resolve_pending_annotations()`` followed by
@@ -895,6 +976,7 @@ def resolve_and_remap(torch_cuda_graph: torch.cuda.CUDAGraph) -> None:
 
 
 def get_kernel_annotations() -> Mapping[int, list[Any]]:
+    # [FUNCTION DOC] Returns the live (not copied) global mapping from toolsId to list of annotation dicts.
     r"""get_kernel_annotations() -> Mapping[int, list]
 
     Return the live registry of recorded kernel annotations.
@@ -925,6 +1007,8 @@ def get_kernel_annotations() -> Mapping[int, list[Any]]:
 
 
 def clear_kernel_annotations() -> None:
+    # [FUNCTION DOC] Empties the annotation table and pending scopes and bumps the generation counter so previously attached
+    # backward hooks stop recording.
     r"""clear_kernel_annotations() -> None
 
     Clear all recorded kernel annotations.
@@ -949,6 +1033,7 @@ def clear_kernel_annotations() -> None:
 
 
 def remove_kernel_annotations(exec_graph_ids: Iterable[int]) -> None:
+    # [FUNCTION DOC] Deletes annotation entries whose upper 32 bits of toolsId (exec graph id) are in the given ids.
     """Drop kernel-annotation entries whose exec graph id (tools_id >> 32) is in
     exec_graph_ids, so the map does not grow across the run. Run by the annotation
     resolver's graph-destroy handler."""
@@ -962,11 +1047,13 @@ def remove_kernel_annotations(exec_graph_ids: Iterable[int]) -> None:
 # Counter-based stream ID registry. IDs start at 60 (above the highest
 # observed non-graphed CUDA stream ID) so every assigned lane is visually
 # distinct in Perfetto and doesn't collide with real streams.
+# Module state: next stream lane id and mapping from stream handle (or process group key) to assigned id.
 _stream_id_counter: int = 60
 _stream_id_map: dict[int, int] = {}
 
 
 def _get_stream_id(stream: torch.cuda.Stream) -> int:
+    # [FUNCTION DOC] HELPER: Returns a stable small lane id for the stream, allocating the next counter value on first sight.
     """Return a small, stable stream ID for the given CUDA stream."""
     global _stream_id_counter
     key = stream.cuda_stream
@@ -977,6 +1064,8 @@ def _get_stream_id(stream: torch.cuda.Stream) -> int:
 
 
 def get_stream_for_pg(pg_key: str) -> int:
+    # [FUNCTION DOC] Returns a unique lane id for a process group key, allocating from the shared counter and map on first use.
+    # KNOWN ISSUE: shares the map with integer stream handles, so a key collision between kinds is unguarded (type-ignored).
     """Return a unique stream ID for the given process group key."""
     global _stream_id_counter
     if pg_key not in _stream_id_map:
@@ -987,6 +1076,11 @@ def get_stream_for_pg(pg_key: str) -> int:
 
 @contextmanager  # type: ignore[arg-type]
 def mark_stream(stream: torch.cuda.Stream, annotation: str | dict[str, Any]):
+    # [FUNCTION DOC] Context manager: runs the body on the given stream while annotating via mark_kernels. If annotations are
+    # disabled it only switches stream. If the stream is already current, no switch or stream-id injection is
+    # done. Otherwise adds a stream key with the lane id to the annotation and starts mark_kernels before the
+    # switch so the capture frontier is snapshotted on the original stream.
+    # KNOWN ISSUE: a dict annotation passed by the caller is mutated in place when the stream key is added.
     """Switch to stream, inject its ID into annotation, and mark kernels.
 
     If *stream* is already the current stream, no stream switch or stream ID

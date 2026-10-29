@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Utilities to analyze and visualize CUDA caching allocator memory snapshots (dictionaries from the memory
+# snapshot API): flamegraph text generation (format_flamegraph, segments, memory, compare), a textual segment
+# fill report (segsum), a replayable allocation trace (trace), HTML plot generators (trace_plot, profile_plot,
+# segment_plot), and a command line entry point when run as a script (reads pickled snapshots, writes SVG/HTML
+# or prints).
+# Public exports: format_flamegraph, segments, memory, compare. Import defines a cache decorator only; no I/O.
 import base64
 import io
 import json
@@ -19,6 +25,8 @@ __all__ = ["format_flamegraph", "segments", "memory", "compare"]
 
 
 def _frame_fmt(f, full_filename=False):
+    # [FUNCTION DOC] HELPER: Formats one stack frame mapping (filename, line, name) as file:line:function; the file is reduced to its
+    # base name unless full_filename is set.
     i = f["line"]
     fname = f["filename"]
     if not full_filename:
@@ -29,6 +37,8 @@ def _frame_fmt(f, full_filename=False):
 
 @cache
 def _frame_filter(name, filename):
+    # [FUNCTION DOC] HELPER: Cached predicate returning False for frames that are noise (known interpreter, unwinder and dispatcher
+    # function names or file path fragments) and True otherwise.
     omit_functions = [
         "unwind::unwind",
         "CapturedTraceback::gather",
@@ -61,6 +71,7 @@ def _frame_filter(name, filename):
 
 
 def _frames_fmt(frames, full_filename=False, reverse=False):
+    # [FUNCTION DOC] HELPER: Returns the formatted strings for frames that pass the noise filter, optionally in reversed order.
     if reverse:
         frames = reversed(frames)
     return [
@@ -71,6 +82,8 @@ def _frames_fmt(frames, full_filename=False, reverse=False):
 
 
 def _block_extra_legacy(b):
+    # [FUNCTION DOC] HELPER: For old-format blocks returns (frames, real size): taken from the first history entry if present, else no
+    # frames and the requested size (or block size).
     if "history" in b:
         frames = b["history"][0].get("frames", [])
         real_size = b["history"][0]["real_size"]
@@ -81,6 +94,7 @@ def _block_extra_legacy(b):
 
 
 def _block_extra(b):
+    # [FUNCTION DOC] HELPER: Returns (frames, requested size) for a block, using the legacy path when the block lacks a frames key.
     if "frames" not in b:
         # old snapshot format made it more complicated to get frames/allocated size
         return _block_extra_legacy(b)
@@ -88,6 +102,12 @@ def _block_extra(b):
 
 
 def format_flamegraph(flamegraph_lines, flamegraph_script=None):
+    # [FUNCTION DOC] Pipes folded-stack text through the flamegraph.pl script (counting unit bytes) and returns the resulting SVG
+    # text. If no script path is given uses a file in the user cache directory (created if needed). Downloads the
+    # script from GitHub when missing (prints a message; atomic temp file then replace; sets executable bit),
+    # then runs it as a subprocess. Raises AssertionError if pipes are missing or the process exits nonzero.
+    # Side effects: network and filesystem writes, subprocess.
+    # KNOWN ISSUE: wait() is called several times on the process; the first return value is discarded, harmless but redundant.
     if flamegraph_script is None:
         cache_dir = os.path.expanduser("~/.cache/")
         os.makedirs(cache_dir, exist_ok=True)
@@ -136,7 +156,11 @@ def format_flamegraph(flamegraph_lines, flamegraph_script=None):
 
 
 def _write_blocks(f, prefix, blocks):
+    # [FUNCTION DOC] HELPER: Writes folded-stack lines to file-like f for each block: prefix;state;frames size. Blocks with history
+    # produce one line per history entry (using its frames or a no-context marker); others use block frames.
+    # Any block size not accounted for is emitted as a gaps line.
     def frames_fragment(frames):
+        # [FUNCTION DOC] HELPER: Joins formatted frames (reversed) with semicolons, or returns a non-python marker if there are none.
         if not frames:
             return "<non-python>"
         return ";".join(_frames_fmt(frames, reverse=True))
@@ -163,6 +187,8 @@ def _write_blocks(f, prefix, blocks):
 
 
 def segments(snapshot, format_flamegraph=format_flamegraph):
+    # [FUNCTION DOC] Builds folded-stack text from every segment of the snapshot (prefix per stream and segment address) and returns
+    # the output of the given flamegraph formatter.
     f = io.StringIO()
     for seg in snapshot["segments"]:
         prefix = f"stream_{seg['stream']};seg_{seg['address']}"
@@ -171,6 +197,7 @@ def segments(snapshot, format_flamegraph=format_flamegraph):
 
 
 def memory(snapshot, format_flamegraph=format_flamegraph):
+    # [FUNCTION DOC] Like segments but groups only by stream (segments of a stream are merged); returns the flamegraph formatter output.
     f = io.StringIO()
     for seg in snapshot["segments"]:
         prefix = f"stream_{seg['stream']}"
@@ -179,10 +206,15 @@ def memory(snapshot, format_flamegraph=format_flamegraph):
 
 
 def compare(before, after, format_flamegraph=format_flamegraph):
+    # [FUNCTION DOC] Compares two segment lists (identified by address and total size). Prints the addresses present only in one side,
+    # writes blocks of segments unique to each side under only_before / only_after prefixes, and returns the
+    # flamegraph formatter output. Segments present in both are ignored.
     def _seg_key(seg):
+        # [FUNCTION DOC] HELPER: Identity of a segment: pair of address and total size.
         return (seg["address"], seg["total_size"])
 
     def _seg_info(seg):
+        # [FUNCTION DOC] HELPER: Label string with the stream and segment address.
         return f"stream_{seg['stream']};seg_{seg['address']}"
 
     f = io.StringIO()
@@ -205,6 +237,7 @@ def compare(before, after, format_flamegraph=format_flamegraph):
 
 
 def _format_size(num):
+    # [FUNCTION DOC] HELPER: Formats a byte count as a human-readable string with binary prefixes (Ki, Mi, ... up to Yi), one decimal.
     # https://stackoverflow.com/questions/1094841/get-human-readable-version-of-file-size
     for unit in ["", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"]:
         if abs(num) < 1024.0:
@@ -214,21 +247,28 @@ def _format_size(num):
 
 
 class Bytes:
+    # [CLASS DOC] Wrapper around an integer byte count whose text form is human readable (binary prefixes). Supports adding a
+    # number, returning a new Bytes. Attribute: value.
     def __init__(self, value):
+        # [FUNCTION DOC] Stores the byte count.
         self.value = value
 
     def __add__(self, rhs):
+        # [FUNCTION DOC] Returns a new Bytes with rhs added to the value.
         return Bytes(self.value + rhs)
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns the human-readable size string.
         return _format_size(self.value)
 
 
 def calc_active(seg):
+    # [FUNCTION DOC] Returns the total size of blocks in the segment whose state is active_allocated.
     return sum(b["size"] for b in seg["blocks"] if b["state"] == "active_allocated")
 
 
 def _report_free(free_external, free_internal):
+    # [FUNCTION DOC] HELPER: Returns text of total free bytes with the percentage that is internal (rounding) free, omitted when total is 0.
     total = free_external + free_internal
     suffix = ""
     if total != 0:
@@ -237,6 +277,7 @@ def _report_free(free_external, free_internal):
     return f"{Bytes(total)}{suffix}"
 
 
+# Page granularity (20 MiB) used by segsum, and the legend text describing the segsum output.
 PAGE_SIZE = 1024 * 1024 * 20
 legend = f"""\
 
@@ -252,6 +293,11 @@ Legend:
 
 
 def segsum(data):
+    # [FUNCTION DOC] Returns a text report of how segments are filled, from a snapshot mapping. For each segment (sorted by total size,
+    # then active bytes) tallies external free, internal free and allocated bytes, draws one character per 20 MiB page
+    # (letter per block, space free, digit tenths filled, star full), and prints segments at least one page large.
+    # Appends totals and a legend. Raises AssertionError if per-segment or global accounting does not add up.
+    # KNOWN ISSUE: the stream label is computed twice; the first computation is dead code.
     r"""Visually reports how the allocator has filled its segments.
 
     This printout can help debug fragmentation issues since free fragments
@@ -338,9 +384,15 @@ def segsum(data):
 
 
 def trace(data):
+    # [FUNCTION DOC] Returns a pseudo-code text listing of the allocator event trace of each non-empty device trace in the snapshot
+    # (alloc, free, segment alloc/free, OOM, annotate and unknown events), with a header per device.
+    # KNOWN ISSUE: the running total memory count is overwritten by the loop index variable and entry-name lookups
+    # are keyed by address, so freed names are rarely recycled (membership tests compare names against address keys).
     out = io.StringIO()
 
     def format(entries):
+        # [FUNCTION DOC] HELPER: Writes the listing for one device's entries to the shared output buffer: assigns short letter names to
+        # allocations and segments, resolves each allocation to a segment and offset, and prints a total at the end.
         segment_intervals: list = []
         segment_addr_to_name = {}
         allocation_addr_to_name = {}
@@ -349,6 +401,7 @@ def trace(data):
         next_name = 0
 
         def _name():
+            # [FUNCTION DOC] HELPER: Returns a recycled name if available, else the next generated name (letter plus optional numeric suffix).
             nonlocal next_name
             if free_names:
                 return free_names.pop()
@@ -357,6 +410,8 @@ def trace(data):
             return f"{chr(ord('a') + m)}{'' if r == 0 else r}"
 
         def find_segment(addr):
+            # [FUNCTION DOC] HELPER: Finds which known segment (traced segment allocations first, then snapshot segments) contains addr;
+            # returns (name, start address) or (None, None).
             for name, saddr, size in segment_intervals:
                 if addr >= saddr and addr < saddr + size:
                     return name, saddr
@@ -433,6 +488,7 @@ def trace(data):
     return out.getvalue()
 
 
+# HTML page template; placeholders for the snapshot data and visualization kind are replaced by _format_viz.
 _memory_viz_template = r"""
 <!DOCTYPE html>
 <html>
@@ -449,6 +505,8 @@ add_local_files(local_files, $VIZ_KIND)
 
 
 def _format_viz(data, viz_kind, device):
+    # [FUNCTION DOC] HELPER: Pickles the snapshot, base64-encodes it, and substitutes it and the viz kind into the HTML template,
+    # returning the HTML string. Emits a FutureWarning if the deprecated device argument is given.
     if device is not None:
         warnings.warn(
             "device argument is deprecated, plots now contain all device",
@@ -467,6 +525,9 @@ def _format_viz(data, viz_kind, device):
 
 
 def filter_alloc_free_pairs(data):
+    # [FUNCTION DOC] For each device trace, removes alloc events that were later freed (their free_requested and the matching
+    # free_completed) so only live allocations remain. Mutates the snapshot in place and returns it; prints a message
+    # for free_completed events lacking a request.
     for dev_id in range(len(data["device_traces"])):
         # set of indexes of trace events for alloc-free pairs
         filterSet = set()
@@ -503,6 +564,8 @@ def filter_alloc_free_pairs(data):
 
 
 def trace_plot(data, device=None, plot_segments=False, filter_freed=False):
+    # [FUNCTION DOC] Returns HTML of an active-memory timeline (or cached-memory timeline when plot_segments is set) for the
+    # snapshot, optionally first filtering out freed alloc/free pairs. device is deprecated and only triggers a warning.
     """Generate a visualization over time of the memory usage recorded by the trace as an html file.
 
     Args:
@@ -529,6 +592,10 @@ def trace_plot(data, device=None, plot_segments=False, filter_freed=False):
 
 
 def _profile_to_snapshot(profile):
+    # [FUNCTION DOC] HELPER: Converts a memory profile (from the profiler with memory profiling) into a snapshot-shaped mapping with
+    # per-device traces (one extra pseudo device for non-CUDA memory) and segments. Builds python call stacks per
+    # allocation, replays the profile timeline into alloc/free events, and constructs final segments and blocks.
+    # Side effects: none besides imports; mutates only local data.
     import torch
     from torch._C._profiler import _EventType
     from torch.profiler._memory_profiler import Action, TensorKey
@@ -567,12 +634,15 @@ def _profile_to_snapshot(profile):
     }
 
     def to_device(device):
+        # [FUNCTION DOC] HELPER: Maps a device to its index; CUDA devices use their own index, all others map to the extra index.
         if device.type == "cuda":
             return device.index
         else:
             return device_count
 
     def allocate(size, tensor_key, version, during_trace=True):
+        # [FUNCTION DOC] HELPER: Creates an alloc event for a tensor key, widening that device segment's address range, tagging category and
+        # stack, and appending it to the device trace unless during_trace is false. Returns the event.
         device = to_device(tensor_key.device)
         addr = tensor_key.storage.ptr
 
@@ -599,6 +669,7 @@ def _profile_to_snapshot(profile):
         return r
 
     def free(alloc, device):
+        # [FUNCTION DOC] HELPER: Appends free_requested and free_completed events mirroring the given alloc event to the device trace.
         for e in ("free_requested", "free_completed"):
             snapshot["device_traces"][device].append(
                 {
@@ -665,6 +736,7 @@ def _profile_to_snapshot(profile):
 
 
 def profile_plot(profile, device=None):
+    # [FUNCTION DOC] Returns HTML of an active-memory timeline derived from a memory-profiling profile. device is deprecated.
     """Generate a visualization over time of the memory usage recorded by kineto memory profiling as an html file.
 
     Args:
@@ -679,6 +751,7 @@ def profile_plot(profile, device=None):
 
 
 def segment_plot(data: Any, device=None):
+    # [FUNCTION DOC] Returns HTML visualizing allocator state history (how allocations are packed in segments) from a snapshot.
     return _format_viz(data, "Allocator State History", device)
 
 
@@ -700,6 +773,7 @@ if __name__ == "__main__":
     subparsers = parser.add_subparsers(dest="action")
 
     def _output(p):
+        # [FUNCTION DOC] HELPER: Adds the output file option (default output.svg) to a sub-command parser.
         p.add_argument(
             "-o",
             "--output",
@@ -770,6 +844,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     def _read(name):
+        # [FUNCTION DOC] HELPER: Loads a pickled snapshot from a file path (or standard input if the name is a dash). A bare list is
+        # wrapped into a mapping with segments and an empty traces entry.
+        # KNOWN ISSUE: the wrapper uses the key traces while the rest of the module reads device_traces; the compare command
+        # also passes whole snapshot mappings where compare expects segment lists.
         if name == "-":
             data = pickle.load(sys.stdin.buffer)
         else:
@@ -780,6 +858,7 @@ if __name__ == "__main__":
         return data
 
     def _write(name, data):
+        # [FUNCTION DOC] HELPER: Writes the text data to the named file.
         with open(name, "w") as f:
             f.write(data)
 

@@ -1,3 +1,5 @@
+# [MODULE DOC] Compatibility module re-exporting multi-GPU communication helpers (broadcast, broadcast_coalesced,
+# reduce_add, reduce_add_coalesced, scatter, gather) from torch.nn.parallel.comm.
 # The functions here have been moved to torch.nn.parallel.comm
 from torch.nn.parallel.comm import (
     broadcast,

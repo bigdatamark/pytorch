@@ -1,3 +1,8 @@
+# [MODULE DOC] Low-level helpers for talking to the GPU driver and runtime compiler from Python: loading the CUDA driver /
+# HIP runtime and NVRTC/HIPRTC libraries through ctypes, error-checking helpers for ctypes and cuda.bindings calls,
+# runtime compilation of kernel source to a binary (_nvrtc_compile), loading modules and launching kernels (_CudaModule,
+# _CudaKernel, _cuda_load_module), and a CUDA device index normalizer. Import tries to import cuda.bindings and sets
+# _HAS_CUDA_BINDINGS accordingly (bindings names become None if missing); no libraries are loaded at import.
 import ctypes
 import sys
 from typing import Any
@@ -22,6 +27,9 @@ from torch._utils import _get_device_index as _torch_get_device_index
 
 
 def _get_hip_runtime_library() -> ctypes.CDLL:
+    # [FUNCTION DOC] HELPER: Loads the HIP runtime shared library (via the ROCm SDK package if available, else a platform default name) and adds
+    # driver-style alias attributes (error string, module load, get function, launch kernel, set function attribute) so it can be
+    # used like the CUDA driver library. Returns the library handle; raises OSError if it cannot be loaded.
     # If ROCm python packages are available, query the OS-independent absolute
     # path to the library provided by those packages, including any version suffix.
     # See https://github.com/ROCm/TheRock/blob/main/docs/packaging/python_packaging.md#dynamic-library-resolution
@@ -45,6 +53,7 @@ def _get_hip_runtime_library() -> ctypes.CDLL:
 
 
 def _get_cuda_library() -> ctypes.CDLL:
+    # [FUNCTION DOC] HELPER: Loads and returns the CUDA driver library (nvcuda.dll on Windows, libcuda.so.1 otherwise); raises OSError if missing.
     if sys.platform == "win32":
         return ctypes.CDLL("nvcuda.dll")
     else:  # Unix-based systems
@@ -53,6 +62,7 @@ def _get_cuda_library() -> ctypes.CDLL:
 
 # Load GPU driver runtime
 def _get_gpu_runtime_library() -> ctypes.CDLL:
+    # [FUNCTION DOC] HELPER: Returns the HIP runtime library on ROCm builds, otherwise the CUDA driver library.
     if torch.version.hip:
         return _get_hip_runtime_library()
     else:
@@ -61,6 +71,7 @@ def _get_gpu_runtime_library() -> ctypes.CDLL:
 
 # Helper: check CUDA errors
 def _check_cuda(result: int) -> None:
+    # [FUNCTION DOC] HELPER: Does nothing if the driver call result is 0; otherwise looks up the driver error string and raises RuntimeError with it.
     if result == 0:
         return
     err_str = ctypes.c_char_p()
@@ -73,6 +84,9 @@ def _check_cuda(result: int) -> None:
 
 
 def _check_cuda_bindings(result: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Validates a cuda.bindings result tuple (error code followed by outputs). Raises RuntimeError if bindings are not available
+    # or the error code is nonzero (message includes the driver or runtime error string). Returns None for no outputs, the single
+    # output, or the list of outputs.
     """Check a cuda.bindings (cuda-python) call result for errors.
 
     All cuda.bindings driver/runtime calls return ``(error, *outputs)``. This
@@ -116,6 +130,8 @@ def _check_cuda_bindings(result: Any) -> Any:
 
 
 def _check_cuda_bindings_driver(result: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Like _check_cuda_bindings but for driver API results: raises RuntimeError unless the code equals success (message includes the
+    # driver error string); returns None, the single output, or the list of outputs.
     """Check a cuda.bindings (cuda-python) driver call result for errors.
 
     Like ``_check_cuda_bindings`` but for the CUDA driver API, whose calls
@@ -144,6 +160,8 @@ def _check_cuda_bindings_driver(result: Any) -> Any:
 
 
 def _get_hiprtc_library() -> ctypes.CDLL:
+    # [FUNCTION DOC] HELPER: Loads the HIP runtime compiler library (ROCm SDK package, or a platform default name) and defines NVRTC-named aliases for its
+    # functions. Returns the library; raises OSError if it cannot be loaded.
     try:
         # pyrefly: ignore [import-error, missing-import]
         import rocm_sdk
@@ -173,6 +191,8 @@ def _get_hiprtc_library() -> ctypes.CDLL:
 
 
 def _get_nvrtc_library() -> ctypes.CDLL:
+    # [FUNCTION DOC] HELPER: Loads the NVRTC library matching the major CUDA version of this build, trying a versioned name then an unversioned one on
+    # Unix. Raises OSError if none can be loaded.
     major_version = int(torch.version.cuda.split(".")[0])  # type: ignore[union-attr]
     if sys.platform == "win32":
         nvrtc_libs = [
@@ -192,6 +212,7 @@ def _get_nvrtc_library() -> ctypes.CDLL:
 
 
 def _get_gpu_rtc_library() -> ctypes.CDLL:
+    # [FUNCTION DOC] HELPER: Returns the HIPRTC library on ROCm builds, otherwise the NVRTC library.
     # Since PyTorch already loads the GPU RTC library, we can use the system library
     # which should be compatible with PyTorch's version
     if torch.version.hip:
@@ -201,6 +222,7 @@ def _get_gpu_rtc_library() -> ctypes.CDLL:
 
 
 def _get_gpu_rtc_compatible_flags() -> list[str]:
+    # [FUNCTION DOC] HELPER: Returns the common NVCC flags from the cpp extension utilities minus those unsupported by NVRTC, plus the common HIPCC flags on ROCm.
     """
     Get HIPCC/NVCC flags that are compatible with NVRTC compilation.
 
@@ -232,6 +254,11 @@ def _nvrtc_compile(
     nvcc_options: list | None = None,
     auto_pch: bool = False,
 ) -> tuple[bytes, str]:
+    # [FUNCTION DOC] HELPER: Compiles kernel source text with NVRTC/HIPRTC and returns (binary image bytes, lowered kernel name). Determines the target
+    # architecture from the current device if not given, builds the option list (architecture, include paths including user
+    # directories, optional pch, extra options, compatible flags), compiles and raises RuntimeError with the compiler log on failure.
+    # KNOWN ISSUE: with auto_pch the --pch option is appended to the caller's nvcc_options list in place; the CUDA version check
+    # compares version strings lexicographically, which misorders versions such as 12.10 versus 12.8.
     """
     Compiles a CUDA kernel using NVRTC and returns the PTX code.
 
@@ -258,6 +285,7 @@ def _nvrtc_compile(
 
     # Helper: check NVRTC errors
     def check_nvrtc(result: int) -> None:
+        # [FUNCTION DOC] HELPER: Raises RuntimeError with the compiler error string if the result code is not success.
         if result != NVRTC_SUCCESS:
             err_str = ctypes.c_char_p()
             libnvrtc.nvrtcGetErrorString(result, ctypes.byref(err_str))
@@ -371,11 +399,16 @@ def _nvrtc_compile(
 
 
 class _CudaModule:
+    # [CLASS DOC] HELPER: Wrapper around a loaded GPU module handle that looks up kernels lazily by attribute name and caches them in a dictionary.
+    # Attributes: _module, _kernels.
     def __init__(self, module: ctypes.c_void_p) -> None:
+        # [FUNCTION DOC] HELPER: Stores the module handle and an empty kernel cache.
         self._module = module
         self._kernels: dict[str, _CudaKernel] = {}
 
     def __getattr__(self, name: str) -> "_CudaKernel":
+        # [FUNCTION DOC] HELPER: Returns the cached kernel for name, or looks the function up in the module, wraps and caches it. Raises AttributeError if the
+        # module has no function of that name.
         if name in self._kernels:
             return self._kernels[name]
 
@@ -401,11 +434,14 @@ class _CudaModule:
 
 
 class _CudaKernel:
+    # [CLASS DOC] HELPER: A compiled kernel callable with tensors and scalars. Attributes: func and module handles, and _max_shared_mem_bytes (the
+    # configured dynamic shared memory limit, 0 when not configured).
     """
     Represents a compiled CUDA kernel that can be called with PyTorch tensors.
     """
 
     def __init__(self, func: ctypes.c_void_p, module: ctypes.c_void_p) -> None:
+        # [FUNCTION DOC] HELPER: Stores the function and module handles and starts with no shared memory configuration.
         self.func = func
         self.module = module
         self._max_shared_mem_bytes = 0
@@ -418,6 +454,11 @@ class _CudaKernel:
         shared_mem: int = 0,
         stream: Any | None = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Launches the kernel with the given grid and block shape, argument list, dynamic shared memory size and stream (current stream
+        # if None). Tensor arguments (CUDA or pinned CPU) become device pointers, integers become C ints, floats become C doubles.
+        # Raises ValueError for other tensors, TypeError for unsupported types, and RuntimeError if shared memory of at least 48 KiB is
+        # requested without enough prior configuration or if the launch fails.
+        # KNOWN ISSUE: Python ints are always passed as 32-bit C ints, so larger values are truncated.
         """
         Call the compiled CUDA kernel
 
@@ -508,6 +549,9 @@ class _CudaKernel:
         )
 
     def set_shared_memory_config(self, shared_mem_bytes: int) -> None:
+        # [FUNCTION DOC] HELPER: Records the allowed dynamic shared memory size. Below 48 KiB only records it; otherwise validates against the device limit (hard-coded
+        # per architecture on ROCm, queried opt-in limit on CUDA) and sets the kernel's max dynamic shared memory attribute. Raises
+        # RuntimeError if the request exceeds the limit or the driver call fails.
         if shared_mem_bytes < 48 * 1024:
             # No configuration needed for <= 48KB, just update the value
             self._max_shared_mem_bytes = shared_mem_bytes
@@ -557,6 +601,8 @@ class _CudaKernel:
 def _cuda_load_module(
     ptx: str | bytes, kernel_names: list[str] | None = None
 ) -> _CudaModule | dict[str, "_CudaKernel"]:
+    # [FUNCTION DOC] HELPER: Loads PTX/binary code (text is encoded first) into the current context and returns a lazy _CudaModule if no kernel names are
+    # given, else a dictionary of kernel name to _CudaKernel. Raises RuntimeError on driver errors.
     """
     Loads a CUDA module from PTX code and returns a module object that can access kernels.
 
@@ -605,6 +651,9 @@ def _cuda_load_module(
 def _get_device_index(
     device: Any, optional: bool = False, allow_cpu: bool = False
 ) -> int:
+    # [FUNCTION DOC] HELPER: Converts a device given as an int, string, torch device or cuda device context object to an integer index (ints returned as is).
+    # Raises ValueError for non-CUDA devices (CPU allowed if allow_cpu, returning -1 via the generic helper); defers to the shared helper
+    # for defaults when optional is set.
     r"""Get the device index from :attr:`device`, which can be a torch.device object, a Python integer, or ``None``.
 
     If :attr:`device` is a torch.device object, returns the device index if it

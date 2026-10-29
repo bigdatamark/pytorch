@@ -1,3 +1,5 @@
+# [MODULE DOC] Deprecated CUDA GradScaler: thin subclass of torch.amp.GradScaler with device fixed to cuda. Also
+# re-exports OptState for backward compatibility.
 from typing_extensions import deprecated
 
 import torch
@@ -10,6 +12,7 @@ __all__ = ["GradScaler"]
 
 
 class GradScaler(torch.amp.GradScaler):
+    # [CLASS DOC] Deprecated subclass of the generic gradient scaler that always uses device "cuda"; all behavior is inherited.
     r"""
     See :class:`torch.amp.GradScaler`.
     ``torch.cuda.amp.GradScaler(args...)`` is deprecated. Please use ``torch.amp.GradScaler("cuda", args...)`` instead.
@@ -28,6 +31,8 @@ class GradScaler(torch.amp.GradScaler):
         growth_interval: int = 2000,
         enabled: bool = True,
     ) -> None:
+        # [FUNCTION DOC] Deprecated constructor (emits FutureWarning). Forwards init_scale, growth_factor, backoff_factor,
+        # growth_interval and enabled to the parent with device "cuda".
         super().__init__(
             "cuda",
             init_scale=init_scale,
