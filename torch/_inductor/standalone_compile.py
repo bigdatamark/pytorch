@@ -1,3 +1,8 @@
+# [MODULE DOC] Standalone compilation API for Inductor: compile a GraphModule with example inputs into
+# a CompiledArtifact that can be called, saved (binary file or unpacked directory) and loaded later
+# without recompiling. Defines the CompiledArtifact base class, its cache-based and AOT-bundled
+# implementations, helpers to resolve fake mode and dynamic shapes, and the standalone_compile entry
+# point. Import-time side effects: creates the module logger.
 from __future__ import annotations
 
 import contextlib
@@ -46,6 +51,9 @@ log = logging.getLogger(__name__)
 
 
 class CompiledArtifact(ABC):
+    # [CLASS DOC] Abstract base for a compiled, invokable, serializable artifact. Holds the compiled
+    # callable and optional (bytes, CacheInfo) artifacts. Subclasses implement __call__ and save
+    # (abstract, one-line stubs); load dispatches on format and file header.
     """
     CompiledArtifact class represents the inductor cache artifacts that
     can be invoked in order to avoid repeated compilation.
@@ -68,6 +76,7 @@ class CompiledArtifact(ABC):
         compiled_fn: Callable[..., Any],
         artifacts: tuple[bytes, CacheInfo] | None,
     ):
+        # [FUNCTION DOC] Store the compiled callable and the optional cache artifacts tuple.
         self._compiled_fn = compiled_fn
         self._artifacts = artifacts
 
@@ -83,6 +92,11 @@ class CompiledArtifact(ABC):
     def load(
         *, path: str, format: Literal["binary", "unpacked"] = "binary"
     ) -> CompiledArtifact:
+        # [FUNCTION DOC] Load an artifact from path. Format unpacked goes to the cache implementation. Binary
+        # format reads the file, checks the header: AOT header (verifies torch key, deserializes the AOT
+        # artifact) or cache header (verifies torch key, reads key and bytes, loads cache artifacts and
+        # builds the artifact from the key). Raises AssertionError on torch key mismatch, trailing data or
+        # bad format, RuntimeError on an unknown header. Reads the file and populates caches.
         if format == "unpacked":
             # If format is unpacked, it must be a CacheCompiledArtifact
             return CacheCompiledArtifact.load(path=path, format=format)
@@ -122,6 +136,9 @@ class CompiledArtifact(ABC):
 
 
 class CacheCompiledArtifact(CompiledArtifact):
+    # [CLASS DOC] Artifact backed by torch.compiler cache artifacts (the AOT autograd cache entry). Wraps the
+    # compiled callable plus (bytes, CacheInfo). Can be saved as a binary blob or unpacked into a cache
+    # directory, and reloaded by looking up the autograd cache key. CACHE_HEADER marks the binary format.
     """
     CompiledArtifact that depends on torch.compiler.save_cache_artifacts
     """
@@ -133,13 +150,16 @@ class CacheCompiledArtifact(CompiledArtifact):
         compiled_fn: Callable[..., Any],
         artifacts: tuple[bytes, CacheInfo] | None,
     ):
+        # [FUNCTION DOC] Store the compiled callable and the optional cache artifacts tuple.
         self._compiled_fn = compiled_fn
         self._artifacts = artifacts
 
     def __call__(self, *args: Any) -> Any:
+        # [FUNCTION DOC] Invoke the compiled callable with the given positional args and return its result.
         return self._compiled_fn(*args)
 
     def is_saveable(self) -> bool:
+        # [FUNCTION DOC] True only if artifacts exist and exactly one aot_autograd artifact was recorded.
         if self._artifacts is None:
             return False
         _, cache_info = self._artifacts
@@ -149,6 +169,9 @@ class CacheCompiledArtifact(CompiledArtifact):
         return len(cache_info.aot_autograd_artifacts) == 1
 
     def _validate_and_unpack(self) -> tuple[bytes, str]:
+        # [FUNCTION DOC] HELPER: Validate artifacts and return (artifact bytes, autograd cache key). Raises
+        # RuntimeError if there are no artifacts or no aot_autograd artifacts, AssertionError if more than
+        # one.
         """Validate the cached artifact, returning ``(artifact_bytes, key)``.
 
         Single source of the None / empty / multiple aot_autograd_artifacts checks,
@@ -174,6 +197,8 @@ class CacheCompiledArtifact(CompiledArtifact):
         return artifact_bytes, cache_info.aot_autograd_artifacts[0]
 
     def _to_binary_bytes(self) -> bytes:
+        # [FUNCTION DOC] HELPER: Serialize to the binary format: cache header, torch key, cache key string, then
+        # artifact bytes. Validates first (may raise). Returns the bytes without writing to disk.
         """Serialize this artifact to the in-memory ``binary`` byte format.
 
         Produces exactly the bytes that ``save(format="binary")`` writes to disk, so
@@ -198,6 +223,10 @@ class CacheCompiledArtifact(CompiledArtifact):
     def save(
         self, *, path: str, format: Literal["binary", "unpacked"] = "binary"
     ) -> None:
+        # [FUNCTION DOC] Save the artifact (timed). Binary: asserts path is not a directory and atomically writes
+        # the serialized bytes. Unpacked: validates, removes an existing directory at path (asserts it is a
+        # directory), loads cache artifacts into a temporary cache dir at path, then writes each inductor
+        # output code to disk and logs its location. Raises AssertionError on bad format or path.
         with dynamo_timed("CompiledArtifact.save"):
             if format == "binary":
                 # can't assert that it is a file since it might not exist yet
@@ -248,6 +277,10 @@ class CacheCompiledArtifact(CompiledArtifact):
     def _load_impl(
         cache_dir_ctx: AbstractContextManager[Any], key: str
     ) -> CompiledArtifact:
+        # [FUNCTION DOC] HELPER: Build an artifact from an autograd cache key. Within the given cache-dir context,
+        # with dynamic shape guards skipping and strict autograd cache enabled, looks up the key locally
+        # (asserts a hit), then post-compiles the entry under a fresh tracing context and fake mode. Returns
+        # a CacheCompiledArtifact wrapping a callable that boxes its args into a list.
         with (
             cache_dir_ctx,
             config.patch(unsafe_skip_cache_dynamic_shape_guards=True),
@@ -290,6 +323,11 @@ class CacheCompiledArtifact(CompiledArtifact):
     def _prepare_load(
         *, path: str, format: Literal["binary", "unpacked"] = "binary"
     ) -> tuple[str, AbstractContextManager[Any]]:
+        # [FUNCTION DOC] HELPER: Format-specific preparation for load; returns (key, cache-dir context manager).
+        # Binary: reads the file, verifies torch key, reads key and bytes, loads the cache artifacts and
+        # returns a null context. Unpacked: path must be a directory containing an aotautograd folder with
+        # exactly one entry (the key) and returns a temporary cache dir context. Raises AssertionError on
+        # invalid layout.
         """
         Do format specific prep and loads, return a context manager and key
         """
@@ -336,6 +374,7 @@ class CacheCompiledArtifact(CompiledArtifact):
     def load(
         *, path: str, format: Literal["binary", "unpacked"] = "binary"
     ) -> CompiledArtifact:
+        # [FUNCTION DOC] Load a cache-backed artifact from path in the given format via prepare-load and load-impl.
         key, cache_dir_ctx = CacheCompiledArtifact._prepare_load(
             path=path, format=format
         )
@@ -343,6 +382,9 @@ class CacheCompiledArtifact(CompiledArtifact):
 
 
 class AOTCompiledArtifact(CompiledArtifact):
+    # [CLASS DOC] Artifact wrapping a single bundled AOT-autograd serializable callable (inner_fn); always
+    # serializable. Supports only the binary format (unpacked raises RuntimeError). AOT_HEADER marks the
+    # binary format. No separate cache artifacts are kept.
     """
     Similar to CompiledArtifact, but the object is a single, bundled precompiled function.
     This object is always a serializable callable function.
@@ -357,6 +399,8 @@ class AOTCompiledArtifact(CompiledArtifact):
         self,
         compiled_fn: Callable[..., Any],
     ):
+        # [FUNCTION DOC] Wrap the compiled callable in a bundled AOT autograd serializable callable and set the
+        # artifacts to None.
         self.inner_fn = BundledAOTAutogradSerializableCallable(compiled_fn)
         self._artifacts = (
             None  # We don't need artifacts, the inner object handles everything
@@ -366,14 +410,19 @@ class AOTCompiledArtifact(CompiledArtifact):
     def from_bundled_callable(
         bundled_fn: BundledAOTAutogradSerializableCallable,
     ) -> AOTCompiledArtifact:
+        # [FUNCTION DOC] Build an AOTCompiledArtifact from an already bundled callable by re-wrapping its
+        # compiled function.
         return AOTCompiledArtifact(bundled_fn.compiled_fn)
 
     def __call__(self, *args: Any) -> Any:
+        # [FUNCTION DOC] Invoke the inner bundled callable with the given args.
         return self.inner_fn(*args)
 
     def save(
         self, *, path: str, format: Literal["binary", "unpacked"] = "binary"
     ) -> None:
+        # [FUNCTION DOC] Save as a binary file: AOT header, torch key, serialized bytes, written atomically to
+        # path. Raises RuntimeError for the unpacked format.
         if format == "unpacked":
             raise RuntimeError(
                 "AOTCompiledArtifact does not support unpacked format yet"
@@ -394,12 +443,15 @@ class AOTCompiledArtifact(CompiledArtifact):
         write_atomic(path, writer.to_bytes())
 
     def serialize(self) -> bytes:
+        # [FUNCTION DOC] Serialize the inner bundled callable to bytes.
         return BundledAOTAutogradSerializableCallable.serialize_compile_artifacts(
             self.inner_fn
         )
 
     @staticmethod
     def deserialize(result_bytes: bytes) -> AOTCompiledArtifact:
+        # [FUNCTION DOC] Deserialize bytes into an AOTCompiledArtifact. Raises AssertionError if the result is
+        # not a bundled AOT autograd callable.
         deserialized = (
             BundledAOTAutogradSerializableCallable.deserialize_compile_artifacts(
                 result_bytes
@@ -415,6 +467,8 @@ class AOTCompiledArtifact(CompiledArtifact):
     def load(
         *, path: str, format: Literal["binary", "unpacked"] = "binary"
     ) -> CompiledArtifact:
+        # [FUNCTION DOC] Load an AOT artifact from a binary file: verifies the AOT header, torch key and no
+        # trailing data, then deserializes. Raises RuntimeError for unpacked, AssertionError on mismatch.
         if format == "unpacked":
             raise RuntimeError(
                 "AOTCompiledArtifact does not support unpacked format yet"
@@ -438,6 +492,8 @@ class AOTCompiledArtifact(CompiledArtifact):
 
 
 def _resolve_ignore_shape_env(dynamic_shapes: DynamicShapesType):
+    # [FUNCTION DOC] HELPER: True when dynamic_shapes is from_example_inputs, telling compile_fx to ignore the
+    # shape envs of the ambient context and the graph module.
     # tells compile_fx to ignore the shape_envs on the ambient context
     # and the graph_module.
     return dynamic_shapes == "from_example_inputs"
@@ -448,6 +504,12 @@ def _resolve_fake_mode(
     dynamic_shapes: DynamicShapesType,
     fake_mode: FakeTensorMode | None = None,
 ) -> FakeTensorMode:
+    # [FUNCTION DOC] HELPER: Pick the FakeTensorMode for a standalone compile. from_example_inputs: use the
+    # given fake_mode (must have a ShapeEnv, else ValueError) or make a fresh one. Other modes reject an
+    # explicit fake_mode (ValueError). from_tracing_context: take the mode from the current tracing
+    # context (asserts it is set). from_graph: search output nodes then all nodes for fake values in
+    # example_value or val metadata, skipping non-Node outputs, falling back to a fresh mode. Unknown
+    # dynamic_shapes raises ValueError.
     if dynamic_shapes == "from_example_inputs":
         if fake_mode is not None:
             if fake_mode.shape_env is None:
@@ -526,6 +588,10 @@ def _standalone_context(
     aot: bool,
     fake_mode: FakeTensorMode | None = None,
 ):
+    # [FUNCTION DOC] HELPER: Context manager for standalone compilation. Resolves the fake mode, then enters a
+    # tracing context, a fresh cache artifact manager, autotune-at-compile-time config, and functorch
+    # config (bundled autograd cache per aot, forced non-lazy backward lowering). Yields None; state is
+    # restored on exit.
     from torch.compiler._cache import CacheArtifactManager
 
     resolved_fake_mode = _resolve_fake_mode(gm, dynamic_shapes, fake_mode)
@@ -558,6 +624,12 @@ def standalone_compile(
     donate_graph_module: bool = False,
     fake_mode: FakeTensorMode | None = None,
 ) -> CompiledArtifact:
+    # [FUNCTION DOC] Implementation of the standalone compile entry. Within the standalone context, copies the
+    # graph module unless donated (sharing torchbind/process group objects), functionalizes in-place
+    # collectives and unboxes process group torchbinds, then runs compile_fx with the given options.
+    # aot=True returns an AOTCompiledArtifact (RuntimeError if the compiled fn lacks serialize);
+    # otherwise saves cache artifacts (warns if unavailable) and returns a CacheCompiledArtifact.
+    # Raises AssertionError if the compiled result is not callable.
     """
     Implementation of torch.inductor.standalone_compile
     """
@@ -604,6 +676,8 @@ def standalone_compile(
 
 
 class NoRunnableInductorModuleError(RuntimeError):
+    # [CLASS DOC] Error raised by compile_to_python when the graph has no compute to lower and so yields no
+    # runnable Inductor output module source.
     """Raised by ``compile_to_python`` when the graph yields no runnable Inductor
     output module -- it has no compute to lower (returns inputs/constants unchanged),
     so the compiled artifact carries no output-module source. Callers (e.g.
@@ -613,6 +687,8 @@ class NoRunnableInductorModuleError(RuntimeError):
 
 
 def _runnable_source(compiled_graph: OutputCode) -> str:
+    # [FUNCTION DOC] HELPER: Return the wrapper module source_code of a compiled graph; raises
+    # NoRunnableInductorModuleError if it is missing or empty.
     """Return the Inductor output-module source for a compiled inner graph.
 
     ``compile_fx_inner`` returns a ``CompiledFxGraph`` that carries the wrapper-module
@@ -630,6 +706,8 @@ def _runnable_source(compiled_graph: OutputCode) -> str:
 
 
 def _placeholder_fake_inputs(gm: GraphModule) -> list[Any]:
+    # [FUNCTION DOC] HELPER: Collect the fake val metadata of all placeholder nodes of gm, in order. Raises
+    # RuntimeError if a placeholder lacks val (graph not traced under a FakeTensorMode).
     """Return the fake ``val`` metadata of ``gm``'s placeholders -- the compile-time input
     contract for a post-AOTAutograd graph. These fake tensors already carry the
     AOTAutograd-decided static/symbolic shapes under one consistent ``FakeTensorMode``, so
@@ -652,6 +730,8 @@ def _placeholder_fake_inputs(gm: GraphModule) -> list[Any]:
 def _acceleration_cache_bytes(
     artifacts: tuple[bytes, CacheInfo] | None,
 ) -> bytes | None:
+    # [FUNCTION DOC] HELPER: Return the raw cache artifact bytes (an accelerator bundle) from the saved
+    # artifacts tuple, or None (with a debug log) when none were captured.
     """Return the opaque cache-artifacts bundle that accelerates a later ``load_from_python``,
     or ``None`` when nothing cacheable was produced (no compute) or caches are disabled.
 
@@ -672,6 +752,9 @@ def _acceleration_cache_bytes(
 def load_from_python(
     python_code: str, cache: bytes | None = None
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Exec the module source from compile_to_python in a fresh namespace and return its call
+    # function. If a cache bundle is given it is loaded first (global cache side effect) so kernels use
+    # precompiled binaries. Raises RuntimeError if no callable call is defined.
     """Load the module emitted by ``compile_to_python`` into a runnable ``call``.
 
     ``python_code`` is self-contained: exec'ing it defines ``call`` and JIT-compiles the
@@ -699,6 +782,13 @@ def compile_to_python(
     *,
     options: dict[str, Any] | None = None,
 ) -> tuple[str, bytes | None]:
+    # [FUNCTION DOC] Internal inductor-layer compile of a post-AOTAutograd, decomposed, functionalized graph
+    # module (placeholders carry fake val metadata). Returns (python source of the output module, cache
+    # bytes or None). Raises TypeError if gm is not a GraphModule, RuntimeError for async/progressive
+    # FX compile modes or when no fake mode is found on placeholders, and NoRunnableInductorModuleError
+    # for graphs without compute. Copies gm, functionalizes collectives, then runs compile_fx_inner
+    # under no_grad with config patches: user options merged over keep_static_cubin_raw=True, with
+    # benchmark_harness and cpp_wrapper forced False, autotune at compile time, fresh cache manager.
     """Compile ``gm`` and return ``(inner_python, cache)`` -- the INNER half of the
     backend contract behind ``torch.compiler.precompile``.
 
@@ -869,6 +959,9 @@ def autograd_cache_key(
     aot: bool = False,  # AOT mode, which uses BundledAOTAutogradCache
     fake_mode: FakeTensorMode | None = None,
 ):
+    # [FUNCTION DOC] Compute the autograd cache key for a graph: resolves the ignore-shape-env flag from
+    # dynamic_shapes and, in the standalone context, delegates to compile_fx.autograd_cache_key with
+    # the graph and example inputs. Returns whatever that function returns.
     from . import compile_fx
 
     ignore_shape_env = _resolve_ignore_shape_env(dynamic_shapes)

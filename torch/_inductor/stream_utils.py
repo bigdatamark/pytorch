@@ -1,3 +1,6 @@
+# [MODULE DOC] Stream helpers for Inductor codegen: name tables of stream ops supported or rejected
+# by AOTInductor, functions producing stream variable names from indices, and helpers that keep
+# generated code rank-identical under compile-on-one-rank (COOR). Re-exports the stream constants.
 """Stream utilities for Inductor codegen."""
 
 from __future__ import annotations
@@ -54,6 +57,8 @@ AOTI_UNSUPPORTED_STREAM_OP_REASONS: dict[str, str] = {
 
 @functools.lru_cache
 def get_stream_name(stream_idx: int) -> str:
+    # [FUNCTION DOC] Cached. Returns the stream variable name for a non-negative index: the default stream
+    # name for index 0, otherwise the numbered side-stream template filled with the index.
     """Generate CUDA Stream name from stream index number.
 
     Args:
@@ -68,10 +73,14 @@ def get_stream_name(stream_idx: int) -> str:
 
 @functools.lru_cache
 def _raw_stream_name_for_device(device_idx: int) -> str:
+    # [FUNCTION DOC] HELPER: Cached. Returns the raw stream variable name for a device index.
     return f"raw_stream{device_idx}"
 
 
 def get_raw_stream_name(device_idx: int) -> str:
+    # [FUNCTION DOC] Returns the raw stream handle variable name for a device index. Under COOR the name
+    # carries no device index (plain raw_stream) so wrappers are identical across ranks; otherwise
+    # delegates to the cached per-device name helper.
     """Generate variable name for a raw stream handle on the given device."""
     # Under compile-on-one-rank the wrapper must be byte-identical across ranks, so the
     # stream variable name cannot carry a rank-specific device index.
@@ -88,6 +97,9 @@ COOR_DEVICE_IDX_VAR = "_coor_device_idx"
 
 
 def coor_device_str(device: torch.device | None) -> str:
+    # [FUNCTION DOC] Device string for generated code. Under COOR with a non-None device returns only the
+    # device type (index dropped); otherwise returns the string form of the device (None gives the
+    # text None).
     """Device string to emit into generated code (benchmark and autotune harnesses).
 
     Under compile-on-one-rank drop the index (``cuda:0`` -> ``cuda``) so the emitted text
@@ -101,6 +113,10 @@ def coor_device_str(device: torch.device | None) -> str:
 
 
 def coor_benchmark_device_idx(device_idx: int) -> tuple[str | None, int | str]:
+    # [FUNCTION DOC] For a Triton kernel benchmark harness, returns a pair (preamble line or None, index
+    # token). Without COOR returns no preamble and the given index. Under COOR returns an assignment
+    # line that sets the device-index variable from the current graph's device ops runtime expression,
+    # and that variable name as the token; the preamble must be emitted before the token is used.
     """(preamble line, index token) for a Triton kernel's benchmark harness.
 
     The harness is emitted into the kernel's own source, which is what the kernel hash

@@ -1,3 +1,7 @@
+# [PACKAGE DOC] Backward-compatibility shim: the template heuristics moved to
+# torch._inductor.heuristics.template. This package imports the moved submodules and aliases them
+# into sys.modules under the old dotted names so old import paths reuse the same module objects
+# (no duplicate registration). Re-exports get_template_heuristic. To be removed in a future release.
 # Backward-compatibility shim.
 # This package has been moved to torch._inductor.heuristics.template.
 # Keep every old import path working -- both

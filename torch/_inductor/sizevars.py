@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Size-variable reasoning for Inductor: SizeVarAllocator wraps a ShapeEnv to simplify
+# sympy index/size expressions, answer statically-known queries without guarding, add guards,
+# compute strides, evaluate size hints and decide vectorization/contiguity facts. Also provides
+# LaneContiguity, stride helpers, and index simplification inside vectorized ranges. Import-time
+# side effects: creates the module logger and a few module constants.
 import dataclasses
 import functools
 import itertools
@@ -56,6 +61,9 @@ Width = int | IntInfinity
 
 @dataclasses.dataclass(frozen=True)
 class LaneContiguity:
+    # [CLASS DOC] Frozen record describing how an index expression varies across vector lanes: contiguous_width
+    # and uniform_width (maximum widths, None unknown, int_oo unbounded), stride, and unknown flag. It does
+    # not prove memory safety; callers must still check dimension, stride and alignment.
     """How an index expression varies across lanes.
 
     This describes only the per-lane relationship, not full memory safety.
@@ -71,20 +79,26 @@ class LaneContiguity:
 
     @property
     def uniform(self) -> bool:
+        # [FUNCTION DOC] True if a uniform width is known (not None).
         return self.uniform_width is not None
 
     def is_contiguous_for(self, width: int) -> bool:
+        # [FUNCTION DOC] True if the contiguous width covers the requested width.
         return _width_covers(self.contiguous_width, width)
 
     def is_uniform_for(self, width: int) -> bool:
+        # [FUNCTION DOC] True if the uniform width covers the requested width.
         return _width_covers(self.uniform_width, width)
 
 
 def _width_covers(max_width: Width | None, width: int) -> bool:
+    # [FUNCTION DOC] HELPER: True if max_width is known and is unbounded or at least width.
     return max_width is not None and (max_width == int_oo or max_width >= width)
 
 
 def _min_width(lhs: Width | None, rhs: Width | None) -> Width | None:
+    # [FUNCTION DOC] HELPER: Minimum of two optional widths; None if either is None; an unbounded width
+    # yields the other.
     if lhs is None or rhs is None:
         return None
     if lhs == int_oo:
@@ -95,6 +109,7 @@ def _min_width(lhs: Width | None, rhs: Width | None) -> Width | None:
 
 
 def _largest_power_of_2_factor(n: int) -> int:
+    # [FUNCTION DOC] HELPER: Largest power of two dividing n (the lowest set bit).
     return n & -n
 
 
@@ -128,6 +143,8 @@ _MAX_SYMBOLS_FOR_EXPENSIVE_SYMPY_OPS = 20
 
 @functools.lru_cache
 def stride_at(index: sympy.Expr, var: sympy.Symbol):
+    # [FUNCTION DOC] Cached. Stride of index with respect to var: zero if index does not depend on var,
+    # otherwise the simplified difference of index with var replaced by var plus one, minus index.
     if not index.has(var):
         # see test_torchinductor_dynamic_shapes.py::test_full_boolean_dynamic_shapes_cpu
         # which has tmp0 = ops.index_expr(s0 >= 1024, torch.bool) and fails below calculation.
@@ -140,6 +157,11 @@ def stride_at(index: sympy.Expr, var: sympy.Symbol):
 
 @functools.lru_cache
 def simplify_index_in_vec_range(index: sympy.Expr, var: sympy.Expr, vec_length: int):
+    # [FUNCTION DOC] Cached. Simplify an index for analysis (not codegen) inside a vectorized loop of
+    # vec_length lanes: floor-division and modular-indexing terms of var whose divisor is a multiple of
+    # vec_length become fresh free symbols; modular indexing with divisor 1 and modulus a multiple
+    # becomes var plus a fresh symbol. Applies simplification and recurses until a fixed point.
+    # Returns the new expression.
     """
     Simplifies the index expression within the range of a vectorized loop.
     Given a vectorized loop variable `var` in the range of a loop with `vec_length`,
@@ -166,6 +188,8 @@ def simplify_index_in_vec_range(index: sympy.Expr, var: sympy.Expr, vec_length: 
     mod_freevar_id = 0
 
     def visit_indexing_div(divisor):
+        # [FUNCTION DOC] HELPER: Replacement for floor division of var by divisor: a fresh symbol if divisor is a
+        # multiple of vec_length, otherwise the original term. Updates a counter.
         nonlocal div_freevar_id
         result = FloorDiv(var, divisor)
         if sympy.gcd(divisor, vec_length) == vec_length:
@@ -174,6 +198,8 @@ def simplify_index_in_vec_range(index: sympy.Expr, var: sympy.Expr, vec_length: 
         return result
 
     def visit_modular_indexing(divisor, modulus):
+        # [FUNCTION DOC] HELPER: Replacement for modular indexing of var: fresh symbol if divisor is a multiple of
+        # vec_length; var plus fresh symbol if divisor is 1 and modulus is a multiple; else unchanged.
         nonlocal mod_freevar_id
         result = ModularIndexing(var, divisor, modulus)
         if sympy.gcd(divisor, vec_length) == vec_length:
@@ -206,6 +232,8 @@ def simplify_index_in_vec_range(index: sympy.Expr, var: sympy.Expr, vec_length: 
 def stride_at_vec_range(
     index: sympy.Expr, var: sympy.Symbol, vec_length: int | None = None
 ):
+    # [FUNCTION DOC] Cached. Stride of index with respect to var, first simplifying the index for a
+    # vectorized range when vec_length is truthy.
     if vec_length:
         index = simplify_index_in_vec_range(index, var, vec_length)
     return stride_at(index, var)
@@ -217,6 +245,10 @@ def statically_known_true(
     axioms: tuple[sympy.Expr] | None = None,
     var_to_range: tuple[tuple[sympy.Symbol, ValueRanges[Any]]] | None = None,
 ) -> bool:
+    # [FUNCTION DOC] Best-effort check that a sympy expression is always true. Plain booleans return as is.
+    # If substituting backed hints makes it false, returns False early. Otherwise asks the shape env's
+    # static evaluator (with optional axioms and var ranges); any failure is logged at debug level and
+    # gives False. Never adds guards.
     if expr in (True, False):
         return bool(expr)
 
@@ -249,6 +281,11 @@ def statically_known_true(
 # lifting and in some cases we should be directly passing through to ShapeEnv,
 # but there is some extra inductor logic that needs to be handled here
 class SizeVarAllocator:
+    # [CLASS DOC] Inductor-side manager of symbolic sizes on top of a ShapeEnv (created if none given).
+    # State: shape_env and aliases to its hints and replacements, unbacked replacements, precomputed
+    # replacements (host-precomputed expressions mapped to kernel arg symbols, which cannot be guarded
+    # and so are inverted when guarding) plus inverse, and cached stride/simplify callables. Methods
+    # simplify expressions, answer statically-known queries without guards, guard, and evaluate hints.
     """
     A class that manages symbolic size variables and their relationships.
 
@@ -259,6 +296,9 @@ class SizeVarAllocator:
     """
 
     def __init__(self, shape_env=None) -> None:
+        # [FUNCTION DOC] Set up from a shape env (a new one if None; reasoning needs existing var ranges), alias
+        # its hints and replacements, init empty precomputed replacement maps, and build the stride, range
+        # simplification and loop simplification caches.
         super().__init__()
         # Note: this can lead to bugs. Reasoning APIs depends on existing information in
         # in the shape_env. For example! var_to_ranges can't be empty!
@@ -286,9 +326,15 @@ class SizeVarAllocator:
         self._simplify_loops = self.make_simplify_loops_cache()
 
     def simplify(self, expr: Expr):
+        # [FUNCTION DOC] Expand an expression and substitute the shape env replacements.
         return sympy.expand(expr).xreplace(self.replacements)
 
     def make_simplify_with_ranges_cache(self) -> Callable[[Expr, VarRanges], Expr]:
+        # [FUNCTION DOC] Return a cached wrapper of the range-based simplifier keyed by expression and ranges;
+        # the cache is cleared when the replacement count changes, and the result is also cached as its own
+        # fixed point.
+        # KNOWN ISSUE: the inherited docstring names a private simplify function but the method builds the
+        # range simplification cache.
         """
         self._simplify_with_ranges() can be expensive, cache its results
         """
@@ -296,6 +342,7 @@ class SizeVarAllocator:
         replacement_count = len(self.replacements)
 
         def simplify_with_ranges(expr: Expr, var_ranges: VarRanges) -> Expr:
+            # [FUNCTION DOC] HELPER: Cached lookup; invalidates cache on new replacements, else computes and stores.
             nonlocal replacement_count
             if replacement_count != len(self.replacements):
                 # new replacements invalidates cached results
@@ -313,6 +360,9 @@ class SizeVarAllocator:
         return simplify_with_ranges
 
     def make_simplify_loops_cache(self):
+        # [FUNCTION DOC] Return a cached wrapper of the loop simplifier keyed by index vars, sizes and formulas,
+        # invalidated when the number of replacements changes.
+        # KNOWN ISSUE: docstring says it caches the range simplifier, but it caches the loop simplifier.
         """
         self._simplify_with_ranges() can be expensive, cache its results
         """
@@ -320,6 +370,7 @@ class SizeVarAllocator:
         replacement_count = len(self.replacements)
 
         def simplify_loops(index_vars, sizes, index_formulas):
+            # [FUNCTION DOC] HELPER: Cached lookup of the loop simplification implementation result.
             nonlocal replacement_count
             if replacement_count != len(self.replacements):
                 # new replacements invalidates cached results
@@ -335,6 +386,10 @@ class SizeVarAllocator:
         return simplify_loops
 
     def _simplify_with_ranges(self, expr: Expr, var_ranges: VarRanges) -> Expr:
+        # [FUNCTION DOC] Simplify an indexing expression knowing iteration variable ranges. Joins dimensions,
+        # builds variable ranges and axioms, then rewrites modular-indexing and floor-division terms:
+        # dropping zero terms, removing the mod or division when the base is statically within bounds, and
+        # merging nested modular indexing. Recurses until the expression stops changing. Returns the result.
         """
         Simplify indexing expression with knowledge of the ranges of
         iteration variables.
@@ -368,6 +423,7 @@ class SizeVarAllocator:
         axioms = tuple(axioms) + self.shape_env.get_axioms()
 
         def statically_known(expr):
+            # [FUNCTION DOC] HELPER: True if the shape env statically proves the expression under the ranges/axioms.
             evaluated = self.shape_env._maybe_evaluate_static(
                 expr,
                 # pyrefly: ignore [bad-argument-type]
@@ -377,6 +433,8 @@ class SizeVarAllocator:
             return bool(evaluated)
 
         def remove_zero_terms(base, divisor):
+            # [FUNCTION DOC] HELPER: Drop additive terms of a non-negative base that are statically smaller than the
+            # gcd with the divisor (they cannot affect the quotient/modulus).
             """Symbols smaller than the divisor are zero"""
             if not statically_known(base >= 0):
                 return base
@@ -392,6 +450,8 @@ class SizeVarAllocator:
             return base
 
         def visit_indexing_div(base, divisor):
+            # [FUNCTION DOC] HELPER: Rewrite floor division: zero if the base is within [0, divisor); merge with an
+            # inner modular indexing when divisible; otherwise unchanged.
             base = remove_zero_terms(base, divisor)
             if statically_known(base >= 0) and statically_known(base < divisor):
                 return sympy.S.Zero
@@ -403,6 +463,9 @@ class SizeVarAllocator:
             return FloorDiv(base, divisor)
 
         def visit_modular_indexing(base, divisor, modulus):
+            # [FUNCTION DOC] HELPER: Rewrite modular indexing: merge with inner modular indexing for constant
+            # positive arguments when periods align; floor division if the base is in [0, modulus*divisor);
+            # otherwise unchanged.
             base = remove_zero_terms(base, divisor)
 
             if isinstance(base, ModularIndexing):
@@ -449,6 +512,11 @@ class SizeVarAllocator:
     def _simplify_loops_impl(
         self, index_vars: list[sympy.Symbol], sizes, index_formulas
     ):
+        # [FUNCTION DOC] HELPER: Remove size-1 loop dimensions and fuse mergeable dimensions (checked by stride
+        # match plus a sound substitution test). Returns (list of remaining sizes, reindex function
+        # expanding new indices to the original ones with zeros for removed dims, prune function keeping
+        # only surviving indices).
+        # KNOWN ISSUE: docstring mentions a channel_last flag that this function does not take.
         """
         Try to remove as many axis from loop iterations as possible, by:
             1) removing size==1 dimensions
@@ -478,6 +546,7 @@ class SizeVarAllocator:
                 sizes[i] = None
 
         def can_merge_dims(a, b):
+            # [FUNCTION DOC] HELPER: True if dimension a can be fused into b for all index formulas.
             for k in range(len(strides)):
                 if self.simplify(strides[k][a] * sizes[a]) == self.simplify(
                     strides[k][b]
@@ -510,6 +579,8 @@ class SizeVarAllocator:
                     sizes[j] = None
 
         def reindex(index):
+            # [FUNCTION DOC] HELPER: Map indices of the reduced loop to the original dims (zero for removed ones);
+            # asserts all given indices are consumed.
             it = list(reversed(index))
             new_index = []
             for size in sizes:
@@ -522,6 +593,8 @@ class SizeVarAllocator:
             return new_index
 
         def prune(index):
+            # [FUNCTION DOC] HELPER: Keep only entries of an original-rank index list for surviving dims;
+            # asserts the length matches the original sizes.
             if len(index) != len(sizes):
                 raise AssertionError(
                     f"expected len(index) == len(sizes), got {len(index)} != {len(sizes)}"
@@ -536,6 +609,8 @@ class SizeVarAllocator:
     # Those are similar to statically_known_true in symbolic_shapes.py but operate on sympy
     # expressions instead of symnodes.
     def statically_known_true(self, expr: sympy.Basic | bool) -> bool:
+        # [FUNCTION DOC] True if the expression is provably true without adding guards; never throws data
+        # dependent errors. Delegates to the module-level function with this shape env.
         """
         Returns true if an expression is always true (symbolically or via guards),
         false otherwise. Never add guards, or throw data dependent errors.
@@ -543,6 +618,7 @@ class SizeVarAllocator:
         return statically_known_true(self.shape_env, expr)
 
     def statically_known_equals(self, left: Expr | int, right: Expr | int) -> bool:
+        # [FUNCTION DOC] True if it is statically known that left equals right.
         """
         Returns a bool indicating if it is sound to optimize as if left and right are equal.
         """
@@ -551,6 +627,7 @@ class SizeVarAllocator:
     def statically_known_list_equals(
         self, left: Sequence[Expr], right: Sequence[Expr]
     ) -> bool:
+        # [FUNCTION DOC] True if lists have equal length and each pair is statically known equal.
         """
         Returns a bool indicating if it is sound to optimize as if left and right lists are equal.
         """
@@ -559,6 +636,7 @@ class SizeVarAllocator:
         )
 
     def statically_known_leq(self, left: Expr, right: Expr | int) -> bool:
+        # [FUNCTION DOC] True if left <= right is provable without guards.
         """
         Returns a bool indicating if it is sound to optimize as if left is less than or equal to right.
         """
@@ -566,6 +644,7 @@ class SizeVarAllocator:
         return self.statically_known_true(expr)
 
     def statically_known_geq(self, left: Expr, right: Expr | int) -> bool:
+        # [FUNCTION DOC] True if left >= right is provable without guards.
         """
         Returns a bool indicating if it is sound to optimize as if left is greater than or equal to right.
         """
@@ -573,6 +652,7 @@ class SizeVarAllocator:
         return self.statically_known_true(expr)
 
     def statically_known_lt(self, left: Expr, right: Expr | int) -> bool:
+        # [FUNCTION DOC] True if left < right is provable without guards.
         """
         Returns a bool indicating if it is sound to optimize as if left is less than right.
         """
@@ -580,6 +660,7 @@ class SizeVarAllocator:
         return self.statically_known_true(expr)
 
     def statically_known_gt(self, left: Expr, right: Expr | int) -> bool:
+        # [FUNCTION DOC] True if left > right is provable without guards.
         """
         Returns a bool indicating if it is sound to optimize as if left is greater than right.
         """
@@ -587,6 +668,10 @@ class SizeVarAllocator:
         return self.statically_known_true(expr)
 
     def _is_multiple_of(self, numerator: Expr, denominator: int) -> bool:
+        # [FUNCTION DOC] HELPER: Structural divisibility test: True only if numerator is provably a multiple of
+        # the integer denominator. Rules in order: concrete integer; product with a divisible factor or
+        # constant; sum of divisible terms; floor division and mod by constants; a cheap gcd check; and,
+        # unless the expression has too many symbols, a static check that the mod is zero.
         """
         Structural divisibility check: returns True only if numerator is
         provably a multiple of denominator.  Recurses over sympy expression
@@ -643,6 +728,10 @@ class SizeVarAllocator:
     def statically_known_multiple_of(
         self, numerator: Expr, denominator: Expr | int
     ) -> bool:
+        # [FUNCTION DOC] True if numerator is provably a multiple of denominator. Identical expressions and
+        # zero numerators succeed; integer denominators use the structural check; symbolic denominators
+        # give up beyond the symbol limit, otherwise try gcd-based cancellation (ignoring polynomial
+        # errors) and finally a static check that the mod is zero.
         """
         Return a bool indicating if it is sound to optimize for the numerator being a multiple of the denominator.
         """
@@ -668,6 +757,7 @@ class SizeVarAllocator:
             return False
 
         def gcd_covers_denominator(gcd: sympy.Basic) -> bool:
+            # [FUNCTION DOC] HELPER: True if gcd is not 1 and equals the denominator (directly or after simplify).
             return gcd != 1 and (
                 gcd == denominator or self.simplify(gcd - denominator) == 0
             )
@@ -684,6 +774,7 @@ class SizeVarAllocator:
         return self.statically_known_true(expr)  # type: ignore[arg-type]
 
     def statically_known_power_of_2(self, expr: Expr) -> bool:
+        # [FUNCTION DOC] True only for a sympy Integer that is a power of two.
         """
         Returns a bool indicating if x is known to be a power of 2.
         """
@@ -692,6 +783,10 @@ class SizeVarAllocator:
     def analyze_lane_contiguity(
         self, expr: Expr, lane_var: sympy.Symbol
     ) -> LaneContiguity:
+        # [FUNCTION DOC] Conservatively classify an index expression over vector lanes of lane_var, returning
+        # a LaneContiguity. Simplifies first; no dependence on the lane var or stride 0 is uniform for any
+        # width; stride 1 is contiguous for any width; sums, products, floor division, modular indexing and
+        # mod are delegated to specialised analyzers; everything else is unknown.
         """Analyze whether `expr` is uniform or contiguous over vector lanes.
 
         The analysis is conservative: unknown cases must fall back to scalar or
@@ -728,6 +823,9 @@ class SizeVarAllocator:
     def _analyze_lane_contiguity_add(
         self, args: tuple[Expr, ...], lane_var: sympy.Symbol
     ) -> LaneContiguity:
+        # [FUNCTION DOC] HELPER: Combine terms of a sum: any unknown term or more than one lane-varying term is
+        # unknown; otherwise uniform widths are min-combined and the varying term's contiguity is limited
+        # by that width.
         """Combine additive terms when at most one term varies across lanes."""
         uniform_width: Width | None = int_oo
         varying_result: LaneContiguity | None = None
@@ -751,6 +849,9 @@ class SizeVarAllocator:
     def _analyze_lane_contiguity_mul(
         self, args: tuple[Expr, ...], lane_var: sympy.Symbol
     ) -> LaneContiguity:
+        # [FUNCTION DOC] HELPER: Product analysis: exactly one lane-dependent factor allowed. The result stride is
+        # the uniform factor times the child stride; stride 0 is uniform, stride 1 keeps contiguity, other
+        # strides carry no contiguous width. Unknown otherwise.
         """Propagate lane stride through lane-uniform multiplication."""
         uniform_factor: Expr = sympy.S.One
         lane_factors = []
@@ -780,6 +881,8 @@ class SizeVarAllocator:
     def _analyze_lane_contiguity_modular_indexing(
         self, expr: Expr, lane_var: sympy.Symbol
     ) -> LaneContiguity:
+        # [FUNCTION DOC] HELPER: Modular indexing with a constant divisor other than 1 is treated as floor
+        # division; divisor 1 is treated as mod; non-constant divisor is unknown.
         """Analyze ModularIndexing(base, divisor, modulus)."""
         base, divisor, modulus = expr.args
         if not isinstance(divisor, (int, sympy.Integer)):
@@ -791,6 +894,10 @@ class SizeVarAllocator:
     def _analyze_lane_contiguity_floor_div(
         self, base: Expr, divisor: Expr, lane_var: sympy.Symbol
     ) -> LaneContiguity:
+        # [FUNCTION DOC] HELPER: Largest width for which base floor-divided by a positive constant divisor is
+        # lane-uniform: requires base to be unit-stride contiguous; tries power-of-two widths (bounded by
+        # divisor factor and base contiguity), halving until the lane-0 group start is a multiple of the
+        # width. Otherwise unknown.
         """Return the largest width where ``base // divisor`` is lane-uniform."""
         if not isinstance(divisor, (int, sympy.Integer)):
             return LaneContiguity(unknown=True)
@@ -819,6 +926,10 @@ class SizeVarAllocator:
         modulus: Expr,
         lane_var: sympy.Symbol,
     ) -> LaneContiguity:
+        # [FUNCTION DOC] HELPER: Largest aligned no-wrap width for base mod a positive constant modulus: base must
+        # be unit-stride contiguous; tries power-of-two widths bounded by the modulus factor and base
+        # contiguity, halving until the group start is a multiple. Returns contiguous with stride 1, or
+        # unknown.
         """Return the largest aligned no-wrap modulo span.
 
         `base % modulus` is contiguous for a vector group only when both the
@@ -850,6 +961,8 @@ class SizeVarAllocator:
     # condition holds. They are similar to expect_true in symbolic_shapes.py and
     # torch.check but operates on sympy expressions instead of symnodes.
     def expect_true(self, expr: Expr) -> bool:
+        # [FUNCTION DOC] Assert-by-guard: if expr is not statically true, defers a runtime assertion through the
+        # shape env (returns its result); returns True if already known. Does not raise on a false expr.
         """
         Use it when you already know that expr is true or should be true and want to
         ensure that guards/runtime assertions are in place to ensure this in compiled
@@ -863,6 +976,8 @@ class SizeVarAllocator:
         return True
 
     def check(self, expr: Expr) -> None:
+        # [FUNCTION DOC] Substitutes inverse precomputed replacements into expr, then requires expect_true to
+        # hold; raises AssertionError otherwise. Side effect: may add guards or runtime asserts.
         """
         Use it when you already know that expr is true or should be true and want to
         ensure that guards/runtime assertions are in place to ensure this in compiled
@@ -874,6 +989,8 @@ class SizeVarAllocator:
             raise AssertionError(f"expect_true failed for {expr}")
 
     def check_equals(self, left: Expr, right: Expr) -> None:
+        # [FUNCTION DOC] Check that left equals right (see check), then return left.
+        # KNOWN ISSUE: annotated as returning None but returns left.
         """
         check(sympy.Eq(left, right)).
 
@@ -882,6 +999,7 @@ class SizeVarAllocator:
         return left
 
     def check_equals_and_simplify(self, left: Expr, right: Expr) -> Expr:
+        # [FUNCTION DOC] Check that left equals right, then return left with inverse precomputed replacements applied.
         """
         check(sympy.Eq(left, right)) and returns left after applying
         inv_precomputed_replacements.
@@ -890,14 +1008,18 @@ class SizeVarAllocator:
         return sympy_subs(left, self.inv_precomputed_replacements)
 
     def check_leq(self, left: Expr, right: Expr) -> None:
+        # [FUNCTION DOC] Check that left <= right (raises AssertionError if it cannot be asserted).
         self.check(sympy.Le(left, right))
 
     def check_lt(self, left: Expr, right: Expr) -> None:
+        # [FUNCTION DOC] Check that left < right (raises AssertionError if it cannot be asserted).
         self.check(sympy.Lt(left, right))
 
     # Similar to the functions guard_or_false/guard_or_true in symbolic_shapes.py
     # but operates on sympy expressions instead of symnodes. see Note [guard_or_].
     def guard_or_false(self, left):
+        # [FUNCTION DOC] Guard-or-false: under backed-size-oblivious mode returns the statically evaluated value or
+        # False; otherwise evaluates the expression with fallback value False. Never specializes on unknowns.
         import torch.fx.experimental._config as exp_config
 
         if exp_config.backed_size_oblivious:
@@ -908,6 +1030,7 @@ class SizeVarAllocator:
         return self.evaluate_expr(left, fallback_value=False)
 
     def guard_or_true(self, left):
+        # [FUNCTION DOC] Guard-or-true: like guard_or_false but the fallback value is True.
         import torch.fx.experimental._config as exp_config
 
         if exp_config.backed_size_oblivious:
@@ -931,6 +1054,9 @@ class SizeVarAllocator:
         size_oblivious: bool = False,
         fallback_value: bool | None = None,
     ) -> bool:
+        # [FUNCTION DOC] Evaluate a sympy expression (Expr or Boolean) to a concrete bool via the shape env,
+        # guarding on the result; optional size-oblivious mode and fallback value. Raises AssertionError
+        # on a non-sympy input.
         if not isinstance(left, (Expr, sympy.logic.boolalg.Boolean)):
             raise AssertionError(type(left))
         return self.shape_env.evaluate_expr(
@@ -940,6 +1066,7 @@ class SizeVarAllocator:
         )
 
     def is_size_one_or_false(self, size: Expr) -> bool:
+        # [FUNCTION DOC] True if size is known to be 1; unbacked sizes return False without guarding.
         """Return True if size equals 1.
 
         Unbacked symbolic sizes return False without introducing a guard.
@@ -947,6 +1074,10 @@ class SizeVarAllocator:
         return self.guard_or_false(sympy.Eq(size, 1))
 
     def evaluate_min(self, left: Expr, right: Expr) -> Expr:
+        # [FUNCTION DOC] Return the smaller of left and right, guarding the choice. Undoes precomputed
+        # replacements, tries guard-or-false comparisons both ways, then a gcd fallback (noted as unsound
+        # for possibly negative or zero unbacked factors), then Min/Max structure rules. Raises TypeError
+        # if undecidable.
         """Return the smaller of left and right, and guard on that choice."""
         if isinstance(left, Expr):
             left = sympy_subs(left, self.inv_precomputed_replacements)  # type: ignore[arg-type]
@@ -977,6 +1108,7 @@ class SizeVarAllocator:
         for lhs, rhs in [(left, right), (right, left)]:
 
             def le_rhs(a: Expr) -> bool:
+                # [FUNCTION DOC] HELPER: Guard-or-false check that a is <= the current right-hand side.
                 return self.guard_or_false(sympy.Le(a, rhs))
 
             # Min(Min(a, b), c) ==> Min(a, b) if (a <= c) or (b <= c).
@@ -991,6 +1123,8 @@ class SizeVarAllocator:
         ) from None
 
     def evaluate_max(self, left: Expr, right: Expr) -> Expr:
+        # [FUNCTION DOC] Return the larger of left and right, defined as the opposite choice of evaluate_min so
+        # both produce the same guards.
         """Return the larger of left and right, and guard on that choice."""
         # Always choose the opposite of eval min for consistency
         # This means min(a, b) and max(a, b) produce the same guards
@@ -998,6 +1132,8 @@ class SizeVarAllocator:
         return right if min_val is left else left
 
     def guard_int(self, expr: Expr | int) -> int:
+        # [FUNCTION DOC] Concretize expr to an int: ints pass through; otherwise take the guarding hint,
+        # check equality (adding a guard) and return the int. Raises on unbacked/unhinted symbols.
         """
         Similar to guard_int in symbolic_shapes.py, except this function works with SymPy
         expressions instead of SymNodes. It extracts the value represented by expr from shapeEnv
@@ -1011,12 +1147,15 @@ class SizeVarAllocator:
         return int(val)
 
     def guard_int_seq(self, left: Sequence[Expr | int]) -> list[int]:
+        # [FUNCTION DOC] Apply guard_int to each element, returning a list of ints.
         """
         Apply guard_int on a sequence of inputs.
         """
         return [self.guard_int(x) for x in left]
 
     def remove_precomputed_replacements(self, expr: Expr) -> Expr:
+        # [FUNCTION DOC] If expr contains precomputed-size symbols, substitute the inverse replacements to restore
+        # original expressions; otherwise return unchanged.
         if any(symbol_is_type(s, SymT.PRECOMPUTED_SIZE) for s in expr.free_symbols):  # type: ignore[attr-defined]
             return sympy_subs(expr, self.inv_precomputed_replacements)  # type: ignore[arg-type]
         return expr
@@ -1025,6 +1164,10 @@ class SizeVarAllocator:
         self,
         expr: Expr | int,
     ) -> Expr | int:
+        # [FUNCTION DOC] Last-resort helper: replace backed symbols with their hint values (unbacked left alone).
+        # Ints pass through; simplifies, undoes precomputed replacements, substitutes hints and expands.
+        # Returns an int if no free symbols remain (or the expression itself for inf/nan), else the
+        # expression. Raises AssertionError if simplify gives a non-Expr non-int.
         """
         Replace all backed symbols in an expression with their concrete hint values.
 
@@ -1057,6 +1200,9 @@ class SizeVarAllocator:
         return expr
 
     def to_symint_or_int(self, expr: Expr | int) -> SymInt | int:
+        # [FUNCTION DOC] Convert an expression to a SymInt (ints and integer constants returned as int). Undoes
+        # precomputed replacements and attaches the guarding hint when available (None if it cannot be
+        # computed).
         """Convert a sympy expression to SymInt, or return int as is."""
         if isinstance(expr, int):
             return expr
@@ -1079,10 +1225,13 @@ class SizeVarAllocator:
         return SymInt(node)
 
     def to_symints_or_ints(self, exprs: Sequence[Expr | int]) -> list[SymInt | int]:
+        # [FUNCTION DOC] Convert each element with to_symint_or_int, returning a list.
         """Convert a sequence of sympy expressions to SymInts, or return ints as is."""
         return [self.to_symint_or_int(e) for e in exprs]
 
     def guarding_hint_or_throw(self, expr: Expr | int) -> int:
+        # [FUNCTION DOC] Return a concrete int hint for guarding using only backed symbol hints; no heuristics for
+        # unbacked symbols. Raises GuardOnDataDependentSymNode if unbacked symbols are involved.
         """
         Return a concrete integer hint for an expression that is safe to use for guarding.
 
@@ -1116,6 +1265,9 @@ class SizeVarAllocator:
         )
 
     def optimization_hint(self, expr: Expr | int, fallback: int | None = None) -> int:
+        # [FUNCTION DOC] Concrete int hint for non-guarding optimizations; unbacked symbols use user hints or
+        # the fallback with heuristics. Delegates to the shared hint routine using inverse precomputed
+        # replacements. Complex values raise, infinity gives the max size, NaN gives the fallback.
         """
         Return a concrete integer hint for an expression.
 
@@ -1141,6 +1293,8 @@ class SizeVarAllocator:
         exprs: Iterable[Expr | int],
         fallback: int | None = None,
     ) -> tuple[int, ...]:
+        # [FUNCTION DOC] Optimization hints for a sequence of expressions as a tuple; the fallback defaults to the
+        # unbacked_symint_fallback config value read at call time.
         """
         Like optimization_hint but for a sequence of expressions.
         Returns a tuple of concrete integer hints.
@@ -1151,6 +1305,8 @@ class SizeVarAllocator:
         return tuple(self.optimization_hint(x, fallback=fallback) for x in exprs)
 
     def all_unbacked_explicitly_hinted(self, exprs: IterateExprs) -> bool:
+        # [FUNCTION DOC] True if every unbacked symbol in the expressions has an explicit hint override
+        # (vacuously True when none).
         """
         Return True if every unbacked symbol in *exprs* has an explicit
         user-provided hint in var_to_hint_override.  If there are no
@@ -1166,6 +1322,8 @@ class SizeVarAllocator:
         expr: Expr | int,
         hint_override: int | None,
     ) -> int:
+        # [FUNCTION DOC] Hint with optional override: a statically known integer wins; else the override if
+        # given; else the normal optimization hint.
         r"""Return a concrete integer hint for an expression, with optional override.
         This is used in dynamic dispatch scenarios where callers may want to
         provide a specific hint value rather than computing one from the expression.
@@ -1199,6 +1357,7 @@ class SizeVarAllocator:
         exprs: Iterable[Expr | int],
         hint_override: int | None,
     ) -> tuple[int, ...]:
+        # [FUNCTION DOC] Apply optimization_hint_with_override over a sequence, returning a tuple.
         """
         Like optimization_hint_with_override but for a sequence of expressions.
         Returns a tuple of concrete integer hints.
@@ -1211,9 +1370,12 @@ class SizeVarAllocator:
         self,
         exprs: Iterable[Expr | int],
     ) -> tuple[int, ...]:
+        # [FUNCTION DOC] Guarding hints for a sequence of expressions as a tuple (raises as guarding_hint_or_throw).
         return tuple(self.guarding_hint_or_throw(x) for x in exprs)
 
     def _lru_cache(self, fn, maxsize=None):
+        # [FUNCTION DOC] HELPER: Return an LRU-cached wrapper of fn whose cache is cleared whenever the number of
+        # replacements changes.
         """
         Wrapper around functools.lru_cache that clears when replacements
         has been invalidated.
@@ -1223,6 +1385,7 @@ class SizeVarAllocator:
 
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Clear the cache if replacements changed, then call the cached function.
             nonlocal prior_len
             if prior_len != len(self.replacements):
                 prior_len = len(self.replacements)
@@ -1232,6 +1395,8 @@ class SizeVarAllocator:
         return wrapper
 
     def make_stride_vars_cache(self):
+        # [FUNCTION DOC] Build a cached stride-computation function around the stride helper, with cache
+        # invalidation on new replacements. Returns the callable.
         cache = self._lru_cache(self._stride_vars)
 
         def stride_vars(
@@ -1239,6 +1404,8 @@ class SizeVarAllocator:
             vars: Sequence[sympy.Symbol],
             support_vars: Sequence[sympy.Symbol] | None = None,
         ) -> list[Expr]:
+            # [FUNCTION DOC] HELPER: Compute strides of index for vars; support_vars defaults to vars; arguments are
+            # converted to tuples for caching.
             if not support_vars:
                 support_vars = vars
             return cache(index, tuple(vars), tuple(support_vars))
@@ -1251,6 +1418,10 @@ class SizeVarAllocator:
         vars: Sequence[sympy.Symbol],
         support_vars: Sequence[sympy.Symbol],
     ) -> list[Expr]:
+        # [FUNCTION DOC] HELPER: Convert an index expression into a list of per-variable strides: removes the
+        # offset, isolates each variable, and takes the difference of the value at one and at zero. A zero
+        # variable gets stride zero. Only valid for plain strided index calculations (wraps give odd
+        # strides).
         """Convert an indexing expression back into strides
 
         NOTE: This is only valid if the index is a standard strided offset
@@ -1286,6 +1457,7 @@ class SizeVarAllocator:
         return strides
 
     def offset_var(self, index: Expr, vars: Sequence[sympy.Symbol]) -> Expr:
+        # [FUNCTION DOC] Return the offset part of an index: simplified expression with all vars set to zero.
         """Extract offset part of an indexing expression"""
         index = self.simplify(index)
         return sympy_subs(index, {v: sympy.S.Zero for v in vars if v != 0})
@@ -1298,6 +1470,8 @@ class SizeVarAllocator:
         vars: Sequence[sympy.Symbol],
         support_vars: Sequence[sympy.Symbol] | None = None,
     ) -> list[int]:
+        # [FUNCTION DOC] Stride hints for optimization only: replaces indirect-index symbols by zero, computes
+        # strides, and converts each to an int hint (fallback 0). Returns a list of ints.
         for v in index.free_symbols:
             if symbol_is_type(v, SymT.INDIRECT):  # type: ignore[attr-defined]
                 index = sympy_subs(index, {v: 0})  # type: ignore[dict-item]
@@ -1307,12 +1481,17 @@ class SizeVarAllocator:
         return result
 
     def stride_order(self, index: Expr, vars: list[sympy.Symbol]) -> list[int]:
+        # [FUNCTION DOC] Return indices of vars ordered by absolute stride hint ascending, with zero-stride
+        # vars last.
         strides = tuple(map(abs, self.stride_hints(index, vars)))
         order = list(range(len(strides)))
         order.sort(key=lambda x: (strides[x] == 0, strides[x]))
         return order
 
     def lookup_precomputed_size(self, expr: Expr) -> Expr:
+        # [FUNCTION DOC] Return a precomputed-size symbol standing for expr, creating and recording the mapping
+        # (both directions) on first use. Numbers and symbols are returned unchanged. Mutates the
+        # precomputed replacement maps.
         if (
             isinstance(expr, (int, sympy.Symbol, sympy.Number))
             or expr.is_number
@@ -1329,11 +1508,15 @@ class SizeVarAllocator:
         return self.precomputed_replacements[expr]
 
     def free_symbols(self) -> OrderedSet[sympy.Symbol]:
+        # [FUNCTION DOC] Return the backed symbols that have no replacement, as an ordered set.
         return OrderedSet(self.backed_var_to_val.keys()) - OrderedSet(
             self.replacements.keys()
         )
 
     def combine_modular_indexing_pairs(self, index: sympy.Expr) -> sympy.Expr:
+        # [FUNCTION DOC] Combine nested modular indexing of a non-negative symbol with both divisors 1 and positive
+        # constant moduli where the inner modulus is a multiple of the outer one, into a single modular
+        # indexing; otherwise return the index unchanged.
         """
         A pair of special ModularIndexing can be combined.
 
@@ -1345,6 +1528,8 @@ class SizeVarAllocator:
         """
 
         def _check_args(x, div, mod, is_first):
+            # [FUNCTION DOC] HELPER: Validate one modular indexing layer: constant divisor 1, positive constant
+            # modulus; the outer layer must wrap a modular indexing, the inner one a statically non-negative symbol.
             if not isinstance(div, sympy.Integer) or not isinstance(mod, sympy.Integer):
                 return False
             if div != 1:
@@ -1388,6 +1573,10 @@ class SizeVarAllocator:
         index: sympy.Expr,
         candidate_vars: Iterable[sympy.Symbol] | None = None,
     ) -> bool | tuple[sympy.Expr, sympy.Expr]:
+        # [FUNCTION DOC] Try to factor a floor division over a sum so loops may merge: requires a sum of terms that
+        # are non-negative symbol multiples with integer constant factors, plus exactly one floor division
+        # of a symbol by a constant (optionally restricted to candidate vars). Returns False if not
+        # applicable, else (new expression, denominator) meaning the original equals new // denominator.
         """
         Expand the FloorDiv to the entire expression so that the expression may
         be simplified.
@@ -1410,6 +1599,7 @@ class SizeVarAllocator:
         def parse_static_term(
             term: sympy.Expr,
         ) -> tuple[sympy.Expr, sympy.Symbol] | None:
+            # [FUNCTION DOC] HELPER: Parse a product of an integer constant and a symbol; None otherwise.
             if not isinstance(term, sympy.Mul):
                 return None
             # For dynamic shape, term like '2*s1*x1' has 3 child nodes.
@@ -1425,6 +1615,8 @@ class SizeVarAllocator:
             return factor, var
 
         def parse_term(term: sympy.Expr) -> tuple[sympy.Expr, sympy.Symbol] | None:
+            # [FUNCTION DOC] HELPER: Parse a term into (integer factor, non-negative symbol), using candidate vars to
+            # find the loop variable when given; None if not of that shape.
             if candidate_vars_set is None:
                 parsed = parse_static_term(term)
                 if parsed is None:
@@ -1518,6 +1710,8 @@ class SizeVarAllocator:
 
 
 def join_dimensions(expr: Expr) -> Expr:
+    # [FUNCTION DOC] Fast-path wrapper: returns the expression unchanged unless it is a sum containing
+    # modular indexing, in which case defers to the cached joiner.
     if not isinstance(expr, sympy.Add) or not expr.has(ModularIndexing):
         return expr  # fast exit path
     return _join_dimensions_cached(expr)
@@ -1525,6 +1719,10 @@ def join_dimensions(expr: Expr) -> Expr:
 
 @functools.lru_cache(256)
 def _join_dimensions_cached(expr: Expr) -> Expr:
+    # [FUNCTION DOC] HELPER: Cached. Merge pairs of terms in a sum that come from view operations: two
+    # modular-indexing terms with chained scale/modulus become one with the product modulus; a modular
+    # indexing plus the matching floor division becomes a floor division. Recurses and returns the
+    # simplified expression (unchanged if nothing matches). Raises AssertionError if not a sum.
     """
     ModularIndexing(i0, 1, 32) + 32 * ModularIndexing(i0, 32, 4)
     becomes
@@ -1580,12 +1778,17 @@ def _join_dimensions_cached(expr: Expr) -> Expr:
 
 
 class SimplifyIndexing(V.WrapperHandler):  # type: ignore[name-defined]
+    # [CLASS DOC] Ops handler wrapper that simplifies the index of load, store, store_reduction, index_expr
+    # value_expr and check_bounds using variable range information from the graph size vars before
+    # forwarding to the inner handler.
     """
     A wrapper around .virtualize.ops that uses var range information to
     simplify ModularIndexing/FloorDiv.
     """
 
     def __init__(self, inner, var_ranges: VarRanges) -> None:
+        # [FUNCTION DOC] Wrap the inner handler and define the index simplifier using the current graph's
+        # range-aware simplification with the given var ranges.
         super().__init__(inner)
         self.name = "SimplifyIndexing"
         self._simplify: Callable[[Expr], Expr] = (
@@ -1593,19 +1796,25 @@ class SimplifyIndexing(V.WrapperHandler):  # type: ignore[name-defined]
         )
 
     def load(self, name: str, index: sympy.Expr):
+        # [FUNCTION DOC] Forward a load with a simplified index.
         return self._inner.load(name, self._simplify(index))
 
     def store(self, name, index, value, mode=None):
+        # [FUNCTION DOC] Forward a store with a simplified index.
         return self._inner.store(name, self._simplify(index), value, mode=mode)
 
     def store_reduction(self, name, index, value):
+        # [FUNCTION DOC] Forward a store_reduction with a simplified index.
         return self._inner.store_reduction(name, self._simplify(index), value)
 
     def index_expr(self, index, dtype):
+        # [FUNCTION DOC] Forward an index_expr with a simplified index.
         return self._inner.index_expr(self._simplify(index), dtype)
 
     def value_expr(self, index, dtype):
+        # [FUNCTION DOC] Forward a value_expr with a simplified index.
         return self._inner.value_expr(self._simplify(index), dtype)
 
     def check_bounds(self, index, size, lower, upper):
+        # [FUNCTION DOC] Forward a bounds check with a simplified index.
         return self._inner.check_bounds(self._simplify(index), size, lower, upper)
