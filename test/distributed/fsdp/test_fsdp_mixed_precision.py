@@ -1,4 +1,12 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] FSDP mixed precision tests (param, buffer and reduce dtypes, grad scaler,
+# eval-time full precision, input casting, batchnorm handling, ignored modules, EMA flow).
+# Defines module level MixedPrecision configs (default_mp, mp_only_reduce,
+# mp_only_param_and_buf, mp_no_mixed_precision and a bf16 variant when NCCL >= 2.10) and the
+# cross product of configs used for parametrized test names.
+# Import-time side effects: exits the process with code 0 if torch.distributed is
+# unavailable or under dev-asan; tries to import torchvision to define a skip decorator.
+# Several tests set the FSDP_USE_FULL_PREC_IN_EVAL environment variable and never reset it.
 
 import contextlib
 import itertools
@@ -143,6 +151,10 @@ _CURRENT_FULL_PRECISION_PARAM_DTYPE = None
 
 @contextlib.contextmanager
 def patch_reduce_scatter(new_reduce_scatter, full_precision_param_dtype):
+    # [FUNCTION DOC] HELPER: Context manager that temporarily replaces the reduce_scatter_single
+    # function of the distributed package with new_reduce_scatter and records
+    # full_precision_param_dtype in the module global _CURRENT_FULL_PRECISION_PARAM_DTYPE.
+    # On exit (even on error) it restores the original function and resets the global to None.
     """
     Patches ``dist.reduce_scatter_single`` with ``new_reduce_scatter`` and
     restores upon exiting. Used for validation of mixed precision.
@@ -159,11 +171,17 @@ def patch_reduce_scatter(new_reduce_scatter, full_precision_param_dtype):
 
 
 class LinearMixedPrecision(nn.Module):
+    # [CLASS DOC] HELPER: Bias-free 10x10 linear module plus one float64 buffer, whose forward
+    # optionally asserts that FSDP mixed precision is applied correctly. State: lin, the
+    # buffer under a configurable name, the original param and buffer dtypes, run_checks.
     """
     A linear module with extra checks for mixed precision training.
     """
 
     def __init__(self, param_dtype, buffer_name="buffer", run_checks=True):
+        # [FUNCTION DOC] HELPER: Creates the linear layer in param_dtype and registers a (1, 2)
+        # random buffer of the module level original buffer dtype (float64) under buffer_name.
+        # Stores the original dtypes and the run_checks flag for use in forward.
         super().__init__()
         self.lin = nn.Linear(10, 10, bias=False).to(param_dtype)
         # Use a configurable buffer name to avoid all submodules sharing the
@@ -175,6 +193,14 @@ class LinearMixedPrecision(nn.Module):
         self.run_checks = run_checks
 
     def forward(self, tup):
+        # [FUNCTION DOC] HELPER: Takes a tuple (input, test case, FSDP root, MixedPrecision
+        # config, full precision param dtype) and returns the same tuple with the input
+        # replaced by the linear output, so it can be chained in a Sequential. When run_checks
+        # is set it asserts, via the test case, that the input and buffer have the configured
+        # mixed precision dtypes (or originals when unset). It also checks each sharded FSDP
+        # unit: if active, params have the low precision dtype and the _mp_shard storage is
+        # freed (or absent when param_dtype is unset); if inactive, params are full precision.
+        # With world size above one, at least one unit must be active. Raises on mismatch.
         inp, cls, fsdp, mp_config, full_precision_param_dtype = tup
         if self.run_checks:
             # Param and input should be the mixed precision type
@@ -240,13 +266,22 @@ class LinearMixedPrecision(nn.Module):
 
 
 class TestFSDPMixedPrecision(FSDPTest):
+    # [CLASS DOC] Base test case with shared helpers for FSDP mixed precision tests: model
+    # builders, validators of _mp_shard allocation, a reduce-scatter dtype checker and the
+    # end to end train loop. Subclasses define world_size and the concrete tests.
     @property
     def world_size(self):
+        # [FUNCTION DOC] Abstract property; always raises ValueError because child classes
+        # must override it.
         raise ValueError("To be implemented by child classes")
 
     def _get_simple_nested_model(
         self, param_dtype, run_checks, *fsdp_args, **fsdp_kwargs
     ):
+        # [FUNCTION DOC] HELPER: Builds an FSDP-wrapped Sequential of two LinearMixedPrecision
+        # modules (buffers named buffer0 and buffer1) on the test device. The first is wrapped
+        # in its own inner FSDP; fsdp_args and fsdp_kwargs go to every FSDP constructor.
+        # Returns the root FSDP model.
         model = FSDP(
             nn.Sequential(
                 FSDP(
@@ -266,12 +301,16 @@ class TestFSDPMixedPrecision(FSDPTest):
         return model
 
     def _get_simple_model(self, param_dtype, *fsdp_args, **fsdp_kwargs):
+        # [FUNCTION DOC] HELPER: Returns a single LinearMixedPrecision (default buffer name,
+        # checks on) moved to the test device and wrapped in one FSDP with the given arguments.
         model = FSDP(
             LinearMixedPrecision(param_dtype).to(device_type), *fsdp_args, **fsdp_kwargs
         )
         return model
 
     def _validate_no_mp_shard(self, fsdp_model):
+        # [FUNCTION DOC] HELPER: Asserts that no flat parameter of any FSDP unit under
+        # fsdp_model has an _mp_shard attribute (it is only allocated with param_dtype set).
         """
         Validates that there is no mixed precision _mp_shard allocated
         when it is not expected to be.
@@ -282,6 +321,8 @@ class TestFSDPMixedPrecision(FSDPTest):
                 self.assertFalse(hasattr(param, "_mp_shard"))
 
     def _validate_mp_shard_freed(self, fsdp_model):
+        # [FUNCTION DOC] HELPER: Asserts that for every flat parameter of every FSDP unit under
+        # fsdp_model the _mp_shard untyped storage has size zero (low precision shard freed).
         """
         Ensures that the mixed precision shard is greed for all FSDP units.
         """
@@ -293,6 +334,11 @@ class TestFSDPMixedPrecision(FSDPTest):
     def _reduce_scatter_validate_mp(
         self, orig_reduce_scatter, mp_config, should_run_low_prec, *args, **kwargs
     ):
+        # [FUNCTION DOC] HELPER: Wrapper used in place of reduce_scatter_single. Gathers all
+        # tensor arguments, computes the expected dtype (if should_run_low_prec: reduce_dtype,
+        # else param_dtype, else the current full precision dtype global; if not
+        # should_run_low_prec: the full precision dtype) and asserts every tensor has it.
+        # Then calls orig_reduce_scatter with the original arguments and returns its result.
         """
         Runs reduce-scatter but verifies mixed precision settings before. This
         is to test mixed precision is working as expected during backward pass.
@@ -338,13 +384,20 @@ class TestFSDPMixedPrecision(FSDPTest):
     def _test_grads_reduced_precision(
         self, offload_params: bool, use_orig_params: bool
     ):
+        # [FUNCTION DOC] HELPER: Wraps a two-linear model in nested FSDP with fp16 mixed
+        # precision and keep_low_precision_grads enabled, using the given cpu offload and
+        # use_orig_params settings. Runs 6 forward/backward steps and asserts every present
+        # gradient is float16, then calls a barrier.
         class MyModel(nn.Module):
+            # [CLASS DOC] HELPER: Two stacked 10x10 linear layers.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates lin1 and lin2.
                 super().__init__()
                 self.lin1 = nn.Linear(10, 10)
                 self.lin2 = nn.Linear(10, 10)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies lin1 then lin2.
                 return self.lin2(self.lin1(x))
 
         m = MyModel().to(device_type)
@@ -380,6 +433,13 @@ class TestFSDPMixedPrecision(FSDPTest):
         sharding_strategy,
         enable_sharded_grad_scaler,
     ):
+        # [FUNCTION DOC] HELPER: Core end to end check. Sets the device to this rank, builds a
+        # simple and a nested FSDP model with the given sharding, offload, prefetch and mixed
+        # precision settings, and for each model, with reduce-scatter patched to validate
+        # dtypes, runs 3 iterations of forward, scaled backward and optimizer step. Asserts the
+        # dtypes of buffers, loss, params and grads, that _mp_shard is freed or never
+        # allocated, that summon_full_params yields full precision params and that state_dict
+        # entries are in original dtypes (buffers float64, params full precision).
         torch.accelerator.set_device_index(self.rank)
         fsdp_models = [
             self._get_simple_model(
@@ -520,11 +580,16 @@ class TestFSDPMixedPrecision(FSDPTest):
 
 
 class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
+    # [CLASS DOC] Mixed precision tests run with two ranks (sharded parameters): end to end
+    # configs, embedding inputs, resnet, batchnorm, eval behavior and input gradients.
     @property
     def world_size(self):
+        # [FUNCTION DOC] Returns 2, the number of ranks for this test class.
         return 2
 
     def _get_subtest_config(self) -> dict[str, list[Any]]:
+        # [FUNCTION DOC] HELPER: Returns the subtest mapping for run_subtests: forward_prefetch
+        # in False/True and backward_prefetch in None, BACKWARD_PRE, BACKWARD_POST.
         """Returns a subtest configuration that subtests prefetching settings
         together."""
         return {
@@ -538,6 +603,9 @@ class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
 
     @skip_if_lt_x_gpu(2)
     def test_mixed_precision_no_reshard_after_forward(self):
+        # [FUNCTION DOC] Needs 2 GPUs. Runs the end to end check once with the bf16 mixed
+        # config if NCCL supports it (else the default fp16 config), CPU param offload,
+        # float64 full precision params, SHARD_GRAD_OP sharding and the grad scaler disabled.
         # Note that we don't exercise all possible different configs so as to
         # not increase test TTS too much.
         mp = default_mp if not nccl_supports_bf16 else mp_diff_buffer_and_reduce
@@ -560,6 +628,9 @@ class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
         full_precision_param_dtype,
         enable_sharded_grad_scaler,
     ):
+        # [FUNCTION DOC] Needs 2 GPUs; parametrized over the cross product of mixed precision
+        # config, CPU offload, full precision param dtype and grad scaler flag. For each
+        # prefetch subtest it runs the end to end check with FULL_SHARD sharding.
         self.run_subtests(
             self._get_subtest_config(),
             self._run_test_mixed_precision_e2e,
@@ -571,6 +642,10 @@ class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
         )
 
     def _test_mixed_precision_embedding_table(self, mp_config):
+        # [FUNCTION DOC] HELPER: With reduce-scatter patched to validate dtypes, wraps a
+        # TransformerWithSharedParams (which has an embedding taking integer inputs) in one
+        # top-level FSDP using mp_config and trains 6 SGD steps. Asserts the loss has the
+        # param dtype (float32 if unset), which also fails if integer inputs were wrongly cast.
         # Basic test to ensure int inputs are not casted which would break
         # modules such as embedding tables.
         param_dtype = mp_config.param_dtype or torch.float32
@@ -604,12 +679,15 @@ class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
 
     @skip_if_lt_x_gpu(2)
     def test_mp_embedding_reduce(self):
+        # [FUNCTION DOC] Needs 2 GPUs. Embedding check with only reduce_dtype set to float16.
         self._test_mixed_precision_embedding_table(
             mp_config=MixedPrecision(reduce_dtype=torch.float16)
         )
 
     @skip_if_lt_x_gpu(2)
     def test_mp_embedding_only_params_and_bufs(self):
+        # [FUNCTION DOC] Needs 2 GPUs. Embedding check with param and buffer dtype float16
+        # and no reduce dtype.
         self._test_mixed_precision_embedding_table(
             mp_config=MixedPrecision(
                 param_dtype=torch.float16,
@@ -619,6 +697,8 @@ class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
 
     @skip_if_lt_x_gpu(2)
     def test_mp_embedding_default(self):
+        # [FUNCTION DOC] Needs 2 GPUs. Embedding check with param, buffer and reduce dtypes
+        # all float16.
         default_mp_config = MixedPrecision(
             param_dtype=torch.float16,
             buffer_dtype=torch.float16,
@@ -628,6 +708,8 @@ class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
 
     @skip_if_lt_x_gpu(2)
     def test_mp_embedding_params_and_reduce_diff(self):
+        # [FUNCTION DOC] Needs 2 GPUs. Embedding check with float16 param and buffer dtypes
+        # and a float32 reduce dtype.
         params_and_reduce_different = MixedPrecision(
             param_dtype=torch.float16,
             reduce_dtype=torch.float32,
@@ -640,6 +722,10 @@ class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
     @skip_if_lt_x_gpu(2)
     @skipIfNoTorchVision
     def test_mixed_precision_resnet(self):
+        # [FUNCTION DOC] Needs 2 GPUs and torchvision. Converts resnet50 to sync batchnorm,
+        # wraps it with FSDP using size-based auto wrap and fp16 mixed precision, asserts the
+        # number of FSDP units wrapping a batchnorm equals the batchnorm count in the original
+        # model, then runs a forward and backward pass to confirm no dtype mismatch.
         """
         End to end test to ensure mixed precision + auto_wrap works
         for ResNet model.
@@ -678,6 +764,8 @@ class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
 
     @skip_if_lt_x_gpu(2)
     def test_grads_reduced_precision(self):
+        # [FUNCTION DOC] Needs 2 GPUs. Runs the low precision gradient check over all
+        # combinations of offload_params and use_orig_params.
         self.run_subtests(
             {
                 "offload_params": [False, True],
@@ -689,8 +777,17 @@ class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
     @skip_if_lt_x_gpu(2)
     @parametrize("convert_sync_bn", [True, False])
     def test_mp_batchnorm(self, convert_sync_bn):
+        # [FUNCTION DOC] Needs 2 GPUs; parametrized on converting to sync batchnorm. Wraps a
+        # net with batchnorm and layernorm using fp16 mixed precision that ignores those module
+        # classes and a policy that never wraps. Expects a UserWarning, asserts the norm
+        # modules became separate FSDP units with default (no) mixed precision while the other
+        # layers stay unwrapped and the root keeps the config, then runs forward and backward.
         class BatchNormNet(nn.Module):
+            # [CLASS DOC] HELPER: Small net of linear, batchnorm, linear, layernorm, linear
+            # layers ending with a softmax.
             def __init__(self, affine=True):
+                # [FUNCTION DOC] HELPER: Creates fc1 (2 to 40), bn (BatchNorm1d, 4 features,
+                # affine per argument), fc2 (40 to 4), ln (LayerNorm 4) and fc3 (4 to 4).
                 super().__init__()
                 self.fc1 = nn.Linear(2, 40, bias=False)
                 self.bn = nn.BatchNorm1d(4, affine=affine)
@@ -699,6 +796,9 @@ class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
                 self.fc3 = nn.Linear(4, 4, bias=False)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies fc1, reshapes to batch of 4 by 10, applies bn,
+                # flattens to 40 features, applies fc2, ln and fc3, and returns the softmax
+                # over dimension 1.
                 x = torch.reshape(self.fc1(x), (-1, 4, 10))
                 x = self.bn(x)
                 x = torch.reshape(x, (-1, 40))
@@ -708,6 +808,8 @@ class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
                 return F.softmax(x, dim=1)
 
         def never_wrap_policy(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Auto wrap policy that ignores its arguments and always
+            # returns False, so no submodule is wrapped by the policy.
             return False
 
         net = BatchNormNet().to(device_type)
@@ -751,6 +853,10 @@ class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
 
     @skip_if_lt_x_gpu(2)
     def test_eval_root_cast_inputs(self):
+        # [FUNCTION DOC] Needs 2 GPUs. For FSDP_USE_FULL_PREC_IN_EVAL set to 1 and 0, wraps a
+        # model whose root has no parameters of its own (only a wrapped child) in eval mode and
+        # runs forward and backward; the model raises if its input is not float32 (flag on) or
+        # float16 (flag off). Side effect: sets the environment variable.
         """
         In a case where root module does not manage FSDP parameters,
         ensure that we don't cast forward inputs which could potentially
@@ -761,11 +867,16 @@ class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
         low_prec_dtype = torch.float16
 
         class MyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: One linear layer that validates the dtype of its input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the 5 to 5 linear layer a.
                 super().__init__()
                 self.a = nn.Linear(5, 5)
 
             def forward(self, x, expect_use_full_prec_in_eval):
+                # [FUNCTION DOC] HELPER: Raises AssertionError if x is not float32 when
+                # expect_use_full_prec_in_eval is true, or not the low precision dtype when
+                # false; otherwise returns the linear layer output.
                 if expect_use_full_prec_in_eval:
                     if x.dtype != torch.float32:
                         raise AssertionError(f"Expected fp32, got {x.dtype}")
@@ -795,6 +906,10 @@ class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
 
     @skip_if_lt_x_gpu(2)
     def test_full_precision_in_eval(self):
+        # [FUNCTION DOC] Needs 2 GPUs. For each combination of cast_forward_inputs and
+        # FSDP_USE_FULL_PREC_IN_EVAL, builds a recursively wrapped transformer with fp16 mixed
+        # precision, checks the training loss is float16 and grads float32, then in eval mode
+        # checks the loss is float32 only if the flag is on. Side effect: sets the env variable.
         """
         Tests that eval runs in full precision if FSDP_USE_FULL_PREC_IN_EVAL is set.
         """
@@ -838,6 +953,11 @@ class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
 
     @skip_if_lt_x_gpu(2)
     def test_full_precision_in_eval_buffers(self):
+        # [FUNCTION DOC] Needs 2 GPUs. For each combination of cast_forward_inputs and
+        # FSDP_USE_FULL_PREC_IN_EVAL, runs a nested model forward and checks buffers are fp16,
+        # then in eval mode (with forward pre-hooks that check buffer dtypes) checks buffers
+        # are the original float64 if the flag is on else fp16, and after train mode and
+        # another forward checks they are fp16 again. Side effect: sets the env variable.
         """
         Tests that when model.eval() and FSDP_USE_FULL_PREC_IN_EVAL is set,
         buffers are in the full precision.
@@ -870,6 +990,8 @@ class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
             # model.eval() + forward pass should make the buffers in full prec again
             # Add pre-forward hooks
             def verify_eval_buffer_dtype(module, input):
+                # [FUNCTION DOC] HELPER: Forward pre-hook asserting every buffer of module has
+                # the original buffer dtype if the flag is on, else float16.
                 expected_dtype = (
                     _BUFFER_ORIG_DTYPE if use_full_prec_in_eval else torch.float16
                 )
@@ -877,6 +999,8 @@ class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
                     self.assertEqual(expected_dtype, buf.dtype)
 
             def _get_underlying_module(m):
+                # [FUNCTION DOC] HELPER: Returns the wrapped module of an FSDP instance, or m
+                # itself if it is not an FSDP instance.
                 return m.module if isinstance(m, FSDP) else m
 
             hook_handles = []
@@ -910,6 +1034,10 @@ class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
 
     @skip_if_lt_x_gpu(2)
     def test_full_precision_in_eval_comm(self):
+        # [FUNCTION DOC] Needs 2 GPUs. For each combination of cast_forward_inputs and
+        # FSDP_USE_FULL_PREC_IN_EVAL, runs forward and backward in eval mode on a transformer
+        # with float16 reduce dtype and checks via patched reduce-scatter that gradients are
+        # communicated in float16 only when the flag is off. Side effect: sets the env variable.
         for (
             cast_forward_inputs,
             use_full_prec_in_eval,
@@ -949,6 +1077,8 @@ class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
 
     @skip_if_lt_x_gpu(2)
     def test_input_grads_with_param_mixed_precision(self):
+        # [FUNCTION DOC] Needs 2 GPUs. Runs the input gradient check over FULL_SHARD,
+        # SHARD_GRAD_OP and NO_SHARD, each with use_orig_params false and true.
         """
         Tests that input tensors that require gradients do get their gradients
         even after being cast to a low precision (when parameter mixed
@@ -971,6 +1101,9 @@ class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
         sharding_strategy: ShardingStrategy,
         use_orig_params: bool,
     ):
+        # [FUNCTION DOC] HELPER: Wraps a bias-free 1024x1024 linear in FSDP with float16 param
+        # dtype and float32 reduce and buffer dtypes. Runs forward and backward on a float32
+        # input requiring grad and asserts it received a gradient that is still float32.
         model = nn.Linear(1024, 1024, bias=False)
         mixed_precision = MixedPrecision(
             param_dtype=torch.float16,
@@ -1000,8 +1133,17 @@ class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
 
     @skip_if_lt_x_gpu(2)
     def test_buffer_dtype_no_root_handle(self):
+        # [FUNCTION DOC] Needs 2 GPUs. Builds a Sequential of conv layers and fixed-kernel
+        # convs (buffers only), wraps it with FSDP (orig params, auto wrap every Sequential,
+        # float16 mixed precision) so the root owns no parameters, and checks that forward and
+        # backward run without dtype errors.
         class NonLearnableConv(nn.Module):
+            # [CLASS DOC] HELPER: Depthwise stride 2 convolution with a fixed, normalized
+            # separable kernel stored as a buffer (no learnable parameters).
             def __init__(self, kernel, in_channels: int):
+                # [FUNCTION DOC] HELPER: Normalizes the 1D kernel to sum one, takes its outer
+                # product, repeats it for each input channel and registers it as buffer kernel.
+                # Sets padding to half the kernel length minus one, rounded down.
                 super().__init__()
                 self.padding = (len(kernel) - 1) // 2
                 kernel = torch.tensor(kernel, dtype=torch.float32)
@@ -1010,6 +1152,8 @@ class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
                 self.register_buffer("kernel", kernel)
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Grouped 2D convolution of x with the kernel buffer,
+                # one group per channel, stride 2 and the stored padding.
                 return nn.functional.conv2d(
                     x,
                     self.kernel,
@@ -1046,16 +1190,20 @@ class TestFSDPMixedPrecisionSharded(TestFSDPMixedPrecision):
 
 
 class TestFSDPMixedPrecisionUnsharded(TestFSDPMixedPrecision):
+    # [CLASS DOC] Mixed precision tests with a single rank, so parameters are not sharded.
     """
     Smaller test suite for unshared param (i.e. world_size == 1) case.
     """
 
     @property
     def world_size(self):
+        # [FUNCTION DOC] Returns 1, the number of ranks for this test class.
         return 1
 
     @skip_if_lt_x_gpu(1)
     def test_grads_reduced_precision(self):
+        # [FUNCTION DOC] Needs 1 GPU. Runs the low precision gradient check over all
+        # combinations of offload_params and use_orig_params.
         self.run_subtests(
             {"offload_params": [False, True], "use_orig_params": [False, True]},
             self._test_grads_reduced_precision,
@@ -1063,6 +1211,8 @@ class TestFSDPMixedPrecisionUnsharded(TestFSDPMixedPrecision):
 
     @skip_if_lt_x_gpu(1)
     def test_mixed_precision_no_reshard_after_forward(self):
+        # [FUNCTION DOC] Needs 1 GPU. Same single end to end run as the sharded variant:
+        # SHARD_GRAD_OP, CPU offload, float64 params, bf16 config if supported else fp16.
         # Note that we don't exercise all possible different configs so as to
         # not increase test TTS too much.
         mp = default_mp if not nccl_supports_bf16 else mp_diff_buffer_and_reduce
@@ -1078,6 +1228,8 @@ class TestFSDPMixedPrecisionUnsharded(TestFSDPMixedPrecision):
 
     @skip_if_lt_x_gpu(1)
     def test_mixed_precision_e2e_full_shard(self):
+        # [FUNCTION DOC] Needs 1 GPU. Single end to end run with FULL_SHARD, CPU offload,
+        # float64 params, grad scaler off, bf16 config if supported else fp16.
         mp = default_mp if not nccl_supports_bf16 else mp_diff_buffer_and_reduce
         self._run_test_mixed_precision_e2e(
             mp_config=mp,
@@ -1094,32 +1246,44 @@ instantiate_parametrized_tests(TestFSDPMixedPrecisionSharded)
 
 
 class IgnoredModule(nn.Module):
+    # [CLASS DOC] HELPER: Wrapper around a single 100x100 linear layer, used as a module to
+    # exclude from FSDP.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the linear layer l.
         super().__init__()
         self.l = nn.Linear(100, 100)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies the linear layer to x.
         return self.l(x)
 
 
 class ModelWithIgnoredModule(nn.Module):
+    # [CLASS DOC] HELPER: Three layer chain linear, IgnoredModule, linear (all 100 wide).
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates l1, the ignored submodule and l2.
         super().__init__()
         self.l1 = nn.Linear(100, 100)
         self.ignored = IgnoredModule()
         self.l2 = nn.Linear(100, 100)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies l1, then the ignored module, then l2.
         return self.l2(self.ignored(self.l1(x)))
 
 
 class TestFSDPMixedPrecisionIgnoredModules(FSDPTest):
+    # [CLASS DOC] Single rank test case for mixed precision combined with ignored modules.
     @property
     def world_size(self):
+        # [FUNCTION DOC] Returns 1, the number of ranks for this test class.
         return 1
 
     @skip_if_lt_x_gpu(1)
     def test_mixed_precision_with_ignored_module(self):
+        # [FUNCTION DOC] Needs 1 GPU. Wraps a model with float16 param mixed precision while
+        # ignoring one submodule, which stays float32, and asserts that forward and backward
+        # raise a RuntimeError saying the dtypes must be the same.
         model = ModelWithIgnoredModule().to(device_type)
         float16 = MixedPrecision(param_dtype=torch.float16)
         model = FSDP(
@@ -1135,12 +1299,19 @@ class TestFSDPMixedPrecisionIgnoredModules(FSDPTest):
 
 
 class TestFSDPDifferentSubmodulePrecision(FSDPTest):
+    # [CLASS DOC] Two rank test case checking how forward inputs are cast when different FSDP
+    # units use different mixed precision settings, using SaveForwardInputsModel to record the
+    # input each submodule saw.
     @property
     def world_size(self):
+        # [FUNCTION DOC] Returns 2, the number of ranks for this test class.
         return 2
 
     @skip_if_lt_x_gpu(2)
     def test_float16_on_one_submodule(self):
+        # [FUNCTION DOC] Needs 2 GPUs. Only child c2 is wrapped with float16 and input casting;
+        # the root uses default precision. Asserts the recorded inputs are float32 for the
+        # root model and c1 and float16 for c2.
         forward_inputs: dict[str, nn.Module] = {}
         float16 = MixedPrecision(param_dtype=torch.float16, cast_forward_inputs=True)
 
@@ -1163,6 +1334,9 @@ class TestFSDPDifferentSubmodulePrecision(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_float16_on_one_submodule_skip_inputs(self):
+        # [FUNCTION DOC] Needs 2 GPUs. Child c2 gets float16 mixed precision with
+        # cast_forward_inputs off, while the model itself casts inputs. Asserts every recorded
+        # input (root, c1, c2) stays float32.
         forward_inputs: dict[nn.Module, torch.Tensor] = {}
         float16 = MixedPrecision(param_dtype=torch.float16, cast_forward_inputs=False)
 
@@ -1184,6 +1358,9 @@ class TestFSDPDifferentSubmodulePrecision(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_float16_on_one_submodule_skip_inputs_error(self):
+        # [FUNCTION DOC] Needs 2 GPUs. Same as the skip-inputs case but no one casts inputs, so
+        # the float16 child receives float32 data. Asserts a RuntimeError about mismatched
+        # matrix multiply dtypes is raised in forward or backward.
         forward_inputs: dict[nn.Module, torch.Tensor] = {}
         float16 = MixedPrecision(param_dtype=torch.float16, cast_forward_inputs=False)
 
@@ -1203,6 +1380,9 @@ class TestFSDPDifferentSubmodulePrecision(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_submodules_with_different_precisions_error(self):
+        # [FUNCTION DOC] Needs 2 GPUs. Child c1 (the first module executed) uses float16 under
+        # a float32 root; the root casts inputs to float32 up front so c1 gets the wrong dtype.
+        # Asserts a RuntimeError about mismatched matrix multiply dtypes is raised.
         forward_inputs: dict[nn.Module, torch.Tensor] = {}
         float16 = MixedPrecision(param_dtype=torch.float16, cast_forward_inputs=True)
         float32 = MixedPrecision(param_dtype=torch.float32, cast_forward_inputs=True)
@@ -1227,6 +1407,8 @@ class TestFSDPDifferentSubmodulePrecision(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_submodules_with_different_precisions(self):
+        # [FUNCTION DOC] Needs 2 GPUs. Float32 root with float16 on child c2, both casting
+        # inputs. Asserts recorded inputs are float32 for the root and c1 and float16 for c2.
         forward_inputs: dict[nn.Module, torch.Tensor] = {}
         float16 = MixedPrecision(param_dtype=torch.float16, cast_forward_inputs=True)
         float32 = MixedPrecision(param_dtype=torch.float32, cast_forward_inputs=True)
@@ -1248,25 +1430,41 @@ class TestFSDPDifferentSubmodulePrecision(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_submodules_with_external_inputs(self):
+        # [FUNCTION DOC] Needs 2 GPUs. Both root and submodule l2 use float16 param mixed
+        # precision. Asserts the root casts its input and the tensor flowing into l2 to
+        # float16 but an extra float32 tensor created inside the root forward and passed to
+        # l2 is not cast.
         class ToyModule(nn.Module):
+            # [CLASS DOC] HELPER: Linear layer that records both of its forward inputs in a
+            # shared dictionary.
             def __init__(self, forward_inputs: dict[str, torch.Tensor]) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear layer l and keeps the shared
+                # dictionary used to record inputs.
                 super().__init__()
                 self.l = nn.Linear(100, 100)
                 self.forward_inputs = forward_inputs
 
             def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Records x and y in the dictionary under l2_input_x
+                # and l2_input_y, then returns the linear layer applied to x only.
                 self.forward_inputs["l2_input_x"] = x
                 self.forward_inputs["l2_input_y"] = y
                 return self.l(x)
 
         class ToyModel(nn.Module):
+            # [CLASS DOC] HELPER: Linear layer followed by a ToyModule that receives an extra
+            # float32 tensor created inside forward.
             def __init__(self, forward_inputs: dict[str, torch.Tensor]) -> None:
+                # [FUNCTION DOC] HELPER: Creates l1 and the ToyModule l2 and keeps the shared
+                # dictionary used to record inputs.
                 super().__init__()
                 self.l1 = nn.Linear(100, 100)
                 self.l2 = ToyModule(forward_inputs)
                 self.forward_inputs = forward_inputs
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Records x as model_input_x, creates a float32 tensor
+                # of ones on the test device and returns l2 applied to the l1 output and it.
                 self.forward_inputs["model_input_x"] = x
                 y = torch.ones(2, 100, device=device_type, dtype=torch.float32)
                 return self.l2(self.l1(x), y)
@@ -1290,12 +1488,17 @@ class TestFSDPDifferentSubmodulePrecision(FSDPTest):
 
 
 class TestFSDPTrainEval(FSDPTest):
+    # [CLASS DOC] Two rank test case for switching between training and evaluation with
+    # mixed precision and an EMA copy of the model.
     @property
     def world_size(self):
+        # [FUNCTION DOC] Returns 2, the number of ranks for this test class.
         return 2
 
     @skip_if_lt_x_gpu(2)
     def test_train_ema_eval_flow(self):
+        # [FUNCTION DOC] Needs 2 GPUs. Runs the train, EMA update and eval flow once for each
+        # of SHARD_GRAD_OP, FULL_SHARD and NO_SHARD sharding strategies.
         """
         Tests a train -> EMA update -> eval flow with mixed precision enabled.
         """
@@ -1314,8 +1517,17 @@ class TestFSDPTrainEval(FSDPTest):
         )
 
     def _test_train_ema_eval_flow(self, sharding_strategy: ShardingStrategy):
+        # [FUNCTION DOC] HELPER: Wraps a transformer plus an EMA AveragedModel copy in FSDP
+        # (transformer layers auto wrapped, float16 params, given sharding). Three times:
+        # train step with Adam, update EMA params from the main copy under summon_full_params,
+        # then eval forward without gradients. Asserts eval output sums differ across
+        # iterations, showing eval uses the updated EMA parameters. Rank 0 prints the model.
         class TransformerWithEMA(nn.Module):
+            # [CLASS DOC] HELPER: Holds a main transformer used in training and an EMA
+            # averaged copy (with buffers) used in eval.
             def __init__(self, device: torch.device):
+                # [FUNCTION DOC] HELPER: Creates the main nn.Transformer and an AveragedModel
+                # around a second one using the EMA multi-average function with buffers.
                 super().__init__()
                 self.module = nn.Transformer(device=device)
                 self.ema_module = AveragedModel(
@@ -1325,6 +1537,8 @@ class TestFSDPTrainEval(FSDPTest):
                 )
 
             def forward(self, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: Forwards all arguments to the main transformer when
+                # in training mode and to the EMA copy otherwise, returning its output.
                 # Use main copy for training and EMA copy for eval
                 if self.training:
                     return self.module(*args, **kwargs)

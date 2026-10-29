@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Test that a model already containing a nested FSDP unit can be wrapped in a
+# new top-level FSDP again (e.g. for inference after training) and give the same output.
+# Skips the whole file (exit code 0) if torch.distributed is unavailable or under dev-asan.
+# Tests are instantiated per device type for cuda, hpu and xpu via instantiate_device_type_tests.
 import sys
 
 import torch
@@ -26,17 +30,26 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 
 class InnerModel(Module):
+    # [CLASS DOC] HELPER: Module holding a Sequential with a single FSDP-wrapped linear
+    # layer (5 to 5), so it already contains a nested FSDP unit.
     def __init__(self, device):
+        # [FUNCTION DOC] HELPER: Builds the Sequential with one FSDP-wrapped linear. The device
+        # argument is unused; the FSDP device_id comes from the module level device_type.
         super().__init__()
         self.layers = Sequential(FSDP(Linear(5, 5), device_id=device_type.type))
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Returns the output of the wrapped Sequential on x.
         return self.layers(x)
 
 
 class TestMultipleWrapping(FSDPTestContinuous):
+    # [CLASS DOC] Distributed test case for re-wrapping a model with nested FSDP in a new FSDP.
     @skip_if_lt_x_gpu(2)
     def test_multiple_wrapping(self, device):
+        # [FUNCTION DOC] Requires at least 2 GPUs. Wraps InnerModel in FSDP and trains it for 3
+        # SGD steps, then runs one forward to get a reference output. Wraps the same inner
+        # model in a second FSDP and asserts its output on the same input equals the first.
         """
         This test simulates wrapping the module after training to run inference.
         This is required in cases where later in a session, the model is wrapped again in FSDP but
