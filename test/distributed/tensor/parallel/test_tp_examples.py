@@ -1,5 +1,11 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] End-to-end tensor-parallel example tests: MLP training/inference (plain and
+# sequence parallel), a Transformer trained single-device versus tensor parallel with exact
+# expected collective counts in forward/backward/optimizer, requires_grad subsets, weight tying,
+# and loss_parallel cross-entropy on 1D and multi-dimensional meshes (including error cases).
+# Module-level: c10d_functional alias and the reduce_scatter/all_gather/all_reduce op shortcuts,
+# the ExpCommCounts tuple, DistTensorParallelExampleTest and its local-tensor variant.
 
 import itertools
 from copy import deepcopy
@@ -57,13 +63,22 @@ reduce_scatter, all_gather, all_reduce = (
 
 
 class ExpCommCounts(NamedTuple):
+    # [CLASS DOC] HELPER: Immutable record of expected collective-op counts (mapping of op to
+    # count) for the forward, backward and optimizer phases; each field defaults to None,
+    # which the validators treat as "no collectives expected".
     fwd: dict | None = None
     bwd: dict | None = None
     optim: dict | None = None
 
 
 class DistTensorParallelExampleTest(DTensorTestBase):
+    # [CLASS DOC] Multi-process DTensor test case with end-to-end tensor-parallel examples.
+    # Stateless; helper methods build single-device and tensor-parallel model pairs and
+    # validate forward, backward and optimizer steps (values and collective counts).
     def _check_module(self, m1, m2, check_grad=False):
+        # [FUNCTION DOC] HELPER: Asserts every parameter of m2 exists in m1 and is equal. With
+        # check_grad compares gradients instead of values. DTensor values from m2 are
+        # redistributed to Replicate and converted to local tensors first.
         named_parameters = dict(m1.named_parameters())
         for name, param_m2 in m2.named_parameters():
             self.assertTrue(name in named_parameters)
@@ -79,6 +94,12 @@ class DistTensorParallelExampleTest(DTensorTestBase):
             self.assertEqual(param_m2, param_m1)
 
     def _test_mlp_training_e2e(self, is_seq_parallel=False, recompute_activation=False):
+        # [FUNCTION DOC] HELPER: Trains one step of an MLP versus its tensor-parallel copy
+        # (column-wise first layer, row-wise second; sequence-parallel layouts if requested, with
+        # per-rank inputs) and optionally with checkpoint wrapping plus input_reshard. Checks
+        # outputs match, expected collective counts (all-reduce, or 2 all-gathers and 1
+        # reduce-scatter for sequence parallel), gradients (summed across ranks for sequence
+        # parallel), parameters after an SGD step, and outputs on a fresh input.
         inp_size = [8, 10]
         # Ensure all tp ranks have same input.
         rng_seed = self.rank if is_seq_parallel else 0
@@ -163,6 +184,9 @@ class DistTensorParallelExampleTest(DTensorTestBase):
         self.assertEqual(output, output_tp)
 
     def _test_mlp_inference(self, device_mesh):
+        # [FUNCTION DOC] HELPER: Parallelizes an MLP copy (column-wise net1, row-wise net2) on
+        # the given mesh and checks its output equals the local model's output for the same
+        # seeded input.
         inp_size = [8, 10]
         # Ensure all tp ranks have same input.
         torch.manual_seed(0)
@@ -190,12 +214,16 @@ class DistTensorParallelExampleTest(DTensorTestBase):
     # @parametrize("recompute_activation", [True, False])
     @parametrize("recompute_activation", [False])
     def test_mlp_training(self, is_seq_parallel, recompute_activation):
+        # [FUNCTION DOC] Parametrized over sequence parallelism (recompute is only False);
+        # delegates to the end-to-end MLP training helper.
         self._test_mlp_training_e2e(
             is_seq_parallel=is_seq_parallel, recompute_activation=recompute_activation
         )
 
     @with_comms
     def test_mlp_inference(self):
+        # [FUNCTION DOC] Runs the MLP inference comparison on a mesh of all devices inside
+        # inference mode.
         device_mesh = DeviceMesh(
             self.device_type,
             torch.arange(0, NUM_DEVICES),
@@ -204,9 +232,14 @@ class DistTensorParallelExampleTest(DTensorTestBase):
             self._test_mlp_inference(device_mesh)
 
     def _setup_single_gpu_model(self, model_args, dtype):
+        # [FUNCTION DOC] HELPER: Builds a Transformer from model_args on the test device with
+        # the given dtype and returns it.
         return Transformer(model_args).to(device=self.device_type, dtype=dtype)
 
     def _setup_tp_model(self, model, is_seq_parallel, dtype):
+        # [FUNCTION DOC] HELPER: Deep-copies model, checks the copy matches, and parallelizes
+        # it over a mesh of all devices via Transformer.parallelize (sequence parallel per flag;
+        # attention outputs kept local only for float64). Returns the parallelized copy.
         model_tp = deepcopy(model)
         self._check_module(model, model_tp)
         device_mesh = DeviceMesh(self.device_type, torch.arange(0, NUM_DEVICES))
@@ -219,6 +252,8 @@ class DistTensorParallelExampleTest(DTensorTestBase):
         )
 
     def _setup_optimizer(self, model, model_tp):
+        # [FUNCTION DOC] HELPER: Creates an Adam optimizer (lr 0.25) for each model; returns the
+        # pair (optimizer for model, optimizer for model_tp).
         # Step 3: Run test by comparing outputs from single-gpu and multi-gpu models.
         LR = 0.25
         optim = torch.optim.Adam(model.parameters(), lr=LR)
@@ -228,6 +263,9 @@ class DistTensorParallelExampleTest(DTensorTestBase):
     def _validate_fwd(
         self, model, model_tp, inp, expected_comms_dict=None, check_comms=True
     ):
+        # [FUNCTION DOC] HELPER: Runs both models forward on inp (the TP one under a comm
+        # counter), asserts equal outputs and, if check_comms, that the counted collectives
+        # equal expected_comms_dict (empty when None). Returns (output, output_tp).
         # Compare outputs on the same input.
         output = model(inp)
         with CommDebugMode() as comm_mode:
@@ -246,6 +284,9 @@ class DistTensorParallelExampleTest(DTensorTestBase):
         expected_comms_dict=None,
         check_comms=True,
     ):
+        # [FUNCTION DOC] HELPER: Backpropagates the summed outputs (the TP one under a comm
+        # counter), asserts gradients of all parameters match, and if check_comms asserts the
+        # counted collectives equal expected_comms_dict (empty when None).
         # Ensure gradients are equal.
         output.sum().backward()
         with CommDebugMode() as comm_mode:
@@ -263,6 +304,9 @@ class DistTensorParallelExampleTest(DTensorTestBase):
         expected_comms_dict=None,
         check_comms=True,
     ):
+        # [FUNCTION DOC] HELPER: Steps both optimizers (the TP one under implicit replication
+        # and a comm counter), asserts parameters still match and, if check_comms, that the
+        # counted collectives equal expected_comms_dict (empty when None).
         optim.step()  # Ensure model weights are still the same after update.
         from torch.distributed.tensor.experimental import implicit_replication
 
@@ -275,6 +319,9 @@ class DistTensorParallelExampleTest(DTensorTestBase):
 
     @staticmethod
     def _thaw_params(thaw_params, model, model_tp):
+        # [FUNCTION DOC] HELPER: Static. If thaw_params is non-empty, freezes (disables
+        # requires_grad for) every parameter of both models whose name is not listed in it,
+        # mutating the models in place. Does nothing for an empty or None value.
         if not thaw_params:
             return
         for target_model in [model, model_tp]:
@@ -288,6 +335,12 @@ class DistTensorParallelExampleTest(DTensorTestBase):
     @parametrize("dtype", [torch.float64, torch.float32])
     @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/1555")
     def test_transformer_training(self, is_seq_parallel, dtype: torch.dtype):
+        # [FUNCTION DOC] Needs a GPU. Builds a dropout-free Transformer and a tensor-parallel
+        # copy, then validates forward, backward and an optimizer step against exact expected
+        # collective counts (base: all-reduces and one all-gather; sequence parallel:
+        # reduce-scatters, all-gathers and optimizer all-reduces).
+        # KNOWN ISSUE: the step count compares the type of the model to a dtype, which is always
+        # false, so the 10-step branch is dead and only one step runs.
         EXP_BASE_CC = ExpCommCounts(
             fwd={all_reduce: 6, all_gather: 1}, bwd={all_reduce: 9}
         )
@@ -423,6 +476,10 @@ class DistTensorParallelExampleTest(DTensorTestBase):
     )
     @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/1555")
     def test_transformer_req_grad(self, thaw_params, is_seq_parallel, dtype, exp_cnts):
+        # [FUNCTION DOC] Needs a GPU. Same setup as the transformer training test but with
+        # weight tying off and only the named parameters left trainable in both models. Forward
+        # is compared without counting collectives; backward and optimizer collective counts
+        # must equal exp_cnts. Parametrized across several freeze patterns.
         # Sample a subset of `requires_grad` patterns
 
         # disabling dropout to facilitate single gpu to multi-device comparison
@@ -461,8 +518,16 @@ class DistTensorParallelExampleTest(DTensorTestBase):
 
     @with_comms
     def test_weight_tying(self):
+        # [FUNCTION DOC] Parallelizes an embedding (column-wise) plus linear (row-wise) model
+        # with distinct seeded weights, checks weights and gradients differ, then ties the
+        # linear weight to the embedding weight and checks they are the same object and have the
+        # same gradient object after a backward pass.
         class TestModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Embedding(16, 8) followed by Linear(8, 16), initialized with
+            # different seeds.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Seeds and creates the embedding, then reseeds and
+                # creates the linear layer so the weights differ.
                 super().__init__()
                 # Initialize different weights for embedding and fc.
                 torch.manual_seed(1)
@@ -471,6 +536,7 @@ class DistTensorParallelExampleTest(DTensorTestBase):
                 self.fc = torch.nn.Linear(8, 16)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Embeds token ids and applies the linear layer.
                 return self.fc(self.embedding(x))
 
         model = TestModule().to(self.device_type)
@@ -487,6 +553,8 @@ class DistTensorParallelExampleTest(DTensorTestBase):
 
         @maybe_run_for_local_tensor
         def assert_not_equal(a, b):
+            # [FUNCTION DOC] HELPER: Asserts a and b differ; runs per simulated rank for local
+            # tensors.
             self.assertNotEqual(a, b)
 
         assert_not_equal(model.embedding.weight.to_local(), model.fc.weight.to_local())
@@ -512,6 +580,11 @@ class DistTensorParallelExampleTest(DTensorTestBase):
 
     @with_comms
     def test_loss_parallel(self):
+        # [FUNCTION DOC] On a 1D mesh, for 2D and 3D logits, every shard dim and each reduction
+        # type, compares loss_parallel cross-entropy with the local result. Sharding the
+        # channel dim: exactly 3 all-reduces forward, a replicated loss equal to the local
+        # loss, no backward comm and a gradient sharded like the input. Sharding any other dim
+        # must raise ValueError mentioning loss_parallel.
         device_mesh = self.build_device_mesh()
         comm_mode = CommDebugMode()
 
@@ -569,6 +642,11 @@ class DistTensorParallelExampleTest(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(4)
     def test_loss_parallel_multi_dim_mesh(self):
+        # [FUNCTION DOC] Needs 4 GPUs. On a (dp, tp) mesh with batch sharded on dp and channels on
+        # tp, checks loss_parallel with sum (Partial on dp, Replicate on tp), none (Shard on
+        # dp), each with and without class weights, including gradients via an explicitly
+        # replicated grad_output that must be redistributed in the backward handler. Mean
+        # reduction must raise NotImplementedError about one-dimensional meshes.
         """Test loss_parallel with multi-dimensional DeviceMesh (e.g. DP + TP)."""
         # Create a 2D mesh: (dp=2, tp=2) on 4 GPUs
         mesh_2d = DeviceMesh(
@@ -677,6 +755,9 @@ class DistTensorParallelExampleTest(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(4)
     def test_loss_parallel_replicate_non_tp_dim(self):
+        # [FUNCTION DOC] Needs 4 GPUs. With a Replicate placement on the non-TP mesh dim, sum and
+        # none reductions keep Replicate on that dim, match the local loss and produce matching
+        # input gradients.
         """Non-TP mesh dim = Replicate (not Shard) must also work."""
         mesh_2d = DeviceMesh(
             self.device_type,
@@ -722,6 +803,9 @@ class DistTensorParallelExampleTest(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(4)
     def test_loss_parallel_tp_not_last_dim(self):
+        # [FUNCTION DOC] Needs 4 GPUs. Puts the TP mesh dim first and DP second; the sum loss
+        # must be Replicate on TP and Partial on DP, match the local loss, and give matching
+        # input gradients.
         """TP mesh dim need not be the last dim: (tp, dp) ordering must also work."""
         # Create a 2D mesh with TP as the FIRST dim: (tp=2, dp=2)
         mesh_2d = DeviceMesh(
@@ -754,6 +838,10 @@ class DistTensorParallelExampleTest(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(4)
     def test_loss_parallel_3d_input_non_batch_shard(self):
+        # [FUNCTION DOC] Needs 4 GPUs. 3D logits (batch, class, seq) with the non-TP mesh dim
+        # sharding seq: the target is sharded on dim 1 (shifted down). Sum gives Partial on that
+        # dim and Replicate on TP; none inherits the target placements; both match the local
+        # loss, and a replicated grad_output yields a gradient sharded like the input.
         """3-D input (batch, class, seq) with the non-TP mesh dim sharding the
         seq dim (d=2 > channel_dim=1). This exercises the ``d > channel_dim``
         dim-shift in target/output placements (Shard(2) on input → Shard(1) on
@@ -816,6 +904,8 @@ class DistTensorParallelExampleTest(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(4)
     def test_loss_parallel_invalid_non_tp_placement(self):
+        # [FUNCTION DOC] Needs 4 GPUs. A Partial placement on the non-TP mesh dim must make
+        # cross-entropy raise ValueError mentioning Shard or Replicate for sum, none and mean.
         """Non-TP mesh dim with a placement that is neither Shard nor Replicate is rejected."""
         mesh_2d = DeviceMesh(
             self.device_type,
@@ -845,6 +935,8 @@ class DistTensorParallelExampleTest(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(4)
     def test_loss_parallel_plain_tensor_target_rejected_on_multi_dim(self):
+        # [FUNCTION DOC] Needs 4 GPUs. On a 2D mesh with a batch-sharded non-TP dim, passing a
+        # plain tensor target must raise ValueError saying a DTensor is required.
         """On multi-dim mesh with a batch-sharded non-TP dim, a plain torch.Tensor
         target is ambiguous (full global vs. local slice) and must be rejected.
         """

@@ -1,5 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for the tensor-parallel parallelize styles (ColwiseParallel,
+# RowwiseParallel, SequenceParallel, PrepareModuleInput, PrepareModuleOutput). Each test applies
+# a style via parallelize_module on a 1D mesh and checks output shapes/placements and the exact
+# collectives counted by CommDebugMode. Defines TensorParallelStyleTest plus a local-tensor
+# variant; defines the module-level alias c10d_functional for the functional collective ops.
 
 from copy import deepcopy
 
@@ -31,12 +36,18 @@ c10d_functional = torch.ops.c10d_functional
 
 
 class TensorParallelStyleTest(DTensorTestBase):
+    # [CLASS DOC] Multi-process DTensor test case covering each tensor-parallel style. Stateless;
+    # world size is fixed to NUM_DEVICES and every test builds its own 1D device mesh.
     @property
     def world_size(self):
+        # [FUNCTION DOC] Returns the number of processes to spawn: the NUM_DEVICES constant.
         return NUM_DEVICES
 
     @with_comms
     def test_colwise_parallel_style(self):
+        # [FUNCTION DOC] Applies ColwiseParallel to a Linear. Default: input replicated, output
+        # sharded on the last dim, no forward comm and one all-reduce in backward. With input
+        # sharded on dim 0: one all-gather forward and one reduce-scatter backward.
         mesh = init_device_mesh(self.device_type, (self.world_size,))
 
         comm_mode = CommDebugMode()
@@ -78,6 +89,8 @@ class TensorParallelStyleTest(DTensorTestBase):
 
     @with_comms
     def test_colwise_parallel_embedding(self):
+        # [FUNCTION DOC] Applies ColwiseParallel to an Embedding; output is sharded on the
+        # embedding dim and no communication happens in forward or backward.
         mesh = init_device_mesh(self.device_type, (self.world_size,))
 
         comm_mode = CommDebugMode()
@@ -99,6 +112,8 @@ class TensorParallelStyleTest(DTensorTestBase):
 
     @with_comms
     def test_colwise_parallel_preserves_requires_grad(self):
+        # [FUNCTION DOC] Checks ColwiseParallel keeps per-parameter requires_grad flags
+        # (weight frozen, bias trainable) after the module is parallelized.
         mesh = init_device_mesh(self.device_type, (self.world_size,))
 
         model = nn.Linear(16, 16, device=self.device_type)
@@ -112,6 +127,9 @@ class TensorParallelStyleTest(DTensorTestBase):
 
     @with_comms
     def test_rowwise_parallel_style(self):
+        # [FUNCTION DOC] Applies RowwiseParallel to a Linear with a last-dim-sharded input.
+        # Default: replicated output via one forward all-reduce, nothing extra in backward.
+        # With output sharded on dim 0: one reduce-scatter forward, one all-gather backward.
         mesh = init_device_mesh(self.device_type, (self.world_size,))
 
         comm_mode = CommDebugMode()
@@ -155,6 +173,9 @@ class TensorParallelStyleTest(DTensorTestBase):
 
     @with_comms
     def test_rowwise_parallel_embedding(self):
+        # [FUNCTION DOC] Applies RowwiseParallel (replicated input indices) to an Embedding.
+        # Default output: one forward all-reduce, none in backward. With output sharded on
+        # dim 1: one forward reduce-scatter and one backward all-gather.
         mesh = init_device_mesh(self.device_type, (self.world_size,))
 
         comm_mode = CommDebugMode()
@@ -201,6 +222,8 @@ class TensorParallelStyleTest(DTensorTestBase):
 
     @with_comms
     def test_rowwise_parallel_preserves_requires_grad(self):
+        # [FUNCTION DOC] Checks RowwiseParallel keeps per-parameter requires_grad flags
+        # (weight frozen, bias trainable) after the module is parallelized.
         mesh = init_device_mesh(self.device_type, (self.world_size,))
 
         model = nn.Linear(16, 16, device=self.device_type)
@@ -214,6 +237,8 @@ class TensorParallelStyleTest(DTensorTestBase):
 
     @with_comms
     def test_prepare_module_input(self):
+        # [FUNCTION DOC] PrepareModuleInput on an Identity module redistributes a dim-0 sharded
+        # input to replicated; the full tensor of the output equals the all-gathered input.
         mesh = init_device_mesh(self.device_type, (self.world_size,))
 
         tensor = torch.ones(2, 16, device=self.device_type)
@@ -229,14 +254,21 @@ class TensorParallelStyleTest(DTensorTestBase):
 
     @with_comms
     def test_prepare_module_input_multiple_inputs(self):
+        # [FUNCTION DOC] Validates PrepareModuleInput with several positional inputs: mismatched
+        # layout tuple lengths raise AssertionError at construction; a module called with more
+        # inputs than input_layouts raises ValueError; matching tuples (with None to skip an
+        # input) work and yield the expected output shape.
         mesh = init_device_mesh(self.device_type, (self.world_size,))
 
         class TestModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Linear(8, 8) layer whose forward adds a second input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear submodule.
                 super().__init__()
                 self.linear = torch.nn.Linear(8, 8)
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns linear(x) plus y.
                 return self.linear(x) + y
 
         # Raise assertion error if input_layouts and desired_input_layouts do not have same length.
@@ -281,14 +313,20 @@ class TensorParallelStyleTest(DTensorTestBase):
 
     @with_comms
     def test_prepare_module_kwargs_input(self):
+        # [FUNCTION DOC] Validates PrepareModuleInput keyword-argument layouts. Sharded kwarg y
+        # is all-gathered (1 collective); a keyword-only module with x and z converted costs 2
+        # collectives; a DTensor x passed in is also redistributed (still 2 collectives total).
         mesh = init_device_mesh(self.device_type, (self.world_size,))
 
         class TestKwargModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Linear(8, 8) layer taking one positional and keyword inputs.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear submodule.
                 super().__init__()
                 self.linear = torch.nn.Linear(8, 8)
 
             def forward(self, x, *, y, z=2):
+                # [FUNCTION DOC] HELPER: Returns linear(x) + y + z.
                 return self.linear(x) + y + z
 
         test_mod = TestKwargModule().to(self.device_type)
@@ -312,11 +350,14 @@ class TensorParallelStyleTest(DTensorTestBase):
         self.assertEqual(output.shape, (1 * self.world_size, 8))
 
         class TestKwargOnlyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Linear(8, 8) layer whose forward takes only keyword inputs.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear submodule.
                 super().__init__()
                 self.linear = torch.nn.Linear(8, 8)
 
             def forward(self, *, x, y=2, z=None):
+                # [FUNCTION DOC] HELPER: Returns linear(x) + y + z (z must not be None).
                 return self.linear(x) + y + z
 
         test_kwonly_mod = TestKwargOnlyModule().to(self.device_type)
@@ -352,6 +393,8 @@ class TensorParallelStyleTest(DTensorTestBase):
 
     @with_comms
     def test_prepare_module_output(self):
+        # [FUNCTION DOC] PrepareModuleOutput on an Identity module redistributes a replicated
+        # output to Shard(0); each rank's local result equals its chunk of the input.
         mesh = init_device_mesh(self.device_type, (self.world_size,))
 
         tensor = torch.ones(8, 16, device=self.device_type)
@@ -367,6 +410,10 @@ class TensorParallelStyleTest(DTensorTestBase):
 
     @with_comms
     def test_sequence_parallel_style(self):
+        # [FUNCTION DOC] Applies SequenceParallel to LayerNorm (with and without affine), a
+        # python RMSNorm, and Dropout, with input sharded on the sequence dim: output stays
+        # Shard(1), no collectives occur, weight/bias grads are Partial, and results match the
+        # unsharded module. A batch-sharded input to RMSNorm needs 2 collectives (fwd and bwd).
         mesh = init_device_mesh(self.device_type, (self.world_size,))
         # early init RNG tracker
         torch.distributed.tensor._random.manual_seed(0, mesh)

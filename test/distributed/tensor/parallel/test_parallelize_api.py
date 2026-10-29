@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for the parallelize_module API: applying ColwiseParallel, RowwiseParallel
+# and the PrepareModule* styles through plans keyed by exact names, wildcard/question/digit
+# patterns, the root module (empty name), under a DeviceMesh context, with src_data_rank, and
+# with unmatched or empty plans (UserWarning). Parallelized models are compared numerically
+# against a local copy (outputs, gradients, SGD updates). Defines DummyModule and
+# TensorParallelAPITests plus a local-tensor variant skipping the src_data_rank test.
 from collections import OrderedDict
 from copy import deepcopy
 
@@ -25,16 +31,24 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 
 
 class DummyModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Parameterless identity module used to test the input/output
+    # preparation styles in isolation.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Initializes an empty module.
         super().__init__()
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Returns the input unchanged.
         return x
 
 
 class TensorParallelAPITests(DTensorTestBase):
+    # [CLASS DOC] Multi-process DTensor test case for parallelize_module. Stateless; provides
+    # helpers that compare a local model with its tensor-parallel copy, and many plan tests.
     @property
     def world_size(self):
+        # [FUNCTION DOC] Returns the accelerator count when it is even and greater than 4,
+        # otherwise 4.
         gpu_num = torch.accelerator.device_count()
         return gpu_num if gpu_num % 2 == 0 and gpu_num > 4 else 4
 
@@ -46,6 +60,11 @@ class TensorParallelAPITests(DTensorTestBase):
         skip_rowwise_bias=False,
         compare_grad=False,
     ):
+        # [FUNCTION DOC] HELPER: For each named parameter of local_module, fetches the same
+        # parameter of dist_module, optionally switching both to their gradients, redistributes
+        # the distributed one to Replicate and asserts equality with the local value. Some
+        # parameters (net2.bias, or any bias when skip_rowwise_bias) are only compared on rank 0
+        # when rank0_only is set. Raises AssertionError on mismatch.
         replicate = [Replicate()]
         for name, param in local_module.named_parameters():
             dist_param = dist_module.get_parameter(name)
@@ -71,6 +90,11 @@ class TensorParallelAPITests(DTensorTestBase):
     def _compare_module(
         self, local_module, dist_module, inp_size, rank0_only=True, rowwise=False
     ):
+        # [FUNCTION DOC] HELPER: Runs a full numerical check of a parallelized module against
+        # its local original. Creates SGD optimizers (lr 0.25), compares parameters, runs a
+        # forward on a seeded random input (chunked along the last dim per rank when rowwise),
+        # compares outputs (DTensor output is redistributed to Replicate first), runs backward
+        # on both, compares gradients, steps both optimizers and compares parameters again.
         LR = 0.25  # the learning rate we use for testing
         local_optim = torch.optim.SGD(local_module.parameters(), lr=LR)
         dist_optim = torch.optim.SGD(dist_module.parameters(), lr=LR)
@@ -108,6 +132,8 @@ class TensorParallelAPITests(DTensorTestBase):
 
     @with_comms
     def test_parallelize_mlp_with_module_api(self):
+        # [FUNCTION DOC] Parallelizes an MLP with a name-to-style plan making net1 and net2
+        # column-wise with replicated output, then checks it matches the local model.
         inp_size = [12, 10]
         model = MLPModule(self.device_type)
         model_tp = deepcopy(model)
@@ -126,6 +152,8 @@ class TensorParallelAPITests(DTensorTestBase):
 
     @with_comms
     def test_parallelize_mlp_with_module_api_nested(self):
+        # [FUNCTION DOC] Same as the flat MLP test but the MLP sits in a Sequential, so plan keys
+        # use dotted paths through the child named dummy_encoder.
         inp_size = [12, 10]
         model = torch.nn.Sequential(
             OrderedDict([("dummy_encoder", MLPModule(self.device_type))])
@@ -146,6 +174,8 @@ class TensorParallelAPITests(DTensorTestBase):
 
     @with_comms
     def test_linear_row_wise_parallel(self):
+        # [FUNCTION DOC] Applies RowwiseParallel directly (single style, not a plan mapping) to
+        # a Linear, giving each rank a different seeded input chunk, and compares with local.
         # test RowwiseParallel
         inp_size = [9, 16]
         rowwise = RowwiseParallel()
@@ -164,6 +194,8 @@ class TensorParallelAPITests(DTensorTestBase):
 
     @with_comms
     def test_linear_col_wise_parallel(self):
+        # [FUNCTION DOC] Applies ColwiseParallel with replicated output directly to a Linear
+        # and compares its behavior with the local module.
         # test ColwiseParallel
         inp_size = [8, 10]
         colwise = ColwiseParallel(output_layouts=Replicate())
@@ -180,6 +212,8 @@ class TensorParallelAPITests(DTensorTestBase):
 
     @with_comms
     def test_prepare_module_input(self):
+        # [FUNCTION DOC] Applies PrepareModuleInput (Shard(0) to Replicate) to an identity
+        # module; the output is a replicated DTensor whose Shard(0) local part equals the input.
         module = DummyModule()
         device_mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
         parallelize_module(
@@ -195,6 +229,8 @@ class TensorParallelAPITests(DTensorTestBase):
 
     @with_comms
     def test_prepare_module_output(self):
+        # [FUNCTION DOC] Applies PrepareModuleOutput (Replicate to Shard(0)) to an identity
+        # module fed a replicated DTensor; the local output equals the Shard(0) local chunk.
         module = DummyModule()
         device_mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
         parallelize_module(
@@ -213,6 +249,9 @@ class TensorParallelAPITests(DTensorTestBase):
 
     @with_comms
     def test_prepare_module_input_output(self):
+        # [FUNCTION DOC] Applies PrepareModuleInputOutput to an identity module: input Shard(0)
+        # to Replicate, output Replicate to Shard(1). The local output equals the Shard(1)
+        # chunk of the input viewed as a Shard(0) DTensor.
         module = DummyModule()
         device_mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
         parallelize_module(
@@ -236,6 +275,8 @@ class TensorParallelAPITests(DTensorTestBase):
 
     @with_comms
     def test_parallelize_module_with_star(self):
+        # [FUNCTION DOC] A plan key with a star wildcard (net*) matches both MLP layers; the
+        # result must match the local model.
         inp_size = [12, 10]
         model = MLPModule(self.device_type)
         device_mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
@@ -252,6 +293,9 @@ class TensorParallelAPITests(DTensorTestBase):
 
     @with_comms
     def test_parallelize_module_src_data_rank(self):
+        # [FUNCTION DOC] With a different seed per rank, parallelize_module with src_data_rank
+        # 1 must communicate and rank 1's full parameters equal its original ones. With
+        # src_data_rank None (column then row style) no collectives may occur.
         # set seed different for each rank
         torch.manual_seed(self.rank)
         model = MLPModule(self.device_type)
@@ -294,6 +338,8 @@ class TensorParallelAPITests(DTensorTestBase):
 
     @with_comms
     def test_parallelize_module_with_question(self):
+        # [FUNCTION DOC] A plan key using a single-character wildcard (net?) matches both MLP
+        # layers; the result must match the local model.
         inp_size = [12, 10]
         model = MLPModule(self.device_type)
         device_mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
@@ -310,6 +356,8 @@ class TensorParallelAPITests(DTensorTestBase):
 
     @with_comms
     def test_parallelize_module_with_digit(self):
+        # [FUNCTION DOC] A plan key with a character range (net followed by a range 1-2)
+        # matches both MLP layers; the result must match the local model.
         inp_size = [12, 10]
         model = MLPModule(self.device_type)
         device_mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
@@ -326,6 +374,8 @@ class TensorParallelAPITests(DTensorTestBase):
 
     @with_comms
     def test_parallelize_module_multi_wildcard(self):
+        # [FUNCTION DOC] On a stacked MLP, plan keys combining a wildcard over layer names with
+        # a bracketed index select net1 (column-wise) and net2 (row-wise) in every layer.
         inp_size = [12, 10]
         model = MLPStacked(self.device_type, n_layers=2)
         device_mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
@@ -343,6 +393,9 @@ class TensorParallelAPITests(DTensorTestBase):
 
     @with_comms
     def test_parallelize_module_with_root_module(self):
+        # [FUNCTION DOC] The empty-string plan key targets the root module with
+        # PrepareModuleInputOutput, alongside sequence-sharded column and row styles on the
+        # children; the whole model must match the local one.
         inp_size = [16, 10]
         model = MLPModule(self.device_type)
         device_mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
@@ -366,6 +419,8 @@ class TensorParallelAPITests(DTensorTestBase):
 
     @with_comms
     def test_parallelize_module_with_no_match(self):
+        # [FUNCTION DOC] Plan entries naming nonexistent submodules (net0.hello.world, net3)
+        # must emit a UserWarning, while matching entries are still applied correctly.
         inp_size = [16, 10]
         model = MLPModule(self.device_type)
         device_mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
@@ -386,6 +441,8 @@ class TensorParallelAPITests(DTensorTestBase):
 
     @with_comms
     def test_under_devicemesh_context(self):
+        # [FUNCTION DOC] Calls parallelize_module without an explicit mesh inside a DeviceMesh
+        # context manager; the current mesh is used and the result matches the local Linear.
         # test ColwiseParallel
         inp_size = [8, 10]
         colwise = ColwiseParallel(output_layouts=Replicate())
@@ -403,6 +460,8 @@ class TensorParallelAPITests(DTensorTestBase):
 
     @with_comms
     def test_empty_plan(self):
+        # [FUNCTION DOC] Calling parallelize_module with no plan must only emit a UserWarning
+        # and not crash.
         torch.manual_seed(5)
         model = torch.nn.Linear(10, 16, device=self.device_type)
 

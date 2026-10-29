@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests that DTensor's parallel RNG gives tensor-parallel ranks different random
+# initial weights while data-parallel replicas get identical ones, on a 2D (dp, tp) mesh.
+# Defines TensorParallelRandomStateTests and a local-tensor variant of it; running the file
+# as a script calls run_tests. No import-time side effects beyond class creation.
 import torch
 import torch.distributed._functional_collectives as funcol
 import torch.distributed.tensor._random as random
@@ -18,7 +22,12 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 
 
 class TensorParallelRandomStateTests(DTensorTestBase):
+    # [CLASS DOC] Multi-process DTensor test case checking RNG state handling when a meta-device
+    # MLP is made tensor parallel and its weights are materialized and re-initialized.
+    # Holds no state of its own; the single test builds a (dp=2, tp=world/2) device mesh.
     def get_tensor_slice(self, idx, n, large_tensor):
+        # [FUNCTION DOC] HELPER: Returns the idx-th of n equal row blocks of a 2D tensor, with
+        # the full column extent. Raises AssertionError if the row count is not divisible by n.
         shape = large_tensor.shape
         if shape[0] % n != 0:
             raise AssertionError(f"Expected shape[0] % n == 0, got {shape[0]} % {n}")
@@ -31,6 +40,9 @@ class TensorParallelRandomStateTests(DTensorTestBase):
 
     @maybe_run_for_local_tensor
     def check_gathered_tensors(self, self_rank, size, gathered_tensors, assertFunc):
+        # [FUNCTION DOC] HELPER: Splits an all-gathered tensor into size row blocks and calls
+        # assertFunc on the pair (own block, other block) for every other rank. Wrapped so it
+        # runs once per simulated rank when local tensors are used. Returns nothing.
         for other_rank in range(size):
             if self_rank != other_rank:
                 assertFunc(
@@ -41,6 +53,11 @@ class TensorParallelRandomStateTests(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(4)
     def test_model_init(self):
+        # [FUNCTION DOC] Needs at least 4 GPUs. Builds a 2D mesh, checks the dp/tp coordinates
+        # match the rank layout, then twice (parallel RNG region enabled, then disabled) makes
+        # a meta MLP column-wise parallel, seeds the device RNG, materializes and resets it.
+        # Gathered weights must differ across TP ranks when enabled and match when disabled;
+        # across DP groups they must always match. Toggles the global RNG tracker flag.
         dp_size = 2
         tp_size = self.world_size // dp_size
         mesh_2d = init_device_mesh(
@@ -102,6 +119,8 @@ class TensorParallelRandomStateTests(DTensorTestBase):
 
                 # compare local shards within the TP group
                 def tp_weights_assert(tensor1, tensor2):
+                    # [FUNCTION DOC] HELPER: Compares two TP-rank shards; they must differ
+                    # when the parallel RNG is enabled and be equal when it is disabled.
                     if enable_distribute_flag:
                         # each rank within a TP group shall initialize local weights differently
                         self.assertNotEqual(tensor1, tensor2)
@@ -124,6 +143,8 @@ class TensorParallelRandomStateTests(DTensorTestBase):
 
                 # compare local shards across TP groups
                 def dp_weights_assert(tensor1, tensor2):
+                    # [FUNCTION DOC] HELPER: Asserts shards from different DP groups are
+                    # equal, since all ranks start from the same seed.
                     # local weights shall be initialized the same across TP groups,
                     # and it doesn't matter whether DTensor's RNG infra is activated since all spmd ranks
                     # started with the same seed.
