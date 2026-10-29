@@ -5,6 +5,13 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [MODULE DOC] Tests for the functorch eager-mode function transforms: grad, grad_and_value, vjp,
+# jvp, jacrev, jacfwd, hessian, linearize, functionalize, make_functional, functional_call,
+# stack_module_state, ensembling and make_fx, plus the internal argnums slicing helper.
+# Test classes are decorated for strict Dynamo handling, most are device-generic (instantiated per
+# device type near the end of the file) and some are parametrized. Import time side effects: tries
+# to import torchvision and emits a UserWarning if it is missing, setting the module flag
+# USE_TORCHVISION accordingly.
 import copy
 import math
 import os
@@ -95,6 +102,14 @@ except ImportError:
 
 
 def _assert_functorch_wrapper_repr(test_case, actual, op_list):
+    # [FUNCTION DOC] HELPER: Checks that the printed representation of a tensor (the string
+    # actual) contains exactly the functorch wrappers implied by op_list, a list of transforms
+    # (grad or vmap) ordered from outermost-first creation level.
+    # It counts the GradTrackingTensor and BatchedTensor markers against the number of grad and
+    # vmap entries, asserts no FunctionalTensor appears and that the text mentions a Tensor. Then
+    # it builds the expected wrapper tokens with level numbers and batch dims, requires the text
+    # to start with the last (innermost) token, and requires all tokens to appear in reverse
+    # order. Returns nothing; failures go through the test case assertions.
     expected_grad_wrappers = sum(op is grad for op in op_list)
     expected_batched_wrappers = sum(op is vmap for op in op_list)
 
@@ -124,6 +139,9 @@ def _assert_functorch_wrapper_repr(test_case, actual, op_list):
 
 
 def _assert_leaf_tensor_repr(test_case, actual):
+    # [FUNCTION DOC] HELPER: Asserts that the string actual, the repr of a tensor, is that of a
+    # plain leaf tensor: no GradTrackingTensor, BatchedTensor or FunctionalTensor wrapper text and
+    # it starts with Tensor( or tensor(. Uses test_case assertions and returns nothing.
     test_case.assertNotIn("GradTrackingTensor(", actual)
     test_case.assertNotIn("BatchedTensor(", actual)
     test_case.assertNotIn("FunctionalTensor(", actual)
@@ -134,7 +152,14 @@ def _assert_leaf_tensor_repr(test_case, actual):
 
 
 class VmapTearDownMixin:
+    # [CLASS DOC] HELPER: Mixin for test classes that use the vmap nesting counters directly. Its
+    # only member is a tearDown hook that cleans up leaked functorch interpreter state.
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Does nothing unless running under Dynamo (TEST_WITH_TORCHDYNAMO).
+        # Otherwise it pops every vmap interpreter at the top of the functorch interpreter stack
+        # by decrementing the vmap nesting, stopping at the first non-vmap interpreter, and emits
+        # a warning if anything was popped. This keeps a failed test from leaving stale nesting
+        # that breaks later tests.
         # Ensure that in the case of a test failure, the next test won't fail
         # because of a previous call to _vmap_increment_nesting that wasn't undone
         # i.e. test_vmap_free_tensor fails when PYTORCH_TEST_WITH_DYNAMO=1
@@ -160,7 +185,13 @@ class VmapTearDownMixin:
 
 @markDynamoStrictTest
 class TestSliceArgnums(TestCase):
+    # [CLASS DOC] Tests for the internal _slice_argnums helper that selects positional arguments
+    # by an int or tuple of ints (negative allowed), covering validation errors, ordering and
+    # pytree arguments.
     def test_invalid_argnum_type(self):
+        # [FUNCTION DOC] Checks that _slice_argnums raises RuntimeError for argnums that are not
+        # an int or tuple (float, list), that tuple elements must be int, and that nested tuples
+        # are rejected with a must-be-int message.
         x = torch.randn(3)
         args = (x,)
         with self.assertRaisesRegex(RuntimeError, "int or Tuple"):
@@ -176,6 +207,9 @@ class TestSliceArgnums(TestCase):
             _slice_argnums(args, ((0, 1), 2))
 
     def test_out_of_bounds_argnum_values(self):
+        # [FUNCTION DOC] Checks that _slice_argnums raises RuntimeError mentioning positional
+        # inputs when an int or tuple argnum is out of range, including negative values below
+        # minus the argument count.
         x = torch.randn(3)
         args = (x,)
         with self.assertRaisesRegex(RuntimeError, "positional inputs"):
@@ -186,12 +220,16 @@ class TestSliceArgnums(TestCase):
             _slice_argnums(args, (-2,))
 
     def test_not_enough_argnums(self):
+        # [FUNCTION DOC] Checks that an empty tuple of argnums raises RuntimeError saying it must
+        # be non-empty.
         x = torch.randn(3)
         args = (x,)
         with self.assertRaisesRegex(RuntimeError, "must be non-empty"):
             _slice_argnums(args, ())
 
     def test_duplicate_argnums(self):
+        # [FUNCTION DOC] Checks that repeated argnums, including the same index given as positive
+        # and negative, raise RuntimeError saying they must be unique.
         x = torch.randn(3)
         args = (x, x)
         with self.assertRaisesRegex(RuntimeError, "must be unique"):
@@ -200,6 +238,8 @@ class TestSliceArgnums(TestCase):
             _slice_argnums(args, (0, -2))
 
     def test_flat_args_with_positive_int_argnum(self):
+        # [FUNCTION DOC] Checks that an int argnum selecting from flat float arguments returns a
+        # one-element tuple holding that argument, for the first and last positive index.
         args = (0.1, 1.1, 2.1, 3.1, 4.1)
 
         res = _slice_argnums(args, 0)
@@ -209,6 +249,8 @@ class TestSliceArgnums(TestCase):
         self.assertEqual(res, (4.1,))
 
     def test_flat_args_with_negative_int_argnum(self):
+        # [FUNCTION DOC] Checks that negative int argnums index from the end of the arguments and
+        # return a one-element tuple, for minus one and minus the argument count.
         args = (0.1, 1.1, 2.1, 3.1, 4.1)
 
         res = _slice_argnums(args, -1)
@@ -218,6 +260,9 @@ class TestSliceArgnums(TestCase):
         self.assertEqual(res, (0.1,))
 
     def test_flat_args_with_tuple_argnum(self):
+        # [FUNCTION DOC] Checks that a tuple of argnums returns the selected arguments as a tuple
+        # in the given order, including selecting all of them and mixing positive with
+        # negative indices.
         args = (0.1, 1.1, 2.1, 3.1, 4.1)
 
         res = _slice_argnums(args, (0, 1, 2, 3, 4))
@@ -227,6 +272,8 @@ class TestSliceArgnums(TestCase):
         self.assertEqual(res, (0.1, 2.1))
 
     def test_pytree_args(self):
+        # [FUNCTION DOC] Checks that arguments that are pytrees (tuples, lists) are returned whole
+        # as single entries when selected by int, one-element tuple, negative or mixed argnums.
         args = ((0.1, 1.1), 2.0, [3.1])
 
         res = _slice_argnums(args, 0)
@@ -242,6 +289,8 @@ class TestSliceArgnums(TestCase):
         self.assertEqual(res, args[0:2])
 
     def test_argnums_reorders(self):
+        # [FUNCTION DOC] Checks that the result order follows the argnums order, so selecting
+        # indices one then zero yields the arguments swapped.
         args = ((0.1, 1.1, 2.1), 3.1, 4.1)
 
         res = _slice_argnums(args, (1, 0))
@@ -249,6 +298,11 @@ class TestSliceArgnums(TestCase):
 
 
 def _get_weights_and_functional_call(net, mechanism):
+    # [FUNCTION DOC] HELPER: Returns a pair (function, weights) for module net. With mechanism
+    # make_functional it returns the result of make_functional on the module. Otherwise it
+    # requires the mechanism to be functional_call (raises AssertionError if not) and returns a
+    # wrapper taking weights and data plus the dict of the module named parameters, so both
+    # mechanisms share one calling convention.
     if mechanism == "make_functional":
         return make_functional(net)
     else:
@@ -257,12 +311,18 @@ def _get_weights_and_functional_call(net, mechanism):
         # this makes it so the function from make_functional and this call have the same signature
 
         def net_func(weights, data):
+            # [FUNCTION DOC] HELPER: Calls the module via functional_call with the given weights
+            # dict and the data as the single positional input, returning its output.
             return functional_call(net, weights, (data,))
 
         return net_func, dict(net.named_parameters())
 
 
 def _get_weights_and_functional_call_with_buffers(net, mechanism):
+    # [FUNCTION DOC] HELPER: Like the weights helper but also handles buffers. With mechanism
+    # make_functional it returns the result of make_functional_with_buffers; otherwise it requires
+    # functional_call (raises AssertionError if not) and returns a wrapper function plus dicts of
+    # named parameters and named buffers.
     if mechanism == "make_functional":
         return make_functional_with_buffers(net)
     else:
@@ -271,6 +331,9 @@ def _get_weights_and_functional_call_with_buffers(net, mechanism):
 
         # this makes it so the function from make_functional and this call have the same signature
         def net_func(weights, buffers, data):
+            # [FUNCTION DOC] HELPER: Calls the module via functional_call using the weights and
+            # buffers as the parameter and buffer dicts and the data as the single positional
+            # input, returning its output.
             return functional_call(net, (weights, buffers), (data,))
 
         return net_func, dict(net.named_parameters()), dict(net.named_buffers())
@@ -278,18 +341,27 @@ def _get_weights_and_functional_call_with_buffers(net, mechanism):
 
 @markDynamoStrictTest
 class TestGradTransform(TestCase):
+    # [CLASS DOC] Device-generic tests for the grad transform: primitive and composite functions,
+    # tensor attribute access inside grad, in-place ops and views, escaped wrappers, composition
+    # with vjp and autograd, argnums handling, pytree inputs, has_aux and unrelated outputs.
     def test_primitive(self, device):
+        # [FUNCTION DOC] Checks grad of sin on a scalar equals cos.
         x = torch.randn([], device=device)
         result = grad(torch.sin)(x)
         self.assertEqual(result, torch.cos(x))
 
     def test_composite_simple(self, device):
+        # [FUNCTION DOC] Checks grad of a function that flattens and sums a 3-d tensor is
+        # all ones.
         x = torch.randn(2, 3, 4, device=device)
         result = grad(lambda x: torch.flatten(x).sum())(x)
         self.assertEqual(result, torch.ones_like(x))
 
     def test_fn_with_kwargs(self, device):
+        # [FUNCTION DOC] Checks grad works when the function takes a keyword argument, giving the
+        # same result as passing it positionally.
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: Returns the sum of the elementwise product of its two inputs.
             return (x * y).sum()
 
         x = torch.randn(3, device=device)
@@ -299,10 +371,13 @@ class TestGradTransform(TestCase):
         self.assertEqual(result, expected)
 
     def test_composite_complicated(self, device):
+        # [FUNCTION DOC] Checks grad of a vector-matrix product summed to a scalar against the
+        # gradient computed by regular autograd.
         x = torch.randn(3, device=device)
         y = torch.randn(3, 5, device=device)
 
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: Matrix-multiplies x and y and returns the sum.
             result = x @ y
             return result.sum()
 
@@ -315,11 +390,14 @@ class TestGradTransform(TestCase):
         self.assertEqual(result, expected)
 
     def test_composite_two_ops(self, device):
+        # [FUNCTION DOC] Checks grad of a cross entropy loss with respect to logits matches
+        # regular autograd, with integer class targets passed as a second argument.
         N, C = 2, 5
         y = torch.randn(N, C, device=device)
         targets = torch.randint(0, C, (N,), device=device)
 
         def foo(y, targets):
+            # [FUNCTION DOC] HELPER: Returns the cross entropy of y against the targets.
             return F.cross_entropy(y, targets)
 
         result = grad(foo)(y, targets)
@@ -330,28 +408,40 @@ class TestGradTransform(TestCase):
         self.assertEqual(result, expected)
 
     def _test_attributes(self, get_attr_lambda, device):
+        # [FUNCTION DOC] HELPER: Shared body for attribute tests. Computes the attribute with the
+        # callable get_attr_lambda on a double precision tensor, then runs grad on a function that
+        # asserts the same attribute computed on the wrapped tensor is equal, so wrappers must
+        # report the same metadata.
         x = torch.randn(2, 3, 5, dtype=torch.double, device=device)
         expected = get_attr_lambda(x)
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Asserts the attribute of the wrapped input equals the
+            # expected value captured from the outer scope, and returns the input sum.
             self.assertEqual(get_attr_lambda(x), expected)
             return x.sum()
 
         grad(foo)(x)
 
     def test_shape(self, device):
+        # [FUNCTION DOC] Checks that the shape attribute is preserved inside grad.
         self._test_attributes(lambda x: x.shape, device)
 
     def test_dtype(self, device):
+        # [FUNCTION DOC] Checks that the dtype attribute is preserved inside grad.
         self._test_attributes(lambda x: x.dtype, device)
 
     def test_is_cuda(self, device):
+        # [FUNCTION DOC] Checks that the is_cuda attribute is preserved inside grad.
         self._test_attributes(lambda x: x.is_cuda, device)
 
     def test_numel(self, device):
+        # [FUNCTION DOC] Checks that numel is preserved inside grad.
         self._test_attributes(lambda x: x.numel(), device)
 
     def test_layout_sparse(self, device):
+        # [FUNCTION DOC] Checks that a sparse COO input keeps its sparse layout inside grad (the
+        # wrapper reports sparse layout) and that the returned gradient is also sparse.
         indices = torch.tensor([[0, 1, 1], [2, 0, 2]], device=device)
         values = torch.tensor([3.0, 4.0, 5.0], device=device)
         sparse_x = torch.sparse_coo_tensor(indices, values, (2, 3), device=device)
@@ -360,6 +450,8 @@ class TestGradTransform(TestCase):
         self.assertEqual(sparse_x.layout, torch.sparse_coo)
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Asserts the wrapped input reports sparse COO layout and
+            # returns the sum of the values of the coalesced tensor.
             # assert GradTrackingTensor still reports sparse layout
             self.assertEqual(x.layout, torch.sparse_coo)
             return x.coalesce()._values().sum()
@@ -370,18 +462,24 @@ class TestGradTransform(TestCase):
         self.assertEqual(result.layout, torch.sparse_coo)
 
     def test_inplace(self, device):
+        # [FUNCTION DOC] Checks grad through an in-place sin on a clone gives cosine.
         x = torch.randn([], device=device)
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Clones the input and applies in-place sin, returning it.
             return x.clone().sin_()
 
         result = grad(foo)(x)
         self.assertEqual(result, x.cos())
 
     def test_inplace_on_view(self, device):
+        # [FUNCTION DOC] Checks grad when an in-place op is applied to a view (first element) of a
+        # clone and the base is summed; compares against regular autograd.
         x = torch.randn(3, device=device)
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Clones the input, applies in-place sin to its first element
+            # view, returns the sum of the clone.
             y = x.clone()
             y0 = y[0]
             y0.sin_()
@@ -396,9 +494,13 @@ class TestGradTransform(TestCase):
         self.assertEqual(result, expected)
 
     def test_inplace_on_view_base(self, device):
+        # [FUNCTION DOC] Checks grad when an in-place op is applied to the base after a view was
+        # taken and the view is returned; compares against regular autograd.
         x = torch.randn(3, device=device)
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Clones the input, takes a view of the first element, applies
+            # in-place sin to the whole clone and returns the view.
             y = x.clone()
             y0 = y[0]
             y.sin_()
@@ -413,10 +515,15 @@ class TestGradTransform(TestCase):
         self.assertEqual(result, expected)
 
     def test_inplace_on_captures(self, device):
+        # [FUNCTION DOC] Checks that mutating a captured (closed over) tensor in place with a
+        # value from inside grad raises RuntimeError saying a captured Tensor cannot be mutated.
+        # Skipped under Dynamo.
         x = torch.tensor([1.0, 2.0, 3.0], device=device)
         captured = torch.randn(3, device=device)
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Copies the input into the captured tensor in place and
+            # returns the sum of their product.
             captured.copy_(x)
             return (x * captured).sum()
 
@@ -424,16 +531,21 @@ class TestGradTransform(TestCase):
             grad(foo)(x)
 
     def test_nesting_simple(self, device):
+        # [FUNCTION DOC] Checks that nested grad of sin gives minus sin.
         x = torch.randn([], device=device)
         result = grad(grad(torch.sin))(x)
         self.assertEqual(result, -torch.sin(x))
 
     @skipIfTorchDynamo("Ref: https://github.com/pytorch/pytorch/issues/103613")
     def test_escaped_wrappers_are_marked_as_dead(self, device):
+        # [FUNCTION DOC] Checks that a tensor that escapes grad (stored in a list) is marked dead,
+        # reporting a level of minus one. Skipped under Dynamo (issue 103613).
         x = torch.randn([], device=device)
         escaped = []
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Computes sin of the input, appends it to the outer escaped
+            # list and returns it.
             y = x.sin()
             escaped.append(y)
             return y
@@ -443,10 +555,14 @@ class TestGradTransform(TestCase):
 
     @skipIfTorchDynamo("Ref: https://github.com/pytorch/pytorch/issues/103613")
     def test_escaped_wrappers_are_ignored(self, device):
+        # [FUNCTION DOC] Checks that an escaped wrapper is ignored afterwards: operations on it
+        # behave as at level zero and give the plain result. Skipped under Dynamo (issue 103613).
         x = torch.randn([], device=device)
         escaped = []
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Computes sin of the input, appends it to the outer escaped
+            # list and returns it.
             y = x.sin()
             escaped.append(y)
             return y
@@ -458,9 +574,13 @@ class TestGradTransform(TestCase):
         self.assertEqual(something, x.sin().sum())
 
     def test_manual_seed_inside_grad(self, device):
+        # [FUNCTION DOC] Checks that seeding the RNG inside a function run under grad works,
+        # comparing against regular autograd under a frozen RNG state.
         x = torch.randn([], device=device)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Seeds the RNG with zero and returns the input times a random
+            # tensor of the same shape.
             torch.manual_seed(0)
             return x * torch.randn_like(x)
 
@@ -471,6 +591,8 @@ class TestGradTransform(TestCase):
             self.assertEqual(result, expected)
 
     def test_vjp(self, device):
+        # [FUNCTION DOC] Checks the vjp function returns the sine output and a function mapping
+        # a cotangent to cotangent times cosine of the input.
         x = torch.randn([], device=device)
         out, vjp_fn = vjp(torch.sin, x)
         self.assertEqual(out, x.sin())
@@ -480,16 +602,23 @@ class TestGradTransform(TestCase):
         self.assertEqual(result, v * x.cos())
 
     def test_vjp_two_outputs(self, device):
+        # [FUNCTION DOC] Checks vjp works for a function returning the same tensor twice, by
+        # calling the returned vjp function with the result as cotangents (no value assertion).
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the input twice as a tuple.
             return x, x
 
         result, vjp_fn = vjp(f, torch.tensor(1.0))
         vjp_fn(result)
 
     def test_conj_bit(self):
+        # [FUNCTION DOC] Checks the conjugate bit is handled: inside grad the input is not conj,
+        # its conjugate is, and the gradient of abs of a complex scalar equals its sign.
         x = torch.tensor(1 + 1j)
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Raises AssertionError if the input is conj or its conjugate
+            # is not conj; returns the absolute value of the conjugate.
             if x.is_conj():
                 raise AssertionError("Expected x to not be conj")
             y = x.conj()
@@ -502,6 +631,8 @@ class TestGradTransform(TestCase):
             self.assertEqual(res, torch.ones_like(res) * torch.sgn(x))
 
     def test_composed_with_autograd(self, device):
+        # [FUNCTION DOC] Checks grad output can be differentiated further with regular autograd,
+        # giving minus sin.
         x = torch.randn([], requires_grad=True, device=device)
 
         y = grad(torch.sin)(x)
@@ -509,10 +640,14 @@ class TestGradTransform(TestCase):
         self.assertEqual(result, -x.sin())
 
     def test_grad_of_vjp_composition(self, device):
+        # [FUNCTION DOC] Checks grad of a function that calls vjp and returns the vjp output
+        # gives cosine of x.
         x = torch.randn([], device=device)
         y = torch.randn([], device=device)
 
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: Runs vjp of sin at x, then returns the grad of the vjp
+            # function applied to y.
             out, vjp_fn = vjp(torch.sin, x)
             return grad(lambda y: vjp_fn(y)[0])(y)
 
@@ -521,10 +656,14 @@ class TestGradTransform(TestCase):
         self.assertEqual(result, expected)
 
     def test_vjp_of_grad_composition(self, device):
+        # [FUNCTION DOC] Checks vjp of grad of sin applied to a cotangent equals minus the
+        # cotangent times sine of x.
         x = torch.randn([], device=device)
         y = torch.randn([], device=device)
 
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: Runs vjp of grad of sin at x and returns the vjp function
+            # applied to y.
             out, vjp_fn = vjp(grad(torch.sin), x)
             return vjp_fn(y)[0]
 
@@ -533,10 +672,14 @@ class TestGradTransform(TestCase):
         self.assertEqual(result, expected)
 
     def test_grad_of_vjp_of_grad_composition(self, device):
+        # [FUNCTION DOC] Checks a three-level composition (grad of vjp of grad of negative cosine)
+        # gives cosine of x.
         x = torch.randn([], device=device)
         y = torch.randn([], device=device)
 
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: Runs vjp of the grad of negative cosine at x, then returns
+            # grad of the vjp function applied to y.
             df, vjp_fn = vjp(grad(lambda x: -torch.cos(x)), x)
             return grad(lambda y: vjp_fn(y)[0])(y)
 
@@ -545,15 +688,19 @@ class TestGradTransform(TestCase):
         self.assertEqual(result, expected)
 
     def test_views(self, device):
+        # [FUNCTION DOC] Checks that grad inside a function of regular-autograd inputs works with
+        # view ops, then differentiates the result with autograd to get minus sin of each input.
         x = torch.randn([], requires_grad=True, device=device)
         y = torch.randn([], requires_grad=True, device=device)
 
         def silly_sin(x):
+            # [FUNCTION DOC] HELPER: Views the input as a scalar and applies sin.
             x = x.view([])
             x = x.sin()
             return x
 
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: Sums the grad of silly_sin at x and the cosine of y.
             z1 = grad(silly_sin)(x)
             z2 = torch.cos(y)
             return z1 + z2
@@ -564,7 +711,11 @@ class TestGradTransform(TestCase):
         self.assertEqual(grads[1], -y.sin())
 
     def test_view_inplace_simple(self, device):
+        # [FUNCTION DOC] Checks grad through an in-place sin applied to a scalar view of a clone
+        # gives cosine.
         def foo(x):
+            # [FUNCTION DOC] HELPER: Clones the input, applies in-place sin on a scalar view and
+            # returns the clone.
             x = x.clone()
             x.view([]).sin_()
             return x
@@ -574,6 +725,9 @@ class TestGradTransform(TestCase):
         self.assertEqual(result, x.cos())
 
     def test_invalid_argnums(self, device):
+        # [FUNCTION DOC] Checks grad rejects invalid argnums with RuntimeError: out of range ints,
+        # a list, non-int entries, and duplicate indices (including via negative index), matching
+        # expected message fragments.
         x = torch.randn([])
         y = torch.randn([])
         with self.assertRaisesRegex(RuntimeError, "but only"):
@@ -590,6 +744,8 @@ class TestGradTransform(TestCase):
             grad(torch.mul, argnums=(0, -2))(x, y)
 
     def test_argnums(self, device):
+        # [FUNCTION DOC] Checks grad with int and tuple argnums on a product returns the other
+        # operand's value (single or tuple results).
         x = torch.randn([])
         y = torch.randn([])
         gx = grad(torch.mul, argnums=0)(x, y)
@@ -606,6 +762,8 @@ class TestGradTransform(TestCase):
         self.assertEqual(gy, x)
 
     def test_out_of_order_argnums(self, device):
+        # [FUNCTION DOC] Checks that tuple argnums in reversed order return gradients in
+        # that order.
         x = torch.randn([])
         y = torch.randn([])
         gy, gx = grad(torch.mul, argnums=(1, 0))(x, y)
@@ -613,6 +771,8 @@ class TestGradTransform(TestCase):
         self.assertEqual(gy, x)
 
     def test_negative_argnums(self, device):
+        # [FUNCTION DOC] Checks negative int and tuple argnums select the same arguments as their
+        # positive equivalents.
         x = torch.randn([])
         y = torch.randn([])
         gx = grad(torch.mul, argnums=-2)(x, y)
@@ -629,9 +789,15 @@ class TestGradTransform(TestCase):
         self.assertEqual(gy, x)
 
     def test_grad_pytree_inputs(self, device):
+        # [FUNCTION DOC] Checks grad with a pytree input: default argnums returns the gradient
+        # pytree of the first argument, a one-element tuple returns it in a tuple, and both
+        # argnums return a pair containing the dict gradient with expected coefficients.
         x = torch.randn([], device=device)
 
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Unpacks a pair from the first argument and returns one times
+            # the first plus two times the second plus three times the value under the foo key of
+            # the second argument.
             x, y = a
             return 1 * x + 2 * y + 3 * b["foo"]
 
@@ -651,6 +817,9 @@ class TestGradTransform(TestCase):
         self.assertEqual(gz["foo"], torch.tensor(3.0, device=device))
 
     def test_grad_aux_tensor(self, device):
+        # [FUNCTION DOC] Checks grad with has_aux: a function returning a non-tuple or a tuple of
+        # the wrong length raises RuntimeError about the output needing to be a tuple; a valid
+        # function returns the gradient and the auxiliary output.
         x = torch.randn(3, device=device)
 
         with self.assertRaisesRegex(
@@ -666,6 +835,8 @@ class TestGradTransform(TestCase):
             grad(lambda t: (t, t + 2, t + 3), has_aux=True)(x)
 
         def f(t):
+            # [FUNCTION DOC] HELPER: Returns the sum of sin of the input and the cosine as the
+            # auxiliary value.
             y = t.sin()
             return y.sum(), t.cos()
 
@@ -674,7 +845,12 @@ class TestGradTransform(TestCase):
         self.assertEqual(out, x.cos())
 
     def test_grad_aux_pytree(self, device):
+        # [FUNCTION DOC] Checks that with has_aux the aux output may be a pytree of tensors, and
+        # that non-tensor aux values (int, float, string, or lists containing them) raise
+        # RuntimeError about unsupported types.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of sin of the input plus an aux dict holding
+            # cosine and a list with tangent.
             y = x.sin()
             return y.sum(), {"a": x.cos(), "b": [x.tan()]}
 
@@ -696,7 +872,10 @@ class TestGradTransform(TestCase):
                 _ = grad(lambda x: (x.sum(), [x, aux]), has_aux=True)(x)
 
     def test_zero_grad(self, device):
+        # [FUNCTION DOC] Checks that grad over a dict input returns zero for entries the function
+        # does not use and nonzero for used ones.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of the squares of the dict entry a.
             return (x["a"] ** 2.0).sum()
 
         inps = {
@@ -708,21 +887,27 @@ class TestGradTransform(TestCase):
         self.assertEqual(grads["b"].sum(), 0.0)
 
     def test_unrelated_grad(self, device):
+        # [FUNCTION DOC] Checks grad of a function returning an unrelated captured tensor gives
+        # zeros like the input.
         x = torch.tensor(1.0, device=device)
         y = torch.tensor(2.0, device=device)
 
         def unrelated(x):
+            # [FUNCTION DOC] HELPER: Ignores its input and returns the captured tensor y.
             return y
 
         result = grad(unrelated)(x)
         self.assertEqual(result, torch.zeros_like(x))
 
     def test_unrelated_vjp(self, device):
+        # [FUNCTION DOC] Checks vjp of a function returning an unrelated captured tensor gives a
+        # tuple with zeros like the input.
         x = torch.tensor(1.0, device=device)
         y = torch.tensor(2.0, device=device)
         v = torch.tensor(1.0, device=device)
 
         def unrelated(x):
+            # [FUNCTION DOC] HELPER: Ignores its input and returns the captured tensor y.
             return y
 
         out, vjp_fn = vjp(unrelated, x)
@@ -731,12 +916,16 @@ class TestGradTransform(TestCase):
         self.assertEqual(result, expected)
 
     def test_unrelated_vjp_multiple_inputs_outputs(self, device):
+        # [FUNCTION DOC] Checks vjp with two inputs and three outputs where outputs are unrelated
+        # captured tensors or one input: gradient for the unused input is zero and for the
+        # passed-through input is ones.
         w = torch.tensor(3.0, device=device)
         x = torch.tensor(4.0, device=device)
         y = torch.tensor(2.0, device=device)
         v = torch.tensor(1.0, device=device)
 
         def unrelated(w, x):
+            # [FUNCTION DOC] HELPER: Returns the captured tensor twice and the second input.
             return y, y, x
 
         out, vjp_fn = vjp(unrelated, w, x)
@@ -747,11 +936,15 @@ class TestGradTransform(TestCase):
     # TODO: https://github.com/pytorch/functorch/issues/12
     @onlyCPU
     def test_unrelated_hessian(self, device):
+        # [FUNCTION DOC] CPU only (see functorch issue 12). Checks jacrev of jacrev of a linear
+        # function with a captured matrix, an unrelated hessian, gives a zero tensor of shape
+        # output by input by input.
         N = 5
         M = 3
         W = torch.randn(N, M, device=device)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Multiplies the captured matrix by the input vector.
             return W @ x
 
         x = torch.randn(M)
@@ -760,7 +953,12 @@ class TestGradTransform(TestCase):
         self.assertEqual(result, expected)
 
     def test_vjp_pytree_input(self, device):
+        # [FUNCTION DOC] Checks vjp with a nested tuple input: output is the product of two
+        # entries, and the vjp function returns a one-element tuple mirroring the input structure,
+        # with the cotangent-weighted gradients and a plain zero for the unused leaf.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the product of the first element and the first
+            # element of the nested second element of its tuple input.
             return x[0] * x[1][0]
 
         x = torch.randn([], device=device)
@@ -771,7 +969,11 @@ class TestGradTransform(TestCase):
         self.assertEqual(result, ((x * v, (x * v, 0.0)),))
 
     def test_vjp_pytree_output(self, device):
+        # [FUNCTION DOC] Checks vjp with a function returning a nested tuple output: the vjp
+        # function accepts a matching nested tuple of cotangents and returns the sum of them for
+        # the single input.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the input and a tuple of the input twice.
             return x, (x, x)
 
         x = torch.randn([], device=device)
@@ -783,6 +985,11 @@ class TestGradTransform(TestCase):
         self.assertEqual(result, v1 + v2 + v3)
 
     def test_vjp_outputs_can_any_pytree(self, device):
+        # [FUNCTION DOC] Checks which output types vjp accepts. None and empty tuple outputs raise
+        # RuntimeError about non-empty output; scalars, bool, float and string outputs raise
+        # RuntimeError about returning only tensors. List, dict and deeply nested list/tuple/dict
+        # outputs work, the output keeps its structure, and the vjp function accepts cotangents of
+        # the same structure and returns a tensor.
         x = torch.randn(2, 3, device=device)
         t = torch.randn(2, 3, device=device)
 
@@ -819,6 +1026,8 @@ class TestGradTransform(TestCase):
             raise AssertionError(f"Expected Tensor, got {type(vjp_out)}")
 
         def composite_output(x):
+            # [FUNCTION DOC] HELPER: Returns a list holding a tuple of the sum and a dict
+            # containing the input and a list of the input and the sum.
             out = x.sum()
             return [
                 (out, {"a": x, "out": [x, out]}),
@@ -838,7 +1047,10 @@ class TestGradTransform(TestCase):
             raise AssertionError(f"Expected Tensor, got {type(vjp_out)}")
 
     def test_vjp_pytree_error(self, device):
+        # [FUNCTION DOC] Checks that passing the vjp function a cotangent with a different pytree
+        # structure than the output raises RuntimeError saying a pytree structure was expected.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the input and a tuple of the input twice.
             return x, (x, x)
 
         x = torch.randn([], device=device)
@@ -850,6 +1062,9 @@ class TestGradTransform(TestCase):
             (result,) = vjp_fn(((v1, (v2, v3)),))
 
     def test_vjp_aux_tensor(self, device):
+        # [FUNCTION DOC] Checks vjp with has_aux: a function returning a non-tuple or wrong length
+        # tuple raises RuntimeError about the output needing to be a tuple; a valid function
+        # returns output, vjp function and aux, and the vjp function gives cotangent times cosine.
         x = torch.randn(3, device=device)
 
         with self.assertRaisesRegex(
@@ -863,6 +1078,8 @@ class TestGradTransform(TestCase):
             vjp(lambda t: (t, t + 2, t + 3), x, has_aux=True)
 
         def f(t):
+            # [FUNCTION DOC] HELPER: Returns sin of the input as output and cosine as the
+            # auxiliary value.
             y = t.sin()
             return y, t.cos()
 
@@ -875,7 +1092,12 @@ class TestGradTransform(TestCase):
         self.assertEqual(grad_x, v * x.cos())
 
     def test_vjp_aux_pytree(self, device):
+        # [FUNCTION DOC] Checks vjp with a pytree (dict containing list) aux output returns it
+        # unchanged, gradients are correct, and non-tensor aux values (int, float, string, or
+        # lists containing them) raise RuntimeError about unsupported types.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns sin of the input and an aux dict with cosine and a
+            # list holding tangent.
             y = x.sin()
             return y, {"a": x.cos(), "b": [x.tan()]}
 
@@ -901,8 +1123,16 @@ class TestGradTransform(TestCase):
                 _ = vjp(lambda x: (x, [x, aux]), x, has_aux=True)
 
     def test_functional_init(self, device):
+        # [FUNCTION DOC] Checks that functional_init, given a module class, a batch size and
+        # device, builds batch-many stacked weights; the resulting functional model runs under
+        # vmap on a batch of inputs without error (no output assertion).
         class MLPClassifier(nn.Module):
+            # [CLASS DOC] HELPER: Small two-layer perceptron classifier (linear, relu, linear, log
+            # softmax) from 2 input features to n_classes, with hidden width hidden_dim.
             def __init__(self, hidden_dim=32, n_classes=2):
+                # [FUNCTION DOC] HELPER: Stores hidden_dim and n_classes and creates two linear
+                # layers, the first from 2 to hidden_dim and the second from hidden_dim
+                # to n_classes.
                 super().__init__()
                 self.hidden_dim = hidden_dim
                 self.n_classes = n_classes
@@ -911,6 +1141,8 @@ class TestGradTransform(TestCase):
                 self.fc2 = nn.Linear(self.hidden_dim, self.n_classes)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the first linear layer, relu, the second linear
+                # layer and log softmax over the last dim; returns the result.
                 x = self.fc1(x)
                 x = F.relu(x)
                 x = self.fc2(x)
@@ -923,8 +1155,16 @@ class TestGradTransform(TestCase):
         vmap(fn)(weights, (inputs,))
 
     def test_functional_init_with_buffers(self, device):
+        # [FUNCTION DOC] Checks that functional_init_with_buffers (batch size given as a list)
+        # builds stacked weights and buffers for a model containing batch norm, and that the
+        # functional model runs under vmap with weights, buffers and inputs (no output assertion).
         class MLPClassifier(nn.Module):
+            # [CLASS DOC] HELPER: Perceptron classifier like the plain one but with a
+            # one-dimensional batch norm layer (affine) between the first relu and the second
+            # linear layer, so it has buffers.
             def __init__(self, hidden_dim=32, n_classes=2):
+                # [FUNCTION DOC] HELPER: Stores sizes and creates the first linear layer, a batch
+                # norm over the hidden width, and the output linear layer.
                 super().__init__()
                 self.hidden_dim = hidden_dim
                 self.n_classes = n_classes
@@ -934,6 +1174,8 @@ class TestGradTransform(TestCase):
                 self.fc2 = nn.Linear(self.hidden_dim, self.n_classes)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies linear, relu, batch norm, linear and log softmax
+                # over the last dim; returns the result.
                 x = self.fc1(x)
                 x = F.relu(x)
                 x = self.bn(x)
@@ -949,7 +1191,13 @@ class TestGradTransform(TestCase):
         vmap(fn)(weights, buffers, (inputs,))
 
     def test_advanced_indexing(self, device):
+        # [FUNCTION DOC] Checks grad works with boolean-mask indexed assignment: a function that
+        # mutates an unrelated tensor with a false mask returns the input and gets gradient one; a
+        # function that zeros the positive entries of a clone and sums gives gradient one at
+        # non-positive entries and zero elsewhere.
         def f(value):
+            # [FUNCTION DOC] HELPER: Assigns zero into an all-ones scalar through an all-false
+            # mask, then returns the input unchanged.
             log_prob = torch.ones((), device=device)
             val = torch.zeros(()) > 0
             log_prob[val] = 0
@@ -959,6 +1207,8 @@ class TestGradTransform(TestCase):
         self.assertEqual(result, torch.ones_like(result))
 
         def f2(value):
+            # [FUNCTION DOC] HELPER: Clones the input, zeros entries greater than zero via a mask
+            # assignment and returns the sum.
             value = value.clone()
             value[value > 0] = 0
             return value.sum()
@@ -968,7 +1218,11 @@ class TestGradTransform(TestCase):
         self.assertEqual(result, (x <= 0).type_as(x))
 
     def test_tensor_ctor_inside_grad(self, device):
+        # [FUNCTION DOC] Checks that creating a new tensor with the torch.tensor constructor
+        # inside a function under grad works (runs without assertion on the result).
         def foo(x):
+            # [FUNCTION DOC] HELPER: Multiplies the input by a freshly created scalar tensor
+            # holding two.
             return x * torch.tensor(2.0, device=device)
 
         x = torch.tensor(3.14, device=device)
@@ -1009,6 +1263,11 @@ class TestGradTransform(TestCase):
         ],
     )
     def test_tensor_print(self, device, op_list_data):
+        # [FUNCTION DOC] Parametrized over combinations of vmap and grad transforms and input
+        # shapes. For every floating dtype and shape it builds the nested transform (vmap with
+        # increasing in_dims) around a function that records the repr of the tensor it receives in
+        # an outer variable, runs it, and validates the recorded string via the wrapper
+        # repr helper.
         op_list, shapes = op_list_data
 
         for dt in get_all_fp_dtypes():
@@ -1018,6 +1277,8 @@ class TestGradTransform(TestCase):
                 buf = None
 
                 def foo(t):
+                    # [FUNCTION DOC] HELPER: Stores the repr of its argument in the enclosing
+                    # variable and returns the mean.
                     nonlocal buf
                     buf = repr(t)
                     return t.mean()
@@ -1036,10 +1297,15 @@ class TestGradTransform(TestCase):
                 _assert_functorch_wrapper_repr(self, buf, op_list)
 
     def test_print_captured_tensor_inside_transform(self, device):
+        # [FUNCTION DOC] Checks the repr of a captured outer tensor printed inside vjp: under
+        # Dynamo it must look like a plain leaf tensor, otherwise it must equal the repr
+        # taken outside.
         x = torch.tensor([1.0, 2.0, 3.0], device=device)
         out = None
 
         def f(y):
+            # [FUNCTION DOC] HELPER: Stores the repr of the captured tensor in the enclosing
+            # variable and returns its argument.
             nonlocal out
             out = repr(x)
             return y
@@ -1052,6 +1318,8 @@ class TestGradTransform(TestCase):
             self.assertEqual(out, repr(x))
 
     def test_no_grad_outside(self, device):
+        # [FUNCTION DOC] Checks grad called inside a no_grad block still computes the derivative
+        # (cosine) but the result does not require grad.
         x = torch.randn([], device=device, requires_grad=True)
         with torch.no_grad():
             y = grad(torch.sin)(x)
@@ -1059,7 +1327,12 @@ class TestGradTransform(TestCase):
         self.assertFalse(y.requires_grad)
 
     def test_no_grad_inside(self, device):
+        # [FUNCTION DOC] Checks no_grad inside the differentiated function: the shifted quantity
+        # is treated as constant, giving first derivative two x, second derivative two, and a
+        # double derivative via regular autograd of two.
         def f(x):
+            # [FUNCTION DOC] HELPER: Computes a square under no_grad as a shift and returns the
+            # square minus that shift.
             with torch.no_grad():
                 shift = x**2
             return x**2 - shift
@@ -1076,7 +1349,11 @@ class TestGradTransform(TestCase):
         self.assertEqual(z, 2)
 
     def test_no_grad_mixed(self, device):
+        # [FUNCTION DOC] Checks no_grad inside the function combined with an outer no_grad: the
+        # gradient is still two x but does not require grad.
         def f(x):
+            # [FUNCTION DOC] HELPER: Computes a square under no_grad as a shift and returns the
+            # square minus that shift.
             with torch.no_grad():
                 shift = x**2
             return x**2 - shift
@@ -1089,7 +1366,11 @@ class TestGradTransform(TestCase):
         self.assertFalse(y.requires_grad)
 
     def test_no_grad_nested_simple(self, device):
+        # [FUNCTION DOC] Checks a nested grad evaluated under no_grad is treated as a constant:
+        # outer grad gives three x squared and regular autograd of that gives six x.
         def h(x):
+            # [FUNCTION DOC] HELPER: Computes the grad of a quartic under no_grad as a shift and
+            # returns the cube minus the shift.
             with torch.no_grad():
                 shift = grad(lambda x: 0.25 * x**4)(x)
             return x**3 - shift
@@ -1102,12 +1383,17 @@ class TestGradTransform(TestCase):
         self.assertEqual(z, 6 * x)
 
     def test_no_grad_nested_complicated(self, device):
+        # [FUNCTION DOC] Checks a combination of nested grad calls, some under no_grad, so that
+        # only the cube contributes: gradient is six x and its autograd derivative is six.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the cube minus a no_grad copy of the cube.
             with torch.no_grad():
                 shift = x**3
             return x**3 - shift
 
         def g(x):
+            # [FUNCTION DOC] HELPER: Returns the grad of the function above at x minus the same
+            # grad computed under no_grad.
             r1 = grad(f)(x)
             with torch.no_grad():
                 shift = grad(f)(x)
@@ -1122,7 +1408,11 @@ class TestGradTransform(TestCase):
         self.assertEqual(z, 6)
 
     def test_no_grad_value(self, device):
+        # [FUNCTION DOC] Checks the value returned by grad_and_value under no_grad is treated as
+        # constant: outer grad gives three x squared and autograd of that gives six x.
         def h(x):
+            # [FUNCTION DOC] HELPER: Computes the value of a cube via grad_and_value under no_grad
+            # and returns the cube minus that value.
             with torch.no_grad():
                 gvalue, value = grad_and_value(lambda x: x**3)(x)
             return x**3 - value
@@ -1135,7 +1425,10 @@ class TestGradTransform(TestCase):
         self.assertEqual(z, 6 * x)
 
     def test_no_grad_outside_vjp(self, device):
+        # [FUNCTION DOC] Checks vjp called and applied under no_grad: gradient is two x and
+        # neither the gradient nor the output requires grad.
         def h(x):
+            # [FUNCTION DOC] HELPER: Returns the square of the input.
             return x**2
 
         x = torch.tensor(2.0, requires_grad=True, device=device)
@@ -1148,7 +1441,11 @@ class TestGradTransform(TestCase):
         self.assertFalse(out.requires_grad)
 
     def test_no_grad_outside_vjp_fn(self, device):
+        # [FUNCTION DOC] Checks that when only the vjp function call is under no_grad, the
+        # gradient does not require grad but the output does, and autograd can still differentiate
+        # the output.
         def h(x):
+            # [FUNCTION DOC] HELPER: Returns the square of the input.
             return x**2
 
         x = torch.tensor(3.14, requires_grad=True, device=device)
@@ -1164,7 +1461,11 @@ class TestGradTransform(TestCase):
         self.assertEqual(z, 2 * x)
 
     def test_no_grad_outside_vjp_only(self, device):
+        # [FUNCTION DOC] Checks that when only the vjp call itself is under no_grad, the output
+        # does not require grad while the gradient computed later does (noted in the test as odd),
+        # and autograd gives two.
         def h(x):
+            # [FUNCTION DOC] HELPER: Returns the square of the input.
             return x**2
 
         x = torch.tensor(3.14, requires_grad=True, device=device)
@@ -1183,6 +1484,9 @@ class TestGradTransform(TestCase):
 
     @skipIfTorchDynamo("internal API test")
     def test_pop_dynamic_layer_stack_to_depth_single(self, device):
+        # [FUNCTION DOC] Internal API test (skipped under Dynamo). Increments grad nesting, checks
+        # the dynamic layer stack depth is one, pops back to depth zero and checks the depth
+        # is zero.
         ft = torch._C._functorch
         ft._grad_increment_nesting()
         self.assertEqual(ft.get_dynamic_layer_stack_depth(), 1)
@@ -1191,6 +1495,9 @@ class TestGradTransform(TestCase):
 
     @skipIfTorchDynamo("internal API test")
     def test_pop_dynamic_layer_stack_to_depth_mixed(self, device):
+        # [FUNCTION DOC] Internal API test (skipped under Dynamo). Pushes vmap, grad and jvp
+        # layers (depth three), pops down to depth two removing exactly one layer, then pops to
+        # zero. Does not decrement nesting explicitly, relying on the pop function to undo layers.
         ft = torch._C._functorch
         ft._vmap_increment_nesting(3, "error")
         ft._grad_increment_nesting()
@@ -1204,12 +1511,15 @@ class TestGradTransform(TestCase):
         self.assertEqual(ft.get_dynamic_layer_stack_depth(), 0)
 
     def test_inference_mode_outside_grad(self, device):
+        # [FUNCTION DOC] Checks grad run inside inference mode gives two x for a sum of squares.
         x = torch.randn(3, device=device)
         with torch.inference_mode():
             y = grad(lambda x: (x**2).sum())(x)
         self.assertEqual(y, 2 * x)
 
     def test_inference_mode_nograd_outside_grad(self, device):
+        # [FUNCTION DOC] Checks grad run inside inference mode combined with no_grad gives two x
+        # for a sum of squares.
         x = torch.randn(3, device=device)
         with torch.inference_mode():
             with torch.no_grad():
@@ -1217,6 +1527,7 @@ class TestGradTransform(TestCase):
         self.assertEqual(y, 2 * x)
 
     def test_inference_mode_outside_vjp(self, device):
+        # [FUNCTION DOC] Checks vjp and its vjp function used inside inference mode give two x.
         x = torch.randn(3, device=device)
         with torch.inference_mode():
             out, vjp_fn = vjp(lambda x: (x**2).sum(), x)
@@ -1224,6 +1535,8 @@ class TestGradTransform(TestCase):
         self.assertEqual(y, 2 * x)
 
     def test_inference_mode_outside_jvp(self, device):
+        # [FUNCTION DOC] Checks jvp inside inference mode returns the directional derivative, the
+        # sum of two x times the tangent.
         x = torch.randn(3, device=device)
         t = torch.ones(3, device=device)
         with torch.inference_mode():
@@ -1231,37 +1544,50 @@ class TestGradTransform(TestCase):
         self.assertEqual(y, (2 * x * t).sum())
 
     def test_inference_mode_outside_jacrev(self, device):
+        # [FUNCTION DOC] Checks jacrev of an elementwise square inside inference mode gives the
+        # diagonal matrix of two x.
         x = torch.randn(3, device=device)
         with torch.inference_mode():
             y = jacrev(lambda x: x**2)(x)
         self.assertEqual(y, torch.diag(2 * x))
 
     def test_inference_mode_outside_vmap_grad(self, device):
+        # [FUNCTION DOC] Checks vmap of grad inside inference mode gives two x for each row.
         xs = torch.randn(5, 3, device=device)
         with torch.inference_mode():
             ys = vmap(grad(lambda x: (x**2).sum()))(xs)
         self.assertEqual(ys, 2 * xs)
 
     def test_inference_mode_outside_grad_vmap(self, device):
+        # [FUNCTION DOC] Checks grad over a function that internally uses vmap, inside inference
+        # mode, gives two x.
         x = torch.randn(3, device=device)
         with torch.inference_mode():
             y = grad(lambda x: vmap(lambda x: (x**2).sum())(x).sum())(x)
         self.assertEqual(y, 2 * x)
 
     def test_inference_mode_nested_grad(self, device):
+        # [FUNCTION DOC] Checks nested grad of a cube inside inference mode gives six x.
         x = torch.randn([], device=device)
         with torch.inference_mode():
             y = grad(grad(lambda x: x**3))(x)
         self.assertEqual(y, 6 * x)
 
     def test_inference_mode_jacrev_grad(self, device):
+        # [FUNCTION DOC] Checks jacrev of grad (a hessian) of a sum of cubes inside inference mode
+        # gives the diagonal matrix of six x.
         x = torch.randn(3, device=device)
         with torch.inference_mode():
             H = jacrev(grad(lambda x: (x**3).sum()))(x)
         self.assertEqual(H, torch.diag(6 * x))
 
     def test_inference_mode_inside_grad(self, device):
+        # [FUNCTION DOC] Checks that using inference mode inside the differentiated function,
+        # while also in an outer inference mode, treats the computed value as constant so the
+        # gradient is ones.
         def f(x):
+            # [FUNCTION DOC] HELPER: Computes a square in inference mode and returns the input
+            # minus it.
             with torch.inference_mode():
                 c = x**2
             return x - c
@@ -1272,6 +1598,9 @@ class TestGradTransform(TestCase):
         self.assertEqual(y, torch.ones_like(x))
 
     def test_inference_mode_restored(self, device):
+        # [FUNCTION DOC] Checks inference mode state is reported as disabled before, enabled
+        # inside, still enabled after running grad inside it, and disabled after leaving
+        # the block.
         self.assertTrue(not torch.is_inference_mode_enabled())
         with torch.inference_mode():
             self.assertTrue(torch.is_inference_mode_enabled())
@@ -1282,12 +1611,23 @@ class TestGradTransform(TestCase):
 
 @markDynamoStrictTest
 class TestAutogradFunction(TestCase):
+    # [CLASS DOC] Device-generic tests for functorch interaction with custom
+    # torch.autograd.Function: dead wrapper unwrapping, materialize grads, functions that return
+    # their input, needs_input_grad and once_differentiable.
     @skipIfTorchDynamo("internal API test")
     def test_unwrap_dead_wrappers(self, device):
+        # [FUNCTION DOC] Internal API test (skipped under Dynamo) of the utility that unwraps dead
+        # grad wrappers in an argument tuple. Verifies the same tuple object is returned for empty
+        # tuples, non-tensor tuples and tuples with only live tensors, and a new tuple with only
+        # the dead wrapper replaced by the underlying tensor (other items identical objects) for a
+        # dead wrapper at each of three positions.
         ft = torch._C._functorch
         unwrap_dead_wrappers = torch._functorch.utils.unwrap_dead_wrappers
 
         def make_dead_wrapper(tensor):
+            # [FUNCTION DOC] HELPER: Creates a grad level, wraps the tensor for it, leaves the
+            # level (always, via cleanup) so the wrapper is dead, asserts it is reported dead and
+            # returns it.
             level = ft._grad_increment_nesting()
             try:
                 wrapped = ft._wrap_for_grad(tensor, level)
@@ -1324,22 +1664,36 @@ class TestAutogradFunction(TestCase):
                     self.assertIs(result[idx], args[idx])
 
     def test_set_materialize_grads(self, device):
+        # [FUNCTION DOC] Checks that a custom Function that disables materialization of grads in
+        # its setup receives a real gradient for the output that is used and None for the unused
+        # one, under grad and nested grad.
         class A(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom autograd Function that returns both inputs, turns off
+            # gradient materialization in setup_context, and whose backward asserts the first
+            # gradient is present and the second is None.
             @staticmethod
             def forward(x, y):
+                # [FUNCTION DOC] HELPER: Returns both inputs unchanged.
                 return x, y
 
             @staticmethod
             def setup_context(ctx, inputs, output):
+                # [FUNCTION DOC] HELPER: Disables materialization of undefined gradients on
+                # the context.
                 ctx.set_materialize_grads(False)
 
             @staticmethod
             def backward(ctx, gx, gy):
+                # [FUNCTION DOC] HELPER: Asserts via the enclosing test that the first gradient is
+                # not None and the second is None, then returns both.
                 self.assertIsNotNone(gx)
                 self.assertIsNone(gy)
                 return gx, gy
 
         def f(y, x):
+            # [FUNCTION DOC] HELPER: Applies the custom function to the two inputs (note argument
+            # order is swapped relative to grad's differentiation arg) and returns the square of
+            # the first result.
             x, y = A.apply(x, y)
             return x**2
 
@@ -1356,13 +1710,29 @@ class TestAutogradFunction(TestCase):
     def test_function_returns_input(
         self, device, inner_requires_grad, save_for, save_tensors, mark_dirty
     ):
+        # [FUNCTION DOC] Parametrized over whether the inner input requires grad, whether tensors
+        # are saved for forward or backward, which tensor is saved (input, output or neither) and
+        # whether the input is marked dirty. Checks that a custom Function returning its input
+        # as-is raises RuntimeError ("An input that has been returned as-is") under grad and jvp
+        # when it saves the input or output without marking it dirty, and otherwise works; also
+        # checks direct application and forward-mode dual inputs, and that the output is the same
+        # object when marked dirty (skipping one dual case tracked by issue 97827).
         class A(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function whose forward returns its input unchanged. Its
+            # setup_context saves the input, output or nothing for either forward or backward,
+            # optionally marking the input dirty, as chosen by the enclosing test parameters;
+            # backward returns the output gradient and jvp returns a modified (dirty) or
+            # viewed tangent.
             @staticmethod
             def forward(x):
+                # [FUNCTION DOC] HELPER: Returns the input as-is.
                 return x
 
             @staticmethod
             def setup_context(ctx, inputs, output):
+                # [FUNCTION DOC] HELPER: Saves the input, output or nothing, using the forward or
+                # backward saving method and optionally marking the input dirty, per the enclosing
+                # test parameters.
                 if save_for == "jvp":
                     save_fn = ctx.save_for_forward
                 else:
@@ -1380,10 +1750,13 @@ class TestAutogradFunction(TestCase):
 
             @staticmethod
             def backward(ctx, grad_output):
+                # [FUNCTION DOC] HELPER: Returns the output gradient unchanged.
                 return grad_output
 
             @staticmethod
             def jvp(ctx, x_t):
+                # [FUNCTION DOC] HELPER: Returns the tangent: with dirty marking an in-place add
+                # of zero on it, otherwise a view of it.
                 # NB: the logic to check ctx.save_for_forward happens
                 #     before we reach this!
                 if mark_dirty:
@@ -1393,6 +1766,7 @@ class TestAutogradFunction(TestCase):
                 return ret
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies the custom function to a clone of the input.
             return A.apply(x.clone())
 
         err_msg = "An input that has been returned as-is"
@@ -1434,17 +1808,26 @@ class TestAutogradFunction(TestCase):
                     self.assertTrue(a_dual is b_dual)
 
     def test_needs_input_grads(self, device):
+        # [FUNCTION DOC] Checks that backward of a custom Function sees needs_input_grad true for
+        # the first input and false for the second under grad and nested grad.
         class A(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function computing the product of two inputs, with an
+            # empty context setup; its backward asserts needs_input_grad is true for the first and
+            # false for the second input and returns None for both.
             @staticmethod
             def forward(x, y):
+                # [FUNCTION DOC] HELPER: Returns the product of the inputs.
                 return x * y
 
             @staticmethod
             def setup_context(ctx, inputs, output):
+                # [FUNCTION DOC] HELPER: Does nothing.
                 return
 
             @staticmethod
             def backward(ctx, grad_output):
+                # [FUNCTION DOC] HELPER: Asserts via the enclosing test the needs_input_grad flags
+                # and returns None for both gradients.
                 self.assertTrue(ctx.needs_input_grad[0])
                 self.assertFalse(ctx.needs_input_grad[1])
                 return None, None
@@ -1456,29 +1839,45 @@ class TestAutogradFunction(TestCase):
         grad(grad(A.apply))(x, y)
 
     def _get_NumpyCubeNotComposable(self):
+        # [FUNCTION DOC] HELPER: Defines and returns a custom Function class that cubes a tensor
+        # using numpy (not composable) and returns the numpy array as a second output.
         class NumpyCubeNotComposable(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function cubing its input via numpy, returning the cubed
+            # tensor and the numpy array. Its backward is marked once_differentiable and computes
+            # three times the square of the saved numpy input.
             @staticmethod
             def forward(input):
+                # [FUNCTION DOC] HELPER: Converts the input to numpy on the CPU and returns the
+                # cube as a tensor on the original device plus the numpy array.
                 input_np = input.cpu().numpy()
                 return torch.tensor(input_np**3, device=input.device), input_np
 
             @staticmethod
             def setup_context(ctx, inputs, output):
+                # [FUNCTION DOC] HELPER: Stores the numpy array output and the input device on
+                # the context.
                 ctx.input_np = output[1]
                 ctx.device = inputs[0].device
 
             @staticmethod
             @torch.autograd.function.once_differentiable
             def backward(ctx, grad_output, grad_saved):
+                # [FUNCTION DOC] HELPER: Returns three times the square of the saved numpy array
+                # as a tensor on the saved device; ignores the incoming gradients.
                 result_np = 3 * (ctx.input_np**2)
                 return torch.tensor(result_np, device=ctx.device)
 
         return NumpyCubeNotComposable
 
     def test_once_differentiable_autograd_vjp(self, device):
+        # [FUNCTION DOC] Checks that using regular autograd on the vjp function result of a
+        # function using a once_differentiable custom Function raises RuntimeError saying it was
+        # marked with once_differentiable when calling backward on the gradient.
         NumpyCubeNotComposable = self._get_NumpyCubeNotComposable()
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Applies the not-composable cube function and returns the
+            # first output.
             y, _ = NumpyCubeNotComposable.apply(x)
             return y
 
@@ -1496,11 +1895,17 @@ class TestAutogradFunction(TestCase):
     # https://github.com/pytorch/pytorch/issues/90224
     @unittest.expectedFailure
     def test_once_differentiable_grad_vjp(self, device):
+        # [FUNCTION DOC] Expected failure (unittest) with TODO linked to issue 90224:
+        # once_differentiable is not supported for grad of vjp. KNOWN ISSUE: the helper below
+        # calls a name f that is not defined in this test (flagged by the linter as undefined), so
+        # the failure is expected regardless of the feature.
         # grad x vjp
         x = torch.randn([], device=device)
         grad_y = torch.randn_like(x)
 
         def h(x, grad_y):
+            # [FUNCTION DOC] HELPER: Runs vjp of the undefined name f at x and returns the vjp
+            # function applied to grad_y.
             _, vjp_fn = vjp(f, x)  # noqa: F821
             (gx,) = vjp_fn(grad_y)
             return gx
@@ -1508,22 +1913,32 @@ class TestAutogradFunction(TestCase):
         grad(h, argnums=(0, 1))(x, grad_y)
 
     def test_grad_fn_name(self, device):
+        # [FUNCTION DOC] Checks that a custom Function applied under grad produces an output whose
+        # grad_fn class name is the Function name plus the suffix GeneratedBackward; the name is
+        # recorded by the inner function into an outer list.
         names = []
 
         class FooBar(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Minimal custom Function that clones its input and passes the
+            # gradient straight through.
             @staticmethod
             def forward(x):
+                # [FUNCTION DOC] HELPER: Returns a clone of the input.
                 return x.clone()
 
             @staticmethod
             def setup_context(ctx, inputs, output):
+                # [FUNCTION DOC] HELPER: Does nothing.
                 return
 
             @staticmethod
             def backward(ctx, grad_output):
+                # [FUNCTION DOC] HELPER: Returns the output gradient unchanged.
                 return grad_output
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Applies the custom function, appends its grad_fn class name
+            # to the outer names list and returns the result.
             y = FooBar.apply(x)
             names.append(type(y.grad_fn).__name__)
             return y
@@ -1535,20 +1950,34 @@ class TestAutogradFunction(TestCase):
 
 @markDynamoStrictTest
 class TestAutogradFunctionVmapAPI(TestCase):
+    # [CLASS DOC] Device-generic tests for the vmap staticmethod protocol of custom autograd
+    # Functions: missing or conflicting vmap support errors, the info object and in_dims
+    # arguments, empty layers, None out dims and return validation.
     def test_no_vmap_staticmethod_and_no_generate_vmap_rule(self, device):
+        # [FUNCTION DOC] Checks that vmap over a custom Function with neither a vmap staticmethod
+        # nor generate_vmap_rule raises RuntimeError saying it does not have vmap support. KNOWN
+        # ISSUE: the forward calls an undefined name to_numpy, but it is never reached since the
+        # error is raised first.
         class NumpyCube(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function that cubes via numpy (helper name undefined
+            # here), with no vmap rule; its backward always raises.
             @staticmethod
             def forward(input):
+                # [FUNCTION DOC] HELPER: Intended to return the cube and derivative of the input
+                # via numpy; refers to an undefined helper so it would fail if called (it is never
+                # reached in the test).
                 input_np = to_numpy(input)  # noqa: F821
                 dinput = torch.tensor(3 * input_np**2, device=input.device)
                 return torch.tensor(input_np**3, device=input.device), dinput
 
             @staticmethod
             def setup_context(ctx, inputs, output):
+                # [FUNCTION DOC] HELPER: Saves the inputs and the second output for backward.
                 ctx.save_for_backward(inputs, output[1])
 
             @staticmethod
             def backward(ctx, grad_output, grad_saved):
+                # [FUNCTION DOC] HELPER: Always raises RuntimeError.
                 raise RuntimeError("foobar")
 
         x = torch.randn(3, device=device)
@@ -1556,25 +1985,36 @@ class TestAutogradFunctionVmapAPI(TestCase):
             vmap(NumpyCube.apply)(x)
 
     def test_has_vmap_staticmethod_and_has_generate_vmap_rule(self, device):
+        # [FUNCTION DOC] Checks that a custom Function defining both a vmap staticmethod and the
+        # generate_vmap_rule flag raises RuntimeError mentioning both when vmapped. KNOWN ISSUE:
+        # forward refers to an undefined name to_numpy but is not reached.
         class NumpyCube(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function with generate_vmap_rule enabled and also a vmap
+            # staticmethod, which is an invalid combination.
             generate_vmap_rule = True
 
             @staticmethod
             def forward(input):
+                # [FUNCTION DOC] HELPER: Intended to return the cube and derivative of the input
+                # via an undefined numpy helper; never reached.
                 input_np = to_numpy(input)  # noqa: F821
                 dinput = torch.tensor(3 * input_np**2, device=input.device)
                 return torch.tensor(input_np**3, device=input.device), dinput
 
             @staticmethod
             def setup_context(ctx, outputs, input):
+                # [FUNCTION DOC] HELPER: Saves the input and the second output for backward
+                # (parameter names are swapped relative to the usual order).
                 ctx.save_for_backward(input, outputs[1])
 
             @staticmethod
             def backward(ctx, grad_output, grad_saved):
+                # [FUNCTION DOC] HELPER: Always raises RuntimeError.
                 raise RuntimeError("foobar")
 
             @staticmethod
             def vmap(infos, in_dims, x):
+                # [FUNCTION DOC] HELPER: Always raises RuntimeError.
                 raise RuntimeError("foobar")
 
         x = torch.randn(3, device=device)
@@ -1582,23 +2022,35 @@ class TestAutogradFunctionVmapAPI(TestCase):
             vmap(NumpyCube.apply)(x)
 
     def test_info_object(self, device):
+        # [FUNCTION DOC] Checks that the info object passed to a custom vmap staticmethod has the
+        # batch size (ten) and the randomness mode, for each of the three modes error, different
+        # and same.
         batch_size = 10
 
         class Id(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function whose vmap staticmethod asserts the batch size
+            # and randomness on the info object against the enclosing test values and returns the
+            # input with its first in_dim.
             @staticmethod
             def forward(input):
+                # [FUNCTION DOC] HELPER: Does nothing (returns None).
                 pass
 
             @staticmethod
             def setup_context(ctx, inputs, output):
+                # [FUNCTION DOC] HELPER: Does nothing.
                 pass
 
             @staticmethod
             def backward(ctx, grad_output, grad_saved):
+                # [FUNCTION DOC] HELPER: Does nothing.
                 pass
 
             @staticmethod
             def vmap(info, in_dims, input):
+                # [FUNCTION DOC] HELPER: Asserts via the enclosing test that info batch size and
+                # randomness equal the expected values, then returns the input and its
+                # single in_dim.
                 self.assertEqual(info.batch_size, batch_size)
                 self.assertEqual(info.randomness, randomness)
                 return input, in_dims[0]
@@ -1609,21 +2061,30 @@ class TestAutogradFunctionVmapAPI(TestCase):
             vmap(Id.apply, randomness=randomness)(x)
 
     def test_in_dims_single_input(self, device):
+        # [FUNCTION DOC] Checks that for a single input the vmap staticmethod receives in_dims as
+        # a one-element tuple, whether the caller gives an int or a one-element tuple.
         class Id(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function whose vmap staticmethod asserts the in_dims is a
+            # tuple holding one and returns the input with its in_dim.
             @staticmethod
             def forward(input):
+                # [FUNCTION DOC] HELPER: Does nothing.
                 pass
 
             @staticmethod
             def setup_context(ctx, inputs, output):
+                # [FUNCTION DOC] HELPER: Does nothing.
                 pass
 
             @staticmethod
             def backward(ctx, grad_output, grad_saved):
+                # [FUNCTION DOC] HELPER: Does nothing.
                 pass
 
             @staticmethod
             def vmap(info, in_dims, input):
+                # [FUNCTION DOC] HELPER: Asserts in_dims equals a one-element tuple holding one,
+                # and returns the input with its in_dim.
                 self.assertEqual(in_dims, (1,))
                 return input, in_dims[0]
 
@@ -1633,21 +2094,31 @@ class TestAutogradFunctionVmapAPI(TestCase):
         vmap(Id.apply, in_dims=(1,))(x)
 
     def test_in_dims_multiple_inputs(self, device):
+        # [FUNCTION DOC] Checks that with two inputs where the second is a list, the vmap
+        # staticmethod receives in_dims as a tuple whose first entry is zero and whose second
+        # entry is a list of two zeros.
         class Id(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function with two inputs whose vmap staticmethod checks
+            # the in_dims structure and returns the inputs with it.
             @staticmethod
             def forward(x, y):
+                # [FUNCTION DOC] HELPER: Does nothing.
                 pass
 
             @staticmethod
             def setup_context(ctx, inputs, output):
+                # [FUNCTION DOC] HELPER: Does nothing.
                 pass
 
             @staticmethod
             def backward(ctx, grad_output, grad_saved):
+                # [FUNCTION DOC] HELPER: Does nothing.
                 pass
 
             @staticmethod
             def vmap(info, in_dims, x, y):
+                # [FUNCTION DOC] HELPER: Asserts in_dims is a tuple with zero and a list, then
+                # returns the inputs and in_dims.
                 self.assertEqual(in_dims, (0, [0, 0]))
                 self.assertTrue(isinstance(in_dims, tuple))
                 self.assertTrue(isinstance(in_dims[1], list))
@@ -1657,24 +2128,35 @@ class TestAutogradFunctionVmapAPI(TestCase):
         vmap(Id.apply)(x, [x, x])
 
     def test_skips_empty_layer(self, device):
+        # [FUNCTION DOC] Checks that a custom Function applied to a constant not batched by vmap
+        # does not invoke the vmap staticmethod (which would raise), i.e. empty vmap layers
+        # are skipped.
         class Id(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function that returns its input and whose vmap
+            # staticmethod raises if called.
             @staticmethod
             def forward(input):
+                # [FUNCTION DOC] HELPER: Returns the input.
                 return input
 
             @staticmethod
             def setup_context(ctx, inputs, output):
+                # [FUNCTION DOC] HELPER: Does nothing.
                 pass
 
             @staticmethod
             def backward(ctx, grad_output, grad_saved):
+                # [FUNCTION DOC] HELPER: Does nothing.
                 pass
 
             @staticmethod
             def vmap(info, in_dims, input):
+                # [FUNCTION DOC] HELPER: Raises RuntimeError saying it should not be called.
                 raise RuntimeError("expected to not be called")
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Applies the custom function to an unbatched constant and
+            # returns the input times one.
             y = torch.tensor(1.0)
             y = Id.apply(y)
             return x * 1
@@ -1683,17 +2165,27 @@ class TestAutogradFunctionVmapAPI(TestCase):
         vmap(f)(x)
 
     def test_none_returns(self, device):
+        # [FUNCTION DOC] Checks that a custom vmap staticmethod may return None as the out dims,
+        # meaning the output is unbatched or all outputs are, for a single output and for a tuple
+        # output; the batched result is expanded to the batch and equals zeros.
         class Zeros(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function producing zeros of the input shape, whose vmap
+            # staticmethod asserts in_dims is zero and returns zeros of the per-sample shape with
+            # None as out dims.
             @staticmethod
             def forward(input):
+                # [FUNCTION DOC] HELPER: Returns zeros with the shape and device of the input.
                 return torch.zeros(input.shape, device=input.device)
 
             @staticmethod
             def setup_context(ctx, inputs, output):
+                # [FUNCTION DOC] HELPER: Does nothing.
                 pass
 
             @staticmethod
             def vmap(info, in_dims, input):
+                # [FUNCTION DOC] HELPER: Raises AssertionError unless in_dims is a one-element
+                # tuple holding zero; returns per-sample zeros and None.
                 if in_dims != (0,):
                     raise AssertionError(f"Expected in_dims == (0,), got {in_dims}")
                 return torch.zeros(input.shape[1:], device=input.device), None
@@ -1704,17 +2196,23 @@ class TestAutogradFunctionVmapAPI(TestCase):
         self.assertEqual(y, torch.zeros_like(x))
 
         class TwoZeros(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function returning the same zeros tensor twice; its vmap
+            # staticmethod returns the zero tuple with None out dims.
             @staticmethod
             def forward(input):
+                # [FUNCTION DOC] HELPER: Returns a tuple of the same zeros tensor twice.
                 r = torch.zeros(input.shape, device=input.device)
                 return r, r
 
             @staticmethod
             def setup_context(ctx, inputs, output):
+                # [FUNCTION DOC] HELPER: Does nothing.
                 pass
 
             @staticmethod
             def vmap(info, in_dims, input):
+                # [FUNCTION DOC] HELPER: Raises AssertionError unless in_dims is a one-element
+                # tuple holding zero; returns a tuple of two per-sample zeros tensors and None.
                 if in_dims != (0,):
                     raise AssertionError(f"Expected in_dims == (0,), got {in_dims}")
                 r = torch.zeros(input.shape[1:], device=input.device)
@@ -1730,18 +2228,28 @@ class TestAutogradFunctionVmapAPI(TestCase):
         self.assertEqual(z, torch.zeros_like(x))
 
     def test_should_have_two_returns(self, device):
+        # [FUNCTION DOC] Checks that the vmap staticmethod must return a pair (output, out dims):
+        # returning only an output, and also returning a four-element tuple, are both expected to
+        # raise RuntimeError saying it must have two returns. KNOWN ISSUE: the second check
+        # applies vmap to the first class (Zeros) again instead of TwoZeros, so the four-return
+        # class is never exercised.
         class Zeros(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function whose vmap staticmethod wrongly returns a single
+            # value rather than a pair.
             @staticmethod
             def forward(input):
+                # [FUNCTION DOC] HELPER: Returns zeros with the shape and device of the input.
                 r = torch.zeros(input.shape, device=input.device)
                 return r
 
             @staticmethod
             def setup_context(ctx, inputs, output):
+                # [FUNCTION DOC] HELPER: Does nothing.
                 pass
 
             @staticmethod
             def vmap(info, in_dims, input):
+                # [FUNCTION DOC] HELPER: Returns per-sample zeros only (invalid, no out dims).
                 r = torch.zeros(input.shape[1:], device=input.device)
                 return r
 
@@ -1751,17 +2259,23 @@ class TestAutogradFunctionVmapAPI(TestCase):
             vmap(Zeros.apply)(x)
 
         class TwoZeros(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function whose vmap staticmethod wrongly returns four
+            # values; never actually applied in the test.
             @staticmethod
             def forward(input):
+                # [FUNCTION DOC] HELPER: Returns a tuple of the same zeros tensor twice.
                 r = torch.zeros(input.shape, device=input.device)
                 return r, r
 
             @staticmethod
             def setup_context(ctx, inputs, output):
+                # [FUNCTION DOC] HELPER: Does nothing.
                 pass
 
             @staticmethod
             def vmap(info, in_dims, input):
+                # [FUNCTION DOC] HELPER: Returns per-sample zeros twice plus two integer zeros
+                # (four values, invalid).
                 r = torch.zeros(input.shape[1:], device=input.device)
                 return r, r, 0, 0
 
@@ -1771,18 +2285,27 @@ class TestAutogradFunctionVmapAPI(TestCase):
             vmap(Zeros.apply)(x)
 
     def test_incompatible_out_dims_error_msg(self, device):
+        # [FUNCTION DOC] Checks that a vmap staticmethod whose out dims structure does not match
+        # the output structure raises RuntimeError saying an incompatible value was returned, for
+        # a tensor output with a tuple out dims and a list output with a tuple out dims.
         class Zeros(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function returning a tensor, whose vmap staticmethod
+            # returns a tensor with a tuple of None as out dims (mismatched structure).
             @staticmethod
             def forward(input):
+                # [FUNCTION DOC] HELPER: Returns zeros with the shape and device of the input.
                 r = torch.zeros(input.shape, device=input.device)
                 return r
 
             @staticmethod
             def setup_context(ctx, inputs, output):
+                # [FUNCTION DOC] HELPER: Does nothing.
                 pass
 
             @staticmethod
             def vmap(info, in_dims, input):
+                # [FUNCTION DOC] HELPER: Returns per-sample zeros and a tuple holding None as out
+                # dims (mismatched).
                 r = torch.zeros(input.shape[1:], device=input.device)
                 return r, (None,)
 
@@ -1792,17 +2315,24 @@ class TestAutogradFunctionVmapAPI(TestCase):
             vmap(Zeros.apply)(x)
 
         class Zeros(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Redefinition for the second check: a Function returning a list,
+            # whose vmap staticmethod returns a list with a tuple of None as out
+            # dims (mismatched).
             @staticmethod
             def forward(input):
+                # [FUNCTION DOC] HELPER: Returns a list holding zeros of the input shape.
                 r = torch.zeros(input.shape, device=input.device)
                 return [r]
 
             @staticmethod
             def setup_context(ctx, inputs, output):
+                # [FUNCTION DOC] HELPER: Does nothing.
                 pass
 
             @staticmethod
             def vmap(info, in_dims, input):
+                # [FUNCTION DOC] HELPER: Returns a list of per-sample zeros and a tuple holding
+                # None as out dims (mismatched).
                 r = torch.zeros(input.shape[1:], device=input.device)
                 return [r], (None,)
 
@@ -1812,19 +2342,29 @@ class TestAutogradFunctionVmapAPI(TestCase):
             vmap(Zeros.apply)(x)
 
     def test_kwarg_only_tensors(self, device):
+        # [FUNCTION DOC] Checks that defining a custom Function with a keyword-only tensor
+        # argument and a vmap rule and then vmapping it raises NotImplementedError saying
+        # kwarg-only Tensor args are unsupported. The class definition and vmap call are both
+        # inside the expected-error block.
         with self.assertRaisesRegex(NotImplementedError, "kwarg-only Tensor args"):
 
             class MyClass(torch.autograd.Function):
+                # [CLASS DOC] HELPER: Custom Function adding a positional input and a keyword-only
+                # input, with a vmap staticmethod returning their sum and an out dim of zero.
                 @staticmethod
                 def forward(x, *, y):
+                    # [FUNCTION DOC] HELPER: Returns the sum of x and the keyword-only y.
                     return x + y
 
                 @staticmethod
                 def setup_context(ctx, inputs, output):
+                    # [FUNCTION DOC] HELPER: Does nothing.
                     pass
 
                 @staticmethod
                 def vmap(info, in_dims, x, *, y):
+                    # [FUNCTION DOC] HELPER: Asserts in_dims is a one-element tuple holding zero
+                    # and returns the sum and out dim zero.
                     if in_dims != (0,):
                         raise AssertionError(f"Expected in_dims == (0,), got {in_dims}")
                     return x + y, 0
@@ -1837,8 +2377,16 @@ class TestAutogradFunctionVmapAPI(TestCase):
 
 @markDynamoStrictTest
 class TestVmapOfGrad(TestCase):
+    # [CLASS DOC] Device-generic tests for vmap of grad: per-sample gradients with views and
+    # in-place ops, new_zeros and new_empty materialization, embedding network gradients, and log
+    # softmax vjp.
     def test_per_sample_grads_inplace_view(self, device):
+        # [FUNCTION DOC] Checks per-sample gradients of a loss that uses an in-place squeeze on a
+        # matrix product: vmap of grad with the weight bound via partial matches a loop of
+        # per-sample grads stacked (absolute tolerance zero, relative tolerance 5e-4).
         def compute_loss(weight, x, t):
+            # [FUNCTION DOC] HELPER: Multiplies x by weight, squeezes the first dim in place and
+            # returns the sum of the difference with the target.
             x = x.mm(weight)
             y = x.squeeze_(0)
             return (y - t).sum()
@@ -1853,10 +2401,14 @@ class TestVmapOfGrad(TestCase):
         self.assertEqual(result, expected, atol=0, rtol=5e-4)
 
     def test_new_zeros_materializes_tensor(self, device):
+        # [FUNCTION DOC] Checks that new_zeros called on a batched tensor inside vmap of grad
+        # yields a tensor that can be filled by copy, with the gradient equal to ones.
         N = 3
         C = 5
 
         def foo(y, x):
+            # [FUNCTION DOC] HELPER: Makes a zero vector via new_zeros on x, copies y into it in
+            # place, returns the sum.
             result = x.new_zeros((C,))
             result.copy_(y)
             return result.sum()
@@ -1867,10 +2419,14 @@ class TestVmapOfGrad(TestCase):
         self.assertEqual(result, torch.ones_like(y))
 
     def test_new_empty_materializes_tensor(self, device):
+        # [FUNCTION DOC] Same as the new_zeros test but using new_empty: the gradient from vmap of
+        # grad is all ones.
         N = 3
         C = 5
 
         def foo(y, x):
+            # [FUNCTION DOC] HELPER: Makes an uninitialized vector via new_empty on x, copies y
+            # into it in place, returns the sum.
             result = x.new_empty((C,))
             result.copy_(y)
             return result.sum()
@@ -1881,7 +2437,11 @@ class TestVmapOfGrad(TestCase):
         self.assertEqual(result, torch.ones_like(y))
 
     def test_per_sample_grads_simple(self, device):
+        # [FUNCTION DOC] Checks per-sample gradients of a squared error of a linear model via vmap
+        # of grad against a loop of grads stacked (zero absolute and 5e-4 relative tolerance).
         def compute_loss(weight, x, t):
+            # [FUNCTION DOC] HELPER: Returns the sum of the squared difference between x times
+            # weight and the target.
             y = x @ weight
             return ((y - t) ** 2).sum()
 
@@ -1895,6 +2455,11 @@ class TestVmapOfGrad(TestCase):
         self.assertEqual(result, expected, atol=0, rtol=5e-4)
 
     def _compare_expected_and_result(self, expected, result, mechanism):
+        # [FUNCTION DOC] HELPER: Compares expected per-sample gradients with batched results. For
+        # make_functional it stacks the per-sample tuples element-wise and compares each element;
+        # otherwise it requires functional_call (raises AssertionError if not), rebuilds a dict of
+        # stacked tensors per key and compares per key. Tolerances are zero absolute and
+        # 1.5e-3 relative.
         if mechanism == "make_functional":
             expected = zip(*expected)
             expected = tuple(torch.stack(shards) for shards in expected)
@@ -1915,14 +2480,24 @@ class TestVmapOfGrad(TestCase):
     @tf32_on_and_off(0.005)
     @parametrize("mechanism", ["make_functional", "functional_call"])
     def test_per_sample_grads_embeddingnet(self, device, mechanism):
+        # [FUNCTION DOC] Parametrized over make_functional and functional_call and run with TF32
+        # on and off. Builds an embedding-based network, computes per-sample gradients through
+        # vmap of grad and compares with a loop over 64 samples via the comparison helper.
         class SampleNet(nn.Module):
+            # [CLASS DOC] HELPER: Small network with an embedding of the vocabulary to 16 dims,
+            # followed by transposing, a mean over the last dim, a linear layer, relu and a linear
+            # layer to 2 outputs.
             def __init__(self, vocab_size: int):
+                # [FUNCTION DOC] HELPER: Creates the embedding and two linear layers for the given
+                # vocabulary size.
                 super().__init__()
                 self.emb = nn.Embedding(vocab_size, 16)
                 self.fc1 = nn.Linear(16, 16)
                 self.fc2 = nn.Linear(16, 2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Embeds the input, swaps the last two dims, averages over
+                # the last dim, then applies linear, relu and linear; returns the result.
                 x = self.emb(x)
                 x = torch.transpose(x, -1, -2)
                 x = torch.mean(x, -1)
@@ -1932,6 +2507,7 @@ class TestVmapOfGrad(TestCase):
                 return x
 
             def name(self):
+                # [FUNCTION DOC] HELPER: Returns the string SampleNet.
                 return "SampleNet"
 
         # Create our inputs...
@@ -1950,6 +2526,8 @@ class TestVmapOfGrad(TestCase):
         net_func, weights = _get_weights_and_functional_call(net, mechanism)
 
         def compute_loss(weights, data, target):
+            # [FUNCTION DOC] HELPER: Runs the functional network with the weights and data and
+            # returns the cross entropy against the target.
             output = net_func(weights, data)
             result = criterion(output, target)
             return result
@@ -1959,10 +2537,15 @@ class TestVmapOfGrad(TestCase):
         self._compare_expected_and_result(expected, result, mechanism)
 
     def test_log_softmax(self, device):
+        # [FUNCTION DOC] Checks vjp of log softmax inside vmap (input batched, cotangent not)
+        # equals the gradient obtained by regular autograd backward with the cotangent expanded to
+        # the input shape.
         x = torch.randn(3, 5, device=device)
         v = torch.randn(5, device=device)
 
         def foo(x, v):
+            # [FUNCTION DOC] HELPER: Runs vjp of log softmax over the last dim at x and returns
+            # the gradient for the cotangent v.
             _, vjp_fn = vjp(partial(torch.log_softmax, dim=-1), x)
             return vjp_fn(v)[0]
 
@@ -1984,8 +2567,14 @@ FIXME_jacrev_only = parametrize("jacapi", [subtest(jacrev, name="jacrev")])
 
 @markDynamoStrictTest
 class TestJac(VmapTearDownMixin, TestCase):
+    # [CLASS DOC] Device-generic tests for jacrev and jacfwd (parametrized by the decorator over
+    # both APIs unless noted): simple and non-flat inputs, vmap and nesting, argnums, pytree
+    # inputs and outputs, has_aux, and later sections. Uses the mixin to clean up leaked vmap
+    # nesting under Dynamo.
     @jacrev_and_jacfwd
     def test_simple(self, device, jacapi):
+        # [FUNCTION DOC] Checks the Jacobian of sin on a vector equals the diagonal matrix
+        # of cosine.
         x = torch.randn(3, device=device)
         y = jacapi(torch.sin)(x)
         expected = torch.diagflat(x.cos())
@@ -1994,6 +2583,8 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_simple_not_flat(self, device, jacapi):
+        # [FUNCTION DOC] Checks the Jacobian of sin for a 2 by 3 input has shape 2,3,2,3 and
+        # equals the reshaped diagonal of cosine.
         x = torch.randn(2, 3, device=device)
         y = jacapi(torch.sin)(x)
         expected = torch.diagflat(x.view(-1).cos())
@@ -2003,9 +2594,14 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_take(self, device, jacapi):
+        # [FUNCTION DOC] Checks the Jacobian of an index-select (take) function equals the one
+        # from the torch.autograd.functional Jacobian. KNOWN ISSUE: it always calls jacrev rather
+        # than the jacapi parameter, so the jacfwd variant tests jacrev too.
         x = torch.rand(5)
 
         def func(x):
+            # [FUNCTION DOC] HELPER: Takes elements of x at an index tensor of three ones and
+            # returns them.
             y = torch.ones(3, dtype=torch.long)
             z = torch.take(x, y)
             return z
@@ -2014,10 +2610,15 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_diff_numel(self, device, jacapi):
+        # [FUNCTION DOC] Checks the Jacobian of a function mapping a 2 by 4 input to a 3 by 1
+        # output (a slice of the first row) has shape 3,1,2,4 with ones at the three expected
+        # positions and zeros elsewhere.
         x = torch.randn(2, 4, device=device)
 
         # Tensor[2, 4] -> Tensor[3, 1]
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns elements one onward of the first row, with a trailing
+            # dim added.
             return x[0, 1:].unsqueeze(-1)
 
         y = jacapi(f)(x)
@@ -2031,6 +2632,8 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_vmap_on_jac_simple(self, device, jacapi):
+        # [FUNCTION DOC] Checks vmap over the Jacobian of sin gives a stack of per-row diagonal
+        # matrices of cosine.
         x = torch.randn(2, 3, device=device)
         y = vmap(jacapi(torch.sin))(x)
         expected = torch.stack([torch.diagflat(x[i].cos()) for i in range(2)])
@@ -2039,7 +2642,10 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_nested_jac_simple(self, device, jacapi):
+        # [FUNCTION DOC] Checks the Jacobian of the Jacobian (nested) of a scalar function, sum of
+        # sin, is the diagonal matrix of minus sin.
         def foo(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of sin of the input.
             return x.sin().sum()
 
         x = torch.randn(3, device=device)
@@ -2050,6 +2656,8 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_multiple_args(self, device, jacapi):
+        # [FUNCTION DOC] Checks the Jacobian of an elementwise product with respect to the second
+        # argument (argnums one) is the diagonal matrix of the first argument.
         x = torch.randn(3, device=device)
         y = torch.randn(3, device=device)
         z = jacapi(torch.multiply, argnums=1)(x, y)
@@ -2059,7 +2667,12 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_multiple_outputs_multiple_argnums(self, device, jacapi):
+        # [FUNCTION DOC] Checks the Jacobian of a function with two outputs and argnums of both
+        # inputs is a tuple of tuples of diagonal matrices holding the expected linear
+        # coefficients per output and input.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Returns a tuple of two linear combinations of x and y with
+            # coefficients two,three and four,five.
             return 2 * x + 3 * y, 4 * x + 5 * y
 
         x = torch.randn(3, device=device)
@@ -2081,7 +2694,12 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_multiple_outputs_single_argnums(self, device, jacapi):
+        # [FUNCTION DOC] Checks that with two outputs a single int argnums yields a tuple of
+        # per-output Jacobians, while a one-element tuple argnums yields a tuple of
+        # one-element tuples.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Returns a tuple of two linear combinations of x and y with
+            # coefficients two,three and four,five.
             return 2 * x + 3 * y, 4 * x + 5 * y
 
         x = torch.randn(3, device=device)
@@ -2102,7 +2720,11 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_multiple_outputs_pytree(self, device, jacapi):
+        # [FUNCTION DOC] Checks that dict outputs produce a dict result whose entries are tuples
+        # of Jacobians over both inputs, equal to the expected diagonal matrices.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Returns a dict with a left and a right linear combination of
+            # x and y.
             return {"left": 2 * x + 3 * y, "right": 4 * x + 5 * y}
 
         x = torch.randn(3, device=device)
@@ -2123,7 +2745,12 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_multiple_inputs_pytree(self, device, jacapi):
+        # [FUNCTION DOC] Checks Jacobians with pytree inputs for scalar data and argnums covering
+        # all arguments, only the pair argument, and the default; results mirror the input
+        # structure with the expected constant coefficients.
         def f(a, b, c):
+            # [FUNCTION DOC] HELPER: Unpacks a pair from a and returns a weighted sum of its
+            # elements, b and c with weights one, two, three, four.
             a0, a1 = a
             return a0 + a1 * 2 + b * 3 + c * 4
 
@@ -2150,7 +2777,10 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_dimensionality(self, device, jacapi):
+        # [FUNCTION DOC] Checks the Jacobian of the identity function: a scalar input gives a
+        # zero-dimensional ones result and a length-one vector gives a one by one matrix of one.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the input.
             return x
 
         x = torch.randn([], device=device)
@@ -2165,7 +2795,11 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_aux_tensor(self, device, jacapi):
+        # [FUNCTION DOC] Checks has_aux with a tensor aux: result is the identity Jacobian and the
+        # aux value is the cosine of the input.
         def f(x):
+            # [FUNCTION DOC] HELPER: Clones the input and returns it with the cosine of the clone
+            # as aux.
             y = x.clone()
             return y, y.cos()
 
@@ -2177,7 +2811,12 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_aux_pytree(self, device, jacapi):
+        # [FUNCTION DOC] Checks has_aux with a pytree aux is returned intact and the Jacobian is
+        # the identity, and non-tensor aux values (int, float, string, or lists containing them)
+        # raise RuntimeError about unsupported types.
         def f(x):
+            # [FUNCTION DOC] HELPER: Clones the input and returns it together with an aux dict of
+            # cosine and a list holding tangent.
             y = x.clone()
             return y, {"a": y.cos(), "b": [y.tan()]}
 
@@ -2200,6 +2839,10 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_outputs_can_any_pytree(self, device, jacapi):
+        # [FUNCTION DOC] Checks which output types the Jacobian APIs accept: None and empty tuple
+        # raise RuntimeError about non-empty output, scalars, bool, float and string outputs raise
+        # RuntimeError about only tensors; list, dict and nested list/tuple/dict outputs work and
+        # keep their structure.
         x = torch.randn(2, 3, device=device)
 
         for output in [None, ()]:
@@ -2231,6 +2874,8 @@ class TestJac(VmapTearDownMixin, TestCase):
             )
 
         def composite_output(x):
+            # [FUNCTION DOC] HELPER: Returns a list with a tuple of the sum and a dict of the
+            # input and a list of the input and the sum.
             out = x.sum()
             return [
                 (out, {"a": x, "out": [x, out]}),
@@ -2246,7 +2891,13 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_multiple_inputs_outputs_pytree(self, device, jacapi):
+        # [FUNCTION DOC] Checks Jacobians with pytree inputs and a pytree output (a tuple of a
+        # tensor and a dict) for default argnums, a one-element argnums tuple and an argnums tuple
+        # of two. Results mirror the output structure and then the input structure, with constant
+        # coefficients and zeros for entries that do not contribute.
         def f(a, b, c):
+            # [FUNCTION DOC] HELPER: Unpacks a pair from a and returns the combination of its
+            # elements, plus a dict with foo holding the combination of b and c.
             a0, a1 = a
             return a0 + a1 * 2, {"foo": b * 3 + c * 4}
 
@@ -2280,7 +2931,12 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_multiple_inputs_outputs_pytree_multidim(self, device, jacapi):
+        # [FUNCTION DOC] Checks the Jacobian of a function taking a dict of two same-shaped
+        # vectors and returning a dict gives a nested dict: each output key maps to a dict by
+        # input key holding a diagonal matrix of the derivative or zeros.
         def f(dct):
+            # [FUNCTION DOC] HELPER: Returns a dict with c as sin of entry a and d as cosine of
+            # entry b.
             a = dct["a"]
             b = dct["b"]
             return {"c": a.sin(), "d": b.cos()}
@@ -2297,7 +2953,10 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_unrelated_input(self, device, jacapi):
+        # [FUNCTION DOC] Checks that an input unused by the function gets an all-zero Jacobian
+        # while the used one gets the identity, with both argnums requested and a tuple result.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Returns the first argument and ignores the second.
             return x
 
         x = torch.randn(2, 3, device=device)
@@ -2312,9 +2971,12 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_unrelated_output(self, device, jacapi):
+        # [FUNCTION DOC] Checks that a function returning a captured tensor, unrelated to its
+        # input, has an all-zero Jacobian of shape output dims followed by input dims.
         y = torch.randn(2, 3, device=device)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Ignores its input and returns the captured tensor.
             return y
 
         x = torch.randn(2, 3, device=device)
@@ -2325,10 +2987,13 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_empty_output(self, device, jacapi):
+        # [FUNCTION DOC] Checks that a function returning an empty tuple raises RuntimeError whose
+        # message contains the text xpected.
         x = torch.randn(3, device=device)
         y = torch.randn(3, device=device)
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Returns an empty tuple.
             return ()
 
         with self.assertRaisesRegex(RuntimeError, "xpected"):
@@ -2336,6 +3001,8 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_argnums_tuple(self, device, jacapi):
+        # [FUNCTION DOC] Checks argnums of a tuple of both inputs on an elementwise product gives
+        # a pair of diagonal matrices (of the other input).
         x = torch.randn(3, device=device)
         y = torch.randn(3, device=device)
         z = jacapi(torch.multiply, argnums=(0, 1))(x, y)
@@ -2350,6 +3017,8 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_argnums_effect_on_return(self, device, jacapi):
+        # [FUNCTION DOC] Checks that a one-element tuple of argnums yields a one-element tuple
+        # result while an int argnums yields a plain tensor.
         x = torch.randn(3, device=device)
         y = torch.randn(3, device=device)
         z = jacapi(torch.multiply, argnums=(0,))(x, y)
@@ -2372,7 +3041,9 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_argnums_defaults_to_zero(self, device, jacapi):
+        # [FUNCTION DOC] Checks that the default argnums differentiates only the first argument.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Returns two times x plus three times y.
             return x * 2 + y * 3
 
         x = torch.randn(3, device=device)
@@ -2383,30 +3054,40 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_empty_argnums(self, device, jacapi):
+        # [FUNCTION DOC] Checks that empty argnums raises RuntimeError saying it must
+        # be non-empty.
         x = torch.randn(3, device=device)
         with self.assertRaisesRegex(RuntimeError, "must be non-empty"):
             jacapi(torch.sin, argnums=())(x)
 
     @jacrev_and_jacfwd
     def test_out_of_bounds_argnums(self, device, jacapi):
+        # [FUNCTION DOC] Checks that an argnums value beyond the number of inputs raises
+        # RuntimeError mentioning only one positional input.
         x = torch.randn(3, device=device)
         with self.assertRaisesRegex(RuntimeError, "only 1 positional inputs"):
             jacapi(torch.sin, argnums=2)(x)
 
     @jacrev_and_jacfwd
     def test_negative_argnums(self, device, jacapi):
+        # [FUNCTION DOC] Checks that a too-negative argnums raises RuntimeError mentioning only
+        # one positional input.
         x = torch.randn(3, device=device)
         with self.assertRaisesRegex(RuntimeError, "only 1 positional inputs"):
             jacapi(torch.sin, argnums=-2)(x)
 
     @jacrev_and_jacfwd
     def test_repeated_argnums(self, device, jacapi):
+        # [FUNCTION DOC] Checks that duplicate argnums raise RuntimeError saying they must
+        # be unique.
         x = torch.randn(3, device=device)
         with self.assertRaisesRegex(RuntimeError, "must be unique"):
             jacapi(torch.sin, argnums=(0, 0))(x)
 
     @jacrev_and_jacfwd
     def test_float_argnums(self, device, jacapi):
+        # [FUNCTION DOC] Checks that a float argnums raises RuntimeError saying it must be int or
+        # Tuple, and a tuple with a float element raises RuntimeError saying it must be int.
         x = torch.randn(3, device=device)
         with self.assertRaisesRegex(RuntimeError, "must be int or Tuple"):
             jacapi(torch.sin, argnums=0.0)(x)
@@ -2414,14 +3095,22 @@ class TestJac(VmapTearDownMixin, TestCase):
             jacapi(torch.multiply, argnums=(1, 0.0))(x, x)
 
     def test_hessian_simple(self, device):
+        # [FUNCTION DOC] Smoke test: computes the hessian of an elementwise sin on a vector and
+        # does not check the result.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns sin of the input.
             return x.sin()
 
         x = torch.randn(3, device=device)
         hessian(f)(x)
 
     def _test_against_reference(self, f, inputs, jacapi):
+        # [FUNCTION DOC] HELPER: Compares the Jacobian API under test (a parameter) applied to a
+        # wrapper taking one tuple of inputs with the reference Jacobian from
+        # torch.autograd.functional called on the function with the inputs; asserts equality.
         def foo(inputs):
+            # [FUNCTION DOC] HELPER: Unpacks the tuple of inputs into positional arguments for
+            # the function.
             return f(*inputs)
 
         expected = torch.autograd.functional.jacobian(f, inputs)
@@ -2430,7 +3119,10 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_against_reference_simple(self, device, jacapi):
+        # [FUNCTION DOC] Compares against the reference Jacobian for an elementwise function of
+        # one 3-d input.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns three times the square of the input.
             return 3 * x**2
 
         x = torch.randn(2, 3, 5, device=device)
@@ -2438,7 +3130,11 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_against_reference_multi_input(self, device, jacapi):
+        # [FUNCTION DOC] Compares against the reference Jacobian for a function of two matrices
+        # (elementwise then matrix product).
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Returns the matrix product of x times its cosine with the
+            # sine of y.
             return (x.cos() * x) @ y.sin()
 
         x = torch.randn(2, 3, device=device)
@@ -2447,7 +3143,11 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_against_reference_multi_input_multi_output(self, device, jacapi):
+        # [FUNCTION DOC] Compares against the reference Jacobian for a function with two inputs
+        # and three outputs.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Returns three outputs: a squared product, a matrix product
+            # with a row-summed scaled y, and the sum of y.
             return (x * x) @ y, x @ (x.sum(1) * y), y.sum()
 
         x = torch.randn(5, 3, device=device)
@@ -2456,7 +3156,10 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_against_reference_unrelated_outputs(self, device, jacapi):
+        # [FUNCTION DOC] Compares against the reference Jacobian for a function returning its
+        # inputs, so outputs are unrelated to each other and repeated.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Returns x, y, x, y.
             return x, y, x, y
 
         x = torch.randn(2, device=device)
@@ -2465,8 +3168,12 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_against_reference_zero_dim(self, device, jacapi):
+        # [FUNCTION DOC] Compares against the reference Jacobian for zero-dimensional outputs, a
+        # zero-dimensional input, and a mix of zero-dimensional input with scalar-reducing output.
         # zero-dim output
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Returns the sum of x, the sum of y and their
+            # elementwise product.
             return x.sum(), y.sum(), x * y
 
         x = torch.randn(3, device=device)
@@ -2475,6 +3182,7 @@ class TestJac(VmapTearDownMixin, TestCase):
 
         # zero-dim input
         def g(x):
+            # [FUNCTION DOC] HELPER: Returns three copies of x stacked.
             return torch.stack([x, x, x])
 
         x = torch.randn([], device=device)
@@ -2482,6 +3190,7 @@ class TestJac(VmapTearDownMixin, TestCase):
 
         # Mixed zero-dim input / zero-dim output
         def h(x, y):
+            # [FUNCTION DOC] HELPER: Returns the sum of y and the product x times y.
             return y.sum(), x * y
 
         x = torch.randn([], device=device)
@@ -2490,7 +3199,12 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_against_reference_correctness_different_devices(self, device, jacapi):
+        # [FUNCTION DOC] Compares against the reference Jacobian where inputs are CPU tensors and
+        # one output is moved to the test device (the device parameter), checking
+        # cross-device correctness.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Returns the product of x and y and a copy of that product
+            # moved to the test device.
             return x * y, (x * y).to(device=device)
 
         x = torch.randn(3)
@@ -2499,7 +3213,10 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_against_reference_default_arg(self, device, jacapi):
+        # [FUNCTION DOC] Compares against the reference Jacobian for a function with a defaulted
+        # third parameter not passed as input.
         def f(x, y, z=3.0):
+            # [FUNCTION DOC] HELPER: Returns the product of x, y and z.
             return x * y * z
 
         x = torch.randn(3, device=device)
@@ -2508,7 +3225,12 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_inplace(self, device, jacapi):
+        # [FUNCTION DOC] Checks Jacobians of functions that mutate an argument in place: copying x
+        # into y and returning y gives identity for argnums zero; slice-assigning y into x in a
+        # function returning stacked sums with argnums one and two gives the expected block
+        # structure of cross terms.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Copies x into y in place and returns y.
             y.copy_(x)
             return y
 
@@ -2518,6 +3240,8 @@ class TestJac(VmapTearDownMixin, TestCase):
 
         # testing tuple of argnums with the example that raised this issue originally
         def g(x, y, z):
+            # [FUNCTION DOC] HELPER: Assigns y into the first two elements of x in place and
+            # returns a column stack of the sum of x squared and the sum of z cubed.
             x[:2] = y
             return torch.vstack([(x**2).sum(), (z**3).sum()])
 
@@ -2540,10 +3264,16 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @parametrize("_preallocate_and_copy", (True, False))
     def test_chunk_jacrev(self, device, _preallocate_and_copy):
+        # [FUNCTION DOC] Parametrized over the preallocate-and-copy option of jacrev. Checks that
+        # jacrev with various chunk sizes (including larger than the output) equals the unchunked
+        # result for a nested tuple output with two argnums, and that a chunk size of zero or
+        # negative raises ValueError about chunk_size being greater than zero.
         x = torch.randn(10, 2, device=device)
         y = torch.randn(1, 2, device=device)
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Returns a nested tuple of sin of x, x plus y, x plus two, and
+            # the sum of x.
             return (x.sin(), x + y), (x + 2, x.sum())
 
         for chunk_size in (1, 2, 3, 4, 7, 10, 1000):
@@ -2565,10 +3295,14 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @parametrize("_preallocate_and_copy", (True, False))
     def test_chunk_jacrev_composition(self, device, _preallocate_and_copy):
+        # [FUNCTION DOC] Parametrized over the preallocate-and-copy option. Checks that vmap over
+        # nested jacrev with chunk size three equals the unchunked result.
         x = torch.randn(10, 2, device=device)
         chunk_size = 3
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns a nested tuple of sin of x, x, x plus two and the sum
+            # of x.
             return (x.sin(), x), (x + 2, x.sum())
 
         expected = vmap(jacrev(jacrev(f)))(x)
@@ -2587,6 +3321,11 @@ class TestJac(VmapTearDownMixin, TestCase):
     # https://github.com/pytorch/pytorch/issues/127036
     @parametrize("_preallocate_and_copy", (True, False))
     def test_chunk_jacrev_chunksize_one(self, device, _preallocate_and_copy):
+        # [FUNCTION DOC] Regression test for issue 127036, parametrized over the
+        # preallocate-and-copy option. With chunk size one, jacrev does not use vmap, so a custom
+        # Function whose backward does a data-dependent (nonzero) op still works and matches the
+        # reference; with chunk size two it raises RuntimeError about batching operators with
+        # dynamic output shape.
         # With chunk_size=1, we shouldn't `vmap` and hence not be limited
         # by it's constraints.
         x = torch.randn(3, 3, device=device)
@@ -2594,21 +3333,28 @@ class TestJac(VmapTearDownMixin, TestCase):
         # Function with Dynamic Op in Backward.
         # This should cause jacrev/vmap(vjp) to fail.
         class IdentityWithDynamicBackwardOp(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function that returns its input and whose backward calls
+            # nonzero (dynamic output shape) on the gradient and returns the gradient.
             @staticmethod
             def forward(input):
+                # [FUNCTION DOC] HELPER: Returns the input.
                 return input
 
             @staticmethod
             def setup_context(ctx, inputs, output):
+                # [FUNCTION DOC] HELPER: Does nothing.
                 pass
 
             @staticmethod
             def backward(ctx, grad_output):
+                # [FUNCTION DOC] HELPER: Calls nonzero on the gradient, discarding the result, and
+                # returns the gradient.
                 # dynamic op in backward pass.
                 grad_output.nonzero()
                 return grad_output
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Applies the custom function.
             return IdentityWithDynamicBackwardOp.apply(x)
 
         # With `chunk_size=1`, we don't use vmap. So the following should work.
@@ -2625,9 +3371,13 @@ class TestJac(VmapTearDownMixin, TestCase):
             jacrev(f, chunk_size=2, _preallocate_and_copy=_preallocate_and_copy)(x)
 
     def test_complex_error(self, device):
+        # [FUNCTION DOC] Checks that complex inputs and complex outputs raise RuntimeError for
+        # both jacrev and jacfwd, with messages naming the API and saying all inputs (or outputs)
+        # are expected to be real.
         # Verify complex input raises error
         # C -> C
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns the complex conjugate of the input.
             return x.conj()
 
         x = torch.randn(1, device=device, dtype=torch.cfloat)
@@ -2641,6 +3391,8 @@ class TestJac(VmapTearDownMixin, TestCase):
         # Verify complex output raises error
         # R -> C
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns the conjugate of the input times an imaginary
+            # constant, giving a complex output from a real input.
             return torch.conj(x * 0.5j)
 
         x = torch.randn(1, device=device, dtype=torch.float)
@@ -2653,7 +3405,10 @@ class TestJac(VmapTearDownMixin, TestCase):
 
     @jacrev_and_jacfwd
     def test_jac_with_non_tensor_args(self, device, jacapi):
+        # [FUNCTION DOC] Checks that a non-tensor positional argument (an int) is allowed: the
+        # Jacobian of an add with the int equals the reference with the int bound by keyword.
         def f(t, int_x):
+            # [FUNCTION DOC] HELPER: Returns the tensor plus the int.
             return t + int_x
 
         t = torch.randn(3, 3, device=device)
@@ -2665,8 +3420,14 @@ class TestJac(VmapTearDownMixin, TestCase):
 
 @markDynamoStrictTest
 class TestHessian(TestCase):
+    # [CLASS DOC] Device-generic tests for hessian, comparing against the reference hessian from
+    # torch.autograd.functional and checking vmap composition across Jacobian levels.
     def _test_against_reference(self, f, inputs):
+        # [FUNCTION DOC] HELPER: Asserts that the hessian of a wrapper taking a tuple of inputs
+        # equals the reference hessian from torch.autograd.functional.
         def foo(inputs):
+            # [FUNCTION DOC] HELPER: Unpacks the tuple of inputs into positional arguments for
+            # the function.
             return f(*inputs)
 
         expected = torch.autograd.functional.hessian(f, inputs)
@@ -2674,14 +3435,21 @@ class TestHessian(TestCase):
         self.assertEqual(result, expected)
 
     def test_hessian_vectorize_correctness_simple(self, device):
+        # [FUNCTION DOC] Compares the hessian against the reference for a scalar function of one
+        # 3-d input.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of three times the square of the input.
             return (3 * x**2).sum()
 
         x = torch.randn(2, 3, 5, device=device)
         self._test_against_reference(f, (x,))
 
     def test_hessian_vectorize_correctness_multi_input(self, device):
+        # [FUNCTION DOC] Compares the hessian against the reference for a scalar function of
+        # three inputs.
         def f(x, y, z):
+            # [FUNCTION DOC] HELPER: Returns the sum of relu-scaled x times sin of y
+            # matrix-multiplied by z.
             return ((x.relu() * x) @ y.sin() @ z).sum()
 
         x = torch.randn(2, 3, device=device)
@@ -2690,8 +3458,11 @@ class TestHessian(TestCase):
         self._test_against_reference(f, (x, y, z))
 
     def test_hessian_vectorize_correctness_unrelated_outputs(self, device):
+        # [FUNCTION DOC] Compares the hessian against the reference when the output is unrelated
+        # to one input, and when the output is a constant unrelated to all inputs.
         # output unrelated to one input
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Returns the sum of squares of x, ignoring y.
             return (x**2).sum()
 
         x = torch.randn(2, device=device)
@@ -2700,6 +3471,7 @@ class TestHessian(TestCase):
 
         # output unrelated to all inputs
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Returns a constant scalar one, ignoring both inputs.
             return torch.ones([])
 
         x = torch.randn(2, device=device)
@@ -2711,6 +3483,9 @@ class TestHessian(TestCase):
         "Frame Handling Difference between Python versions",
     )
     def test_jacfwd_different_levels(self, device):
+        # [FUNCTION DOC] Regression test for functorch issue 597: vmap of nested jacrev and vmap
+        # of hessian of a squared residual loss over a batch give the same Hessian. Skipped under
+        # Dynamo on Python before 3.14 due to frame handling differences.
         # Test case from:
         # https://github.com/pytorch/functorch/issues/597
         b = 8
@@ -2721,6 +3496,8 @@ class TestHessian(TestCase):
         A = 0.1 * torch.randn(b, d, d, device=device)
 
         def loss(A, x1, x2):
+            # [FUNCTION DOC] HELPER: Returns the sum of squares of the difference between x2 and
+            # the transposed product of A with the transposed x1.
             x2_hat = (A @ (x1.T)).T
             res = x2 - x2_hat
             res_sqr = res**2
@@ -2733,11 +3510,18 @@ class TestHessian(TestCase):
 
 @markDynamoStrictTest
 class TestJvp(TestCase):
+    # [CLASS DOC] Device-generic tests for jvp: simple, multiple and pytree inputs, validation
+    # errors, unrelated inputs and outputs, strict mode, has_aux and interaction with forward-grad
+    # enabling and autograd Functions.
     def test_inplace_on_captures(self, device):
+        # [FUNCTION DOC] Checks that mutating a captured tensor in place from a function run under
+        # grad raises RuntimeError saying a captured Tensor cannot be mutated.
         x = torch.tensor([1.0, 2.0, 3.0], device=device)
         captured = torch.randn(3, device=device)
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Copies the input into the captured tensor in place and
+            # returns the sum of their product.
             captured.copy_(x)
             return (x * captured).sum()
 
@@ -2745,6 +3529,7 @@ class TestJvp(TestCase):
             grad(foo)(x)
 
     def test_simple(self, device):
+        # [FUNCTION DOC] Checks jvp of sin returns a tuple of sin and cosine times the tangent.
         x = torch.randn(2, 3, device=device)
         t = torch.randn(2, 3, device=device)
         result = jvp(torch.sin, (x,), (t,))
@@ -2753,12 +3538,15 @@ class TestJvp(TestCase):
         self.assertEqual(result, expected)
 
     def test_multiple_inputs(self, device):
+        # [FUNCTION DOC] Checks jvp for a product of two inputs returns the product and the
+        # product rule tangent.
         x = torch.randn(2, 3, device=device)
         y = torch.randn(2, 3, device=device)
         tx = torch.randn(2, 3, device=device)
         ty = torch.randn(2, 3, device=device)
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Returns the product of x and y.
             return x * y
 
         result = jvp(f, (x, y), (tx, ty))
@@ -2767,7 +3555,11 @@ class TestJvp(TestCase):
         self.assertEqual(result, expected)
 
     def test_pytree_inputs(self, device):
+        # [FUNCTION DOC] Checks jvp with a nested tuple primal and unit tangents gives primal and
+        # tangent outputs equal to ten.
         def f(x, y, z):
+            # [FUNCTION DOC] HELPER: Unpacks a pair from x and returns a weighted sum of its
+            # elements, y and z with weights one, two, three, four.
             a, b = x
             return a + 2 * b + 3 * y + 4 * z
 
@@ -2779,7 +3571,11 @@ class TestJvp(TestCase):
         self.assertEqual(tangent_outs, one * 10)
 
     def test_pytree_inputs_error_cases(self, device):
+        # [FUNCTION DOC] Checks jvp error messages: primals not a tuple; primals and tangents of
+        # different structure; non-tensor leaves in primals or tangents; a primals tuple
+        # containing only an empty tuple (no tensor).
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns its input.
             return x
 
         one = torch.tensor(1.0, device=device)
@@ -2796,7 +3592,10 @@ class TestJvp(TestCase):
             jvp(f, ((),), ((),))
 
     def test_unrelated_input(self, device):
+        # [FUNCTION DOC] Checks jvp where the function ignores the second input: result is the
+        # first input and its tangent.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Returns x and ignores y.
             return x
 
         x = torch.randn(2, 3, device=device)
@@ -2810,9 +3609,12 @@ class TestJvp(TestCase):
         self.assertEqual(result, expected)
 
     def test_unrelated_output(self, device):
+        # [FUNCTION DOC] Checks jvp where the output is an unrelated captured tensor: the tangent
+        # output is zeros.
         y = torch.randn(2, 3, device=device)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Ignores the input and returns the captured tensor.
             return y
 
         x = torch.randn(2, 3, device=device)
@@ -2824,9 +3626,12 @@ class TestJvp(TestCase):
         self.assertEqual(result, expected)
 
     def test_strict_mode(self, device):
+        # [FUNCTION DOC] Checks that jvp with strict mode on raises RuntimeError mentioning strict
+        # when an output does not depend on the inputs.
         y = torch.randn(2, 3, device=device)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the input and an unrelated captured tensor.
             return x, y
 
         x = torch.randn(2, 3, device=device)
@@ -2836,10 +3641,12 @@ class TestJvp(TestCase):
             jvp(f, (x,), (tx,), strict=True)
 
     def test_multiple_outputs(self, device):
+        # [FUNCTION DOC] Checks jvp with two outputs returns primal outputs and tuple of tangents.
         x = torch.randn(2, 3, device=device)
         t = torch.randn(2, 3, device=device)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns sin and cosine of the input.
             return torch.sin(x), torch.cos(x)
 
         result = jvp(f, (x,), (t,))
@@ -2848,12 +3655,15 @@ class TestJvp(TestCase):
         self.assertEqual(result, expected)
 
     def test_multiple_inputs_outputs(self, device):
+        # [FUNCTION DOC] Checks jvp of a linear function with two inputs and outputs equals the
+        # function applied to primals and the function applied to tangents.
         x = torch.randn(2, 3, device=device)
         y = torch.randn(2, 3, device=device)
         tx = torch.randn(2, 3, device=device)
         ty = torch.randn(2, 3, device=device)
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Returns two linear combinations of x and y.
             return 2 * x + 3 * y, 4 * x + 5 * y
 
         result = jvp(f, (x, y), (tx, ty))
@@ -2862,7 +3672,10 @@ class TestJvp(TestCase):
         self.assertEqual(result, expected)
 
     def test_jvp_new_tensor(self):
+        # [FUNCTION DOC] Checks that creating a tensor with new_tensor from the input inside jvp
+        # works, and with zero tangents the output tangent is zeros.
         def f(x):
+            # [FUNCTION DOC] HELPER: Adds a new scalar tensor made by new_tensor to the input.
             y = x.new_tensor(0.5)
             return x + y
 
@@ -2873,6 +3686,8 @@ class TestJvp(TestCase):
         self.assertEqual(actual, expected)
 
     def test_primals_tangents_length_mismatch(self, device):
+        # [FUNCTION DOC] Checks jvp raises RuntimeError about the same python structure when the
+        # tangents tuple length differs from the primals tuple length.
         x = torch.randn(2, 3, device=device)
         t = torch.randn(2, 3, device=device)
 
@@ -2883,10 +3698,15 @@ class TestJvp(TestCase):
             jvp(torch.sin, (x, x), (t, t, t))
 
     def test_nonempty_primals_and_tangents(self, device):
+        # [FUNCTION DOC] Checks that empty primals and tangents raise RuntimeError saying at least
+        # one Tensor is required.
         with self.assertRaisesRegex(RuntimeError, "at least one Tensor"):
             jvp(torch.sin, (), ())
 
     def test_inputs_are_tuples_of_tensors(self, device):
+        # [FUNCTION DOC] Checks jvp argument validation: primals not a tuple, tangents not a tuple
+        # or a list instead, and non-tensor entries in primals or tangents, each raising
+        # RuntimeError with the matching message fragment.
         x = torch.randn(2, 3, device=device)
         t = torch.randn(2, 3, device=device)
 
@@ -2902,6 +3722,10 @@ class TestJvp(TestCase):
             jvp(torch.sin, (x,), (1.0,))
 
     def test_outputs_can_any_pytree(self, device):
+        # [FUNCTION DOC] Checks which output types jvp accepts: None and empty tuple raise
+        # RuntimeError about non-empty output; scalar, bool, float, string outputs raise
+        # RuntimeError about only tensors; list, dict and nested outputs work, and both the primal
+        # and tangent outputs keep the output structure.
         x = torch.randn(2, 3, device=device)
         t = torch.randn(2, 3, device=device)
 
@@ -2936,6 +3760,8 @@ class TestJvp(TestCase):
                 )
 
         def composite_output(x):
+            # [FUNCTION DOC] HELPER: Returns a list with a tuple of the sum and a dict of the
+            # input and a list of the input and the sum.
             out = x.sum()
             return [
                 (out, {"a": x, "out": [x, out]}),
@@ -2951,6 +3777,9 @@ class TestJvp(TestCase):
                 )
 
     def test_aux_tensor(self, device):
+        # [FUNCTION DOC] Checks jvp with has_aux: a function returning a non-tuple or wrong length
+        # tuple raises RuntimeError about the output needing to be a tuple; a valid function
+        # returns output, tangent output and aux with expected values.
         x = torch.randn(3, device=device)
         t = torch.randn(3, device=device)
 
@@ -2967,6 +3796,7 @@ class TestJvp(TestCase):
             jvp(lambda t: (t, t + 2, t + 3), (x,), (t,), has_aux=True)
 
         def f(z):
+            # [FUNCTION DOC] HELPER: Returns sin of the input and the cosine as aux.
             y = z.sin()
             return y, z.cos()
 
@@ -2976,7 +3806,12 @@ class TestJvp(TestCase):
         self.assertEqual(jvp_out, t * x.cos())
 
     def test_aux_pytree(self, device):
+        # [FUNCTION DOC] Checks jvp with a pytree aux returns it intact with correct output and
+        # tangent, and non-tensor aux values (int, float, string or lists containing them) raise
+        # RuntimeError about unsupported types.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns sin of the input and an aux dict of cosine and a list
+            # with tangent.
             y = x.sin()
             return y, {"a": x.cos(), "b": [x.tan()]}
 
@@ -3000,23 +3835,33 @@ class TestJvp(TestCase):
                 _ = jvp(lambda x: (x, [x, aux]), (x,), (t,), has_aux=True)
 
     def test_autograd_function_disables_fwd_grad(self, device):
+        # [FUNCTION DOC] Sanity check that the forward of a custom autograd Function runs with
+        # forward-mode gradient tracking disabled (asserted in the forward through the
+        # enclosing test).
         # Sanity check. We don't really assume this anywhere so
         # it's fine if this breaks one day.
         class MySquare(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function for squaring; its forward asserts forward grad
+            # is disabled and its backward returns the gradient unchanged.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Asserts forward-mode grad is disabled and returns the
+                # square of the input.
                 enabled = fwAD._is_fwd_grad_enabled()
                 self.assertFalse(enabled)
                 return x * x
 
             @staticmethod
             def backward(ctx, gx):
+                # [FUNCTION DOC] HELPER: Returns the incoming gradient unchanged.
                 return gx
 
         x = torch.randn(3, requires_grad=True)
         MySquare.apply(x)
 
     def test_disable_fwd_grad_outside(self, device):
+        # [FUNCTION DOC] Checks jvp called inside a block disabling forward-mode grad still
+        # computes the derivative (cosine).
         x = torch.randn([], device=device)
         t = torch.ones_like(x)
         with fwAD._set_fwd_grad_enabled(False):
@@ -3024,7 +3869,11 @@ class TestJvp(TestCase):
         self.assertEqual(y, x.cos())
 
     def test_disable_fwd_grad_inside(self, device):
+        # [FUNCTION DOC] Checks that disabling forward-mode grad inside the function makes the
+        # shifted value a constant: jvp gives two x and a nested jvp gives two.
         def f(x):
+            # [FUNCTION DOC] HELPER: Computes a square with forward grad disabled as a shift and
+            # returns the square minus the shift.
             with fwAD._set_fwd_grad_enabled(False):
                 shift = x**2
             return x**2 - shift
@@ -3037,7 +3886,11 @@ class TestJvp(TestCase):
         self.assertEqual(y, 2)
 
     def test_disable_fwd_grad_mixed(self, device):
+        # [FUNCTION DOC] Checks that jvp inside an outer block enabling forward grad and a
+        # function that disables it internally still gives two x.
         def f(x):
+            # [FUNCTION DOC] HELPER: Computes a square with forward grad disabled as a shift and
+            # returns the square minus the shift.
             with fwAD._set_fwd_grad_enabled(False):
                 shift = x**2
             return x**2 - shift
@@ -3050,9 +3903,17 @@ class TestJvp(TestCase):
         self.assertEqual(y, 2 * x)
 
     def test_jvp_inside_autograd_function(self, device):
+        # [FUNCTION DOC] Checks jvp can be used inside the forward and backward of a custom
+        # autograd Function: a Function computing sin via negated jvp of cos in forward and jvp of
+        # sin in backward returns sin, and regular autograd gives cosine.
         class MySin(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function implementing sin. Forward negates the tangent
+            # output of jvp of cos with unit tangent and saves the input; backward multiplies the
+            # gradient by the jvp tangent of sin with unit tangent.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Saves x for backward and returns minus the tangent output
+                # of jvp of cos at x with a ones tangent (which is sin x).
                 t = torch.ones_like(x)
                 _, neg_sin_x = jvp(torch.cos, (x,), (t,))
                 ctx.save_for_backward(x)
@@ -3060,6 +3921,8 @@ class TestJvp(TestCase):
 
             @staticmethod
             def backward(ctx, gx):
+                # [FUNCTION DOC] HELPER: Loads the saved input and returns the gradient times the
+                # tangent output of jvp of sin at it with a ones tangent (cosine).
                 (x,) = ctx.saved_tensors
                 t = torch.ones_like(x)
                 _, cos_x = jvp(torch.sin, (x,), (t,))
@@ -3073,11 +3936,15 @@ class TestJvp(TestCase):
         self.assertEqual(gx, x.cos())
 
     def test_zerotensor_vmapjvp_interaction(self, device):
+        # [FUNCTION DOC] Regression check that jvp of covariance nested inside two levels of vmap,
+        # with one vmap over an unbatched input, does not raise (no value assertion).
         dummy = torch.ones(4, 1)
         x = torch.randn(4, 2)
         x_tangent = torch.randn(2)
 
         def push_jvp(dummy, x):
+            # [FUNCTION DOC] HELPER: Returns the jvp result of the covariance function at x using
+            # the captured tangent.
             result = jvp(torch.cov, (x,), (x_tangent,))
             return result
 
@@ -3087,12 +3954,18 @@ class TestJvp(TestCase):
 
 @markDynamoStrictTest
 class TestLinearize(TestCase):
+    # [CLASS DOC] Device-generic tests for linearize, which returns the output and a jvp function;
+    # each test compares with jvp or vmap/grad composition. Tests run for float dtype only and
+    # several skip under the CUDA memory leak check.
     @dtypes(torch.float)
     def test_linearize_basic(self, device, dtype):
+        # [FUNCTION DOC] Checks that linearize of cosine gives the same output as jvp and that its
+        # returned jvp function applied to a tangent gives the same tangent output.
         x_p = make_tensor((3, 1), device=device, dtype=dtype)
         x_t = make_tensor((3, 1), device=device, dtype=dtype)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns the cosine of the input.
             return x.cos()
 
         actual_output, jvp_fn = linearize(fn, x_p)
@@ -3107,10 +3980,13 @@ class TestLinearize(TestCase):
         "Leaking memory, see https://github.com/pytorch/pytorch/pull/150059 for example",
     )
     def test_linearize_return(self, device, dtype):
+        # [FUNCTION DOC] Same as the basic check but for a function returning a tuple of cosine
+        # and sum. Skipped when the CUDA memory leak check is enabled (known leak).
         x_p = make_tensor((3, 1), device=device, dtype=dtype)
         x_t = make_tensor((3, 1), device=device, dtype=dtype)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns a tuple of cosine and the sum of the input.
             return (x.cos(), x.sum())
 
         actual_output, jvp_fn = linearize(fn, x_p)
@@ -3125,16 +4001,22 @@ class TestLinearize(TestCase):
         "Leaking memory, see https://github.com/pytorch/pytorch/pull/150059 for example",
     )
     def test_linearize_composition_vmap(self, device, dtype):
+        # [FUNCTION DOC] Checks that vmap over the jvp function returned by linearize equals vmap
+        # over a direct jvp wrapper, for a batch of tangents. Skipped under the CUDA memory
+        # leak check.
         x_p = make_tensor((3, 1), device=device, dtype=dtype)
         x_t = make_tensor((3, 3, 1), device=device, dtype=dtype)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns a tuple of cosine and the sum of the input.
             return (x.cos(), x.sum())
 
         _, jvp_fn = linearize(fn, x_p)
         actual_batched_jvp = vmap(jvp_fn)(x_t)
 
         def jvp_fn(x_t):
+            # [FUNCTION DOC] HELPER: Replacement (shadows the linearize one) returning the tangent
+            # output of a direct jvp of the function at the primal.
             return jvp(fn, (x_p,), (x_t,))[1]
 
         expected_batched_jvp = vmap(jvp_fn)(x_t)
@@ -3147,10 +4029,14 @@ class TestLinearize(TestCase):
         "Leaking memory, see https://github.com/pytorch/pytorch/pull/150059 for example",
     )
     def test_linearize_composition_grad(self, device, dtype):
+        # [FUNCTION DOC] Checks linearize of a function that calls grad internally gives the same
+        # tangent as a direct jvp. Skipped under the CUDA memory leak check.
         x_p = make_tensor((3,), device=device, dtype=dtype)
         x_t = make_tensor((3,), device=device, dtype=dtype)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns the grad of a dot product with a ones vector
+            # evaluated at the input.
             z = torch.ones(3, device=device, dtype=dtype)
             return grad(lambda x: z @ x)(x)
 
@@ -3158,6 +4044,8 @@ class TestLinearize(TestCase):
         actual_batched_jvp = jvp_fn(x_t)
 
         def jvp_fn(x_t):
+            # [FUNCTION DOC] HELPER: Replacement (shadows the linearize one) returning the tangent
+            # output of a direct jvp of the function at the primal.
             return jvp(fn, (x_p,), (x_t,))[1]
 
         expected_batched_jvp = jvp_fn(x_t)
@@ -3170,6 +4058,8 @@ class TestLinearize(TestCase):
         "Leaking memory, see https://github.com/pytorch/pytorch/pull/150059 for example",
     )
     def test_linearize_nested_input_nested_output(self, device, dtype):
+        # [FUNCTION DOC] Checks linearize with a dict input (containing a tuple) and a nested dict
+        # output equals jvp for output and tangent. Skipped under the CUDA memory leak check.
         x_p = make_tensor((3, 1), device=device, dtype=dtype)
         x_t = make_tensor((3, 1), device=device, dtype=dtype)
         y_p = make_tensor((3, 1), device=device, dtype=dtype)
@@ -3178,6 +4068,9 @@ class TestLinearize(TestCase):
         z_t = make_tensor((3, 1), device=device, dtype=dtype)
 
         def fn(arg):
+            # [FUNCTION DOC] HELPER: Reads x and a pair y,z from the dict input and returns a dict
+            # with the sum of x and a nested dict of y plus z and a tuple of x times z and exp
+            # of y.
             x = arg["x"]
             y = arg["yz"][0]
             z = arg["yz"][1]
@@ -3196,12 +4089,16 @@ class TestLinearize(TestCase):
 
     @onlyCUDA
     def test_linearize_errors(self):
+        # [FUNCTION DOC] CUDA only. Using CPU tensors, checks that the jvp function from linearize
+        # raises RuntimeError when given tangents with a different structure, shape, dtype or
+        # device (moved to cuda) than the primals, with messages naming the mismatch.
         dtype = torch.float
         device = torch.device("cpu")
         x_p = make_tensor((3, 1), device=device, dtype=dtype)
         x_t = make_tensor((3, 1), device=device, dtype=dtype)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Returns sin of the input.
             return x.sin()
 
         _, jvp_fn = linearize(fn, x_p)
@@ -3231,17 +4128,30 @@ class TestLinearize(TestCase):
 # https://github.com/pytorch/pytorch/blob/master/torch/csrc/autograd/autograd_meta.cpp#L18-L43
 @markDynamoStrictTest
 class TestVmapJvpInplaceView(TestCase):
+    # [CLASS DOC] Tests of forward-mode view and in-place semantics under vmap of jvp, following
+    # the numbered cases of the forward grad view and in-place notes in the autograd metadata
+    # source. Each test compares against vmap of the function alone and checks tangent propagation
+    # between views and bases.
     # Case 1 in [Forward Grad View/inplace]
     def test_all_dual_no_view(self, device):
+        # [FUNCTION DOC] Case 1: all inputs are dual and there is no view. A function copies y
+        # into x in place and returns x. Checks outputs equal the batched primal result and
+        # tangents equal the y tangents, including a second run with a non-contiguous, unbatched y
+        # and yt.
         B = 2
 
         def push_jvp(f):
+            # [FUNCTION DOC] HELPER: Returns an inner function that runs jvp of f on the given
+            # primals and tangents.
             def inner(x, xt, y, yt):
+                # [FUNCTION DOC] HELPER: Runs jvp of the outer function at x,y with tangents xt,yt
+                # and returns the result.
                 return jvp(f, (x, y), (xt, yt))
 
             return inner
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Copies y into x in place and returns x.
             x.copy_(y)
             return x
 
@@ -3263,16 +4173,26 @@ class TestVmapJvpInplaceView(TestCase):
 
     # Case 2 in [Forward Grad View/inplace]
     def test_all_dual_base_view_inplace(self, device):
+        # [FUNCTION DOC] Case 2: all inputs dual, an in-place copy into a strided view of x must
+        # propagate to the base. Checks outputs against vmap of the plain function, the view
+        # tangent equals the y tangent, the base tangent has the strided slice replaced, and the
+        # primal x was updated in place.
         B = 2
 
         def push_jvp(f):
+            # [FUNCTION DOC] HELPER: Returns an inner function that runs jvp of f on the given
+            # primals and tangents.
             def inner(x, xt, y, yt):
+                # [FUNCTION DOC] HELPER: Runs jvp of the outer function at x,y with tangents xt,yt
+                # and returns the result.
                 return jvp(f, (x, y), (xt, yt))
 
             return inner
 
         # with view, propagate from view to base
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Takes a strided view of x, copies y into it in place and
+            # returns the view and x.
             view = x[:, ::2]
             view.copy_(y)
             return view, x
@@ -3301,16 +4221,26 @@ class TestVmapJvpInplaceView(TestCase):
 
     # Case 3 in [Forward Grad View/inplace]
     def test_all_dual_base_inplace(self, device):
+        # [FUNCTION DOC] Case 3: all inputs dual, an in-place copy into the base must propagate to
+        # previously made views. Checks outputs against vmap of the plain function, the base
+        # tangent equals the y tangent, and the view tangent is the corresponding strided slice
+        # of it.
         B = 2
 
         def push_jvp(f):
+            # [FUNCTION DOC] HELPER: Returns an inner function that runs jvp of f on the given
+            # primals and tangents.
             def inner(x, xt, y, yt):
+                # [FUNCTION DOC] HELPER: Runs jvp of the outer function at x,y with tangents xt,yt
+                # and returns the result.
                 return jvp(f, (x, y), (xt, yt))
 
             return inner
 
         # Case 3: with view, propagate from base to view
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Takes a strided view of x, copies y into x in place and
+            # returns x and the view.
             view = x[0, ::2]
             x.copy_(y)
             return x, view
@@ -3330,18 +4260,26 @@ class TestVmapJvpInplaceView(TestCase):
 
     # Case 4 in [Forward Grad View/inplace]
     def test_right_dual_view_prop(self, device):
+        # [FUNCTION DOC] Case 4: x is a regular tensor and y is dual; an in-place copy into a view
+        # of a clone must propagate to its base. Checks outputs against the plain batched
+        # function, the view tangent equals the y tangent, and the base tangent is zero except the
+        # copied row.
         B = 2
 
         # Changes on the view must propagate to its base. Also:
         # - x is a regular Tensor
         # - y is a dual tensor
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Clones x, takes its first row as a view, copies y into the
+            # view in place and returns the view and the clone.
             x = x.clone()
             view = x[0]
             view.copy_(y)
             return view, x
 
         def push_jvp(x, y, yt):
+            # [FUNCTION DOC] HELPER: Runs jvp of f with x fixed by partial application, with
+            # primal y and tangent yt.
             return jvp(partial(f, x), (y,), (yt,))
 
         x = torch.randn(2, B, 6, device=device)
@@ -3361,18 +4299,26 @@ class TestVmapJvpInplaceView(TestCase):
 
     # Case 5 in [Forward Grad View/inplace]
     def test_right_dual_base_prop(self, device):
+        # [FUNCTION DOC] Case 5: x is a regular tensor and y is dual; an in-place copy into the
+        # base of a clone must propagate to existing views. Checks outputs against the plain
+        # batched function and that the base tangent equals the y tangent and the view tangent is
+        # its first row.
         B = 2
 
         # Changes on the base must propagate on all its views. Also:
         # - x is a regular Tensor
         # - y is a dual tensor
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Clones x, takes its first row as a view, copies y into the
+            # clone in place and returns the view and the clone.
             x = x.clone()
             view = x[0]
             x.copy_(y)
             return view, x
 
         def push_jvp(x, y, yt):
+            # [FUNCTION DOC] HELPER: Runs jvp of f with x fixed by partial application, with
+            # primal y and tangent yt.
             return jvp(partial(f, x), (y,), (yt,))
 
         x = torch.randn(2, B, 6)
@@ -3391,33 +4337,52 @@ class TestVmapJvpInplaceView(TestCase):
 # Use for testing miscellaneous helper functions
 @markDynamoStrictTest
 class TestHelpers(TestCase):
+    # [CLASS DOC] Device-generic tests for miscellaneous helpers: the saved-tensors context
+    # wrapper, the debug unwrap utility and the leaf reduction helper of the autograd function
+    # support code.
     def test_CtxWithSavedTensors_error_if_name_collision(self, device):
+        # [FUNCTION DOC] Checks that wrapping a context with the saved-tensors wrapper raises
+        # RuntimeError mentioning a name collision when the context already has either of the two
+        # reserved private attribute names (checked with two custom Functions, one per name,
+        # in backward).
         x = torch.randn([], device=device, requires_grad=True)
         y = torch.randn([], device=device, requires_grad=True)
 
         class A(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function that sets the reserved inner context attribute
+            # in forward and wraps the context in backward, which should raise.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Sets a reserved attribute on the context, saves x and
+                # returns it.
                 ctx._pt_inner_ctx = 1
                 ctx.save_for_backward(x)
                 return x
 
             @staticmethod
             def backward(ctx, gy):
+                # [FUNCTION DOC] HELPER: Wraps the context with the saved-tensors wrapper using
+                # the outer y; returns the gradient (not reached when the wrapper raises).
                 wrapped = torch._functorch.autograd_function.CtxWithSavedTensors(  # noqa: F841
                     ctx, (y,)
                 )
                 return gy
 
         class B(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Same as the previous helper Function but sets the other reserved
+            # attribute (new saved tensors) in forward.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Sets the other reserved attribute on the context, saves x
+                # and returns it.
                 ctx._pt_new_saved_tensors = 1
                 ctx.save_for_backward(x)
                 return x
 
             @staticmethod
             def backward(ctx, gy):
+                # [FUNCTION DOC] HELPER: Wraps the context with the saved-tensors wrapper using
+                # the outer y; returns the gradient (not reached when the wrapper raises).
                 wrapped = torch._functorch.autograd_function.CtxWithSavedTensors(  # noqa: F841
                     ctx, (y,)
                 )
@@ -3431,19 +4396,30 @@ class TestHelpers(TestCase):
             out.backward()
 
     def test_CtxWithSavedTensors_nesting(self, device):
+        # [FUNCTION DOC] Checks that the saved-tensors wrapper nests: wrapping a wrapper replaces
+        # saved tensors only in the outer view while the inner one is unchanged, and the backward
+        # result uses the outermost override, giving the gradient equal to z.
         CtxWithSavedTensors = torch._functorch.autograd_function.CtxWithSavedTensors
         x = torch.randn([], device=device, requires_grad=True)
         y = torch.randn([], device=device)
         z = torch.randn([], device=device)
 
         class A(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function whose backward builds two nested wrappers over
+            # the context with override tuples y and z, verifies their saved tensors with plain
+            # checks (not test assertions, since autograd runs backward on another thread) and
+            # returns the gradient times z.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Saves x and returns it.
                 ctx.save_for_backward(x)
                 return x
 
             @staticmethod
             def backward(ctx, gy):
+                # [FUNCTION DOC] HELPER: Wraps the context with y then z, raising AssertionError
+                # if any wrapper reports the wrong saved tensors; returns the gradient times the
+                # outer saved tensor.
                 ctx_y = CtxWithSavedTensors(ctx, (y,))
                 # Can't use self.assertEqual because that relies on TLS
                 # that is not available in multithread autograd
@@ -3483,16 +4459,23 @@ class TestHelpers(TestCase):
         self.assertEqual(x.grad, z)
 
     def test_CtxWithSavedTensors_overrides_saved_tensors(self, device):
+        # [FUNCTION DOC] Checks the saved-tensors wrapper returns exactly the override object
+        # given (even non-tensor data) as its saved_tensors, verified inside backward.
         x = torch.randn([], device=device, requires_grad=True)
 
         class A(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function whose backward wraps the context with a tuple of
+            # integers and checks the wrapper reports it.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Saves x and returns it.
                 ctx.save_for_backward(x)
                 return x
 
             @staticmethod
             def backward(ctx, gy):
+                # [FUNCTION DOC] HELPER: Wraps the context with an integer tuple, raises
+                # AssertionError if saved_tensors differs, returns the gradient.
                 # The override can be literally anything
                 override = (1, 2, 3)
                 wrapped = torch._functorch.autograd_function.CtxWithSavedTensors(
@@ -3508,17 +4491,27 @@ class TestHelpers(TestCase):
         out.backward()
 
     def test_CtxWithSavedTensors_passthrough(self, device):
+        # [FUNCTION DOC] Checks that the saved-tensors wrapper passes needs_input_grad through
+        # from the wrapped context, and that setting an attribute on the wrapper is visible on the
+        # original context.
         x = torch.randn([], device=device, requires_grad=True)
         y = torch.randn([], device=device)
 
         class A(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function of two inputs that multiplies them; its backward
+            # checks the wrapper delegates needs_input_grad and attribute assignment to
+            # the context.
             @staticmethod
             def forward(ctx, x, y):
+                # [FUNCTION DOC] HELPER: Saves x and y and returns their product.
                 ctx.save_for_backward(x, y)
                 return x * y
 
             @staticmethod
             def backward(ctx, gz):
+                # [FUNCTION DOC] HELPER: Wraps the context, raises AssertionError if the
+                # needs_input_grad entries differ or if an attribute set through the wrapper is
+                # not visible on both; returns the gradient for both inputs.
                 # The override can be literally anything
                 override = (1, 2, 3)
                 wrapped = torch._functorch.autograd_function.CtxWithSavedTensors(
@@ -3546,9 +4539,13 @@ class TestHelpers(TestCase):
         out.backward()
 
     def test_debug_unwrap(self):
+        # [FUNCTION DOC] Checks the debug unwrap utility applied under two nested vmaps returns
+        # the original unbatched input tensor itself (identity).
         stuff = []
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Appends the debug-unwrapped argument to the outer list and
+            # returns the sine.
             stuff.append(torch.func.debug_unwrap(x))
             return x.sin()
 
@@ -3558,6 +4555,12 @@ class TestHelpers(TestCase):
         self.assertTrue(stuff[0] is x)
 
     def test_reductify_leaf(self, device):
+        # [FUNCTION DOC] Checks the leaf reduction helper (arguments: gradient, gradient batch
+        # dim, input batch dim, batch size, optionally the input shape) for the combinations: no
+        # gradient gives None; gradient batched and input not gives a sum over the batch dim;
+        # gradient unbatched and input batched gives an expansion (with the input shape given,
+        # summed over the extra dims); both batched moves the batch dim, summing extra dims if the
+        # input shape is given.
         reductify_leaf = torch._functorch.autograd_function.reductify_leaf
         B = 2
 
@@ -3599,7 +4602,12 @@ class TestHelpers(TestCase):
 
 @markDynamoStrictTest
 class TestComposability(TestCase):
+    # [CLASS DOC] Device-generic tests for composing transforms (grad, vmap, vjp, jacrev, make_fx)
+    # in different orders, deprecation warnings of the functorch namespace and errors for
+    # unsupported calls inside transforms.
     def test_deprecation_vmap(self, device):
+        # [FUNCTION DOC] Checks the functorch vmap emits a FutureWarning recommending the
+        # torch.vmap and that torch.vmap emits no warning (warnings turned to errors).
         # functorch version of the API is deprecated
         with self.assertWarnsRegex(FutureWarning, "Please use `torch.vmap`"):
             vmap(torch.sin)
@@ -3615,6 +4623,9 @@ class TestComposability(TestCase):
         ["grad", "jacrev", "jacfwd", "grad_and_value", "hessian", "functionalize"],
     )
     def test_deprecation_transforms(self, device, transform):
+        # [FUNCTION DOC] Parametrized over several transform names. For each, checks the functorch
+        # namespace version emits a FutureWarning recommending the matching torch.func name, and
+        # that the torch.func version emits no warning when warnings are errors.
         api = getattr(functorch, transform)
         new_api = getattr(torch.func, transform)
 
@@ -3630,13 +4641,17 @@ class TestComposability(TestCase):
             new_api(torch.sin)
 
     def test_grad_grad(self, device):
+        # [FUNCTION DOC] Checks grad of grad of sin gives minus sin.
         x = torch.randn([], device=device)
         y = grad(grad(torch.sin))(x)
         self.assertEqual(y, -x.sin())
 
     @skipIfTorchDynamo(msg="https://github.com/pytorch/pytorch/issues/179877")
     def test_grad_vmap(self, device):
+        # [FUNCTION DOC] Checks grad over a function that uses vmap of sin and sums gives cosine.
+        # Skipped under Dynamo (issue 179877).
         def foo(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of vmap of sin applied to x.
             y = vmap(torch.sin)(x)
             return y.sum()
 
@@ -3646,9 +4661,12 @@ class TestComposability(TestCase):
 
     @skipIfTorchDynamo(msg="https://github.com/pytorch/pytorch/issues/180894")
     def test_grad_vjp(self, device):
+        # [FUNCTION DOC] Checks grad over a function that uses vjp matches grad of x times cosine
+        # x summed. Skipped under Dynamo (issue 180894).
         x = torch.randn(3, device=device)
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of the vjp of sin at x with cotangent x.
             _, vjp_fn = vjp(torch.sin, x)
             return vjp_fn(x)[0].sum()
 
@@ -3657,20 +4675,26 @@ class TestComposability(TestCase):
         self.assertEqual(y, expected)
 
     def test_vmap_grad(self, device):
+        # [FUNCTION DOC] Checks vmap of grad of sin gives cosine.
         x = torch.randn(3, device=device)
         y = vmap(grad(torch.sin))(x)
         self.assertEqual(y, x.cos())
 
     def test_vmap_vmap(self, device):
+        # [FUNCTION DOC] Checks nested vmap of sin equals sin.
         x = torch.randn(2, 3, device=device)
         y = vmap(vmap(torch.sin))(x)
         self.assertEqual(y, x.sin())
 
     def test_vmap_vjp(self, device):
+        # [FUNCTION DOC] Checks vmap over a function that builds a vjp inside gives the same as
+        # the outside vjp function, and vmap of an outside vjp function over a batch of cotangents
+        # equals stacking per-sample calls.
         x = torch.randn(3, device=device)
         _, vjp_fn = vjp(torch.sin, x)
 
         def foo(x):
+            # [FUNCTION DOC] HELPER: Builds a vjp of sin at x and returns its result applied to x.
             _, vjp_fn = vjp(torch.sin, x)
             return vjp_fn(x)
 
@@ -3685,6 +4709,8 @@ class TestComposability(TestCase):
         self.assertEqual(result, expected)
 
     def test_vjp_grad(self, device):
+        # [FUNCTION DOC] Checks vjp of grad of sin: the output is cosine and the vjp function
+        # gives minus sin times the cotangent.
         x = torch.randn([], device=device)
         y, vjp_fn = vjp(grad(torch.sin), x)
         self.assertEqual(y, x.cos())
@@ -3693,6 +4719,8 @@ class TestComposability(TestCase):
         self.assertEqual(vjp_fn(v)[0], -x.sin() * v)
 
     def test_vjp_vmap(self, device):
+        # [FUNCTION DOC] Checks vjp of a vmapped sin: output is sin and the vjp function gives
+        # cosine times the cotangent.
         x = torch.randn(3, device=device)
         y, vjp_fn = vjp(vmap(torch.sin), x)
         self.assertEqual(y, x.sin())
@@ -3701,6 +4729,9 @@ class TestComposability(TestCase):
         self.assertEqual(vjp_fn(v)[0], x.cos() * v)
 
     def test_vjp_vjp(self, device):
+        # [FUNCTION DOC] Checks vjp of a function that calls an earlier vjp function: output
+        # equals x times cosine x; the final vjp function is called only to confirm it runs
+        # (result unchecked).
         x = torch.randn(3, device=device)
         y, vjp_fn = vjp(torch.sin, x)
         self.assertEqual(y, x.sin())
@@ -3713,7 +4744,10 @@ class TestComposability(TestCase):
 
     @skipIfTorchDynamo(msg="https://github.com/pytorch/pytorch/issues/180300")
     def test_make_fx_vmap(self, device):
+        # [FUNCTION DOC] Checks make_fx traced over a vmapped function gives a graph module whose
+        # result on new input matches the original. Skipped under Dynamo (issue 180300).
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns sin of the input.
             return torch.sin(x)
 
         inp = torch.randn(5, 3)
@@ -3724,7 +4758,10 @@ class TestComposability(TestCase):
 
     @skipIfTorchDynamo(msg="https://github.com/pytorch/pytorch/issues/179895")
     def test_make_fx_jacrev(self, device):
+        # [FUNCTION DOC] Checks make_fx traced over nested jacrev gives a graph whose result on
+        # new input matches the original. Skipped under Dynamo (issue 179895).
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of sin of the input.
             return x.sin().sum()
 
         inp = torch.randn(3)
@@ -3734,7 +4771,11 @@ class TestComposability(TestCase):
         self.assertEqual(fx_f(new_inp), f(new_inp))
 
     def test_make_fx_vjp(self, device):
+        # [FUNCTION DOC] Checks make_fx can trace a vjp function (called with extra boolean flags)
+        # and the traced graph gives the same result on a new cotangent as the original
+        # vjp function.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of sin of the input.
             return torch.sin(x).sum()
 
         primals = torch.randn(3)
@@ -3750,6 +4791,9 @@ class TestComposability(TestCase):
     # it is redundant to run this test twice on a machine that has GPUs
     @onlyCPU
     def test_no_warning_on_import_functorch(self, device):
+        # [FUNCTION DOC] CPU only; skipped on Windows and in fbcode. Runs a subprocess that
+        # imports functorch with all warnings enabled in the test directory and checks the
+        # combined output is empty, so importing emits no warning.
         out = subprocess.check_output(
             [sys.executable, "-W", "always", "-c", "import functorch"],
             stderr=subprocess.STDOUT,
@@ -3758,7 +4802,11 @@ class TestComposability(TestCase):
         self.assertEqual(out, "")
 
     def test_requires_grad_inside_transform(self, device):
+        # [FUNCTION DOC] Checks calling requires_grad_ on a tensor inside vmap, grad, vmap of grad
+        # and nested grad raises RuntimeError naming the requires_grad_ method.
         def f(x):
+            # [FUNCTION DOC] HELPER: Calls requires_grad_ in place on the input and returns the
+            # sum of sin.
             x.requires_grad_()
             return x.sin().sum()
 
@@ -3776,7 +4824,11 @@ class TestComposability(TestCase):
             grad(grad(f))(x)
 
     def test_retain_grad_inside_transform(self, device):
+        # [FUNCTION DOC] Checks calling retain_grad on an intermediate inside grad raises
+        # RuntimeError naming retain_grad.
         def f(x):
+            # [FUNCTION DOC] HELPER: Calls retain_grad on the sine of the input and returns
+            # its sum.
             y = x.sin()
             y.retain_grad()
             return y.sum()
@@ -3787,7 +4839,11 @@ class TestComposability(TestCase):
             grad(f)(x)
 
     def test_autograd_functional_jacrev_inside_transform(self, device):
+        # [FUNCTION DOC] Checks that calling the torch.autograd.functional Jacobian inside vmap or
+        # grad raises RuntimeError mentioning torch.autograd.functional.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the autograd functional Jacobian of the sum of sin
+            # at x.
             y = torch.autograd.functional.jacobian(lambda x: x.sin().sum(), x)
             return y
 
@@ -3801,7 +4857,10 @@ class TestComposability(TestCase):
             grad(f)(x)
 
     def test_autograd_functional_vjp_inside_transform(self, device):
+        # [FUNCTION DOC] Checks that calling the torch.autograd.functional vjp inside vmap or grad
+        # raises RuntimeError mentioning torch.autograd.functional.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the autograd functional vjp of the sum of sin at x.
             y = torch.autograd.functional.vjp(lambda x: x.sin().sum(), x)
             return y
 
@@ -3816,7 +4875,12 @@ class TestComposability(TestCase):
 
     @skipIfTorchDynamo(msg="https://github.com/pytorch/pytorch/issues/179876")
     def test_autograd_functional_jvp_inside_transform(self, device):
+        # [FUNCTION DOC] Checks that calling the torch.autograd.functional jvp inside vmap or grad
+        # raises RuntimeError mentioning torch.autograd.functional. Skipped under Dynamo
+        # (issue 179876).
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the autograd functional jvp of the sum of sin at x
+            # with a ones tangent.
             t = torch.ones_like(x)
             y = torch.autograd.functional.jvp(lambda x: x.sin().sum(), (x,), (t,))
             return y
@@ -3831,7 +4895,12 @@ class TestComposability(TestCase):
             grad(f)(x)
 
     def test_autograd_functional_jacfwd_inside_transform(self, device):
+        # [FUNCTION DOC] Checks that the autograd functional Jacobian with forward-mode strategy
+        # and vectorization inside vmap raises RuntimeError saying the batching rule for the
+        # make-dual op is not implemented.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the forward-mode vectorized autograd functional
+            # Jacobian of the sum of sin at x.
             y = torch.autograd.functional.jacobian(
                 lambda x: x.sin().sum(), x, strategy="forward-mode", vectorize=True
             )
@@ -3858,14 +4927,24 @@ class TestComposability(TestCase):
         ],
     )
     def test_autograd_function_no_setup_context(self, device, transform):
+        # [FUNCTION DOC] Parametrized over functorch transform names (vmap, grad, jacrev, jacfwd,
+        # grad_and_value, hessian, functionalize). Checks that applying each transform to a custom
+        # autograd Function that uses the old style forward with a context argument and no
+        # setup_context staticmethod raises RuntimeError saying it must override setup_context.
+        # Skipped under Dynamo (issue 180591).
         class MySin(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function computing sin in the old style (forward takes
+            # the context and saves its input there) without a setup_context override; backward
+            # multiplies the gradient by cosine.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Saves x and returns its sine.
                 ctx.save_for_backward(x)
                 return x.sin()
 
             @staticmethod
             def backward(ctx, gy):
+                # [FUNCTION DOC] HELPER: Returns the gradient times cosine of the saved input.
                 (x,) = ctx.saved_tensors
                 return gy * x.cos()
 
@@ -3885,10 +4964,17 @@ class TestComposability(TestCase):
         ],
     )
     def test_transforms_dont_support_saved_tensor_hooks(self, device, transform):
+        # [FUNCTION DOC] Parametrized over grad, jacrev, grad_and_value and hessian. Checks each
+        # transform raises RuntimeError mentioning saved tensor hooks when called inside a
+        # save_on_cpu context or when the transformed function itself enters such a context. (A
+        # branch for functionalize exists but that name is not in the parameter list.)
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of sin of the input.
             return torch.sin(x).sum()
 
         def g(x):
+            # [FUNCTION DOC] HELPER: Calls the sum-of-sin function inside a save_on_cpu
+            # saved-tensor hooks context and returns the result.
             with torch.autograd.graph.save_on_cpu():
                 return f(x)
 
@@ -3906,10 +4992,15 @@ class TestComposability(TestCase):
             transform(g)(x)
 
     def test_vjp_doesnt_support_saved_tensor_hooks(self, device):
+        # [FUNCTION DOC] Checks vjp raises RuntimeError mentioning saved tensor hooks when called
+        # inside save_on_cpu or when the function enters one.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of sin of the input.
             return torch.sin(x).sum()
 
         def g(x):
+            # [FUNCTION DOC] HELPER: Calls the sum-of-sin function inside a save_on_cpu context
+            # and returns the result.
             with torch.autograd.graph.save_on_cpu():
                 return f(x)
 
@@ -3922,10 +5013,15 @@ class TestComposability(TestCase):
             vjp(g, x)
 
     def test_jvp_supports_saved_tensor_hooks(self, device):
+        # [FUNCTION DOC] Smoke test: jvp works both inside a save_on_cpu context and with a
+        # function that enters one (no assertions).
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of sin of the input.
             return torch.sin(x).sum()
 
         def g(x):
+            # [FUNCTION DOC] HELPER: Calls the sum-of-sin function inside a save_on_cpu context
+            # and returns the result.
             with torch.autograd.graph.save_on_cpu():
                 return f(x)
 
@@ -3941,7 +5037,12 @@ class TestComposability(TestCase):
 
     @skipIfTorchDynamo(msg="https://github.com/pytorch/pytorch/issues/184862")
     def test_can_use_functionalize_when_key_is_excluded(self, device):
+        # [FUNCTION DOC] Checks functionalize still works inside make_fx when the Functionalize
+        # dispatch key is in the thread-local exclude set: the traced graph code has no in-place
+        # sin, gives the same result as eager, and the exclude set still contains the key
+        # afterwards. Skipped under Dynamo (issue 184862).
         def f(x):
+            # [FUNCTION DOC] HELPER: Clones the input, applies in-place sin and returns it.
             y = x.clone()
             y.sin_()
             return y
@@ -3959,7 +5060,11 @@ class TestComposability(TestCase):
 
     @skipIfTorchDynamo(msg="https://github.com/pytorch/pytorch/issues/180592")
     def test_can_use_vmap_when_key_is_excluded(self, device):
+        # [FUNCTION DOC] Checks vmap works with the batched functorch dispatch key in the
+        # thread-local exclude set, gives the same result as without, and that the exclude set
+        # still contains the key. Skipped under Dynamo (issue 180592).
         def f(x):
+            # [FUNCTION DOC] HELPER: Sums the input over dim zero.
             return x.sum(0)
 
         x = torch.randn(3, device=device)
@@ -3973,7 +5078,11 @@ class TestComposability(TestCase):
 
     @skipIfTorchDynamo(msg="https://github.com/pytorch/pytorch/issues/181155")
     def test_can_use_grad_when_key_is_excluded(self, device):
+        # [FUNCTION DOC] Checks grad works with the Autograd dispatch key in the thread-local
+        # exclude set, gives the same result as without, and that the exclude set still contains
+        # the key. Skipped under Dynamo (issue 181155).
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns sin of the input.
             return x.sin()
 
         x = torch.randn([], device=device)
@@ -3988,14 +5097,24 @@ class TestComposability(TestCase):
 
 @markDynamoStrictTest
 class TestMakeFunctional(TestCase):
+    # [CLASS DOC] Tests for make_functional, make_functional_with_buffers, functional_call,
+    # combine_state_for_ensemble and stack_module_state: autograd tracking flags, parameter and
+    # buffer tying, correctness against plain modules, error cases and state restoration. Not
+    # device-generic (CPU).
     @parametrize("disable_autograd_tracking", [True, False])
     def test_disable_autograd_tracking(self, disable_autograd_tracking):
+        # [FUNCTION DOC] Parametrized over the disable_autograd_tracking flag. Checks that
+        # make_functional on a single linear layer returns two parameters whose requires_grad is
+        # the opposite of the flag.
         class Foo(nn.Module):
+            # [CLASS DOC] HELPER: Module with one linear layer from 3 to 3 features.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear layer.
                 super().__init__()
                 self.linear = nn.Linear(3, 3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer.
                 x = self.linear(x)
                 return x
 
@@ -4008,8 +5127,17 @@ class TestMakeFunctional(TestCase):
             self.assertEqual(param.requires_grad, not disable_autograd_tracking)
 
     def test_parameter_tying(self):
+        # [FUNCTION DOC] Checks make_functional handles a module whose bias parameter is shared
+        # with a linear layer and whose linear layer is also registered twice: only two distinct
+        # parameters are returned and the functional call with parameters from a reseeded copy
+        # equals the module output.
         class Foo(nn.Module):
+            # [CLASS DOC] HELPER: Module with a shared bias parameter (also assigned as the linear
+            # layer bias) and a second reference to the same linear layer; the forward applies the
+            # layer twice then adds the bias.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the bias parameter and linear layer, ties the
+                # layer bias to the parameter and registers the layer under a second name.
                 super().__init__()
                 self.bias = nn.Parameter(torch.randn(3))
                 self.linear = nn.Linear(3, 3)
@@ -4017,6 +5145,8 @@ class TestMakeFunctional(TestCase):
                 self.linear_tied = self.linear
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer, the tied alias, then adds
+                # the bias.
                 x = self.linear(x)
                 x = self.linear_tied(x)
                 x = x + self.bias
@@ -4037,8 +5167,16 @@ class TestMakeFunctional(TestCase):
         self.assertEqual(result, expected)
 
     def test_buffer_tying(self):
+        # [FUNCTION DOC] Checks make_functional_with_buffers with a module that registers the same
+        # buffer under two names: three parameters and one buffer are reported, and the functional
+        # call with a reseeded copy equals the module output.
         class Foo(nn.Module):
+            # [CLASS DOC] HELPER: Module with a bias parameter, a linear layer, and a buffer
+            # registered twice; forward applies the layer and adds the bias and both
+            # buffer references.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the bias, linear layer and a buffer, plus a
+                # second reference to the same buffer.
                 super().__init__()
                 self.bias = nn.Parameter(torch.randn(3))
                 self.linear = nn.Linear(3, 3)
@@ -4046,6 +5184,8 @@ class TestMakeFunctional(TestCase):
                 self.buffer_tied = self.buffer
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer and adds the bias, the buffer
+                # and its alias.
                 x = self.linear(x)
                 x = x + self.bias
                 x = x + self.buffer
@@ -4069,13 +5209,19 @@ class TestMakeFunctional(TestCase):
 
     @parametrize("disable_autograd_tracking", [True, False])
     def test_with_buffers_disable_autograd_tracking(self, disable_autograd_tracking):
+        # [FUNCTION DOC] Parametrized over the disable_autograd_tracking flag. Checks
+        # make_functional_with_buffers returns two parameters and one buffer, with parameter
+        # requires_grad opposite of the flag.
         class Foo(nn.Module):
+            # [CLASS DOC] HELPER: Module with a linear layer and a buffer added to the output.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear layer and a random buffer.
                 super().__init__()
                 self.linear = nn.Linear(3, 3)
                 self.buffer = nn.Buffer(torch.randn(3))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer and adds the buffer.
                 x = self.linear(x)
                 x = x + self.buffer
                 return x
@@ -4091,18 +5237,26 @@ class TestMakeFunctional(TestCase):
 
     @parametrize("detach_params", [True, False])
     def test_using_detach_functional_call(self, detach_params):
+        # [FUNCTION DOC] Parametrized over whether parameters are detached. Checks that
+        # functional_call with a dict of (optionally detached) parameters plus buffers gives an
+        # output with no grad_fn exactly when parameters were detached.
         class Foo(nn.Module):
+            # [CLASS DOC] HELPER: Module with a linear layer and a buffer added to the output.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear layer and a random buffer.
                 super().__init__()
                 self.linear = nn.Linear(3, 3)
                 self.buffer = nn.Buffer(torch.randn(3))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer and adds the buffer.
                 x = self.linear(x)
                 x = x + self.buffer
                 return x
 
         def params_dict(mod):
+            # [FUNCTION DOC] HELPER: Returns a dict of the module named parameters, with each
+            # value detached if the enclosing test flag is set.
             named_params = mod.named_parameters()
             return (
                 {k: v.detach() for k, v in named_params}
@@ -4117,14 +5271,22 @@ class TestMakeFunctional(TestCase):
         self.assertEqual(out.grad_fn is None, detach_params)
 
     def test_parameter_tying_grad(self):
+        # [FUNCTION DOC] Checks that grad over the functional form of a module with tied
+        # parameters (the layer weight and bias also exposed as attributes) gives the same
+        # gradients as plain autograd over the module parameters, using identically seeded copies.
         class Foo(nn.Module):
+            # [CLASS DOC] HELPER: Module whose linear layer weight and bias are also kept as
+            # attributes and used in a functional linear call after the layer itself.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear layer and aliases its weight and bias.
                 super().__init__()
                 self.linear = nn.Linear(3, 3)
                 self.weight = self.linear.weight
                 self.bias = self.linear.bias
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer and then the functional linear
+                # with the aliased weight and bias.
                 x = self.linear(x)
                 x = F.linear(x, self.weight, self.bias)
                 return x
@@ -4142,6 +5304,7 @@ class TestMakeFunctional(TestCase):
         _, params, buffers = make_functional_with_buffers(mod)
 
         def compute_loss(params, buffers, x):
+            # [FUNCTION DOC] HELPER: Returns the sum of the functional module output.
             return fmod(params, buffers, x).sum()
 
         result = grad(compute_loss)(params, buffers, x)
@@ -4149,8 +5312,16 @@ class TestMakeFunctional(TestCase):
         self.assertEqual(result, expected)
 
     def test_parameter_tying_ensemble(self):
+        # [FUNCTION DOC] Checks combine_state_for_ensemble with modules having tied parameters and
+        # buffers: vmap of the combined functional model over stacked parameters, buffers and
+        # inputs equals a stack of the individual model outputs (models reseeded for
+        # equal weights).
         class Foo(nn.Module):
+            # [CLASS DOC] HELPER: Module with a linear layer whose weight and bias are also kept
+            # as attributes, plus a buffer registered twice, all used in forward.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the layer, aliases for its weight and bias, and a
+                # buffer with an alias.
                 super().__init__()
                 self.linear = nn.Linear(3, 3)
                 self.weight = self.linear.weight
@@ -4159,6 +5330,8 @@ class TestMakeFunctional(TestCase):
                 self.buffer_tied = self.buffer
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the layer, a functional linear using the aliases,
+                # then adds the buffer and its alias.
                 x = self.linear(x)
                 x = F.linear(x, self.weight, self.bias)
                 x = x + self.buffer
@@ -4183,8 +5356,16 @@ class TestMakeFunctional(TestCase):
 
     @parametrize("mechanism", ["make_functional", "functional_call"])
     def test_correctness_mnist(self, mechanism):
+        # [FUNCTION DOC] Parametrized over make_functional and functional_call. Checks the
+        # functional form of a small convolutional classifier (with dropout) gives the same output
+        # as the module when the RNG is seeded identically before building the module and before
+        # running it.
         class Net(nn.Module):
+            # [CLASS DOC] HELPER: Convolutional classifier with two conv layers, 2d dropout, two
+            # linear layers, max pooling, relu, dropout and log softmax on 32 by 32 inputs.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the two convolutions, the 2d dropout and the two
+                # linear layers.
                 super().__init__()
                 self.conv1 = nn.Conv2d(1, 10, kernel_size=5)
                 self.conv2 = nn.Conv2d(10, 20, kernel_size=5)
@@ -4193,6 +5374,9 @@ class TestMakeFunctional(TestCase):
                 self.fc2 = nn.Linear(50, 10)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs conv, max pool and relu; conv, dropout, max pool and
+                # relu; flattens to 320 features; linear and relu; dropout in training mode;
+                # linear; and returns log softmax.
                 x = F.relu(F.max_pool2d(self.conv1(x), 2))
                 x = F.relu(F.max_pool2d(self.conv2_drop(self.conv2(x)), 2))
                 x = x.view(-1, 320)
@@ -4216,6 +5400,8 @@ class TestMakeFunctional(TestCase):
         self.assertEqual(result, expected)
 
     def test_combine_state_for_ensemble_error(self):
+        # [FUNCTION DOC] Checks combine_state_for_ensemble errors with RuntimeError for an empty
+        # model list, models differing in training or eval mode, and models of different classes.
         in_features = 2
         out_features = 2
 
@@ -4235,6 +5421,8 @@ class TestMakeFunctional(TestCase):
             _ = combine_state_for_ensemble(models)
 
     def test_combine_state_for_ensemble_smoke(self):
+        # [FUNCTION DOC] Smoke test: combine_state_for_ensemble on three linear models runs
+        # without error.
         in_features = 2
         out_features = 2
         num_models = 3
@@ -4242,6 +5430,7 @@ class TestMakeFunctional(TestCase):
         _ = combine_state_for_ensemble(models)
 
     def test_stack_module_state_smoke(self):
+        # [FUNCTION DOC] Smoke test: stack_module_state on three linear models runs without error.
         in_features = 2
         out_features = 2
         num_models = 3
@@ -4249,6 +5438,8 @@ class TestMakeFunctional(TestCase):
         _ = stack_module_state(models)
 
     def test_stack_module_state_leaf(self):
+        # [FUNCTION DOC] Checks that the stacked parameters returned by stack_module_state are
+        # leaf tensors that require grad.
         in_features = 2
         out_features = 2
         num_models = 3
@@ -4259,6 +5450,8 @@ class TestMakeFunctional(TestCase):
             self.assertTrue(param.is_leaf)
 
     def test_stack_module_state_mismatch_error(self):
+        # [FUNCTION DOC] Checks stack_module_state raises RuntimeError mentioning requires_grad
+        # when one model has a parameter that does not require grad but the others do.
         in_features = 2
         out_features = 2
         num_models = 3
@@ -4268,6 +5461,9 @@ class TestMakeFunctional(TestCase):
             params, buffers = stack_module_state(models)
 
     def test_stack_module_state_error(self):
+        # [FUNCTION DOC] Checks stack_module_state errors with RuntimeError for an empty model
+        # list, models with different training or eval modes, and models of different classes,
+        # each with a message prefixed by the function name.
         in_features = 2
         out_features = 2
 
@@ -4294,16 +5490,25 @@ class TestMakeFunctional(TestCase):
 
     @parametrize("mechanism", ["make_functional", "functional_call"])
     def test_make_functional_state_correctly_returned_after_forward(self, mechanism):
+        # [FUNCTION DOC] Parametrized over make_functional and functional_call. Checks that after
+        # a functional forward pass the original module weight and bias attributes of the
+        # stateless module are restored (not None and equal to before).
         class Net(nn.Module):
+            # [CLASS DOC] HELPER: Module with one linear layer from 3 to 3 features.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear layer.
                 super().__init__()
                 self.linear = nn.Linear(3, 3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer.
                 x = self.linear(x)
                 return x
 
         def get_module_info(mod):
+            # [FUNCTION DOC] HELPER: Returns either the make_functional result for the module, or
+            # for functional_call the module plus a dict of its named parameters; raises
+            # AssertionError for any other mechanism.
             if mechanism == "make_functional":
                 return make_functional(mod)
             else:
@@ -4347,7 +5552,14 @@ class TestMakeFunctional(TestCase):
 
 @markDynamoStrictTest
 class TestExamplesCorrectness(TestCase):
+    # [CLASS DOC] Device-generic tests that run example workloads (MAML regression and Omniglot,
+    # batch norm replacement, Lennard-Jones forces, and later ones) through function transforms
+    # and compare with plain autograd.
     def _update_params(self, params, grads, alpha, mechanism):
+        # [FUNCTION DOC] HELPER: Performs one gradient descent step with step size alpha. With
+        # make_functional it returns a list of updated parameters computed by position; otherwise
+        # it requires functional_call (raises AssertionError if not) and returns a dict with
+        # updated values per key.
         if mechanism == "make_functional":
             return [(params[i] - alpha * grads[i]) for i in range(len(params))]
         else:
@@ -4359,8 +5571,15 @@ class TestExamplesCorrectness(TestCase):
 
     @parametrize("mechanism", ["make_functional", "functional_call"])
     def test_maml_regression(self, device, mechanism):
+        # [FUNCTION DOC] Parametrized over the weight mechanism. MAML on sine regression: sample
+        # tasks with random amplitude and phase, compute the post-adaptation loss for each task
+        # with vmap and grad, average, take the gradient with respect to the initial parameters
+        # and compare with a loop using plain autograd with create_graph.
         class ThreeLayerNet(nn.Module):
+            # [CLASS DOC] HELPER: Three-layer MLP regressor from 1 to 40 to 40 to 1 with
+            # relu activations.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates three linear layers and two relu modules.
                 super().__init__()
                 self.fc1 = nn.Linear(1, 40)
                 self.relu1 = nn.ReLU()
@@ -4369,6 +5588,8 @@ class TestExamplesCorrectness(TestCase):
                 self.fc3 = nn.Linear(40, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies linear, relu, linear, relu, linear and returns
+                # the result.
                 x = self.fc1(x)
                 x = self.relu1(x)
                 x = self.fc2(x)
@@ -4378,6 +5599,8 @@ class TestExamplesCorrectness(TestCase):
 
         # TODO: should replace with F.mse_loss
         def mse_loss(x, y):
+            # [FUNCTION DOC] HELPER: Returns the mean squared error between x and y (a TODO notes
+            # replacing it with the functional loss).
             return torch.mean((x - y) ** 2)
 
         net, params = _get_weights_and_functional_call(
@@ -4388,6 +5611,9 @@ class TestExamplesCorrectness(TestCase):
         alpha = 0.1
 
         def sample_tasks(outer_batch_size, inner_batch_size):
+            # [FUNCTION DOC] HELPER: Samples random amplitudes and phases for the requested number
+            # of tasks and returns two batches of inputs and sine targets, as tensors on the
+            # test device.
             # Select amplitude and phase for the task
             As = []
             phases = []
@@ -4396,6 +5622,8 @@ class TestExamplesCorrectness(TestCase):
                 phases.append(np.random.uniform(low=0.0, high=np.pi))
 
             def get_batch():
+                # [FUNCTION DOC] HELPER: Draws uniform inputs for each task, computes amplitude
+                # times sine of input plus phase, and returns both as float tensors on the device.
                 xs, ys = [], []
                 for A, phase in zip(As, phases):
                     x = np.random.uniform(
@@ -4413,7 +5641,13 @@ class TestExamplesCorrectness(TestCase):
             return x1, y1, x2, y2
 
         def get_loss_for_task(use_transform, x1, y1, x2, y2):
+            # [FUNCTION DOC] HELPER: Computes the loss after one inner gradient step for a task.
+            # The inner gradient comes from grad when use_transform is set, otherwise from plain
+            # autograd with create_graph; then updates parameters and returns the mean squared
+            # error on the second batch.
             def inner_loss(params, x1, y1):
+                # [FUNCTION DOC] HELPER: Returns the mean squared error of the functional network
+                # on the inputs against the targets.
                 f = net(params, x1)
                 loss = mse_loss(f, y1)
                 return loss
@@ -4455,6 +5689,10 @@ class TestExamplesCorrectness(TestCase):
 
     @parametrize("mechanism", ["make_functional", "functional_call"])
     def test_maml_omniglot(self, device, mechanism):
+        # [FUNCTION DOC] Parametrized over the weight mechanism. MAML on an Omniglot-like conv
+        # network in double precision (group norm instead of batch norm, no in-place relu): the
+        # query loss after two inner steps is computed with vmap and grad, then compared in outer
+        # gradient to a loop with plain autograd.
         # TODO: there appears to be precision issues for float32
         dtype = torch.double
 
@@ -4493,10 +5731,15 @@ class TestExamplesCorrectness(TestCase):
         net = (params, buffers, fnet)
 
         def loss_for_task(net, n_inner_iter, use_transform, x_spt, y_spt, x_qry, y_qry):
+            # [FUNCTION DOC] HELPER: Runs the inner loop of n_inner_iter gradient steps on the
+            # support set (using grad or plain autograd depending on use_transform), then returns
+            # the query cross entropy loss and accuracy.
             params, buffers, fnet = net
             querysz = x_qry.size(0)
 
             def compute_loss(new_params, buffers, x, y):
+                # [FUNCTION DOC] HELPER: Returns the cross entropy of the functional network
+                # output against the labels.
                 logits = fnet(new_params, buffers, x)
                 loss = F.cross_entropy(logits, y)
                 return loss
@@ -4546,6 +5789,10 @@ class TestExamplesCorrectness(TestCase):
     @parametrize("mechanism", ["make_functional", "functional_call"])
     @parametrize("originally_track_running_stats", [True, False])
     def test_update_batch_norm(self, device, originally_track_running_stats, mechanism):
+        # [FUNCTION DOC] Parametrized over the mechanism and whether batch norm originally tracked
+        # running stats. Replaces all batch norm modules via the experimental helper, then
+        # compares per-sample gradients computed with vmap and grad (parameters unbatched) with a
+        # loop of plain autograd gradients, stacked.
         dtype = torch.double
         inplace_relu = False
         classes = 5
@@ -4572,6 +5819,8 @@ class TestExamplesCorrectness(TestCase):
         criterion = nn.CrossEntropyLoss()
 
         def compute_loss(x, y, params, buffers):
+            # [FUNCTION DOC] HELPER: Returns the cross entropy of the functional network on the
+            # input against the labels.
             return criterion(fnet(params, buffers, x), y)
 
         # Get some sample inputs...
@@ -4599,15 +5848,24 @@ class TestExamplesCorrectness(TestCase):
 
     @parametrize("jac", ["jacfwd", "jacrev"])
     def test_lennard_jones_batched_jac(self, device, jac):
+        # [FUNCTION DOC] Parametrized over jacfwd and jacrev. Builds Lennard-Jones training
+        # energies and forces for 100 distances along one axis, a small tanh network, and compares
+        # the parameter gradients of a combined energy and force loss when the forces come from a
+        # vmapped batched Jacobian of the model versus per-sample autograd functional Jacobians
+        # with create_graph.
         sigma = 0.5
         epsilon = 4.0
 
         jac = getattr(functorch, jac)
 
         def lennard_jones(r):
+            # [FUNCTION DOC] HELPER: Returns the Lennard-Jones potential energy at distance r
+            # using the enclosing sigma and epsilon.
             return epsilon * ((sigma / r) ** 12 - (sigma / r) ** 6)
 
         def lennard_jones_force(r):
+            # [FUNCTION DOC] HELPER: Returns the magnitude of the Lennard-Jones force at distance
+            # r using the enclosing sigma and epsilon.
             """Get magnitude of LJ force"""
             return -epsilon * ((-12 * sigma**12 / r**13) + (6 * sigma**6 / r**7))
 
@@ -4632,6 +5890,10 @@ class TestExamplesCorrectness(TestCase):
         ).to(device)
 
         def make_prediction(model, drs, use_functorch):
+            # [FUNCTION DOC] HELPER: Predicts energies and forces from distance vectors: the
+            # energies come from the model on the norms; forces use a vmapped Jacobian of the
+            # model when use_functorch is set, otherwise per-sample autograd functional Jacobians
+            # with create_graph.
             norms = torch.norm(drs, dim=1).reshape(-1, 1)
             energies = model(norms)
 
@@ -4650,6 +5912,8 @@ class TestExamplesCorrectness(TestCase):
             return energies, forces
 
         def loss_fn(energies, forces, predicted_energies, predicted_forces):
+            # [FUNCTION DOC] HELPER: Returns the mean squared error of the energies plus 0.01
+            # times the mean squared error of the forces divided by three.
             return (
                 F.mse_loss(energies, predicted_energies)
                 + 0.01 * F.mse_loss(forces, predicted_forces) / 3
@@ -4667,7 +5931,14 @@ class TestExamplesCorrectness(TestCase):
 
     @parametrize("mechanism", ["make_functional", "functional_call"])
     def test_ensemble_regression(self, device, mechanism):
+        # [FUNCTION DOC] Parametrized over the weight mechanism. Ensemble training on a noisy
+        # two-spiral classification set: one vmapped training step with grad_and_value over two
+        # stacked models (shared data) is compared in loss and updated weights with two separate
+        # plain-autograd steps stacked together.
         def make_spirals(n_samples, noise_std=0.0, rotations=1.0):
+            # [FUNCTION DOC] HELPER: Generates a two-class spiral dataset of the requested size
+            # with random signs and optional Gaussian noise; returns the 2d points and integer
+            # labels on the test device.
             ts = torch.linspace(0, 1, n_samples)
             rs = ts**0.5
             thetas = rs * rotations * 2 * math.pi
@@ -4682,7 +5953,11 @@ class TestExamplesCorrectness(TestCase):
         points, labels = make_spirals(100, noise_std=0.05)
 
         class MLPClassifier(nn.Module):
+            # [CLASS DOC] HELPER: Two-layer perceptron classifier (linear, relu, linear, log
+            # softmax) from 2 features to n_classes with hidden width hidden_dim.
             def __init__(self, hidden_dim=32, n_classes=2):
+                # [FUNCTION DOC] HELPER: Stores sizes and creates two linear layers (2 to
+                # hidden_dim and hidden_dim to n_classes).
                 super().__init__()
                 self.hidden_dim = hidden_dim
                 self.n_classes = n_classes
@@ -4691,6 +5966,8 @@ class TestExamplesCorrectness(TestCase):
                 self.fc2 = nn.Linear(self.hidden_dim, self.n_classes)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies linear, relu, linear and log softmax over the
+                # last dim; returns the result.
                 x = self.fc1(x)
                 x = F.relu(x)
                 x = self.fc2(x)
@@ -4704,7 +5981,12 @@ class TestExamplesCorrectness(TestCase):
         )
 
         def train_step_fn(use_transform, weights, batch, targets, lr=0.2):
+            # [FUNCTION DOC] HELPER: Runs one gradient descent step on the loss with step size lr.
+            # The gradient and loss come from grad_and_value when use_transform is set, otherwise
+            # from plain autograd; returns the loss and the updated weights.
             def compute_loss(weights, batch, targets):
+                # [FUNCTION DOC] HELPER: Returns the negative log likelihood loss of the
+                # functional model output against the targets.
                 output = func_model(weights, batch)
                 loss = loss_fn(output, targets)
                 return loss
@@ -4723,9 +6005,14 @@ class TestExamplesCorrectness(TestCase):
             return (loss, new_weights)
 
         def unpack(train_result):
+            # [FUNCTION DOC] HELPER: Returns the first two entries of a training step result as
+            # a pair.
             return train_result[0], train_result[1]
 
         def init_fn(num_models):
+            # [FUNCTION DOC] HELPER: Creates the requested number of fresh classifier models and
+            # returns their stacked parameters, via the ensemble combine helper or the module
+            # state stack helper depending on the mechanism.
             models = tuple(MLPClassifier().to(device) for _ in range(num_models))
             if mechanism == "make_functional":
                 return combine_state_for_ensemble(models)[1]
@@ -4733,6 +6020,8 @@ class TestExamplesCorrectness(TestCase):
                 return stack_module_state(models)[0]
 
         def slice_weights(batched_weights, index):
+            # [FUNCTION DOC] HELPER: Selects one model from batched weights by index and returns
+            # the weights as detached tensors that require grad, keeping the container structure.
             return tree_map(
                 lambda weight: weight[index].detach().requires_grad_(), batched_weights
             )
@@ -4778,6 +6067,10 @@ class TestExamplesCorrectness(TestCase):
     )
     @parametrize("mechanism", ["make_functional", "functional_call"])
     def test_find_learning_rate_ensembling(self, device, dropout_layer, mechanism):
+        # [FUNCTION DOC] Parametrized over three dropout layer classes and the weight mechanism;
+        # skipped under Dynamo (issues 180336 and 180320). Trains two identically initialized
+        # models with different learning rates under vmap with same randomness, and checks the
+        # losses are equal for both while the updated weights differ.
         # This example mimics what a user might do when trying to find the optimal learning rate. They would
         # want to run a bunch of models with the same behavior (including the same dropout!) and have them
         # each run with different learning rates. Specifically, this is an example of using same randomness with vmap
@@ -4787,7 +6080,11 @@ class TestExamplesCorrectness(TestCase):
         )
 
         class MLPClassifier(nn.Module):
+            # [CLASS DOC] HELPER: Classifier with a dropout layer of the test-selected class,
+            # flatten, linear (16 to hidden), relu, linear and log softmax.
             def __init__(self, hidden_dim=32, n_classes=2):
+                # [FUNCTION DOC] HELPER: Stores sizes, creates the chosen dropout layer and two
+                # linear layers.
                 super().__init__()
                 self.hidden_dim = hidden_dim
                 self.n_classes = n_classes
@@ -4797,6 +6094,8 @@ class TestExamplesCorrectness(TestCase):
                 self.fc2 = nn.Linear(self.hidden_dim, self.n_classes)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies dropout, flattens from dim one, then linear,
+                # relu, linear and log softmax; returns the result.
                 x = self.dropout(x)
                 x = torch.flatten(x, start_dim=1)
                 x = self.fc1(x)
@@ -4812,7 +6111,13 @@ class TestExamplesCorrectness(TestCase):
         )
 
         def train_step_fn(weights, batch, targets, lr):
+            # [FUNCTION DOC] HELPER: Computes loss and gradient via grad_and_value, performs a
+            # gradient descent step with learning rate lr, and returns a flat tuple of the loss
+            # followed by the new weights (flattened to a list for functional_call, since vmap
+            # needs tensor outputs).
             def compute_loss(weights, batch, targets):
+                # [FUNCTION DOC] HELPER: Returns the negative log likelihood of the functional
+                # model output against the targets.
                 output = func_model(weights, batch)
                 loss = loss_fn(output, targets)
                 return loss
@@ -4825,9 +6130,14 @@ class TestExamplesCorrectness(TestCase):
             return (loss, *new_weights)
 
         def unpack(train_result):
+            # [FUNCTION DOC] HELPER: Splits a training step result into the loss and the tuple of
+            # remaining weights.
             return train_result[0], train_result[1:]
 
         def init_fn(num_models):
+            # [FUNCTION DOC] HELPER: Creates one classifier, makes deep copies of it for each
+            # requested model (same initialization), and returns stacked parameters via the
+            # ensemble combine helper or the module state stack helper by mechanism.
             og_model = MLPClassifier().to(device)
             models = tuple(
                 copy.deepcopy(og_model) for _ in range(num_models)
@@ -4857,6 +6167,11 @@ class TestExamplesCorrectness(TestCase):
     @unittest.skipIf(not USE_TORCHVISION, "test requires torchvision")
     @parametrize("mechanism", ["make_functional", "functional_call"])
     def test_resnet18_per_sample_grads(self, device, mechanism):
+        # [FUNCTION DOC] Parametrized over the weight mechanism; skipped if torchvision is
+        # missing, with TF32 turned off. Builds a resnet18 with group norm, computes per-sample
+        # gradients with vmap over grad (weights unbatched, images and targets batched), and
+        # compares with a loop of plain autograd gradients (absolute tolerance 1e-3, relative
+        # tolerance 1.0).
         from torchvision import models
 
         model = models.__dict__["resnet18"](
@@ -4869,6 +6184,8 @@ class TestExamplesCorrectness(TestCase):
         func_model, weights = _get_weights_and_functional_call(model, mechanism)
 
         def compute_loss(weights, image, target):
+            # [FUNCTION DOC] HELPER: Adds a batch dim of one to the image and target, runs the
+            # functional model and returns the summed cross entropy.
             image = image.unsqueeze(0)
             target = target.unsqueeze(0)
             output = func_model(weights, image)
@@ -4897,6 +6214,9 @@ class TestExamplesCorrectness(TestCase):
 
 
 def normalize_devices(fx_g):
+    # [FUNCTION DOC] HELPER: Rewrites an FX graph module in place so that torch.device arguments
+    # (positional or keyword) of every node become the string cpu (to make printed code device
+    # independent), recompiles it and returns the same module.
     for node in fx_g.graph.nodes:
         args = list(node.args)
         for idx, arg in enumerate(args):
@@ -4915,7 +6235,14 @@ def normalize_devices(fx_g):
 
 @markDynamoStrictTest
 class TestFunctionalize(TestCase):
+    # [CLASS DOC] Device-generic tests for functionalize: numerical equivalence with eager (with
+    # and without vmap and view removal), composition with grad, vmap and jvp, fake tensors, and
+    # golden FX code tests for make_fx of functionalized functions.
     def _check_functionalize_correctness(self, f, inpt, *, skip_vmap=False):
+        # [FUNCTION DOC] HELPER: Runs the function eagerly on a clone, with functionalize (under
+        # vmap on a batch of one, unless skip_vmap) on a second clone and with functionalize
+        # removing mutations and views on a third. Asserts outputs match eager and that all three
+        # inputs ended up with the same mutated values.
         inpt1 = inpt.clone()
         inpt2 = inpt.clone()
         inpt3 = inpt.clone()
@@ -4939,7 +6266,11 @@ class TestFunctionalize(TestCase):
         self.assertEqual(inpt1, inpt3)
 
     def test_simple_view(self, device):
+        # [FUNCTION DOC] Checks functionalize correctness for adding to a reshaped view of the
+        # input in place and returning the input.
         def f(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Views x as four by two, adds a ones vector in place through
+            # the view and returns x.
             tmp = torch.ones(2, device=device)
             y = x.view(4, 2)
             y.add_(tmp)
@@ -4948,7 +6279,11 @@ class TestFunctionalize(TestCase):
         self._check_functionalize_correctness(f, torch.zeros(4, 2, device=device))
 
     def test_multioutput_view(self, device):
+        # [FUNCTION DOC] Checks functionalize correctness for an in-place add on a diagonal view
+        # of a split piece of the input.
         def f(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Splits x into two parts, adds a ones vector in place to the
+            # diagonal of the first part and returns x.
             tmp = torch.ones(2, device=device)
             y1, y2 = x.split(2)
             y1_view = y1.diagonal()
@@ -4958,7 +6293,11 @@ class TestFunctionalize(TestCase):
         self._check_functionalize_correctness(f, torch.zeros(4, 2, device=device))
 
     def test_inplace_view(self, device):
+        # [FUNCTION DOC] Checks functionalize correctness (without vmap) for an in-place add on a
+        # row selected from a transposed intermediate.
         def f(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Doubles x, transposes it, takes its first row, adds ones in
+            # place and returns the intermediate.
             tmp = torch.ones(4, device=device)
             y = x + x
             y2 = y.transpose(1, 0)
@@ -4972,7 +6311,10 @@ class TestFunctionalize(TestCase):
 
     # See https://github.com/pytorch/functorch/issues/780
     def test_linear(self, device):
+        # [FUNCTION DOC] Regression test for functorch issue 780: functionalize of a function
+        # calling the internal linear op gives the same result as eager.
         def f(x, y, z) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Returns the internal linear op applied to x, y and z.
             return torch._C._nn.linear(x, y, z)
 
         x = torch.randn(14, 1, 384, device=device)
@@ -4984,7 +6326,12 @@ class TestFunctionalize(TestCase):
         self.assertEqual(out_expected, out_actual)
 
     def test_multioutput_inplace_slice_view(self, device):
+        # [FUNCTION DOC] Checks functionalize correctness (without vmap, see the note on slice
+        # scatter under vmap) for a chain of view ops including reshape, transpose, in-place
+        # unsqueeze and squeeze, and split, followed by an in-place add.
         def f(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Applies a chain of view ops to x and an in-place add to one
+            # split piece, returns x.
             tmp = torch.ones(2, 2, device=device)
             y = x.view(8)
             z0 = y.reshape(2, 4)
@@ -5003,7 +6350,11 @@ class TestFunctionalize(TestCase):
     # Ensure functionalize works with List[Optional[Tensor]] arguments.
     # See the fix / discussion at https://github.com/pytorch/pytorch/pull/76085
     def test_functionalize_opt_tensor_list(self, device):
+        # [FUNCTION DOC] Checks functionalize works with functions taking an optional tensor list
+        # argument (index by tensor) both numerically and with make_fx, comparing the traced code
+        # to a golden string.
         def f(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Returns x indexed by the index tensor.
             return x[indices]
 
         inpta = torch.ones(4, device=device)
@@ -5026,7 +6377,11 @@ def forward(self, x_1, indices_1) -> torch.Tensor:
 
     # Ensure grad(functionalize(f)) works
     def test_functionalize_grad(self, device):
+        # [FUNCTION DOC] Checks grad of a functionalized function equals grad of the original and
+        # that the input is left equal.
         def f(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Doubles x, takes a view, adds ones in place to the doubled
+            # tensor and returns the sum of the view.
             tmp = torch.ones(2, device=device)
             y = x + x
             z = y.view(4, 2)
@@ -5042,13 +6397,19 @@ def forward(self, x_1, indices_1) -> torch.Tensor:
 
     @unittest.skipIf(IS_FBCODE, "fails in fbcode")
     def test_vmap_functionalize_jvp(self, device):
+        # [FUNCTION DOC] Checks vmap of jvp gives the same result with and without functionalize
+        # applied to the jvp wrapper. Skipped in fbcode.
         def f(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Doubles x, takes a flat view, adds one in place to the
+            # doubled tensor and returns the view.
             y = x + x
             z = y.view(-1)
             y.add_(1)
             return z
 
         def jvp_wrapper(x, t):
+            # [FUNCTION DOC] HELPER: Returns the jvp of the view-mutating function at x with
+            # tangent t.
             return jvp(
                 f,
                 (x,),
@@ -5065,7 +6426,12 @@ def forward(self, x_1, indices_1) -> torch.Tensor:
     # TODO: move this test into test_fake_tensor.py
     # once functionalize() can be used in core tests.
     def test_functionalize_fake_tensors(self, device):
+        # [FUNCTION DOC] Checks functionalize works with a fake tensor mode on a tensor that
+        # requires grad (detach and add), and the original tensor keeps its size. The TODO says to
+        # move it to fake tensor tests once functionalize is usable in core tests.
         def f(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Detaches x and returns the sum of the detached tensor
+            # with itself.
             y = x.detach()
             return y + y
 
@@ -5075,7 +6441,13 @@ def forward(self, x_1, indices_1) -> torch.Tensor:
         self.assertEqual(x.size(), (2,))
 
     def test_functionalize_fx_simple(self, device):
+        # [FUNCTION DOC] Checks the make_fx graph of functionalize with mutations and views
+        # removed for an in-place add through a view: view_copy ops replace views and a final copy
+        # into the input preserves the input mutation. Compares printed code (device normalized)
+        # with a golden string.
         def f(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Views x as four by two, adds a ones vector in place through
+            # the view and returns x.
             tmp = torch.ones(2, device=device)
             y = x.view(4, 2)
             y.add_(tmp)
@@ -5104,7 +6476,10 @@ def forward(self, x_1) -> torch.Tensor:
         )
 
     def test_functionalize_fx_transpose_simple(self, device):
+        # [FUNCTION DOC] Checks the traced graph for a transpose with views removed is a transpose
+        # copy op, using a golden string.
         def f(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Returns x transposed.
             return x.transpose(1, 0)
 
         fn = make_fx(functionalize(f, remove="mutations_and_views"))
@@ -5123,7 +6498,13 @@ def forward(self, x_1) -> torch.Tensor:
         )
 
     def test_functionalize_fx_out_op(self, device):
+        # [FUNCTION DOC] Checks the traced functionalized graph for a function using an out
+        # variant op followed by an in-place add through a view, with views removed, against a
+        # golden string.
         def f(inpt: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Allocates an empty scalar tensor, writes the doubled input
+            # into it with the out argument, adds one in place through a view and returns
+            # the tensor.
             out = torch.empty((), dtype=torch.float32)
             torch.add(inpt, inpt, out=out)
             out_view = out.view(4)
@@ -5152,7 +6533,13 @@ def forward(self, inpt_1) -> torch.Tensor:
         )
 
     def test_functionalize_fx_multi_out_op(self, device):
+        # [FUNCTION DOC] Checks the traced graph for an op with two out arguments (aminmax writing
+        # into a plain tensor and a view of another) after functionalization with views removed,
+        # against a golden string.
         def f(inpt: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Allocates two empty outputs, one used through a flat view,
+            # views the input as two by four, runs aminmax along dim zero writing into the
+            # outputs, and returns both.
             mins = torch.empty(4, dtype=torch.float32)
             maxs = torch.empty(2, 2, dtype=torch.float32)
             maxs_view = maxs.view(4)
@@ -5184,7 +6571,12 @@ def forward(self, inpt_1) -> torch.Tensor:
         )
 
     def test_functionalize_fx_reapply_views_simple(self, device):
+        # [FUNCTION DOC] Checks the traced graph of default functionalize (views are reapplied as
+        # view ops, not copies) for an in-place add through a view, with a copy into the input,
+        # against a golden string.
         def f(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Views x as four by two, adds a ones vector in place through
+            # the view and returns x.
             tmp = torch.ones(2, device=device)
             y = x.view(4, 2)
             y.add_(tmp)
@@ -5210,9 +6602,13 @@ def forward(self, x_1) -> torch.Tensor:
         )
 
     def test_functionalize_nonfunctional_output(self, device):
+        # [FUNCTION DOC] Checks the traced graph of functionalize for a function returning a
+        # tensor captured from outside is just a read of the captured constant, against a
+        # golden string.
         global_out = torch.ones(2, device=device)
 
         def f() -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Returns the enclosing captured tensor.
             return global_out
 
         out = make_fx(functionalize(f))()
@@ -5230,7 +6626,11 @@ def forward(self) -> torch.Tensor:
         )
 
     def test_functionalize_optional_tensorlist1(self, device):
+        # [FUNCTION DOC] Checks functionalize handles ops with optional tensor list arguments
+        # (indexing with a tensor) and that the traced graph has a plain index op, against a
+        # golden string.
         def f(a, b) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Returns a indexed by b.
             # at::index has OptionalTensorList arguments,
             # test that here
             return a[b]
@@ -5253,7 +6653,11 @@ def forward(self, a_1, b_1) -> torch.Tensor:
 
     @unittest.skipIf(IS_FBCODE, "fails in fbcode")
     def test_functionalize_optional_tensorlist2(self, device):
+        # [FUNCTION DOC] Checks functionalize on a direct call of the aten index op with an index
+        # tensor (see PR 77846): the traced graph unbinds the tensor and indexes with a list,
+        # against a golden string. Skipped in fbcode.
         def f(a, b) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Returns the result of the aten index op on a and b.
             # See https://github.com/pytorch/pytorch/pull/77846
             return torch.ops.aten.index(a, b)
 
@@ -5276,7 +6680,12 @@ def forward(self, a_1, b_1) -> torch.Tensor:
         )
 
     def test_resize_program_inputs(self, device):
+        # [FUNCTION DOC] Checks functionalize of resizing a program input and filling it: the
+        # traced graph shows resize, fill, an in-place resize and a copy back, returning None,
+        # against a golden string.
         def f(x):
+            # [FUNCTION DOC] HELPER: Resizes x in place to ten elements and fills it with two;
+            # returns nothing.
             x.resize_(10)
             x.fill_(2)
 
@@ -5300,17 +6709,31 @@ def forward(self, x_1):
 
 
 def construct_sum_pyop():
+    # [FUNCTION DOC] HELPER: Builds and returns a custom higher order operator named mysum that
+    # sums a tensor over a dim, with implementations for the vmap transform, the grad transform
+    # (through a single-level autograd Function), and the CPU and CUDA autograd dispatch keys.
+    # Used to test transforms with higher order operators.
     class MySum(HigherOrderOperator):
+        # [CLASS DOC] HELPER: Higher order operator class registered under the name mysum; its
+        # call just forwards to the parent implementation.
         def __init__(self):
+            # [FUNCTION DOC] HELPER: Initializes the base operator with the name mysum.
             super().__init__("mysum")
 
         def __call__(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Forwards all arguments to the base class call and returns
+            # its result.
             return super().__call__(*args, **kwargs)
 
     mysum = MySum()
 
     @mysum.py_impl(torch._C._functorch.TransformType.Vmap)
     def mysum_batch_rule(interpreter, x, dim):
+        # [FUNCTION DOC] HELPER: Vmap rule for mysum. For an unbatched tensor it lowers the
+        # interpreter and calls the operator again (after a no-op view). For a batched tensor it
+        # unwraps the value and batch dim, moves the batch dim to the front, sums over the dim
+        # shifted by one with the interpreter lowered, and rewraps the result with a batch dim
+        # at zero.
         if not torch._C._functorch.is_batchedtensor(x):
             with interpreter.lower():
                 x = x.view_as(x)  # unnecessary, just here to test the dispatch
@@ -5327,11 +6750,21 @@ def construct_sum_pyop():
 
     @mysum.py_impl(torch._C._functorch.TransformType.Grad)
     def mysum_grad_rule(interpreter, x, dim):
+        # [FUNCTION DOC] HELPER: Grad rule for mysum. Applies a single-level autograd Function
+        # that unwraps the input for the grad level, calls the operator with grad enabled and the
+        # interpreter lowered, rewraps the output, and has a backward that expands the gradient
+        # over the summed dim. Runs under the single-level autograd function context.
         level = interpreter.level()
 
         class MySum(torch.autograd.function._SingleLevelFunction):
+            # [CLASS DOC] HELPER: Single-level autograd Function for the grad rule of mysum; saves
+            # the input shape and the dim on the context and expands the gradient back
+            # in backward.
             @staticmethod
             def forward(ctx, x, dim):
+                # [FUNCTION DOC] HELPER: Saves the shape and dim, unwraps x for the grad level,
+                # calls the operator under grad with the interpreter lowered, rewraps the result
+                # for the level and returns it.
                 ctx.x_shape = x.shape
                 ctx.dim = dim
                 x = torch._C._functorch._unwrap_for_grad(x, level)
@@ -5344,6 +6777,8 @@ def construct_sum_pyop():
 
             @staticmethod
             def backward(ctx, gy):
+                # [FUNCTION DOC] HELPER: Inserts the summed dim into the gradient and expands it
+                # to the saved input shape; returns it with None for the dim.
                 return gy.unsqueeze(ctx.dim).expand(ctx.x_shape), None
 
         with enable_single_level_autograd_function():
@@ -5351,10 +6786,12 @@ def construct_sum_pyop():
 
     @mysum.py_impl(torch._C.DispatchKey.AutogradCPU)
     def mysum_autograd_cpu(x, dim):
+        # [FUNCTION DOC] HELPER: CPU autograd implementation: returns the sum of x over dim.
         return torch.sum(x, dim)
 
     @mysum.py_impl(torch._C.DispatchKey.AutogradCUDA)
     def mysum_autograd_cuda(x, dim):
+        # [FUNCTION DOC] HELPER: CUDA autograd implementation: returns the sum of x over dim.
         return torch.sum(x, dim)
 
     return mysum
@@ -5365,12 +6802,18 @@ sum_pyop = construct_sum_pyop()
 
 @markDynamoStrictTest
 class TestHigherOrderOperatorInteraction(TestCase):
+    # [CLASS DOC] Device-generic tests that apply grad and vmap to the custom mysum higher order
+    # operator built at module level (basic use, vmap, grad, nested grad, no_grad interplay) plus
+    # two name and functional-call checks.
     def test_basic_sum(self, device):
+        # [FUNCTION DOC] Checks the operator applied directly equals the ordinary sum.
         x = torch.randn(2, 3, 4, device=device)
         result = sum_pyop(x, 1)
         self.assertEqual(result, torch.sum(x, 1))
 
     def test_vmap_sum(self, device):
+        # [FUNCTION DOC] Checks vmap of the operator (and nested vmap) equals the ordinary sum
+        # over the corresponding dim.
         x = torch.randn(2, 3, 4, device=device)
         result = vmap(sum_pyop, (0, None))(x, 0)
         self.assertEqual(result, torch.sum(x, 1))
@@ -5379,29 +6822,37 @@ class TestHigherOrderOperatorInteraction(TestCase):
         self.assertEqual(result, torch.sum(x, 2))
 
     def test_grad_sum(self, device):
+        # [FUNCTION DOC] Checks grad of the operator gives ones.
         x = torch.randn(3, device=device)
         gx = grad(sum_pyop)(x, 0)
         self.assertEqual(gx, torch.ones_like(x))
 
     def test_grad_grad_sum(self, device):
+        # [FUNCTION DOC] Checks second order grad through the operator on a sine (needs a
+        # non-linearity) gives minus sin.
         x = torch.randn(3, requires_grad=True, device=device)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the operator applied to sin of x over dim zero.
             # higher order grad. Requires a non-linearity
             return sum_pyop(x.sin(), 0)
 
         def grad_f_sum(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of the grad of the sine-sum function at x.
             return grad(f)(x).sum()
 
         ggx = grad(grad_f_sum)(x)
         self.assertEqual(ggx, -x.sin())
 
     def test_vmap_grad_sum(self, device):
+        # [FUNCTION DOC] Checks vmap of grad of the operator gives ones for every row.
         x = torch.randn(2, 3, device=device)
         gx = vmap(grad(sum_pyop), (0, None))(x, 0)
         self.assertEqual(gx, torch.ones_like(x))
 
     def test_no_grad_outside_grad(self, device):
+        # [FUNCTION DOC] Checks grad of the operator inside a no_grad block returns ones that do
+        # not require grad.
         x = torch.randn(3, device=device, requires_grad=True)
         with torch.no_grad():
             y = grad(sum_pyop)(x, 0)
@@ -5409,7 +6860,12 @@ class TestHigherOrderOperatorInteraction(TestCase):
         self.assertFalse(y.requires_grad)
 
     def test_no_grad_inside_grad(self, device):
+        # [FUNCTION DOC] Checks no_grad inside the differentiated function: the operator value
+        # computed there is a constant shift, giving gradient two x, second derivative two, and an
+        # autograd derivative of two.
         def f(x):
+            # [FUNCTION DOC] HELPER: Computes the operator on x squared under no_grad as a shift
+            # and returns the operator on x squared minus the shift.
             with torch.no_grad():
                 shift = sum_pyop(x**2, 0)
             return sum_pyop(x**2, 0) - shift
@@ -5426,13 +6882,17 @@ class TestHigherOrderOperatorInteraction(TestCase):
         self.assertEqual(z, torch.full_like(x, 2))
 
     def test_grad_name_wrapping(self, device):
+        # [FUNCTION DOC] Checks the function returned by grad keeps the wrapped function name.
         def my_fn(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of x.
             return x.sum()
 
         grad_fn = grad(my_fn)
         self.assertEqual(grad_fn.__name__, "my_fn")
 
     def test_functional_call_multiple_dicts(self):
+        # [FUNCTION DOC] Smoke test: functional_call accepts a tuple of two parameter dicts (one
+        # weight, one bias) for a linear layer and runs without error.
         mod = nn.Linear(1, 1)
         x = torch.randn((1, 1))
         params = ({"weight": torch.zeros(1, 1)}, {"bias": torch.ones(1)})
@@ -5440,10 +6900,15 @@ class TestHigherOrderOperatorInteraction(TestCase):
 
 
 def traceable(f):
+    # [FUNCTION DOC] HELPER: Marks the function as allowed in the Dynamo graph and returns a
+    # wrapper preserving its metadata that forwards all positional and keyword arguments to it, so
+    # a transformed function can be traced by torch.compile as a single call.
     f = allow_in_graph(f)
 
     @wraps(f)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Forwards all arguments to the wrapped function and returns
+        # its result.
         return f(*args, **kwargs)
 
     return wrapper
@@ -5451,6 +6916,9 @@ def traceable(f):
 
 @markDynamoStrictTest
 class TestCompileTransforms(TestCase):
+    # [CLASS DOC] Device-generic tests that run function transforms under torch.compile: vmap of
+    # nested Jacobians, dynamic shape regression tests for grad with strided slicing and with
+    # custom pytree inputs, and the deprecated functorch grad API under full-graph compile.
     # torch.compile is not supported on Windows CUDA.
     # Triton only supports GPU with SM70 or later.
     @expectedFailureIf((IS_WINDOWS and TEST_CUDA) or (TEST_CUDA and not SM70OrLater))
@@ -5459,6 +6927,10 @@ class TestCompileTransforms(TestCase):
         "Leaking memory, see https://github.com/pytorch/pytorch/pull/150059 for example",
     )
     def test_compile_vmap_hessian(self, device):
+        # [FUNCTION DOC] Compiles a vmapped forward-over-reverse hessian (with aux outputs) of a
+        # small linear and relu model, and checks the compiled result equals the eager result.
+        # Expected to fail on Windows with CUDA or on CUDA devices older than SM70 (no compile
+        # support); skipped under the CUDA memory leak check.
         # The model and inputs are a smaller version
         # of code at benchmark repo:
         # https://github.com/pytorch/benchmark/blob/main/userbenchmark/functorch/vmap_hessian_fc.py
@@ -5475,6 +6947,8 @@ class TestCompileTransforms(TestCase):
         )
 
         def predict(params_and_buffers, x):
+            # [FUNCTION DOC] HELPER: Runs the module functionally with the given parameters and
+            # buffers and returns the output twice (as output and aux).
             out = torch.func.functional_call(model, params_and_buffers, x)
             return out, out
 
@@ -5491,10 +6965,16 @@ class TestCompileTransforms(TestCase):
 
     @parametrize("backend", ["eager", "aot_eager"])
     def test_compile_dynamic_grad_stride_slice_mha(self, device, backend):
+        # [FUNCTION DOC] Parametrized over the eager and aot_eager backends. Regression test for
+        # issue 181305: grad of a function that slices with a stride, averages, and applies a
+        # linear layer, compiled with dynamic shapes after resetting Dynamo, equals the
+        # eager gradient.
         # Regression test for https://github.com/pytorch/pytorch/issues/181305
         linear = nn.Linear(3, 3).to(device).eval()
 
         def model(x):
+            # [FUNCTION DOC] HELPER: Takes every second element along dim one of x, averages over
+            # dim zero, applies the linear layer and returns the mean.
             y = x[:, ::2, :, :]
             y = y.mean(dim=0)
             y = linear(y)
@@ -5509,17 +6989,28 @@ class TestCompileTransforms(TestCase):
         self.assertEqual(result, expected)
 
     def test_compile_dynamic_grad_vjp_index_select_pytree(self, device):
+        # [FUNCTION DOC] Regression test for issue 171537. Registers a custom pytree node class,
+        # then compares eager and dynamic-shape compiled (eager backend) grad_and_value of a
+        # function that uses vjp over an input holding a positions tensor and index_select. Always
+        # deregisters the pytree node afterwards, even on failure.
         # Regression test for https://github.com/pytorch/pytorch/issues/171537
         from torch.utils import _pytree as pytree
 
         class Input:
+            # [CLASS DOC] HELPER: Simple container holding a positions tensor, registered as a
+            # pytree node for this test.
             def __init__(self, positions):
+                # [FUNCTION DOC] HELPER: Stores the positions tensor.
                 self.positions = positions
 
         def flatten(inp):
+            # [FUNCTION DOC] HELPER: Pytree flatten function: returns a list with the positions
+            # tensor and no context.
             return [inp.positions], None
 
         def unflatten(children, context):
+            # [FUNCTION DOC] HELPER: Pytree unflatten function: builds a new container from the
+            # first child, ignoring the context.
             return Input(children[0])
 
         pytree.register_pytree_node(
@@ -5531,7 +7022,12 @@ class TestCompileTransforms(TestCase):
         try:
 
             def loss(weight, inp):
+                # [FUNCTION DOC] HELPER: Computes a vjp of the energy function over the container
+                # input with ones as cotangent, and returns the sum of the squared energy plus the
+                # sum of the squared input gradient positions.
                 def energy(input_pc):
+                    # [FUNCTION DOC] HELPER: Index-selects five rows of the positions with an
+                    # index range, multiplies by the weight and sums over dim one keeping the dim.
                     idx = torch.arange(5, device=input_pc.positions.device)
                     vals = input_pc.positions.index_select(0, idx) * weight
                     return vals.sum(dim=[1], keepdim=True)
@@ -5554,17 +7050,28 @@ class TestCompileTransforms(TestCase):
             pytree._deregister_pytree_node(Input)
 
     def test_compile_dynamic_grad_vjp_trace_pytree(self, device):
+        # [FUNCTION DOC] Regression test for issue 171537. Same as the index-select variant but
+        # the energy is the trace of the elementwise product of a matrix with the weight. Compares
+        # eager and dynamic-shape compiled grad_and_value, and deregisters the pytree
+        # node afterwards.
         # Regression test for https://github.com/pytorch/pytorch/issues/171537
         from torch.utils import _pytree as pytree
 
         class Input:
+            # [CLASS DOC] HELPER: Simple container holding a matrix tensor, registered as a pytree
+            # node for this test.
             def __init__(self, matrix):
+                # [FUNCTION DOC] HELPER: Stores the matrix tensor.
                 self.matrix = matrix
 
         def flatten(inp):
+            # [FUNCTION DOC] HELPER: Pytree flatten function: returns a list with the matrix
+            # tensor and no context.
             return [inp.matrix], None
 
         def unflatten(children, context):
+            # [FUNCTION DOC] HELPER: Pytree unflatten function: builds a new container from the
+            # first child, ignoring the context.
             return Input(children[0])
 
         pytree.register_pytree_node(
@@ -5576,7 +7083,12 @@ class TestCompileTransforms(TestCase):
         try:
 
             def loss(weight, inp):
+                # [FUNCTION DOC] HELPER: Computes a vjp of the trace energy over the container
+                # with ones as cotangent, and returns the squared energy plus the sum of the
+                # squared input gradient matrix.
                 def energy(input_pc):
+                    # [FUNCTION DOC] HELPER: Returns the trace of the container matrix times
+                    # the weight.
                     return torch.trace(input_pc.matrix * weight)
 
                 y, vjp_fn = torch.func.vjp(energy, inp)
@@ -5599,10 +7111,14 @@ class TestCompileTransforms(TestCase):
     # torch.compile is not supported on Windows
     @torch._dynamo.config.patch(suppress_errors=False)
     def test_grad_deprecated_api(self, device):
+        # [FUNCTION DOC] Run with Dynamo suppress_errors disabled. Checks that the deprecated
+        # functorch grad API (single argnums and tuple argnums on a product) compiles with the
+        # eager backend in full-graph mode and equals the eager result.
         x = torch.randn((), device=device)
         y = torch.randn((), device=device)
 
         def wrapper_fn(x, y):
+            # [FUNCTION DOC] HELPER: Returns the functorch grad of the multiply op at x and y.
             return functorch.grad(torch.mul)(x, y)
 
         actual = wrapper_fn(x, y)
@@ -5611,6 +7127,8 @@ class TestCompileTransforms(TestCase):
         self.assertEqual(actual, expected)
 
         def wrapper_fn(x, y):
+            # [FUNCTION DOC] HELPER: Redefinition returning the functorch grad of the multiply op
+            # at x and y with respect to both arguments.
             return functorch.grad(torch.mul, argnums=(0, 1))(x, y)
 
         actual = wrapper_fn(x, y)
@@ -5619,12 +7137,19 @@ class TestCompileTransforms(TestCase):
 
 
 class TestGradTrackingTensorToList(TestCase):
+    # [CLASS DOC] Tests that tolist works on tensors wrapped by grad (GradTrackingTensor) in
+    # plain, nested, multi-dimensional and conjugate cases, and that gradients are still computed.
+    # Instantiated for each device type in the list at the end of the file.
     """Tests for tolist() method with GradTrackingTensor (functorch tensors)."""
 
     def test_tolist_with_grad(self):
+        # [FUNCTION DOC] Checks that calling tolist on the input inside grad returns a python list
+        # with the right values and that the final gradient is two times the input.
         """Test to see if tolist works inside grad transformation."""
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Asserts through the enclosing test that tolist returns the
+            # list of values one, two, three, then returns the sum of squares.
             # inside grad, x is a GradTrackingTensor
             result = x.tolist()
             # tolist should return a python list and not fail
@@ -5640,10 +7165,16 @@ class TestGradTrackingTensorToList(TestCase):
         self.assertEqual(result, [2.0, 4.0, 6.0])
 
     def test_tolist_nested_grad(self):
+        # [FUNCTION DOC] Checks tolist works on tensors at two nested grad levels and that the
+        # second derivative of the sum of squares is twos.
         """Test `tolist` with nested grad transformations."""
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Calls tolist on the outer input, then returns the sum of the
+            # grad of the inner function at it.
             def g(y):
+                # [FUNCTION DOC] HELPER: Calls tolist on its input, asserts the result is a list
+                # and returns the sum of squares.
                 # y is gradTrackingTensor(lvl=1)
                 inner_list = y.tolist()
                 self.assertIsInstance(inner_list, list)
@@ -5671,9 +7202,13 @@ class TestGradTrackingTensorToList(TestCase):
         )
 
     def test_tolist_multidimensional_grad(self):
+        # [FUNCTION DOC] Checks tolist on a two by three input inside grad returns the nested list
+        # of values and that the gradient of the sum is ones.
         """Test tolist with multi-dimensional tensors in grad."""
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Asserts the tolist result is a nested list of length two with
+            # the expected values, and returns the sum.
             result = x.tolist()
             self.assertIsInstance(result, list)
             self.assertEqual(len(result), 2)
@@ -5697,9 +7232,14 @@ class TestGradTrackingTensorToList(TestCase):
         )
 
     def test_tolist_conj_neg_grad(self):
+        # [FUNCTION DOC] Checks tolist of a conjugated complex tensor inside grad returns a list,
+        # and that grad of the real part of the product with the conjugate gives the expected
+        # complex gradient (twice the input).
         """Test tolist method with conjugate/negative tensors in grad context."""
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Takes the conjugate, asserts its tolist result is a list and
+            # returns the sum of the real part of the product of the input with its conjugate.
             # test with the conjugate view
             x_conj = x.conj()
             result_conj = x_conj.tolist()
