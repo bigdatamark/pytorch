@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Public torch.compiler namespace: thin user-facing wrappers over torch.compile and
+# torch._dynamo (compile, reset, allow_in_graph, nonstrict_trace, substitute_in_graph, disable, backend
+# and stance controls, cudagraph step markers, guard-skipping context managers, cache artifact
+# save/load, compile-state queries, nested_compile_region). Re-exports precompile and PrecompileError from
+# torch._precompile and the config submodule. Most functions import torch._dynamo lazily on call so
+# importing this package stays cheap. Import-time side effects: marks set_stance and
+# set_enable_guard_collectives as forbidden inside graphs.
 import contextlib
 import io
 from collections.abc import Callable
@@ -71,6 +78,7 @@ F = TypeVar("F", bound=FuncType)
 
 
 def compile(*args, **kwargs):
+    # [FUNCTION DOC] Forwards all positional and keyword arguments to torch.compile and returns its result.
     """
     See :func:`torch.compile` for details on the arguments for this function.
     """
@@ -79,6 +87,8 @@ def compile(*args, **kwargs):
 
 
 def reset() -> None:
+    # [FUNCTION DOC] Resets in-process Dynamo state (compilation caches, process-local state) by calling the Dynamo
+    # reset. Does not delete on-disk caches. Returns nothing.
     """
     Reset the in-process compiler state.
 
@@ -92,6 +102,9 @@ def reset() -> None:
 
 
 def allow_in_graph(fn):
+    # [FUNCTION DOC] Marks fn (or recursively each function in a list/tuple) so Dynamo does not trace inside it and
+    # puts it directly into the graph while the backend still traces through it. Delegates to Dynamo and returns the
+    # marked function(s). Unsafe if fn's inputs/outputs are not graph-proxyable or it captures tensors.
     """
     Tells the compiler frontend (Dynamo) to skip symbolic introspection of the function
     and instead directly write it to the graph when encountered.
@@ -177,6 +190,8 @@ def allow_in_graph(fn):
 
 
 def nonstrict_trace(traceable_fn: Callable[_P, _R]) -> Callable[_P, _R]:
+    # [FUNCTION DOC] Decorator marking traceable_fn as opaque to Dynamo but traceable by aot_autograd, with pytree
+    # support for user classes and module arguments. Delegates to Dynamo and returns the wrapped callable.
     """
     Decorator to mark a function as nonstrict-traceable for dynamo.
 
@@ -251,6 +266,9 @@ def substitute_in_graph(
     can_constant_fold_through: bool = False,
     skip_signature_check: bool = False,
 ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    # [FUNCTION DOC] Returns a decorator that registers a polyfill handler for original_fn (usually a C function),
+    # used only when inlining it into a graph. can_constant_fold_through allows constant folding of pure handlers;
+    # skip_signature_check disables comparing signatures. Delegates to Dynamo.
     """
     Register a polyfill handler for a function, usually a C function from the C extension, to be
     used in place of the original function when inlining the original function in the graph.
@@ -309,6 +327,8 @@ def substitute_in_graph(
 
 
 def list_backends(exclude_tags=("debug", "experimental")) -> list[str]:
+    # [FUNCTION DOC] Returns the list of backend names valid for torch.compile, excluding backends carrying any of
+    # exclude_tags (default debug and experimental). Delegates to Dynamo.
     """
     Return valid strings that can be passed to `torch.compile(..., backend="name")`.
 
@@ -321,6 +341,8 @@ def list_backends(exclude_tags=("debug", "experimental")) -> list[str]:
 
 
 def assume_constant_result(fn):
+    # [FUNCTION DOC] Marks fn as returning a constant so the compiler may fold calls; returns the same function.
+    # No validation of the assumption is performed. Delegates to Dynamo.
     """
     This function is used to mark a function `fn` as having a constant result.
     This allows the compiler to optimize away your function.
@@ -340,6 +362,8 @@ def assume_constant_result(fn):
 
 
 def disable(fn=None, recursive=True, *, reason=None):
+    # [FUNCTION DOC] Decorator (or direct call) disabling compilation of fn, optionally recursively into callees,
+    # with an optional reason string. Delegates to Dynamo and returns the wrapped function or decorator.
     """
     This function provides a decorator to disable compilation on a function.
     It also provides the option of recursively disabling called functions.
@@ -355,6 +379,8 @@ def disable(fn=None, recursive=True, *, reason=None):
 
 
 def set_default_backend(backend: str | Callable[..., Any] | None) -> None:
+    # [FUNCTION DOC] Sets the process-wide default backend (name or callable) used when torch.compile gets no backend;
+    # none restores inductor. Delegates to the Dynamo backend registry; returns nothing.
     """Set the default backend for ``torch.compile`` when no ``backend`` argument is specified.
 
     Passing ``None`` resets the default back to ``"inductor"``.
@@ -377,6 +403,7 @@ def set_default_backend(backend: str | Callable[..., Any] | None) -> None:
 
 
 def get_default_backend() -> str | Callable[..., Any]:
+    # [FUNCTION DOC] Returns the current default backend (name or callable) from the Dynamo backend registry.
     """Return the current default backend for ``torch.compile``.
 
     Returns:
@@ -393,6 +420,10 @@ def set_stance(
     skip_guard_eval_unsafe: bool = False,
     force_backend: str | Callable[..., Any] | None = None,
 ):
+    # [FUNCTION DOC] Sets the compiler stance (default, force_eager, eager_on_recompile, fail_on_recompile,
+    # eager_then_compile, aot_eager_then_compile). Usable as a function, context manager or decorator. Optional
+    # skip_guard_eval_unsafe runs only differentiating guards (unsafe), and force_backend forces a backend when the
+    # stance is default (errors otherwise). Delegates to Dynamo; errors if used inside a compiled region.
     """
     Set the current stance of the compiler.
     Can be used as a function, context manager, or decorator.
@@ -474,6 +505,9 @@ set_stance._dynamo_forbidden = True  # type: ignore[attr-defined]
 
 
 def set_enable_guard_collectives(enabled: bool):
+    # [FUNCTION DOC] Enables or disables collectives during guard evaluation to keep ranks synchronized (expensive;
+    # SPMD programs only, otherwise hangs). Installs or clears the global guard-complete hook. Returns whether a hook
+    # was previously installed.
     """
     Enables use of collectives *during* guard evaluation to synchronize behavior
     across ranks.  This is expensive: we have to issue a collective every time
@@ -503,6 +537,8 @@ set_enable_guard_collectives._dynamo_forbidden = True  # type: ignore[attr-defin
 
 
 def cudagraph_mark_step_begin():
+    # [FUNCTION DOC] Signals to CUDA Graph Trees (inductor) that a new training/inference iteration begins, so tensors
+    # from the prior iteration may be freed. Call manually when the automatic heuristic is wrong. Returns nothing.
     """
     Indicates that a new iteration of inference or training is about to begin.
 
@@ -530,6 +566,8 @@ def cudagraph_mark_step_begin():
 
 
 def cudagraph_mark_warmup_incomplete():
+    # [FUNCTION DOC] Asks CUDA Graph Trees to run the current function eagerly once more instead of recording it;
+    # meant for autotuners during warmup. No-op outside warmup. Returns nothing.
     """Request another warmup for the active CUDA Graph Trees function.
 
     Call this synchronously from an autotuner or other code running during CUDA
@@ -544,6 +582,8 @@ def cudagraph_mark_warmup_incomplete():
 
 
 def wrap_numpy(fn):
+    # [FUNCTION DOC] Decorator wrapping a NumPy-array function into a tensor-in tensor-out function (delegates to
+    # Dynamo's wrap_numpy); only meaningful under torch.compile with full graph capture. Returns the wrapped function.
     r"""Decorator that turns a function from ``np.ndarray``\ s to ``np.ndarray``\ s into a function
     from ``torch.Tensor``\ s to ``torch.Tensor``\ s.
 
@@ -581,6 +621,8 @@ _is_non_strict_tracing_flag: bool = False
 
 
 def is_compiling() -> bool:
+    # [FUNCTION DOC] Returns true when running or tracing inside torch.compile or torch.export (module flag), and
+    # always false under TorchScript.
     """
     Indicates whether a graph is executed/traced as part of torch.compile() or torch.export().
 
@@ -603,6 +645,7 @@ def is_compiling() -> bool:
 
 
 def _is_non_strict_tracing() -> bool:
+    # [FUNCTION DOC] HELPER: Returns whether a non-strict make_fx tracing session flag is set.
     """
     Indicates whether we are inside a non-strict make_fx-based tracing session.
     """
@@ -611,6 +654,8 @@ def _is_non_strict_tracing() -> bool:
 
 @contextlib.contextmanager
 def _non_strict_tracing_context():
+    # [FUNCTION DOC] HELPER: Context manager that sets the non-strict tracing flag for its duration and restores the
+    # previous value on exit (module global state).
     """Context manager that sets the non-strict tracing flag."""
     global _is_non_strict_tracing_flag
     old = _is_non_strict_tracing_flag
@@ -623,6 +668,8 @@ def _non_strict_tracing_context():
 
 @contextlib.contextmanager
 def _compile_session_context():
+    # [FUNCTION DOC] HELPER: Context manager that sets the compiling flag for a torch.compile session and restores the
+    # previous value on exit (module global state).
     """Context manager that sets _is_compiling_flag for the duration of a
     torch.compile session.
     """
@@ -637,6 +684,10 @@ def _compile_session_context():
 
 @contextlib.contextmanager
 def _patch_autograd_grad():
+    # [FUNCTION DOC] HELPER: Context manager that temporarily replaces the autograd grad function with a wrapper that
+    # installs stacktrace-preservation hooks on the outputs before calling the original. Emits a one-time deprecation
+    # warning (use the engine backward patch instead). Restores the original on exit.
+    # The patched grad raises an assertion error if called outside a non-strict tracing context.
     """Patch autograd.grad for non-strict make_fx tracing.
 
     This patch installs autograd hooks so traced backward nodes preserve
@@ -661,6 +712,8 @@ def _patch_autograd_grad():
 
     @functools.wraps(_orig_grad)
     def _patched_grad(outputs, inputs, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Replacement for autograd grad: requires non-strict tracing (else assertion error), sets up
+        # stacktrace preservation hooks on outputs, then calls the original and returns its result.
         if not _is_non_strict_tracing():
             raise AssertionError(
                 "_patch_autograd_grad() must be used under "
@@ -679,6 +732,9 @@ def _patch_autograd_grad():
 
 @contextlib.contextmanager
 def _patch_engine_backward():
+    # [FUNCTION DOC] HELPER: Context manager that temporarily replaces the autograd engine backward entry point (both in
+    # the graph module and the autograd package) with a wrapper adding stacktrace-preservation hooks, restoring the
+    # originals on exit.
     """Patch _engine_run_backward for non-strict make_fx tracing.
 
     This patch installs autograd hooks so traced backward nodes preserve
@@ -697,6 +753,8 @@ def _patch_engine_backward():
 
     @functools.wraps(_orig_engine_run_backward)
     def _patched_engine_backward(outputs, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Replacement engine backward: requires non-strict tracing (else assertion error), sets up
+        # stacktrace preservation hooks on outputs, then calls the original and returns its result.
         if not _is_non_strict_tracing():
             raise AssertionError(
                 "_patch_engine_backward() must be used under "
@@ -716,6 +774,7 @@ def _patch_engine_backward():
 
 
 def is_dynamo_compiling() -> bool:
+    # [FUNCTION DOC] Returns false in plain Python; Dynamo treats calls to it as the constant true while tracing.
     """
     Indicates whether a graph is traced via TorchDynamo.
 
@@ -734,6 +793,7 @@ def is_dynamo_compiling() -> bool:
 
 
 def is_exporting() -> bool:
+    # [FUNCTION DOC] Returns the module flag indicating whether torch.export is currently tracing.
     """
     Indicates whether we're under exporting.
 
@@ -752,6 +812,10 @@ def is_exporting() -> bool:
 
 
 def save_cache_artifacts() -> tuple[bytes, CacheInfo] | None:
+    # [FUNCTION DOC] Serializes all cache artifacts recorded during compilation. If caching precompile is enabled in
+    # Dynamo config, first saves the precompile context to the Dynamo cache. Returns a pair of bytes and CacheInfo, or
+    # none if there is nothing to save.
+    # KNOWN ISSUE: relies on torch._dynamo being already imported; the module does not import it here.
     """
     Serializes all the cache artifacts that were created during the compilation
 
@@ -771,6 +835,8 @@ def save_cache_artifacts() -> tuple[bytes, CacheInfo] | None:
 
 
 def load_cache_artifacts(serialized_artifacts: bytes) -> CacheInfo | None:
+    # [FUNCTION DOC] Deserializes bytes from save_cache_artifacts and populates the underlying caches. Returns the
+    # resulting CacheInfo, or none if the bytes could not be parsed. Side effect: writes cache entries.
     """
     Hot loads cache artifacts that were previously serialized via
     save_cache_artifacts
@@ -791,6 +857,9 @@ def load_cache_artifacts(serialized_artifacts: bytes) -> CacheInfo | None:
 
 
 def keep_portable_guards_unsafe(guard_entries):
+    # [FUNCTION DOC] Guard filter for torch.compile: given guard entries, returns a list of booleans (true = keep) that
+    # keeps only portable guards: global-state, shape-env, and non-global tensor-match guards. Unsafe by default.
+    # KNOWN ISSUE: docstring example names a different function (keep_global_context_and_tensor_guards_unsafe).
     """
     A common function to only keep guards that can be used in both Python and non-Python environments.
     This includes:
@@ -815,6 +884,9 @@ def keep_portable_guards_unsafe(guard_entries):
 
 
 def skip_guard_on_inbuilt_nn_modules_unsafe(guard_entries):
+    # [FUNCTION DOC] Guard filter: returns a list of booleans (true = keep) dropping guards whose source is an
+    # unspecialized built-in nn module. Unsafe by default.
+    # KNOWN ISSUE: docstring example names skip_guard_on_all_nn_modules_unsafe instead of this function.
     """
     A common function to skip guards on the inbuilt nn modules like
     torch.nn.Linear. This is unsafe to use by default. But for majority of
@@ -836,6 +908,8 @@ def skip_guard_on_inbuilt_nn_modules_unsafe(guard_entries):
 
 
 def skip_guard_on_all_nn_modules_unsafe(guard_entries):
+    # [FUNCTION DOC] Guard filter: returns a list of booleans (true = keep) dropping guards whose source is any
+    # unspecialized nn module (user-defined or built-in). Unsafe by default.
     """
     A common function to skip guards on all nn modules, both user defined as
     well inbuilt nn modules (like torch.nn.Linear). This is unsafe to use by
@@ -858,6 +932,9 @@ def skip_guard_on_all_nn_modules_unsafe(guard_entries):
 
 
 def keep_tensor_guards_unsafe(guard_entries, keep_parameters=False):
+    # [FUNCTION DOC] Guard filter: keeps only tensor-match guards; guards on nn.Parameter values are kept only when
+    # keep_parameters is true; all other guard types are dropped. Returns a list of booleans (true = keep).
+    # KNOWN ISSUE: docstring example refers to torch.compiler.keep_tensor_guards, which does not exist.
     """
     A common function to keep tensor guards on all tensors. This is unsafe to
     use by default. But if you don't expect any changes in the model code, you
@@ -885,6 +962,8 @@ def keep_tensor_guards_unsafe(guard_entries, keep_parameters=False):
 
 
 def skip_guard_on_globals_unsafe(guard_entries):
+    # [FUNCTION DOC] Guard filter: returns a list of booleans keeping only guards that are not on globals.
+    # KNOWN ISSUE: docstring example refers to a nonexistent skip_guard_on_globals name.
     """
     A common function to skip guards on all globals. This is unsafe to use by
     default. But if you don't expect any changes in the globals, you can just
@@ -900,6 +979,7 @@ def skip_guard_on_globals_unsafe(guard_entries):
 
 
 def skip_all_guards_unsafe(guard_entries):
+    # [FUNCTION DOC] Guard filter: returns a list of booleans all false, i.e. drops every guard. Unsafe.
     """
     A function for skipping all guards on a compiled function.
 
@@ -923,6 +1003,10 @@ def nested_compile_region(
     max_reuse_entries: int = 8,
     reuse_hash_fn=None,
 ):
+    # [FUNCTION DOC] Marks fn (or acts as a decorator when fn is none) as a nested compile region whose compiled code can
+    # be reused across invocations. Optional options (experimental; raises a runtime error unless the Dynamo regional
+    # compile config is on), max_reuse_entries caps reuse cache entries, reuse_hash_fn supplies a traceable integer
+    # cache key. Delegates to the invoke_subgraph compile-region marker; a no-op in eager execution.
     """
     Tells **``torch.compile``** that the marked set of operations forms a nested
     compile region (which is often repeated in the full model) whose code can be
@@ -991,6 +1075,8 @@ def load_compiled_function(
     f_globals: dict[str, object] | None = None,
     external_data: dict[str, Any] | None = None,
 ) -> Callable[..., Any]:
+    # [FUNCTION DOC] Reads the whole serialized AOT-compiled function from a file-like object and deserializes it
+    # with the given globals and external data. Returns the callable. Experimental.
     """
     Load an aot-compiled function from a file.
 

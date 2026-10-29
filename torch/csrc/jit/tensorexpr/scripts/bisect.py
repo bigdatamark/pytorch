@@ -1,9 +1,16 @@
 # mypy: ignore-errors
+# [MODULE DOC] Command-line script that bisects the tensorexpr fuser optimization limit
+# (environment variable PYTORCH_JIT_OPT_LIMIT) to find the first fusion count at which a
+# user-supplied shell command starts failing. Run as main with a required --cmd option
+# (uses click, imported only then). No import-time side effects.
 
 import subprocess
 
 
 def test(cmd, limit):
+    # [FUNCTION DOC] Runs the shell command with the fuser limit set to the given limit, printing
+    # its stdout. Returns -1 (skip) if output or stderr contains an internal assert failure
+    # message, 1 if the exit status is zero (good), otherwise 0 (bad). Spawns a subprocess via shell.
     print(f"Testing PYTORCH_JIT_OPT_LIMIT=tensorexpr_fuser={limit} {cmd}")
     p = subprocess.run(
         f"PYTORCH_JIT_OPT_LIMIT=tensorexpr_fuser={limit} {cmd}",
@@ -25,12 +32,17 @@ def test(cmd, limit):
 
 
 def bisect(cmd):
+    # [FUNCTION DOC] Binary-searches limits between 0 (assumed good) and 10000 (assumed bad) for
+    # the command cmd. Limits that give a skip result are recorded and scanned past, first
+    # forward from the midpoint, then backward. Updates the good/bad bounds until no unskipped
+    # limits remain, then prints the last good and first bad limits. Returns nothing.
     last_good = 0
     first_bad = 10000
     skips = set()
 
     # Test if there are any unskipped commits in (last_good, first_bad)
     def keep_going():
+        # [FUNCTION DOC] HELPER: Returns true if any limit strictly between the current good and bad bounds has not been skipped.
         for limit in range(last_good + 1, first_bad):
             if limit not in skips:
                 return True
@@ -70,6 +82,7 @@ if __name__ == "__main__":
     @click.command()
     @click.option("--cmd", required=True)
     def cli(cmd):
+        # [FUNCTION DOC] HELPER: Click entry point; runs bisect on the cmd option.
         bisect(cmd)
 
     cli()

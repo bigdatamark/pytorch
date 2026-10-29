@@ -1,4 +1,7 @@
 # mypy: ignore-errors
+# [MODULE DOC] Code generator script for NNC external function wrappers. Parses native_functions.yaml
+# via torchgen and, for out-variant ATen ops, emits C++ wrapper functions and registrations into a
+# template file. Run as main with --native-functions, --tags and --template-path options.
 
 import argparse
 
@@ -7,10 +10,13 @@ from torchgen.gen import FileManager, parse_native_yaml
 
 
 def num_leading_spaces(line: str) -> int:
+    # [FUNCTION DOC] HELPER: Returns the count of leading whitespace characters in line.
     return len(line) - len(line.lstrip())
 
 
 def deindent(code: str) -> str:
+    # [FUNCTION DOC] HELPER: Removes the smallest common leading indentation from all lines of code and returns the result.
+    # KNOWN ISSUE: not used anywhere in this file.
     lines = code.split("\n")
     min_leading_spaces = min(map(num_leading_spaces, lines))
     lines = [line[min_leading_spaces:] for line in lines]
@@ -18,6 +24,11 @@ def deindent(code: str) -> str:
 
 
 def gen_external(native_functions_path, tags_path, external_path):
+    # [FUNCTION DOC] Parses the native functions YAML (native_functions_path, tags_path) and, for each out
+    # variant with at most one out argument, no keyword-only arguments and only plain Tensor positional
+    # arguments, builds a C++ wrapper (nnc_aten_NAME) that reconstructs tensors from raw buffers and calls
+    # the ATen out function, swallowing exceptions, plus a registration statement. Writes both lists into
+    # the external_functions_codegen.cpp file at external_path through a FileManager. Returns nothing.
     native_functions = parse_native_yaml(native_functions_path, tags_path)
     func_decls = []
     func_registrations = []
@@ -99,6 +110,7 @@ const static RegisterNNCExternalFunction nnc_{name}(
 
 
 def main() -> None:
+    # [FUNCTION DOC] Parses command-line options (paths to native functions, tags and template) and runs gen_external.
     parser = argparse.ArgumentParser(description="Generate annotated_fn_args script")
     parser.add_argument(
         "--native-functions",

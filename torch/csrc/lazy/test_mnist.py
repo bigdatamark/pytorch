@@ -1,4 +1,9 @@
 # mypy: ignore-errors
+# [MODULE DOC] Manual script (not a unit test) that trains an MNIST convnet on the lazy tensor
+# TorchScript backend. Requires torchvision. At import time it initializes the lazy ts backend.
+# When run as main it builds a DataLoader over MNIST (downloaded to ./data), moves a Net to the
+# lazy device, trains with Adadelta and a StepLR schedule for 14 epochs, and calls mark_step per
+# batch. Setting the LTC_TS_CUDA environment variable adds worker, pin-memory and shuffle options.
 
 import os
 
@@ -18,7 +23,10 @@ torch._lazy.ts_backend.init()
 
 
 class Net(nn.Module):
+    # [CLASS DOC] Small MNIST convolutional classifier: two conv layers, max pooling, two dropouts and
+    # two linear layers (9216 -> 128 -> 10), producing log-probabilities over 10 classes.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Creates the conv, dropout and linear submodules used by forward.
         super().__init__()
         self.conv1 = nn.Conv2d(1, 32, 3, 1)
         self.conv2 = nn.Conv2d(32, 64, 3, 1)
@@ -28,6 +36,8 @@ class Net(nn.Module):
         self.fc2 = nn.Linear(128, 10)
 
     def forward(self, x):
+        # [FUNCTION DOC] Runs the forward pass on a batch of single-channel 28x28 images x and returns
+        # log-softmax class scores of shape (batch, 10).
         x = self.conv1(x)
         x = F.relu(x)
         x = self.conv2(x)
@@ -44,6 +54,9 @@ class Net(nn.Module):
 
 
 def train(log_interval, model, device, train_loader, optimizer, epoch):
+    # [FUNCTION DOC] Trains the model for one epoch over train_loader: for each batch moves data to device,
+    # zeroes grads, computes nll loss, backpropagates, steps the optimizer and calls the lazy mark_step.
+    # Prints loss every log_interval batches. Mutates model and optimizer state; returns nothing.
     model.train()
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)

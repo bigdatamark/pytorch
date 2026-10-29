@@ -1,3 +1,12 @@
+# [MODULE DOC] Top-level compiler configuration module (torch.compiler.config). Declares cross-cutting
+# options as Config objects: independent ones read from environment variables or just-knobs (job_id,
+# PGO read/write keys, cache_key_tag, force_disable_caches, compile_on_one_rank, dynamic_sources,
+# dynamic_values, unbacked_sources, force_cudagraph_gc) and aliases that forward to the matching
+# torch._dynamo.config settings (dynamic_shapes, recompile limits, capture flags, guard options, etc.).
+# Import-time side effect: install_config_module turns this module into a managed config module
+# (patching, serialization, env handling).
+# KNOWN ISSUE: __all__ omits several options defined here (pgo keys, cache_key_tag, dynamic_sources,
+# dynamic_values, unbacked_sources, force_cudagraph_gc).
 """
 This is the top-level configuration module for the compiler, containing
 cross-cutting configuration options that affect all parts of the compiler

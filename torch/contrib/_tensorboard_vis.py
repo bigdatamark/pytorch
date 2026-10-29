@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Debugging tool that converts TorchScript graphs and graph executor states into a
+# TensorBoard GraphDef protobuf and writes it as an event file. Hard-depends on TensorFlow: importing
+# this module raises ImportError with an explanatory message when TensorFlow is missing.
 import time
 from collections import defaultdict
 from functools import partial
@@ -21,6 +24,9 @@ except ImportError:
 
 
 def dump_tensorboard_summary(graph_executor, logdir):
+    # [FUNCTION DOC] Writes a TensorBoard event file in logdir containing the visualization of graph_executor.
+    # Builds the protobuf with visualize, wraps it in an event stamped with the current time and adds it
+    # through a FileWriter. Side effect: file I/O in logdir; returns nothing.
     with FileWriter(logdir) as w:
         pb_graph = visualize(graph_executor)
         evt = event_pb2.Event(
@@ -30,6 +36,12 @@ def dump_tensorboard_summary(graph_executor, logdir):
 
 
 def visualize(graph, name_prefix="", pb_graph=None, executors_it=None):
+    # [FUNCTION DOC] Builds (or appends to) a GraphDef for graph, which may be a plain graph or a graph executor
+    # state. For an executor state it delegates to visualize_graph_executor and returns the protobuf.
+    # For a plain graph it adds an input node, maps the parameter values to its outputs, recursively
+    # adds all nodes, then adds an output node connected to the return values. name_prefix namespaces node
+    # names; pb_graph is the graph to append to (created if absent); executors_it optionally supplies
+    # nested executors in order. Returns the GraphDef.
     """Visualizes an independent graph, or a graph executor."""
     value_map = {}
     pb_graph = pb_graph or graph_pb2.GraphDef()
@@ -56,6 +68,10 @@ def visualize(graph, name_prefix="", pb_graph=None, executors_it=None):
 
 
 def visualize_graph_executor(state, name_prefix, pb_graph, inline_graph):
+    # [FUNCTION DOC] Adds the contents of one graph executor state to pb_graph: the autograd fallback graph (if
+    # any) and each execution plan as independent subgraphs (with a disconnected node recording the
+    # argument spec, plus an optional gradient executor subgraph). Finally calls inline_graph once on the
+    # original graph under the original/ prefix and returns its result. Mutates pb_graph.
     """Append the state of a given GraphExecutor to the graph protobuf.
 
     Args:
@@ -101,9 +117,14 @@ def visualize_graph_executor(state, name_prefix, pb_graph, inline_graph):
 
 
 def visualize_rec(graph, value_map, name_prefix, pb_graph, executors_it=None):
+    # [FUNCTION DOC] Recursive worker for visualize: adds a protobuf node for every node of graph, wiring inputs
+    # through value_map (value id -> protobuf name, updated with outputs). Fusion groups and nested graph
+    # executors are expanded inline as subgraphs. Mutates value_map and pb_graph. Returns nothing.
     """Recursive part of visualize (basically skips setting up the input and output nodes)."""
 
     def inline_graph(subgraph, name, node):
+        # [FUNCTION DOC] HELPER: Recursively visualizes subgraph under the given name, mapping its inputs to the
+        # already-named values of node's inputs and then aliasing node's outputs to the subgraph's outputs.
         rec_value_map = {
             inp.unique(): value_map[val.unique()]
             for inp, val in zip(subgraph.inputs(), node.inputs())
@@ -117,15 +138,20 @@ def visualize_rec(graph, value_map, name_prefix, pb_graph, executors_it=None):
     op_id_counter: defaultdict[str, int] = defaultdict(int)
 
     def name_for(node):
+        # [FUNCTION DOC] HELPER: Returns the operator kind (namespace stripped) and a unique protobuf node name
+        # built from the prefix, kind and a per-kind counter, incrementing the counter.
         kind = node.kind()[node.kind().index("::") + 2 :]
         op_id_counter[kind] += 1
         return kind, name_prefix + kind + "_" + str(op_id_counter[kind])
 
     def add_fusion_group(node):
+        # [FUNCTION DOC] HELPER: Names a fusion group node and inlines its Subgraph attribute.
         op, name = name_for(node)
         inline_graph(node.g("Subgraph"), name + "/", node)
 
     def add_graph_executor(node):
+        # [FUNCTION DOC] HELPER: Handles a graph executor node: if no nested executors iterator was given, adds it as a
+        # plain node; otherwise takes the next executor and visualizes its state inlined at this node.
         op, name = name_for(node)
         if executors_it is None:
             add_node(node)
@@ -136,6 +162,9 @@ def visualize_rec(graph, value_map, name_prefix, pb_graph, executors_it=None):
             )
 
     def add_node(node):
+        # [FUNCTION DOC] HELPER: Adds one node, dispatching fusion groups and graph executors to special handlers;
+        # otherwise creates a protobuf node with its input wiring and records its outputs in value_map.
+        # KNOWN ISSUE: node attributes are not exported (TODO in code).
         if node.kind() == "prim::FusionGroup":
             return add_fusion_group(node)
         elif node.kind() == "prim::GraphExecutor":
