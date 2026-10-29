@@ -1,4 +1,11 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests that Dynamo graph break and error messages are well formed. Each test
+# compiles a tiny function with the eager backend, usually requesting a full graph, and
+# compares the raised Unsupported (or TorchRuntimeError) text, or a captured graph break log
+# record, against an inline expected string after normalizing addresses, file names and line
+# numbers. Also covers traceback shape, verbose bytecode traces, resume-function frames, loop
+# and context manager graph breaks, HOP errors and recompile limit messages. No import-time
+# side effects beyond defining a module level logger subclass instance.
 
 import asyncio
 import logging
@@ -38,15 +45,24 @@ make sure that there is a test for it.
 
 
 class GenericCtxMgr:
+    # [CLASS DOC] HELPER: Minimal do-nothing context manager used to trigger graph breaks
+    # inside a generic (unsupported-for-graph-break) context manager. Holds no state.
     def __enter__(self):
+        # [FUNCTION DOC] HELPER: Enter hook; returns the manager itself.
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # [FUNCTION DOC] HELPER: Exit hook; ignores the exception info and does nothing, so it
+        # never suppresses exceptions.
         pass
 
 
 class WarningOnceLogger(logging.Logger):
+    # [CLASS DOC] HELPER: Logger subclass that adds a once-style warning method, used to check
+    # the message for logger methods Dynamo does not know about. No extra state.
     def warning_once(self, msg):
+        # [FUNCTION DOC] HELPER: Forwards the message to the ordinary warning method (no real
+        # once-only deduplication is done).
         self.warning(msg)
 
 
@@ -54,8 +70,16 @@ warning_once_logger = WarningOnceLogger("warning_once_logger")
 
 
 class ErrorMessagesTest(LoggingTestCase):
+    # [CLASS DOC] Test case (logging-capable) holding all graph break message
+    # tests. Most tests are self contained: they define a small function, compile
+    # it, and check the exact message.
     def test_inplace_view_on_graph_input_hint(self):
+        # [FUNCTION DOC] Checks the message and hints when an in-place view op (transpose in
+        # place) is applied to a graph input under a full graph compile: raises Unsupported
+        # with the delayed function-call explanation.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; transposes its argument in place and
+            # returns it.
             x.transpose_(1, 2)
             return x
 
@@ -80,7 +104,11 @@ from user code:
         )
 
     def test_dynamic_shape_operator_no_meta_kernel(self):
+        # [FUNCTION DOC] Checks the message for a dynamic-output-shape operator without a meta
+        # kernel (least squares solve), with scalar output capture enabled via config patch.
         def fn():
+            # [FUNCTION DOC] HELPER: Compiled target; returns least squares of two random
+            # square matrices.
             return torch.linalg.lstsq(torch.rand(10, 10), torch.rand(10, 10))
 
         with torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True):
@@ -102,7 +130,11 @@ from user code:
             )
 
     def test_data_dependent_operator2(self):
+        # [FUNCTION DOC] Checks the "data dependent operator" message for a tensor
+        # equality call whose non-tensor result depends on tensor data (scalar
+        # output capture is enabled).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; returns whether the input equals itself.
             return torch.equal(x, x)
 
         with torch._dynamo.config.patch(capture_scalar_outputs=True):
@@ -126,6 +158,8 @@ from user code:
             )
 
     def test_sort_with_nonconstant_keys(self):
+        # [FUNCTION DOC] Checks the message when sorting a list of tensors, whose keys are not
+        # compile-time constants.
         lst = [
             torch.tensor(4),
             torch.tensor(1),
@@ -134,6 +168,8 @@ from user code:
         ]
 
         def fn(lst):
+            # [FUNCTION DOC] HELPER: Compiled target; returns the sorted version
+            # of its list argument.
             return sorted(lst)
 
         self.assertExpectedInlineMunged(
@@ -155,7 +191,11 @@ from user code:
         )
 
     def test_super_call_method(self):
+        # [FUNCTION DOC] Checks the "C-implemented special method without model" message when
+        # iterating a zip object passed as input.
         def fn(it):
+            # [FUNCTION DOC] HELPER: Compiled target; builds a list with one added to each
+            # element of the iterable.
             return [x + 1 for x in it]
 
         self.assertExpectedInlineMunged(
@@ -178,7 +218,11 @@ from user code:
         )
 
     def test_dict_items_input(self):
+        # [FUNCTION DOC] Checks the same C-implemented iteration message for a dictionary
+        # items view input, where the error appears at the point of creating an iterator.
         def fn(x, items):
+            # [FUNCTION DOC] HELPER: Compiled target; makes an iterator over the items, takes
+            # the next element and returns it with the sine of the tensor input.
             it = iter(items)
             return next(it), x.sin()
 
@@ -203,7 +247,12 @@ from user code:
         )
 
     def test_super_call_function(self):
+        # [FUNCTION DOC] Checks the observed exception message produced when the
+        # compiled code calls a zip object as if it were a function (raises a type
+        # error that is not caught).
         def fn(it):
+            # [FUNCTION DOC] HELPER: Compiled target; calls its argument and adds
+            # one to each result.
             return [x + 1 for x in it()]
 
         self.assertExpectedInlineMunged(
@@ -227,7 +276,11 @@ from user code:
         )
 
     def test_unsupported_context(self):
+        # [FUNCTION DOC] Checks the "unsupported context manager" message when an integer is
+        # used in a with statement.
         def fn(obj):
+            # [FUNCTION DOC] HELPER: Compiled target; enters its argument as a context manager
+            # and returns one.
             with obj:
                 return 1
 
@@ -251,10 +304,16 @@ from user code:
         )
 
     def test_backend_fake_tensor_exc(self):
+        # [FUNCTION DOC] Checks the backend compiler exception message when a custom backend
+        # raises the fake tensor unsupported exception; the backend name and traceback appear
+        # in it.
         def bad_backend(gm, ex):
+            # [FUNCTION DOC] HELPER: Backend that ignores the graph and inputs and raises the
+            # fake tensor unsupported exception with the text test.
             raise torch._subclasses.fake_tensor.UnsupportedFakeTensorException("test")
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; adds one to the input.
             return x + 1
 
         self.assertExpectedInlineMunged(
@@ -278,7 +337,10 @@ Backend compiler exception
         )
 
     def test_unsupported_builtin(self):
+        # [FUNCTION DOC] Checks the message for a builtin that Dynamo cannot trace (print of a
+        # string constant).
         def fn():
+            # [FUNCTION DOC] HELPER: Compiled target; prints a string.
             print("abc")
 
         self.assertExpectedInlineMunged(
@@ -301,10 +363,17 @@ from user code:
         )
 
     def test_skipfile_call(self):
+        # [FUNCTION DOC] Checks the message when the compiled code calls a function from a
+        # file the skip rules mark as skipped (the unittest skip decorator factory). The file
+        # path in the message is normalized by a post-processing function.
         def fn():
+            # [FUNCTION DOC] HELPER: Compiled target; returns the result of the
+            # unittest skip factory.
             return unittest.skip("test")
 
         def post_munge(s):
+            # [FUNCTION DOC] HELPER: Replaces the machine specific unittest case file path in
+            # the text with a short fixed name.
             return re.sub(r"file `.*case\.py`", "file `case.py`", s)
 
         self.assertExpectedInlineMunged(
@@ -328,7 +397,11 @@ from user code:
         )
 
     def test_skipfile_dynamo_call(self):
+        # [FUNCTION DOC] Checks the message for a call to the dynamo disable API inside a
+        # compiled region.
         def fn():
+            # [FUNCTION DOC] HELPER: Compiled target; calls the dynamo disable API
+            # with no arguments.
             torch._dynamo.disable()
 
         self.assertExpectedInlineMunged(
@@ -350,7 +423,11 @@ from user code:
         )
 
     def test_skipfile_compiler_disable_call(self):
+        # [FUNCTION DOC] Checks the message for a call to the compiler-level disable API
+        # inside a compiled region.
         def fn():
+            # [FUNCTION DOC] HELPER: Compiled target; calls the compiler disable
+            # API with no arguments.
             torch.compiler.disable()
 
         self.assertExpectedInlineMunged(
@@ -372,15 +449,25 @@ from user code:
         )
 
     def test_skipfile_dynamo_disable_wrapped_method(self):
+        # [FUNCTION DOC] Checks the message when inlining a method that was wrapped by the
+        # dynamo disable decorator; memory addresses in the text are normalized.
         class Scheduler:
+            # [CLASS DOC] HELPER: Local class with one method wrapped by the
+            # dynamo disable decorator.
             @torch._dynamo.disable
             def index_for_timestep(self, x):
+                # [FUNCTION DOC] HELPER: Decorated method; returns its argument plus one.
+                # Dynamo refuses to inline it.
                 return x + 1
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; creates a Scheduler and calls the
+            # disabled method.
             return Scheduler().index_for_timestep(x)
 
         def post_munge(s):
+            # [FUNCTION DOC] HELPER: Replaces hexadecimal addresses in the text
+            # with a placeholder.
             return re.sub(r"0x[0-9A-Fa-f]+", "0xmem_addr", s)
 
         self.assertExpectedInlineMunged(
@@ -402,13 +489,22 @@ from user code:
         )
 
     def test_skipfile_inline(self):
+        # [FUNCTION DOC] Checks the message when Dynamo tries to inline a function
+        # from a skipped file reached through a class attribute (the unittest skip
+        # factory); path is normalized.
         class Foo:
+            # [CLASS DOC] HELPER: Local class whose attribute is the unittest skip
+            # factory function.
             fn = unittest.skip
 
         def fn():
+            # [FUNCTION DOC] HELPER: Compiled target; calls the skip factory
+            # through a new instance.
             Foo().fn()
 
         def post_munge(s):
+            # [FUNCTION DOC] HELPER: Replaces the machine specific case file path in backticks
+            # with a short fixed name.
             return re.sub(r"`.*case\.py`", "`case.py`", s)
 
         self.assertExpectedInlineMunged(
@@ -432,7 +528,10 @@ from user code:
         )
 
     def test_dynamo_graph_break_fn(self):
+        # [FUNCTION DOC] Checks the message for an explicit dynamo graph break
+        # call with no message.
         def fn():
+            # [FUNCTION DOC] HELPER: Compiled target; inserts a graph break.
             torch._dynamo.graph_break()
 
         self.assertExpectedInlineMunged(
@@ -453,7 +552,12 @@ from user code:
         )
 
     def test_dynamo_graph_break_fn_with_msg(self):
+        # [FUNCTION DOC] Checks the message for an explicit graph break call that
+        # supplies a message keyword; the message text appears in the explanation
+        # and the keyword in the context.
         def fn():
+            # [FUNCTION DOC] HELPER: Compiled target; inserts a graph break with a
+            # custom message.
             torch._dynamo.graph_break(msg="test graph break")
 
         self.assertExpectedInlineMunged(
@@ -474,7 +578,10 @@ from user code:
         )
 
     def test_warnings(self):
+        # [FUNCTION DOC] Checks the message when the compiled code calls the standard warnings
+        # warn function, which is an untraceable C builtin.
         def fn():
+            # [FUNCTION DOC] HELPER: Compiled target; emits a warning.
             warnings.warn("test")
 
         self.assertExpectedInlineMunged(
@@ -496,10 +603,17 @@ from user code:
         )
 
     def test_logger_method_message(self):
+        # [FUNCTION DOC] Checks the message for calling a method on a Logger subclass instance
+        # that is not registered as reorderable or ignored. Object reprs and qualified names
+        # are normalized by a post-processing function before comparison.
         def fn():
+            # [FUNCTION DOC] HELPER: Compiled target; calls the module level logger's once-
+            # style method.
             warning_once_logger.warning_once("test")
 
         def post_munge(s):
+            # [FUNCTION DOC] HELPER: Rewrites the method description and the fully qualified
+            # method name in the text to short stable names.
             s = re.sub(
                 r"method: <WarningOnceLogger .*?>\.warning_once",
                 "method: <WarningOnceLogger>.warning_once",
@@ -536,10 +650,17 @@ from user code:
 
     @unittest.skipIf(not python_pytree._cxx_pytree_exists, "missing optree package")
     def test_optree_graph_break_message(self):
+        # [FUNCTION DOC] Skipped unless the C++ optree pytree backend exists. Compiles one
+        # function using an optree tree map and asserts no graph break is counted, then
+        # compiles another using an optree deque spec and asserts a graph break is recorded;
+        # compares the first recorded graph break key to the expected skipped-function text
+        # after path normalization.
         import optree
 
         @torch.compile(backend="eager")
         def fn1(x):
+            # [FUNCTION DOC] HELPER: Compiled target; transposes a nested tree and returns
+            # sine and cosine trees.
             tree = {"a": x, "b": (x - 1, 2 * x)}
             sin, cos = optree.tree_transpose_map(
                 lambda t: (torch.sin(t), torch.cos(t)),
@@ -552,6 +673,8 @@ from user code:
 
         @torch.compile(backend="eager")
         def fn2(x):
+            # [FUNCTION DOC] HELPER: Compiled target; builds an optree deque tree spec and
+            # returns it with the input.
             spec = optree.treespec_deque([])
             return spec, x
 
@@ -560,6 +683,8 @@ from user code:
         first_graph_break = next(iter(counters["graph_break"].keys()))
 
         def post_munge(string):
+            # [FUNCTION DOC] HELPER: Replaces the module path prefix of the make-from-
+            # collection name with a placeholder.
             return re.sub(
                 r"(optree\.|qualname: )\S*(\.make_from_collection)",
                 r"\1<path>\2",
@@ -579,8 +704,12 @@ Attempted to call function marked as skipped
         )
 
     def test_unpack_sequence_with_wrong_length(self):
+        # [FUNCTION DOC] Checks that unpacking a one element list into two names is reported
+        # as an observed exception (value error) for a full graph compile.
         @torch.compile(backend="eager", fullgraph=True)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; unpacks a one element list
+            # into two variables.
             a, b = [1]  # noqa: F841
 
         self.assertExpectedInlineMunged(
@@ -606,8 +735,11 @@ from user code:
         )
 
     def test_unpack_sequence_with_non_iterable(self):
+        # [FUNCTION DOC] Checks that unpacking an integer into two names is reported as an
+        # observed type error.
         @torch.compile(backend="eager", fullgraph=True)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; unpacks an integer into two variables.
             a, b = 1  # noqa: RUF100
 
         self.assertExpectedInlineMunged(
@@ -633,8 +765,11 @@ from user code:
         )
 
     def test_unpack_ex_failure(self):
+        # [FUNCTION DOC] Checks that star-unpacking an empty list needing at least one element
+        # is reported as an observed value error.
         @torch.compile(backend="eager", fullgraph=True)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; star-unpacks an empty list.
             a, *b = []  # noqa: F841
 
         self.assertExpectedInlineMunged(
@@ -656,7 +791,10 @@ from user code:
         )
 
     def test_observed_exception(self):
+        # [FUNCTION DOC] Checks the observed exception message when the compiled function
+        # raises a runtime error with no handler.
         def fn():
+            # [FUNCTION DOC] HELPER: Compiled target; raises a runtime error.
             raise RuntimeError("test")
 
         self.assertExpectedInlineMunged(
@@ -678,11 +816,17 @@ from user code:
         )
 
     def test_uninitialized_module(self):
+        # [FUNCTION DOC] Checks the message when a module whose constructor never called the
+        # parent constructor is called inside a compiled function.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module subclass whose constructor is deliberately a no-op,
+            # leaving it uninitialized.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Does nothing, so the parent init is skipped.
                 pass
 
         def fn(mod):
+            # [FUNCTION DOC] HELPER: Compiled target; calls the module with the constant one.
             return mod(1)
 
         self.assertExpectedInlineMunged(
@@ -704,7 +848,11 @@ from user code:
         )
 
     def test_generic_ctx_mgr_graph_break_fullgraph_true(self):
+        # [FUNCTION DOC] Checks the plain graph break message for a graph break inside a
+        # generic context manager when a full graph is required.
         def fn():
+            # [FUNCTION DOC] HELPER: Compiled target; inserts a graph break inside a generic
+            # context manager block.
             with GenericCtxMgr():
                 torch._dynamo.graph_break()
 
@@ -727,7 +875,12 @@ from user code:
 
     @make_logging_test(graph_breaks=True)
     def test_generic_ctx_mgr_graph_break_fullgraph_false(self, records):
+        # [FUNCTION DOC] Compiles without the full graph requirement and checks the single
+        # logged graph break record: the original graph break followed by the second break
+        # caused by active generic context managers (two nested ones active at that point).
         def fn():
+            # [FUNCTION DOC] HELPER: Compiled target; uses sequential and nested generic
+            # context managers and inserts a graph break while two of them are active.
             with GenericCtxMgr():
                 with GenericCtxMgr():
                     pass
@@ -774,8 +927,12 @@ User code traceback:
         )
 
     def test_load_build_class(self):
+        # [FUNCTION DOC] Checks the message for defining a class inside a compiled function
+        # (the class construction builtin is invoked with a non-constant body function).
         def fn():
+            # [FUNCTION DOC] HELPER: Compiled target; defines a local class and returns it.
             class Foo:
+                # [CLASS DOC] HELPER: Empty local class defined inside the compiled function.
                 pass
 
             return Foo
@@ -799,7 +956,11 @@ from user code:
 
     @skipIfNotPy312
     def test_async_return_bytecode_exception_table(self):
+        # [FUNCTION DOC] Only runs on Python 3.12 or newer. Checks that compiling
+        # an async function that simply returns one works and running it with the
+        # event loop yields one.
         async def fn():
+            # [FUNCTION DOC] HELPER: Async function returning one.
             return 1
 
         self.assertEqual(
@@ -808,12 +969,19 @@ from user code:
 
     @skipIfNotPy312
     def test_unsupported_bytecode(self):
+        # [FUNCTION DOC] Only runs on Python 3.12 or newer. Checks the missing bytecode
+        # handler message for an async iteration loop (the async iterator getter instruction);
+        # addresses and the instruction repr are normalized.
         async def fn():
+            # [FUNCTION DOC] HELPER: Async function with an async for loop over a range that
+            # prints each item and returns one.
             async for i in range(3):
                 print(i)
             return 1
 
         def post_munge(s):
+            # [FUNCTION DOC] HELPER: Replaces hex addresses and the full instruction repr for
+            # the async iterator getter with short placeholders; returns the cleaned text.
             s = re.sub(r"0x[0-9A-Fa-f]+", "0xmem_addr", s)
             s = re.sub(
                 r"Instruction\(.*opname='GET_AITER'.*\)\n",
@@ -841,14 +1009,21 @@ from user code:
         )
 
     def test_reconstruction_failure(self):
+        # [FUNCTION DOC] Checks the reconstruction failure message when a compiled function
+        # returns a bound method of an object created inside it; addresses are normalized.
         class Foo:
+            # [CLASS DOC] HELPER: Local class with one trivial method.
             def meth(self):
+                # [FUNCTION DOC] HELPER: Returns zero.
                 return 0
 
         def fn():
+            # [FUNCTION DOC] HELPER: Compiled target; returns a bound method of a
+            # fresh instance.
             return Foo().meth
 
         def post_munge(s):
+            # [FUNCTION DOC] HELPER: Replaces hex addresses with a placeholder.
             return re.sub(r"0x[0-9A-Fa-f]+", "0xmem_addr", s)
 
         self.assertExpectedInlineMunged(
@@ -873,16 +1048,24 @@ from user code:
 
     @make_logging_test(graph_breaks=True)
     def test_reconstruction_failure_gb(self, records):
+        # [FUNCTION DOC] Compiles without full graph and checks two log records: the first
+        # graph break for an explicit break, and the second saying the graph break could not
+        # be handled gracefully due to a reconstruction failure of a sourceless bound method.
         class Foo:
+            # [CLASS DOC] HELPER: Local class with one trivial method.
             def meth(self):
+                # [FUNCTION DOC] HELPER: Returns zero.
                 return 0
 
         def fn():
+            # [FUNCTION DOC] HELPER: Compiled target; keeps a bound method of a new object
+            # across an explicit graph break and returns it.
             f = Foo().meth
             torch._dynamo.graph_break()
             return f
 
         def post_munge(s):
+            # [FUNCTION DOC] HELPER: Replaces hex addresses with a placeholder.
             return re.sub(r"0x[0-9A-Fa-f]+", "0xmem_addr", s)
 
         torch.compile(fn, backend="eager")()
@@ -940,17 +1123,23 @@ User code traceback:
         )
 
     def test_faketensor_nyi(self):
+        # [FUNCTION DOC] Registers a custom op and a fake implementation that raises not
+        # implemented error, then checks the message for running the op under fake tensors
+        # during compile.
         op_name = "mylib::error_messages_faketensor"
 
         @torch.library.custom_op(op_name, mutates_args=())
         def foo(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op implementation; returns the sine of the input.
             return x.sin()
 
         @foo.register_fake
         def _(x):
+            # [FUNCTION DOC] HELPER: Fake implementation; always raises not-implemented.
             raise NotImplementedError
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; calls the registered custom op.
             return torch.ops.mylib.error_messages_faketensor(x)
 
         self.assertExpectedInlineMunged(
@@ -973,7 +1162,11 @@ from user code:
         )
 
     def test_fx_node_error_bad_user_code(self):
+        # [FUNCTION DOC] Checks that adding tensors of lengths three and four
+        # raises the runtime error type with a readable message about fake tensor
+        # call failure and broadcasting.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Compiled target; adds its two arguments.
             return x + y
 
         self.assertExpectedInlineMunged(
@@ -997,9 +1190,14 @@ from user code:
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires cuda")
     def test_fx_node_error_cross_device(self):
+        # [FUNCTION DOC] Skipped without CUDA. Builds a linear layer on the GPU,
+        # calls it with a CPU input in a compiled function and checks the raised
+        # runtime error text mentions the device mismatch and both devices and
+        # does not contain internal fake tensor wording.
         linear = torch.nn.Linear(10, 20, device="cuda").eval()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; applies the GPU linear layer.
             return linear(x)
 
         with self.assertRaises(TorchRuntimeError) as cm:
@@ -1014,7 +1212,11 @@ from user code:
         self.assertNotIn("Unhandled FakeTensor Device Propagation", msg)
 
     def test_data_dependent_branching_fullgraph(self):
+        # [FUNCTION DOC] Checks the data-dependent branching message including the printed
+        # computation that forms the branch condition.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; branches on whether the
+            # tensor sum is positive.
             if x.sum() > 0:
                 return x.sin()
             return x.cos()
@@ -1044,7 +1246,11 @@ from user code:
         )
 
     def test_data_dependent_branching_bool_tensor_hints(self):
+        # [FUNCTION DOC] Checks the data-dependent branching hints for the overflow-clamping
+        # pattern, including the hint about logical or between tensor expressions.
         def cast_overflow_tensors(tensors, offset=1000):
+            # [FUNCTION DOC] HELPER: Compiled target; if any element is infinite or NaN,
+            # clamps the tensor to the dtype maximum minus an offset; returns the tensor.
             if tensors.isinf().any() or tensors.isnan().any():
                 clamp_value = torch.finfo(tensors.dtype).max - offset
                 tensors = torch.clamp(tensors, min=-clamp_value, max=clamp_value)
@@ -1075,17 +1281,25 @@ from user code:
     # Test that the bytecode source attribution is correct with VariableTracker
     @make_logging_test(trace_bytecode=True)
     def test_variable_tracker_source_attribution(self, records):
+        # [FUNCTION DOC] Enables bytecode trace logging, runs a compiled function twice
+        # calling an inner function, collects all log lines mentioning lazy variable trackers,
+        # and asserts at least one exists, the first describes an unrealized function and the
+        # fourth an unrealized tensor.
         def inner(x):
+            # [FUNCTION DOC] HELPER: Adds one to the input.
             return x + 1
 
         @torch.compile(backend="eager")
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; applies the inner function twice.
             x = inner(x)
             return inner(x)
 
         fn(torch.ones(3))
 
         def find_trace_bytecode_lines(long_string):
+            # [FUNCTION DOC] HELPER: Splits the text into lines and returns the list of lines
+            # that contain a lazy variable tracker description.
             # Split the string into lines
             lines = long_string.split("\n")
             # More comprehensive pattern to capture LazyVariableTracker info
@@ -1119,7 +1333,11 @@ from user code:
 
     @make_logging_test(graph_breaks=True)
     def test_data_dependent_branching_gb(self, records):
+        # [FUNCTION DOC] Compiles without full graph and compares the first logged graph break
+        # record to the expected data-dependent branching text with user traceback.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; branches on the tensor sum and returns
+            # sine or cosine.
             if x.sum() > 0:
                 return x.sin()
             return x.cos()
@@ -1156,7 +1374,12 @@ User code traceback:
     @unittest.skipIf(IS_FBCODE, "assert gets patched in internal pytest")
     @make_logging_test(graph_breaks=True)
     def test_assert_failure_in_generic_ctx_mgr(self, records):
+        # [FUNCTION DOC] Skipped in FBCODE where asserts are rewritten. Checks that a failing
+        # assert inside a generic context manager raises an assertion error to the caller and
+        # logs exactly one graph break record about a data-dependent assertion.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; asserts inside a generic context manager
+            # that the argument is none, which fails.
             with GenericCtxMgr():
                 assert x is None  # noqa: S101
 
@@ -1193,10 +1416,16 @@ User code traceback:
         )
 
     def test_no_internal_compiler_stacktrace(self):
+        # [FUNCTION DOC] Catches the error raised by a full graph compile
+        # manually, formats its traceback, normalizes file names, line numbers and
+        # carets, and checks that the traceback shows only the user call and
+        # compiler wrapper frames, not internal Dynamo frames.
         def fn():
+            # [FUNCTION DOC] HELPER: Compiled target; calls gn.
             gn()
 
         def gn():
+            # [FUNCTION DOC] HELPER: Inserts a graph break.
             torch._dynamo.graph_break()
 
         # assertRaises suppresses the traceback, so manually catch
@@ -1252,10 +1481,15 @@ Set TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especiall
 
     @torch._dynamo.config.patch(verbose=True)
     def test_internal_compiler_stacktrace_verbose(self):
+        # [FUNCTION DOC] With verbose config patched on, catches the error from a full graph
+        # compile and checks that the internal traceback is present (replaced by a
+        # placeholder) ahead of the user facing message.
         def fn():
+            # [FUNCTION DOC] HELPER: Compiled target; calls gn.
             gn()
 
         def gn():
+            # [FUNCTION DOC] HELPER: Inserts a graph break.
             torch._dynamo.graph_break()
 
         # assertRaises suppresses the traceback, so manually catch
@@ -1306,8 +1540,13 @@ from user code:
 
     @make_logging_test(graph_breaks=True)
     def test_graph_break_in_loop(self, records):
+        # [FUNCTION DOC] Checks the "graph break in loop" message for a loop containing an
+        # explicit graph break and then for a loop containing a data-dependent branch; each
+        # time exactly one new record is logged and the frame is skipped.
         @torch.compile(backend="eager")
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; loops twice inserting a graph break,
+            # then adds one.
             for i in range(2):
                 torch._dynamo.graph_break()
             return x + 1
@@ -1350,6 +1589,8 @@ User code traceback:
 
         @torch.compile(backend="eager")
         def gn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; loops twice choosing between adding one
+            # or two based on the tensor sum, then adds four.
             for i in range(2):
                 if x.sum() > 0:
                     x = x + 1
@@ -1402,7 +1643,12 @@ User code traceback:
 
     @make_logging_test(graph_breaks=True)
     def test_skip_frame_in_loop_message(self, records):
+        # [FUNCTION DOC] Checks the logged message when a data-dependent branch
+        # inside a generic context manager within a loop forces skipping the
+        # frame; one record is expected.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; loops twice, entering a context manager
+            # and conditionally adding one based on the tensor sum.
             for i in range(2):
                 with GenericCtxMgr():
                     if x.sum() > 0:
@@ -1444,7 +1690,11 @@ User code traceback:
 
     @make_logging_test(dynamo=logging.DEBUG)
     def test_skip_frame_empty_function_message(self, records):
+        # [FUNCTION DOC] Uses debug-level dynamo logging to check the message
+        # emitted when a function traces no operations and the frame is skipped;
+        # the line number is normalized.
         def empty_fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target that does nothing.
             pass
 
         torch.compile(empty_fn, backend="eager")(torch.randn(3))
@@ -1464,13 +1714,19 @@ Frame info: empty_fn (test_error_messages.py line N), file: test_error_messages.
 
     @make_logging_test(graph_breaks=True)
     def test_nested_compile_user_frames(self, records):
+        # [FUNCTION DOC] Checks the user stack in the last graph break record when the break
+        # occurs in nested calls: it lists the test frame and each of the three nested
+        # function frames, and reports the later of two consecutive breaks.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; calls gn with the input plus one.
             gn(x + 1)
 
         def gn(x):
+            # [FUNCTION DOC] HELPER: Calls hn with the input plus one.
             hn(x + 1)
 
         def hn(x):
+            # [FUNCTION DOC] HELPER: Inserts two consecutive graph breaks.
             torch._dynamo.graph_break()  # 0
             torch._dynamo.graph_break()  # 1
 
@@ -1505,7 +1761,12 @@ User code traceback:
     @torch._dynamo.config.patch(verbose=True)
     @make_logging_test(graph_breaks=True)
     def test_latest_bytecode_to_graph_break_fullgraph(self, records):
+        # [FUNCTION DOC] With verbose config and graph break logging patched on, checks the
+        # full graph error message for an explicit break after tensor additions (no bytecode
+        # listing appears in the exception).
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; adds tensors, inserts a graph break,
+            # returns the sum.
             y = x + 1
             z = x + y
             torch._dynamo.graph_break()
@@ -1533,8 +1794,13 @@ from user code:
     @torch._dynamo.config.patch(verbose=True)
     @make_logging_test(graph_breaks=True)
     def test_latest_bytecode_to_graph_break_python_versioning(self, records):
+        # [FUNCTION DOC] Only runs on Python 3.12 exactly. With verbose logging,
+        # compares the whole first graph break record including the list of recent
+        # traced bytecode instructions.
         @torch.compile(backend="eager")
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; adds tensors, inserts a graph break,
+            # returns the sum.
             y = x + 1
             z = x + y
             torch._dynamo.graph_break()
@@ -1591,8 +1857,12 @@ TRACE CALL 0 [NullVariable, LazyVariableTracker(unrealized: <class 'function'>)]
     @torch._dynamo.config.patch(verbose=True)
     @make_logging_test(graph_breaks=True)
     def test_latest_bytecode_to_graph_break(self, records):
+        # [FUNCTION DOC] With verbose logging, checks that the first record includes the
+        # recent bytecode header and between eleven and twenty trace lines.
         @torch.compile(backend="eager")
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; adds tensors, inserts a graph break,
+            # returns the sum.
             y = x + 1
             z = x + y
             torch._dynamo.graph_break()
@@ -1610,15 +1880,23 @@ TRACE CALL 0 [NullVariable, LazyVariableTracker(unrealized: <class 'function'>)]
     @torch._dynamo.config.patch(verbose=True)
     @make_logging_test(graph_breaks=True)
     def test_graph_break_traceback_above_dynamo_shows_user_code(self, records):
+        # [FUNCTION DOC] With verbose logging, checks that records for repeated breaks in a
+        # plain function, a function with data-dependent branches and an object attribute
+        # assignment hook each show the correct source line marker in the traceback, then
+        # compares the last record (with trace lines removed and resume function line numbers
+        # normalized) to expected text.
         @torch.compile(backend="eager")
         # NOTE: comments in this test are used to differentiate lines!
         def f1(x):
+            # [FUNCTION DOC] HELPER: Compiled target; three consecutive graph breaks.
             torch._dynamo.graph_break()  # 0
             torch._dynamo.graph_break()  # 1
             torch._dynamo.graph_break()
 
         @torch.compile(backend="eager")
         def f2(x):
+            # [FUNCTION DOC] HELPER: Compiled target; three consecutive data-dependent
+            # branches each adding one.
             if x.sum() > 0:  # 0
                 x = x + 1
             if x.sum() > 0:  # 1
@@ -1627,11 +1905,16 @@ TRACE CALL 0 [NullVariable, LazyVariableTracker(unrealized: <class 'function'>)]
                 x = x + 1
 
         class Foo:
+            # [CLASS DOC] HELPER: Local class whose attribute assignment hook
+            # inserts a graph break.
             def __setattr__(self, name, value):
+                # [FUNCTION DOC] HELPER: Attribute assignment hook that inserts a graph break.
                 torch._dynamo.graph_break()
 
         @torch.compile(backend="eager")
         def f3(x):
+            # [FUNCTION DOC] HELPER: Compiled target; assigns an attribute on
+            # three fresh instances.
             Foo().attr = x  # 0
             Foo().attr = x  # 1
             Foo().attr = x
@@ -1647,6 +1930,8 @@ TRACE CALL 0 [NullVariable, LazyVariableTracker(unrealized: <class 'function'>)]
         self.assertIn("Foo().attr = x  # 1", records[-1].getMessage())
 
         def post_munge(s):
+            # [FUNCTION DOC] HELPER: Normalizes resume function line numbers and strips
+            # everything from the first trace line onward.
             s = re.sub(
                 r"torch_dynamo_resume_in_f(\d)_at_(\d+)",
                 r"torch_dynamo_resume_in_f\1_at_N",
@@ -1694,10 +1979,14 @@ Most recent bytecode instructions traced (max 20):
     @torch._dynamo.config.patch(verbose=True)
     @make_logging_test(graph_breaks=True)
     def test_graph_break_traceback_inlined_data_dependent_branch(self, records):
+        # [FUNCTION DOC] With verbose logging, checks that a data-dependent branch inside an
+        # inlined helper is attributed to the right lines in the traceback (call site, not the
+        # helper source); the final record is compared after normalization.
         # Tests that data-dependent branches in inlined functions show correct
         # source lines in the verbose traceback (from the call site, not the
         # inlined function's source).
         def helper(x):
+            # [FUNCTION DOC] HELPER: Branches twice on the tensor sum, adding one each time.
             if x.sum() > 0:  # 0
                 x = x + 1
             if x.sum() > 0:  # 1
@@ -1706,11 +1995,14 @@ Most recent bytecode instructions traced (max 20):
 
         @torch.compile(backend="eager")
         def f(x):
+            # [FUNCTION DOC] HELPER: Compiled target; returns the helper result plus one.
             return helper(x) + 1  # call site
 
         f(torch.ones(3))
 
         def post_munge(s):
+            # [FUNCTION DOC] HELPER: Normalizes resume function names with line numbers and
+            # strips trace lines.
             s = re.sub(
                 r"torch_dynamo_resume_in_(\w+)_at_(\d+)",
                 r"torch_dynamo_resume_in_\1_at_N",
@@ -1758,20 +2050,26 @@ Most recent bytecode instructions traced (max 20):
 
     @make_logging_test(graph_breaks=True)
     def test_graph_break_traceback_collapsed_resume_frames(self, records):
+        # [FUNCTION DOC] Checks that the traceback in the last graph break record collapses
+        # repeated resume frames across three nested functions, each with three breaks, to the
+        # correct frames.
         @torch.compile(backend="eager")
         def f1(x):
+            # [FUNCTION DOC] HELPER: Compiled target; three graph breaks then calls f2.
             torch._dynamo.graph_break()
             torch._dynamo.graph_break()
             torch._dynamo.graph_break()
             f2(x)
 
         def f2(x):
+            # [FUNCTION DOC] HELPER: Three graph breaks then calls f3.
             torch._dynamo.graph_break()
             torch._dynamo.graph_break()
             torch._dynamo.graph_break()
             f3(x)
 
         def f3(x):
+            # [FUNCTION DOC] HELPER: Three graph breaks then returns the input plus one.
             torch._dynamo.graph_break()
             torch._dynamo.graph_break()
             torch._dynamo.graph_break()  # correct
@@ -1807,8 +2105,13 @@ User code traceback:
 
     @make_logging_test(dynamo=logging.DEBUG)
     def test_lru_cache_warning_logs_user_stack_trace(self, records):
+        # [FUNCTION DOC] With debug-level dynamo logging, compiles a function decorated with
+        # the standard least-recently-used cache wrapper, finds the log record warning about
+        # calling such a function, asserts it exists, and compares the normalized text, which
+        # lists the user call stack beginning at the test frame.
         @lru_cache
         def foo(x):
+            # [FUNCTION DOC] HELPER: Cached target; adds one to the input.
             return x + 1
 
         torch.compile(foo, backend="eager")(torch.randn(4))
@@ -1832,11 +2135,15 @@ call to a lru_cache wrapped function at: _dynamo/external_utils.py:N
 
     @make_logging_test(dynamo=logging.DEBUG)
     def test_lru_cache_warning_logs_nested_call(self, records):
+        # [FUNCTION DOC] Same as the previous check but the cached function is called from a
+        # nested helper; the warning text lists both the test frame and the helper frame.
         @lru_cache
         def foo(x):
+            # [FUNCTION DOC] HELPER: Cached function; adds one to the input.
             return x + 1
 
         def nested(x):
+            # [FUNCTION DOC] HELPER: Compiled target; calls the cached function.
             return foo(x)
 
         torch.compile(nested, backend="eager")(torch.randn(4))
@@ -1861,16 +2168,23 @@ call to a lru_cache wrapped function at: test_error_messages.py:N
         )
 
     def test_lru_cache_warning(self):
+        # [FUNCTION DOC] Checks only that a user warning is issued (once-style assertion)
+        # whose text says the call originates from a named line in the intermediate helper,
+        # when a full graph compile reaches a cached function.
         # test only the warning message itself
         @lru_cache
         def bax(x):
+            # [FUNCTION DOC] HELPER: Cached function; adds one to the input.
             return x + 1
 
         def bar(x):
+            # [FUNCTION DOC] HELPER: Calls the cached function; the frame the warning must
+            # point to.
             return bax(x)
 
         @torch.compile(backend="eager", fullgraph=True)
         def foo(x):
+            # [FUNCTION DOC] HELPER: Compiled target; calls bar.
             return bar(x)
 
         x = torch.randn(2)
@@ -1881,15 +2195,23 @@ call to a lru_cache wrapped function at: test_error_messages.py:N
             foo(x)
 
     def test_disable_message(self):
+        # [FUNCTION DOC] Checks the messages for calling functions wrapped by the compiler
+        # disable API: one without a reason, one with a reason, and an already compiled module
+        # wrapped by it (reported as an unsupported function call with the module reason).
+        # Addresses normalized.
         @torch.compile(backend="eager", fullgraph=True)
         def outer(fn, x):
+            # [FUNCTION DOC] HELPER: Compiled target; calls its first argument
+            # with the second.
             return fn(x)
 
         @torch.compiler.disable
         def f(x):
+            # [FUNCTION DOC] HELPER: Disabled function; adds one to the input.
             return x + 1
 
         def post_munge(s):
+            # [FUNCTION DOC] HELPER: Replaces hex addresses with a placeholder.
             return re.sub(r"0x[0-9A-Fa-f]+", "0xmem_addr", s)
 
         self.assertExpectedInlineMunged(
@@ -1912,6 +2234,7 @@ from user code:
 
         @torch.compiler.disable(reason="test message")
         def g(x):
+            # [FUNCTION DOC] HELPER: Disabled (with a reason) function; adds two to the input.
             return x + 2
 
         self.assertExpectedInlineMunged(
@@ -1933,7 +2256,10 @@ from user code:
         )
 
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward adds three to the input; compiled and
+            # then wrapped with the disable API in the test.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds three to the input.
                 return x + 3
 
         mod = Mod()
@@ -1960,12 +2286,18 @@ from user code:
 
     # Test that errors while tracing resume function prologues do not get suppressed
     def test_graph_break_in_buggy_resume_prologue(self):
+        # [FUNCTION DOC] Patches the bytecode assembly helper so that an invalid global load
+        # is injected right after the prologue flag store in generated resume code, then
+        # asserts the compile raises the resume prologue tracing error rather than silently
+        # suppressing it. Side effect: the patch is active only inside the with block.
         import torch._dynamo.bytecode_transformation as bt
         import torch._dynamo.resume_execution as rex
 
         # NOTE: do not define non_global as a global in this file!
         @torch.compile(backend="eager")
         def fn(non_global):
+            # [FUNCTION DOC] HELPER: Compiled target; adds one, inserts a graph break, adds
+            # one more.
             non_global = non_global + 1
             torch._dynamo.graph_break()
             return non_global + 1
@@ -1973,6 +2305,11 @@ from user code:
         orig_clean_and_assemble_instructions = bt.clean_and_assemble_instructions
 
         def bad_clean_and_assemble_instructions(instructions, *args):
+            # [FUNCTION DOC] HELPER: Replacement for the instruction assembler. Scans the
+            # instruction list for the first store of the resume prologue flag variable,
+            # splices in a load of the global named non_global right after it (mutating the
+            # list in place), then delegates to the original assembler. Returns the original
+            # assembler result.
             # Inject an invalid LOAD_GLOBAL after the first STORE_FAST IS_TRACING_RESUME_PROLOGUE_VARNAME
             for i, inst in enumerate(instructions):
                 if (
@@ -2002,8 +2339,13 @@ from user code:
 
     @make_logging_test(graph_breaks=True)
     def test_step_graph_break(self, records):
+        # [FUNCTION DOC] Checks the log record for the user step-unsupported call (a break
+        # that cannot be resumed), then resets dynamo and, with error on graph break enabled,
+        # checks the raised Unsupported text for the same call.
         @torch.compile(backend="eager")
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; adds one and two, calls the step-
+            # unsupported debugging hook, then adds four.
             x = x + 1
             x = x + 2
             torch._dynamo.step_unsupported()
@@ -2057,18 +2399,27 @@ from user code:
 
     @make_logging_test(graph_breaks=True)
     def test_store_attr_graph_break(self, records):
+        # [FUNCTION DOC] Checks the graph break record when an object's attribute-assignment
+        # hook is wrapped with the disable API, then resets and checks the same message raised
+        # as an error when error on graph break is enabled. Addresses are normalized.
         class Foo:
+            # [CLASS DOC] HELPER: Local class whose attribute-assignment hook is wrapped by
+            # the disable API and forwards to the parent behavior.
             @torch.compiler.disable
             def __setattr__(self, name, value):
+                # [FUNCTION DOC] HELPER: Disabled attribute-assignment hook; delegates to the
+                # parent hook.
                 super().__setattr__(name, value)
 
         @torch.compile(backend="eager")
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; assigns an attribute on a new instance.
             Foo().attr = x
 
         fn(torch.ones(3))
 
         def post_munge(s):
+            # [FUNCTION DOC] HELPER: Replaces hex addresses with a placeholder.
             return re.sub(r"0x[0-9A-Fa-f]+", "0xmem_addr", s)
 
         self.assertExpectedInline(
@@ -2117,7 +2468,11 @@ from user code:
             )
 
     def test_runtime_error_readable_shape_mismatch(self):
+        # [FUNCTION DOC] Marks one dimension of each input as dynamic and checks that the
+        # runtime error for a size mismatch in addition shows readable symbolic sizes with
+        # hints; the symbol number is normalized.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Compiled target; adds its two arguments.
             return x + y
 
         x = torch.randn(4, 4)
@@ -2126,6 +2481,8 @@ from user code:
         torch._dynamo.mark_dynamic(y, 1)
 
         def post_munge(s):
+            # [FUNCTION DOC] HELPER: Replaces the varying symbol name before a ten hint with a
+            # fixed one.
             s = re.sub(r"s\d+: hint = 10", "s94: hint = 10", s)
             return s
 
@@ -2148,14 +2505,21 @@ from user code:
         )
 
     def test_hop_side_effect_error_includes_hop_context(self):
+        # [FUNCTION DOC] Checks that mutating an outer list inside a function run by non-
+        # reentrant activation checkpointing raises Unsupported mentioning the higher order
+        # operator context.
         # Test that graph breaks inside HOPs include the HOP context
         stack = []
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Checkpointed function; appends to an outer list (side
+            # effect) and returns the sine of the input.
             stack.append(1)  # Mutation outside checkpoint scope
             return x.sin()
 
         def model(x):
+            # [FUNCTION DOC] HELPER: Compiled target; runs the checkpointed
+            # function without reentrancy.
             return torch.utils.checkpoint.checkpoint(fn, x, use_reentrant=False)
 
         self.assertExpectedInlineMunged(
@@ -2182,18 +2546,27 @@ from user code:
 
     @make_logging_test(graph_breaks=True)
     def test_hop_side_effect_error_includes_hop_context_fullgraph_false(self, records):
+        # [FUNCTION DOC] Same side effect check with reentrant checkpointing and no full
+        # graph; the single graph break record shows the higher order operator context.
         # Test that graph breaks inside HOPs include the HOP context
         # even with fullgraph=False (checkpoint allows graph breaks)
         stack = []
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Checkpointed function; appends to an outer list and
+            # returns sine.
             stack.append(1)  # Mutation outside checkpoint scope
             return x.sin()
 
         def model(x):
+            # [FUNCTION DOC] HELPER: Compiled target; runs the function under
+            # reentrant checkpointing.
             return torch.utils.checkpoint.checkpoint(fn, x, use_reentrant=True)
 
         def post_munge(s):
+            # [FUNCTION DOC] HELPER: Rewrites the instruction name part of the
+            # break reason (function call with keywords or the newer keyword call)
+            # to a generic call description.
             # deal with CALL_FUNCTION_KW/CALL_KW
             return re.sub(
                 r"attempting to trace (CALL_FUNCTION_KW|CALL_KW):.*$",
@@ -2232,17 +2605,25 @@ User code traceback:
         )
 
     def test_nested_hop_side_effect_error(self):
+        # [FUNCTION DOC] Checks that when checkpoint is nested inside a wrap higher order
+        # operator, only the innermost one (checkpoint) is named in the error, while the user
+        # frames of all levels are listed.
         # Test that only the innermost HOP context is shown (checkpoint, not wrap)
         stack = []
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Checkpointed function; appends to an outer
+            # list, returns sine.
             stack.append(1)  # Mutation outside checkpoint scope
             return x.sin()
 
         def inner(x):
+            # [FUNCTION DOC] HELPER: Function run by wrap; runs checkpoint on the
+            # inner function.
             return torch.utils.checkpoint.checkpoint(fn, x, use_reentrant=False)
 
         def model(x):
+            # [FUNCTION DOC] HELPER: Compiled target; invokes the wrap higher order operator.
             return torch.ops.higher_order.wrap(inner, x)
 
         self.assertExpectedInlineMunged(
@@ -2270,15 +2651,22 @@ from user code:
         )
 
     def test_cond_with_graph_break_shows_hop_context(self):
+        # [FUNCTION DOC] Checks that a graph break inside the true branch of a
+        # conditional operator raises the uncaptured higher order operator error
+        # naming the conditional operator.
         # Test that torch.cond graph breaks include HOP context
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: True branch; inserts a graph break then returns sine.
             torch._dynamo.graph_break()
             return x.sin()
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: False branch; returns cosine.
             return x.cos()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; runs the conditional operator on the
+            # sign of the tensor sum.
             return torch.cond(x.sum() > 0, true_fn, false_fn, [x])
 
         from torch._dynamo.exc import UncapturedHigherOrderOpError
@@ -2307,22 +2695,33 @@ from user code:
 
     @make_logging_test(graph_breaks=True)
     def test_cond_with_generator_gb_skip(self, records):
+        # [FUNCTION DOC] Checks the uncaptured higher order operator error when a generator
+        # with a graph break is consumed inside a generic context manager within a conditional
+        # branch; the message chains the generator skip note and the context manager break.
+        # Then repeats with error on graph break enabled and expects only the first part.
         def generator():
+            # [FUNCTION DOC] HELPER: Generator yielding one and two, inserting a graph break,
+            # then yielding four.
             yield 1
             yield 2
             torch._dynamo.graph_break()
             yield 4
 
         def true_fn(x):
+            # [FUNCTION DOC] HELPER: True branch; collects the generator values inside a
+            # generic context manager and returns sine plus their sum.
             with GenericCtxMgr():
                 l = list(generator())
             return x.sin() + sum(l)
 
         def false_fn(x):
+            # [FUNCTION DOC] HELPER: False branch; returns cosine.
             return x.cos()
 
         @torch.compile(backend="eager")
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; runs the conditional operator on the
+            # sign of the tensor sum.
             return torch.cond(x.sum() > 0, true_fn, false_fn, [x])
 
         from torch._dynamo.exc import UncapturedHigherOrderOpError
@@ -2392,11 +2791,19 @@ from user code:
     @make_logging_test()
     @torch._dynamo.config.patch(recompile_limit=1)
     def test_recompile_limit_hit_message(self, records):
+        # [FUNCTION DOC] With the recompile limit patched to one, calls a function with a
+        # different integer value twice (static shapes) to hit the limit and checks the logged
+        # limit-hit text (after removing the user stack section and normalizing the path).
+        # Then resets the compiler and checks the Unsupported error raised under error on
+        # graph break.
         @torch.compile(backend="eager", dynamic=False)
         def fn(x, n):
+            # [FUNCTION DOC] HELPER: Compiled target; adds an integer to the tensor.
             return x + n
 
         def outer(x):
+            # [FUNCTION DOC] HELPER: Calls the compiled function twice with loop indices zero
+            # and one.
             for i in range(2):
                 x = fn(x, i)
             return x
@@ -2404,6 +2811,8 @@ from user code:
         outer(torch.ones(3))
 
         def post_munge(s):
+            # [FUNCTION DOC] HELPER: Removes the user stack trace section and shortens the
+            # test file path in a comment in the log text.
             # Remove user stack trace section that appears in recompile limit messages
             s = re.sub(
                 r"\nUser stack trace:.*?(?=\nTo log all)", "", s, flags=re.DOTALL
@@ -2443,13 +2852,22 @@ Dynamo recompile limit exceeded
 
     @make_logging_test(graph_breaks=True)
     def test_nested_generic_ctx_mgr(self, records):
+        # [FUNCTION DOC] Compiles a function with nested generic context managers that calls a
+        # helper with more nesting and a graph break. Expects two log records: the first is
+        # the full message chaining the break with two context manager failures (three and two
+        # active managers); the second is a duplicate-suppressed shortened record for the
+        # first failure.
         def inner():
+            # [FUNCTION DOC] HELPER: Opens three nested generic context managers and inserts a
+            # graph break inside them.
             with GenericCtxMgr():
                 with GenericCtxMgr():
                     with GenericCtxMgr():
                         torch._dynamo.graph_break()
 
         def fn():
+            # [FUNCTION DOC] HELPER: Compiled target; opens two nested generic context
+            # managers and calls inner within them.
             with GenericCtxMgr():
                 with GenericCtxMgr():
                     inner()
@@ -2531,17 +2949,25 @@ Graph break under GenericContextWrappingVariable
 
     @make_logging_test(graph_breaks=True)
     def test_skipped_frame_with_verbose_traceback_nested(self, records):
+        # [FUNCTION DOC] Declares f1, f2 and f3 as module globals, then compiles the outermost
+        # one. Checks the single log record for a break inside a context manager reached
+        # through three nested calls: unresumable break message with user traceback through
+        # all three frames. Side effect: rebinds module level names f1, f2, f3.
         global f1, f2, f3
 
         def f1(x):
+            # [FUNCTION DOC] HELPER: Innermost function; inserts a graph break inside a
+            # generic context manager, then returns the input plus one.
             with GenericCtxMgr():
                 torch._dynamo.graph_break()
                 return x + 1
 
         def f2(x):
+            # [FUNCTION DOC] HELPER: Calls f1 with the input plus two.
             return f1(x + 2)
 
         def f3(x):
+            # [FUNCTION DOC] HELPER: Compiled target; calls f2 with the input plus three.
             return f2(x + 3)
 
         torch.compile(f3, backend="eager")(torch.randn(3))
@@ -2587,9 +3013,15 @@ User code traceback:
 
     @make_logging_test(graph_breaks=True)
     def test_skip_frame_in_loop_message_nested(self, records):
+        # [FUNCTION DOC] Declares f1, f2, f3 as module globals and compiles the outermost one.
+        # Checks the single record for a data-dependent branch in a loop with a context
+        # manager reached through three nested calls (unresumable break). Side effect: rebinds
+        # module level names.
         global f1, f2, f3
 
         def f1(x):
+            # [FUNCTION DOC] HELPER: Innermost function; loops twice with a generic context
+            # manager and a data-dependent branch adding one; returns the tensor.
             for i in range(2):
                 with GenericCtxMgr():
                     if x.sum() > 0:
@@ -2597,9 +3029,11 @@ User code traceback:
             return x
 
         def f2(x):
+            # [FUNCTION DOC] HELPER: Calls f1 with the input plus four.
             return f1(x + 4)
 
         def f3(x):
+            # [FUNCTION DOC] HELPER: Compiled target; calls f2 with the input plus five.
             return f2(x + 5)
 
         result = torch.compile(f3, backend="eager")(torch.randn(3))  # noqa: F841
@@ -2641,14 +3075,22 @@ User code traceback:
 
     @make_logging_test(graph_breaks=True)
     def test_try_block_with_graph_break_suppression(self, records):
+        # [FUNCTION DOC] Declares inner, middle_with_try and outer as module globals. Compiles
+        # outer where a graph break in inner is wrapped by a try block in the middle function,
+        # with verbose off. Expects exactly one full graph break record and two duplicate-
+        # suppressed records (one for each re-traced top frame), and compares all three. Side
+        # effect: rebinds module level names.
         global inner, middle_with_try, outer
 
         def inner(x):
+            # [FUNCTION DOC] HELPER: Adds one, inserts a graph break, then adds another one.
             result = x + 1
             torch._dynamo.graph_break()
             return result + 1
 
         def middle_with_try(x):
+            # [FUNCTION DOC] HELPER: Calls inner inside a try block that swallows exceptions;
+            # falls back to returning its input if the call raised.
             try:
                 return inner(x)
             except Exception:
@@ -2656,6 +3098,7 @@ User code traceback:
             return x
 
         def outer(x):
+            # [FUNCTION DOC] HELPER: Compiled target; calls the middle function.
             return middle_with_try(x)
 
         with torch._dynamo.config.patch(verbose=False):
@@ -2745,15 +3188,22 @@ Call to `torch._dynamo.graph_break()`
 
     @make_logging_test(graph_breaks=True)
     def test_nested_graph_break_different_call_sites_not_suppressed(self, records):
+        # [FUNCTION DOC] Declares inner and outer as module globals; outer calls inner at two
+        # different call sites with verbose off. Expects two graph break records, both with
+        # full user traces, showing duplicate suppression does not apply across different call
+        # sites. Side effect: rebinds module level names.
         global inner, outer
 
         def inner(x):
+            # [FUNCTION DOC] HELPER: Adds one, inserts a graph break, then adds two.
             x = x + 1
             torch._dynamo.graph_break()
             return x + 2
 
         @torch.compile(backend="eager")
         def outer(x):
+            # [FUNCTION DOC] HELPER: Compiled target; calls inner at two separate call sites
+            # with additions in between.
             x = inner(x + 4) + 8
             return inner(x) + 16
 
@@ -2820,19 +3270,27 @@ User code traceback:
     @torch._dynamo.config.patch(verbose=True)
     @make_logging_test(graph_breaks=True)
     def test_inlined_frame_carets(self, records):
+        # [FUNCTION DOC] Skipped before Python 3.13 (no carets in tracebacks). With verbose
+        # logging, checks the first record keeps caret markers under source lines, in both the
+        # outer frame and the inlined inner frame and the user frame above Dynamo. The
+        # bytecode trace section is removed before comparison.
         """Carets come from frame_summary (outer), _populate_loc_in_frame_summary
         (inner), and _extract_stack_with_positions (stack above dynamo)."""
 
         def inner(x):
+            # [FUNCTION DOC] HELPER: Inserts a graph break and returns the input.
             torch._dynamo.graph_break()
             return x
 
         def outer(x):
+            # [FUNCTION DOC] HELPER: Compiled target; calls inner and adds one.
             return inner(x) + 1
 
         torch.compile(outer, backend="eager")(torch.ones(3))
 
         def post_munge(s):
+            # [FUNCTION DOC] HELPER: Removes the recent bytecode instruction section from the
+            # end of the text.
             return re.sub(
                 r"\nMost recent bytecode instructions traced.*", "", s, flags=re.DOTALL
             )
@@ -2882,8 +3340,13 @@ NOTE: the most recent `torch.compile` tracing attempt might not be where you app
     )
     @make_logging_test(graph_breaks=True)
     def test_stack_variable_source_attribution(self, records):
+        # [FUNCTION DOC] Skipped before Python 3.13. Checks that, with carets and stack
+        # attribution not stripped, the record for a graph break inside a loop reports which
+        # source expression produced the iterator left on the stack.
         @torch.compile(backend="eager")
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled target; loops twice inserting a graph break,
+            # then adds one.
             for i in range(2):
                 torch._dynamo.graph_break()
             return x + 1
