@@ -1,5 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-process unit tests for DTensor support in pipeline parallelism: metadata
+# classes (_TensorMeta, _DTensorMeta, _MeshCache), the InferenceMode static/dynamic decision,
+# metadata validation, tuple/local-tensor helpers and DTensor-aware microbatch split/merge.
+# All tests live in one MultiProcContinuousTest class and need 4+ accelerators with an
+# nccl/xccl backend. At import time it picks the accelerator device type and default backend.
 """
 Unit tests for DTensor support in Pipeline Parallelism.
 
@@ -66,12 +71,16 @@ backend = dist.get_default_backend_for_device(device_type)
 
 
 def _requires_multi_gpu(fn):
+    # [FUNCTION DOC] HELPER: Decorator factory applied to test methods. Returns a wrapper around
+    # fn that is gated on an nccl/xccl accelerator backend and on having multiple accelerators
+    # (skipped but reported as passing in sandcastle otherwise). Behavior of fn is unchanged.
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     @skip_but_pass_in_sandcastle_if(
         not TEST_MULTIACCELERATOR, f"{backend} test requires 4+ GPUs"
     )
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Forwards all arguments to the wrapped test and returns its result.
         return fn(*args, **kwargs)
 
     return wrapper
@@ -83,6 +92,9 @@ def _requires_multi_gpu(fn):
 
 
 class TestDTensorPPUnitTests(MultiProcContinuousTest):
+    # [CLASS DOC] Multi-process test case (one process group shared by all tests) covering DTensor
+    # pipeline-parallel metadata, validation, helpers and microbatch split/merge. Provides
+    # backend/device configuration plus helpers to build meshes, DTensors and metadata objects.
     """Unit tests for DTensor PP metadata infrastructure.
 
     All tests live in a single class so the process group is initialized once
@@ -91,17 +103,22 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
 
     @classmethod
     def backend_str(cls) -> str:
+        # [FUNCTION DOC] HELPER: Returns the module-level default distributed backend name.
         return backend
 
     @classmethod
     def device_type(cls) -> str:
+        # [FUNCTION DOC] HELPER: Returns the module-level accelerator device type (or cpu).
         return device_type
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Returns the device of this rank (device type with index = rank).
         return torch.device(device_type, self.rank)
 
     def init_pg(self):
+        # [FUNCTION DOC] HELPER: Per-test setup; on cuda sets the current device to this rank's
+        # device. No-op for other device types.
         if device_type == "cuda":
             torch.cuda.set_device(self.device)
 
@@ -110,12 +127,17 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
     # -----------------------------------------------------------------
 
     def _make_mesh(self, dim_names=("tp",)):
+        # [FUNCTION DOC] HELPER: Builds a 1D device mesh of size world_size with the given
+        # dimension names (default one dim "tp"); requires an initialized process group.
         """Create a 1D device mesh spanning all ranks."""
         return init_device_mesh(
             device_type, (self.world_size,), mesh_dim_names=dim_names
         )
 
     def _make_dtensor(self, mesh, placements, shape=(8, 16), requires_grad=False):
+        # [FUNCTION DOC] HELPER: Creates a random tensor of the given shape on this rank's device
+        # (with requires_grad as given), then distributes it over the mesh with the placements.
+        # Returns the resulting DTensor.
         """Create a DTensor with given properties."""
         t = torch.randn(*shape, device=self.device, requires_grad=requires_grad)
         return distribute_tensor(t, mesh, placements)
@@ -127,12 +149,16 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
         dtype: torch.dtype = torch.float32,
         requires_grad: bool = True,
     ) -> _TensorMeta:
+        # [FUNCTION DOC] HELPER: Builds a _TensorMeta from the given shape, stride, dtype and
+        # requires_grad (defaults: 4x8, strides 8 and 1, float32, requires_grad true).
         """Create a _TensorMeta with sensible defaults."""
         return _TensorMeta(
             shape=shape, stride=stride, dtype=dtype, requires_grad=requires_grad
         )
 
     def _make_dtensor_meta(self) -> _DTensorMeta:
+        # [FUNCTION DOC] HELPER: Builds a fixed _DTensorMeta: local 4x8 float32 requiring grad,
+        # global shape 8x8, one Shard(0) placement on a mesh dim named tp, no mesh layout.
         """Create a _DTensorMeta with sensible defaults."""
         return _DTensorMeta(
             shape=torch.Size([4, 8]),
@@ -152,6 +178,10 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
 
     @_requires_multi_gpu
     def test_tensor_meta_extraction_roundtrip_and_errors(self):
+        # [FUNCTION DOC] For several shapes, dtypes and requires_grad flags, extracts a
+        # _TensorMeta from a plain tensor, checks its fields, rebuilds a tensor with to_tensor
+        # and checks get_diff reports no difference. Also asserts from_tensor on a DTensor raises
+        # PipeliningMetadataError mentioning DTensor.
         """Test _TensorMeta: extraction, roundtrip, DTensor rejection."""
         self.init_pg()
         mesh = self._make_mesh()
@@ -185,6 +215,9 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
 
     @_requires_multi_gpu
     def test_tensor_meta_non_float_requires_grad_guard(self):
+        # [FUNCTION DOC] Verifies metadata marked requires_grad but with integer or bool dtype
+        # yields tensors / DTensors (via to_tensor and to_dtensor) with requires_grad false and
+        # no error, while float32 metadata still yields a tensor requiring grad.
         """Test that to_tensor/to_dtensor don't set requires_grad on non-float dtypes."""
         self.init_pg()
         mesh = self._make_mesh()
@@ -230,6 +263,9 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
 
     @_requires_multi_gpu
     def test_dtensor_meta_extraction_and_roundtrip(self):
+        # [FUNCTION DOC] For Shard(0) and Replicate DTensors, extracts _DTensorMeta and checks
+        # global shape, placements, mesh dim names and mesh cache key. Rebuilds a DTensor with
+        # to_dtensor on the mesh and asserts re-extracted metadata has no differences.
         """Test _DTensorMeta: extraction and roundtrip for Shard/Replicate."""
         self.init_pg()
         mesh = self._make_mesh()
@@ -250,6 +286,9 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
 
     @_requires_multi_gpu
     def test_get_diff_detects_mismatches(self):
+        # [FUNCTION DOC] Asserts get_diff output mentions shape for differing _TensorMeta
+        # shapes, dtype for differing dtypes, placements for Shard vs Replicate _DTensorMeta,
+        # and a type difference when comparing a _DTensorMeta with a _TensorMeta.
         """Test get_diff() detects shape/dtype/placement/cross-type differences."""
         self.init_pg()
         mesh = self._make_mesh()
@@ -276,6 +315,11 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
 
     @_requires_multi_gpu
     def test_mesh_cache_operations(self):
+        # [FUNCTION DOC] Exercises _MeshCache: put makes a key present and get_mesh returns the
+        # stored mesh; the get_mesh_cb callback is skipped on a hit and invoked on a miss; with
+        # no callback a miss raises PipeliningMetadataError mentioning get_mesh;
+        # update_from_tensors registers meshes of DTensors only (ignoring plain tensors and
+        # None), giving a cache of length 1.
         """Test _MeshCache: __contains__/put/get_mesh/callback/update_from_tensors."""
         self.init_pg()
         mesh = self._make_mesh()
@@ -292,6 +336,7 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
         cb_called = [False]
 
         def cb(mesh_dim_names, mesh_layout):
+            # [FUNCTION DOC] HELPER: Mesh callback that records it was called and returns mesh.
             cb_called[0] = True
             return mesh
 
@@ -304,6 +349,7 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
         cb2_called = [False]
 
         def cb2(mesh_dim_names, mesh_layout):
+            # [FUNCTION DOC] HELPER: Mesh callback that records it was called and returns mesh.
             cb2_called[0] = True
             return mesh
 
@@ -332,6 +378,10 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
 
     @_requires_multi_gpu
     def test_needs_dynamic_all_cases(self):
+        # [FUNCTION DOC] Table-driven check of InferenceMode.needs_dynamic over 8 combinations
+        # of stage metadata (missing/partial/complete forward metadata, plain vs DTensor, with
+        # or without backward, partial vs complete grad metadata). Dynamic is expected unless
+        # forward metadata is complete and either plain tensors, no backward, or full grads.
         """Test all 8 cases of the needs_dynamic() decision matrix."""
         self.init_pg()
         tm = self._make_tensor_meta()
@@ -387,6 +437,9 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
 
     @_requires_multi_gpu
     def test_NoneGrad_dtensor_grad_metadata_not_derived(self):
+        # [FUNCTION DOC] Checks _derive_grad_metas on a plain-tensor meta and a DTensor meta:
+        # a grad meta is derived for the plain one but is None for the DTensor one (its
+        # placements cannot be inferred).
         self.init_pg()
         mesh = self._make_mesh()
 
@@ -403,6 +456,11 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
 
     @_requires_multi_gpu
     def test_NoneGrad_dtensor_runtime_send_contract(self):
+        # [FUNCTION DOC] Builds a PipelineStage with backward enabled and manual state. When the
+        # grad metadata is None but a DTensor grad is cached, get_bwd_send_ops must raise
+        # PipeliningMetadataError (grad metadata cannot be derived). When metadata is a DTensor
+        # meta but the cached grad is None, it must return one send op carrying a zero tensor
+        # shaped like the local grad.
         self.init_pg()
         mesh = self._make_mesh()
         dtensor_grad = self._make_dtensor(
@@ -443,6 +501,10 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
 
     @_requires_multi_gpu
     def test_validate_metadata(self):
+        # [FUNCTION DOC] Checks validate_metadata returns no diffs on a match, raises
+        # PipeliningMetadataError on mismatch with raise_on_mismatch, emits a warning containing
+        # "Metadata mismatch" and returns diffs with warn_on_mismatch, and reports a type
+        # difference when a DTensor meta is compared to a plain tensor.
         """Test validate_metadata: match, raise, warn, type mismatch."""
         self.init_pg()
         mesh = self._make_mesh()
@@ -471,6 +533,10 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
 
     @_requires_multi_gpu
     def test_validate_tensors_metadata(self):
+        # [FUNCTION DOC] Checks validate_tensors_metadata accepts a matching pair, raises
+        # PipeliningMetadataError on a length mismatch, only warns when raising is disabled and
+        # warning enabled, accepts a None/None pair, and raises when metadata exists but the
+        # actual value is None.
         """Test validate_tensors_metadata: batch validation, length mismatch, None handling."""
         self.init_pg()
         mesh = self._make_mesh()
@@ -506,6 +572,10 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
 
     @_requires_multi_gpu
     def test_validate_static_arg_grad_correspondence(self):
+        # [FUNCTION DOC] Checks validate_static_arg_grad_correspondence accepts: DTensor with
+        # grad plus DTensor grad, DTensor without grad plus None, plain plus None, DTensor with
+        # grad plus None. It raises PipeliningMetadataError for a DTensor requiring grad paired
+        # with a plain-tensor grad and for sequences of different lengths.
         """Test DTensor↔grad correspondence: all valid/invalid combos."""
         self.init_pg()
         mesh = self._make_mesh()
@@ -547,6 +617,9 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
 
     @_requires_multi_gpu
     def test_extract_tensor_metas(self):
+        # [FUNCTION DOC] Checks extract_tensor_metas returns None for None input, yields
+        # _DTensorMeta for DTensors and plain _TensorMeta for plain tensors, keeps None entries
+        # when allow_none is set, and raises PipeliningMetadataError for None entries otherwise.
         """Test extract_tensor_metas: plain, DTensor, None handling."""
         self.init_pg()
         mesh = self._make_mesh()
@@ -576,6 +649,9 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
 
     @_requires_multi_gpu
     def test_to_local_if_dtensor(self):
+        # [FUNCTION DOC] Checks to_local_if_dtensor converts a DTensor to its local tensor
+        # (same shape as the local shard), returns a plain tensor unchanged (same object), and
+        # with detach set returns a local tensor that does not require grad.
         """Test to_local_if_dtensor: DTensor→local, plain passthrough, detach."""
         self.init_pg()
         mesh = self._make_mesh()
@@ -599,6 +675,10 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
 
     @_requires_multi_gpu
     def test_validate_and_normalize_to_tuple(self):
+        # [FUNCTION DOC] Checks validate_and_normalize_to_tuple: None stays None, a single tensor
+        # becomes a 1-tuple, a list becomes a tuple, None elements are allowed only with
+        # allow_none, and non-tensor elements or a non-tensor/sequence value (an int) raise
+        # PipeliningMetadataError.
         """Test validate_and_normalize_to_tuple: single, tuple, list, None, errors."""
         self.init_pg()
         t = torch.randn(4, 4, device=self.device)
@@ -642,6 +722,10 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
 
     @_requires_multi_gpu
     def test_split_tensor_dtensor_preserves_placements(self):
+        # [FUNCTION DOC] For Shard(0) and Replicate DTensors of shape 8x16, splits into 2 chunks
+        # along dim 0 with _split_tensor and asserts each chunk is a DTensor with the same
+        # placements and mesh, local chunk sizes sum to the original local size, and
+        # concatenating local chunks reproduces the original local data.
         """Test _split_tensor splits a DTensor into chunks that are still DTensors
         with the same placements, correct local shapes, and matching data."""
         self.init_pg()
@@ -685,6 +769,9 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
 
     @_requires_multi_gpu
     def test_merge_chunks_dtensor_roundtrip(self):
+        # [FUNCTION DOC] Splits Shard(0) and Replicate DTensors into 2 chunks, wraps each chunk
+        # in a 1-tuple and merges with merge_chunks; asserts the merged result is a DTensor with
+        # the original placements, mesh, shape and local data.
         """Test that split → merge is a roundtrip: merge_chunks reconstructs
         the original DTensor data and preserves placements."""
         self.init_pg()
@@ -723,6 +810,8 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
 
     @_requires_multi_gpu
     def test_merge_chunks_dtensor_placement_mismatch_raises(self):
+        # [FUNCTION DOC] Merges a Shard(0) DTensor chunk with a Replicate chunk and asserts
+        # merge_chunks raises AssertionError whose message contains "placement mismatch".
         """Test that merge_chunks raises when chunk placements don't match."""
         self.init_pg()
         mesh = self._make_mesh()
@@ -741,6 +830,8 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
 
     @_requires_multi_gpu
     def test_merge_chunks_dtensor_mixed_types_raises(self):
+        # [FUNCTION DOC] Merges one DTensor chunk with one plain tensor chunk and asserts
+        # merge_chunks raises AssertionError whose message contains "mix".
         """Test that merge_chunks raises when mixing DTensors and plain tensors."""
         self.init_pg()
         mesh = self._make_mesh()
@@ -759,6 +850,10 @@ class TestDTensorPPUnitTests(MultiProcContinuousTest):
 
     @_requires_multi_gpu
     def test_split_target_preserves_dtensor_placements(self):
+        # [FUNCTION DOC] Regression test using the schedules _TARGET_CHUNK_SPEC: splits 1D
+        # Shard(0) and Replicate DTensors into 2 chunks (batch 8) and 3 chunks (batch 7, uneven)
+        # with _split_tensor; asserts the chunk count, that every chunk is a DTensor with
+        # unchanged placements, and that chunk sizes along dim 0 sum to the batch size.
         """Regression test: schedules' target-split path must split DTensor
         targets via _split_tensor (not torch.tensor_split) so that Shard
         placements survive (no implicit all-gather to Replicate) and so that

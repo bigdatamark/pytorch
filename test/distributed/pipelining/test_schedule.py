@@ -1,5 +1,12 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for torch.distributed.pipelining schedules: schedule class lookup, adjacency
+# validation, single-stage and pre-split-input execution on a fake process group, generated
+# pipeline orders for the interleaved/looped/zero-bubble/DualPipeV schedules, and the action-list
+# transforms (send/recv insertion, merging backward, unshard/reshard, batching) plus runtime
+# execution and CSV round-tripping. Import-time side effects: computes the module-level device
+# string, creates a logger and seeds the RNG; ARTIFACTS_DIR points at the "artifacts" folder
+# next to this file.
 import copy
 import csv
 import logging
@@ -77,7 +84,13 @@ torch.manual_seed(0)
 
 
 class MockPipelineStage(_PipelineStageBase):
+    # [CLASS DOC] HELPER: Minimal stage stub for schedule-construction tests. Holds only
+    # submod (None), num_stages, group_size, group_rank and group, and turns the
+    # grad-recv-info creation and forward/backward infrastructure preparation into no-ops.
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Sets submod to None and reads num_stages (default 1),
+        # group_size (default 1), group_rank (default 0) and group from keyword arguments.
+        # Positional arguments are ignored; the base class constructor is not called.
         # Mock the necessary attributes
         self.submod = None
         self.num_stages = kwargs.get("num_stages", 1)
@@ -86,22 +99,33 @@ class MockPipelineStage(_PipelineStageBase):
         self.group = kwargs.get("group")
 
     def _create_grad_recv_info(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Stub returning None (no gradient recv info).
         return None
 
     def _prepare_forward_infra(self, n_microbatches):
+        # [FUNCTION DOC] HELPER: Stub that does nothing.
         pass
 
     def _prepare_backward_infra(self, n_microbatches):
+        # [FUNCTION DOC] HELPER: Stub that does nothing.
         pass
 
 
 def _make_adjacency_stage(
     stage_index, num_stages, group_rank, args_recv_info, act_send_info
 ):
+    # [FUNCTION DOC] HELPER: Builds and returns an instance of a locally defined stage mock whose
+    # stage_index, group_rank and group_size (= num_stages) are given, with fixed recv/send info
+    # (args_recv_info, act_send_info) installed when forward infra is prepared. All p2p op
+    # getters return empty lists, so running it exercises only schedule validation.
     """Factory for a minimal mock stage used by adjacency-guard tests."""
 
     class _AdjacencyTestStage(MockPipelineStage):
+        # [CLASS DOC] HELPER: Mock stage that reports preset receive/send peer info and no
+        # communication ops; device is cpu.
         def __init__(self):
+            # [FUNCTION DOC] HELPER: Initializes the mock with the enclosing num_stages and
+            # group_rank, then sets stage_index and device to "cpu".
             super().__init__(
                 num_stages=num_stages,
                 group_size=num_stages,
@@ -111,35 +135,48 @@ def _make_adjacency_stage(
             self.device = "cpu"
 
         def _get_init_p2p_neighbors_ops(self):
+            # [FUNCTION DOC] HELPER: Returns an empty list (no initial neighbor ops).
             return []
 
         def _prepare_forward_infra(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Installs the enclosing args_recv_info and act_send_info on
+            # the stage and returns an empty tuple.
             self.args_recv_info = args_recv_info
             self.act_send_info = act_send_info
             return tuple()
 
         def _prepare_backward_infra(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Stub returning None.
             return None
 
         def clear_runtime_states(self):
+            # [FUNCTION DOC] HELPER: Stub returning None; nothing to clear.
             return None
 
         def get_fwd_recv_ops(self, mb_index):
+            # [FUNCTION DOC] HELPER: Returns an empty list for any microbatch.
             return []
 
         def get_fwd_send_ops(self, mb_index):
+            # [FUNCTION DOC] HELPER: Returns an empty list for any microbatch.
             return []
 
         def get_bwd_recv_ops(self, mb_index):
+            # [FUNCTION DOC] HELPER: Returns an empty list for any microbatch.
             return []
 
         def get_bwd_send_ops(self, mb_index):
+            # [FUNCTION DOC] HELPER: Returns an empty list for any microbatch.
             return []
 
     return _AdjacencyTestStage()
 
 
 def _run_adjacency_validation(stage, num_stages):
+    # [FUNCTION DOC] HELPER: Wraps the stage in a PipelineScheduleMulti with one microbatch,
+    # overrides its pipeline_order with a single no-op entry per rank (num_stages ranks), and
+    # calls step() so the schedule's adjacent-stage communication validation runs. Any
+    # validation error propagates to the caller.
     """Run one step of PipelineScheduleMulti to trigger adjacency validation."""
     schedule = PipelineScheduleMulti([stage], n_microbatches=1)
     schedule.pipeline_order = {i: [None] for i in range(num_stages)}
@@ -147,7 +184,14 @@ def _run_adjacency_validation(stage, num_stages):
 
 
 class ScheduleTest(TestCase):
+    # [CLASS DOC] Test case for schedule class lookup, stage adjacency guards, and end-to-end
+    # schedule execution (single stage, pre-split inputs, eval then train) using a fake process
+    # group so no real communication happens.
     def test_get_schedule_class(self):
+        # [FUNCTION DOC] Asserts get_schedule_class resolves several names (case-insensitive,
+        # including 1F1B, Interleaved1F1B, GPipe, LoopedBFS and the generic Single/Multi base
+        # names) to subclasses of _PipelineSchedule, and that an unknown name raises ValueError
+        # mentioning the original name.
         # List of all expected schedule names
         schedule_names = [
             "1F1B",
@@ -180,12 +224,16 @@ class ScheduleTest(TestCase):
                 get_schedule_class(name)
 
     def test_adjacency_guard_rejects_nonadjacent_send(self):
+        # [FUNCTION DOC] Stage 0 of 3 declares a send to stage 2; running a step must raise
+        # RuntimeError mentioning adjacent-stage communication.
         # Stage 0 sending to stage 2 (skip connection)
         stage = _make_adjacency_stage(0, 3, 0, {0: tuple()}, {0: [2]})
         with self.assertRaisesRegex(RuntimeError, "adjacent-stage communication"):
             _run_adjacency_validation(stage, 3)
 
     def test_adjacency_guard_rejects_nonadjacent_recv(self):
+        # [FUNCTION DOC] Stage 3 of 4 declares a receive whose source is stage 0; running a step
+        # must raise RuntimeError mentioning adjacent-stage communication.
         # Stage 3 receiving from stage 0 (non-adjacent)
         stage = _make_adjacency_stage(
             3,
@@ -198,11 +246,14 @@ class ScheduleTest(TestCase):
             _run_adjacency_validation(stage, 4)
 
     def test_adjacency_guard_allows_adjacent_send(self):
+        # [FUNCTION DOC] Stage 0 of 3 sending to stage 1 is valid; the step must not raise.
         # Stage 0 -> stage 1 is valid
         stage = _make_adjacency_stage(0, 3, 0, {0: tuple()}, {0: [1]})
         _run_adjacency_validation(stage, 3)
 
     def test_adjacency_guard_allows_empty_recv_middle_stage(self):
+        # [FUNCTION DOC] A middle stage (1 of 3) with no receive peers and a send to stage 2
+        # passes the adjacency check; the step must not raise.
         # Middle stage with no recv is fine (no non-adjacent peers)
         stage = _make_adjacency_stage(1, 3, 1, {0: tuple()}, {0: [2]})
         _run_adjacency_validation(stage, 3)
@@ -218,6 +269,12 @@ class ScheduleTest(TestCase):
         ],
     )
     def test_schedule_with_single_stage(self, ScheduleClass):
+        # [FUNCTION DOC] Parametrized over five schedule classes. Initializes a fake one-rank
+        # process group, wraps one MLP layer in a PipelineStage, runs the schedule for two
+        # steps with 2 microbatches and a cross-entropy loss, and compares output, mean
+        # microbatch loss and parameter gradients to an unpipelined reference. Raises
+        # AssertionError on mismatch (printing the failing parameter) and destroys the process
+        # group at the end (not in a finally block, so a failure leaks it).
         """
         Test that schedules with only a single stage work as expected for all schedules.
         """
@@ -239,6 +296,7 @@ class ScheduleTest(TestCase):
             target = y + torch.randn(batch_size, d_hid, device=device)
 
         def loss_fn(y, target):
+            # [FUNCTION DOC] HELPER: Returns the cross entropy of outputs y against target.
             return torch.nn.functional.cross_entropy(y, target)
 
         # Run reference
@@ -311,6 +369,11 @@ class ScheduleTest(TestCase):
         ],
     )
     def test_schedule_with_pre_split_inputs(self, ScheduleClass):
+        # [FUNCTION DOC] Parametrized over five schedule classes. Builds two identical copies of
+        # a small kwarg-taking module, runs one schedule with automatic splitting of x, y and
+        # target and another with explicit arg_mbs, kwarg_mbs and target_mbs, and asserts equal
+        # outputs, stacked losses and parameter gradients. Uses a fake process group which is
+        # always destroyed.
         """
         Test that schedules can consume pre-split microbatch args, kwargs, and target.
         """
@@ -325,11 +388,15 @@ class ScheduleTest(TestCase):
             device = "cpu"
 
             class KwargModule(torch.nn.Module):
+                # [CLASS DOC] HELPER: Tiny module with one Linear layer whose forward takes two
+                # tensors (one passed by keyword in the test).
                 def __init__(self):
+                    # [FUNCTION DOC] HELPER: Creates the d_hid x d_hid Linear layer.
                     super().__init__()
                     self.linear = torch.nn.Linear(d_hid, d_hid)
 
                 def forward(self, x, y):
+                    # [FUNCTION DOC] HELPER: Returns linear(relu(x + y)).
                     return self.linear(torch.relu(x + y))
 
             auto_mod = KwargModule().to(device)
@@ -341,6 +408,9 @@ class ScheduleTest(TestCase):
             loss_fn = torch.nn.MSELoss(reduction="sum")
 
             def make_schedule(mod):
+                # [FUNCTION DOC] HELPER: Wraps mod in a single PipelineStage and returns a
+                # ScheduleClass instance (stage passed bare for single-stage schedule types,
+                # in a list otherwise) with the sum-reduction MSE loss and no grad scaling.
                 stage = PipelineStage(mod, 0, n_stages, device)
                 if issubclass(ScheduleClass, PipelineScheduleSingle):
                     stages = stage
@@ -390,6 +460,11 @@ class ScheduleTest(TestCase):
             torch.distributed.destroy_process_group()
 
     def test_schedule_pre_split_validation(self):
+        # [FUNCTION DOC] On a GPipe schedule with 2 microbatches, checks step() argument
+        # validation: mixing full-batch inputs with arg_mbs, kwargs with kwarg_mbs, or target
+        # with target_mbs raises ValueError; non-list or wrongly typed arg_mbs/kwarg_mbs raise
+        # TypeError; wrong lengths of arg_mbs/target_mbs raise ValueError. Fake process group
+        # is destroyed in a finally block.
         store = FakeStore()
         torch.distributed.init_process_group(
             backend="fake", rank=0, world_size=1, store=store
@@ -457,6 +532,11 @@ class ScheduleTest(TestCase):
         ],
     )
     def test_schedule_eval_then_train(self, ScheduleClass):
+        # [FUNCTION DOC] Parametrized over five schedule classes. Runs eval with full-batch input
+        # and then with pre-split microbatches and asserts equal outputs and losses and that no
+        # parameter gradient is produced; then runs step with pre-split inputs and asserts the
+        # same outputs and losses and that gradients now exist. Fake process group destroyed in
+        # a finally block.
         """Test full-batch and pre-split evaluation followed by training."""
         store = FakeStore()
         torch.distributed.init_process_group(
@@ -472,6 +552,7 @@ class ScheduleTest(TestCase):
         target = torch.randn(batch_size, d_hid, device=device)
 
         def loss_fn(y, target):
+            # [FUNCTION DOC] HELPER: Returns the cross entropy of outputs y against target.
             return torch.nn.functional.cross_entropy(y, target)
 
         submod_name = "layers.0"
@@ -526,6 +607,10 @@ class ScheduleTest(TestCase):
 
     @parametrize("rank", [0, 1])
     def test_fake_pg_cross_rank_uses_static_metadata(self, rank):
+        # [FUNCTION DOC] Parametrized over rank 0 and 1 of a fake two-rank group. With example
+        # input and output args supplied, a GPipe step must succeed and leave the stage in
+        # STATIC inference mode. A stage without example metadata must make step raise
+        # RuntimeError mentioning the fake process group. Group destroyed in a finally block.
         """
         With a fake process group, the cross-rank warm-up vote cannot exchange
         real data, so the schedule must infer the metadata mode locally:
@@ -569,6 +654,9 @@ class ScheduleTest(TestCase):
         ],
     )
     def test_zero_bubble_schedule_errors_with_compile(self, ScheduleClass):
+        # [FUNCTION DOC] Parametrized over the interleaved zero-bubble, ZBV zero-bubble and
+        # DualPipeV schedules. Wraps a torch.compile'd (OptimizedModule) model in a stage and
+        # asserts constructing the schedule raises RuntimeError. Fake group destroyed in finally.
         """
         Test that zero bubble schedules raise an error when used with torch.compile.
         """
@@ -599,7 +687,13 @@ instantiate_parametrized_tests(ScheduleTest)
 
 
 class TestSchedulePlan(TestCase):
+    # [CLASS DOC] Test case for the generated per-rank pipeline orders of schedule classes and
+    # the action-list transformations; setUp provides a shared table of
+    # (num_local_stages, num_microbatches, group_size) configurations.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Calls the base setUp and stores in self.test_cases a list of
+        # (num_local_stages, num_microbatches, group_size) tuples covering small, large, odd and
+        # non-divisible configurations.
         super().setUp()
         # Define a list of test cases with varying num_local_stages, num_microbatches, and group_size
         # These should succeed since num_microbatches % group_size == 0
@@ -640,6 +734,11 @@ class TestSchedulePlan(TestCase):
         [ScheduleInterleaved1F1B, ScheduleLoopedBFS],
     )
     def test_pipeline_order(self, ScheduleClass):
+        # [FUNCTION DOC] Parametrized over Interleaved1F1B and LoopedBFS. For each test case
+        # whose microbatch count is divisible by the group size, builds mock stages and the
+        # schedule, formats its pipeline order, inserts send/recv actions with a round-robin
+        # stage-to-rank mapping and simulates the compute/comm schedule; the simulation raises
+        # if the order deadlocks or is invalid.
         for num_local_stages, num_microbatches, group_size in self.test_cases:
             with self.subTest(
                 num_local_stages=num_local_stages,
@@ -667,6 +766,7 @@ class TestSchedulePlan(TestCase):
                 )
 
                 def stage_to_rank(stage):
+                    # [FUNCTION DOC] HELPER: Maps a stage index to its rank by modulo group_size.
                     return stage % group_size
 
                 comms_sch = _add_send_recv(
@@ -685,6 +785,11 @@ class TestSchedulePlan(TestCase):
         [ScheduleInterleaved1F1B, ScheduleInterleavedZeroBubble],
     )
     def test_pipeline_order_flex_and_zero_bubble(self, ScheduleClass):
+        # [FUNCTION DOC] Parametrized over Interleaved1F1B and InterleavedZeroBubble. For every
+        # test case (including microbatch counts not divisible by the group size) builds mock
+        # stages and the schedule, inserts send/recv actions with a round-robin stage-to-rank
+        # mapping and simulates the result, which raises on an invalid or deadlocking order.
+        # KNOWN ISSUE: warmup_ops and warmups_ops_last_stage are computed but never used.
         for num_local_stages, num_microbatches, group_size in self.test_cases:
             with self.subTest(
                 num_local_stages=num_local_stages,
@@ -705,6 +810,7 @@ class TestSchedulePlan(TestCase):
                 schedule = ScheduleClass(stages, num_microbatches)
 
                 def stage_to_rank(stage):
+                    # [FUNCTION DOC] HELPER: Maps a stage index to its rank by modulo group_size.
                     return stage % group_size
 
                 comms_sch = _add_send_recv(
@@ -724,6 +830,10 @@ class TestSchedulePlan(TestCase):
         [ScheduleDualPipeV, ScheduleZBVZeroBubble],
     )
     def test_pipeline_order_for_v_schedules(self, ScheduleClass):
+        # [FUNCTION DOC] Parametrized over DualPipeV and ZBVZeroBubble. For each test case:
+        # if local stages differ from 2 the constructor must raise ValueError; for DualPipeV
+        # with fewer microbatches than stages it must raise ValueError; otherwise the schedule
+        # is built and its pipeline order is checked with _validate_schedule.
         for num_local_stages, num_microbatches, group_size in self.test_cases:
             with self.subTest(
                 num_local_stages=num_local_stages,
@@ -765,6 +875,8 @@ instantiate_parametrized_tests(TestSchedulePlan)
 
 
 class TestScheduleCsv(TestCase):
+    # [CLASS DOC] Regression test case comparing generated schedules against reference CSV
+    # files stored in the artifacts directory.
     @parametrize(
         "ScheduleClass,csv_name",
         [
@@ -772,6 +884,11 @@ class TestScheduleCsv(TestCase):
         ],
     )
     def test_csv_compare(self, ScheduleClass, csv_name):
+        # [FUNCTION DOC] Builds a DualPipeV schedule (2 local stages, 4 ranks, 10 microbatches)
+        # from mock stages, reads the reference CSV named by csv_name from ARTIFACTS_DIR (one
+        # row of action strings per rank, parsed with _Action.from_str) and asserts every action
+        # in the generated per-rank order equals the reference at the same timestep. Fails with
+        # a message giving the timestep. Raises if the CSV file is missing.
         """
         Test that schedules matches the expected CSV.  This is a regression test to ensure that the schedule
         is not changed unintentionally.
@@ -809,9 +926,15 @@ instantiate_parametrized_tests(TestScheduleCsv)
 
 
 class TestScheduleLowering(TestCase):
+    # [CLASS DOC] Test case for the pure schedule-lowering passes (unshard/reshard insertion,
+    # reduce-grad insertion, merging I and W into B, send/recv insertion, recv deferral and
+    # batching) that transform per-rank lists of _Action objects; uses string notation parsed
+    # by _Action.from_str.
     """Tests lowering passes that convert simple compute-only (FBW) schedules into compute+comms schedules"""
 
     def _parse_actions(self, actions: list[str]) -> list[_Action]:
+        # [FUNCTION DOC] HELPER: Converts a list of action strings into _Action objects using
+        # _Action.from_str, preserving order.
         return [_Action.from_str(s) for s in actions]
 
     @parametrize(
@@ -828,6 +951,9 @@ class TestScheduleLowering(TestCase):
         ],
     )
     def test_action_parse(self, action_str_and_ref):
+        # [FUNCTION DOC] Parses an action string with _Action.from_str, asserts it equals the
+        # reference _Action (stage, computation type, optional microbatch) and that its repr
+        # reproduces the original string.
         """Test that actions can be parsed from strings and round-tripped back to the same strings."""
         act_str, ref = action_str_and_ref
         act = _Action.from_str(act_str)
@@ -861,6 +987,10 @@ class TestScheduleLowering(TestCase):
         ],
     )
     def test_unshard_reshard(self, test_info):
+        # [FUNCTION DOC] Applies _add_unshard_reshard to a compute-only action list and compares
+        # element-wise (zip, so length differences are not detected) with the expected list in
+        # which each stage gets an UNSHARD before its first use and a RESHARD after its last
+        # backward; blank placeholder entries are dropped.
         """Test the lowering pass that takes a 'compute only' schedule (with only F,B,W ops) and adds
         FSDP unshard/reshard operations to the schedule.  This is just part of the process of adding communication
         ops and producing a complete schedule.
@@ -904,6 +1034,9 @@ class TestScheduleLowering(TestCase):
         ],
     )
     def test_reduce_grad(self, test_info):
+        # [FUNCTION DOC] Applies _add_reduce_grad (with 2 microbatches) to a compute-only action
+        # list and checks, with strict length matching, that a REDUCE_GRAD action is placed
+        # after the last backward of each stage and blank entries are dropped.
         compute_sch = self._parse_actions(test_info["compute"])
         expected_comms_sch = self._parse_actions(test_info["comms"])
 
@@ -938,6 +1071,9 @@ class TestScheduleLowering(TestCase):
         ],
     )
     def test_merge_bw(self, test_info):
+        # [FUNCTION DOC] Applies _merge_bw to a list of F, I and W actions and compares
+        # element-wise (zip) with the expected list, where an I immediately followed by its
+        # matching W of the same stage and microbatch collapses into a single B.
         """Test the pass that merges adjacent I and W operations into a B operation."""
         compute_sch = self._parse_actions(test_info["compute"])
         expected_merged_sch = self._parse_actions(test_info["comms"])
@@ -1078,6 +1214,11 @@ class TestScheduleLowering(TestCase):
         ],
     )
     def test_send_recv(self, test_info):
+        # [FUNCTION DOC] Applies _add_send_recv to per-rank compute-only action lists with the
+        # given stage-to-rank mapping, compares every rank's result to the expected list
+        # (positions and length), then runs _simulate_comms_compute and asserts the longest
+        # simulated rank takes exactly simulated_steps steps. Cases: 2 ranks x 2 stages and a
+        # V-shaped 2 ranks x 4 stages layout.
         """Tests the lowering pass that adds send/recv ops to a compute-only schedule."""
         compute_sch = {
             rank: self._parse_actions(test_info["compute"][rank])
@@ -1434,6 +1575,11 @@ class TestScheduleLowering(TestCase):
         ],
     )
     def test_defer_recv_ops(self, test_info):
+        # [FUNCTION DOC] Applies _defer_recv_ops to per-rank action lists that have all RECVs
+        # hoisted early, and compares each rank with the expected list (positions and length).
+        # Expected: RECVs move to just before the compute action (including OVERLAP_F_B
+        # sub-actions) that consumes them; for a rank lower than its peer, RECVs are also
+        # flushed before SENDs to that peer; BACKWARD_WEIGHT does not consume a RECV.
         """Tests that _defer_recv_ops defers RECVs with rank-parity ordering."""
         input_sch = {
             rank: self._parse_actions(test_info["input"][rank])
@@ -1461,6 +1607,11 @@ class TestScheduleLowering(TestCase):
             self.assertEqual(len(result_sch[rank]), len(expected_sch[rank]))
 
     def test_defer_recv_ops_no_deadlock(self):
+        # [FUNCTION DOC] Generates Interleaved1F1B schedules (2 ranks, 4 microbatches, with
+        # comms) via get_schedule_ops with and without deferral of pipeline recvs. Asserts on
+        # rank 0 that the stage-2 forward RECV moves later when deferred; on rank 1 that every
+        # standalone RECV is immediately followed by the action (or OVERLAP sub-action) that
+        # consumes it; and that rank 1's total RECV count is unchanged by deferral.
         """Tests the issue from pytorch/pytorch#172668: RECV_F for stage 2 should not
         be placed before unrelated compute op 0F1 on the same rank, and the deferred
         schedule must not introduce deadlocks.
@@ -1490,6 +1641,8 @@ class TestScheduleLowering(TestCase):
         rank0_no_overlap = schedule_ops_no_overlap[0]
 
         def find_action(actions, stage_idx, comp_type, mb_idx):
+            # [FUNCTION DOC] HELPER: Returns the index of the first non-None action matching the
+            # stage index, computation type and microbatch index, or -1 if there is none.
             for i, a in enumerate(actions):
                 if (
                     a is not None
@@ -1580,7 +1733,14 @@ class TestScheduleLowering(TestCase):
 
     @parametrize("csv_name", ["zb1p_2rank_2stagep"])
     def test_csv(self, csv_name):
+        # [FUNCTION DOC] Reads a compute-only schedule CSV (one row of actions per rank) from
+        # ARTIFACTS_DIR, merges I and W into B per rank, inserts send/recv for 2 model chunks
+        # over 2 pipeline ranks, and compares to the reference comms CSV timestep by timestep.
+        # Then simulates the schedule and asserts the longest rank takes exactly 113 steps.
+        # Raises if either CSV file is missing.
         def _dump_csv(pipeline_order_with_comms, filename: str):
+            # [FUNCTION DOC] HELPER: Writes the schedule to the named CSV file, one row per
+            # rank in mapping order (not called; used by hand to regenerate reference files).
             """Dump a CSV representation of the compute + comms schedule into a file with the provided filename."""
             with open(filename, "w", newline="") as csvfile:
                 writer = csv.writer(csvfile)
@@ -1637,6 +1797,12 @@ class TestScheduleLowering(TestCase):
 
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_grad_with_v_schedule(self):
+        # [FUNCTION DOC] Needs an nccl/xccl-capable environment. On a fake one-rank group, runs
+        # two adjacent stages (1 and 0 colocated, as in a V schedule) through a
+        # _PipelineScheduleRuntime with an explicit compute/comms action list (F then B across
+        # both stages) for two steps. Asserts no leaked tensors, then output, summed loss and
+        # per-parameter gradients match a two-layer reference. Destroys the process group at
+        # the end (not in a finally block).
         """
         We have a special case for V schedules where 2 adjacent stages are on the same rank.
         E.g.
@@ -1755,6 +1921,11 @@ class TestScheduleLowering(TestCase):
 
     @requires_accelerator_dist_backend(["nccl", "xccl"])
     def test_grad_with_split_b_w(self):
+        # [FUNCTION DOC] Needs an nccl/xccl-capable environment. On a fake one-rank group, runs a
+        # single stage through a _PipelineScheduleRuntime with 2 microbatches and separate
+        # input-backward (I) and weight-backward (W) actions for two steps. Asserts no leaked
+        # tensors, then output, summed loss and gradients equal the unpipelined reference.
+        # Destroys the process group at the end (not in a finally block).
         """
         Ensure that separate dInput and dWeight computations are correctly executed.
         This test runs on a single rank and just tests a single stage with 2 microbatches with separate B, W operations.
@@ -1864,7 +2035,10 @@ class TestScheduleLowering(TestCase):
 
 
 class TestValidateSchedule(TestCase):
+    # [CLASS DOC] Test case for _validate_schedule using small hand-built per-rank action maps.
     def test_valid_schedule(self):
+        # [FUNCTION DOC] Two valid 2-rank, 2-stage, 1-microbatch schedules (F+B, and F+I+W per
+        # stage) must pass _validate_schedule without raising.
         schedule_actions = [
             {
                 0: [_Action(0, F, 0), _Action(0, B, 0)],
@@ -1882,6 +2056,8 @@ class TestValidateSchedule(TestCase):
             _validate_schedule(actions, pp_group_size, num_stages, num_microbatches)
 
     def test_invalid_schedule_missing_rank(self):
+        # [FUNCTION DOC] An action map that lacks rank 1 of a 2-rank group must make
+        # _validate_schedule raise AssertionError.
         actions = {
             0: [_Action(0, F, 0), _Action(0, B, 0)],
         }
@@ -1892,6 +2068,8 @@ class TestValidateSchedule(TestCase):
             _validate_schedule(actions, pp_group_size, num_stages, num_microbatches)
 
     def test_invalid_schedule_missing_action(self):
+        # [FUNCTION DOC] A schedule with only forward actions (no backward) must make
+        # _validate_schedule raise AssertionError.
         actions = {
             0: [_Action(0, F, 0)],
             1: [_Action(1, F, 0)],
@@ -1904,7 +2082,12 @@ class TestValidateSchedule(TestCase):
 
 
 class ScheduleUtilTests(TestCase):
+    # [CLASS DOC] Test case for small schedule utility functions.
     def test_generate_stage_to_rank_mapping(self):
+        # [FUNCTION DOC] Checks generate_stage_to_rank_mapping(group size, number of stages):
+        # the default style assigns stages round-robin over ranks; style "v" assigns stages
+        # round-robin forward then reversed on alternating passes (a zigzag), for 2/4, 4/12
+        # and 4/16 configurations.
         stage_to_rank = generate_stage_to_rank_mapping(2, 2)
         self.assertEqual(
             stage_to_rank,
@@ -1975,10 +2158,16 @@ instantiate_parametrized_tests(TestScheduleLowering)
 
 
 class TestBatchP2P(TestCase):
+    # [CLASS DOC] Test case for _batch_p2p using mock P2P op objects and patched
+    # isend/irecv/batch_isend_irecv functions, verifying when ops are dispatched individually
+    # versus batched.
     """Tests that _batch_p2p dispatches homogeneous ops individually to avoid
     head-of-line blocking, while still batching mixed ops for deadlock avoidance."""
 
     def _make_p2p_op(self, op, group_peer=0, group=None):
+        # [FUNCTION DOC] HELPER: Returns a mock P2P op object with the given op function, a
+        # one-element zero tensor, tag 0, the given group peer, and a group (the supplied one
+        # or a fresh mock) given an identity-derived string group_name.
         p = MagicMock()
         p.op = op
         p.tensor = torch.zeros(1)
@@ -1994,11 +2183,15 @@ class TestBatchP2P(TestCase):
         return p
 
     def test_empty_ops(self):
+        # [FUNCTION DOC] An empty op list must yield an empty result list.
         self.assertEqual(_batch_p2p([]), [])
 
     @patch("torch.distributed.pipelining.schedules.dist.batch_isend_irecv")
     @patch("torch.distributed.pipelining.schedules.dist.isend")
     def test_all_isend_dispatched_individually(self, mock_isend, mock_batch):
+        # [FUNCTION DOC] Three send ops on one group must each be dispatched with isend (passing
+        # tensor, group, tag and destination group peer), batch_isend_irecv must not be called,
+        # and three requests are returned.
         mock_isend.return_value = MagicMock()
         group = MagicMock()
         ops = [
@@ -2018,6 +2211,9 @@ class TestBatchP2P(TestCase):
     @patch("torch.distributed.pipelining.schedules.dist.batch_isend_irecv")
     @patch("torch.distributed.pipelining.schedules.dist.irecv")
     def test_all_irecv_dispatched_individually(self, mock_irecv, mock_batch):
+        # [FUNCTION DOC] Three receive ops on one group must each be dispatched with irecv
+        # (passing tensor, group, tag and source group peer), batch_isend_irecv must not be
+        # called, and three requests are returned.
         mock_irecv.return_value = MagicMock()
         group = MagicMock()
         ops = [
@@ -2038,6 +2234,9 @@ class TestBatchP2P(TestCase):
     @patch("torch.distributed.pipelining.schedules.dist.irecv")
     @patch("torch.distributed.pipelining.schedules.dist.isend")
     def test_mixed_ops_use_batch(self, mock_isend, mock_irecv, mock_batch):
+        # [FUNCTION DOC] One send and one receive on the same group must be passed together,
+        # once, to batch_isend_irecv (neither isend nor irecv is called individually) and its
+        # two requests are returned.
         mock_batch.return_value = [MagicMock(), MagicMock()]
         group = MagicMock()
         ops = [
@@ -2056,6 +2255,9 @@ class TestBatchP2P(TestCase):
     @patch("torch.distributed.pipelining.schedules.dist.irecv")
     @patch("torch.distributed.pipelining.schedules.dist.isend")
     def test_mixed_ops_split_per_group(self, mock_isend, mock_irecv, mock_batch):
+        # [FUNCTION DOC] Four mixed send/recv ops spread over two groups must produce exactly two
+        # batch_isend_irecv calls, one per group with that group's ops in order, no individual
+        # isend/irecv calls, and four returned requests.
         """A mixed op list spanning multiple groups (per-direction PP comms) is
         issued as one batch_isend_irecv per group, so each direction runs on its
         own communicator instead of sharing one FIFO."""

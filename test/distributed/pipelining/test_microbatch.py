@@ -1,5 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Device-generic tests for torch.distributed.pipelining.microbatch: splitting
+# args/kwargs into chunks along a batch dimension, merging chunks back, splitting flex-attention
+# BlockMask objects (including batch size one and None), and TensorChunkSpec usage with pipeline.
+# Seeds the RNG at import time and instantiates MicrobatchTests for cpu, cuda, hpu and xpu.
 from model_registry import ModelWithKwargs
 
 import torch
@@ -23,7 +27,13 @@ torch.manual_seed(0)
 
 
 class MicrobatchTests(TestCase):
+    # [CLASS DOC] Test case for microbatch splitting and merging utilities; device-generic tests
+    # take a device argument supplied by instantiate_device_type_tests.
     def test_split_and_merge(self):
+        # [FUNCTION DOC] Splits three tensors (batch 128, 256, 512) given positionally and by
+        # keyword into 2 chunks along dim 0 and checks chunk counts and shapes (first dim halved).
+        # Then merges the chunks with TensorChunkSpec(0) specs and asserts the originals are
+        # recovered. Raises AssertionError on any mismatch.
         x0 = torch.randn(128, d_hid)
         x1 = torch.randn(256, d_hid)
         x2 = torch.randn(512, d_hid)
@@ -86,6 +96,12 @@ class MicrobatchTests(TestCase):
 
     @skipCPUIf(True, "Flex attention backward is not supported on CPU")
     def test_split_block_mask(self, device):
+        # [FUNCTION DOC] Builds a document-packed block-causal flex-attention BlockMask (batch 6)
+        # and a second identical mask, runs attention forward and backward on the full batch,
+        # then splits q, k, v and a dict holding both masks into 4 chunks. Runs attention per
+        # chunk with backward, concatenates chunk inputs, grads, outputs and BlockMask index
+        # tensors, and asserts they equal the full-batch results. Skipped on CPU. Uses
+        # torch.compile on cuda only.
         B = 6
         H = 1
         SEQ_LEN = 512
@@ -93,6 +109,9 @@ class MicrobatchTests(TestCase):
         DOC_LEN = 30
 
         def create_block_causal_mask(batch, eos_id: int):
+            # [FUNCTION DOC] HELPER: Marks document boundaries where tokens equal eos_id (and
+            # the last position), computes a per-token document index via cumulative sum, and
+            # returns a mask function allowing attention within the same document and causally.
             mask = batch == eos_id
             mask[:, -1] = True
             acc_mask = torch.cumsum(torch.where(mask, 1, 0), dim=1)
@@ -105,6 +124,8 @@ class MicrobatchTests(TestCase):
                 q_idx: torch.Tensor,
                 kv_idx: torch.Tensor,
             ):
+                # [FUNCTION DOC] HELPER: Mask predicate: true when query and key are in the
+                # same document and the key is not after the query.
                 return (seq_idx[b, q_idx] == seq_idx[b, kv_idx]) & (q_idx >= kv_idx)
 
             return block_causal_mask
@@ -219,18 +240,24 @@ class MicrobatchTests(TestCase):
         self.assertEqual(concat_out, out)
 
     def test_split_block_mask_batch_size_one(self, device):
+        # [FUNCTION DOC] Creates a causal BlockMask with batch dimension 1 for inputs of batch
+        # 6, splits the inputs and mask dict into 4 chunks, and checks the BlockMask is
+        # broadcast to each chunk: concatenated per-chunk attention outputs must equal the
+        # full-batch output. Raises AssertionError if the number of chunks is not 4.
         B = 6
         H = 1
         SEQ_LEN = 512
         DIM = 32
 
         def create_causal_mask():
+            # [FUNCTION DOC] HELPER: Returns a plain causal mask predicate function.
             def causal_mask(
                 b: torch.Tensor,
                 h: torch.Tensor,
                 q_idx: torch.Tensor,
                 kv_idx: torch.Tensor,
             ):
+                # [FUNCTION DOC] HELPER: True when the key index is at or before the query.
                 return q_idx >= kv_idx
 
             return causal_mask
@@ -276,6 +303,9 @@ class MicrobatchTests(TestCase):
         self.assertEqual(concat_out, out)
 
     def test_split_block_mask_none(self, device):
+        # [FUNCTION DOC] Splits q, k, v plus a None positional arg and a None keyword arg into 4
+        # chunks and asserts the chunk count and that the None values are passed through
+        # unchanged in every chunk.
         B = 6
         H = 1
         SEQ_LEN = 512
@@ -299,6 +329,10 @@ class MicrobatchTests(TestCase):
 
     @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/1682")
     def test_chunk_spec(self, device):
+        # [FUNCTION DOC] Splits an input x (positional, chunk spec dim 0) and y (keyword, chunk
+        # spec dim 0) into 4 chunks using TensorChunkSpec.from_tuple/from_dict, traces
+        # ModelWithKwargs with pipeline using the first chunk as example inputs, and asserts the
+        # pipe output on the full inputs matches eager output. Skipped on XPU.
         mod = ModelWithKwargs().to(device)
         batch_size = ModelWithKwargs.DEFAULT_BATCH_SIZE
 
