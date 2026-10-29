@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Sharding propagation for DTensor. Defines ShardingPropagator, which holds the
+# registries of per-op rules, strategy functions and single-mesh-dim strategies, and computes
+# an OutputSharding (output specs, or required input redistribution) for an op schema, including
+# output tensor metadata via fake tensor execution and a thread-local LRU cache. Also contains
+# helpers for strategy selection by redistribution cost (including unbacked symbolic costs), for
+# validating tensor meta counts, and for aligning the strided-shard flag. Import-time side
+# effects: creates the module logger and an aten alias only.
 import logging
 import threading
 from collections.abc import Callable, Sequence
@@ -49,6 +56,12 @@ def _propagate_use_strided_shard_flag(
     op_strategy: OpStrategy,
     op_schema: OpSchema,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Makes the strided-shard ordering flag consistent across a strategy.
+    # Reads the flag from tensor input specs of the schema that contain strided shards (if those
+    # inputs disagree, the result is true). Then, for every op spec in the strategy, updates any
+    # output or input spec containing strided shards whose flag differs: sets the flag and
+    # either clears the shard order (flag true) or recomputes the default shard order. Mutates
+    # specs in place; does nothing if no input has strided shards.
     """Propagate use_strided_shard_as_shard_order from input specs to output specs.
 
     When inputs carry _StridedShard with an explicit flag, all output (and input)
@@ -69,6 +82,8 @@ def _propagate_use_strided_shard_flag(
         return
 
     def _fixup(spec: DTensorSpec) -> None:
+        # [FUNCTION DOC] HELPER: In place, aligns one spec with the chosen strided-shard flag if it
+        # has any strided shard placement and a different flag (updates the flag and shard order).
         if not any(isinstance(p, _StridedShard) for p in spec.placements):
             return
         if spec.use_strided_shard_as_shard_order == _use_strided:
@@ -94,6 +109,7 @@ def _propagate_use_strided_shard_flag(
 
 
 def _length(obj) -> int:
+    # [FUNCTION DOC] HELPER: Returns 0 for none, 1 for a non-sequence object, else its length.
     if obj is None:
         return 0
     if not isinstance(obj, Sequence):
@@ -102,6 +118,11 @@ def _length(obj) -> int:
 
 
 def _get_expected_num_tensor_outputs(op: OpOverload) -> int | None:
+    # [FUNCTION DOC] HELPER: From the op schema returns, gives the number of returns if the first is
+    # a tensor, none if the first is a list type (unknown length), and zero if there are no
+    # returns or the first return is another type.
+    # KNOWN ISSUE: only the first return is inspected, so tuples mixing tensors and other types
+    # are counted as all tensors.
     """
     Get the expected number of tensor outputs for an operator based on its schema.
 
@@ -131,6 +152,10 @@ def _validate_tensor_meta_count(
     op_schema: OpSchema,
     tensor_meta: TensorMeta | Sequence[TensorMeta | None] | None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Checks the number of outputs described by tensor meta (none is zero, a
+    # single TensorMeta is one, a sequence is its length) against the count expected from the op
+    # schema. For ops returning a tensor list requires a list of metas. Raises AssertionError
+    # on mismatch; returns nothing.
     """
     Validate that the tensor_meta matches the expected number of outputs for the op.
 
@@ -170,10 +195,19 @@ def _validate_tensor_meta_count(
 
 
 class LocalLRUCache(threading.local):
+    # [CLASS DOC] HELPER: Thread-local unbounded LRU cache wrapper around a function. Each thread
+    # has its own cache (the init runs per thread on first access) stored in the cache
+    # attribute. Calling it forwards to the cached function and, when debug logging is on,
+    # logs whether the call was a hit or miss with the op schema and output spec. Exposes
+    # cache_info and cache_clear for the current thread's cache.
     def __init__(self, user_function: Callable) -> None:
+        # [FUNCTION DOC] Wraps the function in an unbounded lru cache for the current thread.
         self.cache = lru_cache(None)(user_function)
 
     def __call__(self, *args, **kwargs) -> object:
+        # [FUNCTION DOC] Calls the cached function. With debug logging enabled on handlers, also
+        # compares hit counters before and after to log hit or miss. Returns the result;
+        # arguments must be hashable (else the cache raises a type error).
         # Fast path: log.handlers check is very cheap (just checking if list is non-empty)
         # Only do the more expensive isEnabledFor check if handlers exist
         if log.handlers and log.isEnabledFor(logging.DEBUG):
@@ -193,9 +227,11 @@ class LocalLRUCache(threading.local):
         return self.cache(*args, **kwargs)
 
     def cache_info(self):
+        # [FUNCTION DOC] Returns hit/miss statistics of the current thread's cache.
         return self.cache.cache_info()
 
     def cache_clear(self):
+        # [FUNCTION DOC] Clears the current thread's cache only (other threads are unaffected).
         return self.cache.cache_clear()
 
 
@@ -205,6 +241,9 @@ def _format_unbacked_hinting_log(
     strategy_index: int,
     replacements: dict,
 ) -> str:
+    # [FUNCTION DOC] HELPER: Builds the debug message describing the chosen strategy (input
+    # placements to output placements with shard order), the op, the input specs and the
+    # replacement values used for unbacked symbols. Lazily evaluated by logging.
     """Format log message for unbacked hinting strategy selection (only called if debug logging enabled)."""
     args_spec = tuple(str(spec) for spec in op_schema.args_schema)
     strat = strategies[strategy_index]
@@ -231,6 +270,11 @@ def _select_min_redistribute_cost(
     strategies: list[OpSpec],
     op_schema: OpSchema | None = None,
 ) -> int:
+    # [FUNCTION DOC] HELPER: Returns the index of the minimum cost. If all costs are concrete or no
+    # free unbacked symbols exist, uses the plain minimum (first on ties). Otherwise replaces each
+    # unbacked symbol by a hint override, else its upper bound, else 8192, evaluates the symbolic
+    # costs under that substitution, picks the minimum, and logs the choice at debug level when
+    # an op schema is given.
     """
     Given a list of costs and corresponding op strategies, selects the minimum cost strategy, returning the index.
     If unbacked symbols are involved, replaces them with known upper-bound values, falling back to hardcoded values.
@@ -295,6 +339,13 @@ def _select_min_redistribute_cost(
 def _select_min_cost_strategy(
     strategy: OpStrategy, op_schema: OpSchema | None = None
 ) -> OpSpec:
+    # [FUNCTION DOC] HELPER: Picks one OpSpec from an OpStrategy. A single spec is returned
+    # directly. Otherwise sums each spec's redistribute costs (AssertionError if unset). With
+    # an op schema, prefers the most negative cost spec, then a zero-cost spec whose input
+    # placements already match the schema inputs, then any other zero-cost spec, and finally
+    # falls back to the minimum-cost selection helper. Returns the chosen OpSpec.
+    # KNOWN ISSUE: when no-redistribute zero-cost specs repeat, the last one wins, while other
+    # categories keep the first.
     from torch.fx.experimental.symbolic_shapes import guard_or_false
 
     if len(strategy.strategies) == 1:
@@ -360,6 +411,13 @@ def _select_min_cost_strategy(
 
 
 class ShardingPropagator:
+    # [CLASS DOC] Computes how DTensor ops propagate sharding. State: registries mapping op
+    # overloads to direct sharding rules, strategy generators, and single-mesh-dim strategies;
+    # per-op runtime schema info used for cache keys; a thread-local cached entry point for
+    # propagation; a decomposition-based strategy object; a table of ops whose shape/stride
+    # arguments must be rewritten to local values; scalar shape adjusters; and a map of squeeze
+    # variants. A class-level lock context (no-op by default) guards fake mode use. Key methods:
+    # the register methods, propagate, and propagate_op_sharding_non_cached.
     # Lock to protect FakeTensorMode context during tensor meta propagation.
     # By default this is a no-op (nullcontext) for performance. Multi-threaded
     # tests should set this to threading.Lock() to prevent race conditions
@@ -367,6 +425,10 @@ class ShardingPropagator:
     _fake_mode_lock = nullcontext()
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Creates empty rule, strategy and schema-info registries, the thread-local
+        # cache around the uncached propagation method, the decomposition strategy bound to
+        # this propagator, and the static tables for shape/stride argument rewriting, scalar
+        # shape adjusters (filled later by op modules) and squeeze variants.
         self.op_to_rules: dict[OpOverload, Callable[[OpSchema], OutputSharding]] = {}
         self.op_strategy_funcs: dict[
             OpOverload,
@@ -442,6 +504,8 @@ class ShardingPropagator:
         rule_func: Callable[[OpSchema], OutputSharding],
         schema_info: RuntimeSchemaInfo | None = None,
     ):
+        # [FUNCTION DOC] Stores the rule function for the op overload (overwriting any earlier one)
+        # and, if given, its runtime schema info. Mutates the registries; returns nothing.
         """
         Register a sharding propagation rule for an operator.
         """
@@ -455,6 +519,8 @@ class ShardingPropagator:
         strategy_info: _SingleDimStrategyInfo,
         schema_info: RuntimeSchemaInfo | None = None,
     ):
+        # [FUNCTION DOC] Stores the single-mesh-dim strategy info for the op overload and, if given,
+        # its schema info in a separate single-dim schema table. Mutates registries.
         """
         Register a strategy over a single mesh-dim, relying on infra to automatically expand to the full mesh.
         """
@@ -468,6 +534,8 @@ class ShardingPropagator:
         strategy_func: Callable[[OpSchema], StrategyType],
         schema_info: RuntimeSchemaInfo | None = None,
     ):
+        # [FUNCTION DOC] Stores the strategy generator for the op overload and, if given, its
+        # runtime schema info (shared table with the rule registration). Mutates registries.
         """
         Register a :class:`OpStrategy` generator for an operator.
 
@@ -520,6 +588,11 @@ class ShardingPropagator:
     def _propagate_tensor_meta_non_cached(
         self, op_schema: OpSchema
     ) -> TensorMeta | Sequence[TensorMeta | None] | None:
+        # [FUNCTION DOC] HELPER: Computes output tensor meta by running the op on fake tensors built
+        # from the schema (inside the class lock, in the ambient or a new fake mode, with proxy
+        # tracing disabled so nothing is recorded in an enclosing graph). Returns none for the
+        # data-dependent equal op and for non-tensor outputs, a TensorMeta for a tensor, and a
+        # tuple or list (matching the output type) with none for non-tensor items.
         """
         Propagate the tensor metadata, it could either return a TensorMeta
         or a list/tuple of TensorMetas
@@ -580,6 +653,10 @@ class ShardingPropagator:
     def _propagate_tensor_meta_cached(
         self, op_schema: OpSchema
     ) -> TensorMeta | Sequence[TensorMeta | None] | None:
+        # [FUNCTION DOC] HELPER: Memoized form of the uncached tensor meta propagation, cached by
+        # propagator and op schema (schema must be hashable).
+        # KNOWN ISSUE: the cache is class-wide, keeps the propagator instance alive, and is not
+        # cleared by the thread-local cache clear helpers.
         """
         Cached version of _propagate_tensor_meta_non_cached
         Use _propagate_tensor_meta instead to handle dynamic shapes.
@@ -589,6 +666,8 @@ class ShardingPropagator:
     def _propagate_tensor_meta(
         self, op_schema: OpSchema
     ) -> TensorMeta | Sequence[TensorMeta | None] | None:
+        # [FUNCTION DOC] HELPER: Returns output tensor meta for the schema, using the uncached path
+        # while tracing (symbolic sizes are unhashable) and the cached path otherwise.
         """
         Propagate the tensor metadata, it could either return a TensorMeta
         or a list/tuple of TensorMetas. Uses the cached version if not
@@ -605,6 +684,12 @@ class ShardingPropagator:
         output_specs: OutputSpecType,
         output_tensor_meta: TensorMeta | Sequence[TensorMeta | None] | None,
     ) -> OutputSpecType:
+        # [FUNCTION DOC] HELPER: Attaches tensor meta to output specs. A single spec requires a
+        # single TensorMeta; a tuple or list of specs requires meta of equal length, giving none
+        # for entries whose meta is none (masked outputs) and passing non-spec entries through.
+        # Specs are shallow-copied with the new meta. Raises ValueError on count or type
+        # mismatches and AssertionError if specs are neither spec nor sequence yet not none.
+        # Returns a spec, a tuple of specs, or none.
         """
         Wrap the output_specs with the tensor metadata from the output.
         """
@@ -665,6 +750,10 @@ class ShardingPropagator:
             return output_specs
 
     def _wrap_with_op_strategy(self, op_schema: OpSchema) -> OpSchema:
+        # [FUNCTION DOC] HELPER: Builds a new schema in which each DTensor spec argument or keyword
+        # is replaced by a one-option OpStrategy; non-empty sequences of only specs become a
+        # TupleStrategy (same container kind), mixed sequences become lists with converted
+        # items, everything else is unchanged. Keeps the op and schema info.
         """
         wrap a op_schema that contains DTensorSpec to another op_schema that contains
         OpStrategy/TupleStrategy, the returned op_schema is then used for sharding
@@ -672,6 +761,8 @@ class ShardingPropagator:
         """
 
         def spec_to_strategy(spec: object) -> object:
+            # [FUNCTION DOC] HELPER: Recursive converter from a spec (or sequence of specs) to
+            # the matching strategy object; other values are returned unchanged.
             if isinstance(spec, DTensorSpec):
                 return OpStrategy([OpSpec(spec)])
             elif isinstance(spec, (list, tuple)) and len(spec) > 0:
@@ -708,6 +799,9 @@ class ShardingPropagator:
         )
 
     def propagate(self, op_info: OpInfo) -> None:
+        # [FUNCTION DOC] Computes the output sharding for an op info and stores it on the op info.
+        # Requires the schema to be set (AssertionError otherwise). Uses the uncached path when
+        # tracing, else the thread-local cached path. Mutates op_info; returns nothing.
         # NB: The logic here is duplicated in _propagate_op_sharding_dispatch_slow_path.
         # Ideally, this function would be deleted, but there are a handful of
         # one off call sites here that aren't cleaned up.
@@ -733,6 +827,24 @@ class ShardingPropagator:
         op_info.output_sharding = output_sharding
 
     def propagate_op_sharding_non_cached(self, op_schema: OpSchema) -> OutputSharding:
+        # [FUNCTION DOC] Main propagation entry (uncached). Returns an OutputSharding for the op
+        # schema. Steps: the local scalar op short-circuits with no output spec; output tensor
+        # meta is computed with fake tensors; then, in order of preference, a single-dim
+        # strategy (expanded to the mesh), a registered strategy function, or the decomposition
+        # path (failures are remembered) produce an OpStrategy or TupleStrategy. For an
+        # OpStrategy, the min-cost spec is chosen, desired input specs compared with actual
+        # ones to decide on redistribution (suggestion schema), shape/stride args, scalar shape
+        # args and squeeze dims are rewritten to local values when needed, and output specs are
+        # built per return type. For a TupleStrategy, a spec is chosen per child and suggestions
+        # are built per list argument. If no strategy exists, a registered rule function is
+        # called (wrapped errors become RuntimeError; if it yields no output spec but a
+        # redistribute schema, the rule is re-run on that schema and redistribution is flagged).
+        # Output specs get the computed tensor meta attached. Raises NotImplementedError (chained
+        # to any decomposition error) when nothing applies, ValueError for unknown strategy types,
+        # and AssertionError on internal inconsistencies. Logs one API-usage event.
+        # KNOWN ISSUE: the API usage key string spells the method name as propogate.
+        # KNOWN ISSUE: a bare string block after the validation step is dead text, not a
+        # docstring or comment.
         """
         Propagate the sharding for an operator given the op_schema.
         """
@@ -1052,6 +1164,10 @@ class ShardingPropagator:
         schema: OpSchema,
         spec: DTensorSpec,
     ) -> OpSchema:
+        # [FUNCTION DOC] HELPER: Returns a copy of the schema where the shape argument (and for the
+        # strided factory op, the stride argument) at the registered positions is replaced by the
+        # local shape computed from the global output meta, mesh and placements, and by local
+        # strides preserving the global layout order. Other arguments and kwargs are unchanged.
         shape_stride_idx = self.op_to_shape_and_stride_idx[schema.op]
         if isinstance(shape_stride_idx, tuple):
             shape_idx, stride_idx = shape_stride_idx
@@ -1075,6 +1191,12 @@ class ShardingPropagator:
         return OpSchema(schema.op, tuple(expected_input_schema), schema.kwargs_schema)
 
     def _adjust_squeeze_to_global_singletons(self, schema: OpSchema) -> OpSchema | None:
+        # [FUNCTION DOC] HELPER: Computes the dims that are singleton in the global shape (symbolic
+        # sizes are conservatively treated as non-singleton) among those the squeeze variant
+        # targets (all dims, one dim, or a dim list, with negatives normalized). Returns a new
+        # schema calling the dims variant of the op on the input spec with that dims tuple, or
+        # none if the op already is that variant with identical dims. Raises RuntimeError if the
+        # input spec has no tensor meta.
         """
         Rewrite squeeze ops to squeeze.dims with only globally-singleton dims.
         Fixes bug where sharded dims with local size 1 get incorrectly squeezed.
@@ -1090,9 +1212,11 @@ class ShardingPropagator:
         ndim = len(global_shape)
 
         def normalize(d: int) -> int:
+            # [FUNCTION DOC] HELPER: Maps a possibly negative dim to its non-negative index.
             return d if d >= 0 else d + ndim
 
         def is_singleton(d: int) -> bool:
+            # [FUNCTION DOC] HELPER: True if the dim is in range and its global size is provably one.
             nd = normalize(d)
             return 0 <= nd < ndim and guard_or_false(global_shape[nd] == 1)
 

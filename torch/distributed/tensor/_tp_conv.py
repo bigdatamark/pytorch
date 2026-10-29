@@ -1,6 +1,11 @@
 # mypy: allow-untyped-defs
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # implement matrix related ops for distributed tensor
+# [MODULE DOC] Tensor-parallel convolution handlers for DTensor, for inputs sharded along the
+# last (width) dimension. Provides ring halo exchange between neighboring ranks, local
+# forward/backward convolution wrappers that pad or trim to account for the exchanged border
+# pixels, and the two dispatch handlers (forward and backward) that run sharding propagation,
+# compute locally, and wrap results as DTensor. Import-time side effect: defines the aten alias.
 from typing import cast
 
 import torch
@@ -12,6 +17,9 @@ aten = torch.ops.aten
 
 
 def _requires_data_exchange(padding, dim_map) -> bool:
+    # [FUNCTION DOC] HELPER: Decides whether neighboring ranks must exchange border data. Returns
+    # false if only the batch dimension is sharded (all later dims unsharded in dim_map), else
+    # true exactly when the last padding entry is nonzero.
     # Data exchange is not need if only sharded across batch dim
     if all(x == -1 for x in dim_map[1:]):
         return False
@@ -20,6 +28,11 @@ def _requires_data_exchange(padding, dim_map) -> bool:
 
 
 def _is_supported(input_size, kernel_size, stride, padding, dilation):
+    # [FUNCTION DOC] HELPER: Validates last-dimension convolution parameters for tensor parallel
+    # execution. Raises RuntimeError if dilation is not one; with padding, stride must be one
+    # and half the kernel size must not exceed the input size; without padding, input size must
+    # be divisible by stride and stride must equal kernel size. Returns true otherwise.
+    # KNOWN ISSUE: the error message for the no-padding branch says "when there is padding".
     if dilation[-1] != 1:
         raise RuntimeError("Dilation must be 1 for tensor parallel convolution.")
     if padding[-1] != 0:
@@ -41,6 +54,11 @@ def _is_supported(input_size, kernel_size, stride, padding, dilation):
 
 
 def _ring_send_recv_construct(in_tensor, d1, d2, left, right, rank, size):
+    # [FUNCTION DOC] HELPER: Halo exchange for the forward pass. Sends the last d1 columns to the
+    # right neighbor and the first d2 columns to the left neighbor, receives the matching
+    # border slices, waits for all requests (blocking communication), then concatenates received
+    # data along the last dim: the first rank appends the right halo, the last rank prepends the
+    # left halo, middle ranks do both. Returns the widened local tensor.
     # dist comms and reconstruct local input tensor
     send_to_right = in_tensor[..., -d1:].contiguous()
     send_to_left = in_tensor[..., :d2].contiguous()
@@ -69,6 +87,12 @@ def _ring_send_recv_construct(in_tensor, d1, d2, left, right, rank, size):
 
 
 def _ring_send_recv_aggregate(grad_in_tensor, d1, d2, left, right, rank, size):
+    # [FUNCTION DOC] HELPER: Halo exchange for the input gradient in backward. Sends edge column
+    # slices of the gradient to neighbors, receives theirs, waits, then trims the halo columns
+    # off the gradient (by rank position) and adds the received slices into the remaining edge
+    # columns, mutating the sliced view in place.
+    # KNOWN ISSUE: the function has no return statement, so it returns None and the caller
+    # replaces the input gradient with None; the trimmed tensor is lost to the caller.
     # dist comms and aggregate gradients for edge pixels
     send_to_right = grad_in_tensor[:, :, :, -d2:].contiguous()
     send_to_left = grad_in_tensor[:, :, :, :d1].contiguous()
@@ -112,6 +136,13 @@ def tp_convolution(
     local_tensor_kwargs: dict[str, object],
     dim_map: list[int],
 ) -> object:
+    # [FUNCTION DOC] Runs the local part of a width-sharded convolution. Requires the op to be the
+    # default aten convolution with nine arguments and a list padding, else raises
+    # AssertionError. If no data exchange is needed, calls the op directly. Otherwise validates
+    # parameters (AssertionError note: _is_supported raises RuntimeError on unsupported ones),
+    # exchanges halos with ring neighbors, runs the op on the widened input, and trims padding
+    # columns from the output by rank position. Returns the local result. Uses collective
+    # communication (side effect).
     if op_call != aten.convolution.default:
         raise AssertionError
     if len(local_tensor_args) != 9:
@@ -173,6 +204,13 @@ def tp_convolution_backward(
     local_tensor_kwargs: dict[str, object],
     dim_map: list[int],
 ) -> object:
+    # [FUNCTION DOC] Runs the local part of the backward of a width-sharded convolution. Requires
+    # the default aten convolution_backward with eleven arguments and a list padding, else
+    # AssertionError. Without data exchange, calls the op directly. Otherwise exchanges input
+    # halos, pads the output gradient by rank position, runs the op, and aggregates the input
+    # gradient edges across neighbors. Returns the tuple of local gradient results.
+    # KNOWN ISSUE: the aggregate helper returns None, so the input gradient entry becomes None;
+    # also weight width is read from a fixed dim index and padding from a fixed index, assuming 4D.
     if op_call != aten.convolution_backward.default:
         raise AssertionError
     if len(local_tensor_args) != 11:
@@ -251,6 +289,10 @@ def convolution_handler(
     args: tuple[object, ...],
     kwargs: dict[str, object],
 ) -> object:
+    # [FUNCTION DOC] Dispatch handler for the aten convolution on DTensors. Unwraps arguments into
+    # an op info, runs sharding propagation, requires a resolved output spec (AssertionError
+    # otherwise), computes the local result with the tensor parallel convolution using the
+    # output spec's dim map, and wraps the result as a DTensor with that spec.
     # extract local tensor and sharding infos to an OpInfo
     op_info = dtensor.DTensor._op_dispatcher.unwrap_to_op_info(op_call, args, kwargs)
 
@@ -279,6 +321,11 @@ def convolution_backward_handler(
     args: tuple[object, ...],
     kwargs: dict[str, object],
 ) -> object:
+    # [FUNCTION DOC] Dispatch handler for aten convolution_backward on DTensors. Requires the first
+    # two arguments (grad output, input) to be DTensors (AssertionError otherwise), redistributes
+    # the grad output to the input's mesh and placements (communication), runs sharding
+    # propagation, computes local results with the tensor parallel backward using the input
+    # spec's dim map, and wraps them with the propagated output spec.
     # Redistribute grad_output tensor to the same placement as input tensor
     # pyrefly: ignore [bad-assignment]
     args = list(args)

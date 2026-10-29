@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Terminal visualization of how a 1D or 2D DTensor is sharded across devices.
+# Provides the public visualize_sharding plus plain-text (tabulate) and colored (rich and
+# matplotlib) table renderers. Optional dependencies are imported lazily inside functions.
+# Import-time side effects: none beyond importing numpy and DTensor utilities.
 import importlib.util
 
 import numpy as np
@@ -15,6 +19,10 @@ Color = tuple[float, float, float]
 def _create_table(
     shards: list[tuple[tuple[int, int], tuple[int, int], int]], device_kind: str = ""
 ):
+    # [FUNCTION DOC] HELPER: Builds a plain-text table string from shards, each given as a row
+    # range, a column range and a device id. Rows and columns are the sorted unique ranges;
+    # each cell lists the device ids (prefixed by device_kind) covering it, comma separated.
+    # Requires the tabulate package (import error otherwise). Returns the table string.
     """
     Creates a tabulate table given row and column ranges with device name
     """
@@ -44,12 +52,17 @@ def _create_table(
 
 
 def make_color_iter(color_map, num_rows, num_cols):
+    # [FUNCTION DOC] HELPER: Generator yielding one color per table cell: calls the color_map
+    # callable with each integer index from zero up to rows times columns (exclusive).
     num_colors = num_rows * num_cols
     for idx in range(num_colors):
         yield color_map(idx)
 
 
 def _canonicalize_color(color: Color) -> str:
+    # [FUNCTION DOC] HELPER: Returns a string color unchanged; converts an RGB triple of floats
+    # in the unit interval to an upper-case hex string with a leading hash (values truncated
+    # to integers in 0-255).
     if isinstance(color, str):
         return color
     r, g, b = (int(a * 255) for a in color)
@@ -57,6 +70,8 @@ def _canonicalize_color(color: Color) -> str:
 
 
 def _get_text_color(color: str) -> str:
+    # [FUNCTION DOC] HELPER: Given a hex background color string with a leading hash, returns
+    # black for light backgrounds (perceived luminance above 186) and white otherwise.
     r, g, b = map(lambda x: int(x, 16), (color[1:3], color[3:5], color[5:7]))  # noqa: C417
     if (r * 0.299 + g * 0.587 + b * 0.114) > 186:
         return "#000000"
@@ -71,6 +86,13 @@ def _create_rich_table(
     min_width: int = 9,
     max_width: int = 80,
 ):
+    # [FUNCTION DOC] HELPER: Prints a rich table to the console in which each cell is one unique
+    # row/column range block, sized proportionally to its share of the tensor shape (scale
+    # controls height; max_width caps console width; min_width is accepted but unused). Cells
+    # show device_kind and the device ids owning the block, colored from the matplotlib tab20b
+    # map when the console supports color, else drawn with box lines. Requires rich and
+    # matplotlib. Returns nothing.
+    # KNOWN ISSUE: min_width is never used; an empty-width division is possible if shape[0] is 0.
     import matplotlib
     import rich.align
     import rich.box
@@ -153,6 +175,14 @@ def _create_rich_table(
 
 
 def visualize_sharding(dtensor, header="", use_rich: bool = False):
+    # [FUNCTION DOC] Prints the sharding layout of a 1D or 2D DTensor. Returns silently for empty
+    # tensors, for ranks outside the mesh, and for all ranks except the one at coordinate zero
+    # in every mesh dimension. Raises RuntimeError for tensors with three or more dims. Computes
+    # each device's local shape and global offset, converts them to inclusive row/column ranges
+    # (1D tensors are treated as one column), then prints a rich table if use_rich is set and
+    # rich plus matplotlib are installed, else a tabulate table. Raises ValueError if neither
+    # backend is available.
+    # KNOWN ISSUE: the header argument is never used. Ranges are inclusive (end = offset + size - 1).
     """
     Visualizes sharding in the terminal for :class:`DTensor` that are 1D or 2D.
 

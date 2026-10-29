@@ -1,3 +1,8 @@
+# [MODULE DOC] Shared DTensor helpers: ExplicitRedistributionContext (thread-local guard against
+# implicit redistribution), computation of local shapes/offsets/strides from global info and
+# placements, global shape reconstruction by all-gather, mesh lookup from op arguments, size
+# normalization and validation of Partial placement mixes. Import-time side effects: creates the
+# module logger and binds compute_global_tensor_info to the C++ implementation.
 import logging
 import threading
 from collections.abc import Callable, Sequence
@@ -29,10 +34,18 @@ logger = logging.getLogger(__name__)
 
 
 def _format_implicit_redistribution_msg(schema: OpSchema) -> str:
+    # [FUNCTION DOC] HELPER: Returns the message text saying an implicit redistribution happened
+    # for the given op schema while the explicit-redistribution context was active.
     return f"Implicit redistribution occurred for {schema} while ExplicitRedistributionContext was active"
 
 
 class ExplicitRedistributionContext:
+    # [CLASS DOC] Re-entrant context manager that, while active in the current thread, makes DTensor
+    # either raise or log a warning when an implicit redistribution is observed. State: a
+    # class-level thread-local holding the active instance, plus per-instance enable flag, strict
+    # flag (any redistribution vs only those with communication cost) and raise-vs-warn choice.
+    # The previously active instance is saved on entry and restored on exit, so nesting works
+    # and an inner disabled instance suppresses the outer one.
     """
     Within this context manager, DTensor will refuse to perform implicit redistribution,
     instead raising an error.  Manual calls to ``redistribute()`` are required wherever a redistribution
@@ -55,6 +68,8 @@ class ExplicitRedistributionContext:
     _local = threading.local()
 
     def __init__(self, enable: bool = True, strict: bool = False, mode="raise"):
+        # [FUNCTION DOC] Stores the enable and strict flags and whether to raise (mode raise) or
+        # warn (mode warn). Raises RuntimeError for any other mode value.
         self._enable = enable
         self._strict = strict
         if mode not in ("raise", "warn"):
@@ -68,6 +83,11 @@ class ExplicitRedistributionContext:
         dst_spec: DTensorSpec,
         redistribution_msg: LazyString,
     ):
+        # [FUNCTION DOC] Called by DTensor when a redistribution from source to destination spec
+        # is about to occur. If a context is active in this thread and enabled, a redistribution
+        # is disallowed when strict, or when its estimated cost is positive. A disallowed one
+        # raises RuntimeError with the message in raise mode, else logs a warning. Otherwise it
+        # does nothing.
         if instance := getattr(cls._local, "_active", None):
             allowed = True
             if instance._enable:
@@ -82,11 +102,15 @@ class ExplicitRedistributionContext:
                     logger.warning(redistribution_msg)
 
     def __enter__(self):
+        # [FUNCTION DOC] Saves the currently active instance of this thread, makes this instance
+        # active (thread-local mutation), and returns itself.
         self._prev = getattr(ExplicitRedistributionContext._local, "_active", None)
         ExplicitRedistributionContext._local._active = self
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # [FUNCTION DOC] Restores the instance that was active before entry; never suppresses
+        # exceptions.
         ExplicitRedistributionContext._local._active = self._prev
 
 
@@ -96,6 +120,11 @@ def compute_local_shape_and_global_offset(
     placements: Sequence[Placement],
     skip_offset: bool = False,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    # [FUNCTION DOC] Public wrapper: returns the local shape and global offset of the current rank
+    # for a tensor of the given global shape on a mesh with the given placements. If the current
+    # rank is not part of the mesh, returns a one-element zero shape and an empty offset.
+    # Otherwise delegates to the plain-data helper using the mesh shape and symbolic coordinate
+    # lookup. With skip_offset, the offset is empty.
     """
     Compute the local tensor shape and the global offsets into the original tensor
     of a DTensor on its current global rank. This is useful for checkpointing purpose.
@@ -158,6 +187,13 @@ def _get_shard_size_and_offsets(
     zero_global_offset: int,
     skip_offset: bool,
 ) -> tuple[int, torch.Tensor | None]:
+    # [FUNCTION DOC] HELPER: For one shard-like placement on one mesh dim, asks the placement for
+    # the local size and offsets of the given rank. Returns the size and an index tensor of
+    # global positions along that tensor dim (or none when skip_offset). A zero-size shard gets
+    # a single placeholder index equal to the global dim size. If earlier mesh dims already
+    # sharded this tensor dim, the new indices are mapped through those previous offsets.
+    # Raises AssertionError if the placement returns offsets of an unexpected type. Runs per
+    # local tensor under local-tensor simulation.
     kwargs: dict[str, Any] = {
         "curr_local_size": curr_local_size,
         "num_chunks": mesh_dim_size,
@@ -192,6 +228,7 @@ def _get_shard_size_and_offsets(
 
 @maybe_run_for_local_tensor
 def _get_first_offset(offsets: torch.Tensor) -> int:
+    # [FUNCTION DOC] HELPER: Returns the first element of an offsets tensor as a Python integer.
     return int(offsets[0])
 
 
@@ -203,6 +240,13 @@ def _compute_local_shape_and_global_offset(
     placements: Sequence[Placement],
     skip_offset: bool = False,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    # [FUNCTION DOC] Computes the unpadded local shape and the starting global offset per tensor
+    # dim for one mesh coordinate (a list/tuple or a callable from mesh dim to coordinate;
+    # none raises AssertionError). Walks placements left to right; for each Shard or
+    # _StridedShard it shrinks that tensor dim to the local size and composes offsets with any
+    # earlier sharding of the same dim. Raises AssertionError if a shard dim is beyond tensor
+    # rank. Returns the local shape and the offset tuple (empty when skip_offset). Dims never
+    # sharded have offset zero.
     """
     Suppose you have a full tensor with size global_shape, and you have sharded
     it according to placements for mesh_shape.  This function returns, for a
@@ -239,6 +283,7 @@ def _compute_local_shape_and_global_offset(
         _coord: list | tuple = my_coordinate
 
         def coordinate_lookup(dim: int) -> RankType:
+            # [FUNCTION DOC] HELPER: Returns the stored coordinate for the given mesh dim.
             return _coord[dim]
     else:
         if my_coordinate is None:
@@ -296,6 +341,12 @@ def compute_local_tensor_info(
     mesh: DeviceMesh,
     placements: Sequence[Placement],
 ) -> tuple[list[int], list[int]]:
+    # [FUNCTION DOC] Derives the local size and stride of a DTensor from a global tensor, mesh and
+    # placements, assuming even sharding. For each shard-like placement divides the sharded dim
+    # by the mesh dim size and shrinks other strides that were at least as large as the scaled
+    # sharded stride. Raises AssertionError for negative or out-of-range shard dims or
+    # indivisible sizes, and RuntimeError for placements that are not shard-like, Replicate or
+    # Partial. Returns lists (local size, local stride).
     """
     Compute the local size and stride of a DTensor from the given global tensor info.
 
@@ -359,6 +410,14 @@ def compute_local_tensor_info(
 def compute_global_tensor_shape(
     shape: torch.Size, mesh: DeviceMesh, placements: Sequence[Placement]
 ) -> torch.Size:
+    # [FUNCTION DOC] Reconstructs the global shape from a local shape for a one-dimensional mesh
+    # with a single placement. Replicate returns the shape unchanged. Shard all-gathers every
+    # rank's shape (collective communication), checks non-sharded dims match across ranks
+    # (RuntimeError otherwise), and sums the sharded dim. Raises NotImplementedError for more
+    # than one placement or other placement types, RuntimeError if placement count differs
+    # from mesh dims.
+    # KNOWN ISSUE: the mesh-dim count check is unreachable unless the mesh is one-dimensional
+    # since more than one placement is rejected first.
     """
     Compute the global size of a DTensor from the given local tensor shape,
     the mesh and placements. Different from `compute_global_tensor_info`,
@@ -397,6 +456,8 @@ def compute_global_tensor_shape(
 
         @maybe_run_for_local_tensor
         def _create_local_shape_tensor(shape):
+            # [FUNCTION DOC] HELPER: Builds an integer tensor holding the shape values on the
+            # mesh device type.
             return torch.tensor(list(shape), device=mesh.device_type)
 
         local_shape = _create_local_shape_tensor(shape)
@@ -408,6 +469,9 @@ def compute_global_tensor_shape(
 
         @maybe_run_for_local_tensor
         def _validate_and_compute_global_shape(local_shape, gathered_shaped_tensors):
+            # [FUNCTION DOC] HELPER: Checks every gathered shape tensor equals the local one on
+            # all non-sharded dims (RuntimeError if not) and returns the sum of the sharded dim
+            # size over all ranks.
             sharded_dim_sum = 0
             shard_dim = placements[0].dim  # type: ignore[union-attr]
             other_dims = [d for d in range(len(shape)) if d != shard_dim]
@@ -435,6 +499,10 @@ def compute_global_tensor_shape(
 def try_find_mesh_from_args(
     op_call: torch._ops.OpOverload, args: Sequence[object]
 ) -> DeviceMesh:
+    # [FUNCTION DOC] Scans args in order and returns the device mesh of the first DTensor or spec,
+    # or of the first element of a non-empty list/tuple whose first item is one. Raises
+    # ValueError mentioning the op if none is found.
+    # KNOWN ISSUE: the docstring says it returns none when no mesh is found, but it raises.
     """
     Find the device mesh object from args.
     It returns None if no mesh is found.
@@ -456,6 +524,9 @@ def try_find_mesh_from_args(
 def compute_local_stride(
     global_stride: ShapeType, local_shape: ShapeType
 ) -> tuple[int, ...]:
+    # [FUNCTION DOC] Computes strides for a local shard: orders dims by descending global stride
+    # (stable for ties) to recover memory layout, then assigns contiguous strides for the local
+    # shape in that order. Returns a tuple of strides.
     """
     Compute the stride of a local tensor shard, given the global stride and local shape.
 
@@ -477,6 +548,8 @@ def compute_local_stride(
 
 
 def normalize_to_torch_size(size) -> torch.Size:  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] Converts a size given as a torch.Size (returned as is), an integer, a
+    # sequence of integers, or a one-element tuple wrapping a sequence into a torch.Size.
     """
     Unify variable types of size argument to torch.Size
     Acceptable types include:
@@ -496,6 +569,8 @@ def normalize_to_torch_size(size) -> torch.Size:  # type: ignore[no-untyped-def]
 
 
 def assert_no_mixed_partial_types(placements: Sequence[Placement]) -> None:
+    # [FUNCTION DOC] Collects the distinct reduce ops of Partial placements and raises ValueError
+    # if there are several, unless the set is exactly sum and avg. Returns nothing.
     """
     Assert that a placement list doesn't contain mixed Partial reduce types.
 

@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Communication debugging for DTensor programs. Defines CommDebugMode, a dispatch
+# mode that counts functional and c10d collectives (globally and per module, split into forward
+# and backward) and records the operations seen with DTensor input shapes, shardings and mesh,
+# plus a module tracker that records module hierarchy, parameters and their shardings. Output
+# can be a text table, a log file or a json dump. Import-time side effects: resolves operator
+# namespaces and builds the native-to-python collective mapping, the c10d collective op set and
+# the trivial op name set.
 import copy
 import json
 import re
@@ -70,12 +77,21 @@ trivial_ops = {
 
 
 class _CommModeModuleTracker(ModTracker):
+    # [CLASS DOC] HELPER: Module tracker used by CommDebugMode. Besides the base class parent
+    # tracking, it records per module name: type and depth plus parameter placements
+    # (module_helper_dict), parameter data (module_parameters_dict), parent sets
+    # (module_parents_dict), the parent-to-children order (parent_dict, with parent_list as a
+    # stack), and placements of DTensor parameters (sharding_dict). The current module is in
+    # name, and activation_checkpointing is true when a forward runs during backward. It
+    # installs global module hooks while active.
     """
     Inherits ModuleTracker and expands on its functionality to track the
     parameters and sharding information of a model at a module-level
     """
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Initializes the base tracker and empty records, hook handle
+        # table, parent stack, checkpointing flag and the current module name.
         super().__init__()
         self.module_helper_dict = {}
         self.module_parameters_dict = {}
@@ -88,6 +104,9 @@ class _CommModeModuleTracker(ModTracker):
         self.name = ""
 
     def _fw_set_module_hook(self, mod, input, output):
+        # [FUNCTION DOC] HELPER: Forward hook run after a module finishes. Sets the checkpointing
+        # flag from whether backward is running; if not checkpointing, pops the module from
+        # the parent stack and makes the previous parent the current module name.
         """
         Updates the current module after module finishes running and
         all other hooks are resolved
@@ -106,6 +125,12 @@ class _CommModeModuleTracker(ModTracker):
             self.name = self.parent_list[-1]
 
     def _fw_pre_hook(self, mod, input):
+        # [FUNCTION DOC] HELPER: Forward pre-hook run before a module forward. Sets the checkpointing
+        # flag, names the module, registers it with the base tracker, and (outside backward)
+        # registers a multi-grad hook on inputs that require grad. When not checkpointing it
+        # records module type, depth, direct parameters (and placements of DTensor ones), parent
+        # set, parent-child link, pushes the module on the parent stack, and (re)installs the
+        # per-module forward hook that pops it. Mutates the tracker records.
         """
         This function is called before the forward pass of a module. It
         collects the parameters and sharding information of a module and
@@ -175,6 +200,7 @@ class _CommModeModuleTracker(ModTracker):
             )
 
     def _fw_post_hook(self, mod, input, output):  # pylint: disable=useless-parent-delegation
+        # [FUNCTION DOC] HELPER: Global forward hook that delegates to the base tracker's post hook.
         """
         This function is called when the forward pass of a module is called.
         It updates the module tracker and removes the module from parent data
@@ -183,6 +209,8 @@ class _CommModeModuleTracker(ModTracker):
         super()._fw_post_hook(mod, input, output)
 
     def _bw_hook(self, mod, output):
+        # [FUNCTION DOC] HELPER: Backward pre-hook: clears the checkpointing flag and makes the
+        # given module the current one.
         """
         This function is called when the backward pass of a module is called. It
         updates the current module for backward passes
@@ -191,6 +219,11 @@ class _CommModeModuleTracker(ModTracker):
         self.name = super()._get_mod_name(mod)
 
     def __enter__(self):
+        # [FUNCTION DOC] HELPER: Resets all records (the root entry named Global gets depth zero and
+        # an empty parent set), then registers the global forward pre-hook, forward hook and
+        # full backward pre-hook (global side effect) and sets the current name to Global.
+        # Returns nothing (not the tracker).
+        # KNOWN ISSUE: does not call the base class enter, so base tracker state is not reset.
         self.activation_checkpointing = False
         self.module_parameters_dict.clear()
         self.sharding_dict.clear()
@@ -207,6 +240,8 @@ class _CommModeModuleTracker(ModTracker):
         self.name = "Global"
 
     def __exit__(self, *args):
+        # [FUNCTION DOC] HELPER: Calls the base exit (removes its hooks), removes the backward
+        # hook, and removes every per-module forward hook installed by the pre-hook.
         super().__exit__(*args)
         self._bw_handle.remove()
 
@@ -215,14 +250,25 @@ class _CommModeModuleTracker(ModTracker):
             handle.remove()
 
     def print_paramater_info(self):
+        # [FUNCTION DOC] HELPER: Prints the recorded parameter mapping to standard output.
+        # KNOWN ISSUE: method name misspells parameter.
         print(self.module_parameters_dict)
 
     def print_sharding_info(self):
+        # [FUNCTION DOC] HELPER: Prints one line per DTensor parameter: qualified name and placements.
         for key, value in self.sharding_dict.items():
             print(key + ": " + str(value))
 
 
 class CommDebugMode(TorchDispatchMode):
+    # [CLASS DOC] Dispatch mode (context manager) that counts collective ops and records operations.
+    # State: comm_counts (collective op to count), comm_module_counts (per module, forward and
+    # backward counters), comm_module_operation_counts (per module list of operation records
+    # with name, input shapes, shardings, mesh and backward/checkpointing flags), comm_registry
+    # (set of recognized functional collective ops) and a module tracker. All records are reset
+    # on entry. Higher-order operators are passed through. Ops involving DTensor are recorded and
+    # deferred (returning not-implemented) so DTensor first decomposes them into collectives.
+    # Reporting: counts getters, a text table, a table log file and a json dump.
     """
     :class:`CommDebugMode` is a context manager that counts the number of
     functional collectives within its context. It does this using a
@@ -242,6 +288,9 @@ class CommDebugMode(TorchDispatchMode):
     """
 
     def __init__(self):
+        # [FUNCTION DOC] Initializes the mode with higher-order operator support, empty counters and
+        # records, the registry of recognized collectives (native and python functional ops plus
+        # the DTensor shard dim all-to-all op) and a fresh module tracker.
         super().__init__()
         self.supports_higher_order_operators = True
         self.comm_counts: dict[Any, int] = defaultdict(int)
@@ -256,6 +305,13 @@ class CommDebugMode(TorchDispatchMode):
         self.advanced_module_tracker = _CommModeModuleTracker()
 
     def generate_json_dump(self, file_name="comm_mode_log.json", noise_level=3):
+        # [FUNCTION DOC] Writes a json file (overwriting file_name) describing the module tree
+        # starting at Global. Each node has fqn, module type, parameters with placements,
+        # children, forward/backward collective counts, and forward/backward/checkpointing
+        # operation lists with names, shapes and shardings converted to strings. The noise level
+        # decides what is included (zero: counts only; one: DTensor ops and module data; two:
+        # also ops without DTensor inputs; three or more: also trivial ops). Requires the mode to
+        # have recorded a run; raises a key error if a module is missing from the tracker.
         """
         Creates json file used to build browser visual
         0. prints module-level collective counts
@@ -273,6 +329,9 @@ class CommDebugMode(TorchDispatchMode):
 
         # recursively builds json data
         def add_json_information(json_dict, fqn):
+            # [FUNCTION DOC] HELPER: Recursively fills the given mapping for one module name:
+            # metadata, collective counts, filtered operation lists (copied and stringified),
+            # then appends a filled child mapping for each recorded child. Returns the mapping.
             json_dict["fqn"] = fqn
             json_dict["module_type"] = ""
             json_dict["parameters"] = []
@@ -404,6 +463,11 @@ class CommDebugMode(TorchDispatchMode):
             json.dump(json_dict, json_file, indent=4)
 
     def generate_comm_debug_tracing_table(self, noise_level=3):
+        # [FUNCTION DOC] Builds and returns a text table (with ANSI color codes) of the recorded run,
+        # one block per module indented by depth: module type, parameter placements, then
+        # forward, backward and activation checkpointing sections listing collective counts
+        # and operations with shape, sharding and mesh. Noise level selects the detail as in
+        # the json dump. Does not print.
         """
         Generates detailed table displaying operations and collective tracing information
         on a module level. Amount of information is dependent on noise_level
@@ -479,6 +543,8 @@ class CommDebugMode(TorchDispatchMode):
                     )
 
             def add_tracing_information(table, collectives_dict, operation_list):
+                # [FUNCTION DOC] HELPER: Appends collective count lines and the operations that
+                # pass the noise filters to the table string and returns the new string.
                 """
                 adds tracing information for module's forward or backward
                 """
@@ -490,6 +556,10 @@ class CommDebugMode(TorchDispatchMode):
                 def add_operations(
                     table, operation, collective_indent, operation_indent
                 ):
+                    # [FUNCTION DOC] HELPER: Appends the operation name line and, if it has DTensor
+                    # inputs, its shape, sharding and mesh lines; returns the new table string.
+                    # KNOWN ISSUE: the name comes from the enclosing loop variable, not from
+                    # the operation argument.
                     """
                     adds operation information to the table
                     """
@@ -552,6 +622,9 @@ class CommDebugMode(TorchDispatchMode):
         return table
 
     def _get_operations_list(self, module_operation_counts):
+        # [FUNCTION DOC] HELPER: Splits a module's recorded operations into three lists: forward
+        # (not backward), backward (backward and not checkpointing), and checkpointing. Returns
+        # the three lists as a tuple.
         forward_operations = [
             op for op in module_operation_counts["operations_list"] if not op["is_bw"]
         ]
@@ -569,9 +642,11 @@ class CommDebugMode(TorchDispatchMode):
         return forward_operations, backward_operations, checkpointing_operations
 
     def get_total_counts(self) -> int:
+        # [FUNCTION DOC] Returns the sum of all collective counts recorded so far.
         return sum(self.comm_counts.values())
 
     def get_comm_counts(self) -> dict[Any, int]:
+        # [FUNCTION DOC] Returns the live mapping from collective op to count (not a copy).
         """Returns the communication counts as a dictionary.
 
         Returns:
@@ -580,12 +655,18 @@ class CommDebugMode(TorchDispatchMode):
         return self.comm_counts
 
     def get_parameter_info(self) -> dict[str, dict[str, Any]]:
+        # [FUNCTION DOC] Returns the tracker's mapping from module name to its direct parameters.
         return self.advanced_module_tracker.module_parameters_dict
 
     def get_sharding_info(self) -> dict[str, dict[str, Any]]:
+        # [FUNCTION DOC] Returns the tracker's mapping from qualified parameter name to placements.
+        # KNOWN ISSUE: the annotation says nested dicts but values are placement tuples.
         return self.advanced_module_tracker.sharding_dict
 
     def __enter__(self):
+        # [FUNCTION DOC] Clears all counters and records, seeds the Global module with empty forward
+        # and backward counters, enters the dispatch mode and the module tracker (installing
+        # global module hooks). Returns the mode itself.
         self.comm_counts.clear()
         self.comm_module_counts.clear()
         self.comm_module_counts["Global"] = {}
@@ -600,12 +681,16 @@ class CommDebugMode(TorchDispatchMode):
 
     # pyrefly: ignore [bad-override]
     def __exit__(self, *args):
+        # [FUNCTION DOC] Exits the module tracker (removing hooks) and then the dispatch mode.
+        # Recorded data stays available for reporting.
         self.advanced_module_tracker.__exit__()
         super().__exit__(*args)
 
     def log_comm_debug_tracing_table_to_file(
         self, file_name="comm_mode_log.txt", noise_level=3
     ):
+        # [FUNCTION DOC] Generates the tracing table, strips ANSI color escapes, and writes it to
+        # file_name (overwriting). Returns nothing.
         """
         Alternative to console CommDebugMode output, writes to file specified by the user
         """
@@ -616,6 +701,9 @@ class CommDebugMode(TorchDispatchMode):
             log_file.write(table)
 
     def _set_noise_parameters(self, noise_level):
+        # [FUNCTION DOC] HELPER: Maps a noise level to four flags returned as a tuple in this order:
+        # include DTensor ops, include module data (both when level above zero), include all
+        # ops (above one), include trivial ops (above two).
         """
         sets variables controlling what information displays based on noise level
         """
@@ -642,6 +730,16 @@ class CommDebugMode(TorchDispatchMode):
         )
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Dispatch hook. Higher-order operators are just called. Otherwise creates an
+        # operation record (name, DTensor arg shapes/placements/mesh, backward and
+        # checkpointing flags) in the current module's list. If DTensor is among the types,
+        # stores the record and returns not-implemented so DTensor decomposes first. Otherwise
+        # runs the op; if it is a recognized collective (native names mapped to python
+        # functional ones) increments the global, current-module and ancestor-module counts under
+        # forward or backward. Under fake tensors the record is skipped; else it is stored.
+        # Returns the op output.
+        # KNOWN ISSUE: the DTensor branch only records DTensor positional args (keyword args
+        # ignored), and ancestors are counted only through the parent set of the current module.
         # When running this mode with DTensor, ordinarily all modes will
         # run **before** subclasses get a chance to run.
         # Returning NotImplemented here gives us a chance to let DTensor
@@ -746,4 +844,5 @@ class CommDebugMode(TorchDispatchMode):
         return out
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns a string showing the total collective count.
         return f"CommDebugMode(get_total_counts()={self.get_total_counts()})"
