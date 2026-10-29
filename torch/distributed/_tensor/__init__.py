@@ -1,3 +1,10 @@
+# [PACKAGE DOC] Backward-compatibility shim for the old torch.distributed._tensor
+# path, which moved to torch.distributed.tensor. At import time it imports the
+# submodules _shards_wrapper, _utils, experimental and device_mesh from the new
+# location and registers them in the module table under the old names, then re-exports
+# the public DTensor API (DeviceMesh, DTensor, Partial, Placement, Replicate, Shard,
+# distribute_module, distribute_tensor, init_device_mesh, empty, full, ones, rand,
+# randn, zeros).
 """
 NOTICE: DTensor has moved to torch.distributed.tensor
 

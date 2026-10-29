@@ -1,3 +1,5 @@
+# [MODULE DOC] Small shared helper for the tools package: collecting the underlying
+# untyped storages of tensors, including traceable wrapper subclasses.
 import warnings
 
 import torch
@@ -6,6 +8,12 @@ from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
 
 def get_untyped_storages(t: torch.Tensor) -> set[torch.UntypedStorage]:
+    # [FUNCTION DOC] Returns the set of untyped storages backing a tensor. Uses a work
+    # stack: plain tensors contribute their untyped storage; traceable wrapper subclasses
+    # are flattened into their inner attributes, whose tensors are pushed for processing
+    # (custom class objects are skipped). Raises AssertionError if a flattened attribute
+    # is neither a Tensor nor a custom class object. Emits a UserWarning (and skips it)
+    # for an object without an untyped storage.
     """
     Recursively extracts untyped storages from a tensor or its subclasses.
 

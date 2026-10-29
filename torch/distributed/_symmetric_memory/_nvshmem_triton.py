@@ -1,3 +1,10 @@
+# [MODULE DOC] Triton device-side bindings for NVSHMEM on CUDA. Provides a finder for
+# the NVSHMEM device bitcode library, a kernel-name registry plus a post-compile hook
+# that initializes NVSHMEM in each compiled kernel module, the requires_nvshmem
+# decorator, and (only when Triton is available) JIT functions and extern wrappers for
+# one-sided put/get, signalling, waiting, fences, barriers, collectives and atomics.
+# Import-time side effects: creates a module logger; conditionally imports Triton and
+# defines kernels.
 import logging
 import os
 import subprocess
@@ -12,6 +19,11 @@ logger = logging.getLogger(__name__)
 
 
 class NvshmemLibFinder:
+    # [CLASS DOC] Locates the libnvshmem_device bitcode file. Search order: the directory
+    # in NVSHMEM_LIB_DIR if set (error if file missing there), then the Python site-
+    # packages nvidia nvshmem wheel directory, common system paths, and RPATH/RUNPATH
+    # entries read (via the external readelf tool) from torch libtorch_nvshmem shared
+    # library. The found path is cached in a class attribute for reuse.
     """
     A class to find path to the NVSHMEM device library.
 
@@ -28,6 +40,11 @@ class NvshmemLibFinder:
 
     @classmethod
     def find_device_library(cls) -> str:
+        # [FUNCTION DOC] Returns the full path to the NVSHMEM device library file, using the
+        # cached value when present. Raises RuntimeError if the user-specified directory lacks
+        # the file or if no search location contains it (message lists searched paths). Side
+        # effects: reads the environment, may run readelf in a subprocess (failures and a
+        # missing torch import are ignored) and caches the result.
         """
         Find the path to the NVSHMEM device library.
 
@@ -100,6 +117,8 @@ class NvshmemLibFinder:
 
 
 def enable_triton(lib_dir: str | None = None) -> dict[str, str]:
+    # [FUNCTION DOC] Deprecated stub: always raises NotImplementedError telling users to
+    # decorate kernels with requires_nvshmem instead. The lib_dir argument is unused.
     raise NotImplementedError(
         "`enable_triton` is deprecated. "
         "If you need NVSHMEM device function support for Triton, "
@@ -108,6 +127,9 @@ def enable_triton(lib_dir: str | None = None) -> dict[str, str]:
 
 
 class NvshmemKernelRegistry:
+    # [CLASS DOC] Registry of Triton kernel function names that require NVSHMEM module
+    # initialization. State is a class-level mapping; classmethods register, deregister
+    # and has manage it. Duplicates the shared registry class in the utils module.
     """
     A class to register kernel functions that ** require NVSHMEM initialization **
     """
@@ -117,6 +139,7 @@ class NvshmemKernelRegistry:
 
     @classmethod
     def register(cls, name: str) -> None:
+        # [FUNCTION DOC] Adds the kernel function name to the registry (no effect if present).
         """
         Register a kernel function with the given name.
 
@@ -127,6 +150,7 @@ class NvshmemKernelRegistry:
 
     @classmethod
     def deregister(cls, name: str) -> None:
+        # [FUNCTION DOC] Removes the name from the registry if present; no error otherwise.
         """
         Deregister a kernel function with the given name.
 
@@ -137,6 +161,7 @@ class NvshmemKernelRegistry:
 
     @classmethod
     def has(cls, name: str) -> bool:
+        # [FUNCTION DOC] Returns True if the name is registered.
         """
         Check if a kernel function with the given name is registered.
 
@@ -150,6 +175,12 @@ class NvshmemKernelRegistry:
 
 
 def _nvshmem_init_hook(*args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] HELPER: Triton post-compile hook (keyword arguments from Triton). For
+    # a compiled function whose name is registered, finds the compiled kernel in the
+    # device cache by key, forces its loading and initializes NVSHMEM device state in its
+    # CUDA module via the C++ binding; if no kernel was created, logs a warning. Does
+    # nothing for unregistered functions. Duplicates the shared hook logic in the utils
+    # module.
     """
     A hook function to initialize the CUModule created by `triton.jit` with
     NVSHMEM device context
@@ -183,6 +214,9 @@ if has_triton():
     # Create a new Callable class that follows the KernelInterface protocol so
     # that the Callable works with the subscript operator, e.g. `foo[(1, 1)]`
     class GridCallableWithExtern(KernelInterface):
+    # [CLASS DOC] HELPER: Triton KernelInterface wrapper that forwards launches to the JIT
+    # function run method with an extra extern-libs mapping so users need not pass it.
+    # Supports the grid subscript launch syntax.
         """
         `KernelInterface` invokes `self.run` in `__getitem__`, i.e. [].  We
         implement a `run` method by directing the call to `JITFunction.run`,
@@ -190,10 +224,13 @@ if has_triton():
         """
 
         def __init__(self, jit_func: JITFunction, extern_libs: dict[str, str]) -> None:
+        # [FUNCTION DOC] HELPER: Stores the JIT function and extern libs mapping.
             self.jit_func = jit_func
             self.extern_libs = extern_libs
 
         def run(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] HELPER: Runs the wrapped JIT function with the given arguments plus
+        # the stored extern libs and returns its result.
             # Call the JITFunction.run with added extern_libs kwarg
             return self.jit_func.run(*args, **kwargs, extern_libs=self.extern_libs)
 
@@ -201,6 +238,12 @@ if has_triton():
 def requires_nvshmem(  # type: ignore[no-untyped-def]
     jit_func,  # JITFunction created by triton.jit
 ):
+    # [FUNCTION DOC] Decorator for a Triton JIT function that needs NVSHMEM device
+    # functions. Raises TypeError if the input is not a JIT function. Finds the device
+    # library (may raise RuntimeError), registers the kernel name, and installs the
+    # NVSHMEM init hook as the global Triton post-compile hook (overwriting any previous
+    # one; the hook filters by registry). Returns a wrapper that adds the device library
+    # as an extern lib at launch. Apply above the JIT decorator.
     """
     A decorator to register a Triton kernel function that requires NVSHMEM initialization.
 
@@ -250,6 +293,11 @@ if has_triton():
 
     @triton.jit  # type: ignore[misc]
     def put(dest, source, nelems, pe):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Triton device function: blocking put of nelems elements from local
+        # source to dest on remote PE pe. Statically asserts that both tensors have the same
+        # type, computes the byte size from the element size and calls the block put extern
+        # wrapper. Returns the status from the extern call. Delivery is not guaranteed until
+        # fence or quiet.
         """
         Put tensor data from local PE to a remote PE.
 
@@ -285,6 +333,8 @@ if has_triton():
 
     @core.extern
     def putmem_block_extern_wrapper(dest, source, size_bytes, pe, _semantic=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] HELPER: Extern wrapper calling the NVSHMEM block-level put of a byte
+        # count between int64 addresses to a given PE; returns an int32 status. Not pure.
         """Low-level extern wrapper for NVSHMEM put"""
         return core.extern_elementwise(
             "",
@@ -304,6 +354,9 @@ if has_triton():
 
     @triton.jit  # type: ignore[misc]
     def get(dest, source, nelems, pe):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Triton device function: blocking get of nelems elements from remote
+        # PE source into local dest. Asserts equal tensor types, computes bytes, calls the
+        # block get extern wrapper and returns its status. Data is usable on return.
         """
         Get tensor data from a remote PE to local PE.
 
@@ -338,6 +391,8 @@ if has_triton():
 
     @core.extern
     def getmem_block_extern_wrapper(dest, source, size_bytes, pe, _semantic=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] HELPER: Extern wrapper calling the NVSHMEM block-level get; int32
+        # status. Not pure.
         """Low-level extern wrapper for NVSHMEM get"""
         return core.extern_elementwise(
             "",
@@ -357,6 +412,11 @@ if has_triton():
 
     @triton.jit  # type: ignore[misc]
     def get_nbi(dest, source, nelems, pe):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Triton device function intended as a non-blocking get from a remote
+        # PE (completion at the next quiet).
+        # KNOWN ISSUE: it calls the blocking get extern wrapper instead of the non-blocking
+        # wrapper defined below, so it behaves like a blocking get.
+        # Asserts equal tensor types, computes bytes, returns the extern status.
         """
         Get tensor data from a remote PE to local PE, non-blocking.
 
@@ -392,6 +452,9 @@ if has_triton():
 
     @core.extern
     def getmem_nbi_block_extern_wrapper(dest, source, size_bytes, pe, _semantic=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] HELPER: Extern wrapper for the NVSHMEM block-level non-blocking get;
+        # int32 status. Currently unused by the get_nbi function. Docstring says it is for
+        # get.
         """Low-level extern wrapper for NVSHMEM get"""
         return core.extern_elementwise(
             "",
@@ -419,6 +482,12 @@ if has_triton():
         sig_op,
         pe,
     ):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Triton device function: copies size_bytes from the local source to
+        # the destination on PE pe, then atomically updates a signal variable on that PE with
+        # a value using the given signal operation (set or add). Blocking at block scope;
+        # returns an int32 status. The signal must be 8-byte aligned symmetric memory.
+        # KNOWN ISSUE: the docstring lists the signal value argument as a second argument
+        # named signal; the actual parameter is sig_val.
         """
         Put data to remote PE with atomic signal operation using block-scoped operation.
 
@@ -481,6 +550,9 @@ if has_triton():
         pe,
         _semantic=None,
     ):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] HELPER: Extern wrapper for the NVSHMEM block-level put-with-signal
+        # taking destination, source, size, signal address, 64-bit signal value, signal
+        # operation and PE; int32 status. Not pure.
         return core.extern_elementwise(
             "",
             "",
@@ -504,6 +576,12 @@ if has_triton():
 
     @triton.jit  # type: ignore[misc]
     def wait_until(ivar, cmp_op, cmp_val):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Triton device function: blocks until the 32-bit integer in symmetric
+        # memory at ivar satisfies the comparison (equal, not equal, greater, and so on, by
+        # code) against cmp_val. Statically asserts a 4-byte element type. Returns the extern
+        # status.
+        # KNOWN ISSUE: the docstring names parameters ivar_tensor and cmp, but the actual
+        # parameters are ivar, cmp_op and cmp_val.
         """
         Wait until a tensor variable meets a specified condition.
 
@@ -542,6 +620,8 @@ if has_triton():
 
     @core.extern
     def wait_until_extern_wrapper(ivar, cmp, cmp_val, _semantic=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] HELPER: Extern wrapper for the NVSHMEM integer wait-until on an int64
+        # address, int32 comparison code and int32 value; int32 result. Not pure.
         return core.extern_elementwise(
             "",
             "",
@@ -559,6 +639,10 @@ if has_triton():
 
     @triton.jit  # type: ignore[misc]
     def signal_wait_until(signal, cmp, cmp_val):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Triton device function: blocks until the 64-bit signal variable at
+        # the signal address satisfies the comparison with cmp_val. The value is widened to
+        # unsigned 64-bit before the extern call. Returns int32 status. Used with put-with-
+        # signal for producer/consumer synchronization.
         """
         Wait until a signal variable meets a specified condition.
 
@@ -603,6 +687,8 @@ if has_triton():
 
     @core.extern
     def signal_wait_until_extern_wrapper(signal, cmp, cmp_val, _semantic=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] HELPER: Extern wrapper for the NVSHMEM signal wait-until with int64
+        # address, int32 comparison code and uint64 value; int32 result. Not pure.
         return core.extern_elementwise(
             "",
             "",
@@ -620,6 +706,9 @@ if has_triton():
 
     @core.extern
     def signal_op(sig_addr, signal, sig_op, pe, _semantic=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Extern device function: atomically updates a 64-bit signal variable
+        # at a symmetric address on remote PE pe, with a value and an operation code (set or
+        # add). One-sided; returns int32 status. Not pure.
         """
         Perform an atomic signal operation on a remote PE.
 
@@ -673,6 +762,9 @@ if has_triton():
     # Memory Ordering Operations
     @core.extern
     def fence(_semantic=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Extern device function: memory fence ordering earlier puts to each
+        # remote PE before later puts to the same PE (per-destination ordering only, no
+        # completion guarantee). Returns int32 status. Takes no user arguments.
         """
         Ensure ordering of put operations to each remote PE.
 
@@ -721,6 +813,9 @@ if has_triton():
 
     @core.extern
     def quiet(_semantic=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Extern device function: blocks until all outstanding remote memory
+        # operations issued by the calling PE (including non-blocking ones) have completed.
+        # Stronger than fence. Returns int32 status.
         """
         Wait for completion of all outstanding put operations.
 
@@ -770,6 +865,8 @@ if has_triton():
     # PE Information Operations
     @core.extern
     def my_pe(_semantic=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Extern device function: returns the PE number (int32, zero-based) of
+        # the calling PE. Marked pure.
         """
         Get the PE number of the calling PE.
 
@@ -813,6 +910,8 @@ if has_triton():
 
     @core.extern
     def n_pes(_semantic=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Extern device function: returns the total number of PEs in the job
+        # (int32). Marked pure.
         """
         Get the total number of PEs in the NVSHMEM job.
 
@@ -857,6 +956,9 @@ if has_triton():
     # Synchronization Operations
     @core.extern
     def barrier_all(_semantic=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Extern device function: collective barrier across all PEs that also
+        # guarantees completion of outstanding memory operations. All PEs must call it; needs
+        # cooperative launch. Returns int32 status.
         """
         Synchronize all PEs with completion guarantee.
 
@@ -903,6 +1005,9 @@ if has_triton():
 
     @core.extern
     def sync_all(_semantic=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Extern device function: lighter collective synchronization across all
+        # PEs that makes local stores visible but does not guarantee completion of outstanding
+        # remote operations. Cooperative launch required. Returns int32 status.
         """
         Synchronize all PEs with local completion guarantee.
 
@@ -950,6 +1055,11 @@ if has_triton():
     # Collective Operations (mem-based APIs - sizes in bytes)
     @triton.jit  # type: ignore[misc]
     def alltoall(team, dest, source, nelems_per_pe):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Triton device function: all-to-all exchange within a team where each
+        # PE sends nelems_per_pe elements to every PE and receives the same from each. Asserts
+        # equal dest and source types, converts the per-PE element count to bytes and calls
+        # the extern wrapper. Collective; returns int32 status. Team zero means the world
+        # team.
         """
         All-to-all tensor exchange between PEs in a team.
 
@@ -985,6 +1095,9 @@ if has_triton():
     def alltoallmem_block_extern_wrapper(
         team: Any, dest: Any, source: Any, size_bytes: Any, _semantic: Any = None
     ) -> None:
+        # [FUNCTION DOC] HELPER: Extern wrapper for the NVSHMEM block-level all-to-all taking
+        # an int32 team, int64 dest and source addresses and per-PE byte size; int32 status.
+        # Not pure.
         """Low-level extern wrapper for NVSHMEM alltoall"""
         return core.extern_elementwise(
             "",
@@ -1004,6 +1117,10 @@ if has_triton():
 
     @triton.jit  # type: ignore[misc]
     def broadcast(team, dest, source, nelems, pe_root):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Triton device function: broadcasts nelems elements from the root PE
+        # source to dest on all PEs in a team. Asserts equal types, computes bytes, calls the
+        # extern wrapper with the root PE. Collective with cooperative launch; returns int32
+        # status.
         """
         Broadcast tensor data from a root PE to all other PEs in a team.
 
@@ -1045,6 +1162,8 @@ if has_triton():
         pe_root: Any,
         _semantic: Any = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Extern wrapper for the NVSHMEM block-level broadcast with
+        # team, dest and source addresses, byte size and root PE; int32 status. Not pure.
         """Low-level extern wrapper for NVSHMEM broadcast"""
         return core.extern_elementwise(
             "",
@@ -1066,6 +1185,10 @@ if has_triton():
     # Reduction Operation
     @triton.jit  # type: ignore[misc]
     def reduce(team, dest, source, nreduce, operation: tl.constexpr):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Triton device function: team-wide reduction of nreduce elements from
+        # source into dest across PEs, with a compile-time operation name (sum, max, min or
+        # prod). Asserts equal types, passes the destination element dtype to the extern
+        # wrapper. Collective with cooperative launch; returns int32 status.
         """
         Performs a collective reduction on tensors across a team of PEs.
 
@@ -1112,6 +1235,12 @@ if has_triton():
         dtype: Any,
         _semantic: Any = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Extern wrapper selecting the typed NVSHMEM reduce function by
+        # element type and operation name. Maps Triton dtype names (integer widths, fp16,
+        # bf16, fp32, fp64) to NVSHMEM type names and accepts the operation as a plain or
+        # constexpr string. Raises TypeError for an unsupported dtype and ValueError for an
+        # unsupported operation. Emits an extern call with team and int64 address and count
+        # arguments; int32 status. Not pure.
         """
         Low-level extern wrapper for NVSHMEM reduction operations.
 
@@ -1200,6 +1329,11 @@ if has_triton():
     triton_kernels: dict = {}
 
     def _log_triton_kernel(kernel) -> None:  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] HELPER: Debug utility that records a compiled Triton kernel in the
+    # module-level kernel dictionary (non-zero ranks are ignored when distributed is
+    # initialized). When the first kernel is recorded it registers an exit hook that
+    # writes each kernel PTX to a temporary file and logs its path. Side effects: global
+    # state, exit hook, files.
         import atexit
         import tempfile
 
@@ -1207,6 +1341,9 @@ if has_triton():
             return
 
         def on_exit() -> None:
+        # [FUNCTION DOC] HELPER: Exit hook: logs a header, then for each recorded kernel
+        # writes its PTX assembly to a new temporary file (not deleted) and logs the name and
+        # file path.
             logger.info("PTX files:")
             for kernel in triton_kernels:
                 with tempfile.NamedTemporaryFile(delete=False) as f:

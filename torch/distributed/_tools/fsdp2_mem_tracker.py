@@ -1,3 +1,11 @@
+# [MODULE DOC] FSDP2-aware memory tracker. Defines FSDPMemTracker (the only public
+# export), which extends MemTracker to categorize memory of FSDP-wrapped modules
+# (sharded/unsharded params and grads, all-gather and reduce-scatter buffers,
+# activations, temporaries, optimizer state, inputs, buffers) and take per-module
+# snapshots around FSDP pre/post forward and backward. Also holds the supporting
+# reference-type enum, module-state enum, per-module stats class and saved-method
+# record. Import-time side effects: imports the fake_collectives module and resolves
+# the c10d op namespace.
 from collections.abc import Callable
 from copy import deepcopy
 from enum import auto, Enum
@@ -33,6 +41,11 @@ c10d = torch.ops.c10d
 
 
 class _FSDPRefType(_RefType):
+    # [CLASS DOC] Enumeration of FSDP memory categories (string values used as keys in
+    # snapshots): sharded and unsharded params and grads, buffers, activations, temporary
+    # backward tensors, all-gather outputs, reduce-scatter inputs, optimizer state and
+    # inputs. Extends the base reference type of MemTracker. The class docstring lists no
+    # BUFFER entry although the member exists.
     """
     Enumerates categories of memory usage in FSDP modules, including parameters, gradients, activations,
     and optimizer states.
@@ -64,11 +77,17 @@ class _FSDPRefType(_RefType):
 
 
 class _SavedFSDPMethods(NamedTuple):
+    # [CLASS DOC] HELPER: Named tuple saving the original pre_backward and post_backward
+    # methods of an FSDP parameter group so they can be restored after instrumentation.
     pre_backward: Callable
     post_backward: Callable
 
 
 class _FSDPModState(_State):
+    # [CLASS DOC] Enumeration of the module states at which memory snapshots are taken
+    # around FSDP pre-forward, post-forward, pre-backward and post-backward (before and
+    # after each), plus activation-checkpoint forward states and peak forward/backward
+    # states.
     """
     Enumerates the states of FSDP modules during the forward and backward passes.
     """
@@ -88,6 +107,10 @@ class _FSDPModState(_State):
 
 
 class _FSDPModMemStats:
+    # [CLASS DOC] HELPER: Per-module memory statistics for an FSDP module. State: the
+    # module FQN, local_peak (per device peak total in bytes) and snapshots (mapping from
+    # module state to a list of snapshots, each mapping device to a mapping of category to
+    # bytes).
     """
     A class to store the memory statistics of an FSDP module.
 
@@ -103,6 +126,8 @@ class _FSDPModMemStats:
     """
 
     def __init__(self, mod_fqn: str) -> None:
+        # [FUNCTION DOC] HELPER: Stores the FQN and initializes empty local peak and snapshot
+        # mappings.
         self.mod_fqn = mod_fqn
         self.local_peak: dict[torch.device, int] = {}
         self.snapshots: dict[
@@ -111,6 +136,9 @@ class _FSDPModMemStats:
 
 
 class _FSDPState(Enum):
+    # [CLASS DOC] HELPER: Enumeration of the tracker current phase: pre-forward, forward,
+    # post-forward, pre-backward, backward, post-backward. Used to decide how all-gather
+    # and reduce-scatter collectives are attributed.
     PRE_FW = auto()
     FW = auto()
     POST_FW = auto()
@@ -120,6 +148,15 @@ class _FSDPState(Enum):
 
 
 class FSDPMemTracker(MemTracker):
+    # [CLASS DOC] Context manager (a dispatch mode) extending MemTracker for FSDP2
+    # modules. Tracks per-device peak memory and per-module snapshots with FSDP-specific
+    # categories. State: the root FSDP module, optional optimizer, a weak-keyed mapping
+    # from FSDP modules to saved original backward methods, the current FSDP phase and the
+    # reference type class. On enter (outermost) it replaces FSDP forward hooks and
+    # parameter-group backward methods with wrapping versions, hooks the optimizer step,
+    # and starts module tracking; on exit it restores them. Only supports a single
+    # iteration per tracked run unless stats are reset. Key methods: track_inputs,
+    # track_external (no-op), and the dispatch handler.
     """
     A ``TorchDispatchMode`` based context manager that extends ``torch.distributed._tools.mem_tracker.MemTracker`` to track
     and categorize the peak memory and module-wise memory usage of FSDP modules.
@@ -164,6 +201,10 @@ class FSDPMemTracker(MemTracker):
         mod: torch.nn.Module,
         optm: torch.optim.Optimizer | None = None,
     ) -> None:
+        # [FUNCTION DOC] Initializes the base tracker, then stores the root module and
+        # optional optimizer. Raises AssertionError if the module is not an FSDP module. Sets
+        # an empty saved-methods mapping, initial phase pre-forward and the FSDP reference
+        # type class.
         super().__init__()
         if not isinstance(mod, FSDPModule):
             raise AssertionError("FSDPMemTracker only supports FSDP modules")
@@ -176,6 +217,9 @@ class FSDPMemTracker(MemTracker):
     def _instrument_fsdp_sharded_params_grads(
         self, fsdp_param_group: FSDPParamGroup
     ) -> None:
+        # [FUNCTION DOC] HELPER: Registers the sharded parameters of a parameter group, and
+        # their sharded gradients if present, for tracking under the sharded param and sharded
+        # grad categories.
         # Track sharded params and grads after initialization
         for fsdp_param in fsdp_param_group.fsdp_params:
             self._update_and_maybe_create_winfos(
@@ -194,6 +238,15 @@ class FSDPMemTracker(MemTracker):
         fsdp_mod: FSDPModule,
         orig_fsdp_state_pre_fw: Callable[_P, tuple[tuple[Unpack[_Ts]], dict[str, Any]]],
     ) -> Callable[_P, tuple[tuple[Unpack[_Ts]], dict[str, Any]]]:
+        # [FUNCTION DOC] HELPER: Returns a wrapper around the original FSDP state pre-forward
+        # function that adds memory tracking. The wrapper sets phase to pre-forward and
+        # requires the module FQN be known (AssertionError otherwise). For a module seen the
+        # first time it creates stats with peak forward and before-pre-forward snapshots; for
+        # a module seen again in forward at the top level it raises NotImplementedError
+        # (multiple iterations unsupported); inside backward it indicates an activation
+        # checkpointing region. It then calls the original, registers unsharded params,
+        # snapshots after pre-forward (or pre-forward AC, marking the AC region top module),
+        # sets phase to forward and returns the original result.
         # We capture memory snapshots before and after ``FSDPState._pre_forward`` to attribute the `unsharded` params
         # and `all_gather` buffers.  There are three cases:
         # Case 1: If the module is not in the ``memory_tracking`` dictionary, create a new ``_FSDPModMemStats``
@@ -211,6 +264,8 @@ class FSDPMemTracker(MemTracker):
         def inner(
             *args: _P.args, **kwargs: _P.kwargs
         ) -> tuple[tuple[Unpack[_Ts]], dict[str, Any]]:
+            # [FUNCTION DOC] HELPER: Wrapper body described by its factory; mutates tracker state
+            # and module stats, returns the args and kwargs from the original pre-forward.
             self._fsdp_state = _FSDPState.PRE_FW
             mod_fqn = self._mod_tracker.get_known_fqn(fsdp_mod)
             if mod_fqn is None:
@@ -267,6 +322,11 @@ class FSDPMemTracker(MemTracker):
         fsdp_mod: FSDPModule,
         orig_fsdp_state_post_fw: Callable[_P, _R],
     ) -> Callable[_P, _R]:
+        # [FUNCTION DOC] HELPER: Returns a wrapper around the original FSDP state post-forward
+        # function. Before calling it, takes a before-post-forward snapshot (or, in backward,
+        # a post-forward AC snapshot and clears the AC region flag if this is its top module)
+        # and sets phase to post-forward; after calling it in forward, takes an after-post-
+        # forward snapshot. Returns the original output.
         # We capture memory snapshots before and after ``FSDPState._post_forward`` to capture the resharded state
         # if ``reshard_after_forward`` is not ``False``. There are two cases:
         # Case 1: This is called in backward, which means we are in the AC region. If this is the top most module
@@ -274,6 +334,8 @@ class FSDPMemTracker(MemTracker):
         # Case 2: This is called in forward.
         @wraps(orig_fsdp_state_post_fw)
         def inner(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+            # [FUNCTION DOC] HELPER: Wrapper body described by its factory; requires stats to
+            # exist for the module (KeyError otherwise).
             mod_stat = self.memory_tracking[fsdp_mod]
             if self._mod_tracker.is_bw:
                 state = _FSDPModState.POST_FW_AC
@@ -300,10 +362,15 @@ class FSDPMemTracker(MemTracker):
         fsdp_mod: FSDPModule,
         orig_fsdp_param_group_pre_backward: Callable[_P, Any],
     ) -> Callable[_P, None]:
+        # [FUNCTION DOC] HELPER: Returns a wrapper around the parameter group pre-backward
+        # method. It sets phase to pre-backward, resets the module local peak and starts the
+        # peak backward snapshot, records a before-pre-backward snapshot, runs the original,
+        # records an after snapshot and sets phase to backward.
         # We capture memory snapshots before and after ``FSDPParamGroup.pre_backward`` to capture the pre-fetching
         # and unsharding of params. We also initialize ``local_peak`` and ``PEAK_BW`` snapshot for the module.
         @wraps(orig_fsdp_param_group_pre_backward)
         def inner(*args: _P.args, **kwargs: _P.kwargs) -> None:
+            # [FUNCTION DOC] HELPER: Wrapper body described by its factory; returns nothing.
             self._fsdp_state = _FSDPState.PRE_BW
             mod_stat = self.memory_tracking[fsdp_mod]
             snapshot = self.get_tracker_snapshot()
@@ -328,11 +395,16 @@ class FSDPMemTracker(MemTracker):
         fsdp_mod: FSDPModule,
         orig_fsdp_param_group_post_backward: Callable[_P, Any],
     ) -> Callable[_P, None]:
+        # [FUNCTION DOC] HELPER: Returns a wrapper around the parameter group post-backward
+        # method. Before it, re-labels unsharded gradients as unsharded grad and snapshots;
+        # sets phase to post-backward; runs the original; afterward registers sharded
+        # gradients and takes an after-post-backward snapshot.
         # We capture the memory snapshots before and after ``FSDPParamGroup.post_backward`` to track and attribute
         # the `unsharded` grads before the post backward and then `sharded` grads and `reduce_scatter`  buffers
         # after the post backward.
         @wraps(orig_fsdp_param_group_post_backward)
         def inner(*args: _P.args, **kwargs: _P.kwargs) -> None:
+            # [FUNCTION DOC] HELPER: Wrapper body described by its factory; returns nothing.
             fsdp_state = fsdp_mod._get_fsdp_state()
             if fsdp_param_group := fsdp_state._fsdp_param_group:
                 for fsdp_param in fsdp_param_group.fsdp_params:
@@ -367,6 +439,13 @@ class FSDPMemTracker(MemTracker):
         return inner
 
     def _instrument_fsdp_module(self) -> None:
+        # [FUNCTION DOC] HELPER: Installs instrumentation on all FSDP modules under the root.
+        # Removes the existing unique FSDP pre/post-forward hook handles once, then for each
+        # module with a parameter group: registers sharded params and grads, re-registers the
+        # forward pre hook (prepended, with kwargs) and forward hook (always called) with
+        # tracking wrappers, saves the original pre/post backward methods and replaces them
+        # with wrapped versions. Finally registers all root module buffers under the buffer
+        # category. Mutates FSDP state and parameter groups.
         # We uninstall the existing `FSDPState._pre_forward` and `FSDPState._post_forward` hooks and install
         # our own hooks that wrap them. We choose this over monkey-patching `FSDPParamGroup.pre_forward` and
         # `FSDPParamGroup.post_forward` because during AC these won't be called.
@@ -429,6 +508,10 @@ class FSDPMemTracker(MemTracker):
             )
 
     def _instrument_optimizer(self) -> None:
+        # [FUNCTION DOC] HELPER: If an optimizer was given, tracks its current states as
+        # optimizer state and registers step pre and post hooks that set and clear the in-
+        # optimizer flag (the post hook also tracks newly created states). Stores both
+        # handles.
         # Register a hook on the optimizer step to track the optimizer states.
         # The pre-hook is to set the flag ``_in_opt`` to True. The post-hook unsets the flag,
         # and also tracks any optimizer states that are created during the optimizer step.
@@ -438,11 +521,14 @@ class FSDPMemTracker(MemTracker):
             def _opt_step_pre_hook(
                 optimizer: optim.Optimizer, args: Any, kwargs: Any
             ) -> None:
+                # [FUNCTION DOC] HELPER: Optimizer step pre-hook: sets the in-optimizer flag.
                 self._in_opt = True
 
             def _opt_step_post_hook(
                 optimizer: optim.Optimizer, args: Any, kwargs: Any
             ) -> None:
+                # [FUNCTION DOC] HELPER: Optimizer step post-hook: tracks optimizer states and clears
+                # the in-optimizer flag.
                 self._track_optimizer_states(_FSDPRefType.OPT, optimizer)
                 self._in_opt = False
 
@@ -452,10 +538,15 @@ class FSDPMemTracker(MemTracker):
             )
 
     def _register_module_and_optimizer_hooks(self) -> None:
+        # [FUNCTION DOC] HELPER: Installs both the FSDP module hooks and the optimizer hooks.
         self._instrument_fsdp_module()
         self._instrument_optimizer()
 
     def _deregister_module_and_optimizer_hooks(self) -> None:
+        # [FUNCTION DOC] HELPER: Undoes the instrumentation: for every saved FSDP module
+        # removes the tracking forward hooks, re-registers the original FSDP pre/post-forward
+        # hooks and restores the original backward methods; clears the saved mapping; removes
+        # the optimizer hook handles if any.
         for (
             fsdp_mod,
             saved_methods,
@@ -480,6 +571,8 @@ class FSDPMemTracker(MemTracker):
             self._optimizer_hook_handles = None
 
     def track_inputs(self, inputs: tuple[Any, ...]) -> None:
+        # [FUNCTION DOC] Marks every tensor found in the (nested) inputs tuple for tracking
+        # under the inputs category. Non-tensor entries are ignored. Mutates tracker state.
         """
         This is used to track the input tensors to the model and annotate them as ``Inputs``.
         Args:
@@ -488,6 +581,7 @@ class FSDPMemTracker(MemTracker):
         """
 
         def _track_inputs(t: torch.Tensor) -> None:
+            # [FUNCTION DOC] HELPER: Registers one tensor under the inputs category.
             self._update_and_maybe_create_winfos(
                 t,
                 _FSDPRefType.INP,
@@ -498,9 +592,15 @@ class FSDPMemTracker(MemTracker):
     def track_external(
         self, *external: nn.Module | optim.Optimizer | torch.Tensor
     ) -> None:
+        # [FUNCTION DOC] No-op in this class; accepts modules, optimizers or tensors and
+        # ignores them.
         """This is no-op for ``FSDPMemTracker``"""
 
     def __enter__(self) -> "FSDPMemTracker":
+        # [FUNCTION DOC] Enters the tracker. On the outermost entry it records the active fake
+        # mode, installs module and optimizer hooks, patches resize tracking, takes the
+        # initial peak snapshot and totals, and enters the module tracker. Always enters the
+        # dispatch mode and increments nesting depth. Returns the tracker.
         if self._depth == 0:
             # None in eager, a FakeTensorMode instance in SAC.  Used in
             # __torch_dispatch__ to skip DTensor propagation ops.
@@ -518,6 +618,8 @@ class FSDPMemTracker(MemTracker):
         return self
 
     def __exit__(self, *args: Any) -> None:
+        # [FUNCTION DOC] Decrements nesting depth; on the outermost exit it removes the hooks,
+        # restores resize behavior and exits the module tracker. Then exits the dispatch mode.
         self._depth -= 1
         if self._depth == 0:
             self._deregister_module_and_optimizer_hooks()
@@ -526,6 +628,16 @@ class FSDPMemTracker(MemTracker):
         TorchDispatchMode.__exit__(self, *args)
 
     def __torch_dispatch__(self, func, types, args=..., kwargs=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Dispatch handler that runs each op and records the memory of its
+        # outputs. Returns NotImplemented if any argument type is DTensor so that DTensor
+        # decomposes first. Runs the op (for wait_tensor under a fake mode it returns the
+        # input itself to mimic eager). Only tracks when the active fake mode is the same as
+        # at entry (skips DTensor propagation ops). Chooses the category: optimizer state,
+        # backward temporary (in backward outside activation checkpointing) or activation. For
+        # all-gather in pre-forward/pre-backward phases it labels the output tensor as all-
+        # gather; for reduce-scatter in post-backward it labels the input as reduce-scatter.
+        # Tracks result tensors, updates the forward or backward peak stats, and returns the
+        # op result.
         # When running this mode with DTensor, ordinarily all modes will
         # run **before** subclasses get a chance to run.
         # Returning NotImplemented here gives us a chance to let DTensor

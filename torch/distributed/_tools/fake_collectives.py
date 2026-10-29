@@ -1,3 +1,10 @@
+# [MODULE DOC] Classification tables for c10d collective operators, used by tools that
+# trace collectives under fake process groups. Defines at import time (resolving
+# torch.ops namespaces) the sets non_functional_collectives, functional_collectives
+# (including DTensor all-to-all and p2p batch ops), sync_ops (barriers and
+# wait_tensor) and their union collective_ops, plus the CollectiveOp helper class
+# that, given an op overload, finds its process group, communicated byte size and work
+# handle.
 from typing import Any
 
 import torch
@@ -75,6 +82,13 @@ collective_ops = set.union(functional_collectives, non_functional_collectives)
 
 
 class CollectiveOp:
+    # [CLASS DOC] Namespace of static lookup sets and static methods describing collective
+    # op overloads. The PG_ARG_n sets say which positional argument index (1 to 5 as
+    # numbered by the set suffix mapping to argument positions 1, 2, 2, 3, 4) holds the
+    # process group; WK and WK_ARG_1 say where the work handle is in the result;
+    # COMM_TENSOR_* sets say how communicated tensor size is derived (from an argument,
+    # the result, a single storage, or a sum). Methods: sum_tensors, get_process_group,
+    # get_comm_tensor_size, get_work. No instance state.
     # Static sets for performance optimization
     PG_ARG_1 = {
         c10d.broadcast_.default,
@@ -202,10 +216,15 @@ class CollectiveOp:
 
     @staticmethod
     def sum_tensors(arg: Any) -> int:
+        # [FUNCTION DOC] Returns total bytes of the underlying untyped storages of every
+        # tensor found in a (possibly nested) argument structure. Note shared storages seen in
+        # several tensors are counted once per tensor, not deduplicated.
         """Calculate total memory consumed by the tensors in the argument."""
         total_memory = 0
 
         def sum_bytes(t: torch.Tensor) -> None:
+            # [FUNCTION DOC] HELPER: Adds the storage byte size of one tensor to the enclosing
+            # running total.
             nonlocal total_memory
             total_memory += t.untyped_storage().nbytes()
 
@@ -214,6 +233,11 @@ class CollectiveOp:
 
     @staticmethod
     def get_process_group(func, args) -> ProcessGroup:  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Returns the ProcessGroup used by a collective op overload given its
+        # positional args, by looking up which argument index holds it: unboxing a script
+        # object for the c10d ops (index 1 or 2) or resolving a group name for functional ops
+        # (index 2, 3 or 4). Not for wait_tensor. Raises TypeError if the op is not a known
+        # collective.
         """Retrieve the process group for collective operations, except `wait_tensor`."""
         if func in CollectiveOp.PG_ARG_1:
             return ProcessGroup.unbox(args[1])
@@ -229,6 +253,12 @@ class CollectiveOp:
 
     @staticmethod
     def get_comm_tensor_size(func, res, args, kwargs) -> int:  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Returns the number of bytes communicated by a collective call, given
+        # op overload, result, args and kwargs (kwargs unused). Depends on the op: sum over a
+        # list argument, the result storage, one argument storage, the larger of input and
+        # output for alltoall variants, input plus output for DTensor all-to-all, and so on.
+        # Not valid for wait_tensor or barriers. Raises TypeError for an unknown op. Some all-
+        # to-all size rules are marked TODO as unconfirmed.
         """Compute the communication tensor size, except for `wait_tensor`, `barrier`, and `monitored_barrier`."""
         if func in CollectiveOp.COMM_TENSOR_ARG_0:
             return CollectiveOp.sum_tensors(args[0])
@@ -263,6 +293,9 @@ class CollectiveOp:
 
     @staticmethod
     def get_work(func, res) -> Work:  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Extracts the Work handle (a FakeWork) from an op result: the result
+        # itself for ops in the WK set, or its second element for ops in WK_ARG_1. Raises
+        # TypeError for any other op.
         if func in CollectiveOp.WK:
             return FakeWork.unbox(res)
         elif func in CollectiveOp.WK_ARG_1:

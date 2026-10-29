@@ -1,3 +1,9 @@
+# [MODULE DOC] Data structures and helpers for building the optimization (MILP) inputs
+# for activation checkpointing and FSDP planning. Defines typed dictionaries
+# (ModOrder, ModRuntime, ModStats, ModuleInfo), a module tree Graph/Node with an
+# ancestor-descendant matrix, an aggregator that merges stats from MemTracker,
+# RuntimeEstimator and SACEstimator, and small name/byte-formatting and baseline-peak
+# helpers. Requires numpy; no import-time side effects.
 import copy
 from collections import OrderedDict
 from typing import cast, TypedDict
@@ -16,6 +22,8 @@ from torch.distributed._tools.sac_estimator import SACEstimator, SACTradeOffStat
 
 
 class ModOrder(TypedDict):
+    # [CLASS DOC] Typed dictionary holding module FQN orderings: forward and backward pre-
+    # order and post-order lists.
     fw_pre_order: list[str]
     bw_pre_order: list[str]
     fw_post_order: list[str]
@@ -23,11 +31,16 @@ class ModOrder(TypedDict):
 
 
 class ModRuntime(TypedDict):
+    # [CLASS DOC] Typed dictionary with the forward and backward runtime of a module (ms).
     fw: float
     bw: float
 
 
 class ModStats(TypedDict):
+    # [CLASS DOC] Typed dictionary of per-module statistics: parameter, gradient and
+    # activation memory figures, input/output sizes, forward/backward runtimes, leaf flag,
+    # and the SAC trade-off data (runtime, memory, piecewise-linear segment count, slopes,
+    # intercepts, breakpoints, original curve). Memory in bytes, time in ms.
     fqn: str
     # per-module params
     param_per_module: int
@@ -71,6 +84,8 @@ class ModStats(TypedDict):
 
 
 class ModuleInfo(TypedDict):
+    # [CLASS DOC] Typed dictionary combining the module ordering (mod_order) and the list
+    # of per-module stats (mod_stats).
     mod_order: ModOrder
     mod_stats: list[ModStats]
 
@@ -82,6 +97,18 @@ def aggregate_stats(
     sac_estimator: SACEstimator,
     dev: torch.device,
 ) -> ModuleInfo:
+    # [FUNCTION DOC] Collects per-module stats for a model into a ModuleInfo. Takes the
+    # model, a MemTracker, a RuntimeEstimator, a SACEstimator and the device the model ran
+    # on. Deep-copies the tracked memory stats, reads runtimes and orderings from the
+    # runtime estimator, and calls the SAC estimator to fit piecewise-linear trade-off
+    # curves (side effect on the estimator) before copying its stats. For each module with
+    # memory stats, builds a ModStats: modules lacking SAC trade-off stats are marked leaf
+    # with zeroed SAC fields, others non-leaf. Activation figures are computed from memory
+    # snapshots on the given device and clamped at zero where noted. Returns the dict with
+    # the ordering and the stats list. Raises KeyError if snapshots or runtimes are
+    # missing for a module.
+    # KNOWN ISSUE: grad_per_module is set to the module parameter memory, not a measured
+    # gradient size (assumes grads match params).
     """
     Collect modulewise stats for a given model, including memory, runtime, and AC tradeoff stats.
 
@@ -187,18 +214,28 @@ def aggregate_stats(
 
 
 class Node(ModStats):
+    # [CLASS DOC] A ModStats record extended with the module index in forward pre-order
+    # and its position in forward post-order.
     index: int  # index according to forward pre-order
     pos_fw_post_order: int  # index according to forward post-order
 
 
 class Graph:
+    # [CLASS DOC] Tree of modules for the MILP solver. State: nodes (list of Node in pre-
+    # order), name2node (mapping from FQN to node), ad_matrix (square numpy array where
+    # entry i,j is 1 if node j is node i or its descendant) and fw_post_order (list of
+    # FQNs). add_node appends a node and indexes it by FQN.
     def __init__(self, n: int) -> None:
+        # [FUNCTION DOC] Creates an empty graph sized for n nodes: empty node list and name
+        # mapping, an n by n zero ancestor-descendant matrix and an empty post-order list.
         self.nodes: list[Node] = []
         self.name2node: dict[str, Node] = {}
         self.ad_matrix = np.zeros((n, n))
         self.fw_post_order: list[str] = []
 
     def add_node(self, node: Node) -> None:
+        # [FUNCTION DOC] Appends the node to the node list and registers it by its FQN
+        # (overwriting a same-named entry).
         self.nodes.append(node)
         self.name2node[node["fqn"]] = node
 
@@ -207,6 +244,16 @@ def parse_module_info(module_info: ModuleInfo) -> Graph:
     """
     Parse module info and create a graph (tree) of modules. The graph will be
     used by MILP solver to find optimal SAC and/or FSDP configurations.
+    # [FUNCTION DOC] Builds a Graph from a ModuleInfo. Raises AssertionError if the number
+    # of stats differs from the length of the forward pre-order. Records the forward post-
+    # order, sorts the stats by forward pre-order position, gives each node its index and
+    # post-order position, adds them to the graph, and fills the ancestor-descendant
+    # matrix (row i marks consecutive following nodes that are the same or descendants of
+    # node i, stopping at the first non-descendant). Returns the graph.
+    # KNOWN ISSUE: the sorted list is stored back into the input dict but the loop still
+    # iterates the original unsorted local list, so node indices follow the original
+    # order, not pre-order, unless the input was already sorted. The input dict is also
+    # mutated (mod_stats replaced, nodes get index fields).
     """
     mod_stats = module_info["mod_stats"]
     fw_pre_order = module_info["mod_order"]["fw_pre_order"]
@@ -242,6 +289,10 @@ def parse_module_info(module_info: ModuleInfo) -> Graph:
 
 def is_self_or_submodule(name_descendant: str, name_ancestor: str) -> bool:
     """
+    # [FUNCTION DOC] Returns True if the first name equals the ancestor name or contains
+    # the ancestor name followed by a dot, i.e. is the same module or a submodule by FQN
+    # text. Uses substring containment, so it can also be true when the ancestor appears
+    # mid-name rather than as a prefix.
     check if name_descendant is a submodule of name_ancestor, or if they are the same
     """
     return name_descendant == name_ancestor or name_ancestor + "." in name_descendant
@@ -249,6 +300,9 @@ def is_self_or_submodule(name_descendant: str, name_ancestor: str) -> bool:
 
 def is_submodule(name_descendant: str, name_ancestor: str) -> bool:
     """
+    # [FUNCTION DOC] Returns True if the ancestor name followed by a dot occurs in the
+    # descendant name (strict submodule test). Substring based, not strictly a prefix
+    # check.
     if name_descendant is a submodule of name_ancestor, but not the same
     """
     return name_ancestor + "." in name_descendant
@@ -256,6 +310,8 @@ def is_submodule(name_descendant: str, name_ancestor: str) -> bool:
 
 def display_bytes(b: int, unit: str = "MiB") -> str:
     """
+    # [FUNCTION DOC] Formats a byte count as text with two decimals in KiB, MiB or GiB
+    # depending on the unit argument (default MiB); any other unit gives plain bytes.
     return a string that represent the number of bytes in a desired unit
     """
     if unit == "KiB":
@@ -269,6 +325,12 @@ def display_bytes(b: int, unit: str = "MiB") -> str:
 
 def get_peak_memory_runtime_baseline(graph: Graph) -> tuple[int, float]:
     """
+    # [FUNCTION DOC] Computes the baseline (no FSDP, no activation checkpointing) peak
+    # memory and compute time from a graph. Peak memory is the maximum over nodes of
+    # first-node parameter memory plus that node's total gradient, activation-gradient and
+    # total activation memory. Compute time is the first (root) node's forward plus
+    # backward runtime. Returns a pair (peak bytes, time in ms). Excludes optimizer state
+    # and embeddings.
     Get the baseline peak memory and runtime.
     Baseline here means there is no FSDP or AC.
     Memory includes the parameters, gradients, activations, and activation gradients.

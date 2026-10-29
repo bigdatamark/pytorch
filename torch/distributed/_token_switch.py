@@ -1,4 +1,12 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Token routing switch abstraction for expert-parallel dispatch and
+# combine, with an NCCL EP backed implementation. Contains the Routing record,
+# autograd functions for dispatch and combine, the abstract TokenSwitch,
+# TokenSwitchNCCL, and helpers that locate and prepare the optional nccl4py package
+# and import the torch._nccl_ep extension. Import-time side effect: only creates a
+# module-level keepalive list; the extension itself is imported lazily when a
+# TokenSwitchNCCL is built. Helpers may mutate environment variables (NCCL_EP_HOME,
+# NCCL_HOME) and preload a shared library.
 from __future__ import annotations
 
 import abc
@@ -20,6 +28,9 @@ _NCCL_EP_KEEPALIVE: list[ctypes.CDLL] = []
 
 
 def _find_pkg_dir(name: str) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns the first search location directory of an installed
+    # package found by name without importing it, or None if the package (or its parent
+    # namespace) is absent or is not a package.
     # Locate an installed package's directory without importing it. find_spec
     # raises (rather than returning None) when a dotted name's parent namespace
     # is absent, so guard that.
@@ -33,6 +44,12 @@ def _find_pkg_dir(name: str) -> str | None:
 
 
 def _prepare_nccl4py() -> None:
+    # [FUNCTION DOC] HELPER: Prepares the environment for a system-NCCL build whose EP
+    # extension links against the nccl4py library. Raises ImportError if nccl4py is not
+    # installed or its EP JIT headers are missing (unless NCCL_EP_HOME is already set).
+    # Side effects: sets NCCL_EP_HOME, sets NCCL_HOME by default when the nvidia.nccl
+    # wheel has headers, and loads libnccl_ep by path (kept alive in a module-level list)
+    # so its SONAME resolves.
     # Dynamic (USE_SYSTEM_NCCL=ON / wheel) build only: the extension NEEDED-links
     # libnccl_ep.so, which the nccl4py wheel provides at runtime. Point nccl-ep's
     # JIT at nccl4py's EP headers (NCCL_EP_HOME) and the nvidia.nccl wheel's NCCL
@@ -73,6 +90,11 @@ def _prepare_nccl4py() -> None:
 
 
 def _import_nccl_ep() -> Any:
+    # [FUNCTION DOC] HELPER: Returns the torch._nccl_ep extension module. Tries a direct
+    # import first (static build); on ImportError calls the nccl4py preparation and
+    # retries. Raises ImportError with a descriptive message if the extension is
+    # unavailable, chaining the original error. May propagate the ImportError from the
+    # preparation step.
     # The EP bindings live in the optional torch._nccl_ep extension (USE_NCCL_EP).
     # A USE_SYSTEM_NCCL=OFF build links libnccl_ep statically and bakes its JIT
     # header paths, so the extension imports directly -- self-contained, no
@@ -103,11 +125,17 @@ def _import_nccl_ep() -> Any:
 
 @dataclass(frozen=True, slots=True)
 class Routing:
+    # [CLASS DOC] Immutable record of a routing plan: an opaque backend handle and the
+    # top-k expert index tensor it was created from.
     handle: object
     topk_idx: torch.Tensor
 
 
 class _DispatchAutograd(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Autograd function for TokenSwitch dispatch. Forward allocates
+    # zeroed output buffers sized for the maximum received tokens and runs the switch
+    # dispatch. Backward treats the incoming token gradient as expert-side data and runs
+    # the switch combine to send it back; weights and indexes get no gradient.
     @staticmethod
     def forward(
         ctx: Any,
@@ -117,6 +145,10 @@ class _DispatchAutograd(torch.autograd.Function):
         topk_weights: torch.Tensor,
         max_recv_tokens: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Forward pass. Takes the switch, routing, tokens (N by H),
+        # top-k weights (N by K) and the maximum receive count. Allocates zero-filled output
+        # tokens, weights and indices with that many rows, calls the switch dispatch, and
+        # saves the switch, routing and token shape on ctx. Returns the three output tensors.
         _N, H = tokens.shape
         K = topk_weights.shape[1]
         out_tokens = tokens.new_zeros(max_recv_tokens, H)
@@ -138,12 +170,19 @@ class _DispatchAutograd(torch.autograd.Function):
         grad_out_topk_weights: torch.Tensor,
         grad_out_topk_idx: torch.Tensor,
     ) -> tuple[None, None, torch.Tensor, None, None]:
+        # [FUNCTION DOC] HELPER: Backward pass. Combines the (contiguous) token gradient
+        # through the switch into a zero tensor of the original token shape and returns it as
+        # the gradient for tokens only; None for the switch, routing, weights and max count.
+        # Gradients of the weight and index outputs are ignored.
         grad_tokens = grad_out_tokens.new_zeros(ctx.tokens_shape)
         ctx.ts._combine(ctx.routing, grad_out_tokens.contiguous(), grad_tokens)
         return None, None, grad_tokens, None, None
 
 
 class _CombineAutograd(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Autograd function for TokenSwitch combine. Forward gathers
+    # expert outputs to token order; backward runs a dispatch of the output gradient to
+    # the experts.
     @staticmethod
     def forward(
         ctx: Any,
@@ -151,6 +190,10 @@ class _CombineAutograd(torch.autograd.Function):
         routing: Routing,
         expert_tokens: torch.Tensor,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Forward pass. Allocates a zeroed (num tokens by hidden)
+        # output from the routing index shape, runs the switch combine from the expert tokens,
+        # saves the switch, routing, expert shape and dtype and top-k on ctx, and returns the
+        # output.
         N = routing.topk_idx.shape[0]
         H = expert_tokens.shape[1]
         out_tokens = expert_tokens.new_zeros(N, H)
@@ -167,6 +210,11 @@ class _CombineAutograd(torch.autograd.Function):
     def backward(
         ctx: Any, grad_out_tokens: torch.Tensor
     ) -> tuple[None, None, torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Backward pass. Runs a switch dispatch of the output gradient
+        # (converted to the expert dtype) into a full-size buffer of max receive tokens rows,
+        # using dummy weight buffers, since the backend needs full-size output; then slices to
+        # the original expert row count and returns it as the gradient for expert tokens (None
+        # for the other inputs).
         M, H = ctx.expert_shape
         N = grad_out_tokens.shape[0]
         K = ctx.top_k
@@ -193,6 +241,11 @@ class _CombineAutograd(torch.autograd.Function):
 
 
 class TokenSwitch(abc.ABC):
+    # [CLASS DOC] Abstract base for a token routing switch used for expert-parallel
+    # dispatch and combine. Subclasses implement create_routing and the private _dispatch
+    # and _combine; the public dispatch and combine methods add optional output buffers
+    # and autograd support. Typical flow: create routing, dispatch tokens to experts,
+    # combine expert outputs.
     """Abstract token routing switch (e.g. expert-parallel dispatch / combine).
 
     Typical usage: :meth:`create_routing`, then :meth:`dispatch` / :meth:`combine`.
@@ -204,6 +257,9 @@ class TokenSwitch(abc.ABC):
         topk_idx: torch.Tensor,
         per_expert_token_counts: torch.Tensor | None = None,
     ) -> Routing:
+        # [FUNCTION DOC] Abstract: creates a Routing for the current phase from top-k expert
+        # indices and an optional int32 buffer receiving per-expert token counts. Base
+        # implementation raises NotImplementedError.
         """Create expert routing for the current phase (e.g. top-k indices).
 
         ``per_expert_token_counts`` is optional 1D int32, length >= local experts:
@@ -221,6 +277,8 @@ class TokenSwitch(abc.ABC):
         out_topk_weights: torch.Tensor,
         out_topk_idx: torch.Tensor,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Abstract: writes dispatched tokens, weights and indices into
+        # the given output buffers according to the routing. Base raises NotImplementedError.
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -230,6 +288,8 @@ class TokenSwitch(abc.ABC):
         expert_tokens: torch.Tensor,
         out_tokens: torch.Tensor,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Abstract: writes expert outputs gathered back in token order
+        # into the output buffer. Base raises NotImplementedError.
         raise NotImplementedError
 
     def dispatch(
@@ -241,6 +301,11 @@ class TokenSwitch(abc.ABC):
         *,
         out: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC] Routes tokens to experts. If out (a triple of output buffers) is
+        # given, dispatches directly into them and returns them, without autograd support.
+        # Otherwise requires max_recv_tokens (raises ValueError if missing), allocates the
+        # buffers and returns a triple (tokens, weights, indices) through an autograd
+        # function; the weights receive no gradient.
         """Route tokens to experts.
 
         With ``out=(out_tokens, out_topk_weights, out_topk_idx)``: writes to the provided
@@ -266,6 +331,9 @@ class TokenSwitch(abc.ABC):
         *,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Gathers expert outputs back to token order. If out is given, writes
+        # into it and returns it, without autograd support; otherwise allocates the output and
+        # returns it through an autograd function so gradients flow.
         """Gather expert outputs back to token order.
 
         With ``out=out_tokens``: writes to the provided buffer and returns it;
@@ -279,6 +347,9 @@ class TokenSwitch(abc.ABC):
 
 
 class TokenSwitchNCCL(TokenSwitch):
+    # [CLASS DOC] TokenSwitch backed by NCCL EP. Holds the loaded extension module, the
+    # maximum receive count per rank and the created EP group; routing handles are created
+    # per phase. Construction can raise ImportError if the extension is unavailable.
     """Token switch backed by NCCL EP (:func:`ncclEpCreateGroup` / dispatch / combine)."""
 
     def __init__(
@@ -289,6 +360,10 @@ class TokenSwitchNCCL(TokenSwitch):
         max_recv_tokens_per_rank: int,
         max_token_bytes: int,
     ) -> None:
+        # [FUNCTION DOC] Imports the NCCL EP extension (see the import helper) and creates the
+        # EP group from the process group, number of experts, per-rank dispatch and receive
+        # token limits and the maximum token size in bytes. Stores the extension, the receive
+        # limit and the group. Raises ImportError if unavailable.
         self._ep = _import_nccl_ep()
         self._max_recv_tokens_per_rank = max_recv_tokens_per_rank
         self._group = self._ep._NcclEpGroup.create(
@@ -304,6 +379,9 @@ class TokenSwitchNCCL(TokenSwitch):
         topk_idx: torch.Tensor,
         per_expert_token_counts: torch.Tensor | None = None,
     ) -> Routing:
+        # [FUNCTION DOC] Creates a backend routing handle from the group, top-k indices and
+        # optional per-expert count buffer, and returns a Routing holding the handle and
+        # indices.
         """Create expert routing for this phase; pass to :meth:`dispatch` / :meth:`combine`."""
         handle = self._ep._NcclEpHandle.create(
             self._group,
@@ -321,6 +399,8 @@ class TokenSwitchNCCL(TokenSwitch):
         out_topk_weights: torch.Tensor,
         out_topk_idx: torch.Tensor,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Calls the extension dispatch with the routing handle, inputs
+        # and the three output buffers (written in place).
         self._ep._nccl_ep_dispatch(
             routing.handle,
             tokens,
@@ -336,6 +416,8 @@ class TokenSwitchNCCL(TokenSwitch):
         expert_tokens: torch.Tensor,
         out_tokens: torch.Tensor,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Calls the extension combine with the routing handle, expert
+        # tokens and output buffer (written in place).
         self._ep._nccl_ep_combine(
             routing.handle,
             expert_tokens,

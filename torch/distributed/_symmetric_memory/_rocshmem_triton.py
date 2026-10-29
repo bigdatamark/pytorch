@@ -1,3 +1,11 @@
+# [MODULE DOC] rocSHMEM Triton bindings for AMD ROCm builds, the counterpart of the
+# NVSHMEM module. Provides a device bitcode library finder, a kernel registry, a post-
+# compile init hook (reusing the c10d module-init entry point), the requires_rocshmem
+# decorator, and (when Triton is available) workgroup-scoped device functions for
+# put/get, signalling, waiting, fences, PE queries and barriers. Collectives and
+# signal_op are stubs that fail at compile time. Import-time side effects: module
+# logger; conditionally imports Triton and defines kernels. Only intended to be
+# imported on ROCm.
 """
 rocSHMEM Triton integration for AMD GPU (ROCm) builds.
 
@@ -23,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 
 class RocshmemLibFinder:
+    # [CLASS DOC] Finds the architecture-specific rocSHMEM device bitcode file (named with
+    # the GPU gfx architecture). Looks first in the directory from ROCSHMEM_LIB_DIR if
+    # set, else in site-packages, the ROCm install lib directory (ROCM_PATH or /opt/rocm),
+    # and system library paths. The found path is cached in a class attribute.
     """
     Find the architecture-specific rocSHMEM device bitcode library.
 
@@ -39,6 +51,11 @@ class RocshmemLibFinder:
 
     @classmethod
     def find_device_library(cls) -> str:
+        # [FUNCTION DOC] Returns the path to the rocSHMEM device library for GPU 0. Uses the
+        # cached value if present. Raises RuntimeError if no GPU is available, if the library
+        # is missing from ROCSHMEM_LIB_DIR, or if it is not found in any search path. Reads
+        # the device architecture name (text before the first colon of the arch string), logs
+        # findings, and caches the result.
         if cls.found_device_lib_path is not None:
             return cls.found_device_lib_path
 
@@ -91,12 +108,17 @@ class RocshmemLibFinder:
 
 
 class RocshmemKernelRegistry(ShmemKernelRegistry):
+    # [CLASS DOC] Kernel-name registry for rocSHMEM, a subclass of the shared registry
+    # with its own separate class-level mapping so it does not mix with other backends.
     """Track Triton kernels that need rocSHMEM HIP-module initialization."""
 
     _to_init: dict[str, Any] = {}
 
 
 def _rocshmem_init_hook(*args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] HELPER: Post-compile hook that initializes rocSHMEM device state in
+    # the compiled module by delegating to the shared hook logic with the rocSHMEM
+    # registry and the c10d module-init entry point (the same binding used for NVSHMEM).
     """
     Post-compile hook that initializes rocSHMEM device context in the
     compiled HIP module using the existing c10d NVSHMEM entrypoint.
@@ -114,6 +136,11 @@ def _rocshmem_init_hook(*args, **kwargs) -> None:  # type: ignore[no-untyped-def
 def requires_rocshmem(  # type: ignore[no-untyped-def]
     jit_func,
 ):
+    # [FUNCTION DOC] Decorator for a Triton JIT function that needs rocSHMEM device APIs.
+    # Delegates to the shared decorator builder with the rocSHMEM library finder, extern
+    # lib key and registry, and the init hook. Raises TypeError if the input is not a JIT
+    # function (message prefixed with the decorator name). Side effects: registers the
+    # kernel and sets the global Triton post-compile hook. Returns the wrapped kernel.
     """
     Decorator to mark a Triton kernel as requiring rocSHMEM device APIs.
 
@@ -169,6 +196,9 @@ if has_triton():
 
     @triton.jit
     def put(dest, source, nelems, pe):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Triton device function: blocking put of nelems elements from local
+        # source to dest on remote PE pe. Asserts equal tensor types, converts to bytes and
+        # calls the workgroup put wrapper. Returns int32 status.
         """Put *nelems* elements from local *source* to *dest* on remote *pe*."""
         tl.static_assert(dest.type == source.type)
         nbytes = nelems * dest.type.element_ty.itemsize
@@ -178,6 +208,8 @@ if has_triton():
 
     @core.extern
     def _putmem_wg(dest, source, size_bytes, pe, _semantic=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] HELPER: Extern wrapper for the rocSHMEM workgroup put (int64
+        # addresses, byte count, int32 PE); int32 status. Not pure.
         return core.extern_elementwise(
             "",
             "",
@@ -196,6 +228,9 @@ if has_triton():
 
     @triton.jit
     def get(dest, source, nelems, pe):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Triton device function: blocking get of nelems elements from remote
+        # PE source into local dest. Asserts equal types, converts to bytes, calls the
+        # workgroup get wrapper; int32 status.
         """Get *nelems* elements from *source* on remote *pe* into local *dest* (blocking)."""
         tl.static_assert(dest.type == source.type)
         nbytes = nelems * dest.type.element_ty.itemsize
@@ -205,6 +240,8 @@ if has_triton():
 
     @core.extern
     def _getmem_wg(dest, source, size_bytes, pe, _semantic=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] HELPER: Extern wrapper for the rocSHMEM workgroup get; int32 status.
+        # Not pure.
         return core.extern_elementwise(
             "",
             "",
@@ -223,6 +260,9 @@ if has_triton():
 
     @triton.jit
     def get_nbi(dest, source, nelems, pe):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Triton device function: non-blocking get from remote PE; completion
+        # requires quiet. Asserts equal types, converts to bytes, calls the non-blocking
+        # workgroup get wrapper; int32 status.
         """Non-blocking get; call quiet() for completion."""
         tl.static_assert(dest.type == source.type)
         nbytes = nelems * dest.type.element_ty.itemsize
@@ -232,6 +272,8 @@ if has_triton():
 
     @core.extern
     def _getmem_nbi_wg(dest, source, size_bytes, pe, _semantic=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] HELPER: Extern wrapper for the rocSHMEM non-blocking workgroup get;
+        # int32 status. Not pure.
         return core.extern_elementwise(
             "",
             "",
@@ -258,6 +300,10 @@ if has_triton():
         sig_op,
         pe,
     ):
+        # [FUNCTION DOC] Triton device function: copies size_bytes to the destination on PE pe
+        # and atomically updates a signal variable there with a value and operation code.
+        # Widens the signal value to unsigned 64 bits and calls the workgroup put-with-signal
+        # wrapper; int32 status.
         """Put data to remote PE and atomically update a signal variable."""
         sig_val = 0 << 32 | sig_val
         return _putmem_signal_wg(
@@ -281,6 +327,9 @@ if has_triton():
         pe,
         _semantic=None,
     ):
+        # [FUNCTION DOC] HELPER: Extern wrapper for the rocSHMEM workgroup put-with-signal
+        # (addresses, size, signal address, uint64 value, operation, PE); int32 status. Not
+        # pure.
         return core.extern_elementwise(
             "",
             "",
@@ -302,6 +351,9 @@ if has_triton():
 
     @triton.jit
     def wait_until(ivar, cmp_op, cmp_val):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Triton device function: blocks until the 32-bit integer variable at
+        # ivar satisfies the comparison with cmp_val. Statically asserts a 4-byte element
+        # type; int32 status.
         """Block until *ivar* satisfies the comparison condition."""
         tl.static_assert(
             ivar.type.element_ty.itemsize == 4,
@@ -311,6 +363,8 @@ if has_triton():
 
     @core.extern
     def _int_wait_until(ivar, cmp, cmp_val, _semantic=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] HELPER: Extern wrapper for the rocSHMEM integer wait-until; int32
+        # status. Not pure.
         return core.extern_elementwise(
             "",
             "",
@@ -327,12 +381,17 @@ if has_triton():
 
     @triton.jit
     def signal_wait_until(signal, cmp, cmp_val):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Triton device function: blocks until a 64-bit unsigned signal
+        # variable satisfies the comparison with cmp_val (widened to unsigned 64 bits); int32
+        # status.
         """Block until a uint64 signal variable satisfies the comparison condition."""
         cmp_val = 0 << 32 | cmp_val
         return _uint64_wait_until(signal.to(tl.int64), cmp, cmp_val.to(tl.uint64))
 
     @core.extern
     def _uint64_wait_until(signal, cmp, cmp_val, _semantic=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] HELPER: Extern wrapper for the rocSHMEM uint64 wait-until; int32
+        # status. Not pure.
         return core.extern_elementwise(
             "",
             "",
@@ -349,6 +408,9 @@ if has_triton():
 
     @triton.jit
     def signal_op(sig_addr, signal, sig_op, pe):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Triton device function stub: always fails at compile time with a
+        # static assertion, since rocSHMEM device bitcode has no signal operation. The message
+        # suggests the atomic set or add calls instead.
         """Not available in current rocSHMEM device bitcode."""
         tl.static_assert(
             False,
@@ -358,6 +420,8 @@ if has_triton():
 
     @core.extern
     def fence(_semantic=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Extern device function: fence ordering issued remote operations per
+        # target PE; int32 status.
         """Ensure ordering of issued remote-memory operations to each target PE."""
         return core.extern_elementwise(
             "",
@@ -370,6 +434,8 @@ if has_triton():
 
     @core.extern
     def quiet(_semantic=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Extern device function: waits for completion of all outstanding
+        # remote memory operations; int32 status.
         """Wait for completion of all outstanding remote-memory operations."""
         return core.extern_elementwise(
             "",
@@ -382,6 +448,7 @@ if has_triton():
 
     @core.extern
     def my_pe(_semantic=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Extern device function: returns the calling PE number (int32). Pure.
         """Return the PE number of the calling PE."""
         return core.extern_elementwise(
             "",
@@ -394,6 +461,8 @@ if has_triton():
 
     @core.extern
     def n_pes(_semantic=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Extern device function: returns the total number of PEs (int32).
+        # Pure.
         """Return the total number of PEs."""
         return core.extern_elementwise(
             "",
@@ -406,6 +475,8 @@ if has_triton():
 
     @core.extern
     def barrier_all(_semantic=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Extern device function: workgroup-scoped barrier across all PEs with
+        # completion guarantee; int32 status.
         """Barrier across all PEs with completion guarantee (workgroup-scoped)."""
         return core.extern_elementwise(
             "",
@@ -418,6 +489,8 @@ if has_triton():
 
     @core.extern
     def sync_all(_semantic=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Extern device function: workgroup-scoped lightweight synchronization
+        # across all PEs; int32 status.
         """Lightweight synchronization barrier across all PEs (workgroup-scoped)."""
         return core.extern_elementwise(
             "",
@@ -433,6 +506,9 @@ if has_triton():
 
     @triton.jit
     def alltoall(team, dest, source, nelems_per_pe):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Triton device function stub: always fails at compile time (static
+        # assertion) because the workgroup all-to-all is absent from device bitcode; use the
+        # host-side stream API instead. Signature mirrors the NVSHMEM backend.
         """Not available: rocshmem_alltoallmem_wg is not in current device bitcode."""
         tl.static_assert(
             False,
@@ -442,6 +518,9 @@ if has_triton():
 
     @triton.jit
     def broadcast(team, dest, source, nelems, pe_root):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Triton device function stub: always fails at compile time because the
+        # workgroup broadcast is not in device bitcode; use the host-side API. Signature
+        # mirrors the NVSHMEM backend.
         """Not available: rocshmem_broadcastmem_wg is not in current device bitcode."""
         tl.static_assert(
             False,
@@ -451,6 +530,9 @@ if has_triton():
 
     @triton.jit
     def reduce(team, dest, source, nreduce, operation: tl.constexpr):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Triton device function stub: always fails at compile time because
+        # team reduce is not in device bitcode; use the host-side API. Signature mirrors the
+        # NVSHMEM backend.
         """Not available: rocshmem team reduce wg ops are not in current device bitcode."""
         tl.static_assert(
             False,

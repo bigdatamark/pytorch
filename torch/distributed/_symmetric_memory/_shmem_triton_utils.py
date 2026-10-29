@@ -1,3 +1,9 @@
+# [MODULE DOC] Shared helpers for the NVSHMEM and rocSHMEM Triton backends: a kernel-
+# name registry, a common post-compile init hook, and (only when Triton is installed)
+# a kernel wrapper that injects extern libraries plus a builder for the requires-
+# backend decorator. Leaf module: imports no backend or dispatch module, avoiding
+# cycles. Import-time side effect: conditional import of Triton classes if has_triton
+# is true.
 """
 Shared utilities for SHMEM Triton backends (_nvshmem_triton, _rocshmem_triton).
 
@@ -12,19 +18,28 @@ from torch.utils._triton import has_triton
 
 
 class ShmemKernelRegistry:
+    # [CLASS DOC] Registry of Triton kernel function names that need SHMEM module
+    # initialization after compilation. State is a class-level mapping shared by the class
+    # and, unless a subclass overrides it, all subclasses. Classmethods register,
+    # deregister (silent if absent) and has (membership test) manage it.
     """Base registry tracking Triton kernels that need SHMEM module init."""
 
     _to_init: dict[str, Any] = {}
 
     @classmethod
+        # [FUNCTION DOC] HELPER: Adds the kernel name to the registry if not already present
+        # (value is left unset).
     def register(cls, name: str) -> None:
         cls._to_init.setdefault(name)
 
     @classmethod
+        # [FUNCTION DOC] HELPER: Removes the kernel name from the registry; no error if it was
+        # not registered.
     def deregister(cls, name: str) -> None:
         cls._to_init.pop(name, None)
 
     @classmethod
+        # [FUNCTION DOC] HELPER: Returns True if the kernel name is registered.
     def has(cls, name: str) -> bool:
         return name in cls._to_init
 
@@ -36,6 +51,13 @@ def run_shmem_init_hook(
     module_init: Callable[[Any], None],
     logger: Any,
 ) -> None:
+    # [FUNCTION DOC] Post-compile hook body shared by both backends. Takes the Triton hook
+    # keyword arguments (function wrapper, cache key, compile info with device), the
+    # registry, a module-init callable and a logger. If the compiled function name is not
+    # registered, returns doing nothing. Otherwise looks up the compiled kernel in the
+    # per-device cache by key; if found, forces its lazy loading and calls module_init
+    # with the kernel module; if missing, logs a warning asking to report to Triton.
+    # Returns nothing.
     """Common post-compile hook logic shared by NVSHMEM and rocSHMEM backends."""
     jit_function = kwargs["fn"].jit_function
     fn_name = jit_function.fn.__name__
@@ -62,6 +84,10 @@ if has_triton():
     from triton.runtime.jit import JITFunction, KernelInterface
 
     class GridCallableWithExtern(KernelInterface):
+    # [CLASS DOC] HELPER: Triton KernelInterface wrapper around a JIT function. Stores the
+    # JIT function and an extern-libs mapping (library name to path); its run method
+    # forwards all arguments to the JIT function with extern_libs added, so callers using
+    # the launch-grid indexing syntax need not pass the library.
         """
         KernelInterface invokes self.run in __getitem__, i.e. [].
         We direct the call to JITFunction.run with extern_libs injected,
@@ -69,10 +95,13 @@ if has_triton():
         """
 
         def __init__(self, jit_func: JITFunction, extern_libs: dict[str, str]) -> None:
+        # [FUNCTION DOC] HELPER: Stores the JIT function and the extern libraries mapping.
             self.jit_func = jit_func
             self.extern_libs = extern_libs
 
         def run(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] HELPER: Forwards positional and keyword arguments to the wrapped JIT
+        # function run, injecting the stored extern libraries; returns its result.
             return self.jit_func.run(*args, **kwargs, extern_libs=self.extern_libs)
 
     def build_requires_shmem_decorator(  # type: ignore[no-untyped-def]
@@ -84,6 +113,13 @@ if has_triton():
         init_hook: Callable[..., None],
         error_prefix: str,
     ):
+        # [FUNCTION DOC] Builds the requires-backend decorator result for a Triton JIT
+        # function. Keyword args: the function, a callable locating the device library path,
+        # the extern-libs key name, the kernel registry, the post-compile init hook and an
+        # error message prefix. Raises TypeError if the input is not a JIT function. Side
+        # effects: registers the kernel name and installs the init hook as the global Triton
+        # post-compile hook (overwriting any previous one). Returns a GridCallableWithExtern
+        # wrapping the function with the library injected.
         """Build the @requires_<backend> decorator for a Triton JIT function."""
         import triton
         from triton.runtime.jit import JITFunction
