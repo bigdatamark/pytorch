@@ -1,4 +1,9 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Dynamo tests for fx_traceback.annotate: custom metadata attached to FX
+# nodes is verified on the dynamo graph and on AOT forward/backward graphs (recorded by
+# AotEagerAndRecordGraphs) via expected-inline strings, covering context-manager and
+# decorator use, activation checkpointing, graph breaks, runtime asserts and flex
+# attention. The device-generic class is instantiated for cuda and xpu at import time.
 
 import warnings
 
@@ -23,16 +28,30 @@ from torch.testing._internal.common_device_type import (
 
 
 def checkpoint_wrapper(fn):
+# [FUNCTION DOC] HELPER: Decorator that returns a wrapper calling the checkpoint utility
+# on the given function with reentrant checkpointing, forwarding positional args only.
     def inner(*args):
+    # [FUNCTION DOC] HELPER: Runs the wrapped function under reentrant activation
+    # checkpointing and returns its result.
         return torch.utils.checkpoint.checkpoint(fn, *args, use_reentrant=True)
 
     return inner
 
 
 class AnnotateTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Tests that annotate metadata propagates to compiled forward and backward
+    # graphs and survives checkpointing, decorators and runtime assertions.
     def test_annotations(self):
+        # [FUNCTION DOC] Compiles a module with nested annotate contexts using the recording aot
+        # backend, runs forward and backward, and checks one forward and one backward graph were
+        # captured and that the custom metadata per node in the dynamo, forward and backward
+        # graphs matches the expected strings (inner annotations merged with outer ones).
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module applying sin, subtract, multiply and divide under nested
+            # annotate contexts.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies sin, subtract and multiply inside annotate scopes
+                # (outer stage plus inner bucket or stream labels), then divides outside them.
                 with fx_traceback.annotate({"pp_stage": 0}):
                     with fx_traceback.annotate({"fdsp_bucket": 0}):
                         sin = torch.sin(x)
@@ -78,6 +97,9 @@ class AnnotateTests(torch._dynamo.test_case.TestCase):
         )
 
     def test_flex_attention_block_mask_fallback_to_eager(self):
+        # [FUNCTION DOC] Compiles a function calling the block-mask ordering helper on a boolean
+        # tensor and asserts the dynamo graph has exactly one argsort node whose custom metadata
+        # marks fallback_to_eager as true.
         backend = AotEagerAndRecordGraphs()
         opt_fn = torch.compile(
             lambda x: _dense_to_ordered(x)[1], backend=backend, fullgraph=True
@@ -93,11 +115,17 @@ class AnnotateTests(torch._dynamo.test_case.TestCase):
         self.assertTrue(annotated_sorts[0].meta["custom"]["fallback_to_eager"])
 
     def test_activation_checkpointing(self):
+        # [FUNCTION DOC] Annotates a call of a checkpointed sin function, compiles with the aot
+        # recording backend, runs backward, and checks the custom metadata (the checkpoint tag
+        # and wrapped body included) in the dynamo, forward and backward graphs.
         @checkpoint_wrapper
+            # [FUNCTION DOC] HELPER: Checkpointed function computing sin.
         def gn(x):
             return torch.sin(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls the checkpointed function inside an annotate scope and
+            # returns the sigmoid of the result.
             with fx_traceback.annotate({"ac_sin": 0}):
                 ac = gn(x)
             return torch.sigmoid(ac)
@@ -134,7 +162,12 @@ class AnnotateTests(torch._dynamo.test_case.TestCase):
         )
 
     def test_activation_checkpointing_annotation_inside(self):
+        # [FUNCTION DOC] Like the checkpointing test but the annotate scope is inside the
+        # checkpointed function, so only the sin node carries metadata; checks dynamo, forward
+        # and backward custom metadata strings.
         @checkpoint_wrapper
+            # [FUNCTION DOC] HELPER: Checkpointed function: add one, sin under annotate, add one
+            # again.
         def gn(x):
             x = x + 1
             with fx_traceback.annotate({"stage": 0}):
@@ -142,6 +175,7 @@ class AnnotateTests(torch._dynamo.test_case.TestCase):
             return p + 1
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies the checkpointed function and returns the sigmoid.
             ac = gn(x)
             return torch.sigmoid(ac)
 
@@ -172,12 +206,19 @@ class AnnotateTests(torch._dynamo.test_case.TestCase):
         )
 
     def test_as_decorator(self):
+        # [FUNCTION DOC] Checks annotate used as a method decorator combined with an outer
+        # annotate context: sin nodes get both labels while others get only the outer one, in
+        # the dynamo, forward and backward graphs.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose sin method is decorated with annotate.
             @fx_traceback.annotate({"fdsp_bucket": 0})
             def sin(self, x):
+                # [FUNCTION DOC] HELPER: Returns the sine of the input.
                 return torch.sin(x)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs the decorated sin, subtract and multiply under an
+                # outer annotate scope, then divides by three outside it.
                 with fx_traceback.annotate({"pp_stage": 0}):
                     sin = self.sin(x)
                     sub = sin - 2
@@ -222,7 +263,11 @@ class AnnotateTests(torch._dynamo.test_case.TestCase):
         )
 
     def test_graph_break(self):
+        # [FUNCTION DOC] Checks a graph break inside an annotate scope does not break eager
+        # compilation: compiled output equals eager output.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies sin, forces a graph break, then cos, inside an
+            # annotate scope.
             with torch.fx.traceback.annotate({"pp_stage": 0}):
                 x = torch.sin(x)
                 torch._dynamo.graph_break()
@@ -234,8 +279,14 @@ class AnnotateTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(fn(x), opt_fn(x))
 
     def test_annotation_on_runtime_asserts(self):
+        # [FUNCTION DOC] Compiles a model with dynamic input size, an item call and a check on
+        # its value under annotate, and verifies all dynamo graph nodes, including the generated
+        # runtime assertion, carry the annotation.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with data-dependent runtime assertion under annotate.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Under annotate, concatenates x with itself, converts y to
+                # a scalar, checks it is at least the new length, and returns the product.
                 with torch.fx.traceback.annotate({"moo": 0}):
                     x = torch.cat([x, x])
                     b = y.item()
@@ -265,16 +316,24 @@ class AnnotateTests(torch._dynamo.test_case.TestCase):
 
 
 class AnnotateTestsDevice(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Device-generic annotate tests for flex attention (instantiated for cuda and
+    # xpu only).
     @skipCUDAIf(
         not IS_FLEX_ATTENTION_CUDA_PLATFORM_SUPPORTED,
         "requires CUDA SM>=8.0 and Triton",
     )
     @skipXPUIf(not IS_FLEX_ATTENTION_XPU_PLATFORM_SUPPORTED, "requires XPU and Triton")
     def test_ac_flex_attention(self, device):
+        # [FUNCTION DOC] Compiles a function using flex attention with a causal-style block mask
+        # and score_mod under annotate, runs backward, and verifies the annotation appears on the
+        # dynamo, forward and backward graphs including subgraphs. Skipped without platform
+        # support.
         def _squared(score, b, h, m, n):
+            # [FUNCTION DOC] HELPER: Score modification that squares the score.
             return score * score
 
         def mask_mod(b, h, q, k):
+            # [FUNCTION DOC] HELPER: Mask function: true when the query index is nonnegative.
             return q >= 0
 
         a = 12
@@ -284,12 +343,15 @@ class AnnotateTestsDevice(torch._dynamo.test_case.TestCase):
         )
 
         def gn(x: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Runs flex attention with x as query, key and value in an
+            # annotate scope using the captured block mask and squared score.
             with fx_traceback.annotate({"compile_inductor": 0}):
                 return flex_attention(
                     x, x, x, block_mask=block_mask, score_mod=_squared
                 )
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies sin, the annotated attention and cos.
             x = torch.sin(x)
             x = gn(x)
             return torch.cos(x)
@@ -370,10 +432,16 @@ class AnnotateTestsDevice(torch._dynamo.test_case.TestCase):
     )
     @skipXPUIf(not IS_FLEX_ATTENTION_XPU_PLATFORM_SUPPORTED, "requires XPU and Triton")
     def test_flex_attention_backward_tag_does_not_leak(self, device):
+        # [FUNCTION DOC] Traces a function that calls flex attention and takes autograd grad
+        # inside an annotate scope using make_fx with node metadata preserved, and asserts that
+        # backward-tagged nodes exist but the flex attention forward node lacks the backward
+        # tag and keeps only the annotation. Skipped without platform support.
         from torch.fx.experimental.proxy_tensor import make_fx
         from torch.fx.traceback import preserve_node_meta
 
         def causal_mask(batch, head, q_idx, kv_idx):
+            # [FUNCTION DOC] HELPER: Causal mask: true when the query index is at least the key
+            # index.
             del batch, head
             return q_idx >= kv_idx
 
@@ -389,6 +457,8 @@ class AnnotateTestsDevice(torch._dynamo.test_case.TestCase):
         block_mask = create_block_mask(causal_mask, 1, 2, 128, 128, device=device)
 
         def fn(q, k, v, block_mask):
+            # [FUNCTION DOC] HELPER: In an annotate scope, runs flex attention, computes gradients
+            # of the output with respect to the inputs (discarded), and returns the output cosine.
             with fx_traceback.annotate({"ac_region_id": 0}):
                 y = flex_attention(q, k, v, block_mask=block_mask)
                 torch.autograd.grad(y, (q, k, v), torch.ones_like(y))

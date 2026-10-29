@@ -1,4 +1,10 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Dynamo tests for tracing torch.autograd.grad and Tensor.backward (with the inputs
+# argument or inferred inputs) inside compiled regions when the trace_autograd_ops option is on.
+# Verifies eager/compiled numerical parity, expected dynamo and AOT graphs via inline expected
+# strings, accumulation semantics, and the Unsupported errors raised for external grad_fn tensors,
+# consumed grad_fns, external gradient edges, non-leaf inputs and in-graph parameters. Defines one
+# test class; no import-time side effects.
 
 import copy
 import re
@@ -22,7 +28,13 @@ from torch.testing._internal.common_utils import (
 @torch._dynamo.config.patch(trace_autograd_ops=True)
 @skipIfTorchDynamo()
 class TestForwardLossBackward(TestCase):
+    # [CLASS DOC] Tests for autograd.grad and backward tracing in compiled functions. Class is
+    # patched to enable traced autograd ops and skipped under dynamo itself.
     def _run_backward_test(self, fn, mod, x, backend=None):
+        # [FUNCTION DOC] HELPER: Runs a function eagerly (recording parameter grads cloned after
+        # clearing them) and compiled with fullgraph (default aot-eager recording backend, grads
+        # cleared first), asserts equal results, equal per-parameter grads and exactly one dynamo
+        # graph, and returns the normalized printed dynamo graph for expected-inline checks.
         """
         Shared utility for running backward tests.
 
@@ -58,10 +70,15 @@ class TestForwardLossBackward(TestCase):
 
     @skipIfCrossRef
     def test_autograd_grad_basic(self):
+        # [FUNCTION DOC] Compiles a function taking autograd.grad of a linear-sum loss with
+        # respect to all parameters; checks eager/compiled results match and the expected dynamo
+        # and AOT forward graphs (the grad call is traced, forward includes backward ops).
         mod = torch.nn.Linear(4, 4)
         x = torch.randn(2, 4)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Linear then sum, grad with respect to the parameters, returns
+            # the detached loss and the two grads.
             res = mod(x)
             loss = res.sum()
             params = tuple(mod.parameters())
@@ -132,10 +149,15 @@ class <lambda>(torch.nn.Module):
 
     @skipIfCrossRef
     def test_autograd_grad_dict_inputs(self):
+        # [FUNCTION DOC] Compiles (eager backend) an autograd.grad call whose inputs are a mapping
+        # of named parameters, and checks results equal eager. The recording backend is created
+        # but its graphs are not inspected.
         mod = torch.nn.Linear(4, 4)
         x = torch.randn(2, 4)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Computes grads with respect to a mapping of parameters and
+            # returns the detached loss with the weight and bias entries.
             res = mod(x)
             loss = res.sum()
             params = dict(mod.named_parameters())
@@ -153,10 +175,14 @@ class <lambda>(torch.nn.Module):
 
     @skipIfCrossRef
     def test_autograd_grad_dict_inputs_kwargs(self):
+        # [FUNCTION DOC] Same as the mapping-inputs test but calls grad with outputs and inputs
+        # given by keyword; compares compiled eager-backend results against eager.
         mod = torch.nn.Linear(4, 4)
         x = torch.randn(2, 4)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Keyword-argument grad over a mapping of parameters; returns
+            # the detached loss and the weight and bias grads.
             res = mod(x)
             loss = res.sum()
             params = dict(mod.named_parameters())
@@ -173,10 +199,14 @@ class <lambda>(torch.nn.Module):
 
     @skipIfCrossRef
     def test_backward_dict_inputs(self):
+        # [FUNCTION DOC] Calls backward with the inputs argument given as a mapping of parameters,
+        # comparing eager (grads reset afterwards) with compiled eager-backend output.
         mod = torch.nn.Linear(4, 4)
         x = torch.randn(2, 4)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Backward limited to a mapping of parameters, returning the
+            # detached loss and clones of the weight and bias grads.
             res = mod(x)
             loss = res.sum()
             params = dict(mod.named_parameters())
@@ -196,10 +226,15 @@ class <lambda>(torch.nn.Module):
 
     @skipIfCrossRef
     def test_autograd_grad_with_kwargs(self):
+        # [FUNCTION DOC] Checks grad called with keyword arguments (retain_graph and create_graph
+        # false) is traced: results match eager and the dynamo and AOT forward graphs equal the
+        # expected strings (grads unused, so no backward ops in the forward).
         mod = torch.nn.Linear(4, 4)
         x = torch.randn(2, 4)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Computes and discards parameter grads with explicit keyword
+            # arguments and returns the detached loss.
             res = mod(x)
             loss = res.sum()
             params = tuple(mod.parameters())
@@ -262,10 +297,14 @@ class <lambda>(torch.nn.Module):
 
     @skipIfCrossRef
     def test_autograd_grad_single_tensor(self):
+        # [FUNCTION DOC] Checks autograd.grad with a single tensor input (not a sequence) is
+        # traced, results match eager, and dynamo and AOT forward graphs equal the expected text.
         mod = torch.nn.Linear(4, 4)
         x = torch.randn(2, 4)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Grad of the loss with respect to the weight; returns the
+            # detached loss and the first grad entry.
             res = mod(x)
             loss = res.sum()
             grad = torch.autograd.grad(loss, mod.weight)
@@ -332,7 +371,12 @@ class <lambda>(torch.nn.Module):
 
     @skipIfCrossRef
     def test_autograd_grad_double_backward_outside_compile(self):
+        # [FUNCTION DOC] Compiles a function that calls grad with retain_graph on a matmul loss
+        # and returns the loss, then back-propagates the returned loss outside the compiled
+        # region; asserts loss, weight grad and the final x and weight grads match eager.
         def fn(x, weight):
+            # [FUNCTION DOC] HELPER: Matmul and sum loss, retained-graph grad with respect to the
+            # weight, returns the loss and the weight grad.
             y = x @ weight
             loss = y.sum()
             # Compute gradient w.r.t weight using autograd.grad
@@ -366,6 +410,8 @@ class <lambda>(torch.nn.Module):
 
     @skipIfCrossRef
     def test_autograd_grad_with_external_grad_fn_as_grad_target(self):
+        # [FUNCTION DOC] Checks grad with respect to an input tensor that has an external grad_fn
+        # compiles fine (traversal stops at that input) and matches eager loss and grads.
         mod_eager = torch.nn.Linear(4, 4)
         x_eager = torch.randn(2, 4, requires_grad=True)
         external_computation_eager = x_eager * 2
@@ -375,6 +421,8 @@ class <lambda>(torch.nn.Module):
         external_computation_compile = x_compile * 2
 
         def fn(mod, external_input):
+            # [FUNCTION DOC] HELPER: Linear, sum, grad with respect to the passed input; returns
+            # the detached loss and the grads tuple.
             res = mod(external_input)
             loss = res.sum()
             grads = torch.autograd.grad(loss, external_input)
@@ -391,12 +439,17 @@ class <lambda>(torch.nn.Module):
 
     @skipIfCrossRef
     def test_autograd_grad_rejects_external_grad_fn_on_output(self):
+        # [FUNCTION DOC] Asserts that taking grad with respect to parameters when the loss depends
+        # on an input carrying an external grad_fn raises the Unsupported error with the external
+        # grad_fn explanation and hints.
         mod = torch.nn.Linear(4, 4)
         x = torch.randn(2, 4, requires_grad=True)
         external_computation = x * 2
 
         @torch.compile(fullgraph=True, backend="aot_eager")
         def fn(external_input):
+            # [FUNCTION DOC] HELPER: Compiled function: linear of the external input, sum, grad
+            # with respect to the weight; returns the detached loss and grads.
             res = mod(external_input)
             loss = res.sum()
             # Computing grad w.r.t. model parameters when loss depends on
@@ -422,11 +475,16 @@ autograd.grad with external grad_fn
 
     @skipIfCrossRef
     def test_autograd_grad_manual_update_matches_eager(self):
+        # [FUNCTION DOC] Runs a training-style step that takes grad without materializing and
+        # manually assigns or accumulates into parameter grads, eager and compiled (via a zero-
+        # argument lambda); asserts equal losses and weight and bias grads.
         mod_eager = torch.nn.Linear(4, 4)
         mod_compiled = copy.deepcopy(mod_eager)
         x = torch.randn(2, 4)
 
         def step_fn(mod):
+            # [FUNCTION DOC] HELPER: Grad of the sum of a linear output with respect to the module
+            # parameters; sets grad when absent, otherwise adds in place; returns detached loss.
             res = mod(x)
             loss = res.sum()
             params = tuple(mod.parameters())
@@ -452,11 +510,16 @@ autograd.grad with external grad_fn
         self.assertEqual(mod_eager.bias.grad, mod_compiled.bias.grad)
 
     def test_autograd_grad_rejects_external_grad_fn_from_outer_scope(self):
+        # [FUNCTION DOC] Asserts that taking grad with respect to a tensor from the outer scope
+        # while the compiled function input has an external grad_fn raises Unsupported with the
+        # external grad_fn message (the debug context names the function argument).
         x = torch.randn(2, 4, requires_grad=True)
         external = x * 2
 
         @torch.compile(fullgraph=True, backend="aot_eager")
         def fn(ext):
+            # [FUNCTION DOC] HELPER: Sums sin of the input and takes retained, allow-unused grad
+            # with respect to the outer-scope tensor; returns it.
             y = (ext.sin()).sum()
             # x is from outer scope - this requires traversing ext's grad_fn
             gx = torch.autograd.grad(y, x, retain_graph=True, allow_unused=True)[0]
@@ -479,10 +542,15 @@ autograd.grad with external grad_fn
 
     @skipIfCrossRef
     def test_autograd_grad_with_unrelated_requires_grad_output(self):
+        # [FUNCTION DOC] Checks that returning an unrelated output that requires grad alongside a
+        # traced grad works: output requires grad, and dynamo graph, AOT forward and backward
+        # graphs equal the expected strings; backward is triggered through the sin output.
         mod = torch.nn.Linear(4, 4)
         x = torch.randn(2, 4, requires_grad=True)
 
         def step_fn(x):
+            # [FUNCTION DOC] HELPER: Takes non-materialized grads of the linear loss, sums them
+            # into a norm, returns the detached norm and sin of the input.
             res = mod(x)
             loss = res.sum()
             params = tuple(mod.parameters())
@@ -583,7 +651,13 @@ class GraphModule(torch.nn.Module):
 
     @skipIfCrossRef
     def test_autograd_grad_missing_detach_errors_like_eager(self):
+        # [FUNCTION DOC] Shows that returning a loss whose graph was consumed by grad fails: eager
+        # backward raises a second-time error; fullgraph compile raises Unsupported naming the
+        # consumed returned tensor; with graph breaks allowed there are two frames and the
+        # returned loss still raises the second-time error on backward.
         def step(mod, x):
+            # [FUNCTION DOC] HELPER: Linear loss, grad with respect to parameters, returns the
+            # non-detached loss and the sum of grad sums.
             res = mod(x)
             loss = res.sum()
             params = tuple(mod.parameters())
@@ -639,9 +713,13 @@ autograd.grad consumed returned tensor's grad_fn
             loss_compiled.backward()
 
     def test_autograd_grad_consumed_intermediate_tensor(self):
+        # [FUNCTION DOC] Checks that returning an intermediate tensor whose grad_fn was consumed
+        # by grad fails in eager on backward and makes fullgraph compile raise Unsupported.
         torch._dynamo.reset()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Builds y and z from x, takes grad of the sum of z, returns y
+            # and the grad (y's graph being consumed).
             y = x * 2  # y.grad_fn = MulBackward
             z = y + 1  # z.grad_fn = AddBackward -> MulBackward
             grad = torch.autograd.grad(
@@ -669,10 +747,14 @@ autograd.grad consumed returned tensor's grad_fn
             compiled_fn(torch.randn(4, requires_grad=True))
 
     def test_autograd_grad_leaked_tensor_names_in_error(self):
+        # [FUNCTION DOC] Asserts the Unsupported error for returning consumed tensors lists the
+        # leaked output tensors.
         """Test that the error message includes the names of all leaked tensors."""
         torch._dynamo.reset()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Takes grad of a sum of two products and returns both consumed
+            # intermediates.
             a = x * 2
             b = x * 3
             z = (a + b).sum()
@@ -690,10 +772,14 @@ autograd.grad consumed returned tensor's grad_fn
 
     @skipIfCrossRef
     def test_autograd_grad_external_grad_fn_detached(self):
+        # [FUNCTION DOC] Checks that an external input with a grad_fn is acceptable once detached
+        # inside the function: compiled call succeeds and returns the expected constant grad.
         torch._dynamo.reset()
 
         @torch.compile(fullgraph=True, backend="aot_eager")
         def fn(y_ext, x_internal):
+            # [FUNCTION DOC] HELPER: Detaches the external tensor, adds three times the internal
+            # one, and returns the grad of the sum with respect to the internal tensor.
             # y_ext has external grad_fn but we detach it
             y_detached = y_ext.detach()
             z = y_detached + x_internal * 3
@@ -709,12 +795,15 @@ autograd.grad consumed returned tensor's grad_fn
 
     @skipIfCrossRef
     def test_autograd_grad_rejects_external_gradient_edge(self):
+        # [FUNCTION DOC] Asserts that passing an external gradient edge object as the grad output
+        # argument raises Unsupported with the external GradientEdge message.
         from torch.autograd.graph import GradientEdge
 
         torch._dynamo.reset()
 
         @torch.compile(fullgraph=True, backend="aot_eager")
         def fn(edge, x):
+            # [FUNCTION DOC] HELPER: Grad with the edge as output and ones as grad outputs.
             return torch.autograd.grad(edge, x, grad_outputs=torch.ones(3))
 
         x = torch.randn(3, requires_grad=True)
@@ -740,12 +829,16 @@ autograd.grad with external GradientEdge
 
     @skipIfCrossRef
     def test_autograd_grad_rejects_tuple_of_external_gradient_edges(self):
+        # [FUNCTION DOC] Asserts a tuple of external gradient edges raises Unsupported, with a
+        # debug context naming the first tuple element.
         from torch.autograd.graph import GradientEdge
 
         torch._dynamo.reset()
 
         @torch.compile(fullgraph=True, backend="aot_eager")
         def fn(edges, x):
+            # [FUNCTION DOC] HELPER: Grad with the edges as outputs and two ones tensors as grad
+            # outputs.
             return torch.autograd.grad(
                 edges, x, grad_outputs=[torch.ones(3), torch.ones(3)]
             )
@@ -774,9 +867,15 @@ autograd.grad with external GradientEdge
 
     @skipIfCrossRef
     def test_autograd_grad_returning_input_tensor(self):
+        # [FUNCTION DOC] Checks that returning an input to grad (grad stops there, so its grad_fn
+        # is not consumed) is safe: eager backward gives grad two; compile only has to run.
+        # KNOWN ISSUE: compiled outputs are never compared or back-propagated, so the test only
+        # checks that compile and run do not raise.
         torch._dynamo.reset()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Grad of z sum with respect to intermediate y; returns y and
+            # the grad.
             y = x * 2  # y.grad_fn = MulBackward
             z = y * 3  # z.grad_fn = MulBackward2 -> MulBackward
             # autograd.grad stops AT y, so y.grad_fn should NOT be consumed
@@ -795,6 +894,9 @@ autograd.grad with external GradientEdge
 
     @skipIfCrossRef
     def test_autograd_grad_gradient_penalty(self):
+        # [FUNCTION DOC] Gradient penalty scenario: two nested grad calls (the first with
+        # create_graph) on a small discriminator; compares eager and compiled penalty value and
+        # parameter grads, using separate copies of the model and input.
         torch._dynamo.reset()
 
         discriminator = torch.nn.Sequential(
@@ -804,6 +906,9 @@ autograd.grad with external GradientEdge
         )
 
         def compute_gradient_penalty_and_grads(discriminator, interpolates):
+            # [FUNCTION DOC] HELPER: Computes input grads with create_graph, the norm based
+            # penalty, then parameter grads of the penalty; returns detached penalty and param
+            # grads.
             params = tuple(discriminator.parameters())
 
             # Forward pass
@@ -861,6 +966,8 @@ autograd.grad with external GradientEdge
 
     @skipIfCrossRef
     def test_autograd_grad_with_tensor_subclass(self):
+        # [FUNCTION DOC] Checks grad inside a compiled function that receives a two-tensor
+        # subclass: the result equals the subclass first inner tensor in eager and compiled.
         torch._dynamo.reset()
 
         from torch.testing._internal.two_tensor import TwoTensor
@@ -870,6 +977,8 @@ autograd.grad with external GradientEdge
         two_tensor = TwoTensor(inner_a, inner_b)
 
         def fn(tt, param):
+            # [FUNCTION DOC] HELPER: Combines subclass inner tensors with the param, sums, and
+            # returns the grad with respect to param.
             result = tt.a * param + tt.b
             loss = result.sum()
             grad = torch.autograd.grad(loss, param)
@@ -888,9 +997,12 @@ autograd.grad with external GradientEdge
 
     @skipIfCrossRef
     def test_autograd_grad_double_consumption_detected(self):
+        # [FUNCTION DOC] Verifies calling grad twice on the same graph fails in eager (second time
+        # error) and at compile time with the Unsupported already consumed message.
         torch._dynamo.reset()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls grad twice on the same sum and adds the results.
             y = x * 2
             z = y * 3
             # First autograd.grad consumes MulBackward from z and y
@@ -926,10 +1038,15 @@ autograd.grad with external GradientEdge
 
     @skipIfCrossRef
     def test_tensor_backward_basic(self):
+        # [FUNCTION DOC] Checks Tensor.backward with an explicit inputs list is rewritten into a
+        # grad call plus no-grad copying into new gradient tensors; compares with eager grads and
+        # checks the expected dynamo and AOT graphs via the shared helper.
         mod = torch.nn.Linear(4, 4)
         x = torch.randn(2, 4)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Backward limited to the parameter list; returns detached
+            # loss.
             res = mod(x)
             loss = res.sum()
             params = list(mod.parameters())
@@ -971,10 +1088,13 @@ class GraphModule(torch.nn.Module):
 
     @skipIfCrossRef
     def test_tensor_backward_without_inputs(self):
+        # [FUNCTION DOC] Checks backward without inputs infers the parameters (grad allowing
+        # unused), using the eager recording backend, and checks the expected graph.
         mod = torch.nn.Linear(4, 4)
         x = torch.randn(2, 4)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Backward without an inputs argument; returns detached loss.
             res = mod(x)
             loss = res.sum()
             loss.backward()  # No inputs - auto-detect!
@@ -1015,10 +1135,14 @@ class GraphModule(torch.nn.Module):
 
     @skipIfCrossRef
     def test_tensor_backward_with_gradient(self):
+        # [FUNCTION DOC] Checks backward of a non-scalar output with an explicit gradient tensor
+        # and inputs list; compares with eager and checks the expected graph.
         mod = torch.nn.Linear(4, 4)
         x = torch.randn(2, 4)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Linear output, ones gradient, backward on parameters; returns
+            # the sum of the detached output.
             res = mod(x)  # [2, 4]
             params = list(mod.parameters())
             # Non-scalar output, need gradient
@@ -1062,10 +1186,14 @@ class GraphModule(torch.nn.Module):
 
     @skipIfCrossRef
     def test_tensor_backward_accumulates_grads(self):
+        # [FUNCTION DOC] Checks two successive backward calls (the first retaining the graph)
+        # accumulate into the same gradient tensors, compared with eager and an expected graph.
         mod = torch.nn.Linear(4, 4)
         x = torch.randn(2, 4)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Calls backward on the parameters twice, retaining the graph
+            # the first time; returns detached loss.
             res = mod(x)
             loss = res.sum()
             params = list(mod.parameters())
@@ -1125,10 +1253,14 @@ class GraphModule(torch.nn.Module):
 
     @skipIfCrossRef
     def test_tensor_backward_preserves_existing_grad_reference(self):
+        # [FUNCTION DOC] Checks compiled backward with inputs accumulates into the existing weight
+        # grad tensor in place: after eager and compiled runs the grad object identity is
+        # preserved and values equal.
         mod = torch.nn.Linear(4, 4)
         x = torch.randn(2, 4)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Backward on the weight only; returns detached loss.
             loss = mod(x).sum()
             loss.backward(inputs=[mod.weight])
             return loss.detach()
@@ -1150,6 +1282,9 @@ class GraphModule(torch.nn.Module):
 
     @skipIfCrossRef
     def test_backward_on_no_grad_tensor(self):
+        # [FUNCTION DOC] Checks that calling backward on a tensor created under no-grad (no
+        # grad_fn) inside a compiled function raises the runtime error about it not requiring
+        # grad.
         """Test that backward on tensor without requires_grad raises error."""
         x = torch.ones(5, 5, requires_grad=True)
         y = torch.ones(5, 5) * 4
@@ -1158,6 +1293,7 @@ class GraphModule(torch.nn.Module):
 
         @torch.compile(backend="eager", fullgraph=True)
         def fn(w):
+            # [FUNCTION DOC] HELPER: Calls backward with a ones tensor on the argument.
             w.backward(torch.ones(5, 5))
 
         self.assertRaisesRegex(
@@ -1170,6 +1306,9 @@ class GraphModule(torch.nn.Module):
     @skipIfCrossRef
     @torch._dynamo.config.patch(graph_break_on_nn_param_ctor=False)
     def test_autograd_grad_with_ingraph_nn_parameter(self):
+        # [FUNCTION DOC] With in-graph parameter creation enabled, checks grad with respect to an
+        # nn.Parameter created in the compiled function matches eager and that the graph uses the
+        # created parameter rather than the synthetic placeholder input.
         """Test autograd.grad works for nn.Parameter created in-graph.
 
         When graph_break_on_nn_param_ctor=False, nn.Parameter is created inside the
@@ -1182,6 +1321,8 @@ class GraphModule(torch.nn.Module):
         """
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Creates a ones parameter, matmuls and sums, returns the grad
+            # with respect to it.
             w = torch.nn.Parameter(torch.ones(4, 4))
             y = x @ w
             loss = y.sum()
@@ -1228,7 +1369,10 @@ class GraphModule(torch.nn.Module):
     @skipIfCrossRef
     @torch._dynamo.config.patch(graph_break_on_nn_param_ctor=False)
     def test_tensor_backward_with_ingraph_nn_parameter(self):
+        # [FUNCTION DOC] With in-graph parameter creation enabled, asserts backward with inputs
+        # naming an in-graph created tensor raises the Unsupported in-graph tensor error.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Creates a parameter, backward on it, returns its grad.
             w = torch.nn.Parameter(torch.ones(4, 4))
             y = x @ w
             loss = y.sum()
@@ -1254,6 +1398,8 @@ backward() with in-graph created tensor
 
     @skipIfCrossRef
     def test_tensor_backward_duplicate_inputs(self):
+        # [FUNCTION DOC] Checks duplicate entries in the backward inputs list do not double
+        # accumulate in compiled mode: weight grad equals the eager one.
         """Test that duplicate inputs don't cause double accumulation.
 
         In eager mode, backward([x, x]) doesn't double-accumulate gradients.
@@ -1263,6 +1409,7 @@ backward() with in-graph created tensor
         x = torch.randn(2, 4)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Backward with the weight passed twice; returns detached loss.
             res = mod(x)
             loss = res.sum()
             # Pass weight twice - should NOT double accumulate
@@ -1284,10 +1431,14 @@ backward() with in-graph created tensor
 
     @skipIfCrossRef
     def test_tensor_backward_non_leaf_inputs(self):
+        # [FUNCTION DOC] Asserts backward with an input list containing a non-leaf tensor raises
+        # the Unsupported non-leaf error when compiled.
         mod = torch.nn.Linear(4, 4)
         x = torch.randn(2, 4)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Backward with the weight and a non-leaf intermediate as
+            # inputs.
             res = mod(x)
             loss = res.sum()
             loss.backward(inputs=[mod.weight, res])
@@ -1307,9 +1458,12 @@ backward() with non-leaf tensor
 
     @skipIfCrossRef
     def test_tensor_should_accumulate_in_same_tensor(self):
+        # [FUNCTION DOC] Checks that compiled backward without inputs accumulates into the same
+        # grad tensor object that eager produced (identity check on the returned grad).
         # We want to make sure torch.compile accumulate_grad
         # logic needs to happen under no_grad context.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Matmul sum loss, backward, returns the first argument grad.
             loss = (a @ b).sum()
             loss.backward()
             return a.grad
@@ -1326,7 +1480,10 @@ backward() with non-leaf tensor
         self.assertTrue(ref is act)
 
     def test_autograd_grad_lost_grad_fn_in_closure(self):
+        # [FUNCTION DOC] Takes a function-transform vjp closure and compiles the closure alone;
+        # asserts Unsupported is raised mentioning a lost grad_fn linkage.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of squares of x.
             return (x**2).sum()
 
         x = torch.randn(4, requires_grad=True)
@@ -1339,7 +1496,10 @@ backward() with non-leaf tensor
             torch.compile(vjp_fn, backend="eager", fullgraph=True)(torch.ones(()))
 
     def test_autograd_grad_transform_closure_compiled_separately(self):
+        # [FUNCTION DOC] Compiles a vjp closure built outside compile with a counting backend; the
+        # result equals eager and no frames are compiled (frame count zero).
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of squares of x.
             return (x**2).sum()
 
         x = torch.randn(4, requires_grad=True)
@@ -1356,11 +1516,16 @@ backward() with non-leaf tensor
 
     @skipIfCrossRef
     def test_autograd_grad_transform_compiled_end_to_end(self):
+        # [FUNCTION DOC] Compiles a function that builds a vjp and applies it in one fullgraph
+        # region; the result equals the eager vjp result.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of squares of x.
             return (x**2).sum()
 
         @torch.compile(backend="eager", fullgraph=True)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Builds the vjp function of the square-sum and applies it to a
+            # scalar ones.
             _, vjp_fn = torch.func.vjp(f, x)
             return vjp_fn(torch.ones(()))
 
@@ -1370,7 +1535,10 @@ backward() with non-leaf tensor
         self.assertEqual(result, expected)
 
     def test_autograd_grad_multi_output_transform_closure(self):
+        # [FUNCTION DOC] Compiles (counting backend) a vjp closure for a two-output function with
+        # a tuple cotangent and checks the result equals eager.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns x doubled and x tripled.
             return x * 2, x * 3
 
         x = torch.randn(4, requires_grad=True)
@@ -1385,11 +1553,16 @@ backward() with non-leaf tensor
 
     @skipIfCrossRef
     def test_autograd_grad_inline_computation_no_graph_break(self):
+        # [FUNCTION DOC] Compiles a function that creates a vjp and calls it within one fullgraph
+        # region, and checks both the value and the gradient equal eager.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the sum of x doubled.
             return (x * 2).sum()
 
         @torch.compile(backend="eager", fullgraph=True)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Builds a vjp for the doubled sum and returns the value and
+            # the vjp applied to a scalar ones.
             y, vjp_fn = torch.func.vjp(f, x)
             return y, vjp_fn(torch.ones(()))
 
