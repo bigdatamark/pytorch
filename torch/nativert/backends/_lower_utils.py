@@ -1,3 +1,6 @@
+# [MODULE DOC] Utilities for lowering an exported program to an AOTInductor-compiled delegate and
+# packaging it for the native runtime. Provides flattening of program inputs/outputs, lowering into a delegate
+# program that calls the executorch call-delegate higher-order op, and writing the pt2 archive.
 import types
 
 import torch
@@ -10,19 +13,26 @@ from ._lowered_aoti_module import LoweredBackendModule
 
 
 def get_new_ep_with_flat_inputs_outputs(ep: ExportedProgram) -> ExportedProgram:
+    # [FUNCTION DOC] Returns a new exported program whose inputs and outputs are flat. Wraps the original module so flat
+    # inputs are unflattened with the input spec, the module is called, and outputs are flattened to a tuple;
+    # then re-exports it using the flattened example inputs of the original.
     class FlattenedModule(torch.nn.Module):
+        # [CLASS DOC] HELPER: Module adapter holding the original module and its input/output specs; its forward
+        # accepts flat inputs and returns a flat tuple of outputs.
         def __init__(
             self,
             original_module: torch.fx.GraphModule,
             in_spec: pytree.TreeSpec,
             out_spec: pytree.TreeSpec,
         ) -> None:
+            # [FUNCTION DOC] Stores the original module and the input and output tree specs.
             super().__init__()
             self.original_module = original_module
             self.in_spec = in_spec
             self.out_spec = out_spec
 
         def forward(self, *flat_inputs):  # type: ignore[no-untyped-def]
+            # [FUNCTION DOC] Rebuilds args and kwargs from flat inputs via the input spec, calls the original module and returns the flattened outputs as a tuple.
             # Unflatten inputs to original structure
             inputs = pytree.tree_unflatten(flat_inputs, self.in_spec)
             args, kwargs = inputs
@@ -44,6 +54,10 @@ def get_new_ep_with_flat_inputs_outputs(ep: ExportedProgram) -> ExportedProgram:
 def lower_exported_program(
     exported_program: ExportedProgram, model_name: str, backend_id: str
 ) -> tuple[ExportedProgram, AOTI_FILES]:
+    # [FUNCTION DOC] Compiles the flattened program ahead of time with AOTInductor in packaging mode, wraps it in a
+    # LoweredBackendModule, patches its forward to flatten inputs, invoke the call-delegate op and restore the
+    # original output structure, and re-exports it. Returns the delegate program and the list of AOTI files.
+    # Raises an assertion error if the compile result is not a list. Side effects: runs compilation.
     """
     Lower an exported program to AOTInductor and return a delegate ExportedProgram
     with the `executorch_call_delegate` HOP
@@ -66,6 +80,8 @@ def lower_exported_program(
     )
 
     def patched_forward(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] HELPER: Replacement forward bound to the lowered module: flattens inputs, calls the delegate op,
+        # and unflattens outputs with the saved output spec when available.
         flat_inputs, _ = pytree.tree_flatten((args, kwargs))
         flat_outputs = torch._higher_order_ops.executorch_call_delegate(
             self, *flat_inputs
@@ -90,6 +106,8 @@ def package_nativert_with_aoti_delegate(
     delegate_ep: ExportedProgram,
     delegate_files: AOTI_FILES,
 ) -> None:
+    # [FUNCTION DOC] Writes a pt2 archive to f containing the original program under model_name and the delegate
+    # program under model_name plus backend id, along with the delegate AOTI files. Returns nothing.
     """
     Package a pt2 archive file that can be consumed by NativeRT with AOTI Delegate
     """

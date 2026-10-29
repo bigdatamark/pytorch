@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Public torch.nested API for nested tensors (strided and jagged layouts): as_nested_tensor,
+# nested_tensor, nested_tensor_from_jagged, narrow, masked_select and to_padded_tensor.
+# Import-time side effects: attaches docs to the builtin padded-tensor op, and registers the jagged
+# nested tensor class and its rebuild helper as safe globals for weights-only loading.
 from typing import Optional, Union
 
 import torch
@@ -30,6 +34,11 @@ def as_nested_tensor(
     device: Device | None = None,
     layout=None,
 ) -> Tensor:
+    # [FUNCTION DOC] Builds a nested tensor, keeping autograd history, from a tensor (batch of equal-size items) or a list
+    # or tuple of tensors, in strided or jagged layout. Nested input is returned (converted for device/dtype) when
+    # layouts match; otherwise a runtime error. Raises a type error for bad input, runtime error for dim below 2 or
+    # unsupported layout. Returns the nested tensor.
+    # KNOWN ISSUE: for nested input with layout left as None the layout comparison fails, so it raises instead of returning the input.
     r"""
     Constructs a nested tensor preserving autograd history from a tensor or a list / tuple of
     tensors.
@@ -221,6 +230,9 @@ def nested_tensor(
     requires_grad=False,
     pin_memory=False,
 ) -> Tensor:
+    # [FUNCTION DOC] Builds a leaf nested tensor from a list of tensors (or array-likes) with optional dtype, layout,
+    # device, requires_grad and pin_memory. Strided uses the builtin; jagged converts scalars to tensors,
+    # builds under no-grad, sets requires_grad and optionally pins memory. Raises a runtime error for an unsupported layout.
     r"""
     Constructs a nested tensor with no autograd history (also known as a "leaf tensor", see
     :ref:`Autograd mechanics <autograd-mechanics>`) from :attr:`tensor_list` a list of tensors.
@@ -290,6 +302,9 @@ def narrow(
     length: int | Tensor,
     layout=torch.strided,
 ) -> Tensor:
+    # [FUNCTION DOC] Builds a nested tensor from a strided tensor by narrowing along dim. Strided layout: needs integer start
+    # and length, copies. Jagged layout: only dim 1, start/length are tensors (ints are converted), result is a view.
+    # Raises a runtime error for bad argument types, non-integer args in strided layout, other dims or layouts.
     r"""
     Constructs a nested tensor (which might be a view) from :attr:`tensor`, a strided tensor. This follows
     similar semantics to torch.Tensor.narrow, where in the :attr:`dim`-th dimension the new nested tensor
@@ -369,6 +384,10 @@ def nested_tensor_from_jagged(
     min_seqlen: int | None = None,
     max_seqlen: int | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Builds a jagged nested tensor viewing a values buffer using offsets and/or lengths. If only lengths
+    # is given they are converted to offsets. jagged_dim defaults to 1; min/max sequence lengths are cached if given.
+    # Raises a runtime error under fx symbolic tracing or when neither offsets nor lengths is given, and a value
+    # error if jagged_dim is below 1. Returns the nested tensor.
     r"""
     Constructs a jagged layout nested tensor from the given jagged components. The jagged layout
     consists of a required values buffer with the jagged dimension packed into a single dimension.
@@ -473,6 +492,8 @@ def nested_tensor_from_jagged(
 
 
 def masked_select(tensor: Tensor, mask: Tensor) -> Tensor:
+    # [FUNCTION DOC] Builds a jagged nested tensor from a strided tensor and strided mask: keeps masked-in values and
+    # derives offsets from per-row counts of selected elements. Raises a runtime error if either input is not strided.
     r"""
     Constructs a nested tensor given a strided tensor input and a strided mask, the resulting jagged layout nested tensor
     will have values retain values where the mask is equal to True. The dimensionality of the mask is preserved and is

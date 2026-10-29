@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Launches several worker processes that each run a function with their index and arguments,
+# with error propagation to the parent. Provides spawn, start_processes, ProcessContext (join/monitor) and
+# exception types for raised errors and abnormal exits. Optional parallel start for forkserver is
+# controlled by the TORCH_MP_PARALLEL_START environment variable. Imports a prctl helper from the package.
 import logging
 import multiprocessing
 import multiprocessing.connection
@@ -30,23 +34,31 @@ __all__ = [
 
 
 class ProcessException(Exception):
+    # [CLASS DOC] Base error for a failed child process. Holds msg, error_index (child rank) and error_pid.
+    # Picklable through __reduce__ so it can cross process boundaries.
     __slots__ = ["error_index", "error_pid"]
 
     def __init__(self, msg: str, error_index: int, error_pid: int):
+        # [FUNCTION DOC] Stores the message, index of the failed process and its pid.
         super().__init__(msg)
         self.msg = msg
         self.error_index = error_index
         self.error_pid = error_pid
 
     def __reduce__(self):
+        # [FUNCTION DOC] Pickle support: rebuild with message, error index and pid.
         return type(self), (self.msg, self.error_index, self.error_pid)
 
 
 class ProcessRaisedException(ProcessException):
+    # [CLASS DOC] A child failed because its function raised; the message holds the child's traceback text.
     """Exception raised when a process failed due to an exception raised by the code."""
 
 
 class ProcessExitedException(ProcessException):
+    # [CLASS DOC] A child died from a signal or exited with a nonzero code without a recorded traceback.
+    # Extra state: exit_code and signal_name (None unless killed by a signal).
+    # KNOWN ISSUE: slots lists only exit_code although signal_name is also set; harmless since exceptions have a dict.
     """Exception raised when a process failed due to signal or exited with a specific code."""
 
     __slots__ = ["exit_code"]
@@ -59,11 +71,13 @@ class ProcessExitedException(ProcessException):
         exit_code: int,
         signal_name: str | None = None,
     ):
+        # [FUNCTION DOC] Stores base error fields plus the exit code and optional signal name.
         super().__init__(msg, error_index, error_pid)
         self.exit_code = exit_code
         self.signal_name = signal_name
 
     def __reduce__(self):
+        # [FUNCTION DOC] Pickle support: rebuild with message, index, pid, exit code and signal name.
         return (
             type(self),
             (
@@ -77,6 +91,9 @@ class ProcessExitedException(ProcessException):
 
 
 def _wrap(fn, i, args, error_file):
+    # [FUNCTION DOC] HELPER: Child process entry point. Requests a parent-death SIGINT where supported, runs the user
+    # function with the process index and args. A keyboard interrupt is swallowed; any other exception has its
+    # formatted traceback pickled to error_file and the process exits with status 1.
     # prctl(2) is a Linux specific system call.
     # On other systems the following function call has no effect.
     # This is set to ensure that non-daemonic child processes can
@@ -97,7 +114,11 @@ def _wrap(fn, i, args, error_file):
 
 
 class ProcessContext:
+    # [CLASS DOC] Handle to a set of started worker processes. State: processes, error_files (one per process,
+    # written only on a Python exception) and sentinels (mapping from process sentinel to index, shrinking as
+    # processes are joined). Methods: pids and join.
     def __init__(self, processes, error_files):
+        # [FUNCTION DOC] Stores the processes and error file names and builds the sentinel-to-index mapping.
         self.error_files = error_files
         self.processes = processes
         self.sentinels = {
@@ -105,9 +126,11 @@ class ProcessContext:
         }
 
     def pids(self):
+        # [FUNCTION DOC] Returns the list of process ids as integers.
         return [int(process.pid) for process in self.processes]
 
     def _join_procs_with_timeout(self, timeout: float):
+        # [FUNCTION DOC] HELPER: Joins every process, sharing one total timeout budget across them.
         """Attempt to join all processes with a shared timeout."""
         end = time.monotonic() + timeout
         for process in self.processes:
@@ -116,6 +139,11 @@ class ProcessContext:
             process.join(time_to_wait)
 
     def join(self, timeout: float | None = None, grace_period: float | None = None):
+        # [FUNCTION DOC] Waits (up to timeout) for any process to finish. Returns True when all have been joined, False if
+        # some remain, immediately True if nothing is left. If a joined process failed, optionally waits a grace
+        # period, sends terminate to live processes, waits again, then kills stragglers, and raises:
+        # ProcessExitedException if no traceback file exists (signal name or exit code in message), otherwise
+        # ProcessRaisedException containing the child's traceback. Side effects: logs warnings, kills processes.
         r"""Join one or more processes within spawn context.
 
         Attempt to join one or more processes in this spawn context.
@@ -212,7 +240,9 @@ class ProcessContext:
 
 
 class SpawnContext(ProcessContext):
+    # [CLASS DOC] Deprecated alias subclass of ProcessContext kept for backward compatibility; warns on creation.
     def __init__(self, processes, error_files):
+        # [FUNCTION DOC] Emits a warning that the class was renamed to ProcessContext, then initializes the base class.
         warnings.warn(
             "SpawnContext is renamed to ProcessContext since 1.4 release.", stacklevel=2
         )
@@ -235,6 +265,11 @@ def start_processes(
     daemon=False,
     start_method="spawn",
 ):
+    # [FUNCTION DOC] Starts nprocs processes with the chosen start method, each running the wrapper that calls fn with
+    # its index and args. Starts them in parallel threads only for forkserver when the environment variable
+    # is set to 1. Each process gets a unique temporary error file name (created then removed).
+    # If join is False returns the ProcessContext; otherwise blocks, joining until all succeed, and
+    # returns None (join raises on child failure). Side effects: spawns processes, creates temp names.
     # To speed up performance in certain cases (see https://github.com/pytorch/pytorch/issues/133010),
     # this func will start processes in parallel if start_method is 'forkserver'.
     # Please opt in to this perf optimization by setting env var (TORCH_MP_PARALLEL_START) to 1.
@@ -254,6 +289,8 @@ def start_processes(
     processes = [None] * nprocs
 
     def start_process(i):
+        # [FUNCTION DOC] HELPER: Creates the error file name, builds and starts one process (daemon flag as given).
+        # Returns the index, the process and the error file name.
         # Each process is assigned a file to write tracebacks to.  We
         # use the file being non-empty to indicate an exception
         # occurred (vs an expected shutdown).  Note: this previously
@@ -298,6 +335,8 @@ def start_processes(
 
 
 def spawn(fn, args=(), nprocs=1, join=True, daemon=False, start_method="spawn"):
+    # [FUNCTION DOC] Public wrapper that runs fn in nprocs spawned processes. Warns (FutureWarning) if start_method is not
+    # spawn, but always uses spawn. Returns what start_processes returns: None when joined, else a ProcessContext.
     r"""Spawns ``nprocs`` processes that run ``fn`` with ``args``.
 
     If one of the processes exits with a non-zero exit status, the

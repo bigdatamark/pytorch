@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Core jagged-layout nested tensor subclass and helpers. Defines NestedTensor (a wrapper
+# subclass over a packed values buffer with offsets and optional lengths, whose ragged dimension is a
+# nested int), registry of nested ints per offsets/lengths tensor, legacy autograd view functions, and
+# constructors/views built on the builtin jagged ops. Import-time side effects: creates the global id
+# counter and weak registry.
 import math
 from typing import *  # noqa: F403
 
@@ -14,6 +19,9 @@ _tensor_symint_registry = WeakTensorKeyDictionary()
 
 
 def get_tensor_symint(tensor, *, coeff=1):
+    # [FUNCTION DOC] Returns the nested int symbolic size associated with a tensor (offsets or lengths). Fake tensors use
+    # their own memo; otherwise a registry keyed weakly by tensor creates a new id from a global counter on first use.
+    # coeff scales the nested int. Side effects: mutates the registry and counter.
     from torch._subclasses.fake_tensor import FakeTensor
     from torch._subclasses.functional_tensor import mb_unwrap_functional_tensor
 
@@ -34,19 +42,24 @@ def get_tensor_symint(tensor, *, coeff=1):
 
 # SDPA metadata; max / min seqlens are needed for e.g. flash
 def _get_sdpa_extreme_seqlen(func, tensor):
+    # [FUNCTION DOC] HELPER: Applies a reduction (max or min) to a tensor and returns the result as a Python int.
     return int(func(tensor).item())
 
 
 def _store_val_in_tensor(val) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Encodes an integer as an empty tensor with that many rows so it is tracked dynamically.
     # hack to get dynamic shapes support: store in a (val, 0) shaped tensor
     return torch.zeros(val, 0)
 
 
 def _load_val_from_tensor(t: torch.Tensor):
+    # [FUNCTION DOC] HELPER: Decodes an integer stored by _store_val_in_tensor from the first dimension.
     return t.shape[0]
 
 
 def _jagged_numel(inp, func):
+    # [FUNCTION DOC] HELPER: Element count of a jagged tensor. Without lengths this is the values numel; otherwise the
+    # sum of lengths times the product of the non-ragged inner sizes. Raises DynamicOutputShapeException for fake lengths.
     if inp._lengths is None:
         return inp._values.numel()
 
@@ -65,10 +78,16 @@ def _jagged_numel(inp, func):
 
 # serialization function must be defined at top level
 def _rebuild_njt(constructor_kwargs):
+    # [FUNCTION DOC] HELPER: Unpickling entry point (top level for serialization); builds a NestedTensor from keyword arguments.
     return NestedTensor(**constructor_kwargs)
 
 
 class NestedTensor(torch.Tensor):
+    # [CLASS DOC] Jagged nested tensor: a wrapper subclass of Tensor representing a tensor with one ragged
+    # dimension, backed by a packed values buffer. State: _values, _offsets, optional _lengths (for holes),
+    # _size and _strides (containing nested ints), _ragged_idx (which dimension is ragged) and _metadata_cache
+    # (lazily cached min/max sequence length tensors). Implements tensor-subclass flatten/unflatten, dispatch and
+    # function overrides, serialization, and accessors.
     _values: torch.Tensor  # type: ignore[assignment]
     _offsets: torch.Tensor
     _lengths: Optional[torch.Tensor]
@@ -101,6 +120,10 @@ class NestedTensor(torch.Tensor):
         lengths=None,
         **kwargs,
     ):
+        # [FUNCTION DOC] Static constructor. Validates that offsets is a 1D tensor, values is not itself nested and both share a
+        # device, obtains the ragged nested int from offsets or lengths, computes outer size and strides from
+        # the values shape with batch size from offsets, and creates the wrapper tensor with the jagged layout and nested dispatch keys.
+        # Raises an assertion error on invalid inputs. Returns the wrapper.
         ks = DispatchKeySet(DispatchKey.NestedTensor)
         ks = ks.add(DispatchKey.AutogradNestedTensor)
 
@@ -161,6 +184,8 @@ class NestedTensor(torch.Tensor):
         return r
 
     def __init__(self, values, offsets, *, lengths=None, **kwargs) -> None:
+        # [FUNCTION DOC] Stores values, offsets, lengths and the metadata cache (min/max seqlen tensors); marks the ragged
+        # dimension of the wrapper and of values as dynamic for compilation and marks cached seqlen tensors dynamic.
         super().__init__()
 
         self._values = values
@@ -190,13 +215,16 @@ class NestedTensor(torch.Tensor):
             torch._dynamo.mark_dynamic(min_seqlen_tensor, 0)
 
     def values(self):
+        # [FUNCTION DOC] Returns the values buffer through the dispatcher so the view relationship with the nested tensor is kept.
         # dispatch to get proper view relationship
         return torch._nested_get_values(self)  # type: ignore[attr-defined]
 
     def offsets(self):
+        # [FUNCTION DOC] Returns the offsets tensor.
         return self._offsets
 
     def lengths(self):
+        # [FUNCTION DOC] Returns the lengths tensor or None.
         return self._lengths
 
     # Private accessor functions for min / max sequence length. They're
@@ -206,6 +234,8 @@ class NestedTensor(torch.Tensor):
     # state would be to have public @properties for min / max sequence length that compile
     # (including setters).
     def _get_max_seqlen(self):
+        # [FUNCTION DOC] HELPER: Returns the maximum sequence length as an int, computing it from offset differences or lengths
+        # and caching it in the metadata cache if absent (may sync with the device).
         max_seqlen_tensor = self._max_seqlen_tensor
         if max_seqlen_tensor is None:
             # compute & cache
@@ -218,6 +248,7 @@ class NestedTensor(torch.Tensor):
         return _load_val_from_tensor(max_seqlen_tensor)
 
     def _get_min_seqlen(self):
+        # [FUNCTION DOC] HELPER: Same as the max version but for the minimum sequence length.
         min_seqlen_tensor = self._min_seqlen_tensor
         if min_seqlen_tensor is None:
             # compute & cache
@@ -234,43 +265,52 @@ class NestedTensor(torch.Tensor):
     # subclass logic. These do not compute / cache if not present.
     @property
     def _max_seqlen_tensor(self) -> Optional[torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Property: cached max seqlen tensor or None; never computes.
         return self._metadata_cache.get("max_seqlen", None)
 
     @_max_seqlen_tensor.setter
     def _max_seqlen_tensor(self, val: Optional[torch.Tensor]) -> None:
+        # [FUNCTION DOC] HELPER: Setter storing the max seqlen tensor in the metadata cache.
         self._metadata_cache["max_seqlen"] = val
 
     @property
     def _min_seqlen_tensor(self) -> Optional[torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Property: cached min seqlen tensor or None; never computes.
         return self._metadata_cache.get("min_seqlen", None)
 
     @_min_seqlen_tensor.setter
     def _min_seqlen_tensor(self, val: Optional[torch.Tensor]) -> None:
+        # [FUNCTION DOC] HELPER: Setter storing the min seqlen tensor in the metadata cache.
         self._metadata_cache["min_seqlen"] = val
 
     # These are old private @property accessors that are kept around for internal BC
     # reasons. TODO: Remove these!
     @property
     def _max_seqlen(self):
+        # [FUNCTION DOC] HELPER: Legacy property; computes (if needed) and returns the max seqlen.
         return self._get_max_seqlen()
 
     @property
     def _min_seqlen(self):
+        # [FUNCTION DOC] HELPER: Legacy property; computes (if needed) and returns the min seqlen.
         return self._get_min_seqlen()
 
     # Convenience accessors that return a min / max seqlen if one is present and do NOT
     # compute / cache them if they're not.
     @property
     def _maybe_max_seqlen(self) -> int | torch.SymInt | None:
+        # [FUNCTION DOC] HELPER: Property: cached max seqlen as an int or symbolic int, or None if not cached (no computation).
         mt = self._max_seqlen_tensor
         return None if mt is None else _load_val_from_tensor(mt)
 
     @property
     def _maybe_min_seqlen(self) -> int | torch.SymInt | None:
+        # [FUNCTION DOC] HELPER: Property: cached min seqlen, or None if not cached (no computation).
         mt = self._min_seqlen_tensor
         return None if mt is None else _load_val_from_tensor(mt)
 
     def _is_contiguous_or_false(self):
+        # [FUNCTION DOC] HELPER: False if lengths are present; otherwise whether the values buffer is contiguous (false when unknown).
         if self.lengths() is not None:
             return False
         from torch._prims_common import is_contiguous_for_memory_format_or_false
@@ -280,6 +320,7 @@ class NestedTensor(torch.Tensor):
         )
 
     def __repr__(self) -> str:  # type: ignore[override]
+        # [FUNCTION DOC] Returns text with the size, offsets, requires_grad or grad_fn info, and contiguity.
         # We should implement this in torch/_tensor_str.py instead
         grad_fn_str = (
             f", requires_grad={self.requires_grad}" if self.requires_grad else ""
@@ -293,6 +334,9 @@ class NestedTensor(torch.Tensor):
     # TODO: Remove this in favor of the default tensor subclass serialization logic.
     # We don't do this today because of https://github.com/pytorch/pytorch/issues/125622.
     def __reduce_ex__(self, proto):
+        # [FUNCTION DOC] Custom pickling. Clears non-serializable cached size/stride data, drops the size and strides from state
+        # (they hold symbolic ints), and returns a rebuild description using _rebuild_njt with values, offsets, lengths,
+        # ragged index, metadata cache and requires_grad. Raises an assertion error if size or strides are missing from state.
         state = torch._utils._get_obj_state(self)
 
         # Cached PyCapsules for sizes / strides are not serializable.
@@ -318,6 +362,8 @@ class NestedTensor(torch.Tensor):
         return (torch._tensor._rebuild_from_type_v2, (func, type(self), args, state))
 
     def __tensor_flatten__(self):
+        # [FUNCTION DOC] Subclass protocol: returns the names of inner tensors (values, offsets, plus lengths and cached min/max
+        # seqlen tensors when present) and a context mapping with requires_grad and ragged_idx.
         ctx = {
             "requires_grad": self.requires_grad,
             "ragged_idx": self._ragged_idx,
@@ -333,6 +379,9 @@ class NestedTensor(torch.Tensor):
 
     @staticmethod
     def __tensor_unflatten__(inner_tensors: Dict, meta, outer_size, outer_stride):
+        # [FUNCTION DOC] Static subclass protocol: rebuilds a NestedTensor from a mapping of inner tensors (2 to 5 expected) and
+        # the context. Rebuilds the metadata cache from seqlen tensors; for fake ragged sources records the outer
+        # ragged size as the memoized nested int. Raises an assertion error if the inner tensor count is out of range.
         from torch._subclasses.fake_tensor import FakeTensor
 
         # inner tensors: _values, _offsets, [_lengths], [_min_seqlen], [_max_seqlen]
@@ -371,6 +420,9 @@ class NestedTensor(torch.Tensor):
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):  # type: ignore[override]
+        # [FUNCTION DOC] Class method dispatcher. Answers metadata ops (size, dim, numel, stride, storage offset, layout, overlapping
+        # check) directly for a single nested argument; otherwise looks up a jagged-specific implementation and calls it;
+        # otherwise tries composite implicit autograd kernels by direct redispatch. Raises NotImplementedError if none applies.
         # If you're wondering why there's a nested tensor with one of its
         # size = -1, see note: [NJT outer_size in AOTDispatcher]
         kwargs = {} if kwargs is None else kwargs
@@ -417,6 +469,9 @@ class NestedTensor(torch.Tensor):
 
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Class method. Handles size, stride, dim, shape and ndim queries on a nested tensor from the stored
+        # symbolic sizes; otherwise tries the jagged function overrides and falls back to running the function
+        # with subclass handling disabled. Side effects: may enable thunkify mode.
         if kwargs is None:
             kwargs = {}
 
@@ -467,8 +522,11 @@ class NestedTensor(torch.Tensor):
 
 # Not actually a view!
 class ViewBufferFromNested(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Legacy autograd function giving the values buffer of a nested tensor; not an actual view.
+    # Superseded by real view ops; kept for backward compatibility.
     @staticmethod
     def forward(ctx, x: NestedTensor):  # type: ignore[override]
+        # [FUNCTION DOC] Saves offsets, metadata cache and ragged index on ctx and returns the values buffer.
         ctx.save_for_backward(x.offsets())
         ctx.metadata_cache = x._metadata_cache
         ctx.ragged_idx = x._ragged_idx
@@ -476,6 +534,7 @@ class ViewBufferFromNested(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, gO: torch.Tensor):  # type: ignore[override]
+        # [FUNCTION DOC] Wraps the incoming gradient as a NestedTensor with the saved offsets, cache and ragged index.
         (offsets,) = ctx.saved_tensors
         return NestedTensor(
             gO,
@@ -487,6 +546,8 @@ class ViewBufferFromNested(torch.autograd.Function):
 
 # Not actually a view!
 class ViewNestedFromBuffer(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Legacy autograd function making a nested tensor from a values buffer and offsets;
+    # not an actual view. Superseded by real view ops; kept for backward compatibility.
     @staticmethod
     def forward(  # pyrefly: ignore  # bad-override
         ctx,
@@ -494,6 +555,8 @@ class ViewNestedFromBuffer(torch.autograd.Function):
         offsets: torch.Tensor,
         metadata_cache: Optional[Dict[str, Any]] = None,
     ):  # type: ignore[override]
+        # [FUNCTION DOC] Converts any plain-integer min/max seqlen entries in the given metadata cache to tensors (mutating
+        # the mapping), and returns a NestedTensor over the detached values with the offsets.
         # maintain BC with this usages of this where the seqlens are stuffed
         # directly into the metadata cache as non-Tensors / ints
         if metadata_cache is not None:
@@ -511,10 +574,12 @@ class ViewNestedFromBuffer(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, gO: NestedTensor):  # type: ignore[override]
+        # [FUNCTION DOC] Returns the values of the incoming nested gradient for the values input and nothing for the others.
         return gO._values, None, None
 
 
 def buffer_from_jagged(jagged):
+    # [FUNCTION DOC] Legacy helper: returns the values buffer of a nested tensor through the autograd function.
     return ViewBufferFromNested.apply(jagged)
 
 
@@ -525,6 +590,10 @@ def jagged_from_list(
     dtype=None,
     device=None,
 ) -> tuple[NestedTensor, torch.Tensor]:
+    # [FUNCTION DOC] Builds a jagged nested tensor from a list of tensors; returns the nested tensor and the offsets.
+    # Raises a runtime error for an empty list, mismatched dtype, device or dim, zero-dim tensors, or more than one
+    # ragged dimension. Concatenates along the ragged dimension (converted to dtype/device if given), computes
+    # int64 offsets if not given, and caches min and max sequence lengths.
     """Constructs a NestedTensor backed by jagged layout from a list of tensors"""
 
     if len(tensors) == 0:
@@ -608,6 +677,10 @@ def jagged_from_list(
 def jagged_from_tensor_and_lengths(
     tensor: torch.Tensor, starts: torch.Tensor, lengths: torch.Tensor
 ) -> tuple[NestedTensor, torch.Tensor, Optional[torch.Tensor]]:
+    # [FUNCTION DOC] Builds a jagged nested tensor from a batch tensor with per-row starts and lengths (broadcast to
+    # batch size). Computes offsets into the flattened values view. If rows are laid out contiguously returns a
+    # plain offsets-only nested tensor, otherwise one that keeps lengths. Returns the nested tensor, offsets, and
+    # the lengths (None when contiguous). Raises a runtime error if starts/lengths do not broadcast, assertion error for under 2 dims.
     """Constructs a NestedTensor backed by jagged layout from a tensor, starts of sequences, and sequence lengths"""
     batch_size = tensor.shape[0]
     if is_expandable_to(starts.shape, (batch_size,)) and is_expandable_to(
@@ -684,6 +757,8 @@ _dummy_instance: Optional[torch.Tensor] = None
 
 
 def _nt_view_dummy() -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Lazily creates and returns a cached meta nested tensor used as a dummy argument so
+    # dispatch reaches the nested tensor subclass for view ops. Mutates a module global.
     global _dummy_instance
     if _dummy_instance is None:
         _dummy_instance = NestedTensor(
@@ -696,6 +771,8 @@ def _nt_view_dummy() -> torch.Tensor:
 def nested_view_from_values_offsets(
     values, offsets, ragged_idx=1, min_seqlen=None, max_seqlen=None
 ):
+    # [FUNCTION DOC] Creates a jagged nested view from values and offsets using the builtin op; optional min/max seqlen
+    # are stored as tensors. Returns the nested tensor.
     min_seqlen_tensor = None
     if min_seqlen is not None:
         min_seqlen_tensor = _store_val_in_tensor(min_seqlen)
@@ -718,6 +795,7 @@ def nested_view_from_values_offsets(
 def nested_view_from_values_offsets_lengths(
     values, offsets, lengths, ragged_idx=1, min_seqlen=None, max_seqlen=None
 ):
+    # [FUNCTION DOC] Like nested_view_from_values_offsets but also takes a lengths tensor (holes). Returns the nested tensor.
     min_seqlen_tensor = None
     if min_seqlen is not None:
         min_seqlen_tensor = _store_val_in_tensor(min_seqlen)
@@ -740,6 +818,8 @@ def nested_view_from_values_offsets_lengths(
 def nested_from_padded(
     padded, offsets, ragged_idx=1, min_seqlen=None, max_seqlen=None, sum_S=None
 ):
+    # [FUNCTION DOC] Creates a jagged nested tensor from a padded dense tensor and offsets using the builtin op, with
+    # optional ragged index, min/max seqlen and total packed length. Returns the nested tensor.
     min_seqlen_tensor = None
     if min_seqlen is not None:
         min_seqlen_tensor = _store_val_in_tensor(min_seqlen)
