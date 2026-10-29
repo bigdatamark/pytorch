@@ -1,3 +1,6 @@
+# [MODULE DOC] Defines FileOpenerIterDataPipe (functional name open_files), which turns a
+# datapipe of pathnames into (pathname, open file stream) tuples using the shared
+# get_file_binaries_from_pathnames utility. Registration under open_files occurs at import.
 from collections.abc import Iterable, Iterator
 from io import IOBase
 
@@ -13,6 +16,9 @@ __all__ = [
 
 @functional_datapipe("open_files")
 class FileOpenerIterDataPipe(IterDataPipe[tuple[str, IOBase]]):
+    # [CLASS DOC] Iterable datapipe that opens each incoming pathname and yields the pair
+    # of pathname and file stream. State: source datapipe, open mode, encoding, nominal
+    # length (-1 means unknown). Invariant: binary mode never has an encoding.
     r"""
     Given pathnames, opens files and yield pathname and file stream in a tuple (functional name: ``open_files``).
 
@@ -50,6 +56,9 @@ class FileOpenerIterDataPipe(IterDataPipe[tuple[str, IOBase]]):
         encoding: str | None = None,
         length: int = -1,
     ) -> None:
+        # [FUNCTION DOC] Stores the pathname source, mode, encoding and nominal length.
+        # Raises ValueError if mode is not one of b, t, rb, rt, r, or if a mode containing
+        # b is combined with an encoding. Opens no files at construction.
         super().__init__()
         self.datapipe: Iterable[str] = datapipe
         self.mode: str = mode
@@ -69,11 +78,15 @@ class FileOpenerIterDataPipe(IterDataPipe[tuple[str, IOBase]]):
     # is determined at runtime based on mode. Some `DataPipe` requiring
     # a subtype would cause mypy error.
     def __iter__(self) -> Iterator[tuple[str, IOBase]]:
+        # [FUNCTION DOC] Lazily opens each pathname with the stored mode and encoding and
+        # yields (pathname, stream). Side effect: opens files; closing is left to callers/GC.
         yield from get_file_binaries_from_pathnames(
             self.datapipe, self.mode, self.encoding
         )
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Returns the nominal length given at construction; raises
+        # TypeError when it is -1 (unknown).
         if self.length == -1:
             raise TypeError(f"{type(self).__name__} instance doesn't have valid length")
         return self.length

@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Build-time script that generates the datapipe type stub from its template.
+# It scans the iter and map datapipe source files with simple text parsing for classes
+# decorated as functional datapipes, extracts constructor signatures and class docstrings,
+# and writes method definitions into the template to produce the stub file. Also holds the
+# per-kind configuration constants. Import-time side effect: if torchgen cannot be imported
+# it temporarily puts the repository root on the module search path to import it. Exports
+# nothing publicly. Running as a script calls main.
 import os
 from collections import defaultdict
 from pathlib import Path
@@ -26,6 +33,8 @@ __all__: list[str] = []  # not intended to expose any symbols
 
 
 def __dir__() -> list[str]:
+    # [FUNCTION DOC] HELPER: Module attribute listing hook; returns an empty list so the
+    # public API test sees no public names.
     return []  # appease public API test
 
 
@@ -34,6 +43,9 @@ def __dir__() -> list[str]:
     category=FutureWarning,
 )
 def materialize_lines(lines: list[str], indentation: int) -> str:
+    # [FUNCTION DOC] Deprecated (emits FutureWarning). Joins lines with newlines followed by
+    # indentation spaces, and also indents newlines embedded inside a line; the first line
+    # is not indented. Returns the combined text.
     output = ""
     new_line_with_indent = "\n" + " " * indentation
     for i, line in enumerate(lines):
@@ -53,6 +65,11 @@ def gen_from_template(
     output_name: str,
     replacements: list[tuple[str, Any, int]],
 ) -> None:
+    # [FUNCTION DOC] Deprecated (emits FutureWarning). Reads a template file in dir, and for
+    # each (placeholder, lines, indentation) replaces the placeholder with the materialized
+    # lines, rewriting the output file in dir with the cumulative content after each
+    # replacement. Side effect: writes the output file.
+    # KNOWN ISSUE: if replacements is empty the output file is never written.
     template_path = os.path.join(dir, template_name)
     output_path = os.path.join(dir, output_name)
 
@@ -67,6 +84,9 @@ def gen_from_template(
 
 
 def find_file_paths(dir_paths: list[str], files_to_exclude: set[str]) -> set[str]:
+    # [FUNCTION DOC] Lists each given directory (not recursive) and returns the set of joined
+    # paths of files whose names end in .py and are not in files_to_exclude. Reads the
+    # filesystem; raises OSError if a directory cannot be listed.
     """
     When given a path to a directory, returns the paths to the relevant files within it.
 
@@ -84,6 +104,9 @@ def find_file_paths(dir_paths: list[str], files_to_exclude: set[str]) -> set[str
 
 
 def extract_method_name(line: str) -> str:
+    # [FUNCTION DOC] Returns the quoted name inside a decorator line (text between the
+    # opening and closing parenthesis plus quote, either double or single quotes). Raises
+    # RuntimeError if neither quoting form is found.
     """Extract method name from decorator in the form of "@functional_datapipe({method_name})"."""
     if '("' in line:
         start_token, end_token = '("', '")'
@@ -98,6 +121,8 @@ def extract_method_name(line: str) -> str:
 
 
 def extract_class_name(line: str) -> str:
+    # [FUNCTION DOC] Returns the text between the class keyword and the first opening
+    # parenthesis of a class definition line. No validation if either is missing.
     """Extract class name from class definition in the form of "class {CLASS_NAME}({Type}):"."""
     start_token = "class "
     end_token = "("
@@ -108,6 +133,16 @@ def extract_class_name(line: str) -> str:
 def parse_datapipe_file(
     file_path: str,
 ) -> tuple[dict[str, list[str]], dict[str, str], set[str], dict[str, list[str]]]:
+    # [FUNCTION DOC] Line-by-line text parser of one source file. For each functional
+    # datapipe decorator it records the method name, the class name that follows, and the
+    # constructor (or new-instance method) parameter text, cleaned by process_signature.
+    # Lines inside triple-quoted blocks are collected as that method's docstring text.
+    # Returns four items: method name to signature token list, method name to class name,
+    # the set of method names defined through the new-instance method (needing a special
+    # output type), and method name to docstring lines. Raises RuntimeError on unbalanced
+    # parentheses; reads the file.
+    # KNOWN ISSUE: docstring lines seen while no method is active are stored under the
+    # empty name, and the parser relies on a triple-double-quote convention.
     """Given a path to file, parses the file and returns a dictionary of method names to function signatures."""
     method_to_signature, method_to_class_name, special_output_type = {}, {}, set()
     doc_string_dict = defaultdict(list)
@@ -160,6 +195,9 @@ def parse_datapipe_file(
 def parse_datapipe_files(
     file_paths: set[str],
 ) -> tuple[dict[str, list[str]], dict[str, str], set[str], dict[str, list[str]]]:
+    # [FUNCTION DOC] Runs the single-file parser over every path and merges the four
+    # results (signatures, class names, special-output method names, docstrings); later
+    # files override earlier ones on name clashes. Returns the merged four items.
     methods_and_signatures = {}
     methods_and_class_names = {}
     methods_with_special_output_types = set()
@@ -184,6 +222,9 @@ def parse_datapipe_files(
 
 
 def split_outside_bracket(line: str, delimiter: str = ",") -> list[str]:
+    # [FUNCTION DOC] Splits text on the delimiter (default comma) except where the delimiter
+    # appears inside square brackets. Brackets themselves are kept in the pieces. Returns
+    # the list of pieces (a trailing delimiter yields a final empty piece).
     """Given a line of text, split it on comma unless the comma is within a bracket '[]'."""
     bracket_count = 0
     curr_token = ""
@@ -203,6 +244,13 @@ def split_outside_bracket(line: str, delimiter: str = ",") -> list[str]:
 
 
 def process_signature(line: str) -> list[str]:
+    # [FUNCTION DOC] Splits a raw parameter text into tokens and cleans them: strips spaces,
+    # renames cls to self, blanks the parameter right after self unless it starts with a star,
+    # replaces defaults on callable-typed parameters with an ellipsis, and drops empty
+    # tokens. Returns the token list.
+    # KNOWN ISSUE: indexing the first character of an empty token (such as one produced by
+    # a trailing comma right after self) would raise IndexError; cls detection uses the
+    # unstripped token.
     """
     Clean up a given raw function signature.
 
@@ -232,6 +280,15 @@ def get_method_definitions(
     method_to_special_output_type: dict[str, str],
     root: str = "",
 ) -> list[str]:
+    # [FUNCTION DOC] Produces the stub text for every functional datapipe found in the given
+    # directory(ies) under root (default: this file's directory). Finds and parses source
+    # files excluding the excluded and deprecated sets, picks the special output type for
+    # methods in that mapping (or those defined via the new-instance method) and the default
+    # output type otherwise, formats each signature, appends the class docstring or an
+    # ellipsis, prefixes a comment naming the class, and sorts the result by method name.
+    # Returns a list of definition strings. Reads the filesystem.
+    # KNOWN ISSUE: a method defined through the new-instance method but missing from
+    # method_to_special_output_type causes a KeyError.
     """
     #.pyi generation for functional DataPipes Process.
 
@@ -298,6 +355,9 @@ mapDP_method_to_special_output_type: dict[str, str] = {"shuffle": "IterDataPipe"
 
 
 def main() -> None:
+    # [FUNCTION DOC] Generates method definitions for iterable and map datapipes using the
+    # module configuration, then renders the stub template next to this file into the
+    # stub file, with the two method lists substituted. Side effect: writes the stub file.
     """
     # Inject file into template datapipe.pyi.in.
 

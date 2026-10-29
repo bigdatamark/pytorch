@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Iterable datapipes that transform items: MapperIterDataPipe (functional
+# name map) applies a function to whole items or selected columns, and CollatorIterDataPipe
+# (functional name collate) is a Mapper specialized for collation, with a helper that
+# collates DataFrame batches by column. Import registers the map and collate functional
+# names.
 import functools
 from collections import namedtuple
 from collections.abc import Callable, Iterator, Sized
@@ -26,6 +31,10 @@ _T_co = TypeVar("_T_co", covariant=True)
 
 @functional_datapipe("map")
 class MapperIterDataPipe(IterDataPipe[_T_co]):
+    # [CLASS DOC] Applies fn to each item of the source datapipe, either to the whole item
+    # or to selected input columns with the result written to an output column. State:
+    # datapipe, fn, input_col, output_col (normalized to a single value). Length equals
+    # the source length when the source is sized.
     r"""
     Applies a function over each item from the source DataPipe (functional name: ``map``).
 
@@ -76,6 +85,12 @@ class MapperIterDataPipe(IterDataPipe[_T_co]):
         input_col=None,
         output_col=None,
     ) -> None:
+        # [FUNCTION DOC] Validates and stores the configuration. Logs API usage once.
+        # Args: datapipe, fn, input_col (None, index/key, or list/tuple of them),
+        # output_col (None, index/key, or single-element list/tuple, normalized to its
+        # element). Raises ValueError if output_col is given without input_col or is a
+        # sequence longer than one; fn is checked for picklability and input_col is
+        # validated against fn's signature by shared utilities.
         torch._C._log_api_usage_once("python.data_pipes.map")
         super().__init__()
         self.datapipe = datapipe
@@ -94,6 +109,13 @@ class MapperIterDataPipe(IterDataPipe[_T_co]):
         validate_input_col(fn, input_col)
 
     def _apply_fn(self, data):
+        # [FUNCTION DOC] HELPER: Applies fn to one item. With no columns it returns fn of
+        # the item. Otherwise fn receives the selected input column(s) as arguments, and the
+        # result is placed in the output column (appended when -1), or replaces the first
+        # input column with the other input columns removed. Tuples are converted to lists
+        # for editing and back; lists and dicts are modified in place.
+        # KNOWN ISSUE: with output_col set, list/dict items are mutated in place, so the
+        # source's own items change.
         if self.input_col is None and self.output_col is None:
             return self.fn(data)
 
@@ -129,10 +151,13 @@ class MapperIterDataPipe(IterDataPipe[_T_co]):
         return tuple(data) if t_flag else data
 
     def __iter__(self) -> Iterator[_T_co]:
+        # [FUNCTION DOC] Yields the mapped result for each source item, lazily.
         for data in self.datapipe:
             yield self._apply_fn(data)
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Returns the source length if the source is sized; otherwise raises
+        # TypeError.
         # pyrefly: ignore [unsafe-overlap]
         if isinstance(self.datapipe, Sized):
             return len(self.datapipe)
@@ -140,6 +165,11 @@ class MapperIterDataPipe(IterDataPipe[_T_co]):
 
 
 def _collate_helper(conversion, item):
+    # [FUNCTION DOC] HELPER: Collates a batch holding exactly one DataFrame into a named
+    # tuple with one field per column. conversion maps column names to callables; columns
+    # missing from the mapping use the TorchArrow default collation. Raises RuntimeError if
+    # the batch has more than one DataFrame, a conversion key is not a column, a
+    # conversion value is not callable, or the TorchArrow default cannot be imported.
     # TODO(VitalyFedyunin): Verify that item is any sort of batch
     if len(item.items) > 1:
         # TODO(VitalyFedyunin): Compact all batch dataframes into one
@@ -184,6 +214,9 @@ def _collate_helper(conversion, item):
 
 @functional_datapipe("collate")
 class CollatorIterDataPipe(MapperIterDataPipe):
+    # [CLASS DOC] A Mapper whose function is a collate function: an explicit collate_fn, a
+    # callable conversion (default is default_collate), or a mapping of column names to
+    # collation callables for DataFrame batches.
     r"""
     Collates samples from DataPipe to Tensor(s) by a custom collate function (functional name: ``collate``).
 
@@ -231,6 +264,9 @@ class CollatorIterDataPipe(MapperIterDataPipe):
         | None = default_collate,
         collate_fn: Callable | None = None,
     ) -> None:
+        # [FUNCTION DOC] Chooses the mapping function: collate_fn if given; else conversion
+        # if it is callable; else a partial of the DataFrame collate helper bound to the
+        # conversion mapping. Then delegates to the Mapper constructor.
         # TODO(VitalyFedyunin): Replace `Callable[..., Any]` with `Callable[[IColumn], Any]`
         # TODO(VitalyFedyunin): Replace with `Dict[Union[str, IColumn], Union[Callable, Enum]]`
         if collate_fn is not None:

@@ -1,3 +1,8 @@
+# [MODULE DOC] Core datapipe base classes: IterDataPipe (iterable style) and MapDataPipe
+# (map style) with a registry of functional-form methods and serialization/representation
+# hooks, DataChunk (list-like batch), DFIterDataPipe (marker base for DataFrame pipes), and
+# internal serialization wrappers that fall back to dill for unpicklable pipes. Import
+# attempts to import dill and records its availability in HAS_DILL.
 import functools
 import pickle
 from collections.abc import Callable, Iterable, Iterator
@@ -37,22 +42,38 @@ UNTRACABLE_DATAFRAME_PIPES = [
 
 
 class DataChunk(list[_T]):
+    # [CLASS DOC] A list subclass used as a batch of samples. The same items are kept in the
+    # list itself and in the items attribute, so subclasses can change how iteration works
+    # (see DataChunkDF) while raw_iterator still gives the stored items.
     def __init__(self, items: Iterable[_T]) -> None:
+        # [FUNCTION DOC] Copies the given iterable into a list, uses it as the list content,
+        # and keeps a reference to that list copy as the items attribute.
         items = list(items)
         super().__init__(items)
         self.items = items
 
     def as_str(self, indent: str = "") -> str:
+        # [FUNCTION DOC] Returns the string form of the chunk: items joined by commas inside
+        # square brackets, with indent prepended.
         return indent + "[" + ", ".join(str(i) for i in iter(self)) + "]"
 
     def __iter__(self) -> Iterator[_T]:
+        # [FUNCTION DOC] Yields the list elements in order (overridable by subclasses).
         yield from super().__iter__()
 
     def raw_iterator(self) -> Iterator[_T]:
+        # [FUNCTION DOC] Yields the elements stored in the items attribute, bypassing any
+        # subclass iteration override.
         yield from self.items
 
 
 class IterDataPipe(IterableDataset[_T_co], metaclass=_IterDataPipeMeta):
+    # [CLASS DOC] Base class of iterable-style datapipes. Class-level state: functions (name
+    # to callable registry backing the functional form, looked up in __getattr__),
+    # reduce_ex_hook, getstate_hook, str_hook, repr_hook (global overrides), and per-instance
+    # iteration bookkeeping (_valid_iterator_id, _number_of_samples_yielded,
+    # _snapshot_state, _fast_forward_iterator) managed by the metaclass hooks. Subclasses
+    # override the iteration method and optionally reset.
     r"""
     Iterable-style DataPipe.
 
@@ -135,10 +156,18 @@ class IterDataPipe(IterableDataset[_T_co], metaclass=_IterDataPipeMeta):
     _fast_forward_iterator: Iterator | None = None
 
     def __iter__(self) -> Iterator[_T_co]:
+        # [FUNCTION DOC] Default iteration: returns the datapipe itself as the iterator.
+        # Subclasses are expected to override this.
         # pyrefly: ignore [bad-return]
         return self
 
     def __getattr__(self, attribute_name):
+        # [FUNCTION DOC] Resolves functional-form names. If attribute_name is registered,
+        # emits a deprecation warning when it is on the deprecated list, and returns the
+        # registered function bound to this instance as its first argument (keeping the
+        # docstring). Otherwise raises AttributeError.
+        # KNOWN ISSUE: the error message is missing the closing quote after the attribute
+        # name.
         if attribute_name in IterDataPipe.functions:
             if attribute_name in _iter_deprecated_functional_names:
                 kwargs = _iter_deprecated_functional_names[attribute_name]
@@ -154,18 +183,28 @@ class IterDataPipe(IterableDataset[_T_co], metaclass=_IterDataPipeMeta):
 
     @classmethod
     def register_function(cls, function_name, function) -> None:
+        # [FUNCTION DOC] Adds or overwrites a callable in the functional-form registry under
+        # function_name (global side effect on the class registry).
         cls.functions[function_name] = function
 
     @classmethod
     def register_datapipe_as_function(
         cls, function_name, cls_to_register, enable_df_api_tracing=False
     ) -> None:
+        # [FUNCTION DOC] Registers a datapipe class under a functional name. Raises a generic
+        # Exception if the name is already taken. The registered callable constructs the
+        # class from the source datapipe plus extra arguments; if the result is an
+        # IterDataPipe and tracing is enabled (or the source is a DataFrame pipe) and the
+        # name is not in the untraceable list, the result is wrapped by trace_as_dataframe.
+        # The callable copies the class docstring.
         if function_name in cls.functions:
             raise Exception(  # noqa: TRY002
                 f"Unable to add DataPipe function name {function_name} as it is already taken"
             )
 
         def class_function(cls, enable_df_api_tracing, source_dp, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Builds cls(source_dp, ...) and optionally wraps an
+            # IterDataPipe result for DataFrame tracing as described in the registrar.
             result_pipe = cls(source_dp, *args, **kwargs)
             if isinstance(result_pipe, IterDataPipe):
                 if enable_df_api_tracing or isinstance(source_dp, DFIterDataPipe):
@@ -183,6 +222,8 @@ class IterDataPipe(IterableDataset[_T_co], metaclass=_IterDataPipeMeta):
         cls.functions[function_name] = function
 
     def __getstate__(self):
+        # [FUNCTION DOC] Pickle support: returns the instance attribute mapping itself (not
+        # a copy), passed through the class-wide getstate_hook if one is set.
         """
         Serialize `lambda` functions when `dill` is available.
 
@@ -195,6 +236,8 @@ class IterDataPipe(IterableDataset[_T_co], metaclass=_IterDataPipeMeta):
         return state
 
     def __reduce_ex__(self, *args, **kwargs):
+        # [FUNCTION DOC] Pickle support: uses reduce_ex_hook(self) if set, falling back to the
+        # default behavior if the hook raises NotImplementedError.
         if IterDataPipe.reduce_ex_hook is not None:
             try:
                 return IterDataPipe.reduce_ex_hook(self)
@@ -204,33 +247,45 @@ class IterDataPipe(IterableDataset[_T_co], metaclass=_IterDataPipeMeta):
 
     @classmethod
     def set_getstate_hook(cls, hook_fn) -> None:
+        # [FUNCTION DOC] Installs the global getstate hook; raises RuntimeError when setting
+        # a hook while one is already installed (pass None to clear).
         if IterDataPipe.getstate_hook is not None and hook_fn is not None:
             raise RuntimeError("Attempt to override existing getstate_hook")
         IterDataPipe.getstate_hook = hook_fn
 
     @classmethod
     def set_reduce_ex_hook(cls, hook_fn) -> None:
+        # [FUNCTION DOC] Installs the global reduce-ex hook; raises RuntimeError when setting
+        # a hook while one is already installed (pass None to clear).
         if IterDataPipe.reduce_ex_hook is not None and hook_fn is not None:
             raise RuntimeError("Attempt to override existing reduce_ex_hook")
         IterDataPipe.reduce_ex_hook = hook_fn
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns repr_hook(self) if a hook is set, else the qualified class
+        # name.
         if self.repr_hook is not None:
             return self.repr_hook(self)
         # Instead of showing <torch. ... .MapperIterDataPipe object at 0x.....>, return the class name
         return str(self.__class__.__qualname__)
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns str_hook(self) if a hook is set, else the qualified class
+        # name.
         if self.str_hook is not None:
             return self.str_hook(self)
         # Instead of showing <torch. ... .MapperIterDataPipe object at 0x.....>, return the class name
         return str(self.__class__.__qualname__)
 
     def __dir__(self):
+        # [FUNCTION DOC] Returns the normal attribute names plus all registered functional
+        # names, to support autocompletion.
         # for auto-completion in a REPL (e.g. Jupyter notebook)
         return list(super().__dir__()) + list(self.functions.keys())
 
     def reset(self) -> None:
+        # [FUNCTION DOC] Hook to restore the datapipe to its initial state; the default does
+        # nothing. Called automatically on each new iteration by the iterator hook.
         r"""
         Reset the `IterDataPipe` to the initial state.
 
@@ -242,11 +297,18 @@ class IterDataPipe(IterableDataset[_T_co], metaclass=_IterDataPipeMeta):
 
 
 class DFIterDataPipe(IterDataPipe):
+    # [CLASS DOC] Marker base class for iterable datapipes that carry DataFrames; used to
+    # decide whether functional results get traced.
     def _is_dfpipe(self) -> bool:
+        # [FUNCTION DOC] HELPER: Always returns True, identifying a DataFrame pipe.
         return True
 
 
 class MapDataPipe(Dataset[_T_co], metaclass=_DataPipeMeta):
+    # [CLASS DOC] Base class of map-style datapipes (key to sample). Mirrors IterDataPipe's
+    # functional-form registry (functions) and the global hooks (reduce_ex_hook,
+    # getstate_hook, str_hook, repr_hook), but has no iteration bookkeeping. Subclasses
+    # override the item access method and optionally length.
     r"""
     Map-style DataPipe.
 
@@ -287,6 +349,11 @@ class MapDataPipe(Dataset[_T_co], metaclass=_DataPipeMeta):
     repr_hook: Callable | None = None
 
     def __getattr__(self, attribute_name):
+        # [FUNCTION DOC] Resolves functional-form names from the map registry: warns if the
+        # name is deprecated, and returns the registered function bound to this instance.
+        # Otherwise raises AttributeError.
+        # KNOWN ISSUE: the error message is missing the closing quote after the attribute
+        # name.
         if attribute_name in MapDataPipe.functions:
             if attribute_name in _map_deprecated_functional_names:
                 kwargs = _map_deprecated_functional_names[attribute_name]
@@ -302,16 +369,22 @@ class MapDataPipe(Dataset[_T_co], metaclass=_DataPipeMeta):
 
     @classmethod
     def register_function(cls, function_name, function) -> None:
+        # [FUNCTION DOC] Adds or overwrites a callable in the map registry under function_name
+        # (global side effect).
         cls.functions[function_name] = function
 
     @classmethod
     def register_datapipe_as_function(cls, function_name, cls_to_register) -> None:
+        # [FUNCTION DOC] Registers a datapipe class under a functional name; raises a generic
+        # Exception if the name is taken. The registered callable constructs the class from
+        # the source datapipe plus extra arguments and copies the class docstring.
         if function_name in cls.functions:
             raise Exception(  # noqa: TRY002
                 f"Unable to add DataPipe function name {function_name} as it is already taken"
             )
 
         def class_function(cls, source_dp, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Returns cls(source_dp, ...).
             result_pipe = cls(source_dp, *args, **kwargs)
             return result_pipe
 
@@ -322,6 +395,8 @@ class MapDataPipe(Dataset[_T_co], metaclass=_DataPipeMeta):
         cls.functions[function_name] = function
 
     def __getstate__(self):
+        # [FUNCTION DOC] Pickle support: returns the instance attribute mapping itself (not
+        # a copy), passed through the class-wide getstate_hook if one is set.
         """
         Serialize `lambda` functions when `dill` is available.
 
@@ -334,6 +409,8 @@ class MapDataPipe(Dataset[_T_co], metaclass=_DataPipeMeta):
         return state
 
     def __reduce_ex__(self, *args, **kwargs):
+        # [FUNCTION DOC] Pickle support: uses reduce_ex_hook(self) if set, falling back to the
+        # default behavior if the hook raises NotImplementedError.
         if MapDataPipe.reduce_ex_hook is not None:
             try:
                 return MapDataPipe.reduce_ex_hook(self)
@@ -343,38 +420,54 @@ class MapDataPipe(Dataset[_T_co], metaclass=_DataPipeMeta):
 
     @classmethod
     def set_getstate_hook(cls, hook_fn) -> None:
+        # [FUNCTION DOC] Installs the global getstate hook; raises RuntimeError when setting
+        # a hook while one is already installed (pass None to clear).
         if MapDataPipe.getstate_hook is not None and hook_fn is not None:
             raise RuntimeError("Attempt to override existing getstate_hook")
         MapDataPipe.getstate_hook = hook_fn
 
     @classmethod
     def set_reduce_ex_hook(cls, hook_fn) -> None:
+        # [FUNCTION DOC] Installs the global reduce-ex hook; raises RuntimeError when setting
+        # a hook while one is already installed (pass None to clear).
         if MapDataPipe.reduce_ex_hook is not None and hook_fn is not None:
             raise RuntimeError("Attempt to override existing reduce_ex_hook")
         MapDataPipe.reduce_ex_hook = hook_fn
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns repr_hook(self) if a hook is set, else the qualified class
+        # name.
         if self.repr_hook is not None:
             return self.repr_hook(self)
         # Instead of showing <torch. ... .MapperMapDataPipe object at 0x.....>, return the class name
         return str(self.__class__.__qualname__)
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns str_hook(self) if a hook is set, else the qualified class
+        # name.
         if self.str_hook is not None:
             return self.str_hook(self)
         # Instead of showing <torch. ... .MapperMapDataPipe object at 0x.....>, return the class name
         return str(self.__class__.__qualname__)
 
     def __dir__(self):
+        # [FUNCTION DOC] Returns the normal attribute names plus all registered functional
+        # names, to support autocompletion.
         # for auto-completion in a REPL (e.g. Jupyter notebook)
         return list(super().__dir__()) + list(self.functions.keys())
 
 
 class _DataPipeSerializationWrapper:
+    # [CLASS DOC] HELPER: Mixin wrapping a datapipe so it can be pickled even when plain
+    # pickle fails, by falling back to dill. State: _datapipe.
     def __init__(self, datapipe) -> None:
+        # [FUNCTION DOC] Stores the wrapped datapipe.
         self._datapipe = datapipe
 
     def __getstate__(self):
+        # [FUNCTION DOC] Serializes the wrapped datapipe with pickle; if that fails and dill
+        # is available, uses dill instead (otherwise re-raises). Returns a pair of the
+        # serialized bytes and a flag telling whether dill was used.
         use_dill = False
         try:
             value = pickle.dumps(self._datapipe)
@@ -388,6 +481,8 @@ class _DataPipeSerializationWrapper:
         return (value, use_dill)
 
     def __setstate__(self, state):
+        # [FUNCTION DOC] Restores the wrapped datapipe from the (bytes, used-dill flag) pair,
+        # using the matching loader.
         value, use_dill = state
         if use_dill:
             # pyrefly: ignore [missing-attribute]
@@ -396,6 +491,8 @@ class _DataPipeSerializationWrapper:
             self._datapipe = pickle.loads(value)
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Returns the wrapped datapipe's length; any failure is converted to a
+        # TypeError saying the instance has no valid length.
         try:
             return len(self._datapipe)
         except Exception as e:
@@ -405,16 +502,23 @@ class _DataPipeSerializationWrapper:
 
 
 class _IterDataPipeSerializationWrapper(_DataPipeSerializationWrapper, IterDataPipe):
+    # [CLASS DOC] HELPER: Serialization wrapper for iterable datapipes; acts as its own
+    # iterator over the wrapped pipe. State: _datapipe, _datapipe_iter.
     def __init__(self, datapipe: IterDataPipe[_T_co]) -> None:
+        # [FUNCTION DOC] Wraps the datapipe and starts with no active iterator.
         super().__init__(datapipe)
         # pyrefly: ignore [invalid-type-var]
         self._datapipe_iter: Iterator[_T_co] | None = None
 
     def __iter__(self) -> "_IterDataPipeSerializationWrapper":
+        # [FUNCTION DOC] Creates a fresh iterator over the wrapped pipe, stores it, and
+        # returns self.
         self._datapipe_iter = iter(self._datapipe)
         return self
 
     def __next__(self) -> _T_co:  # type: ignore[type-var]
+        # [FUNCTION DOC] Returns the next item from the stored iterator; raises
+        # AssertionError if the iteration method was not called first.
         if self._datapipe_iter is None:
             raise AssertionError(
                 "Iterator has not been initialized; call __iter__() before __next__()"
@@ -423,5 +527,8 @@ class _IterDataPipeSerializationWrapper(_DataPipeSerializationWrapper, IterDataP
 
 
 class _MapDataPipeSerializationWrapper(_DataPipeSerializationWrapper, MapDataPipe):
+    # [CLASS DOC] HELPER: Serialization wrapper for map-style datapipes; forwards item access
+    # to the wrapped pipe.
     def __getitem__(self, idx):
+        # [FUNCTION DOC] Returns the wrapped pipe's item for idx.
         return self._datapipe[idx]

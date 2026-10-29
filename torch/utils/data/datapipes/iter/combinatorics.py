@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Iterable datapipes for sampling and shuffling: SamplerIterDataPipe wraps a
+# Sampler over a sized datapipe, and ShufflerIterDataPipe (functional name shuffle) does
+# buffered shuffling with its own seedable random generator. Import registers shuffle.
 import random
 from collections.abc import Iterator, Sized
 from typing import TypeVar
@@ -19,6 +22,9 @@ _T_co = TypeVar("_T_co", covariant=True)
 
 
 class SamplerIterDataPipe(IterDataPipe[_T_co]):
+    # [CLASS DOC] Yields the indices or elements produced by a Sampler built over the
+    # source datapipe. State: datapipe, sampler instance, sampler_args, sampler_kwargs.
+    # The source must be sized.
     r"""
     Generate sample elements using the provided ``Sampler`` (defaults to :class:`SequentialSampler`).
 
@@ -38,6 +44,10 @@ class SamplerIterDataPipe(IterDataPipe[_T_co]):
         sampler_args: tuple | None = None,
         sampler_kwargs: dict | None = None,
     ) -> None:
+        # [FUNCTION DOC] Builds the sampler class over the datapipe, passing the datapipe as
+        # its data_source keyword along with the extra args and kwargs. Raises
+        # AssertionError if the datapipe has no length. Side effect: adds data_source to the
+        # caller-supplied sampler_kwargs mapping.
         # pyrefly: ignore [unsafe-overlap]
         if not isinstance(datapipe, Sized):
             raise AssertionError(
@@ -52,9 +62,12 @@ class SamplerIterDataPipe(IterDataPipe[_T_co]):
         self.sampler = sampler(*self.sampler_args, **self.sampler_kwargs)
 
     def __iter__(self) -> Iterator[_T_co]:
+        # [FUNCTION DOC] Returns an iterator over the sampler.
         return iter(self.sampler)
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Returns the sampler length; raises TypeError if the sampler has
+        # no length.
         # Dataset has been tested as `Sized`
         if isinstance(self.sampler, Sized):
             return len(self.sampler)
@@ -63,6 +76,11 @@ class SamplerIterDataPipe(IterDataPipe[_T_co]):
 
 @functional_datapipe("shuffle")
 class ShufflerIterDataPipe(IterDataPipe[_T_co]):
+    # [CLASS DOC] Buffered shuffle: fills a buffer of buffer_size items, then for each new
+    # source item yields a randomly chosen buffered item and stores the new one; leftovers
+    # are drained in random order. State: datapipe, buffer_size, _buffer, _enabled flag,
+    # _seed and _rng (private random generator, reseeded by reset). Length equals the
+    # source length when sized.
     r"""
     Shuffle the input DataPipe with a buffer (functional name: ``shuffle``).
 
@@ -110,6 +128,9 @@ class ShufflerIterDataPipe(IterDataPipe[_T_co]):
         buffer_size: int = 10000,
         unbatch_level: int = 0,
     ) -> None:
+        # [FUNCTION DOC] Stores the source (unbatched to unbatch_level when nonzero), the
+        # buffer size, shuffling enabled, no seed, and a new random generator. Raises
+        # AssertionError if buffer_size is not positive.
         super().__init__()
         # TODO: Performance optimization
         #       buffer can be a fixed size and remove expensive `append()` and `len()` operations
@@ -126,14 +147,21 @@ class ShufflerIterDataPipe(IterDataPipe[_T_co]):
         self._rng = random.Random()
 
     def set_shuffle(self, shuffle=True):
+        # [FUNCTION DOC] Enables or disables shuffling; returns self for chaining.
         self._enabled = shuffle
         return self
 
     def set_seed(self, seed: int):
+        # [FUNCTION DOC] Sets the seed used at the next reset; returns self for chaining.
         self._seed = seed
         return self
 
     def __iter__(self) -> Iterator[_T_co]:
+        # [FUNCTION DOC] If shuffling is disabled, passes the source through unchanged.
+        # Otherwise implements the buffered shuffle described on the class: yields a random
+        # buffered item in place of each new item once the buffer is full, then drains the
+        # remaining buffer in random order. Uses the instance generator; the buffer is
+        # instance state that reset empties.
         if not self._enabled:
             yield from self.datapipe
         else:
@@ -149,12 +177,17 @@ class ShufflerIterDataPipe(IterDataPipe[_T_co]):
                 yield self._buffer.pop(idx)
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Returns the source length if sized, else raises TypeError.
         # pyrefly: ignore [unsafe-overlap]
         if isinstance(self.datapipe, Sized):
             return len(self.datapipe)
         raise TypeError(f"{type(self).__name__} instance doesn't have valid length")
 
     def reset(self) -> None:
+        # [FUNCTION DOC] Clears the buffer. If shuffling is enabled, seeds the generator
+        # with the user seed, or a random draw from the torch generator if none was set,
+        # then clears the stored seed. Reading the torch generator advances global torch
+        # random state.
         self._buffer = []
         if self._enabled:
             if self._seed is None:
@@ -163,6 +196,9 @@ class ShufflerIterDataPipe(IterDataPipe[_T_co]):
             self._seed = None
 
     def __getstate__(self):
+        # [FUNCTION DOC] Pickle support: returns a tuple of the source, buffer size, enabled
+        # flag, seed, buffer, generator state, iterator id and sample counter, passed through
+        # IterDataPipe.getstate_hook when one is set.
         state = (
             self.datapipe,
             self.buffer_size,
@@ -178,6 +214,8 @@ class ShufflerIterDataPipe(IterDataPipe[_T_co]):
         return state
 
     def __setstate__(self, state):
+        # [FUNCTION DOC] Restores attributes from the tuple produced by __getstate__ and
+        # rebuilds the random generator from the saved generator state.
         (
             self.datapipe,
             self.buffer_size,
@@ -192,4 +230,5 @@ class ShufflerIterDataPipe(IterDataPipe[_T_co]):
         self._rng.setstate(rng_state)
 
     def __del__(self) -> None:
+        # [FUNCTION DOC] Finalizer: empties the shuffle buffer to release references.
         self._buffer.clear()

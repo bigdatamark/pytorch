@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Lightweight type system for datapipes: subtype checks between typing
+# constructs (issubtype, issubinstance), the _DataPipeType wrapper that stores a datapipe's
+# declared item type, the metaclasses _DataPipeMeta and _IterDataPipeMeta that attach the
+# type, validate the declared return annotation of the iteration method, and wrap reset
+# and iteration with hooks, plus the Integer and Boolean placeholders and reinforce_type.
+# Relies on private names from the typing module. No import-time side effects besides
+# defining the default type object.
 # Taking reference from official Python typing
 # https://github.com/python/cpython/blob/master/Lib/typing.py
 
@@ -33,14 +40,22 @@ from torch.utils.data.datapipes._hook_iterator import _SnapshotState, hook_itera
 
 
 class GenericMeta(ABCMeta):  # type: ignore[no-redef]
+    # [CLASS DOC] HELPER: Empty metaclass alias of ABCMeta, the base for datapipe
+    # metaclasses (kept separate to avoid metaclass conflicts with typing Protocol).
     pass
 
 
 class Integer(numbers.Integral):
+    # [CLASS DOC] Abstract stand-in for the Python int type in subtype checks (target of
+    # int in TYPE2ABC); declares no behavior.
     pass
 
 
 class Boolean(numbers.Integral):
+    # [CLASS DOC] Abstract stand-in for the Python bool type in subtype checks (target of
+    # bool in TYPE2ABC); declares no behavior.
+    # KNOWN ISSUE: Integer and Boolean are unrelated classes, so bool is not treated as a
+    # subtype of int here, unlike in Python itself.
     pass
 
 
@@ -62,6 +77,11 @@ TYPE2ABC = {
 
 
 def issubtype(left, right, recursive=True):
+    # [FUNCTION DOC] Returns True if type left is a subtype of type right. Builtin types
+    # are first mapped to abstract classes. Any as right, equal types, or a bare Generic
+    # as right are accepted; None as right rejects everything else; a TypeVar or Union is
+    # expanded and every left variant must match some right constraint. If recursive is
+    # False, generic arguments are not compared. Pure function.
     r"""
     Check if the left-side type is a subtype of the right-side type.
 
@@ -105,6 +125,11 @@ def issubtype(left, right, recursive=True):
 
 
 def _decompose_type(t, to_list=True):
+    # [FUNCTION DOC] HELPER: Expands a TypeVar (its bound, else its constraints) or a Union
+    # (its arguments) into a list of types with builtins mapped to abstract classes. For any
+    # other type returns a one-element list, or None if to_list is False.
+    # KNOWN ISSUE: only typing.Union is recognized; the pipe-style union type has a
+    # different origin and would be treated as a single opaque type.
     if isinstance(t, TypeVar):
         if t.__bound__ is not None:
             ts = [t.__bound__]
@@ -123,6 +148,11 @@ def _decompose_type(t, to_list=True):
 
 
 def _issubtype_with_constraints(variant, constraints, recursive=True):
+    # [FUNCTION DOC] HELPER: Returns True if variant matches any constraint. Nested
+    # TypeVar/Union values on either side are expanded. Generic aliases match when origins
+    # are equal and, if recursive, argument counts match and every argument pair is a
+    # subtype (a constraint without arguments matches any arguments); plain types match by
+    # equality of origin.
     r"""
     Check if the variant is a subtype of either one from constraints.
 
@@ -196,6 +226,12 @@ def _issubtype_with_constraints(variant, constraints, recursive=True):
 
 
 def issubinstance(data, data_type):
+    # [FUNCTION DOC] Returns True if the runtime value data conforms to the type data_type.
+    # First compares the shallow type of data; then, for tuples (arity must match), lists
+    # and sets (all elements against the first argument) and dicts (keys and values), checks
+    # contents recursively. Other values pass once the shallow check passes.
+    # KNOWN ISSUE: a dict check unpacks exactly two type arguments, so a one-argument
+    # annotation would raise an unpacking error.
     if not issubtype(type(data), data_type, recursive=False):
         return False
 
@@ -231,23 +267,35 @@ def issubinstance(data, data_type):
 
 
 class _DataPipeType:
+    # [CLASS DOC] HELPER: Immutable-style wrapper around a type annotation (param) describing
+    # a datapipe's item type, with equality and hash based on param and subtype helpers.
     r"""Save type annotation in `param`."""
 
     def __init__(self, param) -> None:
+        # [FUNCTION DOC] Stores the wrapped type annotation.
         self.param = param
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns the typing-style text of the wrapped type.
         return _type_repr(self.param)
 
     def __eq__(self, other):
+        # [FUNCTION DOC] Equal to another _DataPipeType with an equal param; otherwise
+        # returns NotImplemented.
         if isinstance(other, _DataPipeType):
             return self.param == other.param
         return NotImplemented
 
     def __hash__(self):
+        # [FUNCTION DOC] Hash of the wrapped type, consistent with equality.
         return hash(self.param)
 
     def issubtype(self, other):
+        # [FUNCTION DOC] Returns True if this type is a subtype of other (a _DataPipeType or
+        # a plain type). A bare Generic as other's param always matches. Raises TypeError
+        # for any other kind of other.
+        # KNOWN ISSUE: the Generic check reads other.param before the type check, so a
+        # plain type (no param attribute) raises AttributeError instead of being compared.
         if isinstance(other.param, _GenericAlias):
             if getattr(other.param, "__origin__", None) is Generic:
                 return True
@@ -258,6 +306,7 @@ class _DataPipeType:
         raise TypeError(f"Expected '_DataPipeType' or 'type', but found {type(other)}")
 
     def issubtype_of_instance(self, other):
+        # [FUNCTION DOC] Returns True if the value other conforms to the wrapped type.
         return issubinstance(other, self.param)
 
 
@@ -268,6 +317,10 @@ _DEFAULT_TYPE = _DataPipeType(Generic[_T_co])
 
 
 class _DataPipeMeta(GenericMeta):
+    # [CLASS DOC] HELPER: Metaclass of DataPipe classes. Annotated with a class-level type
+    # attribute holding the item type. Currently it only forwards class creation; the
+    # parameterization helpers below (_getitem_, _eq_, _hash_) are defined but not wired up
+    # as the special methods.
     r"""
     Metaclass for `DataPipe`.
 
@@ -279,6 +332,10 @@ class _DataPipeMeta(GenericMeta):
     type: _DataPipeType
 
     def __new__(cls, name, bases, namespace, **kwargs):
+        # [FUNCTION DOC] Creates the class by delegating to the parent metaclass and
+        # returns it immediately.
+        # KNOWN ISSUE: all statements after the return are unreachable, so the default type
+        # and subclass hook are never installed here.
         return super().__new__(cls, name, bases, namespace, **kwargs)  # type: ignore[call-overload]
 
         # TODO: the statements below are not reachable by design as there is a bug and typing is low priority for now.
@@ -298,11 +355,19 @@ class _DataPipeMeta(GenericMeta):
         return super().__new__(cls, name, bases, namespace, **kwargs)  # type: ignore[call-overload]
 
     def __init__(self, name, bases, namespace, **kwargs) -> None:
+        # [FUNCTION DOC] Delegates initialization to the parent metaclass.
         super().__init__(name, bases, namespace, **kwargs)  # type: ignore[call-overload]
 
     # TODO: Fix isinstance bug
     @_tp_cache
     def _getitem_(self, params):
+        # [FUNCTION DOC] HELPER: Implements subscripting a datapipe class with an item type
+        # (results cached). Strings become forward references; a single type or a tuple is
+        # accepted, each checked as a valid type; raises TypeError for None, for more than
+        # one parameter, or when the type is not a subtype of the current declared type.
+        # Returns self if the type is unchanged, otherwise a new subclass named with the
+        # type and flagged as a type class. If the current type is a parameterized generic,
+        # its parameters are substituted instead.
         if params is None:
             raise TypeError(f"{self.__name__}[t]: t can not be None")
         if isinstance(params, str):
@@ -359,6 +424,10 @@ class _DataPipeMeta(GenericMeta):
 
     # TODO: Fix isinstance bug
     def _eq_(self, other):
+        # [FUNCTION DOC] HELPER: Intended class equality: NotImplemented for non-datapipe
+        # classes; identity if either has no origin; else equal origin and type.
+        # KNOWN ISSUE: not installed as the equality method (trailing-underscore name), and
+        # the origin attribute is only set in unreachable code, so it is effectively unused.
         if not isinstance(other, _DataPipeMeta):
             return NotImplemented
         if self.__origin__ is None or other.__origin__ is None:  # type: ignore[has-type]
@@ -370,10 +439,15 @@ class _DataPipeMeta(GenericMeta):
 
     # TODO: Fix isinstance bug
     def _hash_(self):
+        # [FUNCTION DOC] HELPER: Intended class hash from name and item type; not installed
+        # as the hash method.
         return hash((self.__name__, self.type))
 
 
 class _IterDataPipeMeta(_DataPipeMeta):
+    # [CLASS DOC] HELPER: Metaclass of IterDataPipe classes. On class creation it wraps a
+    # defined reset method so it runs only in certain snapshot states, and wraps a defined
+    # iteration method with the iterator hook.
     r"""
     Metaclass for `IterDataPipe` and inherits from `_DataPipeMeta`.
 
@@ -381,11 +455,18 @@ class _IterDataPipeMeta(_DataPipeMeta):
     """
 
     def __new__(cls, name, bases, namespace, **kwargs):
+        # [FUNCTION DOC] Modifies the class namespace before creation: replaces reset with a
+        # conditional wrapper, and applies hook_iterator to the namespace if it defines the
+        # iteration method. Then creates the class via the parent metaclass.
         if "reset" in namespace:
             reset_func = namespace["reset"]
 
             @functools.wraps(reset_func)
             def conditional_reset(*args, **kwargs) -> None:
+                # [FUNCTION DOC] HELPER: Wrapper around the class's reset. Only if the
+                # datapipe (first argument) is in the Iterating or NotStarted snapshot
+                # state does it zero the yielded-sample counter, clear the fast-forward
+                # iterator and call the real reset. Always sets the state to Iterating.
                 r"""
                 Only execute DataPipe's `reset()` method if `_SnapshotState` is `Iterating` or `NotStarted`.
 
@@ -411,6 +492,12 @@ class _IterDataPipeMeta(_DataPipeMeta):
 
 
 def _dp_init_subclass(sub_cls, *args, **kwargs) -> None:
+    # [FUNCTION DOC] HELPER: Subclass-creation hook for datapipe classes. Adds the
+    # reinforce_type method to the class, skips internal type classes, resolves a string
+    # item type via the defining module's globals (raises TypeError if unsupported), and
+    # validates the iteration method's return annotation: it must be Iterator (bare or
+    # parameterized) whose item type is a subtype of the declared type, else raises
+    # TypeError. Side effect: mutates sub_cls.
     # Add function for datapipe instance to reinforce the type
     sub_cls.reinforce_type = reinforce_type
 
@@ -462,6 +549,10 @@ def _dp_init_subclass(sub_cls, *args, **kwargs) -> None:
 
 
 def reinforce_type(self, expected_type):
+    # [FUNCTION DOC] Narrows the item type of a datapipe instance. A tuple of types is
+    # turned into a tuple type; the value must be a valid type and a subtype of the current
+    # type, else raises TypeError. Sets the instance type attribute and returns the same
+    # instance.
     r"""
     Reinforce the type for DataPipe instance.
 

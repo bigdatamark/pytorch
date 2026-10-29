@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Iterable datapipes that combine or split streams: Concater (concat), Forker
+# (fork) and Demultiplexer (demux) with their private container and child datapipes that
+# share a bounded buffer, Multiplexer (mux) and Zipper (zip). Import registers these
+# functional names; no other side effects.
 import copy as copymodule
 import warnings
 from abc import ABC, abstractmethod
@@ -26,6 +30,8 @@ _T_co = TypeVar("_T_co", covariant=True)
 
 @functional_datapipe("concat")
 class ConcaterIterDataPipe(IterDataPipe):
+    # [CLASS DOC] Yields all items of the first input datapipe, then the next, and so on.
+    # State: datapipes tuple. Sized only if every input is sized.
     r"""
     Concatenates multiple Iterable DataPipes (functional name: ``concat``).
 
@@ -47,6 +53,9 @@ class ConcaterIterDataPipe(IterDataPipe):
     datapipes: tuple[IterDataPipe]
 
     def __init__(self, *datapipes: IterDataPipe) -> None:
+        # [FUNCTION DOC] Stores the input datapipes. Raises ValueError if none are given
+        # and TypeError if any input is not an IterDataPipe. Does not call the base
+        # constructor.
         if len(datapipes) == 0:
             raise ValueError("Expected at least one DataPipe, but got nothing")
         if not all(isinstance(dp, IterDataPipe) for dp in datapipes):
@@ -54,10 +63,13 @@ class ConcaterIterDataPipe(IterDataPipe):
         self.datapipes = datapipes  # type: ignore[assignment]
 
     def __iter__(self) -> Iterator:
+        # [FUNCTION DOC] Yields every item of each input datapipe in order.
         for dp in self.datapipes:
             yield from dp
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Returns the sum of input lengths; raises TypeError if any input
+        # has no length.
         # pyrefly: ignore [unsafe-overlap]
         if all(isinstance(dp, Sized) for dp in self.datapipes):
             # pyrefly: ignore [bad-argument-type]
@@ -68,6 +80,9 @@ class ConcaterIterDataPipe(IterDataPipe):
 
 @functional_datapipe("fork")
 class ForkerIterDataPipe(IterDataPipe):
+    # [CLASS DOC] Factory-style datapipe (functional name fork): constructing it returns
+    # not an instance of itself but either the input unchanged (one instance) or a list
+    # of child datapipes sharing one buffered container.
     r"""
     Creates multiple instances of the same Iterable DataPipe (functional name: ``fork``).
 
@@ -104,6 +119,11 @@ class ForkerIterDataPipe(IterDataPipe):
         buffer_size: int = 1000,
         copy: Literal["shallow", "deep"] | None = None,
     ):
+        # [FUNCTION DOC] Raises ValueError if num_instances is below 1. Returns the input
+        # datapipe itself when num_instances is 1; otherwise builds the shared container
+        # (buffer_size limits how far the leading child may run ahead, negative means
+        # unlimited; copy picks no copy, shallow or deep copy of yielded items) and
+        # returns a list of num_instances child datapipes.
         if num_instances < 1:
             raise ValueError(
                 f"Expected `num_instances` larger than 0, but {num_instances} is found"
@@ -115,27 +135,41 @@ class ForkerIterDataPipe(IterDataPipe):
 
 
 class _ContainerTemplate(ABC):
+    # [CLASS DOC] HELPER: Abstract interface that a container datapipe must implement for
+    # its child datapipes: fetch the next element for an instance, report whether all
+    # instances are exhausted, reset, and report a per-instance length.
     r"""Abstract class for container ``DataPipes``. The following are three required methods."""
 
+    # [FUNCTION DOC] HELPER: Abstract; returns an iterator over the elements for the child
+    # with the given instance_id. (Comment placed above the one-line definition.)
     @abstractmethod
     def get_next_element_by_instance(self, instance_id: int): ...
 
+    # [FUNCTION DOC] HELPER: Abstract; returns True when all children finished iterating.
     @abstractmethod
     def is_every_instance_exhausted(self) -> bool: ...
 
+    # [FUNCTION DOC] HELPER: Abstract; restores the container to its initial state.
     @abstractmethod
     def reset(self) -> None: ...
 
     @abstractmethod
     def get_length_by_instance(self, instance_id: int):
+        # [FUNCTION DOC] HELPER: Abstract; returns the length for the given child or raises
+        # TypeError when no length is supported.
         r"""Raise TypeError if it's not supposed to be implemented to support `list(datapipe)`."""
 
 
 def _no_op(x):
+    # [FUNCTION DOC] HELPER: Identity function used as the default copy function.
     return x
 
 
 class _ForkerIterDataPipe(IterDataPipe, _ContainerTemplate):
+    # [CLASS DOC] HELPER: Container behind fork. Holds the source iterator and a shared
+    # buffer deque of items not yet read by the slowest child. State: child_pointers
+    # (per-child count of items consumed), slowest_ptr, leading_ptr, end_ptr (total length
+    # once the source ends), _child_stop flags, buffer_size limit, copy_fn.
     r"""
     Container to hold instance-specific information on behalf of ForkerIterDataPipe.
 
@@ -150,6 +184,10 @@ class _ForkerIterDataPipe(IterDataPipe, _ContainerTemplate):
         buffer_size: int = 1000,
         copy: Literal["shallow", "deep"] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Initializes buffer and pointer state for num_instances children.
+        # Warns (UserWarning) if buffer_size is negative (unlimited). Picks copy_fn: no-op
+        # for None, shallow or deep copy; raises ValueError for any other copy value.
+        # Does not call the base constructor.
         self.main_datapipe = datapipe
         self._datapipe_iterator: Iterator[Any] | None = None
         self.num_instances = num_instances
@@ -182,10 +220,19 @@ class _ForkerIterDataPipe(IterDataPipe, _ContainerTemplate):
         self._child_stop: list[bool] = [True for _ in range(num_instances)]
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Returns the length of the source datapipe (TypeError if unsized).
         # pyrefly: ignore [bad-argument-type]
         return len(self.main_datapipe)
 
     def get_next_element_by_instance(self, instance_id: int):
+        # [FUNCTION DOC] Generator for one child. If no iteration is active, starts a new
+        # source iterator and marks all children as running. Each step advances that child's
+        # pointer, serves the item from the shared buffer if a faster child already read
+        # it, otherwise pulls from the source and buffers it; drops buffer entries once the
+        # slowest child passes them. Yields copy_fn of each item. Raises BufferError when
+        # the leading child gets more than buffer_size items ahead of the slowest one. On
+        # exit it marks the child stopped and, when all stopped, clears the iterator and
+        # closes streams still in the buffer.
         if self._datapipe_iterator is None and self._child_stop[instance_id]:
             self._datapipe_iterator = iter(self.main_datapipe)
             self._snapshot_state = _SnapshotState.Iterating
@@ -239,13 +286,17 @@ class _ForkerIterDataPipe(IterDataPipe, _ContainerTemplate):
                 self._cleanup()
 
     def is_every_instance_exhausted(self) -> bool:
+        # [FUNCTION DOC] True once the source has ended and every child has stopped.
         return self.end_ptr is not None and all(self._child_stop)
 
     def get_length_by_instance(self, instance_id: int) -> int:
+        # [FUNCTION DOC] Returns the source length for any child (TypeError if unsized).
         # pyrefly: ignore [bad-argument-type]
         return len(self.main_datapipe)
 
     def reset(self) -> None:
+        # [FUNCTION DOC] Drops the source iterator, empties the buffer (without closing
+        # streams) and zeros all pointers and stop flags.
         self._datapipe_iterator = None
         self.buffer = deque()
         self.child_pointers = [0] * self.num_instances
@@ -255,6 +306,9 @@ class _ForkerIterDataPipe(IterDataPipe, _ContainerTemplate):
         self._child_stop = [True for _ in range(self.num_instances)]
 
     def __getstate__(self):
+        # [FUNCTION DOC] Pickle support: returns a tuple of source, instance count, buffer
+        # size, copy function, iterator id and sample counter (buffer is not saved), passed
+        # through IterDataPipe.getstate_hook when set.
         state = (
             self.main_datapipe,
             self.num_instances,
@@ -268,6 +322,7 @@ class _ForkerIterDataPipe(IterDataPipe, _ContainerTemplate):
         return state
 
     def __setstate__(self, state):
+        # [FUNCTION DOC] Restores saved fields and resets buffer, pointers and stop flags.
         (
             self.main_datapipe,
             self.num_instances,
@@ -285,15 +340,21 @@ class _ForkerIterDataPipe(IterDataPipe, _ContainerTemplate):
         self._child_stop = [True for _ in range(self.num_instances)]
 
     def _cleanup(self) -> None:
+        # [FUNCTION DOC] HELPER: Empties the buffer, closing any stream objects in items.
         while self.buffer:
             d = self.buffer.popleft()
             StreamWrapper.close_streams(d)
 
     def __del__(self) -> None:
+        # [FUNCTION DOC] Finalizer: cleans up (closes) buffered streams.
         self._cleanup()
 
 
 class _ChildDataPipe(IterDataPipe):
+    # [CLASS DOC] HELPER: One branch of a fork or demux. Delegates iteration and length to
+    # its container by instance_id, and coordinates the shared "valid iterator" generation:
+    # starting a new iterator on one child invalidates older iterators on all children and
+    # resets the container. State: main_datapipe (container), instance_id.
     r"""
     Iterable Datapipe that is a child of a main DataPipe.
 
@@ -326,6 +387,9 @@ class _ChildDataPipe(IterDataPipe):
     _is_child_datapipe: bool = True
 
     def __init__(self, main_datapipe: IterDataPipe, instance_id: int) -> None:
+        # [FUNCTION DOC] Stores the container and this child's id. Raises AssertionError
+        # if the container does not implement _ContainerTemplate. Does not call the base
+        # constructor.
         if not isinstance(main_datapipe, _ContainerTemplate):
             raise AssertionError("main_datapipe must implement _ContainerTemplate")
 
@@ -333,15 +397,22 @@ class _ChildDataPipe(IterDataPipe):
         self.instance_id = instance_id
 
     def __iter__(self):
+        # [FUNCTION DOC] Returns the container's generator for this child's id.
         # Note that the logic behind setting iterator ID and `reset` are handled within `hook_iterator`
         # We want to separate the code for reset and yield, so that 'reset' executes before __next__ is called
         return self.main_datapipe.get_next_element_by_instance(self.instance_id)
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Returns the container's length for this child (may raise TypeError).
         return self.main_datapipe.get_length_by_instance(self.instance_id)
 
     # This method is called by `hook_iterator` in `_typing.py`.
     def _set_main_datapipe_valid_iterator_id(self) -> int:
+        # [FUNCTION DOC] HELPER: Called when a new iterator is created. If the container has
+        # no id yet, sets it to 0. If this child is in the same generation as the
+        # container, increments the container id, warns (UserWarning) if not all children
+        # were exhausted, and resets the container. Finally adopts the container id and
+        # returns it.
         r"""
         Update the valid iterator ID for both this DataPipe object and `main_datapipe`.
 
@@ -370,6 +441,8 @@ class _ChildDataPipe(IterDataPipe):
 
     # This method is called by `hook_iterator` in `_typing.py`.
     def _check_valid_iterator_id(self, iterator_id) -> bool:
+        # [FUNCTION DOC] HELPER: True only if iterator_id equals both this child's and the
+        # container's current valid id.
         r"""Check the valid iterator ID against that of DataPipe object and that of `main_datapipe`."""
         return (
             iterator_id == self._valid_iterator_id
@@ -379,6 +452,8 @@ class _ChildDataPipe(IterDataPipe):
 
 @functional_datapipe("demux")
 class DemultiplexerIterDataPipe(IterDataPipe):
+    # [CLASS DOC] Factory-style datapipe (functional name demux): constructing it returns a
+    # list of child datapipes, each yielding the items the classifier assigns to it.
     r"""
     Splits the input DataPipe into multiple child DataPipes, using the given classification function (functional name: ``demux``).
 
@@ -424,6 +499,10 @@ class DemultiplexerIterDataPipe(IterDataPipe):
         drop_none: bool = False,
         buffer_size: int = 1000,
     ):
+        # [FUNCTION DOC] Raises ValueError if num_instances is below 1; checks that the
+        # classifier is picklable (via a shared utility). Builds the shared container and
+        # returns a list of num_instances child datapipes. Items classified as None are
+        # dropped only when drop_none is set.
         if num_instances < 1:
             raise ValueError(
                 f"Expected `num_instances` larger than 0, but {num_instances} is found"
@@ -441,6 +520,9 @@ class DemultiplexerIterDataPipe(IterDataPipe):
 
 
 class _DemultiplexerIterDataPipe(IterDataPipe, _ContainerTemplate):
+    # [CLASS DOC] HELPER: Container behind demux. Holds the source iterator, one buffer
+    # deque per child for items read on behalf of other children, current_buffer_usage
+    # across all buffers, classifier_fn, drop_none, buffer_size, and stop/exhausted flags.
     r"""
     Container to hold instance-specific information on behalf of DemultiplexerIterDataPipe.
 
@@ -456,6 +538,9 @@ class _DemultiplexerIterDataPipe(IterDataPipe, _ContainerTemplate):
         drop_none: bool,
         buffer_size: int,
     ) -> None:
+        # [FUNCTION DOC] Stores configuration and creates empty per-child buffers. Warns
+        # (UserWarning) when buffer_size is negative (unlimited). Does not call the base
+        # constructor.
         # pyrefly: ignore [invalid-type-var]
         self.main_datapipe = datapipe
         self._datapipe_iterator: Iterator[Any] | None = None
@@ -478,6 +563,12 @@ class _DemultiplexerIterDataPipe(IterDataPipe, _ContainerTemplate):
         self._child_stop: list[bool] = [True for _ in range(num_instances)]
 
     def _find_next(self, instance_id: int) -> _T_co:  # type: ignore[type-var]
+        # [FUNCTION DOC] HELPER: Reads source items until one is classified for
+        # instance_id and returns it; items for other children are appended to their
+        # buffers. Raises StopIteration when the source is exhausted or the child stopped,
+        # ValueError if the iterator is unset or the classification is None (without
+        # drop_none) or outside the valid range, BufferError if total buffered items exceed
+        # buffer_size. Dropped None items have their streams closed.
         while True:
             if self.main_datapipe_exhausted or self._child_stop[instance_id]:
                 raise StopIteration
@@ -510,6 +601,11 @@ class _DemultiplexerIterDataPipe(IterDataPipe, _ContainerTemplate):
                 )
 
     def get_next_element_by_instance(self, instance_id: int):
+        # [FUNCTION DOC] Generator for one child. Starts a source iterator if none is active
+        # and marks children as running. Yields buffered items for this child first, then
+        # items found by _find_next. When the source is exhausted marks the child stopped.
+        # On exit marks the child stopped, clears the iterator when all stopped, and
+        # discards (closing streams) this child's remaining buffer.
         if self._datapipe_iterator is None and self._child_stop[instance_id]:
             self._datapipe_iterator = iter(self.main_datapipe)
             self._snapshot_state = (
@@ -540,12 +636,17 @@ class _DemultiplexerIterDataPipe(IterDataPipe, _ContainerTemplate):
                 self._cleanup(instance_id)
 
     def is_every_instance_exhausted(self) -> bool:
+        # [FUNCTION DOC] True once the source is exhausted and every child has stopped.
         return self.main_datapipe_exhausted and all(self._child_stop)
 
     def get_length_by_instance(self, instance_id: int) -> int:
+        # [FUNCTION DOC] Always raises TypeError; child lengths are unknown up front.
         raise TypeError
 
     def reset(self) -> None:
+        # [FUNCTION DOC] Drops the source iterator, zeros buffer usage, replaces buffers
+        # with empty ones (no stream closing), sets all children stopped and clears the
+        # exhausted flag.
         self._datapipe_iterator = None
         self.current_buffer_usage = 0
         self.child_buffers = [deque() for _ in range(self.num_instances)]
@@ -553,6 +654,9 @@ class _DemultiplexerIterDataPipe(IterDataPipe, _ContainerTemplate):
         self.main_datapipe_exhausted = False
 
     def __getstate__(self):
+        # [FUNCTION DOC] Pickle support: returns a tuple of source, instance count, buffer
+        # size, classifier, drop_none, iterator id and sample counter (buffers not saved),
+        # passed through IterDataPipe.getstate_hook when set.
         state = (
             self.main_datapipe,
             self.num_instances,
@@ -567,6 +671,7 @@ class _DemultiplexerIterDataPipe(IterDataPipe, _ContainerTemplate):
         return state
 
     def __setstate__(self, state):
+        # [FUNCTION DOC] Restores saved fields and resets iterator, buffers and flags.
         (
             self.main_datapipe,
             self.num_instances,
@@ -583,6 +688,8 @@ class _DemultiplexerIterDataPipe(IterDataPipe, _ContainerTemplate):
         self.main_datapipe_exhausted = False
 
     def _cleanup(self, instance_id: int | None = None) -> None:
+        # [FUNCTION DOC] HELPER: Empties the buffer of one child (or of all when
+        # instance_id is None), closing any stream objects in discarded items.
         ids = (
             range(self.num_instances)
             if instance_id is None
@@ -597,11 +704,15 @@ class _DemultiplexerIterDataPipe(IterDataPipe, _ContainerTemplate):
                 StreamWrapper.close_streams(d)
 
     def __del__(self) -> None:
+        # [FUNCTION DOC] Finalizer: cleans up (closes) all buffered streams.
         self._cleanup()
 
 
 @functional_datapipe("mux")
 class MultiplexerIterDataPipe(IterDataPipe):
+    # [CLASS DOC] Round-robin interleaving of several datapipes, one item from each in
+    # turn, ending when the shortest is exhausted. State: datapipes tuple and a small
+    # buffer holding the items of the current round.
     r"""
     Yields one element at a time from each of the input Iterable DataPipes (functional name: ``mux``).
 
@@ -624,10 +735,15 @@ class MultiplexerIterDataPipe(IterDataPipe):
     """
 
     def __init__(self, *datapipes) -> None:
+        # [FUNCTION DOC] Stores the input datapipes and an empty round buffer. No type
+        # validation is done and the base constructor is not called.
         self.datapipes = datapipes
         self.buffer: list = []  # Store values to be yielded only when every iterator provides one
 
     def __iter__(self):
+        # [FUNCTION DOC] Each round takes one item from every input iterator into the
+        # buffer and, if all succeeded, yields them in input order. If any input is
+        # exhausted mid-round the partial round is discarded and iteration ends.
         iterators = [iter(x) for x in self.datapipes]
         while iterators:
             for it in iterators:
@@ -641,15 +757,20 @@ class MultiplexerIterDataPipe(IterDataPipe):
             self.buffer.clear()
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Returns the shortest input length times the number of inputs;
+        # raises TypeError if any input has no length.
         if all(isinstance(dp, Sized) for dp in self.datapipes):
             return min(len(dp) for dp in self.datapipes) * len(self.datapipes)
         else:
             raise TypeError(f"{type(self).__name__} instance doesn't have valid length")
 
     def reset(self) -> None:
+        # [FUNCTION DOC] Empties the round buffer.
         self.buffer = []
 
     def __getstate__(self):
+        # [FUNCTION DOC] Pickle support: returns a tuple of inputs, iterator id and sample
+        # counter, passed through IterDataPipe.getstate_hook when set.
         state = (
             self.datapipes,
             self._valid_iterator_id,
@@ -660,6 +781,7 @@ class MultiplexerIterDataPipe(IterDataPipe):
         return state
 
     def __setstate__(self, state):
+        # [FUNCTION DOC] Restores saved fields and starts with an empty round buffer.
         (
             self.datapipes,
             self._valid_iterator_id,
@@ -668,11 +790,14 @@ class MultiplexerIterDataPipe(IterDataPipe):
         self.buffer = []
 
     def __del__(self) -> None:
+        # [FUNCTION DOC] Finalizer: empties the round buffer.
         self.buffer.clear()
 
 
 @functional_datapipe("zip")
 class ZipperIterDataPipe(IterDataPipe[tuple[_T_co]]):
+    # [CLASS DOC] Yields tuples of one item from each input datapipe, stopping when the
+    # shortest input ends. State: datapipes tuple. Sized only if every input is sized.
     r"""
     Aggregates elements into a tuple from each of the input DataPipes (functional name: ``zip``).
 
@@ -696,6 +821,8 @@ class ZipperIterDataPipe(IterDataPipe[tuple[_T_co]]):
     datapipes: tuple[IterDataPipe]
 
     def __init__(self, *datapipes: IterDataPipe) -> None:
+        # [FUNCTION DOC] Stores the input datapipes. Raises TypeError if any is not an
+        # IterDataPipe. Zero inputs is accepted (and yields nothing).
         if not all(isinstance(dp, IterDataPipe) for dp in datapipes):
             raise TypeError(
                 "All inputs are required to be `IterDataPipe` for `ZipIterDataPipe`."
@@ -704,10 +831,14 @@ class ZipperIterDataPipe(IterDataPipe[tuple[_T_co]]):
         self.datapipes = datapipes  # type: ignore[assignment]
 
     def __iter__(self) -> Iterator[tuple[_T_co]]:
+        # [FUNCTION DOC] Creates an iterator per input and yields tuples of their items
+        # until the shortest is exhausted (non-strict zip).
         iterators = [iter(datapipe) for datapipe in self.datapipes]
         yield from zip(*iterators, strict=False)
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Returns the shortest input length; raises TypeError if any input
+        # has no length (and ValueError from min for zero inputs).
         # pyrefly: ignore [unsafe-overlap]
         if all(isinstance(dp, Sized) for dp in self.datapipes):
             # pyrefly: ignore [bad-argument-type]

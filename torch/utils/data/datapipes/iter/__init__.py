@@ -1,3 +1,9 @@
+# [PACKAGE DOC] Public namespace of iterable-style datapipes. Re-exports each
+# *IterDataPipe class under its short name (Batcher, Collator, Concater, Demultiplexer,
+# FileLister, FileOpener, Filter, Forker, Grouper, IterableWrapper, Mapper, Multiplexer,
+# RoutedDecoder, Sampler, ShardingFilter, Shuffler, StreamReader, UnBatcher, Zipper).
+# Importing it imports all those submodules, which registers their functional forms.
+# Raises an error at import time if __all__ is not sorted.
 from torch.utils.data.datapipes.iter.callable import (
     CollatorIterDataPipe as Collator,
     MapperIterDataPipe as Mapper,
