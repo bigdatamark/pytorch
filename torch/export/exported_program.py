@@ -1,5 +1,12 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines ExportedProgram, the serializable result of torch.export, together with
+# ModuleCallSignature/ModuleCallEntry and the machinery behind run_decompositions: splitting a
+# decomposition table into composite-implicit ops to override and python decomps, retracing the
+# graph through AOT export with those overrides, renaming placeholders, rebuilding the graph
+# signature, state dict and constants, and cleanup passes. Also hosts verification, module
+# unlifting and range-constraint helpers. Import-time side effects: none beyond imports and
+# building module-level constant lists of dispatch keys.
 import contextlib
 import copy
 import dataclasses
@@ -96,6 +103,9 @@ PassType = Callable[[torch.fx.GraphModule], PassResult | None]
 
 @dataclasses.dataclass
 class ModuleCallSignature:
+    # [CLASS DOC] Records the calling convention of a submodule call in the original program:
+    # input and output argument specs, the pytree specs of inputs and outputs, and optional
+    # names of forward arguments.
     inputs: list[ArgumentSpec]
     outputs: list[ArgumentSpec]
     in_spec: pytree.TreeSpec
@@ -103,6 +113,8 @@ class ModuleCallSignature:
     forward_arg_names: list[str] | None = None
 
     def replace_all_uses_with(self, original_node, new_node):
+        # [FUNCTION DOC] Renames in place every input and output spec whose name equals the
+        # name of original_node to the name of new_node. Mutates the specs; returns nothing.
         for i in self.inputs:
             if i.name == original_node.name:
                 i.name = new_node.name
@@ -113,13 +125,18 @@ class ModuleCallSignature:
 
 @dataclasses.dataclass
 class ModuleCallEntry:
+    # [CLASS DOC] Pairs a submodule fully qualified name with its optional call signature.
     fqn: str
     signature: ModuleCallSignature | None = None
 
 
 def _disable_prexisiting_fake_mode(fn):
+    # [FUNCTION DOC] HELPER: Decorator factory result: wraps fn so that it always runs with any
+    # ambient fake tensor mode temporarily unset. Returns the wrapper.
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Calls fn with the given arguments inside a context that
+        # unsets the active fake mode, and returns its result.
         with unset_fake_temporarily():
             return fn(*args, **kwargs)
 
@@ -132,6 +149,9 @@ def _fx_collection_equivalence_fn(
     spec2_type: type | None,
     spec2_context: pytree.Context,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Pytree spec equivalence callback. Two specs match if both types
+    # are missing and contexts agree, if both are dict-like (dict or immutable dict) or both
+    # list-like with equal contexts, or otherwise if types are identical and contexts equal.
     """Treat containers and their immutable variants as the same type. Otherwise
     compare as normal.
     """
@@ -190,6 +210,12 @@ _BACKEND_KEYS_TO_OVERRIDE = [
 
 @contextmanager
 def _override_composite_implicit_decomp(cia_ops_to_callable):
+    # [FUNCTION DOC] HELPER: Context manager. For each op in the given mapping (op to
+    # replacement callable) it saves the python kernel table, installs not-implemented autograd
+    # kernels for missing autograd keys, replaces the composite-implicit kernel with the given
+    # callable, registers a fake-tensor rule that runs the original decomposition, and routes
+    # backend keys to the original decomposition. On exit it restores kernel tables, clears the
+    # dispatch cache and deregisters the fake impls. Mutates global operator state.
     # This function overrides CompositeImplicitAutograd decomp for
     # functional composite ops that user specified. Ideally we want to not-decompose
     # ALL composite ops but today's C++ functionalization relies on
@@ -230,6 +256,9 @@ def _override_composite_implicit_decomp(cia_ops_to_callable):
         #   1) In post dispatch tracing, CIA would have already decomposed
         #   2) Most CIA impl are device agnostic.
         def _force_dispatch_to_orig_cia_callable(fake_tensor_mode, op, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Fake tensor rule: pops the original_callable keyword and
+            # runs it with the remaining arguments under the given fake tensor mode,
+            # returning its result.
             orig_cia_callable = kwargs["original_callable"]
             del kwargs["original_callable"]
             with fake_tensor_mode:
@@ -275,6 +304,11 @@ def _override_composite_implicit_decomp(cia_ops_to_callable):
 def _split_decomp_table_to_cia_and_python_decomp(
     decomp_table: dict[torch._ops.OperatorBase, Callable],
 ) -> tuple[dict[torch._ops.OperatorBase, Callable], ...]:
+    # [FUNCTION DOC] HELPER: Splits a decomposition table into (cia_ops_to_callable, remaining
+    # table). Ops that are preservable composite-implicit ops are moved out of the table (and
+    # removed from the set of preservable ops); custom preservable ops are copied but stay in
+    # the table; raises an error if such a custom op is an aten op. Preservable ops the user
+    # did not list are mapped to a callable that preserves the op. Mutates decomp_table.
     all_preservable_cia_ops = set(_collect_all_valid_cia_ops())
     cia_ops_to_callable = {}
 
@@ -320,6 +354,8 @@ def _split_decomp_table_to_cia_and_python_decomp(
 
 
 def default_decompositions() -> "CustomDecompTable":
+    # [FUNCTION DOC] Returns a fresh CustomDecompTable holding the default (core aten)
+    # decompositions, for use with run_decompositions.
     """
     This is the default decomposition table which contains decomposition of
     all ATEN operators to core aten opset. Use this API together with
@@ -336,6 +372,13 @@ def _decompose_and_get_gm_with_new_signature_constants(
     joint_loss_index: int | None,
     decompose_custom_triton_ops,
 ):
+    # [FUNCTION DOC] HELPER: Re-traces an ExportedProgram with the given composite-implicit
+    # overrides and python decomposition table. Returns (graph module, new graph signature, new
+    # state dict, constants) for the non-joint case, or continues into the joint-graph path
+    # which uses AOT export and rebuilds the signature. Non-joint path: unwraps subclass
+    # parameters, fakifies params and buffers, retraces to aten IR under fake mode, restores
+    # constants, runs verification and cleanup passes. Mutates ep.graph_module in the joint
+    # path (deletes its buffers) and may raise on verification failures.
     from torch._export.passes.lift_constants_pass import _materialize_and_lift_constants
     from torch._functorch.aot_autograd import aot_export_module
     from torch.export._trace import (
@@ -349,6 +392,8 @@ def _decompose_and_get_gm_with_new_signature_constants(
     from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
     def _is_joint_ir_decomp(ep, joint_loss_index):
+        # [FUNCTION DOC] HELPER: True if a joint loss index was given or the program's
+        # signature has a backward signature.
         return (
             joint_loss_index is not None
             or ep.graph_signature.backward_signature is not None
@@ -619,6 +664,9 @@ def _decompose_and_get_gm_with_new_signature_constants(
     # Update the signatures with the new placeholder names in case they
     # changed when calling aot_export
     def update_arg(old_arg, new_ph):
+        # [FUNCTION DOC] HELPER: Returns an argument spec of the same kind as old_arg but named
+        # after the new placeholder; constants are returned unchanged. Raises RuntimeError for
+        # unsupported kinds (custom objects, tokens).
         if isinstance(old_arg, ConstantArgument):
             return old_arg
         elif isinstance(old_arg, TensorArgument):
@@ -825,6 +873,10 @@ def _decompose_and_get_gm_with_new_signature_constants(
 def _remove_unnecessary_copy_op_pass(
     gm: torch.fx.GraphModule, new_graph_signature: ExportGraphSignature
 ) -> tuple[torch.fx.GraphModule, ExportGraphSignature]:
+    # [FUNCTION DOC] HELPER: For each output of the graph that is a mutated buffer or parameter
+    # and is produced by an aten copy call, replaces that node with the copy source and erases
+    # it, keeping the signature names in sync through a replace hook. Mutates and recompiles
+    # gm; returns (gm, signature).
     """
     Removes redundant copy_ node that was introduced due to mutated buffer.
     """
@@ -852,6 +904,10 @@ def _remove_unnecessary_copy_op_pass(
 def _common_getitem_elimination_pass(
     gm: torch.fx.GraphModule, graph_signature, module_call_graph
 ):
+    # [FUNCTION DOC] HELPER: Eliminates duplicate getitem nodes on the same source and index in
+    # every graph submodule of gm: later duplicates are replaced by the first and erased, and
+    # the module call signatures and graph signature are updated to the surviving node. Mutates
+    # gm in place; returns nothing.
     with gm._set_replace_hook(graph_signature.get_replace_hook()):
         for module in gm.modules():
             if not isinstance(module, torch.fx.GraphModule):
@@ -885,6 +941,12 @@ def _get_updated_module_call_graph(
     graph_signature: ExportGraphSignature,
     old_module_call_graph: list[ModuleCallEntry],
 ):
+    # [FUNCTION DOC] HELPER: Returns a deep copy of the module call graph whose input/output
+    # names are remapped from the old graph module to the new (decomposed) one. Uses node
+    # provenance metadata, positional matching of user inputs, and unchanged names of
+    # params/buffers; when a name vanished because an aten.to call became a no-op, uses the
+    # to-call's input. Raises ValueError when a submodule signature involves a tensor subclass
+    # parameter that was desugared.
     new_module_call_graph = copy.deepcopy(old_module_call_graph)
 
     old_nodes = {node.name: node for node in old_gm.graph.nodes}
@@ -1019,6 +1081,10 @@ def _decompose_exported_program(
     joint_loss_index: int | None,
     decompose_custom_triton_ops: bool,
 ):
+    # [FUNCTION DOC] HELPER: Runs the decomposition of ep and wraps the result in a new
+    # ExportedProgram. Retraces with the given overrides and table, updates the module call
+    # graph, copies graph-level metadata from the old graph module, updates range constraints,
+    # and keeps the example inputs. Returns the new program.
     (
         gm,
         new_graph_signature,
@@ -1068,6 +1134,12 @@ def _decompose_exported_program(
 
 
 class ExportedProgram:
+    # [CLASS DOC] Result of torch.export: holds a flat graph module (_graph_module), the graph
+    # signature, a state dict of lifted parameters and buffers, constants, symbolic range
+    # constraints, the module call graph, optional example inputs and verifier classes, plus
+    # generated guard code. Attributes are read-only through properties (setters raise, except
+    # example_inputs). Key methods: call, module (unlift to a callable module),
+    # run_decompositions, validate, and the named_parameters/named_buffers iterators.
     """
     Package of a program from :func:`export`. It contains
     an :class:`torch.fx.Graph` that represents Tensor computation, a state_dict containing
@@ -1122,6 +1194,12 @@ class ExportedProgram:
         *,
         verifiers: list[type[Verifier]] | None = None,
     ):
+        # [FUNCTION DOC] Builds the program: resets graph codegen to a flat default, creates the
+        # export graph module from root and graph, copies metadata from a graph-module root,
+        # removes duplicate getitem nodes, stores signature, state dict, range constraints,
+        # module call graph (raises if None), example inputs, constants (empty mapping if
+        # none) and verifiers (default Verifier; raises if any is not a Verifier subclass).
+        # Runs validate last, then computes guard code from the graph module. Mutates graph.
         # Remove codegen related things from the graph. It should just be a flat graph.
         graph._codegen = torch.fx.graph.CodeGen()
         self._graph_module = _create_graph_module_for_export(root, graph)
@@ -1155,45 +1233,55 @@ class ExportedProgram:
     @property
     @compatibility(is_backward_compatible=False)
     def graph_module(self):
+        # [FUNCTION DOC] Returns the underlying flat graph module.
         return self._graph_module
 
     @graph_module.setter
     @compatibility(is_backward_compatible=False)
     def graph_module(self, value):
+        # [FUNCTION DOC] Setter that always raises RuntimeError; the attribute is read-only.
         raise RuntimeError("Unable to set ExportedProgram's graph_module attribute.")
 
     @property
     @compatibility(is_backward_compatible=False)
     def graph(self):
+        # [FUNCTION DOC] Returns the fx graph of the graph module.
         return self.graph_module.graph
 
     @graph.setter
     @compatibility(is_backward_compatible=False)
     def graph(self, value):
+        # [FUNCTION DOC] Setter that always raises RuntimeError; the attribute is read-only.
         raise RuntimeError("Unable to set ExportedProgram's graph attribute.")
 
     @property
     @compatibility(is_backward_compatible=False)
     def graph_signature(self):
+        # [FUNCTION DOC] Returns the export graph signature.
         return self._graph_signature
 
     @graph_signature.setter
     @compatibility(is_backward_compatible=False)
     def graph_signature(self, value):
+        # [FUNCTION DOC] Setter that always raises RuntimeError; the attribute is read-only.
         raise RuntimeError("Unable to set ExportedProgram's graph_signature attribute.")
 
     @property
     @compatibility(is_backward_compatible=False)
     def state_dict(self):
+        # [FUNCTION DOC] Returns the mapping of lifted parameter and buffer names to values.
         return self._state_dict
 
     @state_dict.setter
     @compatibility(is_backward_compatible=False)
     def state_dict(self, value):
+        # [FUNCTION DOC] Setter that always raises RuntimeError; the attribute is read-only.
         raise RuntimeError("Unable to set ExportedProgram's state_dict attribute.")
 
     @compatibility(is_backward_compatible=False)
     def parameters(self) -> Iterator[torch.nn.Parameter]:
+        # [FUNCTION DOC] Generator over the original module's parameter values, in signature
+        # order (delegates to named_parameters).
         """
         Returns an iterator over original module's parameters.
         """
@@ -1202,6 +1290,8 @@ class ExportedProgram:
 
     @compatibility(is_backward_compatible=False)
     def named_parameters(self) -> Iterator[tuple[str, torch.nn.Parameter]]:
+        # [FUNCTION DOC] Generator of (name, parameter) pairs for every parameter in the graph
+        # signature, looked up in the state dict (raises KeyError if missing).
         """
         Returns an iterator over original module parameters, yielding
         both the name of the parameter as well as the parameter itself.
@@ -1211,6 +1301,8 @@ class ExportedProgram:
 
     @compatibility(is_backward_compatible=False)
     def buffers(self) -> Iterator[torch.Tensor]:
+        # [FUNCTION DOC] Generator over the original module's buffer values (delegates to
+        # named_buffers).
         """
         Returns an iterator over original module buffers.
         """
@@ -1219,6 +1311,10 @@ class ExportedProgram:
 
     @compatibility(is_backward_compatible=False)
     def named_buffers(self) -> Iterator[tuple[str, torch.Tensor]]:
+        # [FUNCTION DOC] Generator of (name, buffer) pairs for every buffer in the signature.
+        # Non-persistent buffers come from constants; others from the state dict, then
+        # constants, and finally (lazily) from the graph module state dict as a fallback for
+        # buffers owned by nested subgraphs. Raises KeyError if a name is found nowhere.
         """
         Returns an iterator over original module buffers, yielding
         both the name of the buffer as well as the buffer itself.
@@ -1246,11 +1342,13 @@ class ExportedProgram:
     @property
     @compatibility(is_backward_compatible=False)
     def range_constraints(self):
+        # [FUNCTION DOC] Returns the mapping of symbols to their value ranges.
         return self._range_constraints
 
     @range_constraints.setter
     @compatibility(is_backward_compatible=False)
     def range_constraints(self, value):
+        # [FUNCTION DOC] Setter that always raises RuntimeError; the attribute is read-only.
         raise RuntimeError(
             "Unable to set ExportedProgram's range_constraints attribute."
         )
@@ -1258,11 +1356,13 @@ class ExportedProgram:
     @property
     @compatibility(is_backward_compatible=False)
     def module_call_graph(self):
+        # [FUNCTION DOC] Returns the list of module call entries.
         return self._module_call_graph
 
     @module_call_graph.setter
     @compatibility(is_backward_compatible=False)
     def module_call_graph(self, value):
+        # [FUNCTION DOC] Setter that always raises RuntimeError; the attribute is read-only.
         raise RuntimeError(
             "Unable to set ExportedProgram's module_call_graph attribute."
         )
@@ -1270,11 +1370,15 @@ class ExportedProgram:
     @property
     @compatibility(is_backward_compatible=False)
     def example_inputs(self):
+        # [FUNCTION DOC] Returns the stored (args, kwargs) example inputs, or None.
         return self._example_inputs
 
     @example_inputs.setter
     @compatibility(is_backward_compatible=False)
     def example_inputs(self, value):
+        # [FUNCTION DOC] Setter. Accepts None (clears) or a two-element tuple of an args tuple
+        # and a kwargs dict; raises ValueError otherwise. Checks the inputs against the program
+        # input pytree spec (raising on mismatch) before storing them.
         # This is allowed
 
         if value is None:
@@ -1302,7 +1406,12 @@ class ExportedProgram:
     @property
     @compatibility(is_backward_compatible=False)
     def call_spec(self):
+        # [FUNCTION DOC] Returns a named tuple of the input and output pytree specs of the
+        # top-level call (the first module call entry, which must have an empty name); both
+        # are None when the module call graph is empty. Raises an error if the first entry is
+        # not the root.
         class CallSpec(NamedTuple):
+            # [CLASS DOC] HELPER: Named tuple holding the input and output pytree specs.
             in_spec: pytree.TreeSpec | None
             out_spec: pytree.TreeSpec | None
 
@@ -1320,21 +1429,26 @@ class ExportedProgram:
     @call_spec.setter
     @compatibility(is_backward_compatible=False)
     def call_spec(self, value):
+        # [FUNCTION DOC] Setter that always raises RuntimeError; the attribute is read-only.
         raise RuntimeError("Unable to set ExportedProgram's call_spec attribute.")
 
     @property
     @compatibility(is_backward_compatible=False)
     def verifier(self) -> Any:
+        # [FUNCTION DOC] Returns the first (primary) verifier class.
         return self._verifiers[0]
 
     @verifier.setter
     @compatibility(is_backward_compatible=False)
     def verifier(self, value):
+        # [FUNCTION DOC] Setter that always raises RuntimeError; the attribute is read-only.
         raise RuntimeError("Unable to set ExportedProgram's verifier attribute.")
 
     @property
     @compatibility(is_backward_compatible=False)
     def dialect(self) -> str:
+        # [FUNCTION DOC] Returns the dialect name of the primary verifier. Raises an error if
+        # the verifier list is None.
         if self._verifiers is None:
             raise AssertionError("_verifiers must not be None")
         return self._verifiers[0].dialect
@@ -1342,26 +1456,32 @@ class ExportedProgram:
     @dialect.setter
     @compatibility(is_backward_compatible=False)
     def dialect(self, value):
+        # [FUNCTION DOC] Setter that always raises RuntimeError; the attribute is read-only.
         raise RuntimeError("Unable to set ExportedProgram's dialect attribute.")
 
     @property
     @compatibility(is_backward_compatible=False)
     def verifiers(self):
+        # [FUNCTION DOC] Returns the list of verifier classes.
         return self._verifiers
 
     @verifiers.setter
     @compatibility(is_backward_compatible=False)
     def verifiers(self, value):
+        # [FUNCTION DOC] Setter that always raises RuntimeError; the attribute is read-only.
         raise RuntimeError("Unable to set ExportedProgram's verifiers attribute.")
 
     @property
     @compatibility(is_backward_compatible=False)
     def tensor_constants(self):
+        # [FUNCTION DOC] Returns the constants mapping (alias of constants, kept for older
+        # callers).
         return self._constants
 
     @tensor_constants.setter
     @compatibility(is_backward_compatible=False)
     def tensor_constants(self, value):
+        # [FUNCTION DOC] Setter that always raises RuntimeError; the attribute is read-only.
         raise RuntimeError(
             "Unable to set ExportedProgram's tensor_constants attribute."
         )
@@ -1369,14 +1489,20 @@ class ExportedProgram:
     @property
     @compatibility(is_backward_compatible=False)
     def constants(self):
+        # [FUNCTION DOC] Returns the mapping of names to constant values (tensors, script
+        # objects) used by the graph.
         return self._constants
 
     @constants.setter
     @compatibility(is_backward_compatible=False)
     def constants(self, value):
+        # [FUNCTION DOC] Setter that always raises RuntimeError; the attribute is read-only.
         raise RuntimeError("Unable to set ExportedProgram's constants attribute.")
 
     def _get_flat_args_with_check(self, args, kwargs):
+        # [FUNCTION DOC] HELPER: Reorders kwargs to match the input spec, flattens (args,
+        # kwargs) with paths, validates the flat inputs against range constraints and input
+        # placeholders, and returns (tuple of flat values, received tree spec).
         """Flatten args, kwargs using pytree, then, check specs.
 
         Args:
@@ -1400,6 +1526,11 @@ class ExportedProgram:
         return flat_args, received_spec
 
     def _graph_module_flat_inputs(self, args: Any, kwargs: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Builds the positional inputs for the graph module: lifted
+        # parameters, buffers, constants and custom objects (taken from state dict, constants
+        # or graph module state, in signature order) followed by the flattened user inputs.
+        # Raises ValueError if the received input tree spec is not equivalent to the exported
+        # one; may raise KeyError for missing state.
         """Transform args, kwargs of __call__ to args for graph_module.
 
         self.graph_module takes stuff from state dict as inputs.
@@ -1456,12 +1587,16 @@ class ExportedProgram:
         return additional_inputs + flat_args
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        # [FUNCTION DOC] Always raises RuntimeError: programs cannot be called directly, use
+        # the module method to get a callable module instead.
         raise RuntimeError(
             "Unable to call ExportedProgram directly. "
             "You should use `exported_program.module()` instead."
         )
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns a readable multi-line text: indented graph module source, the
+        # graph signature, and the range constraints.
         graph_module = self.graph_module.print_readable(
             print_output=False, colored=False
         ).replace("\n", "\n    ")
@@ -1477,6 +1612,10 @@ class ExportedProgram:
         return string
 
     def module(self, check_guards=True) -> torch.fx.GraphModule:
+        # [FUNCTION DOC] Returns a self-contained graph module with lifted state inlined, built
+        # by the unlift helper. Arg check_guards chooses a guards submodule versus a forward
+        # pre-hook for input checks. The returned module has train and eval replaced by
+        # versions that raise NotImplementedError.
         """
         Returns a self contained GraphModule with all the parameters/buffers inlined.
 
@@ -1492,9 +1631,11 @@ class ExportedProgram:
         module = _unlift_exported_program_lifted_states(self, check_guards=check_guards)
 
         def _train(self, mode: bool = True):
+            # [FUNCTION DOC] HELPER: Replacement for train; always raises NotImplementedError.
             raise NotImplementedError("Calling train() is not supported yet.")
 
         def _eval(self, mode: bool = True):
+            # [FUNCTION DOC] HELPER: Replacement for eval; always raises NotImplementedError.
             raise NotImplementedError("Calling eval() is not supported yet.")
 
         module.train = types.MethodType(_train, module)  # type: ignore[method-assign]
@@ -1502,6 +1643,8 @@ class ExportedProgram:
         return module
 
     def _num_lifted_params_buffers(self):
+        # [FUNCTION DOC] HELPER: Returns the index of the first user input spec, i.e. the count
+        # of leading lifted inputs; the total spec count if there is no user input.
         return next(
             (
                 i
@@ -1517,6 +1660,12 @@ class ExportedProgram:
         decomp_table: dict[torch._ops.OperatorBase, Callable] | None = None,
         decompose_custom_triton_ops: bool = False,
     ) -> "ExportedProgram":
+        # [FUNCTION DOC] Returns a new ExportedProgram with decompositions applied. Args:
+        # decomp_table (None means default core aten table; empty means decompose nothing; a
+        # CustomDecompTable is materialized to a plain mapping) and decompose_custom_triton_ops.
+        # Splits the table into composite-implicit overrides and python decompositions, then
+        # retraces. The decorator runs it with any ambient fake mode disabled. Does not
+        # decompose joint graphs. The original program is not modified.
         """
         Run a set of decompositions on the exported program and returns a new
         exported program. By default we will run the Core ATen decompositions to
@@ -1583,6 +1732,11 @@ class ExportedProgram:
         )
 
     def _transform_do_not_use(self, *passes: PassType) -> "ExportedProgram":
+        # [FUNCTION DOC] HELPER: Runs the given fx passes over the graph module via a pass
+        # manager (with backend decompositions ignored) and returns a new ExportedProgram with
+        # an updated signature and range constraints; returns self if nothing was modified.
+        # Raises an error if the pass result has no graph module. Graph module metadata is
+        # merged from the original and the pass result.
         pm = PassManager(list(passes))
         # Since we abstractly run the passes, we need to disable backend decomp here
         # again.
@@ -1603,6 +1757,13 @@ class ExportedProgram:
             old_signature: ExportGraphSignature,
             new_gm: torch.fx.GraphModule,
         ) -> ExportGraphSignature:
+            # [FUNCTION DOC] HELPER: Rebuilds the signature by renaming each input and output
+            # spec argument to the name of the corresponding node of the transformed graph
+            # (constants and custom objects are kept). Raises an error if the number of inputs
+            # or outputs exceeds the old signature or the last node is not the output node.
+            # KNOWN ISSUE: it stops at the first non-placeholder, so fewer inputs than before
+            # are not detected, and a type constructor call on the arg type assumes a name-only
+            # argument class.
             """
             Update the graph signature's user_input/user_outputs.
             """
@@ -1685,6 +1846,8 @@ class ExportedProgram:
         return transformed_ep
 
     def _check_input_constraints(self, flat_args_with_path):
+        # [FUNCTION DOC] HELPER: Picks the placeholders belonging to user inputs and checks the
+        # flat (path, value) inputs against them and the range constraints; raises on violation.
         from torch._export.utils import _check_input_constraints_for_graph
 
         placeholders = [p for p in self.graph.nodes if p.op == "placeholder"]
@@ -1699,11 +1862,15 @@ class ExportedProgram:
 
     @compatibility(is_backward_compatible=False)
     def validate(self):
+        # [FUNCTION DOC] Public entry to verify the program; delegates to the private validate.
         self._validate()
 
     # TODO: remove this
     @final
     def _validate(self):
+        # [FUNCTION DOC] HELPER: Raises an error if there are no verifiers; otherwise
+        # instantiates each verifier and runs its check on this program (which raises on
+        # violations).
         if len(self.verifiers) == 0:
             raise AssertionError("ExportedProgram must have at least one verifier.")
         for v in self.verifiers:
@@ -1719,6 +1886,10 @@ class ExportedProgram:
         constants=None,
         verifiers=None,
     ) -> "ExportedProgram":
+        # [FUNCTION DOC] HELPER: Builds a new ExportedProgram from a graph module and signature,
+        # reusing (or deep-copying) range constraints, module call graph and example inputs, and
+        # taking state dict, constants and verifiers from the arguments when given, otherwise
+        # from this program.
         return ExportedProgram(
             root=graph_module,
             graph=graph_module.graph,
@@ -1733,6 +1904,8 @@ class ExportedProgram:
 
 
 def _get_shape_env(gm):
+    # [FUNCTION DOC] HELPER: Returns the shape environment found from the fake mode detected in
+    # the node val metadata of gm, or from the first symbolic int value; None if none exists.
     vals = [
         node.meta["val"]
         for node in gm.graph.nodes
@@ -1752,6 +1925,10 @@ def _get_updated_range_constraints(
     gm: torch.fx.GraphModule,
     old_range_constraints: "dict[sympy.Symbol, Any] | None" = None,
 ) -> "dict[sympy.Symbol, Any]":
+    # [FUNCTION DOC] HELPER: Returns range constraints for gm: empty if no shape environment;
+    # otherwise a copy of the old constraints minus symbols that were replaced, plus ranges of
+    # shape environment variables not already present. Raises an error if old constraints is
+    # None.
     if old_range_constraints is None:
         raise AssertionError("old_range_constraints must not be None")
 
@@ -1773,6 +1950,9 @@ def _get_updated_range_constraints(
 
 
 def _create_graph_module_for_export(root, graph):
+    # [FUNCTION DOC] HELPER: Builds a graph module from root and graph. If generated source has
+    # a syntax error (in-memory custom objects), warns and returns a module with an empty graph
+    # whose graph attribute is overridden, so it can only be run via an fx interpreter.
     try:
         gm = torch.fx.GraphModule(root, graph)
     except SyntaxError:
@@ -1795,6 +1975,9 @@ def _create_graph_module_for_export(root, graph):
 
 
 def _convert_guards_to_code(graph_module):
+    # [FUNCTION DOC] HELPER: Returns the shape guards of the graph module as python expression
+    # strings, using only guards over symbols not derived from constant sources and excluding
+    # those that mention the module weights. Empty list if there is no shape environment.
     shape_env = _get_shape_env(graph_module)
     if shape_env is None:
         return []

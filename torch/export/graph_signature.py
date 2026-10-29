@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Data model describing the input/output signature of an exported graph: argument
+# spec dataclasses, input/output kind enums, InputSpec/OutputSpec pairs, and ExportGraphSignature
+# which derives name-to-target views (parameters, buffers, mutations, constants, tokens) from the
+# specs. Also holds private helpers converting an AOT autograd GraphSignature into an
+# ExportGraphSignature. No import-time side effects beyond imports.
 import dataclasses
 from collections.abc import Collection, Mapping
 from enum import auto, Enum
@@ -31,31 +36,38 @@ __all__ = [
 
 @dataclasses.dataclass
 class TensorArgument:
+    # [CLASS DOC] Argument spec naming a tensor-valued graph node; state is the node name.
     name: str
 
 
 @dataclasses.dataclass
 class TokenArgument:
+    # [CLASS DOC] Argument spec naming an effect-ordering token node; state is the node name.
     name: str
 
 
 @dataclasses.dataclass
 class SymIntArgument:
+    # [CLASS DOC] Argument spec naming a symbolic-integer graph node; state is the node name.
     name: str
 
 
 @dataclasses.dataclass
 class SymFloatArgument:
+    # [CLASS DOC] Argument spec naming a symbolic-float graph node; state is the node name.
     name: str
 
 
 @dataclasses.dataclass
 class SymBoolArgument:
+    # [CLASS DOC] Argument spec naming a symbolic-boolean graph node; state is the node name.
     name: str
 
 
 @dataclasses.dataclass
 class CustomObjArgument:
+    # [CLASS DOC] Argument spec for a script-object or opaque custom-object node. State: node
+    # name, fully qualified class name, and an optional fake value used during tracing.
     name: str
     class_fqn: str
     fake_val: FakeScriptObject | None = None
@@ -63,6 +75,8 @@ class CustomObjArgument:
 
 @dataclasses.dataclass
 class ConstantArgument:
+    # [CLASS DOC] Argument spec for a Python constant (int, float, bool, str or None). State: a
+    # name (may be empty for inline constants) and the constant value.
     name: str
     value: int | float | bool | str | None
 
@@ -79,6 +93,8 @@ ArgumentSpec = (
 
 
 class InputKind(Enum):
+    # [CLASS DOC] Enumeration of the roles a graph input can play: user input, parameter,
+    # buffer, lifted constant tensor, custom object, or effect token.
     USER_INPUT = auto()
     PARAMETER = auto()
     BUFFER = auto()
@@ -89,12 +105,18 @@ class InputKind(Enum):
 
 @dataclasses.dataclass
 class InputSpec:
+    # [CLASS DOC] Describes one graph input: its kind, its argument spec, an optional target
+    # (fully qualified name of the lifted state, None for user inputs and tokens) and a
+    # persistent flag that must be set for buffers. Invariant checked at construction.
     kind: InputKind
     arg: ArgumentSpec
     target: str | None
     persistent: bool | None = None
 
     def __post_init__(self):
+        # [FUNCTION DOC] Validates the spec after construction. Raises an error if the kind is
+        # buffer and persistent was not given, or if arg is not one of the known argument
+        # spec types.
         if self.kind == InputKind.BUFFER:
             if self.persistent is None:
                 raise AssertionError("Failed to specify persistent flag on BUFFER.")
@@ -113,12 +135,16 @@ class InputSpec:
             raise AssertionError(f"expected valid arg type, got {type(self.arg)}")
 
     def __str__(self):
+        # [FUNCTION DOC] Returns a one-line text form: arg name, kind name, then target and
+        # persistent flag when they are set.
         target = "" if self.target is None else f" target='{self.target}'"
         persistent = "" if self.persistent is None else f" persistent={self.persistent}"
         return f"{str(self.arg.name)}: {str(self.kind.name)}{target}{persistent}"
 
 
 class OutputKind(Enum):
+    # [CLASS DOC] Enumeration of the roles a graph output can play: user or loss output,
+    # buffer/parameter/user-input mutation, gradient to parameter or user input, or token.
     USER_OUTPUT = auto()
     LOSS_OUTPUT = auto()
     BUFFER_MUTATION = auto()
@@ -131,11 +157,15 @@ class OutputKind(Enum):
 
 @dataclasses.dataclass
 class OutputSpec:
+    # [CLASS DOC] Describes one graph output: its kind, argument spec, and an optional target
+    # (name of the mutated or differentiated state; None for plain outputs and tokens).
     kind: OutputKind
     arg: ArgumentSpec
     target: str | None
 
     def __post_init__(self):
+        # [FUNCTION DOC] Validates after construction: raises an error if arg is not one of
+        # the known argument spec types.
         if not isinstance(
             self.arg,
             (
@@ -151,12 +181,15 @@ class OutputSpec:
             raise AssertionError(f"expected valid arg type, got {self.arg}")
 
     def __str__(self):
+        # [FUNCTION DOC] Returns a one-line text form: arg name, kind name, and target if set.
         target = "" if self.target is None else f" target='{self.target}'"
         return f"{str(self.arg.name)}: {str(self.kind.name)}{target}"
 
 
 @dataclasses.dataclass
 class ExportBackwardSignature:
+    # [CLASS DOC] Backward-related signature for joint graphs: mappings from gradient output
+    # names to parameter names and to user input names, plus the loss output name.
     gradients_to_parameters: dict[str, str]
     gradients_to_user_inputs: dict[str, str]
     loss_output: str
@@ -164,6 +197,10 @@ class ExportBackwardSignature:
 
 @dataclasses.dataclass
 class ExportGraphSignature:
+    # [CLASS DOC] Holds ordered lists of InputSpec and OutputSpec for an export graph and
+    # exposes read-only derived views (tuples or immutable mappings recomputed on each access)
+    # such as parameters, buffers, user inputs/outputs, mutation maps, lifted constants,
+    # tokens and the backward signature. Also supports renaming nodes in the specs.
     """
     :class:`ExportGraphSignature` models the input/output signature of Export Graph,
     which is a fx.Graph with stronger invariants guarantees.
@@ -277,6 +314,8 @@ class ExportGraphSignature:
     # A list of parameters uniquely identified by mangled fully qualified name
     @property
     def parameters(self) -> Collection[str]:
+        # [FUNCTION DOC] Returns a tuple of targets of all inputs whose kind is parameter and
+        # whose target is a string, in input order.
         return tuple(
             s.target
             for s in self.input_specs
@@ -287,6 +326,7 @@ class ExportGraphSignature:
     # A list of buffers uniquely identified by mangled fully qualified name
     @property
     def buffers(self) -> Collection[str]:
+        # [FUNCTION DOC] Returns a tuple of targets of all buffer inputs with string targets.
         return tuple(
             s.target
             for s in self.input_specs
@@ -296,6 +336,8 @@ class ExportGraphSignature:
 
     @property
     def non_persistent_buffers(self) -> Collection[str]:
+        # [FUNCTION DOC] Returns a tuple of targets of buffer inputs explicitly marked as not
+        # persistent (flag is false; an unset flag is not included).
         return tuple(
             s.target
             for s in self.input_specs
@@ -307,6 +349,7 @@ class ExportGraphSignature:
     # A list of lifted constant tensors
     @property
     def lifted_tensor_constants(self) -> Collection[str]:
+        # [FUNCTION DOC] Returns a tuple of targets of inputs of kind constant tensor.
         return tuple(
             s.target
             for s in self.input_specs
@@ -316,6 +359,7 @@ class ExportGraphSignature:
 
     @property
     def lifted_custom_objs(self) -> Collection[str]:
+        # [FUNCTION DOC] Returns a tuple of targets of inputs of kind custom object.
         return tuple(
             s.target
             for s in self.input_specs
@@ -326,6 +370,9 @@ class ExportGraphSignature:
     # Graph node names of pytree-flattened inputs of original program
     @property
     def user_inputs(self) -> Collection[int | float | bool | str | None]:
+        # [FUNCTION DOC] Returns a tuple with one entry per user input, in order: the node name
+        # for tensor, symbolic and custom-object arguments, the constant value for constant
+        # arguments. Raises RuntimeError for any other argument type (for example a token).
         user_inputs: list[int | float | bool | str | None] = []
         for s in self.input_specs:
             if s.kind != InputKind.USER_INPUT:
@@ -352,6 +399,9 @@ class ExportGraphSignature:
     # For joint-graph purposes, will include the loss output.
     @property
     def user_outputs(self) -> Collection[int | float | bool | str | None]:
+        # [FUNCTION DOC] Returns a tuple with one entry per user or loss output, in order: the
+        # node name for tensor, symbolic and custom-object arguments, the constant value for
+        # constants. Raises RuntimeError for any other argument type.
         user_outputs: list[int | float | bool | str | None] = []
         for s in self.output_specs:
             if s.kind not in [
@@ -377,6 +427,8 @@ class ExportGraphSignature:
     # name is found in this dictionary, it is guaranteed to be a lifted parameter.
     @property
     def inputs_to_parameters(self) -> Mapping[str, str]:
+        # [FUNCTION DOC] Returns a read-only mapping from placeholder name to parameter target
+        # for parameter inputs that are tensor arguments with string targets.
         return _immutable_dict(
             (s.arg.name, s.target)
             for s in self.input_specs
@@ -389,6 +441,8 @@ class ExportGraphSignature:
     # name is found in this dictionary, it is guaranteed to be a lifted buffer.
     @property
     def inputs_to_buffers(self) -> Mapping[str, str]:
+        # [FUNCTION DOC] Returns a read-only mapping from placeholder name to buffer target
+        # for buffer inputs that are tensor arguments with string targets.
         return _immutable_dict(
             (s.arg.name, s.target)  # type: ignore[union-attr, misc]
             for s in self.input_specs
@@ -401,6 +455,8 @@ class ExportGraphSignature:
     # original program. Buffers that are not mutated will not be found in this dictionary.
     @property
     def buffers_to_mutate(self) -> Mapping[str, str]:
+        # [FUNCTION DOC] Returns a read-only mapping from output node name to the buffer
+        # target whose updated value it carries (buffer-mutation outputs only).
         return _immutable_dict(
             (s.arg.name, s.target)
             for s in self.output_specs
@@ -411,6 +467,8 @@ class ExportGraphSignature:
 
     @property
     def parameters_to_mutate(self) -> Mapping[str, str]:
+        # [FUNCTION DOC] Returns a read-only mapping from output node name to the parameter
+        # target whose updated value it carries (parameter-mutation outputs only).
         return _immutable_dict(
             (s.arg.name, s.target)
             for s in self.output_specs
@@ -421,6 +479,8 @@ class ExportGraphSignature:
 
     @property
     def user_inputs_to_mutate(self) -> Mapping[str, str]:
+        # [FUNCTION DOC] Returns a read-only mapping from output node name to the user input
+        # target it updates (user-input-mutation outputs only).
         return _immutable_dict(
             (s.arg.name, s.target)
             for s in self.output_specs
@@ -432,6 +492,8 @@ class ExportGraphSignature:
     # A dictionary mapping graph input node names to lifted tensor constants.
     @property
     def inputs_to_lifted_tensor_constants(self) -> Mapping[str, str]:
+        # [FUNCTION DOC] Returns a read-only mapping from placeholder name to constant-tensor
+        # target for lifted constant tensor inputs.
         return _immutable_dict(
             (s.arg.name, s.target)
             for s in self.input_specs
@@ -442,6 +504,8 @@ class ExportGraphSignature:
 
     @property
     def inputs_to_lifted_custom_objs(self) -> Mapping[str, str]:
+        # [FUNCTION DOC] Returns a read-only mapping from placeholder name to custom-object
+        # target for lifted custom object inputs.
         return _immutable_dict(
             (s.arg.name, s.target)
             for s in self.input_specs
@@ -452,6 +516,10 @@ class ExportGraphSignature:
 
     @property
     def backward_signature(self) -> ExportBackwardSignature | None:
+        # [FUNCTION DOC] Builds an ExportBackwardSignature from the output specs, or returns
+        # None when there is no loss output. Collects the loss output name and the maps from
+        # gradient output names to parameter and user input targets. Raises an error if there
+        # are several loss outputs or if an argument or target has an unexpected type.
         loss_output = None
         gradients_to_parameters: dict[str, str] = {}
         gradients_to_user_inputs: dict[str, str] = {}
@@ -499,10 +567,14 @@ class ExportGraphSignature:
     # (updated_inputs, user_outputs, dep_token).
     @property
     def assertion_dep_token(self) -> Mapping[int, str] | None:
+        # [FUNCTION DOC] Always returns None: assertion dependency tokens are no longer
+        # modeled; kept so the consistency check in post-init is skipped.
         return None
 
     @property
     def input_tokens(self) -> Collection[str]:
+        # [FUNCTION DOC] Returns a tuple of node names of token inputs. Raises an error if a
+        # token-kind input does not carry a token argument.
         input_tokens = []
         for s in self.input_specs:
             if s.kind == InputKind.TOKEN:
@@ -515,6 +587,8 @@ class ExportGraphSignature:
 
     @property
     def output_tokens(self) -> Collection[str]:
+        # [FUNCTION DOC] Returns a tuple of node names of token outputs. Raises an error if a
+        # token-kind output does not carry a token argument.
         output_tokens = []
         for s in self.output_specs:
             if s.kind == OutputKind.TOKEN:
@@ -526,6 +600,9 @@ class ExportGraphSignature:
         return tuple(output_tokens)
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Validates the assertion dependency token layout when one exists:
+        # requires exactly one token whose index equals the user output count plus mutated
+        # buffer count, raising an error otherwise. Currently a no-op since the token is None.
         assertion_dep_token = self.assertion_dep_token
         if assertion_dep_token is None:
             return
@@ -541,6 +618,9 @@ class ExportGraphSignature:
             )
 
     def replace_all_uses(self, old: str, new: str):
+        # [FUNCTION DOC] Renames, in place, every argument spec in the output and input specs
+        # whose name equals old to new (constant arguments are skipped). Raises an error if
+        # either name is not a string. Mutates the spec objects.
         """
         Replace all uses of the old name with new name in the signature.
         """
@@ -566,7 +646,13 @@ class ExportGraphSignature:
                     i.arg.name = new
 
     def get_replace_hook(self, replace_inputs=False):
+        # [FUNCTION DOC] Returns a callback suitable as a graph node-replacement hook that keeps
+        # this signature in sync. Arg: replace_inputs, whether placeholder renames also update
+        # the signature. The callback is documented below.
         def _(old, new, user):
+            # [FUNCTION DOC] HELPER: On replacement of node old by name new for a user node,
+            # renames in the signature when the user is the output node, or when old is a
+            # placeholder and input replacement was requested.
             if user.op == "output":
                 self.replace_all_uses(old.name, new)
             if replace_inputs and old.op == "placeholder":
@@ -575,12 +661,16 @@ class ExportGraphSignature:
         return _
 
     def __str__(self):
+        # [FUNCTION DOC] Returns a multi-line text form with an inputs section and an outputs
+        # section listing each spec on its own line.
         input_specs = "\n".join(str(s) for s in self.input_specs)
         output_specs = "\n".join(str(s) for s in self.output_specs)
         return f"\n# inputs\n{input_specs}\n\n# outputs\n{output_specs}\n"
 
 
 def _immutable_dict(items):
+    # [FUNCTION DOC] HELPER: Builds a dict from an iterable of key/value pairs and returns a
+    # read-only view of it (shallow immutability).
     """
     Creates a mapping where items cannot be added, deleted, or updated.
     NOTE: The immutability is shallow (like tuple is an immutable collection).
@@ -591,6 +681,11 @@ def _immutable_dict(items):
 
 
 def _make_argument_spec(node, token_names) -> ArgumentSpec:
+    # [FUNCTION DOC] HELPER: Maps a graph node (or a plain constant) to an argument spec.
+    # Plain int/bool/float/None/str gives an unnamed constant spec. Otherwise the node needs a
+    # val metadata entry (raises an error if missing); token names give a token spec, fake
+    # tensors a tensor spec, symbolic values the matching sym spec, script/opaque objects a
+    # custom-object spec, python scalars a named constant. Raises an error for other types.
     from torch import ScriptObject, SymBool, SymFloat, SymInt
     from torch._library.fake_class_registry import FakeScriptObject
 
@@ -637,6 +732,13 @@ def _convert_to_export_graph_signature(
     gm: "torch.fx.GraphModule",
     non_persistent_buffers: set[str],
 ) -> "ExportGraphSignature":
+    # [FUNCTION DOC] HELPER: Converts an AOT autograd GraphSignature plus its graph module into
+    # an ExportGraphSignature. Builds argument specs from placeholders and from the leaves of
+    # the output node args, then classifies each as an input or output spec using the lookup
+    # tables of the source signature (mutations are expected first in output order). Raises an
+    # error on unknown tensor kinds.
+    # KNOWN ISSUE: reads gradients_to_parameter from the backward signature, while the export
+    # class names the field gradients_to_parameters; looks wrong for joint graphs.
     from torch.utils import _pytree as pytree
 
     is_joint = graph_signature.backward_signature is not None
@@ -678,6 +780,8 @@ def _convert_to_export_graph_signature(
     ]
 
     def to_input_spec(inp: ArgumentSpec) -> InputSpec:
+        # [FUNCTION DOC] HELPER: Classifies one input argument as token, user input, parameter
+        # or buffer (persistent unless in the non-persistent set); raises on unknown tensors.
         if isinstance(inp, TokenArgument):
             return InputSpec(kind=InputKind.TOKEN, arg=inp, target=None)
 
@@ -703,6 +807,10 @@ def _convert_to_export_graph_signature(
             raise AssertionError(f"Unknown tensor input kind: {name}")
 
     def to_output_spec(idx: int, o: ArgumentSpec) -> OutputSpec:
+        # [FUNCTION DOC] HELPER: Classifies the output argument at position idx. Leading
+        # positions (count of buffer, parameter and user-input mutations plus output tokens)
+        # must be mutations; later ones are user, gradient or loss outputs. Tokens and
+        # non-tensors are handled first. Raises an error on unknown kinds.
         if isinstance(o, TokenArgument):
             return OutputSpec(kind=OutputKind.TOKEN, arg=o, target=None)
 

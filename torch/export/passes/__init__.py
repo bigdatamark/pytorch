@@ -1,3 +1,7 @@
+# [PACKAGE DOC] Package of graph-level passes that operate on an ExportedProgram. Currently
+# it defines and exports a single pass, move_to_device_pass, which relocates all tensors and
+# burnt-in device references of an exported program to another device. No import-time side
+# effects besides importing torch, pytree and ExportedProgram.
 from typing import Union
 
 import torch
@@ -11,6 +15,16 @@ __all__ = ["move_to_device_pass"]
 def move_to_device_pass(
     ep: ExportedProgram, location: torch.device | str | dict[str, str]
 ) -> ExportedProgram:
+    # [FUNCTION DOC] Moves an exported program to a new device, in place, and returns it.
+    # Args: ep is the program to mutate; location is a device, a device string, or a mapping
+    # from existing device strings to target device strings (unmapped devices stay put).
+    # Rewrites the private state dict, constants (tensors only), example inputs, any node
+    # keyword argument named device, the device argument of aten.to.device calls, and the
+    # tensor values stored in node metadata, across the graph module and all submodules.
+    # Finally calls validate on the program; raises whatever validate raises.
+    # KNOWN ISSUE: the aten.to.device rewrite assumes the device is the second positional
+    # argument; a node passing it by keyword is not handled there. Also a node keyword
+    # device that is already a string would be looked up via its device attribute and fail.
     """
     Move the exported program to the given device.
 
@@ -29,6 +43,9 @@ def move_to_device_pass(
         curr_device: torch.device,
         location: torch.device | str | dict[str, str],
     ) -> str:
+        # [FUNCTION DOC] HELPER: Returns the target device as a string. With a mapping
+        # location, looks up the current device string and falls back to it when absent;
+        # otherwise returns the string form of location.
         if isinstance(location, dict):
             if str(curr_device) in location:
                 return location[str(curr_device)]
