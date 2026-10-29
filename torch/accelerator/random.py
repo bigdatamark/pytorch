@@ -1,3 +1,4 @@
+# [MODULE DOC] Accelerator-agnostic random number generator helpers: initial seed and RNG state getters for the default generator of the current accelerator. Importing has no side effects.
 import torch
 from torch import Tensor
 
@@ -5,6 +6,8 @@ from ._utils import _device_t, _get_device_index
 
 
 def initial_seed(device: _device_t = None, /) -> int:
+    # [FUNCTION DOC] Return the initial seed (int) of the default generator for the given device (default: current device index).
+    # Resolves the index via _get_device_index (may raise ValueError/RuntimeError); eagerly initializes the accelerator runtime.
     r"""Return the initial seed of the default :class:`torch.Generator` for the current :ref:`accelerator<accelerators>`
     on the specified device.
 
@@ -24,6 +27,8 @@ def initial_seed(device: _device_t = None, /) -> int:
 
 
 def get_rng_state(device: _device_t = None, /) -> Tensor:
+    # [FUNCTION DOC] Return the RNG state of the default generator for the given device (default: current device) as a uint8 tensor.
+    # Resolves the index via _get_device_index; eagerly initializes the accelerator runtime.
     r"""Return the RNG state of the default :class:`torch.Generator` for the current :ref:`accelerator<accelerators>`
     as a `torch.Tensor` of dtype `torch.uint8` for the specified accelerator device.
 
@@ -43,6 +48,8 @@ def get_rng_state(device: _device_t = None, /) -> Tensor:
 
 
 def get_rng_state_all() -> list[Tensor]:
+    # [FUNCTION DOC] Return a list of uint8 RNG state tensors, one per device of the current accelerator (indices 0 to device_count-1).
+    # Eagerly initializes the accelerator runtime.
     r"""Return a list of `torch.Tensor` of dtype `torch.uint8` representing the RNG states of all devices for
     the current :ref:`accelerator<accelerators>`.
 

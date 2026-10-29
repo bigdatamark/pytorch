@@ -1,3 +1,4 @@
+# [PACKAGE DOC] torch.ao.nn: lazily exposes the subpackages intrinsic, qat, quantizable, quantized and sparse (PEP 562 style) to avoid cyclic imports.
 # We are exposing all subpackages to the end-user.
 # Because of possible inter-dependency, we want to avoid
 # the cyclic imports, thus implementing lazy version
@@ -28,6 +29,7 @@ __all__ = [
 
 
 def __getattr__(name: str) -> "ModuleType":
+    # [FUNCTION DOC] Lazy submodule loader: import and return the named subpackage if it is in the exported list, else raise AttributeError.
     if name in __all__:
         import importlib
 

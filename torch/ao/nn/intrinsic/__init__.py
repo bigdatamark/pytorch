@@ -1,3 +1,4 @@
+# [PACKAGE DOC] torch.ao.nn.intrinsic: fused float modules (conv/linear/bn/relu combinations) re-exported from .modules; also imports the private _FusedModule base. Unknown names that appear in __all__ are imported lazily as submodules.
 import types
 
 from .modules import *  # noqa: F403
@@ -34,6 +35,8 @@ __all__ = [
 # the cyclic imports, thus implementing lazy version
 # as per https://peps.python.org/pep-0562/
 def __getattr__(name: str) -> types.ModuleType:
+    # [FUNCTION DOC] Lazy loader: if the name is in __all__, import it as a submodule of this package and return it; otherwise raise AttributeError.
+    # KNOWN ISSUE: every name in __all__ is a fused class already imported at top, so this hook is effectively only reached for missing submodule lookups and would fail for those names.
     if name in __all__:
         import importlib
 

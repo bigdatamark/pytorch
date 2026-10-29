@@ -1,3 +1,4 @@
+# [MODULE DOC] HELPER: Internal utilities for torch.accelerator: device-index normalization and deferred (lazy) calls until the accelerator runtime is initialized. No import-time side effects.
 from collections.abc import Callable
 
 import torch
@@ -5,6 +6,9 @@ from torch.types import Device as _device_t
 
 
 def _get_device_index(device: _device_t, optional: bool = False) -> int:
+    # [FUNCTION DOC] HELPER: Normalize a device spec (int, string, or torch.device) to an integer device index.
+    # Ints pass through. A device must match the current accelerator type, else ValueError; no accelerator raises RuntimeError.
+    # If the index is missing: returns the current device index when optional is true, otherwise raises ValueError.
     if isinstance(device, int):
         return device
     if isinstance(device, str):
@@ -29,6 +33,9 @@ def _get_device_index(device: _device_t, optional: bool = False) -> int:
 
 
 def _lazy_call(callable: Callable[[], None], **kwargs) -> None:
+    # [FUNCTION DOC] HELPER: Run a callable once the current accelerator's runtime is initialized.
+    # Delegates to the device module's _lazy_call (forwarding extra keyword arguments) if present, else runs it immediately.
+    # Silently does nothing if there is no current accelerator. Returns None.
     r"""Defer a callable until the :ref:`accelerator<accelerators>` runtime is initialized.
 
     If the runtime is already initialized or the backend does not support lazy

@@ -1,3 +1,4 @@
+# [MODULE DOC] Defines Graph, a Python wrapper over the C++ accelerator graph for capture and replay of operation sequences. Exports only Graph. No import-time side effects beyond importing the C++ base class.
 import gc
 from typing import Literal
 from typing_extensions import Self
@@ -7,6 +8,9 @@ from torch._C import _acceleratorGraph
 
 
 class Graph(_acceleratorGraph):
+    # [CLASS DOC] Accelerator graph that can be captured (usable as a context manager) and replayed with lower launch overhead.
+    # Subclasses the C++ _acceleratorGraph. State: graph_pool (optional memory pool id tuple) and capture_error_mode (default, global, thread_local, relaxed), both stored at construction and used on each capture_begin. keep_graph controls whether the underlying graph is kept after capture_end.
+    # Methods mostly forward to the C++ base: capture_begin, capture_end, instantiate, replay, reset, pool, enable_debug_mode, debug_dump.
     r"""
     Wrapper around an :ref:`accelerator<accelerators>` graph that supports capture and replay.
 
@@ -57,6 +61,7 @@ class Graph(_acceleratorGraph):
             "default", "global", "thread_local", "relaxed"
         ] = "default",
     ) -> Self:
+        # [FUNCTION DOC] HELPER: Allocate the C++ object, passing only keep_graph to the base constructor; pool and capture_error_mode are accepted but handled in __init__.
         return super().__new__(cls, keep_graph)
 
     def __init__(
@@ -68,12 +73,14 @@ class Graph(_acceleratorGraph):
             "default", "global", "thread_local", "relaxed"
         ] = "default",
     ) -> None:
+        # [FUNCTION DOC] Initialize the base with keep_graph and record pool as graph_pool and capture_error_mode as attributes for later captures.
         super().__init__(keep_graph)
         self.graph_pool = pool
         self.capture_error_mode = capture_error_mode
 
     # pyrefly: ignore [bad-override]
     def capture_begin(self) -> None:
+        # [FUNCTION DOC] Begin recording operations on the current stream into the graph, passing the stored pool and capture error mode to the base implementation.
         r"""
         Begin graph capture on the current stream.
 
@@ -85,6 +92,7 @@ class Graph(_acceleratorGraph):
         )
 
     def capture_end(self) -> None:
+        # [FUNCTION DOC] End capture on the current stream/device; afterwards the graph can be replayed. Forwards to the base.
         r"""
         End graph capture on the current stream of the current device.
 
@@ -93,6 +101,7 @@ class Graph(_acceleratorGraph):
         super().capture_end()
 
     def instantiate(self) -> None:
+        # [FUNCTION DOC] Build the executable graph from the captured one. Called automatically by capture_end (keep_graph false) or by replay (keep_graph true and not yet instantiated).
         r"""
         Instantiate the underlying graph. Will be called by ``capture_end``
         if ``keep_graph=False``, or by ``replay`` if ``keep_graph=True`` and
@@ -101,10 +110,12 @@ class Graph(_acceleratorGraph):
         super().instantiate()
 
     def replay(self) -> None:
+        # [FUNCTION DOC] Replay the captured work; forwards to the base.
         r"""Replay the work captured by this graph."""
         super().replay()
 
     def reset(self) -> None:
+        # [FUNCTION DOC] Discard the held graph so the instance can be recaptured; graph_pool/capture_error_mode may be changed beforehand.
         r"""
         Delete the graph currently held by this instance.
 
@@ -114,6 +125,7 @@ class Graph(_acceleratorGraph):
         super().reset()
 
     def pool(self) -> tuple[int, int]:
+        # [FUNCTION DOC] Return an opaque (int, int) memory pool id for this graph, usable as the pool argument of another graph to share memory.
         r"""
         Return an opaque token representing the id of this graph's memory pool.
 
@@ -134,10 +146,12 @@ class Graph(_acceleratorGraph):
         return super().pool()
 
     def enable_debug_mode(self) -> None:
+        # [FUNCTION DOC] Enable debug mode, required before debug_dump. Forwards to the base.
         r"""Enable debugging mode for ``debug_dump``."""
         return super().enable_debug_mode()
 
     def debug_dump(self, path: str) -> None:
+        # [FUNCTION DOC] Write the captured graph to the file at path (debug mode must be enabled first). Forwards to the base.
         r"""
         Dump the captured graph to a file for debugging purposes if the debugging is
         enabled via ``enable_debug_mode``.
@@ -160,6 +174,7 @@ class Graph(_acceleratorGraph):
         return super().debug_dump(path)
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] Context entry: synchronize the accelerator, optionally run garbage collection (only when the compiler config flag force_cudagraph_gc is set), empty the device and host caches, then begin capture. Returns None.
         torch.accelerator.synchronize()
         if torch.compiler.config.force_cudagraph_gc:
             # We previously always ran garbage collection here. While this can help
@@ -171,6 +186,7 @@ class Graph(_acceleratorGraph):
         self.capture_begin()
 
     def __exit__(self, *exc_info: object) -> None:
+        # [FUNCTION DOC] Context exit: end capture. Does not suppress exceptions.
         self.capture_end()
 
 

@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Automatic mixed precision autocast: the autocast context manager/decorator, availability query, helpers used for pre-dispatch tracing (_enter_autocast/_exit_autocast), a recursive tensor caster, and custom_fwd/custom_bwd decorators for custom autograd functions.
+# Import-time side effect: tries to import numpy and records HAS_NUMPY (np is None when missing).
 import collections
 import functools
 import warnings
@@ -26,6 +28,7 @@ __all__ = [
 
 
 def is_autocast_available(device_type: str) -> bool:
+    # [FUNCTION DOC] Return True if autocast is supported for the given device type string, by asking the C++ runtime.
     r"""
     Return a bool indicating if autocast is available on :attr:`device_type`.
 
@@ -38,8 +41,10 @@ def is_autocast_available(device_type: str) -> bool:
 
 
 def autocast_decorator(autocast_instance, func):
+    # [FUNCTION DOC] HELPER: Wrap func so each call runs inside the given autocast instance as a context. The wrapper keeps func's metadata and is marked as unsupported in TorchScript script mode. Returns the wrapper.
     @functools.wraps(func)
     def decorate_autocast(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Run the wrapped function inside the captured autocast context and return its result.
         with autocast_instance:
             return func(*args, **kwargs)
 
@@ -50,6 +55,8 @@ def autocast_decorator(autocast_instance, func):
 
 
 class autocast:
+    # [CLASS DOC] Context manager and decorator that enables mixed-precision execution for a device type for the duration of a region (thread-local state).
+    # State: device, fast_dtype (target dtype), _enabled, _cache_enabled, plus prev, prev_fastdtype and prev_cache_enabled saved on entry for restoration on exit. Entering sets the device's autocast enabled flag/dtype and increments a global nesting count; exiting restores the previous values and clears the autocast cache when the outermost region ends. Works as a decorator via call. Under TorchScript scripting most methods are inert.
     r"""
     Instances of :class:`autocast` serve as context managers or decorators that
     allow regions of your script to run in mixed precision.
@@ -226,6 +233,9 @@ class autocast:
         enabled: bool = True,
         cache_enabled: bool | None = None,
     ):
+        # [FUNCTION DOC] Configure autocast for a device type. dtype defaults to the device's default autocast dtype; cache_enabled defaults to the global setting.
+        # Raises ValueError if device_type is not a string, RuntimeError if the device type is unsupported for autocast, RuntimeError for CUDA bfloat16 on a device lacking support, AssertionError if a privateuse1 backend has not registered its module or lacks get_amp_supported_dtype.
+        # Emits warnings and disables autocast when CUDA is unavailable or the dtype is unsupported for the device. In scripting mode just stores the settings and returns early.
         if not isinstance(device_type, str):
             raise ValueError(
                 f"Expected `device_type` of type `str`, got: `{type(device_type)}`"
@@ -306,6 +316,7 @@ class autocast:
         self._enabled = enabled
 
     def __enter__(self):
+        # [FUNCTION DOC] Save the current autocast enabled flag, dtype and cache flag, apply this instance's settings, and increment the nesting count. If a pre-dispatch torch function mode is active, also notifies it so autocast can be traced (for export). Returns self.
         if torch._jit_internal.is_scripting():
             if self.fast_dtype is None:
                 raise AssertionError("fast_dtype must not be None in scripting mode")
@@ -341,6 +352,7 @@ class autocast:
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any):  # type: ignore[override]
+        # [FUNCTION DOC] Decrement the nesting count (clearing the autocast cache at the outermost level), restore the previously saved enabled flag, dtype and cache flag, and notify any pre-dispatch torch function mode. Always returns False so exceptions propagate; does nothing in scripting mode.
         if torch._jit_internal.is_scripting():
             return
 
@@ -368,6 +380,7 @@ class autocast:
         return False
 
     def __call__(self, func):
+        # [FUNCTION DOC] Use the instance as a decorator: returns func wrapped to run under this autocast. Raises TypeError if func is not callable (with a hint about using it as a context manager). Returns func unchanged in scripting mode.
         if torch._jit_internal.is_scripting():
             return func
         if not callable(func):
@@ -382,6 +395,7 @@ class autocast:
 
 # Subclass to distinguish autocast variables created by _enter_autocast (and not managed by a with statement)
 class _UnmanagedAutocast(autocast):
+    # [CLASS DOC] HELPER: Marker subclass of autocast for instances created by _enter_autocast and not managed by a with statement; adds no behavior.
     pass
 
 
@@ -389,6 +403,7 @@ class _UnmanagedAutocast(autocast):
 # They are what we trace into a graph during pre_dispatch tracing
 # when we encounter an autocast context manager.
 def _enter_autocast(*vals):
+    # [FUNCTION DOC] HELPER: Functional entry point traced into graphs during pre-dispatch tracing. Forwards to the torch function mode machinery if a mode is active; otherwise builds an unmanaged autocast from the given constructor arguments, enters it, and returns it.
     # For pre-dispatch tracing, if a TorchFunction mode is active, we'll want to trace this into a graph.
     if torch._C._is_torch_function_mode_enabled():
         return torch.overrides.handle_torch_function(
@@ -400,6 +415,7 @@ def _enter_autocast(*vals):
 
 
 def _exit_autocast(mode):
+    # [FUNCTION DOC] HELPER: Counterpart of _enter_autocast. Forwards to the active torch function mode if any (returning its result); otherwise exits the given autocast object. Returns None in the direct case.
     if torch._C._is_torch_function_mode_enabled():
         return torch.overrides.handle_torch_function(torch.amp._exit_autocast, [], mode)
     mode.__exit__(None, None, None)
@@ -408,6 +424,7 @@ def _exit_autocast(mode):
 # Casts Tensors and containers of Tensors.  Special-cases passthroughs for strings and np.ndarrays, which
 # may be falsely detected as "Iterables."
 def _cast(value, device_type: str, dtype: _dtype):
+    # [FUNCTION DOC] HELPER: Recursively convert eligible tensors to dtype. A tensor is converted only if floating point, on the given device type, and not float64. Strings, bytes and numpy arrays pass through; mappings are rebuilt as dicts with cast keys and values; other iterables are cast elementwise (lists and tuples keep their type, other iterables become a lazy generator); anything else is returned as is.
     if isinstance(value, torch.Tensor):
         is_eligible = (
             value.is_floating_point()
@@ -439,6 +456,8 @@ def _cast(value, device_type: str, dtype: _dtype):
 
 
 def custom_fwd(
+    # [FUNCTION DOC] Decorator factory for forward methods of custom autograd functions. Usable bare or with arguments (returns a partial when fwd is None). Raises ValueError if device_type is not a string.
+    # The wrapper records the device's autocast dtype and whether autocast was active on the first argument (the ctx). If cast_inputs is None it just runs fwd. Otherwise, when autocast is active it runs fwd with autocast disabled and all floating-point tensor inputs cast to cast_inputs, and records that autocast was not used; outside autocast it runs fwd unchanged.
     fwd=None,
     *,
     device_type: str,
@@ -475,6 +494,7 @@ def custom_fwd(
 
     @functools.wraps(fwd)
     def decorate_fwd(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapper produced by custom_fwd; stores _dtype and _fwd_used_autocast on the ctx (first argument), optionally casts inputs under a disabled autocast region, and returns fwd's result.
         args[0]._dtype = torch.get_autocast_dtype(device_type)
         if cast_inputs is None:
             args[0]._fwd_used_autocast = torch.is_autocast_enabled(device_type)
@@ -498,6 +518,8 @@ def custom_fwd(
 # cast_inputs argument on custom_bwd is unnecessary and could cause errors if it doesn't match
 # cast_inputs supplied to custom_fwd.
 def custom_bwd(bwd=None, *, device_type: str):
+    # [FUNCTION DOC] Decorator factory for backward methods of custom autograd functions: makes backward run under the same autocast state (enabled flag and dtype) that forward recorded on ctx. Usable bare or with arguments. Raises ValueError if device_type is not a string.
+    # Requires custom_fwd to have set _fwd_used_autocast and _dtype on ctx; otherwise attribute lookup fails at call time.
     """Create a helper decorator for backward methods of custom autograd functions.
 
     Autograd functions are subclasses of :class:`torch.autograd.Function`.
@@ -519,6 +541,7 @@ def custom_bwd(bwd=None, *, device_type: str):
 
     @functools.wraps(bwd)
     def decorate_bwd(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapper produced by custom_bwd; runs bwd inside an autocast region configured from the ctx's saved _fwd_used_autocast and _dtype, returning its result.
         with autocast(
             device_type=device_type,
             enabled=args[0]._fwd_used_autocast,

@@ -1,3 +1,4 @@
+# [PACKAGE DOC] torch.ao.nn.intrinsic.modules: re-exports the fused module classes (ConvBn*, ConvBnReLU*, ConvReLU*, LinearReLU, BNReLU*, LinearBn1d, LinearLeakyReLU, LinearTanh, ConvAdd2d, ConvAddReLU2d) and the private _FusedModule base from fused.
 from .fused import (
     _FusedModule,
     BNReLU2d,

@@ -1,3 +1,4 @@
+# [MODULE DOC] Device-agnostic accelerator memory management and statistics: cache release, allocator stats (flattened into a sorted ordered mapping), allocated/reserved byte queries, peak/accumulated stat resets, and free/total memory info. Most functions are no-ops or return empty/zero values if the allocator is not initialized.
 from collections import OrderedDict
 from typing import Any
 
@@ -21,6 +22,7 @@ __all__ = [
 
 
 def empty_cache() -> None:
+    # [FUNCTION DOC] Release unused cached device memory held by the caching allocator. No-op if the allocator is not initialized.
     r"""Release all unoccupied cached memory currently held by the caching
     allocator so that those can be used in other application.
 
@@ -33,6 +35,7 @@ def empty_cache() -> None:
 
 
 def empty_host_cache() -> None:
+    # [FUNCTION DOC] Release unused cached pinned host memory held by the host caching allocator (always forwards to the C++ binding).
     r"""Release all unoccupied cached host (pinned) memory currently held by the host caching
     allocator so that it can be used by other applications.
 
@@ -43,6 +46,7 @@ def empty_host_cache() -> None:
 
 
 def _flatten_stats(result: list[tuple[str, Any]], prefix: str, value: Any) -> None:
+    # [FUNCTION DOC] HELPER: Recursively flatten a nested mapping of statistics, appending (dotted key path, value) pairs to the given result list. Mutates result; returns None.
     if isinstance(value, dict):
         for key, nested_value in value.items():
             nested_prefix = f"{prefix}.{key}" if prefix else key
@@ -52,6 +56,8 @@ def _flatten_stats(result: list[tuple[str, Any]], prefix: str, value: Any) -> No
 
 
 def memory_stats(device_index: _device_t = None, /) -> OrderedDict[str, Any]:
+    # [FUNCTION DOC] Return an ordered mapping of allocator statistics with dotted names (for example allocated_bytes.all.current), sorted by key.
+    # Returns an empty mapping if the allocator is not initialized. Device index resolved via _get_device_index (may raise).
     r"""Return a dictionary of accelerator device memory allocator statistics for a given device index.
 
     The return value of this function is a dictionary of statistics, each of
@@ -125,6 +131,7 @@ def memory_stats(device_index: _device_t = None, /) -> OrderedDict[str, Any]:
 
 
 def memory_allocated(device_index: _device_t = None, /) -> int:
+    # [FUNCTION DOC] Return current bytes occupied by live tensors on the device (stat allocated_bytes.all.current), 0 if unavailable.
     r"""Return the current :ref:`accelerator<accelerators>` device memory occupied by tensors
     in bytes for a given device index.
 
@@ -141,6 +148,7 @@ def memory_allocated(device_index: _device_t = None, /) -> int:
 
 
 def max_memory_allocated(device_index: _device_t = None, /) -> int:
+    # [FUNCTION DOC] Return peak bytes occupied by live tensors (stat allocated_bytes.all.peak), 0 if unavailable; resettable with reset_peak_memory_stats.
     r"""Return the current :ref:`accelerator<accelerators>` maximum device memory occupied by tensors
     in bytes for a given device index.
 
@@ -161,6 +169,7 @@ def max_memory_allocated(device_index: _device_t = None, /) -> int:
 
 
 def memory_reserved(device_index: _device_t = None, /) -> int:
+    # [FUNCTION DOC] Return current bytes reserved by the caching allocator (stat reserved_bytes.all.current), 0 if unavailable.
     r"""Return the current :ref:`accelerator<accelerators>` device memory managed by the caching allocator
     in bytes for a given device index.
 
@@ -177,6 +186,7 @@ def memory_reserved(device_index: _device_t = None, /) -> int:
 
 
 def max_memory_reserved(device_index: _device_t = None, /) -> int:
+    # [FUNCTION DOC] Return peak bytes reserved by the caching allocator (stat reserved_bytes.all.peak), 0 if unavailable.
     r"""Return the current :ref:`accelerator<accelerators>` maximum device memory managed by the caching allocator
     in bytes for a given device index.
 
@@ -197,6 +207,7 @@ def max_memory_reserved(device_index: _device_t = None, /) -> int:
 
 
 def reset_accumulated_memory_stats(device_index: _device_t = None, /) -> None:
+    # [FUNCTION DOC] Reset the historical (allocated/freed) allocator counters for the device. No-op if the allocator is not initialized.
     r"""Reset the "accumulated" (historical) stats tracked by the current :ref:`accelerator<accelerators>`
     memory allocator for a given device index.
 
@@ -216,6 +227,7 @@ def reset_accumulated_memory_stats(device_index: _device_t = None, /) -> None:
 
 
 def reset_peak_memory_stats(device_index: _device_t = None, /) -> None:
+    # [FUNCTION DOC] Reset the peak allocator statistics for the device. No-op if the allocator is not initialized.
     r"""Reset the "peak" stats tracked by the current :ref:`accelerator<accelerators>`
     memory allocator for a given device index.
 
@@ -235,6 +247,7 @@ def reset_peak_memory_stats(device_index: _device_t = None, /) -> None:
 
 
 def get_memory_info(device_index: _device_t = None, /) -> tuple[int, int]:
+    # [FUNCTION DOC] Return a (free_bytes, total_bytes) tuple for the device (default current); free memory is across all processes. Index resolved via _get_device_index.
     r"""Return the current device memory information for a given device index.
 
     Args:
@@ -254,6 +267,7 @@ def get_memory_info(device_index: _device_t = None, /) -> tuple[int, int]:
 
 
 def _snapshot(device=None, augment_with_fx_traces: bool = False):
+    # [FUNCTION DOC] HELPER: Return a dictionary snapshot of the memory allocator state, dispatching to the xpu memory module when the accelerator is xpu and otherwise to the cuda memory module (even when no accelerator exists). Requires memory history recording to have been enabled on that backend.
     r"""Return a snapshot of the current :ref:`accelerator<accelerators>` memory allocator state.
 
     Requires :func:`_record_memory_history` on the appropriate device module

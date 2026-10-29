@@ -1,4 +1,5 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Gradient scaling for mixed-precision training: GradScaler (scale loss, unscale/check gradients, skip optimizer steps on inf/NaN, dynamically adjust the scale), the OptState enum tracking per-optimizer progress, and small helpers (_MultiDeviceReplicator, _refresh_per_optimizer_state). No import-time side effects.
 from __future__ import annotations
 
 import inspect
@@ -18,16 +19,19 @@ __all__ = ["OptState", "GradScaler"]
 
 
 class _MultiDeviceReplicator:
+    # [CLASS DOC] HELPER: Holds a master tensor and lazily serves per-device copies, caching each copy in a mapping keyed by device. Invariant: each device gets at most one cached copy.
     """Lazily serves copies of a tensor to requested devices.
 
     Copies are cached per-device.
     """
 
     def __init__(self, master_tensor: torch.Tensor) -> None:
+        # [FUNCTION DOC] HELPER: Store the master tensor and an empty per-device cache.
         self.master = master_tensor
         self._per_device_tensors: dict[torch.device, torch.Tensor] = {}
 
     def get(self, device: torch.device) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Return the copy of the master tensor on device, creating (a non-blocking copy) and caching it on first use.
         retval = self._per_device_tensors.get(device, None)
         if retval is None:
             retval = self.master.to(device=device, non_blocking=True, copy=True)
@@ -41,16 +45,20 @@ class _MultiDeviceReplicator:
 # - Defining READY, UNSCALED, STEPPED and _refresh_per_optimizer_state within GradScaler
 #   causes a circular reference, which we'd rather avoid.
 class OptState(Enum):
+    # [CLASS DOC] Enum of an optimizer's stage within one scaler iteration: READY (0, nothing done), UNSCALED (1, gradients unscaled), STEPPED (2, step already taken). Defined at module level so it and its factory avoid circular references and stay picklable.
     READY = 0
     UNSCALED = 1
     STEPPED = 2
 
 
 def _refresh_per_optimizer_state() -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Default factory for per-optimizer state: returns a new mapping with stage READY and an empty found_inf_per_device mapping.
     return {"stage": OptState.READY, "found_inf_per_device": {}}
 
 
 class GradScaler:
+    # [CLASS DOC] Dynamic loss/gradient scaler for float16 training. Typical loop: scale the loss, backward, step (which unscales, checks for inf/NaN and conditionally steps the optimizer), then update the scale.
+    # State: _device, _enabled, _scale and _growth_tracker (tensors created lazily on first scale call), init scale/growth tracker values, growth_factor, backoff_factor, growth_interval, and _per_optimizer_states (mapping from optimizer id to stage and per-device found-inf tensors, reset on update). When disabled (or CUDA unavailable) all methods are pass-throughs/no-ops. Pickling is supported only between iterations.
     """An instance ``scaler`` of :class:`GradScaler`.
 
     Helps perform the steps of gradient scaling
@@ -129,6 +137,7 @@ class GradScaler:
         growth_interval: int = 2000,
         enabled: bool = True,
     ) -> None:
+        # [FUNCTION DOC] Configure the scaler. Disables itself with a warning if the device is cuda but CUDA is unavailable. When enabled, raises AssertionError unless growth_factor > 1 and backoff_factor < 1; sets up lazy scale/growth tracker and the per-optimizer state mapping. Attributes besides _device and _enabled are only set when enabled.
         self._device = device
         self._enabled = enabled
         if self._device == "cuda":
@@ -161,6 +170,7 @@ class GradScaler:
     def _check_scale_growth_tracker(
         self, funcname: str
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Return the (scale, growth tracker) tensors, raising AssertionError (with a hint to call scale first) if either has not been initialized.
         fix = "This may indicate your script did not use scaler.scale(loss or outputs) earlier in the iteration."
         if self._scale is None:
             raise AssertionError(f"Attempted {funcname} but _scale is None.  " + fix)
@@ -171,6 +181,7 @@ class GradScaler:
         return (self._scale, self._growth_tracker)
 
     def _lazy_init_scale_growth_tracker(self, dev: torch.device) -> None:
+        # [FUNCTION DOC] HELPER: Create the scale (float32 scalar) and growth tracker (int32 scalar) on the given device. Raises AssertionError if the tracker already exists.
         if self._growth_tracker is not None:
             raise AssertionError("_growth_tracker initialized before _scale")
         self._scale = torch.full((), self._init_scale, dtype=torch.float32, device=dev)
@@ -194,6 +205,7 @@ class GradScaler:
         self,
         outputs: torch.Tensor | Iterable[torch.Tensor],
     ) -> torch.Tensor | Iterable[torch.Tensor]:
+        # [FUNCTION DOC] Multiply a tensor, or (nested) iterable of tensors, by the current scale. Returns outputs unchanged if disabled. Lazily initializes the scale on first use. Lists and tuples keep their type; other iterables yield a lazy map. Raises ValueError for elements that are neither tensors nor iterables.
         """
         Multiplies ('scales') a tensor or list of tensors by the scale factor.
 
@@ -222,6 +234,7 @@ class GradScaler:
         ] = []  # holds a reference that can be overwritten by apply_scale
 
         def apply_scale(val: torch.Tensor | Iterable[torch.Tensor]):
+            # [FUNCTION DOC] HELPER: Recursively scale a tensor or iterable; the first tensor creates a shared per-device replicator of the scale (kept in the stash) so each device receives one scale copy. Raises ValueError for unsupported types.
             if isinstance(val, torch.Tensor):
                 if len(stash) == 0:
                     if self._scale is None:
@@ -250,6 +263,8 @@ class GradScaler:
         found_inf: torch.Tensor,
         allow_fp16: bool,
     ) -> dict[torch.device, torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Unscale all optimizer gradients in place and record inf/NaN. Groups gradients by device and dtype (using the values of sparse gradients, coalescing fp16 sparse ones), then calls the fused non-finite check-and-unscale kernel, which writes into per-device found_inf tensors.
+        # Raises ValueError for fp16 gradients unless allow_fp16 is true. Returns the mapping from device to found_inf tensor. Mutates gradients under no-grad.
         per_device_inv_scale = _MultiDeviceReplicator(inv_scale)
         per_device_found_inf = _MultiDeviceReplicator(found_inf)
 
@@ -300,6 +315,8 @@ class GradScaler:
         return per_device_found_inf._per_device_tensors
 
     def unscale_(self, optimizer: torch.optim.Optimizer) -> None:
+        # [FUNCTION DOC] Divide the optimizer's gradients by the scale in place and record inf/NaN per device; no-op if disabled. Computes the reciprocal in float64 (except on mps) for precision.
+        # Raises RuntimeError if already unscaled since the last update or if called after step; AssertionError if scale was never initialized. Sets the optimizer's stage to UNSCALED.
         """
         Divides ("unscales") the optimizer's gradient tensors by the scale factor.
 
@@ -367,6 +384,9 @@ class GradScaler:
         *args: Any,
         **kwargs: Any,
     ) -> float | None:
+        # [FUNCTION DOC] HELPER: Call optimizer.step with the given arguments only if no device recorded an inf/NaN (reads the found-inf values, which forces a sync). Returns the step result or None if skipped.
+        # [FUNCTION DOC] Unscale (if needed) and step the optimizer unless inf/NaN gradients were found; returns the step's return value, or None if skipped. If disabled, simply calls optimizer.step.
+        # Raises RuntimeError if a closure keyword argument is passed or step was already called since update; AssertionError if no scale or inf checks exist. Optimizers declaring scale support are handled specially: either the scaler passes itself as grad_scaler (with a FutureWarning) or temporarily attaches grad_scale and found_inf attributes to the optimizer around the call and deletes them afterwards. Sets stage to STEPPED.
         retval: float | None = None
         if not sum(v.item() for v in optimizer_state["found_inf_per_device"].values()):
             retval = optimizer.step(*args, **kwargs)
@@ -482,6 +502,8 @@ class GradScaler:
         return retval
 
     def update(self, new_scale: float | torch.Tensor | None = None) -> None:
+        # [FUNCTION DOC] Adjust the scale at the end of an iteration; no-op if disabled. With new_scale: a float fills the scale; otherwise it must be a single-element, no-grad tensor on the scaler's device type (AssertionError if not) and is copied in. Without new_scale: sums found-inf tensors from all optimizers and runs the fused update that backs off on inf/NaN or grows after growth_interval clean steps; AssertionError if no inf checks were recorded. Finally resets per-optimizer state.
+        # KNOWN ISSUE: an int new_scale is treated as a tensor and fails on attribute access.
         """Update the scale factor.
 
         If any optimizer steps were skipped the scale is multiplied by ``backoff_factor``
@@ -559,9 +581,11 @@ class GradScaler:
         self._per_optimizer_states = defaultdict(_refresh_per_optimizer_state)
 
     def _get_scale_async(self) -> torch.Tensor | None:
+        # [FUNCTION DOC] HELPER: Return the scale tensor (or None if not yet initialized) without syncing.
         return self._scale
 
     def get_scale(self) -> float:
+        # [FUNCTION DOC] Return the current scale as a Python float (forces a device sync); the initial scale if not yet initialized; 1.0 if disabled.
         """Return a Python float containing the current scale, or 1.0 if scaling is disabled.
 
         .. warning::
@@ -576,10 +600,13 @@ class GradScaler:
         return 1.0
 
     def get_growth_factor(self) -> float:
+        # [FUNCTION DOC] Return the growth factor.
         r"""Return a Python float containing the scale growth factor."""
         return self._growth_factor
 
     def set_growth_factor(self, new_factor: float) -> None:
+        # [FUNCTION DOC] Set the growth factor (no validation).
+        # KNOWN ISSUE: the docstring names the argument new_scale but the parameter is new_factor.
         r"""Set a new scale growth factor.
 
         Args:
@@ -588,10 +615,13 @@ class GradScaler:
         self._growth_factor = new_factor
 
     def get_backoff_factor(self) -> float:
+        # [FUNCTION DOC] Return the backoff factor.
         r"""Return a Python float containing the scale backoff factor."""
         return self._backoff_factor
 
     def set_backoff_factor(self, new_factor: float) -> None:
+        # [FUNCTION DOC] Set the backoff factor (no validation).
+        # KNOWN ISSUE: the docstring names the argument new_scale but the parameter is new_factor.
         r"""Set a new scale backoff factor.
 
         Args:
@@ -600,10 +630,12 @@ class GradScaler:
         self._backoff_factor = new_factor
 
     def get_growth_interval(self) -> int:
+        # [FUNCTION DOC] Return the growth interval.
         r"""Return a Python int containing the growth interval."""
         return self._growth_interval
 
     def set_growth_interval(self, new_interval: int) -> None:
+        # [FUNCTION DOC] Set the growth interval (no validation).
         r"""Set a new growth interval.
 
         Args:
@@ -612,6 +644,7 @@ class GradScaler:
         self._growth_interval = new_interval
 
     def _get_growth_tracker(self) -> int:
+        # [FUNCTION DOC] HELPER: Return the count of consecutive unskipped steps as a Python int (forces a sync); the initial value if uninitialized; 0 if disabled.
         if self._enabled:
             return (
                 self._init_growth_tracker
@@ -621,10 +654,12 @@ class GradScaler:
         return 0
 
     def is_enabled(self) -> bool:
+        # [FUNCTION DOC] Return whether this scaler is enabled.
         r"""Return a bool indicating whether this instance is enabled."""
         return self._enabled
 
     def state_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Return a mapping with scale, growth_factor, backoff_factor, growth_interval and _growth_tracker (syncs to read the tensors); an empty mapping if disabled.
         r"""Return the state of the scaler as a :class:`dict`.
 
         It contains five entries:
@@ -652,6 +687,7 @@ class GradScaler:
         return {}
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        # [FUNCTION DOC] Restore scaler state from a mapping produced by state_dict; no-op if disabled. Raises RuntimeError if the mapping is empty. Updates the initial scale/tracker values and fills the live tensors if they already exist.
         r"""Load the scaler state.
 
         If this instance is disabled, :meth:`load_state_dict` is a no-op.
@@ -679,6 +715,7 @@ class GradScaler:
             self._growth_tracker.fill_(state_dict["_growth_tracker"])
 
     def __getstate__(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Pickle support: copy the instance dict, and when enabled require that no per-optimizer state is pending (AssertionError otherwise), replacing tensors with their Python values so they are recreated lazily after unpickling.
         state = self.__dict__.copy()
         if self._enabled:
             if len(self._per_optimizer_states) != 0:
@@ -696,9 +733,11 @@ class GradScaler:
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
+        # [FUNCTION DOC] Pickle support: restore the instance dict from the given state.
         self.__dict__.update(state)
 
     def _check_inf_per_device(self, optimizer: torch.optim.Optimizer) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: Run the inf/NaN check on the optimizer's gradients without really unscaling (inverse scale of 1, fp16 allowed), store the result in the optimizer's state, and return the per-device found-inf mapping. Used by optimizers that handle scaling themselves.
         _scale, _ = self._check_scale_growth_tracker("_check_inf_per_device")
 
         dummy_inv_scale = torch.full((), 1.0, dtype=torch.float32, device=_scale.device)
@@ -711,4 +750,5 @@ class GradScaler:
         return self._per_optimizer_states[id(optimizer)]["found_inf_per_device"]
 
     def _found_inf_per_device(self, optimizer: torch.optim.Optimizer) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: Return the stored per-device found-inf mapping for the optimizer.
         return self._per_optimizer_states[id(optimizer)]["found_inf_per_device"]
