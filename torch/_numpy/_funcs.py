@@ -1,5 +1,10 @@
 # mypy: ignore-errors
 
+# [MODULE DOC] Public NumPy-like function namespace for torch._numpy.
+# At import time, every public (non-underscore) function in _funcs_impl and _reductions_impl is
+# wrapped with the argument normalizer (percentile, quantile, median also promote scalar results;
+# einsum is exported unwrapped because it normalizes manually), renamed, and injected into this
+# module's namespace and __all__. Also defines the vendored index_exp and s_ helpers.
 import inspect
 import itertools
 
@@ -19,7 +24,9 @@ from ._normalizations import normalizer
 
 
 def _public_functions(mod):
+    # [FUNCTION DOC] HELPER: Return (name, function) pairs for all public plain functions of a module.
     def is_public_function(f):
+        # [FUNCTION DOC] HELPER: Predicate: true for plain functions whose name does not start with an underscore.
         return inspect.isfunction(f) and not f.__name__.startswith("_")
 
     return inspect.getmembers(mod, is_public_function)
@@ -52,6 +59,9 @@ Vendored objects from numpy.lib.index_tricks
 
 
 class IndexExpression:
+    # [CLASS DOC] Vendored from numpy.lib.index_tricks: object whose indexing returns the index itself.
+    # State: maketuple flag. With maketuple true, a non-tuple index is wrapped in a 1-tuple (index_exp);
+    # otherwise the index is returned unchanged (s_).
     """
     Written by Konrad Hinsen <hinsen@cnrs-orleans.fr>
     last revision: 1999-7-23
@@ -60,9 +70,11 @@ class IndexExpression:
     """
 
     def __init__(self, maketuple):
+        # [FUNCTION DOC] Store the maketuple flag.
         self.maketuple = maketuple
 
     def __getitem__(self, item):
+        # [FUNCTION DOC] Return the index wrapped in a 1-tuple if maketuple is set and it is not already a tuple; else return it as is.
         if self.maketuple and not isinstance(item, tuple):
             return (item,)
         else:

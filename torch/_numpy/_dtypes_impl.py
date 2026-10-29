@@ -1,5 +1,9 @@
 # mypy: ignore-errors
 
+# [MODULE DOC] Dtype and scalar-type helpers for torch._numpy, operating purely on torch dtypes.
+# Provides the lazily initialised NumPy-style default dtypes, cast/promotion lookups
+# backed by _casting_dicts, and NEP 50 weak-scalar promotion for binary operations.
+# Import-time side effect: imports _casting_dicts midway through the module.
 """Dtypes/scalar type implementations with torch dtypes.
 
 Here `dtype` is always a torch.dtype, this module knows nothing about
@@ -23,6 +27,11 @@ _default_dtypes = None
 
 
 def default_dtypes():
+    # [FUNCTION DOC] Return the cached DefaultDTypes (float, complex, int torch dtypes).
+    # On first call reads torch._dynamo.config numpy_default_float/complex/int, resolves each
+    # name as an attribute of torch, validates they are torch dtypes, and stores them in a
+    # module-global cache. Raises AssertionError if a configured name is not a torch dtype
+    # and AttributeError if the name does not exist in torch. Later config changes are ignored.
     global _default_dtypes
     if _default_dtypes is None:
         import torch._dynamo.config as config
@@ -48,6 +57,8 @@ def default_dtypes():
 
 
 def get_default_dtype_for(dtype):
+    # [FUNCTION DOC] Map a torch dtype to the default dtype of its category: bool stays bool,
+    # complex -> default complex, floating -> default float, anything else -> default int.
     """Default scalar type given sctype category."""
     if dtype == torch.bool:
         return dtype
@@ -63,10 +74,16 @@ from . import _casting_dicts as _cd
 
 
 def can_cast_impl(from_torch_dtype, to_torch_dtype, casting):
+    # [FUNCTION DOC] Look up whether a cast from one torch dtype to another is allowed under the
+    # given casting rule (key into the cast table, e.g. no/equiv/safe/same_kind/unsafe). Returns a bool;
+    # raises KeyError for unknown rule or dtype.
     return _cd._can_cast_dict[casting][from_torch_dtype][to_torch_dtype]
 
 
 def result_type_impl(*tensors):
+    # [FUNCTION DOC] Compute the promoted torch dtype of one or more tensors by folding the
+    # pairwise result-type table over their dtypes. A single tensor returns its own dtype.
+    # Raises IndexError if called with no tensors and KeyError for dtypes missing in the table.
     # NB: torch dtypes here
     dtyp = tensors[0].dtype
     if len(tensors) == 1:
@@ -79,6 +96,7 @@ def result_type_impl(*tensors):
 
 
 def python_type_for_torch(dtyp):
+    # [FUNCTION DOC] Return the Python scalar type (float, complex, bool or int) matching a torch dtype.
     """Get a python scalar type a torch dtype"""
     if dtyp.is_floating_point:
         typ = float
@@ -120,14 +138,18 @@ _NEP50_FUNCS_TENSOR_ONLY = (
 
 
 def is_scalar(x):
+    # [FUNCTION DOC] HELPER: True if x is a Python int, bool, float or complex.
     return isinstance(x, _SCALAR_TYPES)
 
 
 def is_scalar_or_symbolic(x):
+    # [FUNCTION DOC] HELPER: True if x is a Python scalar or a torch symbolic int/float/bool.
     return isinstance(x, _SCALAR_AND_SYMBOLIC_TYPES)
 
 
 def _dtype_for_scalar(py_type):
+    # [FUNCTION DOC] HELPER: Map a Python (or symbolic) scalar type to its NumPy-like torch dtype
+    # (bool, int64, float64, complex128). Raises KeyError for other types.
     return {
         bool: torch.bool,
         torch.SymBool: torch.bool,
@@ -140,18 +162,23 @@ def _dtype_for_scalar(py_type):
 
 
 def _dtype_for_scalar_or_tensor(x):
+    # [FUNCTION DOC] HELPER: Dtype of a tensor, or the dtype implied by the type of a Python scalar.
     return x.dtype if isinstance(x, torch.Tensor) else _dtype_for_scalar(type(x))
 
 
 def is_float_or_fp_tensor(x):
+    # [FUNCTION DOC] True if the tensor dtype, or the dtype implied by the scalar type, is floating point.
     return _dtype_for_scalar_or_tensor(x).is_floating_point
 
 
 def is_complex_or_complex_tensor(x):
+    # [FUNCTION DOC] True if the tensor dtype, or the dtype implied by the scalar type, is complex.
     return _dtype_for_scalar_or_tensor(x).is_complex
 
 
 def _category(dtype):
+    # [FUNCTION DOC] HELPER: Rank of a dtype's kind: 0 bool, 1 integer, 2 floating, 3 complex.
+    # Raises KeyError for dtypes not in the table (e.g. bfloat16).
     return {
         torch.bool: 0,
         torch.SymBool: 0,
@@ -174,9 +201,17 @@ def _category(dtype):
 
 
 def nep50_to_tensors(x1, x2, handle_weaks, function_name):
+    # [FUNCTION DOC] Convert two binary-op operands into tensors following NEP 50 weak-scalar promotion.
+    # If handle_weaks is false or both are non-tensors, scalars are converted to 0-d tensors of the
+    # default dtype for their kind. Otherwise exactly one operand is a Python scalar ("weak"): it adopts
+    # the tensor's dtype when its kind is not higher than the tensor's, else the scalar's default dtype
+    # (float scalar with float32 tensor and complex scalar gives complex64). A Python int out of range of
+    # an integer tensor dtype raises OverflowError. The weak scalar stays a plain Python value unless its
+    # dtype changes or function_name is in the tensor-only list. Returns the pair in original order.
     """If either of inputs is a python scalar, type-promote with NEP 50."""
 
     def to_tensor(scalar, dtype=None):
+        # [FUNCTION DOC] HELPER: Make a 0-d tensor from a scalar, using the given dtype or else the default
         if dtype is None:
             dtype = _dtype_for_scalar(type(scalar))
             dtype = get_default_dtype_for(dtype)

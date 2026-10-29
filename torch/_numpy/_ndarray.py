@@ -1,5 +1,10 @@
 # mypy: ignore-errors
 
+# [MODULE DOC] Defines the ndarray wrapper class around torch.Tensor and the core array constructors for torch._numpy.
+# Contents: Flags (read-only flag view), the ndarray class (methods and operator dunders generated at class creation from
+# the methods, dunder and ri_dunder tables via _funcs and _ufuncs), NumPy-compatible indexing helpers, and array,
+# asarray, ascontiguousarray, from_dlpack, can_cast, result_type. Import-time side effect: builds ndarray methods by
+# looking up functions in _funcs and _ufuncs (so those modules must be fully loaded first).
 from __future__ import annotations
 
 import builtins
@@ -48,19 +53,25 @@ SHORTHAND_TO_FLAGS = {
 
 
 class Flags:
+    # [CLASS DOC] Minimal stand-in for ndarray.flags: a read-only mapping of flag names to values.
+    # State: _flag_to_value dict holding only the flags the owner computed. Flags may be read by upper-case name,
+    # one-letter or two-letter shorthand, or lower-case attribute; modification is not supported.
     def __init__(self, flag_to_value: dict):
+        # [FUNCTION DOC] Store the flag-value mapping. Raises AssertionError if any key is not a known flag name.
         invalid_keys = [k for k in flag_to_value if k not in FLAGS]
         if invalid_keys:
             raise AssertionError(f"Invalid flag keys: {invalid_keys}")
         self._flag_to_value = flag_to_value
 
     def __getattr__(self, attr: str):
+        # [FUNCTION DOC] Attribute access for lower-case flag names (e.g. c_contiguous): returns the value for the upper-cased flag. Raises AttributeError for anything else.
         if attr.islower() and attr.upper() in FLAGS:
             return self[attr.upper()]
         else:
             raise AttributeError(f"No flag attribute '{attr}'")
 
     def __getitem__(self, key):
+        # [FUNCTION DOC] Look up a flag by name or shorthand. Raises KeyError for an unknown key and NotImplementedError for a known flag that was not provided.
         if key in SHORTHAND_TO_FLAGS:
             key = SHORTHAND_TO_FLAGS[key]
         if key in FLAGS:
@@ -72,12 +83,14 @@ class Flags:
             raise KeyError(f"No flag key '{key}'")
 
     def __setattr__(self, attr, value):
+        # [FUNCTION DOC] Setting a lower-case flag attribute is routed to item assignment (which always raises); other attributes are set normally.
         if attr.islower() and attr.upper() in FLAGS:
             self[attr.upper()] = value
         else:
             super().__setattr__(attr, value)
 
     def __setitem__(self, key, value):
+        # [FUNCTION DOC] Flags cannot be modified: raises NotImplementedError for known flag keys and KeyError for unknown ones.
         if key in FLAGS or key in SHORTHAND_TO_FLAGS:
             raise NotImplementedError("Modifying flags is not implemented")
         else:
@@ -85,9 +98,11 @@ class Flags:
 
 
 def create_method(fn, name=None):
+    # [FUNCTION DOC] HELPER: Wrap fn in a plain function named name (default the function's own name) with qualified name ndarray.<name>, so it can be installed as an ndarray method.
     name = name or fn.__name__
 
     def f(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Forward all positional and keyword arguments to fn.
         return fn(*args, **kwargs)
 
     f.__name__ = name
@@ -163,6 +178,7 @@ ri_dunder = {
 
 
 def _upcast_int_indices(index):
+    # [FUNCTION DOC] HELPER: Recursively convert small integer index tensors (int8, int16, int32, uint8) to int64, descending into tuples; everything else is returned unchanged.
     if isinstance(index, torch.Tensor):
         if index.dtype in (torch.int8, torch.int16, torch.int32, torch.uint8):
             return index.to(torch.int64)
@@ -172,6 +188,7 @@ def _upcast_int_indices(index):
 
 
 def _has_advanced_indexing(index):
+    # [FUNCTION DOC] HELPER: True if any element of the index tuple is a sequence, a bool, a boolean tensor or a tensor with at least one dimension.
     """Check if there's any advanced indexing"""
     return any(
         isinstance(idx, (Sequence, bool))
@@ -181,6 +198,8 @@ def _has_advanced_indexing(index):
 
 
 def _numpy_compatible_indexing(index):
+    # [FUNCTION DOC] HELPER: Make an index NumPy-compatible when advanced indexing is present. Non-tuple indices are wrapped in a tuple; if any element is advanced, Python ints
+    # (not bools) and 0-d integer tensors are turned into one-element lists so they combine like NumPy advanced indices. Returns a tuple.
     """Convert scalar indices to lists when advanced indexing is present for NumPy compatibility."""
     if not isinstance(index, tuple):
         index = (index,)
@@ -214,6 +233,7 @@ def _numpy_compatible_indexing(index):
 
 
 def _get_bool_depth(s):
+    # [FUNCTION DOC] HELPER: Return a pair (is_bool, depth): whether the value is a bool, boolean tensor or nested sequence of bools, and how many dimensions of the indexed array it consumes.
     """Returns the depth of a boolean sequence/tensor"""
     if isinstance(s, bool):
         return True, 0
@@ -226,6 +246,9 @@ def _get_bool_depth(s):
 
 
 def _numpy_empty_ellipsis_patch(index, tensor_ndim):
+    # [FUNCTION DOC] HELPER: Work around a NumPy/PyTorch difference for an ellipsis matching zero dimensions between advanced indices.
+    # Returns a triple (index, squeeze_fn, unsqueeze_fn). If the index has an ellipsis that consumes no dimensions and advanced indexing on both sides, the ellipsis is replaced
+    # by a new axis and the two functions remove/add that axis on the result/value; otherwise the index is returned (as a tuple) with identity functions.
     """
     Patch for NumPy-compatible ellipsis behavior when ellipsis doesn't match any dimensions.
 
@@ -279,9 +302,11 @@ def _numpy_empty_ellipsis_patch(index, tensor_ndim):
             )
 
             def squeeze_fn(x):
+                # [FUNCTION DOC] HELPER: Remove the inserted axis (counted from the end) from the result.
                 return x.squeeze(-end_ndims)
 
             def unsqueeze_fn(x):
+                # [FUNCTION DOC] HELPER: Insert the axis (counted from the end) into a tensor value having enough dimensions; other values are returned unchanged.
                 if isinstance(x, torch.Tensor) and x.ndim >= end_ndims:
                     return x.unsqueeze(-end_ndims)
                 return x
@@ -294,6 +319,7 @@ def _numpy_empty_ellipsis_patch(index, tensor_ndim):
 # Used to indicate that a parameter is unspecified (as opposed to explicitly
 # `None`)
 class _Unspecified:
+    # [CLASS DOC] HELPER: Sentinel type; a single instance (the unspecified attribute) marks a parameter that was not passed, as distinct from an explicit None.
     pass
 
 
@@ -305,7 +331,12 @@ _Unspecified.unspecified = _Unspecified()
 
 
 class ndarray:
+    # [CLASS DOC] NumPy-like array wrapping a torch.Tensor.
+    # State: the tensor attribute holds the data. Methods are mostly thin forwards: at class creation, the functions named in methods are installed from _funcs,
+    # dunder and ri_dunder operators (plain, reflected and in-place variants; in-place uses out=self) and conj/conjugate/divmod from _ufuncs.
+    # Also defines properties (shape, size, ndim, dtype, strides, itemsize, flags, data, nbytes, T, real, imag, flat), conversion methods, NumPy-compatible indexing, iteration and DLPack support.
     def __init__(self, t=None):
+        # [FUNCTION DOC] Create an ndarray from a tensor (default: an empty tensor). Raises ValueError for any other argument type; use array or asarray instead.
         if t is None:
             self.tensor = torch.Tensor()
         elif isinstance(t, torch.Tensor):
@@ -352,31 +383,38 @@ class ndarray:
 
     @property
     def shape(self):
+        # [FUNCTION DOC] Property: shape as a tuple of ints.
         return tuple(self.tensor.shape)
 
     @property
     def size(self):
+        # [FUNCTION DOC] Property: total number of elements.
         return self.tensor.numel()
 
     @property
     def ndim(self):
+        # [FUNCTION DOC] Property: number of dimensions.
         return self.tensor.ndim
 
     @property
     def dtype(self):
+        # [FUNCTION DOC] Property: the dtype as a torch._numpy dtype wrapper.
         return _dtypes.dtype(self.tensor.dtype)
 
     @property
     def strides(self):
+        # [FUNCTION DOC] Property: strides in bytes (torch element strides times element size).
         elsize = self.tensor.element_size()
         return tuple(stride * elsize for stride in self.tensor.stride())
 
     @property
     def itemsize(self):
+        # [FUNCTION DOC] Property: size in bytes of one element.
         return self.tensor.element_size()
 
     @property
     def flags(self):
+        # [FUNCTION DOC] Property: a Flags object with C_CONTIGUOUS, F_CONTIGUOUS (contiguity of the transpose), OWNDATA (the tensor is not a view) and WRITEABLE (always true).
         # Note contiguous in torch is assumed C-style
         return Flags(
             {
@@ -389,38 +427,48 @@ class ndarray:
 
     @property
     def data(self):
+        # [FUNCTION DOC] Property: the address of the underlying data (an int), not a buffer object as in NumPy.
         return self.tensor.data_ptr()
 
     @property
     def nbytes(self):
+        # [FUNCTION DOC] Property: byte size of the tensor's whole underlying storage.
+        # KNOWN ISSUE: for views this is the size of the entire storage, not of the viewed elements as NumPy reports.
         return self.tensor.storage().nbytes()
 
     @property
     def T(self):
+        # [FUNCTION DOC] Property: the transposed array (all axes reversed).
         return self.transpose()
 
     @property
     def real(self):
+        # [FUNCTION DOC] Property: real part as an ndarray.
         return _funcs.real(self)
 
     @real.setter
     def real(self, value):
+        # [FUNCTION DOC] Setter: assign the array-like value to the real part of the tensor in place.
         self.tensor.real = asarray(value).tensor
 
     @property
     def imag(self):
+        # [FUNCTION DOC] Property: imaginary part as an ndarray.
         return _funcs.imag(self)
 
     @imag.setter
     def imag(self, value):
+        # [FUNCTION DOC] Setter: assign the array-like value to the imaginary part of the tensor in place.
         self.tensor.imag = asarray(value).tensor
 
     @property
     def flat(self):
+        # [FUNCTION DOC] Property: the flattened array (same as ravel; NumPy returns an iterator object).
         return self.ravel()
 
     # ctors
     def astype(self, dtype, order="K", casting="unsafe", subok=True, copy=True):
+        # [FUNCTION DOC] Return a copy converted to dtype. Only the defaults order K, casting unsafe, subok true and copy true are supported; any other value raises NotImplementedError.
         if order != "K":
             raise NotImplementedError(f"astype(..., order={order} is not implemented.")
         if casting != "unsafe":
@@ -437,13 +485,17 @@ class ndarray:
 
     @normalizer
     def copy(self: ArrayLike, order: NotImplementedType = "C"):
+        # [FUNCTION DOC] Return a copy of the array (normalized wrapper; order is unsupported unless default).
         return self.clone()
 
     @normalizer
     def flatten(self: ArrayLike, order: NotImplementedType = "C"):
+        # [FUNCTION DOC] Return the array flattened to one dimension (order unsupported unless default).
         return torch.flatten(self)
 
     def resize(self, *new_shape, refcheck=False):
+        # [FUNCTION DOC] Resize the array in place to new_shape (accepts a tuple or separate ints; no-op for no or None shape). Unlike NumPy, new elements are zero-filled, not repeated copies.
+        # Raises NotImplementedError if refcheck is true, ValueError for negative sizes. Mutates self.tensor via resize_; growing requires a contiguous tensor.
         # NB: differs from np.resize: fills with zeros instead of making repeated copies of input.
         if refcheck:
             raise NotImplementedError(
@@ -473,6 +525,7 @@ class ndarray:
             b[old_numel:].zero_()
 
     def view(self, dtype=_Unspecified.unspecified, type=_Unspecified.unspecified):
+        # [FUNCTION DOC] Return a view with the given dtype (default: current dtype) as a new ndarray. The type argument is unsupported and raises NotImplementedError.
         if dtype is _Unspecified.unspecified:
             dtype = self.dtype
         if type is not _Unspecified.unspecified:
@@ -483,17 +536,21 @@ class ndarray:
 
     @normalizer
     def fill(self, value: ArrayLike):
+        # [FUNCTION DOC] Fill the array in place with a scalar or 0-d array value. Returns None.
         # Both Pytorch and NumPy accept 0D arrays/tensors and scalars, and
         # error out on D > 0 arrays
         self.tensor.fill_(value)
 
     def tolist(self):
+        # [FUNCTION DOC] Return the data as nested Python lists.
         return self.tensor.tolist()
 
     def __iter__(self):
+        # [FUNCTION DOC] Iterate over the first axis, yielding each sub-tensor wrapped in an ndarray.
         return (ndarray(x) for x in self.tensor.__iter__())
 
     def __str__(self):
+        # [FUNCTION DOC] String form: the tensor's string with "tensor" replaced by torch.ndarray and the dtype prefix torch. removed.
         return (
             str(self.tensor)
             .replace("tensor", "torch.ndarray")
@@ -503,6 +560,7 @@ class ndarray:
     __repr__ = create_method(__str__)
 
     def __eq__(self, other):
+        # [FUNCTION DOC] Elementwise equality via the equal ufunc. If other cannot be converted (RuntimeError or TypeError), return an all-False boolean array of the same shape.
         try:
             return _ufuncs.equal(self, other)
         except (RuntimeError, TypeError):
@@ -511,9 +569,11 @@ class ndarray:
             return asarray(falsy)
 
     def __ne__(self, other):
+        # [FUNCTION DOC] Elementwise inequality, computed as the logical inversion of equality.
         return ~(self == other)
 
     def __index__(self):
+        # [FUNCTION DOC] Convert a single-element integer array to a Python int for use as an index. Raises TypeError for anything not convertible.
         try:
             return operator.index(self.tensor.item())
         except Exception as exc:
@@ -522,18 +582,23 @@ class ndarray:
             ) from exc
 
     def __bool__(self):
+        # [FUNCTION DOC] Truth value of a single-element array (delegates to tensor bool conversion).
         return bool(self.tensor)
 
     def __int__(self):
+        # [FUNCTION DOC] Convert a single-element array to a Python int.
         return int(self.tensor)
 
     def __float__(self):
+        # [FUNCTION DOC] Convert a single-element array to a Python float.
         return float(self.tensor)
 
     def __complex__(self):
+        # [FUNCTION DOC] Convert a single-element array to a Python complex.
         return complex(self.tensor)
 
     def is_integer(self):
+        # [FUNCTION DOC] True if the array holds a single element whose value is integral; False on any failure (including multi-element arrays).
         try:
             v = self.tensor.item()
             result = int(v) == v
@@ -542,24 +607,31 @@ class ndarray:
         return result
 
     def __len__(self):
+        # [FUNCTION DOC] Size of the first axis. Raises an error (IndexError) for 0-d arrays.
         return self.tensor.shape[0]
 
     def __contains__(self, x):
+        # [FUNCTION DOC] Membership test delegated to the tensor.
         return self.tensor.__contains__(x)
 
     def transpose(self, *axes):
+        # [FUNCTION DOC] Transpose with the axes given as separate arguments (no axes reverses all axes).
         # np.transpose(arr, axis=None) but arr.transpose(*axes)
         return _funcs.transpose(self, axes)
 
     def reshape(self, *shape, order="C"):
+        # [FUNCTION DOC] Reshape with the shape given as a tuple or separate ints; order is passed through to the reshape function.
         # arr.reshape(shape) and arr.reshape(*shape)
         return _funcs.reshape(self, shape, order=order)
 
     def sort(self, axis=-1, kind=None, order=None):
+        # [FUNCTION DOC] Sort in place along axis: computes a sorted copy and copies it into self. Returns None.
         # ndarray.sort works in-place
         _funcs.copyto(self, _funcs.sort(self, axis, kind, order))
 
     def item(self, *args):
+        # [FUNCTION DOC] Return the element: with no arguments the Python scalar of a one-element array; with one argument a flat index; with several a multi-index.
+        # KNOWN ISSUE: the flat-index and multi-index forms return an ndarray (via indexing), not a Python scalar as NumPy does.
         # Mimic NumPy's implementation with three special cases (no arguments,
         # a flat index and a multi-index):
         # https://github.com/numpy/numpy/blob/main/numpy/_core/src/multiarray/methods.c#L702
@@ -572,9 +644,15 @@ class ndarray:
             return self.__getitem__(args)
 
     def __getitem__(self, index):
+        # [FUNCTION DOC] Index the array with NumPy semantics and return an ndarray. Negative-step slices are emulated by flipping the tensor along that axis
+        # and adjusting the slice; ndarray indices become tensors, small integer index tensors are upcast to int64, scalars are adapted when advanced indexing is present,
+        # and the empty-ellipsis difference is patched on the result.
+        # KNOWN ISSUE: the negative-step slice adjustment tests truthiness of start and stop, so a zero or negative bound is mishandled (zero is treated as unspecified).
         tensor = self.tensor
 
         def neg_step(i, s):
+            # [FUNCTION DOC] HELPER: For a negative-step slice at axis i, flip the enclosing tensor along that axis (rebinding it) and return an equivalent positive-direction slice; other index items are returned unchanged.
+            # Raises AssertionError if start or stop is not an int or None.
             if not (isinstance(s, slice) and s.step is not None and s.step < 0):
                 return s
 
@@ -608,6 +686,8 @@ class ndarray:
         return maybe_squeeze(ndarray(tensor.__getitem__(index)))
 
     def __setitem__(self, index, value):
+        # [FUNCTION DOC] Assign value into the indexed region in place. Index is normalized as in __getitem__; non-scalar values are converted to a tensor and cast to the array dtype.
+        # Returns whatever the tensor assignment returns (None).
         index = _util.ndarrays_to_tensors(index)
         index = _upcast_int_indices(index)
         # Apply NumPy-compatible indexing conversion
@@ -625,13 +705,16 @@ class ndarray:
     put = _funcs.put
 
     def __dlpack__(self, *, stream=None):
+        # [FUNCTION DOC] DLPack export of the underlying tensor; stream is forwarded.
         return self.tensor.__dlpack__(stream=stream)
 
     def __dlpack_device__(self):
+        # [FUNCTION DOC] DLPack device tuple of the underlying tensor.
         return self.tensor.__dlpack_device__()
 
 
 def _tolist(obj):
+    # [FUNCTION DOC] HELPER: Recursively convert nested lists/tuples containing ndarrays into nested lists, replacing each ndarray by its tensor's list form.
     """Recursively convert tensors into lists."""
     a1 = []
     for elem in obj:
@@ -649,6 +732,9 @@ def _tolist(obj):
 
 
 def array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0, like=None):
+    # [FUNCTION DOC] Create an ndarray from obj (list, tuple, scalar, tensor or ndarray), optionally with dtype, copy flag and minimum number of dimensions.
+    # Unsupported: subok true, like given, order other than K (raise NotImplementedError). If obj is already an ndarray and copy is False with no dtype and enough dimensions, it is returned as is.
+    # Lists/tuples of tensors are stacked; other sequences are converted via nested lists. Returns a new ndarray.
     if subok is not False:
         raise NotImplementedError("'subok' parameter is not supported.")
     if like is not None:
@@ -689,10 +775,12 @@ def array(obj, dtype=None, *, copy=True, order="K", subok=False, ndmin=0, like=N
 
 
 def asarray(a, dtype=None, order="K", *, like=None):
+    # [FUNCTION DOC] Convert a to an ndarray without copying when possible (array with copy False and ndmin 0).
     return array(a, dtype=dtype, order=order, like=like, copy=False, ndmin=0)
 
 
 def ascontiguousarray(a, dtype=None, *, like=None):
+    # [FUNCTION DOC] Convert a to an ndarray and ensure it is contiguous; non-contiguous arrays get a contiguous tensor assigned in place on the (possibly shared) result.
     arr = asarray(a, dtype=dtype, like=like)
     if not arr.tensor.is_contiguous():
         arr.tensor = arr.tensor.contiguous()
@@ -700,11 +788,13 @@ def ascontiguousarray(a, dtype=None, *, like=None):
 
 
 def from_dlpack(x, /):
+    # [FUNCTION DOC] Create an ndarray from an object supporting DLPack (shares memory).
     t = torch.from_dlpack(x)
     return ndarray(t)
 
 
 def _extract_dtype(entry):
+    # [FUNCTION DOC] HELPER: Get a dtype wrapper from a dtype-like; if that fails, treat the entry as an array-like and use its dtype.
     try:
         dty = _dtypes.dtype(entry)
     except Exception:
@@ -713,6 +803,7 @@ def _extract_dtype(entry):
 
 
 def can_cast(from_, to, casting="safe"):
+    # [FUNCTION DOC] Whether from_ (dtype or array-like) can be cast to to (dtype or array-like) under the casting rule (default safe). Returns a bool.
     from_ = _extract_dtype(from_)
     to_ = _extract_dtype(to)
 
@@ -720,6 +811,7 @@ def can_cast(from_, to, casting="safe"):
 
 
 def result_type(*arrays_and_dtypes):
+    # [FUNCTION DOC] Compute the promoted dtype of arrays and dtypes. Each entry is converted to a tensor if possible, otherwise treated as a dtype and represented by an empty one-element tensor. Returns a torch._numpy dtype wrapper.
     tensors = []
     for entry in arrays_and_dtypes:
         try:

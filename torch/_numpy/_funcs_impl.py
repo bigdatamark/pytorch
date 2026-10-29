@@ -1,5 +1,11 @@
 # mypy: ignore-errors
 
+# [MODULE DOC] Implementations of NumPy-compatible functions operating directly on torch tensors and torch dtypes.
+# Functions here take tensors (and scalars) with NumPy-style signatures; type annotations such as ArrayLike, DTypeLike, OutArray and
+# NotImplementedType are markers consumed by the normalizer decorator when _funcs.py re-exports every public function here
+# (argument conversion, out= handling, wrapping results in ndarray). Covers array joining and splitting, creation routines,
+# cov/corrcoef/convolve/correlate, element selection, shape manipulation, sorting, math, reductions helpers, indexing and
+# more. Underscore-prefixed names are internal and not exported. No import-time side effects.
 """A thin pytorch / numpy compat layer.
 
 Things imported from here have numpy-compatible signatures but operate on
@@ -37,6 +43,7 @@ if TYPE_CHECKING:
 def copy(
     a: ArrayLike, order: NotImplementedType = "K", subok: NotImplementedType = False
 ):
+    # [FUNCTION DOC] Return a copy of the tensor (clone). order and subok are unsupported markers.
     return a.clone()
 
 
@@ -46,11 +53,14 @@ def copyto(
     casting: CastingModes | None = "same_kind",
     where: NotImplementedType = None,
 ):
+    # [FUNCTION DOC] Copy src into dst in place after casting src to dst's dtype under the casting rule (default same_kind).
+    # Mutates dst; returns None. Raises a casting error if the cast is not allowed. The where argument is unsupported.
     (src,) = _util.typecast_tensors((src,), dst.dtype, casting=casting)
     dst.copy_(src)
 
 
 def atleast_1d(*arys: ArrayLike):
+    # [FUNCTION DOC] Return each input viewed as at least 1-d: a single tensor for one input, a list of tensors for several.
     res = torch.atleast_1d(*arys)
     if isinstance(res, tuple):
         return list(res)
@@ -59,6 +69,7 @@ def atleast_1d(*arys: ArrayLike):
 
 
 def atleast_2d(*arys: ArrayLike):
+    # [FUNCTION DOC] Return each input viewed as at least 2-d: a single tensor for one input, a list of tensors for several.
     res = torch.atleast_2d(*arys)
     if isinstance(res, tuple):
         return list(res)
@@ -67,6 +78,7 @@ def atleast_2d(*arys: ArrayLike):
 
 
 def atleast_3d(*arys: ArrayLike):
+    # [FUNCTION DOC] Return each input viewed as at least 3-d: a single tensor for one input, a list of tensors for several.
     res = torch.atleast_3d(*arys)
     if isinstance(res, tuple):
         return list(res)
@@ -75,6 +87,7 @@ def atleast_3d(*arys: ArrayLike):
 
 
 def _concat_check(tup, dtype, out):
+    # [FUNCTION DOC] HELPER: Validate arguments of concatenation-like functions. Raises ValueError if the sequence is empty and TypeError if both out and dtype are given.
     if tup == ():
         raise ValueError("need at least one array to concatenate")
 
@@ -88,6 +101,7 @@ def _concat_check(tup, dtype, out):
 
 
 def _concat_cast_helper(tensors, out=None, dtype=None, casting="same_kind"):
+    # [FUNCTION DOC] HELPER: Pick the target dtype (explicit dtype, the out array dtype, or the promoted dtype of all inputs) and cast every tensor to it under the casting rule. Returns the cast tensors.
     """Figure out dtypes, cast if necessary."""
 
     if out is not None or dtype is not None:
@@ -105,6 +119,7 @@ def _concat_cast_helper(tensors, out=None, dtype=None, casting="same_kind"):
 def _concatenate(
     tensors, axis=0, out=None, dtype=None, casting: CastingModes | None = "same_kind"
 ):
+    # [FUNCTION DOC] HELPER: Pure-torch concatenate: optionally flattens inputs when axis is None, casts to a common dtype, then concatenates along axis. Does not copy into out.
     # pure torch implementation, used below and in cov/corrcoef below
     tensors, axis = _util.axis_none_flatten(*tensors, axis=axis)
     tensors = _concat_cast_helper(tensors, out, dtype, casting)
@@ -118,6 +133,8 @@ def concatenate(
     dtype: DTypeLike | None = None,
     casting: CastingModes | None = "same_kind",
 ):
+    # [FUNCTION DOC] Join a sequence of arrays along an existing axis (None flattens them first). Validates arguments, promotes or casts dtypes, and returns the concatenated tensor (out handling is done by the normalizer).
+    # Raises ValueError for an empty sequence and TypeError if both out and dtype are given.
     _concat_check(ar_tuple, dtype, out=out)
     result = _concatenate(ar_tuple, axis=axis, out=out, dtype=dtype, casting=casting)
     return result
@@ -129,6 +146,7 @@ def vstack(
     dtype: DTypeLike | None = None,
     casting: CastingModes | None = "same_kind",
 ):
+    # [FUNCTION DOC] Stack arrays vertically (row-wise) after casting to a common dtype; raises ValueError for an empty sequence.
     _concat_check(tup, dtype, out=None)
     tensors = _concat_cast_helper(tup, dtype=dtype, casting=casting)
     return torch.vstack(tensors)
@@ -143,6 +161,7 @@ def hstack(
     dtype: DTypeLike | None = None,
     casting: CastingModes | None = "same_kind",
 ):
+    # [FUNCTION DOC] Stack arrays horizontally (column-wise) after casting to a common dtype; raises ValueError for an empty sequence.
     _concat_check(tup, dtype, out=None)
     tensors = _concat_cast_helper(tup, dtype=dtype, casting=casting)
     return torch.hstack(tensors)
@@ -154,6 +173,7 @@ def dstack(
     dtype: DTypeLike | None = None,
     casting: CastingModes | None = "same_kind",
 ):
+    # [FUNCTION DOC] Stack arrays depth-wise (along the third axis) after casting to a common dtype; raises ValueError for an empty sequence.
     # XXX: in numpy 1.24 dstack does not have dtype and casting keywords
     # but {h,v}stack do.  Hence add them here for consistency.
     _concat_check(tup, dtype, out=None)
@@ -167,6 +187,7 @@ def column_stack(
     dtype: DTypeLike | None = None,
     casting: CastingModes | None = "same_kind",
 ):
+    # [FUNCTION DOC] Stack 1-d arrays as columns of a 2-d array (2-d arrays are stacked as is) after casting to a common dtype; raises ValueError for an empty sequence.
     # XXX: in numpy 1.24 column_stack does not have dtype and casting keywords
     # but row_stack does. (because row_stack is an alias for vstack, really).
     # Hence add these keywords here for consistency.
@@ -183,6 +204,7 @@ def stack(
     dtype: DTypeLike | None = None,
     casting: CastingModes | None = "same_kind",
 ):
+    # [FUNCTION DOC] Join arrays along a new axis (normalized against the result rank) after casting to a common dtype. Raises ValueError for an empty sequence, TypeError if both out and dtype are given, and an axis error when out of range.
     _concat_check(arrays, dtype, out=out)
 
     tensors = _concat_cast_helper(arrays, dtype=dtype, casting=casting)
@@ -192,6 +214,7 @@ def stack(
 
 
 def append(arr: ArrayLike, values: ArrayLike, axis=None):
+    # [FUNCTION DOC] Append values to arr. With axis None both are flattened (arr only if not already 1-d) and joined along the last axis; otherwise they are concatenated along axis. Returns a new tensor.
     if axis is None:
         if arr.ndim != 1:
             arr = arr.flatten()
@@ -204,6 +227,7 @@ def append(arr: ArrayLike, values: ArrayLike, axis=None):
 
 
 def _split_helper(tensor, indices_or_sections, axis, strict=False):
+    # [FUNCTION DOC] HELPER: Dispatch splitting: an int means equal sections, a list or tuple means split points. Any other type raises TypeError. The strict flag only affects the int case.
     if isinstance(indices_or_sections, int):
         return _split_helper_int(tensor, indices_or_sections, axis, strict)
     elif isinstance(indices_or_sections, (list, tuple)):
@@ -214,6 +238,8 @@ def _split_helper(tensor, indices_or_sections, axis, strict=False):
 
 
 def _split_helper_int(tensor, indices_or_sections, axis, strict=False):
+    # [FUNCTION DOC] HELPER: Split into n sections along axis like NumPy: when the length is not divisible, the first (length mod n) sections get one extra element.
+    # Raises NotImplementedError if the argument is not an int, ValueError if n is not positive or (when strict) the division is uneven. Returns a tuple of tensor views.
     if not isinstance(indices_or_sections, int):
         raise NotImplementedError("split: indices_or_sections")
 
@@ -241,6 +267,8 @@ def _split_helper_int(tensor, indices_or_sections, axis, strict=False):
 
 
 def _split_helper_list(tensor, indices_or_sections, axis):
+    # [FUNCTION DOC] HELPER: Split at the given index list along axis, converting NumPy split indices to torch section lengths. Indices beyond the axis length yield trailing empty pieces.
+    # Raises NotImplementedError if the argument is not a list. Returns a tuple of tensors.
     if not isinstance(indices_or_sections, list):
         raise NotImplementedError("split: indices_or_sections: list")
     # numpy expects indices, while torch expects lengths of sections
@@ -258,14 +286,17 @@ def _split_helper_list(tensor, indices_or_sections, axis):
 
 
 def array_split(ary: ArrayLike, indices_or_sections, axis=0):
+    # [FUNCTION DOC] Split into sections or at indices along axis, allowing unequal sections.
     return _split_helper(ary, indices_or_sections, axis)
 
 
 def split(ary: ArrayLike, indices_or_sections, axis=0):
+    # [FUNCTION DOC] Split into sections or at indices along axis; an integer count must divide the length evenly (else ValueError).
     return _split_helper(ary, indices_or_sections, axis, strict=True)
 
 
 def hsplit(ary: ArrayLike, indices_or_sections):
+    # [FUNCTION DOC] Split horizontally: along axis 1 for arrays with two or more dimensions, else axis 0. Raises ValueError for 0-d input or uneven division.
     if ary.ndim == 0:
         raise ValueError("hsplit only works on arrays of 1 or more dimensions")
     axis = 1 if ary.ndim > 1 else 0
@@ -273,22 +304,26 @@ def hsplit(ary: ArrayLike, indices_or_sections):
 
 
 def vsplit(ary: ArrayLike, indices_or_sections):
+    # [FUNCTION DOC] Split along the first axis. Raises ValueError if the array has fewer than 2 dimensions or the division is uneven.
     if ary.ndim < 2:
         raise ValueError("vsplit only works on arrays of 2 or more dimensions")
     return _split_helper(ary, indices_or_sections, 0, strict=True)
 
 
 def dsplit(ary: ArrayLike, indices_or_sections):
+    # [FUNCTION DOC] Split along the third axis. Raises ValueError if the array has fewer than 3 dimensions or the division is uneven.
     if ary.ndim < 3:
         raise ValueError("dsplit only works on arrays of 3 or more dimensions")
     return _split_helper(ary, indices_or_sections, 2, strict=True)
 
 
 def kron(a: ArrayLike, b: ArrayLike):
+    # [FUNCTION DOC] Kronecker product of two arrays.
     return torch.kron(a, b)
 
 
 def vander(x: ArrayLike, N=None, increasing=False):
+    # [FUNCTION DOC] Vandermonde matrix of x with N columns (default len(x)); powers increase left to right if increasing is true.
     return torch.vander(x, N, increasing)
 
 
@@ -304,6 +339,8 @@ def linspace(
     dtype: DTypeLike | None = None,
     axis=0,
 ):
+    # [FUNCTION DOC] Evenly spaced numbers over [start, stop]. Only axis 0, retstep false and endpoint true are supported (else NotImplementedError).
+    # Dtype defaults to the default float dtype. start and stop must be scalars (torch raises TypeError otherwise).
     if axis != 0 or retstep or not endpoint:
         raise NotImplementedError
     if dtype is None:
@@ -320,6 +357,8 @@ def geomspace(
     dtype: DTypeLike | None = None,
     axis=0,
 ):
+    # [FUNCTION DOC] Numbers spaced evenly on a log scale between start and stop, implemented through logspace with a derived base. Only axis 0 and endpoint true are supported (else NotImplementedError).
+    # KNOWN ISSUE: the dtype argument is ignored.
     if axis != 0 or not endpoint:
         raise NotImplementedError
     base = torch.pow(stop / start, 1.0 / (num - 1))
@@ -341,6 +380,8 @@ def logspace(
     dtype: DTypeLike | None = None,
     axis=0,
 ):
+    # [FUNCTION DOC] Numbers spaced evenly on a log scale: base raised to a linear range from start to stop. Only axis 0 and endpoint true are supported (else NotImplementedError).
+    # KNOWN ISSUE: dtype None is passed straight to torch rather than defaulting to the default float dtype.
     if axis != 0 or not endpoint:
         raise NotImplementedError
     return torch.logspace(start, stop, num, base=base, dtype=dtype)
@@ -354,6 +395,9 @@ def arange(
     *,
     like: NotImplementedType = None,
 ):
+    # [FUNCTION DOC] Evenly spaced values in a half-open interval. A single argument is treated as stop with start 0. Result dtype defaults to the default float dtype if any argument is floating, else the default int dtype.
+    # Raises ZeroDivisionError for step 0, TypeError if neither start nor stop given, NotImplementedError for complex arguments. Returns an empty tensor when the range is empty.
+    # Complex dtypes are computed in float64 and cast.
     if step == 0:
         raise ZeroDivisionError
     if stop is None and start is None:
@@ -397,6 +441,7 @@ def empty(
     *,
     like: NotImplementedType = None,
 ):
+    # [FUNCTION DOC] Uninitialized array of the given shape; dtype defaults to the default float dtype.
     if dtype is None:
         dtype = _dtypes_impl.default_dtypes().float_dtype
     return torch.empty(shape, dtype=dtype)
@@ -413,6 +458,7 @@ def empty_like(
     subok: NotImplementedType = False,
     shape=None,
 ):
+    # [FUNCTION DOC] Uninitialized array shaped like prototype (optionally reshaped to shape) with optional dtype.
     result = torch.empty_like(prototype, dtype=dtype)
     if shape is not None:
         result = result.reshape(shape)
@@ -427,6 +473,7 @@ def full(
     *,
     like: NotImplementedType = None,
 ):
+    # [FUNCTION DOC] Array of the given shape filled with fill_value; an int shape becomes a 1-tuple, dtype defaults to the dtype of fill_value.
     if isinstance(shape, int):
         shape = (shape,)
     if dtype is None:
@@ -444,6 +491,7 @@ def full_like(
     subok: NotImplementedType = False,
     shape=None,
 ):
+    # [FUNCTION DOC] Array shaped like a filled with fill_value, with optional dtype and optional reshape to shape.
     # XXX: fill_value broadcasts
     result = torch.full_like(a, fill_value, dtype=dtype)
     if shape is not None:
@@ -458,6 +506,7 @@ def ones(
     *,
     like: NotImplementedType = None,
 ):
+    # [FUNCTION DOC] Array of ones of the given shape; dtype defaults to the default float dtype.
     if dtype is None:
         dtype = _dtypes_impl.default_dtypes().float_dtype
     return torch.ones(shape, dtype=dtype)
@@ -470,6 +519,7 @@ def ones_like(
     subok: NotImplementedType = False,
     shape=None,
 ):
+    # [FUNCTION DOC] Array of ones shaped like a, with optional dtype and optional reshape to shape.
     result = torch.ones_like(a, dtype=dtype)
     if shape is not None:
         result = result.reshape(shape)
@@ -483,6 +533,7 @@ def zeros(
     *,
     like: NotImplementedType = None,
 ):
+    # [FUNCTION DOC] Array of zeros of the given shape; dtype defaults to the default float dtype.
     if dtype is None:
         dtype = _dtypes_impl.default_dtypes().float_dtype
     return torch.zeros(shape, dtype=dtype)
@@ -495,6 +546,7 @@ def zeros_like(
     subok: NotImplementedType = False,
     shape=None,
 ):
+    # [FUNCTION DOC] Array of zeros shaped like a, with optional dtype and optional reshape to shape.
     result = torch.zeros_like(a, dtype=dtype)
     if shape is not None:
         result = result.reshape(shape)
@@ -505,6 +557,7 @@ def zeros_like(
 
 
 def _xy_helper_corrcoef(x_tensor, y_tensor=None, rowvar=True):
+    # [FUNCTION DOC] HELPER: Prepare cov/corrcoef input. Without y returns x unchanged. With y, both are promoted to at least 2-d (views), transposed if not rowvar (and not a single row), cloned, and concatenated along axis 0.
     """Prepare inputs for cov and corrcoef."""
 
     # https://github.com/numpy/numpy/blob/v1.24.0/numpy/lib/function_base.py#L2636
@@ -538,6 +591,9 @@ def corrcoef(
     *,
     dtype: DTypeLike | None = None,
 ):
+    # [FUNCTION DOC] Pearson correlation coefficient matrix of the variables in x (and y). The deprecated bias and ddof raise NotImplementedError.
+    # Half precision CPU input is computed in float32 and cast back.
+    # KNOWN ISSUE: for float16 CPU input a user-supplied dtype is overwritten with float32.
     if bias is not None or ddof is not None:
         # deprecated in NumPy
         raise NotImplementedError
@@ -568,6 +624,8 @@ def cov(
     *,
     dtype: DTypeLike | None = None,
 ):
+    # [FUNCTION DOC] Covariance matrix of the variables in m (and y). ddof defaults to 1 unless bias is set (then 0); fweights and aweights are forwarded to torch. Half precision CPU input is computed in float32 and cast back.
+    # KNOWN ISSUE: for float16 CPU input a user-supplied dtype is overwritten with float32.
     m = _xy_helper_corrcoef(m, y, rowvar)
 
     if ddof is None:
@@ -588,6 +646,8 @@ def cov(
 
 
 def _conv_corr_impl(a, v, mode):
+    # [FUNCTION DOC] HELPER: 1-d cross-correlation core shared by convolve and correlate. Promotes both inputs to a common dtype and runs a 1-d convolution with padding derived from mode (full, valid, same).
+    # Raises NotImplementedError for mode same with an even-length second input. Returns a 1-d tensor.
     dt = _dtypes_impl.result_type_impl(a, v)
     a = _util.cast_if_needed(a, dt)
     v = _util.cast_if_needed(v, dt)
@@ -611,6 +671,7 @@ def _conv_corr_impl(a, v, mode):
 
 
 def convolve(a: ArrayLike, v: ArrayLike, mode="full"):
+    # [FUNCTION DOC] Discrete convolution of two 1-d arrays. Swaps the inputs if the second is longer, flips the kernel (torch computes correlation), then calls the shared implementation. mode is full, valid or same.
     # NumPy: if v is longer than a, the arrays are swapped before computation
     if a.shape[0] < v.shape[0]:
         a, v = v, a
@@ -622,6 +683,7 @@ def convolve(a: ArrayLike, v: ArrayLike, mode="full"):
 
 
 def correlate(a: ArrayLike, v: ArrayLike, mode="valid"):
+    # [FUNCTION DOC] Cross-correlation of two 1-d arrays: conjugates the second input and applies the shared implementation (default mode valid).
     v = torch.conj_physical(v)
     return _conv_corr_impl(a, v, mode)
 
@@ -630,6 +692,7 @@ def correlate(a: ArrayLike, v: ArrayLike, mode="valid"):
 
 
 def bincount(x: ArrayLike, /, weights: ArrayLike | None = None, minlength=0):
+    # [FUNCTION DOC] Count occurrences of each non-negative int in x, optionally weighted, with at least minlength bins. Empty input is allowed. x is safely cast to the default int dtype (raises on unsafe cast).
     if x.numel() == 0:
         # edge case allowed by numpy
         x = x.new_empty(0, dtype=int)
@@ -646,6 +709,7 @@ def where(
     y: ArrayLikeOrScalar | None = None,
     /,
 ):
+    # [FUNCTION DOC] Choose elements from x or y by condition; with only the condition returns the indices of nonzero elements (tuple of tensors). Raises ValueError if exactly one of x and y is given. Non-bool condition is converted to bool.
     if (x is None) != (y is None):
         raise ValueError("either both or neither of x and y should be given")
 
@@ -663,14 +727,17 @@ def where(
 
 
 def ndim(a: ArrayLike):
+    # [FUNCTION DOC] Number of dimensions.
     return a.ndim
 
 
 def shape(a: ArrayLike):
+    # [FUNCTION DOC] Shape as a tuple.
     return tuple(a.shape)
 
 
 def size(a: ArrayLike, axis=None):
+    # [FUNCTION DOC] Total number of elements, or the length along axis if given.
     if axis is None:
         return a.numel()
     else:
@@ -681,11 +748,13 @@ def size(a: ArrayLike, axis=None):
 
 
 def expand_dims(a: ArrayLike, axis):
+    # [FUNCTION DOC] Insert length-1 axes at the given positions; returns a view (never copies).
     shape = _util.expand_shape(a.shape, axis)
     return a.view(shape)  # never copies
 
 
 def flip(m: ArrayLike, axis=None):
+    # [FUNCTION DOC] Reverse the order of elements along the given axis or axes (default all). Returns a copy, unlike NumPy which returns a view.
     # XXX: semantic difference: np.flip returns a view, torch.flip copies
     if axis is None:
         axis = tuple(range(m.ndim))
@@ -695,14 +764,17 @@ def flip(m: ArrayLike, axis=None):
 
 
 def flipud(m: ArrayLike):
+    # [FUNCTION DOC] Reverse the order of rows (flip along the first axis).
     return torch.flipud(m)
 
 
 def fliplr(m: ArrayLike):
+    # [FUNCTION DOC] Reverse the order of columns (flip along the second axis); requires at least 2 dimensions.
     return torch.fliplr(m)
 
 
 def rot90(m: ArrayLike, k=1, axes=(0, 1)):
+    # [FUNCTION DOC] Rotate an array by 90 degrees k times in the plane given by axes (normalized against the rank). Returns a new tensor.
     axes = _util.normalize_axis_tuple(axes, m.ndim)
     return torch.rot90(m, k, axes)
 
@@ -711,20 +783,24 @@ def rot90(m: ArrayLike, k=1, axes=(0, 1)):
 
 
 def broadcast_to(array: ArrayLike, shape, subok: NotImplementedType = False):
+    # [FUNCTION DOC] Broadcast the array to the given shape (returns a view); subok is an unsupported marker.
     return torch.broadcast_to(array, size=shape)
 
 
 # This is a function from tuples to tuples, so we just reuse it.  However,
 # dynamo expects its __module__ to be torch._numpy
 def broadcast_shapes(*args):
+    # [FUNCTION DOC] Compute the broadcast of several shapes (tuples) and return the resulting shape tuple. Kept in this module so dynamo sees it as part of torch._numpy.
     return torch.broadcast_shapes(*args)
 
 
 def broadcast_arrays(*args: ArrayLike, subok: NotImplementedType = False):
+    # [FUNCTION DOC] Broadcast several arrays against each other; returns a tuple of tensors (views).
     return torch.broadcast_tensors(*args)
 
 
 def meshgrid(*xi: ArrayLike, copy=True, sparse=False, indexing="xy"):
+    # [FUNCTION DOC] Coordinate matrices from coordinate vectors. indexing must be xy or ij (else ValueError); xy swaps the first two axes. sparse keeps broadcastable vectors, otherwise full matrices; copy clones the outputs. Returns a list of tensors.
     ndim = len(xi)
 
     if indexing not in ["xy", "ij"]:
@@ -749,6 +825,7 @@ def meshgrid(*xi: ArrayLike, copy=True, sparse=False, indexing="xy"):
 
 
 def indices(dimensions, dtype: DTypeLike | None = int, sparse=False):
+    # [FUNCTION DOC] Grid of indices for the given dimensions. Dense output is a tensor of shape (N, *dimensions) with dtype dtype; sparse output is a tuple of N broadcastable index tensors. Default dtype is the Python int type.
     # https://github.com/numpy/numpy/blob/v1.24.0/numpy/core/numeric.py#L1691-L1791
     dimensions = tuple(dimensions)
     N = len(dimensions)
@@ -772,26 +849,31 @@ def indices(dimensions, dtype: DTypeLike | None = int, sparse=False):
 
 
 def tril(m: ArrayLike, k=0):
+    # [FUNCTION DOC] Lower triangle of the matrix (elements above the k-th diagonal zeroed).
     return torch.tril(m, k)
 
 
 def triu(m: ArrayLike, k=0):
+    # [FUNCTION DOC] Upper triangle of the matrix (elements below the k-th diagonal zeroed).
     return torch.triu(m, k)
 
 
 def tril_indices(n, k=0, m=None):
+    # [FUNCTION DOC] Row and column indices of the lower triangle of an n-by-m matrix (m defaults to n) with diagonal offset k. Returns a 2-row tensor, not a tuple.
     if m is None:
         m = n
     return torch.tril_indices(n, m, offset=k)
 
 
 def triu_indices(n, k=0, m=None):
+    # [FUNCTION DOC] Row and column indices of the upper triangle of an n-by-m matrix (m defaults to n) with diagonal offset k. Returns a 2-row tensor, not a tuple.
     if m is None:
         m = n
     return torch.triu_indices(n, m, offset=k)
 
 
 def tril_indices_from(arr: ArrayLike, k=0):
+    # [FUNCTION DOC] Lower-triangle indices for the shape of a 2-d array. Raises ValueError if not 2-d. Returns a tensor to avoid a graph break.
     if arr.ndim != 2:
         raise ValueError("input array must be 2-d")
     # Return a tensor rather than a tuple to avoid a graphbreak
@@ -799,6 +881,7 @@ def tril_indices_from(arr: ArrayLike, k=0):
 
 
 def triu_indices_from(arr: ArrayLike, k=0):
+    # [FUNCTION DOC] Upper-triangle indices for the shape of a 2-d array. Raises ValueError if not 2-d. Returns a tensor to avoid a graph break.
     if arr.ndim != 2:
         raise ValueError("input array must be 2-d")
     # Return a tensor rather than a tuple to avoid a graphbreak
@@ -813,6 +896,8 @@ def tri(
     *,
     like: NotImplementedType = None,
 ):
+    # [FUNCTION DOC] Array with ones at and below the k-th diagonal and zeros elsewhere, of shape (N, M) with M defaulting to N.
+    # KNOWN ISSUE: dtype None is passed to torch directly, giving torch's default dtype rather than the configured default float dtype.
     if M is None:
         M = N
     tensor = torch.ones((N, M), dtype=dtype)
@@ -823,6 +908,7 @@ def tri(
 
 
 def isclose(a: ArrayLike, b: ArrayLike, rtol=1.0e-5, atol=1.0e-8, equal_nan=False):
+    # [FUNCTION DOC] Elementwise closeness test after promoting both inputs to a common dtype; returns a boolean tensor.
     dtype = _dtypes_impl.result_type_impl(a, b)
     a = _util.cast_if_needed(a, dtype)
     b = _util.cast_if_needed(b, dtype)
@@ -830,6 +916,7 @@ def isclose(a: ArrayLike, b: ArrayLike, rtol=1.0e-5, atol=1.0e-8, equal_nan=Fals
 
 
 def allclose(a: ArrayLike, b: ArrayLike, rtol=1e-05, atol=1e-08, equal_nan=False):
+    # [FUNCTION DOC] True if all elements are close after promoting both inputs to a common dtype; returns a bool.
     dtype = _dtypes_impl.result_type_impl(a, b)
     a = _util.cast_if_needed(a, dtype)
     b = _util.cast_if_needed(b, dtype)
@@ -837,6 +924,7 @@ def allclose(a: ArrayLike, b: ArrayLike, rtol=1e-05, atol=1e-08, equal_nan=False
 
 
 def _tensor_equal(a1, a2, equal_nan=False):
+    # [FUNCTION DOC] HELPER: Shared implementation of array_equal/array_equiv: False on shape mismatch, otherwise whether all elements are equal (optionally treating NaNs as equal). Returns a Python bool.
     # Implementation of array_equal/array_equiv.
     if a1.shape != a2.shape:
         return False
@@ -847,10 +935,12 @@ def _tensor_equal(a1, a2, equal_nan=False):
 
 
 def array_equal(a1: ArrayLike, a2: ArrayLike, equal_nan=False):
+    # [FUNCTION DOC] True if both arrays have the same shape and elements; NaNs compare equal only if equal_nan.
     return _tensor_equal(a1, a2, equal_nan=equal_nan)
 
 
 def array_equiv(a1: ArrayLike, a2: ArrayLike):
+    # [FUNCTION DOC] True if the arrays are broadcastable and equal after broadcasting; False if broadcasting fails.
     # *almost* the same as array_equal: _equiv tries to broadcast, _equal does not
     try:
         a1_t, a2_t = torch.broadcast_tensors(a1, a2)
@@ -863,6 +953,7 @@ def array_equiv(a1: ArrayLike, a2: ArrayLike):
 def nan_to_num(
     x: ArrayLike, copy: NotImplementedType = True, nan=0.0, posinf=None, neginf=None
 ):
+    # [FUNCTION DOC] Replace NaN with nan and infinities with posinf/neginf (defaults: largest/smallest finite values). Complex input is processed on real and imaginary parts separately. copy is an unsupported marker.
     # work around RuntimeError: "nan_to_num" not implemented for 'ComplexDouble'
     if x.is_complex():
         re = torch.nan_to_num(x.real, nan=nan, posinf=posinf, neginf=neginf)
@@ -882,6 +973,7 @@ def take(
     out: OutArray | None = None,
     mode: NotImplementedType = "raise",
 ):
+    # [FUNCTION DOC] Take elements along an axis (None flattens first) using the index array, via indexing; mode and out are not handled here.
     (a,), axis = _util.axis_none_flatten(a, axis=axis)
     axis = _util.normalize_axis_index(axis, a.ndim)
     idx = (slice(None),) * axis + (indices, ...)
@@ -890,6 +982,7 @@ def take(
 
 
 def take_along_axis(arr: ArrayLike, indices: ArrayLike, axis):
+    # [FUNCTION DOC] Gather values from arr along axis using indices of matching dimensionality; axis None flattens arr first.
     (arr,), axis = _util.axis_none_flatten(arr, axis=axis)
     axis = _util.normalize_axis_index(axis, arr.ndim)
     return torch.take_along_dim(arr, indices, axis)
@@ -901,6 +994,7 @@ def put(
     values: ArrayLike,
     mode: NotImplementedType = "raise",
 ):
+    # [FUNCTION DOC] Replace elements of a (flat positions given by indices) with values, in place. values is cast to a's dtype, repeated or truncated to match the number of indices. mode is unsupported. Returns None.
     v = values.type(a.dtype)
     # If indices is larger than v, expand v to at least the size of indices. Any
     # unnecessary trailing elements are then trimmed.
@@ -917,6 +1011,7 @@ def put(
 
 
 def put_along_axis(arr: ArrayLike, indices: ArrayLike, values: ArrayLike, axis):
+    # [FUNCTION DOC] Write values into arr in place at indices along axis (None flattens first; indices and values are broadcast together and values cast to arr's dtype). Returns None.
     (arr,), axis = _util.axis_none_flatten(arr, axis=axis)
     axis = _util.normalize_axis_index(axis, arr.ndim)
 
@@ -933,6 +1028,7 @@ def choose(
     out: OutArray | None = None,
     mode: NotImplementedType = "raise",
 ):
+    # [FUNCTION DOC] Construct an array by picking, per element of a, from the list of choice arrays (broadcast together) using a as the index into the choice list. mode and out are not handled here.
     # First, broadcast elements of `choices`
     choices = torch.stack(torch.broadcast_tensors(*choices))
 
@@ -959,6 +1055,7 @@ def unique(
     *,
     equal_nan: NotImplementedType = True,
 ):
+    # [FUNCTION DOC] Unique elements (sorted) of ar along axis (None flattens). Returns the unique tensor, or a tuple including inverse indices and/or counts if requested. return_index and equal_nan are unsupported markers.
     (ar,), axis = _util.axis_none_flatten(ar, axis=axis)
     axis = _util.normalize_axis_index(axis, ar.ndim)
 
@@ -970,14 +1067,17 @@ def unique(
 
 
 def nonzero(a: ArrayLike):
+    # [FUNCTION DOC] Indices of nonzero elements as a tuple of tensors, one per dimension.
     return torch.nonzero(a, as_tuple=True)
 
 
 def argwhere(a: ArrayLike):
+    # [FUNCTION DOC] Indices of nonzero elements as a 2-d tensor with one row per element.
     return torch.argwhere(a)
 
 
 def flatnonzero(a: ArrayLike):
+    # [FUNCTION DOC] Indices of nonzero elements of the flattened array.
     return torch.flatten(a).nonzero(as_tuple=True)[0]
 
 
@@ -987,20 +1087,25 @@ def clip(
     max: ArrayLike | None = None,
     out: OutArray | None = None,
 ):
+    # [FUNCTION DOC] Limit values to the interval [min, max] (either may be None). out is handled by the normalizer.
     return torch.clamp(a, min, max)
 
 
 def repeat(a: ArrayLike, repeats: ArrayLikeOrScalar, axis=None):
+    # [FUNCTION DOC] Repeat each element repeats times, along axis (None flattens first).
     return torch.repeat_interleave(a, repeats, axis)
 
 
 def tile(A: ArrayLike, reps):
+    # [FUNCTION DOC] Tile the array by reps (an int is treated as a 1-tuple).
     if isinstance(reps, int):
         reps = (reps,)
     return torch.tile(A, reps)
 
 
 def resize(a: ArrayLike, new_shape=None):
+    # [FUNCTION DOC] Return a new array of new_shape filled by repeating the flattened input (zeros if input or new size is empty), unlike ndarray.resize. new_shape None returns the input unchanged; an int is a 1-tuple.
+    # Raises ValueError for negative dimensions.
     # implementation vendored from
     # https://github.com/numpy/numpy/blob/v1.24.0/numpy/core/fromnumeric.py#L1420-L1497
     if new_shape is None:
@@ -1031,6 +1136,7 @@ def resize(a: ArrayLike, new_shape=None):
 
 
 def diagonal(a: ArrayLike, offset=0, axis1=0, axis2=1):
+    # [FUNCTION DOC] Diagonal of the array for the plane (axis1, axis2) with offset (axes normalized); returns a view.
     axis1 = _util.normalize_axis_index(axis1, a.ndim)
     axis2 = _util.normalize_axis_index(axis2, a.ndim)
     return torch.diagonal(a, offset, axis1, axis2)
@@ -1044,6 +1150,7 @@ def trace(
     dtype: DTypeLike | None = None,
     out: OutArray | None = None,
 ):
+    # [FUNCTION DOC] Sum along the offset diagonal in the plane (axis1, axis2), optionally with dtype. out is handled by the normalizer.
     result = torch.diagonal(a, offset, dim1=axis1, dim2=axis2).sum(-1, dtype=dtype)
     return result
 
@@ -1057,6 +1164,7 @@ def eye(
     *,
     like: NotImplementedType = None,
 ):
+    # [FUNCTION DOC] 2-d identity-like array of shape (N, M) (M defaults to N) with ones on the k-th diagonal; dtype defaults to the default float dtype.
     if dtype is None:
         dtype = _dtypes_impl.default_dtypes().float_dtype
     if M is None:
@@ -1067,23 +1175,29 @@ def eye(
 
 
 def identity(n, dtype: DTypeLike | None = None, *, like: NotImplementedType = None):
+    # [FUNCTION DOC] Square identity matrix of size n.
+    # KNOWN ISSUE: dtype None is passed to torch directly, giving torch's default dtype rather than the configured default float dtype.
     return torch.eye(n, dtype=dtype)
 
 
 def diag(v: ArrayLike, k=0):
+    # [FUNCTION DOC] Extract the k-th diagonal of a 2-d array or build a 2-d array with v on the k-th diagonal.
     return torch.diag(v, k)
 
 
 def diagflat(v: ArrayLike, k=0):
+    # [FUNCTION DOC] Build a 2-d array with the flattened input on the k-th diagonal.
     return torch.diagflat(v, k)
 
 
 def diag_indices(n, ndim=2):
+    # [FUNCTION DOC] Index arrays for the main diagonal of an array with ndim dimensions and size n each: a tuple of ndim copies of the same range.
     idx = torch.arange(n)
     return (idx,) * ndim
 
 
 def diag_indices_from(arr: ArrayLike):
+    # [FUNCTION DOC] Diagonal indices for an array. Raises ValueError if it has fewer than 2 dimensions or its dimensions are not all equal.
     if not arr.ndim >= 2:
         raise ValueError("input array must be at least 2-d")
     # For more than d=2, the strided formula is only valid for arrays with
@@ -1095,6 +1209,7 @@ def diag_indices_from(arr: ArrayLike):
 
 
 def fill_diagonal(a: ArrayLike, val: ArrayLike, wrap=False):
+    # [FUNCTION DOC] Fill the main diagonal of a (at least 2-d) in place with val (scalar or array, trimmed to fit); for tall 2-d matrices wrap restarts the diagonal after the matrix width plus one rows. Returns a. Raises ValueError for fewer than 2 dimensions.
     if a.ndim < 2:
         raise ValueError("array must be at least 2-d")
     if val.numel() == 0 and not wrap:
@@ -1129,6 +1244,7 @@ def fill_diagonal(a: ArrayLike, val: ArrayLike, wrap=False):
 
 
 def vdot(a: ArrayLike, b: ArrayLike, /):
+    # [FUNCTION DOC] Dot product of two flattened arrays (first argument conjugated), after promotion to a common dtype; half is computed in float32 and bool as uint8, then converted back.
     # 1. torch only accepts 1D arrays, numpy flattens
     # 2. torch requires matching dtype, while numpy casts (?)
     t_a, t_b = torch.atleast_1d(a, b)
@@ -1161,6 +1277,7 @@ def vdot(a: ArrayLike, b: ArrayLike, /):
 
 
 def tensordot(a: ArrayLike, b: ArrayLike, axes=2):
+    # [FUNCTION DOC] Tensor dot product over the given axes (int, or pair of axis lists; bare ints in the pair become lists), after promoting both inputs to a common dtype.
     if isinstance(axes, (list, tuple)):
         axes = [[ax] if isinstance(ax, int) else ax for ax in axes]
 
@@ -1172,6 +1289,7 @@ def tensordot(a: ArrayLike, b: ArrayLike, axes=2):
 
 
 def dot(a: ArrayLike, b: ArrayLike, out: OutArray | None = None):
+    # [FUNCTION DOC] Dot product: scalar multiplication if either input is 0-d, otherwise matrix multiplication; bool is computed as uint8 and converted back. out is handled by the normalizer.
     dtype = _dtypes_impl.result_type_impl(a, b)
     is_bool = dtype == torch.bool
     if is_bool:
@@ -1192,6 +1310,7 @@ def dot(a: ArrayLike, b: ArrayLike, out: OutArray | None = None):
 
 
 def inner(a: ArrayLike, b: ArrayLike, /):
+    # [FUNCTION DOC] Inner product over the last axes; half is computed in float32 and bool as uint8, results converted back.
     dtype = _dtypes_impl.result_type_impl(a, b)
     is_half = dtype == torch.float16 and (a.is_cpu or b.is_cpu)
     is_bool = dtype == torch.bool
@@ -1215,10 +1334,13 @@ def inner(a: ArrayLike, b: ArrayLike, /):
 
 
 def outer(a: ArrayLike, b: ArrayLike, out: OutArray | None = None):
+    # [FUNCTION DOC] Outer product of two vectors. out is handled by the normalizer.
     return torch.outer(a, b)
 
 
 def cross(a: ArrayLike, b: ArrayLike, axisa=-1, axisb=-1, axisc=-1, axis=None):
+    # [FUNCTION DOC] Cross product of 2- or 3-element vectors along axisa/axisb (axis overrides all three), vendored from NumPy; result axis placed at axisc. Inputs are promoted to a common dtype, shapes broadcast.
+    # Raises ValueError if a vector dimension is not 2 or 3. The 2-by-2 case returns the scalar z-component.
     # implementation vendored from
     # https://github.com/numpy/numpy/blob/v1.24.0/numpy/core/numeric.py#L1486-L1685
     if axis is not None:
@@ -1294,6 +1416,11 @@ def cross(a: ArrayLike, b: ArrayLike, axisa=-1, axisb=-1, axisc=-1, axis=None):
 
 
 def einsum(*operands, out=None, dtype=None, order="K", casting="safe", optimize=False):
+    # [FUNCTION DOC] Einstein summation, normalized manually (exported without the normalizer). Accepts either a subscripts string followed by operands or the alternating operand/sublist format.
+    # Operands are converted to tensors, promoted to a common dtype (half on CPU computed in float32, small ints in int64; casting rule enforced), and torch einsum is run. The optimize argument temporarily sets the opt_einsum backend
+    # strategy/enabled state (True maps to auto, False disables) and is restored afterwards, even on error. out is copied into via maybe_copy_to; the result is wrapped in an ndarray.
+    # Raises TypeError if out is not an ndarray, NotImplementedError if order is not K, ValueError for a bad casting mode.
+    # KNOWN ISSUE: the half/short-int upcast is not reverted, so results for those input dtypes have the wider dtype.
     # Have to manually normalize *operands and **kwargs, following the NumPy signature
     # We have a local import to avoid polluting the global space, as it will be then
     # exported in funcs.py
@@ -1387,6 +1514,7 @@ def einsum(*operands, out=None, dtype=None, order="K", casting="safe", optimize=
 
 
 def _sort_helper(tensor, axis, kind, order):
+    # [FUNCTION DOC] HELPER: Shared preparation for sort/argsort. Raises NotImplementedError for complex dtypes. Flattens if axis is None, normalizes axis, and returns (tensor, axis, stable) where stable is true iff kind is stable.
     if tensor.dtype.is_complex:
         raise NotImplementedError(f"sorting {tensor.dtype} is not supported")
     (tensor,), axis = _util.axis_none_flatten(tensor, axis=axis)
@@ -1398,6 +1526,7 @@ def _sort_helper(tensor, axis, kind, order):
 
 
 def sort(a: ArrayLike, axis=-1, kind=None, order: NotImplementedType = None):
+    # [FUNCTION DOC] Sorted copy of the array along axis (default last; None flattens). kind stable requests a stable sort; order is unsupported. Complex dtypes raise NotImplementedError.
     # `order` keyword arg is only relevant for structured dtypes; so not supported here.
     a, axis, stable = _sort_helper(a, axis, kind, order)
     result = torch.sort(a, dim=axis, stable=stable)
@@ -1405,6 +1534,7 @@ def sort(a: ArrayLike, axis=-1, kind=None, order: NotImplementedType = None):
 
 
 def argsort(a: ArrayLike, axis=-1, kind=None, order: NotImplementedType = None):
+    # [FUNCTION DOC] Indices that would sort the array along axis (default last; None flattens). kind stable requests a stable sort. Complex dtypes raise NotImplementedError.
     a, axis, stable = _sort_helper(a, axis, kind, order)
     return torch.argsort(a, dim=axis, stable=stable)
 
@@ -1412,6 +1542,7 @@ def argsort(a: ArrayLike, axis=-1, kind=None, order: NotImplementedType = None):
 def searchsorted(
     a: ArrayLike, v: ArrayLike, side="left", sorter: ArrayLike | None = None
 ):
+    # [FUNCTION DOC] Indices at which values v would be inserted into sorted a to keep order (side left or right, optional sorter). Complex dtypes raise NotImplementedError.
     if a.dtype.is_complex:
         raise NotImplementedError(f"searchsorted with dtype={a.dtype}")
 
@@ -1422,18 +1553,21 @@ def searchsorted(
 
 
 def moveaxis(a: ArrayLike, source, destination):
+    # [FUNCTION DOC] Move axes from source positions to destination positions (both normalized to tuples); returns a view.
     source = _util.normalize_axis_tuple(source, a.ndim, "source")
     destination = _util.normalize_axis_tuple(destination, a.ndim, "destination")
     return torch.moveaxis(a, source, destination)
 
 
 def swapaxes(a: ArrayLike, axis1, axis2):
+    # [FUNCTION DOC] Swap two axes (normalized against the rank); returns a view.
     axis1 = _util.normalize_axis_index(axis1, a.ndim)
     axis2 = _util.normalize_axis_index(axis2, a.ndim)
     return torch.swapaxes(a, axis1, axis2)
 
 
 def rollaxis(a: ArrayLike, axis, start=0):
+    # [FUNCTION DOC] Roll the given axis backwards until it lies before position start (vendored from NumPy). Raises an axis error if start is out of range. Returns the input itself when no movement is needed, else a permuted view.
     # Straight vendor from:
     # https://github.com/numpy/numpy/blob/v1.24.0/numpy/core/numeric.py#L1259
     #
@@ -1461,6 +1595,7 @@ def rollaxis(a: ArrayLike, axis, start=0):
 
 
 def roll(a: ArrayLike, shift, axis=None):
+    # [FUNCTION DOC] Roll elements along the given axis or axes (None flattens); an int shift is repeated for every axis given.
     if axis is not None:
         axis = _util.normalize_axis_tuple(axis, a.ndim, allow_duplicate=True)
         if not isinstance(shift, tuple):
@@ -1472,6 +1607,8 @@ def roll(a: ArrayLike, shift, axis=None):
 
 
 def squeeze(a: ArrayLike, axis=None):
+    # [FUNCTION DOC] Remove length-1 dimensions: all of them for axis None, none for an empty tuple, else the specified axis or axes.
+    # KNOWN ISSUE: for a tuple of axes the loop squeezes the original array each iteration instead of the running result, so only the last axis takes effect.
     if axis == ():
         result = a
     elif axis is None:
@@ -1487,6 +1624,7 @@ def squeeze(a: ArrayLike, axis=None):
 
 
 def reshape(a: ArrayLike, newshape, order: NotImplementedType = "C"):
+    # [FUNCTION DOC] Reshape; newshape is the tuple of the shape (a single-element tuple is unwrapped so that both call styles work). order is unsupported.
     # if sh = (1, 2, 3), numpy allows both .reshape(sh) and .reshape(*sh)
     newshape = newshape[0] if len(newshape) == 1 else newshape
     return a.reshape(newshape)
@@ -1498,6 +1636,7 @@ def reshape(a: ArrayLike, newshape, order: NotImplementedType = "C"):
 
 
 def transpose(a: ArrayLike, axes=None):
+    # [FUNCTION DOC] Permute dimensions. No axes (or empty, or None) reverses them; a single-element axes tuple is unwrapped so that both call styles work.
     # numpy allows both .transpose(sh) and .transpose(*sh)
     # also older code uses axes being a list
     if axes in [(), None, (None,)]:
@@ -1508,6 +1647,7 @@ def transpose(a: ArrayLike, axes=None):
 
 
 def ravel(a: ArrayLike, order: NotImplementedType = "C"):
+    # [FUNCTION DOC] Flatten to one dimension; order is an unsupported marker.
     return torch.flatten(a)
 
 
@@ -1518,6 +1658,7 @@ def diff(
     prepend: ArrayLike | None = None,
     append: ArrayLike | None = None,
 ):
+    # [FUNCTION DOC] n-th discrete difference along axis. n must be non-negative (ValueError); n of 0 returns the input. prepend and append are broadcast to the array shape except along axis (scalars get length 1 there) before differencing.
     axis = _util.normalize_axis_index(axis, a.ndim)
 
     if n < 0:
@@ -1544,6 +1685,7 @@ def diff(
 
 
 def angle(z: ArrayLike, deg=False):
+    # [FUNCTION DOC] Argument (phase angle) of complex numbers; in degrees if deg is true.
     result = torch.angle(z)
     if deg:
         result = result * (180 / torch.pi)
@@ -1551,11 +1693,14 @@ def angle(z: ArrayLike, deg=False):
 
 
 def sinc(x: ArrayLike):
+    # [FUNCTION DOC] Normalized sinc function.
     return torch.sinc(x)
 
 
 # NB: have to normalize *varargs manually
 def gradient(f: ArrayLike, *varargs, axis=None, edge_order=1):
+    # [FUNCTION DOC] Numerical gradient of an N-d array using central differences inside and first- or second-order one-sided differences at edges (vendored from NumPy). Spacing is given in varargs (none, one scalar for all axes, or one scalar or 1-d coordinate array per axis).
+    # Integer input is promoted to float64. Returns a single tensor for one axis, else a list per axis. Raises ValueError for bad spacing shapes or lengths, edge_order above 2, or axes too short; TypeError for a wrong number of spacing arguments.
     N = f.ndim  # number of dimensions
 
     varargs = _util.ndarrays_to_tensors(varargs)
@@ -1732,6 +1877,7 @@ def gradient(f: ArrayLike, *varargs, axis=None, edge_order=1):
 
 
 def round(a: ArrayLike, decimals=0, out: OutArray | None = None):
+    # [FUNCTION DOC] Round to the given number of decimals. Complex values round real and imaginary parts separately; integer input is returned unchanged. out is handled by the normalizer.
     if a.is_floating_point():
         result = torch.round(a, decimals=decimals)
     elif a.is_complex():
@@ -1751,6 +1897,7 @@ round_ = round
 
 
 def real_if_close(a: ArrayLike, tol=100):
+    # [FUNCTION DOC] Return the real part if all imaginary parts are below tol (relative to dtype epsilon when tol is above 1, else absolute); otherwise the array unchanged. Non-complex input is returned unchanged.
     if not torch.is_complex(a):
         return a
     if tol > 1:
@@ -1764,48 +1911,59 @@ def real_if_close(a: ArrayLike, tol=100):
 
 
 def real(a: ArrayLike):
+    # [FUNCTION DOC] Real part of the array.
     return torch.real(a)
 
 
 def imag(a: ArrayLike):
+    # [FUNCTION DOC] Imaginary part of the array (zeros for non-complex input).
     if a.is_complex():
         return a.imag
     return torch.zeros_like(a)
 
 
 def iscomplex(x: ArrayLike):
+    # [FUNCTION DOC] Boolean mask of elements with nonzero imaginary part (all False for non-complex input).
     if torch.is_complex(x):
         return x.imag != 0
     return torch.zeros_like(x, dtype=torch.bool)
 
 
 def isreal(x: ArrayLike):
+    # [FUNCTION DOC] Boolean mask of elements with zero imaginary part (all True for non-complex input).
     if torch.is_complex(x):
         return x.imag == 0
     return torch.ones_like(x, dtype=torch.bool)
 
 
 def iscomplexobj(x: ArrayLike):
+    # [FUNCTION DOC] True if the array has a complex dtype.
     return torch.is_complex(x)
 
 
 def isrealobj(x: ArrayLike):
+    # [FUNCTION DOC] True if the array does not have a complex dtype.
     return not torch.is_complex(x)
 
 
 def isneginf(x: ArrayLike, out: OutArray | None = None):
+    # [FUNCTION DOC] Boolean mask of negative infinities. out is handled by the normalizer.
     return torch.isneginf(x)
 
 
 def isposinf(x: ArrayLike, out: OutArray | None = None):
+    # [FUNCTION DOC] Boolean mask of positive infinities. out is handled by the normalizer.
     return torch.isposinf(x)
 
 
 def i0(x: ArrayLike):
+    # [FUNCTION DOC] Modified Bessel function of the first kind, order 0.
     return torch.special.i0(x)
 
 
 def isscalar(a):
+    # [FUNCTION DOC] True if the argument converts to an array with exactly one element; False if conversion fails. Imports the array normalizer locally to avoid exporting it.
+    # KNOWN ISSUE: differs from NumPy, which tests for scalar types; any single-element array-like (e.g. a one-item list) returns True.
     # We need to use normalize_array_like, but we don't want to export it in funcs.py
     from ._normalizations import normalize_array_like
 
@@ -1820,26 +1978,31 @@ def isscalar(a):
 
 
 def hamming(M):
+    # [FUNCTION DOC] Hamming window of M points (non-periodic) in the default float dtype.
     dtype = _dtypes_impl.default_dtypes().float_dtype
     return torch.hamming_window(M, periodic=False, dtype=dtype)
 
 
 def hanning(M):
+    # [FUNCTION DOC] Hann window of M points (non-periodic) in the default float dtype.
     dtype = _dtypes_impl.default_dtypes().float_dtype
     return torch.hann_window(M, periodic=False, dtype=dtype)
 
 
 def kaiser(M, beta):
+    # [FUNCTION DOC] Kaiser window of M points with shape parameter beta (non-periodic) in the default float dtype.
     dtype = _dtypes_impl.default_dtypes().float_dtype
     return torch.kaiser_window(M, beta=beta, periodic=False, dtype=dtype)
 
 
 def blackman(M):
+    # [FUNCTION DOC] Blackman window of M points (non-periodic) in the default float dtype.
     dtype = _dtypes_impl.default_dtypes().float_dtype
     return torch.blackman_window(M, periodic=False, dtype=dtype)
 
 
 def bartlett(M):
+    # [FUNCTION DOC] Bartlett window of M points (non-periodic) in the default float dtype.
     dtype = _dtypes_impl.default_dtypes().float_dtype
     return torch.bartlett_window(M, periodic=False, dtype=dtype)
 
@@ -1863,6 +2026,8 @@ array_precision = {
 
 
 def common_type(*tensors: ArrayLike):
+    # [FUNCTION DOC] Common floating dtype of the inputs, vendored from NumPy: integer inputs count as double precision, complex if any input is complex. Returns a torch dtype from the array_type table.
+    # Raises TypeError for dtypes not in the precision table (e.g. bfloat16).
     is_complex = False
     precision = 0
     for a in tensors:
@@ -1893,6 +2058,8 @@ def histogram(
     weights: ArrayLike | None = None,
     density=None,
 ):
+    # [FUNCTION DOC] Histogram of a over bins (int count or edges), optional range, weights and density. The deprecated normed raises ValueError; complex weights raise NotImplementedError. Integer input is computed in double.
+    # Returns (counts, bin edges); counts are int64 when unweighted-or-integer-weighted and not density, and edges are int64 for integer input.
     if normed is not None:
         raise ValueError("normed argument is deprecated, use density= instead")
 
@@ -1938,6 +2105,7 @@ def histogram2d(
     weights: ArrayLike | None = None,
     density=None,
 ):
+    # [FUNCTION DOC] 2-d histogram of x and y (must have equal length, else ValueError) via histogramdd. Returns (counts, x edges, y edges).
     # vendored from https://github.com/numpy/numpy/blob/v1.24.0/numpy/lib/twodim_base.py#L655-L821
     if len(x) != len(y):
         raise ValueError("x and y must have the same length.")
@@ -1963,6 +2131,9 @@ def histogramdd(
     weights: ArrayLike | None = None,
     density=None,
 ):
+    # [FUNCTION DOC] Multi-dimensional histogram of sample (a list/tuple is treated as columns, a 2-d array as rows of points), normalized manually. bins is an int, a sequence of ints, or a sequence of edge arrays (cast to the sample dtype and cast back on output).
+    # The deprecated normed raises ValueError. Returns (counts, list of edge tensors).
+    # KNOWN ISSUE: when weights are given the range is recomputed from the sample min/max, silently overriding a user-supplied range.
     # have to normalize manually because `sample` interpretation differs
     # for a list of lists and a 2D array
     if normed is not None:
@@ -2014,6 +2185,9 @@ def histogramdd(
 
 
 def min_scalar_type(a: ArrayLike, /):
+    # [FUNCTION DOC] Smallest dtype that can hold the single value in a (like NumPy min_scalar_type); arrays with more than one element return their own dtype. Returns a torch._numpy DType wrapper.
+    # Bool stays bool; ints prefer unsigned; floats and complex check ranges.
+    # KNOWN ISSUE: a float NaN or inf value fits no range so the chosen dtype is never assigned and an unbound-variable error results.
     # https://github.com/numpy/numpy/blob/maintenance/1.24.x/numpy/core/src/multiarray/convert_datatype.c#L1288
 
     from ._dtypes import DType
@@ -2051,6 +2225,7 @@ def min_scalar_type(a: ArrayLike, /):
 
 
 def pad(array: ArrayLike, pad_width: ArrayLike, mode="constant", **kwargs):
+    # [FUNCTION DOC] Constant padding of an array; pad_width is broadcast to one (before, after) pair per axis. Only mode constant is supported (else NotImplementedError); constant_values is read from kwargs (default 0) and converted to the array's Python scalar kind.
     if mode != "constant":
         raise NotImplementedError
     value = kwargs.get("constant_values", 0)
