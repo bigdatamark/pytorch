@@ -1,3 +1,10 @@
+# [MODULE DOC] Inference-time FX graph optimizations: conv/linear + batch-norm fusion,
+# dropout removal, and conversion of supported subgraphs to MKLDNN layout (found via
+# union-find coloring and kept or reverted by a heuristic). Main entry point is
+# optimize_for_inference; also exports helper passes, the MklSubgraph container, two
+# heuristics and UnionFind. Module-level lists mkldnn_supported and
+# mkldnn_supported_unknown define which modules/functions can run in MKLDNN. No
+# import-time side effects beyond imports.
 import copy
 import logging
 import operator
@@ -34,6 +41,8 @@ __all__ = [
 
 
 def _parent_name(target: str) -> tuple[str, str]:
+    # [FUNCTION DOC] HELPER: Splits a dotted qualified name at its last dot into
+    # (parent path, last atom); the parent is the empty string when there is no dot.
     """
     Splits a qualname into parent path and last atom.
     For example, `foo.bar.baz` -> (`foo.bar`, `baz`)
@@ -46,6 +55,12 @@ def _parent_name(target: str) -> tuple[str, str]:
 def matches_module_pattern(
     pattern: Iterable[type], node: fx.Node, modules: dict[str, torch.nn.Module]
 ) -> bool:
+    # [FUNCTION DOC] Returns true if node is a call_module whose target module has
+    # exactly the second type in pattern and whose first argument is a call_module node
+    # whose module has exactly the first type (exact type match, not subclass). Returns
+    # false if the node has no args or any check fails. No side effects.
+    # KNOWN ISSUE: pairing uses zip so patterns longer than 2 are silently truncated
+    # to 2 and patterns shorter than 2 only check the leading entries.
     if len(node.args) == 0:
         return False
     nodes: tuple[Argument, fx.Node] = (node.args[0], node)
@@ -66,6 +81,10 @@ def matches_module_pattern(
 def replace_node_module(
     node: fx.Node, modules: dict[str, torch.nn.Module], new_module: torch.nn.Module
 ) -> None:
+    # [FUNCTION DOC] Swaps the module that a call_module node refers to. Updates the
+    # modules mapping entry for the node's target and sets the new module as an
+    # attribute on its parent module. Mutates both. Raises an error if the target is
+    # not a string.
     if not isinstance(node.target, str):
         raise AssertionError(f"Expected str target, got {type(node.target)}")
     parent_name, name = _parent_name(node.target)
@@ -76,6 +95,12 @@ def replace_node_module(
 def fuse(
     model: torch.nn.Module, inplace: bool = False, no_trace: bool = False
 ) -> torch.nn.Module:
+    # [FUNCTION DOC] Fuses conv1d/2d/3d followed by matching batch norm, and linear
+    # followed by 1d batch norm, in eval mode. Copies the model unless inplace is set;
+    # traces it unless no_trace is set and it is already a GraphModule. For each match
+    # whose first layer has a single user and whose norm tracks running stats, the
+    # fused layer replaces the first layer and the norm node is removed. Returns a new
+    # GraphModule. Mutates module attributes of the (copied) model.
     """
     Fuses convolution/BN and linear/BN layers for inference purposes.
     Will deepcopy your model by default, but can modify the model inplace as well.
@@ -116,15 +141,22 @@ def fuse(
 
 
 def remove_dropout(model: nn.Module) -> nn.Module:
+    # [FUNCTION DOC] Symbolically traces the model and returns a transformed
+    # GraphModule in which every call to a Dropout module is replaced by its single
+    # input. Does not mutate the input model.
     """
     Removes all dropout layers from the module.
     """
     fx_model = fx.symbolic_trace(model)
 
     class DropoutRemover(torch.fx.Transformer):
+        # [CLASS DOC] HELPER: Transformer that forwards the input of Dropout module
+        # calls instead of emitting them; other module calls are unchanged.
         def call_module(
             self, target: Target, args: tuple[Argument, ...], kwargs: dict[str, Any]
         ) -> Any:
+            # [FUNCTION DOC] Returns the sole argument for Dropout targets (raises an
+            # error if the arg count is not one); otherwise defers to the base class.
             if isinstance(self.submodules[target], nn.Dropout):
                 if len(args) != 1:
                     raise AssertionError(f"Expected 1 arg for Dropout, got {len(args)}")
@@ -141,6 +173,11 @@ def extract_subgraph(
     inputs: list[fx.Node],
     outputs: list[fx.Node],
 ) -> fx.GraphModule:
+    # [FUNCTION DOC] Builds a new graph with one placeholder per input node, copies the
+    # given nodes in order (remapping their args through an environment), and outputs
+    # the listed output nodes as a list. Lints the graph and returns a GraphModule that
+    # takes its submodules from orig_module. Nodes must be given in topological order
+    # and reference only inputs or earlier nodes, else a lookup error occurs.
     """
     Given lists of nodes from an existing graph that represent a subgraph, returns a submodule that executes that subgraph.
     """
@@ -182,6 +219,11 @@ mkldnn_supported_unknown = [operator.add, operator.mul]
 def modules_to_mkldnn(
     nodes: list[fx.Node], modules: dict[str, nn.Module]
 ) -> dict[nn.Module, nn.Module]:
+    # [FUNCTION DOC] For every call_module node whose module has exactly type Conv2d,
+    # Linear or BatchNorm2d, builds the MKLDNN equivalent (float dtype), swaps it in via
+    # replace_node_module (mutating modules and parents), and records a deep copy of the
+    # original keyed by the new module. Returns that mapping. Raises an error if a
+    # target is not a string.
     """
     For each node, if it's a module that can be preconverted into MKLDNN,
     then we do so and create a mapping to allow us to convert from the MKLDNN
@@ -215,6 +257,9 @@ def reset_modules(
     modules: dict[str, nn.Module],
     old_modules: dict[nn.Module, nn.Module],
 ) -> None:
+    # [FUNCTION DOC] For each call_module node whose current module is a key of
+    # old_modules, restores the original module via replace_node_module (mutating
+    # modules and parents). Raises an error if a target is not a string.
     """
     Maps each module that's been changed with `modules_to_mkldnn` back to its
     original.
@@ -229,7 +274,12 @@ def reset_modules(
 
 
 class MklSubgraph:
+    # [CLASS DOC] Plain container describing one MKLDNN subgraph: the owning graph,
+    # the interior nodes, the entry nodes (to_mkldnn calls) and exit nodes (to_dense
+    # calls). Lists start empty and are filled by optimize_for_inference.
     def __init__(self, fx_graph: fx.Graph) -> None:
+        # [FUNCTION DOC] Stores the graph and creates empty lists for nodes,
+        # start_nodes and end_nodes.
         self.fx_graph = fx_graph
         self.nodes: list[fx.Node] = []
         self.start_nodes: list[fx.Node] = []
@@ -239,6 +289,13 @@ class MklSubgraph:
 def gen_mkl_autotuner(
     example_inputs: list[torch.Tensor], iters: int = 10, warmup: int = 1
 ) -> Callable[[MklSubgraph], bool]:
+    # [FUNCTION DOC] Returns a heuristic function (graph -> bool) that benchmarks a
+    # subgraph both in MKLDNN layout and in dense form, using random inputs shaped from
+    # shape propagation of example_inputs, with warmup runs then iters timed runs, and
+    # says to keep MKLDNN when it is strictly faster. The first call runs shape
+    # propagation on the owning module and caches state in closure variables. Side
+    # effects: the returned heuristic reverts the subgraph's modules to their originals
+    # to time the dense version.
     """
     This generates a heuristic that can be passed into `optimize_for_inference` that
     determines whether a subgraph should be run in MKL by running it with the example_inputs.
@@ -251,6 +308,10 @@ def gen_mkl_autotuner(
     old_modules = None
 
     def use_mkl_heuristic(graph: MklSubgraph) -> bool:
+        # [FUNCTION DOC] HELPER: Heuristic closure; extracts the subgraph as a module,
+        # times it with MKLDNN inputs, resets its modules to the originals, times it
+        # with dense inputs, and returns whether MKLDNN was faster. Raises an error if
+        # the graph has no owning module.
         nonlocal fx_model, old_modules
         input_nodes = graph.start_nodes
         if fx_model is None:
@@ -266,6 +327,8 @@ def gen_mkl_autotuner(
         submodule = extract_subgraph(fx_model, graph.nodes, input_nodes, output_args)
 
         def benchmark(f: Callable[[], object]) -> float:
+            # [FUNCTION DOC] HELPER: Calls f warmup times untimed, then iters times, and
+            # returns the total wall-clock seconds of the timed calls.
             for _ in range(warmup):
                 f()
             begin = time.time()
@@ -292,6 +355,8 @@ def gen_mkl_autotuner(
 
 
 def use_mkl_length(graph: MklSubgraph) -> bool:
+    # [FUNCTION DOC] Default heuristic: returns true when the subgraph has more than two
+    # interior nodes.
     """
     This is a heuristic that can be passed into `optimize_for_inference` that
     determines whether a subgraph should be run in MKL by checking if there
@@ -301,15 +366,22 @@ def use_mkl_length(graph: MklSubgraph) -> bool:
 
 
 class UnionFind:
+    # [CLASS DOC] Disjoint-set structure over integers 0 to n-1 with path compression
+    # and union by size. State: parent list (None until make_set) and size list.
+    # Elements must be made into sets before find or join.
     def __init__(self, n: int) -> None:
+        # [FUNCTION DOC] Allocates parent (all None) and size (all zero) lists of length n.
         self.parent: list[int | None] = [None] * n
         self.size: list[int] = [0] * n
 
     def make_set(self, v: int) -> None:
+        # [FUNCTION DOC] Makes v its own root with size one.
         self.parent[v] = v
         self.size[v] = 1
 
     def find(self, v: int) -> int:
+        # [FUNCTION DOC] Returns the root of v's set, compressing the path recursively.
+        # Raises an error if v (or an ancestor) was never made into a set.
         par = self.parent[v]
         if v == par:
             return v
@@ -319,6 +391,11 @@ class UnionFind:
         return cast(int, self.parent[v])
 
     def join(self, a: int, b: int) -> int | None:
+        # [FUNCTION DOC] Merges the sets of a and b, attaching the smaller root under the
+        # larger and updating size. Returns the root only when they were already in the
+        # same set.
+        # KNOWN ISSUE: returns None after an actual merge, so the return value is
+        # inconsistent and callers must not rely on it.
         a, b = self.find(a), self.find(b)
         if a == b:
             return a
@@ -333,6 +410,18 @@ def optimize_for_inference(
     pass_config: dict[str, Any] | None = None,
     tracer: type[fx.Tracer] = fx.Tracer,
 ) -> torch.nn.Module:
+    # [FUNCTION DOC] Runs conv/bn fusion, dropout removal and MKLDNN layout
+    # optimization according to pass_config (keys conv_bn_fuse, remove_dropout,
+    # mkldnn_layout_optimize; the last is false or a dict holding a heuristic). MKLDNN
+    # step: wraps nodes of supported modules/functions with to_mkldnn/to_dense calls,
+    # converts the modules, cancels adjacent to_dense/to_mkldnn pairs, colors connected
+    # regions with union-find into MklSubgraph objects, and for each one the heuristic
+    # rejects removes its conversions and restores modules. Logs the remaining
+    # conversion count. Returns a GraphModule. Raises RuntimeError for a malformed
+    # mkldnn config and an error for non-float or non-CPU module parameters.
+    # KNOWN ISSUE: modules are taken from the original model while the graph is traced
+    # from a copy, so module swaps mutate the input model, and unknown-support nodes
+    # read the target of every arg, which fails for non-Node args.
     """
     Performs a set of optimization passes to optimize a model for the
     purposes of inference. Specifically, the passes that are run are:
@@ -373,6 +462,8 @@ def optimize_for_inference(
     modules: dict[str, nn.Module] = dict(model.named_modules())
 
     class MklSupport(Enum):
+        # [CLASS DOC] HELPER: Enum classifying a node's MKLDNN support: NO, YES, or
+        # UNKNOWN (only convertible if its inputs are already in MKLDNN layout).
         NO = 1
         YES = 2
         UNKNOWN = 3
@@ -437,6 +528,8 @@ def optimize_for_inference(
     uf = UnionFind(num_nodes)
 
     def get_color(n: fx.Node) -> int | None:
+        # [FUNCTION DOC] HELPER: Returns the union-find root of the node's color or
+        # start color, or None when the node belongs to no MKLDNN region.
         if hasattr(n, "color"):  # Current node is part of a MKL subgraph
             return uf.find(n.color)
         if hasattr(n, "start_color"):  # Current node is input to MKL subgraph

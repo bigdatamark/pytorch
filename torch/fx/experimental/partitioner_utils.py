@@ -1,3 +1,9 @@
+# [MODULE DOC] Data structures and latency/memory helpers for FX graph partitioners:
+# Partition (a set of nodes with memory accounting and parent/child links), Device,
+# latency records, PartitionMode, PartitionerConfig, and functions that compute extra
+# memory for a node, per-partition critical-path latency, communication latency between
+# partitions, and whole-graph latency. Nodes are expected to carry a size_bytes
+# attribute set by earlier analysis. No import-time side effects.
 from enum import Enum
 from typing import NamedTuple
 
@@ -5,11 +11,18 @@ from torch.fx.node import map_arg, Node
 
 
 class Partition:
+    # [CLASS DOC] A group of graph nodes assigned together. State: nodes (set),
+    # partition_id, parents and children (sets of partitions), bfs_level (-1 until
+    # assigned), used_mem_bytes (kept in sync by add_node, remove_node and
+    # recalculate_mem_size) and logical_device_ids. Placeholder and get_attr inputs of a
+    # member node are pulled into the partition along with it.
     """Partition class contains all the information about an individual partition.
     It also provides necessary methods for manipulating the partition.
     """
 
     def __init__(self, partition_id: int) -> None:
+        # [FUNCTION DOC] Creates an empty partition with the given id, no parents or
+        # children, bfs level -1, zero memory use and no logical devices.
         self.nodes: set[Node] = set()
         self.partition_id = partition_id
         self.parents: set[Partition] = set()
@@ -19,14 +32,20 @@ class Partition:
         self.logical_device_ids: list[int] = []
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns the partition id as a string.
         return str(self.partition_id)
 
     def recalculate_mem_size(self) -> None:
+        # [FUNCTION DOC] Recomputes used_mem_bytes from scratch as the sum, over member
+        # nodes, of the extra size each needs given the member set. Raises an error if
+        # a needed node lacks size information.
         self.used_mem_bytes = 0
         for node in self.nodes:
             self.used_mem_bytes += get_extra_size_of(node, self.nodes)
 
     def add_node(self, node: Node) -> None:
+        # [FUNCTION DOC] Adds the node, plus any of its placeholder or get_attr input
+        # nodes, to the partition and recalculates memory use.
         input_nodes: dict[Node, None] = {}
         map_arg(node.args, input_nodes.setdefault)
         map_arg(node.kwargs, input_nodes.setdefault)
@@ -38,6 +57,11 @@ class Partition:
         self.recalculate_mem_size()
 
     def remove_node(self, node: Node) -> None:
+        # [FUNCTION DOC] If the node is a member, removes it and also removes each of its
+        # placeholder or get_attr inputs that no remaining member uses, then
+        # recalculates memory. Does nothing for a non-member.
+        # KNOWN ISSUE: removing an input node assumes it is still in the set; a
+        # placeholder input not previously added would raise a lookup error.
         # Remove a node only if the node is in the partition
         if node in self.nodes:
             self.nodes.remove(node)
@@ -57,12 +81,16 @@ class Partition:
 
 
 class Device(NamedTuple):
+    # [CLASS DOC] Immutable record of a device: name, available memory in bytes and
+    # logical id.
     name: str
     available_mem_bytes: int
     logical_id: int
 
 
 class NodeLatency(NamedTuple):
+    # [CLASS DOC] Immutable per-node latency in seconds, split into memory-bandwidth
+    # and computation parts.
     # Latency due to the memory bandwidth
     mem_latency_sec: float
     # Latency due to the computation
@@ -70,6 +98,8 @@ class NodeLatency(NamedTuple):
 
 
 class PartitionLatency(NamedTuple):
+    # [CLASS DOC] Immutable latency summary of a partition's critical path in seconds:
+    # summed memory latency, summed compute latency and overall latency.
     # Sum of all nodes' memory latency on the critical path
     mem_latency_sec: float
     # Sum of all nodes' compute latency on the critical path
@@ -79,6 +109,8 @@ class PartitionLatency(NamedTuple):
 
 
 class PartitionMode(Enum):
+    # [CLASS DOC] Enumerates partitioning strategies: size_based, sparse_nn,
+    # cost_aware, kl_based and aot_based.
     size_based = 0
     sparse_nn = 1
     cost_aware = 2
@@ -87,6 +119,11 @@ class PartitionMode(Enum):
 
 
 class PartitionerConfig(NamedTuple):
+    # [CLASS DOC] Immutable configuration for a partitioner: device list, mode (default
+    # size_based), transfer rate, optional node latency and node-to-partition mappings,
+    # partition-to-logical-device mapping, and whether to saturate the host.
+    # KNOWN ISSUE: the mapping defaults are shared mutable dictionaries across all
+    # instances that use the defaults.
     devices: list[Device]
     mode: PartitionMode = PartitionMode.size_based
     transfer_rate_bytes_per_sec: float = 0.0
@@ -98,6 +135,9 @@ class PartitionerConfig(NamedTuple):
 
 
 def get_extra_size_of(node: Node, nodes: set[Node]) -> int:
+    # [FUNCTION DOC] Returns the bytes needed to add node to the given set: the output
+    # size of each input node not already in the set plus the node's own total size.
+    # Raises RuntimeError if any involved node has no (or empty) size_bytes attribute.
     """Given a node and a set of nodes,
     this function return the extra size that needed
     if this node is included in this set.
@@ -128,9 +168,16 @@ def get_extra_size_of(node: Node, nodes: set[Node]) -> int:
 def get_latency_of_one_partition(
     partition: Partition, node_to_latency_mapping: dict[Node, NodeLatency]
 ) -> PartitionLatency:
+    # [FUNCTION DOC] Computes the critical-path latency of one partition: starts from
+    # each top node (no non-placeholder inputs inside the partition), follows users
+    # inside the partition accumulating memory, compute and overall (max of the two per
+    # node) latency, and returns the path with the largest overall latency. An empty
+    # partition gives all zeros. Raises a lookup error if a node lacks a latency entry.
     """Given a partition and its nodes' latency, return a PartitionLatency for this partition"""
 
     def get_top_nodes(partition: Partition) -> list[Node]:
+        # [FUNCTION DOC] HELPER: Returns the non-placeholder, non-get_attr nodes of the
+        # partition that have no such input node inside the partition.
         """Given a partition, return a list of nodes on the top bfs level"""
         top_nodes: list[Node] = []
         for node in partition.nodes:
@@ -151,6 +198,9 @@ def get_latency_of_one_partition(
         return top_nodes
 
     def dfs_helper(node: Node, partition_latency: PartitionLatency) -> PartitionLatency:
+        # [FUNCTION DOC] HELPER: Recursively adds this node's latency to the running path
+        # latency and returns the path (through in-partition users) with the greatest
+        # overall latency; a node with no in-partition users ends the path.
         """Given a top node of a partition, this function returns
         the latency of the critical path in the partition
         """
@@ -217,6 +267,8 @@ def get_latency_of_one_partition(
 def get_partition_to_latency_mapping(
     partitions: list[Partition], node_to_latency_mapping: dict[Node, NodeLatency]
 ) -> dict[Partition, PartitionLatency]:
+    # [FUNCTION DOC] Returns a mapping from each partition to its critical-path latency
+    # computed by get_latency_of_one_partition with the node latency mapping.
     """Given all the partitions and node_to_latency_mapping dictionary,
     return a mapping dictionary of each partition to its overall latency
     """
@@ -235,6 +287,11 @@ def get_comm_latency_between(
     child_partition: Partition,
     transfer_rate_bytes_per_sec: float,
 ) -> float:
+    # [FUNCTION DOC] Returns the seconds to send data from parent to child: zero if both
+    # have identical non-empty logical device lists; otherwise the summed output sizes
+    # of distinct parent-partition nodes used as inputs by child nodes (nodes without
+    # size information count zero) divided by the transfer rate.
+    # KNOWN ISSUE: a transfer rate of zero (the config default) raises a division error.
     """Given two partitions (parent and child),
     calculate the communication latency between the two.
     """
@@ -271,11 +328,18 @@ def get_latency_of_partitioned_graph(
     partition_to_latency_mapping: dict[Partition, PartitionLatency],
     transfer_rate_bytes_per_sec: float,
 ) -> float:
+    # [FUNCTION DOC] Returns the latency of the longest path through the partition DAG,
+    # starting at partitions without parents, summing each partition's overall latency
+    # and the communication latency on each parent-child edge. Zero if there are no
+    # partitions. Assumes the parent/child links are acyclic.
     """Given all partitions in a graph, find the critical path among all partitions
     and return its latency as the latency of the whole graph
     """
 
     def dfs_helper(partition: Partition, latency_so_far_sec: float) -> float:
+        # [FUNCTION DOC] HELPER: Recursively adds this partition's latency to the
+        # running total and returns the maximum total over all child paths, including
+        # communication latency per edge.
         """This function helps to recursively get the latency of a path of partitions"""
         # Update latency by adding current partition's latency
         latency_so_far_sec += partition_to_latency_mapping[
@@ -298,6 +362,7 @@ def get_latency_of_partitioned_graph(
         return latency_so_far_sec
 
     def get_top_partitions(partitions: list[Partition]) -> list[Partition]:
+        # [FUNCTION DOC] HELPER: Returns the partitions that have no parents.
         """This function is to return all the partitions without parents
         as the starting points of all the paths
         """

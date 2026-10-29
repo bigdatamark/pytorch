@@ -1,3 +1,9 @@
+# [MODULE DOC] Declares the z3 sorts and datatypes used to encode gradual tensor types:
+# an uninterpreted Dyn sort and constant, a dimension datatype (pair of integers), and a
+# TensorType datatype (Dyn or tensors of rank 1 to 4 built from dimensions). Exports
+# HAS_Z3, dyn_type, dim, tensor_type, D (dimension constructor) and z3_dyn.
+# Import-time side effect: tries to import z3; on ImportError only HAS_Z3 is set to
+# false and the other names are left undefined.
 try:
     import z3  # type: ignore[import]
 

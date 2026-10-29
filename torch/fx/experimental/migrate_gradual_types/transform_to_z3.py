@@ -1,3 +1,13 @@
+# [MODULE DOC] Translates gradual-type constraints (conjunctions, disjunctions, tensor
+# and dimension equalities, inequalities, algebraic expressions) into z3 expressions and
+# runs the solver. Main API: transform_to_z3, transform_var, transform_dimension,
+# transform_algebraic_expression, transform_all_constraints,
+# transform_all_constraints_trace_time, iterate_till_fixed_point and
+# evaluate_conditional_with_constraints. A dimension is encoded as a pair whose first
+# component is a flag (nonzero for a known number, zero for dynamic) and second the value.
+# Import-time side effect: tries to import z3 and, only if present, defines all the
+# functions and sets HAS_Z3 true; otherwise just HAS_Z3 is set false and the names in
+# the export list are undefined.
 from typing import Any, TypeAlias
 
 import torch
@@ -71,6 +81,17 @@ try:
     def transform_to_z3(
         constraint: Constraint, counter: int, dimension_dict: dict[int, int]
     ) -> tuple[_Z3Expr, int]:
+        # [FUNCTION DOC] Recursively converts a constraint into a z3 expression and the
+        # updated fresh-variable counter. Conjunction and disjunction become z3 And/Or of
+        # converted parts; true and false constraints become plain booleans; tensor
+        # equality converts both sides as tensor variables; dimension equality handles a
+        # boolean-variable definition, dimension-vs-dimension, or algebraic comparison;
+        # inequality requires dimensions and encodes dynamic/number cases; less-or-equal,
+        # greater and less compare the value components. May update dimension_dict
+        # (mapping from dimension variable ids to fresh ids). Raises NotImplementedError
+        # for unsupported operators or constraint kinds and an error if operands are not
+        # dimensions where required.
+        # KNOWN ISSUE: reads the conjunction attribute under its misspelled name (conjucts).
         if isinstance(constraint, Conj):
             conjuncts = []
             for c in constraint.conjucts:
@@ -271,6 +292,12 @@ try:
         counter: int,
         dimension_dict: dict[int, int],
     ) -> tuple[_Z3Expr, int]:
+        # [FUNCTION DOC] Converts a tensor type, the dynamic type or a tensor variable to
+        # a z3 term. A concrete tensor type of rank 1 to 4 becomes the matching tensor
+        # constructor applied to converted dimensions (counter and dimension_dict may be
+        # updated); the dynamic type becomes the z3 dyn constant; a tensor variable
+        # becomes a named z3 constant. Raises an error for rank 0 or above 4 and
+        # NotImplementedError for other inputs. Returns the term and the counter.
         """
         Transforms tensor variables to a format understood by z3
         Args:
@@ -311,6 +338,11 @@ try:
     def transform_dimension(
         dimension: DVar | int | _DynType, counter: int, dimension_dict: dict[int, int]
     ) -> tuple[_Z3Expr, int]:
+        # [FUNCTION DOC] Encodes a dimension as a z3 pair. The dynamic marker gets flag
+        # zero and a fresh integer (counter incremented); a number gets flag one and
+        # itself; a dimension variable gets a flag integer remembered in dimension_dict
+        # (allocated from the counter on first use, mutating the dict) and an integer
+        # named by the variable id. Raises NotImplementedError for other inputs.
         """
         Takes a dimension variable or a number and transforms it to a tuple
         according to our scheme
@@ -345,6 +377,13 @@ try:
         counter: int,
         dimension_dict: dict[int, int],
     ) -> tuple[_Z3Expr, int]:
+        # [FUNCTION DOC] Converts a dimension or algebraic expression to a z3 integer
+        # term using only the value component of each dimension. A product multiplies
+        # its factors; a binary expression converts both sides recursively and applies
+        # subtract, add, divide, multiply or modulo. Returns the term and updated
+        # counter. Raises an error if the input is neither a dimension nor algebraic
+        # expression or a product factor is not a dimension, NotImplementedError for an
+        # unknown operator.
         """
         Transforms an algebraic expression to z3 format
         Args:
@@ -410,6 +449,8 @@ try:
             raise RuntimeError
 
     def transform_all_constraints(traced: torch.nn.Module, counter: int = 0) -> _Z3Expr:
+        # [FUNCTION DOC] Generates constraints for a traced module, simplifies them to a
+        # fixed point, and returns the z3 translation (with a fresh dimension mapping).
         """
         Given a trace, generates constraints and transforms them to z3 format
 
@@ -428,6 +469,9 @@ try:
     def iterate_till_fixed_point(
         constraints: Constraint, counter: int
     ) -> tuple[Constraint, int]:
+        # [FUNCTION DOC] Repeatedly applies constraint transformation until the result
+        # equals the previous one; returns the final constraint and counter.
+        # May not terminate if the transformation never stabilizes.
         """
         Transform constraints till reaching a fixed point
         """
@@ -440,6 +484,14 @@ try:
     def transform_all_constraints_trace_time(
         tracer_root: torch.nn.Module, graph: Graph, node: Node, counter: int = 0
     ) -> tuple[_Z3Expr, _Z3Expr]:
+        # [FUNCTION DOC] Generates constraints for the graph so far, splits off the last
+        # conjunct (the conditional's definition, which must be a dimension constraint
+        # whose left side is a boolean variable and right side a boolean constraint),
+        # simplifies both parts to fixed points, converts to z3, and returns two
+        # expressions: the rest conjoined with the condition, and the rest conjoined
+        # with its negation. Mutates the generated conjunct list. Raises TypeError or an
+        # error if the last conjunct has the wrong shape.
+        # KNOWN ISSUE: the node argument is unused.
         """
         Takes a node and a graph and generates two sets of constraints.
         One set constraints the node's constraints and another set
@@ -512,6 +564,10 @@ try:
         counter: int = 0,
         user_constraints: _Z3Expr | None = None,
     ) -> tuple[_Z3Result, _Z3Result]:
+        # [FUNCTION DOC] Builds the positive and negative constraint sets for a
+        # conditional and checks each, with optional extra user constraints, in a fresh
+        # z3 solver. Returns the two solver results (satisfiable, unsatisfiable or
+        # unknown) for the condition and its negation.
         """
         Given an IR and a node representing a conditional, evaluate the conditional
         and its negation

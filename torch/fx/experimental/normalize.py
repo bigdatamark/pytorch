@@ -1,3 +1,7 @@
+# [MODULE DOC] FX transformers that canonicalize call sites. NormalizeArgs rewrites
+# arguments of function and module calls to match the target signature (keyword form
+# with defaults filled in); NormalizeOperators remaps torch arithmetic and comparison
+# functions to the equivalent python operator functions. No import-time side effects.
 import operator
 from collections.abc import Callable
 from typing import Any
@@ -17,6 +21,11 @@ from .schema_type_annotation import AnnotateTypesWithSchema
 
 
 class NormalizeArgs(Transformer):
+    # [CLASS DOC] Transformer that rewrites each call_function and call_module node so
+    # its args and kwargs follow the target's signature (all keyword when
+    # normalize_to_only_use_kwargs is set). Holds node_map from new proxies to original
+    # nodes and the normalize flag. Copies meta and type from the original node to the
+    # new one. Falls back to the unmodified call when normalization is not possible.
     """
     Normalize arguments to Python targets. This means that
     `args/kwargs` will be matched up to the module/functional's
@@ -37,14 +46,28 @@ class NormalizeArgs(Transformer):
     def __init__(
         self, module: torch.fx.GraphModule, normalize_to_only_use_kwargs: bool = True
     ) -> None:
+        # [FUNCTION DOC] Initializes the transformer over the given graph module, with an
+        # empty proxy-to-node map, and stores the flag controlling kwargs-only output.
         super().__init__(module)
         self.node_map: dict[Proxy, Node] = {}
         self.normalize_to_only_use_kwargs = normalize_to_only_use_kwargs
 
     def run_node(self, n: Node) -> Any:
+        # [FUNCTION DOC] Executes one node during transformation. Resolves its args from
+        # the environment, computes type hints for positional and keyword arguments
+        # (node arguments use the node's own type metadata, others their runtime type),
+        # and for call_function nodes goes through this class's call_function with the
+        # hints; other ops use the base behavior. For non-output nodes it records the
+        # result in node_map and copies the original meta and type onto the new node.
+        # Returns the resulting proxy. Raises an error if the positional type structure
+        # is not a tuple.
+        # KNOWN ISSUE: get_type returns the current node's type metadata for every
+        # Node-valued argument rather than that argument's own type.
         args, kwargs = self.fetch_args_kwargs_from_env(n)
 
         def get_type(arg: object) -> Any:
+            # [FUNCTION DOC] HELPER: Returns the type metadata of the enclosing node
+            # when arg is a Node, otherwise the runtime type of arg.
             if isinstance(arg, fx.Node):
                 return n.meta.get("type")
             return type(arg)
@@ -72,6 +95,10 @@ class NormalizeArgs(Transformer):
         arg_types: tuple[Any, ...] | None = None,
         kwarg_types: dict[str, Any] | None = None,
     ) -> Proxy:
+        # [FUNCTION DOC] Normalizes a function call using the optional type hints to pick
+        # an overload. If normalization succeeds, emits a new call_function proxy with
+        # the normalized args and kwargs; otherwise delegates to the base transformer
+        # unchanged. Raises an error if target is not callable.
         if not callable(target):
             raise AssertionError(f"Expected callable target, got {type(target)}")
         new_args_and_kwargs = normalize_function(
@@ -93,6 +120,10 @@ class NormalizeArgs(Transformer):
     def call_module(
         self, target: Target, args: tuple[Argument, ...], kwargs: dict[str, Any]
     ) -> Proxy:
+        # [FUNCTION DOC] Normalizes a module call using the submodule's forward
+        # signature; on success delegates to the base call_module with the normalized
+        # args and kwargs, otherwise with the originals. Raises an error if target is
+        # not a string.
         if not isinstance(target, str):
             raise AssertionError(f"Expected str target, got {type(target)}")
         new_args_and_kwargs = normalize_module(
@@ -110,6 +141,12 @@ class NormalizeArgs(Transformer):
 
 
 class NormalizeOperators(AnnotateTypesWithSchema):
+    # [CLASS DOC] Schema-annotating transformer that remaps torch binary functions
+    # (add, mul, sub, div, floor_divide, remainder and the six comparisons) to the
+    # matching python operator functions via the class-level mapping
+    # binary_magic_method_remap. Other calls pass through.
+    # KNOWN ISSUE: the class docstring is truncated mid-sentence, and the mapping is
+    # keyed by torch functions while the docstring says operators map to torch ops.
     """
     Normalize callsites that are different ways of "spelling" the same
     invocation into a single, canonical call. Currently supports:
@@ -147,6 +184,10 @@ class NormalizeOperators(AnnotateTypesWithSchema):
     def call_function(
         self, target: Target, args: tuple[Argument, ...], kwargs: dict[str, Any]
     ) -> Proxy:
+        # [FUNCTION DOC] If target is a key of the remap table and exactly two positional
+        # args are given, emits the mapped operator function with those two args and no
+        # kwargs; otherwise delegates unchanged. Raises an error if target is not
+        # callable.
         # Normalize operators according to the magic methods implemented on tensors here:
         # https://github.com/pytorch/pytorch/blob/28c5d90b679c6b38bf4183ec99f16d933c2f1bcd/tools/autograd/templates/python_variable_methods.cpp#L1137
 
