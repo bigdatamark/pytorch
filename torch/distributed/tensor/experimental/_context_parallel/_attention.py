@@ -1,3 +1,12 @@
+# [MODULE DOC] Context parallelism (CP) for attention. Provides ring attention
+# implementations of the scaled dot product attention (flash, efficient, cuDNN,
+# forward and backward) over a sequence-sharded DTensor mesh, KV rotation
+# strategies (all-to-all and all-gather), an online softmax merger, a DTensor
+# dispatcher hook (monkey-patch or module-wrapper mode), flex-attention block
+# mask conversion, sharding/unsharding helpers, the public context_parallel
+# context manager, context_parallel_unshard and set_rotate_method. Module-level
+# state: _cp_options (global options) and _dispatch_mode. Import-time side
+# effects: creates the logger and default options only.
 import contextlib
 import itertools
 import logging
@@ -45,12 +54,17 @@ __all__ = [
 
 
 class _CausalBehavior(Enum):
+    # [CLASS DOC] HELPER: How to run attention for one KV block: SKIP (no work),
+    # NOT_IS_CAUSAL (full attention) or IS_CAUSAL (apply the causal mask). The
+    # enum value is passed as the is_causal argument of the attention op.
     SKIP = None
     NOT_IS_CAUSAL = False
     IS_CAUSAL = True
 
 
 class _RotateMethod(Enum):
+    # [CLASS DOC] Enum of KV rotation strategies for ring attention: ALL_TO_ALL
+    # (permute buffers each step) or ALL_GATHER (one gather, then pick chunks).
     ALL_TO_ALL = auto()
     ALL_GATHER = auto()
 
@@ -60,6 +74,8 @@ logger = logging.getLogger(__name__)
 
 
 class _DispatchMode(Enum):
+    # [CLASS DOC] HELPER: How the CP dispatcher is installed: MONKEY_PATCH
+    # (replace functions in modules) or MODULE_WRAPPER (wrap module inputs/outputs).
     MONKEY_PATCH = auto()
     MODULE_WRAPPER = auto()
 
@@ -69,6 +85,10 @@ _dispatch_mode: _DispatchMode = _DispatchMode.MONKEY_PATCH
 
 @dataclass
 class _ContextParallelOptions:
+    # [CLASS DOC] HELPER: Global settings for context parallel: convert_to_f32
+    # (accumulate in float32), enable_load_balance (round-robin chunk layout,
+    # requires causal attention) and rotate_method (default all-gather). A single
+    # instance, _cp_options, is mutated by public setters.
     # Whether to upcast parameters and gradients to float32 to avoid accumulation
     # errors. It is likely this is always True, but we currently keep this variable
     # for experimental purposes.
@@ -83,6 +103,10 @@ _cp_options = _ContextParallelOptions()
 def _is_causal_behavior(
     rank: int, world_size: int, i: int, is_causal: bool
 ) -> _CausalBehavior:
+    # [FUNCTION DOC] HELPER: Decides the causal behavior for ring step i on a rank.
+    # Not causal -> full attention. Step 0 -> causal. Otherwise full attention if
+    # the source rank of the KV block is lower than rank or load balancing is
+    # enabled, else skip. Reads the global options only.
     """
     Calculate is_causal behavior for each KV block. The attention can either be
     calculated in full, not at all or with the causal mask applied.
@@ -101,6 +125,8 @@ def _is_causal_behavior(
 
 
 def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Waits on and returns the result when the tensor is an
+    # async collective tensor; otherwise returns it unchanged (e.g. when tracing).
     """
     When tracing the code, the result tensor is not an AsyncCollectiveTensor,
     so we cannot call ``wait()``.
@@ -118,6 +144,10 @@ def _partial_update(
     idx: int,
     add: bool,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Splits the original tensor into n_chunks along dim and
+    # returns the concatenation with chunk idx either incremented by the new
+    # tensor (add true; may modify that chunk view in place) or replaced by it.
+    # Raises AssertionError if the chunk shape differs from the new tensor shape.
     """
     This API partially updates a chunk of ``original`` tensor. The ``original``
     tensor will be first chunked along ``dim`` dimension, then the ``idx`` chunk
@@ -137,9 +167,16 @@ def _partial_update(
 
 
 class _SDPAMerger:
+    # [CLASS DOC] HELPER: Accumulates attention outputs and logsumexp values from
+    # successive KV blocks with a numerically stable sigmoid update. State: the
+    # running output and logsumexp, dtype memory, whether to compute in float32
+    # and whether the logsumexp needs a trailing dim removed on output.
+    # step() feeds one block; results() returns the merged pair.
     """A class to help merge the local SDPA result."""
 
     def __init__(self, convert_to_f32: bool, seq_dim: int):
+        # [FUNCTION DOC] HELPER: Initializes empty running results and records the
+        # float32 conversion flag and the sequence dim.
         self._seq_dim = seq_dim
         self._out: torch.Tensor | None = None
         self._lse: torch.Tensor | None = None
@@ -151,6 +188,13 @@ class _SDPAMerger:
     def _merge_one(
         self, block_out: torch.Tensor, block_lse: torch.Tensor, partial: bool
     ) -> None:
+        # [FUNCTION DOC] HELPER: Merges one block into the running result. A logsumexp
+        # with fewer dims than the output gets a trailing dim (remembered for
+        # results). The first block is stored; later blocks update using the
+        # sigmoid formulation. If partial, only the second of two sequence chunks
+        # of the running state is updated. Raises AssertionError on rank mismatch.
+        # KNOWN ISSUE: the second branch re-checks that stored values are not None
+        # right after the branch already established that; the checks are redundant.
         # The cuDNN backend preserves the last dimension for LSE.
         # Apply unsqueeze only if the input does not already have
         # the required dimensionality.
@@ -207,6 +251,8 @@ class _SDPAMerger:
                 self._out = out
 
     def step(self, out: torch.Tensor, lse: torch.Tensor, partial: bool) -> None:
+        # [FUNCTION DOC] HELPER: Records the input dtypes, optionally upcasts to float32
+        # and merges the block into the running result.
         self._out_dtype = out.dtype
         self._lse_dtype = lse.dtype
 
@@ -217,6 +263,9 @@ class _SDPAMerger:
         self._merge_one(out, lse, partial)
 
     def results(self) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Returns the merged (output, logsumexp) cast back to the
+        # last seen input dtypes, squeezing the logsumexp trailing dim if one was
+        # added. Raises AssertionError if no block was merged.
         if self._out is None:
             raise AssertionError
         if self._lse is None:
@@ -230,6 +279,8 @@ class _SDPAMerger:
 
 
 class _AttentionOp(Protocol):
+    # [CLASS DOC] HELPER: Protocol for a callable attention op taking query, key,
+    # value and extra keyword arguments and returning a tuple of tensors.
     def __call__(
         self,
         query: torch.Tensor,
@@ -240,6 +291,9 @@ class _AttentionOp(Protocol):
 
 
 class _RingRotater(ABC):
+    # [CLASS DOC] HELPER: Abstract interface for passing KV buffers around the ring:
+    # exchange_buffers starts sending the current buffer, next_buffer returns the
+    # buffer received from the previous rank.
     @abstractmethod
     def __init__(self, pg: dist.ProcessGroup, seq_dim: int) -> None: ...
 
@@ -251,38 +305,52 @@ class _RingRotater(ABC):
 
 
 class _AllToAllRotater(_RingRotater):
+    # [CLASS DOC] HELPER: Rotates buffers by a permute collective to the next rank each
+    # step. State: process group, sequence dim, last in-flight buffer.
     """Use all_to_all to send the kv to the next rank."""
 
     def __init__(self, pg: dist.ProcessGroup, seq_dim: int) -> None:
+        # [FUNCTION DOC] HELPER: Stores the group and sequence dim; no buffer yet.
         self._pg = pg
         self._seq_dim = seq_dim
         self._buffer: torch.Tensor | None = None
 
     def exchange_buffers(self, curr_buffer: torch.Tensor) -> None:
+        # [FUNCTION DOC] HELPER: Makes the buffer contiguous and permutes it so each rank
+        # sends to the next rank (last wraps to rank 0); stores the pending result.
         curr_buffer = curr_buffer.contiguous()
         size = dist.get_world_size(self._pg)
         dsts = list(range(1, size)) + [0]
         self._buffer = ft_c.permute_tensor(curr_buffer, dsts, self._pg)
 
     def next_buffer(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Waits for and returns the received buffer. Raises
+        # AssertionError if no exchange was started.
         if self._buffer is None:
             raise AssertionError
         return _maybe_wait(self._buffer)
 
 
 class _AllGatherRotater(_RingRotater):
+    # [CLASS DOC] HELPER: Rotates buffers with a single all-gather on the first exchange;
+    # later steps just select a different rank chunk. State: group, sequence
+    # dim, gathered buffer, step counter.
     """
     Allgather the kv and return only the required kv.
     Only one communication will be done.
     """
 
     def __init__(self, pg: dist.ProcessGroup, seq_dim: int) -> None:
+        # [FUNCTION DOC] HELPER: Stores group and sequence dim; step counter starts at zero.
         self._pg = pg
         self._seq_dim = seq_dim
         self._aggregated_buffer: torch.Tensor | None = None
         self._idx = 0
 
     def exchange_buffers(self, curr_buffer: torch.Tensor) -> None:
+        # [FUNCTION DOC] HELPER: Increments the step counter and, on first use only,
+        # all-gathers the contiguous buffer along dim zero over the group.
+        # Later buffers passed in are ignored.
         # We only need to perform allgather once.
         self._idx += 1
         if self._aggregated_buffer is None:
@@ -291,6 +359,9 @@ class _AllGatherRotater(_RingRotater):
             )
 
     def next_buffer(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Waits for the gathered buffer and returns the chunk
+        # belonging to the rank that many steps behind this rank (negative indices
+        # wrap). Raises AssertionError if no gather was started.
         rank = dist.get_rank(self._pg)
         idx = rank - self._idx
 
@@ -303,6 +374,8 @@ class _AllGatherRotater(_RingRotater):
 def _create_rotater(
     pg: dist.ProcessGroup, seq_dim: int, method: _RotateMethod | None = None
 ) -> _RingRotater:
+    # [FUNCTION DOC] HELPER: Factory returning a rotater for the method (default from
+    # global options). Raises NotImplementedError for unknown methods.
     if method is None:
         method = _cp_options.rotate_method
 
@@ -324,6 +397,18 @@ def _templated_ring_attention(
     is_causal: bool = False,
     **kwargs: object,
 ) -> tuple[torch.Tensor, ...]:
+    # [FUNCTION DOC] HELPER: Forward ring attention. Inputs: process group, sequence
+    # dim, attention op, query/key/value, causal flag and op kwargs. Loops over
+    # the group size: receives the KV from the previous rank, sends the current
+    # KV on, picks the full or partial q/k/v by causal behavior and load
+    # balancing, calls the op and merges outputs with the merger. Returns the
+    # merged output, merged logsumexp and the extra op outputs of the first
+    # executed step. Raises NotImplementedError for causal with different q/kv
+    # lengths, RuntimeError if load balancing is on without causal,
+    # AssertionError for a non-group or if no op ran.
+    # KNOWN ISSUE: chunking and size checks use hard-coded dim 2 and the rotater
+    # is created with sequence dim 2, ignoring the seq_dim argument except for
+    # the merger. Also the result of exchange_buffers (always None) is assigned.
     """
     A generalized ring attention implementation that can support multiple attention ops.
 
@@ -502,6 +587,14 @@ def _templated_ring_attention_backward(
     is_causal: bool,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, ...]:
+    # [FUNCTION DOC] HELPER: Backward ring attention. Rotates KV forward and the
+    # accumulated KV gradients through an all-to-all rotater; per step picks
+    # full or partial q/k/v/out/grad/logsumexp like the forward, calls the
+    # backward op (adjusting max_q/max_k when balanced), and accumulates
+    # gradients (query locally; key/value are added to the received buffers,
+    # partially for round-robin chunks). Returns grad query, key, value and the
+    # extra op outputs. Mutates the kwargs mapping by storing the grad output.
+    # Raises RuntimeError if load balancing is on without causal.
     """This API implements the backward pass of the ring attention."""
     if not is_causal and _cp_options.enable_load_balance:
         raise RuntimeError("Load balancing requires `is_causal=True`.")
@@ -676,6 +769,10 @@ def _scaled_dot_product_ring_flash_attention(
     *,
     scale: float | None = None,
 ) -> tuple[torch.Tensor, ...]:
+    # [FUNCTION DOC] HELPER: Ring flash attention forward on local shards. Runs the
+    # ring attention template with the flash op over the mesh group using
+    # sequence dim 2. Returns the merged output, logsumexp and extra op outputs.
+    # Raises NotImplementedError if a debug mask is requested.
     if return_debug_mask:
         raise NotImplementedError("return_debug_mask is not supported yet")
 
@@ -707,6 +804,10 @@ def _scaled_dot_product_ring_efficient_attention(
     *,
     scale: float | None = None,
 ) -> tuple[torch.Tensor, ...]:
+    # [FUNCTION DOC] HELPER: Ring efficient attention forward on local shards. Forces
+    # logsumexp computation (needed for merging) and runs the ring template with
+    # the efficient op, sequence dim 2. Returns merged output, logsumexp and
+    # extra outputs. Raises NotImplementedError if an attention bias is given.
     if attn_bias is not None:
         raise NotImplementedError("attn_bias is not supported yet")
 
@@ -745,6 +846,10 @@ def _scaled_dot_product_ring_cudnn_attention(
     *,
     scale: float | None = None,
 ) -> tuple[torch.Tensor, ...]:
+    # [FUNCTION DOC] HELPER: Ring cuDNN attention forward on local shards. Forces
+    # logsumexp computation and runs the ring template with the cuDNN op,
+    # sequence dim 2. Returns merged output, logsumexp and extra outputs.
+    # Raises NotImplementedError if an attention bias is given.
     if attn_bias is not None:
         raise NotImplementedError("attn_bias is not supported yet")
 
@@ -790,6 +895,9 @@ def _scaled_dot_product_ring_flash_attention_backward(
     *,
     scale: float | None = None,
 ) -> tuple[torch.Tensor, ...]:
+    # [FUNCTION DOC] HELPER: Ring flash attention backward on local shards. Calls the
+    # backward ring template with the flash backward op (grad output named
+    # grad_out), sequence dim 2. Returns grad query, key, value and extras.
     # TODO: remove this hardcoding
     seq_dim = 2
     group = mesh.get_group()
@@ -833,6 +941,10 @@ def _scaled_dot_product_ring_efficient_attention_backward(
     *,
     scale: float | None = None,
 ) -> tuple[torch.Tensor, ...]:
+    # [FUNCTION DOC] HELPER: Ring efficient attention backward on local shards. Calls
+    # the backward ring template with the efficient backward op (grad output
+    # named grad_out_, bias passed as attn_bias), sequence dim 2. Returns grad
+    # query, key, value and extras.
     # TODO: remove this hardcoding
     seq_dim = 2
     group = mesh.get_group()
@@ -877,6 +989,9 @@ def _scaled_dot_product_ring_cudnn_attention_backward(
     *,
     scale: float | None = None,
 ) -> tuple[torch.Tensor, ...]:
+    # [FUNCTION DOC] HELPER: Ring cuDNN attention backward on local shards. Calls the
+    # backward ring template with the cuDNN backward op (grad output named
+    # grad_out), sequence dim 2. Returns grad query, key, value and extras.
     # TODO: remove this hardcoding
     seq_dim = 2
     group = mesh.get_group()
@@ -909,6 +1024,14 @@ def _sdpa_handler(
     args: tuple[object, ...],
     kwargs: dict[str, object],
 ) -> object:
+    # [FUNCTION DOC] HELPER: DTensor custom-op handler for SDPA ops. Unwraps the call to
+    # op info, runs sharding propagation, requires that no input redistribution
+    # is needed, dispatches to the matching ring attention function with the
+    # compute mesh and local args, and wraps the local results into DTensors per
+    # the output spec. Raises AssertionError on missing output sharding or when
+    # redistribution is needed, NotImplementedError for ops not in the table.
+    # KNOWN ISSUE: the unsupported-op message mentions only flash and memory
+    # efficient attention although cuDNN attention is also supported.
     # extract local tensor and sharding infos to a OpInfo
     op_info = DTensor._op_dispatcher.unwrap_to_op_info(op_call, args, kwargs)
     logger.debug("Dispatching op_call: %s", op_info.schema or op_call)
@@ -972,6 +1095,13 @@ def _distribute_function(
     input_fn: InputFnType,
     output_fn: OutputFnType,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Replaces the named function in its module by a wrapper that
+    # applies the input function, calls the original and applies the output
+    # function (with no module). Records the wrapper in a module-level mapping
+    # so it can be restored. Side effect: mutates the module attribute and global state.
+    # KNOWN ISSUE: the already-patched check looks up the original function, but
+    # the mapping is keyed by the wrapper, so the check never matches and repeated
+    # calls wrap again.
     """
     A helper function to replace a function with a distributed version by
     using the monkey patching approach.
@@ -982,7 +1112,11 @@ def _distribute_function(
     def wrapper(
         target_fn: Callable, input_fn: InputFnType, output_fn: OutputFnType
     ) -> Callable:
+        # [FUNCTION DOC] HELPER: Builds the wrapper closure around target_fn using the
+        # given input and output functions and the enclosing device mesh.
         def inner_fn(*args: ArgsType, **kwargs: KwargsType) -> Any:
+            # [FUNCTION DOC] HELPER: Transforms args via input_fn, calls the target and
+            # returns output_fn applied to the inputs and outputs.
             args, kwargs = input_fn(None, args, kwargs, device_mesh)
             outputs = target_fn(*args, **kwargs)
             return output_fn(None, (args, kwargs), outputs, device_mesh)
@@ -1000,6 +1134,8 @@ def _distribute_function(
 
 
 def _restore_function(fn: Callable, fn_module: types.ModuleType) -> None:
+    # [FUNCTION DOC] HELPER: If fn is a recorded wrapper, sets the original function back
+    # as the module attribute. No-op otherwise. The mapping entry is kept.
     """Restore the function that is replaced by _distribute_function."""
     if fn not in _replaced_functions:
         return
@@ -1009,6 +1145,9 @@ def _restore_function(fn: Callable, fn_module: types.ModuleType) -> None:
 
 
 def _enable_cp_dtensor_dispatcher() -> None:
+    # [FUNCTION DOC] HELPER: Installs the SDPA custom op handlers into the DTensor
+    # dispatcher (merged with the pre-existing ones) and registers the CP sharding
+    # rules. Mutates global dispatcher and propagator state.
     """Enables DTensor dispatcher to dispatch SDPA to CP."""
     # Enable custom op handlers for CP
     DTensor._op_dispatcher._custom_op_handlers = {
@@ -1022,6 +1161,8 @@ def _enable_cp_dtensor_dispatcher() -> None:
 
 
 def _disable_cp_dtensor_dispatcher() -> None:
+    # [FUNCTION DOC] HELPER: Restores the original custom op handlers and unregisters the
+    # CP sharding rules without clearing sharding caches (too expensive).
     """Disables DTensor dispatcher to dispatch SDPA to CP."""
     # Restore original custom op handlers
     DTensor._op_dispatcher._custom_op_handlers = existing_custom_ops
@@ -1037,6 +1178,11 @@ def _disable_cp_dtensor_dispatcher() -> None:
 
 
 def _enable_context_parallel_dispatcher_impl(seq_dim: int, mesh: DeviceMesh) -> None:
+    # [FUNCTION DOC] HELPER: Activates CP according to the dispatch mode. In monkey-patch
+    # mode, replaces the functional SDPA by a wrapper that converts inputs to
+    # sequence-sharded DTensors and outputs to local tensors, then enables the
+    # DTensor dispatcher; in module-wrapper mode only enables the dispatcher.
+    # Raises ValueError for an unknown mode.
     sdpa_cp = _ContextParallel(
         seq_dim=seq_dim,
         attention_type=_ContextParallel.AttentionType.SDPA,
@@ -1058,6 +1204,9 @@ def _enable_context_parallel_dispatcher_impl(seq_dim: int, mesh: DeviceMesh) -> 
 
 
 def _disable_context_parallel_dispatcher_impl() -> None:
+    # [FUNCTION DOC] HELPER: Undoes the dispatcher setup: restores the functional SDPA in
+    # monkey-patch mode (nothing extra in wrapper mode), then disables the DTensor
+    # dispatcher. Raises NotImplementedError for an unknown mode.
     if _dispatch_mode == _DispatchMode.MONKEY_PATCH:
         _restore_function(F.scaled_dot_product_attention, F)
     elif _dispatch_mode == _DispatchMode.MODULE_WRAPPER:
@@ -1077,6 +1226,13 @@ def _context_parallel_buffers(
     buffer_seq_dims: list[int],
     load_balancer: _LoadBalancer | None = None,
 ) -> list[torch.Tensor | BlockMask]:
+    # [FUNCTION DOC] HELPER: Shards each buffer along its sequence dim over the mesh.
+    # If a load balancer is given, tensors are first rearranged with its index
+    # tensor (selected or gathered per batch element) and then distributed as a
+    # DTensor sharded on the sequence dim, keeping the local tensor. Block masks
+    # are rebuilt as context-parallel block masks. Returns the list of local
+    # shards. Raises AssertionError for badly shaped indices and ValueError for
+    # a batch size mismatch or an unknown buffer type.
     """
     Shard the buffers along the sequence dimensions according to CP rules.
     Args:
@@ -1190,6 +1346,13 @@ def _create_cp_block_mask(
     device_mesh: DeviceMesh,
     load_balancer: _LoadBalancer | None = None,
 ) -> BlockMask:
+    # [FUNCTION DOC] HELPER: Builds a flex-attention block mask for this rank's query
+    # shard against the full key-value sequence. Rewrites the user mask function
+    # to map local query positions to global ones and undo the load-balancer
+    # rearrangement, then builds the mask with a lazily compiled mask builder
+    # (global cache). Uses a default load balancer if none is given. Raises
+    # NotImplementedError if the query length is not divisible by world size
+    # times the default block size.
     """
     Creates a specialized BlockMask for Context Parallel FlexAttention.
 
@@ -1251,6 +1414,10 @@ def _create_cp_block_mask(
         local_q_size: int,
         qkv_rearrange_indices: torch.Tensor | None = None,
     ) -> _mask_mod_signature:
+        # [FUNCTION DOC] HELPER: Returns a mask function that converts a local query index
+        # to global, maps both query and key-value indices back through the
+        # rearrangement indices, and calls the user mask function. Raises
+        # AssertionError if the indices are not two-dimensional.
         if not (qkv_rearrange_indices is None or qkv_rearrange_indices.ndim == 2):
             raise AssertionError(
                 "load balance index expects shape (1, seq_len) or (B, seq_len) "
@@ -1260,6 +1427,9 @@ def _create_cp_block_mask(
         def qkv_idx_restore(
             b: torch.Tensor, idx_post_rearrange: torch.Tensor
         ) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Maps an index in the rearranged sequence back to the
+            # original position using the shared or per-batch rearrange indices;
+            # identity if there are none.
             if qkv_rearrange_indices is not None:
                 if (
                     qkv_rearrange_indices.size(0) == 1
@@ -1273,6 +1443,8 @@ def _create_cp_block_mask(
             return idx_pre_rearrange
 
         def local_q_idx_to_q_idx(local_q_idx: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Converts a rank-local query index to a global index by
+            # offsetting with the rank's contiguous block range.
             # calculate local block_idx and block_offset
             local_blk_idx, local_blk_offset = (
                 local_q_idx // block_size,
@@ -1325,7 +1497,12 @@ def _create_cp_block_mask(
 
 
 class _ContextParallel(ParallelStyle):
+    # [CLASS DOC] HELPER: Parallel style applying context parallelism to an attention
+    # module through forward hooks. State: seq_dim and attention_type (flex or
+    # SDPA). Flex mode all-gathers key and value before attention; SDPA mode
+    # wraps tensor inputs as sequence-sharded DTensors and converts outputs back.
     class AttentionType(Enum):
+        # [CLASS DOC] HELPER: Enum of supported attention kinds: FLEX or SDPA.
         FLEX = "flex_attention"
         SDPA = "scaled_dot_product_attention"
 
@@ -1334,11 +1511,15 @@ class _ContextParallel(ParallelStyle):
         seq_dim: int,
         attention_type: AttentionType,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Stores the sequence dim and attention type.
         super().__init__()
         self.seq_dim = seq_dim
         self.attention_type = attention_type
 
     def _apply(self, module: nn.Module, mesh: DeviceMesh) -> nn.Module:
+        # [FUNCTION DOC] HELPER: Registers forward pre-hook (flex) or pre-hook plus forward
+        # hook (SDPA) on the module bound to the mesh; returns the module.
+        # Raises ValueError for an unknown attention type.
         if self.attention_type == self.AttentionType.FLEX:
             module.register_forward_pre_hook(
                 partial(self.flex_input_fn, mesh=mesh), with_kwargs=True
@@ -1357,6 +1538,12 @@ class _ContextParallel(ParallelStyle):
     def flex_input_fn(
         self, module: nn.Module | None, args: Any, kwargs: Any, mesh: DeviceMesh
     ) -> Any:
+        # [FUNCTION DOC] HELPER: Pre-hook for flex attention. Extracts query, key, value
+        # from positional or keyword args (removing keywords it takes), makes key
+        # and value contiguous, all-gathers them along the sequence dim through
+        # the custom op, and returns the arg tuple and kwargs with the gathered
+        # tensors in the original positions. Raises AssertionError if any is not
+        # a tensor. Mutates the kwargs mapping.
         # We don't care about other args, and these argument order must be consistent
         # with the signature of flex_attention.
         expected_arg_names = ("query", "key", "value")
@@ -1394,6 +1581,10 @@ class _ContextParallel(ParallelStyle):
         kwargs: dict[str, Any],
         mesh: DeviceMesh,
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        # [FUNCTION DOC] HELPER: Pre-hook for SDPA. Wraps every plain tensor arg (positional
+        # and keyword) as a DTensor sharded on the sequence dim without checks;
+        # existing DTensors must already have that placement (AssertionError
+        # otherwise). Returns the new args and kwargs.
         placement = [Shard(self.seq_dim)]
         all_args = []
 
@@ -1414,6 +1605,8 @@ class _ContextParallel(ParallelStyle):
     def sdpa_output_fn(
         self, module: nn.Module | None, inputs: Any, outputs: Any, mesh: DeviceMesh
     ) -> Any:
+        # [FUNCTION DOC] HELPER: Forward hook for SDPA: converts DTensor outputs to local
+        # tensors; returns a single tensor for a single tensor output, else a tuple.
         new_outputs = []
         for output in [outputs] if isinstance(outputs, torch.Tensor) else outputs:
             output = output.to_local() if isinstance(output, DTensor) else output
@@ -1436,6 +1629,14 @@ def _context_parallel_shard(
     seq_dims: CPBufferSeqDims,
     load_balancer: _LoadBalancer | None = None,
 ) -> list[torch.Tensor | BlockMask]:
+    # [FUNCTION DOC] HELPER: New-style sharding API. Sets global state: dispatch mode to
+    # module wrapper and load balancing on exactly when a balancer is passed.
+    # Validates equal lengths of buffers and sequence dims and the same pytree
+    # structure, and that all buffers share a device, flattens, shards with the
+    # buffer helper and rebuilds the original structure. Raises ValueError on
+    # length or structure mismatch, AssertionError on device mismatch.
+    # KNOWN ISSUE: the docstring and signature promise a list, but the result is
+    # rebuilt in the input container structure (could be a mapping).
     """
     Shard the buffers along the specified sequence dimensions (`seq_dims`), so that each
     rank retains only its corresponding shard according to the provided `mesh`. If a
@@ -1504,6 +1705,8 @@ def _context_parallel_shard(
 
 
 def _enable_context_parallel_dispatcher() -> None:
+    # [FUNCTION DOC] HELPER: Experimental public entry that enables the CP DTensor
+    # dispatcher (handlers and sharding rules).
     """
     Enable the context parallel dispatcher. This API is experimental and subject to change.
     """
@@ -1511,6 +1714,7 @@ def _enable_context_parallel_dispatcher() -> None:
 
 
 def _disable_context_parallel_dispatcher() -> None:
+    # [FUNCTION DOC] HELPER: Experimental public entry that disables the CP DTensor dispatcher.
     """
     Disable the context parallel dispatcher. This API is experimental and subject to change.
     """
@@ -1529,6 +1733,16 @@ def context_parallel(
     buffer_seq_dims: list[int] | None = None,
     no_restore_buffers: set[torch.Tensor] | None = None,
 ) -> Generator[None, None, None]:
+    # [FUNCTION DOC] Public context manager (no gradients) enabling context parallelism.
+    # Sets dispatch mode to monkey-patch, saves clones of the buffers that must
+    # be restored, shards the buffers in place (resize and copy) along their
+    # sequence dims using the default head-tail balancer when applicable,
+    # enables the dispatcher, and yields. On exit, disables the dispatcher,
+    # restores the load-balance option and restores the saved buffers. Raises
+    # ValueError for mismatched lengths or if no_restore_buffers is not a subset
+    # of buffers, AssertionError for non-tensor shards.
+    # KNOWN ISSUE: with no buffers the code indexes the first buffer and fails
+    # with an index error; the sequence dim passed to the dispatcher is fixed to 2.
     """
 
     ``context_parallel`` is an experimental API to enable context
@@ -1623,6 +1837,13 @@ def context_parallel_unshard(
     seq_dims: list[int],
     load_balancer: _LoadBalancer | None = None,
 ) -> list[torch.Tensor]:
+    # [FUNCTION DOC] Public (no gradients). All-gathers each sharded buffer along its
+    # sequence dim, then, if a balancer is given or the default applies,
+    # reorders each batch element with the restore indices to recover original
+    # order. Returns the list of unsharded buffers. Raises AssertionError for
+    # badly shaped indices, ValueError for a batch size mismatch.
+    # KNOWN ISSUE: the restore step indexes per batch element along sequence dim
+    # minus one, so it assumes a batch dim 0 and a positive sequence dim.
     """
     Unshard the tensors (e.g., output) that are sharded due to context parallelism.
 
@@ -1701,6 +1922,10 @@ def context_parallel_unshard(
 
 
 def set_rotate_method(rotate_method: str) -> None:
+    # [FUNCTION DOC] Public. Sets the global KV rotation method to all-gather
+    # (string allgather) or all-to-all (string alltoall) and logs a note that
+    # flex attention does not support all-to-all. Raises NotImplementedError for any
+    # other string. Mutates global options.
     """
     Context Parallel SDPA requires the rotation of kv shards. Users can call this
     API to specify which rotation method to use. "alltoall" shuffles the kv shards

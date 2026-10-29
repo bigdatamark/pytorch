@@ -1,5 +1,11 @@
 # mypy: allow-untyped-defs
 # Copyright (c) Meta Platforms, Inc. and affiliates
+# [MODULE DOC] Implements local_map, an experimental API that lets a function
+# written for plain local tensors be called with DTensor arguments: inputs are
+# validated/redistributed and unwrapped to local tensors, the function runs,
+# and outputs are wrapped back into DTensors. Optionally annotates and checks
+# spmd_types (V/R/I/P) on the local tensors. Exports local_map. Import-time
+# side effect: imports spmd_types only when it is available.
 import functools
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -39,6 +45,11 @@ def _placements_to_spmd_type(
     grad_placements: PlacementType,
     device_mesh: DeviceMesh,
 ) -> dict:
+    # [FUNCTION DOC] HELPER: Maps per-mesh-dim placements to a mapping from mesh axis
+    # to spmd local type (Shard -> V, Replicate -> R or I when grad is Replicate,
+    # Partial -> P). When grad placements are given, checks they match the
+    # backward type of the forward type. Raises ValueError for unsupported
+    # placement types or an unrepresentable forward/backward pair.
     """Convert DTensor placements to a dict of MeshAxis -> spmd local type.
 
     Mapping: Shard -> V, Replicate -> R (or I if grad is Replicate), Partial -> P.
@@ -92,6 +103,9 @@ def _annotate_spmd_types(
     in_grad_placements: InputPlacements,
     device_mesh: DeviceMesh,
 ) -> None:
+    # [FUNCTION DOC] HELPER: For each tensor in the flat local args that has a non-None
+    # placement entry, computes its spmd types and asserts them on the tensor.
+    # Skips non-tensors and entries without placements. Mutates tensor annotations.
     """Annotate unwrapped local tensors with spmd_types inferred from placements.
 
     Assumes local_map has already validated in_placements and unwrapped DTensors.
@@ -111,6 +125,11 @@ def _annotate_spmd_types(
 
 
 def _valid_grad_placements(placement: Placement) -> str:
+    # [FUNCTION DOC] HELPER: Returns a human-readable description of the valid grad
+    # placements for a forward placement, used in error messages. Raises ValueError
+    # for unsupported placement types.
+    # KNOWN ISSUE: for a Partial forward placement the message says Replicate
+    # with type P, but the backward type of P is R, so the label looks inconsistent.
     if type(placement) is Shard:
         return "Shard (spmd.V)"
     elif type(placement) is Replicate:
@@ -125,6 +144,9 @@ def _valid_grad_placements(placement: Placement) -> str:
 def _dtensor_placement_if_compatible(
     local_type, placement: Placement
 ) -> Placement | None:
+    # [FUNCTION DOC] HELPER: Converts an spmd local type to a DTensor placement. For type
+    # V, returns the given placement if it is Shard or Partial, else None; for
+    # other types returns the placement from the spmd conversion helper.
     if local_type == spmd.V:
         if type(placement) in (Shard, Partial):
             return placement
@@ -137,6 +159,11 @@ def _out_spmd_types_to_grad_placements(
     out_placements_tuple: tuple[PlacementType, ...],
     device_mesh: DeviceMesh,
 ) -> tuple[PlacementType, ...]:
+    # [FUNCTION DOC] HELPER: Validates each flat output against its out placement spec
+    # (non-tensors need None, tensors need a spec and an spmd annotation on every
+    # mesh dim compatible with the placement) and computes the backward grad
+    # placements from the backward types. Returns a tuple of grad placement
+    # tuples (None for non-tensor outputs). Raises ValueError on any mismatch.
     """Validate output SPMD types and return backward grad placements."""
     grad_out_placements: list[PlacementType] = []
     for out, spec in zip(flat_out, out_placements_tuple, strict=True):
@@ -225,6 +252,11 @@ def local_map(
     redistribute_inputs: bool = False,
     spmd_types: bool = False,
 ):
+    # [FUNCTION DOC] Public API. If func is None, returns a decorator that applies
+    # local_map with the same options; otherwise returns a callable bound to func
+    # and the options. The returned callable runs func on local shards of DTensor
+    # arguments and wraps outputs as DTensors per out_placements. No work is done
+    # until the returned callable is invoked.
     """
     :meth:`local_map` is an experimental API that allows users to pass :class:`DTensor` s
     to a function that is written to be applied on ``torch.Tensor`` s. It is done by extracting
@@ -342,6 +374,8 @@ def local_map(
     if func is None:
         # decorator mode
         def decorated(func):
+            # [FUNCTION DOC] HELPER: Decorator that wraps func with local_map using the
+            # captured options; returns the wrapped callable.
             return local_map(
                 func=func,
                 out_placements=out_placements,
@@ -377,6 +411,16 @@ def _local_map_wrapped(
     *args,
     **kwargs,
 ):
+    # [FUNCTION DOC] HELPER: Runtime body of local_map. Flattens args; checks the
+    # in_placements length; for each DTensor arg checks (or redistributes when
+    # allowed) its placements, unwraps it to a local tensor (using grad placement
+    # hints, waiting on async tensors) and infers the mesh if unset; validates
+    # that non-tensor args have None placements. Calls func on local args
+    # (under spmd type checking when enabled). If any DTensor was seen, wraps
+    # tensor outputs with DTensor.from_local per out_placements and returns the
+    # rebuilt structure; else returns func output unchanged. Raises ValueError on
+    # placement mismatch, RuntimeError if spmd_types is missing, and
+    # AssertionError on malformed placements or outputs.
     # process input args
     flat_args, args_spec = pytree.tree_flatten(args)
     if in_placements is not None:

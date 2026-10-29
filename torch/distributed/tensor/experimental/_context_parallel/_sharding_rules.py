@@ -1,4 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
+# [MODULE DOC] Context-parallel (CP) sharding rules for the scaled dot product
+# attention aten ops (flash, memory-efficient, cuDNN, forward and backward).
+# Each rule is a single-mesh-dim strategy that shards q/k/v/output along the
+# sequence dim (SEQ_DIM). register_cp_sharding_rules installs them into the
+# DTensor sharding propagator and unregister_cp_sharding_rules restores the
+# originals. No import-time side effects beyond defining names.
 """
 Context Parallelism sharding rules for scaled_dot_product attention operators.
 
@@ -31,6 +37,11 @@ SingleDimPlacementList = list[Placement | _ShardingPlaceholder | None]
 
 @contextmanager
 def _single_dim_strategy_context(op_overload, strategy_func, schema_info=None):
+    # [FUNCTION DOC] HELPER: Context manager that temporarily registers a single-dim
+    # strategy (and optional schema info) for an op on the global DTensor sharding
+    # propagator. Yields the previously registered strategy and schema info (each
+    # may be None). On exit, restores the originals or removes the entries. Does
+    # not clear sharding propagation caches (deliberately, for cost reasons).
     """Temporarily install a single-dim strategy for Context Parallelism."""
     from torch.distributed.tensor import DTensor
 
@@ -70,6 +81,7 @@ def _single_dim_strategy_context(op_overload, strategy_func, schema_info=None):
 
 
 def _cp_sharding() -> _ShardingPlaceholder:
+    # [FUNCTION DOC] HELPER: Returns a sharding placeholder for the sequence dim.
     return _ShardingPlaceholder(SEQ_DIM)
 
 
@@ -81,6 +93,11 @@ def _scaled_dot_product_flash_attention_cp_single_dim_strategy(
     args_schema: ArgsType,
     kwargs_schema: KwargsType,
 ) -> list[SingleDimPlacementList]:
+    # [FUNCTION DOC] HELPER: Single-dim strategy for the flash attention forward op.
+    # Returns one placement row: outputs (output, logsumexp sharded on sequence;
+    # rng state replicated; the debug mask sharded only if the debug-mask
+    # argument is set, else replicated; others unspecified) followed by q, k, v
+    # sharded on sequence.
     return_debug_mask = len(args_schema) >= 6 and args_schema[5]
     debug_attn_mask_sharding: Placement | _ShardingPlaceholder = (
         _cp_sharding() if return_debug_mask else Replicate()
@@ -109,6 +126,10 @@ def _scaled_dot_product_flash_attention_backward_cp_single_dim_strategy(
     args_schema: ArgsType,
     kwargs_schema: KwargsType,
 ) -> list[SingleDimPlacementList]:
+    # [FUNCTION DOC] HELPER: Single-dim strategy for the flash attention backward op.
+    # Returns one row: three gradients and the first six tensor inputs
+    # sharded on sequence, then replicated placements for the remaining tensor
+    # inputs (count of tensor-metadata args minus six).
     num_tensor_inputs = sum(isinstance(arg, TensorMeta) for arg in args_schema)
     cp_strategy: SingleDimPlacementList = [
         _cp_sharding(),  # grad_q
@@ -133,6 +154,10 @@ def _scaled_dot_product_efficient_attention_cp_single_dim_strategy(
     args_schema: ArgsType,
     kwargs_schema: KwargsType,
 ) -> list[SingleDimPlacementList]:
+    # [FUNCTION DOC] HELPER: Single-dim strategy for the efficient attention forward op.
+    # One row: output and logsumexp sharded on sequence, philox values
+    # unspecified, q/k/v sharded on sequence, plus a replicated entry for the
+    # attention bias when one is passed.
     has_attn_bias = args_schema[3] is not None
 
     cp_strategy: SingleDimPlacementList = [
@@ -154,6 +179,11 @@ def _scaled_dot_product_efficient_attention_backward_cp_single_dim_strategy(
     args_schema: ArgsType,
     kwargs_schema: KwargsType,
 ) -> list[SingleDimPlacementList]:
+    # [FUNCTION DOC] HELPER: Single-dim strategy for the efficient attention backward op.
+    # One row: grad q/k/v sharded on sequence; grad bias and the bias input
+    # sharded on dim 1 when a bias exists (grad bias unspecified otherwise);
+    # grad output, q, k, v, output, logsumexp sharded on sequence; then two
+    # replicated entries for the trailing inputs.
     has_attn_bias = args_schema[4] is not None
 
     cp_strategy: SingleDimPlacementList = [
@@ -182,6 +212,11 @@ def _scaled_dot_product_cudnn_attention_cp_single_dim_strategy(
     args_schema: ArgsType,
     kwargs_schema: KwargsType,
 ) -> list[SingleDimPlacementList]:
+    # [FUNCTION DOC] HELPER: Single-dim strategy for the cuDNN attention forward op.
+    # One row: output sharded on sequence; logsumexp sharded if it is computed,
+    # else replicated; debug mask sharded only if requested, else unspecified;
+    # other outputs unspecified; q/k/v sharded on sequence; a replicated entry
+    # for the attention bias when present.
     attn_bias_meta = args_schema[3]
     compute_log_sumexp = args_schema[4]
     return_debug_mask = len(args_schema) >= 8 and args_schema[7]
@@ -216,6 +251,12 @@ def _scaled_dot_product_cudnn_attention_backward_cp_single_dim_strategy(
     args_schema: ArgsType,
     kwargs_schema: KwargsType,
 ) -> list[SingleDimPlacementList]:
+    # [FUNCTION DOC] HELPER: Single-dim strategy for the cuDNN attention backward op.
+    # Validates the argument types (raises AssertionError if fewer than 15
+    # args or unexpected types). One row: gradients and the first tensor inputs
+    # sharded on sequence, replicated entries for philox tensors given as
+    # metadata, a sequence-sharded entry for the bias if it is a tensor metadata,
+    # then unspecified entries for cumulative sequence lengths given as metadata.
     if len(args_schema) < 15:
         raise AssertionError(f"Expected at least 15 args, got {len(args_schema)}")
 
@@ -273,6 +314,10 @@ _original_strategies = {}
 
 
 def register_cp_sharding_rules():
+    # [FUNCTION DOC] Installs the CP strategies for the six SDPA ops by entering a
+    # strategy context for each and keeping the contexts (and originals) in
+    # module-level dicts. No-op if already registered. Mutates global sharding
+    # propagator state.
     """Register Context Parallelism sharding rules for all scaled_dot_product ops."""
     global _cp_strategy_contexts, _original_strategies
 
@@ -323,6 +368,10 @@ def register_cp_sharding_rules():
 
 
 def unregister_cp_sharding_rules(clear_the_cache=False):
+    # [FUNCTION DOC] Exits every stored strategy context, restoring the original
+    # strategies, optionally clears the Python and fast-path sharding
+    # propagation caches, and resets the module-level dicts. Safe to call when
+    # nothing is registered.
     """Unregister Context Parallelism sharding rules and restore original strategies."""
     global _cp_strategy_contexts, _original_strategies
 

@@ -1,5 +1,8 @@
 # mypy: allow-untyped-defs
 # Copyright (c) Meta Platforms, Inc. and affiliates
+# [MODULE DOC] Experimental API register_sharding, letting users register custom
+# DTensor sharding strategies for operators. Exports register_sharding only. No
+# import-time side effects; registration happens when the returned decorator is applied.
 from collections.abc import Callable, Sequence
 from functools import partial
 
@@ -21,6 +24,11 @@ __all__ = ["register_sharding"]
 
 
 def register_sharding(op: OpOverload | list[OpOverload]):
+    # [FUNCTION DOC] Returns a decorator that registers a user-written sharding
+    # function for one op overload or a list of them. The function maps argument
+    # specs to a sequence of (output placements, input placements) pairs. Applying
+    # the decorator registers a strategy on the DTensor sharding propagator
+    # (global state, overriding existing strategies) and returns the user function.
     """
     :meth:`register_sharding` is an experimental API that allows users to register sharding
     strategies for an operator when the tensor inputs and outputs are DTensor.
@@ -71,7 +79,14 @@ def register_sharding(op: OpOverload | list[OpOverload]):
         ],
         op_schema: OpSchema,
     ) -> StrategyType:
+        # [FUNCTION DOC] HELPER: Builds the op strategy by converting strategy args to
+        # specs, calling the user function, concatenating each output/input
+        # placement pair into a single-mesh-dim strategy, and expanding to the full
+        # mesh. Returns the expanded strategy.
         def strategy_to_spec(strategy: object) -> object:
+            # [FUNCTION DOC] HELPER: Recursively replaces an operator strategy with its
+            # first strategy's output spec and a tuple strategy with a tuple of
+            # specs; other values pass through unchanged.
             if isinstance(strategy, OpStrategy):
                 # take the output spec from the first strategy
                 return strategy.strategies[0].output_spec
@@ -103,7 +118,13 @@ def register_sharding(op: OpOverload | list[OpOverload]):
         )
 
     def wrapper(custom_sharding_fn):
+        # [FUNCTION DOC] HELPER: Decorator body. Registers the strategy for each
+        # overload with schema info derived from the op schema; returns the
+        # user function unchanged. Mutates the global sharding propagator.
         def derive_schema_info(op):
+            # [FUNCTION DOC] HELPER: Builds conservative runtime schema info: static
+            # arg position is the first int-typed (or optional int) argument, static
+            # kwargs are the keyword-only int arguments, and pytree handling is on.
             # NOTE: without user directly providing RuntimeSchemaInfo, for now
             #       we create it in a conservative fashion as follows:
             #       1. let static_argnum be the first int argument

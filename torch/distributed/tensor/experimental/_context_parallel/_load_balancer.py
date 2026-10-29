@@ -1,3 +1,9 @@
+# [MODULE DOC] Load-balancing strategies for context-parallel sharding. Defines
+# the private abstract _LoadBalancer plus head-tail, per-document head-tail
+# and processing-time round-robin (PTRR, flex-attention block mask based)
+# implementations. Each produces index tensors that rearrange (or restore) the
+# sequence so contiguous per-rank chunks carry balanced attention work. Also
+# a factory for the default balancer. No import-time side effects.
 # this file contains the `_LoadBalancer` class and its family of implementation
 # for different load-balancing strategies in tensor sharding.
 import functools
@@ -10,8 +16,15 @@ from torch.nn.attention.flex_attention import BlockMask
 
 # make it private since it's still a prototype
 class _LoadBalancer(ABC):
+    # [CLASS DOC] HELPER: Abstract base for load balancers. Subclasses implement
+    # index generation that rearranges the sequence dim before contiguous
+    # sharding across ranks; holds no state itself.
     @abstractmethod
     def _generate_indices(self, restore: bool = False) -> Tensor | None:
+        # [FUNCTION DOC] HELPER: Abstract. Returns an integer index tensor of shape
+        # (1, seq_len) or (batch, seq_len) that rearranges the sequence for balance
+        # (restore false) or undoes that rearrangement (restore true). May return
+        # None in implementations that skip balancing. Rank-major layout is required.
         """
         Generate indices for load balancing.
         Args:
@@ -85,12 +98,22 @@ class _LoadBalancer(ABC):
 
 
 class _HeadTailLoadBalancer(_LoadBalancer):
+    # [CLASS DOC] HELPER: Head-tail balancer: splits the sequence into twice the
+    # world size equal chunks and gives rank r chunk r plus its mirror chunk.
+    # State: seq_length, world_size, device. Suited to causal masks.
     def __init__(self, seq_length: int, world_size: int, device: str | torch.device):
+        # [FUNCTION DOC] HELPER: Stores sequence length, world size and the device on
+        # which index tensors are created.
         self.seq_length = seq_length
         self.world_size = world_size
         self.device = device
 
     def _generate_indices(self, restore: bool = False) -> Tensor:
+        # [FUNCTION DOC] HELPER: Builds head-tail rearrangement indices as an integer
+        # tensor of shape (1, seq_length): rank-major pairs of head chunk and
+        # mirrored tail chunk. With restore true, returns the inverse permutation
+        # (argsort). Raises AssertionError if seq_length is not divisible by
+        # twice the world size.
         """
         Generate head-and-tail load balancing indices or restore indices.
         Args:
@@ -174,12 +197,20 @@ class _HeadTailLoadBalancer(_LoadBalancer):
 
 
 class _PerDocumentHeadTailLoadBalancer(_LoadBalancer):
+    # [CLASS DOC] HELPER: Applies head-tail balancing inside each document of
+    # each batch element, laid out rank-major so each rank's contiguous shard
+    # holds a head and tail slice of every document. State: per-batch lists of
+    # document lengths, world_size, device.
     def __init__(
         self,
         seq_length_per_doc: list[list[int]],
         world_size: int,
         device: str | torch.device,
     ):
+        # [FUNCTION DOC] HELPER: Stores per-batch document length lists, world size and
+        # device.
+        # KNOWN ISSUE: docstring says shape (B, seq_len), but the value is a list
+        # (per batch element) of document lengths, not per-token data.
         """
         `seq_length_per_doc` has size (B, seq_len) if the load-balancing should vary
         within the batch. Otherwise `seq_length_per_doc` should have size (1, seq_len).
@@ -189,6 +220,9 @@ class _PerDocumentHeadTailLoadBalancer(_LoadBalancer):
         self.device = device
 
     def _generate_indices(self, restore: bool = False) -> Tensor:
+        # [FUNCTION DOC] HELPER: Returns an integer tensor of shape (batch, seq_len) by
+        # stacking the per-batch-element indices, one row per entry of the
+        # document-length lists. Restore selects inverse permutations.
         """
         Generate the per-document head-and-tail rearrange indices so that after rearranging
         the input is load-balanced in per-document head-and-tail style.
@@ -258,6 +292,12 @@ class _PerDocumentHeadTailLoadBalancer(_LoadBalancer):
         )
 
     def _generate_indices_for_batch(self, seq_length_per_doc, restore) -> Tensor:  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] HELPER: Builds rank-major indices for one batch element: each
+        # document is cut into twice the world size equal chunks, rank r takes
+        # chunk r and its mirror, and per-rank pieces from all documents are
+        # concatenated in document order then flattened. With restore true
+        # returns the inverse permutation. Raises AssertionError if any document
+        # length is not divisible by twice the world size.
         world_size = self.world_size
         device = self.device
         if not all(
@@ -298,6 +338,9 @@ class _PerDocumentHeadTailLoadBalancer(_LoadBalancer):
 
 
 class _PTRRLoadBalancer(_LoadBalancer):
+    # [CLASS DOC] HELPER: Processing-time round-robin balancer driven by a flex
+    # attention BlockMask. State: block_mask and world_size. Estimates per-block-row
+    # work from the mask and assigns rows to ranks in snake order.
     """
     Processing-Time based Round-Robin (PTRR) load balancer. This load balancer should
     only be used for flex_attention() since it leverages `BlockMask`.
@@ -308,6 +351,7 @@ class _PTRRLoadBalancer(_LoadBalancer):
         block_mask: BlockMask,
         world_size: int,
     ):
+        # [FUNCTION DOC] HELPER: Stores the block mask and world size.
         """
         `block_mask` must have shape (B, 1, seq_len, seq_len) or (1, 1, seq_len, seq_len).
         """
@@ -316,6 +360,13 @@ class _PTRRLoadBalancer(_LoadBalancer):
 
     @staticmethod
     def ptrr_scheduling(process_time: Tensor, group_size: int) -> Tensor:
+        # [FUNCTION DOC] HELPER: Static. Takes a 1-D tensor of task process times and a
+        # group count. Sorts tasks by descending time (stable), assigns them to
+        # groups in a snake (forward then reversed) order, and sorts each group.
+        # Returns an integer tensor of shape (group_size, n / group_size) of task
+        # indices. Raises AssertionError if not 1-D, NotImplementedError if the
+        # task count is not divisible by the group count.
+        # KNOWN ISSUE: docstring says it returns lists of lists, but it returns a tensor.
         """
         Separate the tasks into `group_size` groups using PTRR scheduling.
         process_time:
@@ -372,6 +423,12 @@ class _PTRRLoadBalancer(_LoadBalancer):
         return tasks_in_group
 
     def _generate_indices(self, restore: bool = False) -> Tensor:
+        # [FUNCTION DOC] HELPER: Computes per-row block counts (kv plus full kv blocks)
+        # from the mask, runs the scheduling per batch element, expands block
+        # indices to token indices and returns shape (batch, seq_len). With
+        # restore true returns the per-row inverse permutations. Raises
+        # AssertionError if query and key-value block sizes differ.
+        # Assumes a single head entry in the mask.
         """
         Generate the PTRR reorder indices of shape `(1, seq_len)` or `(batch_size, seq_len)`.
 
@@ -475,6 +532,9 @@ class _PTRRLoadBalancer(_LoadBalancer):
 def _create_default_load_balancer(
     seq_length: int, world_size: int, device: str | torch.device
 ) -> _LoadBalancer | None:
+    # [FUNCTION DOC] HELPER: Returns a head-tail balancer when load balancing is enabled
+    # in the context-parallel options and the length divides by twice the world
+    # size; otherwise returns None. Imports options lazily from the attention module.
     from ._attention import _cp_options
 
     if _cp_options.enable_load_balance and seq_length % (world_size * 2) == 0:
