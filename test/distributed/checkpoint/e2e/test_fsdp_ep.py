@@ -1,5 +1,10 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] 8-GPU test of FSDP combined with expert-parallel style placement: some
+# submodules are wrapped by FSDP on a per-expert 2-rank mesh while the rest use a mesh of
+# all 8 ranks. Verifies that get_state_dict returns DTensors on the expected meshes and only
+# on the owning ranks. Defines small dummy models and one test class; no import-time effects.
+
 import torch
 import torch.nn as nn
 from torch.distributed.checkpoint.state_dict import get_state_dict
@@ -17,25 +22,36 @@ from torch.testing._internal.distributed.common_state_dict import VerifyStateDic
 
 
 class Dummymodel(nn.Module):
+    # [CLASS DOC] HELPER: Parameter-free placeholder for an expert layer not owned by this rank.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Initializes an empty module.
         super().__init__()
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Not usable; always raises NotImplementedError.
         raise NotImplementedError
 
 
 class EPModel(nn.Module):
+    # [CLASS DOC] HELPER: Expert layer with two Linear(16,16)+ReLU sequential blocks, net1
+    # and net2. Only instantiated on the rank that owns the expert.
     def __init__(self, rank):
+        # [FUNCTION DOC] HELPER: Builds net1 and net2; the rank argument is unused.
         super().__init__()
         self.net1 = nn.Sequential(nn.Linear(16, 16), nn.ReLU())
         self.net2 = nn.Sequential(nn.Linear(16, 16), nn.ReLU())
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Not usable; always raises NotImplementedError.
         raise NotImplementedError
 
 
 class SecondTier(nn.Module):
+    # [CLASS DOC] HELPER: Holds a list of four expert slots (a real EPModel at index equal
+    # to rank modulo 4, Dummymodel elsewhere) and a shared Linear+ReLU block named net.
     def __init__(self, rank):
+        # [FUNCTION DOC] HELPER: Builds ep_layers selecting the real expert by rank modulo 4,
+        # and the net block.
         super().__init__()
         self.ep_layers = nn.ModuleList(
             [EPModel(rank) if rank % 4 == i else Dummymodel() for i in range(4)]
@@ -43,11 +59,16 @@ class SecondTier(nn.Module):
         self.net = nn.Sequential(nn.Linear(16, 16), nn.ReLU())
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Not usable; always raises NotImplementedError.
         raise NotImplementedError
 
 
 class TopModel(nn.Module):
+    # [CLASS DOC] HELPER: Top-level model with a SecondTier child named second and a
+    # Linear+ReLU block named net.
     def __init__(self, rank):
+        # [FUNCTION DOC] HELPER: Seeds the global RNG with 0 (side effect) so initial weights
+        # are identical across ranks, then builds second and net.
         super().__init__()
         torch.manual_seed(0)
 
@@ -55,18 +76,28 @@ class TopModel(nn.Module):
         self.net = nn.Sequential(nn.Linear(16, 16), nn.ReLU())
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Not usable; always raises NotImplementedError.
         raise NotImplementedError
 
 
 class TestFSDPWithEP(DTensorTestBase, VerifyStateDictMixin):
+    # [CLASS DOC] Multi-process test case for FSDP plus per-expert sharding state dicts.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Number of processes: the accelerator count capped at 8.
         return min(8, torch.accelerator.device_count())
 
     @with_comms
     @skip_if_lt_x_gpu(8)
     @with_temp_dir
     def test_e2e(self):
+        # [FUNCTION DOC] Wraps each expert slot in FSDP over the data-parallel submesh of
+        # a 2x4 mesh (with its root mesh link cleared), then wraps the second tier and the
+        # whole model over an 8-rank mesh, and obtains model and Adam optimizer state dicts.
+        # Asserts the always-sharded params (net and second.net) are DTensors on all 8 ranks,
+        # that expert params exist only on the rank owning that expert and live on the
+        # two-rank mesh containing this rank and its peer, and that optimizer state keys
+        # equal model state keys. Needs 8 GPUs.
         model = TopModel(self.rank).to(self.device_type)
 
         mesh_fsdp_tp = init_device_mesh(

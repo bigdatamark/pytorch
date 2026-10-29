@@ -1,5 +1,9 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Unit test for torch.distributed.checkpoint._dedup_tensors.dedup_tensors:
+# verifies that a shard item duplicated across rank save plans is retained only by the
+# lowest rank. Defines a plan-building helper and one TestCase; no import-time side effects.
+
 import dataclasses
 
 import torch
@@ -22,6 +26,10 @@ def create_plan(second_fqn: str) -> SavePlan:
     Returns:
         SavePlan: A plan that includes the two write items.
     """
+    # [FUNCTION DOC] HELPER: Builds a save plan with two write items. The first is a random
+    # 4-element tensor named tensor_0 whose item type is forced to SHARD (so every plan
+    # contains the same duplicated shard); the second is a random 10-element tensor named
+    # by second_fqn. Returns the SavePlan holding both items; no side effects.
     # the first write item is for a duplicated shard (that covers the whole tensor)
     write_item_1 = _create_write_item_for_tensor("tensor_0", torch.rand(4))
     write_item_1 = dataclasses.replace(write_item_1, type=WriteItemType.SHARD)
@@ -33,11 +41,15 @@ def create_plan(second_fqn: str) -> SavePlan:
 
 
 class TestDedupTensor(TestCase):
+    # [CLASS DOC] Single-process test case for dedup_tensors; holds no state.
     """
     Test class for deduplication of tensor write items across different ranks.
     """
 
     def test_dedup_shards(self):
+        # [FUNCTION DOC] Builds plans for two simulated ranks that share the duplicated
+        # tensor_0 shard and each own a distinct tensor, runs dedup_tensors, and checks
+        # that rank 0 keeps both items (tensor_0 and r0) while rank 1 keeps only r1.
         rank0 = create_plan("r0")
         rank1 = create_plan("r1")
 

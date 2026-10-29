@@ -1,5 +1,11 @@
 # Owner(s): ["oncall: distributed checkpointing"]
 
+# [MODULE DOC] Tests for consolidating distributed Hugging Face safetensors checkpoints into
+# full-tensor files plus an index metadata file: single and multi-file outputs, rank-0 and
+# every-rank consolidation, and the low-level helpers that compute contiguous element runs and
+# write a sub-tensor into a full-tensor byte buffer. GPU tests need 2 GPUs and the safetensors
+# package; no import-time side effects.
+
 import importlib
 import json
 import os
@@ -26,7 +32,13 @@ from torch.testing._internal.distributed.checkpoint_utils import with_temp_dir
 
 
 class TestConsolidateHFSafeTensors(DTensorTestBase):
+    # [CLASS DOC] Test case (multi-process for the GPU tests) for safetensors consolidation.
     def _create_d_tensors(self) -> None:
+        # [FUNCTION DOC] HELPER: Builds the 4x4 float matrix of values 0..15 and, on a 1D
+        # mesh over all ranks, two DTensors from each rank's local slice: one sharded by rows
+        # and one by columns. Saves both under dtensor and dtensor_col with a distributed
+        # HuggingFaceStorageWriter into the temp dir, then barriers and syncs the
+        # filesystem. Assumes the world size divides 4.
         global_tensor = torch.arange(16, dtype=torch.float).view(4, 4)
         mesh_shape = (self.world_size,)
         mesh_1d = init_device_mesh(self.device_type, mesh_shape)
@@ -75,6 +87,10 @@ class TestConsolidateHFSafeTensors(DTensorTestBase):
     @with_temp_dir
     @skip_if_lt_x_gpu(2)
     def test_consolidate_to_one_file(self) -> None:
+        # [FUNCTION DOC] Skips (prints a message) if safetensors is missing. Saves the sharded
+        # tensors, then on rank 0 consolidates both into one file indexed 1; checks the
+        # single output file holds both full tensors and the index file reports total size
+        # 128 bytes and maps both names to that file. Ends with a barrier.
         if importlib.util.find_spec("safetensors") is None:
             print("safetensors not installed")
             return
@@ -118,6 +134,10 @@ class TestConsolidateHFSafeTensors(DTensorTestBase):
     @with_temp_dir
     @skip_if_lt_x_gpu(2)
     def test_consolidate_to_two_files(self):
+        # [FUNCTION DOC] Same as the single-file test but maps the two tensors to indices 1
+        # and 2: rank 0 consolidates, and each of two output files must hold exactly one full
+        # tensor, with the index file mapping each name to its own file. Skips without
+        # safetensors.
         if importlib.util.find_spec("safetensors") is None:
             print("safetensors not installed")
             return
@@ -161,6 +181,9 @@ class TestConsolidateHFSafeTensors(DTensorTestBase):
         dist.barrier()
 
     def test_calculate_max_contiguous_elements_validations(self) -> None:
+        # [FUNCTION DOC] Checks the helper raises ValueError for empty lists, lists of
+        # differing lengths, an index outside the sub-tensor shape, and a sub-tensor
+        # dimension larger than the full tensor dimension.
         """Test validation logic in _calculate_max_contiguous_elements function."""
 
         # Test empty lists validation
@@ -191,6 +214,10 @@ class TestConsolidateHFSafeTensors(DTensorTestBase):
             )  # sub_tensor_shape[1] > tensor_shape[1]
 
     def test_calculate_max_contiguous_elements_valid_cases(self) -> None:
+        # [FUNCTION DOC] Checks the number of elements that can be written contiguously from
+        # a starting index for 1D, 2D and 3D cases: remaining items in a row, whole rows or
+        # slices when the sub-tensor spans the full trailing width, a single element at the
+        # last position, and only one sub-tensor row width for column-sharded shapes.
         """Test valid cases for _calculate_max_contiguous_elements function."""
 
         # Test 1D case - simple remaining elements
@@ -234,6 +261,10 @@ class TestConsolidateHFSafeTensors(DTensorTestBase):
     @with_temp_dir
     @skip_if_lt_x_gpu(2)
     def test_consolidate_with_two_ranks(self):
+        # [FUNCTION DOC] Uses the every-rank consolidation entry point with two output files
+        # (indices 1 and 2): checks each file has the expected full tensor, the index file
+        # exists with total size 128 bytes and the right name-to-file map. Skips without
+        # safetensors.
         if importlib.util.find_spec("safetensors") is None:
             print("safetensors not installed")
             return
@@ -282,6 +313,9 @@ class TestConsolidateHFSafeTensors(DTensorTestBase):
     @with_temp_dir
     @skip_if_lt_x_gpu(2)
     def test_consolidate_one_file_with_two_ranks(self):
+        # [FUNCTION DOC] Every-rank consolidation into a single output file, so one rank has
+        # no data to write while the other writes both tensors; checks the file holds both
+        # full tensors, i.e. the idle rank waits correctly. Skips without safetensors.
         if importlib.util.find_spec("safetensors") is None:
             print("safetensors not installed")
             return
@@ -311,6 +345,10 @@ class TestConsolidateHFSafeTensors(DTensorTestBase):
         self.assertTrue(torch.equal(loaded_dict["dtensor_col"], global_tensor))
 
     def test_write_sub_tensor_to_file_optimized(self) -> None:
+        # [FUNCTION DOC] Single-process check of the sub-tensor writer on in-memory byte
+        # buffers: a row slice of a 4x6 float tensor at row offset 1, and a column slice of a
+        # 3x8 tensor at column offset 3 are written, and the buffer is compared with a
+        # zero tensor holding the slice at that location.
         """Test the _write_sub_tensor_to_file_optimized function with various scenarios."""
 
         # Test case 1: Simple 2D tensor, row-wise sharding

@@ -1,5 +1,11 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Multi-GPU test that saves and loads a module whose state dict holds DTensors
+# (sharded and replicated, on the full mesh and on a submesh of even ranks) plus module
+# extra state, using DCP's default save/load planners and a FileSystemWriter/Reader.
+# Defines a small test module and a DTensorTestBase subclass; SUBMESH_TENSOR_SIZE is the
+# global length of the submesh tensors. No import-time side effects.
+
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dist_cp
@@ -24,6 +30,9 @@ SUBMESH_TENSOR_SIZE = 6
 
 
 class MyTestModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Test module owning four DTensor parameters (sdt, rdt, submesh_sdt,
+    # submesh_rdt) and non-parameter extra state (an int and a tensor) that is exported
+    # and restored through get_extra_state/set_extra_state so it appears in the state dict.
     def __init__(
         self,
         sdt: DTensor,
@@ -33,6 +42,10 @@ class MyTestModule(torch.nn.Module):
         extra_state: int = 1,
         extra_state_tensor: torch.Tensor = torch.zeros(1),
     ) -> None:
+        # [FUNCTION DOC] HELPER: Wraps each DTensor argument in a Parameter and stores the
+        # extra state int and tensor in private attributes.
+        # KNOWN ISSUE: the default extra_state_tensor is one shared tensor object created
+        # at definition time, so default-constructed modules alias it.
         super().__init__()
         self.sdt = torch.nn.Parameter(sdt)
         self.rdt = torch.nn.Parameter(rdt)
@@ -43,37 +56,53 @@ class MyTestModule(torch.nn.Module):
 
     @property
     def extra_state(self) -> int:
+        # [FUNCTION DOC] HELPER: Property returning the integer extra state.
         return self._extra_state
 
     @extra_state.setter
     def extra_state(self, new_extra_state: int) -> None:
+        # [FUNCTION DOC] HELPER: Property setter replacing the integer extra state.
         self._extra_state = new_extra_state
 
     @property
     def extra_state_tensor(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Property returning the extra state tensor.
         return self._extra_state_tensor
 
     @extra_state_tensor.setter
     def extra_state_tensor(self, new_extra_state_tensor: torch.Tensor) -> None:
+        # [FUNCTION DOC] HELPER: Property setter replacing the extra state tensor.
         self._extra_state_tensor = new_extra_state_tensor
 
     def get_extra_state(self) -> dict[str, int | torch._tensor.Tensor]:
+        # [FUNCTION DOC] HELPER: Module hook returning a mapping with the keys extra_state
+        # and extra_state_tensor, which becomes the module's _extra_state state dict entry.
         return {
             "extra_state": self._extra_state,
             "extra_state_tensor": self._extra_state_tensor,
         }
 
     def set_extra_state(self, state: dict[str, int | torch._tensor.Tensor]) -> None:
+        # [FUNCTION DOC] HELPER: Module hook restoring the int and tensor extra state from
+        # the mapping produced by get_extra_state; raises KeyError if a key is missing.
         self._extra_state = state["extra_state"]  # pyre-ignore[8]
         self._extra_state_tensor = state["extra_state_tensor"]  # pyre-ignore[8]
 
 
 class DTensorPlanner(DTensorTestBase):
+    # [CLASS DOC] Multi-process test case (one process per GPU) exercising DCP save/load of
+    # DTensor state dicts through the default planners.
     def create_dtensor_model(
         self,
         tensor_to_shard: torch.tensor,
         tensor_to_replicate: torch.tensor,
     ) -> torch.nn.Module:
+        # [FUNCTION DOC] HELPER: Builds a MyTestModule on the current device type. The two
+        # input tensors are distributed over a mesh of all ranks (one sharded on dim 0, one
+        # replicated); two zero tensors of length SUBMESH_TENSOR_SIZE are created on a
+        # submesh of even ranks (sharded and replicated). Returns a tuple of the model,
+        # the sharded DTensor and the replicated DTensor.
+        # KNOWN ISSUE: the return annotation says Module but a 3-tuple is returned.
         mesh = DeviceMesh(
             device_type=self.device_type,
             mesh=range(dist.get_world_size()),
@@ -115,6 +144,12 @@ class DTensorPlanner(DTensorTestBase):
     @with_temp_dir
     @skip_if_lt_x_gpu(2)
     def test_distributed_tensor_planner(self) -> None:
+        # [FUNCTION DOC] Saves the model state dict with DefaultSavePlanner, rebuilds the
+        # model with values scaled by ten, loads the checkpoint into the new state dict
+        # with DefaultLoadPlanner, and checks per key: full-mesh sharded and replicated
+        # local tensors equal the originals, submesh tensors are zeros on even ranks and
+        # empty on odd ranks, and extra state is back to its saved values. Needs at least
+        # 2 GPUs; uses a temp directory as the checkpoint path.
         CHECKPOINT_DIR = self.temp_dir
 
         local_tensor = torch.arange(0, 4, dtype=torch.float32)

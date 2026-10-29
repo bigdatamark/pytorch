@@ -1,5 +1,12 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Multi-GPU tests of FSDP2 (fully_shard) interoperating with the distributed
+# state dict APIs and DCP: parity of get_model_state_dict with the module's own state dict,
+# full and CPU-offloaded state dicts, and cross-parallelism checkpoint portability (FSDP1 to
+# FSDP2, FSDP1 or TP to FSDP2 plus tensor parallel on a 2D mesh, and FSDP2 plus TP to TP,
+# with uneven sharding and implicit replication). Import-time side effect: computes the module
+# global device_type from the current accelerator.
+
 import contextlib
 import copy
 
@@ -36,11 +43,15 @@ device_type = acc.type if (acc := torch.accelerator.current_accelerator()) else 
 
 
 class TestFullyShardWithDistributedStateDict(FSDPTest):
+    # [CLASS DOC] Multi-process test case for FSDP2 state dict and checkpoint behavior.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Number of processes: the accelerator count capped at 4.
         return min(4, torch.accelerator.device_count())
 
     def _get_base_model(self, mlp_dim: int = 2):
+        # [FUNCTION DOC] HELPER: Returns a sequential model of an MLP, a nested sequential of an
+        # MLP and a Linear, and a second MLP, all with width mlp_dim.
         base_model = nn.Sequential(
             MLP(mlp_dim),
             nn.Sequential(MLP(mlp_dim), nn.Linear(mlp_dim, mlp_dim)),
@@ -50,12 +61,18 @@ class TestFullyShardWithDistributedStateDict(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_1d_fsdp_get_model_state_dict(self):
+        # [FUNCTION DOC] Runs the state dict parity check for MLP widths 2, 3, 4 and 5 as
+        # subtests. Needs at least 2 GPUs.
         self.run_subtests(
             {"mlp_dim": [2, 3, 4, 5]},
             self._test_1d_fsdp_get_model_state_dict,
         )
 
     def _test_1d_fsdp_get_model_state_dict(self, mlp_dim: int):
+        # [FUNCTION DOC] HELPER: Shards copies of the base model with fully_shard, once with
+        # the default resharding after forward and once without it (after running a
+        # forward so parameters stay unsharded), and checks that get_model_state_dict equals
+        # the module's own state dict in both cases, i.e. the state dict hooks reshard.
         """
         Test model.state_dict() and distributed_state_dict parity.
         """
@@ -85,6 +102,11 @@ class TestFullyShardWithDistributedStateDict(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_1d_fsdp_cpu_offload_full_model_state_dict(self):
+        # [FUNCTION DOC] Compares a full, CPU-offloaded model state dict of an FSDP2 model with
+        # the original model state dict: on rank 0 they must be equal and the original
+        # tensors all on CPU; on other ranks the result must be empty. Needs 2 GPUs.
+        # KNOWN ISSUE: the CPU placement check is applied to the original dict, not to the
+        # offloaded result it is meant to validate.
         """
         Test full_state_dict and cpu_offload works for FSDP2 state_dict.
         """
@@ -102,6 +124,7 @@ class TestFullyShardWithDistributedStateDict(FSDPTest):
         cpu_device = torch.device("cpu")
 
         def is_cpu(v):
+            # [FUNCTION DOC] HELPER: True if a tensor, or the DTensor, is on the CPU device.
             if isinstance(v, DTensor):
                 return v.device == torch.device("cpu")
             else:
@@ -115,6 +138,8 @@ class TestFullyShardWithDistributedStateDict(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_save_with_fsdp1_and_load_with_fsdp2(self):
+        # [FUNCTION DOC] Runs the FSDP1 to FSDP2 round trip as subtests for full and sharded
+        # FSDP1 state dict types. Needs at least 2 GPUs.
         self.run_subtests(
             {
                 "state_dict_type": [
@@ -128,6 +153,11 @@ class TestFullyShardWithDistributedStateDict(FSDPTest):
     @skip_if_lt_x_gpu(2)
     @with_temp_dir
     def _test_save_with_fsdp1_and_load_with_fsdp2(self, state_dict_type: StateDictType):
+        # [FUNCTION DOC] HELPER: Trains an FSDP1 model and AdamW one step, saves its model and
+        # sharded optimizer state dicts under the given state dict type to a temp dir, and
+        # records full CPU-offloaded dicts. Builds an FSDP2 model and optimizer, loads the
+        # checkpoint into its state dicts and applies them, then asserts the full model and
+        # optimizer state dicts of both frameworks are equal.
         """
         Test that we can save a model with FSDP1 and load it with FSDP2.
         """
@@ -199,11 +229,17 @@ class TestFullyShardWithDistributedStateDict(FSDPTest):
     @skip_if_lt_x_gpu(4)
     @with_temp_dir
     def test_save_with_fsdp1_and_load_with_fsdp2_tp(self):
+        # [FUNCTION DOC] On a 2D data-parallel by tensor-parallel mesh, trains a plain model
+        # and an FSDP1 copy one step, then saves the plain full state dicts and the FSDP1
+        # sharded state dicts. Builds an FSDP2 plus tensor-parallel model, loads each saved
+        # variant (full, sharded) into it, and asserts its full state dicts equal the plain
+        # model's. Needs 4 GPUs.
         """
         Test that we can save a model with FSDP1 and load it with FSDP2 + TP on 2d mesh.
         """
 
         def _get_base_model(mlp_dim: int = 2):
+            # [FUNCTION DOC] HELPER: Returns a sequential model of three MLPs of width mlp_dim.
             base_model = nn.Sequential(MLP(mlp_dim), MLP(mlp_dim), MLP(mlp_dim))
             return base_model
 
@@ -324,11 +360,16 @@ class TestFullyShardWithDistributedStateDict(FSDPTest):
     @skip_if_lt_x_gpu(4)
     @with_temp_dir
     def test_save_with_tp_and_load_with_fsdp2_tp(self):
+        # [FUNCTION DOC] Same flow as the FSDP1 variant but the saved sharded state comes from
+        # a tensor-parallel-only model on a 1D mesh: saves plain full and TP sharded state
+        # dicts, loads each into an FSDP2 plus tensor-parallel model on a 2D mesh, and asserts
+        # its full state dicts equal the plain model's. Needs 4 GPUs.
         """
         Test that we can save a model with TP and load it with FSDP2 + TP on 2d mesh.
         """
 
         def _get_base_model(mlp_dim: int = 2):
+            # [FUNCTION DOC] HELPER: Returns a sequential model of three MLPs of width mlp_dim.
             base_model = nn.Sequential(MLP(mlp_dim), MLP(mlp_dim), MLP(mlp_dim))
             return base_model
 
@@ -451,6 +492,8 @@ class TestFullyShardWithDistributedStateDict(FSDPTest):
 
     @skip_if_lt_x_gpu(4)
     def test_save_with_fsdp2_tp_and_load_with_tp(self):
+        # [FUNCTION DOC] Runs the FSDP2 plus TP to TP round trip as subtests with implicit
+        # replication allowed and not allowed. Needs at least 4 GPUs.
         self.run_subtests(
             {"allow_implicit_replication": [True, False]},
             self._test_save_with_fsdp2_tp_and_load_with_tp,
@@ -461,12 +504,20 @@ class TestFullyShardWithDistributedStateDict(FSDPTest):
     def _test_save_with_fsdp2_tp_and_load_with_tp(
         self, allow_implicit_replication: bool
     ):
+        # [FUNCTION DOC] HELPER: Uses MLP width 5 (uneven shards). For each of saving a full or
+        # a sharded state dict, trains a plain model and an FSDP2 plus TP model one step,
+        # saves the FSDP2 plus TP model and optimizer state dicts, loads them into a
+        # TP-only model, and asserts the full state dicts of the plain, FSDP2 plus TP and TP
+        # models all match. With implicit replication enabled, the first MLP is left out of
+        # the TP plan and the run happens inside the implicit replication context.
         """
         Test that we can save a model with FSDP2 + TP on 2d mesh and load it with TP.
         """
         mlp_dim = 5
 
         def _get_base_model(mlp_dim):
+            # [FUNCTION DOC] HELPER: Returns a sequential model of three MLPs of width mlp_dim
+            # with dim_multiplier 1.
             # dim_multiplier=1 helps make it easier to hit corner cases in uneven sharding
             # (e.g. in/out dim both=5 means unevenness is easier to hit depending on row/col sharding)
             base_model = nn.Sequential(

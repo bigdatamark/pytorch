@@ -1,5 +1,11 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Backward-compatibility tests for distributed checkpoint (DCP): metadata
+# dataclasses must be constructible with legacy arguments, checkpoints written with the
+# legacy sharded-tensor TensorProperties and with the version 2_3 behavior must still load,
+# and storage metadata must carry the checkpoint id and save/load ids. Some tests write to
+# a fixed directory under /tmp; no import-time side effects.
+
 from unittest.mock import patch
 
 import torch
@@ -17,7 +23,12 @@ from torch.testing._internal.distributed.checkpoint_utils import with_temp_dir
 
 
 class TestDCPCompatbility(TestCase):
+    # [CLASS DOC] Single-process TestCase guarding DCP metadata and on-disk format BC.
     def test_metadata(self) -> None:
+        # [FUNCTION DOC] Constructs chunk, tensor, bytes, Metadata and MetadataIndex objects
+        # using only the minimal original fields; any exception is re-raised as a
+        # RuntimeError saying the change may break DCP backward compatibility, which
+        # enforces that newly added metadata fields keep default values.
         # Ensure that all the new fields of all the metadata have the default
         # values so that we can always deserialize from a legacy metadata.
         try:
@@ -41,6 +52,11 @@ class TestDCPCompatbility(TestCase):
             ) from e
 
     def test_sharded_tensor_dependency(self) -> None:
+        # [FUNCTION DOC] Saves a state dict while the checkpoint metadata module's
+        # TensorProperties is patched to the legacy sharded-tensor TensorProperties class,
+        # then loads it back with a fresh reader. Passes if load does not raise.
+        # Side effect: writes to the fixed directory /tmp/dcp_testing (not cleaned up).
+        # KNOWN ISSUE: the load result is never compared with the saved values.
         # Ensure that we can load the existing DCP checkpoints back even if the
         # metadata contain # _shard.sharded_tensor.metadata.
         from torch.distributed._shard.sharded_tensor.metadata import (
@@ -60,6 +76,10 @@ class TestDCPCompatbility(TestCase):
 
     @with_temp_dir
     def test_storage_meta(self) -> None:
+        # [FUNCTION DOC] Saves a state dict to a temp dir with a FileSystemWriter, reads the
+        # metadata back with a FileSystemReader, and checks storage_meta is present and its
+        # checkpoint_id, save_id and load_id equal the temp dir, the writer's save_id and
+        # the reader's load_id respectively.
         writer = dcp.FileSystemWriter(self.temp_dir)
         dcp.save({"a": torch.zeros(4, 4)}, storage_writer=writer)
 
@@ -72,6 +92,10 @@ class TestDCPCompatbility(TestCase):
 
     @with_temp_dir
     def test_with_v_2_3(self) -> None:
+        # [FUNCTION DOC] Saves a nested state dict (tensor, dicts, list) while the module
+        # global _act_like_version in dcp._version is set to 2_3, resets it to None, then
+        # loads into a differently valued state dict and asserts it now equals the saved one.
+        # Side effect: temporarily mutates that global; it is not restored if save raises.
         sd = {
             "a": torch.zeros(4, 4),
             "dict": {
