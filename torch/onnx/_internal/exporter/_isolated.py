@@ -1,3 +1,5 @@
+# [MODULE DOC] Runs functions in a forked subprocess so a crash (segfault) in native code does
+# not kill the main process. Provides safe_call; on Windows it falls back to a direct call.
 """Isolated calls to methods that may segfault."""
 
 from __future__ import annotations
@@ -23,6 +25,8 @@ _IS_WINDOWS = os.name == "nt"
 def _call_function_and_return_exception(
     func: Callable[[Unpack[_Ts]], _R], args: tuple[Unpack[_Ts]], kwargs: dict[str, Any]
 ) -> _R | Exception:
+    # [FUNCTION DOC] HELPER: Pool worker entry point. Calls func with args and kwargs and returns
+    # the result, or returns (not raises) any Exception so it can be sent back across processes.
     """Call function and return an exception if there is one."""
 
     try:
@@ -32,6 +36,12 @@ def _call_function_and_return_exception(
 
 
 def safe_call(func: Callable[_P, _R], *args: _P.args, **kwargs: _P.kwargs) -> _R:
+    # [FUNCTION DOC] Calls func in a one-worker forked process pool and returns its result.
+    # Re-raises, in the caller, an exception returned by the worker. On Windows (no fork) it warns
+    # and calls func directly in-process. Raises multiprocessing.TimeoutError if no result in 5s.
+    # KNOWN ISSUE: the 5 second timeout is hard coded, so slow functions fail; a function whose
+    # legitimate return value is an Exception instance is raised instead of returned.
+    # A segfault in the child leaves the wait to time out rather than raising a clear error.
     """Call a function in a separate process.
 
     Args:

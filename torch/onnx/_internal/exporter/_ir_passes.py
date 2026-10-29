@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Passes over an ONNX IR model used during export: renaming graph inputs and
+# outputs, renaming symbolic dimensions (including inside shape expressions), and collecting
+# opset imports for the model and its functions. Defines a module logger and the default ONNX
+# domain constant. No other import-time side effects.
 from __future__ import annotations
 
 import logging
@@ -20,6 +24,11 @@ logger = logging.getLogger(__name__)
 
 
 def rename_inputs(model: ir.Model, new_names: Sequence[str]) -> None:
+    # [FUNCTION DOC] Renames the graph inputs, in order, to new_names. The original name is
+    # saved in each input's metadata. Mutates the model. Raises ValueError if new_names has
+    # duplicates.
+    # KNOWN ISSUE: pairing stops at the shorter list, so a length mismatch is silently
+    # ignored.
     unique_names = frozenset(new_names)
     if len(unique_names) != len(new_names):
         seen = set()
@@ -36,6 +45,11 @@ def rename_inputs(model: ir.Model, new_names: Sequence[str]) -> None:
 
 
 def rename_outputs(model: ir.Model, new_names: Sequence[str]) -> None:
+    # [FUNCTION DOC] Renames the graph outputs, in order, to new_names, saving the original
+    # name in each output's metadata. Mutates the model. Raises ValueError if new_names has
+    # duplicates.
+    # KNOWN ISSUE: pairing stops at the shorter list, so a length mismatch is silently
+    # ignored.
     unique_names = frozenset(new_names)
     if len(unique_names) != len(new_names):
         seen = set()
@@ -52,6 +66,9 @@ def rename_outputs(model: ir.Model, new_names: Sequence[str]) -> None:
 
 
 def _all_values(model: ir.Model):
+    # [FUNCTION DOC] HELPER: Generator over every value in the model: graph inputs,
+    # initializers, outputs of all nodes (recursing into subgraphs), and the same for each
+    # model function.
     """Yield all values in a model."""
     # Yield all values in the model
     yield from model.graph.inputs
@@ -66,6 +83,11 @@ def _all_values(model: ir.Model):
 
 
 def _replace_names(shape_expr: str, rename_mapping: dict[str, str]) -> str:
+    # [FUNCTION DOC] HELPER: Replaces whole-word occurrences of each old name in a shape
+    # expression string by its new name, applying the mapping entries in order. Returns the
+    # new string.
+    # KNOWN ISSUE: replacements are applied one after another, so a new name equal to a
+    # later old name can be replaced again.
     """Replace all known names in a shape expression with new names."""
     for old_name, new_name in rename_mapping.items():
         shape_expr = re.sub(
@@ -77,6 +99,12 @@ def _replace_names(shape_expr: str, rename_mapping: dict[str, str]) -> str:
 def rename_axis(
     model: ir.Model, rename_mapping: dict[str | ir.SymbolicDim, str]
 ) -> None:
+    # [FUNCTION DOC] Renames symbolic dimensions in every value shape of the model and its
+    # functions. Args: model, rename_mapping (keys are names or symbolic dimensions with
+    # string values). Exact name matches are replaced; for compound expressions the
+    # contained names are replaced, longest names first. Shapes are updated only when
+    # something changed. Raises ValueError for an invalid key type or a symbolic dimension
+    # without a string value.
     """Rename dynamic axes in a model according to the specified dynamic_axes names."""
 
     # Create a mapping from string to string for easier replacement
@@ -133,6 +161,10 @@ def rename_axis(
 def _maybe_set_opset_version(
     opset_imports: dict[str, int], domain: str, version: int | None
 ) -> None:
+    # [FUNCTION DOC] HELPER: Sets the opset version of a domain in the dict unless already
+    # set to something other than 1. The default ONNX domain gets the TorchLib opset; an
+    # unknown version becomes 1 (valid for custom function domains); otherwise the given
+    # version is used.
     """Set the opset version for the domain."""
     if domain in opset_imports and opset_imports[domain] != 1:
         # Already set
@@ -150,6 +182,9 @@ def _maybe_set_opset_version(
 
 
 def add_opset_imports(model: ir.Model) -> None:
+    # [FUNCTION DOC] Fills the opset imports of the model and each function from the domains
+    # and versions of their nodes. Function opsets are also copied into the model because
+    # ONNX Runtime does not add them after inlining. Mutates the model and its functions.
     """Collect all opsets used and add opset imports to the model and functions."""
     for node in ir.traversal.RecursiveGraphIterator(model.graph):
         domain = node.domain

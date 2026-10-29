@@ -1,3 +1,6 @@
+# [MODULE DOC] Defines ExportableModule, an abstract torch.nn.Module base class whose subclasses
+# declare their own example inputs, dynamic shapes and input/output names so they can be passed
+# directly to torch.onnx.export or exported with to_onnx. No import-time side effects.
 """Abstract interface for ONNX exportable modules."""
 
 from __future__ import annotations
@@ -13,6 +16,11 @@ if TYPE_CHECKING:
 
 
 class ExportableModule(torch.nn.Module, abc.ABC):
+    # [CLASS DOC] Abstract base for modules that describe how they are exported to ONNX.
+    # Holds no state of its own. Subclasses must implement example_arguments and may
+    # override dynamic_shapes, input_names and output_names (defaults: none, meaning static
+    # shapes and generated names). Key method: to_onnx, which calls torch.onnx.export on the
+    # module.
     """Abstract interface for ONNX exportable modules.
 
     Inherit from this class and implement the defined abstract methods
@@ -54,6 +62,10 @@ class ExportableModule(torch.nn.Module, abc.ABC):
 
     @abc.abstractmethod
     def example_arguments(self) -> tuple[tuple[Any], dict[str, Any] | None]:
+        # [FUNCTION DOC] Abstract. Returns example inputs for forward as a pair: a tuple
+        # of positional arguments and a mapping of keyword arguments (or none). Used as
+        # the tracing inputs for export. The base implementation raises
+        # NotImplementedError.
         """Return example arguments for the model's forward method.
 
         This method must be implemented by subclasses to provide sample inputs
@@ -83,6 +95,9 @@ class ExportableModule(torch.nn.Module, abc.ABC):
         raise NotImplementedError
 
     def dynamic_shapes(self) -> Any:
+        # [FUNCTION DOC] Returns the dynamic shape specification for the export inputs,
+        # in any format accepted by torch.export. The default returns none (all
+        # dimensions static).
         """Return dynamic shape specifications for the model's inputs.
 
         Override this method to specify which dimensions of the input tensors
@@ -117,6 +132,8 @@ class ExportableModule(torch.nn.Module, abc.ABC):
         return None
 
     def input_names(self) -> Sequence[str] | None:
+        # [FUNCTION DOC] Returns names for the ONNX graph inputs, or none (the default)
+        # to let the exporter generate them.
         """Return names for the model's input tensors.
 
         Override this method to provide custom names for the input tensors in the
@@ -144,6 +161,8 @@ class ExportableModule(torch.nn.Module, abc.ABC):
         return None
 
     def output_names(self) -> Sequence[str] | None:
+        # [FUNCTION DOC] Returns names for the ONNX graph outputs, or none (the default)
+        # to let the exporter generate them.
         """Return names for the model's output tensors.
 
         Override this method to provide custom names for the output tensors in the
@@ -171,6 +190,10 @@ class ExportableModule(torch.nn.Module, abc.ABC):
         return None
 
     def to_onnx(self, **kwargs: Any) -> torch.onnx.ONNXProgram:
+        # [FUNCTION DOC] Exports this module by calling torch.onnx.export on it,
+        # forwarding all keyword arguments. Returns: the resulting ONNXProgram. Raises
+        # AssertionError if export returns none. Side effects are those of
+        # torch.onnx.export.
         """Export the module to ONNX format.
 
         This method provides a convenient wrapper around ``torch.onnx.export`` that

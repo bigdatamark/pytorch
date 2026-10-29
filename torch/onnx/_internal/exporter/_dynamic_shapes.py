@@ -1,6 +1,10 @@
 """Compatibility functions for the torch.onnx.export API."""
 
 # mypy: allow-untyped-defs
+# [MODULE DOC] Conversions between the legacy dynamic_axes format of torch.onnx.export and the
+# dynamic_shapes format of torch.export, plus helpers to flatten dynamic shapes, replace axis
+# name strings with the export dynamic marker, and map exported symbolic dimension names to
+# user-provided names. No import-time side effects.
 from __future__ import annotations
 
 import inspect
@@ -26,6 +30,17 @@ def from_dynamic_axes_to_dynamic_shapes(
     output_names: set[str],
     input_names: Sequence[str] | None = None,
 ) -> tuple[dict[str, Any | None] | None, tuple[Any, ...], dict[str, Any] | None]:
+    # [FUNCTION DOC] Deprecated. Converts dynamic_axes (input name to a list of axis indices, or
+    # to a mapping of axis index to name) into a dynamic_shapes tree matching the model inputs.
+    # Args: model, args, kwargs, dynamic_axes, output_names (entries named here are skipped),
+    # input_names (those not present get no dynamic dims). Returns: (dynamic_shapes, args, kwargs).
+    # If dynamic_axes is none, returns none with args and kwargs unchanged; otherwise the inputs
+    # are reordered by the model signature, returned as positional args, with empty kwargs.
+    # Raises ValueError for non-integer axes or an axes value that is not a mapping, list or none.
+    # Side effect: emits a DeprecationWarning.
+    # KNOWN ISSUE: shapes are unflattened in the insertion order of dynamic_axes plus input_names,
+    # not signature order, so a mismatched ordering can pair shapes with the wrong inputs. Inputs
+    # missing from both args and kwargs are silently dropped.
     """
     Converts dynamic_axes into dynamic_shapes by wrapping the axis names with ``torch.export.Dim.DYNAMIC``.
 
@@ -112,6 +127,13 @@ def from_dynamic_shapes_to_dynamic_axes(
     input_names: Sequence[str],
     exception: Exception,
 ) -> dict[str, Any] | None:
+    # [FUNCTION DOC] Converts dynamic_shapes into dynamic_axes: each flattened input with dynamic
+    # dimensions is assigned, in order, to the next name in input_names, and its non-none axes are
+    # collected as a list of indices. Args: dynamic_shapes, input_names, exception (the original
+    # error, chained as the cause). Returns: mapping of input name to list of axis indices.
+    # Raises ValueError (from exception) if there are fewer input names than flattened inputs.
+    # KNOWN ISSUE: the declared return type allows none but it never returns none; every
+    # non-none axis spec, including a static int, counts as dynamic.
     """
     Converts dynamic_shapes into dynamic_axes by removing torch.export.Dim wrapping
     and converting to list or dict form based on whether dimension names are present.
@@ -165,6 +187,9 @@ def from_dynamic_shapes_to_dynamic_axes(
 def _any_str_or_dim_in_dynamic_shapes(
     dynamic_shapes: dict[str, Any] | tuple[Any, ...] | list[Any],
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Returns true if the flattened dynamic_shapes contain any string or Dim
+    # axis (something that can carry a custom name). Returns false when any flattened entry is not
+    # an axes container or none (unsupported content), or when no named axis is found.
     """Check if there is any string or Dim in the dynamic_shapes."""
     flat_dynamic_shapes, _ = _flatten_dynamic_shapes_to_axes(dynamic_shapes)
     # This indicates the dynamic_shapes includes something we don't support in axes, and it's flattened
@@ -190,6 +215,11 @@ def _any_str_or_dim_in_dynamic_shapes(
 def convert_str_to_export_dim(
     dynamic_shapes: dict[str, Any] | tuple[Any, ...] | list[Any] | None,
 ) -> tuple[dict[str, Any] | tuple[Any, ...] | list[Any] | None, bool]:
+    # [FUNCTION DOC] Replaces every string axis name in dynamic_shapes with the export dynamic
+    # marker, keeping the original nesting. Args: dynamic_shapes (may be none). Returns: a pair of
+    # the converted shapes and a flag telling whether conversion happened. If shapes are none or
+    # contain no string or Dim, the input is returned unchanged with the flag false; otherwise the
+    # flag is true. Does not mutate the input.
     # 1. If there is no string in dynamic_shapes, we do not touch dynamic_shapes
     if dynamic_shapes is None or not _any_str_or_dim_in_dynamic_shapes(dynamic_shapes):
         return dynamic_shapes, False
@@ -235,6 +265,14 @@ def convert_str_to_export_dim(
 def create_rename_mapping(
     inputs, dynamic_shapes: dict[str, Any] | tuple[Any, ...] | list[Any]
 ) -> dict[str, str]:
+    # [FUNCTION DOC] Builds a mapping from the symbolic dimension names found on the ONNX
+    # model inputs to the custom axis names given in dynamic_shapes. Args: inputs (ONNX IR
+    # values, in the same order as the flattened dynamic_shapes), dynamic_shapes. Returns: mapping
+    # old name to custom name; empty (with a UserWarning) if the input count differs from the
+    # flattened shapes count. Static dims, hint or int entries and none entries are skipped; if
+    # two axes share one old name, the first custom name wins and a warning is issued.
+    # KNOWN ISSUE: the warning messages begin with a stray "#" character, and the two branches
+    # use different stacklevel values; the mapping branch's warning omits the category.
     """Create a mapping from old names to new names for dynamic axes."""
 
     # NOTE: There's no need to handle cases where kwargs are out of order with the model signature,
@@ -302,6 +340,8 @@ def create_rename_mapping(
 
 
 def _get_custom_axis_name(axis: Dim | str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the name of an axis: the name attribute of a Dim, or the
+    # string itself.
     """Get the custom axis name from a torch.export.Dim."""
     if isinstance(axis, Dim):
         return axis.__name__
@@ -312,6 +352,8 @@ def _unflatten_dynamic_shapes_with_inputs_tree(
     inputs: list[Any],
     dynamic_shapes: dict[str, Any],
 ) -> dict[str, Any | None]:
+    # [FUNCTION DOC] HELPER: Reshapes the dynamic_shapes values (taken in mapping order) to the
+    # tree structure of the inputs. Args: inputs, dynamic_shapes. Returns: the unflattened tree.
     _, tree_structure = _pytree.tree_flatten(inputs)
     return _pytree.tree_unflatten(dynamic_shapes.values(), tree_structure)
 
@@ -319,8 +361,13 @@ def _unflatten_dynamic_shapes_with_inputs_tree(
 def _flatten_dynamic_shapes_to_axes(
     dynamic_shapes: dict[str, Any | None] | tuple[Any, ...] | list[Any],
 ) -> tuple[list[Any], _pytree.TreeSpec]:
+    # [FUNCTION DOC] HELPER: Flattens dynamic_shapes with a pytree, treating each axes container
+    # (mapping of int to dim spec, or list/tuple of dim specs) as a leaf. Returns: (leaves,
+    # tree spec).
     # If it's a dict/list/tuple with torch.export.Dim, we consider it's an axis to dim mapping
     def is_axes(x) -> bool:
+        # [FUNCTION DOC] HELPER: True if x is a mapping with int keys and dim-like values, or a
+        # list/tuple of dim-like values, where dim-like means none, Dim, hint, string or int.
         return (
             isinstance(x, dict)
             and all(
@@ -337,6 +384,8 @@ def _flatten_dynamic_shapes_to_axes(
 
 
 def _signature(model) -> inspect.Signature:
+    # [FUNCTION DOC] HELPER: Returns the call signature of the model's forward method, or
+    # of the model itself if it has no forward. Raises ValueError if neither is callable.
     should_be_callable = getattr(model, "forward", model)
     if callable(should_be_callable):
         return inspect.signature(should_be_callable)

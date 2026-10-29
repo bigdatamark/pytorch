@@ -1,3 +1,9 @@
+# [MODULE DOC] Implements InputObserver, which temporarily replaces a model method (usually
+# forward) with a recorder that stores a few sets of inputs and outputs, then infers from them
+# the arguments and dynamic shapes to give to torch.export / torch.onnx.export, and later
+# compares the saved outputs with an exported ONNX program. Contains InputCandidate (one
+# recorded call), InputObserverInfo (all recordings and the inference logic) and flatten
+# helpers. Exports only InputObserver. No import-time side effects.
 from __future__ import annotations
 
 
@@ -22,6 +28,13 @@ def _flatten_unflatten_for_dynamic_shapes(
     obj: Any,
     change_function: Callable[[torch.Tensor], Any] | None = None,
 ) -> Any:
+    # [FUNCTION DOC] HELPER: Rebuilds an argument structure in the form expected by a
+    # dynamic shapes specification. Tensors are returned as is, or replaced by the result of
+    # change_function when given. Containers are rebuilt recursively: mappings stay
+    # mappings, tuples and lists keep their type, a leaf with no content becomes none, and a
+    # custom class with attributes becomes a list of its flattened children (custom classes
+    # appear in flattened form). Args: obj, change_function. Raises ValueError for a
+    # structure it cannot interpret.
     """Returns the object in a different structure similar to what
     the definition of the dynamic shapes should use.
 
@@ -72,6 +85,11 @@ def _flatten_unflatten_for_dynamic_shapes(
 def _infer_dynamic_dimensions(
     shape_list: Sequence[tuple[int, ...]], set_batch_dimension: bool = False
 ) -> list[int]:
+    # [FUNCTION DOC] HELPER: Given several shapes observed for the same tensor, returns the
+    # indices of dimensions whose size differs between shapes. Optionally forces dimension
+    # zero to be included. Args: shape_list (all of the same rank), set_batch_dimension.
+    # Returns: sorted list of dynamic dimension indices. Raises an error (via a check) if
+    # ranks differ or the list is empty.
     """Returns the list of dynamic dimensions given a list of shapes
     corresponding to the same tensor.
 
@@ -100,6 +118,12 @@ def _infer_dynamic_dimensions(
 
 
 class InputCandidate:
+    # [CLASS DOC] One recorded call: positional args, keyword args and constant keyword
+    # values, stored together with their flattened tensor list and tree spec. State: args,
+    # kwargs, flat_list, spec, cst_kwargs (copy of constants), lazily built position
+    # mappings, and the aligned list/spec set by align_with. When cloning, tensors are
+    # detached copies and non-tensor leaves become none. Invariant: once aligned, the
+    # aligned list follows the layout of the best candidate.
     """Retains one set of inputs given to the forward method or any
     other method the class :class:`InputObserver` is stealing from.
     Any class is allowed as long as it can be flattened.
@@ -123,6 +147,11 @@ class InputCandidate:
         clone: bool,
         cst_kwargs: dict[str, int | str | float | bool],
     ):
+        # [FUNCTION DOC] Flattens args and kwargs into a tensor list plus tree spec and
+        # stores them. Args: args, kwargs, clone (when true, tensors are replaced by
+        # detached copies, non-tensor leaves by none, and args/kwargs are rebuilt from
+        # them), cst_kwargs (constant scalar keyword values, copied). Also initializes
+        # lazy mappings and the aligned list/spec to none.
         self.args = args
         self.kwargs = kwargs
         self.flat_list, self.spec = torch.utils._pytree.tree_flatten((args, kwargs))
@@ -143,6 +172,8 @@ class InputCandidate:
         self.aligned_flat_list: list[torch.Tensor | None] | None = None
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Returns a short summary: counts of args, kwargs, flattened
+        # tensors and aligned tensors.
         return (
             f"{self.__class__.__name__}({len(self.args)} args, "
             f"{len(self.kwargs)} kwargs, {len(self.flat_list)} tensors, "
@@ -150,10 +181,13 @@ class InputCandidate:
         )
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Returns the number of flattened leaves, including none entries.
         """Returns the number of flattened tensors, None tensors are included."""
         return len(self.flat_list)
 
     def str_obs(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns a one-line description with counts of args and
+        # kwargs and the constant keyword values, without the data.
         """Prints out some information about the observations."""
         return (
             f"InputCandidate(args=#{len(self.args)}(...), "
@@ -161,6 +195,10 @@ class InputCandidate:
         )
 
     def build_mappings(self) -> list[int | str]:
+        # [FUNCTION DOC] Computes, once, for each flattened leaf the position index
+        # (positional) or name (keyword) of the argument it came from, and the number of
+        # leaves per argument. Caches both on the object. Returns: the per-leaf list of
+        # argument positions/names.
         if self._position_to_args_kwargs is not None:
             return self._position_to_args_kwargs
         self._n_tensors_for_args_kwargs = {}
@@ -180,6 +218,8 @@ class InputCandidate:
 
     @property
     def position_to_args_kwargs(self) -> list[int | str]:
+        # [FUNCTION DOC] Property. Per flattened leaf, the positional index or keyword
+        # name of the argument it belongs to; built on first access.
         """Returns the corresponding args or kwargs
         for every tensor in the flattened inputs.
         """
@@ -190,6 +230,8 @@ class InputCandidate:
 
     @property
     def n_tensors_for_args_kwargs(self) -> dict[int | str, int]:
+        # [FUNCTION DOC] Property. Mapping from argument position or keyword name to its
+        # number of flattened leaves; built on first access.
         """Returns the number of flat tensors in every args or kwargs."""
         if self._n_tensors_for_args_kwargs is None:
             self.build_mappings()
@@ -201,6 +243,7 @@ class InputCandidate:
         aligned_flat_list: list[torch.Tensor | None],
         aligned_spec: torch.utils._pytree.PyTreeSpec,
     ):
+        # [FUNCTION DOC] HELPER: Stores the aligned flat list and spec on the object.
         self.aligned_flat_list = aligned_flat_list
         self.aligned_spec = aligned_spec
 
@@ -210,6 +253,17 @@ class InputCandidate:
         captured_inputs: dict[int | str, int],
         signature_names: list[str],
     ):
+        # [FUNCTION DOC] Aligns this candidate with the best candidate, filling in none
+        # for arguments that are missing, none or empty so the flattened layout matches
+        # the best candidate. Args: best_candidate, captured_inputs (mutable mapping of
+        # argument to leaf count, updated here and used to detect inconsistent counts
+        # across calls), signature_names (used to turn extra positional args into
+        # keyword args). Sets the aligned list and uses the best candidate's spec.
+        # Raises RuntimeError if constant values differ or an argument has a different
+        # leaf count.
+        # KNOWN ISSUE: arguments are tested by truthiness, so any falsy non-tensor value
+        # is treated as missing. A keyword value for a name that the best candidate
+        # holds positionally is not found.
         """Two candidates are considered as aligned if after being flattened
         if they have the same number of tensors (None allowed)."""
         if self.cst_kwargs != best_candidate.cst_kwargs:
@@ -269,12 +323,20 @@ class InputCandidate:
 
     @property
     def n_aligned_tensors(self) -> int:
+        # [FUNCTION DOC] Property. Number of leaves in the aligned list. Raises
+        # RuntimeError if the candidate was not aligned.
         if self.aligned_flat_list is None:
             raise RuntimeError("This input was not aligned with the others.")
         return len(self.aligned_flat_list)
 
 
 class InputObserverInfo:
+    # [CLASS DOC] Store of all recorded calls of an observed method and the logic that
+    # infers dynamic shapes and export arguments. State: recorded InputCandidate list,
+    # flattened outputs with specs and latencies, signature names, default values,
+    # value_if_missing mapping, names of the var positional and var keyword parameters, the
+    # best candidate (the one with most leaves) and the leaf counts captured while aligning.
+    # Used by InputObserver.
     """Contains all the necessary information to infer dynamic shapes
     and the arguments to send to :func:`torch.export.export`.
 
@@ -309,6 +371,10 @@ class InputObserverInfo:
         args_name_and_position: tuple[str, int] | None,
         kwargs_name: str | None,
     ):
+        # [FUNCTION DOC] Stores the signature information (names, scalar defaults,
+        # values to use when an argument is missing, var-positional name and index, var-
+        # keyword name) and starts with empty recordings, no best candidate and no
+        # captured counts.
         self.default_values = default_values
         self.value_if_missing = value_if_missing
         self.inputs: list[InputCandidate] = []
@@ -322,10 +388,19 @@ class InputObserverInfo:
         self._captured_inputs: dict[int | str, int] | None = None
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Returns the number of recorded input sets.
         """Returns the number of collected set of inputs/outputs."""
         return len(self.inputs)
 
     def add_inputs(self, args: tuple[Any, ...], kwargs: dict[str, Any]):
+        # [FUNCTION DOC] Records one call. Scalar keyword values that differ from a non-
+        # none signature default are kept as constants, other scalars and none values
+        # are dropped. Missing keys of value_if_missing are filled in (by name into
+        # keyword args, by position into args). Keyword args are reordered by signature
+        # order. The call is stored as a cloned InputCandidate and becomes the best
+        # candidate if it has more leaves. Raises ValueError for keys not in the
+        # signature, NotImplementedError for a position beyond the given args, TypeError
+        # for a key that is neither a string nor an integer.
         """Stores one set of inputs. They are deepcopied.
 
         Args:
@@ -407,6 +482,8 @@ class InputObserverInfo:
             self._best_candidate = candidate
 
     def add_outputs(self, res: torch.Tensor | tuple[torch.Tensor, ...], latency: float):
+        # [FUNCTION DOC] Records the outputs of the matching call: stores the tree spec,
+        # a detached copy of every tensor (none stays none) and the measured latency.
         """Stores outputs. They are deepcopied."""
         flat_res, spec = torch.utils._pytree.tree_flatten(res)
         self.outputs_specs.append(spec)
@@ -416,6 +493,11 @@ class InputObserverInfo:
         self.latencies.append(latency)
 
     def align_inputs_none_values(self):
+        # [FUNCTION DOC] Aligns every recorded candidate with the best candidate so all
+        # have the same flattened layout. Does nothing if all are already aligned.
+        # Raises RuntimeError if there are no inputs or some call used a keyword the
+        # best candidate lacks. Side effect: resets and refills the captured leaf counts
+        # and sets aligned lists on candidates.
         """Once the best candidate is chosen, this method aligns every set of inputs
         on the best candidate, it inserts None at the right position when
         optional inputs are not specified. We consider a set of inputs is aligned
@@ -449,6 +531,17 @@ class InputObserverInfo:
         set_batch_dimension_for: set[int | str] | bool | None = None,
         return_flat: bool = False,
     ) -> tuple[dict[int, Any] | None, ...] | dict[str, dict[int, Any] | None]:
+        # [FUNCTION DOC] Infers the dynamic shapes specification from all recorded
+        # inputs. A dimension is dynamic if its size changes between calls, or if it is
+        # the first dimension of an argument selected by set_batch_dimension_for (bool
+        # for all, or names/positions). Args: set_batch_dimension_for, return_flat
+        # (return a flat tuple of per-leaf mappings used when inferring arguments).
+        # Returns: a tuple (positional only) or a mapping from parameter name to shapes,
+        # with var-keyword entries nested under its name and constant keywords set to
+        # none. Raises NotImplementedError if the best candidate is not aligned or leaf
+        # counts differ between sets. Aligns inputs as a side effect.
+        # KNOWN ISSUE: the nested case assumes equal leaf counts per argument and does
+        # not check it.
         """Infers dynamic shapes based on the collected tensors.
         Most of the time, models do support a batch dimension
         but this batch dimension has the same value for every input sample.
@@ -477,6 +570,10 @@ class InputObserverInfo:
             )
 
         def _set_batch_dimension(name_or_position) -> bool:
+            # [FUNCTION DOC] HELPER: Tells whether the first dimension of an
+            # argument, given by name or position, must be dynamic. A position is
+            # also matched through its parameter name; raises an error via a check
+            # if the position is beyond the signature.
             if not set_batch_dimension_for:
                 return False
             if (
@@ -493,6 +590,8 @@ class InputObserverInfo:
             return False
 
         def _set_batch_dimension_for_flat_index(index) -> bool:
+            # [FUNCTION DOC] HELPER: Same as the batch dimension test, for a
+            # flattened leaf index, using the argument the leaf belongs to.
             return _set_batch_dimension(
                 # pyrefly: ignore[missing-attribute]
                 self._best_candidate.position_to_args_kwargs[index]
@@ -608,6 +707,9 @@ class InputObserverInfo:
         index = 0
 
         def change_function(t):
+            # [FUNCTION DOC] HELPER: Replaces the next tensor, in flattening order,
+            # by its inferred dynamic shape mapping. Advances a counter; raises
+            # RuntimeError if more tensors are visited than shapes.
             nonlocal index
             if index >= len(flat_dynamic_shapes):
                 raise RuntimeError(
@@ -660,6 +762,19 @@ class InputObserverInfo:
         | dict[str, torch.Tensor]
         | tuple[list[torch.Tensor] | tuple[torch.Tensor, ...], dict[str, torch.Tensor]]
     ):
+        # [FUNCTION DOC] Builds concrete arguments from the recordings. Args:
+        # index_or_candidate (none picks a recorded call with the same argument counts
+        # as the best candidate; an int picks a recorded call by index; or a candidate),
+        # flat (return the flat list of leaves), as_args_kwargs (always return a pair of
+        # args and kwargs). Leaves that are none are replaced by tensors taken from
+        # another call: empty if the dimension is dynamic (zero length along the largest
+        # dynamic dim), or zeros of the same shape. Constant keywords are added to
+        # kwargs. Returns args, kwargs or a mapping when only one kind exists, or a
+        # pair. Raises RuntimeError if a leaf is never observed, if the candidate is not
+        # aligned, or if args cannot be merged into one mapping because of a var-
+        # positional parameter. Raises an error via a check on a bad index.
+        # KNOWN ISSUE: if no recorded call matches the argument counts, no candidate is
+        # found and an AssertionError is raised.
         """Infers arguments based on the collected tensors.
 
         Args:
@@ -796,6 +911,11 @@ class InputObserverInfo:
         return tuple(args), kwargs
 
     def _post_process_for_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        # [FUNCTION DOC] HELPER: When the method has a var-keyword parameter, moves
+        # entries whose names are not in the signature into a nested mapping under the
+        # var-keyword parameter name, as torch.export requires. Returns the mapping
+        # unchanged otherwise. Raises ValueError if a key equals the var-keyword
+        # parameter name.
         """:func:`torch.export.export` requires dynamic shapes and keyword arguments
         that are not part of the explicit function signature but are collected via
         ``**<kwargs_name>`` to be wrapped under the corresponding parameter name
@@ -821,6 +941,13 @@ class InputObserverInfo:
 
 
 class InputObserver:
+    # [CLASS DOC] Public tool. Used as a context manager call on a model, it swaps a method
+    # (forward by default) for a wrapper that records inputs and outputs of the first few
+    # calls, then restores the original on exit. State: info (InputObserverInfo, created at
+    # first use and retained across uses) and value_if_missing. Methods:
+    # infer_dynamic_shapes, infer_arguments, check_discrepancies, num_obs.
+    # KNOWN ISSUE: the docstring examples write a dotted name where a keyword argument named
+    # dynamic_shapes is meant.
     """Steals forward method to collect inputs and outputs.
     This information is used to infer dynamic shapes and
     export arguments.
@@ -909,6 +1036,9 @@ class InputObserver:
     """
 
     def __init__(self, value_if_missing: dict[str | int, Any] | None = None):
+        # [FUNCTION DOC] Creates an observer with no recordings. value_if_missing maps a
+        # name or position to a value used when that argument is absent in a call (only
+        # for inferring shapes and arguments).
         self.info: InputObserverInfo | None = None
         self.value_if_missing = value_if_missing or {}
 
@@ -919,6 +1049,11 @@ class InputObserver:
         _store_n_calls: int = 3,
         **kwargs,
     ):
+        # [FUNCTION DOC] HELPER: The wrapper installed in place of the observed method.
+        # Records the inputs if fewer than the allowed number of calls were stored,
+        # calls the original method, times it, records outputs and latency, and returns
+        # the original result unchanged. Raises AssertionError if the captured method or
+        # info is missing.
         if _captured_method is None:
             raise AssertionError("_captured_forward cannot be None")
         if self.info is None:
@@ -934,6 +1069,8 @@ class InputObserver:
         return res
 
     def num_obs(self) -> int:
+        # [FUNCTION DOC] Returns the number of recorded input sets (zero if nothing was
+        # recorded).
         """Returns the number of stored set of inputs."""
         return 0 if not self.info else len(self.info)
 
@@ -944,6 +1081,16 @@ class InputObserver:
         store_n_calls: int = 3,
         method_name: str = "forward",
     ):
+        # [FUNCTION DOC] Context manager. Replaces the named method of the model by a
+        # recording wrapper that keeps the original signature, yields this observer, and
+        # restores the original method on exit (also on error). Args: model,
+        # store_n_calls (how many further calls to record), method_name. On first use
+        # creates the info object from the signature (names, scalar defaults, var-
+        # positional and var-keyword parameters). Raises ValueError if the model lacks
+        # the method. Side effect: sets an attribute on the model object.
+        # KNOWN ISSUE: on exit the original bound method is set as an instance attribute
+        # rather than the attribute being removed, so the method stays shadowed on the
+        # instance.
         """Starts collecting inputs and outputs of a specific method.
         The model method is replaced by a new one collecting tensors
         before and after the inner one is called.
@@ -1005,12 +1152,17 @@ class InputObserver:
             setattr(model, method_name, captured_method)
 
     def _check_captured(self):
+        # [FUNCTION DOC] HELPER: Raises RuntimeError if nothing was recorded yet.
         if self.info is None:
             raise RuntimeError("No inputs were captured.")
 
     def infer_dynamic_shapes(
         self, set_batch_dimension_for: set[int | str] | bool | None = None
     ) -> tuple[dict[int, Any] | None, ...] | dict[str, dict[int, Any] | None]:
+        # [FUNCTION DOC] Public wrapper that infers dynamic shapes from the recorded
+        # inputs. Args: set_batch_dimension_for (bool or names/positions whose first
+        # dimension is dynamic). Returns the nested specification from the info object.
+        # Raises RuntimeError if nothing was recorded.
         """
         Infers dynamic shapes. Most of the time, models do support a batch dimension
         but this batch dimension has the same value for every input sample.
@@ -1043,6 +1195,13 @@ class InputObserver:
         | dict[str, torch.Tensor]
         | tuple[list[torch.Tensor] | tuple[torch.Tensor, ...], dict[str, torch.Tensor]]
     ):
+        # [FUNCTION DOC] Public wrapper that builds export arguments. Args:
+        # index_or_args_or_kwargs (none, an int index of a recording, or a tuple of args
+        # or a mapping of kwargs to complete with none placeholders), flat,
+        # as_args_kwargs (see the info object). A user tuple or mapping is wrapped in an
+        # uncloned candidate and aligned to the best candidate. Returns the inferred
+        # arguments. Raises RuntimeError if nothing was recorded, ValueError for another
+        # input type.
         """Infers arguments based on the collected tensors.
 
         Args:
@@ -1122,6 +1281,18 @@ class InputObserver:
         ] = _onnx_program._ort_session_initializer,
         skip_none: bool = True,
     ) -> list[dict[str, str | int | float | bool]]:
+        # [FUNCTION DOC] Runs every recorded input through the exported ONNX program and
+        # compares the result with the recorded torch outputs. Args: onnx_program, atol,
+        # rtol, progress_bar, initializer (builds the runtime session), skip_none
+        # (ignore outputs that are none). Returns one mapping per recording with
+        # SUCCESS, max absolute and relative error or an error text, plus index, torch
+        # and runtime durations and counts of inputs, none and empty inputs. Exceptions
+        # in the run are captured as an error entry; a leaf-count mismatch raises
+        # RuntimeError. Side effects: creates an inference session on the program and
+        # releases it at the end.
+        # KNOWN ISSUE: the relative error divides by the absolute value plus rtol, not
+        # plus a small epsilon, and is compared against rtol; abs and rel keep running
+        # maxima across outputs.
         """Computes the discrepancies between the saved inputs and outputs
         with the saved onnx model.
 

@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Derives ONNX operator signatures from the type annotations of Python (onnxscript
+# or traced) functions. Contains mappings from Python types to ONNX attribute types, the set of
+# all ONNX value types, helpers that classify annotations (optional, attribute, type variable,
+# sequence) and compute allowed ONNX types, and op_signature_from_function, the entry point.
+# Import-time side effects: builds the constant tables from the lazily imported ONNX IR and
+# creates a logger.
 """Helpers for constructing ONNX operator signatures from Python functions."""
 
 from __future__ import annotations
@@ -61,6 +67,10 @@ TypeAnnotationValue = Any
 
 
 def _is_optional(type_: type) -> bool:
+    # [FUNCTION DOC] HELPER: Returns true if the annotation is an optional type: a union
+    # that includes the none type, in either the old or the new union syntax.
+    # KNOWN ISSUE: a check against Optional itself can never be true because the origin of
+    # an optional annotation is Union; it is harmless dead code.
     """Returns whether a type_ is an Optional."""
     origin_type = typing.get_origin(type_)
     if origin_type is Union and type(None) in typing.get_args(type_):
@@ -80,6 +90,11 @@ def _is_optional(type_: type) -> bool:
 
 
 def _get_attr_type(type_: type) -> ir.AttributeType:
+    # [FUNCTION DOC] HELPER: Maps a Python annotation to an ONNX attribute type: a known
+    # scalar, tensor or graph type gives the single-value type; a list, tuple or sequence of
+    # such a type gives the repeated type. Anything else (including a TypeError while
+    # checking, which is logged) gives UNDEFINED, meaning the parameter is an input rather
+    # than an attribute.
     """Obtain the type of the attribute from a Python class."""
     try:
         if type_ in _PY_TYPE_TO_ATTR_TYPE:
@@ -104,6 +119,10 @@ def _get_attr_type(type_: type) -> ir.AttributeType:
 
 
 def _get_type_constraint_name(type_: TypeAnnotationValue) -> str | None:
+    # [FUNCTION DOC] HELPER: Returns the name for the type constraint of an annotation: the
+    # TypeVar name, the name of the first non-none member of an optional, or the name of a
+    # sequence's element TypeVar prefixed with Sequence_. Returns none when no name can be
+    # derived.
     """Returns the name of the type constraint for a given type annotation.
 
     Args:
@@ -133,6 +152,14 @@ def _get_type_constraint_name(type_: TypeAnnotationValue) -> str | None:
 def _get_allowed_types_from_type_annotation(
     type_: TypeAnnotationValue,
 ) -> set[ir.TypeProtocol]:
+    # [FUNCTION DOC] HELPER: Computes the set of ONNX value types an annotation allows. The
+    # generic tensor type allows every tensor type; a TypeVar uses its constraints, else its
+    # bound, else everything; a type with a dtype gives that tensor type; an optional gives
+    # the types of its members; a union merges member types; a sequence gives sequence types
+    # of the element types; anything else allows all value types. Raises AssertionError for
+    # a union containing none.
+    # KNOWN ISSUE: the shared constant set of all types is returned directly in some cases,
+    # so a caller that mutates the result would corrupt it.
     """Obtain the allowed types from a type annotation."""
     if type_ is onnxscript.onnx_types.TensorType:
         # Any tensor type
@@ -198,6 +225,18 @@ def op_signature_from_function(
     *,
     since_version: int = 1,
 ) -> ir.schemas.OpSignature:
+    # [FUNCTION DOC] Builds an ONNX OpSignature for func from its signature and type hints.
+    # Args: func, domain, name (defaults to the function name), overload, since_version.
+    # Annotated parameters whose type maps to an attribute type become attribute parameters
+    # (with default when present); other parameters become inputs sharing a type constraint
+    # by TypeVar name, else one constraint per parameter name; unannotated parameters are
+    # inputs allowing any value. Return annotations (a tuple means several outputs) become
+    # outputs reusing an input's type constraint when it has the same TypeVar, else a new
+    # constraint named for the output index. Returns the signature. Errors from type-hint
+    # resolution propagate.
+    # KNOWN ISSUE: an explicit return annotation of none resolves to the none type, not the
+    # absence of a type, so it produces one output with an unconstrained type. Variadic
+    # inputs are not supported (marked as a TODO) and are treated as non-variadic.
     """Produce an OpSignature from a function using type annotation."""
 
     py_signature = inspect.signature(func)

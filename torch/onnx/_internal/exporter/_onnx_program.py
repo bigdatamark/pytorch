@@ -1,5 +1,12 @@
 # mypy: allow-untyped-defs
 # mypy: disable-error-code="attr-defined,name-defined"
+# [MODULE DOC] Defines ONNXProgram, the public result of torch.onnx.export: an ONNX IR model
+# plus the ExportedProgram it came from, callable with torch tensors through ONNX Runtime or the
+# reference evaluator, and savable to disk. Also holds helpers converting between torch tensors,
+# NumPy arrays and ONNX Runtime values (including bfloat16 and 8-bit float types), flattening
+# call arguments, and handling large models. Defines a size threshold of 1.5GB for switching to
+# external data, a set of float8 dtypes unsupported by NumPy, and a logger. No heavy imports at
+# import time (onnxruntime and others are imported lazily).
 from __future__ import annotations
 
 
@@ -43,6 +50,10 @@ logger = logging.getLogger(__name__)
 
 
 def _ort_session_initializer(model: str | bytes) -> ort.InferenceSession:
+    # [FUNCTION DOC] HELPER: Default session factory. Creates an ONNX Runtime session from a
+    # model (serialized bytes or a file path), with error-level logging, preferring the CUDA
+    # provider over the CPU provider when available. Raises ImportError if onnxruntime is
+    # missing.
     """Initialize an ONNX Runtime inference session with the specified model."""
     import onnxruntime as ort
 
@@ -62,6 +73,8 @@ def _ort_session_initializer(model: str | bytes) -> ort.InferenceSession:
 
 
 def _count_initializer_size(graph: ir.Graph) -> int:
+    # [FUNCTION DOC] HELPER: Returns the total size in bytes of all initializers that have a
+    # constant value.
     """Count the total size of the initializers in bytes."""
     return sum(
         v.const_value.nbytes
@@ -75,6 +88,9 @@ def _set_graph_outputs(
     graph: ir.Graph,
     outputs: list[ir.Value],
 ):
+    # [FUNCTION DOC] HELPER: Context manager that temporarily replaces the outputs of a
+    # graph by the given values and restores the original outputs on exit, even on error.
+    # Mutates the graph.
     """Temporarily set the outputs of the graph.
 
     Args:
@@ -92,6 +108,9 @@ def _set_graph_outputs(
 
 
 def _create_value_mapping(graph: ir.Graph) -> dict[str, ir.Value]:
+    # [FUNCTION DOC] HELPER: Builds a mapping from name to value for initializers, graph
+    # inputs and node outputs of the top-level graph (not subgraphs), skipping unnamed
+    # values. Later entries override earlier ones with the same name.
     """Return a dictionary mapping names to values in the graph.
 
     The mapping does not include values from subgraphs.
@@ -118,6 +137,8 @@ def _create_value_mapping(graph: ir.Graph) -> dict[str, ir.Value]:
 
 
 def _to_numpy_array(input: torch.Tensor | int | float | str | bool) -> np.ndarray:
+    # [FUNCTION DOC] HELPER: Converts a Python scalar or a torch tensor to a NumPy array,
+    # using the exporter tensor wrapper for tensors so special dtypes are handled.
     if isinstance(input, (int, float, str, bool)):
         return ir.tensor(input).numpy()
 
@@ -127,6 +148,9 @@ def _to_numpy_array(input: torch.Tensor | int | float | str | bool) -> np.ndarra
 
 
 def _from_numpy_array(array: np.ndarray) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Converts a NumPy array to a torch tensor. Arrays of bfloat16 or
+    # float8 types from the ml_dtypes package are reinterpreted bit-wise into the matching
+    # torch dtypes; others use the standard conversion.
     """Convert a NumPy array to a PyTorch tensor."""
     import ml_dtypes  # type: ignore[import-not-found]
     import numpy as np
@@ -145,6 +169,11 @@ def _from_numpy_array(array: np.ndarray) -> torch.Tensor:
 
 
 def _to_ort_value(input: torch.Tensor | int | float | str | bool) -> ort.OrtValue:
+    # [FUNCTION DOC] HELPER: Converts a Python scalar or torch tensor to an ONNX Runtime
+    # value. Integers become 64-bit and floats 32-bit arrays. Bfloat16 and float8 tensors
+    # are viewed as unsigned integers and passed with an explicit ONNX element type. Raises
+    # RuntimeError if that is unsupported by the installed onnxruntime. Other tensors go
+    # through NumPy.
     """Convert a PyTorch tensor to an ONNX Runtime OrtValue."""
     import numpy as np
     import onnxruntime as ort
@@ -183,6 +212,8 @@ def _to_ort_value(input: torch.Tensor | int | float | str | bool) -> ort.OrtValu
 
 
 def _from_ort_value(value: ort.OrtValue) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Converts an ONNX Runtime value to a torch tensor. Bfloat16 and
+    # float8 values use DLPack; failure raises RuntimeError. Other types go through NumPy.
     if value.element_type() in (
         ir.DataType.BFLOAT16,
         ir.DataType.FLOAT8E4M3FN,
@@ -202,6 +233,12 @@ def _from_ort_value(value: ort.OrtValue) -> torch.Tensor:
 
 
 class ONNXProgram:
+    # [CLASS DOC] Public result of exporting a model to ONNX; callable with the same inputs
+    # as the original model. State: model (ONNX IR model, mutable), exported_program
+    # (source, may be none), a lazily created ONNX Runtime session, a temporary directory
+    # used for large models, and the capture strategy name. Key methods: __call__,
+    # call_reference, compute_values, save, optimize, apply_weights, rename_axes,
+    # initialize_inference_session, release, and the model_proto property.
     """A class to represent an ONNX program that is callable with torch tensors.
 
     Attributes:
@@ -212,6 +249,8 @@ class ONNXProgram:
     def __init__(
         self, model: ir.Model, exported_program: torch.export.ExportedProgram | None
     ) -> None:
+        # [FUNCTION DOC] Stores the model and optional exported program; no session is
+        # created yet, no temporary directory and no capture strategy.
         """Initialize the ONNX program with the specified model and exported program.
         Args:
             model: The ONNX model.
@@ -225,6 +264,8 @@ class ONNXProgram:
         self._capture_strategy: str | None = None
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns a multi-line text showing the model and the exported
+        # program, each indented.
         return f"""\
 ONNXProgram(
     model=
@@ -236,6 +277,13 @@ ONNXProgram(
 """
 
     def __call__(self, *args, **kwargs) -> Sequence[torch.Tensor]:
+        # [FUNCTION DOC] Runs the model with ONNX Runtime. Args and kwargs are
+        # flattened, none values dropped and complex tensors converted to real form,
+        # then matched in order to the graph inputs. Creates the session on first use.
+        # Returns: tuple of output tensors. Raises ImportError if onnxruntime is
+        # missing.
+        # KNOWN ISSUE: inputs are paired with graph inputs by position and extra or
+        # missing values are silently ignored by the pairing.
         """Run the ONNX model with the same arguments you would provide to the GraphModule."""
         import onnxruntime as ort
 
@@ -261,6 +309,10 @@ ONNXProgram(
         return tuple(_from_ort_value(output) for output in outputs)
 
     def call_reference(self, *args, **kwargs) -> Sequence[torch.Tensor]:
+        # [FUNCTION DOC] Runs the model with the ONNX reference evaluator on NumPy
+        # arrays, using the same input preparation as the call operator. Returns: tuple
+        # of output tensors. Raises AssertionError if the evaluator does not return a
+        # sequence.
         """Run the ONNX model using the reference backend."""
         import onnx.reference
 
@@ -279,6 +331,14 @@ ONNXProgram(
     def compute_values(
         self, value_names: Sequence[str], args=(), kwargs=None
     ) -> Sequence[torch.Tensor]:
+        # [FUNCTION DOC] Computes intermediate values by name. Temporarily makes the
+        # named values the graph outputs, runs the model on args and kwargs, and
+        # restores outputs. Releases any existing session before and after, so the next
+        # call creates a new session. Args: value_names, args, kwargs. Returns: tuple of
+        # tensors in the order of value_names. Raises ValueError if a name is not found
+        # in the top-level graph.
+        # KNOWN ISSUE: the docstring says it returns a dictionary and omits args and
+        # kwargs; the code returns a tuple.
         """Compute the values of the specified names in the ONNX model.
 
         This method is used to compute the values of the specified names in the ONNX model.
@@ -310,10 +370,15 @@ ONNXProgram(
 
     @property
     def model_proto(self) -> onnx.ModelProto:
+        # [FUNCTION DOC] Property. Serializes the current IR model into a new ONNX
+        # ModelProto each time.
         """Return the ONNX ``ModelProto`` object."""
         return ir.serde.serialize_model(self.model)
 
     def optimize(self) -> None:
+        # [FUNCTION DOC] Replaces the model by an optimized version (constant folding,
+        # redundancy removal) from onnxscript. Does not reset an existing inference
+        # session.
         """Optimize the ONNX model.
 
         This method optimizes the ONNX model by performing constant folding and
@@ -329,6 +394,14 @@ ONNXProgram(
         keep_initializers_as_inputs: bool = False,
         external_data: bool | None = None,
     ) -> None:
+        # [FUNCTION DOC] Writes the model to destination. Optional flags control whether
+        # initializers are included and whether they also stay as graph inputs.
+        # Temporarily mutates the graph and restores it afterwards, even on error. Uses
+        # external data files when requested or when the initializers exceed 1.5GB;
+        # otherwise saves as one file. Args: destination, include_initializers,
+        # keep_initializers_as_inputs, external_data. Side effects: file I/O.
+        # KNOWN ISSUE: the docstring says it raises TypeError for a non-path destination
+        # with external data; the function does not check this itself.
         """Save the ONNX model to the specified destination.
 
         When ``external_data`` is ``True`` or the model is larger than 2GB,
@@ -389,6 +462,9 @@ ONNXProgram(
                 self.model.graph.inputs.extend(original_inputs)
 
     def apply_weights(self, state_dict: dict[str, torch.Tensor]) -> None:
+        # [FUNCTION DOC] Replaces initializer values with tensors from state_dict,
+        # matched by name. Names not in the model are skipped with an exporter warning.
+        # Mutates the model.
         """Apply the weights from the specified state dict to the ONNX model.
 
         Use this method to replace FakeTensors or other weights.
@@ -416,6 +492,11 @@ ONNXProgram(
             [str | bytes], ort.InferenceSession
         ] = _ort_session_initializer,
     ) -> None:
+        # [FUNCTION DOC] Creates the ONNX Runtime session via initializer and stores it.
+        # Models with initializers over 1.5GB are saved to a temporary directory with
+        # external data and the file path is passed; otherwise the serialized bytes are
+        # passed. Replaces any previous session. Side effects: may create a temporary
+        # directory, kept until release.
         """Initialize the ONNX Runtime inference session.
 
         Args:
@@ -441,6 +522,8 @@ ONNXProgram(
         logger.debug("Inference session initialized.")
 
     def release(self) -> None:
+        # [FUNCTION DOC] Drops the inference session, runs garbage collection and
+        # deletes the temporary directory, if any. Safe to call repeatedly.
         """Release the inference session.
 
         You may call this method to release the resources used by the inference session.
@@ -454,6 +537,9 @@ ONNXProgram(
             self._tempdir = None
 
     def rename_axes(self, rename_mapping: dict[str | ir.SymbolicDim, str]) -> None:
+        # [FUNCTION DOC] Renames symbolic dimensions in the model using a mapping from
+        # names or symbolic dimensions to new names. Mutates the model; errors come from
+        # the rename pass.
         """Rename axes in a model according to the specified rename mapping.
 
         Example::
@@ -482,6 +568,9 @@ ONNXProgram(
         self,
         dynamic_shapes: dict[str, Any] | tuple[Any, ...] | list[Any],
     ) -> None:
+        # [FUNCTION DOC] HELPER: Builds a rename mapping from dynamic_shapes and the
+        # graph inputs and applies it to the model, so custom axis names from the user
+        # are used.
         """Rename dynamic axes in a model according to the specified dynamic_axes names."""
         rename_mapping = _dynamic_shapes.create_rename_mapping(
             self.model.graph.inputs, dynamic_shapes
@@ -490,6 +579,9 @@ ONNXProgram(
 
 
 def _process_args(args, kwargs) -> tuple[torch.Tensor, ...]:
+    # [FUNCTION DOC] HELPER: Prepares call arguments for the ONNX model: flattens them,
+    # removes none values, and converts complex tensors to real form. Returns a tuple of
+    # values.
     """Process input arguments for the ONNX model."""
     args = _flatten_inputs(args, kwargs)
     args = _remove_none_from_inputs(args)
@@ -498,15 +590,21 @@ def _process_args(args, kwargs) -> tuple[torch.Tensor, ...]:
 
 
 def _flatten_inputs(model_args, model_kwargs):
+    # [FUNCTION DOC] HELPER: Flattens positional and keyword arguments with a pytree and
+    # returns the list of leaves.
     flattened_args, _ = _pytree.tree_flatten((model_args, model_kwargs))
     return flattened_args
 
 
 def _remove_none_from_inputs(model_args):
+    # [FUNCTION DOC] HELPER: Returns a tuple of the arguments without the none entries.
     return tuple(arg for arg in model_args if arg is not None)
 
 
 def _convert_complex_to_real_representation(model_args):
+    # [FUNCTION DOC] HELPER: Returns a tuple where each complex tensor is replaced by its
+    # real view with a trailing dimension of size two (conjugates resolved first); others
+    # pass unchanged.
     """Convert complex dtype tensors to real representation tensors.
 
     ONNX does not support complex dtype tensors. Thus, we convert complex dtype tensors
