@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Data classes for the constraint language used by the gradual type migration
+# (type inference over FX graphs). Defines the Constraint hierarchy (logical
+# Conj/Disj, constants T/F, binary constraints over tensors or dimensions, and
+# operator-specific constraints such as greatest upper bound, reshape, index select,
+# transpose, get item, conv, max pool, broadcasting and product), the variable
+# classes TVar, DVar and BVar, the _Operand type alias, and the predicates
+# is_algebraic_expression, is_bool_expr and is_dim. Every class provides structural
+# equality and a readable repr. No import-time side effects.
+# KNOWN ISSUE: classes define equality without a hash method, so instances are
+# unhashable.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, TypeAlias
@@ -50,96 +61,123 @@ from torch.fx.tensor_type import _DynType, Dyn, TensorType
 
 
 class Constraint:
+    # [CLASS DOC] Common base class of all constraint objects; carries no state.
     pass
 
 
 class Conj(Constraint):
+    # [CLASS DOC] Logical conjunction of constraints; holds the list of conjuncts.
+    # KNOWN ISSUE: the attribute is spelled conjucts (typo) and used consistently.
     def __init__(self, conjuncts: Sequence[Constraint]) -> None:
+        # [FUNCTION DOC] Copies the given sequence of constraints into a list.
         """
         :param conjuncts: Conjunction of constraints
         """
         self.conjucts = list(conjuncts)
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is a Conj with an equal list of conjuncts.
         if isinstance(other, Conj):
             return self.conjucts == other.conjucts
         else:
             return False
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form: And followed by the list of conjuncts.
         return f"And({self.conjucts})"
 
 
 class Disj(Constraint):
+    # [CLASS DOC] Logical disjunction of constraints; holds the list of disjuncts.
     def __init__(self, disjuncts: Sequence[Constraint]) -> None:
+        # [FUNCTION DOC] Copies the given sequence of constraints into a list.
         """
         :param disjuncts: Disjunction of constraints
         """
         self.disjuncts = list(disjuncts)
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is a Disj with an equal list of disjuncts.
         if isinstance(other, Disj):
             return self.disjuncts == other.disjuncts
         else:
             return False
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form: Or followed by the list of disjuncts.
         return f"Or({self.disjuncts})"
 
 
 class Prod(Constraint):
+    # [CLASS DOC] Algebraic expression: the product of a list of dimensions
+    # (dimension variables, integers or the dynamic type).
     def __init__(self, products: Sequence[DVar | int | _DynType]) -> None:
+        # [FUNCTION DOC] Copies the given dimensions into a list of factors.
         """
         :param products: lists of dimensions to multiply
         """
         self.products = list(products)
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is a Prod with an equal list of factors.
         if isinstance(other, Prod):
             return self.products == other.products
         else:
             return False
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form: Product followed by the list of factors.
         return f"Product({self.products})"
 
 
 class T(Constraint):
+    # [CLASS DOC] The constant true constraint; stateless, all instances are equal.
     """
     True
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] No-op initializer.
         pass
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal to any instance of T.
         return isinstance(other, T)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form: True.
         return "True"
 
 
 class F(Constraint):
+    # [CLASS DOC] The constant false constraint; stateless, all instances are equal.
     """
     False
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] No-op initializer.
         pass
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal to any instance of F.
         return isinstance(other, F)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form: False.
         return "False"
 
 
 class BinaryConstraint(Constraint):
+    # [CLASS DOC] Generic binary constraint holding a left operand, a right operand
+    # and an operation name (one of the operation module constants). Base class of
+    # BinConstraintT and BinConstraintD.
     """
     Represents all binary operations
     """
 
     def __init__(self, lhs: _Operand, rhs: _Operand, op: str | None) -> None:
+        # [FUNCTION DOC] Stores lhs, rhs and op without validation.
         """
         :param lhs: lhs of the constraint
         :param rhs: rhs of the constraint
@@ -150,6 +188,8 @@ class BinaryConstraint(Constraint):
         self.op = op
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is any BinaryConstraint (subclass included)
+        # with equal lhs, rhs and op; the exact subclass is not compared.
         if isinstance(other, BinaryConstraint):
             return (
                 self.lhs == other.lhs and self.rhs == other.rhs and self.op == other.op
@@ -158,15 +198,20 @@ class BinaryConstraint(Constraint):
             return False
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form: parenthesized lhs, op, rhs.
         return f"({self.lhs} {self.op} {self.rhs})"
 
 
 class BinConstraintT(BinaryConstraint):
+    # [CLASS DOC] Binary constraint whose operands are tensor-level: tensor
+    # variables, tensor types, integers or the dynamic type.
     """
     Binary constraints about tensors
     """
 
     def __init__(self, lhs: _Operand, rhs: _Operand, op: str | None) -> None:
+        # [FUNCTION DOC] Validates that both operands are TVar, TensorType, int or
+        # Dyn, raising AssertionError otherwise, then stores them via the base class.
         if not (
             (isinstance(lhs, (TVar, TensorType, int)) or lhs == Dyn)
             and (isinstance(rhs, (TVar, TensorType, int)) or rhs == Dyn)
@@ -176,11 +221,16 @@ class BinConstraintT(BinaryConstraint):
 
 
 class BinConstraintD(BinaryConstraint):
+    # [CLASS DOC] Binary constraint whose operands are dimension-level: algebraic
+    # expressions, dimensions or boolean expressions.
     """
     Binary constraints about dimensions
     """
 
     def __init__(self, lhs: _Operand, rhs: _Operand, op: str | None) -> None:
+        # [FUNCTION DOC] Validates each operand is an algebraic expression, a
+        # dimension or a boolean expression, raising AssertionError otherwise, then
+        # stores them via the base class.
         if not (is_algebraic_expression(lhs) or is_dim(lhs) or is_bool_expr(lhs)):
             raise AssertionError(f"Invalid lhs type: {type(lhs)}")
         if not (is_algebraic_expression(rhs) or is_dim(rhs) or is_bool_expr(rhs)):
@@ -190,11 +240,14 @@ class BinConstraintD(BinaryConstraint):
 
 
 class TGreatestUpperBound(Constraint):
+    # [CLASS DOC] Constraint that res is the greatest upper bound (with respect to
+    # the dynamic type) of two tensor operands; stores res, rhs1 and rhs2.
     """
     Greatest Upper bound for tensors with dynamic type
     """
 
     def __init__(self, res: TVar, rhs1: TVar, rhs2: TVar) -> None:
+        # [FUNCTION DOC] Stores the result variable and both operands unvalidated.
         """
         :param res: tensor variable that stores the result of the output
         :param rhs1: tensor or tensor variable
@@ -205,9 +258,11 @@ class TGreatestUpperBound(Constraint):
         self.rhs2 = rhs2
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form: res equals rhs1 joined (starred join symbol) with rhs2.
         return f"{self.res} = {self.rhs1}\u2294*{self.rhs2}"
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is a TGreatestUpperBound with equal fields.
         if isinstance(other, TGreatestUpperBound):
             return (
                 self.res == other.res
@@ -219,6 +274,8 @@ class TGreatestUpperBound(Constraint):
 
 
 class DGreatestUpperBound(Constraint):
+    # [CLASS DOC] Constraint that res is the greatest upper bound of two dimensions;
+    # stores res, rhs1 and rhs2, all of which must be dimensions.
     """
     Greatest Upper bound for dimensions
     """
@@ -229,6 +286,8 @@ class DGreatestUpperBound(Constraint):
         rhs1: DVar | int | _DynType,
         rhs2: DVar | int | _DynType,
     ) -> None:
+        # [FUNCTION DOC] Raises AssertionError unless res, rhs1 and rhs2 are each a
+        # dimension variable, integer or the dynamic type; then stores them.
         """
         :param res: Dimension variable to store the result
         :param rhs1: dimension variable 1
@@ -246,9 +305,11 @@ class DGreatestUpperBound(Constraint):
         self.rhs2 = rhs2
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form: res equals rhs1 joined (join symbol) with rhs2.
         return f"{self.res} = {self.rhs1}\u2294{self.rhs2}"
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is a DGreatestUpperBound with equal fields.
         if isinstance(other, DGreatestUpperBound):
             return (
                 self.res == other.res
@@ -260,11 +321,14 @@ class DGreatestUpperBound(Constraint):
 
 
 class CanReshape(Constraint):
+    # [CLASS DOC] Constraint that a tensor variable src can be reshaped to the
+    # concrete tensor type target; stores both.
     """
     can_reshape constraint
     """
 
     def __init__(self, src: TVar, target: TensorType) -> None:
+        # [FUNCTION DOC] Stores src and target without validation.
         """
         :param src: tensor variable
         :param target: tensor
@@ -273,9 +337,11 @@ class CanReshape(Constraint):
         self.target = target
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form: can-reshape applied to src and target.
         return f"can-reshape({self.src}, {self.target})"
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is a CanReshape with equal src and target.
         if isinstance(other, CanReshape):
             return self.src == other.src and self.target == other.target
         else:
@@ -283,6 +349,9 @@ class CanReshape(Constraint):
 
 
 class IndexSelect(Constraint):
+    # [CLASS DOC] Constraint describing index_select on a tensor of known rank
+    # tensor_size: output is input_var with the dimension at index replaced by
+    # dim_replace. Stores input_var, tensor_size, dim_replace, index and output.
     def __init__(
         self,
         tensor_size: int,
@@ -291,6 +360,8 @@ class IndexSelect(Constraint):
         index: int,
         output: TVar,
     ) -> None:
+        # [FUNCTION DOC] Raises AssertionError unless input_var and output are TVar,
+        # dim_replace is a DVar or Dyn, and index is an int; then stores all fields.
         """
         Args:
             input_var: input to index_select
@@ -315,6 +386,7 @@ class IndexSelect(Constraint):
         self.output = output
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form: output equals IndexSelect with input, size, dim, index.
         return (
             f" {self.output} = "
             f"IndexSelect({self.input_var}, "
@@ -324,6 +396,7 @@ class IndexSelect(Constraint):
         )
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is an IndexSelect with all five fields equal.
         if isinstance(other, IndexSelect):
             return (
                 self.tensor_size == other.tensor_size
@@ -337,9 +410,13 @@ class IndexSelect(Constraint):
 
 
 class Transpose(Constraint):
+    # [CLASS DOC] Constraint that output is input_var (of rank tensor_size) with the
+    # dimensions at index1 and index2 swapped. Stores all five fields.
     def __init__(
         self, tensor_size: int, input_var: TVar, index1: int, index2: int, output: TVar
     ) -> None:
+        # [FUNCTION DOC] Raises AssertionError unless input_var and output are TVar
+        # and index1 and index2 are ints; then stores all fields.
         """
         Args:
             tensor_size: current tensor size
@@ -364,6 +441,7 @@ class Transpose(Constraint):
         self.output = output
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form: output equals Transpose with input, size, indices.
         return (
             f" {self.output} = "
             f"Transpose({self.input_var}, "
@@ -373,6 +451,7 @@ class Transpose(Constraint):
         )
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is a Transpose with all five fields equal.
         if isinstance(other, Transpose):
             return (
                 self.tensor_size == other.tensor_size
@@ -386,9 +465,13 @@ class Transpose(Constraint):
 
 
 class GetItem(Constraint):
+    # [CLASS DOC] Constraint that dimension variable res is the dimension at integer
+    # position index of input_var, a tensor of rank tensor_size.
     def __init__(
         self, tensor_size: int, index: int, res: DVar, input_var: TVar
     ) -> None:
+        # [FUNCTION DOC] Raises AssertionError unless res is a DVar; stores all fields
+        # (other arguments are not validated).
         """
         Constraint for getting item given a tensor size
         :param tensor_size: actual number
@@ -405,9 +488,11 @@ class GetItem(Constraint):
         self.input_var = input_var
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form: res equals GetItem with input, size and index.
         return f" {self.res} = GetItem({self.input_var}, tensor_size: {self.tensor_size}, {self.index})"
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is a GetItem with all four fields equal.
         if isinstance(other, GetItem):
             return (
                 self.res == other.res
@@ -420,6 +505,8 @@ class GetItem(Constraint):
 
 
 class GetItemTensor(Constraint):
+    # [CLASS DOC] Constraint for indexing a tensor (rank tensor_size) with a tuple of
+    # None / slice entries, producing tensor variable res. Stores all four fields.
     def __init__(
         self,
         tensor_size: int,
@@ -427,6 +514,8 @@ class GetItemTensor(Constraint):
         res: TVar,
         input_var: TVar,
     ) -> None:
+        # [FUNCTION DOC] Raises AssertionError unless res is a TVar; stores all fields
+        # (other arguments are not validated).
         """
         Constraint for getting item given a tensor size
         However, when the argument is a tuple, we will
@@ -445,9 +534,11 @@ class GetItemTensor(Constraint):
         self.input_var = input_var
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form: res equals GetItemT with input, size and index tuple.
         return f" {self.res} = GetItemT({self.input_var}, tensor_size: {self.tensor_size}, {self.index_tuple})"
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is a GetItemTensor with all four fields equal.
         if isinstance(other, GetItemTensor):
             return (
                 self.res == other.res
@@ -460,6 +551,10 @@ class GetItemTensor(Constraint):
 
 
 class CalcConv(Constraint):
+    # [CLASS DOC] Constraint that conv_result is the output type of a 2D convolution
+    # over input_var with c_out output channels and the given kernel, padding, stride
+    # and dilation. matching_constraint holds the dimension variables used by the
+    # constraint transformation. Pure data holder.
     def __init__(
         self,
         conv_result: TVar,
@@ -471,6 +566,8 @@ class CalcConv(Constraint):
         dilation: int | tuple[int, int],
         matching_constraint_vars: list[DVar],
     ) -> None:
+        # [FUNCTION DOC] Stores all arguments without validation; the list of
+        # matching dimension variables is stored as matching_constraint.
         """
         :param conv_result: the convolution result
         :param input_var: input to convolution
@@ -487,6 +584,8 @@ class CalcConv(Constraint):
         self.matching_constraint = matching_constraint_vars
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form: result equals calc-conv of input, c_out, kernel,
+        # padding, stride and dilation (matching_constraint is omitted).
         return (
             f"{self.conv_result} ="
             f" calc-conv({self.input_var},"
@@ -496,6 +595,7 @@ class CalcConv(Constraint):
         )
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is a CalcConv with all fields equal.
         if isinstance(other, CalcConv):
             return (
                 self.conv_result == other.conv_result
@@ -512,6 +612,10 @@ class CalcConv(Constraint):
 
 
 class CalcMaxPool(Constraint):
+    # [CLASS DOC] Constraint that maxpool_result is the output type of a 2D max pool
+    # over input_var with the given kernel, padding, stride and dilation.
+    # matching_constraint holds the dimension variables used by the constraint
+    # transformation. Pure data holder.
     def __init__(
         self,
         maxpool_result: TVar,
@@ -522,6 +626,10 @@ class CalcMaxPool(Constraint):
         dilation: int | tuple[int, int],
         matching_constraint_vars: list[DVar],
     ) -> None:
+        # [FUNCTION DOC] Stores all arguments without validation; the list of
+        # matching dimension variables is stored as matching_constraint.
+        # KNOWN ISSUE: the docstring says input_var is the input to convolution
+        # (copy of the CalcConv text); it is the max pool input.
         """
         :param maxpool_result: the result of maxpool
         :param input_var: input to convolution
@@ -536,6 +644,8 @@ class CalcMaxPool(Constraint):
         self.matching_constraint = matching_constraint_vars
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form: result equals calc-maxpool of input, kernel,
+        # padding, stride and dilation (matching_constraint is omitted).
         return (
             f"{self.maxpool_result} ="
             f" calc-maxpool({self.input_var},"
@@ -545,6 +655,7 @@ class CalcMaxPool(Constraint):
         )
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is a CalcMaxPool with all fields equal.
         if isinstance(other, CalcMaxPool):
             return (
                 self.maxpool_result == other.maxpool_result
@@ -560,7 +671,10 @@ class CalcMaxPool(Constraint):
 
 
 class ApplyBroadcasting(Constraint):
+    # [CLASS DOC] Constraint that res1 and res2 are input1 and input2 after
+    # broadcasting them against each other. Stores all four tensor variables.
     def __init__(self, res1: TVar, res2: TVar, input1: TVar, input2: TVar) -> None:
+        # [FUNCTION DOC] Stores the two result and two input variables unvalidated.
         """
         :param res1: resulting tensor 1
         :param res2: resulting tensor 2
@@ -573,6 +687,7 @@ class ApplyBroadcasting(Constraint):
         self.input2 = input2
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is an ApplyBroadcasting with equal fields.
         if isinstance(other, ApplyBroadcasting):
             return (
                 self.res1 == other.res1
@@ -584,6 +699,7 @@ class ApplyBroadcasting(Constraint):
             return False
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form: both results equal apply-broadcasting of both inputs.
         return (
             f"{self.res1}, {self.res2} ="
             f" apply-broadcasting({self.input1},"
@@ -592,6 +708,9 @@ class ApplyBroadcasting(Constraint):
 
 
 class CalcProduct(Constraint):
+    # [CLASS DOC] Constraint for flatten: flattened is the tensor obtained by
+    # multiplying the dimensions of dims_to_flatten between positions start and end,
+    # with the dynamic type propagated. Stores all four fields.
     """
     Given correct dimensions, calculate the product for flatten accounting for Dyn
     """
@@ -599,6 +718,8 @@ class CalcProduct(Constraint):
     def __init__(
         self, start: int, end: int, flattened: TVar, dims_to_flatten: list[DVar]
     ) -> None:
+        # [FUNCTION DOC] Raises AssertionError unless dims_to_flatten is a list,
+        # flattened is a TVar, and start and end are ints; then stores all fields.
         """
         :param start: start index
         :param end: end index
@@ -620,6 +741,7 @@ class CalcProduct(Constraint):
         self.flattened = flattened
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is a CalcProduct with all fields equal.
         if isinstance(other, CalcProduct):
             return (
                 self.start == other.start
@@ -632,24 +754,30 @@ class CalcProduct(Constraint):
             return False
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form: flattened equals CalcProduct with start, end, dims.
         return f"{self.flattened} = CalcProduct({self.start}, {self.end}, {self.dims_to_flatten})"
 
 
 class TVar:
+    # [CLASS DOC] Tensor variable identified by an integer id; not a Constraint
+    # subclass. Two TVars are equal when their ids are equal.
     """
     Tensor variable with no tensor constructor
     """
 
     def __init__(self, tvar: int) -> None:
+        # [FUNCTION DOC] Stores the integer id of the variable.
         """
         :param tvar: tensor variable
         """
         self.tvar = tvar
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form: TV with the id.
         return f"TV({self.tvar})"
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is a TVar with the same id.
         if isinstance(other, TVar):
             return self.tvar == other.tvar
         else:
@@ -657,20 +785,26 @@ class TVar:
 
 
 class DVar:
+    # [CLASS DOC] Dimension variable identified by an integer id c; two DVars are
+    # equal when their ids are equal.
     """
     Dimension variable
     """
 
     def __init__(self, c: int) -> None:
+        # [FUNCTION DOC] Stores the id. KNOWN ISSUE: the docstring says character or
+        # number, but the annotation and all uses are integers.
         """
         :param c: character or number
         """
         self.c = c
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form: DV with the id.
         return f"DV({self.c})"
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is a DVar with the same id.
         if isinstance(other, DVar):
             return self.c == other.c
         else:
@@ -678,20 +812,26 @@ class DVar:
 
 
 class BVar:
+    # [CLASS DOC] Boolean variable identified by an integer id c; two BVars are
+    # equal when their ids are equal.
     """
     Boolean variable
     """
 
     def __init__(self, c: int) -> None:
+        # [FUNCTION DOC] Stores the id. KNOWN ISSUE: the docstring says character or
+        # number, but the annotation and all uses are integers.
         """
         :param c: character or number
         """
         self.c = c
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form: BV with the id.
         return f"BV({self.c})"
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is a BVar with the same id.
         if isinstance(other, BVar):
             return self.c == other.c
         else:
@@ -716,6 +856,8 @@ _Operand: TypeAlias = (
 
 
 def is_algebraic_expression(constraint: object) -> bool:
+    # [FUNCTION DOC] True for a dimension binary constraint whose operation is add,
+    # subtract, divide, multiply or modulo, or for a Prod; false otherwise.
     if isinstance(constraint, BinConstraintD):
         return constraint.op in [op_add, op_sub, op_div, op_mul, op_mod]
     else:
@@ -723,6 +865,8 @@ def is_algebraic_expression(constraint: object) -> bool:
 
 
 def is_bool_expr(constraint: object) -> bool:
+    # [FUNCTION DOC] True for a dimension binary constraint whose operation is
+    # greater-than, less-than, not-equal or equal, or for a BVar, Conj or Disj.
     if isinstance(constraint, BinConstraintD):
         return constraint.op in [op_gt, op_lt, op_neq, op_eq]
     else:
@@ -730,4 +874,5 @@ def is_bool_expr(constraint: object) -> bool:
 
 
 def is_dim(d: object) -> bool:
+    # [FUNCTION DOC] True if d is a DVar, an int (booleans included) or the dynamic type.
     return isinstance(d, (DVar, int)) or d == Dyn

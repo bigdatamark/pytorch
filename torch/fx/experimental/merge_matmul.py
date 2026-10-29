@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# FX graph transformation that merges several torch.matmul calls sharing the same
+# right-hand operand into one concatenated matmul followed by a split.
+# Main contents: split_result_tensors (runtime helper used inside the rewritten
+# graph), may_depend_on / are_nodes_independent (bounded dependency analysis), and
+# merge_matmul (the pass; traces a module and returns a rewritten GraphModule).
+# No import-time side effects.
 import itertools
 import operator
 
@@ -10,6 +17,13 @@ from torch.fx.passes.tools_common import legalize_graph
 def split_result_tensors(
     result: torch.Tensor, inputs: list[torch.Tensor]
 ) -> tuple[torch.Tensor, ...]:
+    # [FUNCTION DOC] Splits a merged matmul result along dim 0 into one chunk per
+    # input, with chunk sizes taken from each input's leading dimension. Returns the
+    # tuple of chunks produced by torch.split. If result is an fx Proxy (symbolic
+    # tracing), the sizes list is all zeros because real shapes are unavailable.
+    # No side effects.
+    # KNOWN ISSUE: the all-zero split sizes used during tracing are not valid for a
+    # real split; the traced call is only a placeholder node, never evaluated then.
     """
     A free function for use in the merge_matmul graph transformation below that
     splits the output from a merged matmul into the individual results for each
@@ -33,6 +47,10 @@ def split_result_tensors(
 
 
 def may_depend_on(a: Node, b: Node, search_depth: int = 6) -> bool:
+    # [FUNCTION DOC] Conservative check whether node a may transitively depend on
+    # node b. Returns true if a equals b; false if a has no input nodes; true if the
+    # search depth reaches zero (assumes dependency); otherwise true if any input of
+    # a may depend on b with depth reduced by one. Pure, no side effects.
     """
     Determine if one node depends on another in a torch.fx.Graph.
 
@@ -70,6 +88,11 @@ def may_depend_on(a: Node, b: Node, search_depth: int = 6) -> bool:
 
 
 def are_nodes_independent(nodes: list[Node]) -> bool:
+    # [FUNCTION DOC] Returns true only if no pair of the given nodes may depend on
+    # each other in either direction (using the bounded may_depend_on check);
+    # returns false as soon as one dependent pair is found. Pure.
+    # KNOWN ISSUE: the docstring says it returns true if any pair has a dependency,
+    # which is the opposite of the actual behavior.
     """
     Check if all of the given nodes are pairwise-data independent.
 
@@ -88,6 +111,14 @@ def are_nodes_independent(nodes: list[Node]) -> bool:
 
 
 def merge_matmul(in_mod: torch.nn.Module) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] Symbolically traces in_mod and, for every right-hand operand
+    # used by two or more mutually independent torch.matmul calls, concatenates the
+    # left-hand operands, performs one matmul, splits the result with
+    # split_result_tensors, and replaces and erases the original matmul nodes.
+    # get_attr operands are keyed by attribute name. The graph is re-sorted with
+    # legalize_graph after each merge, then recompiled and linted. Returns the new
+    # GraphModule; raises whatever tracing or lint raises.
+    # KNOWN ISSUE: lhs_users is populated but never used.
     """
     A graph transformation that merges matrix multiplication operations that share the same right-hand
     side operand into one large matrix multiplication.
