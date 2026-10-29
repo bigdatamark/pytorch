@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Local (single-process, simulated) implementations of c10d collectives and point-to-point ops
+# operating on LocalTensor, dispatched to by LocalTensorMode. Provides both the "regular" flavor
+# (takes a process group object, mutates preallocated outputs in place, returns a FakeWork handle)
+# and the "functional" flavor (takes a group name or group, allocates and returns new outputs).
+# Process group ranks are mapped to a layout so the same collective is replayed on every group
+# that is a translated copy of the given group. Imports are side-effect free.
 import functools
 import math
 import operator
@@ -31,10 +38,14 @@ from torch.distributed.distributed_c10d import (
 
 
 def _gcd_list(numbers: Sequence[int]) -> int:
+    # [FUNCTION DOC] HELPER: Greatest common divisor of a sequence of ints; returns 0 for an empty sequence.
     return 0 if not numbers else functools.reduce(math.gcd, numbers)
 
 
 def _indices_to_layout(indices: list[int]) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    # [FUNCTION DOC] HELPER: Infers a regular-grid layout (tuple of shapes, tuple of strides) from a sorted list of unique indices.
+    # The last stride is the gcd of consecutive differences; the start of each row is any index whose predecessor at that stride is absent;
+    # recurses on the row starts. Zero or one index gives an empty layout. Raises AssertionError if the stride cannot be determined or the indices do not form a regular grid.
     # Base case: A single index represents a point, not a dimension.
     if len(indices) <= 1:
         return (), ()
@@ -77,6 +88,8 @@ def _indices_to_layout(indices: list[int]) -> tuple[tuple[int, ...], tuple[int, 
 def _resolve_pg_or_name(
     group: ScriptObject | ProcessGroup | str | GroupName,
 ) -> ScriptObject | ProcessGroup:
+    # [FUNCTION DOC] HELPER: Accepts a live ProcessGroup, a ScriptObject group, or a group name; returns the first two unchanged and
+    # resolves a name to its process group (needed when functional collectives receive a real group instead of a name).
     """Accept any of the group reps that may reach a functional collective.
 
     Under ``compile_on_one_rank=True`` the functional collective ops receive
@@ -94,6 +107,9 @@ def _resolve_pg_or_name(
 def _prepare_collective_groups(
     process_group_so: ScriptObject | ProcessGroup,
 ) -> tuple[list[int], list[int], int]:
+    # [FUNCTION DOC] HELPER: Given a process group (unboxing a ScriptObject), returns a triple of (group ranks shifted so the first is zero, the starting
+    # global offsets of every translated copy of this group across the default world, and the original first rank). The group ranks must be non-empty and sorted
+    # (AssertionError otherwise); the layout is inferred from the ranks and its complement over the world size gives the offsets.
     process_group = (
         ProcessGroup.unbox(process_group_so)
         if isinstance(process_group_so, ScriptObject)
@@ -128,6 +144,8 @@ def _local_functional_all_gather_into_tensor(
     group_size: int,
     group_name: GroupName | ProcessGroup,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Functional all_gather_into_tensor on a LocalTensor. For each group copy whose ranks are all present, concatenates the members' shards along dimension 0
+    # and gives every member a clone. Returns a new LocalTensor. Raises AssertionError if the input is not a LocalTensor. The group_size argument is unused.
     # "all_gather_into_tensor(Tensor input, int group_size, str group_name) -> Tensor"
     from . import LocalTensor
 
@@ -166,6 +184,8 @@ def _local_functional_reduce_scatter_tensor(
     group_size: int,
     group_name: GroupName | ProcessGroup,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Functional reduce_scatter_tensor on a LocalTensor. Per group copy, reduces the members' shards with the named reduce op, splits the result along dimension 0
+    # into equal chunks and gives chunk i to member i (a zero-sized tensor if there are fewer chunks than members). Returns a new LocalTensor; AssertionError if input is not a LocalTensor.
     #  "reduce_scatter_tensor(Tensor input, str reduce_op, int group_size, str group_name) -> Tensor"
     from . import _zero_sized_like, LocalTensor
 
@@ -213,6 +233,8 @@ def _local_functional_shard_dim_alltoall(
     shard_dim: int,
     group_name: GroupName | ProcessGroup,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Functional shard-dim all-to-all on a LocalTensor. Per group copy, concatenates the members' shards along gather_dim, splits that along shard_dim
+    # into one chunk per member and gives chunk i to member i (zero-sized if missing). Returns a new LocalTensor; AssertionError if input is not a LocalTensor.
     # "shard_dim_alltoall(Tensor input, int gather_dim, int shard_dim, str group_name) -> Tensor"
     from . import _zero_sized_like, LocalTensor
 
@@ -262,6 +284,9 @@ def _local_functional_all_to_all_single(
     input_split_sizes: list[torch.SymInt],
     group_name: GroupName | ProcessGroup,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Functional all_to_all_single on a LocalTensor. Input split sizes (ints or per-rank SymInts) give each rank's chunk sizes along dimension 0;
+    # within each group copy, member dst receives the dst-th chunk from every member (in group order), concatenated. Output split sizes are ignored. Returns a new LocalTensor;
+    # AssertionError if the input is not a LocalTensor.
     # "all_to_all_single(Tensor input, SymInt[] output_split_sizes, SymInt[] input_split_sizes, str group_name) -> Tensor"
     from . import LocalIntNode, LocalTensor
 
@@ -320,6 +345,8 @@ def _local_broadcast_(
     async_op: bool = True,
     timeout: int = -1,
 ) -> tuple[list[torch.Tensor], ScriptObject]:
+    # [FUNCTION DOC] HELPER: Local broadcast_. Takes a one-element tensor list (root_tensor must be zero, else AssertionError) holding a LocalTensor. In each fully-present group copy,
+    # copies the root rank's shard into every other member's shard in place. Returns the tensors and a boxed FakeWork.
     # "broadcast_(Tensor[] tensors, __torch__.torch.classes.c10d.ProcessGroup process_group, "
     # "int root_rank, int root_tensor, bool async_op=True, int timeout=-1) -> (Tensor[], __torch__.torch.classes.c10d.Work)"
     from . import LocalTensor
@@ -363,6 +390,8 @@ def _local_reduce(
     reduce_op: ReduceOp | str,
     tensors: list[torch.Tensor],
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Reduces a list of tensors element-wise using the given ReduceOp or its lowercase string name (sum, avg, product, min, max, band, bor, bxor).
+    # Average is a sum divided by the count. Raises NotImplementedError for premul_sum or an unknown op.
     if reduce_op == ReduceOp.SUM or reduce_op == "sum":
         op = operator.add
     elif reduce_op == ReduceOp.AVG or reduce_op == "avg":
@@ -400,6 +429,8 @@ def _local_all_reduce_(
     async_op: bool = True,
     timeout: int = -1,
 ) -> tuple[list[torch.Tensor], ScriptObject]:
+    # [FUNCTION DOC] HELPER: Local allreduce_. Takes a one-element tensor list holding a LocalTensor (AssertionError otherwise); for each fully-present group copy reduces the members' shards
+    # and writes the result back to every member in place. Returns the tensors and a boxed FakeWork.
     # "allreduce_(Tensor[] tensors, __torch__.torch.classes.c10d.ProcessGroup process_group, "
     # "__torch__.torch.classes.c10d.ReduceOp reduce_op, Tensor? sparse_indices, bool async_op=True, "
     # "int timeout=-1) -> (Tensor[], __torch__.torch.classes.c10d.Work)");
@@ -446,6 +477,8 @@ def _local_allreduce_coalesced_(
     async_op: bool = True,
     timeout: int = -1,
 ) -> ScriptObject:
+    # [FUNCTION DOC] HELPER: Local allreduce_coalesced_. Like local allreduce but over several LocalTensors (AssertionError for non-LocalTensors); each is reduced independently per group copy, in place.
+    # Returns a boxed FakeWork.
     # "allreduce_coalesced_(Tensor[] tensors, __torch__.torch.classes.c10d.ProcessGroup process_group, "
     # "__torch__.torch.classes.c10d.ReduceOp reduce_op, bool async_op=True, int timeout=-1) -> __torch__.torch.classes.c10d.Work"
     from . import LocalTensor
@@ -489,6 +522,8 @@ def _local_reduce_scatter_tensor_coalesced_(
     async_op: bool = True,
     timeout: int = -1,
 ) -> ScriptObject:
+    # [FUNCTION DOC] HELPER: Local reduce_scatter_tensor_coalesced_. For each (input, output) pair of LocalTensors and each fully-present group copy, reduces the members' inputs, splits
+    # along dimension 0 into one chunk per member and copies chunk i into member i's output in place. Returns a boxed FakeWork. AssertionError for non-LocalTensors.
     # "reduce_scatter_tensor_coalesced_(Tensor[] outputs, Tensor[] inputs, "
     # "__torch__.torch.classes.c10d.ProcessGroup process_group, "
     # "__torch__.torch.classes.c10d.ReduceOp reduce_op, bool async_op=True, "
@@ -543,6 +578,8 @@ def _local_allgather_base_(
     async_op: bool = True,
     timeout: int = -1,
 ) -> tuple[torch.Tensor, ScriptObject]:
+    # [FUNCTION DOC] HELPER: Local _allgather_base_. For each group copy present in both tensors, concatenates the members' input shards along dimension 0 and copies the result into every
+    # member's output shard in place. Returns the output tensor and a boxed FakeWork. AssertionError for non-LocalTensors.
     # "_allgather_base_(Tensor output_tensor, Tensor input_tensor, __torch__.torch.classes.c10d.ProcessGroup
     # process_group, bool async_op=True, int timeout=-1) -> (Tensor, __torch__.torch.classes.c10d.Work)");
     from . import LocalTensor
@@ -584,6 +621,8 @@ def _local_reduce_scatter_base_(  # type: ignore[no-untyped-def]
     async_op: bool = True,
     timeout: int = -1,
 ) -> tuple[torch.Tensor, ScriptObject]:
+    # [FUNCTION DOC] HELPER: Local _reduce_scatter_base_. For each group copy present in both tensors, reduces the members' input shards, splits along dimension 0 into one chunk per member
+    # and copies chunk i into member i's output shard in place. Returns the output tensor and a boxed FakeWork. AssertionError for non-LocalTensors.
     # "_reduce_scatter_base_(Tensor output_tensor, Tensor input_tensor,
     # __torch__.torch.classes.c10d.ProcessGroup process_group, __torch__.torch.classes.c10d.ReduceOp reduce_op,
     # bool async_op=True, int timeout=-1) -> (Tensor, __torch__.torch.classes.c10d.Work)"
@@ -632,6 +671,8 @@ def _local_all_gather_(
     async_op: bool = True,
     timeout: int = -1,
 ) -> tuple[list[list[torch.Tensor]], ScriptObject]:
+    # [FUNCTION DOC] HELPER: Local allgather_ (list-of-list flavor; exactly one output list and one input tensor, AssertionError otherwise). For each group copy, the i-th output LocalTensor receives
+    # the i-th member's input (the input may be a plain tensor, used as is). Returns the outputs and a boxed FakeWork. AssertionError if an output is not a LocalTensor.
     # "allgather_(Tensor[][] output_tensors, Tensor[] input_tensors, "
     # "__torch__.torch.classes.c10d.ProcessGroup process_group, bool async_op=True, "
     # "int timeout=-1) -> (Tensor[][], __torch__.torch.classes.c10d.Work)");
@@ -679,6 +720,8 @@ def _local_allgather_into_tensor_coalesced_(
     process_group_so: ScriptObject,
     async_op: bool = True,
 ) -> ScriptObject:
+    # [FUNCTION DOC] HELPER: Local allgather_into_tensor_coalesced_. For each pair of input and output LocalTensors and each fully-present group copy, concatenates the members' inputs along dimension 0
+    # and copies it into every member's output in place. Raises AssertionError on length mismatch or non-LocalTensors. Returns a boxed FakeWork.
     # "allgather_into_tensor_coalesced_(Tensor[] outputs, Tensor[] inputs, "
     # "__torch__.torch.classes.c10d.ProcessGroup process_group, bool async_op=True) "
     # "-> __torch__.torch.classes.c10d.Work"
@@ -736,6 +779,7 @@ def _local_gather_(
     async_op: bool = True,
     timeout: int = -1,
 ) -> ScriptObject:
+    # [FUNCTION DOC] HELPER: Unsupported: always raises NotImplementedError because gather only delivers data to the root rank (an MPMD pattern); use allgather instead.
     # "gather_(Tensor[][] output_tensors, Tensor[] input_tensors, "
     # "__torch__.torch.classes.c10d.ProcessGroup process_group, int root_rank, "
     # "bool async_op=True, int timeout=-1) -> __torch__.torch.classes.c10d.Work"
@@ -753,6 +797,8 @@ def _local_scatter_(
     async_op: bool = True,
     timeout: int = -1,
 ) -> tuple[list[torch.Tensor], ScriptObject]:
+    # [FUNCTION DOC] HELPER: Local scatter_. Requires one output LocalTensor and one input list whose length equals the group size (AssertionError otherwise). In each fully-present group copy,
+    # member i receives the i-th input's shard taken from the root rank (assumed to sit at the same relative position in every copy). Returns the outputs and a boxed FakeWork.
     # "scatter_(Tensor[] output_tensors, Tensor[][] input_tensors, "
     # "__torch__.torch.classes.c10d.ProcessGroup process_group, int root_rank, "
     # "bool async_op=True, int timeout=-1) -> (Tensor[], __torch__.torch.classes.c10d.Work)");
@@ -808,6 +854,8 @@ def _local_alltoall_(
     async_op: bool = True,
     timeout: int = -1,
 ) -> tuple[list[torch.Tensor], ScriptObject]:
+    # [FUNCTION DOC] HELPER: Local alltoall_. Lists of input and output LocalTensors must each have one entry per group member (AssertionError otherwise). In each group copy, the j-th input of member i
+    # is copied to member j's i-th output, in place. Returns the outputs and a boxed FakeWork.
     # "alltoall_(Tensor[] output_tensors, Tensor[] input_tensors, "
     # "__torch__.torch.classes.c10d.ProcessGroup process_group, bool async_op=True, "
     # "int timeout=-1) -> (Tensor[], __torch__.torch.classes.c10d.Work)";
@@ -862,6 +910,9 @@ def _local_alltoall_base_(
     async_op: bool = True,
     timeout: int = -1,
 ) -> ScriptObject:
+    # [FUNCTION DOC] HELPER: Local alltoall_base_. Input and output must be LocalTensors (AssertionError otherwise). In each fully-present group copy, splits each member's input along dimension 0
+    # (by input split sizes, or evenly if none) and copies split j of member i into member j's output at the region chosen by output split sizes (or even regions), in place.
+    # Raises ValueError if a split and its destination region differ in element count. Returns a boxed FakeWork.
     # "alltoall_base_(Tensor output, Tensor input, __torch__.torch.classes.c10d.ProcessGroup process_group, "
     # "int[] output_split_sizes, int[] input_split_sizes, bool async_op=True, int timeout=-1) -> __torch__.torch.classes.c10d.Work";
 
@@ -955,6 +1006,7 @@ def _local_barrier(
     async_op: bool = True,
     timeout: int = -1,
 ) -> ScriptObject:
+    # [FUNCTION DOC] HELPER: Local barrier: only checks the tensor is a LocalTensor (AssertionError otherwise); no synchronization is needed in one process. Returns a boxed FakeWork.
     # "barrier(Tensor tensor, __torch__.torch.classes.c10d.ProcessGroup process_group, "
     # "int[] device_ids, bool async_op=True, int timeout=-1) -> __torch__.torch.classes.c10d.Work";
 
@@ -980,6 +1032,7 @@ def _local_monitored_barrier_(
     timeout: int,
     wait_all_ranks: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Local monitored_barrier_: only checks the tensor is a LocalTensor (AssertionError otherwise); otherwise a no-op returning nothing.
     # "monitored_barrier_(Tensor tensor, __torch__.torch.classes.c10d.ProcessGroup process_group, "
     # "int[] device_ids, int timeout, bool wait_all_ranks) -> ()";
 
@@ -1003,6 +1056,8 @@ def _local_send(
     dst: int,
     tag: int,
 ) -> ScriptObject:
+    # [FUNCTION DOC] HELPER: Local send, valid only under LocalRunnerMode. Takes one LocalTensor tagged with its source rank (see _attach_rank), and queues that rank's shard for the destination
+    # through the current runner. Raises AssertionError for a wrong tensor count or type. Returns a boxed FakeWork.
     # "send(Tensor[] tensors, __torch__.torch.classes.c10d.ProcessGroup process_group, "
     # "int dst, int tag) -> __torch__.torch.classes.c10d.Work";
 
@@ -1029,6 +1084,8 @@ def _local_recv_(
     src: int,
     tag: int,
 ) -> ScriptObject:
+    # [FUNCTION DOC] HELPER: Local recv_, valid only under LocalRunnerMode. Takes one LocalTensor tagged with its rank (see _attach_rank) and returns a boxed work whose completion callback waits on the
+    # current runner until data arrives from src (or from any source if src is -1) and then stores it as that rank's shard. Raises AssertionError for a wrong tensor count or type.
     # "recv_(Tensor[] tensors, __torch__.torch.classes.c10d.ProcessGroup process_group, "
     # "int src, int tag) -> __torch__.torch.classes.c10d.Work";
     from . import LocalRunnerMode, LocalTensor
@@ -1042,7 +1099,9 @@ def _local_recv_(
     dst = int(tensor.__src_rank__)
 
     def _recv_and_store(timeout: timedelta) -> bool:
+        # [FUNCTION DOC] HELPER: Work callback: blocks via the current runner until data is available, stores it, and returns True. The timeout argument is unused.
         def _wait_and_store(obj: object) -> None:
+            # [FUNCTION DOC] HELPER: Stores the received object as this rank's shard; raises AssertionError if it is not a tensor.
             if not isinstance(obj, torch.Tensor):
                 raise AssertionError("Expected to receive a Tensor")
             if not isinstance(tensor, LocalTensor):
@@ -1060,6 +1119,7 @@ def _local_recv_(
 def _local_recv_any_source_(
     tensors: list[torch.Tensor], process_group_so: ScriptObject, tag: int
 ) -> ScriptObject:
+    # [FUNCTION DOC] HELPER: Local recv_any_source_: same as local recv with source rank -1 (any sender).
     # "recv_any_source_(Tensor[] tensors, __torch__.torch.classes.c10d.ProcessGroup process_group, "
     # "int tag) -> __torch__.torch.classes.c10d.Work";
 
@@ -1067,6 +1127,8 @@ def _local_recv_any_source_(
 
 
 def _attach_rank(tensor: torch.Tensor, rank: int) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Tags a tensor (unwrapping DTensor to its local tensor) with the rank that initiates a send or receive, so the local p2p implementations can find it. Mutates the tensor by
+    # setting an attribute; returns the (possibly unwrapped) tensor.
     """
     Attaches rank as an attribute to given tensor so that the send or recv implementation
     knows which rank initiates the operation (note under local tensor mode ).
@@ -1085,6 +1147,9 @@ def local_p2p_op(
     tensor: torch.Tensor,
     op: Callable[[torch.Tensor, int], Work | None],
 ) -> Work | list[Work | None] | None:
+    # [FUNCTION DOC] Runs a point-to-point op for every simulated (source, destination) pair, where dst is a SymInt backed by a LocalIntNode mapping source rank to destination rank
+    # (AssertionError otherwise). For each pair tags the tensor with the source rank and calls op with the tensor and destination. Returns the list of resulting Work objects (or None entries).
+    # Validates op with the c10d helper first.
     """
     Runs a point-to-point (P2P) operation for all combinations of source and destination ranks.
     """
@@ -1106,6 +1171,7 @@ def local_p2p_op(
 
 
 def wait_all(work: Work | list[Work | None] | None) -> None:
+    # [FUNCTION DOC] Waits for a Work, or for each non-None Work in a list; does nothing for None.
     """
     Waits for all work objects in the input to complete.
 
