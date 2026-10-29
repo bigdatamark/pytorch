@@ -1,4 +1,19 @@
 # mypy: ignore-errors
+# [MODULE DOC] Shared infrastructure for torch.nn tests. Contains: (1) fixture factories, one
+# per loss configuration with no reduction, each returning a test-spec mapping with fullname,
+# constructor (via wrap_functional), C++ parity call and variable map, reference function and
+# flags; (2) module_tests and get_new_module_tests, which build the long list of
+# module/functional specs, plus no-batch-dimension and padding-mode variants; (3) reference
+# implementations of many losses collected in loss_reference_fns; (4) criterion_tests, filled at
+# import time with no-batch-dimension criterion specs; (5) NNTestCase, TestBase, ModuleTest,
+# NewModuleTest, CriterionTest and InputVariableMixin which run forward, Jacobian, gradcheck,
+# pickle, non-contiguous, dtype and CPU/GPU comparisons; (6) small helpers for bfloat16 and
+# empty-input checks and a basic net factory. Import-time side effects: defines module_tests,
+# loss_reference_fns and criterion_tests; does not seed the RNG (get_new_module_tests does).
+# KNOWN ISSUE: the constructor lambdas in the no-batch criterion loops read the loop variable
+# reduction when called later rather than when created, so every generated spec ends up using
+# the last reduction (sum) instead of its own; the loss_reference_fns annotation also uses the
+# string literal str as the key type.
 
 from abc import abstractmethod
 import tempfile
@@ -33,6 +48,9 @@ PRECISION = 1e-5
 
 
 def get_reduction(m):
+    # [FUNCTION DOC] Returns the reduction string of a loss module: its reduction attribute if
+    # set, otherwise the string derived from the legacy size_average setting. Raises an error if
+    # neither yields a value.
     result = getattr(m, 'reduction', None)
     if result is None:
         result = _Reduction.legacy_get_string(getattr(m, 'sizeAverage', None), True, emit_warning=False)
@@ -42,6 +60,8 @@ def get_reduction(m):
 
 
 def get_weight(m):
+    # [FUNCTION DOC] Returns the weight tensor of a module: the weight attribute if present and
+    # not None, otherwise the weights attribute (or None if absent).
     result = getattr(m, 'weight', None)
     if result is not None:
         return result
@@ -168,18 +188,34 @@ module_tests = [
 # values won't be causing test failure for modules like MaxPooling.
 # size should be small, otherwise randperm fails / long overflows.
 def _rand_tensor_non_equal(*size):
+    # [FUNCTION DOC] HELPER: Returns a double tensor of the given shape holding a random
+    # permutation of 0..N-1, so all values are distinct (avoids ties in pooling tests). Size
+    # must be small since a full permutation is generated.
     total = reduce(mul, size, 1)
     return torch.randperm(total).view(*size).double()
 
 
 def wrap_functional(fn, **kwargs):
+    # [FUNCTION DOC] Wraps a functional callable into a module class: returns a new nn.Module
+    # subclass whose forward applies the callable to the positional arguments plus the fixed
+    # keyword arguments given here. Returns the class, not an instance.
     class FunctionalModule(nn.Module):
+        # [CLASS DOC] HELPER: Throwaway module type created per call of wrap_functional. Holds
+        # no state; the wrapped callable and its keyword arguments are captured by closure.
         def forward(self, *args):
+            # [FUNCTION DOC] Calls the captured functional with the given positional arguments
+            # and the captured keyword arguments and returns its result.
             return fn(*args, **kwargs)
     return FunctionalModule
 
 
 def poissonnllloss_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for the Poisson
+    # negative log likelihood loss with no reduction. A fixed random normal target is created
+    # once per call; inputs are uniform random 10 by 10; the reference computes the
+    # exponential of the input minus target times input. Pickling is skipped and the default
+    # dtype is double.
     t = torch.randn(10, 10)
     return dict(
         fullname='PoissonNLLLoss_no_reduce',
@@ -195,6 +231,11 @@ def poissonnllloss_no_reduce_test():
 
 
 def bceloss_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for binary cross
+    # entropy with no reduction. A fixed random binary target of shape 15 by 10 is created once;
+    # inputs are uniform values clamped away from 0 and 1; the reference applies the elementwise
+    # log formula. Precision is relaxed to 7e-4; pickling is skipped; double dtype.
     t = Variable(torch.randn(15, 10).gt(0).to(torch.double))
     return dict(
         fullname='BCELoss_no_reduce',
@@ -211,6 +252,9 @@ def bceloss_no_reduce_test():
 
 
 def bceloss_no_reduce_scalar_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for binary cross
+    # entropy with no reduction on 0-dim (scalar) input and target.
     t = torch.randn(()).gt(0).to(torch.double)
     return dict(
         fullname='BCELoss_no_reduce_scalar',
@@ -226,6 +270,10 @@ def bceloss_no_reduce_scalar_test():
 
 
 def bceloss_weights_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for weighted binary
+    # cross entropy with no reduction. A random per-class weight of length 10 is applied; the
+    # target is a fixed random binary 15 by 10 tensor; precision 3e-4; pickling skipped.
     t = Variable(torch.randn(15, 10, dtype=torch.double).gt(0).to(torch.double))
     weights = torch.rand(10, dtype=torch.double)
     return dict(
@@ -246,6 +294,9 @@ def bceloss_weights_no_reduce_test():
 
 
 def bceloss_weights_no_reduce_scalar_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for weighted binary
+    # cross entropy with no reduction on 0-dim input, target and weight.
     t = torch.randn(()).gt(0).to(torch.double)
     weights = torch.rand((), dtype=torch.double)
     return dict(
@@ -265,6 +316,11 @@ def bceloss_weights_no_reduce_scalar_test():
 
 
 def bce_with_logistic_legacy_enum_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for binary cross
+    # entropy with logits using the deprecated boolean reduce=False argument instead of a
+    # reduction string. The reference applies sigmoid then the log formula; the double-backward
+    # check is disabled.
     t = Variable(torch.randn(15, 10).gt(0).to(torch.double))
     sigmoid = nn.Sigmoid()
     return dict(
@@ -283,6 +339,10 @@ def bce_with_logistic_legacy_enum_test():
 
 
 def bce_with_logistic_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for binary cross
+    # entropy with logits and no reduction on 15 by 10 input with a fixed binary target.
+    # Double-backward check disabled.
     t = Variable(torch.randn(15, 10).gt(0).to(torch.double))
     sigmoid = nn.Sigmoid()
     return dict(
@@ -301,6 +361,10 @@ def bce_with_logistic_no_reduce_test():
 
 
 def bce_with_logistic_no_reduce_scalar_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for binary
+    # cross entropy with logits and no reduction on 0-dim input and target.
+    # Double-backward check disabled.
     t = torch.randn(()).gt(0).to(torch.double)
     sigmoid = nn.Sigmoid()
     return dict(
@@ -319,6 +383,13 @@ def bce_with_logistic_no_reduce_scalar_test():
 
 
 def kldivloss_with_target_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for KL divergence
+    # loss with no reduction. The target is a fixed uniform 10 by 10 double tensor and the input
+    # is the log of uniform values; the reference is loss_reference_fns for KLDivLoss;
+    # forward-mode AD is declared supported.
+    # KNOWN ISSUE: body is identical to kldivloss_no_reduce_test apart from the fullname, so it
+    # is a duplicate test configuration.
     t = torch.rand(10, 10, dtype=torch.double)
     return dict(
         fullname='KLDivLoss_with_target_no_reduce',
@@ -335,6 +406,10 @@ def kldivloss_with_target_no_reduce_test():
 
 
 def kldivloss_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for KL divergence
+    # loss with no reduction (same configuration as kldivloss_with_target_no_reduce_test under a
+    # different fullname).
     t = torch.rand(10, 10, dtype=torch.double)
     return dict(
         fullname='KLDivLoss_no_reduce',
@@ -352,6 +427,9 @@ def kldivloss_no_reduce_test():
 
 
 def kldivloss_no_reduce_scalar_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for KL divergence
+    # loss with no reduction on 0-dim input and target.
     t = torch.rand((), dtype=torch.double)
     return dict(
         fullname='KLDivLoss_no_reduce_scalar',
@@ -368,6 +446,12 @@ def kldivloss_no_reduce_scalar_test():
 
 
 def kldivloss_with_log_target_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for KL divergence
+    # loss with no reduction and log_target enabled. The target is the log of uniform values and
+    # the reference is the log-target variant of the KL reference.
+    # KNOWN ISSUE: body is identical to kldivloss_no_reduce_log_target_test apart from the
+    # fullname (duplicate test).
     t = torch.rand(10, 10, dtype=torch.double).log()
     return dict(
         fullname='KLDivLoss_with_log_target_no_reduce',
@@ -384,6 +468,10 @@ def kldivloss_with_log_target_no_reduce_test():
 
 
 def kldivloss_no_reduce_log_target_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for KL divergence
+    # loss with no reduction and log_target enabled (duplicate of
+    # kldivloss_with_log_target_no_reduce_test under another fullname).
     t = torch.rand(10, 10, dtype=torch.double).log()
     return dict(
         fullname='KLDivLoss_no_reduce_log_target',
@@ -401,6 +489,9 @@ def kldivloss_no_reduce_log_target_test():
 
 
 def kldivloss_no_reduce_scalar_log_target_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for KL divergence
+    # loss with no reduction and log_target enabled on 0-dim input and target.
     t = torch.rand((), dtype=torch.double).log()
     return dict(
         fullname='KLDivLoss_no_reduce_scalar_log_target',
@@ -417,6 +508,10 @@ def kldivloss_no_reduce_scalar_log_target_test():
 
 
 def l1loss_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for L1 loss
+    # with no reduction on 2 by 3 by 4 tensors. Reference is the absolute difference;
+    # forward AD supported.
     t = torch.randn(2, 3, 4, dtype=torch.double)
     return dict(
         fullname='L1Loss_no_reduce',
@@ -432,6 +527,11 @@ def l1loss_no_reduce_test():
 
 
 def l1loss_no_reduce_complex_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for L1 loss with
+    # no reduction on complex double 2 by 3 by 4 tensors. Reference is the absolute value of
+    # the difference.
+    # KNOWN ISSUE: unlike its siblings it does not set default_dtype to double.
     t = torch.randn(2, 3, 4, dtype=torch.cdouble)
     return dict(
         fullname='L1Loss_no_reduce_complex',
@@ -446,6 +546,9 @@ def l1loss_no_reduce_complex_test():
 
 
 def l1loss_no_reduce_scalar_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for L1 loss with no
+    # reduction on 0-dim input and target.
     t = torch.randn((), dtype=torch.double)
     return dict(
         fullname='L1Loss_no_reduce_scalar',
@@ -461,6 +564,10 @@ def l1loss_no_reduce_scalar_test():
 
 
 def mseloss_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for mean squared
+    # error loss with no reduction. Input shape is 2 by 3 by 4 by 5 with a fixed random double
+    # target; reference is the squared difference.
     input_size = (2, 3, 4, 5)
     target = torch.randn(*input_size, dtype=torch.double)
     return dict(
@@ -477,6 +584,9 @@ def mseloss_no_reduce_test():
 
 
 def mseloss_no_reduce_scalar_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for mean squared
+    # error loss with no reduction on 0-dim input and target.
     input_size = ()
     target = torch.randn(input_size, dtype=torch.double)
     return dict(
@@ -493,6 +603,11 @@ def mseloss_no_reduce_scalar_test():
 
 
 def nllloss_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for negative
+    # log likelihood loss with no reduction. Targets are 15 random class indices in 0..9
+    # created once; inputs are logs of uniform 15 by 10 values; the reference is the
+    # NLLLoss entry of loss_reference_fns.
     t = Variable(torch.empty(15).uniform_().mul(10).floor().long())
     kwargs = {'reduction': 'none'}
     return dict(
@@ -510,6 +625,10 @@ def nllloss_no_reduce_test():
 
 
 def nllloss_no_reduce_ignore_index_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for negative log
+    # likelihood loss with no reduction and ignore_index 2. Same data as nllloss_no_reduce_test;
+    # targets equal to the ignored index must contribute zero.
     t = Variable(torch.empty(15).uniform_().mul(10).floor().long())
     kwargs: dict[str, int | str] = {'ignore_index': 2, 'reduction': 'none'}
     return dict(
@@ -528,10 +647,16 @@ def nllloss_no_reduce_ignore_index_test():
 
 
 def nllloss_no_reduce_weights_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for negative log
+    # likelihood loss with no reduction and per-class weights. A random weight vector of length
+    # 10 is cast to the input dtype at call time.
     t = Variable(torch.empty(15).uniform_().mul(10).floor().long())
     weight = torch.rand(10)
 
     def kwargs(i):
+        # [FUNCTION DOC] HELPER: Returns the options mapping (weight cast to the dtype of the
+        # given tensor, reduction none) used by the constructor and the reference.
         return {'weight': weight.type_as(i), 'reduction': 'none'}
 
     return dict(
@@ -550,10 +675,17 @@ def nllloss_no_reduce_weights_test():
 
 
 def nllloss_no_reduce_weights_ignore_index_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for negative log
+    # likelihood loss with no reduction, class weights and ignore_index 2.
+    # KNOWN ISSUE: the constructor passes the data attribute of the input to the options builder
+    # while the reference passes the input itself; harmless since only the dtype is used.
     t = Variable(torch.empty(15).uniform_().mul(10).floor().long())
     weight = torch.rand(10)
 
     def kwargs(i):
+        # [FUNCTION DOC] HELPER: Returns the options mapping (weight cast to the dtype of the
+        # given tensor, reduction none, ignore_index 2).
         return {'weight': weight.type_as(i), 'reduction': 'none',
                 'ignore_index': 2}
 
@@ -573,10 +705,16 @@ def nllloss_no_reduce_weights_ignore_index_test():
 
 
 def nllloss_no_reduce_weights_ignore_index_neg_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for negative log
+    # likelihood loss with no reduction, class weights and negative ignore_index -1. Uses a
+    # fixed double input tensor rather than an input generator.
     t = Variable(torch.empty(15).uniform_().mul(10).floor().long())
     weight = torch.rand(10)
 
     def kwargs(i):
+        # [FUNCTION DOC] HELPER: Returns the options mapping (weight cast to the dtype of the
+        # given tensor, reduction none, ignore_index -1).
         return {'weight': weight.type_as(i), 'reduction': 'none',
                 'ignore_index': -1}
 
@@ -596,6 +734,11 @@ def nllloss_no_reduce_weights_ignore_index_neg_test():
 
 
 def nllloss2d_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for 2-d negative
+    # log likelihood loss with no reduction. Input is the log of uniform values of shape 2 by
+    # 3 by 5 by 5 and targets have shape 2 by 5 by 5 with classes 0..2; reference is the N-d
+    # NLL reference.
     t = Variable(torch.rand(2, 5, 5).mul(3).floor().long())
     kwargs = {'reduction': 'none'}
     return dict(
@@ -613,6 +756,9 @@ def nllloss2d_no_reduce_test():
 
 
 def nllloss2d_no_reduce_ignore_index_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for 2-d negative log
+    # likelihood loss with no reduction and ignore_index 1.
     t = Variable(torch.rand(2, 5, 5).mul(3).floor().long())
     kwargs: dict[str, int | str] = {'ignore_index': 1, 'reduction': 'none'}
     return dict(
@@ -631,10 +777,15 @@ def nllloss2d_no_reduce_ignore_index_test():
 
 
 def nllloss2d_no_reduce_weights_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for 2-d negative log
+    # likelihood loss with no reduction and per-class weights of length 3.
     t = Variable(torch.rand(2, 5, 5).mul(3).floor().long())
     weight = torch.rand(3)
 
     def kwargs(i):
+        # [FUNCTION DOC] HELPER: Returns the options mapping (weight cast to the dtype of the
+        # given tensor, reduction none).
         return {'weight': weight.type_as(i), 'reduction': 'none'}
 
     return dict(
@@ -653,6 +804,10 @@ def nllloss2d_no_reduce_weights_test():
 
 
 def nlllossNd_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for N-d negative log
+    # likelihood loss with no reduction. Input has shape 2 by 3 by 5 by 5 by 2 by 2 and targets
+    # have shape 2 by 5 by 5 by 2 by 2.
     t = Variable(torch.rand(2, 5, 5, 2, 2).mul(3).floor().long())
     kwargs = {'reduction': 'none'}
     return dict(
@@ -670,6 +825,9 @@ def nlllossNd_no_reduce_test():
 
 
 def nlllossNd_no_reduce_ignore_index_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for N-d negative log
+    # likelihood loss with no reduction and ignore_index 1.
     t = Variable(torch.rand(2, 5, 5, 2, 2).mul(3).floor().long())
     kwargs: dict[str, int | str] = {'ignore_index': 1, 'reduction': 'none'}
     return dict(
@@ -688,10 +846,15 @@ def nlllossNd_no_reduce_ignore_index_test():
 
 
 def nlllossNd_no_reduce_weights_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for N-d negative log
+    # likelihood loss with no reduction and per-class weights of length 3.
     t = Variable(torch.rand(2, 5, 5, 2, 2).mul(3).floor().long())
     weight = torch.rand(3)
 
     def kwargs(i):
+        # [FUNCTION DOC] HELPER: Returns the options mapping (weight cast to the dtype of the
+        # given tensor, reduction none).
         return {'weight': weight.type_as(i), 'reduction': 'none'}
 
     return dict(
@@ -710,6 +873,9 @@ def nlllossNd_no_reduce_weights_test():
 
 
 def smoothl1loss_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for smooth L1 loss
+    # with no reduction on 2 by 3 by 4 tensors.
     t = torch.randn(2, 3, 4, dtype=torch.double)
     return dict(
         fullname='SmoothL1Loss_no_reduce',
@@ -727,6 +893,9 @@ def smoothl1loss_no_reduce_test():
 
 
 def smoothl1loss_no_reduce_scalar_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for smooth L1 loss
+    # with no reduction on 0-dim input and target.
     t = torch.randn((), dtype=torch.double)
     return dict(
         fullname='SmoothL1Loss_no_reduce_scalar',
@@ -744,6 +913,9 @@ def smoothl1loss_no_reduce_scalar_test():
 
 
 def smoothl1loss_beta_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for smooth L1 loss
+    # with no reduction and beta 0.5.
     t = torch.randn(2, 3, 4, dtype=torch.double)
     return dict(
         fullname='SmoothL1Loss_beta',
@@ -761,6 +933,9 @@ def smoothl1loss_beta_test():
 
 
 def smoothl1loss_zero_beta_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for smooth L1 loss
+    # with no reduction and beta 0, where the loss degenerates to L1.
     t = torch.randn(2, 3, 4, dtype=torch.double)
     return dict(
         fullname='SmoothL1Loss_zero_beta',
@@ -778,6 +953,10 @@ def smoothl1loss_zero_beta_test():
 
 
 def huberloss_delta_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for Huber loss
+    # with no reduction and delta 0.5. The target is generated in the default dtype rather
+    # than double.
     t = torch.randn(2, 3, 4)
     return dict(
         fullname='HuberLoss_delta',
@@ -795,6 +974,11 @@ def huberloss_delta_test():
 
 
 def multilabelmarginloss_0d_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for multilabel margin
+    # loss with no reduction on 0-dim input and a zero 0-dim long target. Sum-reduction checking
+    # is enabled and double-backward is disabled.
+    # KNOWN ISSUE: does not set default_dtype to double, unlike most siblings.
     t = torch.zeros(()).long()
     return dict(
         fullname='MultiLabelMarginLoss_0d_no_reduce',
@@ -812,6 +996,10 @@ def multilabelmarginloss_0d_no_reduce_test():
 
 
 def multilabelmarginloss_1d_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for multilabel margin
+    # loss with no reduction on a 1-d input of length 10. Target is random class indices 0..9
+    # (no negative terminator); sum-reduction check on, double-backward off.
     t = Variable(torch.rand(10).mul(10).floor().long())
     return dict(
         fullname='MultiLabelMarginLoss_1d_no_reduce',
@@ -830,6 +1018,10 @@ def multilabelmarginloss_1d_no_reduce_test():
 
 
 def multilabelmarginloss_index_neg_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for multilabel margin
+    # loss with no reduction where targets may contain negative values. Targets are random
+    # integers clamped from below at -1 so rows end early at the first negative entry.
     t = Variable(torch.clamp(torch.rand(5, 10).add(-.5).mul(20).floor().long(), min=-1))
     return dict(
         fullname='MultiLabelMarginLoss_index_neg',
@@ -848,6 +1040,9 @@ def multilabelmarginloss_index_neg_test():
 
 
 def multilabelmarginloss_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for multilabel margin
+    # loss with no reduction on 5 by 10 input and random class-index targets.
     t = Variable(torch.rand(5, 10).mul(10).floor().long())
     return dict(
         fullname='MultiLabelMarginLoss_no_reduce',
@@ -866,6 +1061,9 @@ def multilabelmarginloss_no_reduce_test():
 
 
 def hingeembeddingloss_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for hinge embedding
+    # loss with no reduction. Targets are random plus or minus one values of length 10.
     t = Variable(torch.randn(10).gt(0).to(torch.double).mul_(2).sub(1))
     return dict(
         fullname='HingeEmbeddingLoss_no_reduce',
@@ -883,6 +1081,9 @@ def hingeembeddingloss_no_reduce_test():
 
 
 def hingeembeddingloss_margin_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for hinge embedding
+    # loss with no reduction and margin 0.5.
     t = Variable(torch.randn(10).gt(0).to(torch.double).mul_(2).sub(1))
     return dict(
         fullname='HingeEmbeddingLoss_margin_no_reduce',
@@ -900,6 +1101,9 @@ def hingeembeddingloss_margin_no_reduce_test():
 
 
 def softmarginloss_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for soft margin loss
+    # with no reduction on 5 by 5 tensors with a random normal target.
     t = torch.randn(5, 5, dtype=torch.double)
     return dict(
         fullname='SoftMarginLoss_no_reduce',
@@ -917,6 +1121,11 @@ def softmarginloss_no_reduce_test():
 
 
 def multilabelsoftmarginloss_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for multilabel soft
+    # margin loss with no reduction. Targets are random zero/one values of shape 5 by 10; the
+    # reference is the negative log-sigmoid expression summed over classes and divided by the
+    # class count; double-backward off.
     t = torch.rand(5, 10).mul(2).floor()
     return dict(
         fullname='MultiLabelSoftMarginLoss_no_reduce',
@@ -934,6 +1143,9 @@ def multilabelsoftmarginloss_no_reduce_test():
 
 
 def multilabelsoftmarginloss_weights_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for multilabel soft
+    # margin loss with no reduction and per-class weights of length 10.
     t = torch.rand(5, 10).mul(2).floor()
     weights = torch.rand(10)
     return dict(
@@ -955,6 +1167,10 @@ def multilabelsoftmarginloss_weights_no_reduce_test():
 
 
 def multimarginloss_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for multi margin loss
+    # with no reduction. Targets are 5 random class indices in 0..7 with 10-class inputs of
+    # shape 5 by 10; sum-reduction check on, double-backward off.
     t = torch.rand(5).mul(8).floor().long()
     return dict(
         fullname='MultiMarginLoss_no_reduce',
@@ -973,6 +1189,9 @@ def multimarginloss_no_reduce_test():
 
 
 def multimarginloss_1d_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for multi margin loss
+    # with no reduction on a 1-d input of length 10 with a length-1 target.
     t = torch.rand(1).mul(8).floor().long()
     return dict(
         fullname='MultiMarginLoss_1d_no_reduce',
@@ -991,6 +1210,9 @@ def multimarginloss_1d_no_reduce_test():
 
 
 def multimarginloss_1d_input_0d_target_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for multi margin loss
+    # with no reduction on a 1-d input with a 0-dim target.
     t = torch.rand(()).mul(8).floor().long()
     return dict(
         fullname='multimarginloss_1d_input_0d_target_no_reduce',
@@ -1009,6 +1231,9 @@ def multimarginloss_1d_input_0d_target_no_reduce_test():
 
 
 def multimarginloss_p_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for multi margin loss
+    # with no reduction and p equal to 2. Inputs are clamped to the open unit interval.
     t = torch.rand(5).mul(8).floor().long()
     return dict(
         fullname='MultiMarginLoss_p_no_reduce',
@@ -1027,6 +1252,9 @@ def multimarginloss_p_no_reduce_test():
 
 
 def multimarginloss_margin_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for multi margin loss
+    # with no reduction and margin 0.5.
     t = torch.rand(5).mul(8).floor().long()
     return dict(
         fullname='MultiMarginLoss_margin_no_reduce',
@@ -1047,6 +1275,9 @@ def multimarginloss_margin_no_reduce_test():
 
 
 def multimarginloss_weights_no_reduce_test():
+    # [FUNCTION DOC] HELPER: Builds and returns one test-spec mapping (keys fullname,
+    # constructor, cpp_function_call, cpp_var_map, reference_fn and flags) for multi margin loss
+    # with no reduction and per-class weights of length 10.
     t = torch.rand(5).mul(8).floor().long()
     weights = torch.rand(10, dtype=torch.double)
     return dict(
@@ -1069,12 +1300,18 @@ def multimarginloss_weights_no_reduce_test():
 
 
 def single_batch_reference_fn(input, parameters, module):
+    # [FUNCTION DOC] Reference function for module tests without a batch dimension: adds a
+    # leading batch dimension of size one to the input (or each input in a list or tuple), runs
+    # the module with the random number generator state frozen, and removes the batch dimension
+    # from the output. Args: input, parameters (unused), module. Returns the squeezed output.
     """Reference function for modules supporting no batch dimensions.
 
     The module is passed the input and target in batched form with a single item.
     The output is squeezed to compare with the no-batch input.
     """
     def unsqueeze_inp(inp):
+        # [FUNCTION DOC] HELPER: Adds a leading dimension of size one to a tensor, or to every
+        # tensor of a list or tuple (returned as a list).
         if isinstance(inp, (list, tuple)):
             return [t.unsqueeze(0) for t in inp]
         return inp.unsqueeze(0)
@@ -1086,6 +1323,13 @@ def single_batch_reference_fn(input, parameters, module):
 
 
 def get_new_module_tests():
+    # [FUNCTION DOC] Builds and returns the full list of test-spec mappings for nn modules and
+    # functionals. Seeds the global random number generator first, then collects the loss
+    # fixture mappings, a long literal list of per-module mappings (keys such as module_name,
+    # constructor_args, cpp_constructor_args, input_size, desc, reference_fn, cudnn, tf32
+    # settings, default_dtype), convolution padding-mode variants for 1-d, 2-d and 3-d (3-d
+    # reflect skipped), and no-batch-dimension variants of non-linear activations. Mutates
+    # global RNG state; consumers must call it once and share the result.
     common_utils.set_rng_seed()
     new_module_tests = [
         poissonnllloss_no_reduce_test(),
@@ -2726,6 +2970,11 @@ def get_new_module_tests():
 
 
 def kldivloss_reference(input, target, reduction='mean', log_target=False):
+    # [FUNCTION DOC] Reference KL divergence between prediction (log probabilities) and target,
+    # elementwise: with log_target the target is exponentiated times the difference of target
+    # and input, otherwise target times the difference of log target and input. Reduction mean,
+    # sum or batchmean (sum over batch size, only for non-scalar results); anything else returns
+    # the elementwise tensor.
     if log_target:
         result = torch.exp(target) * (target - input)
     else:
@@ -2741,6 +2990,12 @@ def kldivloss_reference(input, target, reduction='mean', log_target=False):
 
 def nlllossNd_reference(input, target, weight=None, ignore_index=-100,
                         reduction='mean'):
+    # [FUNCTION DOC] Reference N-d negative log likelihood loss written with explicit loops over
+    # every output position. Input must have at least 3 dimensions (batch, class, spatial...).
+    # Per position picks the input value at the target class, multiplies by the class weight
+    # (zero when the target equals ignore_index) and negates. Reduction mean divides the sum by
+    # the total weight, sum sums, otherwise returns the per-position tensor. Raises an error if
+    # input has fewer than 3 dimensions.
     if input.dim() < 3:
         raise AssertionError(f"Expected input.dim() >= 3, got {input.dim()}")
     N = input.size(0)
@@ -2768,6 +3023,10 @@ def nlllossNd_reference(input, target, weight=None, ignore_index=-100,
 
 def cross_entropy_loss_prob_target_reference(input, target, weight=None, reduction='mean',
                                              label_smoothing=0.0):
+    # [FUNCTION DOC] Reference cross entropy for class-probability targets: log-softmax over
+    # dimension 1, optional label smoothing mixing the target with a uniform distribution,
+    # per-class weights, sum over classes, then mean/sum/none reduction. Raises an error if
+    # input has fewer than 2 dimensions or label_smoothing exceeds 1.
     if input.dim() < 2:
         raise AssertionError(f"Expected input.dim() >= 2, got {input.dim()}")
 
@@ -2792,6 +3051,12 @@ def cross_entropy_loss_prob_target_reference(input, target, weight=None, reducti
 
 def cross_entropy_loss_indices_target_reference(input, target, weight=None, ignore_index=-100,
                                                 reduction='mean', label_smoothing=0.0):
+    # [FUNCTION DOC] Reference cross entropy for class-index targets: log-softmax over dimension
+    # 1 followed by nll_loss with the given weight, ignore_index and reduction. If label
+    # smoothing is zero returns that value; otherwise adds a smoothing term (negative sum of
+    # weighted log-probabilities over classes with ignored positions zeroed, reduced the same
+    # way) and returns the mix of the two scaled by one minus smoothing and smoothing over class
+    # count. Raises an error unless smoothing is in the half-open range above 0 up to 1.
     log_softmax_input = torch.log_softmax(input, 1)
     nllloss = F.nll_loss(
         log_softmax_input,
@@ -2833,6 +3098,9 @@ def cross_entropy_loss_indices_target_reference(input, target, weight=None, igno
 
 def cross_entropy_loss_reference(input, target, weight=None, ignore_index=-100, reduction='mean',
                                  label_smoothing=0.0):
+    # [FUNCTION DOC] Dispatches to the probability-target reference when input and target have
+    # the same shape, otherwise to the class-index reference; forwards weight, reduction, label
+    # smoothing and (index case only) ignore_index.
     if input.shape == target.shape:
         return cross_entropy_loss_prob_target_reference(
             input,
@@ -2853,6 +3121,11 @@ def linear_cross_entropy_loss_reference(input, linear_weight, target,
                                         ignore_index=None,
                                         reduction='mean',
                                         label_smoothing=0.0):
+    # [FUNCTION DOC] Reference for fused linear plus cross entropy: applies a linear map (weight
+    # flattened to 2-d, optional flattened bias) to the input, reshapes the result to batch
+    # dimensions, class dimension and any extra trailing output dimensions, then calls the
+    # standard cross entropy with the given weight, reduction and label smoothing. An
+    # ignore_index of None means the default -100.
     num_classes = linear_weight.shape[0]
     out_features = linear_weight.shape[1:-1]
     in_features = linear_weight.shape[-1]
@@ -2872,8 +3145,15 @@ def linear_cross_entropy_loss_reference(input, linear_weight, target,
 
 def nllloss_reference(input, target, weight=None, ignore_index=-100,
                       reduction='mean'):
+    # [FUNCTION DOC] Reference negative log likelihood loss for 2-d input (samples by classes)
+    # with 1-d targets, computed per sample with a Python loop. Samples whose target equals
+    # ignore_index contribute zero loss and zero weight. Reduction mean divides summed loss by
+    # summed weight, sum sums, otherwise returns the per-sample tensor.
 
     def nll_loss_helper(input, target, weight, ignore_index):
+        # [FUNCTION DOC] HELPER: Returns a pair (loss, weight) for one sample: (0, 0) if the
+        # target is ignored, otherwise the negated input value at the target class times its
+        # weight and that weight.
         if target == ignore_index:
             return (0, 0)
         norm = 1 if weight is None else weight[target]
@@ -2893,6 +3173,9 @@ def nllloss_reference(input, target, weight=None, ignore_index=-100,
 
 
 def smoothl1loss_reference(input, target, reduction='mean', beta=1.0):
+    # [FUNCTION DOC] Reference smooth L1 loss: for absolute difference below beta uses half the
+    # squared difference over beta, otherwise absolute difference minus half beta; beta equal to
+    # zero degenerates to absolute difference. Reduction mean, sum or none.
     abs_diff = (input - target).abs()
     ge_beta_mask = (abs_diff >= beta).type_as(abs_diff)
     lt_beta_mask = (abs_diff < beta).type_as(abs_diff)
@@ -2909,6 +3192,9 @@ def smoothl1loss_reference(input, target, reduction='mean', beta=1.0):
 
 
 def huberloss_reference(input, target, reduction='mean', delta=1.0):
+    # [FUNCTION DOC] Reference Huber loss: half the squared difference where the absolute
+    # difference is below delta, otherwise delta times (absolute difference minus half delta).
+    # Reduction mean, sum or none.
     abs_diff = (input - target).abs()
     ge_delta_mask = (abs_diff >= delta)
     lt_delta_mask = (abs_diff < delta)
@@ -2921,6 +3207,10 @@ def huberloss_reference(input, target, reduction='mean', delta=1.0):
 
 
 def _multilabelmarginloss_reference(input, target):
+    # [FUNCTION DOC] HELPER: Reference multilabel margin loss for a single sample: collects
+    # target indices up to the first negative entry, then sums the hinge terms (one minus
+    # target-class score plus other-class score) over every pair of target class and non-target
+    # class. Returns the unnormalized sum.
     targets = []
     for target_index in target:
         if target_index < 0:
@@ -2937,6 +3227,10 @@ def _multilabelmarginloss_reference(input, target):
 
 
 def multilabelmarginloss_reference(input, target, reduction='mean'):
+    # [FUNCTION DOC] Reference multilabel margin loss supporting 0-d/1-d inputs by promoting to
+    # 2-d, summing the per-sample loss, dividing by the class count, and applying mean, sum or
+    # none reduction (squeezing back for low-dimensional input with no reduction). Raises an
+    # error if a low-dimensional input has a target with 2 or more dimensions.
     # make everything 2-dimensional
     input_dim = input.dim()
     if input.dim() < 2:
@@ -2964,6 +3258,8 @@ def multilabelmarginloss_reference(input, target, reduction='mean'):
 
 
 def hingeembeddingloss_reference(input, target, margin=1.0, reduction='mean'):
+    # [FUNCTION DOC] Reference hinge embedding loss: input where target is 1, otherwise the
+    # margin minus input clamped at zero. Reduction mean, sum or none.
     margin_clamp = (margin - input).clamp(min=0).type_as(input)
     output = torch.where(target == 1, input, margin_clamp)
 
@@ -2975,6 +3271,8 @@ def hingeembeddingloss_reference(input, target, margin=1.0, reduction='mean'):
 
 
 def softmarginloss_reference(input, target, reduction='mean'):
+    # [FUNCTION DOC] Reference soft margin loss: log of one plus exp of negative input times
+    # target. Reduction mean, sum or none.
     output = (1 + (-input * target).exp()).log()
 
     if reduction == 'mean':
@@ -2985,6 +3283,9 @@ def softmarginloss_reference(input, target, reduction='mean'):
 
 
 def _multimarginloss_reference(input, target_idx, p, margin, weight):
+    # [FUNCTION DOC] HELPER: Reference multi margin loss for one sample: sums, over classes
+    # other than the target index, the target-class weight times the margin-hinge raised to
+    # power p. Uses unit weights if no weight is given.
     if weight is None:
         weight = input.new(len(input)).fill_(1)
 
@@ -2996,6 +3297,9 @@ def _multimarginloss_reference(input, target_idx, p, margin, weight):
 
 
 def multimarginloss_reference(input, target, p=1, margin=1, weight=None, reduction='mean'):
+    # [FUNCTION DOC] Reference multi margin loss: promotes low-dimensional input to 2-d and a
+    # 0-d target to 1-d, computes the per-sample loss, divides by the class count, and applies
+    # mean, sum or none reduction (squeezing the result back when the target was 0-d).
     if input.dim() < 2:
         input = input.unsqueeze(0) if input.dim() == 1 else input.unsqueeze(0).unsqueeze(0)
 
@@ -3019,7 +3323,12 @@ def multimarginloss_reference(input, target, p=1, margin=1, weight=None, reducti
 
 
 def cosineembeddingloss_reference(input1, input2, target, margin=0, reduction='mean'):
+    # [FUNCTION DOC] Reference cosine embedding loss: one minus cosine similarity where target
+    # is 1, otherwise cosine similarity minus margin clamped at zero. Cosine is computed per row
+    # with a small epsilon added to the norms. Reduction mean, sum or none.
     def _cos(a, b):
+        # [FUNCTION DOC] HELPER: Computes row-wise cosine similarity of two 2-d tensors with a
+        # loop over rows; returns a 1-d tensor.
         cos = a.new(a.size(0))
         for i in range(a.size(0)):
             cos[i] = (a[i] * b[i]).sum() / ((((a[i] * a[i]).sum() + 1e-12) * ((b[i] * b[i]).sum() + 1e-12)) ** 0.5)
@@ -3036,6 +3345,10 @@ def cosineembeddingloss_reference(input1, input2, target, margin=0, reduction='m
 
 def tripletmarginloss_reference(anchor, positive, negative, margin=1.0, p=2, eps=1e-6, swap=False,
                                 reduction='mean'):
+    # [FUNCTION DOC] Reference triplet margin loss: pairwise p-norm distances anchor-positive
+    # and anchor-negative (with swap, the negative distance becomes the smaller of that and the
+    # positive-negative distance), then margin plus positive distance minus negative distance
+    # clamped at zero. Reduction mean, sum or none.
     d_p = torch.pairwise_distance(anchor, positive, p, eps)
     d_n = torch.pairwise_distance(anchor, negative, p, eps)
     if swap:
@@ -3051,6 +3364,8 @@ def tripletmarginloss_reference(anchor, positive, negative, margin=1.0, p=2, eps
 
 
 def marginrankingloss_reference(input1, input2, target, margin=0, reduction='mean'):
+    # [FUNCTION DOC] Reference margin ranking loss: negative target times (input1 minus input2)
+    # plus margin, clamped at zero. Reduction mean, sum or none.
     output = (-target * (input1 - input2) + margin).clamp(min=0)
     if reduction == 'mean':
         return output.mean()
@@ -3061,6 +3376,11 @@ def marginrankingloss_reference(input1, input2, target, margin=0, reduction='mea
 
 # this directly follows Graves et al.'s paper, in contrast to the production implementation, it does not use log-space
 def ctcloss_reference(log_probs, targets, input_lengths, target_lengths, blank=0, reduction='mean'):
+    # [FUNCTION DOC] Reference CTC loss following the original paper with the forward (alpha)
+    # recursion in probability space, computed in double precision per batch element. Targets
+    # may be padded 2-d or concatenated 1-d; input and target lengths are converted to long
+    # tensors. Reduction mean divides each loss by its target length before averaging, sum sums,
+    # none returns the vector. Result is cast back to the original dtype of log_probs.
     input_lengths = torch.as_tensor(input_lengths, dtype=torch.long)
     target_lengths = torch.as_tensor(target_lengths, dtype=torch.long)
     dt = log_probs.dtype
@@ -3121,6 +3441,11 @@ criterion_tests = []
 
 
 def single_batch_reference_criterion_fn(*args):
+    # [FUNCTION DOC] Reference function for criterion tests without a batch dimension. The last
+    # positional argument is the criterion itself and the others are inputs/targets (possibly
+    # nested lists or tuples); each is given a leading batch dimension of size one and flattened
+    # into the criterion call. For reduction none the batch dimension is removed from the
+    # output, otherwise the scalar is returned.
     """Reference function for criterion supporting no batch dimensions.
 
     The criterion is passed the input and target in batched form with a single item.
@@ -3129,11 +3454,15 @@ def single_batch_reference_criterion_fn(*args):
     criterion = args[-1]
 
     def unsqueeze_inp(inp):
+        # [FUNCTION DOC] HELPER: Adds a leading dimension of size one to a tensor, or to every
+        # tensor of a list or tuple (returned as a list).
         if isinstance(inp, (list, tuple)):
             return [t.unsqueeze(0) for t in inp]
         return inp.unsqueeze(0)
 
     def flatten(xs):
+        # [FUNCTION DOC] HELPER: Recursively flattens nested lists and tuples into one flat list
+        # of leaves.
         result = []
         if isinstance(xs, (list, tuple)):
             for x in xs:
@@ -3241,18 +3570,32 @@ for (name, input_fn, target_fn), reduction in product(classification_criterion_n
 
 
 class NNTestCase(TestCase):
+    # [CLASS DOC] Base test case for nn tests (extends the common TestCase). Subclasses supply
+    # the abstract hooks _forward, _get_parameters, _zero_grad_parameters and _backward; the
+    # base class builds on them to compute analytical and numerical Jacobians with respect to
+    # inputs and parameters and compare them (check_jacobian) using the module-level PRECISION
+    # tolerance. Holds no state of its own.
+    # KNOWN ISSUE: abstractmethod is used but the base class does not use an abstract
+    # metaclass, so missing overrides are not detected at instantiation; the base methods
+    # just raise NotImplementedError.
 
     # _forward is defined in classes inheriting from NNTestCase
     @abstractmethod
     def _forward(self, *args, **kwargs):
+        # [FUNCTION DOC] Abstract hook: runs the module forward on the given input. Base version
+        # raises NotImplementedError.
         raise NotImplementedError
 
     @abstractmethod
     def _get_parameters(self, module: nn.Module) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
+        # [FUNCTION DOC] Abstract hook: returns a pair of lists (parameters, gradients of
+        # parameters) for the module. Base version raises NotImplementedError.
         raise NotImplementedError
 
     @abstractmethod
     def _zero_grad_parameters(self, module: nn.Module) -> None:
+        # [FUNCTION DOC] Abstract hook: resets the parameter gradients of the module. Base
+        # version raises NotImplementedError.
         raise NotImplementedError
 
     @abstractmethod
@@ -3260,9 +3603,14 @@ class NNTestCase(TestCase):
                   input: _TensorOrTensors, output: torch.Tensor,
                   grad_output: torch.Tensor | Sequence[torch.Tensor],
                   create_graph: bool = False):
+        # [FUNCTION DOC] Abstract hook: runs backward from grad_output (optionally
+        # creating a graph) and returns the gradient with respect to input. Base version
+        # raises NotImplementedError.
         raise NotImplementedError
 
     def _jacobian(self, input, num_out):
+        # [FUNCTION DOC] Returns zero-filled Jacobian containers with shape (number of elements
+        # of each input tensor, num_out), mirroring nested tuple/list structure of the input.
         if isinstance(input, tuple):
             return tuple(self._jacobian(elem, num_out) for elem in input)
         elif isinstance(input, list):
@@ -3271,6 +3619,8 @@ class NNTestCase(TestCase):
             return torch.zeros(input.nelement(), num_out)
 
     def _flatten_tensors(self, x):
+        # [FUNCTION DOC] Flattens a tensor (sparse tensors are densified first) to 1-d, or
+        # recursively returns a tuple of flattened tensors for a nested sequence.
         if isinstance(x, torch.Tensor):
             if x.is_sparse:
                 return x.to_dense().view(-1)
@@ -3280,6 +3630,8 @@ class NNTestCase(TestCase):
             return tuple(self._flatten_tensors(a) for a in x)
 
     def _zero_grad_input(self, input):
+        # [FUNCTION DOC] Zeroes and detaches the gradient of an input tensor if it requires grad
+        # and has one; recurses over sequences. Mutates the gradients in place.
         if isinstance(input, torch.Tensor):
             if input.requires_grad and input.grad is not None:
                 input.grad.zero_()
@@ -3289,6 +3641,11 @@ class NNTestCase(TestCase):
                 self._zero_grad_input(i)
 
     def _analytical_jacobian(self, module, input: _TensorOrTensors, jacobian_input=True, jacobian_parameters=True):
+        # [FUNCTION DOC] Computes the analytical Jacobian by running forward once and then one
+        # backward per output element with a one-hot output gradient. Returns a tuple containing
+        # the input Jacobian (if jacobian_input) and the parameter Jacobian (if
+        # jacobian_parameters), each of shape (inputs or parameters by output elements). Side
+        # effects: zeroes parameter and input gradients repeatedly and calls the backward hook.
         output = self._forward(module, input)
         output_size = output.nelement()
 
@@ -3331,7 +3688,13 @@ class NNTestCase(TestCase):
         return res
 
     def _numerical_jacobian(self, module, input: _TensorOrTensors, jacobian_input=True, jacobian_parameters=True):
+        # [FUNCTION DOC] Computes the numerical Jacobian by finite differences (epsilon 1e-6) of
+        # the detached forward result, with respect to the input (if jacobian_input) and the
+        # concatenation of all parameters (if jacobian_parameters). Returns a tuple in the same
+        # order as the analytical version.
         def fw(*input):
+            # [FUNCTION DOC] HELPER: Forward closure used by the numerical Jacobian: runs the
+            # module and returns the detached output.
             return self._forward(module, input).detach()
 
         res: tuple[torch.Tensor, ...] = ()
@@ -3348,6 +3711,10 @@ class NNTestCase(TestCase):
         return res
 
     def check_jacobian(self, module, input: _TensorOrTensors, jacobian_input=True):
+        # [FUNCTION DOC] Checks analytical versus numerical Jacobians for a module. Parameter
+        # Jacobians are included if the module has parameters. Asserts the largest absolute
+        # difference across all non-empty pairs is at most PRECISION. Fails the test via
+        # assertLessEqual. Does not verify the shapes of the Jacobians.
         jacobian_parameters = bool(self._get_parameters(module)[0])
         analytical = self._analytical_jacobian(module, input, jacobian_input, jacobian_parameters)
         numerical = self._numerical_jacobian(module, input, jacobian_input, jacobian_parameters)
@@ -3364,10 +3731,22 @@ class NNTestCase(TestCase):
 
 
 class TestBase:
+    # [CLASS DOC] Base class for declarative test specs. Constructed from a constructor (module
+    # class or factory), an optional description, optional reference function, optional
+    # fullname, and keyword arguments that supply the required arguments constructor_args, input
+    # and extra_args either as a value, a generating function (suffix _fn) or a size (suffix
+    # _size). State: desc, fullname, constructor, reference_fn, the extra keyword arguments and
+    # a per-instance cache of materialised arguments. Subclasses define how a spec is run when
+    # called with a test case.
 
     _required_arg_names = {'constructor_args', 'input', 'extra_args'}
 
     def __init__(self, constructor, desc='', reference_fn=None, fullname=None, **kwargs):
+        # [FUNCTION DOC] Stores the constructor, description, reference function, fullname and
+        # extra keyword arguments, and creates the argument cache. For each required argument
+        # name, defaults constructor_args and extra_args to an empty tuple when none of the
+        # value/_fn/_size forms is given; raises ValueError if input is missing in all three
+        # forms. Mutates the passed-in keyword mapping.
         self.desc = desc
         self.fullname = fullname
         self.constructor = constructor
@@ -3382,6 +3761,8 @@ class TestBase:
         self._arg_cache = {}
 
     def get_name(self):
+        # [FUNCTION DOC] Returns the test name: test_ plus fullname if set, otherwise test_ plus
+        # the constructor name with the description appended after an underscore if non-empty.
         if self.fullname is not None:
             return 'test_' + self.fullname
 
@@ -3391,6 +3772,9 @@ class TestBase:
         return test_name
 
     def _unpack(self, value):
+        # [FUNCTION DOC] HELPER: Returns tensors and non-iterable values unchanged;
+        # rebuilds any other iterable container as the same container type with each
+        # element unpacked recursively.
         if isinstance(value, torch.Tensor):
             return value
         elif is_iterable(value):
@@ -3400,13 +3784,22 @@ class TestBase:
 
     @property
     def constructor_args(self):
+        # [FUNCTION DOC] Property: the (cached) constructor arguments, with containers rebuilt
+        # by the unpack step.
         return self._get_arg('constructor_args', True)
 
     @property
     def extra_args(self):
+        # [FUNCTION DOC] Property: the (cached) extra arguments, with containers rebuilt by the
+        # unpack step.
         return self._get_arg('extra_args', True)
 
     def _get_arg(self, name, unpack):
+        # [FUNCTION DOC] HELPER: Returns the cached argument for a required argument name,
+        # creating it on first use from the value, the generating function, or random normal
+        # tensors of the given size (nested lists of sizes allowed; existing tensors become
+        # double). Optionally rebuilds containers via the unpack step. Raises an error if the
+        # name is not a required argument or no source exists.
         if name not in self._required_arg_names:
             raise AssertionError(f"Expected name '{name}' to be in required arg names")
 
@@ -3425,6 +3818,8 @@ class TestBase:
                     )
 
                 def map_tensor_sizes(sizes):
+                    # [FUNCTION DOC] HELPER: Maps a size, a tensor or nested lists of those to
+                    # random normal tensors; existing tensors are converted to double.
                     if isinstance(sizes, list):
                         return [map_tensor_sizes(s) for s in sizes]
                     elif isinstance(sizes, torch.Tensor):
@@ -3437,19 +3832,32 @@ class TestBase:
         return self._unpack(self._arg_cache[name]) if unpack else self._arg_cache[name]
 
     def _get_input(self, unpack=True):
+        # [FUNCTION DOC] HELPER: Returns the cached input argument, optionally unpacked.
         return self._get_arg('input', unpack)
 
     def __call__(self, test_case):
+        # [FUNCTION DOC] Abstract entry point: runs the test against a test case. Base version
+        # raises NotImplementedError.
         raise NotImplementedError
 
 
 class ModuleTest(TestBase):
+    # [CLASS DOC] Test spec for nn modules, running forward against an optional reference
+    # function, a non-contiguous input/gradient check, a pickling round trip and a
+    # subclass-defined extra check (_do_test). State from keyword arguments: jacobian_input,
+    # test_cuda, pickle, check_gradgrad, FIXME_no_cuda_gradgrad_comparison, precision (default
+    # 2e-4), check_forward_only and default_dtype (falls back to the current default dtype).
+    # Also provides a CUDA-versus-CPU comparison (test_cuda).
 
     @abstractmethod
     def _do_test(self, test_case: Any, module: nn.Module, input: Any) -> Any:
+        # [FUNCTION DOC] Abstract hook: subclass-specific checks on the constructed module and
+        # input. Base version raises NotImplementedError.
         raise NotImplementedError
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] Initializes the base spec and reads the flags and tolerances listed in
+        # the class description from the keyword arguments.
         super().__init__(*args, **kwargs)
         self.jacobian_input = kwargs.get('jacobian_input', True)
         self.should_test_cuda = kwargs.get('test_cuda', True)
@@ -3464,6 +3872,12 @@ class ModuleTest(TestBase):
             self.default_dtype = torch.get_default_dtype()
 
     def __call__(self, test_case):
+        # [FUNCTION DOC] Runs the spec under the configured default dtype: constructs the module
+        # and input, compares forward output with the reference function (if given, dtype not
+        # strictly checked), returns early if check_forward_only, runs the non-contiguous test,
+        # optionally saves and reloads the module through a temporary file (full unpickling
+        # allowed) comparing outputs, then runs the subclass _do_test. Failures are reported
+        # through the test case assertions.
         with set_default_dtype(self.default_dtype):
             module = self.constructor(*self.constructor_args)
             input = self._get_input()
@@ -3491,6 +3905,11 @@ class ModuleTest(TestBase):
             self._do_test(test_case, module, input)
 
     def noncontiguize(self, obj):
+        # [FUNCTION DOC] Returns a non-contiguous copy of a tensor (recursing over lists and
+        # tuples): stacks the tensor with an empty tensor along the dimension just after the
+        # first dimension of size above one and selects the tensor slice, detaching it and
+        # keeping requires_grad. Raises an error if the result is unexpectedly contiguous when
+        # it has more than one element.
         if isinstance(obj, list):
             return [self.noncontiguize(o) for o in obj]
         elif isinstance(obj, tuple):
@@ -3515,6 +3934,11 @@ class ModuleTest(TestBase):
         return noncontig
 
     def test_noncontig(self, test_case, module, input):
+        # [FUNCTION DOC] Checks that forward and backward results do not depend on memory
+        # layout: skips scalars; computes reference output, input gradient and parameter
+        # gradients with contiguous data, then repeats for every combination of contiguous or
+        # non-contiguous input and grad_output (with the RNG state frozen) and asserts equality.
+        # Mutates gradients of the module and input.
         # check no scalars, can't make non-contig
         if isinstance(input, torch.Tensor) and input.dim() == 0:
             return
@@ -3552,6 +3976,14 @@ class ModuleTest(TestBase):
                 test_case.assertEqual(test_case._get_parameters(module)[1], d_param)
 
     def test_cuda(self, test_case):
+        # [FUNCTION DOC] Compares the module on CPU and GPU: skips (raises SkipTest) if CUDA is
+        # unavailable or disabled. Copies CPU parameters to a float GPU copy, compares outputs,
+        # then five rounds of random backward gradients (inputs and parameters), then optional
+        # double-backward comparisons, and finally the non-contiguous check on the GPU module.
+        # Tolerance comes from the precision attribute.
+        # KNOWN ISSUE: in the double-backward section, the comparison of the last first-order
+        # input gradients is repeated although they were already compared in the loop above; it
+        # does not use the gradient results computed just before it.
         if not TEST_CUDA or not self.should_test_cuda:
             raise unittest.SkipTest('Excluded from CUDA tests')
 
@@ -3646,10 +4078,18 @@ class ModuleTest(TestBase):
 
 
 class InputVariableMixin:
+    # [CLASS DOC] Mixin for specs whose inputs must require gradients; overrides _get_input to
+    # mark floating-point and complex tensors (recursively in containers) as requiring grad.
+    # Holds no state of its own.
     def _get_input(self):
+        # [FUNCTION DOC] Returns the input argument (unpacked form disabled) with every floating
+        # or complex tensor, including those nested in containers, set to require grad. Mutates
+        # the cached input tensors.
         input = TestBase._get_input(self, False)  # type: ignore[arg-type]
 
         def map_variables(i):
+            # [FUNCTION DOC] HELPER: Sets requires_grad on floating or complex tensors and
+            # rebuilds containers recursively.
             if isinstance(i, torch.Tensor):
                 if i.is_floating_point() or i.is_complex():
                     i.requires_grad = True
@@ -3661,7 +4101,15 @@ class InputVariableMixin:
 
 
 class NewModuleTest(InputVariableMixin, ModuleTest):  # type: ignore[misc]
+    # [CLASS DOC] Full-featured module test: adds gradient checking, in-place variant
+    # comparison, dtype/device movement checks and printing to ModuleTest. Extra state from
+    # keyword arguments: cudnn, check_inplace, check_gradgrad, skip_double, skip_half,
+    # with_tf32, tf32_precision, test_cpu, has_sparse_gradients, check_batched_grad,
+    # gradcheck_fast_mode, supports_forward_ad, supports_fwgrad_bwgrad. Inputs require grad via
+    # the mixin.
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] Initializes the base test and reads the extra flags and tolerances
+        # listed in the class description from the keyword arguments.
         super().__init__(*args, **kwargs)
         self.cudnn = kwargs.get('cudnn', False)
         self.check_inplace = kwargs.get('check_inplace', False)
@@ -3678,10 +4126,18 @@ class NewModuleTest(InputVariableMixin, ModuleTest):  # type: ignore[misc]
         self.supports_fwgrad_bwgrad = kwargs.get('supports_fwgrad_bwgrad', False)
 
     def _check_gradients(self, test_case, module, input_tuple):
+        # [FUNCTION DOC] HELPER: Runs gradient checks on module parameters and inputs: for
+        # modules with sparse gradients uses the Jacobian comparison on the single input,
+        # otherwise runs gradcheck (with batched grad and forward AD options); additionally runs
+        # gradgradcheck unless disabled. Failures are test assertions. Raises an error if kwargs
+        # are passed to the checked function or the sparse path has more than one input.
         params = tuple(x for x in module.parameters())
         num_inputs = len(input_tuple)
 
         def fn_to_gradcheck(*inputs_and_params, **kwargs):
+            # [FUNCTION DOC] HELPER: Closure for gradcheck: runs the module forward on the
+            # leading inputs (parameters are included as extra arguments only so that they are
+            # differentiated). Raises an error if keyword arguments are given.
             if kwargs:
                 raise AssertionError(f"Expected no kwargs, got {kwargs}")
             return test_case._forward(module, inputs_and_params[:num_inputs])
@@ -3708,6 +4164,14 @@ class NewModuleTest(InputVariableMixin, ModuleTest):  # type: ignore[misc]
                                                check_fwd_over_rev=self.supports_fwgrad_bwgrad))
 
     def _do_test(self, test_case, module, input):
+        # [FUNCTION DOC] Subclass check run after the common checks: temporarily sets thread
+        # count to 1, runs the gradient checks, prints the module repr, optionally verifies the
+        # in-place variant gives the same output and input gradient without changing the
+        # original input version, then checks that casting to float and double, and (if CUDA)
+        # moving to GPU 0, back to CPU, GPU 1, double and half keep parameters at the expected
+        # tensor type and device. Restores the thread count at the end.
+        # KNOWN ISSUE: the thread count is not restored if any step raises, since there is
+        # no try/finally.
         num_threads = torch.get_num_threads()
         torch.set_num_threads(1)
         input_tuple = input if isinstance(input, tuple) else (input,)
@@ -3752,6 +4216,8 @@ class NewModuleTest(InputVariableMixin, ModuleTest):  # type: ignore[misc]
             test_case.assertEqual(input.grad, input_ip.grad)
 
         def assert_module_parameters_are(tensor_type, device_id=None):
+            # [FUNCTION DOC] HELPER: Asserts that every parameter of the module has the given
+            # tensor type and, if device_id is given, lives on that device.
             for p in module.parameters():
                 test_case.assertIsInstance(p, tensor_type)
                 if device_id is not None:
@@ -3774,6 +4240,8 @@ class NewModuleTest(InputVariableMixin, ModuleTest):  # type: ignore[misc]
         else:
             # check that float()/double() casters work correctly
             def to_type(tensor, real, complex):
+                # [FUNCTION DOC] HELPER: Converts a tensor to the given real dtype if floating,
+                # the given complex dtype if complex, else returns it unchanged.
                 if tensor.is_complex():
                     return tensor.to(complex)
                 elif tensor.is_floating_point():
@@ -3782,13 +4250,19 @@ class NewModuleTest(InputVariableMixin, ModuleTest):  # type: ignore[misc]
                     return tensor
 
             def to_half(x):
+                # [FUNCTION DOC] HELPER: Converts floating tensors to half precision; complex
+                # tensors are not supported.
                 # TODO: torch.complex32 when properly supported
                 return to_type(x, torch.float16, None)
 
             def to_single(x):
+                # [FUNCTION DOC] HELPER: Converts floating tensors to float32 and complex
+                # tensors to complex64.
                 return to_type(x, torch.float32, torch.complex64)
 
             def to_double(x):
+                # [FUNCTION DOC] HELPER: Converts floating tensors to float64 and complex
+                # tensors to complex128.
                 return to_type(x, torch.float64, torch.complex128)
 
             # to float
@@ -3856,19 +4330,31 @@ class NewModuleTest(InputVariableMixin, ModuleTest):  # type: ignore[misc]
         torch.set_num_threads(num_threads)
 
     def _get_target(self):
+        # [FUNCTION DOC] HELPER: Returns the target argument without unpacking.
         return self._get_arg('target', False)
 
     @property
     def constructor_args(self):
+        # [FUNCTION DOC] Property: the constructor arguments without unpacking containers.
         return self._get_arg('constructor_args', False)
 
 
 class CriterionTest(InputVariableMixin, TestBase):  # type: ignore[misc]
+    # [CLASS DOC] Test spec for loss modules (criterions). Required arguments are the base ones
+    # plus a target. State from keyword arguments: test_cuda, check_forward_only,
+    # check_gradgrad, check_half, check_bfloat16, check_complex, test_cpu, with_tf32 (default
+    # True), tf32_precision, check_batched_grad and default_dtype. Running it checks the forward
+    # result against the reference function and runs gradcheck/gradgradcheck; test_cuda compares
+    # CPU and GPU results for a given dtype. Test cases are expected to provide
+    # _forward_criterion and _backward_criterion.
     # TODO: check that criterions don't ignore grad_output
 
     _required_arg_names = TestBase._required_arg_names.union({'target'})
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] Initializes the base spec and reads the flags and tolerances listed in
+        # the class description from the keyword arguments; default dtype falls back to the
+        # current global default.
         super().__init__(*args, **kwargs)
         self.should_test_cuda = kwargs.get('test_cuda', True)
         self.check_forward_only = kwargs.get('check_forward_only', False)
@@ -3885,6 +4371,11 @@ class CriterionTest(InputVariableMixin, TestBase):  # type: ignore[misc]
             self.default_dtype = torch.get_default_dtype()
 
     def __call__(self, test_case):
+        # [FUNCTION DOC] Runs the spec under the configured default dtype: builds module,
+        # input and target, checks that repr and str work, compares forward output with the
+        # reference function when given, returns early if check_forward_only, then runs
+        # gradcheck over inputs, parameters and target, and gradgradcheck if enabled.
+        # Failures are test assertions.
         with set_default_dtype(self.default_dtype):
             module = self.constructor(*self.constructor_args)
             input = self._get_input()
@@ -3909,11 +4400,15 @@ class CriterionTest(InputVariableMixin, TestBase):  # type: ignore[misc]
                 inputs = (input,) + params + (target,)
 
                 def apply_fn(input, target, *params):
+                    # [FUNCTION DOC] HELPER: Wraps a one-input criterion call for gradcheck;
+                    # parameters are accepted only to be differentiated.
                     return module(input, target)
             else:
                 inputs = input + params + (target,)
 
                 def apply_fn(input1, input2, target, *params):  # type: ignore[misc]
+                    # [FUNCTION DOC] HELPER: Wraps a two-input criterion call for gradcheck;
+                    # parameters are accepted only to be differentiated.
                     return module(input1, input2, target)
 
             gradcheck(apply_fn, inputs, check_batched_grad=self.check_batched_grad)
@@ -3922,7 +4417,14 @@ class CriterionTest(InputVariableMixin, TestBase):  # type: ignore[misc]
                 gradgradcheck(apply_fn, inputs, check_batched_grad=self.check_batched_grad)
 
     def test_cuda(self, test_case, dtype, extra_args=None):
+        # [FUNCTION DOC] Compares CPU and GPU criterion output and input gradients for the given
+        # dtype: skips (SkipTest) if CUDA is unavailable or disabled; converts input, target and
+        # module to dtype, moves GPU copies to CUDA, and for half or bfloat16 recomputes the CPU
+        # side in the default dtype. Tolerance is 1e-1 for half and bfloat16 and 4e-4 otherwise.
+        # Optional extra_args are forwarded to the test case helpers.
         def convert_dtype(obj, dtype, requires_grad=False):
+            # [FUNCTION DOC] HELPER: Detaches tensors (recursing over tuples), converts them to
+            # the dtype and sets requires_grad; non-tensors are returned unchanged.
             if isinstance(obj, torch.Tensor):
                 return obj.detach().to(dtype=dtype).requires_grad_(requires_grad)
             elif isinstance(obj, tuple):
@@ -3973,18 +4475,28 @@ class CriterionTest(InputVariableMixin, TestBase):  # type: ignore[misc]
                                   atol=1e-1 if dtype in {torch.half, torch.bfloat16} else 4e-4, rtol=0, exact_dtype=False)
 
     def _get_target(self):
+        # [FUNCTION DOC] HELPER: Returns the target argument without unpacking.
         return self._get_arg('target', False)
 
     @property
     def constructor_args(self):
+        # [FUNCTION DOC] Property: the constructor arguments without unpacking containers.
         return self._get_arg('constructor_args', False)
 
     @property
     def extra_args(self):
+        # [FUNCTION DOC] Property: the extra arguments without unpacking containers.
         return self._get_arg('extra_args', False)
 
 
 def _test_bfloat16_ops(test_case, op, device, inp_dims=(), prec=1e-2, scale_factor=None):
+    # [FUNCTION DOC] HELPER: Compares an op in float32 against the same op converted to
+    # bfloat16 for forward output and input gradient within tolerance prec. Input has the
+    # given dimensions on the device; if scale_factor is given the input is regenerated as
+    # scaled uniform values rounded through bfloat16. Mutates the op in place by converting
+    # it to bfloat16.
+    # KNOWN ISSUE: when scale_factor is given the first random input is generated and
+    # then discarded.
     # fp32 compute
     input1 = torch.randn(inp_dims, dtype=torch.float32, device=device, requires_grad=True)
     if scale_factor is not None:
@@ -4004,6 +4516,10 @@ def _test_bfloat16_ops(test_case, op, device, inp_dims=(), prec=1e-2, scale_fact
     test_case.assertEqual(input1.grad.data, input2.grad.data, atol=prec, rtol=prec, exact_dtype=False)
 
 def _test_module_empty_input(test_case, module, inp, check_size=True, inference=False):
+    # [FUNCTION DOC] HELPER: Runs a module on an input with an empty dimension and checks
+    # results: forward (unless inference only the input is set to require grad), backward with
+    # random gradient, optionally that output size equals input size, and that all parameter
+    # gradients and the input gradient are zero.
     if not inference:
         inp.requires_grad_(True)
     out = module(inp)
@@ -4020,14 +4536,23 @@ def _test_module_empty_input(test_case, module, inp, check_size=True, inference=
 
 
 def _create_basic_net():
+    # [FUNCTION DOC] HELPER: Builds and returns a triple of test modules: a Layer with a
+    # parameter and a buffer, a Net containing a Layer plus its own parameter and buffer, and a
+    # Sequential containing the same Net twice (shared module).
     class Layer(nn.Module):
+        # [CLASS DOC] HELPER: Tiny module with one parameter (shape 3 by 5, uninitialized) and
+        # one buffer (zeros of shape 1 by 3 by 3 by 7); no forward.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Registers the dummy parameter and buffer.
             super().__init__()
             self.layer_dummy_param = nn.Parameter(torch.empty(3, 5))
             self.layer_dummy_buf = nn.Buffer(torch.zeros(1, 3, 3, 7))
 
     class Net(nn.Module):
+        # [CLASS DOC] HELPER: Tiny module containing a Layer child, an uninitialized 3 by 5
+        # parameter and a zeros buffer of shape 7 by 3 by 3 by 1; no forward.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Registers the child layer, dummy parameter and buffer.
             super().__init__()
             self.l1 = Layer()
             self.dummy_param = nn.Parameter(torch.empty(3, 5))
