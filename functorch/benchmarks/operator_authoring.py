@@ -1,3 +1,10 @@
+# [MODULE DOC] Benchmark comparing NNC-fused pointwise operators (nnc_add, nnc_addnorm built
+# with pointwise_operator) against eager ATen and TorchScript versions across tensor sizes,
+# layouts, broadcasting, dtypes, out= and backward cases. Module globals WRITE_CSV, CUDA,
+# SIZES, NUMBER and REPEAT configure it. Import-time side effects: scripts two functions with
+# torch.jit.script. Running main prints speedup tables and may write a CSV.
+# KNOWN ISSUE: pointwise_operator is imported from functorch.compile, whose package does not
+# export it, so importing this module fails with an ImportError.
 import timeit
 from functools import partial
 
@@ -17,19 +24,24 @@ REPEAT = 20
 
 @pointwise_operator
 def nnc_add(a, b):
+    # [FUNCTION DOC] HELPER: Pointwise-fused elementwise addition of a and b; returns the sum.
     return a + b
 
 
 @pointwise_operator
 def nnc_addnorm(a, b, mean, std):
+    # [FUNCTION DOC] HELPER: Pointwise-fused (a + b - mean) / std; returns the result tensor.
     return (a + b - mean) / std
 
 
 def eager_addnorm(a, b, mean, std):
+    # [FUNCTION DOC] HELPER: Eager reference for nnc_addnorm: (a + b - mean) / std.
     return (a + b - mean) / std
 
 
 def inplace_addnorm(a, b, mean, std, out):
+    # [FUNCTION DOC] HELPER: Same math as eager_addnorm but computed with out= variants of add,
+    # sub and div writing into the preallocated out tensor, which is mutated and returned.
     out = torch.add(a, b, out=out)
     torch.sub(out, mean, out=out)
     torch.div(out, std, out=out)
@@ -41,11 +53,15 @@ ts_ip_addnorm = torch.jit.script(inplace_addnorm)
 
 
 def maybe_synced(fn):
+    # [FUNCTION DOC] HELPER: If the global CUDA flag is set, synchronize once and return a
+    # wrapper that calls fn, synchronizes CUDA, and returns fn's result; otherwise return fn
+    # unchanged. Used so timing includes GPU completion.
     if CUDA:
         synchronize = torch.cuda.synchronize
         synchronize()  # warmup
 
         def _fn():
+            # [FUNCTION DOC] HELPER: Call fn, wait for CUDA to finish, return fn's result.
             result = fn()
             synchronize()
             return result
@@ -55,6 +71,10 @@ def maybe_synced(fn):
 
 
 def benchmark_loop(setup):
+    # [FUNCTION DOC] HELPER: For each size in SIZES, call setup with the size to get a pair of
+    # callables (nnc, aten), wrap them with maybe_synced, and time each REPEAT times with the
+    # per-size NUMBER of calls. Takes the median over repeats, prints and returns an array of
+    # aten-time / nnc-time speedups per size. Raises an error if the result shape is wrong.
     result = np.zeros((REPEAT, len(SIZES), 2), dtype=np.float64)
     for s, n in enumerate(SIZES):
         nnc, aten = setup(n)
@@ -74,7 +94,11 @@ def benchmark_loop(setup):
 
 
 def test(make_args, nnc=nnc_add, aten=torch.add):
+    # [FUNCTION DOC] HELPER: Benchmark the nnc function against the aten function on inputs
+    # from make_args(size). Returns the speedup array from benchmark_loop.
     def setup(n):
+        # [FUNCTION DOC] HELPER: Build args for size n, run both implementations, and raise an
+        # error if dtype, size, stride or values differ. Returns two zero-argument callables.
         args = make_args(n)
         result_aten = aten(*args)
         result_nnc = nnc(*args)
@@ -97,7 +121,11 @@ def test(make_args, nnc=nnc_add, aten=torch.add):
 
 
 def test_inplace(make_args, nnc=nnc_add, aten=torch.add):
+    # [FUNCTION DOC] HELPER: Like test, but benchmarks the in-place form where the first input
+    # is also passed as out. Returns the speedup array.
     def inplace_setup(n):
+        # [FUNCTION DOC] HELPER: Check both implementations agree when writing into a clone of
+        # the first input, then return callables that write back into that input.
         a, b = make_args(n)
         result_aten = torch.clone(a)
         result_nnc = torch.clone(a)
@@ -110,7 +138,11 @@ def test_inplace(make_args, nnc=nnc_add, aten=torch.add):
 
 
 def test_out(make_args, out, nnc=nnc_add, aten=torch.add):
+    # [FUNCTION DOC] HELPER: Like test, but benchmarks the out= form with output tensors made
+    # by the out factory (called with the size). Returns the speedup array.
     def out_setup(n):
+        # [FUNCTION DOC] HELPER: Check both implementations produce equal values into fresh
+        # outputs, then return callables writing into one shared preallocated output.
         args = make_args(n)
         result_aten = out(n)
         result_nnc = out(n)
@@ -124,7 +156,11 @@ def test_out(make_args, out, nnc=nnc_add, aten=torch.add):
 
 
 def test_backwards(make_args, nnc=nnc_add, aten=torch.add):
+    # [FUNCTION DOC] HELPER: Like test, but benchmarks forward plus backward of the summed
+    # output. Exactly one input must require grad. Returns the speedup array.
     def backwards_setup(n):
+        # [FUNCTION DOC] HELPER: Verify both implementations give the same gradient for the
+        # single requires-grad input, then return callables doing forward and backward.
         args = make_args(n)
         (grad_var,) = (a for a in args if a.requires_grad)
         aten(*args).sum().backward()
@@ -141,6 +177,10 @@ def test_backwards(make_args, nnc=nnc_add, aten=torch.add):
 
 
 def main():
+    # [FUNCTION DOC] HELPER: Run the whole benchmark suite (add, broadcasting, in-place, out=,
+    # transposed, sliced, dtype promotion, fused addnorm and backward cases). Sets one thread
+    # and enables CPU fusion in the JIT (global side effects), prints a speedup table, and if
+    # WRITE_CSV is set writes ../operator_authoring_results.csv. Returns nothing.
     torch.set_num_threads(1)  # TODO(jansel): add parallel support
     torch._C._jit_override_can_fuse_on_cpu(True)
 

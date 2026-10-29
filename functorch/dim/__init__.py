@@ -1,3 +1,11 @@
+# [PACKAGE DOC] functorch.dim: first-class dimensions. Lets users create named dimension objects
+# (Dim, DimList via dims() and dimlists()), index tensors with them, and have operations
+# automatically batch over the bound dimensions using functorch vmap layers. Contents: Dim and
+# DimList, tensor wrappers (_Tensor, Tensor) with a torch-function hook, dimension-aware stack,
+# split, cat, dot and index helpers, and error types DimensionBindError and
+# DimensionMismatchError. Import-time side effects: registers wrapped torch functions and Tensor
+# methods onto the classes at the end of the module (see _def and the code below it); module
+# globals POINTWISE_OPTIMIZE and DOT_OPTIMIZED toggle fast paths.
 from __future__ import annotations
 
 import dis
@@ -26,16 +34,20 @@ _n_dims_created = 0
 
 
 def _relevant_op(opcode: str | None) -> bool:
+    # [FUNCTION DOC] HELPER: True if opcode is a non-empty name starting with STORE_ (a variable
+    # store instruction).
     """Check if opcode is relevant for variable assignment."""
     return bool(opcode and opcode.startswith("STORE_"))
 
 
 def handle_from_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Identity function; returns the tensor unchanged (a hook point).
     """Handle tensor conversion for torch function integration."""
     return tensor
 
 
 def _create_dim(name: str, size: int | None = None) -> Dim:
+    # [FUNCTION DOC] HELPER: Build a Dim with the given name; a size of None becomes -1 (unbound).
     """Create a new Dim object."""
     return Dim(name, size if size is not None else -1)
 
@@ -43,6 +55,13 @@ def _create_dim(name: str, size: int | None = None) -> Dim:
 def dims(
     n: int | None = None, sizes: list[int | None] | None = None
 ) -> Dim | tuple[Dim, ...]:
+    # [FUNCTION DOC] Create n new Dim objects (n from argument n, else the length of sizes, else
+    # inferred by inspecting the caller's bytecode for the assignment target count). Names are
+    # taken from the assigned variable names when the call is directly assigned; otherwise they
+    # are d0, d1, and so on. sizes gives per-dim sizes (None leaves unbound). Returns one Dim if
+    # exactly one is requested, else a tuple. Raises SyntaxError if the count cannot be
+    # determined, ValueError if sizes length mismatches, RuntimeError if no caller frame.
+    # Reads the caller's frame; no other side effects.
     """
     Create and return one or more Dim objects.
 
@@ -108,6 +127,9 @@ def dims(
             found_ndims = 0
 
         def genobject(i: int) -> Dim:
+            # [FUNCTION DOC] HELPER: Create the i-th Dim, naming it from the decoder's current
+            # store target when names were found (and advancing the decoder), else d followed
+            # by i (and disabling further name lookup). Uses sizes[i] if sizes was given.
             nonlocal found_ndims
             name = None
             if i < found_ndims:
@@ -140,6 +162,11 @@ def dims(
 
 
 class DimList:
+    # [CLASS DOC] A sequence of first-class Dims whose length may be unknown. State: _name (used
+    # to name generated Dims), _dims (list of Dim), _bound (whether the length is fixed). Once
+    # bound the length cannot change (rebinding to a different length raises
+    # DimensionBindError). Used in indexing to stand for several dimensions. Key methods:
+    # bind_len, bind, size, indexing by int or slice.
     """
     A list of first-class dimensions that can be bound to tensor dimensions.
 
@@ -157,6 +184,9 @@ class DimList:
         len_or_dims: int | Sequence | None = None,
         name: str | None = None,
     ):
+        # [FUNCTION DOC] Create a DimList. An int len_or_dims binds it to that many fresh Dims;
+        # a sequence creates one Dim per item (an int item is a size, with a generated name;
+        # any other item is passed as the Dim name) and marks it bound; None leaves it unbound.
         """
         Initialize a new DimList object.
 
@@ -182,11 +212,15 @@ class DimList:
             self._set_dims(dims)
 
     def _set_dims(self, dims: list) -> None:
+        # [FUNCTION DOC] HELPER: Store the given Dim list and mark this DimList bound.
         """Set the dimensions and mark as bound."""
         self._bound = True
         self._dims = dims
 
     def bind_len(self, size: int) -> None:
+        # [FUNCTION DOC] Fix the length. If unbound, mark bound and create size fresh unsized
+        # Dims named from _name plus index. If already bound, only check the length matches and
+        # raise DimensionBindError otherwise.
         """
         Bind this DimList to a specific length.
 
@@ -209,6 +243,9 @@ class DimList:
                 self._dims.append(Dim(dim_name))
 
     def bind(self, sizes: Sequence[int]) -> None:
+        # [FUNCTION DOC] Bind the length to len(sizes) via bind_len, then set each Dim's size to
+        # the corresponding value (converted to int; may raise from the Dim size setter if a
+        # different size was already set). Raises ValueError if sizes is not a sized sequence.
         """
         Bind this DimList to specific sizes.
 
@@ -228,28 +265,37 @@ class DimList:
             self._dims[i].size = int(dim_size)
 
     def _size(self) -> int:
+        # [FUNCTION DOC] HELPER: Number of Dims; raises DimensionBindError if unbound.
         if not self._bound:
             raise DimensionBindError("DimList not bound")
         return len(self._dims)
 
     def size(self) -> int:
+        # [FUNCTION DOC] Number of Dims in the list; raises DimensionBindError if unbound.
         """Return the size (number of dimensions) of this DimList."""
         return self._size()
 
     def _set_bound(self, b: bool) -> None:
+        # [FUNCTION DOC] HELPER: Directly set the bound flag without touching the Dims.
         """Set the bound status (for internal use)."""
         self._bound = b
 
     @property
     def is_bound(self) -> bool:
+        # [FUNCTION DOC] Property: True once the length of the list is fixed.
         """Property to check if DimList is bound."""
         return self._bound
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Length of the list; raises DimensionBindError if unbound.
         """Return the length of the DimList."""
         return self.size()
 
     def __getitem__(self, key: int | slice) -> Dim | tuple[Dim, ...]:
+        # [FUNCTION DOC] Return the Dim at an int index, or a tuple of Dims for a slice. Raises
+        # DimensionBindError if unbound, IndexError for an out-of-range or negative int index
+        # (negative indices are not supported, unlike ordinary lists), ValueError for other key
+        # types.
         if not self._bound:
             raise DimensionBindError("DimList not bound")
 
@@ -267,6 +313,8 @@ class DimList:
             raise ValueError("expected an int or a slice")
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Bound: parenthesized comma-separated reprs of the Dims; unbound with a
+        # name: a star followed by the name; otherwise the text <unbound_dimlist>.
         """Return string representation of the DimList."""
         if self._bound:
             # Show as tuple representation
@@ -279,6 +327,7 @@ class DimList:
             return "<unbound_dimlist>"
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Same text as __repr__.
         """Return string representation of the DimList."""
         return self.__repr__()
 
@@ -290,10 +339,15 @@ class DimList:
         args: tuple = (),
         kwargs: dict | None = None,
     ) -> Any:
+        # [FUNCTION DOC] Torch-function hook for DimList: forwards the call unchanged to the
+        # _Tensor hook and returns its result.
         return _Tensor.__torch_function__(func, types, args, kwargs)
 
 
 def _create_dimlist(name: str, size: int | list[int | None] | None = None) -> DimList:
+    # [FUNCTION DOC] HELPER: Make a named DimList. An int size binds it to that length; a list
+    # binds it to the list length and sets each non-None entry as that Dim's size; None leaves
+    # it unbound.
     """Create a DimList object with the given name and optional size."""
     dimlist = DimList(name=name)
     if size is not None:
@@ -311,6 +365,10 @@ def _create_dimlist(name: str, size: int | list[int | None] | None = None) -> Di
 def dimlists(
     n: int | None = None, sizes: list[int | None] | None = None
 ) -> DimList | tuple[DimList, ...]:
+    # [FUNCTION DOC] Same protocol as dims() but creates DimList objects: count comes from n,
+    # sizes length, or the caller's assignment target; names come from the assigned variable
+    # names, else d0, d1, and so on. A single result is returned bare, several as a tuple.
+    # Raises SyntaxError, ValueError or RuntimeError in the same situations as dims().
     """
     Create and return one or more DimList objects.
 
@@ -363,6 +421,9 @@ def dimlists(
 
         # Generator function for dimlist names
         def genobject(i: int) -> str:
+            # [FUNCTION DOC] HELPER: Return the name for the i-th DimList: the decoder's current
+            # store target (advancing it) when names were found, else d followed by i (which
+            # also disables further name lookup).
             nonlocal found_ndims
             name = None
             if i < found_ndims:
@@ -398,10 +459,13 @@ def dimlists(
 
 
 class DimensionMismatchError(Exception):
+    # [CLASS DOC] Error raised when dimensions of operands do not match as required.
     pass
 
 
 class DimensionBindError(Exception):
+    # [CLASS DOC] Error raised when a Dim or DimList cannot be bound to a size or length (for
+    # example conflicting sizes, or an unbound DimList used where a length is needed).
     pass
 
 
@@ -409,6 +473,10 @@ from . import op_properties
 
 
 def _safe_print(*args: Any, **kwargs: Any) -> None:
+    # [FUNCTION DOC] HELPER: Print args to standard error, replacing any argument whose type name
+    # mentions torch with a placeholder of its class name, to avoid triggering torch-function
+    # dispatch while printing. Extra keyword arguments go to print.
+    # KNOWN ISSUE: passing a file keyword argument would conflict with the fixed file argument.
     """Safe print that avoids recursive torch function dispatches."""
     import sys
 
@@ -424,21 +492,37 @@ def _safe_print(*args: Any, **kwargs: Any) -> None:
 
 
 class _Tensor:
+    # [CLASS DOC] Base class of first-class-dimension values (Dim and Tensor). Subclasses supply
+    # levels (_get_levels), the underlying tensor (_get_tensor) and ndim. This class provides
+    # the torch-function hook that intercepts torch operations: it special-cases multiply of
+    # scalars, item get/set, len, softmax, stack and split, and otherwise runs the operation
+    # either pointwise (aligning operands by level) or under functorch vmap layers, then wraps
+    # results as Tensor objects. Also defines expand, index, order-related helpers, and repr.
     def _get_levels(self) -> list[Any]:
+        # [FUNCTION DOC] Abstract: subclasses return their list of levels; raises
+        # NotImplementedError here.
         raise NotImplementedError("_get_levels must be implemented by subclass")
 
     def _get_tensor(self) -> torch.Tensor | None:
+        # [FUNCTION DOC] Abstract: subclasses return the underlying tensor; raises
+        # NotImplementedError here.
         raise NotImplementedError("_get_tensor must be implemented by subclass")
 
     @property
     def ndim(self) -> int:
+        # [FUNCTION DOC] Abstract property: number of positional dimensions; raises
+        # NotImplementedError here.
         raise NotImplementedError("ndim must be implemented by subclass")
 
     @property
     def dims(self) -> tuple[Any, ...]:
+        # [FUNCTION DOC] Property: tuple of the first-class Dim objects among the levels, in
+        # level order (positional levels excluded).
         return tuple(l.dim() for l in self._get_levels() if not l.is_positional())
 
     def dim(self) -> int:
+        # [FUNCTION DOC] Number of positional dimensions (same as ndim), mirroring the tensor
+        # method of the same name.
         return self.ndim
 
     @classmethod
@@ -449,6 +533,12 @@ class _Tensor:
         args: tuple = (),
         kwargs: dict | None = None,
     ) -> Any:
+        # [FUNCTION DOC] Intercept a torch function call involving first-class dims. Special
+        # cases: multiply of two zero-dim floating tensors becomes a delayed Tensor (when
+        # DOT_OPTIMIZED); item get and set are routed to the indexing module (set returns None,
+        # raises ValueError unless given exactly three args); length returns the first size;
+        # softmax, stack and split use the dim-aware implementations. Everything else goes to
+        # _torch_function_fallback. Returns the result of the chosen path.
         if kwargs is None:
             kwargs = {}
 
@@ -538,6 +628,12 @@ class _Tensor:
     def _torch_function_fallback(
         func: Callable, types: tuple, args: tuple, kwargs: dict
     ) -> Any:
+        # [FUNCTION DOC] HELPER: Run func on arguments that may carry first-class dims. Flattens
+        # args/kwargs, gathers each tensor-like argument's levels and a device-holding tensor.
+        # For pointwise ops (when POINTWISE_OPTIMIZE) aligns all operands to the union of levels
+        # and calls func directly, wrapping tensor results with those levels. Otherwise enters
+        # EnableAllLayers, passes batched tensors with updated levels, and converts results
+        # back from batched form. Returns results in the same structure as func's output.
         """Fallback torch function implementation for non-special-cased functions."""
         is_pointwise = POINTWISE_OPTIMIZE and func in op_properties.pointwise
         # TODO: optimize pytree here
@@ -579,6 +675,8 @@ class _Tensor:
 
             # Wrap tensor results
             def wrap_tensor(obj: Any) -> Any:
+                # [FUNCTION DOC] HELPER: Wrap a plain tensor as a first-class-dim Tensor with the
+                # common result levels; other objects are returned unchanged.
                 if isinstance(obj, torch.Tensor):
                     return Tensor.from_positional(
                         obj, result_levels, device_holding_tensor is not None
@@ -607,6 +705,8 @@ class _Tensor:
 
             # Unwrap results from functorch layers
             def unwrap_tensor(obj: Any) -> Any:
+                # [FUNCTION DOC] HELPER: Convert a batched tensor result back to a Tensor via the
+                # layer guard; other objects are returned unchanged.
                 if isinstance(obj, torch.Tensor):
                     return guard.from_batched(obj, device_holding_tensor is not None)
                 return obj
@@ -617,6 +717,9 @@ class _Tensor:
                 return tree_map(unwrap_tensor, result)
 
     def __setitem__(self, index: Any, value: Any) -> None:
+        # [FUNCTION DOC] Assign value into self at index using the first-class-dim setitem logic
+        # (in-place mutation of the underlying tensor). Raises DimensionBindError if value
+        # carries a Dim missing from the target.
         """Set values in tensor using first-class dimensions."""
         from functorch.dim._getsetitem import setitem
 
@@ -626,6 +729,11 @@ class _Tensor:
     # versions, but if they did they need the stack/cat treatment
 
     def expand(self, *args: Dim) -> _Tensor:
+        # [FUNCTION DOC] If every argument is a Dim, return a new Tensor with those Dims prepended
+        # as zero-stride levels sized by each Dim (a view, no copy). Raises DimensionBindError if
+        # a Dim is already present or repeated, or ValueError if an unbound Dim size is read.
+        # If any argument is not a Dim, falls back to ordinary tensor expand via the torch
+        # function path, as it also does when no tensor info is available.
         """
         Expand tensor by adding new dimensions or expanding existing dimensions.
 
@@ -719,6 +827,11 @@ class _Tensor:
         | tuple[int | slice | torch.Tensor, ...]
         | list[int | slice | torch.Tensor],
     ) -> _Tensor:
+        # [FUNCTION DOC] Index the given dims of self with the matching indices. dims and indices
+        # may each be a single item or equal-length sequences. A dim may be a dim pack (sequence):
+        # the packed dims are flattened into the first one before indexing. Returns the indexed
+        # result as a Tensor. Raises TypeError for a bad dim spec, a dim missing from the tensor,
+        # or mismatched lengths between dims and indices.
         """
         Index tensor using first-class dimensions.
         """
@@ -728,11 +841,15 @@ class _Tensor:
 
         # Helper to check if obj is a dimpack (tuple/list) and extract items
         def maybe_dimpack(obj: Any, check_first: bool = False) -> tuple[Any, bool]:
+            # [FUNCTION DOC] HELPER: If obj is a tuple or list, return (list of its items, True);
+            # else (None, False). The check_first argument is unused.
             if isinstance(obj, (tuple, list)):
                 return list(obj), True
             return None, False
 
         def parse_dim_entry(s: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Convert a dim specification s (Dim or int position) into a
+            # DimEntry relative to self's ndim; raises TypeError if it is not a valid dimension.
             d = _wrap_dim(s, self.ndim, False)
             if d.is_none():
                 raise TypeError(f"expected a dimension specifyer but found {repr(s)}")
@@ -740,6 +857,8 @@ class _Tensor:
 
         # Helper for dimension not present errors
         def dim_not_present(d: Any) -> None:
+            # [FUNCTION DOC] HELPER: Always raises TypeError describing the missing dimension d
+            # (position out of range or Dim not in the tensor); never returns normally.
             if d.is_positional():
                 raise TypeError(
                     f"dimension {d.position() + self.ndim} not in tensor of {self.ndim} dimensions"
@@ -864,6 +983,9 @@ class _Tensor:
         return invoke_getitem(info)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form: the underlying tensor, then a line listing dims (positional
+        # levels shown as non-negative positions, first-class levels as their Dims) and the
+        # tensor sizes.
         tensor, levels, ndim = self._get_tensor(), self._get_levels(), self.ndim
         dims_repr = []
         for l in levels:
@@ -883,6 +1005,11 @@ TensorLike = (_Tensor, torch.Tensor)
 
 
 class Dim(_Tensor):
+    # [CLASS DOC] A first-class dimension: a named, optionally sized axis usable as an index and
+    # as an implicit vmap batch dimension. State: _name, _size (-1 means unbound), _level (unique
+    # creation-order id from the module counter, used to order layers), and lazily cached _range
+    # and _batchtensor. The size may be set once; setting a different size raises
+    # DimensionBindError. A Dim behaves as a one-dimensional tensor of its range.
     _level: int
     _name: str
     _size: int
@@ -890,6 +1017,9 @@ class Dim(_Tensor):
     _batchtensor: torch.Tensor | None
 
     def __init__(self, name: str, s: int = -1) -> None:
+        # [FUNCTION DOC] Create a Dim with the given name and size (-1 = unbound). Assigns the
+        # next value of the global creation counter as its level and increments that counter
+        # (global side effect).
         global _n_dims_created
         self._name = name
         self._size = s
@@ -900,20 +1030,25 @@ class Dim(_Tensor):
 
     @property
     def ndim(self) -> int:
+        # [FUNCTION DOC] Property: always 1.
         return 1
 
     @classmethod
     def check_exact(cls, obj: Any) -> bool:
+        # [FUNCTION DOC] True only if obj's type is exactly this class (subclasses excluded).
         return type(obj) is cls
 
     @property
     def size(self) -> int:
+        # [FUNCTION DOC] Property: the bound size; raises ValueError if the Dim is unbound.
         if self._size == -1:
             raise ValueError(f"dimension {self._name} is unbound")
         return self._size
 
     @size.setter
     def size(self, v: int) -> None:
+        # [FUNCTION DOC] Setter: bind the size to v if unbound; if already bound to a different
+        # value raises DimensionBindError; the same value is accepted (no-op).
         if self._size == -1:
             self._size = v
         elif self._size != v:
@@ -924,10 +1059,13 @@ class Dim(_Tensor):
 
     @property
     def is_bound(self) -> bool:
+        # [FUNCTION DOC] Property: True once a size has been set.
         """Return True if this dimension is bound to a size."""
         return self._size != -1
 
     def _get_range(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Return (creating and caching on first use) the 1-D integer range
+        # tensor of this Dim's size. Raises ValueError if the Dim is unbound.
         """
         Get a tensor representing the range [0, size) for this dimension.
 
@@ -939,6 +1077,8 @@ class Dim(_Tensor):
         return self._range
 
     def _get_batchtensor(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Return (creating and caching) the range tensor wrapped as a
+        # functorch batched tensor at batch dimension 0 and this Dim's level.
         """
         Get a batched tensor representation of this dimension.
 
@@ -952,6 +1092,7 @@ class Dim(_Tensor):
         return self._batchtensor
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Text form is just the Dim's name.
         """String representation of a Dim object."""
         return self._name
 
@@ -964,6 +1105,12 @@ class Dim(_Tensor):
 # is somewhat intentional, as FCD tensors are intended to be substitutable
 # with regular Tensor (just with some positional dims hidden).
 class Tensor(_Tensor):
+    # [CLASS DOC] A tensor with first-class dimensions. State: _tensor (underlying data, or None
+    # while a delayed computation is pending), _levels (list of DimEntry, one per underlying
+    # dimension, mixing positional and Dim levels), _has_device (whether it is on a non-CPU
+    # device), _batchtensor (lazily built functorch batched form) and delayed-evaluation fields
+    # (_delayed, _delayed_orig, _delayed_args). Instances are made through from_positional or
+    # create_delayed, not by direct construction. Key methods: ndim, order, tensor access.
     _tensor: torch.Tensor | None
     _batchtensor: torch.Tensor | None
     _levels: list[DimEntry]
@@ -974,16 +1121,22 @@ class Tensor(_Tensor):
 
     @property
     def ndim(self) -> int:
+        # [FUNCTION DOC] Property: number of positional levels.
         return sum(1 if l.is_positional() else 0 for l in self._levels)
 
     @classmethod
     def check_exact(cls, other: Any) -> bool:
+        # [FUNCTION DOC] True only if other's type is exactly Tensor (subclasses excluded).
         return type(other) is cls
 
     @classmethod
     def from_positional(
         cls, tensor: torch.Tensor, levels: list[DimEntry], has_device: bool
     ) -> _Tensor | torch.Tensor:
+        # [FUNCTION DOC] Wrap tensor with levels (one per tensor dimension). Validates that
+        # positional levels are consecutive and end at -1 (raises AssertionError otherwise, and
+        # if the level count differs from tensor.dim()). If no level is a Dim, returns the plain
+        # tensor unchanged; else returns a new Tensor holding tensor, levels and has_device.
         """
         Create a functorch Tensor from a regular PyTorch tensor with specified dimension levels.
 
@@ -1044,6 +1197,9 @@ class Tensor(_Tensor):
     def create_delayed(
         cls, orig: Callable, args: tuple, levels: list[DimEntry], has_device: bool
     ) -> _Tensor:
+        # [FUNCTION DOC] Build a Tensor with no data yet that records orig applied to args; the
+        # operation runs when the tensor is first read (see _get_tensor), after unwrapping any
+        # tensor-like args. Stores levels and has_device as given.
         """
         Create a delayed tensor that defers the operation until later.
         """
@@ -1057,6 +1213,8 @@ class Tensor(_Tensor):
 
         # Create delayed evaluation function that unwraps Tensor objects
         def evaluate_delayed() -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Replace each argument that has a tensor getter with its
+            # underlying tensor, call the recorded operation and return its result.
             unwrapped_args = []
             for arg in args:
                 if hasattr(arg, "_get_tensor"):
@@ -1070,6 +1228,8 @@ class Tensor(_Tensor):
         return result
 
     def _get_tensor(self) -> torch.Tensor | None:
+        # [FUNCTION DOC] Return the underlying tensor, first running and caching the pending
+        # delayed computation if there is one (then clearing the delayed fields).
         """Get the underlying tensor, handling delayed operations if needed."""
         if (
             hasattr(self, "_delayed")
@@ -1085,14 +1245,18 @@ class Tensor(_Tensor):
         return self._tensor
 
     def _get_levels(self) -> list[Any]:
+        # [FUNCTION DOC] Return the stored list of levels (not a copy).
         """Get the dimension levels."""
         return self._levels
 
     def _get_has_device(self) -> bool:
+        # [FUNCTION DOC] Return the stored has-device flag.
         """Get whether this tensor has device information."""
         return self._has_device
 
     def _get_batchtensor(self) -> torch.Tensor | None:
+        # [FUNCTION DOC] Return the functorch batched form of the data (one batch dimension per
+        # Dim level), building and caching it on first use via _add_batch_dims.
         """Get the batched tensor representation, creating it lazily if needed."""
         if self._batchtensor is None:
             self._batchtensor = self._add_batch_dims(
@@ -1103,6 +1267,10 @@ class Tensor(_Tensor):
     def _add_batch_dims(
         self, t: torch.Tensor | None, levels_: list[Any]
     ) -> torch.Tensor | None:
+        # [FUNCTION DOC] HELPER: Wrap t as a functorch batched tensor, adding one batch dimension
+        # per Dim level, repeatedly picking the Dim with the smallest creation level first and
+        # replacing its entry with a "none" entry. Returns t when no Dim levels remain. Raises
+        # AssertionError if t is None while Dim levels exist.
         levels = list(levels_)
 
         while True:
@@ -1131,6 +1299,8 @@ class Tensor(_Tensor):
         return None
 
     def order(self, *dims: Any) -> _Tensor:
+        # [FUNCTION DOC] Convert the given Dims of this tensor into positional dimensions in the
+        # given order, delegating to the order module; returns the resulting tensor.
         """Reorder the dimensions of this tensor."""
         from ._order import order
 
@@ -1139,6 +1309,12 @@ class Tensor(_Tensor):
 
 
 def stack(tensors: Any, new_dim: Any, dim: int = 0) -> _Tensor:
+    # [FUNCTION DOC] Stack tensors (which may carry first-class dims) along new_dim. If new_dim is
+    # not a Dim, falls back to ordinary stack at position dim. Otherwise aligns all inputs to the
+    # union of their levels, binds new_dim's size to the count of tensors, stacks at the
+    # resolved position (dim given as an int, position or Dim, relative to the result's
+    # positional dims) and inserts new_dim as a level there. Raises ValueError for an empty
+    # input, TypeError if the dim is not found. Returns a Tensor.
     """
     Stack tensors along a new dimension.
 
@@ -1208,6 +1384,13 @@ def stack(tensors: Any, new_dim: Any, dim: int = 0) -> _Tensor:
 
 
 def split(tensor: Any, split_size_or_sections: Any, dim: Any = None) -> tuple:
+    # [FUNCTION DOC] Split tensor along dim. Integer sizes (single int or all-int sequence)
+    # use the ordinary split path (raising TypeError if dim is a Dim). If the sizes are all
+    # Dims, splits the chosen dimension into pieces whose sizes bind those Dims; unbound Dims
+    # share the remaining length evenly (rounded up chunks), bound ones keep their size; the
+    # sizes must add up to the source size. Each piece is a Tensor with the split level
+    # replaced by the corresponding Dim. Raises TypeError for mixed sizes, missing dimension,
+    # or size mismatch. Returns a tuple of pieces.
     """
     Split tensor along a dimension.
 
@@ -1337,20 +1520,29 @@ def split(tensor: Any, split_size_or_sections: Any, dim: Any = None) -> tuple:
 
 
 def cat(tensors: Any, dim: Any, new_dim: Any) -> _Tensor:
+    # [FUNCTION DOC] Concatenate tensors along dim by stacking them along a fresh temporary Dim
+    # and then indexing the pair (temporary Dim, dim) with new_dim, which flattens them into
+    # new_dim. Returns the resulting Tensor.
     n = dims(1)  # Get single Dim instead of tuple
     return stack(tensors, n, dim).index([n, dim], new_dim)  # type: ignore[list-item]
 
 
 class DotPart:
+    # [CLASS DOC] HELPER: Accumulator for one group of dimension entries in a dot product. State:
+    # dims (list of DimEntry) and total_size (product of the sizes of the first-class Dims
+    # appended; positional entries do not contribute).
     """
     Helper class for organizing dimensions in dot products.
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Start with no entries and a total size of one.
         self.dims: list[DimEntry] = []
         self.total_size = 1
 
     def append(self, dim_entry: Any) -> None:
+        # [FUNCTION DOC] HELPER: Add dim_entry to dims and, if it is a first-class Dim, multiply
+        # total_size by its size (raises ValueError if that Dim is unbound).
         """Add a dimension entry to this part."""
         self.dims.append(dim_entry)
         if not dim_entry.is_positional():
@@ -1358,6 +1550,9 @@ class DotPart:
 
 
 def dot_prepare(parts: list[DotPart], tensor_info: TensorInfo) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Rearrange the tensor so its dimensions follow the concatenated
+    # dims of the parts, then, if any part has other than exactly one dim, reshape to one
+    # dimension per part using each part's total size. Raises RuntimeError if the tensor is None.
     """
     Prepare tensor for dot product by matching levels and reshaping.
     """
@@ -1382,6 +1577,9 @@ def dot_prepare(parts: list[DotPart], tensor_info: TensorInfo) -> torch.Tensor:
 
 
 def dot_finish(parts: list[DotPart], result_tensor: torch.Tensor) -> Tensor:
+    # [FUNCTION DOC] HELPER: Turn a matrix-multiply result back into a Tensor whose levels are the
+    # concatenated dims of the parts, reshaping to the individual Dim sizes if any part had
+    # other than one dim. The has-device flag is always set to true.
     """
     Finish dot product by reshaping result and creating Tensor.
     """
@@ -1404,6 +1602,12 @@ def dot_finish(parts: list[DotPart], result_tensor: torch.Tensor) -> Tensor:
 
 
 def dot(lhs: Any, rhs: Any, sum_dims: Any) -> _Tensor | torch.Tensor:
+    # [FUNCTION DOC] Contract lhs and rhs over sum_dims using a matrix multiply. Classifies each
+    # level as batch (both or neither have stride), left-only, right-only or contracted (in
+    # sum_dims), reshapes both operands accordingly and calls a batched multiply when there are
+    # batch dims, else a plain matrix multiply. If either operand has no tensor info, falls back
+    # to ordinary matmul. Raises ValueError if a summed dimension exists in neither operand.
+    # Returns a Tensor with levels batch, left-only, right-only.
     """
     Perform dot product between two tensors along specified dimensions.
 
@@ -1436,6 +1640,9 @@ def dot(lhs: Any, rhs: Any, sum_dims: Any) -> _Tensor | torch.Tensor:
     lr_dims = DotPart()  # Left-right (contracted dims)
 
     def insert_dim(d: Any, lhs_idx: Any, rhs_idx: Any) -> None:
+        # [FUNCTION DOC] HELPER: File level d into the contracted part if it is in sum_dims, else
+        # by the strides of its position in lhs/rhs (None index counts as stride zero): both or
+        # neither nonzero goes to batch, lhs only to left-only, otherwise right-only.
         """Insert dimension into appropriate part based on stride pattern."""
         reduced = d in sum_dims
         lhs_stride = lhs_strides[lhs_idx] if lhs_idx is not None else 0
@@ -1500,6 +1707,9 @@ del _Tensor.ndim
 
 
 def index(self: Any, positions: Any, dims: Any) -> _Tensor:
+    # [FUNCTION DOC] Module-level index function usable on ordinary tensors: if self is already
+    # a first-class tensor, calls its index method; otherwise wraps the plain tensor as a
+    # first-class Tensor and then indexes positions with dims. Returns the result.
     """
     Index a regular tensor by binding specified positions to dims.
 
@@ -1531,6 +1741,9 @@ def index(self: Any, positions: Any, dims: Any) -> _Tensor:
 
 
 def _def(name: str, *args: Any, **kwargs: Any) -> None:
+    # [FUNCTION DOC] HELPER: Look up the torch.Tensor method called name, wrap it with _wrap
+    # (forwarding the extra arguments such as reduce, single_dim, dim_offset) and install the
+    # wrapper as an attribute of _Tensor. Global side effect at import time.
     orig = getattr(torch.Tensor, name)
     setattr(_Tensor, name, _wrap(orig, *args, **kwargs))
 

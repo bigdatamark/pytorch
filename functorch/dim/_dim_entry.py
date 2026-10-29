@@ -1,3 +1,8 @@
+# [MODULE DOC] DimEntry, a small wrapper identifying one tensor dimension ("level") in
+# first-class dimensions: either a first-class Dim object or a negative integer giving a
+# positional dimension counted from the right. Also provides ndim_of_levels (count positional
+# levels) and _match_levels (restride a tensor to a target level order). No import-time side
+# effects beyond imports; Dim is imported lazily to avoid a circular import.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -14,10 +19,18 @@ import torch  # noqa: TC002
 # NB: The old code represented dimension was from as negative number, so we
 # follow this convention even though it shouldn't be necessary now
 class DimEntry:
+    # [CLASS DOC] Identifies one level of a first-class-dimension tensor. State: data, either a
+    # Dim object (a named first-class dimension), a negative int (positional dimension counted
+    # from the right), or the int 0 meaning "none". Equality compares ints by value and Dims by
+    # identity (to avoid triggering tensor-like comparison); a positional entry never equals a
+    # Dim entry. Key methods: is_positional, is_none, position, dim.
     # The dimension this is from the rhs, or a FCD
     data: Dim | int
 
     def __init__(self, data: Dim | int | None = None) -> None:
+        # [FUNCTION DOC] Create an entry from a Dim, a negative int, or None (stored as 0,
+        # the "none" entry). Raises an error if given a non-negative int (including an explicit
+        # 0) or any value that is neither int nor Dim.
         from . import Dim
 
         if type(data) is int:
@@ -31,6 +44,8 @@ class DimEntry:
         self.data = data
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] True only if other is a DimEntry and both are positional with equal
+        # ints, or both hold the very same Dim object. Mixed or non-DimEntry compare as False.
         if not isinstance(other, DimEntry):
             return False
         # Use 'is' for Dim objects to avoid triggering __torch_function__
@@ -46,9 +61,11 @@ class DimEntry:
             return False
 
     def is_positional(self) -> bool:
+        # [FUNCTION DOC] True if data is an int that is negative (a positional dimension).
         return type(self.data) is int and self.data < 0
 
     def is_none(self) -> bool:
+        # [FUNCTION DOC] True if this is the "none" entry, i.e. data is not a Dim and equals 0.
         # Use isinstance to check for Dim objects, avoid triggering __torch_function__
         from . import Dim
 
@@ -60,20 +77,24 @@ class DimEntry:
             return self.data == 0
 
     def position(self) -> int:
+        # [FUNCTION DOC] Return the stored int. Raises an error if data is not an int.
         if not isinstance(self.data, int):
             raise AssertionError(f"Expected int, got {type(self.data)}")
         return self.data
 
     def dim(self) -> Dim:
+        # [FUNCTION DOC] Return the stored Dim. Raises an error if data is an int.
         if isinstance(self.data, int):
             raise AssertionError("Expected Dim, got int")
         return self.data
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] String form is the repr of the wrapped data (Dim or int).
         return repr(self.data)
 
 
 def ndim_of_levels(levels: Sequence[DimEntry]) -> int:
+    # [FUNCTION DOC] Return how many entries in levels are positional (not first-class Dims).
     r = 0
     for l in levels:
         if l.is_positional():
@@ -87,6 +108,11 @@ def _match_levels(
     to_levels: list[DimEntry],
     drop_levels: bool = False,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Return tensor viewed with the dimension order of to_levels. For each
+    # target level, size and stride come from the matching entry in from_levels; a level absent
+    # there gets stride 0 and size 1 (positional) or the Dim's size (first-class). Returns the
+    # tensor itself if the levels are equal. Raises an error if from_levels is longer than
+    # to_levels and drop_levels is False. The parameter drop_levels only gates that check.
     """
     Reshape a tensor to match target levels using as_strided.
 

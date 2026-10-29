@@ -1,3 +1,7 @@
+# [MODULE DOC] Script that plots a fuser benchmark scorecard. Reads perf.csv from the current
+# directory (columns operator, shape, fuser, time), computes each fuser's time relative to the
+# "eager" column per operator and shape, draws one bar subplot per operator (y limit 0 to 5),
+# and writes scorecard.svg. All work happens at import time.
 import matplotlib.pyplot as plt
 import pandas
 

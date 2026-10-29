@@ -1,3 +1,6 @@
+# [PACKAGE DOC] functorch.compile: public re-export of the AOT compilation API from
+# torch._functorch (aot_function, aot_module, compilers, partitioners, minifier, config);
+# contains no logic of its own.
 from torch._functorch import config
 from torch._functorch.aot_autograd import (
     aot_function,

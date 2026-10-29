@@ -1,3 +1,10 @@
+# [MODULE DOC] Benchmark script comparing per-sample gradient computation of a ResNet-18
+# (10 classes, CUDA, batch 128, 32x32 images) between functorch (grad + vmap over a functional
+# model) and Opacus (grad_sample hooks). Requires opacus, torchvision and a CUDA device.
+# Import-time side effects: builds both models with the same seed, raises an error if their
+# parameters differ, creates a PrivacyEngine, runs six timed runs of each method printing
+# seconds, and prints the number of functorch gradient tensors. No results are asserted equal
+# (see the TODO at the end).
 import time
 
 from opacus import PrivacyEngine
@@ -23,6 +30,9 @@ func_model, weights = make_functional(model_functorch)
 
 
 def compute_loss(weights, image, target):
+    # [FUNCTION DOC] HELPER: Loss of the functional model for one sample. Adds a batch dimension
+    # of size one to image and target, calls the global func_model with weights, and returns the
+    # cross-entropy loss tensor.
     images = image.unsqueeze(0)
     targets = target.unsqueeze(0)
     output = func_model(weights, images)
@@ -31,6 +41,9 @@ def compute_loss(weights, image, target):
 
 
 def functorch_per_sample_grad():
+    # [FUNCTION DOC] HELPER: Compute per-sample gradients with functorch: vmap of grad of
+    # compute_loss, mapping over the global images and targets (weights shared). Synchronizes
+    # CUDA. Returns a tuple of (the gradients result, elapsed wall-clock seconds).
     compute_grad = grad(compute_loss)
     compute_per_sample_grad = vmap(compute_grad, (None, 0, 0))
 
@@ -60,6 +73,10 @@ privacy_engine = PrivacyEngine(
 
 
 def opacus_per_sample_grad():
+    # [FUNCTION DOC] HELPER: Run forward and backward of the Opacus model on the global images
+    # and targets, synchronize CUDA, and time it. Collects each parameter's grad_sample into a
+    # list, then deletes the grad_sample attribute and clears grad so runs can repeat.
+    # Returns (list of per-sample gradients, elapsed seconds).
     start = time.time()
     output = model_opacus(images)
     loss = criterion(output, targets)

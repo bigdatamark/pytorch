@@ -1,3 +1,9 @@
+# [MODULE DOC] Implements indexing (getitem and setitem) of tensors with first-class dimensions.
+# Indices may be ordinary values, Dim objects, DimList objects, dim packs (sequences of Dims),
+# None, ellipsis, or tensors carrying dims. The core getsetitem analyses an index into an
+# IndexingInfo (flattened index list, restrided tensor, result levels, whether advanced indexing
+# is needed, or whether the original tensor method can be used). getitem and setitem then apply
+# it. No import-time side effects; Dim, Tensor and friends are imported lazily from the package.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -14,6 +20,9 @@ if TYPE_CHECKING:
 
 
 def _safe_index(lst: list, item: Any) -> int | None:
+    # [FUNCTION DOC] HELPER: Return the position of item in lst or None. When both are DimEntry
+    # objects equality is used; otherwise identity is used, so Dim objects are never compared
+    # with equality (which would trigger tensor-like behavior).
     """
     Helper function to find index of item in list.
 
@@ -34,6 +43,12 @@ def _safe_index(lst: list, item: Any) -> int | None:
 
 @dataclass
 class IndexingInfo:
+    # [CLASS DOC] Plain data record describing how to perform one indexing operation. Fields:
+    # can_call_original (use the plain tensor method, nothing else is meaningful),
+    # advanced_indexing (flat_inputs must be applied as a real index on self_tensor),
+    # self_tensor (possibly restrided base tensor), flat_inputs (one entry per indexed dim:
+    # slice, int, Dim or matched index tensor), result_levels (levels of the result) and
+    # has_device.
     can_call_original: bool = False
     advanced_indexing: bool = False
     self_tensor: torch.Tensor | None = None
@@ -43,6 +58,7 @@ class IndexingInfo:
 
 
 def has_dims(obj: Any) -> bool:
+    # [FUNCTION DOC] True if obj is exactly a Dim or exactly a first-class-dim Tensor.
     """
     Check if an object has first-class dimensions.
 
@@ -55,6 +71,12 @@ def has_dims(obj: Any) -> bool:
 
 
 def _bind_dims_to_size(sz: int, sd: int, dims: list, nsz: list, nsd: list) -> None:
+    # [FUNCTION DOC] HELPER: Split one tensor dimension of size sz and stride sd into the Dims of a
+    # dim pack. At most one Dim may be unbound; its size is inferred (sz divided by the product
+    # of the others) and assigned to it. Appends each Dim's size to nsz and its stride (row-major
+    # within the pack, starting from sd) to nsd. Raises DimensionBindError if two Dims are
+    # unbound, the inferred size does not divide evenly, or the sizes' product differs from sz.
+    # KNOWN ISSUE: one error message says "to not match" instead of "do not match".
     """
     Bind dimensions to size and calculate proper strides for dim packs.
     """
@@ -107,10 +129,18 @@ def _bind_dims_to_size(sz: int, sd: int, dims: list, nsz: list, nsd: list) -> No
 
 
 def slice_to_tuple(flat_inputs: list) -> tuple:
+    # [FUNCTION DOC] HELPER: Convert the list of flat index items to a tuple so it can be used
+    # as a multi-dimensional index.
     return tuple(flat_inputs)
 
 
 def extractIndices(index: Any, indices: list) -> bool:
+    # [FUNCTION DOC] HELPER: Append the components of index to the indices list. A tuple is
+    # spread into it (returns True); a tensor, string/bytes or non-iterable is appended whole
+    # (False). A list is spread (True) if it has 32 or more items or contains a tensor, slice,
+    # iterable, ellipsis, None or dim-carrying item; otherwise it is appended whole (False).
+    # Any other value is appended whole (False). The result says whether index acted as a
+    # sequence of indices.
     if isinstance(index, tuple):  # mpy::tuple_view::check
         indices.extend(index)
         return True
@@ -151,6 +181,10 @@ def extractIndices(index: Any, indices: list) -> bool:
 
 
 def getitem(cls: Any, func: Any, types: Any, args: Any, kwargs: Any) -> Any:
+    # [FUNCTION DOC] Torch-function style handler for item access: args holds the tensor and the
+    # index (cls, func, types, kwargs are unused). Analyses the index; if no first-class dims
+    # are involved, calls the original tensor getitem directly, otherwise performs the indexing
+    # via invoke_getitem and returns a first-class-dim Tensor.
     self = args[0]
     index = args[1]
 
@@ -163,6 +197,11 @@ def getitem(cls: Any, func: Any, types: Any, args: Any, kwargs: Any) -> Any:
 
 
 def setitem(self: Any, index: Any, rhs: Any) -> None:
+    # [FUNCTION DOC] Assign rhs into self at index with first-class-dim semantics. If no dims are
+    # involved, delegates to the original tensor setitem. Otherwise: checks every Dim of rhs
+    # appears among the result levels (raises DimensionBindError if not), aligns rhs to the result
+    # levels, then either assigns through the advanced index or copies into the selected view.
+    # Mutates self in place. Raises RuntimeError if the analysed tensor is missing.
     """Set values in tensor using first-class dimensions."""
     from . import DimensionBindError, TensorInfo
 
@@ -228,6 +267,10 @@ def setitem(self: Any, index: Any, rhs: Any) -> None:
 
 
 def invoke_getitem(iinfo: IndexingInfo) -> Any:
+    # [FUNCTION DOC] Execute a prepared indexing: if advanced indexing is flagged, index
+    # self_tensor with the flat inputs, else use self_tensor as is. Wraps the result as a
+    # first-class-dim Tensor with the result levels and device flag. Raises RuntimeError if
+    # self_tensor is missing.
     if iinfo.advanced_indexing:
         self_tensor = iinfo.self_tensor
         tup = slice_to_tuple(iinfo.flat_inputs)
@@ -247,6 +290,12 @@ def invoke_getitem(iinfo: IndexingInfo) -> Any:
 
 
 def getsetitem(self: Any, index: Any, tensors_have_dims: bool) -> IndexingInfo:
+    # [FUNCTION DOC] Analyse an index applied to self. Splits it into a list of items, counts how
+    # many dimensions are indexed, and returns early with can_call_original set when no dims,
+    # dim lists or dim packs are involved and tensors_have_dims is false. Otherwise expands an
+    # ellipsis or binds one unbound DimList to the remaining dimensions, flattens DimLists into
+    # their Dims, and delegates to getsetitem_flat. Raises DimensionBindError if more than one
+    # ellipsis/unbound list exists, and ValueError if too many indices are supplied.
     from . import DimList  # Import DimList for type checking
 
     can_call_original_getitem = not tensors_have_dims
@@ -268,6 +317,8 @@ def getsetitem(self: Any, index: Any, tensors_have_dims: bool) -> IndexingInfo:
     dimlists = []  # Track DimList positions for later processing
 
     def check_expanding(i: int) -> None:
+        # [FUNCTION DOC] HELPER: Record offset i as the single expanding item (ellipsis or
+        # unbound DimList); raises DimensionBindError if one was already recorded.
         nonlocal expanding_object
         if expanding_object != -1:
             from . import DimensionBindError
@@ -279,6 +330,7 @@ def getsetitem(self: Any, index: Any, tensors_have_dims: bool) -> IndexingInfo:
         expanding_object = i
 
     def is_dimpack(s: Any) -> bool:
+        # [FUNCTION DOC] HELPER: True if s is a non-empty tuple or list made only of Dims.
         from . import Dim
 
         return (
@@ -367,6 +419,13 @@ def getsetitem_flat(
     values: list,
     has_dimpacks_or_none: bool,
 ) -> IndexingInfo:
+    # [FUNCTION DOC] Core of indexing analysis on an already flattened index list. Matches the
+    # index items against the tensor's levels in order (keys/values give explicit assignments
+    # for particular levels), tracks how often each Dim is used, optionally restrides the tensor
+    # for dim packs and None entries, decides which Dims become slices versus index ranges, and
+    # moves index tensors to the device of a device-holding tensor. Returns IndexingInfo with
+    # flat inputs, result levels (positional ones renumbered from the right) and the advanced
+    # indexing flag. Raises RuntimeError/AssertionError on missing tensors or inconsistent state.
     from . import Dim
 
     # Track dimension usage
@@ -374,6 +433,8 @@ def getsetitem_flat(
     seen_dims_nuses: list[int] = []
 
     def add_dim(dim: Any) -> None:
+        # [FUNCTION DOC] HELPER: Count a use of dim in seen_dims/seen_dims_nuses (adding it with
+        # count one if new), using identity-safe lookup.
         # Use safe indexing to avoid triggering __torch_function__ on Dim objects
         idx = _safe_index(seen_dims, dim)
         if idx is not None:
@@ -387,10 +448,14 @@ def getsetitem_flat(
     device_holding_tensor = None
 
     def append_flat_handle(handle: Any) -> None:
+        # [FUNCTION DOC] HELPER: Append a non-tensor index item (slice, int, Dim, ...) to
+        # flat_inputs and a matching None placeholder to tensor_inputs.
         flat_inputs.append(handle)
         tensor_inputs.append(None)
 
     def append_tensor_input(ti: TensorInfo) -> None:
+        # [FUNCTION DOC] HELPER: Append a None placeholder to flat_inputs and the TensorInfo ti
+        # to tensor_inputs; remembers the first tensor that lives on a real device.
         flat_inputs.append(None)
         tensor_inputs.append(ti)
         nonlocal device_holding_tensor
@@ -405,6 +470,8 @@ def getsetitem_flat(
     sd = self_info.tensor.stride()
 
     def append_size(i: int) -> None:
+        # [FUNCTION DOC] HELPER: When restriding is needed (dim packs or None present), copy
+        # the original size and stride of dimension i to the new size/stride lists; else no-op.
         if has_dimpacks_or_none:
             nsz.append(sz[i])
             nsd.append(sd[i])
@@ -412,6 +479,8 @@ def getsetitem_flat(
     input_it = input_list[:]
 
     def parse_nones() -> None:
+        # [FUNCTION DOC] HELPER: Consume leading None items from the remaining input list; each
+        # becomes a full slice in flat_inputs and a new size-one, stride-zero dimension.
         nonlocal input_it
         while input_it and input_it[0] is None:
             append_flat_handle(slice(None))
@@ -420,6 +489,10 @@ def getsetitem_flat(
             input_it = input_it[1:]
 
     def append_item(i: int, arg: Any) -> None:
+        # [FUNCTION DOC] HELPER: Record index item arg applied to tensor dimension i. A Dim gets
+        # its size bound from the tensor if unbound; a tensor with dims is stored as a tensor
+        # input and its Dims counted; a dim pack is bound to the dimension's size/stride via
+        # _bind_dims_to_size; anything else is stored as a plain flat item.
         if Dim.check_exact(arg):
             d = arg
             if d._size == -1:
@@ -491,6 +564,9 @@ def getsetitem_flat(
     requires_getindex = False
 
     def mark_tensor_index() -> None:
+        # [FUNCTION DOC] HELPER: Track where index dimensions are inserted in the result: the
+        # current result length on first call; if a later tensor index is not adjacent, reset the
+        # insertion point to the front (position zero).
         nonlocal tensor_insert_point
         if tensor_insert_point == -1:
             tensor_insert_point = len(result_levels)

@@ -1,3 +1,7 @@
+# [MODULE DOC] EnableAllLayers: a context manager used by first-class dimensions that pushes one
+# functorch vmap nesting level per bound Dim so batching rules apply, and converts batched
+# results back into first-class-dim Tensors. Depends on private torch._C._functorch bindings.
+# No import-time side effects.
 from __future__ import annotations
 
 from typing import Any, TYPE_CHECKING
@@ -12,6 +16,11 @@ if TYPE_CHECKING:
 
 
 class EnableAllLayers:
+    # [CLASS DOC] Context manager that, on entry, enters one functorch vmap level per first-class
+    # Dim found in the given levels (sorted by each Dim's level) and, on exit, pops them in
+    # reverse. State: levels_to_dim (the Dims, ordered) and levels_start (the functorch level of
+    # the first pushed layer, 0 until entered). Invariant: layers popped on exit must match the
+    # ones pushed, otherwise an error is raised. Also maps batched tensors back to Tensor objects.
     """
     RAII-style context manager for enabling functorch vmap layers.
     It manages the creation and cleanup of functorch dynamic layers.
@@ -32,6 +41,9 @@ class EnableAllLayers:
     levels_to_dim: list[Dim]
 
     def __init__(self, levels: list[DimEntry]):
+        # [FUNCTION DOC] Collect the Dim of every non-positional entry in levels into
+        # levels_to_dim, sorted by the Dim's _level. Raises an error if an entry holds a
+        # non-Dim. Does not touch functorch state; layers are only pushed on entry.
         """
         Initialize and push dynamic layers for all first-class dimensions.
 
@@ -55,6 +67,9 @@ class EnableAllLayers:
         self.levels_to_dim.sort(key=lambda d: d._level)
 
     def __enter__(self) -> EnableAllLayers:  # noqa: PYI034
+        # [FUNCTION DOC] Push one vmap nesting level (randomness mode "different") per Dim, with
+        # that Dim's size as batch size, and record the first level in levels_start. Global
+        # side effect on the functorch dynamic layer stack. Returns self.
         # Create functorch dynamic layers
         for i, dim in enumerate(self.levels_to_dim):
             batch_size = dim.size
@@ -64,6 +79,9 @@ class EnableAllLayers:
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        # [FUNCTION DOC] Pop one vmap nesting level per Dim, checking each popped level equals
+        # the expected one (highest first); raises an error on mismatch. Exception arguments are
+        # ignored and exceptions are not suppressed.
         """Clean up dynamic layers in reverse order."""
         to_remove = self.levels_start + len(self.levels_to_dim) - 1
         for i in range(len(self.levels_to_dim)):
@@ -72,6 +90,11 @@ class EnableAllLayers:
                 raise AssertionError(f"Expected layer {to_remove - i}, got {popped}")
 
     def from_batched(self, batchedtensor: torch.Tensor, has_device: bool) -> Tensor:
+        # [FUNCTION DOC] Unwrap the functorch batched-tensor layers of batchedtensor. Starts with
+        # a positional level for each base dimension, then for each wrapper layer inserts the
+        # matching first-class Dim at the layer's batch dimension. Returns a new Tensor holding
+        # the innermost tensor, the original batched tensor, has_device, and the levels. Raises
+        # an error if a layer level lies outside this manager's range or lacks level/bdim info.
         """
         Create a Tensor from a batched tensor by unwrapping functorch layers.
 
@@ -117,6 +140,10 @@ class EnableAllLayers:
     def inplace_update_layers(
         self, batchtensor: torch.Tensor, levels: list[DimEntry]
     ) -> None:
+        # [FUNCTION DOC] For a functorch batched tensor, walk its wrapper layers from the
+        # innermost Dim outward and, for each managed Dim that appears in levels, overwrite the
+        # layer's level with the matching level of this manager (unsafe in-place mutation of the
+        # tensor). Does nothing if the tensor is not batched. Returns nothing.
         """
         Update the levels of a batched tensor in place.
 
