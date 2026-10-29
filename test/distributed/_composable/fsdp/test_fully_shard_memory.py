@@ -1,4 +1,11 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-GPU memory tests for fully_shard (FSDP2). Checks peak and
+# current active device memory against analytic bounds during init, forward,
+# backward, optimizer step and zero_grad (with options for resharding, CPU
+# offload, optimizer-in-backward), that memory does not grow with GC disabled,
+# that deleting a sharded model frees memory, and that HSDP all-reduce buffers
+# are not reused too early with mixed reduce dtype. Only sets device_type at
+# import time.
 
 import contextlib
 import functools
@@ -36,13 +43,21 @@ device_type = torch.device(get_devtype())
 
 
 class TestFullyShardMemory(FSDPTest):
+    # [CLASS DOC] Test case measuring device memory of FSDP2 training phases
+    # with a small Transformer. World size is capped at 2 ranks. Provides memory
+    # statistic readers and an optimizer-in-backward registration helper.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Returns the smaller of 2 and the number of available
+        # devices of the current device type.
         return min(2, torch.get_device_module(device_type).device_count())
 
     @skip_if_lt_x_gpu(2)
     @unittest.skipIf(TEST_HPU, " 'empty_cache' is not supported on hpu")
     def test_fully_shard_training_memory(self):
+        # [FUNCTION DOC] Runs the training-memory check over reshard_after_forward,
+        # CPU offload, and optimizer-in-backward on/off. Needs 2+ GPUs and is
+        # skipped on HPU.
         self.run_subtests(
             {
                 "reshard_after_forward": [True, False],
@@ -58,6 +73,17 @@ class TestFullyShardMemory(FSDPTest):
         use_cpu_offload: bool,
         run_optim_in_backward: bool,
     ):
+        # [FUNCTION DOC] HELPER: Returns early for unusual option combinations
+        # (no reshard with offload, or optimizer-in-backward without reshard or
+        # with offload). Otherwise requires world size 2, warms up cuBLAS
+        # workspaces, records baseline peak memory, builds a 3-layer Transformer
+        # sharded per block plus root, and asserts upper bounds on memory minus
+        # baseline after init, forward, backward, optimizer step and zero_grad.
+        # Bounds are computed from parameter counts (4 bytes each) plus buffers.
+        # Raises AssertionError if the world size is not 2 or a bound is exceeded.
+        # KNOWN ISSUE: the optimizer-in-backward backward bounds divide by 1e-6
+        # rather than 1e6, making that bound huge so the check is effectively
+        # vacuous. Also buffer_mb is assigned twice in a row (16, then 16 or 18).
         if (
             # CPU offloading is typically for memory savings, so we expect
             # users to want to reshard after forward
@@ -239,6 +265,12 @@ class TestFullyShardMemory(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_fully_shard_training_memory_no_gc(self):
+        # [FUNCTION DOC] Disables Python's cyclic GC, builds a 6-layer Transformer
+        # with attention, feed-forward, block and root all sharded, runs one
+        # warm-up step then collects garbage once, and runs 10 more training
+        # steps. Asserts current active memory grew by at most 2 MB, guarding
+        # against reference-cycle leaks. Always re-enables GC in a finally block.
+        # Needs 2+ GPUs.
         """Memory should not grow across training steps when GC is disabled.
 
         Regression test: reference cycles in FSDP's autograd integration can
@@ -298,6 +330,11 @@ class TestFullyShardMemory(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_fully_shard_del_memory(self):
+        # [FUNCTION DOC] Checks that building a Transformer on CPU leaves device
+        # memory unchanged, that after sharding current memory is at most the
+        # local shard size plus a 4 MB buffer, and that after deleting the model
+        # and running garbage collection memory returns exactly to the baseline.
+        # Needs 2+ GPUs.
         base_mem_mb = self._get_peak_active_memory_mb()
         vocab_size = 32
         model_args = ModelArgs(
@@ -327,6 +364,9 @@ class TestFullyShardMemory(FSDPTest):
         self.assertEqual(mem_mb, base_mem_mb)
 
     def _get_peak_active_memory_mb(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns the peak active device memory in MB
+        # (rounded), from the all-pool peak active bytes stat, or the MaxInUse
+        # stat on HPU.
         mem_stats = torch.get_device_module(device_type).memory_stats()
         # HPU uses different memory stat keys.
         if not TEST_HPU:
@@ -334,6 +374,9 @@ class TestFullyShardMemory(FSDPTest):
         return round(mem_stats["MaxInUse"] / 1e6)
 
     def _get_curr_active_memory_mb(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns the currently active device memory in MB
+        # (rounded), from the all-pool current active bytes stat, or the InUse
+        # stat on HPU.
         mem_stats = torch.get_device_module(device_type).memory_stats()
         # HPU uses different memory stat keys.
         if not TEST_HPU:
@@ -343,11 +386,17 @@ class TestFullyShardMemory(FSDPTest):
     def _register_optim_in_backward(
         self, model: torch.nn.Module, **optim_kwargs
     ) -> None:
+        # [FUNCTION DOC] HELPER: Creates one AdamW optimizer per model parameter
+        # (with the given kwargs) and registers a post-accumulate-grad hook on
+        # each parameter that steps and zeroes that parameter's optimizer, so the
+        # gradient is consumed during backward. Mutates the model's hooks.
         param_to_optim = {}
         for param in model.parameters():
             param_to_optim[param] = torch.optim.AdamW([param], **optim_kwargs)
 
         def optim_hook(param: torch.nn.Parameter) -> None:
+            # [FUNCTION DOC] HELPER: Hook run after a parameter's gradient is
+            # accumulated; steps and then zeroes that parameter's own optimizer.
             param_to_optim[param].step()
             param_to_optim[param].zero_grad()
 
@@ -356,6 +405,8 @@ class TestFullyShardMemory(FSDPTest):
 
 
 class TestFullyShardHSDPSyncCorrectness(FSDPTest):
+    # [CLASS DOC] Test case for hybrid-sharded (replicate x shard) FSDP2
+    # all-reduce buffer lifetime. World size is capped at 4 ranks; stateless.
     """Sync-correctness guards for HSDP+AR buffer lifetime.
 
     These tests exercise cases where the AR output buffer could be reclaimed
@@ -367,12 +418,16 @@ class TestFullyShardHSDPSyncCorrectness(FSDPTest):
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Returns the smaller of 4 and the number of available
+        # devices of the current device type.
         return min(4, torch.get_device_module(device_type).device_count())
 
     # This test is CUDA-specific because it relies on torch.cuda._sleep.
     @skip_if_lt_x_gpu(4)
     @unittest.skipIf(not TEST_CUDA, "HSDP sync correctness test is CUDA-only")
     def test_ar_buffer_lifetime_mixed_dtype(self):
+        # [FUNCTION DOC] Runs the all-reduce buffer lifetime regression check for
+        # bfloat16 and float16 reduce dtypes. Needs 4+ GPUs and CUDA.
         """Regression guard for PR #140044 (`[FSDP2] Fix CUDA sync for bf16
         HSDP AR, fp32 params`).
 
@@ -409,6 +464,13 @@ class TestFullyShardHSDPSyncCorrectness(FSDPTest):
         )
 
     def _test_ar_buffer_lifetime_mixed_dtype(self, mp_dtype: torch.dtype):
+        # [FUNCTION DOC] HELPER: Builds a 2x2 HSDP mesh and a float32 three-Linear
+        # model sharded with param and reduce dtype set to mp_dtype. Runs one
+        # forward/backward with normal all-reduce for reference gradient sums,
+        # then three runs with all-reduce patched to sleep about 500 ms first.
+        # Asserts no NaNs and that each parameter's gradient sum matches the
+        # reference within a relative tolerance of 1e-3 (absolute floor 1e-3),
+        # detecting buffers reused before the all-reduce finished.
         torch.manual_seed(0)
         mesh = init_device_mesh(
             device_type.type,
@@ -435,6 +497,10 @@ class TestFullyShardHSDPSyncCorrectness(FSDPTest):
         inp = torch.randn(4, dim, device=device_type.type, dtype=torch.float32)
 
         def run_one(slow_ar: bool):
+            # [FUNCTION DOC] HELPER: Clears existing gradients, optionally patches
+            # the all-reduce to sleep first, runs forward and backward on the
+            # shared input, and returns a mapping from parameter name to the sum
+            # of its (local) gradient as a Python float, for params with grads.
             for p in model.parameters():
                 if p.grad is not None:
                     p.grad = None
@@ -442,6 +508,9 @@ class TestFullyShardHSDPSyncCorrectness(FSDPTest):
             orig_all_reduce = dist.all_reduce
 
             def slow_all_reduce(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Enqueues a device sleep of about 500 ms
+                # on the current stream, then calls the original all-reduce with
+                # the same arguments and returns its result.
                 torch.get_device_module(device_type)._sleep(
                     int(500 * get_cycles_per_ms())
                 )

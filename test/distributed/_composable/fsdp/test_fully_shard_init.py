@@ -1,4 +1,13 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for fully_shard (FSDP2) initialization. Covers moving
+# parameters/buffers to the accelerator (plain and DTensor), container subclasses
+# with forward, mesh argument validation, managed modules/states discovery,
+# ParamModuleInfo construction, sharded parameter layout (plain and 2D DTensor),
+# lazy init and root detection, meta-device init and materialization, process
+# group based meshes (1D and HSDP), HSDP broadcast, custom all-reduce hooks,
+# shard_placement_fn, the old import path, and mixed/non-float dtype params.
+# Most classes use the multi-threaded test harness; two use real processes.
+# Only sets device_type at import time.
 
 import copy
 import itertools
@@ -57,14 +66,20 @@ device_type = torch.device(get_devtype())
 
 
 class TestFullyShardDeviceTensor(FSDPTestMultiThread):
+    # [CLASS DOC] Single-rank threaded tests that fully_shard moves plain
+    # (non-DTensor) parameters and buffers to the accelerator.
     """Tests that tensor parameters are moved to the expected device."""
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 1, the number of simulated ranks.
         return 1
 
     @skip_if_lt_x_gpu(1)
     def test_move_states_to_device_tensor(self):
+        # [FUNCTION DOC] Builds a CPU MLP with a buffer, checks everything is on
+        # CPU, applies fully_shard, and asserts every parameter and buffer is
+        # now on the current accelerator device.
         model = MLP(8, torch.device("cpu"), with_buffer=True)
         for tensor in itertools.chain(model.parameters(), model.buffers()):
             self.assertEqual(tensor.device, torch.device("cpu"))
@@ -77,6 +92,9 @@ class TestFullyShardDeviceTensor(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(1)
     def test_move_states_to_device_ignored_param_device(self):
+        # [FUNCTION DOC] Shards a CPU MLP while ignoring the out_proj weight and
+        # bias. Asserts the ignored parameters stay on CPU after fully_shard, and
+        # move to the accelerator only after an explicit model.to call.
         cpu_device = torch.device("cpu")
         model = MLP(8, cpu_device, with_buffer=True)
         ignored_params = [model.out_proj.weight, model.out_proj.bias]
@@ -92,14 +110,22 @@ class TestFullyShardDeviceTensor(FSDPTestMultiThread):
 
 
 class TestFullyShardDeviceDTensor(FSDPTestMultiThread):
+    # [CLASS DOC] Four-rank threaded tests of device placement for models whose
+    # parameters are DTensors from tensor parallelism, before FSDP sharding.
     """Tests that DTensor parameters are moved to the expected device."""
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 4, the number of simulated ranks.
         return 4
 
     @skip_if_lt_x_gpu(1)
     def test_move_states_to_device_dtensor_valid(self):
+        # [FUNCTION DOC] Applies tensor parallelism on a 2x2 (dp, tp) accelerator
+        # mesh to a CPU MLP, checks DTensor params (and local shards) are already
+        # on the accelerator while plain buffers stay on CPU, then applies
+        # fully_shard on the dp mesh and asserts all states end up on the
+        # accelerator. Raises AssertionError if world size is below 4.
         if not (self.world_size >= 4):
             raise AssertionError(f"Expected world_size >= 4, but got {self.world_size}")
         dp_size = 2
@@ -133,6 +159,10 @@ class TestFullyShardDeviceDTensor(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(1)
     def test_move_states_to_device_dtensor_invalid(self):
+        # [FUNCTION DOC] Applies tensor parallelism using a CPU tp mesh but passes
+        # an accelerator dp mesh to fully_shard. Asserts all states are on CPU
+        # beforehand and that fully_shard raises ValueError saying the DTensor
+        # mesh type (cpu) differs from the FSDP mesh type.
         if not (self.world_size >= 4):
             raise AssertionError(f"Expected world_size >= 4, but got {self.world_size}")
         dp_size = 2
@@ -165,20 +195,32 @@ class TestFullyShardDeviceDTensor(FSDPTestMultiThread):
 
 
 class TestFullyShardContainerSubclasses(FSDPTestMultiThread):
+    # [CLASS DOC] Single-rank threaded tests that container module subclasses
+    # which define forward are accepted by fully_shard. Nests two container
+    # subclasses used as test models.
     """Tests that fully_shard accepts ModuleDict/ModuleList subclasses that implement forward()."""
 
     class DictWithForward(nn.ModuleDict):
+        # [CLASS DOC] HELPER: ModuleDict subclass holding one Linear under key
+        # lin and defining forward to apply it.
         def __init__(self, in_features=8, out_features=8):
+            # [FUNCTION DOC] HELPER: Creates the dict with a single Linear entry.
             super().__init__({"lin": nn.Linear(in_features, out_features)})
 
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Returns the lin entry applied to x.
             return self["lin"](x)
 
     class ListWithForward(nn.ModuleList):
+        # [CLASS DOC] HELPER: ModuleList subclass holding one Linear and defining
+        # forward to apply each element in order.
         def __init__(self, in_features=8, out_features=8):
+            # [FUNCTION DOC] HELPER: Creates the list with a single Linear.
             super().__init__([nn.Linear(in_features, out_features)])
 
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Applies each contained module to the running
+            # value in order and returns the final output.
             out = x
             for m in self:
                 out = m(out)
@@ -186,10 +228,13 @@ class TestFullyShardContainerSubclasses(FSDPTestMultiThread):
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 1, the number of simulated ranks.
         return 1
 
     @skip_if_lt_x_gpu(1)
     def test_moduledict_subclass_with_forward(self):
+        # [FUNCTION DOC] Shards a ModuleDict subclass with forward on a 1D mesh,
+        # expecting no error from the container type, then runs a forward.
         model = self.DictWithForward(8, 8)
         mesh = init_device_mesh(device_type.type, (self.world_size,))
         # Should not raise due to container type since forward() is implemented
@@ -199,6 +244,8 @@ class TestFullyShardContainerSubclasses(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(1)
     def test_modulelist_subclass_with_forward(self):
+        # [FUNCTION DOC] Same as the ModuleDict case but for a ModuleList
+        # subclass with forward: shard on a 1D mesh and run one forward.
         model = self.ListWithForward(8, 8)
         mesh = init_device_mesh(device_type.type, (self.world_size,))
         fsdp_model = fully_shard(model, mesh=mesh)
@@ -207,13 +254,18 @@ class TestFullyShardContainerSubclasses(FSDPTestMultiThread):
 
 
 class TestFullyShardMeshArg(FSDPTestMultiThread):
+    # [CLASS DOC] Four-rank threaded tests of mesh argument validation in
+    # fully_shard.
     """Tests the ``mesh`` argument."""
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 4, the number of simulated ranks.
         return 4
 
     def test_invalid_mesh_ndim(self):
+        # [FUNCTION DOC] Passes a 3D mesh and asserts ValueError stating that a 1D
+        # or 2D mesh is expected.
         mesh = init_device_mesh(device_type.type, (self.world_size, 1, 1))
         model = MLP(8)
         regex = r"fully\_shard expects a 1D or 2D DeviceMesh but got DeviceMesh"
@@ -221,6 +273,8 @@ class TestFullyShardMeshArg(FSDPTestMultiThread):
             fully_shard(model, mesh=mesh)
 
     def test_2d_mesh_without_mesh_dim_names(self):
+        # [FUNCTION DOC] Passes a 2D mesh lacking dim names and asserts an
+        # AssertionError asking for mesh_dim_names to be specified for HSDP.
         mesh = init_device_mesh(device_type.type, (self.world_size // 2, 2))
         model = MLP(8)
         regex = "Please init the 2D mesh for HSDP with mesh_dim_names specified"
@@ -229,13 +283,18 @@ class TestFullyShardMeshArg(FSDPTestMultiThread):
 
 
 class TestFullyShardManagedModulesAndStates(FSDPTestMultiThread):
+    # [CLASS DOC] Single-rank threaded tests of the private helpers that compute
+    # which modules, parameters, and buffers one fully_shard call manages.
     """Tests getting the managed modules/states for a ``fully_shard`` module."""
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 1, the number of simulated ranks.
         return 1
 
     def test_managed_modules_single(self):
+        # [FUNCTION DOC] For one root module, expects the managed modules to be
+        # all of its submodules including itself.
         model = MLP(8)
         # Assume calling `fully_shard` on `model`
         managed_modules = _get_managed_modules((model,))
@@ -243,6 +302,8 @@ class TestFullyShardManagedModulesAndStates(FSDPTestMultiThread):
         self._check_managed_modules(managed_modules, expected_managed_modules)
 
     def test_managed_modules_nested(self):
+        # [FUNCTION DOC] With the first child already fully_shard-ed, expects the
+        # root's managed modules to exclude that child's subtree.
         model = nn.Sequential(*[MLP(8) for _ in range(2)])
         fully_shard(model[0])
         # Assume calling `fully_shard` on `model`
@@ -251,6 +312,9 @@ class TestFullyShardManagedModulesAndStates(FSDPTestMultiThread):
         self._check_managed_modules(managed_modules, expected_managed_modules)
 
     def test_managed_modules_nested_fully_shard_and_replicate(self):
+        # [FUNCTION DOC] With one child under replicate and another under
+        # fully_shard, expects the root's managed modules to exclude both
+        # subtrees and include only the middle child and the root.
         model = nn.Sequential(*[MLP(8) for _ in range(3)])
         replicate(model[0])
         fully_shard(model[2])
@@ -260,6 +324,8 @@ class TestFullyShardManagedModulesAndStates(FSDPTestMultiThread):
         self._check_managed_modules(managed_modules, expected_managed_modules)
 
     def test_managed_modules_duplicate(self):
+        # [FUNCTION DOC] When the same MLP appears twice in a Sequential, expects
+        # the shared module to be counted once in the managed modules.
         mlp = MLP(8)
         model = nn.Sequential(mlp, mlp)  # duplicate MLP
         # Assume calling `fully_shard` on `model`
@@ -269,6 +335,11 @@ class TestFullyShardManagedModulesAndStates(FSDPTestMultiThread):
         self._check_managed_modules(managed_modules, expected_managed_modules)
 
     def test_managed_modules_list_of_mlps(self):
+        # [FUNCTION DOC] Passes several sibling modules as one group and expects
+        # the union of their submodules. A second group (children 1 and 3) is
+        # computed but never compared.
+        # KNOWN ISSUE: the second managed_modules and its expected list are
+        # computed without a following check, so that case is untested.
         model = nn.Sequential(*[MLP(8) for _ in range(5)])
         # Assume calling `fully_shard` on `[model[0], model[1], model[2]]`
         managed_modules = _get_managed_modules((model[0], model[1], model[2]))
@@ -287,11 +358,16 @@ class TestFullyShardManagedModulesAndStates(FSDPTestMultiThread):
         managed_modules: list[nn.Module],
         expected_managed_modules: list[nn.Module],
     ):
+        # [FUNCTION DOC] HELPER: Asserts the managed module list has the expected
+        # length and the same members as the expected list, ignoring order.
         self.assertEqual(len(managed_modules), len(expected_managed_modules))
         # Check set comparison since we do not require anything about the order
         self.assertEqual(set(managed_modules), set(expected_managed_modules))
 
     def test_managed_states_shared_params_and_buffers(self):
+        # [FUNCTION DOC] Ties a weight across three MLPs and a buffer across two,
+        # then expects the managed states to list each shared parameter and
+        # buffer only once.
         model = nn.Sequential(*[MLP(8, with_buffer=True) for _ in range(3)])
         model[0].in_proj.weight = model[1].in_proj.weight
         model[2].in_proj.weight = model[1].in_proj.weight
@@ -304,6 +380,8 @@ class TestFullyShardManagedModulesAndStates(FSDPTestMultiThread):
         self._check_managed_states(params, buffers, expected_params, expected_buffers)
 
     def test_managed_states_nested_fully_shard(self):
+        # [FUNCTION DOC] With the first child already fully_shard-ed, expects the
+        # root's managed parameters and buffers to be only the second child's.
         model = nn.Sequential(*[MLP(8, with_buffer=True) for _ in range(2)])
         fully_shard(model[0])
         # Assume calling `fully_shard` on `model`
@@ -314,6 +392,8 @@ class TestFullyShardManagedModulesAndStates(FSDPTestMultiThread):
         self._check_managed_states(params, buffers, expected_params, expected_buffers)
 
     def test_managed_states_list_of_mlps(self):
+        # [FUNCTION DOC] For a group of three sibling MLPs, expects the managed
+        # parameters and buffers to be the concatenation of theirs.
         model = nn.Sequential(*[MLP(8, with_buffer=True) for _ in range(5)])
         # Assume calling `fully_shard` on `[model[0], model[1], model[2]]`
         managed_modules = _get_managed_modules((model[0], model[1], model[2]))
@@ -337,6 +417,8 @@ class TestFullyShardManagedModulesAndStates(FSDPTestMultiThread):
         expected_managed_params: list[nn.Parameter],
         expected_managed_buffers: list[torch.Tensor],
     ):
+        # [FUNCTION DOC] HELPER: Asserts the parameter and buffer lists match the
+        # expected ones in length and membership (order ignored).
         self.assertEqual(len(managed_params), len(expected_managed_params))
         self.assertEqual(len(managed_buffers), len(expected_managed_buffers))
         self.assertEqual(set(managed_params), set(expected_managed_params))
@@ -344,11 +426,17 @@ class TestFullyShardManagedModulesAndStates(FSDPTestMultiThread):
 
 
 class TestFullyShardParamModuleInfos(FSDPTestMultiThread):
+    # [CLASS DOC] Two-rank threaded tests of the helper that builds one
+    # ParamModuleInfo per parameter (owning module, name, and shared aliases).
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 2, the number of simulated ranks.
         return 2
 
     def test_get_param_module_infos_shared_params(self):
+        # [FUNCTION DOC] Ties a weight between two MLPs and checks the infos for
+        # the de-duplicated parameters: the shared weight is recorded once, with
+        # the other module and name listed as its shared alias.
         model = nn.Sequential(*[MLP(8) for _ in range(2)])
         model[0].in_proj.weight = model[1].in_proj.weight
         managed_modules = _get_managed_modules((model,))
@@ -369,6 +457,13 @@ class TestFullyShardParamModuleInfos(FSDPTestMultiThread):
         self.assertEqual(param_module_infos, expected_param_module_infos)
 
     def test_get_param_module_infos_duplicates(self):
+        # [FUNCTION DOC] Uses parameters listed from a model with the same MLP
+        # twice and checks each info lists the same module as its own alias.
+        # A second scenario (a shared in_proj across two MLPs) builds an
+        # expected list but does not assert anything.
+        # KNOWN ISSUE: the second expected_param_module_infos is never compared
+        # (and references mlp rather than the new model), so that part is
+        # untested.
         mlp = MLP(8)
         model = nn.Sequential(mlp, mlp)  # shared MLP
         params = list(model.parameters())
@@ -396,6 +491,8 @@ class TestFullyShardParamModuleInfos(FSDPTestMultiThread):
         ]
 
     def test_get_param_module_infos_list_of_mlps(self):
+        # [FUNCTION DOC] For a group of two sibling MLPs, checks the infos list all
+        # eight parameters in order with no shared aliases.
         model = nn.Sequential(*[MLP(8) for _ in range(2)])
         managed_modules = _get_managed_modules((model[0], model[1]))
         params, _ = _get_managed_states(managed_modules)
@@ -416,12 +513,18 @@ class TestFullyShardParamModuleInfos(FSDPTestMultiThread):
 
 
 class TestFullyShardShardedParameterTensor(FSDPTestMultiThread):
+    # [CLASS DOC] Two-rank threaded tests of how fully_shard shards ordinary
+    # (non-DTensor) parameters and which parameters it rejects.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 2, the number of simulated ranks.
         return 2
 
     @skip_if_lt_x_gpu(1)
     def test_shard_tensor_parameters(self):
+        # [FUNCTION DOC] Shards models with odd dimension sizes (uneven shards),
+        # with and without a tied in_proj, and checks each parameter via
+        # _check_1d_sharded_parameters.
         # Use odd dim sizes to test uneven shards
         model = nn.Sequential(*[MLP(3, dim_multiplier=3) for _ in range(3)])
         orig_params = [param.detach().clone() for param in model.parameters()]
@@ -439,6 +542,10 @@ class TestFullyShardShardedParameterTensor(FSDPTestMultiThread):
     def _check_1d_sharded_parameters(
         self, orig_params: list[nn.Parameter], sharded_params: list[nn.Parameter]
     ):
+        # [FUNCTION DOC] HELPER: For each pair, asserts the sharded parameter is a
+        # DTensor on the 1D world mesh with the original size and stride, placed
+        # as a dim-0 shard, whose local tensor equals this rank's dim-0 chunk of
+        # the original.
         self.assertEqual(len(orig_params), len(sharded_params))
         global_mesh = init_device_mesh(device_type.type, (self.world_size,))
         for orig_param, sharded_param in zip(orig_params, sharded_params):
@@ -451,6 +558,9 @@ class TestFullyShardShardedParameterTensor(FSDPTestMultiThread):
             self.assertEqual(sharded_param._local_tensor, chunks[self.rank])
 
     def test_raise_scalar_parameter(self):
+        # [FUNCTION DOC] Registers a zero-dimensional parameter and asserts
+        # fully_shard raises ValueError telling the user to make it a 1D tensor
+        # of one element.
         """Tests raising an exception when the model has scalar parameters."""
         model = nn.Sequential(*[MLP(3, dim_multiplier=3) for _ in range(3)])
         model.register_parameter(
@@ -462,6 +572,8 @@ class TestFullyShardShardedParameterTensor(FSDPTestMultiThread):
             fully_shard(model)
 
     def test_raise_noncontiguous_parameter(self):
+        # [FUNCTION DOC] Shards a channels-last Conv2d and asserts
+        # NotImplementedError about non-contiguous parameters.
         """
         Tests raising an exception when the model has non-contiguous
         parameters. This is due to lack of implementation support.
@@ -474,12 +586,21 @@ class TestFullyShardShardedParameterTensor(FSDPTestMultiThread):
 
 
 class TestFullyShardShardedParameterDTensor(FSDPTestMultiThread):
+    # [CLASS DOC] Four-rank threaded tests of FSDP sharding on top of tensor
+    # parallel DTensor parameters (2D placements).
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 4, the number of simulated ranks.
         return 4
 
     @skip_if_lt_x_gpu(1)
     def test_shard_dtensor_parameters(self):
+        # [FUNCTION DOC] Applies column/row tensor parallelism to an MLP with odd
+        # sizes, then fully_shard on the dp mesh. Asserts each parameter is a
+        # DTensor on the global mesh with original size and stride, and that the
+        # placements are: strided dim-0 shard plus shard for in_proj, shard on
+        # dim 0 and 1 for the out_proj weight, and shard plus replicate for the
+        # out_proj bias.
         dp_size = 2 if self.world_size > 2 else 1
         global_mesh = init_device_mesh(
             device_type.type,
@@ -519,11 +640,18 @@ class TestFullyShardShardedParameterDTensor(FSDPTestMultiThread):
 
 
 class TestFullyShardLazyInit(FSDPTestMultiThread):
+    # [CLASS DOC] Two-rank threaded tests of the lazy initialization of FSDP
+    # state: root detection, FQN computation, error cases, and re-registering
+    # sharded parameters after meta-device materialization.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 2, the number of simulated ranks.
         return 2
 
     def test_fully_shard_is_root(self):
+        # [FUNCTION DOC] After lazy init from the root, asserts only the root
+        # state is marked root and the shared state context lists all three
+        # states with the root first.
         """
         Tests that ``_is_root`` is set correctly after lazy initialization.
 
@@ -552,6 +680,10 @@ class TestFullyShardLazyInit(FSDPTestMultiThread):
         )
 
     def test_fully_shard_module_and_param_fqns(self):
+        # [FUNCTION DOC] After lazy init, asserts each param group has the right
+        # module FQN (empty for the root) and holds parameters with the right
+        # fully qualified names: the root group gets only the unwrapped second
+        # child's parameters; each wrapped Linear gets its own.
         """
         Tests that the module and parameter FQNs are computed correctly after
         lazy initialization.
@@ -609,6 +741,9 @@ class TestFullyShardLazyInit(FSDPTestMultiThread):
         )
 
     def test_fully_shard_double_lazy_init(self):
+        # [FUNCTION DOC] Lazily initializes a non-root child state first, then the
+        # root, and asserts the root call raises RuntimeError saying the child
+        # was already initialized and forward must run through the root first.
         model = nn.Sequential(MLP(8), MLP(8))
         fully_shard(model[0].in_proj)
         fully_shard(model[0].out_proj)
@@ -624,6 +759,8 @@ class TestFullyShardLazyInit(FSDPTestMultiThread):
             root_state._lazy_init()
 
     def test_fully_shard_multi_module_root(self):
+        # [FUNCTION DOC] Applies fully_shard to a list of two modules and asserts
+        # lazy init raises RuntimeError that a single root module is required.
         model = nn.Sequential(MLP(8), MLP(8))
         fully_shard([model[0], model[1]])
         root_state = fully_shard.state(model[0])
@@ -632,14 +769,28 @@ class TestFullyShardLazyInit(FSDPTestMultiThread):
             root_state._lazy_init()
 
     def test_reset_sharded_param_in_lazy_init(self):
+        # [FUNCTION DOC] Builds a meta-device model, shards both layers and the
+        # root, materializes the layers with to_empty, replaces the root-owned
+        # weight_norm parameter, and runs forward and backward to check lazy init
+        # picks up the replaced parameter without error.
         class MyModel(nn.Module):
+            # [CLASS DOC] HELPER: Two bias-free Linear layers and a 3-element
+            # weight_norm parameter; forward returns a scalar.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates layer1, layer2, and an
+                # uninitialized weight_norm parameter.
                 super().__init__()
                 self.layer1 = nn.Linear(3, 3, bias=False)
                 self.layer2 = nn.Linear(3, 3, bias=False)
                 self.weight_norm = nn.Parameter(torch.empty(3))
 
             def init_weight_norm(self):
+                # [FUNCTION DOC] HELPER: Under no_grad, sums the per-row norms of
+                # both layer weights and assigns the result as a new weight_norm
+                # parameter.
+                # KNOWN ISSUE: the assignment targets the enclosing test's local
+                # variable named model instead of self; it works only because
+                # they are the same object.
                 with torch.no_grad():
                     weight_norm = torch.linalg.norm(
                         self.layer1.weight, dim=1
@@ -647,6 +798,8 @@ class TestFullyShardLazyInit(FSDPTestMultiThread):
                 model.weight_norm = nn.Parameter(weight_norm)
 
             def forward(self, inp: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Applies both layers in sequence and
+                # returns the sum of the output plus the sum of weight_norm.
                 out = self.layer1(inp)
                 out = self.layer2(out)
                 return out.sum() + self.weight_norm.sum()
@@ -667,12 +820,21 @@ class TestFullyShardLazyInit(FSDPTestMultiThread):
 
 
 class TestFullyShardMetaDeviceInit(FSDPTestMultiThread):
+    # [CLASS DOC] Four-rank threaded tests of sharding models created on the meta
+    # device and later materializing them, in 1D and 2D settings, plus the
+    # error when unmaterialized meta parameters reach forward.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 4, the number of simulated ranks.
         return 4
 
     @skip_if_lt_x_gpu(1)
     def test_meta_device_1d_init(self):
+        # [FUNCTION DOC] For several MLP widths (even, uneven, tiny) and two mixed
+        # precision policies, builds meta-device models, shards them on a 1D
+        # mesh, asserts parameters remain on meta, and runs
+        # _test_to_empty_and_reset_parameters. Also checks fully_shard works
+        # under a meta device context with the default mesh.
         default_pg = torch.distributed.distributed_c10d._get_default_group()
         mesh = init_device_mesh(device_type.type, mesh_shape=(default_pg.size(),))
         # Test both even sharding (8), uneven sharding (3), and empty local tensor (1)
@@ -713,6 +875,10 @@ class TestFullyShardMetaDeviceInit(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(1)
     def test_meta_device_2d_init(self):
+        # [FUNCTION DOC] Builds meta-device MLPs (even and uneven width), applies
+        # tensor parallelism and then fully_shard on the dp mesh, asserts the
+        # parameters stay on meta, and runs the materialization checks against
+        # the global 2D mesh. Raises AssertionError if world size is below 4.
         if not (self.world_size >= 4):
             raise AssertionError(f"Expected world_size >= 4, but got {self.world_size}")
         dp_size = 2
@@ -746,6 +912,11 @@ class TestFullyShardMetaDeviceInit(FSDPTestMultiThread):
     def _test_to_empty_and_reset_parameters(
         self, model: nn.Module, mesh: DeviceMesh, mlp_dim: int
     ):
+        # [FUNCTION DOC] HELPER: Materializes a meta-device sharded model on the
+        # accelerator with to_empty, fills all states with a constant, calls
+        # reset_parameters on modules that have it, and asserts non-empty local
+        # parameter shards and all buffers no longer equal the constant. Then
+        # runs one forward, backward and Adam step. The mesh argument is unused.
         # Check that we can materialize it on GPU with empty values
         device = torch.device(
             device_type.type, torch.get_device_module(device_type).current_device()
@@ -776,6 +947,9 @@ class TestFullyShardMetaDeviceInit(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(1)
     def test_invalid_meta_device_init(self):
+        # [FUNCTION DOC] Shards a meta-device model and runs forward without
+        # materializing it, asserting RuntimeError listing the first MLP's
+        # parameters still on meta (the second child is not listed).
         default_pg = torch.distributed.distributed_c10d._get_default_group()
         mesh = init_device_mesh(device_type.type, mesh_shape=(default_pg.size(),))
         mlp_dim = 8
@@ -797,6 +971,12 @@ class TestFullyShardMetaDeviceInit(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(1)
     def test_rank0_broadcast_meta_device_init(self):
+        # [FUNCTION DOC] Rank 0 builds a full CPU Transformer state dict; all
+        # ranks build a sharded meta-device Transformer. Rank 0 broadcasts each
+        # full tensor over the mesh group and every rank distributes it to its
+        # shard, then loads the result with assign. Builds a reference sharded
+        # model by broadcasting parameters, then checks parameters match and one
+        # forward/backward gives equal loss and gradients.
         model_args = ModelArgs(dropout_p=0.0)
         # Assume we have a CPU full state dict on rank 0
         if self.rank == 0:
@@ -882,12 +1062,21 @@ class TestFullyShardMetaDeviceInit(FSDPTestMultiThread):
 
 
 class TestFullyShardProcessGroupInit(FSDPTestMultiThread):
+    # [CLASS DOC] Four-rank threaded tests that device meshes built from existing
+    # process groups behave like meshes from init_device_mesh when used with
+    # fully_shard (1D and HSDP).
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 4, the number of simulated ranks.
         return 4
 
     @skip_if_lt_x_gpu(1)
     def test_1d_process_group_init(self):
+        # [FUNCTION DOC] Builds a 1D dp mesh from the dp process group and checks
+        # its mesh tensor, coordinates and group names equal the reference mesh.
+        # Shards two copies of an MLP, one per mesh, runs forward/backward with
+        # tp-consistent inputs, and asserts equal loss, local parameters,
+        # gradients and mesh tensors. Raises AssertionError if world size is not 4.
         if not (self.world_size == 4):
             raise AssertionError(f"Expected world_size == 4, but got {self.world_size}")
         # For convenience, use device mesh's infra to construct the DP PG
@@ -951,6 +1140,12 @@ class TestFullyShardProcessGroupInit(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(1)
     def test_2d_process_group_init(self):
+        # [FUNCTION DOC] Builds an HSDP mesh from intra-node (shard) and
+        # inter-node (replicate) process groups, checks it and its child meshes
+        # match a reference mesh, and verifies forward/backward parity of two
+        # sharded MLP copies. Then enables a separate reduce-scatter group and
+        # asserts every param group has one distinct from the shard group, with
+        # all modules sharing a single such group.
         shard_mesh_dim_size = 2
         if not (self.world_size % shard_mesh_dim_size == 0):
             raise AssertionError(
@@ -1044,12 +1239,20 @@ class TestFullyShardProcessGroupInit(FSDPTestMultiThread):
 
 
 class TestFullyShardHSDPBroadcast(FSDPTestMultiThread):
+    # [CLASS DOC] Four-rank threaded test that replicas of an HSDP-sharded model
+    # can be synchronized by broadcasting along the replicate mesh dimension.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 4, the number of simulated ranks.
         return 4
 
     @skip_if_lt_x_gpu(1)
     def test_hsdp_broadcast_across_replicas(self):
+        # [FUNCTION DOC] Shards a Transformer (with an extra buffer) on a 2x2
+        # HSDP mesh, overwrites states on non-zero replicas with a constant,
+        # verifies replicas differ, broadcasts local shards from the first rank of
+        # the replicate group, verifies replicas are now equal, and runs one
+        # forward/backward.
         shard_size, replicate_size = 2, 2
         mesh = init_device_mesh(
             device_type.type,
@@ -1113,16 +1316,26 @@ class TestFullyShardHSDPBroadcast(FSDPTestMultiThread):
 
 
 class TestHSDPWithCustomHook(FSDPTestMultiThread):
+    # [CLASS DOC] Four-rank threaded tests of set_all_reduce_hook: stream
+    # restrictions and a custom inter-replica all-reduce in place of native HSDP.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 4, the number of simulated ranks.
         return 4
 
     def perThreadSetUp(self) -> None:
+        # [FUNCTION DOC] HELPER: Runs the base per-thread setup, then sets the
+        # default tensor device to the test device for this thread.
         super().perThreadSetUp()
         torch.set_default_device(device_type)
 
     @skip_if_lt_x_gpu(1)
     def test_custom_hook_custom_stream(self):
+        # [FUNCTION DOC] Asserts set_all_reduce_hook with a stream on a native
+        # HSDP model raises ValueError "stream cannot be set when using native
+        # HSDP". Then shards on a 1D intra-node mesh, installs a hook with a
+        # custom stream, runs forward/backward, and asserts the hook ran on that
+        # custom stream.
         hsdp_mesh = init_device_mesh(
             device_type.type, (2, 2), mesh_dim_names=("replicate", "shard")
         )
@@ -1149,6 +1362,8 @@ class TestHSDPWithCustomHook(FSDPTestMultiThread):
         hook_used_stream = None
 
         def _hook(_output: torch.Tensor) -> None:
+            # [FUNCTION DOC] HELPER: Records the current device stream into the
+            # enclosing hook_used_stream variable; ignores the reduced output.
             nonlocal hook_used_stream
             hook_used_stream = torch.get_device_module(device_type).current_stream()
 
@@ -1165,6 +1380,11 @@ class TestHSDPWithCustomHook(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(1)
     def test_custom_hsdp_all_reduce_hook(self):
+        # [FUNCTION DOC] Shards an MLP with constant per-replica-group weights on
+        # an intra-node mesh and installs a hook that averages the reduced
+        # gradient across the inter-node group. After forward/backward asserts
+        # the hook ran and the local gradients of both projections equal the
+        # expected values (halved by averaging with the zero-weight replica).
         world_pg = dist.distributed_c10d._get_default_group()
         intra_pg = _init_intra_node_process_group(2)
         inter_pg = _init_inter_node_process_group(world_pg, 2)
@@ -1188,6 +1408,8 @@ class TestHSDPWithCustomHook(FSDPTestMultiThread):
         hook_called: bool = False
 
         def _custom_hook(output: torch.Tensor) -> None:
+            # [FUNCTION DOC] HELPER: All-reduces the given gradient in place with
+            # an average across the inter-node group, and sets hook_called.
             nonlocal hook_called
             dist.all_reduce(output, group=inter_pg, op=dist.ReduceOp.AVG)
             hook_called = True
@@ -1218,11 +1440,17 @@ class TestHSDPWithCustomHook(FSDPTestMultiThread):
 
 
 class TestFullyShardShardPlacementFn(FSDPTestMultiThread):
+    # [CLASS DOC] Eight-rank threaded tests of the shard_placement_fn argument,
+    # which chooses the dimension each parameter is sharded on.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 8, the number of simulated ranks.
         return 8
 
     def _init_models(self):
+        # [FUNCTION DOC] HELPER: Seeds the RNG with 42, builds a 3-layer
+        # Transformer without dropout, broadcasts its parameters from rank 0, and
+        # returns it with a deep copy to use as an unsharded reference.
         torch.manual_seed(42)
         model_args = ModelArgs(n_layers=3, dropout_p=0.0)
         model = Transformer(model_args)
@@ -1233,9 +1461,16 @@ class TestFullyShardShardPlacementFn(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(1)
     def test_init_1d_transformer_shard_largest_dim(self):
+        # [FUNCTION DOC] Shards each layer and the root choosing the largest
+        # dimension of every parameter. Asserts every parameter has exactly one
+        # Shard placement, at least one is on dim 1, and the full tensors equal
+        # the reference parameters.
         model, ref_model = self._init_models()
 
         def shard_placement_fn(param: nn.Parameter) -> Shard | None:
+            # [FUNCTION DOC] HELPER: Returns a Shard placement on the first
+            # largest dimension of the parameter's shape; raises AssertionError
+            # if the shape has no dimensions.
             largest_dim = largest_dim_size = -1
             for dim, dim_size in enumerate(param.shape):
                 if dim_size > largest_dim_size:
@@ -1264,9 +1499,14 @@ class TestFullyShardShardPlacementFn(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(1)
     def test_init_1d_transformer_shard_dim_neg1(self):
+        # [FUNCTION DOC] Shards using a placement function that returns a negative
+        # dim, checking FSDP normalizes it, and that full tensors match the
+        # reference parameters.
         model, ref_model = self._init_models()
 
         def shard_placement_fn(param: nn.Parameter) -> Shard | None:
+            # [FUNCTION DOC] HELPER: Always returns a shard on the last dimension
+            # (negative index), ignoring the parameter.
             # Check that FSDP will normalize this dim to non-negative
             return Shard(-1)
 
@@ -1280,6 +1520,12 @@ class TestFullyShardShardPlacementFn(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(1)
     def test_init_2d_transformer_shard_diff_dim(self):
+        # [FUNCTION DOC] Applies tensor parallelism with sequence parallel to the
+        # Transformer, then fully_shard on the dp mesh with a placement function
+        # choosing the dimension opposite to the TP shard. Asserts linear weights
+        # have two Shard placements whose dims sum to 1 (FSDP and TP on different
+        # dims), other parameters have at least one Shard, and full tensors match
+        # the reference.
         model, ref_model = self._init_models()
 
         dp_size, tp_size = self.world_size // 2, 2
@@ -1289,6 +1535,10 @@ class TestFullyShardShardPlacementFn(FSDPTestMultiThread):
         model = Transformer.parallelize(model, global_mesh["tp"], use_seq_parallel=True)
 
         def shard_placement_fn(param: nn.Parameter) -> Shard | None:
+            # [FUNCTION DOC] HELPER: For a DTensor parameter, returns a Shard on
+            # the dim mirroring its first existing Shard (last dim minus that
+            # dim), raising AssertionError if negative; otherwise returns
+            # Shard(0).
             if isinstance(param, DTensor):
                 for placement in param.placements:
                     if isinstance(placement, Shard):
@@ -1333,10 +1583,16 @@ class TestFullyShardShardPlacementFn(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(1)
     def test_init_1d_uneven_shard_largest_dim(self):
+        # [FUNCTION DOC] Shards a model with a 17-wide layer using the largest-dim
+        # placement and asserts NotImplementedError since uneven sharding on
+        # dim 1 is unsupported.
         torch.manual_seed(42)
         model = nn.Sequential(nn.Linear(16, 17), nn.Linear(17, 8))
 
         def shard_placement_fn(param: nn.Parameter) -> Shard | None:
+            # [FUNCTION DOC] HELPER: Returns a Shard on the first largest
+            # dimension of the parameter; raises AssertionError for an invalid
+            # dimension.
             largest_dim = -1
             largest_dim_size = -1
             for dim, dim_size in enumerate(param.shape):
@@ -1359,9 +1615,13 @@ class TestFullyShardShardPlacementFn(FSDPTestMultiThread):
             fully_shard(model, shard_placement_fn=shard_placement_fn)
 
     def test_invalid_shard_dim(self):
+        # [FUNCTION DOC] Requests dim 1 for every parameter, including 1D biases,
+        # and asserts fully_shard raises AssertionError that the dim is invalid
+        # for a 1D tensor.
         model = nn.Sequential(nn.Linear(16, 16), nn.Linear(16, 8))
 
         def shard_placement_fn(param: nn.Parameter) -> Shard | None:
+            # [FUNCTION DOC] HELPER: Always returns a shard on dim 1.
             return Shard(1)
 
         # Shard(1) is invalid for 1D bias parameters
@@ -1374,11 +1634,19 @@ class TestFullyShardShardPlacementFn(FSDPTestMultiThread):
 # TODO: Remove this test class once we remove the old import path:
 # torch/distributed/_composable/fsdp
 class TestFullyShardOldImport(FSDPTestMultiThread):
+    # [CLASS DOC] Two-rank threaded test of training with fully_shard imported
+    # through the public path; to be removed with the deprecated import path.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 2, the number of simulated ranks.
         return 2
 
     def test_old_import_training(self):
+        # [FUNCTION DOC] Shards two Linear layers and the root with a bfloat16
+        # param policy, asserts all three are FSDPModule instances, and runs one
+        # forward/backward.
+        # KNOWN ISSUE: despite the class comment, the imports at the top of this
+        # file use the new public path, so the old path is not exercised.
         model = nn.Sequential(nn.Linear(16, 16), nn.Linear(16, 16))
         mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16)
         fully_shard(model[0], mp_policy=mp_policy)
@@ -1394,14 +1662,24 @@ class TestFullyShardOldImport(FSDPTestMultiThread):
 
 
 class TestFullyShardMixedDtypeParam(FSDPTestMultiThread):
+    # [CLASS DOC] Two-rank threaded test that frozen parameters of differing
+    # dtypes can share one FSDP group.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 2, the number of simulated ranks.
         return 2
 
     @skip_if_lt_x_gpu(2)
     def test_mixed_dtypes_no_grad_param(self):
+        # [FUNCTION DOC] Shards a model with a frozen float8 parameter and a
+        # trainable float32 parameter on a 1D mesh and runs its forward, expecting
+        # no error.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Holds a frozen float8 weight and a float32 weight
+            # of equal shape; forward returns nothing.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the two 256x256 uninitialized
+                # parameters; the float8 one has requires_grad False.
                 super().__init__()
                 # no grad params with different dtypes
                 self.w_fp8 = torch.nn.Parameter(
@@ -1413,6 +1691,7 @@ class TestFullyShardMixedDtypeParam(FSDPTestMultiThread):
                 )
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Ignores the input and returns None.
                 return
 
         mesh = init_device_mesh(device_type.type, (self.world_size,))
@@ -1422,12 +1701,18 @@ class TestFullyShardMixedDtypeParam(FSDPTestMultiThread):
 
 
 class TestFullyShardNonFloatParam(FSDPTest):
+    # [CLASS DOC] Two-process test case for integer-typed (non-float) frozen
+    # parameters inside an FSDP group.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 2, the number of ranks.
         return 2
 
     @skip_if_lt_x_gpu(2)
     def test_non_float_param(self):
+        # [FUNCTION DOC] Runs the non-float parameter check over three sets of
+        # integer dtypes, two mixed precision policies, and with or without an
+        # extra frozen float parameter. Needs 2+ GPUs.
         """Non-float params (e.g. uint8, int64) are supported in all-gather,
         excluded from reduce-scatter, and not cast by mp_policy.param_dtype."""
         self.run_subtests(
@@ -1454,8 +1739,20 @@ class TestFullyShardNonFloatParam(FSDPTest):
         mp_policy: MixedPrecisionPolicy,
         frozen_float: bool,
     ):
+        # [FUNCTION DOC] HELPER: Builds a Linear model plus frozen integer
+        # parameters (and optionally a frozen float one), shards it with the given
+        # policy, and runs forward/backward with all-gather and reduce-scatter
+        # patched to assert: all-gather input dtype is the single common dtype
+        # (param_dtype for floats, original for ints) or uint8 when mixed, its
+        # output byte count is the sum of per-param bytes, and the reduce-scatter
+        # input numel counts only parameters requiring grad.
         class Model(nn.Module):
+            # [CLASS DOC] HELPER: Linear layer plus optional frozen float
+            # parameter and one frozen integer parameter per requested dtype.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the linear layer, the optional
+                # frozen float parameter, and non_float_N integer parameters
+                # (random values below 127) with requires_grad False.
                 super().__init__()
                 self.linear = nn.Linear(16, 16)
                 if frozen_float:
@@ -1472,6 +1769,7 @@ class TestFullyShardNonFloatParam(FSDPTest):
                     )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies only the linear layer to x.
                 return self.linear(x)
 
         model = Model()
@@ -1495,6 +1793,10 @@ class TestFullyShardNonFloatParam(FSDPTest):
         orig_ag = dist.all_gather_single
 
         def assert_all_gather(*args, **kw):
+            # [FUNCTION DOC] HELPER: Wrapper for the single-tensor all-gather;
+            # extracts output and input tensors from positional or keyword args,
+            # asserts the input dtype and output byte size, then calls the
+            # original and returns its result.
             output = kw.get("output", args[0] if len(args) > 0 else None)
             input = kw.get("input_tensor", args[1] if len(args) > 1 else None)
             self.assertEqual(input.dtype, expected_ag_dtype)
@@ -1507,6 +1809,9 @@ class TestFullyShardNonFloatParam(FSDPTest):
         orig_rs = dist.reduce_scatter_single
 
         def assert_reduce_scatter(*args, **kw):
+            # [FUNCTION DOC] HELPER: Wrapper for the single-tensor reduce-scatter;
+            # asserts the input tensor's numel equals the expected total of
+            # trainable parameters, then calls the original and returns its result.
             input = kw.get("input", args[1] if len(args) > 1 else None)
             self.assertEqual(input.numel(), expected_rs_input_numel)
             return orig_rs(*args, **kw)

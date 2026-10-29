@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-GPU test that GradScaler works with fully_shard (FSDP2)
+# models, both pure FSDP and 2D (FSDP over a data-parallel mesh plus tensor
+# parallel). Checks unscaling, inf detection, optimizer-step skipping, and scale
+# backoff. Sets a device_type global at import; no other import-time side effects.
 import copy
 
 import torch
@@ -20,14 +24,28 @@ device_type = torch.device(get_devtype())
 
 
 class TestFullyShardGradientScaler(FSDPTest):
+    # [CLASS DOC] Test case checking GradScaler behavior on FSDP2 sharded
+    # parameters. Uses the default FSDPTest world size and holds no extra state.
     @skip_if_lt_x_gpu(4)
     def test_gradient_scaler(self):
+        # [FUNCTION DOC] Runs the scaler check for every combination of injecting
+        # an inf gradient or not and using a 2D (dp x tp) mesh or plain FSDP.
+        # Needs 4+ GPUs.
         self.run_subtests(
             {"has_inf": [True, False], "test_2d": [True, False]},
             self._test_gradient_scaler,
         )
 
     def _test_gradient_scaler(self, has_inf: bool, test_2d: bool):
+        # [FUNCTION DOC] HELPER: Builds either two sharded bias-free Linear layers
+        # or, if test_2d, three MLPs tensor-parallelized on a 2 x (world/2) mesh
+        # and sharded over the dp dimension. Scales the loss with an initial scale
+        # of 2, backpropagates, and optionally writes an inf into the first
+        # param's local grad on device index 1. Then verifies: unscale_ marks
+        # found_inf as has_inf on every device, the stage becomes UNSCALED, and
+        # grads equal initial grads times the inverse scale. After step, optimizer
+        # state is unchanged if inf was found and changed otherwise. After
+        # update, the scale shrinks by the backoff factor with inf, else stays.
         torch.manual_seed(0)
         model = nn.Sequential(
             *[nn.Linear(4, 4, device=device_type, bias=False) for _ in range(2)]

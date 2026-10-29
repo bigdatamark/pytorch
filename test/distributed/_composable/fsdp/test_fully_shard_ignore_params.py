@@ -1,4 +1,11 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests the ignored_params argument of fully_shard (FSDP2) in a
+# DDP-outside / FSDP-middle / DDP-inside arrangement. Provides small nested
+# test models (A, B, C, X, Y) and helper functions that find parameters to
+# ignore, wrap modules in post-order, and compare against a pure DDP reference.
+# Import-time side effects: sets device_type, and exits the process with status
+# 0 (printing to stderr) if torch.distributed is unavailable or the dev-asan
+# build is in use.
 
 import sys
 
@@ -35,17 +42,26 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 
 class C(nn.Module):
+    # [CLASS DOC] HELPER: Innermost test module holding a single dim x dim Linear
+    # (lin_c); forward applies it.
     def __init__(self, dim: int) -> None:
+        # [FUNCTION DOC] HELPER: Creates the lin_c Linear layer of size dim.
         super().__init__()
 
         self.lin_c = nn.Linear(dim, dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Returns lin_c applied to x.
         return self.lin_c(x)
 
 
 class B(nn.Module):
+    # [CLASS DOC] HELPER: Middle test module with a Linear (lin_b), a nested C
+    # (module_c), and a learnable parameter subtrahend that is subtracted at the
+    # end of forward.
     def __init__(self, dim: int, subtrahend: torch.Tensor) -> None:
+        # [FUNCTION DOC] HELPER: Creates lin_b, module_c, and wraps the given
+        # tensor as the subtrahend parameter (no copy is made).
         super().__init__()
 
         self.lin_b = nn.Linear(dim, dim)
@@ -53,33 +69,48 @@ class B(nn.Module):
         self.subtrahend = nn.Parameter(subtrahend)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Runs module_c, then lin_b on its result, and
+        # returns that minus the subtrahend parameter.
         c_result = self.module_c(x)
         return self.lin_b(c_result) - self.subtrahend
 
 
 class A(nn.Module):
+    # [CLASS DOC] HELPER: Outermost test model with a nested B (module_b) and an
+    # addend parameter. Forward returns a scalar (sum of all outputs).
     def __init__(
         self, dim: int, addend: torch.Tensor, subtrahend: torch.Tensor
     ) -> None:
+        # [FUNCTION DOC] HELPER: Creates module_b from dim and the subtrahend
+        # tensor, and wraps the addend tensor as a parameter.
         super().__init__()
 
         self.module_b = B(dim, subtrahend)
         self.addend = nn.Parameter(addend)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Computes module_b on x plus addend and returns the
+        # sum over all elements as a scalar tensor.
         result = self.module_b(x) + self.addend
         return result.sum()
 
 
 class Y(nn.Module):
+    # [CLASS DOC] HELPER: Tiny module owning one random 10-element parameter p on
+    # the test device. No forward is defined; unused in the tests in this file.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates parameter p from a random length-10 tensor.
         super().__init__()
         p = torch.randn(10, device=device_type)
         self.p = nn.Parameter(p)
 
 
 class X(nn.Module):
+    # [CLASS DOC] HELPER: Tiny module owning a random 10-element parameter q and
+    # a child Y. No forward is defined; unused in the tests in this file.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates parameter q from a random length-10 tensor
+        # and a child Y module.
         super().__init__()
         q = torch.randn(10, device=device_type)
         self.q = nn.Parameter(q)
@@ -87,6 +118,8 @@ class X(nn.Module):
 
 
 def _append_prefix(prefix: str, name: str) -> str:
+    # [FUNCTION DOC] HELPER: Joins a dotted module path prefix and a child name
+    # with a dot, or returns plain concatenation when either one is empty.
     if prefix != "" and name != "":
         return prefix + "." + name
     else:
@@ -94,6 +127,11 @@ def _append_prefix(prefix: str, name: str) -> str:
 
 
 def _generate_model_and_input() -> nn.Module:
+    # [FUNCTION DOC] HELPER: Deterministically builds a model of type A (dim 8)
+    # on the test device using fixed seeds 42, 70 for the parameters and 84 for
+    # a random 8x8 input. Reseeds the global RNG. Returns a (model, input) pair.
+    # KNOWN ISSUE: the return annotation says a single module but a tuple is
+    # returned.
     dim = 8
 
     torch.manual_seed(42)
@@ -111,6 +149,9 @@ def _generate_model_and_input() -> nn.Module:
 
 
 def _find_name_param_mappings(module: torch.nn.Module, prefix: str):
+    # [FUNCTION DOC] HELPER: Walks named_parameters of the module with the given
+    # name prefix and returns two mappings: name to parameter, and parameter to
+    # name. Shared parameters collapse to one entry in the first mapping only.
     name_to_param_map = {}
     param_to_name_map = {}
     for name, param in module.named_parameters(prefix):
@@ -120,6 +161,11 @@ def _find_name_param_mappings(module: torch.nn.Module, prefix: str):
 
 
 def _discover_ddp_ignored_params(module: torch.nn.Module, prefix: str):
+    # [FUNCTION DOC] HELPER: Recursively collects the fully qualified parameter
+    # names that DDP should ignore: for every submodule that is an FSDP2 module,
+    # all of its parameter names (prefixed) are returned and recursion stops
+    # there; otherwise children are searched with extended prefixes. Returns a
+    # list of names.
     ddp_ignore_parameters: list[str] = []
     if isinstance(module, FSDP2):
         ddp_ignore_parameters = [name for name, _ in module.named_parameters(prefix)]
@@ -138,6 +184,10 @@ def _modify_ddp_ignored_params(
     fsdp_ignored_params: set[torch.nn.Parameter],
     name_to_param_map: dict,
 ):
+    # [FUNCTION DOC] HELPER: Filters the DDP-ignored names, dropping any whose
+    # parameter is in the FSDP-ignored set (DDP must keep managing those). Looks
+    # each name up in name_to_param_map and raises AssertionError if a name is
+    # missing. Returns the filtered list in input order.
     modified_list = []
     for name in ddp_ignored_param_names:
         if name not in name_to_param_map:
@@ -150,6 +200,9 @@ def _modify_ddp_ignored_params(
 
 
 def _get_full_tensor(name, param):
+    # [FUNCTION DOC] HELPER: Returns the gathered full tensor if the parameter is
+    # a DTensor (a collective), else returns the parameter itself. The name
+    # argument is unused.
     if isinstance(param, DTensor):
         return param.full_tensor()
     else:
@@ -159,6 +212,11 @@ def _get_full_tensor(name, param):
 def _discover_fsdp_ignored_params(
     module: torch.nn.Module, ignored_path, path: str
 ) -> set[torch.nn.Parameter]:
+    # [FUNCTION DOC] HELPER: Recursively finds the set of parameters FSDP should
+    # ignore: when the current path equals ignored_path, all parameters under
+    # that module are returned (and AssertionError is raised if it has any
+    # buffers, which are unsupported); otherwise the union over children is
+    # returned. Returns an empty set if the path is never matched.
     total_ignored_params = set()
 
     if ignored_path == path:
@@ -187,6 +245,10 @@ def _post_order_wrap_fsdp(
     ignored_path: str,
     ignored_params: set[torch.nn.Parameter],
 ) -> torch.nn.Module:
+    # [FUNCTION DOC] HELPER: Applies fully_shard bottom-up (children before
+    # parents) over the module tree on the given mesh, passing ignored_params
+    # to each call, but skips the subtree whose path equals ignored_path. The
+    # module is modified in place and also returned.
     if ignored_path != path:
         for name, sub_module in list(module.named_children()):
             child_path = _append_prefix(path, name)
@@ -200,6 +262,9 @@ def _post_order_wrap_fsdp(
 
 
 def _find_all_fsdped_modules(module: torch.nn.Module, path) -> set[str]:
+    # [FUNCTION DOC] HELPER: Recursively returns the set of dotted paths of all
+    # modules in the tree that are FSDP2 modules, including the starting module
+    # (under the given path, which may be empty).
     result = set()
     for name, child in list(module.named_children()):
         child_path = _append_prefix(path, name)
@@ -211,14 +276,21 @@ def _find_all_fsdped_modules(module: torch.nn.Module, path) -> set[str]:
 
 
 class TestFullyShardIgnoreParams(FSDPTest):
+    # [CLASS DOC] Test case for fully_shard with ignored_params; holds no state
+    # beyond FSDPTest. Provides comparison helpers and one end-to-end test.
     """Tests for fully_shard ignore params"""
 
     def compare_params(self, name, ref_param, test_param):
+        # [FUNCTION DOC] HELPER: Gathers full tensors for both parameters and
+        # asserts they are close. The name argument is only passed through.
         ref_full_tensor = _get_full_tensor(name, ref_param)
         test_full_tensor = _get_full_tensor(name, test_param)
         self.assertTrue(torch.allclose(ref_full_tensor, test_full_tensor))
 
     def compare_ref_test_params(self, ref_name_to_param_map, test_name_to_param_map):
+        # [FUNCTION DOC] HELPER: Asserts the two name-to-parameter mappings have
+        # identical key sets, then asserts the parameters under every name are
+        # numerically close via compare_params.
         for name in ref_name_to_param_map:
             self.assertTrue(name in test_name_to_param_map)
 
@@ -231,6 +303,11 @@ class TestFullyShardIgnoreParams(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_ddp_A_fsdp_B_ddp_C(self):
+        # [FUNCTION DOC] Compares a plain DDP model against a model where module_b
+        # is FSDP-sharded (with module_c's parameters ignored by FSDP) inside an
+        # outer DDP. Verifies the sharded module set, the DDP ignore lists, then
+        # trains 3 Adam steps checking equal losses and parameters each step
+        # (optimizer steps under implicit_replication). Needs 2+ GPUs.
         default_pg = dist.distributed_c10d._get_default_group()
         mesh = init_device_mesh(device_type.type, mesh_shape=(default_pg.size(),))
 

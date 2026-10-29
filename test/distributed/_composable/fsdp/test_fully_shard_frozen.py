@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-GPU tests of fully_shard (FSDP2) with frozen parameters
+# (requires_grad False). Each test compares training against a DDP-wrapped
+# reference model. Covers frozen/non-frozen mixes inside one communication
+# group, across groups (with optional unfreezing), and modules that run several
+# times per forward. Defines one FSDPTest subclass and a device_type global
+# derived from get_devtype; no other import-time side effects.
 
 import copy
 import functools
@@ -30,12 +36,20 @@ device_type = torch.device(get_devtype())
 
 
 class TestFullyShardFrozen(FSDPTest):
+    # [CLASS DOC] Test case for fully_shard on models with frozen parameters.
+    # Stateless apart from the FSDPTest process-group setup; the world size is
+    # capped at 4 ranks. Each public test runs subtests over a config grid.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Returns the number of ranks: the smaller of 4 and the
+        # number of devices available for the current device type.
         return min(4, torch.get_device_module(device_type).device_count())
 
     @skip_if_lt_x_gpu(2)
     def test_train_mixed_requires_grad_per_group(self):
+        # [FUNCTION DOC] Runs the per-group mixed-frozen check over a grid of
+        # reshard_after_forward (False, True, 2), activation checkpointing on/off,
+        # and whether freezing happens before or after fully_shard. Needs 2+ GPUs.
         """
         Tests training parity with DDP when mixing frozen and non-frozen
         parameters in the same FSDP communication group. This checks that
@@ -58,6 +72,14 @@ class TestFullyShardFrozen(FSDPTest):
         use_activation_checkpointing: bool,
         freeze_after_init: bool,
     ):
+        # [FUNCTION DOC] HELPER: Builds three MLPs where only biases train,
+        # either frozen before sharding or after it. Wraps a DDP reference and an
+        # FSDP model (each MLP plus root, optionally checkpointed), then trains 10
+        # iterations with Adam. Patches reduce-scatter to assert its output numel
+        # equals the local bias numel, and counts post-backward autograd function
+        # calls. Checks sharded parity and equal losses each step, and that at
+        # least num_mlps minus one hooks ran in autograd backward. Raises
+        # AssertionError if a child is not an MLP or a check fails.
         torch.manual_seed(42)
         num_mlps, lin_dim = (3, 32)
         model = nn.Sequential(
@@ -100,6 +122,8 @@ class TestFullyShardFrozen(FSDPTest):
         )
 
         def assert_fn(output: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Asserts the reduce-scatter output tensor has
+            # exactly the expected number of elements (local bias elements only).
             self.assertEqual(output.numel(), expected_numel)
 
         reduce_scatter = functools.partial(
@@ -109,6 +133,9 @@ class TestFullyShardFrozen(FSDPTest):
         backward_count = 0
 
         def backward_with_count(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Wrapper for the post-backward function's
+            # backward. Increments the enclosing backward_count, then delegates to
+            # the original backward and returns its result.
             nonlocal backward_count
             backward_count += 1
             return orig_backward(*args, **kwargs)
@@ -136,6 +163,9 @@ class TestFullyShardFrozen(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_train_mixed_requires_grad_across_groups(self):
+        # [FUNCTION DOC] Runs the across-groups frozen check over reshard_after_forward
+        # (False, True, 2) and whether frozen params are unfrozen on the last
+        # iteration. Needs 2+ GPUs.
         """
         Tests training parity with DDP when mixing frozen and non-frozen
         parameters across different FSDP communication groups, including
@@ -154,6 +184,12 @@ class TestFullyShardFrozen(FSDPTest):
         reshard_after_forward: bool | int,
         unfreeze_params: bool,
     ):
+        # [FUNCTION DOC] HELPER: Builds six Linear+ReLU blocks, shards each Linear
+        # as its own group (no root wrap), and keeps a DDP reference with unused
+        # parameter detection. Freezes alternating layers, then runs 3 iterations
+        # where iteration 1 is forward-only under no_grad and the last optionally
+        # unfreezes the FSDP model's params. Finally asserts equal losses and that
+        # at least num_linears minus one post-backward calls came from autograd.
         torch.manual_seed(42)
         num_linears, lin_dim = (6, 32)
         modules: list[nn.Module] = []
@@ -174,6 +210,11 @@ class TestFullyShardFrozen(FSDPTest):
         backward_count = 0
 
         def _set_requires_grad(seq: nn.Module, requires_grad: bool):
+            # [FUNCTION DOC] HELPER: Sets requires_grad on the parameters of the
+            # even-indexed layers of the sequential. Mutates the parameters.
+            # KNOWN ISSUE: the inner index is i mod 2, which is always 0 for even
+            # i, so only layer 0 is ever modified, not every other layer as the
+            # comment suggests.
             for i in range(num_linears):
                 # Interleave frozen -> non-frozen -> ... linears
                 if i % 2 == 0:
@@ -181,6 +222,9 @@ class TestFullyShardFrozen(FSDPTest):
                         param.requires_grad_(requires_grad)
 
         def backward_with_count(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Counts calls to the post-backward function's
+            # backward via the enclosing backward_count, then delegates to the
+            # original backward and returns its result.
             nonlocal backward_count
             backward_count += 1
             return orig_backward(*args, **kwargs)
@@ -214,6 +258,8 @@ class TestFullyShardFrozen(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_multi_forward_mixed_requires_grad(self):
+        # [FUNCTION DOC] Runs the multi-forward frozen/trainable check for each
+        # reshard_after_forward value (True, False, 2). Needs 2+ GPUs.
         """
         Tests training parity with DDP when having trainable and frozen modules
         that participate multiple times in forward.
@@ -227,8 +273,17 @@ class TestFullyShardFrozen(FSDPTest):
         self,
         reshard_after_forward: bool | int,
     ):
+        # [FUNCTION DOC] HELPER: Shards every Linear of a module that calls a
+        # frozen and a trainable Linear three times each per forward (also once
+        # under no_grad), plus the root. Trains 10 iterations against a DDP
+        # reference and asserts equal losses each iteration.
         class MultiForwardModule(nn.Module):
+            # [CLASS DOC] HELPER: Test model with three Linear layers; layer_no_grad
+            # is frozen. Its forward reuses layer_no_grad and layer_with_grad
+            # repeatedly, including calls under no_grad.
             def __init__(self, device: torch.device):
+                # [FUNCTION DOC] HELPER: Creates the three 5x5 Linear layers on the
+                # given device and freezes layer_no_grad.
                 super().__init__()
                 self.layer_0 = nn.Linear(5, 5, device=device)
                 self.layer_no_grad = nn.Linear(5, 5, device=device)
@@ -236,6 +291,10 @@ class TestFullyShardFrozen(FSDPTest):
                 self.layer_no_grad.requires_grad_(False)
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Applies layer_0, then three rounds of
+                # relu(layer_with_grad) into layer_no_grad, each followed by an
+                # in-place add of relu(layer_with_grad(x)) computed under no_grad.
+                # Returns the final tensor.
                 x = self.layer_0(x)
                 for _ in range(3):
                     x = self.layer_no_grad(F.relu(self.layer_with_grad(x)))

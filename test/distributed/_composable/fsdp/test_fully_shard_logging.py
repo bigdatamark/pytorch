@@ -1,4 +1,8 @@
 # Owner(s): ["module: fsdp"]
+# [MODULE DOC] Test that fully_shard (FSDP2) emits its debug log messages when
+# the "fsdp" log channel is enabled. The check runs a small sharded model in a
+# subprocess and inspects its stderr. Defines a requires_distributed skip
+# decorator factory and a device_type global at import time.
 import functools
 import os
 import unittest
@@ -22,8 +26,17 @@ device_type = torch.device(get_devtype())
 
 @skip_if_lt_x_gpu(2)
 class LoggingTests(LoggingTestCase):
+    # [CLASS DOC] Logging test case for FSDP2, skipped unless at least 2 GPUs are
+    # present (class-level skip decorator). Holds no state of its own.
     @requires_distributed()
     def test_fsdp_logging(self):
+        # [FUNCTION DOC] Launches a subprocess with log channel fsdp enabled and
+        # a single-rank environment (rank 0, world size 1, localhost port 34715).
+        # The child shards two bias-free Linear layers plus the root, runs one
+        # forward and backward with the fully_shard logger at debug level, and
+        # the test asserts stderr contains the root pre-forward, per-layer
+        # pre/post forward and pre/post backward (indices 0 and 1), and root
+        # post-backward messages. Skipped without torch.distributed.
         env = dict(os.environ)
         env["TORCH_LOGS"] = "fsdp"
         env["RANK"] = "0"
