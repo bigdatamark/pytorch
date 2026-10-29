@@ -1,3 +1,10 @@
+# [MODULE DOC] Codegen for TraceType.cpp, the Tracer dispatch-key kernels used by the JIT
+# tracer. For each traceable native function it emits a kernel that records the op (name,
+# inputs) into the active tracing state, redispatches to the next key with tracing
+# temporarily disabled, then records outputs. Holds the manual-kernel op sets
+# (MANUAL_BACKEND, MANUAL_AUTOGRAD_AND_TRACER, MANUAL_AUTOGRAD, MANUAL_TRACER), the
+# do-not-trace set, rename tables, C++ templates and the gen_trace_type entry point, which
+# writes a sharded TraceType.cpp. No import-time side effects besides building constants.
 from __future__ import annotations
 
 import itertools
@@ -77,6 +84,9 @@ DONT_RECORD_TRACE = {
 
 
 def should_trace(f: NativeFunction) -> bool:
+    # [FUNCTION DOC] Decides whether the op gets trace recording. False if any argument is
+    # a Storage or Type, if it returns no Tensor or tensor list, or if its base name is in
+    # DONT_RECORD_TRACE; true otherwise. Pure predicate.
     # Operations involving Storage or Type are not traceable at the moment
     if any(
         str(arg.type) in {"Storage", "Type"} for arg in f.func.schema_order_arguments()
@@ -113,6 +123,10 @@ RENAME_TRACE = {
 
 
 def format_trace_op_name(f: NativeFunction) -> str:
+    # [FUNCTION DOC] Returns C++ that assigns the traced op symbol. Functional, out and
+    # dunder ops use their plain name (after RENAME_TRACE). In-place ops get a runtime
+    # choice on the tracer's force_outplace flag between the out-of-place base name and the
+    # in-place name, both renamed via RENAME_TRACE.
     # TODO: byte-for-byte compatible with old codegen behavior - should clean up
     if (
         f.func.kind() in (SchemaKind.functional, SchemaKind.out)
@@ -142,7 +156,16 @@ ADD_TRACE_INPUT = CodeTemplate("""jit::tracer::addInputs(node, "${name}", ${inpu
 
 
 def format_trace_inputs(f: NativeFunction) -> str:
+    # [FUNCTION DOC] Returns newline-joined C++ statements adding every schema-order
+    # argument as a tracer input (TensorOptions are split into dtype, layout, device and
+    # pinned memory). For out overloads the out arguments are dropped from the regular list
+    # and appended in a force_outplace conditional: in-place records them by name, while
+    # out-of-place records factory-style options of the out tensor only for factory ops
+    # (and always for normal).
     def dispatch_trace_input(arg: Argument | TensorOptionsArguments) -> Sequence[str]:
+        # [FUNCTION DOC] HELPER: Returns the C++ statement(s) tracing one argument; an
+        # options argument yields four statements, an optional tensor list uses a direct
+        # call, anything else yields one templated statement.
         if isinstance(arg, TensorOptionsArguments):
             name = "options"
             return [
@@ -301,6 +324,10 @@ if (jit::tracer::isTracing()) {
 
 
 def format_prerecord_trace(f: NativeFunction) -> str:
+    # [FUNCTION DOC] Returns the C++ block run before redispatch: creates the trace node,
+    # sets the op name, adds inputs (plus extra fill/zero arguments for in-place variants
+    # under force_outplace), inserts the node, guards in-place ops with a uniqueness check
+    # on the mutated input, and disables tracing. Empty string if the op is not traced.
     if not should_trace(f):
         return ""
 
@@ -347,6 +374,12 @@ if (tracer_state) {
 
 
 def format_postrecord_trace(f: NativeFunction) -> str:
+    # [FUNCTION DOC] Returns the C++ block run after redispatch: restores the tracing state
+    # and records outputs on the node. For out overloads it records the out arguments, or
+    # picks at runtime between them and the return names when those differ. Empty string
+    # if the op is not traced.
+    # KNOWN ISSUE: the runtime condition here uses force_outplace directly, whereas the
+    # pre-record code reads it through the tracer state; the name may not be in scope.
     if not should_trace(f):
         return ""
 
@@ -381,6 +414,9 @@ def format_postrecord_trace(f: NativeFunction) -> str:
 
 
 def tie_return_values(f: NativeFunction) -> str:
+    # [FUNCTION DOC] HELPER: Returns the C++ declaration target for the redispatch result:
+    # a single auto variable (named after the return or result) or a structured binding
+    # over all return names.
     if len(f.func.returns) == 1:
         return f"auto {f.func.returns[0].name or 'result'}"
     names = cpp.return_names(f)
@@ -388,6 +424,9 @@ def tie_return_values(f: NativeFunction) -> str:
 
 
 def get_return_value(f: NativeFunction) -> str:
+    # [FUNCTION DOC] HELPER: Returns the C++ expression for the kernel's return value: the
+    # single name, a forwarded tuple of references for out ops, or a tuple built by moving
+    # each named value otherwise.
     names = cpp.return_names(f)
     if len(f.func.returns) == 1:
         return names[0]
@@ -405,6 +444,10 @@ ${assign_return_values}at::_ops::${unambiguous_name}::redispatch(${unpacked_args
 
 
 def emit_trace_body(f: NativeFunction) -> list[str]:
+    # [FUNCTION DOC] Returns the ordered C++ body pieces of a trace kernel: pre-record block,
+    # a redispatch call (to keys after Tracer, assigning results only for functional and
+    # mutable ops that return something), post-record block, and a return statement when the
+    # op has returns.
     trace_body: list[str] = []
 
     trace_body.append(format_prerecord_trace(f))
@@ -451,6 +494,8 @@ ${return_type} ${type_wrapper_name}(${formals}) {
 
 
 def type_wrapper_name(f: NativeFunction, key: str = "Default") -> str:
+    # [FUNCTION DOC] Returns the generated C++ function name: the C++ op name, with the
+    # overload name appended if any, and the dispatch key appended unless it is Default.
     if f.func.name.overload_name:
         name = f"{cpp.name(f.func)}_{f.func.name.overload_name}"
     else:
@@ -468,6 +513,9 @@ def type_wrapper_name(f: NativeFunction, key: str = "Default") -> str:
 
 @with_native_function
 def method_definition(f: NativeFunction) -> str:
+    # [FUNCTION DOC] Returns the C++ definition of the trace kernel: dispatch key set plus
+    # all schema-order arguments (SymInt types) and the generated body. Raises
+    # AssertionError if the op is in MANUAL_TRACER.
     if cpp.name(f.func) in MANUAL_TRACER:
         raise AssertionError(f"Function {cpp.name(f.func)} is in MANUAL_TRACER")
 
@@ -500,6 +548,8 @@ m.impl("${name}",
 
 @with_native_function
 def method_registration(f: NativeFunction) -> str:
+    # [FUNCTION DOC] Returns the C++ library registration line binding the op name to the
+    # generated TraceType kernel. Raises AssertionError if the op is in MANUAL_TRACER.
     if cpp.name(f.func) in MANUAL_TRACER:
         raise AssertionError(f"Function {cpp.name(f.func)} is in MANUAL_TRACER")
 
@@ -511,6 +561,9 @@ def method_registration(f: NativeFunction) -> str:
 
 
 def gen_trace_type_func(fn: NativeFunction) -> dict[str, list[str]]:
+    # [FUNCTION DOC] Per-function template environment for sharded output: maps the keys
+    # ops_headers, trace_method_definitions and trace_wrapper_registrations to one-element
+    # lists for this op.
     return {
         "ops_headers": [f"#include <ATen/ops/{fn.root_name}_ops.h>"],
         "trace_method_definitions": [method_definition(fn)],
@@ -521,6 +574,9 @@ def gen_trace_type_func(fn: NativeFunction) -> dict[str, list[str]]:
 def gen_trace_type(
     out: str, native_functions: list[NativeFunction], template_path: str
 ) -> None:
+    # [FUNCTION DOC] Entry point. Writes TraceType.cpp into the out directory, split into 10
+    # shards keyed by op root name, from all native functions not in MANUAL_TRACER. Side
+    # effect is file output; returns nothing.
     # NOTE: see Note [Sharded File] at the top of the VariableType.cpp
     # template regarding sharding of the generated files.
     fm = FileManager(install_dir=out, template_dir=template_path, dry_run=False)

@@ -1,3 +1,9 @@
+# [MODULE DOC] Codegen for variable_factories.h. Finds ATen factory functions (those taking
+# TensorOptions or named with a _like suffix) and emits inline C++ wrappers that call the
+# ATen function with autograd dispatch disabled and then wrap the result via make_variable,
+# applying requires_grad explicitly. Defines the two type regexes used for qualifying types
+# and the helpers fully_qualified_type, gen_variable_factories, is_factory_function and
+# process_function. No import-time side effects beyond compiling the regexes.
 # Generates C++ functions that wrap ATen tensor factory methods to turn them into Variables.
 #
 # This writes one file: variable_factories.h
@@ -22,7 +28,12 @@ TYPE_PATTERN = re.compile(r"(?:const\s+)?([A-Z]\w+)")
 # Add 'at::' to types defined in ATen namespace, e.g. Tensor, TensorList, IntArrayRef and etc.
 # TODO: maybe update the cpp argument API to take optional namespace argument?
 def fully_qualified_type(argument_type: str) -> str:
+    # [FUNCTION DOC] Takes a C++ type string and returns it with the at:: namespace inserted
+    # before the leading capitalized type name (keeping any const prefix and any
+    # std::optional wrapper). Strings that do not match the pattern are returned unchanged.
+    # Pure function; no side effects.
     def maybe_optional_type(type: str, is_opt: bool) -> str:
+        # [FUNCTION DOC] HELPER: Wraps the type in std::optional when is_opt is true.
         return f"std::optional<{type}>" if is_opt else type
 
     opt_match = OPTIONAL_TYPE_PATTERN.match(argument_type)
@@ -40,6 +51,10 @@ def fully_qualified_type(argument_type: str) -> str:
 def gen_variable_factories(
     out: str, native_yaml_path: str, tags_yaml_path: str, template_path: str
 ) -> None:
+    # [FUNCTION DOC] Parses the native functions yaml and tags yaml, selects the factory
+    # functions, and renders the variable_factories.h template into the out directory,
+    # filling in the include list of per-op headers and the generated wrapper definitions.
+    # Side effects: writes one file via FileManager. Returns nothing.
     native_functions = parse_native_yaml(
         native_yaml_path, tags_yaml_path
     ).native_functions
@@ -61,6 +76,8 @@ def gen_variable_factories(
 
 @with_native_function
 def is_factory_function(f: NativeFunction) -> bool:
+    # [FUNCTION DOC] Returns true if the function has a function variant and either takes
+    # TensorOptions arguments or has a C++ name ending in _like. Pure predicate.
     if Variant.function not in f.variants:
         return False
 
@@ -71,6 +88,12 @@ def is_factory_function(f: NativeFunction) -> bool:
 
 @with_native_function
 def process_function(f: NativeFunction) -> str | None:
+    # [FUNCTION DOC] Returns None for non-factory functions. Otherwise returns C++ source
+    # with one inline wrapper per signature (the regular one and the SymInt one if present).
+    # Each wrapper takes the same arguments with at::-qualified types and defaults, strips
+    # requires_grad from the TensorOptions passed to ATen, calls ATen under
+    # AutoDispatchBelowADInplaceOrView, and wraps the result with make_variable using the
+    # requires_grad flag read from the options (false if there are no options argument).
     name = cpp.name(f.func)
     has_tensor_options = python.has_tensor_options(f)
     is_factory = has_tensor_options or name.endswith("_like")

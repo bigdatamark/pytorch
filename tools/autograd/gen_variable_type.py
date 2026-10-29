@@ -1,3 +1,12 @@
+# [MODULE DOC] Codegen for VariableType.h and the sharded VariableType_*.cpp, the Autograd
+# dispatch-key kernels. For each op using derived dispatch it emits a kernel that unpacks
+# arguments, decides whether grad is required, creates and wires a grad_fn node (saving
+# inputs/outputs), redispatches below autograd, sets history, handles forward-mode AD
+# formulas, runs debug-only TensorImpl/storage sanity checks, and returns results. Ops without
+# derivatives instead register a generic not-implemented kernel. Holds the op lists that tune
+# these behaviors (no-derivative ops, complex/sparse gradient allowlists, check exemptions),
+# the C++ snippet templates, and the entry points gen_variable_type, gen_variable_type_func
+# and emit_body. Only constants are built at import time; files are written on call.
 # Generates VariableType.h/cpp
 #
 # **If any changes are being made to the VariableType codegen please also check
@@ -891,6 +900,11 @@ def gen_variable_type(
     template_path: str,
     used_keys: set[str],
 ) -> None:
+    # [FUNCTION DOC] Entry point. Writes VariableType.h, then writes an intermediate
+    # VariableType.cpp template (under the templates subdirectory of out) whose placeholders
+    # are expanded per dispatch key in used_keys, then writes the final sharded (10 shards)
+    # VariableType cpp files from the ops that use derived dispatch, keyed by C++ op name.
+    # Side effect is file output; returns nothing.
     """VariableType.h and VariableType.cpp body
 
     This is the at::Type subclass for differentiable tensors. The
@@ -909,6 +923,9 @@ def gen_variable_type(
     # helper that generates a TORCH_LIBRARY_IMPL macro for each
     # dispatch key that appears in derivatives.yaml
     def wrapper_registrations(used_keys: set[str]) -> str:
+        # [FUNCTION DOC] HELPER: For each key in sorted order returns a library-impl block
+        # (key Default maps to the Autograd dispatch key) containing a template placeholder
+        # for that key's registrations; blocks are joined by blank lines.
         library_impl_macro_list: list[str] = []
         for key in sorted(used_keys):
             dispatch_key = key
@@ -967,6 +984,8 @@ def gen_variable_type(
 
 @with_native_function_and
 def gen_wrapper_registration(f: NativeFunction, key: str = "Default") -> str:
+    # [FUNCTION DOC] Returns the C++ registration statement binding the op to the
+    # VariableType kernel generated for the given dispatch key.
     return WRAPPER_REGISTRATION.substitute(
         unqual_operator_name_with_overload=f.func.name,
         type_wrapper_name=type_wrapper_name(f, key),
@@ -977,6 +996,14 @@ def gen_wrapper_registration(f: NativeFunction, key: str = "Default") -> str:
 def gen_variable_type_func(
     fn: NativeFunctionWithDifferentiabilityInfo,
 ) -> dict[str, list[str]]:
+    # [FUNCTION DOC] Per-op environment for sharded output. Maps per-key names for method
+    # definitions and wrapper registrations to one-element lists. Ops with no derivative
+    # info that are not exempted (exempt: grad-accumulator resets, no-derivative list,
+    # no differentiable outputs, check exemptions) get an empty definition and a generic
+    # not-implemented autograd registration under the Default key. Otherwise one kernel
+    # per dispatch key in the info (or Default when there is no info) is generated through
+    # emit_body. Raises AssertionError if manual-backend membership disagrees with the op's
+    # manual kernel flag, or if a manual-autograd/derivative op is not abstract.
     f = fn.func
     result = {}
     with native_function_manager(f):
@@ -1088,6 +1115,18 @@ _foreach_ops_with_different_arity = {
 def emit_body(
     fn: NativeFunctionWithDifferentiabilityInfo, key: str = "Default"
 ) -> list[str]:
+    # [FUNCTION DOC] Returns the ordered C++ statements forming the autograd kernel body for
+    # one op and dispatch key. Steps: unpack arguments; if a derivative is required, compute
+    # the any-requires-grad and forward-grad flags, in-place checks, save original self,
+    # and create/populate grad_fn; call the underlying op below autograd (with debug
+    # sanity checks); set or rebase history; check complex support; set forward-mode
+    # tangents or forbid them; save outputs; fire creation hooks; reset the grad accumulator
+    # for listed ops; and return the result. Handles in-place foreach ops with per-element
+    # grad_fns. Raises AssertionError or RuntimeError on inconsistent derivative info
+    # (missing foreach info, mismatched arg types or counts, derivative given for a
+    # non-differentiable op, forward-derivative count mismatch).
+    # The nested emit_* helpers below read this function's locals (info, key-specific forward
+    # derivatives, differentiable inputs and outputs, flags) via closure.
     if dispatch_strategy(fn) != "use_derived":
         raise AssertionError(
             f"dispatch_strategy(fn) is {dispatch_strategy(fn)}, expected 'use_derived'"
@@ -1144,6 +1183,9 @@ def emit_body(
     def gen_differentiable_input(
         arg: Argument | SelfArgument | TensorOptionsArguments,
     ) -> DifferentiableInput | None:
+        # [FUNCTION DOC] HELPER: Converts one argument (a SelfArgument is unwrapped) into a
+        # DifferentiableInput with its name, type and SymInt-aware C++ type. Returns None for
+        # TensorOptions arguments and for arguments not differentiable per the info.
         if isinstance(arg, TensorOptionsArguments):
             return None
         a: Argument = arg.argument if isinstance(arg, SelfArgument) else arg
@@ -1163,6 +1205,9 @@ def emit_body(
 
     @with_native_function
     def gen_differentiable_inputs(f: NativeFunction) -> list[DifferentiableInput]:
+        # [FUNCTION DOC] HELPER: Returns the differentiable inputs among the non-out
+        # arguments. For in-place foreach ops with info, foreach arguments are first replaced
+        # by the reference op's arguments (same position) so names match the derivative formulas.
         arguments = list(f.func.arguments.non_out)
         if is_inplace_foreach and info is not None:
             for i, arg in enumerate(f.func.arguments.flat_non_out):
@@ -1182,6 +1227,9 @@ def emit_body(
     def find_args_with_derivatives(
         differentiable_inputs: list[DifferentiableInput],
     ) -> list[DifferentiableInput]:
+        # [FUNCTION DOC] HELPER: Returns the inputs that appear as variables in some
+        # derivative formula, or all inputs if there is no info or no derivatives. Raises
+        # RuntimeError if a formula names a variable that is not a differentiable input.
         """Find arguments that have derivative definitions"""
         if info is None or not info.has_derivatives:
             return differentiable_inputs
@@ -1246,6 +1294,10 @@ def emit_body(
     )
 
     def emit_save_inputs() -> list[str]:
+        # [FUNCTION DOC] HELPER: Returns statements storing the saved inputs on grad_fn
+        # (with optional should-compute-output guards), wrapped in a loop over the grad_fn
+        # vector for in-place foreach, and recording tensor-list sizes otherwise. Empty if the
+        # op has no derivatives.
         setup: list[str] = []
         if info is None or not info.has_derivatives:
             return setup
@@ -1257,6 +1309,16 @@ def emit_body(
         # We don't want to save tensors if we know that they will never be used
         # when computing the derivative, so we add guards to those statements
         def guard_for(arg: SavedAttribute) -> str | None:
+            # [FUNCTION DOC] HELPER: Returns a C++ condition under which a saved tensor is
+            # needed, or None for no guard. No guard when a tensor list is involved (except
+            # in-place foreach), for backward ops, with at most one differentiable input,
+            # for non-tensor values, or when several derivatives use the value. Otherwise
+            # the condition is the should-compute-output check of the edge using it, or for
+            # multi-output formulas the condition extracted from the wrap_opt_if call.
+            # Raises AssertionError on inconsistent derivative info.
+            # KNOWN ISSUE: the slice start for the wrap_opt_if condition is computed from a
+            # raw string containing escaped parentheses, so it is one character longer than
+            # the matched text prefix; the first character of the condition is dropped.
             if info is None:
                 raise AssertionError("info is None in guard_for")
 
@@ -1349,6 +1411,12 @@ def emit_body(
         return setup
 
     def setup_derivative(differentiable_inputs: list[DifferentiableInput]) -> list[str]:
+        # [FUNCTION DOC] HELPER: Returns statements that declare and populate grad_fn. For
+        # out ops it only emits checks that no input or output requires grad. Otherwise it
+        # builds the node (or a vector of nodes for in-place foreach, one per element) using
+        # the derivative's node class or a generic not-implemented node, saves inputs, and
+        # emits no-requires-grad checks for inputs without derivatives, all inside the
+        # any-requires-grad setup block.
         body: list[str] = []
         if is_out_fn:
             # For out functions, ensure that no input or output requires grad
@@ -1416,6 +1484,8 @@ def emit_body(
         return body
 
     def emit_check_if_in_complex_autograd_allowlist() -> list[str]:
+        # [FUNCTION DOC] HELPER: Unless the op is in the complex-gradient allowlist, returns
+        # statements raising an error at runtime if a tensor or tensor-list output is complex.
         body: list[str] = []
         if base_name in GRADIENT_IMPLEMENTED_FOR_COMPLEX:
             return body
@@ -1430,6 +1500,9 @@ def emit_body(
         tensor_args: list[DifferentiableInput],
         args_with_derivatives: list[DifferentiableInput],
     ) -> list[str]:
+        # [FUNCTION DOC] HELPER: Returns runtime no-requires-grad checks for every tensor
+        # argument lacking a derivative, skipping declared non-differentiable names and
+        # an argument named output.
         """Checks that arguments without derivatives don't require grad"""
         body: list[str] = []
         for arg in tensor_args:
@@ -1446,6 +1519,10 @@ def emit_body(
         return body
 
     def emit_original_self_definition() -> list[str]:
+        # [FUNCTION DOC] HELPER: For in-place ops returns a declaration of an optional
+        # holder (a vector of them for foreach) for the pre-mutation self, plus code cloning
+        # self into it when some forward derivative needs the original value and its
+        # forward-grad flag is set. Empty for non-in-place ops.
         body: list[str] = []
         if inplace:
             if is_inplace_foreach:
@@ -1486,6 +1563,13 @@ def emit_body(
         is_output: bool,
         guard_for: Callable[[SavedAttribute], str | None] = lambda name: None,
     ) -> Sequence[str]:
+        # [FUNCTION DOC] HELPER: Returns statements assigning each saved attribute (sorted by
+        # name) to a grad_fn member, converting by type: tensors become saved variables
+        # (cloning self lazily for in-place ops, and flagging inplace views for outputs),
+        # tensor lists become saved variable lists, arrays become vectors, strings are
+        # copied. Foreach in-place names are remapped to per-element expressions. Each
+        # assignment is wrapped in the condition from guard_for when it returns one.
+        # Raises AssertionError on unexpected combinations of output/foreach/in-place flags.
         # assign the saved variables to the generated grad_fn
         stmts: list[str] = []
         for arg in sorted(saved_variables, key=lambda sa: str(sa.nctype.name)):
@@ -1606,6 +1690,9 @@ def emit_body(
     def emit_dispatch_call(
         f: NativeFunction, input_base: str, unpacked_args: Sequence[str]
     ) -> str:
+        # [FUNCTION DOC] HELPER: Returns the C++ redispatch call for the op using the dispatch
+        # key set after autograd and the given unpacked arguments.
+        # KNOWN ISSUE: the input_base parameter is never used.
         """Dispatch call via function in a namespace or method on Tensor."""
         # code-generated autograd kernels plumb and recompute dispatch keys directly through the kernel for performance.
         # Ops also always have a function variant of the redispatch API.
@@ -1624,6 +1711,9 @@ def emit_body(
     def wrap_output(
         f: NativeFunction, unpacked_bindings: list[Binding], var: str
     ) -> str:
+        # [FUNCTION DOC] HELPER: Returns the C++ statement assigning the temporary result
+        # variable to the op's return values (moved if any return is tensor-like).
+        # KNOWN ISSUE: unpacked_bindings is unused.
         call = ""
         rhs_value: str | None = None
         if not any(r.type.is_tensor_like() for r in f.func.returns):
@@ -1640,6 +1730,12 @@ def emit_body(
     def check_tensorimpl_and_storage(
         call: str, unpacked_bindings: list[Binding]
     ) -> str:
+        # [FUNCTION DOC] HELPER: Wraps the call text with debug-mode-only checks. Before the
+        # call it saves storage and impl state of tensor, tensor-list and optional-list
+        # inputs; after it, it enforces they are unchanged, that view outputs share storage
+        # with the viewed input, and that non-view outputs have use count one (subject to
+        # the exemption lists). Returns the call unchanged for exempt ops. Raises
+        # AssertionError for unsupported return types or inconsistent state.
         # See NOTE [ TensorImpl and Storage Pointer Sanity Checks ]
         stmts_before_call: list[str] = []
         stmts_after_call: list[str] = []
@@ -1757,6 +1853,13 @@ def emit_body(
     def emit_call(
         f: NativeFunction, unpacked_bindings: list[Binding], try_jit_decomposition: bool
     ) -> str:
+        # [FUNCTION DOC] HELPER: Returns the C++ that performs the underlying op below
+        # autograd under the appropriate dispatch guard (below autograd for views and
+        # mutating ops, below ADInplaceOrView otherwise). Non-mutating ops with returns go
+        # through a temporary, optionally with a JVP decomposition fallback, then assign
+        # results; others call without capturing a value. The text is wrapped by the
+        # debug sanity checks. Raises AssertionError if decomposition is requested for a
+        # void or mutating op.
         # We only care about adding `at::AutoDispatchBelowAutograd` guard for non-variable dispatch
         # (which corresponds to 'use_derived' strategy). The purpose of this guard is to make sure
         # the baseType operations still dispatch to non-Variable type, even if the arguments passed
@@ -1824,6 +1927,9 @@ def emit_body(
         return call
 
     def emit_history() -> str:
+        # [FUNCTION DOC] HELPER: Returns C++ attaching grad_fn to the differentiable outputs
+        # (flattened). Uses rebase for mutating non-view ops and set otherwise; in-place
+        # foreach runs per element over the grad_fn vector, keeping rebased nodes in a vector.
         fn = "rebase" if modifies_arguments(f) and view_info is None else "set"
         output_names = [r.name for r in differentiable_outputs]
         # TODO: flatten allocates a std::vector, which could be expensive
@@ -1849,6 +1955,9 @@ def emit_body(
             )
 
     def emit_fire_creation_hooks() -> str:
+        # [FUNCTION DOC] HELPER: Returns C++ firing node-creation hooks for the grad_fn (the
+        # rebased node for mutating non-view ops), looping over elements for in-place foreach
+        # and skipping null nodes.
         rebase = modifies_arguments(f) and view_info is None
         if not is_inplace_foreach:
             node = "_rebased_fn" if rebase else "grad_fn"
@@ -1864,6 +1973,9 @@ def emit_body(
             )
 
     def emit_save_outputs() -> str:
+        # [FUNCTION DOC] HELPER: Returns C++ saving the outputs needed by backward on
+        # grad_fn, guarded by grad_fn being non-null (or looped for foreach). Empty for out
+        # ops, ops without derivatives, or when nothing is saved.
         if is_out_fn:
             # out functions don't currently support differentiation
             return ""
@@ -1880,6 +1992,10 @@ def emit_body(
         return ""
 
     def emit_any_requires_grad() -> list[str]:
+        # [FUNCTION DOC] HELPER: Returns the single-statement setup computing whether any
+        # input with a derivative requires grad, optionally ANDed with the declared output
+        # differentiability condition (at most one allowed; AssertionError otherwise).
+        # Foreach argument names are mapped back from reference names.
         extra_condition = ""
         if info and info.output_differentiability_conditions:
             if len(info.output_differentiability_conditions) != 1:
@@ -1901,12 +2017,19 @@ def emit_body(
         ]
 
     def get_any_has_forward_grad_name(var_names: tuple[str, ...]) -> str:
+        # [FUNCTION DOC] HELPER: Returns the C++ variable name holding the any-forward-grad
+        # flag for a derivative, built from its output variable names joined by underscores.
         if len(var_names) == 1:
             return f"_any_has_forward_grad_{var_names[0]}"
         else:
             return f"_any_has_forward_grad_{'_'.join(var_names)}"
 
     def emit_any_has_forward_grad() -> list[str]:
+        # [FUNCTION DOC] HELPER: Returns declarations of the any-forward-grad flag for each
+        # forward derivative. Non-foreach ops get a boolean (ANDed with the output
+        # differentiability condition when present). Foreach ops get a vector of booleans
+        # computed per element from the required inputs, with size checks for list inputs
+        # other than self. Raises AssertionError if more than one condition is declared.
         content: list[str] = []
         if not is_foreach:
             for derivative in fw_derivatives:
@@ -1966,6 +2089,9 @@ def emit_body(
         return content
 
     def emit_check_inplace() -> list[str]:
+        # [FUNCTION DOC] HELPER: For in-place ops returns a runtime check statement per
+        # differentiable output that mutation is allowed given the requires-grad state;
+        # empty otherwise.
         if not inplace:
             return []
         return [
@@ -1974,6 +2100,16 @@ def emit_body(
         ]
 
     def emit_fw_derivatives() -> list[str]:
+        # [FUNCTION DOC] HELPER: Returns C++ blocks computing forward-mode tangents. For each
+        # forward derivative it unpacks the required input tangents (zero tensors when
+        # undefined) and primals, original self when needed, evaluates the formula into an
+        # optional result (per element for foreach, with names rewritten), and collects
+        # setter statements that are emitted together at the end. Supports single tensor,
+        # multi-tensor and tensor-list outputs. Raises AssertionError on inconsistent
+        # in-place or foreach shapes and RuntimeError for unsupported output types.
+        # KNOWN ISSUE: the zeros function name used for the original-self tangent is the
+        # one left over from the last input in the loop, and is unbound if there are no
+        # differentiable inputs.
         content: list[str] = []
         fw_grad_setters: list[str] = []
         for derivative in fw_derivatives:
@@ -2181,6 +2317,11 @@ def emit_body(
         return content
 
     def get_any_has_fw_grad_cond(derivative: ForwardDerivative | None) -> str:
+        # [FUNCTION DOC] HELPER: Returns a C++ condition string true if any relevant input has
+        # a forward gradient. Without a derivative, checks all differentiable inputs (tensor
+        # or tensor list; RuntimeError otherwise). With one, checks only the inputs it requires,
+        # or is simply true for a lone tensor-list input with no required tangents (RuntimeError
+        # for other no-required-input cases).
         #
         # Produces a condition string (e.g, "isFwGradDefined(grad_output) || isFwGradDefined(output)")
         #
@@ -2248,6 +2389,9 @@ def emit_body(
             return any_has_fw_grad
 
     def emit_forbid_fw_derivatives(is_out_fn: bool = False) -> str:
+        # [FUNCTION DOC] HELPER: Returns C++ raising an error if any input has a forward
+        # gradient, with a message saying the op is an out= function or is not yet implemented.
+        # Returns an empty string if the condition is empty.
         if is_out_fn:
             msg = "because it is an out= function"
         else:

@@ -1,3 +1,9 @@
+# [MODULE DOC] Codegen for ViewFuncs.h and ViewFuncs.cpp. For every out-of-place view op with
+# derived autograd support, emits a ViewFunc subclass that stores the non-self arguments,
+# exposes their SymInt and Tensor state via getters/setters, and replays the view op on a
+# new base tensor. Contains the declaration/definition C++ templates, naming helpers,
+# state getter/setter generation, process_function and the gen_view_funcs entry point.
+# Writes files only when gen_view_funcs is called; no import-time side effects.
 # Generates ViewFuncs.h/cpp
 #
 # NOTE: If any changes are being made to the ViewFunc codegen please also check
@@ -116,6 +122,9 @@ std::unique_ptr<ViewFunc> ${op}::clone_and_set(
 def view_func_name(
     f: NativeFunction, include_namespace: bool = False, camel_case: bool = True
 ) -> str:
+    # [FUNCTION DOC] Builds the ViewFunc class name for a native function from its
+    # unambiguous name with a view_func suffix, camel-cased (keeping a leading underscore for
+    # private ops) or snake-cased, optionally prefixed with the generated C++ namespace.
     name = f.func.name.unambiguous_name()
     view_func_name = f"{name.replace('.', '_')}_view_func"
     if camel_case:
@@ -131,10 +140,13 @@ def view_func_name(
 
 
 def is_symint_or_tensor(arg: Argument) -> bool:
+    # [FUNCTION DOC] HELPER: True if the argument type is tensor-like or SymInt-like.
     return arg.type.is_tensor_like() or arg.type.is_symint_like()
 
 
 def remove_const_ref(binding: Binding) -> Binding:
+    # [FUNCTION DOC] HELPER: Returns a copy of the binding whose C++ type has const and
+    # reference qualifiers removed; name, argument and default are kept.
     return Binding(
         name=binding.name,
         nctype=binding.nctype.remove_const_ref(),
@@ -144,6 +156,11 @@ def remove_const_ref(binding: Binding) -> Binding:
 
 
 def returns_multi_tensor(fn: NativeFunction) -> bool:
+    # [FUNCTION DOC] HELPER: True if the single return is a list of tensors. Raises an
+    # AssertionError if the function does not have exactly one return.
+    # KNOWN ISSUE: the list-like check compares the result of is_list_like against None,
+    # which is only meaningful if that method returns an optional; a falsy non-None result
+    # would still count as list-like.
     returns = fn.func.returns
     if len(returns) != 1:
         raise AssertionError(f"Expected 1 return, got {len(returns)}")
@@ -165,6 +182,12 @@ def generate_state_getter_setter(
     bindings: list[Binding],
     state_vec_type: NamedCType,
 ) -> tuple[list[str], list[str], str]:
+    # [FUNCTION DOC] Produces C++ statements for one state kind (SymInts or Tensors).
+    # For each binding the getter appends its value(s) to a vector (all elements for lists,
+    # the value only if present for optionals, the value otherwise) and the setter copies
+    # them back from a running index. Returns the getter lines (declare, reserve, append,
+    # return), the setter lines, and a C++ expression string for the total item count
+    # ("0" when no bindings). Raises AssertionError if a binding is not an Argument.
     getter_logic = []
     setter_logic = []
 
@@ -214,6 +237,11 @@ def generate_state_getter_setter(
 
 
 def process_function(fn: NativeFunction, template: CodeTemplate) -> str:
+    # [FUNCTION DOC] Renders the given declaration or definition template for one view op.
+    # Builds constructor/clone arguments and stored state from the non-self bindings, an
+    # initializer list, the dispatch call on a base tensor, an extra view_idx member when the
+    # op returns a tensor list, and SymInt/Tensor getter/setter logic. Returns the C++ text.
+    # Raises AssertionError on unexpected binding names. No other side effects.
     bindings = extract_bindings(fn)
     non_self_bindings = [b for b in bindings if b.name != "self"]
 
@@ -314,6 +342,10 @@ def gen_view_funcs(
     fns_with_infos: list[NativeFunctionWithDifferentiabilityInfo],
     template_path: str,
 ) -> None:
+    # [FUNCTION DOC] Entry point. Keeps ops that use derived autograd, are views and do not
+    # modify their arguments, renders declarations, definitions and op header includes, and
+    # writes ViewFuncs.h and ViewFuncs.cpp from templates into the out directory.
+    # Returns nothing; side effect is file output.
     # don't need the info parts, just the function
     fns = [fn.func for fn in fns_with_infos if use_derived(fn)]
     # only want out-of-place views
