@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Shared builders for ShardedTensor op handlers: a decorator factory adding validation / early stop / extra check, and a registrar that applies an op to each local shard.
+# Registration with the sharded op table happens at call time of the register function.
 import functools
 
 from torch.distributed._shard.common_op_utils import _basic_validation
@@ -10,6 +12,8 @@ from torch.distributed._shard.sharded_tensor import (
 
 
 def _sharded_op_common(op, early_stop_func, extra_check):
+    # [FUNCTION DOC] HELPER: Return a decorator for a sharded op handler. The wrapped handler first validates the arguments, runs the optional extra_check, then the optional early_stop_func;
+    # if early stop returns a truthy value the first argument (the sharded tensor) is returned unchanged, otherwise the original handler is called with (types, args, kwargs, pg).
     """
     Inject sharded tensor op registration with common logics executed before
     different behaviors are done on either local shards or a local tensor.
@@ -39,8 +43,10 @@ def _sharded_op_common(op, early_stop_func, extra_check):
     """
 
     def decorator_sharded_func(wrapped_func):
+    # [FUNCTION DOC] HELPER: Decorator that wraps wrapped_func with the common validation and early stop logic.
         @functools.wraps(wrapped_func)
         def wrapper(types, args=(), kwargs=None, pg=None):
+        # [FUNCTION DOC] HELPER: Wrapper body performing the validation, extra check and early stop described above, defaulting kwargs to an empty mapping.
             _basic_validation(op, args, kwargs)
 
             # pyrefly: ignore [bad-index]
@@ -61,6 +67,9 @@ def _sharded_op_common(op, early_stop_func, extra_check):
 
 
 def _register_sharded_op_on_local_shards(
+    # [FUNCTION DOC] Register a handler for op that applies it to every local shard of the first argument. Optional early_stop_func and extra_check are used as in the common wrapper.
+    # If customized_func is given it is called with (args, kwargs, pg) and must return the new local shards and global metadata; otherwise the op is applied to each shard tensor with the remaining arguments
+    # and the shard metadata is kept. Builds a new ShardedTensor from the shards, preserving process group, rref flag and sharding spec. Returns the registered function.
     op, early_stop_func=None, extra_check=None, customized_func=None
 ):
     """
@@ -93,6 +102,7 @@ def _register_sharded_op_on_local_shards(
     @_sharded_op_impl(op)
     @_sharded_op_common(op, early_stop_func, extra_check)
     def sharded_tensor_op_on_local_shards(types, args=(), kwargs=None, pg=None):
+        # [FUNCTION DOC] HELPER: Registered handler body implementing the per-shard application described in the enclosing function.
         # pyrefly: ignore [bad-index]
         st = args[0]
         st_metadata = st.metadata()

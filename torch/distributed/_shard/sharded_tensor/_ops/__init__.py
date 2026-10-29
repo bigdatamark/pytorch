@@ -1,3 +1,5 @@
+# [PACKAGE DOC] Imports (for their registration side effects) all ShardedTensor op handlers: misc ops, tensor ops, the ChunkShardingSpec embedding and embedding_bag ops,
+# and re-exports allclose, equal and the init ops (constant_, kaiming_uniform_, normal_, uniform_).
 import torch.distributed._shard.sharded_tensor._ops.misc_ops
 import torch.distributed._shard.sharded_tensor._ops.tensor_ops
 

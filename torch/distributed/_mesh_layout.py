@@ -1,3 +1,7 @@
+# [MODULE DOC] Internal bookkeeping for DeviceMesh using CuTe-style layouts (shape/stride pairs over integer ranks).
+# Defines _FlatLayout (one normalized, coalesced, 1-D-like layout) and _MeshLayout (a tuple of _FlatLayout axes
+# representing a whole mesh), built on the pycute helpers (composition, complement, coalesce, ...).
+# Used to compute flatten/unflatten/slice results and the rank groups for communicators. No import-time side effects.
 """
 Definition of CuTe inspired Layouts for DeviceMesh internal bookkeeping and functions to manipulate them
 """
@@ -27,6 +31,10 @@ from torch.distributed._pycute import (
 
 @dataclass(frozen=True)
 class _FlatLayout:
+    # [CLASS DOC] Immutable (frozen dataclass) normalized layout of one mesh dimension: attributes shape and stride are flat tuples of ints.
+    # The constructor coalesces and flattens the input so equivalent layouts compare equal; size-1 dims vanish and a
+    # trivial layout becomes the empty (0-dimensional) one. Length and indexing are deliberately disabled.
+    # Key methods: to_pycute, numel, composition, complement, all_ranks_from_zero, global_ranks, check_sorted, check_orthogonal.
     """
     A canonical CuTe layout for a single dimension of a DeviceMesh
 
@@ -59,6 +67,10 @@ class _FlatLayout:
     stride: tuple[int, ...]
 
     def __init__(self, shape: IntTuple, stride: IntTuple | None = None) -> None:
+        # [FUNCTION DOC] Build a normalized layout from shape and optional stride (default: suffix product of shape, i.e. row-major).
+        # Raises TypeError if shape or stride is neither int nor tuple, ValueError if their nesting structures do not match.
+        # Coalesces and flattens the result; a single size-1/stride-0 dim becomes the empty layout. Sets attributes via the
+        # object-level setter because the dataclass is frozen.
         if not is_tuple(shape) and not is_int(shape):
             raise TypeError(f"shape must be a tuple or int, got {type(shape)}")
         stride = stride if stride is not None else suffix_product(shape)
@@ -82,24 +94,31 @@ class _FlatLayout:
         object.__setattr__(self, "stride", flat_stride)
 
     def __len__(self) -> NoReturn:
+        # [FUNCTION DOC] HELPER: Always raises RuntimeError; the length of the internal representation is intentionally not exposed.
         raise RuntimeError(
             "You should never need to know the length of the internal representation of a FlatLayout"
         )
 
     def __getitem__(self, i: int) -> NoReturn:
+        # [FUNCTION DOC] HELPER: Always raises RuntimeError; indexing into the internal representation is intentionally not exposed.
         raise RuntimeError(
             "You should never need to index into the internal representation of a FlatLayout"
         )
 
     def to_pycute(self) -> Layout:
+        # [FUNCTION DOC] Convert to a pycute Layout; the empty layout maps to the trivial layout of size 1 and stride 0.
         if not self.shape:
             return Layout(1, 0)
         return Layout(self.shape, self.stride)
 
     def numel(self) -> int:
+        # [FUNCTION DOC] Return the total number of elements (product of shape; 1 for the empty layout).
         return math.prod(self.shape)
 
     def composition(self, layout: "_MeshLayout") -> "_MeshLayout":
+        # [FUNCTION DOC] Compose this layout with another (self applied after layout) via pycute composition, per top-level axis of the argument.
+        # Takes a _MeshLayout and returns a _MeshLayout whose axes are the normalized per-axis results.
+        # Result picks indices from this layout's output space, selected by the right-hand layout.
         """
         By-dimension composition allows one layout to "select from" or "filter through" another layout.
         Think of it as function composition: (self ∘ layout)(input) = self(layout(input))
@@ -130,6 +149,8 @@ class _FlatLayout:
         return _MeshLayout(result_axes)
 
     def complement(self, world_size: int) -> "_FlatLayout":
+        # [FUNCTION DOC] Return the complement layout relative to world_size: the layout that, repeated with this one, covers world_size ranks.
+        # Delegates to pycute complement and normalizes the result. Errors from pycute (incompatible layout/world_size) propagate.
         """
         Compute the "complement layout" relative to a given world_size.
         A complement layout fills in the "missing" factor so that: self repeat a layout of complement(self, world_size)
@@ -155,6 +176,8 @@ class _FlatLayout:
         return _FlatLayout(result.shape, result.stride)
 
     def all_ranks_from_zero(self) -> list[int]:
+        # [FUNCTION DOC] Enumerate every rank offset the layout generates, iterating coordinates in row-major order of the shape and
+        # summing coordinate times stride. Returns a list of ints (a single 0-length-product entry list for the empty layout).
         """
         This function computes the all ranks specified by the layout starting from zero.
 
@@ -194,6 +217,8 @@ class _FlatLayout:
         ]
 
     def global_ranks(self, world_size: int) -> list[list[int]]:
+        # [FUNCTION DOC] Compute global rank groups for a world of world_size ranks: one list per offset taken from the complement layout,
+        # each containing that offset added to every rank of this layout. Used to build communicators. Returns a list of lists of ints.
         """
         Build global ranks specified by the layout via two-level ranks composition.
 
@@ -222,9 +247,13 @@ class _FlatLayout:
         ]
 
     def check_sorted(self) -> bool:
+        # [FUNCTION DOC] Return True if the strides are already in non-increasing (descending) order.
         return tuple(sorted(self.stride, reverse=True)) == self.stride
 
     def check_orthogonal(self) -> bool:
+        # [FUNCTION DOC] Return True if no two coordinates map to the same rank, i.e. dimensions do not overlap.
+        # Layouts with fewer than two dims are trivially fine. Otherwise sorts dims by stride descending and requires each stride
+        # to be a multiple of the next stride times the next size. Returns a bool.
         """
         Check if the layout has any overlap between the ranks it generates. If there is overlap,
         we return False, otherwise True.
@@ -263,12 +292,16 @@ class _FlatLayout:
 
     @property
     def sizes_and_strides(self) -> Iterator[tuple[int, int]]:
+        # [FUNCTION DOC] Property: iterator of (size, stride) pairs, one per dimension.
         """Iterate over (size, stride) pairs for each dimension."""
         return zip(self.shape, self.stride)
 
 
 @dataclass(frozen=True)
 class _MeshLayout(Sequence[_FlatLayout]):
+    # [CLASS DOC] Immutable (frozen dataclass) Sequence of _FlatLayout axes describing a full DeviceMesh; attribute axes is a tuple.
+    # Supports len, iteration, integer indexing (returns an axis) and slicing (returns a new _MeshLayout).
+    # Holds methods needing the multi-dimensional structure: top_level_sizes, numel, cosize, collapse, splice, remap_to_tensor.
     """
     A multi-dimensional structure consisting of a series of dimension-less layouts
 
@@ -285,12 +318,15 @@ class _MeshLayout(Sequence[_FlatLayout]):
     axes: tuple[_FlatLayout, ...]
 
     def __init__(self, axes: Sequence[_FlatLayout]) -> None:
+        # [FUNCTION DOC] Store the given axes sequence as a tuple (set via the object-level setter since frozen).
         object.__setattr__(self, "axes", tuple(axes))
 
     @classmethod
     def from_sizes_strides(
         cls, sizes: tuple[int, ...], strides: tuple[int, ...] | None = None
     ) -> "_MeshLayout":
+        # [FUNCTION DOC] Classmethod: build a layout with one single-dim axis per (size, stride) pair; strides default to the flattened
+        # suffix product of sizes. Raises ValueError if sizes and strides differ in length.
         if strides is None:
             strides = flatten(suffix_product(sizes))
         if len(sizes) != len(strides):
@@ -301,6 +337,7 @@ class _MeshLayout(Sequence[_FlatLayout]):
         return cls(axes)
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Return the number of axes.
         return len(self.axes)
 
     @overload
@@ -310,29 +347,36 @@ class _MeshLayout(Sequence[_FlatLayout]):
     def __getitem__(self, i: slice) -> "_MeshLayout": ...
 
     def __getitem__(self, i: int | slice) -> "_FlatLayout | _MeshLayout":
+        # [FUNCTION DOC] Index with an int to get the axis, or with a slice to get a new _MeshLayout of the selected axes.
         if isinstance(i, slice):
             return _MeshLayout(self.axes[i])
         return self.axes[i]
 
     def __iter__(self) -> Iterator[_FlatLayout]:
+        # [FUNCTION DOC] Iterate over the axes.
         return iter(self.axes)
 
     def to_pycute(self) -> Layout:
+        # [FUNCTION DOC] Convert to a pycute Layout by concatenating each axis's pycute layout; zero axes gives the trivial layout (size 1, stride 0).
         if len(self.axes) == 0:
             return Layout(1, 0)
         return make_layout(*(axis.to_pycute() for axis in self.axes))
 
     @property
     def top_level_sizes(self) -> tuple[int, ...]:
+        # [FUNCTION DOC] Property: tuple of the number of elements of each axis.
         return tuple(axis.numel() for axis in self.axes)
 
     def numel(self) -> int:
+        # [FUNCTION DOC] Return the total number of elements (product of the top-level sizes).
         return math.prod(self.top_level_sizes)
 
     def cosize(self) -> int:
+        # [FUNCTION DOC] Return the cosize (extent of the generated index range) from the pycute layout.
         return self.to_pycute().cosize()
 
     def collapse(self) -> _FlatLayout:
+        # [FUNCTION DOC] Merge all axes into one coalesced _FlatLayout, forgetting the multi-axis structure.
         """
         Merge all axes into a single _FlatLayout.
 
@@ -344,6 +388,8 @@ class _MeshLayout(Sequence[_FlatLayout]):
         return _FlatLayout(shapes, strides)
 
     def splice(self, start: int, end: int, layout: "_MeshLayout") -> "_MeshLayout":
+        # [FUNCTION DOC] Out-of-place replacement of axes start through end (slice semantics) with the axes of the given layout.
+        # Returns a new _MeshLayout; self is unchanged.
         """
         Replace (out-of-place) the start:end slice with the given list of layouts
 
@@ -354,6 +400,10 @@ class _MeshLayout(Sequence[_FlatLayout]):
         return _MeshLayout(new_axes)
 
     def remap_to_tensor(self, rank_map: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Map this layout onto the concrete rank_map tensor (must be 1-D, contiguous, with at least cosize elements) and
+        # return a tensor of actual ranks with shape (number of repeats, *top_level_sizes). Computes the collapsed layout's complement
+        # over rank_map's size, takes a strided view with complement dims first then layout dims, and reshapes.
+        # Raises AssertionError if rank_map is not 1-D, not contiguous, or smaller than the cosize.
         """
         Leverage layout as an index for mesh tensor that re-maps the indexes after layout
         transformation to actual device ranks.

@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Public entry points of the sharding package: shard a tensor into a ShardedTensor (_shard_tensor), shard a module parameter in place (shard_parameter),
+# shard a whole module from a ShardingPlan (shard_module), plus output resharding / local-shard collection hooks and a context manager that
+# sets the process group used when loading ShardedTensors. Module state: _CURRENT_PROCESS_GROUP (global, None when no load context is active).
 from contextlib import contextmanager
 
 import torch
@@ -15,6 +18,9 @@ from .sharding_spec import ChunkShardingSpec, ShardingSpec
 def _shard_tensor(
     tensor: torch.Tensor, sharding_spec: ShardingSpec, src_rank=0, process_group=None
 ) -> ShardedTensor:
+    # [FUNCTION DOC] HELPER: Shard a contiguous tensor according to sharding_spec, using src_rank's data as ground truth, within process_group (default group if None).
+    # Raises ValueError if the tensor is not contiguous or if src_rank or sharding_spec differ across ranks (checked with an object all-gather, a collective).
+    # Returns the ShardedTensor produced by the spec's shard method.
     """
     Given a :class:`torch.Tensor`, it shards that tensor according to the provided
     ``sharding_spec``. ``src_rank`` denotes the source rank which would be
@@ -80,6 +86,8 @@ def shard_parameter(
     src_rank=0,
     process_group=None,
 ):
+    # [FUNCTION DOC] Replace the parameter named param_name of module with a sharded parameter wrapping a ShardedTensor made from it (collective call).
+    # Raises AttributeError if the module lacks the attribute, ValueError if it is not a tensor or not contiguous. Mutates the module by registering the new parameter; returns None.
     """
     Given a :class:`torch.nn.Module`, a ``param_name`` for a parameter in that
     module, it shards that parameter according to the provided
@@ -133,6 +141,8 @@ _CURRENT_PROCESS_GROUP: dist.ProcessGroup | None = None
 
 @contextmanager
 def load_with_process_group(process_group):
+    # [FUNCTION DOC] Context manager that sets the module-global current process group used when loading ShardedTensors, yielding the group.
+    # Raises RuntimeError if a previous such context is still active. Always resets the global to None on exit.
     """
     Context manager to set the process group with which to load a ShardedTensor.
     """
@@ -150,6 +160,7 @@ def load_with_process_group(process_group):
 
 
 def _get_current_process_group():
+    # [FUNCTION DOC] HELPER: Return the process group set by load_with_process_group, or the default group when no context is active.
     """
     Retrieves the current process group set by ``load_with_process_group``.
     If not set, it just returns the default group.
@@ -164,6 +175,8 @@ def _get_current_process_group():
 def _reshard_output(
     module: torch.nn.Module, resharding_spec: ShardingSpec
 ) -> torch.nn.Module:
+    # [FUNCTION DOC] HELPER: Register a forward hook on module that reshards any ShardedTensor output to resharding_spec (other outputs pass through unchanged).
+    # Mutates the module's hooks and returns the same module.
     """
     Hook a module with output resharding in the forward pass according
     to the given ``resharding_spec``.
@@ -178,6 +191,7 @@ def _reshard_output(
     """
 
     def hook_func(_module, _input, output):
+        # [FUNCTION DOC] HELPER: Forward hook body: reshard ShardedTensor outputs, return anything else unchanged.
         if isinstance(output, ShardedTensor):
             return output.reshard(resharding_spec)
         return output
@@ -187,6 +201,8 @@ def _reshard_output(
 
 
 def _collect_local_shard(module: torch.nn.Module) -> torch.nn.Module:
+    # [FUNCTION DOC] HELPER: Register a forward hook on module that converts a ShardedTensor output into its local tensor, squeezing the sharding dim when it has
+    # size 1 and the spec is a ChunkShardingSpec. Mutates the module's hooks and returns the same module.
     """
     Hook a module with local shards collection in the forward pass.
 
@@ -205,6 +221,8 @@ def _collect_local_shard(module: torch.nn.Module) -> torch.nn.Module:
     """
 
     def hook_func(_module, _input, output):
+        # [FUNCTION DOC] HELPER: Forward hook body: for ShardedTensor outputs return the local tensor (squeezed along the chunk dim if that dim is size 1);
+        # for other outputs returns None, which leaves the original output unchanged.
         if isinstance(output, ShardedTensor):
             local_tensor = output.local_tensor()
             # Squeeze the # of dimensions manually, only applicable to ChunkShardingSpec
@@ -223,6 +241,10 @@ def _collect_local_shard(module: torch.nn.Module) -> torch.nn.Module:
 
 
 def shard_module(module: nn.Module, plan: ShardingPlan, src_rank=0, process_group=None):
+    # [FUNCTION DOC] Shard module according to plan (collective, all ranks must call). First records paths of Sharder entries; then for each plan entry shards the named
+    # parameter (ShardingSpec) or applies the Sharder to the submodule (Sharder); then applies output resharding for output_plan entries and local-tensor collection hooks for return_local_tensor entries.
+    # Raises RuntimeError if a parameter lies under a Sharder path, KeyError for an empty Sharder path, TypeError for unsupported plan values.
+    # KNOWN ISSUE: the sharder branch assigns the sharded module to a fixed attribute named mod_name on the parent instead of the submodule's real name, so the swap is not applied as the comment intends.
     """
     Shards a given module according to the provided sharding `plan`. This method
     first shards all the parameters according to the given sharding `plan`. Then if

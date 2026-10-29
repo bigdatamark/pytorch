@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] ShardedTensor handlers for the binary comparison ops equal and allclose. Compares process group, metadata, shard counts and each local shard,
+# then agrees on one boolean across ranks with an all-reduce. Registers both handlers at import time.
 import torch
 import torch.distributed as dist
 import torch.distributed.distributed_c10d as distributed_c10d
@@ -6,6 +8,7 @@ from torch.distributed._shard.sharded_tensor import _sharded_op_impl, ShardedTen
 
 
 def _communicate_result(result, pg):
+    # [FUNCTION DOC] HELPER: Collective: each rank contributes a one or zero tensor on the current accelerator device; all-reduce sums them in pg and returns True only if every rank contributed one.
     # Gather results from all ranks.
     if result:
         result_tensor = torch.ones(
@@ -26,6 +29,9 @@ def _communicate_result(result, pg):
 
 
 def binary_cmp(cmp_fun, types, args, kwargs=None, process_group=None):
+    # [FUNCTION DOC] HELPER: Compare two ShardedTensors with cmp_fun (extra kwargs are forwarded to it). Raises ValueError unless exactly two arguments, TypeError unless both are ShardedTensor.
+    # Returns False immediately if process groups differ; if a rank is outside either group, returns whether both are outside. Otherwise the result is the all-rank agreement on equal metadata,
+    # equal shard counts, equal per-shard metadata and cmp_fun on each shard tensor.
     if len(args) != 2:
         raise ValueError(f"Expected two arguments for torch.{cmp_fun.__name__}")
 
@@ -74,9 +80,11 @@ def binary_cmp(cmp_fun, types, args, kwargs=None, process_group=None):
 
 @_sharded_op_impl(torch.equal)
 def equal(types, args, kwargs, process_group):
+    # [FUNCTION DOC] Sharded handler for the equal op; delegates to the binary comparison with torch equal.
     return binary_cmp(torch.equal, types, args, kwargs, process_group)
 
 
 @_sharded_op_impl(torch.allclose)
 def allclose(types, args, kwargs, process_group):
+    # [FUNCTION DOC] Sharded handler for the allclose op; delegates to the binary comparison with torch allclose.
     return binary_cmp(torch.allclose, types, args, kwargs, process_group)

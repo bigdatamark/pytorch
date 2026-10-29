@@ -30,6 +30,9 @@
 #
 #################################################################################################
 
+# [PACKAGE DOC] Vendored subset of NVIDIA's pycute (CuTe layout algebra in Python). Re-exports the IntTuple helpers from int_tuple
+# (as_tuple, flatten, product, idx2crd, crd2idx, shape_div, suffix_product, ...), the layout algebra from layout (Layout, coalesce,
+# composition, complement, logical_divide/product, inverses, ...) and the Integer type from typing. Used by DeviceMesh layouts.
 from .int_tuple import (
     as_tuple,
     crd2crd,

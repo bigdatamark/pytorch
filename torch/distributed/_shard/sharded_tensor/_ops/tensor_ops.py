@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] ShardedTensor handlers for basic tensor operations: default pass-through property and method accessors (shape, dtype, size, requires_grad, ...),
+# device, is_meta, type_as, deepcopy, in-place copy, clone, detach and requires_grad_. Handlers are registered at import time with the sharded op table.
 import copy
 
 import torch
@@ -40,6 +42,8 @@ _register_default_op(torch.Tensor.is_leaf.__get__, _sharded_op_impl)  # type: ig
 # the device property on each rank
 @_sharded_op_impl(torch.Tensor.device.__get__)
 def tensor_device(types, args=(), kwargs=None, pg=None):
+    # [FUNCTION DOC] Handler for the device property: the device of the first local shard if any; else cpu for the gloo backend; else the current CUDA device.
+    # Raises TypeError if the first argument is not a ShardedTensor.
     # pyrefly: ignore [bad-index]
     self_st = args[0]
     # Validate types
@@ -57,11 +61,13 @@ def tensor_device(types, args=(), kwargs=None, pg=None):
 
 @_sharded_op_impl(torch.Tensor.is_meta.__get__)  # type: ignore[attr-defined]
 def st_is_meta(types, args=(), kwargs=None, pg=None):
+    # [FUNCTION DOC] Handler for is_meta: returns whether the local tensor is on the meta device.
     # pyrefly: ignore [bad-index]
     return args[0].local_tensor().is_meta
 
 
 def sharded_type_as_check(*args, **kwargs):
+    # [FUNCTION DOC] HELPER: Extra check for type_as: raises ValueError unless a second argument is given and is a Tensor or ShardedTensor.
     """
     Perform extra checks for the sharded_type_as op such as the input needs to
     be either a Tensor or ShardedTensor.
@@ -77,6 +83,7 @@ def sharded_type_as_check(*args, **kwargs):
 
 
 def same_dtype(*args, **kwargs):
+    # [FUNCTION DOC] HELPER: Early stop test for type_as: true when the dtypes of the first two arguments are equal.
     """
     When the dtype is the same, return the original ShardedTensor.
 
@@ -88,6 +95,8 @@ def same_dtype(*args, **kwargs):
 
 
 def sharded_type_as(args, kwargs, pg):
+    # [FUNCTION DOC] HELPER: Custom logic for type_as: casts each local shard tensor to the target tensor's type (using its local tensor if it is a ShardedTensor)
+    # and returns the new shard list with a deep copy of the metadata whose dtype is updated.
     """
     Handles ``__torch_function__`` dispatch for the ``torch.Tensor.type_as`` op.
 
@@ -119,6 +128,7 @@ _register_sharded_op_on_local_shards(
 
 
 def sharded_deepcopy(args, kwargs, pg):
+    # [FUNCTION DOC] HELPER: Custom logic for deepcopy: deep copies the local shards and metadata and returns them (the process group is deliberately not copied).
     # NOTE: we directly implement deepcopy magic method
     # instead of using the default tensor.__deepcopy__
     # and implement clone(). This is because the default
@@ -138,6 +148,8 @@ _register_sharded_op_on_local_shards(
 
 @_sharded_op_impl(torch.Tensor.copy_)
 def sharded_inplace_copy(types, args, kwargs, pg):
+    # [FUNCTION DOC] Handler for in-place copy_: requires every pair of local shards of source and destination to have equal metadata (RuntimeError otherwise),
+    # then copies each shard tensor in place honoring the non_blocking keyword, and returns the destination ShardedTensor. Does not check shard counts differ.
     # NOTE: inplace op don't need to rewrap
     kwargs = {} if kwargs is None else kwargs
     self_st = args[0]
@@ -155,6 +167,7 @@ def sharded_inplace_copy(types, args, kwargs, pg):
 
 
 def sharded_clone(args, kwargs, pg):
+    # [FUNCTION DOC] HELPER: Custom logic for clone: raises RuntimeError for any memory format other than preserve; clones each local shard tensor with copied metadata and returns shards plus a deep copy of the global metadata.
     self_st = args[0]
     desire_memory_format = kwargs.get("memory_format", None)
     if desire_memory_format and desire_memory_format != torch.preserve_format:
@@ -177,6 +190,7 @@ _register_sharded_op_on_local_shards(
 
 
 def sharded_detach(args, kwargs, pg):
+    # [FUNCTION DOC] HELPER: Custom logic for detach: detaches each local shard tensor, copies shard metadata, and returns the shards plus global metadata copy with requires_grad cleared.
     self_st = args[0]
     detached_local_shards = [
         Shard(
@@ -198,6 +212,8 @@ _register_sharded_op_on_local_shards(
 
 @_sharded_op_impl(torch.Tensor.requires_grad_)
 def tensor_requires_grad_set(types, args=(), kwargs=None, pg=None):
+    # [FUNCTION DOC] Handler for requires_grad_: sets the flag (positional or keyword, default true) on every local shard tensor and on the wrapper (with subclass dispatch disabled),
+    # updates the metadata, and returns the same ShardedTensor; returns early if the value is unchanged. Raises TypeError if the first argument is not a ShardedTensor.
     # pyrefly: ignore [bad-index]
     self_st = args[0]
     # Validate types

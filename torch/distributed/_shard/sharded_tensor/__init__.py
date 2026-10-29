@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [PACKAGE DOC] ShardedTensor package (deprecated in favor of DTensor). Re-exports from api: Shard, ShardedTensor, ShardedTensorBase, ShardedTensorMetadata, TensorProperties, plus ShardMetadata.
+# Defines creation functions (empty, ones, zeros, full, rand, randn, init_from_local_shards), state-dict hooks that carry ShardedTensor attributes, and decorators for registering sharded op handlers
+# (custom_sharded_op_impl for user ops, _sharded_op_impl for builtin ones). Import-time side effect: the final star-import of the _ops subpackage registers all builtin op handlers.
 import functools
 from typing import TYPE_CHECKING
 
@@ -34,6 +37,8 @@ def empty(
     process_group=None,
     init_rrefs=False,
 ) -> ShardedTensor:
+    # [FUNCTION DOC] Create a ShardedTensor with uninitialized data using sharding_spec and the given global size (varargs), forwarding dtype, layout, requires_grad, pin_memory,
+    # memory_format, process_group and init_rrefs to the constructor. Collective: call on all ranks.
     """
     Returns a :class:`ShardedTensor` filled with uninitialized data.
         Needs to be called on all ranks in an SPMD fashion.
@@ -89,6 +94,7 @@ def ones(
     process_group=None,
     init_rrefs=False,
 ) -> ShardedTensor:
+    # [FUNCTION DOC] Create a ShardedTensor filled with ones by delegating to full with fill value 1; other arguments are forwarded. Collective: call on all ranks.
     """
     Returns a :class:`ShardedTensor` with the scalar value 1.
         Needs to be called on all ranks in an SPMD fashion.
@@ -143,6 +149,7 @@ def zeros(
     process_group=None,
     init_rrefs=False,
 ) -> ShardedTensor:
+    # [FUNCTION DOC] Create a ShardedTensor filled with zeros by delegating to full with fill value 0; other arguments are forwarded. Collective: call on all ranks.
     """
     Returns a :class:`ShardedTensor` filled with the scalar value 0.
         Needs to be called on all ranks in an SPMD fashion.
@@ -199,6 +206,8 @@ def full(
     process_group=None,
     init_rrefs=False,
 ) -> ShardedTensor:
+    # [FUNCTION DOC] Create a ShardedTensor of the given global size and fill every local shard with fill_value via the constant init handler.
+    # Keyword arguments (dtype, layout, requires_grad, pin_memory, memory_format, process_group, init_rrefs) are forwarded to the constructor. Collective: call on all ranks.
     """
     Creates a :class:`ShardedTensor` filled with fill_value. The tensor's dtype
         is inferred from fill_value. If dtype is specified, it will override the
@@ -253,6 +262,7 @@ def rand(
     process_group=None,
     init_rrefs=False,
 ) -> ShardedTensor:
+    # [FUNCTION DOC] Create a ShardedTensor and fill local shards with samples from the uniform distribution on zero to one using the uniform init handler. Collective: call on all ranks.
     """
     Creates a :class:`ShardedTensor` filled with random numbers from a uniform distribution
         on the interval :math:`[0, 1)`. The shape of the tensor is defined by the
@@ -309,6 +319,8 @@ def randn(
     process_group=None,
     init_rrefs=False,
 ) -> ShardedTensor:
+    # [FUNCTION DOC] Create a ShardedTensor and fill local shards with samples from the standard normal distribution (mean 0, std 1) via the normal init handler. Collective: call on all ranks.
+    # KNOWN ISSUE: the docstring says uniform distribution but the code samples a normal distribution.
     """
     Creates a :class:`ShardedTensor` filled with random numbers from a uniform distribution
         with mean `0` and variance `1` (also called standard normal distribution). The shape
@@ -358,6 +370,9 @@ def randn(
 def init_from_local_shards(
     local_shards: list[Shard], *global_size, process_group=None, init_rrefs=False
 ) -> ShardedTensor:
+    # [FUNCTION DOC] Build a ShardedTensor from this rank's list of local Shard objects and the global size (varargs), via the class-level construction helper
+    # (which gathers global metadata). Collective: call on all ranks.
+    # KNOWN ISSUE: the docstring examples construct ShardMetadata with a shard_lengths keyword while the class field is shard_sizes.
     """
     Creates an :class:`ShardedTensor` from local shards and the global metadata.
     Needs to be called on all ranks in an SPMD fashion.
@@ -410,6 +425,8 @@ def init_from_local_shards(
 
 
 def state_dict_hook(module, destination, prefix, local_metadata):
+    # [FUNCTION DOC] State dict hook: for the module and each submodule, every instance attribute that is a ShardedTensor is stored into destination under the dotted
+    # prefix plus submodule path plus attribute name. Mutates destination; returns nothing.
     """
     Hook to add ShardedTensor to Module's ``state_dict``. Needs to be
     registered to the Module using
@@ -433,6 +450,8 @@ def pre_load_state_dict_hook(
     unexpected_keys,
     error_msgs,
 ):
+    # [FUNCTION DOC] Pre-load hook: for every submodule attribute name whose prefixed dotted key is in state_dict and holds a ShardedTensor, set that attribute on the submodule.
+    # The strict, missing/unexpected keys and error message arguments are unused.
     """
     Pre-load state dict hook to add ShardedTensor to the module.
     """
@@ -446,6 +465,8 @@ def pre_load_state_dict_hook(
 
 
 def custom_sharded_op_impl(func):
+    # [FUNCTION DOC] Return a decorator (a partial application of the registration helper) that registers a user function as the handler for op func in the custom sharded op table
+    # (takes priority for overrides of builtin handling). The handler gets (types, args, kwargs, process_group).
     """
     Provides a way for users to write their own custom sharded operator. This
     can be used to override existing ShardedTensor operators or write a new
@@ -480,6 +501,7 @@ def custom_sharded_op_impl(func):
 
 
 def _sharded_op_impl(func):
+    # [FUNCTION DOC] HELPER: Return a decorator that registers a function as the builtin sharded handler for op func in the default sharded op table.
     """
     Decorator to register a default sharded op.
     """

@@ -30,12 +30,15 @@
 #
 #################################################################################################
 
+# [MODULE DOC] Defines Integer, an abstract base whose subclass hook treats any int subclass except bool and float as an Integer (used by is_int).
 from abc import ABC
 
 
 class Integer(ABC):  # noqa: B024  # Uses __subclasshook__ instead of abstract methods
+    # [CLASS DOC] Abstract marker class for isinstance checks only; membership is decided by the subclass hook, not by registration.
     @classmethod
     def __subclasshook__(cls, c: type) -> bool:
+        # [FUNCTION DOC] Classmethod subclass hook: False for bool and float, otherwise true exactly when c is a subclass of int (so symbolic ints that subclass int count).
         if c in [bool, float]:
             return False
 

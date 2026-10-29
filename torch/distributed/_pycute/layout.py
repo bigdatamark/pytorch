@@ -30,6 +30,10 @@
 #
 #################################################################################################
 
+# [MODULE DOC] Layout algebra for the vendored pycute: Layout (shape/stride pair of IntTuples) and operations coalesce, filter, composition,
+# complement, left/right inverse, logical divide/product, zipped and tiled variants, and slicing. Adapted to lexicographic
+# (right-most is innermost) order rather than CuTe's co-lexicographic order. Many operations accept a tuple of layouts or None to work by mode.
+# No import-time side effects.
 """
 Definition of CuTe Layouts and functions to manipulate them which works with the order
 of lexicographic instead of co-lexicographic as implemented in the original layout.py
@@ -59,15 +63,21 @@ CoordinateType: TypeAlias = (
 
 
 class LayoutBase:
+    # [CLASS DOC] Marker base class used only so is_layout can recognize layouts; has no state or methods.
     pass
 
 
 def is_layout(x: object) -> TypeIs["Layout"]:
+    # [FUNCTION DOC] Type guard: true if x is an instance of LayoutBase.
     return isinstance(x, LayoutBase)
 
 
 class Layout(LayoutBase):
+    # [CLASS DOC] A CuTe layout: public attributes shape and stride (IntTuples with the same structure) defining a function from logical coordinates to integer indices.
+    # Supports equality, len (rank of the top-level shape; 1 if shape is an int), call (coordinate to index, or slicing when a coordinate has None),
+    # indexing by mode, size (domain size), cosize (codomain extent) and string forms.
     def __init__(self, _shape: IntTuple, _stride: IntTuple | None = None) -> None:
+        # [FUNCTION DOC] Store shape; stride defaults to the suffix product of shape (compact lexicographic strides).
         self.shape = _shape
         if _stride is None:
             self.stride = suffix_product(self.shape)
@@ -76,12 +86,14 @@ class Layout(LayoutBase):
 
     # operator ==
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal only to another Layout with identical shape and stride (no normalization); returns a bool.
         if not isinstance(other, Layout):
             return False
         return self.shape == other.shape and self.stride == other.stride
 
     # operator len(L)  (len [rank] like tuples)
     def __len__(self) -> int:
+        # [FUNCTION DOC] Return the number of top-level modes (1 when shape is a plain int).
         if is_tuple(self.shape):
             return len(self.shape)
         else:
@@ -89,6 +101,8 @@ class Layout(LayoutBase):
 
     # operator ()    (map coord to idx)
     def __call__(self, *args: CoordinateType) -> Self | int:
+        # [FUNCTION DOC] Evaluate the layout. With no None in the arguments, maps the coordinate (the single argument, or the arguments as a tuple) to a linear index via crd2idx.
+        # With None placeholders, slices shape and stride and returns the sub-layout (mirrors cute C++ operator call).
         """
         Map a logical coordinate to a linear index (Coord has no Underscore slice operators)
         OR
@@ -109,6 +123,7 @@ class Layout(LayoutBase):
 
     # operator []    (get-i like tuples)
     def __getitem__(self, i: int) -> Self:
+        # [FUNCTION DOC] Return mode i as a Layout. For an int shape only i equal to 0 is valid (raises AssertionError otherwise).
         if is_tuple(self.shape):
             return Layout(self.shape[i], self.stride[i])  # type: ignore[index]
         else:
@@ -118,18 +133,22 @@ class Layout(LayoutBase):
 
     # size(layout)   Size of the domain
     def size(self) -> int:
+        # [FUNCTION DOC] Size of the domain: product of shape.
         return product(self.shape)
 
     # cosize(layout)   Size of the codomain
     def cosize(self) -> int:
+        # [FUNCTION DOC] Size of the codomain: index of the last domain element plus one (assumes non-negative strides).
         return self(self.size() - 1) + 1  # type: ignore[operator]
 
     # print and str
     def __str__(self) -> str:
+        # [FUNCTION DOC] Format as shape:stride.
         return f"{self.shape}:{self.stride}"
 
     # error msgs and representation
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Format as a constructor-like string with shape and stride.
         return f"Layout({self.shape},{self.stride})"
 
 
@@ -141,6 +160,8 @@ LayoutInput: TypeAlias = Layout | IntTuple | tuple[object, ...] | None
 
 # Make Layout from a list of layouts (each layout its own mode in the result)
 def make_layout(*layouts: Layout | tuple[Layout, ...]) -> Layout:
+    # [FUNCTION DOC] Build a layout whose modes are the given layouts (one mode per layout). Accepts varargs of layouts or a single iterable of layouts.
+    # Returns Layout(tuple of shapes, tuple of strides).
     if len(layouts) == 1 and not is_layout(layouts[0]):
         layouts = layouts[0]
 
@@ -150,6 +171,7 @@ def make_layout(*layouts: Layout | tuple[Layout, ...]) -> Layout:
 
 # Size of the domain
 def size(layout: LayoutOrIntTuple) -> int:
+    # [FUNCTION DOC] Domain size of a Layout, or the product of an IntTuple.
     if is_layout(layout):
         return layout.size()
     return product(layout)
@@ -157,11 +179,15 @@ def size(layout: LayoutOrIntTuple) -> int:
 
 # Size of the codomain
 def cosize(layout: Layout) -> int:
+    # [FUNCTION DOC] Codomain size of a layout (delegates to the method).
     return layout.cosize()
 
 
 # Layout coalesce -- flatten and combine as many modes as possible while preserving the int-to-int function
 def coalesce(layout: Layout, profile: LayoutProfile = None) -> Layout:
+    # [FUNCTION DOC] Flatten and merge as many modes as possible without changing the int-to-int mapping, processing right to left (lexicographic).
+    # Drops size-1 modes and merges adjacent modes whose stride matches the inner extent. With a tuple profile, coalesces by mode for the profiled
+    # modes and keeps the rest (raises AssertionError if the layout has fewer modes than the profile). Returns a Layout (a size-1 stride-0 layout if empty).
     if is_tuple(profile):
         if len(layout) < len(profile):
             raise AssertionError
@@ -205,6 +231,8 @@ def coalesce(layout: Layout, profile: LayoutProfile = None) -> Layout:
 
 # Layout filter -- replace all stride-0 modes with size-1 and then coalesce to remove them
 def filter(layout: Layout, profile: LayoutProfile = None) -> Layout:
+    # [FUNCTION DOC] Remove all modes of size 1 or stride 0 from the flattened layout, then coalesce. Returns Layout(1, 0) if nothing remains.
+    # With a tuple profile, applies by mode (AssertionError if the layout has fewer modes than the profile).
     if is_tuple(profile):
         if len(layout) < len(profile):
             raise AssertionError
@@ -233,6 +261,9 @@ def filter(layout: Layout, profile: LayoutProfile = None) -> Layout:
 # Layout composition
 # Use tuples-of-layouts to perform this operation by-mode and None as no-op
 def composition(layoutA: Layout, layoutB: LayoutInput) -> Layout:
+    # [FUNCTION DOC] Compose layoutA after layoutB (result maps a coordinate through B, then A). None for B is a no-op; an int B is treated as a layout of that size;
+    # a tuple B applies by mode. For a plain layout B, walks the coalesced A right to left, dividing out B's stride and taking up to B's size from each mode.
+    # Raises AssertionError if mode sizes are not divisible against the running stride, or if A has fewer modes than a tuple B.
     if layoutB is None:
         return layoutA
     elif is_int(layoutB):
@@ -301,6 +332,9 @@ def composition(layoutA: Layout, layoutB: LayoutInput) -> Layout:
 
 # Layout complement
 def complement(layout: LayoutOrIntTuple, max_idx: int = 1) -> Layout:
+    # [FUNCTION DOC] Compute the complement of a layout (or int size) w.r.t. max_idx: a layout filling the gaps in the layout's image so that the pair spans max_idx.
+    # Sorts modes by stride, requires them non-overlapping (AssertionError otherwise, skipped for symbolic values), appends a final ceil-divided mode,
+    # reverses to lexicographic order and coalesces.
     if is_int(layout):
         return complement(Layout(layout))
 
@@ -334,6 +368,8 @@ def complement(layout: LayoutOrIntTuple, max_idx: int = 1) -> Layout:
 
 # Layout right inverse
 def right_inverse(layout: LayoutOrIntTuple | None) -> Layout | None:
+    # [FUNCTION DOC] Compute the right inverse (a layout f with layout(f(i)) == i over the contiguous prefix of the image). None gives None; an int becomes Layout(int).
+    # Sorts modes by stride and stops at the first stride gap; returns a coalesced Layout.
     if layout is None:
         return None
     elif is_int(layout):
@@ -363,6 +399,7 @@ def right_inverse(layout: LayoutOrIntTuple | None) -> Layout | None:
 
 # Layout left inverse
 def left_inverse(layout: LayoutOrIntTuple | None) -> Layout | None:
+    # [FUNCTION DOC] Compute the left inverse as the right inverse of the layout made from the complement followed by the layout. None gives None; an int becomes Layout(int).
     if layout is None:
         return None
     elif is_int(layout):
@@ -373,6 +410,8 @@ def left_inverse(layout: LayoutOrIntTuple | None) -> Layout | None:
 # Split a layout by the composition of B and the "rest"
 # Use tuples-of-layouts to perform this operation by-mode and None as no-op
 def logical_divide(layoutA: Layout, layoutB: LayoutInput) -> Layout:
+    # [FUNCTION DOC] Split layoutA by layoutB: compose A with a layout made of B and its complement w.r.t. the size of A. None is a no-op, an int B is converted to a layout,
+    # a tuple B applies by mode (AssertionError if A has fewer modes).
     if layoutB is None:
         return layoutA
     elif is_int(layoutB):
@@ -400,6 +439,8 @@ def logical_divide(layoutA: Layout, layoutB: LayoutInput) -> Layout:
 # Reproduce a layoutA over a layoutB
 # Use tuples-of-layouts to perform this operation by-mode and None as no-op
 def logical_product(layoutA: Layout, layoutB: LayoutInput) -> Layout:
+    # [FUNCTION DOC] Repeat layoutA over layoutB: a layout of A followed by the complement of A (sized to size of A times cosize of B) composed with B. None is a no-op; a tuple B applies by mode.
+    # KNOWN ISSUE: the int case calls logical_divide instead of logical_product, which looks like a copy-paste bug.
     if layoutB is None:
         return layoutA
     elif is_int(layoutB):
@@ -426,6 +467,8 @@ def logical_product(layoutA: Layout, layoutB: LayoutInput) -> Layout:
 
 # Gather the modes from a hierarchical logical_divide or logical_product
 def hier_unzip(
+    # [FUNCTION DOC] HELPER: Hierarchically apply a splitter (logical_divide or logical_product, which must return a rank-2 layout) and gather results into two modes:
+    # all tile parts first, all rest parts second. None for B gives a layout of (trivial, A); a tuple B recurses per mode (AssertionError if A has fewer modes).
     splitter: object,
     layoutA: Layout,
     layoutB: LayoutInput,
@@ -457,27 +500,32 @@ def hier_unzip(
 
 # Apply logical divide hierarchically and gather the split modes into two modes
 def zipped_divide(layoutA: Layout, layoutB: LayoutInput) -> Layout:
+    # [FUNCTION DOC] Hierarchical logical divide with the split modes gathered into two modes.
     return hier_unzip(logical_divide, layoutA, layoutB)
 
 
 # Perform logical divide hierarchically and gather tiles (B-layouts) into a new mode
 def tiled_divide(layoutA: Layout, layoutB: LayoutInput) -> Layout:
+    # [FUNCTION DOC] Zipped divide, then the second mode is unpacked so each rest mode becomes its own top-level mode after the first.
     result = zipped_divide(layoutA, layoutB)
     return make_layout([result[0]] + [result[1][i] for i in range(len(result[1]))])  # type: ignore[arg-type]
 
 
 # Apply logical product hierarchically and gather the split modes into two modes
 def zipped_product(layoutA: Layout, layoutB: LayoutInput) -> Layout:
+    # [FUNCTION DOC] Hierarchical logical product with the split modes gathered into two modes.
     return hier_unzip(logical_product, layoutA, layoutB)
 
 
 # Perform logical product hierarchically and gather tiles (B-layouts) into a new mode
 def tiled_product(layoutA: Layout, layoutB: LayoutInput) -> Layout:
+    # [FUNCTION DOC] Zipped product, then the second mode is unpacked so each rest mode becomes its own top-level mode after the first.
     result = zipped_product(layoutA, layoutB)
     return make_layout([result[0]] + [result[1][i] for i in range(len(result[1]))])  # type: ignore[arg-type]
 
 
 def slice_and_offset(crd: tuple[object, ...], layout: Layout) -> tuple[Layout, int]:
+    # [FUNCTION DOC] Slice layout by a coordinate containing None placeholders. Returns a pair: the sliced sub-layout, and the integer offset of the coordinate.
     return (
         Layout(slice_(crd, layout.shape), slice_(crd, layout.stride)),
         crd2idx(crd, layout.shape, layout.stride),  # type: ignore[arg-type]

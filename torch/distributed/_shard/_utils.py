@@ -1,3 +1,5 @@
+# [MODULE DOC] Small helpers for the sharding package: the deprecation message constant (recommending DTensor) and functions that narrow a tensor to a shard
+# given offsets and sizes or a ShardMetadata.
 from collections.abc import Sequence
 
 import torch
@@ -12,6 +14,8 @@ def narrow_tensor_by_index(
     offsets: Sequence[int],
     sizes: Sequence[int],
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Narrow tensor along each dimension idx to the range [offset, offset + size) for the paired entries of offsets and sizes; dimensions where size is not smaller than the tensor
+    # size are left untouched. Returns the (possibly same) tensor view. Errors from the narrow op (out of range) propagate.
     """
     Narrow the tensor according to ``offsets`` and ``sizes``.
     """
@@ -26,6 +30,7 @@ def narrow_tensor_by_index(
 
 
 def narrow_tensor(tensor: torch.Tensor, metadata: ShardMetadata) -> torch.Tensor:
+    # [FUNCTION DOC] Narrow tensor using the shard offsets and sizes from the given ShardMetadata; returns the resulting view.
     """
     Narrow the tensor according to the metadata
     """

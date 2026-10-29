@@ -1,3 +1,5 @@
+# [PACKAGE DOC] Sharded optimizer support: exports ShardedOptimizer (from api, via import) and defines named_params_with_sharded_tensor, a helper that yields
+# parameters including ShardedTensor members so they can be handed to ShardedOptimizer.
 from collections.abc import Iterator
 from typing import Union
 
@@ -12,6 +14,9 @@ def named_params_with_sharded_tensor(
     prefix: str = "",
     recurse: bool = True,
 ) -> Iterator[tuple[str, nn.Parameter | ShardedTensor]]:
+    # [FUNCTION DOC] Generator over (name, parameter) pairs for a module. First yields every ShardedTensor attribute found in the instance dictionaries of the module
+    # (and its submodules when recurse is true, using prefix for names), each only once; then yields all regular parameters from named_parameters.
+    # Note the prefix and recurse arguments only affect the first phase. Names of sharded tensors are joined with a dot.
     r"""Returns an iterator over module parameters (together with the
     ShardedTensor parameters), yielding both the name of the parameter
     as well as the parameter itself. This is typically passed to a

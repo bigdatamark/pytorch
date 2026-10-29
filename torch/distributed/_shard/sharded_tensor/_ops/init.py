@@ -1,16 +1,22 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] ShardedTensor handlers for torch.nn.init ops (uniform_, normal_, kaiming_uniform_, constant_), which apply the init to each local shard tensor,
+# and for tensor-like creation ops (full_like, empty_like, zeros_like, ones_like, rand_like, randn_like) mapped to the sharded creation functions via tensor_like_creation_op_map.
+# Registers all handlers at import time.
 import torch
 import torch.distributed._shard.sharded_tensor as sharded_tensor
 from torch.distributed._shard.sharded_tensor import _sharded_op_impl
 
 
 def validate_param(param, param_name):
+    # [FUNCTION DOC] HELPER: Raise ValueError if param is None, naming param_name in the message.
     if param is None:
         raise ValueError(f"param: {param_name} shouldn't be None!")
 
 
 @_sharded_op_impl(torch.nn.init.uniform_)
 def uniform_(types, args=(), kwargs=None, pg=None):
+    # [FUNCTION DOC] Sharded handler for uniform init: reads tensor, a and b from kwargs (each must be present and not None, else ValueError or KeyError),
+    # fills every local shard tensor in place, and returns the same ShardedTensor.
     r"""
     Fills the Tensor in tensor.local_shards with values drawn from the uniform
     distribution :math:`\mathcal{U}(a, b)`.
@@ -37,6 +43,7 @@ def uniform_(types, args=(), kwargs=None, pg=None):
 
 @_sharded_op_impl(torch.nn.init.normal_)
 def normal_(types, args=(), kwargs=None, pg=None):
+    # [FUNCTION DOC] Sharded handler for normal init: reads tensor, mean and std from kwargs (validated as not None), applies the init to every local shard in place and returns the ShardedTensor.
     r"""
     Fills the Tensors in tensor.local_shards with values drawn from the normal
     distribution :math:`\mathcal{N}(\text{mean}, \text{std}^2)`.
@@ -63,6 +70,8 @@ def normal_(types, args=(), kwargs=None, pg=None):
 
 @_sharded_op_impl(torch.nn.init.kaiming_uniform_)
 def kaiming_uniform_(types, args=(), kwargs=None, pg=None):
+    # [FUNCTION DOC] Sharded handler for Kaiming uniform init: reads tensor, a, mode and nonlinearity from kwargs (validated as not None), initializes every local shard in place and returns the ShardedTensor.
+    # Note fan computation is per local shard, not global.
     r"""
     Fills the Tensors in tensor.local_shards with values according to the method
     described in `Delving deep into rectifiers: Surpassing human-level
@@ -106,6 +115,7 @@ def kaiming_uniform_(types, args=(), kwargs=None, pg=None):
 
 @_sharded_op_impl(torch.nn.init.constant_)
 def constant_(types, args=(), kwargs=None, pg=None):
+    # [FUNCTION DOC] Sharded handler for constant fill: reads tensor and val from kwargs (validated as not None), fills every local shard in place and returns the ShardedTensor.
     r"""
     Fills the input ShardedTensor with the value \text{val}val.
     Args:
@@ -136,8 +146,10 @@ tensor_like_creation_op_map = {
 
 # tensor ops that behave the same as the default tensor
 def register_tensor_creation_op(op):
+    # [FUNCTION DOC] HELPER: Register a handler for a tensor-like creation op that builds a new ShardedTensor using the matching sharded creation function, the input's sharding spec and size, plus remaining positional and keyword arguments.
     @_sharded_op_impl(op)
     def tensor_creation_op(types, args=(), kwargs=None, pg=None):
+        # [FUNCTION DOC] HELPER: Handler body: looks up the creation function for the op (RuntimeError if unsupported), defaults kwargs, and returns the newly created ShardedTensor.
         """
         Handles ``__torch_function__`` dispatch for tensor creation ops that
         takes a ShardedTensor as argument, such as ``torch.zeros_like`` or
