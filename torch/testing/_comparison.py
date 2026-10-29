@@ -1,4 +1,13 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Implementation of torch.testing.assert_close and its comparison machinery. Contains
+# default dtype tolerances, mismatch message builders, ErrorMeta (an internal exception carrying
+# the real error type, message and item id), and a family of Pair classes (None, bool, number,
+# tensor-like, plain object) that each know how to compare one actual/expected couple. Inputs are
+# walked recursively (sequences, mappings, dataclasses) to originate pairs, which are then
+# compared. Import-time side effects: tries to import numpy (HAS_NUMPY), builds the table of dtype
+# precisions (extended with the quantized dtypes) and the tuple of types skipped for dataclass
+# detection, and records whether distributed support is available.
+
 import abc
 import cmath
 import collections.abc
@@ -35,6 +44,11 @@ _HAS_DTENSOR = torch.distributed.is_available()
 
 
 def _unwrap_dtensor_for_comparison(actual, expected):
+    # [FUNCTION DOC] HELPER: Prepares inputs for comparison when DTensors are involved. If
+    # distributed support is missing, returns the inputs unchanged. If both are DTensors, checks
+    # that placements and device meshes match and returns their local tensors; raises
+    # AssertionError on a mismatch. If exactly one is a DTensor, raises TypeError because the
+    # comparison is ambiguous. Otherwise returns the inputs unchanged.
     """Handle DTensor inputs for assertEqual/assert_close."""
     if not _HAS_DTENSOR:
         return actual, expected
@@ -64,11 +78,17 @@ def _unwrap_dtensor_for_comparison(actual, expected):
 
 
 class ErrorMeta(Exception):
+    # [CLASS DOC] HELPER: Internal exception that carries the information needed to produce a
+    # user-facing error: the target exception type, the message, and an id tuple locating the
+    # failing item in nested inputs. Its own message tells users to file an issue if they see it.
+    # Key method to_error builds the real exception.
     """Internal testing exception that makes that carries error metadata."""
 
     def __init__(
         self, type: type[Exception], msg: str, *, id: tuple[Any, ...] = ()
     ) -> None:
+        # [FUNCTION DOC] HELPER: Stores the exception type, message and id (default empty), and
+        # initializes the base exception with a fixed message asking users to report the issue.
         super().__init__(
             "If you are a user and see this message during normal operation "
             "please file an issue at https://github.com/pytorch/pytorch/issues. "
@@ -80,6 +100,10 @@ class ErrorMeta(Exception):
         self.id = id
 
     def to_error(self, msg: str | Callable[[str], str] | None = None) -> Exception:
+        # [FUNCTION DOC] HELPER: Builds the user-facing exception. If msg is not a string, starts
+        # from the stored message, appends the item location from the id when present, and, when
+        # msg is a callable, passes the text through it. Returns an instance of the stored
+        # exception type; does not raise.
         if not isinstance(msg, str):
             generated_msg = self.msg
             if self.id:
@@ -116,6 +140,10 @@ def default_tolerances(
     *inputs: torch.Tensor | torch.dtype,
     dtype_precisions: dict[torch.dtype, tuple[float, float]] | None = None,
 ) -> tuple[float, float]:
+    # [FUNCTION DOC] Returns the loosest (maximum) relative and absolute tolerance over the dtypes
+    # of the given tensors or dtypes, looking each up in the precision table (an optional custom
+    # table can be passed); unknown dtypes count as zero tolerance. Raises TypeError if an input
+    # is neither a tensor nor a dtype.
     """Returns the default absolute and relative testing tolerances for a set of inputs based on the dtype.
 
     See :func:`assert_close` for a table of the default tolerance for each dtype.
@@ -146,6 +174,9 @@ def get_tolerances(
     atol: float | None,
     id: tuple[Any, ...] = (),
 ) -> tuple[float, float]:
+    # [FUNCTION DOC] Returns the (rtol, atol) pair to use. If both are given they are returned
+    # unchanged; if neither is given, default tolerances for the inputs are returned. Raises
+    # ErrorMeta carrying a ValueError if exactly one is given.
     """Gets absolute and relative to be used for numeric comparisons.
 
     If both ``rtol`` and ``atol`` are specified, this is a no-op. If both are not specified, the return value of
@@ -179,6 +210,9 @@ def _make_bitwise_mismatch_msg(
     extra: str | None = None,
     first_mismatch_idx: tuple[int, ...] | None = None,
 ):
+    # [FUNCTION DOC] HELPER: Builds the error text for a bitwise mismatch: a header with the
+    # identifier (default or derived through a callable) followed by optional extra text and the
+    # index of the first mismatched element. Returns the stripped string.
     """Makes a mismatch error message for bitwise values.
 
     Args:
@@ -215,6 +249,10 @@ def _make_mismatch_msg(
     rel_diff_idx: int | tuple[int, ...] | None = None,
     rtol: float,
 ) -> str:
+    # [FUNCTION DOC] HELPER: Builds the error text for a numeric mismatch: header says equal or
+    # close depending on whether both tolerances are zero, then optional extra text, then the
+    # absolute and relative difference lines (with optional index and allowed tolerance). Returns
+    # the stripped string.
     """Makes a mismatch error message for numeric values.
 
     Args:
@@ -241,6 +279,9 @@ def _make_mismatch_msg(
         idx: int | tuple[int, ...] | None,
         tol: float,
     ) -> str:
+        # [FUNCTION DOC] HELPER: Formats one difference line for either absolute or relative
+        # difference, including the index when known and the allowed tolerance when not doing an
+        # equality check. Returns a line ending with a newline.
         if idx is None:
             msg = f"{type.title()} difference: {diff}"
         else:
@@ -273,6 +314,9 @@ def make_scalar_mismatch_msg(
     atol: float,
     identifier: str | Callable[[str], str] | None = None,
 ) -> str:
+    # [FUNCTION DOC] Builds the mismatch error text for two Python scalars. Computes the absolute
+    # difference and the relative difference (infinite if the expected value is zero) and formats
+    # them with the shared message builder. Returns the string.
     """Makes a mismatch error message for scalars.
 
     Args:
@@ -307,6 +351,13 @@ def make_tensor_mismatch_msg(
     atol: float,
     identifier: str | Callable[[str], str] | None = None,
 ):
+    # [FUNCTION DOC] Builds the mismatch error text for two tensors given the boolean match mask.
+    # Reports how many elements mismatch; for one-byte floating types it only gives the first
+    # mismatch index (bitwise report). Otherwise it computes the greatest absolute and relative
+    # difference over mismatches only (integer types are promoted to int64 first) and the
+    # positions of those maxima. Returns the string.
+    # KNOWN ISSUE: the relative difference divides by the expected value, which gives infinite or
+    # NaN when expected is zero, and the one-byte float branch assumes at least one mismatch.
     """Makes a mismatch error message for tensors.
 
     Args:
@@ -322,6 +373,8 @@ def make_tensor_mismatch_msg(
     """
 
     def unravel_flat_index(flat_index: int) -> tuple[int, ...]:
+        # [FUNCTION DOC] HELPER: Converts a flat element position into a per-dimension index tuple
+        # using the shape of the match mask; returns an empty tuple for zero-dimensional tensors.
         if not matches.shape:
             return ()
 
@@ -382,10 +435,17 @@ def make_tensor_mismatch_msg(
 
 
 class UnsupportedInputs(Exception):
+    # [CLASS DOC] Exception raised from a Pair constructor to say the pair type cannot handle the
+    # given inputs, so the next pair type should be tried.
     """Exception to be raised during the construction of a :class:`Pair` in case it doesn't support the inputs."""
 
 
 class Pair(abc.ABC):
+    # [CLASS DOC] Abstract base class of all comparison pairs. A pair holds an actual value, an
+    # expected value and the id locating them in nested inputs; the subclass compare method
+    # performs the check and reports failures as ErrorMeta. Constructors receive all options and
+    # keep unknown ones; a constructor raises UnsupportedInputs to decline. Subclasses add
+    # extra_repr to show their options.
     """ABC for all comparison pairs to be used in conjunction with :func:`assert_equal`.
 
     Each subclass needs to overwrite :meth:`Pair.compare` that performs the actual comparison.
@@ -406,6 +466,7 @@ class Pair(abc.ABC):
         id: tuple[Any, ...] = (),
         **unknown_parameters: Any,
     ) -> None:
+        # [FUNCTION DOC] Stores actual, expected, the id and any unrecognized options.
         self.actual = actual
         self.expected = expected
         self.id = id
@@ -413,10 +474,13 @@ class Pair(abc.ABC):
 
     @staticmethod
     def _inputs_not_supported() -> NoReturn:
+        # [FUNCTION DOC] HELPER: Raises UnsupportedInputs. Never returns.
         raise UnsupportedInputs
 
     @staticmethod
     def _check_inputs_isinstance(*inputs: Any, cls: type | tuple[type, ...]):
+        # [FUNCTION DOC] HELPER: Raises UnsupportedInputs unless every input is an instance of the
+        # given class or tuple of classes.
         """Checks if all inputs are instances of a given class and raise :class:`UnsupportedInputs` otherwise."""
         if not all(isinstance(input, cls) for input in inputs):
             Pair._inputs_not_supported()
@@ -424,6 +488,9 @@ class Pair(abc.ABC):
     def _fail(
         self, type: type[Exception], msg: str, *, id: tuple[Any, ...] = ()
     ) -> NoReturn:
+        # [FUNCTION DOC] HELPER: Raises an ErrorMeta with the given exception type and message.
+        # The id is the explicit one, or the stored id of the pair if none is given and one
+        # exists. Never returns.
         """Raises an :class:`ErrorMeta` from a given exception type and message and the stored id.
 
         .. warning::
@@ -435,9 +502,13 @@ class Pair(abc.ABC):
 
     @abc.abstractmethod
     def compare(self) -> None:
+        # [FUNCTION DOC] Abstract: compares actual with expected and raises ErrorMeta on mismatch;
+        # returns nothing.
         """Compares the inputs and raises an :class`ErrorMeta` in case they mismatch."""
 
     def extra_repr(self) -> Sequence[str | tuple[str, Any]]:
+        # [FUNCTION DOC] Returns the extra options to show in the representation, as names of
+        # attributes or name and value pairs; empty here.
         """Returns extra information that will be included in the representation.
 
         Should be overwritten by all subclasses that use additional options. The representation of the object will only
@@ -447,6 +518,8 @@ class Pair(abc.ABC):
         return []
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns a multi-line text with the class name, id, actual,
+        # expected and every extra representation item, one per line.
         head = f"{type(self).__name__}("
         tail = ")"
         body = [
@@ -465,6 +538,8 @@ class Pair(abc.ABC):
 
 
 class ObjectPair(Pair):
+    # [CLASS DOC] Fallback pair for any inputs: compares with the equality operator. It accepts
+    # every input, so it must be last in the list of pair types.
     """Pair for any type of inputs that will be compared with the `==` operator.
 
     .. note::
@@ -475,6 +550,9 @@ class ObjectPair(Pair):
     """
 
     def compare(self) -> None:
+        # [FUNCTION DOC] Compares with equality. Raises ErrorMeta (ValueError) if the equality
+        # operation itself raises, chaining the original error, and ErrorMeta (AssertionError) if
+        # the values are not equal.
         try:
             equal = self.actual == self.expected
         except Exception as error:
@@ -490,15 +568,20 @@ class ObjectPair(Pair):
 
 
 class NonePair(Pair):
+    # [CLASS DOC] Pair for None: handles inputs where either side is None, and requires that both
+    # are None.
     """Pair for ``None`` inputs."""
 
     def __init__(self, actual: Any, expected: Any, **other_parameters: Any) -> None:
+        # [FUNCTION DOC] Declines the inputs (UnsupportedInputs) unless at least one is None, then
+        # initializes the base pair.
         if not (actual is None or expected is None):
             self._inputs_not_supported()
 
         super().__init__(actual, expected, **other_parameters)
 
     def compare(self) -> None:
+        # [FUNCTION DOC] Raises ErrorMeta (AssertionError) unless both values are None.
         if not (self.actual is None and self.expected is None):
             self._fail(
                 AssertionError, f"None mismatch: {self.actual} is not {self.expected}"
@@ -506,6 +589,8 @@ class NonePair(Pair):
 
 
 class BooleanPair(Pair):
+    # [CLASS DOC] Pair for booleans, including numpy bool values when numpy is available. Inputs
+    # are converted to Python bool at construction; compare requires identical truth values.
     """Pair for :class:`bool` inputs.
 
     .. note::
@@ -522,11 +607,15 @@ class BooleanPair(Pair):
         id: tuple[Any, ...],
         **other_parameters: Any,
     ) -> None:
+        # [FUNCTION DOC] Converts both inputs to Python bool (declining unsupported types) and
+        # initializes the base pair. The id is a required keyword.
         actual, expected = self._process_inputs(actual, expected, id=id)
         super().__init__(actual, expected, **other_parameters)
 
     @property
     def _supported_types(self) -> tuple[type, ...]:
+        # [FUNCTION DOC] HELPER: Property returning the tuple of accepted types: bool, plus the
+        # numpy bool type when numpy is available.
         cls: list[type] = [bool]
         if HAS_NUMPY:
             # pyrefly: ignore [missing-attribute]
@@ -536,6 +625,8 @@ class BooleanPair(Pair):
     def _process_inputs(
         self, actual: Any, expected: Any, *, id: tuple[Any, ...]
     ) -> tuple[bool, bool]:
+        # [FUNCTION DOC] HELPER: Declines inputs that are not supported booleans, then converts
+        # both to Python bool. Returns the converted pair.
         self._check_inputs_isinstance(actual, expected, cls=self._supported_types)
         actual, expected = (
             self._to_bool(bool_like, id=id) for bool_like in (actual, expected)
@@ -543,6 +634,8 @@ class BooleanPair(Pair):
         return actual, expected
 
     def _to_bool(self, bool_like: Any, *, id: tuple[Any, ...]) -> bool:
+        # [FUNCTION DOC] HELPER: Converts a bool or numpy bool to a Python bool. Raises ErrorMeta
+        # (TypeError) for any other type.
         if isinstance(bool_like, bool):
             return bool_like
         # pyrefly: ignore [missing-attribute]
@@ -554,6 +647,7 @@ class BooleanPair(Pair):
             )
 
     def compare(self) -> None:
+        # [FUNCTION DOC] Raises ErrorMeta (AssertionError) if the two booleans differ.
         if self.actual is not self.expected:
             self._fail(
                 AssertionError,
@@ -562,6 +656,9 @@ class BooleanPair(Pair):
 
 
 class NumberPair(Pair):
+    # [CLASS DOC] Pair for Python numbers (int, float, complex) and numpy numbers. Stores rtol and
+    # atol (defaulting from the number types treated as int64, float64 and complex128), equal_nan
+    # and check_dtype. compare uses an absolute-plus-relative tolerance test.
     """Pair for Python number (:class:`int`, :class:`float`, and :class:`complex`) inputs.
 
     .. note::
@@ -609,6 +706,12 @@ class NumberPair(Pair):
         check_dtype: bool = False,
         **other_parameters: Any,
     ) -> None:
+        # [FUNCTION DOC] Converts both inputs to Python numbers (declining other types),
+        # initializes the base pair, resolves tolerances from the corresponding dtypes
+        # (raising ErrorMeta ValueError if only one of rtol and atol is given), and stores
+        # equal_nan and check_dtype.
+        # KNOWN ISSUE: the class docstring table maps complex to complex64, but the code table
+        # uses complex128.
         actual, expected = self._process_inputs(actual, expected, id=id)
         super().__init__(actual, expected, id=id, **other_parameters)
 
@@ -623,6 +726,8 @@ class NumberPair(Pair):
 
     @property
     def _supported_types(self) -> tuple[type, ...]:
+        # [FUNCTION DOC] HELPER: Property returning the accepted types: int, float, complex, plus
+        # the numpy number type when numpy is available.
         cls = list(self._NUMBER_TYPES)
         if HAS_NUMPY:
             # pyrefly: ignore [missing-attribute]
@@ -632,6 +737,8 @@ class NumberPair(Pair):
     def _process_inputs(
         self, actual: Any, expected: Any, *, id: tuple[Any, ...]
     ) -> tuple[int | float | complex, int | float | complex]:
+        # [FUNCTION DOC] HELPER: Declines unsupported inputs, then converts both to Python
+        # numbers. Returns the converted pair.
         self._check_inputs_isinstance(actual, expected, cls=self._supported_types)
         actual, expected = (
             self._to_number(number_like, id=id) for number_like in (actual, expected)
@@ -641,6 +748,8 @@ class NumberPair(Pair):
     def _to_number(
         self, number_like: Any, *, id: tuple[Any, ...]
     ) -> int | float | complex:
+        # [FUNCTION DOC] HELPER: Converts numpy numbers through their item method and passes
+        # Python numbers through. Raises ErrorMeta (TypeError) for any other type.
         # pyrefly: ignore [missing-attribute]
         if HAS_NUMPY and isinstance(number_like, np.number):
             return number_like.item()
@@ -652,6 +761,11 @@ class NumberPair(Pair):
             )
 
     def compare(self) -> None:
+        # [FUNCTION DOC] Compares the numbers. If check_dtype is set, raises ErrorMeta
+        # (AssertionError) when the Python types differ. Equal values pass; two NaNs pass if
+        # equal_nan is set; otherwise passes when the absolute difference is finite and within
+        # atol plus rtol times the expected magnitude. Else raises ErrorMeta (AssertionError) with
+        # a scalar mismatch message.
         if self.check_dtype and type(self.actual) is not type(self.expected):
             self._fail(
                 AssertionError,
@@ -678,6 +792,8 @@ class NumberPair(Pair):
         )
 
     def extra_repr(self) -> Sequence[str]:
+        # [FUNCTION DOC] Returns the names of the options to show in the representation: rtol,
+        # atol, equal_nan and check_dtype.
         return (
             "rtol",
             "atol",
@@ -687,6 +803,13 @@ class NumberPair(Pair):
 
 
 class TensorLikePair(Pair):
+    # [CLASS DOC] Pair for tensors and objects convertible to tensors. Stores tolerances and the
+    # flags check_device, check_dtype, check_layout, check_stride and equal_nan. compare first
+    # checks attributes (shape, quantization, layout, stride, device, dtype), skips value checks
+    # for meta tensors, then equalizes device, dtype and layout and compares values with a
+    # layout-specific strategy (quantized, sparse COO, sparse compressed, jagged, one-byte float,
+    # or regular).
+    # KNOWN ISSUE: the class docstring leaves allow_subclasses undescribed.
     """Pair for :class:`torch.Tensor`-like inputs.
 
     Kwargs:
@@ -724,6 +847,10 @@ class TensorLikePair(Pair):
         check_stride: bool = False,
         **other_parameters: Any,
     ):
+        # [FUNCTION DOC] Validates and converts inputs to tensors (declining non-related types, or
+        # differing types when subclasses are disallowed), initializes the base pair, resolves
+        # tolerances (raising ErrorMeta ValueError if only one of rtol and atol is given), and
+        # stores the check flags.
         actual, expected = self._process_inputs(
             actual, expected, id=id, allow_subclasses=allow_subclasses
         )
@@ -741,6 +868,9 @@ class TensorLikePair(Pair):
     def _process_inputs(
         self, actual: Any, expected: Any, *, id: tuple[Any, ...], allow_subclasses: bool
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Requires the inputs to be directly related by subclassing (and of
+        # identical type if subclasses are not allowed), otherwise declines. Converts both to
+        # tensors and checks that the layout is supported. Returns the two tensors.
         directly_related = isinstance(actual, type(expected)) or isinstance(
             expected, type(actual)
         )
@@ -756,6 +886,8 @@ class TensorLikePair(Pair):
         return actual, expected
 
     def _to_tensor(self, tensor_like: Any) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Returns the tensor itself, or converts the object with the
+        # as_tensor function. Declines the inputs if conversion fails.
         if isinstance(tensor_like, torch.Tensor):
             return tensor_like
 
@@ -765,6 +897,8 @@ class TensorLikePair(Pair):
             self._inputs_not_supported()
 
     def _check_supported(self, tensor: torch.Tensor, *, id: tuple[Any, ...]) -> None:
+        # [FUNCTION DOC] HELPER: Raises ErrorMeta (ValueError) if the tensor layout is not
+        # strided, jagged or one of the sparse layouts.
         if tensor.layout not in {
             torch.strided,
             torch.jagged,
@@ -779,6 +913,9 @@ class TensorLikePair(Pair):
             )
 
     def compare(self) -> None:
+        # [FUNCTION DOC] Checks the attributes first; returns early if either tensor is on the
+        # meta device; otherwise equalizes attributes and compares values. Raises ErrorMeta on
+        # any mismatch.
         actual, expected = self.actual, self.expected
 
         self._compare_attributes(actual, expected)
@@ -793,6 +930,10 @@ class TensorLikePair(Pair):
         actual: torch.Tensor,
         expected: torch.Tensor,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Checks shape, whether both are quantized and the quantization
+        # scheme, then optionally layout (or stride for strided tensors), device and dtype
+        # according to the check flags. Raises ErrorMeta (AssertionError) via a local
+        # reporting helper.
         """Checks if the attributes of two tensors match.
 
         Always checks
@@ -814,6 +955,8 @@ class TensorLikePair(Pair):
         def raise_mismatch_error(
             attribute_name: str, actual_value: Any, expected_value: Any
         ) -> NoReturn:
+            # [FUNCTION DOC] HELPER: Raises an ErrorMeta (AssertionError) saying the named
+            # attribute differs between actual and expected.
             self._fail(
                 AssertionError,
                 f"The values for attribute '{attribute_name}' do not match: {actual_value} != {expected_value}.",
@@ -848,6 +991,10 @@ class TensorLikePair(Pair):
     def _equalize_attributes(
         self, actual: torch.Tensor, expected: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Brings the tensors to a comparable form: MPS tensors and tensors
+        # on different devices move to CPU; differing dtypes are promoted to a common dtype
+        # (unsigned 16, 32 and 64-bit types are first treated as int64); differing layouts are
+        # converted to dense. Returns the pair of tensors.
         """Equalizes some attributes of two tensors for value comparison.
 
         If ``actual`` and ``expected`` are ...
@@ -899,6 +1046,10 @@ class TensorLikePair(Pair):
         return actual, expected
 
     def _compare_values(self, actual: torch.Tensor, expected: torch.Tensor) -> None:
+        # [FUNCTION DOC] HELPER: Chooses the comparison strategy from the tensor kind: quantized,
+        # sparse COO, sparse compressed, jagged (compares the packed values), one-byte floating
+        # point (bitwise equality only) or regular, and calls it with the stored tolerances and
+        # equal_nan. Raises ErrorMeta on mismatch.
         if actual.is_quantized:
             compare_fn = self._compare_quantized_values
         elif actual.is_sparse:
@@ -924,6 +1075,9 @@ class TensorLikePair(Pair):
                 equal_nan: bool,
                 identifier: str | Callable[[str], str] | None = None,
             ) -> None:
+                # [FUNCTION DOC] HELPER: Bitwise comparison for one-byte floating types: raises
+                # ErrorMeta (AssertionError) if a nonzero tolerance is requested, then does an
+                # exact value comparison.
                 if rtol != 0.0 or atol != 0.0:
                     raise ErrorMeta(
                         AssertionError,
@@ -957,6 +1111,8 @@ class TensorLikePair(Pair):
         atol: float,
         equal_nan: bool,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Compares quantized tensors by dequantizing both and comparing as
+        # regular values with the given tolerances. Raises ErrorMeta on mismatch.
         """Compares quantized tensors by comparing the :meth:`~torch.Tensor.dequantize`'d variants for closeness.
 
         .. note::
@@ -983,6 +1139,9 @@ class TensorLikePair(Pair):
         atol: float,
         equal_nan: bool,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Compares sparse COO tensors: sparse dimension counts and stored
+        # value counts must match (ErrorMeta AssertionError otherwise), indices must be exactly
+        # equal and values close.
         """Compares sparse COO tensors by comparing
 
         - the number of sparse dimensions,
@@ -1031,6 +1190,9 @@ class TensorLikePair(Pair):
         atol: float,
         equal_nan: bool,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Compares sparse compressed (CSR, CSC, BSR, BSC) tensors: stored
+        # value counts must match, compressed and plain indices must be equal after promotion to a
+        # common integer dtype, and values must be close. Raises ErrorMeta on mismatch.
         """Compares sparse compressed tensors by comparing
 
         - the number of non-zero elements (nnz) for equality,
@@ -1107,6 +1269,8 @@ class TensorLikePair(Pair):
         equal_nan: bool = False,
         identifier: str | Callable[[str], str] | None = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Checks exact equality of values by calling the closeness check
+        # with zero tolerances. Raises ErrorMeta on mismatch.
         """Checks if the values of two tensors are equal."""
         self._compare_regular_values_close(
             actual, expected, rtol=0, atol=0, equal_nan=equal_nan, identifier=identifier
@@ -1122,6 +1286,9 @@ class TensorLikePair(Pair):
         equal_nan: bool,
         identifier: str | Callable[[str], str] | None = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Checks element closeness with an elementwise closeness test. On
+        # failure builds a scalar message for zero-dimensional tensors or a tensor message
+        # otherwise, and raises ErrorMeta (AssertionError).
         """Checks if the values of two tensors are close up to a desired tolerance."""
         matches = torch.isclose(
             actual, expected, rtol=rtol, atol=atol, equal_nan=equal_nan
@@ -1144,6 +1311,8 @@ class TensorLikePair(Pair):
         self._fail(AssertionError, msg)
 
     def extra_repr(self) -> Sequence[str]:
+        # [FUNCTION DOC] Returns the names of the options to show in the representation:
+        # tolerances, equal_nan and the check flags.
         return (
             "rtol",
             "atol",
@@ -1166,6 +1335,15 @@ def originate_pairs(
     **options: Any,
     # pyrefly: ignore [bad-return]
 ) -> list[Pair]:
+    # [FUNCTION DOC] Walks the inputs and returns the list of pairs to compare. Sequences (not
+    # strings) of equal length and mappings with equal key sets are recursed element by element,
+    # extending the id with the index or key; dataclasses are compared as a whole object if their
+    # equality gives a real bool, else field by field (compare-enabled fields only). Otherwise
+    # the first pair type that accepts the inputs is used. Raises ErrorMeta for mismatched
+    # lengths or keys or when no pair type accepts, and RuntimeError for unexpected errors from a
+    # pair constructor.
+    # KNOWN ISSUE: the docstring says dataclass handling raises nothing special, but a
+    # RuntimeError from equality that is not about tensor truth values is re-raised.
     """Originates pairs from the individual inputs.
 
     ``actual`` and ``expected`` can be possibly nested :class:`~collections.abc.Sequence`'s,
@@ -1349,6 +1527,13 @@ def not_close_error_metas(
     mapping_types: tuple[type, ...] = (collections.abc.Mapping,),
     **options: Any,
 ) -> list[ErrorMeta]:
+    # [FUNCTION DOC] Builds the pairs and compares each, returning the list of ErrorMeta for
+    # failing pairs (empty means everything matched). Origination errors are converted to real
+    # exceptions and raised; unexpected exceptions from a comparison are wrapped in RuntimeError.
+    # Hides itself from pytest tracebacks. The returned list is built in a way that breaks a
+    # reference cycle between frames and errors.
+    # KNOWN ISSUE: the docstring says this asserts that inputs are equal, but it only returns
+    # error metadata and raises only for origination failures.
     """Asserts that inputs are equal.
 
     ``actual`` and ``expected`` can be possibly nested :class:`~collections.abc.Sequence`'s or
@@ -1426,6 +1611,15 @@ def assert_close(
     check_stride: bool = False,
     msg: str | Callable[[str], str] | None = None,
 ):
+    # [FUNCTION DOC] Public entry point: asserts that actual and expected are close. Unwraps
+    # DTensors, runs the pair comparison with the none, bool, number and tensor-like pairs and the
+    # given options, and raises the first collected error converted through the optional message
+    # (string, or callable receiving the generated text). Returns nothing. Hides itself from
+    # pytest tracebacks.
+    # KNOWN ISSUE: the docstring types equal_nan as bool or str but only bool is used; it lists
+    # ValueError for inputs that cannot be turned into tensors and AssertionError for unrelated
+    # types, but the code raises TypeError when no pair accepts the inputs. Only the first error
+    # is reported (see the TODO in the code).
     r"""Asserts that ``actual`` and ``expected`` are close.
 
     If ``actual`` and ``expected`` are strided, non-quantized, real-valued, and finite, they are considered close if
@@ -1703,6 +1897,12 @@ def assert_allclose(
     equal_nan: bool = True,
     msg: str = "",
 ) -> None:
+    # [FUNCTION DOC] Deprecated wrapper (emits a FutureWarning). Converts inputs to tensors
+    # (expected takes the dtype of actual), chooses legacy default tolerances (float16, float32
+    # and float64 table) when neither tolerance is given, and calls assert_close with check_dtype
+    # off, equal_nan default True and the message if non-empty. Raises what assert_close raises.
+    # KNOWN ISSUE: if only one of rtol and atol is given the default tolerances are not applied
+    # and assert_close raises ValueError.
     """
     .. warning::
 
