@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Fake configuration module used by tests of torch.utils._config_module. Declares config
+# values of many kinds (plain scalars and containers, optional, ignored, compile-ignored,
+# Config entries with justknob, environment-variable defaults/overrides, aliases and
+# deprecation) plus a nested class namespace. At import it calls install_config_module on
+# itself, replacing the module class with the config-aware one.
+
 import sys
 
 from torch.utils._config_module import Config, install_config_module
@@ -43,6 +50,8 @@ e_deprecated_alias: bool = Config(
 
 
 class nested:
+    # [CLASS DOC] HELPER: Namespace class holding one nested config value, e_bool, to test
+    # config entries grouped in sub-namespaces. Has no methods or instance state.
     e_bool = True
 
 

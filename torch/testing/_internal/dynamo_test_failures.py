@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Loads the sets of test names that are expected to fail or must be skipped under Dynamo,
+# Inductor and compiled autograd, by listing file names in the test directory's
+# dynamo_expected_failures, dynamo_skips, inductor_expected_failures, inductor_skips and
+# compiled_autograd_skips folders. Exposes test_dir, FIXME_inductor_non_strict and those
+# sets (plus extra_dynamo_skips merged into dynamo_skips). Import-time side effects: reads
+# the filesystem, logs a warning if the directory is missing (sets are then empty), and
+# raises AssertionError if a name is not of the two-part form or a failure set overlaps its
+# skip set.
 """
 This file contains the list of tests that are known to fail under Dynamo
 
@@ -27,6 +36,11 @@ import sys
 
 
 def find_test_dir() -> str | None:
+    # [FUNCTION DOC]
+    # Locates the repository test directory containing the dynamo_expected_failures folder.
+    # Returns None on Windows. Otherwise first checks a path relative to this file, then walks
+    # up from the directory of the main script looking for a directory named test that holds
+    # that folder. Returns the directory path, or None if main has no file or nothing is found.
     # Find the path to the dynamo expected failure and skip files.
     from os.path import abspath, basename, dirname, exists, join, normpath
 

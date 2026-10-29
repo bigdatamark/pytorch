@@ -1,5 +1,13 @@
 # mypy: ignore-errors
 
+# [MODULE DOC]
+# Hypothesis strategies for generating quantization test data: quantization parameters
+# (qparams), array shapes (array_shapes), float32 tensors with optional per-tensor or
+# per-channel quantization parameters (tensor, per_channel_tensor) and convolution test
+# inputs (tensor_conv), plus the floats wrapper and an overflow filter. Import-time side
+# effects: registers a hypothesis settings profile named no_deadline (deadline disabled, or
+# unlimited timeout on very old versions) and loads it as the active profile.
+
 from collections import defaultdict
 from collections.abc import Iterable
 import numpy as np
@@ -37,6 +45,9 @@ _ENFORCED_ZERO_POINT = defaultdict(lambda: None, {
 })
 
 def _get_valid_min_max(qparams):
+    # [FUNCTION DOC] HELPER: Given a (scale, zero_point, quantized_type) tuple, computes the
+    # smallest and largest float values whose quantized intermediates stay within the 64-bit
+    # integer range (with a small safety adjustment). Returns both bounds as float32 numbers.
     scale, zero_point, _quantized_type = qparams
     adjustment = 1 + torch.finfo(torch.float).eps
     _long_type_info = torch.iinfo(torch.long)
@@ -50,6 +61,11 @@ def _get_valid_min_max(qparams):
 # it is too old, removes the `width` parameter (which was introduced)
 # in 3.67.0
 def _floats_wrapper(*args, **kwargs):
+    # [FUNCTION DOC] HELPER: Wrapper over the hypothesis floats strategy that supports the
+    # width keyword on hypothesis older than 3.67.0. For old versions, when NaN and infinity
+    # are not allowed and no positional or min/max arguments are given, it emulates the width by
+    # setting min and max to the limits of the matching float type (16, 32 or 64 bits), then
+    # drops width. Mutates kwargs. Returns the resulting strategy.
     if 'width' in kwargs and hypothesis.version.__version_info__ < (3, 67, 0):
         # As long as nan, inf, min, max are not specified, reimplement the width
         # parameter for older versions of hypothesis.
@@ -77,6 +93,9 @@ def _floats_wrapper(*args, **kwargs):
     return st.floats(*args, **kwargs)
 
 def floats(*args, **kwargs):
+    # [FUNCTION DOC]
+    # Float strategy that defaults the width keyword to 32 bits, then delegates to the
+    # version-compatible wrapper. Returns a hypothesis strategy.
     if 'width' not in kwargs:
         kwargs['width'] = 32
     return _floats_wrapper(*args, **kwargs)
@@ -97,6 +116,10 @@ Note: This filter is slow. Use it only when filtering of the test cases is
       absolutely necessary!
 """
 def assume_not_overflowing(tensor, qparams):
+    # [FUNCTION DOC]
+    # Hypothesis filter: computes valid bounds from qparams and asserts, via hypothesis assume,
+    # that the tensor minimum and maximum lie within them; the test case is rejected otherwise
+    # (UnsatisfiedAssumption). Returns True when the case passes.
     min_value, max_value = _get_valid_min_max(qparams)
     assume(tensor.min() >= min_value)
     assume(tensor.max() <= max_value)
@@ -120,6 +143,14 @@ Generates:
 @st.composite
 def qparams(draw, dtypes=None, scale_min=None, scale_max=None,
             zero_point_min=None, zero_point_max=None):
+    # [FUNCTION DOC]
+    # Composite strategy producing (scale, zero_point, quantized_type). The type is sampled
+    # from dtypes (default: quint8, qint8, qint32; a single type is accepted). The zero point is
+    # the enforced value for the type when one exists (0 for qint32), else an integer drawn
+    # between the given bounds (default: type range). Scale is a 32-bit float drawn between
+    # scale_min and scale_max (defaults: float32 epsilon and float32 max).
+    # KNOWN ISSUE: the descriptive string above says scale defaults are 1e-3 and 1e3, but the
+    # code uses float epsilon and float max.
     if dtypes is None:
         dtypes = _ALL_QINT_TYPES
     if not isinstance(dtypes, (list, tuple)):
@@ -161,6 +192,11 @@ Example:
 """
 @st.composite
 def array_shapes(draw, min_dims=1, max_dims=None, min_side=1, max_side=None, max_numel=None):
+    # [FUNCTION DOC]
+    # Composite strategy producing a shape tuple of positive ints. Rank lies in
+    # [min_dims, max_dims] (default max is min_dims plus 2, capped at 32) and each side in
+    # [min_side, max_side] (default max is min_side plus 5). Optionally rejects shapes whose
+    # element count exceeds max_numel. Raises an error if min_dims or max_dims is 32 or more.
     """Return a strategy for array shapes (tuples of int >= 1)."""
     if min_dims >= 32:
         raise AssertionError(f"Expected min_dims < 32, got {min_dims}")
@@ -195,6 +231,15 @@ Generates:
 """
 @st.composite
 def tensor(draw, shapes=None, elements=None, qparams=None, dtype=np.float32):
+    # [FUNCTION DOC]
+    # Composite strategy producing a pair (array, quantization info). Shape comes from a
+    # strategy or is sampled from an iterable of shapes. Without qparams, elements default to
+    # finite floats in [-1e6, 1e6], NaN/inf cases are rejected, and the second item is None.
+    # With qparams, a parameter set is drawn, elements default to the overflow-safe range,
+    # scale and zero point are recomputed from the array statistics (zero point replaced by the
+    # enforced value if any) and returned as (scale, zero_point, quantized_type).
+    # KNOWN ISSUE: the descriptive string above says X is always float32, but dtype is
+    # configurable.
     if isinstance(shapes, SearchStrategy):
         _shape = draw(shapes)
     else:
@@ -220,6 +265,13 @@ def tensor(draw, shapes=None, elements=None, qparams=None, dtype=np.float32):
 
 @st.composite
 def per_channel_tensor(draw, shapes=None, elements=None, qparams=None):
+    # [FUNCTION DOC]
+    # Like tensor, but float32 only and with per-channel quantization. Without qparams returns
+    # (array, None). With qparams, computes per-channel scales and zero points, picks a random
+    # axis (uses numpy global random state, not hypothesis draws), swaps that axis with axis 0
+    # by transposing the array, and returns (array, (scale, zero_point, axis, quantized_type)).
+    # KNOWN ISSUE: the random axis is not drawn through hypothesis, so examples are not
+    # reproducible from the hypothesis seed.
     if isinstance(shapes, SearchStrategy):
         _shape = draw(shapes)
     else:
@@ -305,6 +357,16 @@ def tensor_conv(
     kernel_range=(3, 7), max_groups=1, can_be_transposed=False,
     elements=None, qparams=None
 ):
+    # [FUNCTION DOC]
+    # Composite strategy producing convolution test inputs (X, W, b, groups, transposed).
+    # Draws batch size, per-group channel counts, group count, spatial rank (sampled if an
+    # iterable), feature-map sizes and kernel sizes from the given ranges. Weight shape is
+    # (out, in per group, kernel...) or, when can_be_transposed draws true, (in, out per group,
+    # kernel...). X, W and b are each the (array, qparams) pair from the tensor strategy.
+    # qparams may be one strategy (reused) or a list of exactly three; a list of another
+    # length raises an error.
+    # KNOWN ISSUE: the descriptive string above lists four results, but five are returned
+    # (including the transposed flag). With qparams None the code indexes None and fails.
 
     # Resolve the minibatch, in_channels, out_channels, iH/iW, iK/iW
     batch_size = draw(st.integers(*batch_size_range))
@@ -368,6 +430,10 @@ settings.load_profile("no_deadline")
 
 
 def assert_deadline_disabled():
+    # [FUNCTION DOC]
+    # Checks that hypothesis test deadlines are disabled. On hypothesis older than 3.27 it only
+    # emits a warning telling the user to upgrade; otherwise raises an error if the active
+    # settings still have a deadline.
     """Check that deadlines are effectively disabled across Hypothesis versions."""
     if hypothesis_version < (3, 27, 0):
         import warnings

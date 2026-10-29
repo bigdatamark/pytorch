@@ -1,5 +1,12 @@
 # mypy: allow-untyped-defs
 
+# [MODULE DOC]
+# Utilities for generating the RPC test matrix. Collects the agent-agnostic, TensorPipe-only
+# and faulty-agent test suites into lists (GENERIC_TESTS, GENERIC_CUDA_TESTS, TENSORPIPE_TESTS,
+# TENSORPIPE_CUDA_TESTS, FAULTY_AGENT_TESTS), defines the SpawnHelper multiprocess base class,
+# and provides generate_tests to mix an agent fixture into each suite. Importing this module
+# imports all the RPC test modules; it has no other side effects.
+
 import os
 import sys
 import unittest
@@ -58,6 +65,9 @@ from torch.testing._internal.distributed.rpc.rpc_test import (
 
 
 def _check_and_set_tcp_init():
+    # [FUNCTION DOC] HELPER: If the RPC_INIT_WITH_TCP environment variable equals "1", sets
+    # MASTER_ADDR to localhost and MASTER_PORT to a free port (mutates os.environ) so all
+    # spawned processes agree on one port. Otherwise does nothing.
     # if we are running with TCP init, set main address and port
     # before spawning subprocesses, since different processes could find
     # different ports.
@@ -68,6 +78,9 @@ def _check_and_set_tcp_init():
 
 
 def _check_and_unset_tcp_init():
+    # [FUNCTION DOC] HELPER: Undoes _check_and_set_tcp_init: when RPC_INIT_WITH_TCP equals "1",
+    # deletes MASTER_ADDR and MASTER_PORT from os.environ (raises KeyError if either is
+    # missing). Otherwise does nothing.
     use_tcp_init = os.environ.get("RPC_INIT_WITH_TCP", None)
     if use_tcp_init == "1":
         del os.environ["MASTER_ADDR"]
@@ -90,12 +103,21 @@ def _check_and_unset_tcp_init():
     "Skip ASAN as torch + multiprocessing spawn have known issues",
 )
 class SpawnHelper(MultiProcessTestCase):
+    # [CLASS DOC]
+    # Multi-process test base that spawns worker processes in setUp. Skipped entirely under
+    # dev-debug ASAN. Used as the last base of every generated RPC test class.
     def setUp(self):
+        # [FUNCTION DOC]
+        # Runs base setUp, configures TCP rendezvous environment variables if requested, then
+        # spawns the worker processes.
         super().setUp()
         _check_and_set_tcp_init()
         self._spawn_processes()
 
     def tearDown(self):
+        # [FUNCTION DOC]
+        # Removes the TCP rendezvous environment variables if they were set, then runs base
+        # tearDown.
         _check_and_unset_tcp_init()
         super().tearDown()
 
@@ -157,6 +179,11 @@ def generate_tests(
     tests: list[type[RpcAgentTestFixture]],
     module_name: str,
 ) -> dict[str, type[RpcAgentTestFixture]]:
+    # [FUNCTION DOC]
+    # Builds one new class per suite in tests, deriving from the suite, the mixin fixture and
+    # SpawnHelper, named prefix plus the suite name, with its module attribute set to
+    # module_name (needed for pickling). Returns a mapping from new class name to class.
+    # Suites are skipped, with a message on stderr, when running on sandcastle under dev ASAN.
     """Mix in the classes needed to autogenerate the tests based on the params.
 
     Takes a series of test suites, each written against a "generic" agent (i.e.,

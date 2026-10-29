@@ -1,5 +1,14 @@
 # mypy: ignore-errors
 
+# [MODULE DOC]
+# Utilities for generating TorchScript (JIT) tests by metaprogramming. Provides the size
+# constants L, M, S, input construction (create_input), the table of nn.functional test
+# specifications, builders for scripted and traced functions and scripted modules from source
+# text templates, helpers to split tensor from non-tensor arguments, alias-annotation
+# checking, and lookups of nn module test names and specs, plus exclusion sets of tests known
+# to fail in script mode. Import-time side effects: imports torch.jit submodules and nn test
+# definitions, and raises AssertionError if the default dtype is not float32.
+
 # Torch
 from torch.jit.annotations import BroadcastingList2, BroadcastingList3  # noqa: F401
 import torch.nn.functional as F
@@ -28,28 +37,50 @@ S = 5
 
 
 def unpack_variables(args):
+    # [FUNCTION DOC]
+    # Recursively walks nested tuples and returns a structurally equal tuple of the leaves;
+    # non-tuple values are returned unchanged. Effectively a deep tuple copy.
     if isinstance(args, tuple):
         return tuple(unpack_variables(elem) for elem in args)
     else:
         return args
 
 class dont_convert(tuple):
+    # [CLASS DOC] HELPER: Marker tuple subclass with no extra state. Arguments of this type are
+    # passed through create_input unchanged instead of being turned into random tensors.
     __slots__ = ()
 
 non_differentiable = collections.namedtuple('non_differentiable', ['tensor'])
 
 def create_input(call_args, requires_grad=True, non_contiguous=False, call_kwargs=None, dtype=torch.float, device=None):
+    # [FUNCTION DOC]
+    # Materializes test inputs from a specification. A non-tuple call_args is wrapped in a
+    # tuple. Each positional argument and keyword value is mapped: size objects and
+    # dont_convert tuples pass through; an empty tuple becomes a random scalar tensor; a tuple of
+    # ints becomes a random tensor of that shape; non_differentiable wrappers give a detached
+    # tensor on the device; tensors are cloned, conjugated, optionally made non-contiguous and
+    # given requires_grad only if floating or complex; callables are invoked with dtype and
+    # device and their result mapped; everything else passes through. Returns (args tuple,
+    # kwargs dict). Raises RuntimeError if a given tensor's complexity mismatches dtype.
+    # KNOWN ISSUE: the RuntimeError is built with two separate message arguments (a stray
+    # comma), so the message prints as a tuple. Both non_differentiable branches do the same
+    # thing, and the conj is applied to every tensor even for real dtypes.
     if not isinstance(call_args, tuple):
         call_args = (call_args,)
 
     def map_arg(arg):
+        # [FUNCTION DOC] HELPER: Converts one specification entry into an actual input (see
+        # create_input); recurses for callables.
         def maybe_non_contig(tensor):
+            # [FUNCTION DOC] HELPER: Returns a clone, or a non-contiguous equivalent when
+            # non_contiguous is requested and the tensor has at least two elements.
             if not non_contiguous or tensor.numel() < 2:
                 return tensor.clone()
 
             return noncontiguous_like(tensor)
 
         def conjugate(tensor):
+            # [FUNCTION DOC] HELPER: Returns the conjugate view of the tensor.
             return tensor.conj()
 
         if isinstance(arg, (torch.Size, dont_convert)):
@@ -97,6 +128,13 @@ def create_input(call_args, requires_grad=True, non_contiguous=False, call_kwarg
 #   kwargs for function,                                     // optional
 # )
 def get_nn_functional_tests():
+    # [FUNCTION DOC]
+    # Builds and returns the list of nn.functional test specifications. Each entry is a tuple
+    # of: function name, input size or tensor, positional args, optional variant name, optional
+    # autodiff info (flag plus node lists), and optional skip/gradcheck functions and kwargs
+    # as described in the comment above. Creates random tensors at call time.
+    # KNOWN ISSUE: some entries use a parenthesized single value instead of a one-element
+    # tuple (for example the inplace relu6 and selu, and unfold), so args are not tuples.
     nn_functional_tests = [
         ('conv1d', (S, S, S), ((S, S, S),)),
         ('conv2d', (S, S, S, S), ((S, S, S, S),)),
@@ -325,6 +363,9 @@ def the_method({}):
 '''
 
 def value_to_literal(value):
+    # [FUNCTION DOC]
+    # Renders a value as source text: strings become quoted escaped literals, tensors the
+    # torch-prefixed tensor repr, anything else its string form. Returns a string.
     if isinstance(value, str):
         # Quotes string and escapes special characters
         return ascii(value)
@@ -334,6 +375,12 @@ def value_to_literal(value):
         return str(value)
 
 def get_call(method_name, func_type, args, kwargs):
+    # [FUNCTION DOC]
+    # Builds the source text of a call expression. args is a list of already-rendered argument
+    # strings whose first item is the receiver; kwargs is a mapping rendered with value_to_literal.
+    # func_type selects the form: functional/function gives a call on torch, method gives a
+    # call on the first argument (dropped from the list), nn_functional gives a call on
+    # torch.nn.functional. Raises TypeError for any other type. Returns the string.
     kwargs_str = ', '.join([k + '=' + value_to_literal(v) for k, v in kwargs.items()])
     self_arg = args[0]
     if func_type == 'method':
@@ -355,6 +402,9 @@ def get_call(method_name, func_type, args, kwargs):
     return call
 
 def get_constant(x):
+    # [FUNCTION DOC]
+    # Maps positive and negative infinity to the source text of the math module constants
+    # (so scripts can refer to them); any other value is returned unchanged.
     if x == inf:
         return 'math.inf'
     if x == -inf:
@@ -362,6 +412,11 @@ def get_constant(x):
     return x
 
 def get_script_args(args):
+    # [FUNCTION DOC]
+    # Splits call arguments for script generation. Tensors become named formal parameters
+    # (i0, i1, ...) and are collected as inputs; iterables of tensors become list-typed formals
+    # and inputs; strings and other values become inline literal text. Returns a tuple of
+    # (formals list, tensor inputs list, actuals list of expression strings).
     formals: list[str] = []
     tensors: list[torch.Tensor | list[torch.Tensor]] = []
     actuals: list[str] = []
@@ -385,6 +440,10 @@ def get_script_args(args):
 # create a script function from (name, func_type, output_process_fn),
 # and returns the compiled function and example inputs
 def gen_script_fn_and_args(method_name, func_type, *args, **kwargs):
+    # [FUNCTION DOC]
+    # Generates source text for a function named the_method that makes the requested call,
+    # compiles it with a TorchScript compilation unit and returns (compiled function, tensor
+    # inputs). Raises compilation errors from TorchScript or TypeError for a bad func_type.
     formals, tensors, actuals = get_script_args(args)
     call = get_call(method_name, func_type, actuals, kwargs)
     script = script_template.format(', '.join(formals), call)
@@ -394,9 +453,16 @@ def gen_script_fn_and_args(method_name, func_type, *args, **kwargs):
 # create a script function from (name, func_type),
 # returns a function takes in (args, kwargs) and runs the compiled function
 def create_script_fn(self, method_name, func_type):
+    # [FUNCTION DOC]
+    # Returns a callable that, for given arguments, scripts the named operator, checks that its
+    # graph survives export and import using the test case self, runs it and returns the
+    # output. After each call the callable stores the optimized graph in a last_graph attribute.
     # function returns tuple containing original output and
     # filtered output to be used in checking gradients
     def script_fn(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Generates and compiles the script for these arguments, asserts
+        # export/import round-trip, runs it on the tensor inputs, records last_graph on itself
+        # and returns the output.
         fn, tensors = gen_script_fn_and_args(method_name, func_type, *args, **kwargs)
         self.assertExportImport(fn.graph, tensors)
         output = fn(*tensors)
@@ -406,6 +472,12 @@ def create_script_fn(self, method_name, func_type):
     return script_fn
 
 class SplitInputs:
+    # [CLASS DOC]
+    # Partition of a call's positional and keyword arguments into tensor inputs (single
+    # tensors or iterables of tensors) and non-tensor ones. Attributes: tensor and non-tensor
+    # positional lists, tensor and non-tensor keyword mappings, per-argument type markers ('t'
+    # or 's') for positions and keywords, the original keyword order, and the flat list of all
+    # tensor inputs (positional first, then keyword values). Key method: nontensors_match.
     all_tensors: list[Any]
     tensor_args: list[Any]
     nontensor_args: list[Any]
@@ -417,9 +489,13 @@ class SplitInputs:
 
     @staticmethod
     def _is_tensor_input(arg):
+        # [FUNCTION DOC] HELPER: True if arg is a tensor or an iterable of tensors.
         return isinstance(arg, torch.Tensor) or is_iterable_of_tensors(arg)
 
     def __init__(self, args, kwargs):
+        # [FUNCTION DOC]
+        # Classifies each positional argument and keyword value as tensor or not and fills all
+        # the attributes described in the class comment. Does not mutate the inputs.
         self.arg_types = ['t' if self._is_tensor_input(arg) else 's' for arg in args]
         self.kwarg_types = {k: 't' if self._is_tensor_input(v) else 's' for k, v in kwargs.items()}
         self.tensor_args = [arg for arg in args if self._is_tensor_input(arg)]
@@ -430,6 +506,9 @@ class SplitInputs:
         self.kwarg_order = list(kwargs.keys())
 
     def nontensors_match(self, other: 'SplitInputs'):
+        # [FUNCTION DOC]
+        # Returns True only if the other split has identical argument type markers, keyword type
+        # markers, keyword order, non-tensor positional values and non-tensor keyword values.
         if self.arg_types != other.arg_types:
             return False
         if self.kwarg_types != other.kwarg_types:
@@ -446,9 +525,15 @@ class SplitInputs:
 # applied, and all tensor arguments remain.
 # used to trace functions when some arguments are not tensors
 def partial_apply_nontensors(fn, args, kwargs):
+    # [FUNCTION DOC]
+    # Splits args and kwargs into tensor and non-tensor parts and returns (new function,
+    # the split). The new function takes only the flat tensor inputs, in the order of the split's
+    # tensor list, re-interleaves them with the fixed non-tensor values and calls fn.
     inputs = SplitInputs(args, kwargs)
 
     def new_fn(*tensors_):
+        # [FUNCTION DOC] HELPER: Rebuilds the full positional and keyword arguments from the
+        # given tensors plus the captured non-tensors and calls fn with them.
         tensors = iter(tensors_)
         full_args = [args[i] if s == 's' else next(tensors) for i, s in enumerate(inputs.arg_types)]
         full_kwargs = {k: kwargs[k] if s == 's' else next(tensors) for k, s in inputs.kwarg_types.items()}
@@ -458,7 +543,15 @@ def partial_apply_nontensors(fn, args, kwargs):
 
 # create a trace function from input fn
 def create_traced_fn(self, fn, cache_traced_fn=False):
+    # [FUNCTION DOC]
+    # Returns a callable that traces fn with TorchScript (tensor inputs only; non-tensor
+    # arguments are fixed) and runs the traced module. With cache_traced_fn true, the first
+    # trace is stored on the callable and reused, with a test assertion that non-tensor inputs
+    # match those of the first call. Each call also records last_graph and graph attributes
+    # and asserts export/import using the test case self.
     def traced_fn(*inputs, **kwargs):
+        # [FUNCTION DOC] HELPER: Traces (or reuses the cached trace), runs it on the flat
+        # tensor inputs, stores graph attributes on itself and returns the output.
         # `check_trace` is set to False because check_trace is run with @no_grad
         # Also, `check_against_reference` already does all the checks
         # against python function
@@ -506,6 +599,12 @@ EXCLUDE_SCRIPT = {
 # generates a script function and set of example inputs
 # from a specified test in the format of nn_functional_tests
 def get_nn_functional_compiled_fn_and_inputs(name, self_size, args, variant_name='', *extra_args):
+    # [FUNCTION DOC]
+    # From an nn.functional test specification, builds random input tensors (self input from
+    # self_size, other args from args) and compiles a script calling the named function in
+    # torch.nn.functional with emit hooks disabled. Returns (compiled function, tensor inputs).
+    # KNOWN ISSUE: the test name built from name and variant_name, the detached tensor copies
+    # and extra_args are never used.
     test_name = 'test_nn_' + name
 
     if variant_name != '':
@@ -549,7 +648,16 @@ def forward({}):
 '''
 
 def create_script_module(self, nn_module, constructor_args, *args, **kwargs):
+    # [FUNCTION DOC]
+    # Returns a callable that wraps nn_module (constructed with constructor_args) in a script
+    # module whose forward calls the submodule with the given arguments, then returns that
+    # module. If self (a test case) is truthy, also asserts export/import of the module and
+    # runs it once. Records the module graph in create_script_module.last_graph (global state).
     def script_module(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Generates the forward source from the arguments, defines a
+        # ScriptModule holding the submodule (optionally as a constant when the is_constant
+        # keyword is set), checks its repr, defines the script, optionally validates, stores the
+        # graph and returns the module.
         _formals, tensors, actuals = get_script_args(args)
 
         method_args = ', '.join(['self'] + actuals)
@@ -563,13 +671,18 @@ def create_script_module(self, nn_module, constructor_args, *args, **kwargs):
 
         # Create module to use the script method
         class TheModule(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module holding one attribute, submodule, an instance of
+            # nn_module built from constructor_args; its forward is defined dynamically.
             __constants__ = submodule_constants
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Constructs the wrapped nn module as the submodule.
                 super().__init__()
                 self.submodule = nn_module(*constructor_args)
 
         def make_module(script):
+            # [FUNCTION DOC] HELPER: Instantiates TheModule, checks its string form works,
+            # defines the forward method from the script source and returns the module.
             module = TheModule()
             # check __repr__
             str(module)
@@ -586,6 +699,10 @@ def create_script_module(self, nn_module, constructor_args, *args, **kwargs):
     return script_module
 
 def check_alias_annotation(method_name, args, kwargs, *, aten_name, func_type='method'):
+    # [FUNCTION DOC]
+    # Compiles a script calling the operator, inlines and constant-propagates its graph, then
+    # runs the JIT alias-annotation checker for aten_name on the tensor inputs. The checker
+    # raises if the declared aliasing disagrees with the observed behavior. Returns nothing.
     formals, tensors, actuals = get_script_args(args)
     call = get_call(method_name, func_type, actuals, kwargs)
     script = script_template.format(', '.join(formals), call)
@@ -596,6 +713,9 @@ def check_alias_annotation(method_name, args, kwargs, *, aten_name, func_type='m
     torch._C._jit_check_alias_annotation(CU.the_method.graph, tuple(tensors), aten_name)
 
 def get_nn_module_name_from_kwargs(**kwargs):
+    # [FUNCTION DOC]
+    # Returns the module name from a test spec's keywords: module_name if present, else
+    # fullname, else the name of the constructor. Returns None if none of them is given.
     if 'module_name' in kwargs:
         return kwargs['module_name']
     elif 'fullname' in kwargs:
@@ -604,6 +724,9 @@ def get_nn_module_name_from_kwargs(**kwargs):
         return kwargs['constructor'].__name__
 
 def get_nn_mod_test_name(**kwargs):
+    # [FUNCTION DOC]
+    # Builds the test name for a module spec: the prefix test_nn_ plus fullname if given,
+    # else the module name with an underscore and desc appended when desc is present.
     if 'fullname' in kwargs:
         test_name = kwargs['fullname']
     else:
@@ -613,6 +736,9 @@ def get_nn_mod_test_name(**kwargs):
     return f'test_nn_{test_name}'
 
 def get_nn_module_class_from_kwargs(**kwargs):
+    # [FUNCTION DOC]
+    # Returns the module class name: the module name from the keywords truncated at its first
+    # underscore, or the whole name if it has none.
     name = get_nn_module_name_from_kwargs(**kwargs)
     index = name.find("_")
     if index == -1:
@@ -621,6 +747,15 @@ def get_nn_module_class_from_kwargs(**kwargs):
         return name[0:name.find("_")]
 
 def try_get_nn_module_compiled_mod_and_inputs(*args, **kwargs):
+    # [FUNCTION DOC]
+    # From an nn module test spec given as keywords, builds a scripted module and its inputs.
+    # Returns None (skips) for eval variants, excluded test names and functional modules.
+    # Otherwise resolves the module class (constructor or torch.nn attribute), constructor
+    # args, input tensors (double, or complex double if all complex), extra and target
+    # arguments, then returns (scripted module output of create_script_module applied to the
+    # inputs, deep copy of the inputs).
+    # KNOWN ISSUE: the first test name computed from name and desc is immediately overwritten
+    # by the call to get_nn_mod_test_name; the tensor check on a tuple of inputs is dead code.
     name = get_nn_module_name_from_kwargs(**kwargs)
 
     if 'desc' in kwargs and 'eval' in kwargs['desc']:
@@ -683,6 +818,10 @@ def try_get_nn_module_compiled_mod_and_inputs(*args, **kwargs):
 
 
 def get_all_nn_module_tests():
+    # [FUNCTION DOC]
+    # Returns the concatenated list of module test specs: the shared module tests, the newly
+    # generated module tests and a short extra list (Bilinear, RNN/LSTM/GRU cells,
+    # MultiheadAttention, Transformer) defined here. Creates random tensors for extras.
     # additional modules test
     # TODO: delete this list once we make all nn_tests work
     additional_module_tests = [

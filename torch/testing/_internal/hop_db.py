@@ -1,5 +1,15 @@
 # mypy: ignore-errors
 
+# [MODULE DOC]
+# Database of OpInfo entries (hop_db) that describe higher-order operators (scan, map, cond,
+# switch, invoke_subgraph, invoke_quant, while_loop, auto_functionalize, flex_attention and
+# its backward, flex_gemm, local_map_hop, register_hook, inline_asm_elementwise) so that
+# generic OpInfo-based tests can exercise them. Each entry pairs a simple wrapper function
+# ("simple_*") with a sample-input generator ("sample_inputs_*"). Also holds an allowlist of
+# higher-order ops that have no OpInfo yet. Import-time side effects: defines and registers
+# the custom operator testlib::mutating_custom_op (with cpu, cuda, xpu and fake
+# implementations) in the global operator library, and creates a module-level InvokeQuant.
+
 import functools
 
 import torch
@@ -23,6 +33,10 @@ from torch._higher_order_ops.register_hook import register_hook_op
 
 
 def sample_inputs_map(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of sample inputs for map. Yields one SampleInput whose mapped input is a list
+    # of two 2x2x2 tensors, with two single-element tensors as extra arguments. Values lie in
+    # [0.1, 2]; requires_grad is forwarded. opinfo and kwargs are unused.
     make_arg = functools.partial(
         make_tensor, device=device, dtype=dtype, requires_grad=requires_grad
     )
@@ -33,19 +47,32 @@ def sample_inputs_map(opinfo, device, dtype, requires_grad, **kwargs):
 
 
 def inner_f(x, y0, y1):
+    # [FUNCTION DOC] HELPER: Body shared by the map tests. Takes a two-element list x and
+    # extras y0, y1; returns a list of two tensors: cosine of x[0] plus one times y0, and the
+    # cosine (computed in place) of x[1] plus sine of y1, viewed back to the shape of x[1].
+    # Uses in-place operations on temporaries only.
     return [x[0].cos().add_(1.0) * y0, (x[1] + y1.sin()).cos_().view(x[1].size())]
 
 
 def simple_map(xs, y0, y1):
+    # [FUNCTION DOC]
+    # Applies the map higher-order op once over xs with inner_f as the body, passing y0 and
+    # y1 as extra arguments. Returns the stacked results.
     def f(x, y0, y1):
+        # [FUNCTION DOC] HELPER: Map body; delegates to inner_f.
         return inner_f(x, y0, y1)
 
     return map(f, xs, y0, y1)
 
 
 def nested_map(xs, y0, y1):
+    # [FUNCTION DOC]
+    # Applies map twice nested: the outer body maps an inner body (inner_f) over its input.
+    # Returns the result of the outer map.
     def f1(xx, y0, y1):
+        # [FUNCTION DOC] HELPER: Outer map body; maps f2 over xx and returns the result.
         def f2(x, y0, y1):
+            # [FUNCTION DOC] HELPER: Inner map body; delegates to inner_f.
             return inner_f(x, y0, y1)
 
         return map(f2, xx, y0, y1)
@@ -54,9 +81,15 @@ def nested_map(xs, y0, y1):
 
 
 def triple_nested_map(xs, y0, y1):
+    # [FUNCTION DOC]
+    # Applies map three levels deep (f0 maps f1, which maps f2, which calls inner_f).
+    # Returns the result of the outermost map.
     def f0(xs, y0, y1):
+        # [FUNCTION DOC] HELPER: Outermost map body; maps f1 over its input.
         def f1(xx, y0, y1):
+            # [FUNCTION DOC] HELPER: Middle map body; maps f2 over its input.
             def f2(x, y0, y1):
+                # [FUNCTION DOC] HELPER: Innermost map body; delegates to inner_f.
                 return inner_f(x, y0, y1)
 
             return map(f2, xx, y0, y1)
@@ -67,6 +100,9 @@ def triple_nested_map(xs, y0, y1):
 
 
 def cuda_only_dtypes(*dtypes):
+    # [FUNCTION DOC] HELPER: Builds OpInfo dtype keyword arguments that enable the given
+    # dtypes only on CUDA. Returns a mapping with empty default and XPU dtype sets and the
+    # given dtypes for CUDA.
     return {
         "dtypes": empty_types(),
         "dtypesIfCUDA": custom_types(*dtypes),
@@ -135,6 +171,8 @@ torch.library.define(
 
 @torch.library.impl("testlib::mutating_custom_op", "cpu")
 def foo_impl_cpu(x, z):
+    # [FUNCTION DOC] HELPER: CPU kernel of testlib::mutating_custom_op. Adds 5 to x and z in
+    # place (mutating the inputs), then returns clones of x and z and their sum.
     x.add_(5)
     z.add_(5)
     return x.clone(), z.clone(), x + z
@@ -142,6 +180,8 @@ def foo_impl_cpu(x, z):
 
 @torch.library.impl("testlib::mutating_custom_op", "cuda")
 def foo_impl_cuda(x, z):
+    # [FUNCTION DOC] HELPER: CUDA kernel of testlib::mutating_custom_op; same behavior as the
+    # CPU one (mutates x and z by adding 5, returns clones and their sum).
     x.add_(5)
     z.add_(5)
     return x.clone(), z.clone(), x + z
@@ -149,6 +189,8 @@ def foo_impl_cuda(x, z):
 
 @torch.library.impl("testlib::mutating_custom_op", "xpu")
 def foo_impl_xpu(x, z):
+    # [FUNCTION DOC] HELPER: XPU kernel of testlib::mutating_custom_op; same behavior as the
+    # CPU one (mutates x and z by adding 5, returns clones and their sum).
     x.add_(5)
     z.add_(5)
     return x.clone(), z.clone(), x + z
@@ -156,10 +198,16 @@ def foo_impl_xpu(x, z):
 
 @torch.library.register_fake("testlib::mutating_custom_op")
 def foo_impl_abstract(x, z):
+    # [FUNCTION DOC] HELPER: Fake (shape/dtype propagation) implementation of
+    # testlib::mutating_custom_op. Returns clones of x and z and their sum without adding 5.
+    # KNOWN ISSUE: it does not perform the in-place mutation that the real kernels do.
     return x.clone(), z.clone(), x + z
 
 
 def sample_inputs_cond(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of sample inputs for cond. Yields one SampleInput holding a single 2x2x2
+    # tensor with values in [0.1, 2]. requires_grad is forwarded.
     make_arg = functools.partial(
         make_tensor, device=device, dtype=dtype, requires_grad=requires_grad
     )
@@ -167,10 +215,16 @@ def sample_inputs_cond(opinfo, device, dtype, requires_grad, **kwargs):
 
 
 def simple_cond(x):
+    # [FUNCTION DOC]
+    # Calls cond with the predicate "sum of x greater than 2"; the true branch returns a
+    # one-tuple with cosine of x and the false branch a one-tuple with sine of x.
     return torch.cond(x.sum() > 2, lambda x: (x.cos(),), lambda x: (x.sin(),), [x])
 
 
 def sample_inputs_switch(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of sample inputs for switch. Yields one SampleInput holding a single 2x2x2
+    # tensor with values in [0.1, 2]. requires_grad is forwarded.
     make_arg = functools.partial(
         make_tensor, device=device, dtype=dtype, requires_grad=requires_grad
     )
@@ -178,6 +232,11 @@ def sample_inputs_switch(opinfo, device, dtype, requires_grad, **kwargs):
 
 
 def simple_switch(x):
+    # [FUNCTION DOC]
+    # Calls the switch higher-order op (imported lazily) with a tensor index derived from the
+    # predicate "sum of x greater than 2" cast to integer (so 0 or 1), and three branches
+    # returning one-tuples of cosine, sine and absolute value of x. Only indices 0 and 1 are
+    # reachable, so the third branch is never selected.
     # Tensor index so the HOP is actually captured (Python-constant indices
     # would specialize away in dynamo).
     from torch._higher_order_ops.switch import switch
@@ -191,6 +250,10 @@ def simple_switch(x):
 
 
 def sample_inputs_invoke_subgraph(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of sample inputs for invoke_subgraph (also reused for invoke_quant). Yields one
+    # SampleInput holding a single 2x2x2 tensor with values in [0.1, 2]. requires_grad is
+    # forwarded.
     make_arg = functools.partial(
         make_tensor, device=device, dtype=dtype, requires_grad=requires_grad
     )
@@ -199,14 +262,21 @@ def sample_inputs_invoke_subgraph(opinfo, device, dtype, requires_grad, **kwargs
 
 @mark_compile_region
 def fn_for_invoke_subgraph(x):
+    # [FUNCTION DOC] HELPER: Region marked for compilation as a subgraph; returns sine of x.
     return torch.sin(x)
 
 
 def simple_invoke_subgraph(x):
+    # [FUNCTION DOC]
+    # Calls the compile-region-marked function so it runs as an invoke_subgraph op; returns
+    # sine of x.
     return fn_for_invoke_subgraph(x)
 
 
 def sample_inputs_auto_functionalize(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of sample inputs for the mutating custom op. Yields one SampleInput with two
+    # 2x2x2 tensors (values in [0.1, 2], never requiring grad, regardless of requires_grad).
     make_arg = functools.partial(
         make_tensor, device=device, dtype=dtype, requires_grad=False
     )
@@ -216,15 +286,23 @@ def sample_inputs_auto_functionalize(opinfo, device, dtype, requires_grad, **kwa
 
 
 def simple_auto_functionalize(x, z):
+    # [FUNCTION DOC]
+    # Calls testlib::mutating_custom_op, which mutates x and z in place; returns its three
+    # outputs.
     return torch.ops.testlib.mutating_custom_op(x, z)
 
 
 def sample_inputs_flex_attention(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of sample inputs for flex_attention. Yields one SampleInput with query, key
+    # and value tensors of shape 2x2x128x8, a score modification function and an empty block
+    # mask built from query and key. requires_grad is forwarded.
     make_arg = functools.partial(
         make_tensor, device=device, dtype=dtype, requires_grad=requires_grad
     )
 
     def score_mod(score, b, h, m, n):
+        # [FUNCTION DOC] HELPER: Score modification adding the head index to each score.
         return score + h
 
     q, k, v = (make_arg(2, 2, 128, 8, low=0.1, high=2) for _ in range(3))
@@ -235,14 +313,22 @@ def sample_inputs_flex_attention(opinfo, device, dtype, requires_grad, **kwargs)
 def sample_inputs_flex_attention_backward(
     opinfo, device, dtype, requires_grad, **kwargs
 ):
+    # [FUNCTION DOC]
+    # Generator of sample inputs for the flex_attention backward op. Builds query, key and
+    # value tensors (2x2x128x16, no grad), a causal block mask, runs the forward HOP to get
+    # output and logsumexp, and yields one SampleInput with query plus the remaining backward
+    # arguments (key, value, detached outputs, a random output gradient, no logsumexp
+    # gradient, score mod, block mask tuple, scale, empty options and buffers).
     make_arg = functools.partial(
         make_tensor, device=device, dtype=dtype, requires_grad=False
     )
 
     def score_mod(score, b, h, m, n):
+        # [FUNCTION DOC] HELPER: Identity score modification.
         return score
 
     def mask_mod(b, h, m, n):
+        # [FUNCTION DOC] HELPER: Causal mask; true where query index is at least key index.
         return m >= n
 
     q, k, v = (make_arg(2, 2, 128, 16, low=0.1, high=2) for _ in range(3))
@@ -264,15 +350,21 @@ def sample_inputs_flex_attention_backward(
 def sample_inputs_flex_attention_backward_explicit_buffers(
     opinfo, device, dtype, requires_grad, **kwargs
 ):
+    # [FUNCTION DOC]
+    # Like sample_inputs_flex_attention_backward, but the mask function closes over a scalar
+    # int32 tensor (mask_offset, value 128) so the block mask carries an explicit buffer.
+    # Yields one SampleInput with the same argument layout.
     make_arg = functools.partial(
         make_tensor, device=device, dtype=dtype, requires_grad=False
     )
     mask_offset = torch.full((), 128, device=device, dtype=torch.int32)
 
     def score_mod(score, b, h, m, n):
+        # [FUNCTION DOC] HELPER: Identity score modification.
         return score
 
     def mask_mod(b, h, m, n):
+        # [FUNCTION DOC] HELPER: Mask comparing query index plus the captured offset to key index.
         return m + mask_offset >= n
 
     q, k, v = (make_arg(2, 2, 128, 16, low=0.1, high=2) for _ in range(3))
@@ -307,6 +399,9 @@ def simple_flex_attention_backward(
     score_mod_other_buffers,
     mask_mod_other_buffers,
 ):
+    # [FUNCTION DOC]
+    # Thin wrapper that forwards all its arguments, in order, to the flex_attention_backward
+    # higher-order op and returns its result (gradients for query, key, value and buffers).
     return torch.ops.higher_order.flex_attention_backward(
         query,
         key,
@@ -326,6 +421,9 @@ def simple_flex_attention_backward(
 
 
 def sample_inputs_flex_gemm(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of sample inputs for flex_gemm. Yields one SampleInput with a 2x3 and a 3x4
+    # matrix (values in [0.1, 2], no grad).
     make_arg = functools.partial(
         make_tensor, device=device, dtype=dtype, requires_grad=False
     )
@@ -333,13 +431,20 @@ def sample_inputs_flex_gemm(opinfo, device, dtype, requires_grad, **kwargs):
 
 
 def simple_flex_gemm(a, b):
+    # [FUNCTION DOC]
+    # Runs flex_gemm with matrix multiply on a and b and an epilogue that adds one to the
+    # accumulator and applies ReLU. Returns the result.
     def epilogue_fn(acc):
+        # [FUNCTION DOC] HELPER: Epilogue; returns the accumulator plus one, passed through ReLU.
         return (acc + 1).relu()
 
     return flex_gemm(torch.mm, (a, b), epilogue_fn)
 
 
 def sample_inputs_while_loop(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of sample inputs for while_loop variants. Yields one SampleInput with a scalar
+    # counter tensor of value 3 and a 2x3x4 tensor with values in [0.1, 2] (no grad).
     make_arg = functools.partial(
         make_tensor, device=device, dtype=dtype, requires_grad=False
     )
@@ -350,20 +455,30 @@ def sample_inputs_while_loop(opinfo, device, dtype, requires_grad, **kwargs):
 
 
 def simple_while_loop(iter_t, x):
+    # [FUNCTION DOC]
+    # Runs the while_loop higher-order op: while the counter is positive, decrement it and
+    # replace x by its cosine. Returns the final counter and tensor.
     def cond_fn(iter_t, x):
+        # [FUNCTION DOC] HELPER: Loop condition; true while the counter is greater than zero.
         return iter_t > 0
 
     def body_fn(iter_t, x):
+        # [FUNCTION DOC] HELPER: Loop body; returns the decremented counter and cosine of x.
         return iter_t - 1, x.cos()
 
     return torch._higher_order_ops.while_loop(cond_fn, body_fn, (iter_t, x))
 
 
 def simple_while_loop_stack_output(iter_t, x):
+    # [FUNCTION DOC]
+    # Same loop as simple_while_loop but through while_loop_stack_output with no extra
+    # arguments; per-iteration outputs are stacked by the op. Returns its results.
     def cond_fn(iter_t, x):
+        # [FUNCTION DOC] HELPER: Loop condition; true while the counter is greater than zero.
         return iter_t > 0
 
     def body_fn(iter_t, x):
+        # [FUNCTION DOC] HELPER: Loop body; returns the decremented counter and cosine of x.
         return iter_t - 1, x.cos()
 
     return torch._higher_order_ops.while_loop_stack_output(
@@ -372,6 +487,9 @@ def simple_while_loop_stack_output(iter_t, x):
 
 
 def sample_inputs_local_map_hop(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of sample inputs for local_map_hop. Yields one SampleInput with two 2x3x4
+    # plain tensors (values in [0.1, 2], no grad).
     # TODO: once HOPs support DTensor inputs, we should also test DTensors
     make_arg = functools.partial(
         make_tensor, device=device, dtype=dtype, requires_grad=False
@@ -383,7 +501,13 @@ def sample_inputs_local_map_hop(opinfo, device, dtype, requires_grad, **kwargs):
 
 
 def simple_local_map_hop(inp1, inp2):
+    # [FUNCTION DOC]
+    # Symbolically traces a body (cosine of inp1 plus sine of inp2) into a graph module,
+    # attaches replicate placements for inputs and outputs in its metadata, and calls the
+    # local_map higher-order op on it. Raises an error if torch.distributed is unavailable.
+    # Returns the op's result.
     def body_gm(inp1, inp2):
+        # [FUNCTION DOC] HELPER: Traced body; returns cosine of inp1 plus sine of inp2.
         return inp1.cos() + inp2.sin()
 
     gm = torch.fx.symbolic_trace(body_gm)
@@ -402,6 +526,10 @@ def simple_local_map_hop(inp1, inp2):
 
 
 def sample_inputs_scan(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of sample inputs for scan. Yields one SampleInput with an initial carry of
+    # shape 2x2 and a sequence tensor of shape 2x2x2, values in [0.1, 2]. requires_grad is
+    # forwarded.
     make_arg = functools.partial(
         make_tensor, device=device, dtype=dtype, requires_grad=requires_grad
     )
@@ -412,7 +540,11 @@ def sample_inputs_scan(opinfo, device, dtype, requires_grad, **kwargs):
 
 
 def simple_scan(init, xs):
+    # [FUNCTION DOC]
+    # Runs the scan higher-order op over xs starting from init. Each step computes a new carry
+    # as matrix product of carry and the slice plus the slice, and emits a copy of the old carry.
     def combine_fn(carry, x):
+        # [FUNCTION DOC] HELPER: Scan step; returns the new carry and a clone of the old one.
         result = carry @ x + x
         return result, carry.clone()
 
@@ -423,20 +555,31 @@ quant_tracer = InvokeQuant()
 
 
 def simple_invoke_quant(x):
+    # [FUNCTION DOC]
+    # Calls the module-level InvokeQuant tracer on a body that multiplies sine of x by y,
+    # passing x twice; returns the first output scaled by 2.
     def fn(x, y):
+        # [FUNCTION DOC] HELPER: Body returning a one-tuple with sine of x times y.
         return (torch.sin(x) * y,)
 
     return quant_tracer(fn, x, x)[0] * 2.0
 
 
 def simple_invoke_quant_packed(x):
+    # [FUNCTION DOC]
+    # Calls invoke_quant_packed on a body returning a one-tuple with sine of x; returns the
+    # first output scaled by 2.
     def fn(x):
+        # [FUNCTION DOC] HELPER: Body returning a one-tuple with sine of x.
         return (torch.sin(x),)
 
     return invoke_quant_packed(fn, x)[0] * 2.0
 
 
 def sample_inputs_register_hook(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of sample inputs for register_hook. Yields one SampleInput with a 2x2x2 tensor
+    # (values in [0.1, 2]) that always requires grad, regardless of the requires_grad argument.
     make_arg = functools.partial(
         make_tensor, device=device, dtype=dtype, requires_grad=True
     )
@@ -444,13 +587,20 @@ def sample_inputs_register_hook(opinfo, device, dtype, requires_grad, **kwargs):
 
 
 def simple_register_hook(x):
+    # [FUNCTION DOC]
+    # Applies the register_hook op to x with a hook that doubles the gradient. Returns the op's
+    # result.
     def hook(grad):
+        # [FUNCTION DOC] HELPER: Gradient hook; returns the gradient times two.
         return grad * 2
 
     return register_hook_op(x, hook)
 
 
 def sample_inputs_inline_asm(opinfo, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC]
+    # Generator of sample inputs for inline_asm_elementwise. Yields one SampleInput with a
+    # 2x2x2 tensor with values in [0.1, 2]. requires_grad is forwarded.
     make_arg = functools.partial(
         make_tensor, device=device, dtype=dtype, requires_grad=requires_grad
     )
@@ -458,6 +608,10 @@ def sample_inputs_inline_asm(opinfo, device, dtype, requires_grad, **kwargs):
 
 
 def simple_inline_asm(x):
+    # [FUNCTION DOC]
+    # Applies inline_asm_elementwise to x with a register-move assembly string, using the AMD
+    # syntax when running on HIP and the NVIDIA PTX syntax otherwise; output dtype float32.
+    # Returns the result.
     if torch.version.hip:
         return inline_asm_elementwise(
             x,

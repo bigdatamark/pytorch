@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Third fake config module for config tests. Defines list, set and optional callable values
+# to test handling of non-scalar entries. Calls install_config_module on itself at import.
+
 import sys
 from typing import Callable  # noqa: UP035
 

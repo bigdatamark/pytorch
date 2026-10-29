@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Second fake config module for config tests. Defines the target of an alias used by
+# fake_config_module and entries with multiple environment variable names for default and
+# force overrides. Calls install_config_module on itself at import.
+
 import sys
 
 from torch.utils._config_module import Config, install_config_module

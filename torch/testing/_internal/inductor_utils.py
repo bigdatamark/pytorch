@@ -1,5 +1,14 @@
 # mypy: ignore-errors
 
+# [MODULE DOC]
+# Helpers for Inductor tests: feature-detection flags (HAS_CPU, HAS_TRITON, HAS_PALLAS,
+# HAS_HELION, HAS_GPU, GPU_TYPE, RUN_CPU, RUN_GPU, RUN_TPU, IS_A100, IS_H100, IS_BIG_GPU,
+# many of them lazily evaluated), skip decorators (requires_gpu, requires_triton,
+# skipCUDAIf and similar), float8 quantization helpers, a mock graph handler, and context
+# managers to patch the Inductor backend registration or add a custom fallback pass.
+# Import-time side effects: probes for Triton, GPUs and device test bases, may import triton,
+# and creates the module logger.
+
 import contextlib
 import functools
 import logging
@@ -41,6 +50,9 @@ log: logging.Logger = logging.getLogger(__name__)
 
 
 def test_cpu():
+    # [FUNCTION DOC] HELPER: Detects whether a C++ compiler works for Inductor by loading an
+    # empty C++ code cache entry. Returns True on success and False if the compile or
+    # compiler lookup raises a process, OS, invalid-compiler or compile error. May compile.
     try:
         from torch._inductor.codecache import CppCodeCache
 
@@ -118,6 +130,9 @@ def _check_has_dynamic_shape(
     self: TestCase,
     code,
 ):
+    # [FUNCTION DOC] HELPER: Test assertion on generated C++ source text. Scans lines for a
+    # for loop, and for one whose header has a symbolic size variable (name containing ks)
+    # between semicolons. Fails the test via assertTrue if no dynamic loop or no loop is found.
     for_loop_found = False
     has_dynamic = False
     lines = code.split("\n")
@@ -134,11 +149,20 @@ def _check_has_dynamic_shape(
 
 
 def skipDeviceIf(cond, msg, *, device):
+    # [FUNCTION DOC]
+    # Builds a test-method decorator that skips the test when cond is true and the test
+    # instance's device attribute equals the given device string (raising SkipTest with msg).
+    # If cond is false the decorator returns the function unchanged. Returns the decorator.
     if cond:
 
         def decorate_fn(fn):
+            # [FUNCTION DOC] HELPER: Wraps fn so the device check happens at call time.
             @functools.wraps(fn)
             def inner(self, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: Logs a warning if the test instance has no device
+                # attribute, skips when the device matches, else calls the wrapped test.
+                # KNOWN ISSUE: after warning about a missing device attribute it still reads
+                # self.device, which raises AttributeError.
                 if not hasattr(self, "device"):
                     warn_msg = (
                         "Expect the test class to have attribute device but not found. "
@@ -155,12 +179,18 @@ def skipDeviceIf(cond, msg, *, device):
     else:
 
         def decorate_fn(fn):
+            # [FUNCTION DOC] HELPER: No-op decorator; returns fn unchanged.
             return fn
 
     return decorate_fn
 
 
 def skip_windows_ci(name: str, file: str) -> None:
+    # [FUNCTION DOC]
+    # On Windows CI only: writes a message to stderr naming the test module, then exits the
+    # process with status 0 if name is the main module, else raises SkipTest. No-op elsewhere.
+    # KNOWN ISSUE: the module name is computed by stripping any of the characters '.', 'p', 'y'
+    # from both ends of the basename, not by removing the .py suffix, so names are mangled.
     if IS_WINDOWS and IS_CI:
         module = os.path.basename(file).strip(".py")
         sys.stderr.write(
@@ -180,7 +210,12 @@ requires_helion = functools.partial(unittest.skipIf, not HAS_HELION, "requires h
 
 
 def requires_gpu_with_enough_memory(min_mem_required):
+    # [FUNCTION DOC]
+    # Builds a decorator that skips the decorated test unless an XPU or CUDA device with at
+    # least min_mem_required bytes of memory is available. Returns the decorator.
     def inner(fn):
+        # [FUNCTION DOC] HELPER: Queries total memory of the current XPU (preferred) or CUDA
+        # device at decoration time and returns either a skipped version of fn or fn itself.
         total_memory = sys.maxsize
         if torch.xpu.is_available():
             total_memory = torch.xpu.get_device_properties().total_memory
@@ -211,6 +246,10 @@ IS_BIG_GPU = LazyVal(lambda: HAS_GPU_AND_TRITON and is_big_gpu())
 
 
 def dummy_graph():
+    # [FUNCTION DOC]
+    # Builds a GraphLowering from a fake-traced addition of two random tensors with a shape
+    # environment derived from the example inputs. Returns the graph object, for tests that
+    # need a graph to access size variables. Side effects: none beyond random tensor creation.
     """
     Create a graph. This is useful for unit testing code which accesses
     V.graph.sizevars.
@@ -231,6 +270,10 @@ def dummy_graph():
 
 
 def maybe_skip_size_asserts(op):
+    # [FUNCTION DOC]
+    # Returns a context manager. For FFT and a few linalg ops whose meta and eager strides
+    # differ, and when the TORCHINDUCTOR_SIZE_ASSERTS environment variable is unset, it is the
+    # Inductor config patch disabling size asserts; otherwise a null context.
     """
     For certain ops, there meta and eager implementation returns different
     strides. This cause size/strides assert fail. Skip adding those
@@ -268,6 +311,9 @@ def maybe_skip_size_asserts(op):
 
 
 def get_func_call() -> str:
+    # [FUNCTION DOC]
+    # Returns the text that begins the generated entry function: the C++ entry signature
+    # when cpp_wrapper is enabled in the Inductor config, else the Python call definition.
     return (
         "void inductor_entry_impl("
         if torch._inductor.config.cpp_wrapper
@@ -276,10 +322,18 @@ def get_func_call() -> str:
 
 
 def get_kernel_launch() -> str:
+    # [FUNCTION DOC]
+    # Returns the text that identifies a kernel launch in generated code: the C++ triton call
+    # prefix when cpp_wrapper is enabled, else the Python run call.
     return "call_triton_" if torch._inductor.config.cpp_wrapper else ".run("
 
 
 def clone_preserve_strides_offset(x, device=None):
+    # [FUNCTION DOC]
+    # Copies a tensor while preserving its sizes, strides and storage offset (including
+    # unused storage outside the view). Non-tensors are returned unchanged. The whole underlying
+    # storage is viewed flat, cloned (or copied to device if given), and re-viewed with the
+    # original geometry. Returns the new tensor.
     if not isinstance(x, torch.Tensor):
         return x
     buffer = torch.as_strided(
@@ -306,6 +360,9 @@ Tensor = torch.Tensor
 
 
 def _to_fp8_saturated(x: Tensor, float8_dtype: torch.dtype) -> Tensor:
+    # [FUNCTION DOC] HELPER: Clamps x to the representable range of the given float8 dtype
+    # (e4m3fn, e5m2, e4m3fnuz or e5m2fnuz) then casts to it, i.e. saturating instead of
+    # overflowing. Raises TypeError for any other dtype.
     # The default behavior in PyTorch for casting to `float8_e4m3fn`
     # and `e5m2` is to not saturate. In this context, we should saturate.
     # A common case where we want to saturate is when the history of a
@@ -329,6 +386,10 @@ def _to_fp8_saturated(x: Tensor, float8_dtype: torch.dtype) -> Tensor:
 def _amax_to_scale(
     amax: torch.Tensor, float8_dtype: torch.dtype, orig_dtype: torch.dtype
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Converts absolute-max values to float8 scales (max representable
+    # value divided by amax floored at a tiny epsilon), in float32; e4m3fn uses its maximum,
+    # every other dtype uses the e5m2 maximum. For float16 originals the scale is capped at the
+    # float16 maximum. Runs without gradient tracking.
     # To make scale dtype to be fp32 for accuracy
     amax = amax.float()
     if float8_dtype == torch.float8_e4m3fn:
@@ -345,6 +406,8 @@ def _amax_to_scale(
 
 
 def _quantize_tensorwise(x: Tensor, float8_dtype: torch.dtype):
+    # [FUNCTION DOC] HELPER: Quantizes x to float8 with one scale for the whole tensor.
+    # Returns the saturated float8 tensor and the reciprocal scale.
     amax = torch.max(torch.abs(x))
     scale = _amax_to_scale(amax, float8_dtype, x.dtype)
     x_fp8 = _to_fp8_saturated(x * scale, float8_dtype)
@@ -353,6 +416,8 @@ def _quantize_tensorwise(x: Tensor, float8_dtype: torch.dtype):
 
 
 def _quantize_rowwise(x: Tensor, float8_dtype: torch.dtype):
+    # [FUNCTION DOC] HELPER: Quantizes a 2D tensor to float8 with one scale per row (amax
+    # along dim 1, kept as a column). Returns the float8 tensor and the reciprocal scales.
     amax = torch.max(torch.abs(x), dim=1, keepdim=True).values
     scale = _amax_to_scale(amax, float8_dtype, x.dtype)
     x_fp8 = _to_fp8_saturated(x * scale, float8_dtype)
@@ -363,6 +428,10 @@ def _quantize_rowwise(x: Tensor, float8_dtype: torch.dtype):
 def _quantize_blockwise(
     x: Tensor, float8_dtype: torch.dtype, block_outer: int, block_inner: int
 ):
+    # [FUNCTION DOC] HELPER: Quantizes a 2D tensor to float8 with one scale per block of
+    # (block_outer x block_inner) elements (block sizes capped at the tensor dims). Scales are
+    # expanded back to element granularity for the division. Returns the float8 tensor
+    # and the per-block reciprocal scales.
     min_outer = min(block_outer, x.shape[0])
     min_inner = min(block_inner, x.shape[1])
     x = x.unflatten(1, (-1, min_inner)).unflatten(0, (-1, min_outer))
@@ -382,9 +451,15 @@ def _quantize_blockwise(
 
 
 class MockGraphHandler:
+    # [CLASS DOC] HELPER: Minimal stand-in for a graph lowering object, to install as the
+    # virtualized graph in tests. State: a size-variable allocator, a mapping from buffer name
+    # to buffer, and empty containers for graph inputs, mutated and removed buffers, constants,
+    # plus a scheduler of None. Provides buffer lookup and a fixed float32 dtype.
     """Minimal mock graph handler for testing virtualized context."""
 
     def __init__(self, name_to_buffer=None):
+        # [FUNCTION DOC] HELPER: Creates a fresh size-variable allocator and stores the
+        # optional buffer mapping (empty mapping if not given) and empty bookkeeping containers.
         import torch._inductor.sizevars
 
         self.sizevars = torch._inductor.sizevars.SizeVarAllocator()
@@ -396,17 +471,24 @@ class MockGraphHandler:
         self.scheduler = None
 
     def try_get_buffer(self, buffer_name: str):
+        # [FUNCTION DOC] HELPER: Returns the buffer registered under the name, or None.
         return self.name_to_buffer.get(buffer_name)
 
     def get_buffer(self, buffer_name: str):
+        # [FUNCTION DOC] HELPER: Returns the buffer registered under the name; raises KeyError
+        # if absent.
         return self.name_to_buffer[buffer_name]
 
     def get_dtype(self, buffer_name: str) -> torch.dtype:
+        # [FUNCTION DOC] HELPER: Ignores the name and always returns float32.
         """Return default dtype for any buffer (for testing)."""
         return torch.float32
 
 
 def has_cpp_wrapper_for_device(device: str) -> bool:
+    # [FUNCTION DOC]
+    # Initializes Inductor backend registration (global side effect) and returns whether a C++
+    # wrapper code generator is registered for the given device string.
     from torch._inductor.codegen.common import (
         get_wrapper_codegen_for_device,
         init_backend_registration,
@@ -423,6 +505,12 @@ def patch_inductor_backend(
     custom_pass=None,
     custom_backend_config: ConfigModule = None,
 ):
+    # [FUNCTION DOC]
+    # Context manager that temporarily re-registers the Inductor backend of a device with an
+    # overridden Python wrapper code generator, custom graph pass and/or custom backend config
+    # (each falls back to the existing registration when None), keeping the scheduling and the
+    # C++ and FX wrappers. The original registration is restored on exit, even on error.
+    # Mutates the global backend registry.
     """
     Patch the inductor backend for a specific device.
     """
@@ -479,6 +567,10 @@ def patch_inductor_backend(
         )
 
 def patch_custom_fallback_pass(predicate: Callable[[torch.fx.Node], bool]) -> contextlib.ContextDecorator:
+    # [FUNCTION DOC]
+    # Returns a config patch (usable as a context manager or decorator) that installs a custom
+    # post-grad pre-pass which sets a should-fallback flag in the metadata of every graph node
+    # for which predicate returns true.
     """
     Create a custom pass which falls back based on the provided predicate. For example,
     we could provide a predicate which returns True for all aten.add.default nodes.
@@ -487,12 +579,17 @@ def patch_custom_fallback_pass(predicate: Callable[[torch.fx.Node], bool]) -> co
     from torch._inductor.custom_graph_pass import CustomGraphPass
 
     class Pass(CustomGraphPass):
+        # [CLASS DOC] HELPER: Custom graph pass that marks nodes selected by the enclosing
+        # predicate for fallback. Stateless; reports no cache uuid.
         def __call__(self, graph: torch.fx.Graph):
+            # [FUNCTION DOC] HELPER: Mutates the graph in place: sets the should-fallback
+            # metadata flag on each node where the predicate is true. Returns nothing.
             for node in graph.nodes:
                 if predicate(node):
                     node.meta["should_fallback"] = True
 
         def uuid(self):
+            # [FUNCTION DOC] HELPER: Returns None, meaning the pass is not cache-keyable.
             return None
 
 
