@@ -1,5 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for how DTensor sharding propagation handles ops that have no direct
+# sharding strategy and instead go through decompositions. Uses a fake process group
+# (world size 4) for placement-only checks, plus a real multi-process test class that
+# checks values and decomposition cache keys. Importing has no side effects.
 
 import torch
 import torch.distributed as dist
@@ -21,9 +25,14 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 
 
 class TestDecompSharding(TestCase):
+    # [CLASS DOC] Single-process tests running on a fake process group of world_size (4)
+    # ranks, rank 0. They only inspect output placements (no real communication) of ops
+    # whose sharding is derived via decomposition or fallback rules.
     world_size = 4
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Initializes a "fake" backend process group with a FakeStore
+        # for rank 0 and world_size ranks (global state, undone in tearDown).
         super().setUp()
         fake_store = FakeStore()
         dist.init_process_group(
@@ -31,10 +40,14 @@ class TestDecompSharding(TestCase):
         )
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Destroys the default process group created in setUp.
         super().tearDown()
         dist.destroy_process_group()
 
     def test_aminmax_decomp(self):
+        # [FUNCTION DOC] Checks aminmax on DTensors: result min/max get Partial("min") and
+        # Partial("max") placements on a 1d mesh (input Shard(0)), and on a 2d mesh (input
+        # Shard(1) plus Partial min) each mesh dim yields the matching Partial reduce op.
         """
         def decomp(x):
             amin = aten.amin.default(x)
@@ -61,6 +74,11 @@ class TestDecompSharding(TestCase):
         self.assertEqual(out.max.placements, (Partial("max"), Partial("max")))
 
     def test_custom_recursive_decomp(self):
+        # [FUNCTION DOC] Defines two custom ops in a scoped library (CPU impls, decompositions
+        # and fake impls), where op1 decomposes into op2 which decomposes into a matmul. With
+        # 2d-mesh inputs, asserts the output placements are (Shard(0), Partial sum), and that
+        # a repeated op1 call and a later op2 call do not grow the python sharding
+        # propagation cache (cache currsize unchanged).
         """
         op1 decomps -> op2, which decomps -> mm
 
@@ -131,6 +149,11 @@ class TestDecompSharding(TestCase):
             self.assertEqual(cache_size, cache.currsize)
 
     def test_misc_ops_with_no_sharding_rules(self):
+        # [FUNCTION DOC] For several aten ops (binary_cross_entropy_with_logits, mse_loss,
+        # smooth_l1_loss, expand_copy, glu, index_add, polar) asserts the expected output
+        # placements: loss ops give Partial avg (also with _StridedShard on a 2d mesh), glu
+        # and polar force Replicate, index_add keeps Shard(1), expand_copy keeps Partial min.
+        # check_no_strategy asserts the op has no registered strategy/rule in the propagator.
         """miscellaneous aten ops"""
         from torch.distributed.tensor import empty as d_empty
 
@@ -139,6 +162,8 @@ class TestDecompSharding(TestCase):
         mesh_2d = DeviceMesh("cpu", torch.arange(self.world_size).reshape(-1, 2))
 
         def check_no_strategy(op):
+            # [FUNCTION DOC] HELPER: Asserts op is absent from the sharding propagator's
+            # op_strategy_funcs, op_single_dim_strategy_funcs and op_to_rules tables.
             # if someone registers a rule for these ops, delete the test
             sharding_prop = DTensor._op_dispatcher.sharding_propagator
             self.assertTrue(op not in sharding_prop.op_strategy_funcs)
@@ -202,6 +227,9 @@ class TestDecompSharding(TestCase):
         self.assertEqual(out.placements, (Replicate(),))
 
     def test_roll_flip_strategies(self):
+        # [FUNCTION DOC] On a 1d mesh with a Shard(0) 16x16 tensor: roll over dim 1 and flip
+        # over dim 1 keep Shard(0); roll with an empty dims list and flip over dim 0
+        # produce Replicate.
         """roll and flip unshard on active dims, keep sharding on others."""
         from torch.distributed.tensor import empty as d_empty
 
@@ -229,6 +257,8 @@ class TestDecompSharding(TestCase):
         self.assertEqual(out.placements, (Replicate(),))
 
     def test_fft_strategies(self):
+        # [FUNCTION DOC] Calls _fft_c2c on a complex 16x16 DTensor over dim 1: Shard(0) input
+        # stays Shard(0), Shard(1) input (the transform dim) becomes Replicate.
         """FFT primitives unshard on transform dims, keep sharding on others."""
         from torch.distributed.tensor import empty as d_empty
 
@@ -247,8 +277,14 @@ class TestDecompSharding(TestCase):
 
 
 class TestDecompShardingWithComms(DTensorTestBase):
+    # [CLASS DOC] Multi-process (with_comms) tests that run decomposed ops on real DTensors
+    # and compare gathered results against plain tensors, checking cache keys do not
+    # conflate calls differing in static/keyword arguments.
     @with_comms
     def test_decomp_schema_caches_static_args(self):
+        # [FUNCTION DOC] Shards a random 8x8x8 tensor on dim 2, then unsafe_chunk along dim 1
+        # (placements stay Shard(2)) and along dim 2 (placements become Replicate); both are
+        # compared with full_tensor against the local result, guarding against stale cache hits.
         """
         Test that decomposition ops use the correct cache key with static args.
         unsafe_chunk decomposes through split, and two unsafe_chunk calls with different dims
@@ -276,6 +312,9 @@ class TestDecompShardingWithComms(DTensorTestBase):
 
     @with_comms
     def test_decomp_schema_for_cache_aminmax(self):
+        # [FUNCTION DOC] Runs aminmax on a Shard(0) DTensor first with no dim (shape and
+        # gathered min compared to local) then with dim=1 (min and max compared exactly via
+        # torch.equal), verifying the second call does not reuse the first call's cache entry.
         """Test that aminmax with different dim kwargs doesn't hit stale cache."""
         device_mesh = self.build_device_mesh()
         t = torch.randn(
