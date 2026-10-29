@@ -1,4 +1,9 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Re-runs many existing dynamo test classes with the nested_graph_breaks config
+# enabled, plus debug_force_nested_calls and debug_disable_compile_counter. At import time it
+# imports the source test modules (relative, falling back to absolute), generates a
+# NestedGraphBreaks-prefixed copy of each class into module globals, and marks a list of
+# known-incompatible generated tests as expected failures.
 import unittest
 
 import torch
@@ -50,6 +55,10 @@ test_classes = {}
 
 
 def make_nested_cls(cls):
+    # [FUNCTION DOC] HELPER: Builds a copy of the test class cls (name prefix
+    # NestedGraphBreaks, test suffix _nested_graph_breaks) whose tests run with the three
+    # dynamo config flags patched on, honoring the xfail marker attribute. Registers it in
+    # test_classes and module globals (required for test discovery) and sets its module.
     config = torch._dynamo.config
 
     test_class = make_test_cls_with_patches(

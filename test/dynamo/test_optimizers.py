@@ -4,6 +4,11 @@ PYTEST_DONT_REWRITE (prevents pytest from rewriting assertions, which interferes
 with test_adam in OptimizerTests)
 """
 
+# [MODULE DOC] End-to-end tests of torch.compile with optimizers: compiling a training step
+# that updates a tensor requiring grad, compiling a closure that builds an Adagrad optimizer,
+# and compiling the step method of a small custom optimizer. Defines MyOptimizer and one
+# test class. No import-time side effects beyond imports.
+
 import functools
 
 import torch
@@ -14,10 +19,16 @@ from torch.nn import Parameter
 
 
 class MyOptimizer(torch.optim.Optimizer):
+    # [CLASS DOC] HELPER: Minimal optimizer with empty defaults. Its step adds one in place
+    # to the first parameter of each group, or subtracts one if any parameter in the group
+    # is complex. Holds no extra state.
     def __init__(self, params):
+        # [FUNCTION DOC] HELPER: Initializes the base Optimizer with params and no defaults.
         super().__init__(params, {})
 
     def _init_group(self, params, group):
+        # [FUNCTION DOC] HELPER: Appends every parameter of the group to the given list
+        # (mutated) and returns True if any parameter is complex.
         any_complex = False
         for p in group["params"]:
             params.append(p)
@@ -25,6 +36,8 @@ class MyOptimizer(torch.optim.Optimizer):
         return any_complex
 
     def step(self):
+        # [FUNCTION DOC] HELPER: For each param group, collects parameters and modifies the
+        # first one in place: subtract 1 if any is complex, otherwise add 1. Takes no closure.
         for group in self.param_groups:
             params = []
             any_complex = self._init_group(params, group)
@@ -35,15 +48,25 @@ class MyOptimizer(torch.optim.Optimizer):
 
 
 class End2EndTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Compile-with-optimizer regression tests. Stateless.
     # https://github.com/pytorch/torchdynamo/issues/1604
     def test_optimizing_over_tensor_with_requires_grad(self):
+        # [FUNCTION DOC] Compiles a full training iteration (zero_grad, forward, loss,
+        # backward, optimizer step) with a counting backend, running it twice with Adam over
+        # an input tensor that requires grad, and checks the frame count is 2.
         class Net(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward does a batched matmul of x and y and
+            # flattens from dimension 1.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns flatten of bmm(x, y) starting at dim 1.
                 z = torch.bmm(x, y)
                 z = torch.flatten(z, 1)
                 return z
 
         def training_iter_fn(batch, model, optimizer):
+            # [FUNCTION DOC] HELPER: One training step: zero grads, run model on the batch
+            # mapping, cross-entropy loss against fixed targets, backward, optimizer step;
+            # returns the loss.
             optimizer.zero_grad()
             out = model(**batch)
             target = torch.tensor([0, 7])
@@ -65,9 +88,16 @@ class End2EndTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(cnts.frame_count, 2)
 
     def test_state_dict(self):
+        # [FUNCTION DOC] Compiles (eager backend) a function that constructs an Adagrad
+        # optimizer plus a closure for it, then runs optimizer.step with that closure
+        # outside compilation. Passes if nothing raises.
         @torch.compile(backend="eager")
         def _test_state_dict(weight, bias, input):
+            # [FUNCTION DOC] HELPER: Compiled; creates an Adagrad optimizer over weight
+            # and bias and a partial-bound loss closure, returning both.
             def fn_base(optimizer, weight, bias):
+                # [FUNCTION DOC] HELPER: Zeroes grads, computes a squared linear-output sum
+                # loss from the enclosing input, runs backward and returns the loss.
                 optimizer.zero_grad()
                 i = input
                 loss = (weight.mv(i) + bias).pow(2).sum()
@@ -86,6 +116,9 @@ class End2EndTests(torch._dynamo.test_case.TestCase):
         optimizer.step(fn)
 
     def test_init_group(self):
+        # [FUNCTION DOC] For float32 and complex64, runs MyOptimizer.step eagerly on one
+        # copy of a random parameter and compiled (eager backend, fullgraph) on another,
+        # then checks the results are equal.
         for dtype in [torch.float32, torch.cfloat]:
             tensor = torch.randn(5, 5, dtype=dtype)
             params = Parameter(tensor.detach().clone(), requires_grad=False)
