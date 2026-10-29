@@ -1,4 +1,9 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for dynamo compile packages and precompile: saving a CompilePackage to disk
+# and reloading it (DiskDynamoStore), the in-memory DynamoCache and PrecompileContext save/reload
+# flow that simulates a new process, installing cached code without recompiling, source change
+# detection and cleanup hooks. Many tests are parametrized over backend and device and skip when
+# CUDA or XPU with Triton is missing. Defines two small module-level helpers.
 
 import gc
 import importlib
@@ -32,10 +37,15 @@ from torch.testing._internal.inductor_utils import (
 
 
 def compute_loss_helper(x):
+    # [FUNCTION DOC] HELPER: Returns the scalar loss produced by the testing reduce helper for
+    # the input; used inside a compiled function to exercise calls from resume code.
     return reduce_to_scalar_loss(x)
 
 
 def compiled_region_with_backend_id_for_package_test():
+    # [FUNCTION DOC] HELPER: Dummy function whose code names a generated compiled-function global
+    # with a zero-id backend name. It is never called; tests read its code object to feed fake
+    # bytecode to a package.
     return __compiled_fn_0_00000000_0000_0000_0000_000000000000()  # noqa: F821
 
 
@@ -43,12 +53,21 @@ def compiled_region_with_backend_id_for_package_test():
 @torch._dynamo.config.patch({"strict_precompile": True})
 @instantiate_parametrized_tests
 class TestPackage(torch._inductor.test_case.TestCase):
+    # [CLASS DOC] Inductor test case with the bundled autograd cache and strict precompile
+    # enabled, and with parametrized tests instantiated. Tests save packages or the precompile
+    # context, reset dynamo to simulate a fresh process, reload, and compare outputs, using the
+    # fail-on-recompile stance to prove no recompilation happens. Also defines two nested helper
+    # classes for qualname tests.
     def path(self):
+        # [FUNCTION DOC] HELPER: Returns a per-test directory under the inductor cache directory
+        # named after the test id, creating it if missing.
         path = os.path.join(cache_dir(), f"package_{self.id()}")
         os.makedirs(path, exist_ok=True)
         return path
 
     def setUp(self):
+        # [FUNCTION DOC] Fixture: after the parent setUp, resets dynamo, clears the dynamo
+        # counters, and clears both the DynamoCache and the PrecompileContext.
         super().setUp()
         torch._dynamo.reset()
         torch._dynamo.utils.counters.clear()
@@ -56,6 +75,9 @@ class TestPackage(torch._inductor.test_case.TestCase):
         PrecompileContext.clear()
 
     def _save_and_reload(self, expected_backends, expected_dynamo):
+        # [FUNCTION DOC] HELPER: Saves all precompile artifacts into the dynamo cache, asserts
+        # the numbers of dynamo and backend entries in the returned debug info equal the expected
+        # counts, then resets dynamo and clears PrecompileContext to simulate a new process.
         """
         Serializes all artifacts, clears all caches, then reloads the serialized artifact
         Simulates a new process.
@@ -71,7 +93,11 @@ class TestPackage(torch._inductor.test_case.TestCase):
         PrecompileContext.clear()
 
     def test_guarded_code_records_backend_ids_from_bytecode(self):
+        # [FUNCTION DOC] Builds a package for a simple function, adds guarded code from the dummy
+        # function's code object inside a code context, and checks the cache entry's first code
+        # lists the global name found in that bytecode as its backend id.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Adds one to the input.
             return x + 1
 
         (backend_id,) = (
@@ -88,12 +114,18 @@ class TestPackage(torch._inductor.test_case.TestCase):
 
     @unittest.expectedFailure  # FUNCTION_MATCH guard not serializable today
     def test_nn_module(self):
+        # [FUNCTION DOC] Expected to fail (marked as expected failure because function-match
+        # guards cannot be serialized): compiles a module with a CUDA linear layer through a
+        # package using the inductor backend and runs it.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a single 10 by 10 linear layer on CUDA.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the CUDA linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(10, 10, device="cuda")
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer.
                 return self.linear(x)
 
         fn = MyModule()
@@ -105,6 +137,11 @@ class TestPackage(torch._inductor.test_case.TestCase):
     @parametrize("backend", ("eager", "inductor"))
     @parametrize("device", ("cpu", "cuda", "xpu"))
     def test_basic_fn(self, backend, device):
+        # [FUNCTION DOC] Parametrized by backend and device. Compiles with a package, saves it to
+        # disk (recording eager backends explicitly), resets dynamo, verifies a fail-on-recompile
+        # error is raised when calling the old compiled function, then loads the package,
+        # installs it and checks the result equals the original output. Skips when the device is
+        # unavailable.
         if device == "cuda" and not HAS_CUDA_AND_TRITON:
             raise unittest.SkipTest("Requires CUDA/Triton")
         if device == "xpu" and not HAS_XPU_AND_TRITON:
@@ -113,6 +150,7 @@ class TestPackage(torch._inductor.test_case.TestCase):
         ctx = DiskDynamoStore()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Adds one to the input.
             return x + 1
 
         args = (
@@ -149,6 +187,9 @@ class TestPackage(torch._inductor.test_case.TestCase):
     @parametrize("backend", ("eager", "inductor"))
     @parametrize("device", ("cpu", "cuda", "xpu"))
     def test_lazy_backward(self, backend, device):
+        # [FUNCTION DOC] Same save and reload flow as the basic test but the function is sine
+        # plus cosine on an input requiring grad, and a backward pass is run before saving so the
+        # lazy backward is exercised. Checks the loaded package reproduces the output.
         if device == "cuda" and not HAS_CUDA_AND_TRITON:
             raise unittest.SkipTest("Requires CUDA/Triton")
         if device == "xpu" and not HAS_XPU_AND_TRITON:
@@ -157,6 +198,7 @@ class TestPackage(torch._inductor.test_case.TestCase):
         ctx = DiskDynamoStore()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sine of the input plus cosine of the input.
             return x.sin() + x.cos()
 
         args = (
@@ -196,6 +238,11 @@ class TestPackage(torch._inductor.test_case.TestCase):
     @parametrize("backend", ("eager", "inductor"))
     @parametrize("device", ("cpu", "cuda", "xpu"))
     def test_graph_break_bomb(self, backend, device):
+        # [FUNCTION DOC] Saves a package for a recursive binary-search style function whose data-
+        # dependent branches cause many graph breaks, over ten scalar inputs; after reset, the
+        # original compiled function must fail on recompile, and the loaded package must
+        # reproduce every result with the eager backend. A new input outside the covered range
+        # must trigger a recompile error.
         if device == "cuda" and not HAS_CUDA_AND_TRITON:
             raise unittest.SkipTest("Requires CUDA/Triton")
         if device == "xpu" and not HAS_XPU_AND_TRITON:
@@ -204,6 +251,9 @@ class TestPackage(torch._inductor.test_case.TestCase):
         ctx = DiskDynamoStore()
 
         def fn(x, l, r):
+            # [FUNCTION DOC] HELPER: Recursive function that returns the tensor sum when the
+            # range is empty or equals the midpoint, else recurses on the lower or upper half
+            # based on comparing the sum with the midpoint.
             if l > r:
                 return x.sum()
             mid = (l + r) // 2
@@ -215,6 +265,8 @@ class TestPackage(torch._inductor.test_case.TestCase):
                 return fn(x, mid + 1, r)
 
         def guard_filter_fn(guards):
+            # [FUNCTION DOC] HELPER: Guard filter returning, per guard, whether to keep it: drops
+            # closure-match and function-match guards.
             return [
                 guard.guard_type not in ("CLOSURE_MATCH", "FUNCTION_MATCH")
                 for guard in guards
@@ -260,6 +312,10 @@ class TestPackage(torch._inductor.test_case.TestCase):
     @parametrize("backend", ("eager", "inductor"))
     @parametrize("device", ("cpu", "cuda", "xpu"))
     def test_dynamic_shape(self, backend, device):
+        # [FUNCTION DOC] Marks a tensor dimension dynamic with bounds three to five, compiles and
+        # saves a package, then after reset checks that a size-five input fails on recompile
+        # before loading but works after loading, while a size-seven input outside the bounds
+        # raises a recompile error.
         if device == "cuda" and not HAS_CUDA_AND_TRITON:
             raise unittest.SkipTest("Requires CUDA/Triton")
         if device == "xpu" and not HAS_XPU_AND_TRITON:
@@ -268,6 +324,7 @@ class TestPackage(torch._inductor.test_case.TestCase):
         ctx = DiskDynamoStore()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Adds the size of the first dimension to the input.
             return x + x.shape[0]
 
         args = (torch.randn(3, 2, device=device),)
@@ -308,6 +365,12 @@ class TestPackage(torch._inductor.test_case.TestCase):
                 compiled_fn(*args2)
 
     def test_install_survives_stale_cleanup_hooks(self):
+        # [FUNCTION DOC] Checks that cleanup hooks keyed on stale code objects do not remove
+        # module global bindings installed by loading a package. Records pre-existing generated
+        # globals and cleanup refs, compiles and saves a package with a data-dependent branch,
+        # pins the new code objects, reloads and installs, then drops the pins and runs garbage
+        # collection. Asserts the hooks ran, the installed globals remain in scope, and the
+        # loaded function works without recompiling.
         # The first compile installs its generated functions -- and, on every
         # compile, a builtins-dict global (see install_builtins_dict_in_fglobals)
         # -- into the module globals behind a CleanupHook keyed on the generated
@@ -319,6 +382,8 @@ class TestPackage(torch._inductor.test_case.TestCase):
         ctx = DiskDynamoStore()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Adds the first dimension size to the input and doubles it
+            # when its sum is positive (a data-dependent branch that forces a resume function).
             y = x + x.shape[0]
             if y.sum() > 0:  # data-dependent branch, forces a resume function
                 return y * 2
@@ -386,9 +451,15 @@ class TestPackage(torch._inductor.test_case.TestCase):
             self.assertEqual(expected, compiled_fn(*args))
 
     def test_file_change(self):
+        # [FUNCTION DOC] Writes two versions of a small helper module (add and subtract) to a
+        # temporary directory, imports the original, compiles and saves a package for a function
+        # calling it, then imports the modified source and asserts loading the package raises an
+        # error about source code changes. Re-importing the original makes loading succeed.
         ctx = DiskDynamoStore()
 
         def import_from_path(module_name, file_path):
+            # [FUNCTION DOC] HELPER: Imports a module from a file path under the given name,
+            # registers it in the module table and executes it, returning the module.
             spec = importlib.util.spec_from_file_location(module_name, file_path)
             module = importlib.util.module_from_spec(spec)
             sys.modules[module_name] = module
@@ -422,11 +493,15 @@ def add(x, y):
             )
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Calls the imported helper module's add function with the
+                # input and one.
                 return module.add(x, 1)
 
             args = (torch.randn(3, 2),)
 
             def guard_filter_fn(guards):
+                # [FUNCTION DOC] HELPER: Guard filter that drops closure-match, function-match
+                # and module-match guards.
                 return [
                     guard.guard_type
                     not in ("CLOSURE_MATCH", "FUNCTION_MATCH", "MODULE_MATCH")
@@ -458,15 +533,21 @@ def add(x, y):
 
     @parametrize("device", ("cpu", "cuda", "xpu"))
     def test_dynamo_cache_manual_load(self, device):
+        # [FUNCTION DOC] Compiles two functions through separate packages with the inductor
+        # backend, saves them to the DynamoCache, saves and reloads state, loads and installs
+        # both packages by function, and checks that under fail-on-recompile the original
+        # compiled functions return equal results and the frame counter is unchanged.
         if device == "cuda" and not HAS_CUDA_AND_TRITON:
             raise unittest.SkipTest("Requires CUDA/Triton")
         if device == "xpu" and not HAS_XPU_AND_TRITON:
             raise unittest.SkipTest("Requires XPU/Triton")
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sine plus cosine of the input.
             return x.sin() + x.cos()
 
         def fn2(x):
+            # [FUNCTION DOC] HELPER: Cosine of the input plus the input.
             return x.cos() + x
 
         package1 = CompilePackage(fn)
@@ -494,6 +575,10 @@ def add(x, y):
 
     @parametrize("backend", ("eager", "inductor"))
     def test_reset_clears_installed_package(self, backend):
+        # [FUNCTION DOC] Regression test for an issue about reset not clearing installed
+        # packages: after saving, resetting, loading and installing a package, the debug listing
+        # of precompile entries for the function code is non-empty; after another reset it is
+        # empty.
         # Regression test for https://github.com/pytorch/pytorch/issues/190664.
         # package.install() must register target_code in input_codes so that
         # torch._dynamo.reset() clears precompile entries on the installed code.
@@ -502,6 +587,7 @@ def add(x, y):
         ctx = DiskDynamoStore()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sine plus cosine of the input.
             return x.sin() + x.cos()
 
         package = CompilePackage(fn)
@@ -523,15 +609,21 @@ def add(x, y):
     @parametrize("device", ("cpu", "cuda", "xpu"))
     @torch._dynamo.config.patch(caching_precompile=True)
     def test_automatic_dynamo_serialize(self, device):
+        # [FUNCTION DOC] With caching precompile enabled, compiles two functions with
+        # torch.compile, clears the DynamoCache, saves and reloads precompile state, recompiles
+        # and checks that under fail-on-recompile results equal eager and no new frames are
+        # compiled.
         if device == "cuda" and not HAS_CUDA_AND_TRITON:
             raise unittest.SkipTest("Requires CUDA/Triton")
         if device == "xpu" and not HAS_XPU_AND_TRITON:
             raise unittest.SkipTest("Requires XPU/Triton")
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sine plus cosine of the input.
             return x.sin() + x.cos()
 
         def fn2(x):
+            # [FUNCTION DOC] HELPER: Cosine of the input plus the input.
             return x.cos() + x
 
         arg1 = torch.randn(3, 2, device=device)
@@ -555,6 +647,9 @@ def add(x, y):
         self.assertEqual(torch._dynamo.convert_frame.FRAME_COUNTER, total_frames)
 
     def test_import_source_unpickle_without_trace(self):
+        # [FUNCTION DOC] Pickles and unpickles an ImportSource for the torch module without any
+        # active tracing context and checks the round trip yields an equal source and does not
+        # raise.
         # Deserializing an ImportSource happens at torch.compile() time with no
         # active TracingContext (e.g. precompile warm-load). Reconstructing the
         # source must not install a guard (which would require a tracing
@@ -570,6 +665,9 @@ def add(x, y):
     @parametrize("device", ("cpu", "cuda", "xpu"))
     @torch._dynamo.config.patch(caching_precompile=True)
     def test_automatic_dynamo_import_source_guard(self, device):
+        # [FUNCTION DOC] With caching precompile, compiles a function using a pytree leaf check
+        # (whose guard state contains an import source), saves and reloads, and checks the warm-
+        # loaded compiled function gives the same result with no recompile and no new frames.
         # Warm-loading a guard state whose serialized sources include an
         # ImportSource must not raise. `pytree.tree_is_leaf` routes through
         # `get_pytree_SUPPORTED_NODES_source`, which builds an
@@ -580,6 +678,8 @@ def add(x, y):
             raise unittest.SkipTest("Requires XPU/Triton")
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: If the input is a pytree leaf, returns relu of it plus its
+            # sine, otherwise returns it unchanged.
             if torch.utils._pytree.tree_is_leaf(x):
                 return torch.nn.functional.relu(x) + x.sin()
             return x
@@ -601,12 +701,17 @@ def add(x, y):
     @parametrize("device", ("cpu", "cuda", "xpu"))
     @torch._dynamo.config.patch(caching_precompile=True)
     def test_automatic_dynamo_recompiles(self, device):
+        # [FUNCTION DOC] With caching precompile, compiles a function for two shapes (second
+        # causes a recompile), saves and reloads expecting two backends and one dynamo entry,
+        # then checks both shapes and a third shape run without recompiling and frame count
+        # unchanged.
         if device == "cuda" and not HAS_CUDA_AND_TRITON:
             raise unittest.SkipTest("Requires CUDA/Triton")
         if device == "xpu" and not HAS_XPU_AND_TRITON:
             raise unittest.SkipTest("Requires XPU/Triton")
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sine plus cosine of the input.
             return x.sin() + x.cos()
 
         arg1 = torch.randn(3, 2, device=device)
@@ -638,12 +743,20 @@ def add(x, y):
     @parametrize("device", ("cpu", "cuda", "xpu"))
     @torch._dynamo.config.patch(caching_precompile=True)
     def test_automatic_dynamo_graph_breaks(self, device):
+        # [FUNCTION DOC] With caching precompile, compiles the recursive graph-break function
+        # over ten inputs, saves and reloads expecting nine backends and one dynamo entry, then
+        # checks results under fail-on-recompile and an unchanged frame count. Skipped when
+        # running under dynamo or on Linux.
+        # KNOWN ISSUE: the skip condition includes the Linux platform check (with a linked
+        #     issue), so the test is effectively skipped on Linux.
         if device == "cuda" and not HAS_CUDA_AND_TRITON:
             raise unittest.SkipTest("Requires CUDA/Triton")
         if device == "xpu" and not HAS_XPU_AND_TRITON:
             raise unittest.SkipTest("Requires XPU/Triton")
 
         def fn(x, l, r):
+            # [FUNCTION DOC] HELPER: Recursive function splitting the range by comparing the
+            # tensor sum with the midpoint; returns the sum at the base cases.
             if l > r:
                 return x.sum()
             mid = (l + r) // 2
@@ -655,6 +768,8 @@ def add(x, y):
                 return fn(x, mid + 1, r)
 
         def guard_filter_fn(guards):
+            # [FUNCTION DOC] HELPER: Guard filter dropping closure-match and function-match
+            # guards.
             return [
                 guard.guard_type not in ("CLOSURE_MATCH", "FUNCTION_MATCH")
                 for guard in guards
@@ -685,12 +800,17 @@ def add(x, y):
     @parametrize("device", ("cpu", "cuda", "xpu"))
     @torch._dynamo.config.patch(caching_precompile=True)
     def test_automatic_dynamo_lazy_backward(self, device):
+        # [FUNCTION DOC] With caching precompile, compiles sine plus cosine on an input requiring
+        # grad, runs backward, saves and reloads, then reruns forward and backward on a clone
+        # under fail-on-recompile and checks no new frames. Skipped on Linux.
+        # KNOWN ISSUE: skipped on Linux because of a linked issue, so effectively not run there.
         if device == "cuda" and not HAS_CUDA_AND_TRITON:
             raise unittest.SkipTest("Requires CUDA/Triton")
         if device == "xpu" and not HAS_XPU_AND_TRITON:
             raise unittest.SkipTest("Requires XPU/Triton")
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sine plus cosine of the input.
             return x.sin() + x.cos()
 
         arg1 = torch.randn(3, 2, device=device, requires_grad=True)
@@ -714,12 +834,19 @@ def add(x, y):
     @parametrize("device", ("cpu", "cuda", "xpu"))
     @torch._dynamo.config.patch(caching_precompile=True)
     def test_graph_break_partial_backend(self, device):
+        # [FUNCTION DOC] With caching precompile, compiles a function with a graph break, then
+        # removes the backend artifact associated with the resume function and clears the
+        # generated names from module globals before save and reload (expecting one backend and
+        # one dynamo entry). After reload, the rerun still works and exactly one extra frame is
+        # compiled for the missing backend.
         if device == "cuda" and not HAS_CUDA_AND_TRITON:
             raise unittest.SkipTest("Requires CUDA/Triton")
         if device == "xpu" and not HAS_XPU_AND_TRITON:
             raise unittest.SkipTest("Requires XPU/Triton")
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sine of the input, a graph break, then sine of the input
+            # plus the earlier value.
             y = x.sin()
             torch._dynamo.graph_break()
             return x.sin() + y
@@ -761,6 +888,9 @@ def add(x, y):
     @parametrize("device", ("cpu", "cuda", "xpu"))
     @torch._dynamo.config.patch(caching_precompile=True)
     def test_call_function_from_resume(self, device):
+        # [FUNCTION DOC] With caching precompile, compiles a function that calls a helper doing a
+        # backward pass on a linear module output (the helper is called from resume code), saves
+        # and reloads, and checks it reruns with no recompile.
         if device == "cuda" and not HAS_CUDA_AND_TRITON:
             raise unittest.SkipTest("Requires CUDA/Triton")
         if device == "xpu" and not HAS_XPU_AND_TRITON:
@@ -768,6 +898,8 @@ def add(x, y):
         mod = torch.nn.Linear(2, 3, device=device)
 
         def foo(x, mod):
+            # [FUNCTION DOC] HELPER: Runs the module on the input, backpropagates the scalar loss
+            # from the helper and returns nothing.
             pred = mod(x)
             compute_loss_helper(pred).backward()
             return None
@@ -789,12 +921,17 @@ def add(x, y):
     @parametrize("device", ("cpu", "cuda", "xpu"))
     @torch._dynamo.config.patch(caching_precompile=True)
     def test_code_with_generator(self, device):
+        # [FUNCTION DOC] With caching precompile, compiles a function containing a generator
+        # expression over a list of tensors and checks that saving and reloading succeeds with
+        # one backend and one dynamo entry.
         if device == "cuda" and not HAS_CUDA_AND_TRITON:
             raise unittest.SkipTest("Requires CUDA/Triton")
         if device == "xpu" and not HAS_XPU_AND_TRITON:
             raise unittest.SkipTest("Requires XPU/Triton")
 
         def foo(set_of_x):
+            # [FUNCTION DOC] HELPER: Raises TypeError if any element of the input list is not a
+            # tensor, otherwise returns the concatenation along dimension zero.
             if not all(isinstance(s, torch.Tensor) for s in set_of_x):
                 raise TypeError(
                     f"Expected all elements of set_of_x to be tensors, got {set_of_x}"
@@ -810,22 +947,33 @@ def add(x, y):
     @parametrize("device", ("cpu", "cuda", "xpu"))
     @torch._dynamo.config.patch(caching_precompile=True)
     def test_automatic_dynamo_graph_breaks_from_print_model_as_fn(self, device):
+        # [FUNCTION DOC] With caching precompile, compiles a module whose forward calls print on
+        # a tensor sum (graph break) with inductor, saves and reloads expecting two backends and
+        # one dynamo entry, then recompiles with the stance set to fail on recompile and checks
+        # frame count unchanged.
         if device == "cuda" and not HAS_CUDA_AND_TRITON:
             raise unittest.SkipTest("Requires CUDA/Triton")
         if device == "xpu" and not HAS_XPU_AND_TRITON:
             raise unittest.SkipTest("Requires XPU/Triton")
 
         def guard_filter_fn(guards):
+            # [FUNCTION DOC] HELPER: Guard filter dropping closure-match and function-match
+            # guards.
             return [
                 guard.guard_type not in ("CLOSURE_MATCH", "FUNCTION_MATCH")
                 for guard in guards
             ]
 
         class TempNN(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward applies relu, squares, halves, prints the
+            # sum as a Python number (graph break) and adds one.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Calls the parent constructor only.
                 super().__init__()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies relu, in-place square, in-place halve, prints
+                # the sum item, adds one in place and returns the tensor.
                 x = torch.nn.functional.relu(x)
                 x *= x
                 x /= 2
@@ -857,13 +1005,19 @@ def add(x, y):
             self.assertEqual(torch._dynamo.convert_frame.FRAME_COUNTER, total_frames)
 
     class _tempTensorSamplerForQualName:
+        # [CLASS DOC] HELPER: Sampler holding a value, mask and probability, with class methods
+        # that build an instance from a tensor; used to check qualified-name handling of class
+        # methods and instance methods in packages.
         def __init__(self, val, mask, prob):
+            # [FUNCTION DOC] HELPER: Stores the value, mask and probability.
             self.val = val
             self.mask = mask
             self.prob = prob
 
         @classmethod
         def class_method_that_is_used(cls, x):
+            # [FUNCTION DOC] HELPER: Class method computing a sigmoid probability and a random
+            # threshold on the input device, makes a boolean mask and returns a new sampler.
             prob = torch.sigmoid(x)
             thresh = torch.rand(1, device=x.device)
             mask = (prob > thresh).to(torch.bool)
@@ -871,27 +1025,40 @@ def add(x, y):
 
         @classmethod
         def class_method_that_is_not_used(cls, x):
+            # [FUNCTION DOC] HELPER: Class method identical in behavior to the previous one, but
+            # invoked from an instance in the test.
             prob = torch.sigmoid(x)
             thresh = torch.rand(1, device=x.device)
             mask = (prob > thresh).to(torch.bool)
             return cls(x, mask, prob)
 
         def instance_method_that_is_used(self, x):
+            # [FUNCTION DOC] HELPER: Instance method returning half of the input.
             return x / 2
 
     class _tempNetForQualName(torch.nn.Module):
+        # [CLASS DOC] HELPER: Module whose forward exercises instance methods, class methods
+        # called from the class and from an instance, and a device context, to test qualified
+        # names of methods.
         def __init__(self):
+            # [FUNCTION DOC] HELPER: Calls the parent constructor only.
             super().__init__()
 
         def instance_method_without_args(self):
+            # [FUNCTION DOC] HELPER: Returns a random tensor of fixed shape one by two by three
+            # by four.
             shape = [1, 2, 3, 4]
             x = torch.randn(shape)
             return x
 
         def instance_method_with_args(self, x):
+            # [FUNCTION DOC] HELPER: Returns the input plus one.
             return x + 1
 
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Squares the input in place, builds a random tensor in a
+            # device context, uses a sampler built via the class method, applies instance methods
+            # and class methods from instances, and returns the final tensor.
             x *= x
             with torch.device(x.device):
                 y = self.instance_method_without_args()
@@ -914,6 +1081,9 @@ def add(x, y):
     @parametrize("device", ("cpu", "cuda", "xpu"))
     @torch._dynamo.config.patch(caching_precompile=True)
     def test_classmethod_qualname(self, device):
+        # [FUNCTION DOC] With caching precompile, compiles the bound forward of the qualname
+        # network with the skip-guard-on-globals filter and runs it once; passes if no error is
+        # raised.
         if device == "cuda" and not HAS_CUDA_AND_TRITON:
             raise unittest.SkipTest("Requires CUDA/Triton")
         if device == "xpu" and not HAS_XPU_AND_TRITON:

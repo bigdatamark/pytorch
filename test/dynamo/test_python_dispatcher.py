@@ -1,4 +1,7 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for how dynamo traces dispatch key set queries, thread-local dispatch key
+# include and exclude sets, functorch interpreter lookups and Python/TLS snapshot dispatch keys.
+# Defines device_type at import time as the current accelerator type or cpu when none exists.
 import unittest
 
 import torch
@@ -14,9 +17,17 @@ device_type = (
 
 
 class PythonDispatcherTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Dynamo test case covering dispatch key set handling: results of compiled
+    # functions are compared with eager dispatch key sets, graph contents are checked for a
+    # constant-folded branch, and recompilation is counted via guards on key sets.
     def test_dispatch_key1(self):
+        # [FUNCTION DOC] Compiles a function (aot_eager, full graph) that adds one to a tensor
+        # and returns its dispatch key set; checks the raw representation equals the eager key
+        # set of the incremented tensor.
         @torch.compile(backend="aot_eager", fullgraph=True)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function under test: increments the input and returns its
+            # dispatch key set.
             x = x + 1
             return torch._C._dispatch_keys(x)
 
@@ -24,10 +35,14 @@ class PythonDispatcherTests(torch._dynamo.test_case.TestCase):
         self.assertTrue(fn(x).raw_repr() == torch._C._dispatch_keys(x + 1).raw_repr())
 
     def test_dispatch_key2(self):
+        # [FUNCTION DOC] Same check for a TwoTensor wrapper subclass: the compiled key set after
+        # applying sine must equal the eager one for the same operation.
         from torch.testing._internal.two_tensor import TwoTensor
 
         @torch.compile(backend="aot_eager", fullgraph=True)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function under test: applies sine to the input and returns
+            # its dispatch key set.
             x = x.sin()
             return torch._C._dispatch_keys(x)
 
@@ -37,8 +52,13 @@ class PythonDispatcherTests(torch._dynamo.test_case.TestCase):
         self.assertTrue(fn(z).raw_repr() == torch._C._dispatch_keys(z.sin()).raw_repr())
 
     def test_dispatch_key3(self):
+        # [FUNCTION DOC] Compiles a function returning both a sine result and the thread-local
+        # include dispatch key set; checks the value and that the returned key set equals the
+        # eager thread-local include set.
         @torch.compile(backend="aot_eager", fullgraph=True)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function under test: reads the thread-local include set and
+            # returns sine of input plus one together with that set.
             key_set = torch._C._dispatch_tls_local_include_set()
             return torch.sin(x + 1), key_set
 
@@ -49,10 +69,17 @@ class PythonDispatcherTests(torch._dynamo.test_case.TestCase):
         )
 
     def test_dispatch_key4(self):
+        # [FUNCTION DOC] Compiles a function that combines the thread-local include set with the
+        # input keys, subtracts the exclude set, and branches on whether the top-priority key is
+        # the Python dispatcher. Checks the result matches the else branch and that the recorded
+        # graph contains only the subtract and sine operations (expected text).
         eager = EagerAndRecordGraphs()
 
         @torch.compile(backend=eager, fullgraph=True)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function under test: builds a key set from include set,
+            # input keys and exclude set, then returns sine of input plus one if the highest
+            # priority key is the Python dispatcher, else sine of input minus one.
             key_set = torch._C._dispatch_tls_local_include_set()
             key_set = key_set | torch._C._dispatch_keys(x)
             key_set = key_set - torch._C._dispatch_tls_local_exclude_set()
@@ -82,10 +109,16 @@ class GraphModule(torch.nn.Module):
 
     @unittest.skipIf(not TEST_CUDA and not TEST_XPU, "requires cuda or xpu")
     def test_dispatch_key_set_guard(self):
+        # [FUNCTION DOC] Skipped unless CUDA or XPU is available. Compiles a function branching
+        # on whether a passed dispatch key set contains the CPU key, with a compile counter. Two
+        # CPU tensors with equal key sets cause one compile and no recompile; a tensor on the
+        # accelerator device has a different key set and triggers a second compile.
         counter = CompileCounter()
 
         @torch.compile(backend=counter, fullgraph=True)
         def fn(x, dks):
+            # [FUNCTION DOC] HELPER: Function under test: returns sine of input plus one if the
+            # key set has CPU, else sine of input minus one.
             if dks.has("CPU"):
                 return torch.sin(x + 1)
             else:
@@ -109,9 +142,15 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(counter.frame_count, 2)
 
     def test_functorch_interpreter(self):
+        # [FUNCTION DOC] Compiles a function that applies vmap to a helper reading the current
+        # functorch interpreter, checks results for two input pairs and that only one frame is
+        # compiled (no recompile for different values).
         counter = CompileCounter()
 
         def square_and_add(x, y):
+            # [FUNCTION DOC] HELPER: Reads the current functorch interpreter; under vmap returns
+            # the sum of squares and second input scaled by the interpreter level, otherwise
+            # returns the square scaled by the level.
             interpreter = (
                 torch._functorch.pyfunctorch.retrieve_current_functorch_interpreter()
             )
@@ -123,6 +162,8 @@ class GraphModule(torch.nn.Module):
 
         @torch.compile(backend=counter, fullgraph=True)
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Compiled entry point applying vmap of the helper to both
+            # inputs.
             return torch.vmap(square_and_add)(x, y)
 
         x = torch.tensor([1, 2, 3, 4])
@@ -137,8 +178,15 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(counter.frame_count, 1)
 
     def test_graph_break_recovers_missing_python_tls_snapshot(self):
+        # [FUNCTION DOC] Checks that a graph break recovers the Python TLS snapshot key: inside a
+        # compiled function the Python dispatch key is included, the PythonTLSSnapshot key is
+        # excluded, then a graph break occurs. The output must equal eager sine. The original
+        # thread-local inclusion state of both keys is saved and restored in a finally block.
         @torch.compile(backend="eager_noexcept")
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function under test: sets thread-local key inclusion flags
+            # for the Python and PythonTLSSnapshot keys, forces a graph break, then returns sine
+            # of input.
             torch._C._dispatch_tls_set_dispatch_key_included(
                 torch._C.DispatchKey.Python, True
             )

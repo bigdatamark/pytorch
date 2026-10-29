@@ -1,4 +1,8 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for the interaction between dynamo and the torch profiler: dynamo_timed and
+# compile events showing up in profiles, chromium event logger scoping and thread-locality, cache
+# lookup events, compiled region annotations, execution trace with dynamic shapes, and capture of
+# record_function contexts into graphs. No import-time side effects besides imports.
 import threading
 from unittest.mock import patch
 
@@ -14,13 +18,22 @@ from torch.testing._internal.common_utils import TemporaryFileName
 
 
 class DynamoProfilerTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Dynamo test case with profiler-related tests. Most tests run small functions
+    # under a profiler and inspect event names; others use a private ChromiumEventLogger patched
+    # into the dynamo utils module.
     def test_dynamo_timed_profiling_isolated(self):
+        # [FUNCTION DOC] Profiles a call to a function using the dynamo_timed context manager and
+        # checks an event named with the timed label plus a dynamo_timed suffix appears.
         # dynamo_timed functions should appear in profile traces.
         def inner_fn(x):
+            # [FUNCTION DOC] HELPER: Returns the sine of the input inside a dynamo_timed region
+            # labeled inner_fn.
             with dynamo_timed("inner_fn"):
                 return x.sin()
 
         def outer_fn(x, y):
+            # [FUNCTION DOC] HELPER: Calls the timed helper and multiplies its result by the
+            # second input.
             return inner_fn(x) * y
 
         x, y = (torch.rand((2, 2)) for _ in range(2))
@@ -33,6 +46,8 @@ class DynamoProfilerTests(torch._dynamo.test_case.TestCase):
         )
 
     def test_dynamo_timed_profiling_backend_compile(self):
+        # [FUNCTION DOC] Profiles a real torch.compile with the aot_eager backend and checks a
+        # profiler event for the user compiler call (dynamo_timed suffix) is present.
         # dynamo_timed functions should appear in profile traces.
         # this checks whether these actually appear in actual dynamo execution.
         # "backend_compile" is just chosen as an example; if it gets renamed
@@ -41,6 +56,8 @@ class DynamoProfilerTests(torch._dynamo.test_case.TestCase):
         fn_name = "call_user_compiler"
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test: sine of first input times cosine of
+            # second.
             return x.sin() * y.cos()
 
         x, y = (torch.rand((2, 2)) for _ in range(2))
@@ -53,9 +70,12 @@ class DynamoProfilerTests(torch._dynamo.test_case.TestCase):
         )
 
     def test_compile_events_visible_in_profiler(self):
+        # [FUNCTION DOC] Resets dynamo, profiles compiling a simple add function and checks at
+        # least one event name carries the dynamo_timed marker.
         torch._dynamo.reset()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function under test: adds one to the input.
             return x + 1
 
         with torch.profiler.profile(with_stack=False) as prof:
@@ -70,12 +90,18 @@ class DynamoProfilerTests(torch._dynamo.test_case.TestCase):
         )
 
     def test_record_functions_thread_local(self):
+        # [FUNCTION DOC] Starts three threads each fetching the logger's record functions
+        # mapping, adding one entry, and recording its size; checks every thread saw size one,
+        # proving the mapping is thread-local.
         """Verify record_functions dict is thread-local (no cross-thread contamination)"""
 
         logger = ChromiumEventLogger()
         results = {}
 
         def thread_func(thread_id):
+            # [FUNCTION DOC] HELPER: Thread body: gets the record functions mapping from the
+            # shared logger, adds a thread-specific entry and stores the mapping size in the
+            # shared results mapping under the thread id.
             # Each thread creates its own record_functions dict
             rf = logger.get_record_functions()
             rf[f"thread_{thread_id}"] = f"value_{thread_id}"
@@ -96,6 +122,10 @@ class DynamoProfilerTests(torch._dynamo.test_case.TestCase):
             )
 
     def test_chromium_event_timed_scoped_reset_preserves_outer_event(self):
+        # [FUNCTION DOC] With a logger installed as the global chromium log, starts an outer
+        # event, then enters a timed inner event with reset on exit. Checks the stack, pt2
+        # compile substack and event data keep the outer event after the inner scope exits, no
+        # warnings are logged, and after ending the outer event everything is empty.
         logger = ChromiumEventLogger()
 
         with patch.object(torch._dynamo.utils, "CHROMIUM_EVENT_LOG", logger):
@@ -123,6 +153,10 @@ class DynamoProfilerTests(torch._dynamo.test_case.TestCase):
             self.assertEqual(logger.get_event_data(), {})
 
     def test_chromium_event_timed_scoped_reset_preserves_outer_record_function(self):
+        # [FUNCTION DOC] Under a profiler with a patched global logger, starts an outer event and
+        # enters a timed inner event with reset on exit; checks record function entries for outer
+        # and inner exist inside and only the outer remains afterwards, that ending the outer
+        # event empties the mapping, and that both names appear in profiler events.
         logger = ChromiumEventLogger()
 
         with (
@@ -154,10 +188,13 @@ class DynamoProfilerTests(torch._dynamo.test_case.TestCase):
         self.assertIn("inner", event_names)
 
     def test_nested_compilation_events_in_profiler(self):
+        # [FUNCTION DOC] Profiles compiling a function with the inductor backend and checks that
+        # some event names mention dynamo and some mention inductor (lowercased comparison).
         """Verify nested compilation events (dynamo→inductor) show hierarchy"""
         torch._dynamo.reset()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function under test: input doubled plus its sine.
             return x * 2 + torch.sin(x)
 
         with torch.profiler.profile(with_stack=False) as prof:
@@ -174,7 +211,11 @@ class DynamoProfilerTests(torch._dynamo.test_case.TestCase):
 
     @patch.object(torch._dynamo.config, "assume_static_by_default", False)
     def test_profile_dynamic_shapes_runtime(self):
+        # [FUNCTION DOC] With assume_static_by_default patched off, compiles a matmul-add with
+        # dynamic shapes, runs it for two shape sets to get a dynamic graph, then runs a third
+        # shape set under a profiler that records shapes. Only checks nothing raises.
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Matrix multiply of the first two inputs plus the third.
             return x @ y + z
 
         opt_fn = torch.compile(fn, backend="aot_eager", dynamic=True, fullgraph=True)
@@ -192,7 +233,11 @@ class DynamoProfilerTests(torch._dynamo.test_case.TestCase):
 
     @patch.object(torch._dynamo.config, "assume_static_by_default", False)
     def test_profile_dynamic_shapes_compilation(self):
+        # [FUNCTION DOC] With assume_static_by_default patched off, compiles a dynamic-shape
+        # matmul-add for the first time under a shape-recording profiler. Only checks nothing
+        # raises.
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Matrix multiply of the first two inputs plus the third.
             return x @ y + z
 
         opt_fn = torch.compile(fn, backend="aot_eager", dynamic=True, fullgraph=True)
@@ -204,7 +249,12 @@ class DynamoProfilerTests(torch._dynamo.test_case.TestCase):
 
     @patch.object(torch._dynamo.config, "assume_static_by_default", False)
     def test_profile_dynamic_shapes_list_compilation(self):
+        # [FUNCTION DOC] Like the previous compile-under-profiler test but the function
+        # concatenates a list of two tensors along the first dimension before adding the third;
+        # exercises shape recording of list inputs. Only checks nothing raises.
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Concatenates the first two inputs along dimension zero and
+            # adds the third.
             return torch.cat([x, y], dim=0) + z
 
         opt_fn = torch.compile(fn, backend="aot_eager", dynamic=True, fullgraph=True)
@@ -215,7 +265,10 @@ class DynamoProfilerTests(torch._dynamo.test_case.TestCase):
             opt_fn(*inputs)
 
     def test_execution_trace_dynamic_shapes(self):
+        # [FUNCTION DOC] Compiles a dynamic-shape function and runs it while an execution trace
+        # observer is registered to a temporary file; only checks nothing raises.
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Matrix multiply of the first two inputs plus the third.
             return x @ y + z
 
         et = torch.profiler.ExecutionTraceObserver()
@@ -230,7 +283,11 @@ class DynamoProfilerTests(torch._dynamo.test_case.TestCase):
             et.unregister_callback()
 
     def test_profiler_cache_lookup(self):
+        # [FUNCTION DOC] For both the autograd profiler and the torch profiler, warms up a
+        # compiled function then profiles one call; checks the result equals eager and exactly
+        # one event with the cache lookup name appears.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Squares the input, adds two and cubes the result.
             y = x**2
             y = y + 2
             z = y**3
@@ -263,7 +320,10 @@ class DynamoProfilerTests(torch._dynamo.test_case.TestCase):
             )
 
     def test_profiler_guardless_cache_hit_skips_guard_lookup(self):
+        # [FUNCTION DOC] Compiles with all guards skipped, runs once to compile, then profiles a
+        # second call; checks the result is correct and no cache lookup event was emitted.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Adds one to the input.
             return x + 1
 
         x = torch.randn((2, 2))
@@ -283,7 +343,12 @@ class DynamoProfilerTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(events, [])
 
     def test_profiler_cache_lookup_profiler_step(self):
+        # [FUNCTION DOC] Runs a compiled function ten times under a profiler with a wait, warmup
+        # and active schedule, stepping the profiler each iteration; checks the cache lookup
+        # event is recorded in the profile events.
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Subtracts the second input from the first and adds the
+            # third.
             return torch.add(torch.sub(x, y), z)
 
         opt_fn = torch.compile(fn, backend="aot_eager")
@@ -307,11 +372,19 @@ class DynamoProfilerTests(torch._dynamo.test_case.TestCase):
         )
 
     def test_profiler_enabled_export(self):
+        # [FUNCTION DOC] Exports a module whose forward branches on whether the autograd profiler
+        # is enabled, once without a profiler and once under one (re-exporting because export
+        # skips guards), checking the exported graph module matches eager each time.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward applies sine and then cosine if the
+            # autograd profiler is enabled, else sigmoid.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Calls the parent constructor only.
                 super().__init__()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies sine, then returns cosine if the profiler is
+                # enabled, otherwise sigmoid.
                 x = torch.sin(x)
                 if torch.autograd._profiler_enabled():
                     return torch.cos(x)
@@ -335,7 +408,12 @@ class DynamoProfilerTests(torch._dynamo.test_case.TestCase):
             self.assertEqual(ref, res)
 
     def test_profiler_dynamo_compiled_region(self):
+        # [FUNCTION DOC] Compiles a function containing a print (a graph break) and calls it with
+        # two input shapes under a profiler; checks the list of compiled region annotation event
+        # names equals the expected sequence of region ids with their recompile indices.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sums the second input over dimension one, prints the shape
+            # and multiplies the first input by it.
             r = y.sum(dim=1)
             print(r.shape)
             return x * r
@@ -366,7 +444,13 @@ class DynamoProfilerTests(torch._dynamo.test_case.TestCase):
 
     @torch._dynamo.config.patch("capture_profiler_record_function", True)
     def test_dynamo_preserve_record_func(self):
+        # [FUNCTION DOC] With capture of profiler record function enabled, compiles a function
+        # with three record_function regions and checks the dynamo graph and the AOT forward
+        # graph contain enter and exit profiler ops for each region (expected text), and that
+        # running under a profiler emits the three region names in order.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Runs sine, cosine and add two in separate named record
+            # function regions.
             with record_function("my_net1"):
                 a = x.sin()
             with record_function("my_cos"):
@@ -428,6 +512,9 @@ def forward(self, arg0_1):
 
     @torch._dynamo.config.patch("capture_profiler_record_function", True)
     def test_profiler_record_function_create_uses_record_args_and_kwargs(self):
+        # [FUNCTION DOC] With record function capture enabled, checks the context variable
+        # factory takes its target values from positional arguments and from keyword arguments
+        # (name and args), giving the expected lists of constant values.
         ctx = ProfilerRecordFunctionContextVariable.create(
             func=record_function,
             record_args=[ConstantVariable.create("with_args")],
@@ -449,8 +536,13 @@ def forward(self, arg0_1):
 
     @torch._dynamo.config.patch("capture_profiler_record_function", True)
     def test_dynamo_preserve_record_func_decorator(self):
+        # [FUNCTION DOC] With record function capture enabled, compiles a function decorated with
+        # record_function; checks the dynamo graph has enter and exit ops around the body
+        # (expected text) and the profiler shows exactly one event named for the region.
         @record_function("my_net")
         def fn(x):
+            # [FUNCTION DOC] HELPER: Decorated function that computes the sine of the input plus
+            # two.
             a = x.sin()
             return a + 2
 
@@ -476,8 +568,14 @@ def forward(self, L_args_0_ : torch.Tensor):
 
     @torch._dynamo.config.patch("capture_profiler_record_function", True)
     def test_dynamo_preserve_record_func_with_graph_break(self):
+        # [FUNCTION DOC] With record function capture enabled, compiles a function with two
+        # record_function regions separated by a graph break. Checks two graphs are produced,
+        # each containing the matching region name and enter and exit ops, and the profiler shows
+        # both names in order.
         # Test that record_function works correctly with graph breaks
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sine in a pre-break region, a graph break, then cosine in a
+            # post-break region.
             with record_function("pre_graph_break"):
                 a = x.sin()
             # This causes a graph break
@@ -527,9 +625,17 @@ def forward(self, L_args_0_ : torch.Tensor):
 
     @torch._dynamo.config.patch("capture_profiler_record_function", True)
     def test_dynamo_preserve_record_func_spanning_graph_break(self):
+        # [FUNCTION DOC] With record function capture enabled, compiles a function whose
+        # record_function region spans a graph break. Despite the leading comment about an error,
+        # it only checks that the result matches eager and the profiler has exactly one event
+        # with that name.
+        # KNOWN ISSUE: the inline comment says a spanning region raises an error, but the test
+        #     asserts a normal result and a single profiler event rather than an exception.
         # Test that record_function that spans across a graph break raises an error
         # This prevents the confusing behavior where the context gets duplicated across graphs
         def fn(x):
+            # [FUNCTION DOC] HELPER: Adds one, then inside a record_function region takes sine,
+            # graph breaks, takes cosine, and finally subtracts one.
             x = x + 1
             with record_function("spanning_context"):
                 a = x.sin()

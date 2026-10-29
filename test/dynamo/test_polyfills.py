@@ -1,4 +1,7 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for the group_tensors_by_device_and_dtype polyfill in dynamo: equivalence
+# with the C++ implementation, empty input, grouping behavior, and traceability of the C++
+# binding under torch.compile. No import-time side effects besides imports.
 
 import torch
 import torch._dynamo.testing
@@ -6,9 +9,15 @@ from torch._dynamo.test_case import run_tests, TestCase
 
 
 class TestGroupTensorsByDeviceAndDtype(TestCase):
+    # [CLASS DOC] Test case for the polyfill that groups parallel lists of tensors by (device,
+    # dtype) key, returning for each key the grouped lists plus the original indices (empty when
+    # indices are not requested).
     """Tests for the group_tensors_by_device_and_dtype polyfill."""
 
     def test_polyfill_matches_cpp_single_list(self):
+        # [FUNCTION DOC] Builds one list of four CPU tensors with alternating float32 and float64
+        # dtypes and checks the polyfill and the C++ function return the same keys, same grouped
+        # list lengths, equal tensors (None must match None) and equal indices.
         """Test that polyfill matches C++ implementation for a single list."""
         from torch._dynamo.polyfills import group_tensors_by_device_and_dtype
 
@@ -40,6 +49,8 @@ class TestGroupTensorsByDeviceAndDtype(TestCase):
             self.assertEqual(cpp_indices, polyfill_indices)
 
     def test_polyfill_matches_cpp_multiple_lists(self):
+        # [FUNCTION DOC] Same comparison against C++ for three parallel lists (the second and
+        # third are random tensors shaped like the first) with indices requested.
         """Test that polyfill matches C++ implementation for multiple lists."""
         from torch._dynamo.polyfills import group_tensors_by_device_and_dtype
 
@@ -72,6 +83,8 @@ class TestGroupTensorsByDeviceAndDtype(TestCase):
             self.assertEqual(cpp_indices, polyfill_indices)
 
     def test_polyfill_matches_cpp_with_nones(self):
+        # [FUNCTION DOC] Same comparison for three parallel lists where the middle list holds
+        # only None entries; None entries must be preserved in the polyfill result as in C++.
         """Test that polyfill matches C++ implementation with None values."""
         from torch._dynamo.polyfills import group_tensors_by_device_and_dtype
 
@@ -104,6 +117,8 @@ class TestGroupTensorsByDeviceAndDtype(TestCase):
             self.assertEqual(cpp_indices, polyfill_indices)
 
     def test_polyfill_matches_cpp_without_indices(self):
+        # [FUNCTION DOC] Compares polyfill and C++ with indices not requested; besides matching
+        # C++, checks the polyfill indices are an empty list for each group.
         """Test that polyfill matches C++ implementation without indices."""
         from torch._dynamo.polyfills import group_tensors_by_device_and_dtype
 
@@ -136,6 +151,8 @@ class TestGroupTensorsByDeviceAndDtype(TestCase):
             self.assertEqual(polyfill_indices, [])
 
     def test_polyfill_empty_input(self):
+        # [FUNCTION DOC] Checks the polyfill returns an empty mapping for an empty outer list and
+        # for an outer list holding one empty list.
         """Test that polyfill handles empty input correctly."""
         from torch._dynamo.polyfills import group_tensors_by_device_and_dtype
 
@@ -146,6 +163,9 @@ class TestGroupTensorsByDeviceAndDtype(TestCase):
         self.assertEqual(result, {})
 
     def test_polyfill_groups_correctly(self):
+        # [FUNCTION DOC] Groups four tensors (two float32, two float64) on CPU and checks two
+        # groups keyed by device and dtype, each holding the right tensors in order, with index
+        # lists for the float32 group and the float64 group matching positions in the input.
         """Test that polyfill groups tensors correctly by device and dtype."""
         from torch._dynamo.polyfills import group_tensors_by_device_and_dtype
 
@@ -185,6 +205,10 @@ class TestGroupTensorsByDeviceAndDtype(TestCase):
         self.assertEqual(f64_indices, [1, 3])
 
     def test_group_tensors_traceable_with_compile(self):
+        # [FUNCTION DOC] Compiles with full graph and a compile counter a function that calls the
+        # C++ grouping binding on tensors and grads, sums over matching pairs, and checks the
+        # compiled result is close to eager, at least one frame was compiled and operations were
+        # traced.
         """Test that torch._C._group_tensors_by_device_and_dtype is traceable with torch.compile.
 
         This test verifies:
@@ -195,6 +219,9 @@ class TestGroupTensorsByDeviceAndDtype(TestCase):
         cnts = torch._dynamo.testing.CompileCounter()
 
         def fn(tensors, grads):
+            # [FUNCTION DOC] HELPER: Groups the two lists by device and dtype, then adds up the
+            # float sums of the elementwise sum of each non-None tensor and grad pair, returning
+            # the scalar total.
             # Group tensors by device and dtype (this uses the polyfill under compile)
             grouped = torch._C._group_tensors_by_device_and_dtype(
                 [tensors, grads], True
