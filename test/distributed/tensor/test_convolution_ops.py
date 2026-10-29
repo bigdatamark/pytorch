@@ -1,6 +1,12 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Tests for DTensor convolution support (Conv1d/2d/3d forward and backward) on
+# a 2-rank mesh. Compares DTensor-based training/forward/backward against plain-tensor
+# references for downsampling, depthwise, batch-sharded and last-spatial-dim-sharded
+# convolutions, bias=None regressions, and checks communication counts via CommDebugMode.
+# Defines _conv_fn (replicates module parameters), the DistConvolutionOpsTest class and a
+# local-tensor variant of it created at import time with several send/recv tests skipped.
 import copy
 
 import torch
@@ -35,6 +41,11 @@ def _conv_fn(
     module: nn.Module,
     device_mesh: DeviceMesh,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Partition function for distribute_module. Converts every named
+    # parameter of the module into an nn.Parameter wrapping a Replicate DTensor on the mesh
+    # and re-registers it on the module under the name with dots replaced by underscores
+    # (for the flat conv modules this overwrites the same-named parameter). The name
+    # argument is unused because the loop variable shadows it. Mutates the module in place.
     for name, param in module.named_parameters():
         dist_spec = [Replicate()]
         dist_param = torch.nn.Parameter(
@@ -45,13 +56,23 @@ def _conv_fn(
 
 
 class DistConvolutionOpsTest(DTensorTestBase):
+    # [CLASS DOC] Multi-process (2 ranks) DTensor convolution tests. Each test builds the
+    # device mesh, distributes a conv module with replicated parameters and a (usually
+    # sharded) input, and compares forward/backward results or trained weights against a
+    # deep-copied non-distributed reference model.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Returns the fixed world size of 2 ranks for these tests.
         # hard code world size to 2
         return 2
 
     @with_comms
     def test_downsampling_convolution(self):
+        # [FUNCTION DOC] Trains a strided Conv2d (kernel 4, stride 4, weights 1, bias 0) for
+        # ITER_TIME SGD steps, once with replicated parameters and an input and gradient
+        # sharded on the last dim, and once as a plain model with the same data. Asserts the
+        # absolute and relative mean squared difference of the local weight and bias versus
+        # the reference are each at most 1e-6.
         device_mesh = self.build_device_mesh()
         shard_spec = [Shard(3)]
 
@@ -122,6 +143,10 @@ class DistConvolutionOpsTest(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_depthwise_convolution(self):
+        # [FUNCTION DOC] Same train-and-compare procedure as the downsampling test but with
+        # a depthwise Conv2d (256 groups, kernel 7, padding 3) on inputs sharded on the last
+        # dim; asserts weight and bias MSE (absolute and relative) vs the plain model are
+        # at most 1e-6. Requires at least 2 GPUs.
         device_mesh = self.build_device_mesh()
         shard_spec = [Shard(3)]
 
@@ -190,6 +215,9 @@ class DistConvolutionOpsTest(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_conv_backward_none_grad_inp(self):
+        # [FUNCTION DOC] Runs conv2d on replicated DTensor input, weight and bias, where only
+        # weight and bias require grad, then backward. Asserts weight and bias grads are set
+        # and the input grad stays None. Requires at least 2 GPUs.
         device_mesh = self.build_device_mesh()
         conv = nn.Conv2d(64, 64, 3, padding=1).train()
         x = torch.randn(1, 64, 32, 32)
@@ -210,6 +238,11 @@ class DistConvolutionOpsTest(DTensorTestBase):
     def _run_single_arg_fwd(
         self, model, arg, placements=None
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Runs one forward pass of the model both distributed and
+        # locally. Wraps arg as a DTensor with the given placements (default replicated),
+        # runs the module distributed with replicated params, and runs a deep copy of the
+        # original on the gathered full tensor. Returns (distributed full output, local
+        # output).
         """Given model and arg, runs fwd model local and distbuted given device_mesh"""
         device_mesh = self.build_device_mesh()
         model_copy = copy.deepcopy(model).to(device=self.device_type)
@@ -221,6 +254,8 @@ class DistConvolutionOpsTest(DTensorTestBase):
 
     @with_comms
     def test_conv1d(self):
+        # [FUNCTION DOC] Checks a Conv1d forward with a replicated input matches the local
+        # result.
         model = nn.Conv1d(64, 64, 3, padding=1)
         x = torch.randn(1, 64, 8, device=self.device_type)
         out_dt, out = self._run_single_arg_fwd(model, x)
@@ -228,6 +263,8 @@ class DistConvolutionOpsTest(DTensorTestBase):
 
     @with_comms
     def test_conv3d(self):
+        # [FUNCTION DOC] Checks a Conv3d forward with the input built from a local tensor as
+        # Shard(0) matches the local result on the gathered full tensor.
         model = nn.Conv3d(64, 64, 3, padding=1)
         x = torch.randn(1, 64, 8, 8, 8, device=self.device_type)
         out_dt, out = self._run_single_arg_fwd(model, x, [Shard(0)])
@@ -236,6 +273,9 @@ class DistConvolutionOpsTest(DTensorTestBase):
     @with_tf32_off
     @with_comms
     def test_conv2d_no_bias_compile(self):
+        # [FUNCTION DOC] Regression test for issue 167091: a torch.compiled conv2d with bias
+        # None on replicated DTensors must not crash, must give output shape [1, 8, 5, 5],
+        # and must match the eager DTensor result locally. TF32 is disabled by decorator.
         """Test Conv2d with bias=False in compile mode (Issue #167091)
 
         Regression test: Previously this would fail during torch.compile
@@ -244,6 +284,7 @@ class DistConvolutionOpsTest(DTensorTestBase):
         device_mesh = self.build_device_mesh()
 
         def conv_fn(x, w):
+            # [FUNCTION DOC] HELPER: conv2d of x with weight w, no bias, padding 1.
             return F.conv2d(x, w, bias=None, padding=1)
 
         compiled_fn = torch.compile(conv_fn)
@@ -270,6 +311,9 @@ class DistConvolutionOpsTest(DTensorTestBase):
 
     @with_comms
     def test_conv2d_no_bias_backward(self):
+        # [FUNCTION DOC] Regression test for issue 167091: eager conv2d with bias None on
+        # replicated DTensors, then backward with a random gradient. Asserts the weight
+        # parameter receives a gradient of shape [8, 4, 3, 3].
         """Test Conv2d backward pass with bias=False (Issue #167091)
 
         Regression test: Previously backward pass would fail when
@@ -300,6 +344,10 @@ class DistConvolutionOpsTest(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_conv2d_batch_shard_strided(self):
+        # [FUNCTION DOC] Strided (stride 2, kernel 7) Conv2d with the input sharded on the
+        # batch dim: forward and backward must perform zero collectives (CommDebugMode total
+        # count 0) and the gathered output and input gradient must match a plain reference.
+        # Requires at least 2 GPUs.
         """Batch-dim sharding with stride != 1 should not hit _is_supported."""
         device_mesh = self.build_device_mesh()
 
@@ -331,6 +379,8 @@ class DistConvolutionOpsTest(DTensorTestBase):
     @with_tf32_off
     @with_comms
     def test_convolution_last_dim_shard(self):
+        # [FUNCTION DOC] Runs the last-dim-shard check for 1-D, 2-D and 3-D convolutions via
+        # run_subtests with the parameter conv_dim in 1, 2, 3.
         run_subtests(
             self,
             {"conv_dim": [1, 2, 3]},
@@ -338,6 +388,11 @@ class DistConvolutionOpsTest(DTensorTestBase):
         )
 
     def _test_convolution_last_dim_shard(self, conv_dim):
+        # [FUNCTION DOC] HELPER: For conv_dim in 1..3 builds the matching Conv class with
+        # kernel 4, stride 4 and padding 0 on the last spatial dim (size 16), other spatial
+        # dims size 8 with kernel 3, stride 1, padding 1. Shards the input on its last dim,
+        # and checks forward output and input gradient placements, shapes and gathered values
+        # against a plain reference model.
         device_mesh = self.build_device_mesh()
         conv_cls = (nn.Conv1d, nn.Conv2d, nn.Conv3d)[conv_dim - 1]
         spatial_shape = (8,) * (conv_dim - 1) + (16,)
@@ -375,6 +430,9 @@ class DistConvolutionOpsTest(DTensorTestBase):
 
     @with_comms
     def test_conv2d_module_no_bias(self):
+        # [FUNCTION DOC] Regression test for issue 167091: an nn.Conv2d with bias=False,
+        # distributed with replicated params, runs forward on a replicated DTensor input,
+        # gives output shape [1, 8, 5, 5], and the module bias remains None.
         """Test nn.Conv2d module with bias=False (Issue #167091)
 
         Regression test: Ensures nn.Conv2d with bias=False works with DTensor.
@@ -407,6 +465,9 @@ class DistConvolutionOpsTest(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_conv1d_batch_shard(self):
+        # [FUNCTION DOC] Conv1d with the input sharded on the batch dim: forward and backward
+        # must issue no collectives, the output and the input gradient stay Shard(0), and
+        # gathered values match a plain reference. Requires at least 2 GPUs.
         device_mesh = self.build_device_mesh()
 
         model = nn.Conv1d(3, 8, kernel_size=3, padding=1).to(self.device_type)
@@ -440,6 +501,9 @@ class DistConvolutionOpsTest(DTensorTestBase):
     @with_comms
     @skip_if_lt_x_gpu(2)
     def test_conv3d_batch_shard(self):
+        # [FUNCTION DOC] Conv3d counterpart of the batch-shard test: no collectives in forward
+        # or backward, output and input gradient stay Shard(0), values match a plain
+        # reference. Requires at least 2 GPUs.
         device_mesh = self.build_device_mesh()
 
         model = nn.Conv3d(3, 8, kernel_size=3, padding=1).to(self.device_type)

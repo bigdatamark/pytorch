@@ -1,6 +1,11 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Unit tests for the DTensor sharding propagation helpers einop_rule and
+# pointwise_rule in torch.distributed.tensor._ops._common_rules. Tests build DTensorSpec
+# objects from dimension maps on a device mesh, wrap them in an OpSchema for an aten op,
+# and check the resulting output spec or the suggested redistribute schema. Runs under a
+# 4-rank DTensorContinuousTestBase; no import-time side effects beyond defining aten alias.
 import torch
 from torch.distributed.tensor import DeviceMesh
 from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
@@ -16,11 +21,17 @@ aten = torch.ops.aten
 
 
 class CommonRulesTest(DTensorContinuousTestBase):
+    # [CLASS DOC] Test case for einop_rule and pointwise_rule sharding propagation. Fixed
+    # at world_size 4 so that both 1-D meshes (4 ranks) and 2x2 meshes can be built.
+    # Each test constructs specs and asserts on output_spec / redistribute_schema only;
+    # no tensors are communicated.
     # hard code world size to 4 as we need to test
     # at least with 2d mesh
     world_size = 4
 
     def _gen_tensor_meta(self, shape):
+        # [FUNCTION DOC] HELPER: Allocates an empty CPU tensor of the given shape and returns
+        # a TensorMeta holding its shape, stride and dtype (default float32).
         empty_tensor = torch.empty(shape)
         return TensorMeta(
             empty_tensor.shape,
@@ -29,6 +40,10 @@ class CommonRulesTest(DTensorContinuousTestBase):
         )
 
     def test_einop_basic_propagation(self):
+        # [FUNCTION DOC] Checks einop_rule on a matmul equation over a 1-D mesh: sharding on
+        # the n dim of mat2 yields output dim map [-1, 0], sharding on the m dim of mat1
+        # yields [0, -1], and sharding the contracted k dim on both inputs yields a
+        # partial placement on the output.
         # plain einsum, mm
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
 
@@ -82,6 +97,10 @@ class CommonRulesTest(DTensorContinuousTestBase):
         self.assertTrue(output_spec.placements[0].is_partial())
 
     def test_einop_pointwise_propagation(self):
+        # [FUNCTION DOC] Checks einop_rule with pointwise-style equations: identical specs
+        # keep their dim map, a lower-rank operand broadcasts against a higher-rank one
+        # (dim map of the larger operand wins), and a size-1 dim labeled "1" in the
+        # equation broadcasts to the common shape.
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
 
         add_call = aten.add.Tensor
@@ -133,6 +152,8 @@ class CommonRulesTest(DTensorContinuousTestBase):
         self.assertEqual(output_spec.dim_map, [0, -1, -1])
 
     def test_einop_merge_sharding(self):
+        # [FUNCTION DOC] On a 2x2 mesh, mat1 sharded on m (mesh dim 0) and mat2 sharded on
+        # n (mesh dim 1) merge into an output sharded as dim map [0, 1].
         # 2d mesh einop merge sharding
         mesh_shape = torch.arange(self.world_size).reshape(
             self.world_size // 2, self.world_size // 2
@@ -158,6 +179,11 @@ class CommonRulesTest(DTensorContinuousTestBase):
         self.assertEqual(output_spec.dim_map, [0, 1])
 
     def test_einop_linearity(self):
+        # [FUNCTION DOC] Tests the linearity flag of einop_rule with a partial input on mesh
+        # dim 1. Without linearity there is no output spec and the suggested schema
+        # redistributes input 0 to a non-partial placement. With linearity=True (mm and a
+        # pointwise add) there is also no output spec, and the suggestion converts the
+        # second input's mesh dim 1 placement to partial.
         mesh_shape = torch.arange(self.world_size).reshape(
             self.world_size // 2, self.world_size // 2
         )
@@ -225,6 +251,9 @@ class CommonRulesTest(DTensorContinuousTestBase):
         self.assertTrue(mat2_spec.placements[1].is_partial())
 
     def test_einop_multi_sharding_on_mesh_dim(self):
+        # [FUNCTION DOC] On a 1-D mesh both mm operands are sharded on their first dim over
+        # the same mesh dim, which cannot be propagated: expects no output spec and a
+        # redistribute suggestion keeping mat1 as [0, -1] and replicating mat2.
         # einop prop with multi sharding on same mesh dim
         mesh_shape = torch.arange(self.world_size)
         mesh = DeviceMesh(self.device_type, mesh_shape)
@@ -253,6 +282,9 @@ class CommonRulesTest(DTensorContinuousTestBase):
         self.assertEqual(schema_suggestion.args_schema[1].dim_map, [-1, -1])
 
     def test_einop_errors(self):
+        # [FUNCTION DOC] Verifies einop_rule raises RuntimeError mentioning "sharded two
+        # different ways" when the same equation dim is sharded on different mesh dims in
+        # the two add operands.
         mesh_shape = torch.arange(self.world_size).reshape(
             self.world_size // 2, self.world_size // 2
         )
@@ -273,6 +305,8 @@ class CommonRulesTest(DTensorContinuousTestBase):
             einop_rule("ij,ij->ij", OpSchema(add_call, (mat1_spec, mat2_spec), {}))
 
     def test_pointwise_rules_broadcasting(self):
+        # [FUNCTION DOC] pointwise_rule on where with a 1-D sharded condition, a scalar-shaped
+        # self and a 1x1 other: broadcasting to rank 2 gives output dim map [-1, 0].
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
 
         where_call = aten.where.self
@@ -298,6 +332,9 @@ class CommonRulesTest(DTensorContinuousTestBase):
         self.assertEqual(output_spec.dim_map, [-1, 0])
 
     def test_pointwise_rules_suggestion(self):
+        # [FUNCTION DOC] pointwise_rule on lerp with mismatched shardings and a trailing
+        # non-spec scalar argument: no output spec, and the redistribute schema keeps all
+        # three positional args, with the scalar -1 unchanged in position 2.
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size))
 
         lerp_call = aten.lerp.Scalar
@@ -325,6 +362,10 @@ class CommonRulesTest(DTensorContinuousTestBase):
         self.assertEqual(schema_suggestion.args_schema[2], -1)
 
     def test_pointwise_multi_sharding_on_mesh_dim(self):
+        # [FUNCTION DOC] pointwise_rule on a 2x2 mesh. A rank-2 and rank-1 add align by
+        # broadcasting and yield dim map [-1, 0]. A second case where two tensor dims map
+        # to conflicting mesh dims yields no output spec; the suggestion un-shards the
+        # first input's dim 0 (giving [-1, -1, -1, 1]) and leaves the second input as is.
         # 2d mesh pointwise sharding
         mesh_shape = torch.arange(self.world_size).reshape(
             self.world_size // 2, self.world_size // 2
@@ -370,6 +411,9 @@ class CommonRulesTest(DTensorContinuousTestBase):
         self.assertEqual(schema_suggestion.args_schema[1].dim_map, mat2)
 
     def test_pointwise_enforce_sharding_multi_sharding_on_mesh_dim(self):
+        # [FUNCTION DOC] pointwise_rule on the in-place add_ overload over a 2x2 mesh with
+        # conflicting shardings: no output spec; the suggestion keeps the first (mutated)
+        # argument's sharding and redistributes the second input to match it.
         # 2d mesh pointwise sharding
         mesh_shape = torch.arange(self.world_size).reshape(
             self.world_size // 2, self.world_size // 2

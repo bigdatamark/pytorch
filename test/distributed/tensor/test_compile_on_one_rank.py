@@ -1,5 +1,13 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Tests for the compile_on_one_rank (CooR) compiler config: compiling a graph on
+# one rank so the same artifact is valid on every rank. Covers (a) multi-process DTensor
+# tests checking compiled graphs are identical across ranks, (b) CUDA tests that make_fx and
+# inductor replace concrete cuda device indices with an in-graph current_device node and emit
+# device-agnostic, machine-independent code, and (c) single-process fake-process-group tests
+# that legacy in-place collectives become functional ones serializable by GraphPickler.
+# Import-time side effect: if TEST_WITH_DEV_DBG_ASAN is set, prints a message to stderr and
+# exits the process with status 0 before any test is defined.
 import difflib
 import functools
 import os
@@ -38,13 +46,25 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 
 def extract_graph(fx_g, _, graph_cell):
+    # [FUNCTION DOC] HELPER: Compiler callback for aot_autograd. Stores the generated Python
+    # source of the given FX graph module into the first slot of the list graph_cell
+    # (mutating it), ignores the example inputs argument, and returns the graph module
+    # unchanged so it runs as is.
     """Extract the FX graph code into a mutable cell."""
     graph_cell[0] = fx_g.code
     return fx_g
 
 
 class TestCompileOnOneRank(DTensorTestBase):
+    # [CLASS DOC] Multi-process tests (default DTensorTestBase world size) that compile
+    # DTensor and collective code under compile_on_one_rank=True and check that the
+    # captured forward graph source is the same on all ranks, or that compilation succeeds
+    # with an explicit or implicit process group.
     def _assert_graphs_identical_across_ranks(self, local_graph_code):
+        # [FUNCTION DOC] HELPER: Collective helper. Fails if local_graph_code is None.
+        # Encodes the graph source as bytes, all-gathers the lengths, pads to the maximum
+        # length, all-gathers the padded byte tensors, decodes each rank's source, and fails
+        # the test with a unified diff against rank 0 on the first rank whose source differs.
         """Gather compiled graph code from all ranks and assert they are identical."""
         self.assertIsNotNone(local_graph_code, "Graph was not captured")
 
@@ -96,6 +116,10 @@ class TestCompileOnOneRank(DTensorTestBase):
                 )
 
     def _compile_and_capture_graph(self, model):
+        # [FUNCTION DOC] HELPER: Wraps the model with torch.compile using an aot_autograd
+        # backend (min-cut partitioner) whose forward and backward compilers record graph
+        # source via extract_graph. Returns (compiled model, one-element list that is filled
+        # with the graph source of the last compiled graph once the model runs).
         """Compile model with a graph-capturing backend and return the graph cell."""
         fw_graph_cell = [None]
         fw_compiler = functools.partial(extract_graph, graph_cell=fw_graph_cell)
@@ -115,6 +139,10 @@ class TestCompileOnOneRank(DTensorTestBase):
     @with_comms
     @compiler_config.patch(compile_on_one_rank=True)
     def test_compiled_rowwise_embedding_graph_consistency(self):
+        # [FUNCTION DOC] Builds an embedding model with a rowwise-parallel embedding on the
+        # mesh (replicated input, Shard(1) output), compiles it under compile_on_one_rank and
+        # runs it on a replicated integer DTensor, then asserts the captured forward graph is
+        # identical on all ranks (no rank-specific bounds literals baked in).
         """Test that compiled graphs are identical across all ranks.
 
         When rowwise sharded embeddings are compiled with torch.compile, the
@@ -130,13 +158,18 @@ class TestCompileOnOneRank(DTensorTestBase):
         mesh = self.build_device_mesh()
 
         class Network(nn.Module):
+            # [CLASS DOC] HELPER: Minimal module holding one nn.Embedding named
+            # tok_embeddings, created on the given device; forward looks up the indices.
             def __init__(self, num_embeddings, embedding_dim, device):
+                # [FUNCTION DOC] HELPER: Creates the embedding table of shape
+                # (num_embeddings, embedding_dim) on the given device.
                 super().__init__()
                 self.tok_embeddings = nn.Embedding(
                     num_embeddings, embedding_dim, device=device
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the embedding lookup of the index input x.
                 return self.tok_embeddings(x)
 
         torch.manual_seed(0)
@@ -168,9 +201,14 @@ class TestCompileOnOneRank(DTensorTestBase):
     @with_comms
     @compiler_config.patch(compile_on_one_rank=True)
     def test_all_reduce_with_explicit_pg_input(self):
+        # [FUNCTION DOC] Compiles (inductor, fullgraph) a function that all-reduces a clone
+        # of its input over a ProcessGroup passed in as an argument, and asserts the compiled
+        # output equals the eager output.
         pg = dist.distributed_c10d._get_default_group()
 
         def f(t, group):
+            # [FUNCTION DOC] HELPER: Clones t, all-reduces the clone in place over group,
+            # and returns the result plus one.
             t = t.clone()
             dist.all_reduce(t, group=group)
             return t + 1
@@ -183,6 +221,9 @@ class TestCompileOnOneRank(DTensorTestBase):
     @with_comms
     @compiler_config.patch(compile_on_one_rank=True)
     def test_compiled_dtensor_rng_op_graph_consistency(self):
+        # [FUNCTION DOC] Compiles rand_like on a Shard(0) DTensor with an aot_autograd
+        # backend that captures the forward graph source, runs it, and asserts the captured
+        # graph is identical across ranks.
         """Compiled random ops on sharded DTensors should produce identical graphs."""
         mesh = self.build_device_mesh()
         dt = DTensor.from_local(
@@ -209,6 +250,9 @@ class TestCompileOnOneRank(DTensorTestBase):
     @with_comms
     @compiler_config.patch(compile_on_one_rank=True)
     def test_all_reduce_with_implicit_world_group(self):
+        # [FUNCTION DOC] Compiles (aot_eager, fullgraph) a function calling all_reduce with
+        # no group argument (implicit WORLD group) and asserts the compiled result equals
+        # the eager result; regression test for issue 181890.
         """`dist.all_reduce(t)` with no `group=` (implicit `dist.group.WORLD`)
         should compile under compile_on_one_rank=True.
 
@@ -225,6 +269,8 @@ class TestCompileOnOneRank(DTensorTestBase):
         """
 
         def f(t):
+            # [FUNCTION DOC] HELPER: Clones t, all-reduces it in place over the default
+            # group, and returns the result plus one.
             t = t.clone()
             dist.all_reduce(t)
             return t + 1
@@ -236,6 +282,8 @@ class TestCompileOnOneRank(DTensorTestBase):
 
 
 def _factory_from_input_device(x):
+    # [FUNCTION DOC] HELPER: Returns a zero tensor of shape (4, x.shape[1]) created on x's
+    # device with x's dtype, i.e. a factory op whose device is taken from an input.
     # Factory op whose device + dtype are derived from an input tensor, mirroring
     # real CooR graphs (e.g. token_dispatcher.py: torch.zeros(..., device=x.device)
     # and SimpleFSDP mixed-precision casts). Shape is incidental.
@@ -243,6 +291,9 @@ def _factory_from_input_device(x):
 
 
 def _indexed_cuda_device_nodes(gm):
+    # [FUNCTION DOC] HELPER: Scans the graph nodes of gm and returns the list of nodes having
+    # a torch.device argument or keyword value of type cuda with a non-None index (each node
+    # at most once).
     """Nodes carrying a concrete, indexed cuda device in their args/kwargs.
 
     These are the rank-specific constants that make a make_fx graph non
@@ -264,12 +315,18 @@ def _indexed_cuda_device_nodes(gm):
 
 
 def _current_device_nodes(gm):
+    # [FUNCTION DOC] HELPER: Returns the call_function nodes of gm whose target is the
+    # coor.current_device default op overload.
     """Nodes that fetch the current device in-graph."""
     target = torch.ops.coor.current_device.default
     return [n for n in gm.graph.nodes if n.op == "call_function" and n.target is target]
 
 
 class TestCompileOnOneRankDeviceAsParameter(TestCase):
+    # [CLASS DOC] Single-process tests (mostly requiring CUDA, some 2 GPUs) that under
+    # compile_on_one_rank, make_fx tracing and inductor replace concrete device indices by
+    # an in-graph current_device node, refuse non-current devices and unsupported wrappers,
+    # and generate code that is identical across devices and cache directories.
     """Device-as-parameter for the make_fx tracing path used by graph_trainer/CooR.
 
     Under compile_on_one_rank, a factory/cast op whose device matches the current
@@ -284,6 +341,9 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
     @compiler_config.patch(compile_on_one_rank=True)
     def test_factory_device_replaced_with_current_device(self):
+        # [FUNCTION DOC] Traces the device-from-input factory with make_fx (fake mode) on a
+        # cuda:0 input under compile_on_one_rank. Asserts exactly one current_device node
+        # exists and has users, and that no node still carries a concrete indexed cuda device.
         gm = make_fx(_factory_from_input_device, tracing_mode="fake")(
             torch.randn(2, 8, device="cuda:0")
         )
@@ -302,6 +362,9 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
     @unittest.skipIf(torch.cuda.device_count() < 2, "requires >= 2 GPUs")
     @compiler_config.patch(compile_on_one_rank=True)
     def test_runtime_follows_current_device_not_input(self):
+        # [FUNCTION DOC] Traces the factory once on cuda:0 under compile_on_one_rank, then
+        # runs the graph with a cuda:0 input while the current device is 0 and again while it
+        # is 1; asserts the output lands on cuda:0 and cuda:1 respectively. Needs 2 GPUs.
         # The runtime device follows the process's current device, not the input's.
         # The input is kept on cuda:0 in both runs; only the current device changes.
         gm = make_fx(_factory_from_input_device, tracing_mode="fake")(
@@ -318,6 +381,9 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
     def test_default_path_unchanged_bakes_device(self):
+        # [FUNCTION DOC] Without compile_on_one_rank, tracing the factory keeps the concrete
+        # cuda device baked: asserts no current_device nodes and at least one indexed cuda
+        # device node.
         # Without compile_on_one_rank the device stays baked (the feature must be
         # gated so it does not perturb the default tracing path).
         gm = make_fx(_factory_from_input_device, tracing_mode="fake")(
@@ -329,10 +395,14 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
     @compiler_config.patch(compile_on_one_rank=True)
     def test_to_copy_explicit_device_replaced(self):
+        # [FUNCTION DOC] Traces a cast to bfloat16 with explicit device cuda:0 under
+        # compile_on_one_rank; asserts one current_device node and no baked indexed cuda
+        # device remain.
         # An explicit-device dtype cast (the SimpleFSDP mixed-precision pattern,
         # aten._to_copy with a device= kwarg) also gets its baked device rewired to
         # the current_device() node, alongside the factory-op path.
         def f(x):
+            # [FUNCTION DOC] HELPER: Casts x to bfloat16 on explicit device cuda:0.
             return x.to(device="cuda:0", dtype=torch.bfloat16)
 
         gm = make_fx(f, tracing_mode="fake")(torch.randn(2, 8, device="cuda:0"))
@@ -342,9 +412,13 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
     @compiler_config.patch(compile_on_one_rank=True)
     def test_unindexed_accelerator_device_replaced(self):
+        # [FUNCTION DOC] Traces a factory using the bare device cuda under
+        # compile_on_one_rank and asserts exactly one current_device node is present.
         # A bare device="cuda" (index None) matching the current accelerator is also
         # replaced by the current_device() node.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns zeros of shape (4, x.shape[1]) on the bare
+            # device cuda with x's dtype.
             return torch.zeros(4, x.shape[1], device="cuda", dtype=x.dtype)
 
         gm = make_fx(f, tracing_mode="fake")(torch.randn(2, 8, device="cuda:0"))
@@ -353,8 +427,12 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
     @compiler_config.patch(compile_on_one_rank=True)
     def test_cpu_device_left_alone(self):
+        # [FUNCTION DOC] Traces a cpu zeros factory (with a cuda input) under
+        # compile_on_one_rank; asserts no current_device node is added and that some node
+        # still has a cpu torch.device argument.
         # cpu is portable on every rank, so a cpu factory is not rewritten.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns zeros of shape (4, x.shape[1]) on cpu.
             return torch.zeros(4, x.shape[1], device="cpu")
 
         gm = make_fx(f, tracing_mode="fake")(torch.randn(2, 8, device="cuda:0"))
@@ -372,6 +450,9 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
     @compiler_config.patch(compile_on_one_rank=True)
     def test_coor_check_current_accelerator(self):
+        # [FUNCTION DOC] With current device 0, calls the shared validator
+        # _coor_check_current_accelerator: it must accept cuda:0, bare cuda and cpu, and raise
+        # RuntimeError mentioning "device-agnostic" for cuda:1.
         # The shared validator (used by the make_fx input check, the operand rewrite, and the
         # benchmark-harness device renderer) must accept the current accelerator (bare or its
         # index) and cpu, and refuse a non-current accelerator -- so a device cannot be
@@ -394,6 +475,9 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
     @compiler_config.patch(compile_on_one_rank=True)
     @torch._inductor.config.patch(cpp_wrapper=True)
     def test_cpp_wrapper_under_coor_rejected(self):
+        # [FUNCTION DOC] With inductor cpp_wrapper enabled and compile_on_one_rank on,
+        # compiling a simple add on a cuda input must raise an exception whose message says
+        # compile-on-one-rank is not supported with cpp_wrapper/AOTInductor.
         # cpp_wrapper/AOTInductor bakes the compile-time device index into the C++ device
         # guard, which is not rank-portable. Compile-on-one-rank must refuse it rather than
         # silently emit a non-portable artifact.
@@ -410,6 +494,9 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
     @compiler_config.patch(compile_on_one_rank=True)
     @torch._inductor.config.patch(fx_wrapper=True)
     def test_fx_wrapper_under_coor_rejected(self):
+        # [FUNCTION DOC] With inductor fx_wrapper enabled and compile_on_one_rank on,
+        # compiling a simple add on a cuda input must raise an exception whose message says
+        # compile-on-one-rank is not supported with fx_wrapper.
         # fx_wrapper's device-context codegen is a no-op, so it would bake the compile-time
         # device index like cpp_wrapper. Compile-on-one-rank must refuse it rather than
         # silently emit a non-portable artifact.
@@ -422,10 +509,14 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
     @compiler_config.patch(compile_on_one_rank=True)
     def test_factory_without_matching_input_succeeds(self):
+        # [FUNCTION DOC] Traces a function creating zeros on cuda:0 from a cpu-only input
+        # under compile_on_one_rank; asserts a single current_device node and no baked
+        # indexed cuda device (the factory is rewritten rather than rejected).
         # Unlike provenance-following, matching the current accelerator needs no input
         # on that device: a cuda factory in a cpu-input graph is now rewritten, not
         # rejected.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns zeros of length x.shape[0] on device cuda:0.
             return torch.zeros(x.shape[0], device="cuda:0")
 
         gm = make_fx(f, tracing_mode="fake")(torch.randn(2, device="cpu"))
@@ -435,10 +526,14 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
     @compiler_config.patch(compile_on_one_rank=True)
     def test_wrong_index_raises(self):
+        # [FUNCTION DOC] With current device 0, tracing a function that creates a tensor on
+        # cuda:1 under compile_on_one_rank must raise RuntimeError saying the index differs
+        # from the current accelerator.
         # A cuda index that is not the current device's index cannot be made SPMD, so
         # the rewrite refuses it (raised during tracing before the fake op runs, so
         # this needs only the current device to exist).
         def f(x):
+            # [FUNCTION DOC] HELPER: Ignores x and returns zeros of length 4 on cuda:1.
             return torch.zeros(4, device="cuda:1")
 
         with torch.cuda.device(0):
@@ -450,6 +545,9 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
     @unittest.skipIf(torch.cuda.device_count() < 2, "requires >= 2 GPUs")
     @compiler_config.patch(compile_on_one_rank=True)
     def test_noncurrent_device_tensor_rejected(self):
+        # [FUNCTION DOC] With current device 0, tracing a function whose input tensor lives on
+        # cuda:1 must raise RuntimeError mentioning "device-agnostic", since graph tensors must
+        # be on the current device. Needs 2 GPUs.
         # CooR rejects a device *operand* that isn't the current accelerator (see
         # test_wrong_index_raises), but its single-device invariant also requires the
         # graph's *tensors* to be on the current device: the inductor wrapper collapses
@@ -457,6 +555,7 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
         # cuda:1 graph would be run on cuda:0. A graph whose input is on a non-current GPU
         # has no device operand to catch, so make_fx must reject it on the tensor device.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns x plus one.
             return x + 1
 
         with torch.cuda.device(0):
@@ -466,11 +565,16 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
     @unittest.skipIf(torch.cuda.device_count() < 2, "requires >= 2 GPUs")
     @compiler_config.patch(compile_on_one_rank=True)
     def test_graph_code_identical_across_devices(self):
+        # [FUNCTION DOC] Traces the device-from-input factory under current device 0 and then
+        # 1 and asserts the resulting FX graph source strings are equal and contain no
+        # "cuda:" text. Needs 2 GPUs.
         # The functional FX graph text (.code) must be byte-identical across ranks: the
         # device operand is the current_device() node, never a baked cuda:N. (.code
         # carries no per-tensor device annotations, so it stays clean while the tensor meta
         # remains on its real cuda:N device.)
         def code_on(dev):
+            # [FUNCTION DOC] HELPER: With device dev current, traces the factory on a fake
+            # cuda:dev input and returns the graph source text.
             with torch.cuda.device(dev):
                 return make_fx(_factory_from_input_device, tracing_mode="fake")(
                     torch.randn(2, 8, device=f"cuda:{dev}")
@@ -484,12 +588,18 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
     # A device-derived factory + a reduction, so inductor emits a real kernel.
     @staticmethod
     def _coor_inductor_fn(x):
+        # [FUNCTION DOC] HELPER: Static function used for inductor tests. Creates zeros of
+        # shape (4, x.shape[1]) on x's device and dtype and returns them plus the sum of x,
+        # so inductor emits a real kernel.
         z = torch.zeros(4, x.shape[1], device=x.device, dtype=x.dtype)
         return z + x.sum()
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
     @compiler_config.patch(compile_on_one_rank=True)
     def test_inductor_compiles_under_coor(self):
+        # [FUNCTION DOC] Resets dynamo, compiles the helper function with inductor and runs it
+        # on a cuda input capturing generated code. Asserts the output is on cuda, the code
+        # contains the current_device call, and it contains no baked device index.
         # The current_device() node must lower through inductor, and the generated code
         # must be device-agnostic: the device is resolved at runtime with no baked
         # rank-specific index, so one compiled artifact is shareable across ranks.
@@ -507,6 +617,9 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
         self._assert_no_baked_device(code)
 
     def _assert_no_baked_device(self, code):
+        # [FUNCTION DOC] HELPER: Asserts via regex that the generated code string has no
+        # cuda:N literal, no repr of a cuda torch.device with an index, and no
+        # DeviceProperties with an index.
         # A baked index reaches generated code in more forms than "cuda:N": repr() of a
         # torch.device gives device(type='cuda', index=0), and triton_meta renders
         # DeviceProperties(..., index=0). Check all three.
@@ -515,6 +628,9 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
         self.assertNotRegex(code, r"DeviceProperties\([^)]*index=\d")
 
     def _inductor_code_on_device(self, dev):
+        # [FUNCTION DOC] HELPER: Resets dynamo, then with device dev current compiles the
+        # helper function with inductor, runs it on a cuda:dev input, and returns all
+        # captured generated code strings joined by newlines.
         from torch._inductor.utils import run_and_get_code
 
         torch._dynamo.reset()
@@ -530,6 +646,10 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
     @unittest.skipIf(torch.cuda.device_count() < 2, "requires >= 2 GPUs")
     @compiler_config.patch(compile_on_one_rank=True)
     def test_inductor_code_identical_across_devices(self):
+        # [FUNCTION DOC] For each of two inductor configs (benchmark_kernel and
+        # autotune_at_compile_time), generates code on device 0 and device 1, and fails with
+        # a unified diff if they differ after normalizing the per-process AOT id counter;
+        # also asserts no baked device index in the device 0 code. Needs 2 GPUs.
         # The inductor-side rewrite is a dozen independent opt-in `if _coor_enabled():`
         # sites with no structural funnel, so pattern-matching one rank's output cannot
         # show that none was missed. Diffing the code generated on two different devices
@@ -542,6 +662,7 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
         # a rank-specific value -- it differs only because both compiles run in this one
         # process, so normalize it before diffing.
         def norm(s):
+            # [FUNCTION DOC] HELPER: Replaces the numeric AOT ID prefix in code text with N.
             return re.sub(r"AOT ID: \['\d+_", "AOT ID: ['N_", s)
 
         # Each config emits device references through a different path: the kernel's own
@@ -573,6 +694,9 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
     @compiler_config.patch(compile_on_one_rank=True)
     @torch._inductor.config.patch({"triton.force_cooperative_reductions": True})
     def test_cooperative_reduction_workspace_name_not_baked(self):
+        # [FUNCTION DOC] With forced cooperative reductions, compiles a sum over a large cuda
+        # tensor and asserts the code uses the semaphores_cuda workspace without a numeric
+        # device suffix and has no baked device index.
         # The cooperative-reduction semaphore workspace is named after its device, and
         # that name is emitted into the wrapper -- so an index in it makes the wrapper
         # differ across ranks even though no "cuda:N" literal appears. This runs on
@@ -594,6 +718,10 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
         "needs a GPU-enabled build whose devices can be hidden",
     )
     def test_coor_compiles_on_gpu_build_with_no_visible_device(self):
+        # [FUNCTION DOC] Runs a subprocess with CUDA/HIP visible devices emptied and a single
+        # inductor compile thread, in which a cpu add is compiled under compile_on_one_rank
+        # and must stay on cpu. Asserts the subprocess exits 0 (stderr tail shown otherwise).
+        # Skipped for builds with neither CUDA nor HIP.
         # A GPU-enabled build running where no device is visible -- a container started
         # without --gpus, a scheduler setting CUDA_VISIBLE_DEVICES="", every GPU already
         # allocated -- must still compile a cpu graph under CooR. current_accelerator()
@@ -641,6 +769,9 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
     @compiler_config.patch(compile_on_one_rank=True)
     def test_inductor_code_identical_across_cache_dirs(self):
+        # [FUNCTION DOC] Generates inductor code on device 0 under two fresh cache
+        # directories and fails with a unified diff if they differ after normalizing the AOT
+        # id, ensuring no machine-specific cache paths leak into generated code.
         # The artifact may be built on one machine and run on another (compatible) one,
         # so generated text must not embed machine-specific paths -- the inductor cache
         # dir is absolute and carries the building user's name. Two fresh cache roots
@@ -651,12 +782,15 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
         from torch._inductor.utils import fresh_cache
 
         def code_with_fresh_cache():
+            # [FUNCTION DOC] HELPER: Inside a fresh inductor cache, returns the inductor code
+            # generated on device 0.
             with fresh_cache():
                 return self._inductor_code_on_device(0)
 
         code_a, code_b = code_with_fresh_cache(), code_with_fresh_cache()
 
         def norm(s):
+            # [FUNCTION DOC] HELPER: Replaces the numeric AOT ID prefix in code text with N.
             return re.sub(r"AOT ID: \['\d+_", "AOT ID: ['N_", s)
 
         if norm(code_a) != norm(code_b):
@@ -676,6 +810,9 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
     @compiler_config.patch(compile_on_one_rank=True)
     def test_extern_kernel_device_arg_not_baked(self):
+        # [FUNCTION DOC] Compiles a function using randperm with the input's device (an aten
+        # fallback keeping a device argument). Asserts the code still calls the randperm
+        # fallback, has no baked device index, and the output is a permutation of 0..7.
         # An aten fallback that keeps a device= argument (randperm has no inductor
         # lowering) renders that argument through val_to_arg_str's repr() path, which
         # bakes the index as device(type='cuda', index=0) -- a form the "cuda:N" checks
@@ -683,6 +820,7 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
         from torch._inductor.utils import run_and_get_code
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns a random permutation of 0..7 on x's device.
             return torch.randperm(8, device=x.device) + 0
 
         torch._dynamo.reset()
@@ -698,6 +836,9 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
     @compiler_config.patch(compile_on_one_rank=True)
     @torch._inductor.config.patch({"triton.cudagraphs": True})
     def test_cudagraphs_under_coor_runs_on_nonzero_device(self):
+        # [FUNCTION DOC] With triton cudagraphs on and cuda:1 current, compiles the helper
+        # function and calls it three times (record then replay) on a cuda:1 input; asserts
+        # the output is on cuda:1 and equals the eager reference. Needs 2 GPUs.
         # cudagraphs is not refused under CooR (see the guard in compile_fx.py): its
         # device dependence lives in the wrapper-level artifact, which is not shared
         # across ranks today. Pin that it works on a rank's own device.
@@ -716,6 +857,8 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
     @unittest.skipIf(torch.cuda.device_count() < 2, "requires >= 2 GPUs")
     @compiler_config.patch(compile_on_one_rank=True)
     def test_inductor_runs_on_nonzero_device(self):
+        # [FUNCTION DOC] With cuda:1 current, compiles and runs the helper function on a
+        # cuda:1 input and asserts the output is on cuda:1. Needs 2 GPUs.
         # Problem 2 (runtime): a graph compiled under CooR must run on a rank's own
         # (non-zero) device -- the device guard, stream, and kernel load must follow the
         # runtime current device, not a baked index.
@@ -730,6 +873,10 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
     @unittest.skipIf(torch.cuda.device_count() < 2, "requires >= 2 GPUs")
     @compiler_config.patch(compile_on_one_rank=True)
     def test_inductor_compiled_on_one_device_runs_on_another(self):
+        # [FUNCTION DOC] In a fresh cache, compiles and runs the helper on cuda:0, clears
+        # in-memory caches, then compiles and runs it on cuda:1. Asserts the second compile is
+        # an FX graph cache miss (zero hits, one miss, because the key includes the device),
+        # and the output is on cuda:1 and matches the eager reference. Needs 2 GPUs.
         # Problem 3 (shareable artifact): a graph first compiled on cuda:0 must produce a
         # correct result when the same code is compiled and run on cuda:1 with the on-disk
         # cache warm from the cuda:0 run.
@@ -772,6 +919,10 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
     @unittest.skipIf(torch.cuda.device_count() < 2, "requires >= 2 GPUs")
     @compiler_config.patch(compile_on_one_rank=True)
     def test_inductor_shared_kernel_reused_in_process_across_devices(self):
+        # [FUNCTION DOC] With caches cleared, compiles the helper once and calls it on
+        # cuda:0 then on cuda:1 (same in-process kernel launcher). Asserts each output is on
+        # its own device and equals the eager reference, pinning per-device kernel handles.
+        # Needs 2 GPUs.
         # A rank only ever drives one device, but CooR's kernel cache key is
         # device-agnostic, so within one process the in-memory autotuner hands the same
         # loaded launcher to whatever device is current. A loaded CUfunction is
@@ -804,6 +955,9 @@ class TestCompileOnOneRankDeviceAsParameter(TestCase):
 
 
 def _baked_pg_constants(gm):
+    # [FUNCTION DOC] HELPER: Walks get_attr nodes of gm, resolving each dotted target by
+    # attribute lookup on gm, and returns the targets whose value is a ScriptObject of a
+    # ProcessGroup type (baked torchbind process groups).
     """get_attr nodes that resolve to a torchbind ProcessGroup baked onto the gm.
 
     These are unserializable: torch.classes.c10d.ProcessGroup has no
@@ -822,6 +976,8 @@ def _baked_pg_constants(gm):
 
 
 def _call_targets(gm):
+    # [FUNCTION DOC] HELPER: Returns the string form of the target of every call_function
+    # node in gm, in graph order.
     return [str(n.target) for n in gm.graph.nodes if n.op == "call_function"]
 
 
@@ -829,6 +985,9 @@ def _call_targets(gm):
 # distributed ops (mesh_get_process_group) keep a real ProcessGroup in
 # node.meta["val"]/["eager_input_vals"], which is not picklable and not needed.
 def _drop_distributed_meta(key):
+    # [FUNCTION DOC] HELPER: Node metadata key filter for GraphPickler. Returns False for the
+    # keys val, eager_input_vals, source_fn_stack, nn_module_stack and fwd_source_fn_stack
+    # (dropped) and True for all others.
     return key not in (
         "val",
         "eager_input_vals",
@@ -840,6 +999,10 @@ def _drop_distributed_meta(key):
 
 @unittest.skipIf(not dist.is_available(), "distributed not available")
 class TestCompileOnOneRankLegacyCollective(TestCase):
+    # [CLASS DOC] Single-process tests on a fake process group (world size 2, rank 0) and a
+    # 2-rank cpu mesh created in setUp and torn down in tearDown. Checks that legacy c10d
+    # collectives traced by make_fx become functional collectives with the group obtained
+    # in-graph under compile_on_one_rank, and are baked as ProcessGroup constants otherwise.
     """Legacy in-place c10d collectives (dist.all_reduce) under compile_on_one_rank.
 
     The in-place op ``c10d.allreduce_`` binds the ProcessGroup directly, so make_fx
@@ -853,23 +1016,33 @@ class TestCompileOnOneRankLegacyCollective(TestCase):
     """
 
     def setUp(self):
+        # [FUNCTION DOC] Initializes a fake-backend default process group (rank 0, world size
+        # 2) on a FakeStore and builds a 1-D cpu device mesh of size 2 as self.mesh.
         super().setUp()
         self.store = FakeStore()
         dist.init_process_group(backend="fake", store=self.store, rank=0, world_size=2)
         self.mesh = init_device_mesh("cpu", (2,))
 
     def tearDown(self):
+        # [FUNCTION DOC] Destroys the default process group, then calls the base tearDown.
         dist.destroy_process_group()
         super().tearDown()
 
     @staticmethod
     def _fn(t, mesh):
+        # [FUNCTION DOC] HELPER: Clones t, all-reduces the clone in place with the MAX
+        # reduction over the mesh's process group, and returns it plus one.
         t = t.clone()
         dist.all_reduce(t, op=dist.ReduceOp.MAX, group=mesh.get_group())
         return t + 1
 
     @compiler_config.patch(compile_on_one_rank=True)
     def test_legacy_all_reduce_serializes_under_coor(self):
+        # [FUNCTION DOC] Traces the all-reduce helper with make_fx (fake mode) under
+        # compile_on_one_rank. Asserts the graph has a mesh_get_process_group node (with
+        # users) and a functional all_reduce, no legacy in-place allreduce, and no baked
+        # ProcessGroup constant; then pickles the graph with GraphPickler using the
+        # metadata filter, which must not raise.
         gm = make_fx(self._fn, tracing_mode="fake")(torch.arange(4.0), self.mesh)
         targets = _call_targets(gm)
 
@@ -892,6 +1065,8 @@ class TestCompileOnOneRankLegacyCollective(TestCase):
 
     @staticmethod
     def _rs_fn(t, mesh):
+        # [FUNCTION DOC] HELPER: Allocates an output like t, reduce-scatters the list of t and
+        # t plus one into it with the MAX reduction over the mesh's group, returns it plus one.
         out = torch.empty_like(t)
         group = mesh.get_group()
         dist.reduce_scatter(out, [t, t + 1], op=dist.ReduceOp.MAX, group=group)
@@ -899,6 +1074,10 @@ class TestCompileOnOneRankLegacyCollective(TestCase):
 
     @compiler_config.patch(compile_on_one_rank=True)
     def test_legacy_reduce_scatter_serializes_under_coor(self):
+        # [FUNCTION DOC] Same checks as the all-reduce test for the reduce-scatter helper:
+        # a mesh_get_process_group node and functional reduce_scatter_tensor are present, the
+        # legacy in-place reduce_scatter and baked ProcessGroup constants are absent, and
+        # GraphPickler serialization with the metadata filter succeeds.
         gm = make_fx(self._rs_fn, tracing_mode="fake")(torch.arange(4.0), self.mesh)
         targets = _call_targets(gm)
 
@@ -913,6 +1092,8 @@ class TestCompileOnOneRankLegacyCollective(TestCase):
         )
 
     def test_default_path_bakes_pg(self):
+        # [FUNCTION DOC] Without compile_on_one_rank, tracing the all-reduce helper keeps the
+        # legacy in-place allreduce op and bakes a ProcessGroup constant onto the graph.
         # Without compile_on_one_rank the legacy in-place op is unchanged and bakes
         # the ProcessGroup as a torchbind constant (the gated-against behavior).
         gm = make_fx(self._fn, tracing_mode="fake")(torch.arange(4.0), self.mesh)
