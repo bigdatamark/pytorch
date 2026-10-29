@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Implements the default-device mechanism behind using a torch.device object as a
+# context manager or decorator. Provides a TorchFunctionMode (DeviceContext) that injects a
+# device keyword into factory functions when none is given, plus the decorator helpers.
+# Holds the module global CURRENT_DEVICE. Called from C++ (torch/csrc/Device.cpp). No import-time
+# side effects beyond defining names.
 import functools
 
 import torch
@@ -12,6 +17,9 @@ CURRENT_DEVICE: torch.device | None = None
 
 @functools.lru_cache(1)
 def _device_constructors():
+    # [FUNCTION DOC] HELPER: Returns (cached after first call) the set of torch factory functions
+    # that accept a device keyword and should receive the default device. Excludes the
+    # "_like" functions and normal. Takes no arguments, has no side effects.
     return {
         # standard ones
         torch.empty,
@@ -66,11 +74,22 @@ def _device_constructors():
 
 # NB: This is directly called from C++ in torch/csrc/Device.cpp
 class DeviceContext(TorchFunctionMode):
+    # [CLASS DOC] Torch function mode that makes a given device the default for factory
+    # functions. State: device (a torch.device), prev_mode (an enclosing DeviceContext that was
+    # displaced on entry, or None), old_device (saved previous CURRENT_DEVICE, set on enter).
+    # Invariant: while active, the single DeviceContext sits at the bottom of the torch function
+    # mode stack. Key methods: __enter__, __exit__, __torch_function__.
     def __init__(self, device) -> None:
+        # [FUNCTION DOC] Converts the device argument (string, int or device) to a torch.device
+        # and stores it; initializes prev_mode to None. Raises if the device is invalid.
         self.device = torch.device(device)
         self.prev_mode: DeviceContext | None = None
 
     def __enter__(self):
+        # [FUNCTION DOC] Activates the mode: saves and replaces the global CURRENT_DEVICE, then
+        # pops every mode off the torch function stack, pushes this mode at the bottom and
+        # re-pushes the others above it. If an older DeviceContext is found it is recorded as
+        # prev_mode and dropped from the stack. Returns None.
         global CURRENT_DEVICE
         self.old_device = CURRENT_DEVICE
         CURRENT_DEVICE = self.device
@@ -89,6 +108,10 @@ class DeviceContext(TorchFunctionMode):
                 _push_mode(mode)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # [FUNCTION DOC] Deactivates the mode: restores CURRENT_DEVICE, pops all modes above the
+        # bottom one (raising AssertionError if any is a DeviceContext), pops the bottom mode
+        # (raising AssertionError if it is not a DeviceContext), re-pushes prev_mode if present,
+        # then re-pushes the other modes in their original order. Does not suppress exceptions.
         global CURRENT_DEVICE
         CURRENT_DEVICE = self.old_device
         cur_stack = []
@@ -116,6 +139,10 @@ class DeviceContext(TorchFunctionMode):
             _push_mode(mode)
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Intercepts torch function calls. If the function is a known device
+        # constructor and no device keyword (or None) was passed, sets the keyword to this
+        # mode's device. Calls the function with the possibly updated arguments and returns its
+        # result.
         kwargs = kwargs or {}
         if func in _device_constructors() and kwargs.get("device") is None:
             kwargs["device"] = self.device
@@ -124,10 +151,14 @@ class DeviceContext(TorchFunctionMode):
 
 # NB: This is directly called from C++ in torch/csrc/Device.cpp
 def device_decorator(device, func):
+    # [FUNCTION DOC] Wraps func so that each call runs inside the given device used as a
+    # context manager. Returns the wrapped callable.
     return context_decorator(lambda: device, func)
 
 
 def set_device(device):
+    # [FUNCTION DOC] Takes a device specifier and returns a decorator that wraps a function so
+    # it runs with that default device. The device is converted to a torch.device eagerly.
     """
     Set the default device inside of the wrapped function by decorating it with this function.
 

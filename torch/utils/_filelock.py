@@ -1,3 +1,6 @@
+# [MODULE DOC] Defines FileLock, a subclass of the third-party filelock FileLock that records
+# wait counters (torch.monitor) around acquiring, holding and releasing the lock.
+# Imports filelock and torch.monitor at import time.
 from types import TracebackType
 from typing_extensions import Self
 
@@ -7,6 +10,9 @@ from torch.monitor import _WaitCounter
 
 
 class FileLock(base_FileLock):
+    # [CLASS DOC] Drop-in file lock with monitoring. Extra state: region_counter, a wait-counter
+    # guard created on each enter and closed on exit, covering the time the lock is held.
+    # Behavior otherwise inherited from the base lock.
     """
     This behaves like a normal file lock.
 
@@ -19,6 +25,9 @@ class FileLock(base_FileLock):
     """
 
     def __enter__(self) -> Self:
+        # [FUNCTION DOC] Acquires the lock via the base class while timing it under the enter
+        # counter, then starts the region counter. Returns the lock object (the base result).
+        # Side effects: creates and enters the region counter guard, stored on the instance.
         self.region_counter = _WaitCounter("pytorch.filelock.region").guard()
         with _WaitCounter("pytorch.filelock.enter").guard():
             result = super().__enter__()
@@ -31,6 +40,9 @@ class FileLock(base_FileLock):
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
+        # [FUNCTION DOC] Ends the region counter, then releases the lock via the base class
+        # while timing it under the exit counter. Always returns None, so exceptions from the
+        # protected block are not suppressed. Fails if enter was not called first.
         self.region_counter.__exit__()
         with _WaitCounter("pytorch.filelock.exit").guard():
             # Returns nothing per

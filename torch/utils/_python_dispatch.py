@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Python-side support for the torch dispatch mode stack and wrapper tensor
+# subclasses: the TorchDispatchMode base class, stack push/pop/inspection helpers, infra mode
+# (functional/proxy) handling, the traceable wrapper subclass protocol and predicates,
+# subclass transformation, and alias/schema analysis used to fix up storage aliasing in
+# subclass dispatch handlers. Holds module global flags tracking whether any dispatch mode is
+# active; these are updated by mode enter/exit. Importing also imports torchgen and the
+# dynamo guards extension.
 from __future__ import annotations
 
 import contextlib
@@ -41,6 +48,8 @@ _is_in_any_mode_without_ignore_compile_internals = False
 
 
 def is_in_torch_dispatch_mode(include_infra_modes: bool = True) -> bool:
+    # [FUNCTION DOC] Returns whether execution is inside a dispatch mode context. With
+    # include_infra_modes false, only non-infra (user) modes count. Reads module global flags.
     return (
         _is_in_torch_dispatch_mode
         if include_infra_modes
@@ -49,10 +58,14 @@ def is_in_torch_dispatch_mode(include_infra_modes: bool = True) -> bool:
 
 
 def is_in_any_mode_without_ignore_compile_internals() -> bool:
+    # [FUNCTION DOC] Returns whether any active mode reports that it does not ignore compile
+    # internals (reads a module global flag).
     return _is_in_any_mode_without_ignore_compile_internals
 
 
 def any_torch_dispatch_mode_on_stack() -> bool:
+    # [FUNCTION DOC] Scans the dispatch stack from bottom to top and returns True if any mode is
+    # neither an infra mode nor one that ignores compile internals; False otherwise.
     stack_len = torch._C._len_torch_dispatch_stack()
 
     for idx in range(stack_len):
@@ -70,6 +83,14 @@ def any_torch_dispatch_mode_on_stack() -> bool:
 
 
 class TorchDispatchMode:
+    # [CLASS DOC] Base class for dispatch modes that intercept operator calls within a dynamic
+    # scope. Subclasses implement the dispatch hook; entering the context pushes the mode on the
+    # dispatch stack and exiting pops it. State: three stacks (deques) of saved previous values of
+    # the module-level activity flags, one entry per nesting of enter, plus an optional
+    # dispatch key stored directly in the instance mapping for pre-dispatch modes. Class
+    # attribute supports_higher_order_operators controls handling of higher-order operators.
+    # On subclass creation, if dynamo skipping is enabled, a non-classmethod dispatch hook is
+    # wrapped to disable dynamo recursively.
     """
     A ``TorchDispatchMode`` allows you to override the meaning of all
     ``__torch_dispatch__`` overridable functions within a dynamic scope,
@@ -107,6 +128,9 @@ class TorchDispatchMode:
     supports_higher_order_operators = False
 
     def __init_subclass__(cls, **kwargs):
+        # [FUNCTION DOC] Subclass hook: after the normal setup, if the class opts into skipping
+        # dynamo and defines its own dispatch hook that is not a classmethod, replaces the hook
+        # with a version that recursively disables dynamo. Mutates the new subclass.
         super().__init_subclass__(**kwargs)
         if cls._should_skip_dynamo():
             if "__torch_dispatch__" in cls.__dict__:
@@ -115,6 +139,8 @@ class TorchDispatchMode:
                     cls.__torch_dispatch__ = torch._disable_dynamo(raw, recursive=True)
 
     def __init__(self, _dispatch_key=None):
+        # [FUNCTION DOC] Optionally records a pre-dispatch key (raises AssertionError if given
+        # and not a dispatch key), and creates the three empty stacks of saved flag values.
         if _dispatch_key is not None:
             if not isinstance(_dispatch_key, torch._C.DispatchKey):
                 raise AssertionError("_dispatch_key must be a torch._C.DispatchKey")
@@ -127,6 +153,8 @@ class TorchDispatchMode:
         )
 
     def _lazy_init_old_dispatch_mode_flags(self):
+        # [FUNCTION DOC] HELPER: Creates any of the three flag stacks that are missing, for
+        # subclasses whose constructor did not call the base constructor.
         if not hasattr(self, "old_dispatch_mode_flags"):
             self.old_dispatch_mode_flags: deque[bool] = deque()  # type: ignore[no-redef]
 
@@ -141,9 +169,16 @@ class TorchDispatchMode:
             ] = deque()
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Abstract hook called for each intercepted operator with the operator,
+        # participating types, positional and keyword arguments. Subclasses return the result.
+        # Raises NotImplementedError here.
         raise NotImplementedError
 
     def __enter__(self):
+        # [FUNCTION DOC] Activates the mode: saves the previous module flags on the per-instance
+        # stacks, sets them to reflect this mode (non-infra and without-ignore flags are or-ed
+        # with this mode's properties), tells the dynamo guards extension, and pushes the mode on
+        # the dispatch stack. Returns self.
         global _is_in_torch_dispatch_mode
         global _is_in_non_infra_torch_dispatch_mode
         global _is_in_any_mode_without_ignore_compile_internals
@@ -175,6 +210,10 @@ class TorchDispatchMode:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # [FUNCTION DOC] Deactivates the mode: restores the three module flags from the saved
+        # stacks, updates the dynamo guards extension, and pops the mode from the stack (using the
+        # stored dispatch key or mode key, if any, to pick the stack). Does not suppress
+        # exceptions. Raises IndexError if exit is not paired with an enter.
         mb_dk_or_mode_key = self.__dict__.get("_dispatch_key", None)
         if mb_dk_or_mode_key is None:
             # Today, mode keys are not used at all in the per-dispatch-key-mode logic (for pre-dispatch)
@@ -197,6 +236,8 @@ class TorchDispatchMode:
 
     @classmethod
     def push(cls, *args, **kwargs):
+        # [FUNCTION DOC] Deprecated constructor alias: emits a warning that it is unnecessary and
+        # returns a new instance built from the arguments (does not push anything).
         warnings.warn(
             "`Mode.push()` is no longer necessary and can be replaced with just `with Mode()`",
             stacklevel=2,
@@ -206,10 +247,14 @@ class TorchDispatchMode:
 
     @classmethod
     def is_infra_mode(cls) -> bool:
+        # [FUNCTION DOC] Whether this mode class is internal infrastructure (functional or proxy
+        # style) rather than user code. Default False; overridden by infra modes.
         return False
 
     @classmethod
     def _should_skip_dynamo(cls) -> bool:
+        # [FUNCTION DOC] HELPER: Class-level switch (default True) deciding whether the dispatch
+        # hook is wrapped to skip compilation inside it. Consulted at subclass creation.
         """Skip Dynamo when the flag is set to True
 
         This is temporary measure to rollout a feature
@@ -236,6 +281,8 @@ class TorchDispatchMode:
 
     @classmethod
     def ignore_compile_internals(cls) -> bool:
+        # [FUNCTION DOC] Whether the mode should be turned off during compilation and see only
+        # the compiled artifact's runtime. Default: True for infra modes, False otherwise.
         """Ignore operators that are compiled via torch.compile.
 
         If ``True``, then this TorchDispatchMode ignores operators that
@@ -268,6 +315,7 @@ class TorchDispatchMode:
 
 
 def _get_current_dispatch_mode() -> TorchDispatchMode | None:
+    # [FUNCTION DOC] HELPER: Returns the mode on top of the dispatch stack, or None if empty.
     """
     Return the top user mode on the stack (the next one that would be
     executed) if there are any.
@@ -279,6 +327,9 @@ def _get_current_dispatch_mode() -> TorchDispatchMode | None:
 
 
 def _detect_infra_mode(key):
+    # [FUNCTION DOC] HELPER: Returns the active functional or proxy infra mode for the key,
+    # looking at both the pre-dispatch and the regular stacks; None if neither has one. Raises
+    # AssertionError for any other key or if both stacks have an active mode.
     if key not in (
         torch._C._TorchDispatchModeKey.FUNCTIONAL,
         torch._C._TorchDispatchModeKey.PROXY,
@@ -305,6 +356,9 @@ def _detect_infra_mode(key):
 
 
 def _unset_infra_mode(key):
+    # [FUNCTION DOC] HELPER: Removes and returns the active infra mode for the key from whichever
+    # stack holds it (pre-dispatch or regular); returns None if none. Raises AssertionError if
+    # both stacks have one. Side effect: mutates the mode stack.
     from torch._ops import _get_dispatch_mode_pre_dispatch, unset_mode_pre_dispatch
 
     pre_dispatch_mode = _get_dispatch_mode_pre_dispatch(key)
@@ -322,6 +376,10 @@ def _unset_infra_mode(key):
 
 
 def _disable_infra_mode(key):
+    # [FUNCTION DOC] HELPER: Generator that temporarily removes the functional or proxy infra
+    # mode for the key, yields it (or None) and pushes it back afterwards. Raises AssertionError
+    # for other keys. KNOWN ISSUE: it is not decorated as a context manager, so it cannot be
+    # used directly in a with statement as intended.
     if key not in (
         torch._C._TorchDispatchModeKey.FUNCTIONAL,
         torch._C._TorchDispatchModeKey.PROXY,
@@ -338,6 +396,7 @@ def _disable_infra_mode(key):
 
 
 def _get_current_dispatch_mode_stack() -> list[TorchDispatchMode]:
+    # [FUNCTION DOC] HELPER: Returns a new list of the modes on the dispatch stack, bottom first.
     """
     Returns the current stack of dispatch modes, with the most recent
     (i.e., the one that will be processed first) at the end of the
@@ -348,6 +407,10 @@ def _get_current_dispatch_mode_stack() -> list[TorchDispatchMode]:
 
 
 def _push_mode(mode: TorchDispatchMode) -> None:
+    # [FUNCTION DOC] HELPER: Pushes a mode. A mode without a dispatch key goes on the regular
+    # dispatch stack. A mode with the pre-dispatch key first clears the cached dispatch handlers
+    # of all cached ops for the related backend keys, then goes on the pre-dispatch stack.
+    # Raises AssertionError for any other dispatch key.
     k = mode._dispatch_key if hasattr(mode, "_dispatch_key") else None
     if k is not None and k != torch._C.DispatchKey.PreDispatch:
         raise AssertionError(
@@ -369,6 +432,9 @@ def _push_mode(mode: TorchDispatchMode) -> None:
 
 
 def _pop_mode(k: DispatchKey | torch._C._TorchDispatchModeKey | None = None):
+    # [FUNCTION DOC] HELPER: Pops and returns a mode: from the pre-dispatch stack for the
+    # pre-dispatch key, from the regular stack for no key or an infra mode key. Returns None
+    # (nothing popped) for any other key.
     if k == torch._C.DispatchKey.PreDispatch:  # type: ignore[attr-defined]
         from torch._ops import _pop_mode_from_pre_dispatch
 
@@ -380,6 +446,8 @@ def _pop_mode(k: DispatchKey | torch._C._TorchDispatchModeKey | None = None):
 
 @contextlib.contextmanager
 def _pop_mode_temporarily(k: DispatchKey | None = None):
+    # [FUNCTION DOC] HELPER: Context manager that pops a mode (per the key), yields it, and
+    # pushes it back on exit even on error.
     old = _pop_mode(k)
     try:
         yield old
@@ -389,6 +457,10 @@ def _pop_mode_temporarily(k: DispatchKey | None = None):
 
 @contextlib.contextmanager
 def _disable_current_modes():
+    # [FUNCTION DOC] HELPER: Context manager that pops every mode off the pre-dispatch stack and
+    # the regular stack, yields the list of removed modes (pre-dispatch ones first), and
+    # restores both stacks on exit. Raises AssertionError if the same infra mode type
+    # (functional, proxy, schema check) is present on both stacks.
     from torch._ops import (
         _len_torch_dispatch_stack_pre_dispatch,
         _pop_mode_from_pre_dispatch,
@@ -445,7 +517,10 @@ def _disable_current_modes():
 
 
 class BaseTorchDispatchMode(TorchDispatchMode):
+    # [CLASS DOC] Pass-through mode: a ready-to-use dispatch mode that just runs each operator.
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Calls the operator with the given arguments (defaulting keyword
+        # arguments to empty) and returns its result.
         if kwargs is None:
             kwargs = {}
         return func(*args, **kwargs)
@@ -455,6 +530,10 @@ class BaseTorchDispatchMode(TorchDispatchMode):
 # protocol repeats the Tensor members that call sites commonly use after
 # is_traceable_wrapper_subclass() narrows a value to this protocol.
 class TraceableWrapperSubclass(Protocol):
+    # [CLASS DOC] Structural type for wrapper tensor subclasses traceable by PT2: requires
+    # flatten and unflatten methods plus the commonly used tensor members (shape, stride, size,
+    # storage_offset, dim, to). Only declarations with ellipsis bodies; no behavior. The one-line
+    # member stubs are not documented individually.
     """
     Canonical protocol for wrapper tensor subclasses that PT2 can trace through.
 
@@ -541,10 +620,14 @@ TensorWithFlatten = TraceableWrapperSubclass
 
 
 def _has_traceable_wrapper_subclass_protocol(t: object) -> bool:
+    # [FUNCTION DOC] HELPER: True if the object (instance or class) has both the flatten and
+    # the unflatten attributes (duck typing only).
     return hasattr(t, "__tensor_flatten__") and hasattr(t, "__tensor_unflatten__")
 
 
 def is_traceable_wrapper_subclass(t: object) -> TypeIs[TraceableWrapperSubclass]:
+    # [FUNCTION DOC] True if t is an instance of a strict tensor subclass (not a plain tensor)
+    # that has the flatten and unflatten attributes. Pure.
     """
     Returns whether ``t`` is a tensor subclass that matches the
     ``TraceableWrapperSubclass`` protocol at runtime.
@@ -562,6 +645,8 @@ def is_traceable_wrapper_subclass(t: object) -> TypeIs[TraceableWrapperSubclass]
 def is_traceable_wrapper_subclass_type(
     t: type,
 ) -> TypeIs[type[TraceableWrapperSubclass]]:
+    # [FUNCTION DOC] Class version of the instance check: True if t is a strict tensor subclass
+    # type with the flatten and unflatten attributes. Raises TypeError if t is not a class.
     """Same as above, but takes a type argument instead of an instance."""
     return (
         issubclass(t, torch.Tensor)
@@ -571,6 +656,11 @@ def is_traceable_wrapper_subclass_type(
 
 
 def transform_subclass(t, callback, outer_size=None, outer_stride=None):
+    # [FUNCTION DOC] Flattens the wrapper subclass t, applies callback (given attribute name and
+    # inner tensor) to each inner tensor, and rebuilds a new instance of the same type using the
+    # context, with outer size and stride defaulting to those of t. Raises AssertionError if the
+    # rebuilt tensor's shape or stride differs from the requested ones. Returns the new tensor.
+    # KNOWN ISSUE: the error messages join the type and the method name without a dot separator.
     """
     Given a traceable, wrapper tensor subclass ``t`` that implements
     ``__torch_dispatch__`` and holds some inner tensors,
@@ -613,6 +703,13 @@ def transform_subclass(t, callback, outer_size=None, outer_stride=None):
 
 
 def _correct_storage_aliasing(func, schema_info, args, outs) -> None:
+    # [FUNCTION DOC] HELPER: For each (argument index, output index) pair in the schema info's
+    # read-only alias matches, makes the output share the input's storage by an unsafe storage
+    # swap, leaving output sizes and strides untouched. Mutates the output tensors. Raises
+    # AssertionError if func is not an OpOverload, args is not a tuple, outs is not a list or
+    # tuple, or if types of aliased arguments and subclass outputs do not match.
+    # KNOWN ISSUE: two of the argument-check error messages report the type of args instead of
+    # the type of func or outs.
     """
     Given: an OpOverload, a SchemaInfo (cached information from torchgen about schema),
     and the inputs/outputs to the OpOverload,
@@ -632,6 +729,10 @@ def _correct_storage_aliasing(func, schema_info, args, outs) -> None:
         raise AssertionError(f"outs must be a list or tuple, got {type(args)}")
 
     def alias_non_inplace_storage(arg, ret) -> None:
+        # [FUNCTION DOC] HELPER: Verifies that argument and result types match when either is a
+        # traceable wrapper subclass (for a list result, each element), then swaps the storage
+        # of the result (each element of a list) to that of arg. Raises AssertionError on a type
+        # mismatch or a result that is neither a tensor nor a list.
         # This is hopefully a reasonable assert:
         # subclasses that rely on this API for output aliasing
         # should always return wrapper tensor subclasses for us to manually alias.
@@ -679,6 +780,9 @@ def _correct_storage_aliasing(func, schema_info, args, outs) -> None:
 
 
 def _get_write_alias(x) -> str | None:
+    # [FUNCTION DOC] HELPER: For an alias info record, returns the single alias name if it is a
+    # write alias, or None if it has no aliases or is not written. Raises AssertionError if the
+    # alias set has more than one name.
     alias_set = x.alias_set
     if not alias_set or not x.is_write:
         return None
@@ -695,6 +799,8 @@ def _get_write_alias(x) -> str | None:
 # and sometimes use torchscript schema parsing (for custom ops, for which torchgen parsing is untested).
 @dataclass
 class AliasInfo:
+    # [CLASS DOC] Alias annotation of one schema argument or return: alias_set (names of alias
+    # sets), is_write (whether the annotation marks mutation) and name (argument name or None).
     alias_set: set[str]
     is_write: bool
     name: str | None
@@ -702,6 +808,9 @@ class AliasInfo:
 
 @dataclass
 class SchemaInfo:
+    # [CLASS DOC] Cached alias summary of an operator schema: alias info for arguments and
+    # outputs, whether the op is an in-place view op, the write alias name per output (or None
+    # when no output is written) and the read-only (argument index, output index) alias matches.
     args: list[AliasInfo]
     outs: list[AliasInfo]
 
@@ -721,6 +830,11 @@ class SchemaInfo:
 # This is cached for efficiency, since it can involve running torchgen
 @functools.cache
 def get_alias_info(func) -> SchemaInfo:
+    # [FUNCTION DOC] Builds (and caches per op) the alias summary of an operator overload. ATen
+    # ops are parsed with torchgen after text fixes to the schema string; other ops use the
+    # runtime schema's alias info. Computes read-only alias matches, per-output write aliases
+    # and the in-place view tag. Raises AssertionError if an ATen schema string lacks the
+    # namespace prefix, and RuntimeError if only some outputs are written aliases.
     # For ATen ops: use torchgen (since torchscript parser doesn't handle alias annotations
     # properly for some ops that output tensorlists)
     if func.namespace == "aten":
@@ -821,6 +935,10 @@ def get_alias_info(func) -> SchemaInfo:
 def autograd_would_have_decomposed(
     func: torch._ops.OpOverload, flat_args: Sequence[torch.Tensor | object]
 ) -> bool:
+    # [FUNCTION DOC] Decides, from the first tensor in flat_args, whether autograd would have
+    # decomposed the operator: returns True unless the operator has a kernel registered for that
+    # tensor's device backend key. With no tensors returns True. Raises AssertionError if the
+    # device type has no dispatch key.
     """
     Suppose that an operator has CompositeImplicitAutograd decomp registered.
     Would autograd have used this decomposition?  It will only use it if there
@@ -877,6 +995,12 @@ def autograd_would_have_decomposed(
 
 
 def return_and_correct_aliasing(func, args, kwargs, out):
+    # [FUNCTION DOC] Post-processes a subclass's operator result to honor aliasing: aliases
+    # output storages for view ops; for in-place view ops, re-runs the op under no-dispatch with
+    # the meta-in-TLS flag set to update wrapper metadata (skipped for functional tensors); and
+    # for ops with mutable output aliases returns the corresponding input argument(s) (as the
+    # same container type as out when several) instead of out. Otherwise returns out.
+    # Raises AssertionError on unexpected schema shapes.
     """
     This function should be used by wrapper tensor ``__torch_dispatch__`` subclasses
     that would like to work with torch.compile. It ensures that the subclass
@@ -897,6 +1021,9 @@ def return_and_correct_aliasing(func, args, kwargs, out):
     schema_info = get_alias_info(func)
 
     def get_arg_from_alias(output_alias, schema_info, args, kwargs):
+        # [FUNCTION DOC] HELPER: Normalizes the call arguments and returns the one input argument
+        # whose alias set contains output_alias (by keyword name if present, else by position).
+        # Raises AssertionError unless exactly one argument matches.
         new_args, new_kwargs = torch.fx.operator_schemas.normalize_function(  # type: ignore[misc]
             func, args=args, kwargs=kwargs
         )

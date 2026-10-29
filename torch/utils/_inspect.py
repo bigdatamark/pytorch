@@ -1,3 +1,6 @@
+# [MODULE DOC] Fast replacement for signature binding: a metadata helper and a bind function
+# that avoids the standard library's slower general path when a signature has no variadics.
+# No import-time side effects.
 import inspect
 from typing import Any
 
@@ -5,6 +8,9 @@ from typing import Any
 def _signature_metadata(
     sig: inspect.Signature,
 ) -> tuple[tuple[inspect.Parameter, ...], bool, int]:
+    # [FUNCTION DOC] HELPER: Given a signature, returns the tuple of its parameters, whether any
+    # is variadic (positional or keyword), and the count of positional-only plus
+    # positional-or-keyword parameters. Pure.
     """
     Returns tuple(sig.parameters.values()), if any has VAR_POSITIONAL or VAR_KEYWORD, and the max_positional
     """
@@ -28,6 +34,11 @@ def _signature_metadata(
 def _fast_bind(
     sig: inspect.Signature, *args: Any, **kwargs: Any
 ) -> inspect.BoundArguments:
+    # [FUNCTION DOC] HELPER: Binds the given arguments to the signature and returns a bound
+    # arguments object. Delegates to the standard bind for signatures with variadics; otherwise
+    # walks the parameters by hand and raises TypeError for too many positional arguments,
+    # positional-only names passed by keyword, duplicate values, missing required arguments or
+    # unexpected keywords. Defaults are not applied to the result (same as the standard bind).
     """
     Fast path for inspect.Signature.bind() for signatures without
     VAR_POSITIONAL or VAR_KEYWORD parameters. Falls back to sig.bind()
