@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Prepare step of FX graph mode quantization. Annotates graph nodes with target dtype info
+# derived from qconfigs and the backend config, decides where observers or fake quants
+# are needed (per node output, per edge, shared across nodes), inserts them as
+# call_module nodes, handles standalone and custom modules, equalization and QAT module
+# swaps. Public entry points: prepare, insert_observers_for_model,
+# propagate_dtypes_for_known_nodes. Import time: defines module-level dtype lists and
+# default placeholder observer constructors/target-dtype dicts.
 import copy
 import warnings
 from typing import Any
@@ -112,6 +119,12 @@ def _needs_obs_or_fq(
     reuse_input_obs_or_fq: bool,
     is_zeroth_arg: bool = False,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Decides whether an observer/fake quant is needed between a producer with dtype
+    # prev_output_dtype and a consumer wanting cur_target_dtype. Dynamic target: raises
+    # AssertionError unless target dtype is observable and previous dtype is observable
+    # (not int/float/bool/None); returns is_zeroth_arg. Otherwise False if reusing the
+    # input observer; True if the target is an observable dtype, the previous dtype is
+    # observable or float, and the two differ; else False.
     """
     note: we will treat "not specified" as torch.float for now
     utility function that checks if we should insert an observer or fake quant node
@@ -152,6 +165,7 @@ def _needs_obs_or_fq(
 def _is_activation_post_process_node(
     node: Node, named_modules: dict[str, torch.nn.Module]
 ) -> bool:
+    # [FUNCTION DOC] HELPER: True if node is a call_module node whose target module is an observer or fake quant.
     return (
         isinstance(node, torch.fx.Node)
         and node.op == "call_module"
@@ -162,6 +176,8 @@ def _is_activation_post_process_node(
 def _get_dtype_and_is_dynamic(
     obs_or_fq: ObserverOrFakeQuantize | None,
 ) -> tuple[torch.dtype | None, bool]:
+    # [FUNCTION DOC] HELPER: Returns (dtype, is_dynamic) of an observer/fake quant instance; (None, False) if
+    # None is given. Missing is_dynamic attribute counts as False.
     """Given a constructor for observer or fake quant module, returns
     a Tuple of dtype and is_dynamic
     """
@@ -179,6 +195,11 @@ def _is_input_arg_dtype_supported_by_backend(
     dtype_config: DTypeConfig,
     backend_config: BackendConfig,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Checks whether the dtype configured for one argument of node is allowed by the
+    # backend dtype_config. Lists/tuples require all elements to pass; non-Node args
+    # pass. Activation args compare input dtype, dynamic flag and constraints; weight
+    # and bias args compare weight/bias dtype (weight also constraints). A backend
+    # dtype of None means anything is accepted. Reads node.meta target_dtype_info.
     """Check if the configured qconfig for the argument
     is supported by the backend or not
     """
@@ -252,6 +273,10 @@ def _is_output_dtype_supported_by_backend(
     qconfig: QConfigAny,
     dtype_config: DTypeConfig,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Checks whether the node's configured output dtype matches the backend
+    # dtype_config output dtype and satisfies its constraints (backend dtype None
+    # accepts all). A dynamic output observer is treated as float32 output.
+    # Defaults to an fp32 placeholder observer when none is recorded.
     """Check if the configured qconfig for the output
     is supported by the backend or not
     """
@@ -298,6 +323,9 @@ def _is_observer_in_same_graph(
     obs_or_fq_map: dict[EdgeOrNode, ObserverOrFakeQuantize],
     is_qat,
 ):
+    # [FUNCTION DOC] HELPER: Returns False when the node's output dtype is quint8/uint8 and its first arg is a
+    # graph placeholder (input assumed already quantized and observed elsewhere);
+    # otherwise True.
     """Check if observer in same graph
     when the node output is not fp32 and input is 'placeholder'
     the input is assumed to be quantized, so it is observed
@@ -321,6 +349,10 @@ def _is_pattern_dtype_config_and_qconfig_supported_by_backend(
     qconfig: QConfigAny,
     backend_config: BackendConfig,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if no backend config or pattern is given. Otherwise finds the pattern's
+    # dtype configs and root node (via its root node getter), and returns True if some
+    # dtype config supports all args and kwargs of the root node plus the output of the
+    # first matched node. Raises AssertionError on an empty matched pattern.
     """Check if the dtype configuration of a pattern is supported by
     the backend or not, and whether the qconfig satisfies constraints
     specified in the corresponding dtype config.
@@ -362,6 +394,10 @@ def _get_standalone_module_configs(
     parent_qconfig: QConfigAny,
     parent_backend_config: BackendConfig | None,
 ) -> tuple[QConfigMapping, tuple[Any, ...], PrepareCustomConfig, BackendConfig | None]:
+    # [FUNCTION DOC] HELPER: Resolves the config for a standalone submodule node. Config entry lookup by class
+    # then overridden by name; falls back to a global-only mapping using the parent qconfig,
+    # empty custom config and the parent backend config. Returns (qconfig mapping, example
+    # inputs, prepare custom config, backend config).
     """
     Returns the standalone module QConfigMapping and PrepareCustomConfig
     for `node`, assuming that the module pointed to by `node` is
@@ -390,10 +426,14 @@ def _get_standalone_module_configs(
 def _qat_swap_modules(
     root: torch.nn.Module, module_to_qat_module: dict[Pattern, type[torch.nn.Module]]
 ) -> None:
+    # [FUNCTION DOC] HELPER: Swaps modules of root in place to their QAT counterparts using the mapping,
+    # keeping qconfig attributes.
     convert(root, mapping=module_to_qat_module, inplace=True, remove_qconfig=False)
 
 
 def _add_matched_node_name_to_set(matched_node_pattern: NodePattern, s: set[str]):
+    # [FUNCTION DOC] HELPER: Recursively adds the names of all Nodes in a nested list/tuple pattern to set s
+    # (mutated in place); non-Node leaves are ignored.
     if isinstance(matched_node_pattern, Node):
         s.add(matched_node_pattern.name)
     elif isinstance(matched_node_pattern, (list, tuple)):
@@ -409,6 +449,10 @@ def _insert_obs_or_fq(
     graph: Graph,
     model_device: torch.device | None = None,
 ) -> Node:
+    # [FUNCTION DOC] HELPER: Registers obs_or_fq as a new uniquely named attribute on model (moving it to the
+    # model's single device, determined if not given), records it in named_modules, and
+    # adds a call_module node after node in graph. Name prefix is based on the node name for
+    # equalization observers, else a default activation prefix. Returns the new node.
     """
     Attaches `obs_or_fq` to `model`, and creates a node which calls
     `obs_or_fq` on the output of `node`.
@@ -443,6 +487,9 @@ def _set_target_dtype_info_for_matched_node_pattern(
     cache_for_no_tensor_check: dict[Node, bool],
     processed_nodes: set[Node],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Recursively walks a nested matched pattern; for each unseen Node, marks it
+    # processed and (if qconfig is not None) stores the computed target dtype info in
+    # node.meta. Non-Node leaves are ignored. Mutates processed_nodes and node meta.
     """Sets the target_dtype_info for each node in matched_node_pattern
     Note: processed_nodes is used to ensure we only process each node once
     """
@@ -497,6 +544,12 @@ def _get_target_activation_dtype_for_node(
     backend_config: BackendConfig,
     cache_for_no_tensor_check: dict[Node, bool],
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Builds the target dtype info mapping for a node. If all node args are non-tensors,
+    # both activation constructors are None. With a qconfig: input/output activation from
+    # qconfig.activation, weight constructor, a placeholder bias observer (float16 only for
+    # fp16 static activation and weight, else float), weight/bias arg indices from the
+    # backend config for call_function targets, reuse-input flag, share-observers flag from
+    # the handler and standalone flag. Without a qconfig: a copy of the fp32 default.
     """
     For each op attribute in the op's input activation, output activation,
     weight, bias - returns the settings of dtype and is_dynamic we expect
@@ -596,6 +649,13 @@ def _get_output_act_obs_or_fq(
     obs_or_fq_map: dict[EdgeOrNode, ObserverOrFakeQuantize],
     is_qat: bool,
 ) -> ObserverOrFakeQuantize | None:
+    # [FUNCTION DOC] HELPER: Returns a fresh observer/fake quant instance describing arg's output (or None if no
+    # constructor). For the tail of a custom-module LSTM or an observer node, it reads the
+    # original producing node's recorded output constructor; otherwise reads arg's own
+    # target dtype info, defaulting to an fp32 placeholder. Raises AssertionError for non-Node
+    # args or missing target_dtype_info; raises NotImplementedError if a quantization
+    # annotation (pt2e flow) is present.
+    # KNOWN ISSUE: the obs_or_fq_map and is_qat parameters are unused.
     """Get the constructor for observer or fake quant object for
     the argument in the original graph as the output of previous node,
     skipping inserted observers
@@ -665,6 +725,8 @@ def _get_arg_target_dtype_as_output(
     obs_or_fq_map: dict[EdgeOrNode, ObserverOrFakeQuantize],
     is_qat: bool,
 ) -> torch.dtype | None:
+    # [FUNCTION DOC] HELPER: Returns the target dtype of arg viewed as the output of its producer, or None
+    # if it has no observer constructor.
     arg_as_output_act_obs_or_fq = _get_output_act_obs_or_fq(
         arg, named_modules, obs_or_fq_map, is_qat
     )
@@ -681,6 +743,11 @@ def _get_arg_as_input_act_obs_or_fq(
     obs_or_fq_map: dict[EdgeOrNode, ObserverOrFakeQuantize],
     is_qat: bool,
 ) -> ObserverOrFakeQuantize | None:
+    # [FUNCTION DOC] HELPER: Returns a new observer/fake quant instance for arg as an input of node, chosen from
+    # node's target dtype info by role: activation, weight (None for ops in the
+    # non-quantizable-weight set) or bias; defaults to fp32 placeholder. Returns None if the
+    # constructor is None. Raises AssertionError for non-Node arg, NotImplementedError for
+    # pt2e annotations.
     """Get the observer or fake quant constructor for the Argument `arg`, as input
     to Node `node`
     """
@@ -728,6 +795,14 @@ def _maybe_insert_input_observer_for_arg_or_kwarg(
     backend_config: BackendConfig | None = None,
     model_device: torch.device | None = None,
 ) -> Argument:
+    # [FUNCTION DOC] HELPER: Returns arg, or the observer node replacing it, after inserting an input observer
+    # between arg and node when needed. Lists/tuples recurse elementwise preserving
+    # container type; non-Nodes returned unchanged. Regular nodes compare the producer's
+    # output dtype to the dtype node wants (via _needs_obs_or_fq). Standalone modules use
+    # the input-quantized indexes of their custom config and the qconfig activation.
+    # An existing observer of the same type and dtype among arg's users is reused. Records
+    # the (arg, node) edge in obs_or_fq_map; mutates graph and model when inserting.
+    # Raises AssertionError on missing target_dtype_info or qconfig, NotImplementedError for pt2e.
     """
     Given a `node` and an `arg`, inserts an input observer between
     `node` and `arg` if necessary.
@@ -898,6 +973,8 @@ def _maybe_insert_input_observers_for_node(
     backend_config: BackendConfig | None = None,
     model_device: torch.device | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Applies per-argument input observer insertion to every positional and keyword
+    # argument of node, then reassigns node.args and node.kwargs in place.
     """
     If needed, inserts observers to the input args and kwargs of `node`.
     Note: modifies `node` inplace.
@@ -963,6 +1040,11 @@ def _maybe_insert_input_equalization_observers_for_node(
     graph: Graph,
     is_branch: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: For nodes that support equalization (and have an equalization qconfig), wraps each
+    # non-bias Node argument with a new equalization observer (weight or input-activation
+    # constructor by role) and reassigns node.args in place. Does nothing without a qconfig
+    # or support; if is_branch is true, warns that the node cannot be equalized and
+    # does nothing. Note kwargs are not handled.
     """
     If `node` needs to be equalized, find the input/weight observers it needs in
     `equalization_qconfig`, creates them, and inserts it into `graph`.
@@ -1013,6 +1095,11 @@ def _maybe_insert_output_observer_for_node(
     obs_or_fq_map: dict[EdgeOrNode, ObserverOrFakeQuantize],
     is_qat: bool,
 ) -> Node | None:
+    # [FUNCTION DOC] HELPER: Inserts an output observer after node when its output target dtype is observable
+    # and differs from float, and returns the new observer node; returns None otherwise.
+    # Never observes dynamic outputs or standalone module outputs. Records node in
+    # obs_or_fq_map. Raises AssertionError for output nodes or missing target_dtype_info,
+    # NotImplementedError for pt2e annotations.
     """
     If `node` needs an output observer, creates it, inserts it into `graph`
     and returns it.
@@ -1096,6 +1183,8 @@ def _maybe_insert_observers_before_graph_output(
     obs_or_fq_map: dict[EdgeOrNode, ObserverOrFakeQuantize],
     is_qat: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Rewrites the graph output node's args, replacing each returned Node whose output
+    # dtype differs from its quantized input dtype with a newly inserted observer node.
     """
     If the output needs to be quantized and there are any nodes
     in the output which are not already observed, inserts observers
@@ -1108,6 +1197,10 @@ def _maybe_insert_observers_before_graph_output(
         named_modules: dict[str, torch.nn.Module],
         graph: Graph,
     ) -> Argument:
+        # [FUNCTION DOC] HELPER: Recurses through lists, tuples and dicts of output values; for a Node inserts an
+        # observer (built from its input activation constructor) when its output dtype
+        # differs from that observable dtype, returning the observer node, else the
+        # node itself. None passes through; any other type raises a generic Exception.
         """
         Navigate an arbitrary data structure of lists, tuples, dicts.
         For each container type, recurse on all inputs. Once any Node
@@ -1196,6 +1289,11 @@ def _maybe_propagate_dtype_for_node(
     target_dtype: torch.dtype | type,
     node_name_to_match_result_with_qconfig: dict[str, _MatchResultWithQConfig],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Marks node as carrying a non-observable dtype by clearing both its input and output
+    # activation observer constructors in its target dtype info; if the node's handler is a
+    # general tensor value op, repeats the process on its first argument when that is a Node.
+    # KNOWN ISSUE: target_dtype is never stored (only passed through recursion) although the
+    # docstring says it is assigned with is_dynamic False.
     """
     Assigns `target_dtype` to `node`, setting `is_dynamic` to False. If `node`
     is a general tensor shape op, also call this function recursively on
@@ -1226,6 +1324,10 @@ def propagate_dtypes_for_known_nodes(
     graph: Graph,
     node_name_to_match_result_with_qconfig: dict[str, _MatchResultWithQConfig],
 ) -> None:
+    # [FUNCTION DOC] Public pass: for each graph node, finds the argument positions known to hold non-observable
+    # values (for example boolean masks) and, for each such Node argument (including
+    # elements of lists/tuples), clears its observer constructors in target dtype info,
+    # recursing to producers of general tensor value ops. Mutates node meta in place.
     """
     Currently we assume that inputs to the graph are either `torch.float` or
     `torch.quint8`, which is not always correct. For ops such as
@@ -1265,6 +1367,11 @@ def _maybe_make_input_output_share_observers(
     model: torch.nn.Module,
     named_modules: dict[str, torch.nn.Module],
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Makes the observer modules of all other inputs (when the first input is a list or
+    # tuple) and of all output observer users of node point to the module of the first
+    # input's observer, found by tracing back through first args (bounded by an iteration
+    # guard that raises AssertionError). Returns False if there is no Node/sequence arg or no
+    # observer can be found; True on success. Orphaned observer modules are not deleted.
     """
     Ensures that we share an observer
     for all input arguments as well as the output argument. In detail, given
@@ -1367,6 +1474,9 @@ def _maybe_make_input_output_share_observers(
 def _remove_output_observer(
     node: Node, model: torch.nn.Module, named_modules: dict[str, torch.nn.Module]
 ):
+    # [FUNCTION DOC] HELPER: Removes the output observers of node: rewires their users to use node directly and
+    # erases the observer nodes from the model graph. Raises AssertionError if a user of
+    # node is not an observer node.
     items = list(node.users.items())
     for output_obs_node, _ in items:
         if not _is_activation_post_process_node(output_obs_node, named_modules):
@@ -1383,6 +1493,9 @@ def _swap_custom_module_to_observed(
     named_modules: dict[str, torch.nn.Module],
     prepare_custom_config: PrepareCustomConfig,
 ):
+    # [FUNCTION DOC] HELPER: Replaces the custom float module at node's target with its observed counterpart
+    # (class chosen from the float-to-observed mapping and qconfig, built through its from-float
+    # constructor), setting it on the parent module and not touching the graph.
     custom_module = named_modules[node.target]  # type: ignore[index]
     custom_module_class_mapping = prepare_custom_config.float_to_observed_mapping
     observed_custom_module_class = get_swapped_custom_module_class(
@@ -1403,6 +1516,18 @@ def insert_observers_for_model(
     observed_node_names: set[str],
     is_qat: bool,
 ) -> Node | None:
+    # [FUNCTION DOC] Public pass that mutates model's graph and modules to insert observers/fake quants. Steps:
+    # (1) set default fp32 target dtype info on all nodes, then per matched pattern set it from
+    # the qconfig; (2) override for quantized graph inputs/outputs (by custom config indexes)
+    # and for nodes with no tensor args, then propagate known non-observable dtypes;
+    # (3) reset patterns whose dtype config is unsupported by the backend to fp32;
+    # (4) per original node, insert input observers (and equalization observers) at the root
+    # of each pattern, output observers at the last node (rewiring users, sharing observers
+    # when required, swapping custom modules to observed form, inserting dequant stubs for
+    # custom LSTM), and observers before the graph output. Fills observed_node_names and
+    # returns the output node (None if absent).
+    # KNOWN ISSUE: step 3 reads target dtype info from the variable node left over from an earlier loop
+    # (the last graph node) instead of the current pattern's node.
     """
     Inserts observers, using the following high level algorithm:
 
@@ -1900,6 +2025,9 @@ def _run_prepare_fx_on_standalone_modules(
     prepare_custom_config: PrepareCustomConfig,
     backend_config: BackendConfig,
 ) -> None:
+    # [FUNCTION DOC] HELPER: For every matched standalone-module node, resolves its configs, runs the standalone
+    # prepare routine from quantize_fx on that submodule, and installs the observed module
+    # in its parent and in named_modules. Mutates model modules only; the graph is unchanged.
     """
     Runs prepare_fx on each standalone module. Note: this does
     not modify the graph, it just replaces the unobserved modules with
@@ -1951,6 +2079,9 @@ def _save_state(
     is_qat: bool,
     observed_node_names: set[str],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Stores the prepare-time state (qconfig maps, scope map, custom config, equalization
+    # map, qconfig mapping, QAT flag, observed node names) on the observed module's meta
+    # under the observed graph module attributes key.
     observed.meta["_observed_graph_module_attrs"] = ObservedGraphModuleAttrs(
         node_name_to_qconfig=node_name_to_qconfig,
         node_name_to_scope=node_name_to_scope,
@@ -1973,6 +2104,14 @@ def prepare(
     backend_config: BackendConfig | dict[str, Any] | None = None,
     is_standalone_module: bool = False,
 ) -> GraphModule:
+    # [FUNCTION DOC] Public entry of the FX prepare step. Fills defaults (custom config, equalization config,
+    # native backend config); converts deprecated dict arguments with a FutureWarning;
+    # deep-copies the qconfig mappings; adjusts qconfigs for fusion (and QAT module swaps,
+    # which also swap modules); propagates qconfigs to modules; computes per-node qconfigs,
+    # matches patterns, prepares standalone submodules, and calls observer insertion;
+    # rebuilds a GraphModule and saves state in its meta. For a standalone module it also
+    # records the input/output quantized indexes (output must be a single Node, else
+    # AssertionError). Returns the prepared GraphModule. Mutates the input model.
     """standalone_module means it a submodule that is not inlined in
     parent module, and will be quantized separately as one unit.
 

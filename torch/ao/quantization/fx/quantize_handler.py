@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Quantize handler classes for the FX quantization flow. QuantizeHandler records a
+# matched node pattern, its root node and how many of the root node's args are tensors;
+# helpers build a configurable handler class per backend pattern config. The many
+# named subclasses (BinaryOp, Cat, ConvRelu, ...) are empty legacy placeholders kept
+# only for backward compatible imports from torch.ao.quantization.
 from abc import ABC
 from collections.abc import Callable
 
@@ -33,6 +38,8 @@ __all__ = [
 
 
 def _default_root_node_getter(node_pattern):
+    # [FUNCTION DOC] HELPER: Returns the root Node of a (possibly nested tuple) pattern by repeatedly taking
+    # the last element until a Node is reached. Returns None unchanged if the pattern is None.
     if node_pattern is None:
         return node_pattern
     while not isinstance(node_pattern, Node):
@@ -42,6 +49,9 @@ def _default_root_node_getter(node_pattern):
 
 # Base Pattern Handler
 class QuantizeHandler(ABC):  # noqa: B024
+    # [CLASS DOC] Base holder for a matched quantization pattern. State: node_pattern, modules mapping,
+    # root_node, custom/standalone module flags and num_tensor_args (count of root node
+    # args that carry tensors). Subclasses override is_general_tensor_value_op.
     """Base handler class for the quantizer patterns"""
 
     def __init__(
@@ -52,6 +62,9 @@ class QuantizeHandler(ABC):  # noqa: B024
         is_custom_module=False,
         is_standalone_module=False,
     ):
+        # [FUNCTION DOC] Stores the pattern and modules, computes root_node with the given getter (default:
+        # last-element descent), stores the custom/standalone flags, and counts the root
+        # node's args that are Nodes not made only of non-tensor values (num_tensor_args).
         """Records pattern information in __init__, which will be used
         in convert
         """
@@ -77,6 +90,7 @@ class QuantizeHandler(ABC):  # noqa: B024
                     self.num_tensor_args += 1
 
     def is_general_tensor_value_op(self) -> bool:
+        # [FUNCTION DOC] Base implementation always returns False (output does not share the input observer).
         """
         Returns True if the operator works for both floating point and
         quantized input, and does some computation based on the input Tensor,
@@ -94,9 +108,11 @@ class QuantizeHandler(ABC):  # noqa: B024
         return False
 
     def is_custom_module(self):
+        # [FUNCTION DOC] Returns the stored custom-module flag.
         return self.is_custom_module_
 
     def is_standalone_module(self):
+        # [FUNCTION DOC] Returns the stored standalone-module flag.
         return self.is_standalone_module_
 
 
@@ -105,17 +121,24 @@ def _get_quantize_handler_cls(
     dtype_configs: list[DTypeConfig],
     num_tensor_args_to_observation_type: dict[int, ObservationType],
 ) -> type[QuantizeHandler]:
+    # [FUNCTION DOC] HELPER: Builds and returns a QuantizeHandler subclass closed over the backend's
+    # observation type, dtype configs and a mapping from tensor-arg count to observation type.
     """
     Return a configurable QuantizeHandler that matches the given specifications from the backend.
     """
 
     class ConfigurableQuantizeHandler(QuantizeHandler):
+        # [CLASS DOC] HELPER: Handler that sets observation_type and dtype_configs from the enclosing
+        # backend specification.
         def __init__(
             self,
             node_pattern: NodePattern,
             modules: dict[str, torch.nn.Module],
             root_node_getter: Callable | None = None,
         ):
+            # [FUNCTION DOC] HELPER: Runs the base init, then picks observation_type: if a per-tensor-count mapping
+            # exists, looks up num_tensor_args (raises AssertionError if missing), else uses
+            # the default observation type. Stores dtype_configs.
             super().__init__(node_pattern, modules, root_node_getter)
             if num_tensor_args_to_observation_type:
                 if self.num_tensor_args not in num_tensor_args_to_observation_type:
@@ -131,6 +154,7 @@ def _get_quantize_handler_cls(
             self.dtype_configs = dtype_configs
 
         def is_general_tensor_value_op(self) -> bool:
+            # [FUNCTION DOC] HELPER: True when observation_type is OUTPUT_SHARE_OBSERVER_WITH_INPUT.
             return (
                 self.observation_type
                 == ObservationType.OUTPUT_SHARE_OBSERVER_WITH_INPUT
@@ -142,6 +166,9 @@ def _get_quantize_handler_cls(
 def _get_pattern_to_quantize_handlers(
     backend_config: BackendConfig,
 ) -> dict[Pattern, QuantizerCls]:
+    # [FUNCTION DOC] HELPER: Returns a mapping from each pattern in the backend config (complex format) to a
+    # configurable handler class built from that pattern's observation type, dtype
+    # configs and per-tensor-count observation types.
     """
     Note: Quantize handler is just a holder for some check methods like
     (should_insert_observer_for_output), maybe this can be a enum as well,
@@ -164,63 +191,76 @@ def _get_pattern_to_quantize_handlers(
 # TODO: remove this class, this is still exposed in torch.ao.quantization
 # but we should be able to break bc
 class BinaryOpQuantizeHandler(QuantizeHandler):
+    # [CLASS DOC] HELPER: Empty legacy subclass kept for backward compatible imports.
     pass
 
 
 class CatQuantizeHandler(QuantizeHandler):
+    # [CLASS DOC] HELPER: Empty legacy subclass kept for backward compatible imports.
     pass
 
 
 # TODO: remove this class
 class ConvReluQuantizeHandler(QuantizeHandler):
+    # [CLASS DOC] HELPER: Empty legacy subclass kept for backward compatible imports.
     pass
 
 
 # TODO: remove this class
 class LinearReLUQuantizeHandler(QuantizeHandler):
+    # [CLASS DOC] HELPER: Empty legacy subclass kept for backward compatible imports.
     pass
 
 
 # TODO: remove this class
 class BatchNormQuantizeHandler(QuantizeHandler):
+    # [CLASS DOC] HELPER: Empty legacy subclass kept for backward compatible imports.
     pass
 
 
 # TODO: remove this class
 class EmbeddingQuantizeHandler(QuantizeHandler):
+    # [CLASS DOC] HELPER: Empty legacy subclass kept for backward compatible imports.
     pass
 
 
 # TODO: remove this class
 class RNNDynamicQuantizeHandler(QuantizeHandler):
+    # [CLASS DOC] HELPER: Empty legacy subclass kept for backward compatible imports.
     pass
 
 
 # TODO: remove this class
 class DefaultNodeQuantizeHandler(QuantizeHandler):
+    # [CLASS DOC] HELPER: Empty legacy subclass kept for backward compatible imports.
     """Common quantized op, first input and first output will be quantized"""
 
 
 # TODO: remove this class
 class FixedQParamsOpQuantizeHandler(QuantizeHandler):
+    # [CLASS DOC] HELPER: Empty legacy subclass kept for backward compatible imports.
     pass
 
 
 # TODO: remove
 class CopyNodeQuantizeHandler(QuantizeHandler):
+    # [CLASS DOC] HELPER: Empty legacy subclass kept for backward compatible imports.
     pass
 
 
 # TODO: remove
 class GeneralTensorShapeOpQuantizeHandler(QuantizeHandler):
+    # [CLASS DOC] HELPER: Empty legacy subclass kept for backward compatible imports.
     pass
 
 
 # TODO: not used, can be removed after torch.ao.quantization namespace is deprecated
 class CustomModuleQuantizeHandler(QuantizeHandler):
+    # [CLASS DOC] HELPER: Empty legacy subclass kept for backward compatible imports.
     pass
 
 
 # TODO: not used, can be removed after torch.ao.quantization namespace is deprecated
 class StandaloneModuleQuantizeHandler(QuantizeHandler):
+    # [CLASS DOC] HELPER: Empty legacy subclass kept for backward compatible imports.
     pass

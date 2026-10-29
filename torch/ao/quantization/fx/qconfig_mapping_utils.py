@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Internal helpers for resolving QConfigMapping entries in the FX quantization flow:
+# per-node qconfig lookup (module name, regex, object type, call order precedence),
+# fusion and QAT adjustments of the mapping, prepare/convert mapping consistency
+# checks, dtype-config support checks and flattening for propagate_qconfig_.
+# Exports nothing publicly (__all__ is empty); no import-time side effects.
 import re
 from collections import defaultdict, OrderedDict
 from collections.abc import Callable
@@ -36,6 +41,9 @@ def _maybe_adjust_qconfig_for_module_name_object_type_order(
     cur_object_type_idx: int,
     fallback_qconfig: QConfigAny,
 ) -> QConfigAny:
+    # [FUNCTION DOC] HELPER: Looks through the mapping's (module name, object type, index) ordered qconfigs
+    # for an entry matching the current module path, object type and invocation index;
+    # returns its qconfig, otherwise returns fallback_qconfig.
     for (
         module_name,
         object_type,
@@ -51,6 +59,10 @@ def _maybe_adjust_qconfig_for_module_name_object_type_order(
 
 
 def _update_qconfig_for_fusion(model: GraphModule, qconfig_mapping: QConfigMapping):
+    # [FUNCTION DOC] HELPER: Mutates the mapping's object_type qconfigs so each fused module type found as a
+    # call_module target in the model gets the qconfig of its first constituent op type.
+    # Returns the mapping early (unchanged) if object_type is empty. Raises LookupError
+    # if constituent ops of a fused module have differing qconfigs.
     """
     Update the QConfigMapping to account for fused modules such as LinearReLU.
     This assumes the QConfigMapping's attributes have already been converted to OrderedDicts.
@@ -98,6 +110,11 @@ def _generate_node_name_to_qconfig(
     qconfig_mapping: QConfigMapping,
     node_name_to_scope: dict[str, tuple[str, type]],
 ) -> dict[str, QConfigAny]:
+    # [FUNCTION DOC] HELPER: Walks graph nodes and returns a mapping from node name to resolved qconfig (with
+    # the module's device check wrapped in). get_attr and call_method use type/name
+    # lookup; call_function and call_module also apply per-submodule invocation counts
+    # for ordered overrides; observer call_module nodes are skipped; other ops map to
+    # None. Side effect: sets the qconfig attribute on each call_module target module.
     global_qconfig = qconfig_mapping.global_qconfig
     node_name_to_qconfig = {}
 
@@ -200,6 +217,8 @@ def _generate_node_name_to_qconfig(
 def _check_is_valid_config_dict(
     config_dict: Any, allowed_keys: set[str], dict_name: str
 ) -> None:
+    # [FUNCTION DOC] HELPER: Raises ValueError naming dict_name and the allowed keys if config_dict has any
+    # key outside allowed_keys; otherwise returns nothing.
     r"""Checks if the given config_dict has the correct keys
 
     Args:
@@ -222,6 +241,10 @@ def _check_is_valid_config_dict(
 def _compare_prepare_convert_qconfig_mappings(
     prepare_qconfig_mapping: QConfigMapping, convert_qconfig_mapping: QConfigMapping
 ):
+    # [FUNCTION DOC] HELPER: Verifies the convert mapping is consistent with the prepare mapping: global
+    # qconfigs must be equal, and every key in prepare's object_type, module_name and
+    # module_name_regex dicts must exist in convert with an equal qconfig (a None
+    # value in convert is allowed). Raises AssertionError otherwise.
     r"""Compare the qconfig_mapping passed in convert to the one from prepare and check the values
 
     Args:
@@ -267,6 +290,10 @@ def _compare_prepare_convert_qconfig_mappings(
 def _is_qconfig_supported_by_dtype_configs(
     qconfig: QConfig, dtype_configs: list[DTypeConfig]
 ):
+    # [FUNCTION DOC] HELPER: Returns True if any dtype config matches the qconfig's activation/weight dtypes.
+    # Missing dtypes default to float. Dynamic configs need a dynamic input activation
+    # and float output; static configs need input, output, weight and bias dtypes to
+    # match (bias expected float16 only when both activation and weight are float16).
     for dtype_config in dtype_configs:
         is_dynamic = dtype_config.is_dynamic
         if is_dynamic is None:
@@ -314,10 +341,13 @@ def _get_object_type_qconfig(
     object_type: Callable | str,
     fallback_qconfig: QConfigAny,
 ) -> QConfigAny:
+    # [FUNCTION DOC] HELPER: Returns the object_type qconfig for the given type or method name, or fallback_qconfig.
     return qconfig_mapping.object_type_qconfigs.get(object_type, fallback_qconfig)
 
 
 def _get_module_name_regex_qconfig(qconfig_mapping, module_name, fallback_qconfig):
+    # [FUNCTION DOC] HELPER: Returns the qconfig of the first regex (matched from the start of the name) in
+    # module_name_regex_qconfigs that matches module_name, else fallback_qconfig.
     for regex_pattern, qconfig in qconfig_mapping.module_name_regex_qconfigs.items():
         if re.match(regex_pattern, module_name):
             # first match wins
@@ -326,6 +356,8 @@ def _get_module_name_regex_qconfig(qconfig_mapping, module_name, fallback_qconfi
 
 
 def _get_module_name_qconfig(qconfig_mapping, module_name, fallback_qconfig):
+    # [FUNCTION DOC] HELPER: Looks up module_name in module_name_qconfigs, recursing to parent module names
+    # until a match is found; returns fallback_qconfig when the name becomes empty.
     if module_name == "":
         # module name qconfig not found
         return fallback_qconfig
@@ -339,6 +371,8 @@ def _get_module_name_qconfig(qconfig_mapping, module_name, fallback_qconfig):
 def _maybe_adjust_qconfig_for_module_type_or_name(
     qconfig_mapping, module_type, module_name, global_qconfig
 ):
+    # [FUNCTION DOC] HELPER: Resolves a qconfig with precedence module name (including ancestors) > module
+    # name regex > object type > global_qconfig.
     # get qconfig for module_name,
     # fallback to module_name_regex_qconfig, module_type_qconfig,
     # global_qconfig if necessary
@@ -357,6 +391,9 @@ def _maybe_adjust_qconfig_for_module_type_or_name(
 def _get_flattened_qconfig_dict(
     qconfig_mapping: QConfigMapping,
 ) -> dict[Callable | str, QConfigAny]:
+    # [FUNCTION DOC] HELPER: Returns a new mapping with the global qconfig under the empty-string key plus all
+    # object_type and module_name qconfigs (regex entries ignored; later sources
+    # override earlier on key clash).
     """flatten the global, object_type and module_name qconfig
     to the same qconfig_dict so that it can be used by
     propagate_qconfig_ function.
@@ -389,6 +426,8 @@ def _get_flattened_qconfig_dict(
 def _update_qconfig_for_qat(
     qconfig_mapping: QConfigMapping, backend_config: BackendConfig
 ):
+    # [FUNCTION DOC] HELPER: Mutates the object_type qconfigs in place: for every module type that the backend
+    # swaps to a QAT module class, adds the same qconfig under the QAT class key.
     """
     Update the qconfig_mapping to account for module swaps during QAT.
     During QAT we perform a module swap on the nn.Module types to the corresponding nn.qat.modules types.
