@@ -1,3 +1,5 @@
+# [MODULE DOC] Defines tensor_factory_functions, a tuple of torch functions that create tensors from non-tensor
+# arguments (derived from native_functions.yaml, plus torch.tensor). The list may go stale as factories are added.
 import torch
 
 

@@ -1,3 +1,5 @@
+# [PACKAGE DOC] Custom operator library internals: imports autograd, fake_impl, simple_registry and utils
+# submodules and re-exports register_fake_class, capture_triton, triton_op and wrap_triton.
 import torch._library.autograd
 import torch._library.fake_impl
 import torch._library.simple_registry

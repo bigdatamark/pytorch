@@ -1,3 +1,8 @@
+# [MODULE DOC] Benchmark and profiling helpers embedded in Inductor-generated compiled modules. Provides per-kernel
+# benchmarking (benchmark_all_kernels), profile report parsing (parse_profile_event_list), a torch profiler runner
+# (perf_profile), an NCU runner (ncu_analyzer), a CUDA memory snapshot collector, and compiled_module_main, the
+# command-line entry point called from a compiled module's main block. Import-time side effects: computes
+# PROFILE_DIR and PROFILE_PATH under the system temp directory.
 import argparse
 import datetime
 import tempfile
@@ -15,6 +20,8 @@ from .runtime.runtime_utils import create_bandwidth_info_str, get_num_bytes
 
 
 class BenchmarkCallableType(Protocol):
+    # [CLASS DOC] HELPER: Protocol for the compiled module's benchmark function, called with times and repeat keyword
+    # arguments and returning the measured wall time (the one-line __call__ stub declares only this signature).
     def __call__(self, times: int, repeat: int) -> float: ...
 
 
@@ -29,6 +36,8 @@ _kernel_category_choices = [
 
 
 def get_kernel_category_by_source_code(src_code: str) -> str:
+    # [FUNCTION DOC] Returns the kernel category (one of the known decorator names) whose triton heuristics decorator text
+    # appears in the source code; returns unknown if zero or several categories match.
     """
     Similar to get_kernel_category but use the source code. Call this API
     if we have not compile the src_code to module yet.
@@ -43,6 +52,9 @@ def get_kernel_category_by_source_code(src_code: str) -> str:
 
 
 def get_kernel_category(kernel_mod: ModuleType) -> str:
+    # [FUNCTION DOC] Returns the category of a compiled kernel module by checking which category names appear among the
+    # module's globals (imported decorators); returns unknown unless exactly one matches.
+    # KNOWN ISSUE: the docstring lists only three categories, but foreach, split_scan and template are also possible.
     """
     Given the module defining a triton kernel, return the category of the kernel.
     Category can be one of:
@@ -61,6 +73,8 @@ def get_kernel_category(kernel_mod: ModuleType) -> str:
 
 
 def get_triton_kernel(mod: ModuleType):  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] HELPER: Returns the single autotuner object in the module whose name starts with the triton prefix.
+    # Raises AssertionError unless exactly one such object exists.
     from torch._inductor.runtime.triton_heuristics import CachingAutotuner
 
     cand_list = [
@@ -78,6 +92,11 @@ def get_triton_kernel(mod: ModuleType):  # type: ignore[no-untyped-def]
 def benchmark_all_kernels(
     benchmark_name: str, benchmark_all_configs: dict[Any, Any] | None
 ) -> None:
+    # [FUNCTION DOC] Benchmarks every kernel module cached in PyCodeCache that has get_args and call, printing results.
+    # Per kernel: gets its triton kernel and arguments, computes data size in GB (from metadata or argument sizes), then
+    # either benchmarks all autotune configs (if benchmark_all_configs is truthy; asserts the module supports it) or
+    # times the selected config (asserts exactly one launcher). Prints bandwidth/register info lines, or a hint message if
+    # no kernel was found. Experimental; relevant only with config.benchmark_kernel.
     """
     An experimental API used only when config.benchmark_kernel is true.
 
@@ -117,6 +136,8 @@ def benchmark_all_kernels(
             shared: Any | None,
             prefix: str = "",
         ) -> str:
+            # [FUNCTION DOC] HELPER: Builds the printable info line for a timing: bandwidth from kernel size and time, with
+            # register, spill and shared memory details appended if all are known.
             if not any(x is None for x in [n_regs, n_spills, shared]):
                 kernel_detail_str = (
                     f"  {n_regs:3} regs  {n_spills:3} spills  {shared:8} shared mem"
@@ -169,6 +190,8 @@ def benchmark_all_kernels(
 
 @dataclass
 class ProfileEvent:
+    # [CLASS DOC] Dataclass for one aggregated profile row: category, kernel key, self device time in ms, and average
+    # count per run (float).
     category: str
     key: str
     self_device_time_ms: float
@@ -184,6 +207,10 @@ def parse_profile_event_list(
     nruns: int,
     device_name: str,
 ) -> None:
+    # [FUNCTION DOC] Aggregates profiler events (non-CPU only) by category inferred from the kernel name prefix
+    # (pointwise, reduction, persistent reduction, unknown triton, unknown), averaged over nruns, and prints per-category
+    # tables, device busy percent, total wall time, and a summary line for later tabulation. Raises AssertionError for
+    # legacy profiler events. If device_name is empty, category tables are skipped and no device is reported.
     """
     Parse and generate a report for an event_list.
     """
@@ -191,6 +218,7 @@ def parse_profile_event_list(
     def get_self_device_time(
         ev: torch.autograd.profiler_util.EventList,
     ) -> float:
+        # [FUNCTION DOC] HELPER: Converts an event's total self device time from microseconds to milliseconds per run.
         """
         ev.self_device_time_total is in microsecond. Convert to millisecond.
         """
@@ -202,6 +230,7 @@ def parse_profile_event_list(
         ev: torch.autograd.profiler_util.EventList,
         category: str,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Records a ProfileEvent (key, per-run time, per-run count) under the given category.
         profile_ev = ProfileEvent(
             category=category,
             key=ev.key,  # type: ignore[attr-defined]
@@ -231,6 +260,8 @@ def parse_profile_event_list(
         add_event(ev, category)
 
     def report_category(category: str, profile_events: list[ProfileEvent]) -> float:
+        # [FUNCTION DOC] HELPER: Prints a table of the category's events sorted by descending time with percent of wall time
+        # and a total row, and returns the total time in ms (0.0 and no output if no device).
         if not device_name:
             return 0.0
 
@@ -262,6 +293,8 @@ def parse_profile_event_list(
         return total_time
 
     def report() -> None:
+        # [FUNCTION DOC] HELPER: Prints all category reports in a fixed order, the busy percent, wall time, and the
+        # tabulate summary line. Raises AssertionError if an unexpected category was recorded.
         category_list = [
             "triton_pointwise",
             "triton_reduction",
@@ -318,6 +351,9 @@ def perf_profile(
     benchmark_name: str,
     benchmark_compiled_module_fn: BenchmarkCallableType,
 ) -> None:
+    # [FUNCTION DOC] Runs the benchmark function under the torch profiler, exports a Chrome trace to PROFILE_PATH, prints
+    # the trace location and a top-10 table of averaged events, then prints the parsed per-category report. Side effects:
+    # writes a file, prints.
     with torch.profiler.profile(record_shapes=True) as p:
         benchmark_compiled_module_fn(times=times, repeat=repeat)
 
@@ -337,6 +373,10 @@ def ncu_analyzer(
     benchmark_compiled_module_fn: BenchmarkCallableType,
     args: argparse.Namespace,
 ) -> None:
+    # [FUNCTION DOC] Runs NVIDIA Nsight Compute on a subprocess that imports the benchmark module and runs it once.
+    # Uses args.ncu_kernel_regex to filter kernels and args.ncu_metrics (else the full set) to select metrics, writing the
+    # report to a timestamped file in the temp directory. Prints the output path, or the error if the ncu command fails
+    # (the failure is not re-raised).
     import inspect
     import os
     import subprocess
@@ -403,6 +443,8 @@ def ncu_analyzer(
 def collect_memory_snapshot(
     benchmark_compiled_module_fn: BenchmarkCallableType,
 ) -> None:
+    # [FUNCTION DOC] Records CUDA memory history while running the benchmark 10 times, dumps a snapshot to a pickle file
+    # in the temp directory, stops recording, and prints the path. Raises AssertionError if CUDA is unavailable.
     if not torch.cuda.is_available():
         raise AssertionError("CUDA is not available")
 
@@ -420,6 +462,10 @@ def collect_memory_snapshot(
 def compiled_module_main(
     benchmark_name: str, benchmark_compiled_module_fn: BenchmarkCallableType
 ) -> None:
+    # [FUNCTION DOC] Entry point for a compiled module's main block (excluded from Dynamo). Parses command-line options
+    # (kernel benchmarking, all configs, profile, CUDA memory snapshot, NCU options, times, repeat). If kernel benchmarking
+    # is requested, runs it. Otherwise runs the whole-module benchmark, reports peak GPU memory if CUDA exists, and
+    # optionally collects a memory snapshot, profiles, and runs NCU analysis.
     """
     This is the function called in __main__ block of a compiled module.
     """

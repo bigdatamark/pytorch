@@ -1,3 +1,6 @@
+# [MODULE DOC] Step-closure machinery for lazy tensors: closures registered with add_step_closure are stored on the
+# per-device DeviceContext and executed by run_step_closures after a mark step, synchronously via ClosureHandler or on a
+# background thread via AsyncClosureHandler.
 import os
 import threading
 from collections.abc import Callable, Iterable
@@ -12,10 +15,14 @@ _Ts = TypeVarTuple("_Ts")
 
 
 class ClosureHandler:
+    # [CLASS DOC] Synchronous executor of step closures; stateless. A handler is called with an iterable of
+    # zero-argument callables and runs each in order on the calling thread.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: No-op constructor.
         pass
 
     def run(self, closure: Callable[[], object]) -> None:
+        # [FUNCTION DOC] Calls the given zero-argument closure immediately, ignoring its return value.
         """Run closure function
 
         Args:
@@ -24,11 +31,16 @@ class ClosureHandler:
         closure()
 
     def __call__(self, closures: Iterable[Callable[[], object]]) -> None:
+        # [FUNCTION DOC] Runs every closure in the iterable in order via run.
         for closure in closures:
             self.run(closure)
 
 
 class AsyncClosureHandler(ClosureHandler):
+    # [CLASS DOC] Runs closures on a single background worker thread fed by a bounded queue. State: closure queue
+    # (size from env LTC_MAX_ASYNC_QUEUE, else max_queue_size), an exception queue, a lock, a finished event, and the
+    # thread handle. run blocks when the queue is full; the worker exits after 3 seconds of idle time or on the first
+    # closure exception, which is stored and re-raised (as RuntimeError) on the next run.
     """Handler for Asynchronous Step Closures
     Args:
         max_queue_size: The maximum length of the closure queue after which
@@ -39,6 +51,8 @@ class AsyncClosureHandler(ClosureHandler):
     """
 
     def __init__(self, max_queue_size: int = 100) -> None:
+        # [FUNCTION DOC] Creates the bounded closure queue, the exception queue, the lock, the finished event and an unset
+        # event-loop thread handle. The queue size is read from the LTC_MAX_ASYNC_QUEUE environment variable if set.
         super().__init__()
         self._closure_queue: Queue[Callable[[], object]] = Queue(
             int(os.environ.get("LTC_MAX_ASYNC_QUEUE", max_queue_size))
@@ -49,10 +63,14 @@ class AsyncClosureHandler(ClosureHandler):
         self._closure_event_loop: threading.Thread | None = None
 
     def start_event_loop(self) -> None:
+        # [FUNCTION DOC] Starts the worker thread if none is recorded; does nothing otherwise. Side effect: spawns a thread.
         """Start closure event loop if not started"""
         if self._closure_event_loop is None:
 
             def event_loop() -> None:
+                # [FUNCTION DOC] HELPER: Worker loop. Takes closures from the queue (waiting up to 3 seconds), runs them and marks
+                # them done. On timeout with an empty queue (checked under the lock) it sets the finished event and returns. Any
+                # exception from a closure is put on the exception queue and the loop ends.
                 # Run loop until closure event is set and closure queue is empty
                 while True:
                     try:
@@ -72,6 +90,9 @@ class AsyncClosureHandler(ClosureHandler):
             self._closure_event_loop.start()
 
     def run(self, closure: Callable[[], object]) -> None:
+        # [FUNCTION DOC] Enqueues the closure (blocking if the queue is full) under the lock. If the worker thread is missing
+        # or dead, checks the exception queue: a stored exception raises RuntimeError chained to it; otherwise restarts the
+        # worker thread.
         with self._closure_lock:
             self._closure_queue.put(closure, block=True)
             if (
@@ -105,6 +126,9 @@ def add_step_closure(
     args: tuple[object, ...] = (),
     run_async: bool = False,
 ) -> None:
+    # [FUNCTION DOC] Registers a closure and its arguments on the current device context to run after the next step
+    # barrier. Uses the async list if run_async is true, else the sync list, creating the list on the context as needed.
+    # Closures run in queued order. Returns None.
     """Adds a closure to the list of the ones to be run at the end of the step.
     Many times during model training there is the need to print/report (print to
     console, post to tensorboard, etc...) information which require the content of
@@ -137,6 +161,9 @@ def add_step_closure(
 
 
 def run_step_closures() -> DeviceContext:
+    # [FUNCTION DOC] Executes and clears the pending async closures (via a lazily created AsyncClosureHandler) and sync
+    # closures (via a lazily created ClosureHandler) stored on the current device context. Returns the device context.
+    # Side effects: mutates the context's closure lists and handler attributes; closures run.
     devctx = get_device_context()
     async_step_closures = getattr(devctx, "async_step_closures", None)
     if async_step_closures is not None:

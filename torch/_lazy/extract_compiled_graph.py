@@ -1,3 +1,7 @@
+# [MODULE DOC] Extracts a cached lazy-tensor (TorchScript backend) compiled graph from an FX GraphModule and wraps it in
+# a callable that runs the cached graph directly without retracing. Contains GraphInputMatcher, ReturnValueHandler,
+# force_lazy_device, get_fallback_ops and extract_compiled_graph. Reads env var debug_extract_compiled_graph at import
+# to set a module-level debug flag that enables printing.
 import copy
 import dataclasses
 import itertools
@@ -24,11 +28,15 @@ _IValue: TypeAlias = object
 
 
 class _CompiledFn(Protocol):
+    # [CLASS DOC] HELPER: Protocol for the compiled callable: takes tensors positionally and returns a sequence of tensors.
     def __call__(self, *args: torch.Tensor) -> Sequence[torch.Tensor]: ...
 
 
 @dataclasses.dataclass
 class GraphInputMatcher:
+    # [CLASS DOC] Dataclass that rebuilds graph inputs for later calls. Fields: tensor_id_to_arg_idx (tensor id to
+    # call-argument position), graph_input_tensor_ids, and graph_input_ivalues (traced values per graph input).
+    # Inputs whose id maps to an argument are replaced by the current argument; others keep the traced (const) value.
     """
     The GraphInputMatcher class setup the graph inputs for future calls after lazy tracing.
     Specifically, those graph inputs corresponding to method parameters should be replaced with the
@@ -50,6 +58,7 @@ class GraphInputMatcher:
 
     # get the real graph input tensors
     def __call__(self, args: Sequence[object]) -> list[_IValue]:
+        # [FUNCTION DOC] Given the current call arguments, returns the list of real graph inputs in graph input order.
         real_input: list[_IValue] = []
         for tensor_id, traced_ivalue in zip(
             self.graph_input_tensor_ids, self.graph_input_ivalues
@@ -64,6 +73,9 @@ class GraphInputMatcher:
 
 
 class ReturnValueHandler:
+    # [CLASS DOC] Maps deduplicated graph outputs back to the original output list. Built from the list of lazy outputs;
+    # duplicates (same object identity) are grouped. State: index (per unique output, the list of original positions) and
+    # total_count (original length).
     r"""
     When ltc_sync_multi is called on multi tensors, the compiled graph
     will contain output only for unique tensors - if a tensor appears multiple
@@ -82,6 +94,8 @@ class ReturnValueHandler:
     """
 
     def __init__(self, lazy_out_list: Sequence[object]) -> None:
+        # [FUNCTION DOC] Groups positions of lazy_out_list by object identity, recording first-occurrence order in index and
+        # the full length in total_count.
         self.index: list[list[int]] = []
         self.total_count = len(lazy_out_list)
 
@@ -96,6 +110,8 @@ class ReturnValueHandler:
                 tensor_id_to_idx[id(lazy_tensor)] = uniq_idx
 
     def duplicate_eager_tensors(self, eager_tensor_list: Sequence[_T]) -> list[_T]:
+        # [FUNCTION DOC] Expands a list of unique eager tensors into a list of total_count items, placing each at all of its
+        # original positions. Raises AssertionError if the input length differs from the number of unique outputs.
         duplicated_list: list[_T | None] = [None] * self.total_count
         if len(eager_tensor_list) != len(self.index):
             raise AssertionError(
@@ -110,6 +126,9 @@ class ReturnValueHandler:
 
 
 def force_lazy_device(model: fx.GraphModule) -> None:
+    # [FUNCTION DOC] Rewrites an FX graph module in place: every torch.device in node args/kwargs becomes the lazy device
+    # (same index), and nodes calling known tensor factory functions with no device argument get a lazy device keyword.
+    # Then recompiles the module. Returns None.
     """
     Factory methods in a Fx graph may create tensors for a specific eager devices.
     If we take no actions, those eager tensors will be mixed with lazy tensors and
@@ -117,11 +136,13 @@ def force_lazy_device(model: fx.GraphModule) -> None:
     """
 
     def tolazydevice(dev: _T) -> _T:
+        # [FUNCTION DOC] HELPER: Returns a lazy device with the same index if the value is a torch.device, else the value.
         if isinstance(dev, torch.device):
             return cast(_T, torch.device("lazy", index=dev.index))
         return dev
 
     def hasDeviceArg(args: Iterable[Argument], kwargs: Mapping[str, Argument]) -> bool:
+        # [FUNCTION DOC] HELPER: Returns true if any positional or keyword argument is a torch.device.
         return any(
             isinstance(arg, torch.device)
             for arg in itertools.chain(args, kwargs.values())
@@ -153,6 +174,8 @@ def force_lazy_device(model: fx.GraphModule) -> None:
 
 
 def get_fallback_ops() -> list[str]:
+    # [FUNCTION DOC] Returns strings of the form op=count for every metrics counter whose name contains aten:: and has a
+    # positive value, i.e. operators that fell back to eager during lazy tracing.
     fallback_ops = []
     for opname in metrics.counter_names():
         if "aten::" not in opname:
@@ -167,6 +190,10 @@ def get_fallback_ops() -> list[str]:
 def extract_compiled_graph(
     model: fx.GraphModule, example_inputs: Sequence[torch.Tensor]
 ) -> _CompiledFn:
+    # [FUNCTION DOC] Traces the model with lazy tensors and returns a callable running the cached compiled graph. Steps:
+    # move example inputs to lazy, deep-copy the model to lazy and force lazy devices, trace while resetting metrics, and
+    # raise RuntimeError if any aten fallback occurred. Then record graph inputs, graph hash and output dedup info, and
+    # sync so the graph is cached. Prints debug info if the debug flag is set. TorchScript backend specific.
     """
     Optimize an eager model with LTC and returns a wrapper to execute the
     compiled graph directly without retracing. It depends on other mechanisms
@@ -227,6 +254,10 @@ def extract_compiled_graph(
     lazy.sync_multi(args_and_out, [])
 
     def optimized_mod(*args: torch.Tensor) -> Sequence[torch.Tensor]:
+        # [FUNCTION DOC] HELPER: The returned wrapper. Builds graph inputs from args, runs the cached graph, re-duplicates
+        # outputs, copies results back into any argument tensors that were updated in place, and returns the outputs after the
+        # first len(args) entries. Returns an empty tuple if there are no args or outputs. Raises AssertionError on a length
+        # mismatch.
         if len(args_and_out) == 0:
             return ()
         graph_input = graph_input_matcher(args)
