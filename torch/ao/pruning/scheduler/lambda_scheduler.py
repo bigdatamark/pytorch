@@ -1,3 +1,5 @@
+# [MODULE DOC] Defines LambdaSL, a scheduler that sets each group's sparsity level to
+# its base level times a user-supplied function of the epoch. Exports LambdaSL.
 import warnings
 from collections.abc import Callable
 
@@ -10,6 +12,9 @@ __all__ = ["LambdaSL"]
 
 
 class LambdaSL(BaseScheduler):
+    # [CLASS DOC] Scheduler holding one multiplier function per sparsifier group
+    # (sl_lambdas); each step sets a group's level to its base level times its function
+    # of the current epoch.
     """Sets the sparsity level of each parameter group to the final sl
     times a given function. When last_epoch=-1, sets initial sl as zero.
     Args:
@@ -39,6 +44,9 @@ class LambdaSL(BaseScheduler):
         last_epoch: int = -1,
         verbose: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Stores the sparsifier and builds sl_lambdas: a single callable is
+        # repeated for every group; a list or tuple must match the group count (ValueError
+        # otherwise). Then runs the base constructor, which performs the first step.
         self.sparsifier = sparsifier
 
         if not isinstance(sl_lambda, list) and not isinstance(sl_lambda, tuple):
@@ -52,6 +60,8 @@ class LambdaSL(BaseScheduler):
         super().__init__(sparsifier, last_epoch, verbose)  # type: ignore[no-untyped-call]
 
     def get_sl(self) -> list[float]:
+        # [FUNCTION DOC] Returns for each group its base level multiplied by its lambda
+        # evaluated at the current epoch. Warns if called outside of step.
         if not self._get_sl_called_within_step:
             warnings.warn(
                 "To get the last sparsity level computed by the scheduler, "

@@ -1,10 +1,14 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines NearlyDiagonalSparsifier, which keeps a band of diagonals around
+# the main diagonal of a 2D weight. No import-time side effects.
 import torch
 
 from . import base_sparsifier
 
 
 class NearlyDiagonalSparsifier(base_sparsifier.BaseSparsifier):
+    # [CLASS DOC] Sparsifier whose mask keeps only entries within a distance of half
+    # (nearliness minus one) of the main diagonal; configured by the odd integer nearliness.
     r"""Nearly Diagonal Sparsifier
 
     This sparsifier creates a nearly diagonal mask to be applied to the weight matrix.
@@ -30,12 +34,18 @@ class NearlyDiagonalSparsifier(base_sparsifier.BaseSparsifier):
     """
 
     def __init__(self, nearliness: int = 1):
+        # [FUNCTION DOC] Stores nearliness as the default config and initializes the base class.
         defaults = {"nearliness": nearliness}
         super().__init__(defaults=defaults)
 
     def update_mask(  # type:ignore[override]
         self, module, tensor_name, nearliness, **kwargs
     ):
+        # [FUNCTION DOC] Resets the mask of module.tensor_name to zeros and, unless nearliness
+        # is not positive (then all zeros remain), sets to one the entries within half of
+        # nearliness (integer division) of the diagonal in every row. Raises ValueError if
+        # nearliness is even or its half is not smaller than the smaller tensor dimension.
+        # The weight must be 2D. Mutates the mask in place.
         mask = getattr(module.parametrizations, tensor_name)[0].mask
         mask.data = torch.zeros_like(mask)
         if nearliness <= 0:

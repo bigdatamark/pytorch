@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Utilities for combining data sparsification with quantization of
+# Embedding and EmbeddingBag modules. Exposes SUPPORTED_MODULES (the two embedding
+# types) and post_training_sparse_quantize. No import-time side effects.
 
 import torch
 import torch.nn as nn
@@ -9,6 +12,9 @@ SUPPORTED_MODULES = {nn.Embedding, nn.EmbeddingBag}
 
 
 def _fetch_all_embeddings(model):
+    # [FUNCTION DOC] HELPER: Walks the module tree of model with an explicit stack and
+    # returns a list of (fully qualified name, module) pairs for every child whose exact
+    # type is in SUPPORTED_MODULES. Matching modules are not descended into.
     """Fetches Embedding and EmbeddingBag modules from the model"""
     embedding_modules = []
     stack = [model]
@@ -30,6 +36,17 @@ def post_training_sparse_quantize(
     select_embeddings: list[nn.Module] | None = None,
     **sparse_config,
 ):
+    # [FUNCTION DOC] Sparsifies and quantizes the embedding modules of model in place.
+    # Builds a data sparsifier from data_sparsifier_class and sparse_config. Embeddings
+    # are either all found in the model or taken from select_embeddings (must be a list
+    # of supported embedding modules that belong to model, else AssertionError).
+    # With sparsify_first, each embedding is added to the sparsifier (dots in the name
+    # replaced by underscores), step and squash_mask are applied, then the model is
+    # prepared and converted with the float-qparams weight-only qconfig. Otherwise the
+    # model is quantized first; per-channel scales, zero points, axis, dtype and the
+    # dequantized weights are saved, the dequantized weights are sparsified, and then
+    # requantized per channel with the saved parameters and set back on the modules.
+    # Returns None. Mutates model and sets qconfig on the embedding modules.
     """Takes in a model and applies sparsification and quantization to only embeddings & embeddingbags.
     The quantization step can happen before or after sparsification depending on the `sparsify_first` argument.
 

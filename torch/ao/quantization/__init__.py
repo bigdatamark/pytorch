@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [PACKAGE DOC] Public entry point of eager and FX quantization: wildcard re-exports of
+# fake quantize, observers, qconfig and qconfig mapping, quant types, quantization
+# mappings, prepare/convert/quantize entry points, JIT quantization and stubs, plus
+# fuse_modules. Defines the ObserverOrFakeQuantize type alias, default_eval_fn and the
+# internal _DerivedObserverOrFakeQuantize observer. The all-list controls the public
+# names, some of which come from the star imports.
 
 import sys
 from collections.abc import Callable
@@ -164,6 +170,8 @@ __all__ = [
 
 
 def default_eval_fn(model, calib_data):
+    # [FUNCTION DOC] Runs model on the input of every (data, target) pair in calib_data,
+    # discarding outputs; used to feed calibration data through observers. Returns None.
     r"""Define the default evaluation function.
 
     Default evaluation function takes a torch.utils.data.Dataset or a list of
@@ -174,6 +182,10 @@ def default_eval_fn(model, calib_data):
 
 
 class _DerivedObserverOrFakeQuantize(ObserverBase):
+    # [CLASS DOC] HELPER: Observer that does not observe data itself; its quantization
+    # parameters come from a user function applied to the list of other observers or fake
+    # quantizers it depends on. Attributes: obs_or_fqs, derive_qparams_fn, quant_min,
+    # quant_max, qscheme, ch_axis.
     r"""This observer is used to describe an observer whose quantization parameters
     are derived from other observers
     """
@@ -190,6 +202,8 @@ class _DerivedObserverOrFakeQuantize(ObserverBase):
         qscheme: torch.qscheme | None = None,
         ch_axis: int | None = None,
     ):
+        # [FUNCTION DOC] HELPER: Stores the dependency list, derivation function and quantization
+        # settings. Raises AssertionError if qscheme is per channel and ch_axis is None.
         super().__init__(dtype)
         self.obs_or_fqs = obs_or_fqs
         self.derive_qparams_fn = derive_qparams_fn
@@ -207,7 +221,10 @@ class _DerivedObserverOrFakeQuantize(ObserverBase):
                 )
 
     def forward(self, x: Tensor) -> Tensor:
+        # [FUNCTION DOC] HELPER: Identity; returns x unchanged and records nothing.
         return x
 
     def calculate_qparams(self):  # type:ignore[override]
+        # [FUNCTION DOC] HELPER: Returns the (scale, zero point) pair produced by calling the
+        # derivation function on the dependency list.
         return self.derive_qparams_fn(self.obs_or_fqs)

@@ -1,3 +1,6 @@
+# [PACKAGE DOC] Experimental structured pruners; re-exports BaseStructuredSparsifier,
+# FPGMPruner, LSTMSaliencyPruner, SaliencyPruner and the parametrization helpers
+# BiasHook and FakeStructuredSparsity.
 from .base_structured_sparsifier import BaseStructuredSparsifier
 from .FPGM_pruner import FPGMPruner
 from .lstm_saliency_pruner import LSTMSaliencyPruner

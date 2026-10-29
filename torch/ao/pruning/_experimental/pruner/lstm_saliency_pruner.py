@@ -1,3 +1,6 @@
+# [MODULE DOC] Defines LSTMSaliencyPruner, a structured pruner for packed LSTM weight
+# matrices that prunes each of the four gate blocks separately by L1 saliency.
+# No import-time side effects.
 from typing import Any, cast
 
 import torch
@@ -8,6 +11,9 @@ from .parametrization import FakeStructuredSparsity
 
 
 class LSTMSaliencyPruner(BaseStructuredSparsifier):
+    # [CLASS DOC] Structured pruner for LSTM weights (weight_ih_l and weight_hh_l packed
+    # tensors holding four gate blocks). The row mask is split into four equal parts and
+    # each part is pruned independently by L1 norm so gates stay aligned.
     """
     Prune packed LSTM weights based on saliency.
     For each layer {k} inside a LSTM, we have two packed weight matrices
@@ -27,6 +33,12 @@ class LSTMSaliencyPruner(BaseStructuredSparsifier):
     """
 
     def update_mask(self, module: nn.Module, tensor_name: str, **kwargs: Any) -> None:
+        # [FUNCTION DOC] For each FakeStructuredSparsity parametrization on module.tensor_name,
+        # computes per-row L1 norm saliency, splits mask and saliency into four equal
+        # chunks, and in each chunk sets to False the mask entries of the int(chunk size
+        # times kwargs sparsity_level) lowest-saliency rows (in place on the mask).
+        # Raises a generic Exception when the weight has fewer than two dimensions and
+        # KeyError if sparsity_level is missing from kwargs.
         weights = getattr(module, tensor_name)
 
         for p in getattr(module.parametrizations, tensor_name):

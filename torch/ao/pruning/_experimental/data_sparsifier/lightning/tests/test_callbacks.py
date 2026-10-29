@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Tests for the pytorch_lightning data sparsity callbacks
+# (PostTrainingDataSparsity and TrainingAwareDataSparsity). Defines a dummy
+# model, a helper that builds a Lightning module, a step-based data scheduler,
+# and two TestCase classes that drive the callback hooks by hand. Tests are
+# skipped when pytorch_lightning is not installed. No import-time side effects.
 import importlib
 import math
 import unittest
@@ -27,7 +32,11 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 
 class DummyModel(nn.Module):
+    # [CLASS DOC] HELPER: Test model holding a Sequential of bias-free Linear layers
+    # (with ReLU between them) whose widths follow the given output-channel list.
     def __init__(self, iC: int, oC: list[int]):
+        # [FUNCTION DOC] HELPER: Builds the linear/ReLU stack from input size iC
+        # and the list of output sizes oC; each layer feeds the next.
         super().__init__()
         self.linears = nn.Sequential()
         i = iC
@@ -39,20 +48,29 @@ class DummyModel(nn.Module):
 
 
 def _make_lightning_module(iC: int, oC: list[int]):
+    # [FUNCTION DOC] HELPER: Lazily imports pytorch_lightning (raises ImportError if
+    # absent), defines a LightningModule wrapping a DummyModel, and returns an instance.
     import pytorch_lightning as pl  # type: ignore[import]
 
     class DummyLightningModule(pl.LightningModule):
+        # [CLASS DOC] HELPER: Minimal LightningModule exposing a DummyModel as attribute model.
         def __init__(self, ic: int, oC: list[int]):
+            # [FUNCTION DOC] HELPER: Stores a DummyModel built from the enclosing
+            # iC and oC (the ic argument is ignored).
             super().__init__()
             self.model = DummyModel(iC, oC)
 
         def forward(self):
+            # [FUNCTION DOC] HELPER: No-op forward; never used by the tests.
             pass
 
     return DummyLightningModule(iC, oC)
 
 
 class StepSLScheduler(BaseDataScheduler):
+    # [CLASS DOC] HELPER: Test data scheduler that multiplies the scheduled parameter
+    # of every data group by gamma each time the epoch is a multiple of step_size.
+    # Attributes: gamma, step_size.
     """The sparsity param of each data group is multiplied by gamma every step_size epochs."""
 
     def __init__(
@@ -64,11 +82,17 @@ class StepSLScheduler(BaseDataScheduler):
         last_epoch=-1,
         verbose=False,
     ):
+        # [FUNCTION DOC] HELPER: Records gamma and step_size, then runs the base
+        # scheduler constructor (which performs the initial step).
         self.gamma = gamma
         self.step_size = step_size
         super().__init__(data_sparsifier, schedule_param, last_epoch, verbose)
 
     def get_schedule_param(self):
+        # [FUNCTION DOC] HELPER: Returns a mapping from data group name to the new value of
+        # the scheduled parameter: unchanged at epoch 0 or when the epoch is not a
+        # multiple of step_size, otherwise multiplied by gamma. Emits a UserWarning if
+        # called outside of step().
         if not self._get_sp_called_within_step:
             warnings.warn(
                 "To get the last learning rate computed by the scheduler, "
@@ -90,7 +114,13 @@ class StepSLScheduler(BaseDataScheduler):
 
 
 class TestPostTrainingCallback(TestCase):
+    # [CLASS DOC] Tests for PostTrainingDataSparsity; one end-to-end test plus a check helper.
     def _check_on_fit_end(self, pl_module, callback, sparsifier_args):
+        # [FUNCTION DOC] HELPER: Calls the callback's on_fit_end hook with a dummy trainer
+        # and verifies: sparsifier defaults match the given args, each supported
+        # parameter is registered in state and data_groups (unsupported ones are not),
+        # sparsity is above zero, and surviving values equal the originals.
+        # Raises AssertionError on any mismatch.
         """Makes sure that each component of is working as expected while calling the
         post-training callback.
         Specifically, check the following -
@@ -152,6 +182,8 @@ class TestPostTrainingCallback(TestCase):
         not importlib.util.find_spec("pytorch_lightning"), "No pytorch_lightning"
     )
     def test_post_training_callback(self):
+        # [FUNCTION DOC] Builds a PostTrainingDataSparsity callback with DataNormSparsifier
+        # and a dummy Lightning module, then runs the on_fit_end checks.
         sparsifier_args = {
             "sparsity_level": 0.5,
             "sparse_block_shape": (1, 4),
@@ -164,6 +196,8 @@ class TestPostTrainingCallback(TestCase):
 
 
 class TestTrainingAwareCallback(TestCase):
+    # [CLASS DOC] Tests for TrainingAwareDataSparsity: simulates a multi-epoch training
+    # loop by calling each callback hook and checking sparsifier/scheduler state.
     """Class to test in-training version of lightning callback
     Simulates model training and makes sure that each hook is doing what is expected
     """
@@ -171,6 +205,9 @@ class TestTrainingAwareCallback(TestCase):
     def _check_on_train_start(
         self, pl_module, callback, sparsifier_args, scheduler_args
     ):
+        # [FUNCTION DOC] HELPER: Calls on_train_start and asserts that the data sparsifier
+        # and data scheduler were created and that their defaults/attributes match the
+        # given sparsifier_args and scheduler_args. Raises AssertionError otherwise.
         """Makes sure that the data_sparsifier and data_scheduler objects are being created
         correctly.
         Basically, confirms that the input args and sparsifier/scheduler args are in-line.
@@ -203,6 +240,8 @@ class TestTrainingAwareCallback(TestCase):
                 )
 
     def _simulate_update_param_model(self, pl_module):
+        # [FUNCTION DOC] HELPER: Mutates every model parameter in place by adding one,
+        # imitating a training update.
         """This function might not be needed as the model is being copied
         during train_epoch_end() but good to have if things change in the future
         """
@@ -210,6 +249,9 @@ class TestTrainingAwareCallback(TestCase):
             param.data = param + 1
 
     def _check_on_train_epoch_start(self, pl_module, callback):
+        # [FUNCTION DOC] HELPER: Calls on_train_epoch_start; if the callback has a saved
+        # sparsifier state dict, verifies the live sparsifier's container tensors, masks
+        # and data_groups equal the saved ones. Raises AssertionError on difference.
         """Basically ensures that the sparsifier's state is correctly being restored.
         The state_dict() comparison is needed. Consider the flow -
 
@@ -288,6 +330,10 @@ class TestTrainingAwareCallback(TestCase):
                 )
 
     def _check_on_train_epoch_end(self, pl_module, callback):
+        # [FUNCTION DOC] HELPER: Calls on_train_epoch_end, then for each parameter checks
+        # that sparsity is positive and that the scheduler's latest parameter equals the
+        # base value times gamma to the power of the epoch (compared in log space).
+        # Raises AssertionError otherwise.
         """Checks the following -
         1. sparsity is correctly being achieved after .step()
         2. scheduler and data_sparsifier sparsity levels are in-line
@@ -319,6 +365,9 @@ class TestTrainingAwareCallback(TestCase):
                 )
 
     def _check_on_train_end(self, pl_module, callback):
+        # [FUNCTION DOC] HELPER: Calls on_train_end and asserts no model parameter remains
+        # parametrized in the sparsifier's container (masks squashed).
+        # KNOWN ISSUE: reads the attribute spelled _continer, which mirrors a typo in the sparsifier.
         """Confirms that the mask is squashed after the training ends
         This is achieved by making sure that each parameter in the internal container
         are not parametrized.
@@ -337,6 +386,9 @@ class TestTrainingAwareCallback(TestCase):
         not importlib.util.find_spec("pytorch_lightning"), "No pytorch_lightning"
     )
     def test_train_aware_callback(self):
+        # [FUNCTION DOC] Creates a TrainingAwareDataSparsity callback (DataNormSparsifier with
+        # StepSLScheduler), runs the start check, then five simulated epochs of
+        # epoch-start, parameter update and epoch-end checks.
         sparsifier_args = {
             "sparsity_level": 0.5,
             "sparse_block_shape": (1, 4),

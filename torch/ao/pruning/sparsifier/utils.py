@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Helper functions for sparsifiers: checking for a parametrization on a
+# module, swapping a dense module for a sparse one, converting between modules and
+# fully qualified names, splitting a tensor name into its parts, and the FakeSparsity
+# mask parametrization. Exports all of these. No import-time side effects.
 from itertools import chain
 from typing import Any
 
@@ -17,6 +21,8 @@ __all__ = [
 
 
 def module_contains_param(module: nn.Module, parametrization: type[nn.Module]) -> bool:
+    # [FUNCTION DOC] Returns True if module is parametrized and any parametrization on any of
+    # its tensors is an instance of the given class; otherwise False.
     if is_parametrized(module):
         # see if any of the module tensors have a parametrization attached that matches the one passed in
         return any(
@@ -29,6 +35,11 @@ def module_contains_param(module: nn.Module, parametrization: type[nn.Module]) -
 def swap_module(
     mod: nn.Module, mapping: dict[type[nn.Module], type[nn.Module]]
 ) -> nn.Module:
+    # [FUNCTION DOC] If the type of mod before parametrization is a key in mapping, builds the
+    # sparse module through the target class's from_dense, copies over forward pre-hooks
+    # and forward hooks, and moves it to the original module's single device. Raises
+    # AssertionError if the original has parameters or buffers on more than one device.
+    # Returns the new module, or mod itself if its type is not in mapping.
     r"""Swaps the module using from_dense according to the mapping passed in.
     Args:
         mod: input module
@@ -68,6 +79,9 @@ def swap_module(
 
 
 def module_to_fqn(model: nn.Module, module: nn.Module, prefix: str = "") -> str | None:
+    # [FUNCTION DOC] Searches model's children recursively for module and returns its dotted
+    # fully qualified name, an empty string if module is model itself, or None if it is
+    # not a descendant. The prefix is used internally during recursion.
     """
     Returns the fqn for a module or None if module not a descendant of model.
     """
@@ -81,6 +95,9 @@ def module_to_fqn(model: nn.Module, module: nn.Module, prefix: str = "") -> str 
 
 
 def fqn_to_module(model: nn.Module | None, path: str) -> nn.Module | None:
+    # [FUNCTION DOC] Follows the dotted path by attribute lookup from model (so it also reaches
+    # tensors) and returns the result; any missing step yields None from then on. An
+    # empty path returns model.
     """
     Given an fqn, returns the corresponding module or tensor or None if the fqn given by `path`
     doesn't correspond to anything. Similar to model.get_submodule(path) but works for tensors.
@@ -92,6 +109,9 @@ def fqn_to_module(model: nn.Module | None, path: str) -> nn.Module | None:
 
 
 def get_arg_info_from_tensor_fqn(model: nn.Module, tensor_fqn: str) -> dict[str, Any]:
+    # [FUNCTION DOC] Splits tensor_fqn at its last dot into module path and tensor name,
+    # resolves the module (None if absent), and returns a mapping with module_fqn,
+    # module, tensor_name and tensor_fqn.
     """
     Uses tensor_fqn to obtain a dict containing module_fqn, module and tensor_name
     """
@@ -113,6 +133,9 @@ def get_arg_info_from_tensor_fqn(model: nn.Module, tensor_fqn: str) -> dict[str,
 
 # Parametrizations
 class FakeSparsity(nn.Module):
+    # [CLASS DOC] Parametrization applying an element-wise mask, held as buffer mask, to a
+    # tensor. The mask object identity must not change after it is passed in. Its
+    # state_dict is empty so masks are not saved with the module.
     r"""Parametrization for the weights. Should be attached to the 'weight' or
     any other parameter that requires a mask applied to it.
 
@@ -124,10 +147,13 @@ class FakeSparsity(nn.Module):
     """
 
     def __init__(self, mask):
+        # [FUNCTION DOC] Registers mask as the buffer mask.
         super().__init__()
         self.register_buffer("mask", mask)
 
     def forward(self, x):
+        # [FUNCTION DOC] Returns the mask multiplied element-wise with x. Raises AssertionError
+        # if the mask shape differs from the shape of x.
         if self.mask.shape != x.shape:
             raise AssertionError(
                 f"mask shape ({self.mask.shape}) must match x shape ({x.shape})"
@@ -135,6 +161,7 @@ class FakeSparsity(nn.Module):
         return self.mask * x
 
     def state_dict(self, *args, **kwargs):
+        # [FUNCTION DOC] Returns an empty mapping so the mask is not saved with the module.
         # We don't want to let the parametrizations to save the mask.
         # That way we make sure that the linear module doesn't store the masks
         # alongside their parametrizations.

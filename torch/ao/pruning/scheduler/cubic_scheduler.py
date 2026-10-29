@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines CubicSL, a scheduler that raises sparsity following a cubic curve
+# (gradual pruning schedule), plus a clamp helper. Exports CubicSL.
 import warnings
 
 from .base_scheduler import BaseScheduler
@@ -8,10 +10,14 @@ __all__ = ["CubicSL"]
 
 
 def _clamp(x, lo, hi):
+    # [FUNCTION DOC] HELPER: Returns x limited to the range from lo to hi (lo applied last).
     return max(lo, min(hi, x))
 
 
 class CubicSL(BaseScheduler):
+    # [CLASS DOC] Scheduler whose per-group level moves from init_sl toward the group's final
+    # level (base_sl) along a cubic curve between a start step and a number of pruning
+    # steps. Per-group lists: init_sl, init_t, delta_t, total_t, initially_zero.
     r"""Sets the sparsity level of each parameter group to the final sl
     plus a given exponential function.
 
@@ -50,6 +56,9 @@ class CubicSL(BaseScheduler):
         last_epoch=-1,
         verbose=False,
     ):
+        # [FUNCTION DOC] Stores the sparsifier, expands each of init_sl, init_t, delta_t, total_t
+        # and initially_zero to a per-group list (ValueError on wrong length), then runs the
+        # base constructor, which performs the first step.
         self.sparsifier = sparsifier
 
         self.init_sl = self._make_sure_a_list(init_sl)
@@ -63,6 +72,12 @@ class CubicSL(BaseScheduler):
 
     @staticmethod
     def sparsity_compute_fn(s_0, s_f, t, t_0, dt, n, initially_zero=False):
+        # [FUNCTION DOC] Static. Returns 0 if initially_zero is set and t is before t_0. Otherwise
+        # computes the final level plus the initial-minus-final gap times the cube of one
+        # minus the elapsed fraction (t minus t_0 over dt times n), then clamps the result
+        # to the range from s_0 to s_f and returns it.
+        # KNOWN ISSUE: the clamp bounds are given as s_0 then s_f; when s_0 > s_f the range
+        # is inverted, and no clamp on t beyond total steps beyond the lower bound is applied.
         r""" "Computes the current level of sparsity.
 
         Based on https://arxiv.org/pdf/1710.01878.pdf
@@ -87,6 +102,10 @@ class CubicSL(BaseScheduler):
         return s_t
 
     def get_sl(self):
+        # [FUNCTION DOC] Returns the list of new sparsity levels, one per group, by applying
+        # sparsity_compute_fn with the current epoch and each group's init level, final
+        # level (base_sl), start step, frequency, step count and initially_zero flag.
+        # Warns if called outside of step.
         if not self._get_sl_called_within_step:
             warnings.warn(
                 "To get the last sparsity level computed by the scheduler, "

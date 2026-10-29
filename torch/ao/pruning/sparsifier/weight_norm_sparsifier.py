@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines WeightNormSparsifier, which zeroes blocks of a weight with the
+# smallest norm and/or the smallest values inside each block. Exports WeightNormSparsifier.
+# No import-time side effects.
 import operator
 from collections.abc import Callable
 from functools import reduce
@@ -13,12 +16,19 @@ __all__ = ["WeightNormSparsifier"]
 
 
 def _flat_idx_to_2d(idx, shape):
+    # [FUNCTION DOC] HELPER: Converts flat indices into row and column indices for a 2D shape;
+    # returns the pair (rows, cols). Currently unused in this module.
     rows = idx // shape[1]
     cols = idx % shape[1]
     return rows, cols
 
 
 class WeightNormSparsifier(BaseSparsifier):
+    # [CLASS DOC] Block-based sparsifier. Defaults: sparsity_level (fraction of blocks removed),
+    # sparse_block_shape (block rows, cols), zeros_per_block (zeros inside each block,
+    # all of them by default). The norm function (norm_fn) scores blocks: absolute value
+    # for 1, square for 2, or a user callable. The final mask combines a tensor-level
+    # mask (whole blocks) and a block-level mask (smallest values inside each block).
     r"""Weight-Norm Sparsifier
 
     This sparsifier computes the norm of every sparse block and "zeroes-out" the
@@ -63,6 +73,10 @@ class WeightNormSparsifier(BaseSparsifier):
         zeros_per_block: int | None = None,
         norm: Callable | int | None = None,
     ):
+        # [FUNCTION DOC] Builds the default config; zeros_per_block defaults to the number of
+        # elements in a block. Selects norm_fn: None means 2, a callable is used as is, 1
+        # is absolute value, 2 is elementwise square; any other value raises
+        # NotImplementedError. Then initializes the base class.
         if zeros_per_block is None:
             zeros_per_block = reduce(operator.mul, sparse_block_shape)
         defaults = {
@@ -92,6 +106,11 @@ class WeightNormSparsifier(BaseSparsifier):
         input_shape=None,
         device=None,
     ):
+        # [FUNCTION DOC] HELPER: Zeroes, in the unfolded mask, the entries at the given indices
+        # along dim, then folds the mask back to output_shape using non-overlapping
+        # blocks of block_shape, replacing the mask data. If mask is None, builds an
+        # all-ones mask of input_shape on device (AssertionError if input_shape is also
+        # missing). Returns the mask.
         r"""Creates patches of size `block_shape` after scattering the indices."""
         if mask is None:
             if input_shape is None:
@@ -106,6 +125,13 @@ class WeightNormSparsifier(BaseSparsifier):
     def _make_tensor_mask(
         self, data, input_shape, sparsity_level, sparse_block_shape, mask=None
     ):
+        # [FUNCTION DOC] HELPER: Builds a mask (padded to a multiple of the block shape, then
+        # cropped back) that zeroes whole blocks with the lowest scores. Sparsity level at or
+        # above one gives all zeros, at or below zero gives all ones. Otherwise block
+        # scores are average-pooled data, the number of blocks to zero is the rounded
+        # level times block count clamped to at most count minus one, and those blocks
+        # are zeroed through the scatter-fold helper. Returns the mask.
+        # KNOWN ISSUE: input_shape is unused.
         r"""Creates a tensor-level mask.
 
         Tensor-level mask is described as a mask, where the granularity of sparsification of the
@@ -160,6 +186,13 @@ class WeightNormSparsifier(BaseSparsifier):
         return mask
 
     def _make_block_mask(self, data, sparse_block_shape, zeros_per_block, mask=None):
+        # [FUNCTION DOC] HELPER: Builds a mask that, inside each block, zeroes the
+        # zeros_per_block smallest values. Data is padded with NaN to a multiple of the
+        # block shape and unfolded into blocks; if zeros_per_block equals the block size the
+        # mask is all zeros. The mask data is replaced in place and the mask is returned
+        # (with padded size; the padding is not cropped).
+        # KNOWN ISSUE: padded NaN entries take part in the smallest-value selection, and
+        # the returned mask keeps the padded shape rather than the data shape.
         r"""Creates a block-level mask.
 
         Block-level mask is described as a mask, where the granularity of sparsification of the
@@ -218,6 +251,12 @@ class WeightNormSparsifier(BaseSparsifier):
         zeros_per_block,
         **kwargs,
     ):
+        # [FUNCTION DOC] Recomputes the mask of module.tensor_name in place. Raises ValueError if
+        # zeros_per_block is negative or larger than the block size. A level of zero or
+        # less, or zero zeros per block, gives all ones; a level of one or more with a
+        # fully zeroed block gives all zeros. Otherwise scores the weight with norm_fn,
+        # builds the tensor-level mask, and, if blocks are only partly zeroed, combines it
+        # by logical or with the block-level mask.
         values_per_block = reduce(operator.mul, sparse_block_shape)
         if zeros_per_block > values_per_block:
             raise ValueError(

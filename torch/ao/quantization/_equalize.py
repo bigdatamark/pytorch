@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Cross-layer equalization (data-free quantization, section 4.1 of the
+# referenced paper): rescales the weights of adjacent layers so that per-channel ranges
+# match, repeating until the weights converge. Contains weight/bias accessors that work
+# for plain and fused modules, per-axis range helpers, pair-list preprocessing, equalize
+# and converged. Defines the supported module type sets at import.
 import copy
 from itertools import chain
 from typing import Any
@@ -33,6 +38,8 @@ _all_supported_types = _supported_types.union(_supported_intrinsic_types)
 
 
 def set_module_weight(module, weight) -> None:
+    # [FUNCTION DOC] Replaces the weight with a new Parameter built from weight; for fused
+    # modules (type not in the plain supported set) the first submodule is changed.
     if type(module) in _supported_types:
         module.weight = torch.nn.Parameter(weight)
     else:
@@ -40,6 +47,8 @@ def set_module_weight(module, weight) -> None:
 
 
 def set_module_bias(module, bias) -> None:
+    # [FUNCTION DOC] Replaces the bias with a new Parameter built from bias; for fused modules
+    # the first submodule is changed.
     if type(module) in _supported_types:
         module.bias = torch.nn.Parameter(bias)
     else:
@@ -47,6 +56,8 @@ def set_module_bias(module, bias) -> None:
 
 
 def has_bias(module) -> bool:
+    # [FUNCTION DOC] Returns whether the module (or the first submodule of a fused module) has a
+    # bias that is not None.
     if type(module) in _supported_types:
         return module.bias is not None
     else:
@@ -54,6 +65,7 @@ def has_bias(module) -> bool:
 
 
 def get_module_weight(module):
+    # [FUNCTION DOC] Returns the weight of the module, or of its first submodule for fused modules.
     if type(module) in _supported_types:
         return module.weight
     else:
@@ -61,6 +73,7 @@ def get_module_weight(module):
 
 
 def get_module_bias(module):
+    # [FUNCTION DOC] Returns the bias of the module, or of its first submodule for fused modules.
     if type(module) in _supported_types:
         return module.bias
     else:
@@ -68,6 +81,8 @@ def get_module_bias(module):
 
 
 def max_over_ndim(input, axis_list, keepdim=False):
+    # [FUNCTION DOC] Reduces input by maximum over each listed axis in turn, highest axis
+    # first, and returns the result. Sorts axis_list in place (side effect on the caller's list).
     """Apply 'torch.max' over the given axes."""
     axis_list.sort(reverse=True)
     for axis in axis_list:
@@ -76,6 +91,8 @@ def max_over_ndim(input, axis_list, keepdim=False):
 
 
 def min_over_ndim(input, axis_list, keepdim=False):
+    # [FUNCTION DOC] Reduces input by minimum over each listed axis in turn, highest axis
+    # first, and returns the result. Sorts axis_list in place (side effect on the caller's list).
     """Apply 'torch.min' over the given axes."""
     axis_list.sort(reverse=True)
     for axis in axis_list:
@@ -84,6 +101,9 @@ def min_over_ndim(input, axis_list, keepdim=False):
 
 
 def channel_range(input, axis=0):
+    # [FUNCTION DOC] Returns, for each index along axis, the maximum minus the minimum of the
+    # input over all other dimensions. Raises AssertionError if the result length differs
+    # from the axis size.
     """Find the range of weights associated with a specific channel."""
     size_of_tensor_dim = input.ndim
     axis_list = list(range(size_of_tensor_dim))
@@ -100,6 +120,8 @@ def channel_range(input, axis=0):
 
 
 def get_name_by_module(model, module):
+    # [FUNCTION DOC] Returns the dotted name of module inside model, matched by identity; raises
+    # ValueError if module is not part of model.
     """Get the name of a module within a model.
 
     Args:
@@ -116,6 +138,13 @@ def get_name_by_module(model, module):
 
 
 def cross_layer_equalization(module1, module2, output_axis=0, input_axis=1):
+    # [FUNCTION DOC] Rescales two adjacent layers in place. Each scaling factor is the square
+    # root of the output-channel range of module1's weight over the input-channel range of
+    # module2's weight (a tiny constant is added to the latter, mutating it). module1's
+    # weight and bias are divided by it and module2's weight multiplied, so the
+    # network function is preserved for piecewise linear activations. Raises ValueError
+    # for unsupported module types and TypeError if module1's output channels differ from
+    # module2's input channels.
     """Scale the range of Tensor1.output to equal Tensor2.input.
 
     Given two adjacent tensors', the weights are scaled such that
@@ -172,6 +201,9 @@ def cross_layer_equalization(module1, module2, output_axis=0, input_axis=1):
 
 
 def process_paired_modules_list_to_name(model, paired_modules_list):
+    # [FUNCTION DOC] Replaces, inside each group of the list, every module with its name in
+    # model (strings are kept) and returns the same list object. Raises TypeError for
+    # items that are neither modules nor strings. Mutates the input groups.
     """Processes a list of paired modules to a list of names of paired modules."""
 
     for group in paired_modules_list:
@@ -184,6 +216,9 @@ def process_paired_modules_list_to_name(model, paired_modules_list):
 
 
 def expand_groups_in_paired_modules_list(paired_modules_list):
+    # [FUNCTION DOC] Returns a new list in which groups of two are kept and longer groups are
+    # split into overlapping consecutive pairs. Raises ValueError for a group of one.
+    # Empty groups are silently dropped.
     """Expands module pair groups larger than two into groups of two modules."""
     new_list = []
 
@@ -199,6 +234,11 @@ def expand_groups_in_paired_modules_list(paired_modules_list):
 
 
 def equalize(model, paired_modules_list, threshold=1e-4, inplace=True):
+    # [FUNCTION DOC] Applies cross-layer equalization over the given pairs (modules or names;
+    # groups longer than two are expanded into consecutive pairs) repeatedly until the
+    # weights change by less than threshold between rounds. Works on a deep copy unless
+    # inplace is true. Returns the model. Note that the names in the input list are
+    # rewritten in place as a side effect.
     """Equalize modules until convergence is achieved.
 
     Given a list of adjacent modules within a model, equalization will
@@ -252,6 +292,10 @@ def equalize(model, paired_modules_list, threshold=1e-4, inplace=True):
 
 
 def converged(curr_modules, prev_modules, threshold=1e-4):
+    # [FUNCTION DOC] Returns True if the summed vector norm of weight differences between
+    # matching modules of the two name-to-module mappings is below threshold. Raises
+    # ValueError if the key sets differ; returns False when any previous module is None
+    # (first round).
     """Test whether modules are converged to a specified threshold.
 
     Tests for the summed norm of the differences between each set of modules

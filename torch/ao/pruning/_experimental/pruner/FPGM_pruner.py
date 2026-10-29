@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines FPGMPruner, a structured pruner that removes convolution
+# filters closest to the geometric median (Filter Pruning via Geometric Median).
+# Exports FPGMPruner. No import-time side effects.
 from collections.abc import Callable
 
 import torch
@@ -10,6 +13,10 @@ __all__ = ["FPGMPruner"]
 
 
 class FPGMPruner(BaseStructuredSparsifier):
+    # [CLASS DOC] Structured sparsifier that scores each filter (row of the weight) by the
+    # sum of its distances to all other filters and masks the filters with the smallest
+    # sums (the most redundant). Configured by sparsity_level (fraction of rows pruned)
+    # and a distance function dist_fn chosen at construction.
     r"""Filter Pruning via Geometric Median (FPGM) Structured Pruner
     This sparsifier prune filter (row) in a tensor according to distances among filters according to
     `Filter Pruning via Geometric Median for Deep Convolutional Neural Networks Acceleration <https://arxiv.org/abs/1811.00250>`_.
@@ -28,6 +35,10 @@ class FPGMPruner(BaseStructuredSparsifier):
     """
 
     def __init__(self, sparsity_level: float = 0.5, dist: Callable | int | None = None):
+        # [FUNCTION DOC] Stores sparsity_level as the default config and selects dist_fn:
+        # None means 2; a callable is used as is; 1 or 2 give pairwise p-norm distance
+        # (cdist) with that p. Any other value raises NotImplementedError.
+        # KNOWN ISSUE: the class docstring says the default is 3 (L2), but code defaults to 2.
         defaults = {
             "sparsity_level": sparsity_level,
         }
@@ -46,6 +57,9 @@ class FPGMPruner(BaseStructuredSparsifier):
         super().__init__(defaults=defaults)
 
     def _compute_distance(self, t):
+        # [FUNCTION DOC] HELPER: Flattens each row (dimension 0 slice) of t into a vector,
+        # stacks them, applies dist_fn to get the pairwise distance matrix, and returns
+        # the per-row sum of absolute distances (larger means more distinct filter).
         r"""Compute distance across all entries in tensor `t` along all dimension
         except for the one identified by dim.
         Args:
@@ -76,6 +90,10 @@ class FPGMPruner(BaseStructuredSparsifier):
     def update_mask(  # type: ignore[override]
         self, module, tensor_name, sparsity_level, **kwargs
     ):
+        # [FUNCTION DOC] Updates, in place, the boolean row mask of the parametrization on
+        # module.tensor_name. sparsity_level <= 0 keeps all rows, >= 1 masks all rows;
+        # otherwise the rows with the smallest distance score (count is the rounded
+        # level times the row count, clamped) are set to False. Extra kwargs are ignored.
         tensor_weight = getattr(module, tensor_name)
         mask = getattr(module.parametrizations, tensor_name)[0].mask
 

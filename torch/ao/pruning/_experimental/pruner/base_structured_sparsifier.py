@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Core of structured pruning. Provides lookup functions for supported
+# modules, activation functions and activation modules, a builder for the default
+# table mapping module/function sequence patterns to pruning conversion functions,
+# and BaseStructuredSparsifier, which attaches fake-sparsity parametrizations and
+# then rewrites a traced model by physically removing pruned channels.
+# No import-time side effects.
 from collections.abc import Callable
 from itertools import chain
 from operator import getitem
@@ -28,6 +34,8 @@ from .prune_functions import (
 
 
 def _get_supported_structured_pruning_modules():
+    # [FUNCTION DOC] HELPER: Returns a new set of module types prunable by default
+    # (Linear, Conv2d, LSTM).
     SUPPORTED_STRUCTURED_PRUNING_MODULES = {  # added to config if None given
         nn.Linear,
         nn.Conv2d,
@@ -37,6 +45,8 @@ def _get_supported_structured_pruning_modules():
 
 
 def _get_supported_activation_functions():
+    # [FUNCTION DOC] HELPER: Returns a new set of functional activations (relu, gelu,
+    # sigmoid, etc.) that may sit between prunable layers in a pattern.
     SUPPORTED_ACTIVATION_FUNCTIONS = {
         F.relu,
         F.rrelu,
@@ -64,6 +74,8 @@ def _get_supported_activation_functions():
 
 
 def _get_supported_activation_modules():
+    # [FUNCTION DOC] HELPER: Returns a new set of activation module types (ReLU, GELU,
+    # etc.) mirroring the functional activations set.
     SUPPORTED_ACTIVATION_MODULES = {
         nn.ReLU,
         nn.RReLU,
@@ -94,6 +106,12 @@ def _get_default_structured_pruning_patterns() -> dict[
     tuple[type[nn.Module] | Callable | MatchAllNode | str, ...],
     Callable[..., None],
 ]:
+    # [FUNCTION DOC] HELPER: Builds the default mapping from tuples of node kinds (module
+    # types, functions or the string output) to the prune function that handles that
+    # sequence. Base entries cover linear/conv chains and LSTM followed by linear
+    # (optionally via layernorm). For every supported activation (function or module) it
+    # adds linear-act-linear, conv-act-conv, conv with avg/max pool (module or
+    # functional, both orders with the activation) and conv-adaptive-pool-flatten-linear.
     """
     Returns the patterns for conv2d / linear conversion for each element in the activation functions/modules defined above.
     """
@@ -206,6 +224,12 @@ def _get_default_structured_pruning_patterns() -> dict[
 
 
 class BaseStructuredSparsifier(BaseSparsifier):
+    # [CLASS DOC] Base class for structured pruners. Subclasses implement update_mask to
+    # produce a per-output-channel boolean mask. prepare (via _prepare) registers a
+    # FakeStructuredSparsity parametrization plus bias hooks on each configured module;
+    # prune traces the model with FX and applies pattern-specific conversion functions
+    # to shrink layers. Attribute patterns maps node-sequence patterns to conversion
+    # functions; after prune, traced holds the rewritten GraphModule.
     r"""Base class for structured pruning.
 
     Abstract methods that need to be implemented:
@@ -219,6 +243,8 @@ class BaseStructuredSparsifier(BaseSparsifier):
     """
 
     def __init__(self, defaults, patterns=None):
+        # [FUNCTION DOC] Initializes the base sparsifier with defaults and stores patterns;
+        # when patterns is None the default structured-pruning pattern table is used.
         super().__init__(defaults)
         if patterns is None:
             patterns = _get_default_structured_pruning_patterns()
@@ -229,11 +255,19 @@ class BaseStructuredSparsifier(BaseSparsifier):
         model: nn.Module,
         SUPPORTED_MODULES: set[type] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Builds the sparsifier config from model, restricting to
+        # SUPPORTED_MODULES (default: Linear, Conv2d, LSTM) and delegating to the base class.
         if SUPPORTED_MODULES is None:
             SUPPORTED_MODULES = _get_supported_structured_pruning_modules()
         super().make_config_from_model(model, SUPPORTED_MODULES=SUPPORTED_MODULES)
 
     def _prepare(self, *args, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: For each config group, takes the configured mask (or an
+        # all-true row mask), records it in state under the tensor name, and registers the
+        # parametrization (default FakeStructuredSparsity) on the tensor. For Linear and
+        # Conv2d modules the bias is moved to a separate parameter named _bias, bias is
+        # set to None, prune_bias is recorded, and a forward hook (BiasHook) is added.
+        # Extra args are ignored. Mutates the model.
         r"""This function will attach the FakeStructuredSparsity parameterizations
         and BiasHooks at the appropriate points in the model.
         """
@@ -268,6 +302,14 @@ class BaseStructuredSparsifier(BaseSparsifier):
                 )
 
     def prune(self) -> None:
+        # [FUNCTION DOC] Symbolically traces the model, then for each graph node tries each
+        # pattern; on a match whose first module is parametrized with
+        # FakeStructuredSparsity, calls the conversion function with the matched modules
+        # and functions to shrink them. Raises a generic Exception if any module still
+        # holds a fake-sparsity parametrization. Lints and recompiles the graph, stores it
+        # as traced and returns it (a GraphModule, despite the None annotation).
+        # KNOWN ISSUE: the return annotation says None but a GraphModule is returned; the
+        # inner loop reuses the name node, shadowing the outer loop variable.
         r"""
         This function will FX symbolically trace the model and then find instances of the patterns
         defined in self.patterns (by default SUPPORTED_STRUCTURED_PRUNING_PATTERNS ).

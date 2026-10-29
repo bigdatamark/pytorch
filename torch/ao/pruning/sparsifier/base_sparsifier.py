@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines BaseSparsifier, the abstract base class for unstructured
+# sparsifiers that attach mask parametrizations to model tensors, update masks on
+# step, squash masks into weights, and convert modules to sparse versions. Exports
+# BaseSparsifier; also defines SUPPORTED_MODULES (Linear only) and
+# KEYS_NOT_IN_STATE_DICT (group keys left out of saved state). No import-time side effects.
 import abc
 import copy
 from collections import defaultdict
@@ -27,6 +32,12 @@ KEYS_NOT_IN_STATE_DICT = ["module", "module_fqn", "tensor_name"]
 
 # TODO update desc with new config args
 class BaseSparsifier(abc.ABC):
+    # [CLASS DOC] Abstract sparsifier. State: defaults (per-group default config), state
+    # (mapping tensor name to its dict, holding the mask), groups (list of per-tensor
+    # config dicts with module, module_fqn, tensor_name, tensor_fqn and user options),
+    # enable_mask_update flag, and after prepare also model and config. Typical flow is
+    # prepare, repeated step, squash_mask, optionally convert. Subclasses must implement
+    # update_mask.
     r"""Base class for all sparsifiers.
 
     Abstract methods that need to be implemented:
@@ -53,6 +64,8 @@ class BaseSparsifier(abc.ABC):
     """
 
     def __init__(self, defaults: dict[str, Any] | None = None):
+        # [FUNCTION DOC] Stores defaults (empty mapping if None), creates an empty
+        # auto-creating state mapping and an empty groups list, and enables mask updates.
         super().__init__()
         self.defaults: dict[str, Any] = defaults or {}
 
@@ -61,6 +74,7 @@ class BaseSparsifier(abc.ABC):
         self.enable_mask_update = True
 
     def __getstate__(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Pickle support: returns a mapping with only defaults, state and groups.
         return {
             "defaults": self.defaults,
             "state": self.state,
@@ -68,9 +82,12 @@ class BaseSparsifier(abc.ABC):
         }
 
     def __setstate__(self, state: dict[str, dict[str, Any]]) -> None:
+        # [FUNCTION DOC] Restores attributes by merging the given mapping into the instance attributes.
         self.__dict__.update(state)
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns a multi-line string listing each group with its module and its
+        # other config entries sorted by key.
         format_string = self.__class__.__name__ + " ("
         for i, sparse_args in enumerate(self.groups):
             module = sparse_args["module"]
@@ -85,6 +102,8 @@ class BaseSparsifier(abc.ABC):
         return format_string
 
     def state_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Returns a mapping with state (the live state mapping) and groups (copies
+        # of each group dict without the keys module, module_fqn and tensor_name).
         r"""Returns the state of the optimizer as a :class:`dict`.
 
         It contains:
@@ -111,6 +130,15 @@ class BaseSparsifier(abc.ABC):
         }
 
     def load_state_dict(self, state_dict: dict[str, Any], strict: bool = True):
+        # [FUNCTION DOC] Restores state and groups from state_dict onto the prepared model. For
+        # each saved tensor name, locates its module in the model (RuntimeError if missing
+        # and strict), finds or registers a FakeSparsity parametrization, and sets its
+        # mask from the saved state (the mask entry is removed from the saved state).
+        # Groups matching that tensor are refreshed with module info. Finally installs
+        # the state and groups. Requires prepare to have set model.
+        # KNOWN ISSUE: with strict false and a missing module, the code still dereferences
+        # the module and fails; the parametrization registered when none is found is
+        # not checked for existing different parametrizations.
         groups = copy.deepcopy(state_dict["groups"])
         states = state_dict["state"]
         for tensor_fqn, s in states.items():
@@ -142,6 +170,9 @@ class BaseSparsifier(abc.ABC):
         model: nn.Module,
         SUPPORTED_MODULES: set[type[nn.Linear]] = SUPPORTED_MODULES,
     ) -> None:
+        # [FUNCTION DOC] Sets config to a list of dicts, one per module in the model (found by a
+        # stack-based walk) whose exact type is in SUPPORTED_MODULES, each naming the
+        # module's weight by fully qualified name. Matching modules are not descended into.
         self.config = []
         stack = [model]
         while stack:
@@ -156,6 +187,12 @@ class BaseSparsifier(abc.ABC):
                     stack.append(child)
 
     def prepare(self, model, config):
+        # [FUNCTION DOC] Stores model and config (building config from the model when None) and
+        # creates one group per config element: a deep copy of defaults updated with the
+        # element, plus module, module_fqn, tensor_name and tensor_fqn derived from the
+        # required tensor_fqn key. AssertionError is raised for non-dict elements, a
+        # missing tensor_fqn, or user values that conflict with the derived info. Then calls
+        # _prepare, which attaches parametrizations; the model is modified in place.
         r"""Prepares a model, by adding the parametrizations.
 
         Note::
@@ -214,6 +251,9 @@ class BaseSparsifier(abc.ABC):
         self._prepare()
 
     def _prepare(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: For each group, takes its mask (or an all-ones tensor like the
+        # target), stores it in state under the tensor name, and registers the group's
+        # parametrization class (default FakeSparsity) on the module tensor.
         r"""Adds mask parametrization to the layer weight"""
         for config in self.groups:
             module = config["module"]
@@ -232,6 +272,11 @@ class BaseSparsifier(abc.ABC):
         *args,
         **kwargs,
     ):
+        # [FUNCTION DOC] For each group, removes the parametrizations from its tensor while
+        # keeping the masked values, then optionally attaches a sparse_params mapping to
+        # the module holding the group config values named in params_to_keep (all layers)
+        # plus those in params_to_keep_per_layer for that module's fqn. Mutates the model.
+        # Extra args are ignored.
         r"""Squashes the sparse masks into the appropriate tensors.
 
         If either the `params_to_keep` or `params_to_keep_per_layer` is set,
@@ -310,6 +355,10 @@ class BaseSparsifier(abc.ABC):
         inplace: bool = False,
         parameterization: type[nn.Module] = FakeSparsity,
     ):
+        # [FUNCTION DOC] Returns a module in which each child that carries the given
+        # parametrization and whose pre-parametrization type is in mapping is swapped for
+        # its sparse version; other children are converted recursively. Copies the input
+        # first unless inplace is true. Raises NotImplementedError if mapping is None.
         r"""Converts submodules in input module to a different module according to `mapping`
         by calling `from_dense` method on the target module class
         Args:
@@ -348,6 +397,9 @@ class BaseSparsifier(abc.ABC):
         return module
 
     def step(self, use_path: bool = True) -> None:
+        # [FUNCTION DOC] Does nothing if mask updates are disabled; otherwise, without gradient
+        # tracking, calls update_mask once per group with the group's config entries as
+        # keyword arguments. The use_path argument is unused.
         if not self.enable_mask_update:
             return
         with torch.no_grad():
@@ -356,4 +408,6 @@ class BaseSparsifier(abc.ABC):
 
     @abc.abstractmethod
     def update_mask(self, module: nn.Module, tensor_name: str, **kwargs):
+        # [FUNCTION DOC] Abstract: subclasses must update, in place, the mask of tensor_name on
+        # module using the remaining group config in kwargs.
         pass

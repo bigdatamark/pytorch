@@ -1,8 +1,12 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines SaliencyPruner, a structured pruner that removes rows with the
+# smallest L1 norm. No import-time side effects.
 from .base_structured_sparsifier import BaseStructuredSparsifier
 
 
 class SaliencyPruner(BaseStructuredSparsifier):
+    # [CLASS DOC] Structured pruner scoring each row (output channel) of an N-dimensional
+    # weight by its L1 norm and masking the lowest-scoring fraction given by sparsity_level.
     """
     Prune rows based on the saliency (L1 norm) of each row.
 
@@ -13,6 +17,11 @@ class SaliencyPruner(BaseStructuredSparsifier):
     """
 
     def update_mask(self, module, tensor_name, **kwargs):
+        # [FUNCTION DOC] Computes the L1 norm of each row of module.tensor_name, then sets to
+        # False (in place) the mask entries of the int(mask length times kwargs
+        # sparsity_level) rows with the smallest norm. Raises a generic Exception for
+        # weights with fewer than two dimensions and AssertionError if the saliency
+        # shape differs from the mask shape.
         # tensor_name will give you the FQN, all other entries in sparse config is present in kwargs
         weights = getattr(module, tensor_name)
         mask = getattr(module.parametrizations, tensor_name)[0].mask
