@@ -1,3 +1,9 @@
+# [MODULE DOC] Experimental FX quantization demo used only for testing. Defines observer
+# classes that record min/max statistics while interpreting a traced graph, a registry
+# mapping patterns (modules, functions or nested tuples of them) to handler classes, and a
+# Quantizer that matches patterns on a GraphModule, observes sample inputs, and builds a new
+# quantized GraphModule. Import-time side effect: the decorated handler classes fill the
+# module-level pattern registry.
 r"""
 **This file is EXPERIMENTAL and is mostly used for testing purposes! Do not
 rely on it for anything!**
@@ -20,6 +26,12 @@ from torch.nn.utils import fuse_conv_bn_weights
 def _minmax_scale_zeropoint(
     min_val, max_val, qmin=-127, qmax=128, eps=torch.finfo(torch.float32).eps
 ):
+    # [FUNCTION DOC] HELPER: Computes an affine quantization scale and zero point from a
+    # value range. The range is first widened to include zero. If it is degenerate, returns
+    # scale 1.0 and zero point 0. Otherwise scale is the range divided by the quantized
+    # span, floored at eps, and the zero point is derived from the minimum, clamped into the
+    # quantized range and converted to int. Returns the pair (scale, zero point). The eps
+    # default is the float32 machine epsilon, evaluated once at definition time.
     min_val = min(0.0, min_val)
     max_val = max(0.0, max_val)
     if max_val == min_val:
@@ -35,11 +47,21 @@ def _minmax_scale_zeropoint(
 
 
 class MinMaxObserver:
+    # [CLASS DOC] HELPER: Observer handler that tracks the running minimum and maximum of
+    # the tensor values produced by a matched node. State: min and max (start at infinity
+    # and negative infinity) and all_tensors, which becomes False once a non-tensor value is
+    # seen.
     def __init__(self, quantizer, node):
+        # [FUNCTION DOC] HELPER: Initializes min to positive infinity, max to negative
+        # infinity and all_tensors to True. The quantizer and node arguments are accepted
+        # for interface compatibility and ignored.
         self.min, self.max = float("inf"), float("-inf")
         self.all_tensors = True
 
     def observe(self, node, env):
+        # [FUNCTION DOC] HELPER: Records the value computed for the node (looked up by node
+        # name in the environment mapping). A non-tensor value clears all_tensors and is
+        # otherwise ignored; a tensor widens the stored min and max.
         v = env[node.name]
         if not isinstance(v, torch.Tensor):
             self.all_tensors = False
@@ -48,14 +70,20 @@ class MinMaxObserver:
         self.min = min(self.min, float(v.min()))
 
     def scale_zeropoint(self):
+        # [FUNCTION DOC] HELPER: Returns the (scale, zero point) pair for the observed
+        # range, using the unsigned 8-bit span from 0 to 255.
         return _minmax_scale_zeropoint(self.min, self.max, qmin=0, qmax=255)
 
 
 class NoObserver:
+    # [CLASS DOC] HELPER: Handler base class for patterns that need no statistics; both its
+    # constructor and its observe method do nothing.
     def __init__(self, quantizer, node):
+        # [FUNCTION DOC] HELPER: Does nothing; arguments are ignored.
         pass
 
     def observe(self, node, env):
+        # [FUNCTION DOC] HELPER: Does nothing; observation is a no-op for this handler type.
         pass
 
 
@@ -63,7 +91,13 @@ _DEFAULT_QUANTIZATION_PATTERNS = {}
 
 
 def register_pattern(pattern):
+    # [FUNCTION DOC] Decorator factory for the pattern registry. Given a pattern, returns a
+    # decorator that stores the decorated handler class in the module-level default patterns
+    # mapping under that pattern and returns the class unchanged.
     def insert(fn):
+        # [FUNCTION DOC] HELPER: Registers the given function in the default patterns
+        # mapping under the enclosing pattern (mutating module state) and returns it
+        # unchanged.
         _DEFAULT_QUANTIZATION_PATTERNS[pattern] = fn
         return fn
 
@@ -72,7 +106,14 @@ def register_pattern(pattern):
 
 @register_pattern(operator.add)
 class Add(MinMaxObserver):
+    # [CLASS DOC] HELPER: Handler for the add operator pattern, observing min/max of the
+    # sum.
     def quantize(self, quantizer, node, load_arg):
+        # [FUNCTION DOC] HELPER: Produces a quantized add. If any non-tensor value was
+        # observed returns NotImplemented so the quantizer copies the node unchanged.
+        # Otherwise creates a function-call node in the quantizer's new graph targeting the
+        # quantized add op, with args loaded through the supplied load_arg callback and the
+        # observed scale and zero point as keyword arguments. Returns that node.
         if not self.all_tensors:
             return NotImplemented
         scale, zeropoint = self.scale_zeropoint()
@@ -85,7 +126,11 @@ class Add(MinMaxObserver):
 
 
 class Relu(NoObserver):
+    # [CLASS DOC] HELPER: Handler for relu that needs no observation. Not registered in the
+    # pattern registry in this file.
     def quantize(self, quantizer, node, load_arg):
+        # [FUNCTION DOC] HELPER: Applies torch.relu directly to the loaded first argument of
+        # the node and returns the resulting value (it does not create a graph node).
         return torch.relu(
             load_arg(node.args[0])
         )  # torch.relu works directly on quantized tensors?
@@ -97,12 +142,20 @@ class Relu(NoObserver):
 @register_pattern(torch.nn.MaxPool2d)
 @register_pattern(torch.nn.AdaptiveAvgPool2d)
 class CopyNode(NoObserver):
+    # [CLASS DOC] HELPER: Handler registered for ReLU, AvgPool2d, MaxPool2d and
+    # AdaptiveAvgPool2d modules, whose quantized form needs no extra information. No
+    # observation is done.
     def quantize(self, quantizer, node, load_arg):
+        # [FUNCTION DOC] HELPER: Copies the node into the quantizer's new graph, with its
+        # arguments mapped through load_arg, and returns the new node.
         return quantizer.quantized_graph.node_copy(node, load_arg)
 
 
 class IdentityModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Pass-through module whose forward returns its input. Used as a
+    # stand-in for batch norm modules that were fused away.
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Returns the input unchanged.
         return x
 
 
@@ -119,7 +172,16 @@ class IdentityModule(torch.nn.Module):
     )
 )
 class ConvNormRelu(MinMaxObserver):
+    # [CLASS DOC] HELPER: Handler for a 2d convolution optionally followed by batch norm and
+    # then relu, registered for the four combinations. State: relu_node and bn_node (None
+    # when absent), bn module, conv_node and conv module. Observes min/max of the output via
+    # its base.
     def __init__(self, quantizer, node):
+    # [FUNCTION DOC] HELPER: Walks backward from the matched node. If its module is a ReLU,
+    # records it and steps to the first argument; if that is a BatchNorm2d, records the node
+    # and module and steps again. The remaining node must call a Conv2d module, otherwise
+    # raises AssertionError. Stores the conv node and module. Modules are looked up in the
+    # quantizer's module mapping.
         super().__init__(quantizer, node)
         self.relu_node, self.bn_node = None, None
         if isinstance(quantizer.modules[node.target], torch.nn.ReLU):
@@ -137,6 +199,14 @@ class ConvNormRelu(MinMaxObserver):
         self.conv = quantizer.modules[self.conv_node.target]
 
     def quantize(self, quantizer, node, load_arg):
+        # [FUNCTION DOC] HELPER: Replaces the float conv (and optional batch norm and relu)
+        # by a quantized conv. Fuses batch norm into the weights if present, quantizes the
+        # weights per tensor to signed 8-bit, builds the intrinsic ConvReLU2d when a relu
+        # was matched or a plain quantized Conv2d otherwise, and sets its weight, bias,
+        # output scale and zero point from the observed activation range. Side effects:
+        # installs the quantized module in the parent module and replaces the batch norm
+        # submodule with an identity module. Returns a module-call node in the new graph
+        # using the conv target and the loaded first input.
         mod = self.conv
         weight, bias = mod.weight, mod.bias
 
@@ -199,6 +269,9 @@ class ConvNormRelu(MinMaxObserver):
 
 # turn foo.bar -> ['foo', 'bar']
 def _parent_name(target):
+    # [FUNCTION DOC] HELPER: Splits a dotted module path at the last dot and returns the
+    # pair of parent path and attribute name; the parent is the empty string when there is
+    # no dot.
     r = target.rsplit(".", 1)
     if len(r) == 1:
         return "", r[0]
@@ -207,7 +280,14 @@ def _parent_name(target):
 
 
 class DefaultQuant(MinMaxObserver):
+    # [CLASS DOC] HELPER: Default constructor for input quantizers. Observes min/max like
+    # its base and quantizes a node's value to unsigned 8-bit per tensor.
     def quantize(self, input):
+        # [FUNCTION DOC] HELPER: Returns a graph node that quantizes the given input node to
+        # quint8 per tensor using the observed scale and zero point. Raises AssertionError
+        # if a non-tensor value was observed.
+        # KNOWN ISSUE: the AssertionError message says the flag should be non-empty, which
+        #     does not describe the actual condition (all observed values must be tensors).
         if not self.all_tensors:
             raise AssertionError("Expected self.all_tensors to be non-empty")
         scale, zeropoint = self.scale_zeropoint()
@@ -217,6 +297,13 @@ class DefaultQuant(MinMaxObserver):
 
 
 def matches(modules, node, pattern, max_uses=sys.maxsize):
+    # [FUNCTION DOC] HELPER: Checks whether a node matches a pattern. A pattern is either a
+    # single matcher or a tuple of a matcher for the node followed by matchers for its
+    # arguments. Returns False if the node has more users than max_uses. A module-class
+    # matcher requires a module-call node whose module is an instance; another callable
+    # requires a function-call node with that exact target; anything else is compared with
+    # the node target. For tuples the argument count must equal the number of sub-patterns
+    # and each argument must match recursively with at most one user. Returns a bool.
     if isinstance(pattern, tuple):
         self_match, *arg_matches = pattern
     else:
@@ -250,9 +337,18 @@ def matches(modules, node, pattern, max_uses=sys.maxsize):
 
 
 class Quantizer:
+    # [CLASS DOC] HELPER: Experimental quantizer for a traced module. State: root module,
+    # graph, quant_ctor, state_dict and modules mapping, matches (node name to a pair of
+    # root node and handler), quants (input node name to observer), and quantized_graph (set
+    # by quantize). Typical flow: construct, call observe with sample inputs, then call
+    # quantize.
     def __init__(
         self, mod, patterns=_DEFAULT_QUANTIZATION_PATTERNS, quant_ctor=DefaultQuant
     ):
+        # [FUNCTION DOC] HELPER: Stores the traced module, its graph and the constructor
+        # used for input quantizers; caches the state dict and a mapping of module names to
+        # modules; then computes the pattern matches and the set of input observers. The
+        # default patterns argument is the shared module-level registry.
         self.root = mod
         self.graph = mod.graph
         self.quant_ctor = quant_ctor
@@ -269,6 +365,12 @@ class Quantizer:
         self.quants = self._find_quants(quant_ctor)
 
     def observe(self, args):
+        # [FUNCTION DOC] HELPER: Runs the graph as a simple interpreter on the given
+        # positional inputs, keeping an environment of node name to value. After each node
+        # it lets the matched handler (if the node is a match root) and any input observer
+        # for that node record the value. On the output node returns the loaded output
+        # value. Raises RuntimeError if the graph has no output node. Side effect: updates
+        # the observers' statistics.
         # most of this function is just an interpreter for the graph
         # it would be possible to put this in some abstraction, but
         # it is pretty nice to just be able to see exactly what is happening here
@@ -279,6 +381,8 @@ class Quantizer:
         env = {}
 
         def load_arg(a):
+            # [FUNCTION DOC] HELPER: Maps every node inside the given argument structure to
+            # its computed value from the environment.
             return map_arg(a, lambda node: env[node.name])
 
         for node in self.graph.nodes:
@@ -309,12 +413,22 @@ class Quantizer:
         raise RuntimeError("Graph had no output node!")
 
     def quantize(self):
+        # [FUNCTION DOC] HELPER: Builds a new graph from the old one and returns a
+        # GraphModule over the original root. Unmatched nodes are copied; match roots are
+        # converted by their handler, and if the handler returns NotImplemented the root
+        # node is copied instead. Matched non-root nodes are skipped. Sets quantized_graph
+        # and may replace submodules of the root via the handlers.
         self.quantized_graph = Graph()
 
         env = {}
         quant_env = {}
 
         def load_arg(n, quantized):
+            # [FUNCTION DOC] HELPER: Fetches a node's value in the new graph. For
+            # unquantized use, a dequantize node is created from the quantized value if only
+            # that exists; for quantized use, the input observer quantizes the float value
+            # if only that exists. Results are cached in the respective mapping and
+            # returned.
             if not quantized:
                 if n.name not in env and n.name in quant_env:
                     env[n.name] = Proxy(quant_env[n.name]).dequantize().node
@@ -325,6 +439,9 @@ class Quantizer:
                 return quant_env[n.name]
 
         def copy_recursive(node):
+            # [FUNCTION DOC] HELPER: Copies one node into the new graph with its arguments
+            # loaded in unquantized form, records it in the float environment and returns
+            # the new node.
             r = env[node.name] = self.quantized_graph.node_copy(
                 node, lambda n: load_arg(n, quantized=False)
             )
@@ -353,10 +470,19 @@ class Quantizer:
         return GraphModule(self.root, self.quantized_graph)
 
     def _find_matches(self, patterns):
+        # [FUNCTION DOC] HELPER: Finds pattern matches by visiting nodes in reverse order,
+        # skipping nodes already matched. For each registered pattern that matches, records
+        # the matched nodes under their names with a pair of the root node and a handler
+        # instance created from the registered class. Returns the mapping of node name to
+        # that pair.
         modules = dict(self.root.named_modules())
         match_map = {}  # node name -> (root_node, match_value?)
 
         def apply_match(pattern, node, match):
+            # [FUNCTION DOC] HELPER: Recursively records the match for the node: for a tuple
+            # pattern the first element applies to the same node and the rest to the node's
+            # positional arguments; otherwise stores the match under the node name in the
+            # enclosing mapping.
             if isinstance(pattern, tuple):
                 s, *args = pattern
                 apply_match(s, node, match)
@@ -374,9 +500,15 @@ class Quantizer:
         return match_map
 
     def _find_quants(self, quant_ctor):
+        # [FUNCTION DOC] HELPER: Creates an input observer, using the given constructor, for
+        # every node that is an argument or keyword argument of a matched node. At most one
+        # per distinct node name. Returns the mapping of node name to observer.
         quants = {}
 
         def visit_arg(n):
+            # [FUNCTION DOC] HELPER: Creates and stores an observer for the node unless one
+            # exists. Done even for already-quantized values, since a match may later
+            # decline with NotImplemented.
             # note: we have to measure quantization information
             # even for nodes where we might not use it because it is already
             # quantized. This is because each match has the option to

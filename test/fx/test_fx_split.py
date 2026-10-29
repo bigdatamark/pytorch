@@ -1,4 +1,10 @@
 # Owner(s): ["module: fx"]
+# [MODULE DOC] Tests for FX graph splitting utilities: splitting by tags, a splitter base
+# class with a custom operator-support check, and output type preservation. Defines a
+# scripted dataclass and a wrapped (opaque to tracing) function used by one test. Importing
+# the file compiles the dataclass with the TorchScript compiler. Running the file directly
+# raises an error stating the tests are not currently used and must be enabled in test
+# discovery.
 
 import dataclasses
 from collections import defaultdict
@@ -13,6 +19,8 @@ from torch.testing._internal.common_utils import TestCase
 @torch.jit.script
 @dataclasses.dataclass
 class DummyDataClass:
+    # [CLASS DOC] HELPER: Dataclass with three integer fields a, b and c, compiled with
+    # TorchScript.
     a: int
     b: int
     c: int
@@ -20,13 +28,24 @@ class DummyDataClass:
 
 @torch.fx.wrap
 def wrapped_add(_dataclass, y):
+    # [FUNCTION DOC] HELPER: Wrapped function (kept as a single call node by tracing).
+    # Returns the c field of the dataclass plus y.
     return _dataclass.c + y
 
 
 class TestFXSplit(TestCase):
+    # [CLASS DOC] Tests for tag-based splitting preserving metadata and for splitting
+    # through the splitter base class with a dataclass-producing call node. No state.
     def test_split_preserve_node_meta(self):
+        # [FUNCTION DOC] Splits a traced three-op module by tags, one op per tag, after
+        # storing each node's name in its meta. Asserts every non-output node in each child
+        # graph still has the meta name equal to its node name, and that placeholder nodes
+        # of the split module also keep the meta (copied correctly).
         class TestModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module computing x plus x, y times y and returning their
+            # difference.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the doubled x minus the squared y.
                 x = x + x
                 y = y * y
                 return x - y
@@ -55,6 +74,12 @@ class TestFXSplit(TestCase):
                 self.assertEqual(node.meta["name"], node.name)
 
     def test_dataclass_as_graph_entry(self):
+        # [FUNCTION DOC] Edge case: the graph contains a call_function node with no input
+        # dependencies (a dataclass constructed inside forward and passed to a wrapped
+        # function with the input). Builds a splitter with an operator-support object that
+        # accepts only the wrapped function, calls it, asserts a result is returned (no
+        # exception) and that the split module's output equals the original module's on a
+        # random input.
         """
         Test that splitting works when the graph entry is a dataclass instance
         and a wrapped function is called with it, resulting in a call_function
@@ -72,7 +97,11 @@ class TestFXSplit(TestCase):
         """  # noqa: W605
 
         class TestModuleWithFunctionEntry(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that builds a dataclass value from constants and
+            # passes it with the input to the wrapped function.
             def forward(self, y):
+                # [FUNCTION DOC] HELPER: Creates the dataclass value from three constants
+                # and returns the wrapped function applied to it and y.
                 # This creates a call_function node with no input dependencies
                 dummy_data_class = DummyDataClass(2, 3, 4)
                 z = wrapped_add(dummy_data_class, y)
@@ -83,12 +112,20 @@ class TestFXSplit(TestCase):
 
         # Create custom operator support to mark wrapped_add as supported
         class CustomOpSupport(op_support.OperatorSupportBase):
+            # [CLASS DOC] HELPER: Operator support that accepts only the wrapped function.
             def is_node_supported(self, submodules, node) -> bool:
+                # [FUNCTION DOC] HELPER: Returns True if the node target is the wrapped
+                # function. Submodules argument is unused.
                 return node.target is wrapped_add
 
         # Create a simple splitter to test the edge case
         class TestSplitter(splitter_base._SplitterBase):
+            # [CLASS DOC] HELPER: Minimal splitter built on the private splitter base class
+            # with default settings.
             def __init__(self, module, sample_input, operator_support):
+                # [FUNCTION DOC] HELPER: Creates default base settings and forwards the
+                # module, sample input, operator support and settings to the base
+                # constructor.
                 settings = splitter_base._SplitterSettingBase()
                 super().__init__(module, sample_input, operator_support, settings)
 
@@ -115,8 +152,14 @@ class TestFXSplit(TestCase):
 
 
 class TestSplitByTags(TestCase):
+    # [CLASS DOC] Tests splitting a symbolically traced module by tags and checking the
+    # resulting submodule names, order and contents plus the original-to-split name mapping.
     class TestModule(torch.nn.Module):
+        # [CLASS DOC] HELPER: Module with four linear layers; three inputs go through the
+        # first three, the results are concatenated and fed to the fourth.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Creates four linear layers of sizes 2 to 3, 4 to 5, 6
+            # to 7 and 8 to 6.
             super().__init__()
             self.linear1 = torch.nn.Linear(2, 3)
             self.linear2 = torch.nn.Linear(4, 5)
@@ -129,6 +172,8 @@ class TestSplitByTags(TestCase):
             x2: torch.Tensor,
             x3: torch.Tensor,
         ) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Applies the first three layers to the three inputs,
+            # concatenates the outputs and returns the fourth layer applied to the result.
             v1 = self.linear1(x1)
             v2 = self.linear2(x2)
             v3 = self.linear3(x3)
@@ -139,6 +184,11 @@ class TestSplitByTags(TestCase):
     def trace_and_tag(
         module: torch.nn.Module, tags: list[str]
     ) -> tuple[torch.fx.GraphModule, dict[str, list[str]]]:
+        # [FUNCTION DOC] HELPER: Static helper. Symbolically traces the module and assigns a
+        # tag to every node: the first tag for nodes whose name mentions the first layer,
+        # the second tag for those mentioning the second layer, the third tag for everything
+        # else. Records the names of module-call nodes per tag (all nodes for the first
+        # two). Returns the graph module and a mapping from tag to node names.
         """
         Test simple gm consists of nodes with tag (only show call_module nodes here):
             linear1 - tag: "red"
@@ -182,6 +232,11 @@ class TestSplitByTags(TestCase):
         return gm, tag_node
 
     def test_split_by_tags(self) -> None:
+        # [FUNCTION DOC] Splits the tagged module by tags requesting the name mapping.
+        # Asserts the split module's children are named after the tags in order, that each
+        # child contains the expected module-call nodes in order, and that the original-to-
+        # split qualified name mapping equals the expected mapping of the four layers to
+        # their tag-prefixed names.
         tags = ["red", "blue", "green"]
         module = TestSplitByTags.TestModule()
         gm, tag_node = TestSplitByTags.trace_and_tag(module, tags)
@@ -227,13 +282,19 @@ class TestSplitByTags(TestCase):
 
 
 class TestSplitOutputType(TestCase):
+    # [CLASS DOC] Tests that splitting by tags preserves the output type and value for an
+    # exported module.
     class TestModule(torch.nn.Module):
+        # [CLASS DOC] HELPER: Module with a convolution, a multiplication by 0.5 and a relu.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Creates a 3 to 16 channel 3 by 3 convolution with bias
+            # and a relu.
             super().__init__()
             self.conv = torch.nn.Conv2d(3, 16, 3, stride=1, bias=True)
             self.relu = torch.nn.ReLU()
 
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Convolves, halves the result and applies relu.
             conv = self.conv(x)
             conv = conv * 0.5
             relu = self.relu(conv)
@@ -243,6 +304,10 @@ class TestSplitOutputType(TestCase):
     def trace_and_tag(
         module: torch.nn.Module, inputs: torch.Tensor, tags: list[str]
     ) -> tuple[torch.fx.GraphModule, dict[str, list[str]]]:
+        # [FUNCTION DOC] HELPER: Static helper. Exports the module in strict mode with the
+        # given inputs and takes the resulting graph module. Tags nodes by name: conv nodes
+        # get the first tag, mul nodes the second, everything else the third. Returns the
+        # graph module and a mapping from tag to node names.
         """
         Test simple gm consists of nodes with tag (only show call_module nodes here):
             conv - tag: "red"
@@ -285,6 +350,9 @@ class TestSplitOutputType(TestCase):
         return gm, tag_node
 
     def test_split_by_tags(self) -> None:
+        # [FUNCTION DOC] Exports and tags the module, splits it by tags, runs the original
+        # module and the split module on a random 1 by 3 by 224 by 224 input and asserts the
+        # outputs have the same type and equal values.
         tags = ["red", "blue", "green"]
         module = TestSplitOutputType.TestModule()
 

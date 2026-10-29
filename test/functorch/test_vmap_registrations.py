@@ -1,4 +1,9 @@
 # Owner(s): ["module: functorch"]
+# [MODULE DOC] Tests that functorch vmap coverage stays in sync with the dispatcher. Queries
+# the C++ dispatcher for the operator registrations under the CompositeImplicitAutograd,
+# FuncTorchBatched and FuncTorchBatchedDecomposition keys (at import time) and generates one
+# parametrized test per registered operator. Known-bad operators are kept in module-level
+# xfail sets and turned into expected failures.
 import typing
 import unittest
 
@@ -206,6 +211,13 @@ xfail_not_implemented = {
 def dispatch_registrations(
     dispatch_key: str, xfails: set, filter_func: typing.Callable = lambda reg: True
 ):
+    # [FUNCTION DOC] Builds a parametrize decorator with one subtest per operator
+    # registration. Takes a dispatch key name, a set of operator names expected to fail, and
+    # an optional predicate selecting registrations (default accepts all). Looks up the
+    # sorted registrations for the key via the dispatcher, drops those rejected by the
+    # predicate, and names each subtest after the operator with dots replaced by
+    # underscores. Operators in the xfail set get an expectedFailure decorator. Returns a
+    # parametrize decorator over "registration".
     registrations = sorted(get_registrations_for_dispatch_key(dispatch_key))
     subtests = [
         subtest(
@@ -231,6 +243,10 @@ FuncTorchBatchedDecompositionRegistrations = set(
 
 
 def filter_vmap_implementable(reg):
+    # [FUNCTION DOC] Predicate: True if an operator registration is something vmap should
+    # support. Lowercases the name and rejects anything outside the aten namespace,
+    # underscore prefixed names, out variants, dimname variants, fbgemm, quantize, sparse
+    # and is_ predicates.
     reg = reg.lower()
     if not reg.startswith("aten::"):
         return False
@@ -256,10 +272,18 @@ def filter_vmap_implementable(reg):
 
 
 class TestFunctorchDispatcher(TestCase):
+    # [CLASS DOC] Test case holding dispatcher-consistency checks for functorch batching
+    # rules. Test methods are generated per registered operator by the
+    # dispatch_registrations decorator and instantiated by instantiate_parametrized_tests.
+    # Holds no state.
     @dispatch_registrations("CompositeImplicitAutograd", xfail_functorch_batched)
     def test_register_a_batching_rule_for_composite_implicit_autograd(
         self, registration
     ):
+        # [FUNCTION DOC] Fails if a CompositeImplicitAutograd operator also has its own
+        # FuncTorchBatched registration (operators in the xfail set are expected to fail).
+        # Raises AssertionError telling the developer to use BatchRulesDecomposition
+        # instead.
         if registration in FuncTorchBatchedRegistrations:
             raise AssertionError(
                 f"You've added a batching rule for a CompositeImplicitAutograd operator {registration}. "
@@ -271,6 +295,10 @@ class TestFunctorchDispatcher(TestCase):
         "FuncTorchBatchedDecomposition", xfail_functorch_batched_decomposition
     )
     def test_register_functorch_batched_decomposition(self, registration):
+        # [FUNCTION DOC] Fails if an operator registered under FuncTorchBatchedDecomposition
+        # is not also CompositeImplicitAutograd (operators in the xfail set are expected to
+        # fail). Raises AssertionError advising registration under FuncTorchBatched in
+        # another file.
         if registration not in CompositeImplicitAutogradRegistrations:
             raise AssertionError(
                 f"The registrations in BatchedDecompositions.cpp must be for CompositeImplicitAutograd "
@@ -282,6 +310,11 @@ class TestFunctorchDispatcher(TestCase):
         "CompositeImplicitAutograd", xfail_not_implemented, filter_vmap_implementable
     )
     def test_unimplemented_batched_registrations(self, registration):
+        # [FUNCTION DOC] Fails if a vmap-implementable CompositeImplicitAutograd operator
+        # lacks a FuncTorchBatchedDecomposition registration (operators in the not-
+        # implemented xfail set are expected to fail). Raises AssertionError asking for an
+        # OpInfo and a registration in BatchedDecompositions.cpp, or an xfail entry if the
+        # operator is not user facing.
         if registration not in FuncTorchBatchedDecompositionRegistrations:
             raise AssertionError(
                 f"Please check that there is an OpInfo that covers the operator {registration} "
