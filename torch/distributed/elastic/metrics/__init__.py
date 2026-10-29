@@ -1,5 +1,11 @@
 #!/usr/bin/env/python3
 # mypy: allow-untyped-defs
+# [PACKAGE DOC] Public entry point of the torchelastic metrics API. Re-exports the metric
+# publishing helpers (put_metric, publish_metric, prof, profile), the handler types
+# (MetricHandler, NullMetricHandler, ConsoleMetricHandler) and data/config types
+# (MetricData, MetricsConfig) defined in the api submodule, and exposes initialize_metrics,
+# a no-op hook that ignores its config. Import-time side effect: tries to star-import the
+# optional static_init module for deployment-specific setup, silently ignoring its absence.
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
