@@ -3,6 +3,12 @@
 
 # ruff: noqa
 # flake8: noqa
+# [MODULE DOC] Dynamo-patched copy of the CPython 3.13 test_range suite for the builtin
+# range type: construction and argument errors, huge (beyond machine int) operands,
+# len overflow, indexing and slicing, index/count/contains, comparison, repr, pickling
+# of ranges and their iterators, iterator __setstate__, and start/stop/step
+# attributes. Defines two pure-Python reference generators used for cross-checking.
+# No import-time side effects besides class creation.
 
 # Test copied from
 # https://raw.githubusercontent.com/python/cpython/refs/tags/v3.13.5/Lib/test/test_range.py
@@ -28,6 +34,10 @@ from test.support import ALWAYS_EQ
 
 # pure Python implementations (3 args only), for comparison
 def pyrange(start, stop, step):
+    # [FUNCTION DOC] HELPER: Pure-Python reference generator for range with three arguments.
+    # Yields start, start+step, ... while the sequence has not reached stop; the stop is first
+    # snapped to the next value congruent to start modulo step. Yields nothing if the
+    # range is empty.
     if (start - stop) // step < 0:
         # replace stop with next element in the sequence of integers
         # that are congruent to start modulo step.
@@ -37,12 +47,20 @@ def pyrange(start, stop, step):
             start += step
 
 def pyrange_reversed(start, stop, step):
+    # [FUNCTION DOC] HELPER: Reference for reversed(range): returns a generator over the same
+    # elements in reverse order, built by adjusting stop to the last element and calling
+    # pyrange with a negated step.
     stop += (start - stop) % step
     return pyrange(stop - step, start - step, -step)
 
 
 class RangeTest(__TestCase):
+    # [CLASS DOC] Test case for the builtin range: construction, errors, large values,
+    # sequence operations, comparison, pickling and attributes.
     def assert_iterators_equal(self, xs, ys, test_id, limit=None):
+        # [FUNCTION DOC] HELPER: Assert that iterator xs yields the same items as ys, optionally
+        # limited to the first limit items. Fails the test with a message tagged by test_id
+        # if xs ends early, has extra items, or differs at some position.
         # check that an iterator xs matches the expected results ys,
         # up to a given limit.
         if limit is not None:
@@ -64,6 +82,8 @@ class RangeTest(__TestCase):
                           'expected {}, got {}'.format(test_id, i, y, x))
 
     def test_range(self):
+        # [FUNCTION DOC] Checks list contents of range for 1-3 arguments, negative and empty
+        # ranges, membership, lengths, and len for ranges near sys.maxsize.
         self.assertEqual(list(range(3)), [0, 1, 2])
         self.assertEqual(list(range(1, 5)), [1, 2, 3, 4])
         self.assertEqual(list(range(0)), [])
@@ -100,6 +120,8 @@ class RangeTest(__TestCase):
         self.assertEqual(len(r), sys.maxsize)
 
     def test_range_constructor_error_messages(self):
+        # [FUNCTION DOC] Checks the TypeError messages of range called with no arguments and with
+        # too many (six) arguments.
         with self.assertRaisesRegex(
                 TypeError,
                 "range expected at least 1 argument, got 0"
@@ -113,6 +135,8 @@ class RangeTest(__TestCase):
             range(1, 2, 3, 4, 5, 6)
 
     def test_large_operands(self):
+        # [FUNCTION DOC] Checks range with arguments beyond 64 bits: lengths, emptiness, truth
+        # value, negative strides, membership and first/last elements of generated lists.
         x = range(10**20, 10**20+10, 3)
         self.assertEqual(len(x), 4)
         self.assertEqual(len(list(x)), 4)
@@ -169,9 +193,15 @@ class RangeTest(__TestCase):
         self.assertEqual(seq[-1], -a-c)
 
     def test_large_range(self):
+        # [FUNCTION DOC] Checks ranges whose length exceeds sys.maxsize: len raises OverflowError,
+        # while membership, truthiness, indexing, slicing and out-of-range IndexError work,
+        # verified against a computed length.
         # Check long ranges (len > sys.maxsize)
         # len() is expected to fail due to limitations of the __len__ protocol
         def _range_len(x):
+            # [FUNCTION DOC] HELPER: Return len of range x, or
+            # if that raises OverflowError, compute
+            # the length from first element, last element and step.
             try:
                 length = len(x)
             except OverflowError:
@@ -254,6 +284,8 @@ class RangeTest(__TestCase):
             x[expected_len]
 
     def test_invalid_invocation(self):
+        # [FUNCTION DOC] Checks invalid range calls raise errors: wrong argument count and zero
+        # step (including big ints) and float or string arguments in every combination.
         self.assertRaises(TypeError, range)
         self.assertRaises(TypeError, range, 1, 2, 3, 4)
         self.assertRaises(ValueError, range, 1, 2, 0)
@@ -278,6 +310,9 @@ class RangeTest(__TestCase):
         self.assertRaises(TypeError, range, 0.0, 0.0, 1.0)
 
     def test_index(self):
+        # [FUNCTION DOC] Checks range.index and count: results, ValueError for missing values,
+        # TypeError without argument, propagation of exceptions from comparisons, big ranges, and
+        # an always-equal object.
         u = range(2)
         self.assertEqual(u.index(0), 0)
         self.assertEqual(u.index(1), 1)
@@ -289,10 +324,13 @@ class RangeTest(__TestCase):
         self.assertRaises(TypeError, u.index)
 
         class BadExc(Exception):
+            # [CLASS DOC] HELPER: Exception raised by BadCmp.
             pass
 
         class BadCmp:
+            # [CLASS DOC] HELPER: Object whose equality test raises BadExc when compared with 2.
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: Raises BadExc if other equals 2, else returns False.
                 if other == 2:
                     raise BadExc()
                 return False
@@ -314,27 +352,37 @@ class RangeTest(__TestCase):
         self.assertEqual(range(10).index(ALWAYS_EQ), 0)
 
     def test_user_index_method(self):
+        # [FUNCTION DOC] Checks that range accepts user objects defining the index protocol
+        # (small and large values), propagates errors from a failing index method, rejects
+        # a non-integer return with TypeError, and the same for slice bounds.
         bignum = 2*sys.maxsize
         smallnum = 42
 
         # User-defined class with an __index__ method
         class I:
+            # [CLASS DOC] HELPER: Wraps an integer and exposes it through the index protocol.
             def __init__(self, n):
+                # [FUNCTION DOC] HELPER: Store int(n) in attribute n.
                 self.n = int(n)
             def __index__(self):
+                # [FUNCTION DOC] HELPER: Return the stored integer.
                 return self.n
         self.assertEqual(list(range(I(bignum), I(bignum + 1))), [bignum])
         self.assertEqual(list(range(I(smallnum), I(smallnum + 1))), [smallnum])
 
         # User-defined class with a failing __index__ method
         class IX:
+            # [CLASS DOC] HELPER: Object whose index method raises RuntimeError.
             def __index__(self):
+                # [FUNCTION DOC] HELPER: Always raises RuntimeError.
                 raise RuntimeError
         self.assertRaises(RuntimeError, range, IX())
 
         # User-defined class with an invalid __index__ method
         class IN:
+            # [CLASS DOC] HELPER: Object whose index method returns a string.
             def __index__(self):
+                # [FUNCTION DOC] HELPER: Returns a non-integer string.
                 return "not a number"
 
         self.assertRaises(TypeError, range, IN())
@@ -349,6 +397,8 @@ class RangeTest(__TestCase):
             range(0, 10)[:IN()]
 
     def test_count(self):
+        # [FUNCTION DOC] Checks range.count results and int return type for small, huge and
+        # strided ranges, and len of a range just above sys.maxsize.
         self.assertEqual(range(3).count(-1), 0)
         self.assertEqual(range(3).count(0), 1)
         self.assertEqual(range(3).count(1), 1)
@@ -367,11 +417,14 @@ class RangeTest(__TestCase):
         self.assertEqual(len(range(sys.maxsize, sys.maxsize+10)), 10)
 
     def test_repr(self):
+        # [FUNCTION DOC] Checks repr of ranges with one, two and three arguments.
         self.assertEqual(repr(range(1)), 'range(0, 1)')
         self.assertEqual(repr(range(1, 2)), 'range(1, 2)')
         self.assertEqual(repr(range(1, 2, 3)), 'range(1, 2, 3)')
 
     def test_pickling(self):
+        # [FUNCTION DOC] Pickles and unpickles ranges (including huge values) with every protocol
+        # and checks the elements are unchanged.
         testcases = [(13,), (0, 11), (-22, 10), (20, 3, -1),
                      (13, 21, 3), (-2, 2, 2), (2**65, 2**65+2)]
         for proto in range(pickle.HIGHEST_PROTOCOL + 1):
@@ -382,6 +435,8 @@ class RangeTest(__TestCase):
                                      list(r))
 
     def test_iterator_pickling(self):
+        # [FUNCTION DOC] Pickles range iterators at start and after one step, for all protocols and
+        # big boundary values, checking type and remaining elements are preserved.
         testcases = [(13,), (0, 11), (-22, 10), (20, 3, -1), (13, 21, 3),
                      (-2, 2, 2)]
         for M in 2**31, 2**63:
@@ -412,7 +467,11 @@ class RangeTest(__TestCase):
                     self.assertEqual(list(it), data[1:])
 
     @skipIfTorchDynamo("infinite loop")
+        # [FUNCTION DOC] Pickles an iterator advanced past 32 bits using __setstate__ and checks
+        # the next element after unpickling. Skipped under Dynamo (infinite loop).
     def test_iterator_pickling_overflowing_index(self):
+        # [FUNCTION DOC] Pickle round trip for an iterator
+        # advanced to 2**32+1 with the state setter.
         for proto in range(pickle.HIGHEST_PROTOCOL + 1):
             with self.subTest(proto=proto):
                 it = iter(range(2**32 + 2))
@@ -422,6 +481,8 @@ class RangeTest(__TestCase):
                 self.assertEqual(next(it), 2**32 + 1)
 
     def test_exhausted_iterator_pickling(self):
+        # [FUNCTION DOC] Exhausts an iterator over a huge range, pickles it with each protocol and
+        # checks both original and copy yield no more items.
         for proto in range(pickle.HIGHEST_PROTOCOL + 1):
             r = range(2**65, 2**65+2)
             i = iter(r)
@@ -435,6 +496,7 @@ class RangeTest(__TestCase):
             self.assertEqual(list(i2), [])
 
     def test_large_exhausted_iterator_pickling(self):
+        # [FUNCTION DOC] Same as above for a small range of 20 elements.
         for proto in range(pickle.HIGHEST_PROTOCOL + 1):
             r = range(20)
             i = iter(r)
@@ -448,6 +510,8 @@ class RangeTest(__TestCase):
             self.assertEqual(list(i2), [])
 
     def test_iterator_unpickle_compat(self):
+        # [FUNCTION DOC] Unpickles byte strings produced by older Python versions (protocols 0-4,
+        # small and huge ranges) and checks the iterator yields 14, 16, 18.
         testcases = [
             b'c__builtin__\niter\n(c__builtin__\nxrange\n(I10\nI20\nI2\ntRtRI2\nb.',
             b'c__builtin__\niter\n(c__builtin__\nxrange\n(K\nK\x14K\x02tRtRK\x02b.',
@@ -466,6 +530,9 @@ class RangeTest(__TestCase):
             self.assertEqual(list(it), [14, 16, 18])
 
     def test_iterator_setstate(self):
+        # [FUNCTION DOC] Checks __setstate__ on forward and
+        # reversed iterators, for small and 64-bit+
+        # ranges, repositions iteration as expected.
         it = iter(range(10, 20, 2))
         it.__setstate__(2)
         self.assertEqual(list(it), [14, 16, 18])
@@ -480,6 +547,8 @@ class RangeTest(__TestCase):
         self.assertEqual(list(it), [12, 10])
 
     def test_odd_bug(self):
+        # [FUNCTION DOC] Regression check that a bad argument (a list) to range raises TypeError,
+        # not SystemError.
         # This used to raise a "SystemError: NULL result without error"
         # because the range validation step was eating the exception
         # before NULL was returned.
@@ -487,6 +556,9 @@ class RangeTest(__TestCase):
             range([], 1, -1)
 
     def test_types(self):
+        # [FUNCTION DOC] Checks membership semantics with non-int values: equal floats, bool and
+        # complex are contained; objects not equal-comparable are not; int subclasses with custom
+        # equality are handled by comparison.
         # Non-integer objects *equal* to any of the range's items are supposed
         # to be contained in the range.
         self.assertIn(1.0, range(3))
@@ -497,7 +569,12 @@ class RangeTest(__TestCase):
 
         # Objects are never coerced into other types for comparison.
         class C2:
+            # [CLASS DOC] HELPER: Object convertible via int and index but not equal to ints.
+            # [FUNCTION DOC] HELPER: Conversion to int; returns
+            # 1. (Single-line def, block sits above.)
             def __int__(self): return 1
+            # [FUNCTION DOC] HELPER: Index conversion; returns 1.
+            # (Single-line def, block sits above.)
             def __index__(self): return 1
         self.assertNotIn(C2(), range(3))
         # ..except if explicitly told so.
@@ -506,11 +583,15 @@ class RangeTest(__TestCase):
         # Check that the range.__contains__ optimization is only
         # used for ints, not for instances of subclasses of int.
         class C3(int):
+            # [CLASS DOC] HELPER: int subclass whose equality is always true.
+            # [FUNCTION DOC] HELPER: Equality that always returns True. (Single-line def.)
             def __eq__(self, other): return True
         self.assertIn(C3(11), range(10))
         self.assertIn(C3(11), list(range(10)))
 
     def test_strided_limits(self):
+        # [FUNCTION DOC] Checks membership at the boundaries
+        # of positive and negative strided ranges.
         r = range(0, 101, 2)
         self.assertIn(0, r)
         self.assertNotIn(1, r)
@@ -531,6 +612,7 @@ class RangeTest(__TestCase):
         self.assertNotIn(-20, r)
 
     def test_empty(self):
+        # [FUNCTION DOC] Checks empty ranges contain nothing.
         r = range(0)
         self.assertNotIn(0, r)
         self.assertNotIn(1, r)
@@ -542,6 +624,9 @@ class RangeTest(__TestCase):
 
     @skipIfTorchDynamo("Unrolls ~3M symbolic range-iterator steps; ~597s vs 0.9s eager")
     def test_range_iterators(self):
+        # [FUNCTION DOC] Compares range iterators and reversed range iterators with the pure-Python
+        # reference over many start/end/step combinations (32 and 64 bit limits), checking the first
+        # 100 items. Skipped under Dynamo because it is far too slow.
         # exercise 'fast' iterators, that use a rangeiterobject internally.
         # see issue 7298
         limits = [base + jiggle
@@ -567,6 +652,8 @@ class RangeTest(__TestCase):
             self.assert_iterators_equal(iter1, iter2, test_id, limit=100)
 
     def test_range_iterators_invocation(self):
+        # [FUNCTION DOC] Checks range iterator types cannot be constructed directly: calling the
+        # type raises TypeError for both machine-int and long iterators.
         # verify range iterators instances cannot be created by
         # calling their type
         rangeiter_type = type(iter(range(0)))
@@ -575,7 +662,12 @@ class RangeTest(__TestCase):
         self.assertRaises(TypeError, long_rangeiter_type, 1, 3, 1)
 
     def test_slice(self):
+        # [FUNCTION DOC] Checks slicing ranges gives the same elements and length as slicing the
+        # equivalent list, for various ranges and slice bounds.
         def check(start, stop, step=None):
+            # [FUNCTION DOC] HELPER: Build a slice from the
+            # arguments and assert slicing the current range
+            # r matches slicing list(r) in elements and length.
             i = slice(start, stop, step)
             self.assertEqual(list(r[i]), list(r)[i])
             self.assertEqual(len(r[i]), len(list(r)[i]))
@@ -595,6 +687,8 @@ class RangeTest(__TestCase):
             check(-1, -3, -1)
 
     def test_contains(self):
+        # [FUNCTION DOC] Checks membership for ascending, descending and strided ranges with ints,
+        # equal floats, unequal floats and strings.
         r = range(10)
         self.assertIn(0, r)
         self.assertIn(1, r)
@@ -629,6 +723,7 @@ class RangeTest(__TestCase):
         self.assertNotIn("", r)
 
     def test_reverse_iteration(self):
+        # [FUNCTION DOC] Checks reversed iteration matches the reversed list for several ranges.
         for r in [range(10),
                   range(0),
                   range(1, 9, 3),
@@ -638,6 +733,9 @@ class RangeTest(__TestCase):
             self.assertEqual(list(reversed(r)), list(r)[::-1])
 
     def test_issue11845(self):
+        # [FUNCTION DOC] Issue 11845: slices of a range using
+        # many bounds and steps (including None,
+        # negative, beyond length) must not raise errors.
         r = range(*slice(1, 18, 2).indices(20))
         values = {None, 0, 1, -1, 2, -2, 5, -5, 19, -19,
                   20, -20, 21, -21, 30, -30, 99, -99}
@@ -647,6 +745,9 @@ class RangeTest(__TestCase):
                     r[i:j:k]
 
     def test_comparison(self):
+        # [FUNCTION DOC] Checks range equality matches equality of the corresponding tuples,
+        # not-equal is its negation, ranges are unequal to other sequence types, huge values
+        # compare properly, and order comparisons raise TypeError.
         test_ranges = [range(0), range(0, -1), range(1, 1, 3),
                        range(1), range(5, 6), range(5, 6, 2),
                        range(5, 7, 2), range(2), range(0, 4, 2),
@@ -690,6 +791,8 @@ class RangeTest(__TestCase):
 
 
     def test_attributes(self):
+        # [FUNCTION DOC] Checks start, stop, step attributes for several ranges, including bool
+        # arguments.
         # test the start, stop and step attributes of range objects
         self.assert_attrs(range(0), 0, 0, 1)
         self.assert_attrs(range(10), 0, 10, 1)
@@ -703,6 +806,9 @@ class RangeTest(__TestCase):
         self.assert_attrs(range(False, True, True), 0, 1, 1)
 
     def assert_attrs(self, rangeobj, start, stop, step):
+        # [FUNCTION DOC] HELPER: Assert the range has the given
+        # start, stop and step, and that each is
+        # exactly an int.
         self.assertEqual(rangeobj.start, start)
         self.assertEqual(rangeobj.stop, stop)
         self.assertEqual(rangeobj.step, step)
