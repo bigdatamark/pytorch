@@ -1,4 +1,17 @@
 # mypy: ignore-errors
+# [MODULE DOC]
+# Device-generic test framework: turns test template classes (tests that take a "device" and
+# optionally "dtype"/"op" arguments) into concrete per-device-type test classes.
+# Main contents: DeviceTypeTestBase and its per-backend subclasses (CPU, CUDA, MPS, XPU, HPU,
+# Lazy, PrivateUse1); instantiate_device_type_tests, which replaces a template class in a given
+# module scope with generated classes; the @dtypes/@ops/@precisionOverride/@toleranceOverride
+# parametrization decorators; and many skip / only / expected-failure decorators keyed on device
+# type, library availability, and CUDA/ROCm/cuDNN versions; plus largeTensorTest memory gating.
+# Import-time side effects: probes torch for available backends to build the module-level list
+# device_type_test_bases; if the TORCH_TEST_DEVICES environment variable is set, executes each
+# listed Python file (separated by colons) and appends the TEST_CLASS it defines; computes
+# flex-attention platform flags and the float8 type/max constants (queries CUDA/XPU/MPS state);
+# creates a thread-local holding the default precision and relative tolerance.
 
 import copy
 import gc
@@ -289,6 +302,10 @@ log = logging.getLogger(__name__)
 
 
 def _dtype_test_suffix(dtypes):
+    # [FUNCTION DOC] HELPER: Builds the name suffix for a test variant from its dtype(s).
+    # A non-empty list or tuple gives an underscore plus the dtype names joined by underscores;
+    # a single truthy dtype gives an underscore plus its name; anything else (empty, None)
+    # gives an empty string. Pure function, no side effects.
     """Returns the test suffix for a dtype, sequence of dtypes, or None."""
     if isinstance(dtypes, (list, tuple)):
         if len(dtypes) == 0:
@@ -301,6 +318,11 @@ def _dtype_test_suffix(dtypes):
 
 
 def _update_param_kwargs(param_kwargs, name, value):
+    # [FUNCTION DOC] HELPER: Sets one argument in the mapping of test keyword arguments.
+    # First removes any existing entry under the singular name or the plural name (name plus
+    # "s"). Then a list/tuple value is stored under the plural name, any other non-None value
+    # under the singular name, and None leaves the mapping without the argument.
+    # Mutates param_kwargs in place; returns nothing.
     """Adds a kwarg with the specified name and value to the param_kwargs dict."""
     # Make name plural (e.g. devices / dtypes) if the value is composite.
     plural_name = f"{name}s"
@@ -320,6 +342,14 @@ def _update_param_kwargs(param_kwargs, name, value):
 
 
 class DeviceTypeTestBase(TestCase):
+    # [CLASS DOC] Base class for the per-device-type test classes generated from templates.
+    # Class attributes: device_type (string name), bypass_device_restrictions (lets only-on
+    # decorators run anyway), op_overrides / op_allowlist / test_exclusions (optional test
+    # configuration, all None by default), and a thread-local holder of precision/rel_tol.
+    # Key methods: instantiate_test (expands one template test into concrete tests),
+    # get_primary_device / get_all_devices (device strings), precision and rel_tol properties,
+    # and helpers that apply op overrides, allowlists, exclusions and per-dtype tolerances.
+    # Subclasses set device_type and usually override device discovery in setUpClass.
     device_type: str = "generic_device_type"
 
     # When True, @onlyOn-based decorators (@onlyCUDA, @onlyMPS, etc.) will not
@@ -397,22 +427,34 @@ class DeviceTypeTestBase(TestCase):
 
     @property
     def precision(self):
+        # [FUNCTION DOC] Property: returns the absolute tolerance from the thread-local state.
         return self._tls.precision
 
     @precision.setter
     def precision(self, prec):
+        # [FUNCTION DOC] Setter: stores the absolute tolerance in the thread-local state,
+        # which is shared by all instances in the same thread.
         self._tls.precision = prec
 
     @property
     def rel_tol(self):
+        # [FUNCTION DOC] Property: returns the relative tolerance from the thread-local state.
         return self._tls.rel_tol
 
     @rel_tol.setter
     def rel_tol(self, prec):
+        # [FUNCTION DOC] Setter: stores the relative tolerance in the thread-local state.
         self._tls.rel_tol = prec
 
     @classmethod
     def _apply_op_overrides(cls, ops, test=None):
+        # [FUNCTION DOC] HELPER: Attaches override decorators to the ops used by an @ops test.
+        # Collects class-level overrides (mapping from op full name to decorator list) and, if
+        # a test is given, the overrides stored on it. If there are none, returns immediately.
+        # Otherwise deep-copies the op list, appends each decorator to the matching op (class
+        # decorators first get their device_type set to this class's device type or the
+        # registered privateuse1 backend name), skips names not in the list, and replaces the
+        # op list on the ops object (mutated in place). Returns nothing.
         class_overrides = cls.op_overrides or {}
         test_overrides = {} if test is None else getattr(test, "_op_overrides", {})
 
@@ -443,10 +485,14 @@ class DeviceTypeTestBase(TestCase):
     # Note: single device tests use this device exclusively.
     @classmethod
     def get_primary_device(cls):
+        # [FUNCTION DOC] Classmethod: returns the device string single-device tests use. The
+        # default is just the device type name; subclasses override to return an indexed device.
         return cls.device_type
 
     @classmethod
     def distributed_backend(cls) -> str:
+        # [FUNCTION DOC] Classmethod: returns the default distributed backend name for this
+        # device type, by asking torch.distributed (imported lazily inside the call).
         """
         Default distributed backend for this device type.
         """
@@ -456,6 +502,8 @@ class DeviceTypeTestBase(TestCase):
 
     @classmethod
     def _get_test_exclusions(cls, test_class_name):
+        # [FUNCTION DOC] HELPER: Looks up the exclusion rule configured for a template class
+        # name in test_exclusions. Returns the rule, or None if no configuration or no entry.
         test_exclusions = getattr(cls, "test_exclusions", None)
         if test_exclusions is not None and test_class_name in test_exclusions:
             return test_exclusions[test_class_name]
@@ -463,6 +511,12 @@ class DeviceTypeTestBase(TestCase):
 
     @classmethod
     def _should_exclude(cls, test_class_name, *, test_name=None, dtype_variant=None):
+        # [FUNCTION DOC] HELPER: Decides whether a generated class, method, or dtype variant is
+        # excluded by test_exclusions. With only a class name, true when the rule is the
+        # wildcard. With a test name, true for the wildcard method rule or when the name is in a
+        # list rule. With a dtype variant too, true when any dtype of the variant is in the
+        # method's excluded "dtypes" list. Returns false when no rule exists.
+        # Raises an error if a dtype variant is given without a test name.
         if test_name is None and dtype_variant is not None:
             raise AssertionError("dtype_variant requires test_name")
 
@@ -471,10 +525,13 @@ class DeviceTypeTestBase(TestCase):
             return False
 
         def _check_class():
+            # [FUNCTION DOC] HELPER: True if the whole class is excluded (rule is the wildcard).
             # "TestClassA": "*" — exclude all generated variants in the class.
             return exclusion_rule == "*"
 
         def _check_method():
+            # [FUNCTION DOC] HELPER: True if the method is excluded entirely: either the mapping
+            # rule maps it to the wildcard, or a list rule contains its name.
             # "TestClassC": {"test_a": "*"} — exclude all generated variants of
             # a specific method.
             if isinstance(exclusion_rule, Mapping):
@@ -486,6 +543,8 @@ class DeviceTypeTestBase(TestCase):
             return False
 
         def _check_dtype():
+            # [FUNCTION DOC] HELPER: True if the method's mapping rule lists "dtypes" and the
+            # dtype variant (a single dtype, or a list/tuple where any member counts) is in it.
             # "TestClassC": {"test_b": {"dtypes": [torch.float32]}} — exclude
             # specific dtype-generated variants of a method.
             if not isinstance(exclusion_rule, Mapping):
@@ -511,6 +570,9 @@ class DeviceTypeTestBase(TestCase):
 
     @classmethod
     def _apply_op_allowlist(cls, ops):
+        # [FUNCTION DOC] HELPER: If op_allowlist is set, replaces the op list of the given ops
+        # object with only the ops whose full name is in the allowlist (mutates ops). No-op when
+        # the allowlist is None.
         """Filters ops.op_list to only include ops declared in op_allowlist.
 
         If op_allowlist is None (default), no filtering is applied.
@@ -528,6 +590,9 @@ class DeviceTypeTestBase(TestCase):
 
     @classmethod
     def _init_and_get_primary_device(cls):
+        # [FUNCTION DOC] HELPER: Returns the primary device string; if that raises (device info
+        # is only set by setUpClass for some backends), calls setUpClass once on the class and
+        # tries again. Side effect: may run the class's setUpClass.
         try:
             return cls.get_primary_device()
         except Exception:
@@ -544,12 +609,18 @@ class DeviceTypeTestBase(TestCase):
     #   mechanism of acquiring all available devices.
     @classmethod
     def get_all_devices(cls):
+        # [FUNCTION DOC] Classmethod: returns the list of all devices of this type, primary
+        # first, without duplicates. The default only contains the primary device.
         return [cls.get_primary_device()]
 
     # Returns the dtypes the test has requested.
     # Prefers device-specific dtype specifications over generic ones.
     @classmethod
     def _get_dtypes(cls, test):
+        # [FUNCTION DOC] HELPER: Returns the dtypes requested by a test via the dtype decorators,
+        # preferring the entry for this device type over the generic "all" entry; None if the
+        # test has no dtypes attribute. Raises an error if device-specific dtypes were given
+        # without the generic ones.
         if not hasattr(test, "dtypes"):
             return None
 
@@ -561,16 +632,23 @@ class DeviceTypeTestBase(TestCase):
         return test.dtypes.get(cls.device_type, default_dtypes)
 
     def _get_precision_override(self, test, dtype):
+        # [FUNCTION DOC] HELPER: Returns the absolute tolerance override the test declares for
+        # the dtype, or the current precision if the test has no overrides or none for the dtype.
         if not hasattr(test, "precision_overrides"):
             return self.precision
         return test.precision_overrides.get(dtype, self.precision)
 
     def _get_tolerance_override(self, test, dtype):
+        # [FUNCTION DOC] HELPER: Returns the (atol, rtol) pair the test declares for the dtype,
+        # or the current precision and relative tolerance if there is no override for it.
         if not hasattr(test, "tolerance_overrides"):
             return self.precision, self.rel_tol
         return test.tolerance_overrides.get(dtype, tol(self.precision, self.rel_tol))
 
     def _apply_precision_override_for_test(self, test, param_kwargs):
+        # [FUNCTION DOC] HELPER: If the test variant has a dtype (or dtypes) argument, sets the
+        # instance precision and relative tolerance from the test's precision and tolerance
+        # overrides (tolerance overrides win). Mutates the thread-local tolerance state.
         dtype = param_kwargs.get("dtype")
         dtype = param_kwargs.get("dtypes", dtype)
         if dtype:
@@ -585,6 +663,9 @@ class DeviceTypeTestBase(TestCase):
         op_allowlist=None,
         test_exclusions=None,
     ):
+        # [FUNCTION DOC] Classmethod: replaces all three configuration class attributes
+        # (op_overrides, op_allowlist, test_exclusions) with the given values; omitted ones
+        # become None, so calling it with no arguments resets the configuration.
         """
         Sets or resets the test configuration fields.
 
@@ -600,9 +681,23 @@ class DeviceTypeTestBase(TestCase):
     # Creates device-specific tests.
     @classmethod
     def instantiate_test(cls, name, test, *, generic_cls=None):
+        # [FUNCTION DOC] Classmethod: expands one template test into concrete test methods set
+        # on this class. Uses the test's parametrize function (default: one variant), composed
+        # with dtype parametrization if dtype decorators are present (dtype variants listed in
+        # test_exclusions are dropped; returns early if none remain). Each variant gets a name of
+        # the base name, optional parameter suffix, device type, then dtype suffix; the name is
+        # validated and the variant is installed via a nested helper.
+        # Raises an error if a generated name already exists on the class.
         def instantiate_test_helper(
             cls, name, *, test, param_kwargs=None, decorator_fn=lambda _: []
         ):
+            # [FUNCTION DOC] HELPER: Builds one concrete test and sets it on the class. Adds a
+            # device argument (or the list of all devices if the test requires several) when the
+            # test signature asks for one, applies the decorators returned by decorator_fn, and
+            # wraps the test so that it runs with per-dtype tolerance overrides, restores the
+            # previous tolerances afterwards, and on a RuntimeError records whether the suite
+            # should stop (suppressing the error for expected failures on fatal errors).
+            # Raises an error if the name is already defined on the class.
             # Add the device param kwarg if the test needs device or devices.
             param_kwargs = {} if param_kwargs is None else param_kwargs
             test_sig_params = inspect.signature(test).parameters
@@ -619,6 +714,13 @@ class DeviceTypeTestBase(TestCase):
             # Constructs the test
             @wraps(test)
             def instantiated_test(self, param_kwargs=param_kwargs):
+                # [FUNCTION DOC] HELPER: The generated test method. Saves precision settings,
+                # applies overrides for the dtype, calls the template test with the stored
+                # keyword arguments and returns its result. On RuntimeError it sets the
+                # stop-suite flag from _should_stop_test_suite and re-raises (or returns quietly
+                # for an expected failure when stopping). Always restores the saved settings.
+                # KNOWN ISSUE: _should_stop_test_suite is not defined on the base class, HPU or
+                # PrivateUse1 bases, so a RuntimeError there raises AttributeError instead.
                 # Sets precision and runs test
                 # Note: precision is reset after the test is run
                 guard_precision = self.precision
@@ -657,6 +759,8 @@ class DeviceTypeTestBase(TestCase):
             setattr(cls, name, instantiated_test)
 
         def default_parametrize_fn(test, generic_cls, device_cls):
+            # [FUNCTION DOC] HELPER: Default parametrization; yields a single variant with the
+            # test unchanged, empty suffix, no keyword arguments, and no extra decorators.
             # By default, no parametrization is needed.
             yield (test, "", {}, lambda _: [])
 
@@ -679,6 +783,8 @@ class DeviceTypeTestBase(TestCase):
                 return
 
             def dtype_parametrize_fn(test, generic_cls, device_cls, dtypes=dtypes):
+                # [FUNCTION DOC] HELPER: Yields one variant per dtype, with an empty suffix (the
+                # dtype name is appended later, after the device) and the dtype as a keyword.
                 for dtype in dtypes:
                     param_kwargs: dict[str, Any] = {}
                     _update_param_kwargs(param_kwargs, "dtype", dtype)
@@ -729,6 +835,9 @@ class DeviceTypeTestBase(TestCase):
             )
 
     def run(self, result=None):
+        # [FUNCTION DOC] Runs the test through the parent implementation, then asks the result
+        # object to stop the whole run if the stop-suite flag was set by a fatal error.
+        # KNOWN ISSUE: with the default result of None, stopping would call a method on None.
         super().run(result=result)
         # Early terminate test if _stop_test_suite is set.
         if self._stop_test_suite:
@@ -736,14 +845,20 @@ class DeviceTypeTestBase(TestCase):
 
 
 class CPUTestBase(DeviceTypeTestBase):
+    # [CLASS DOC] Test base for the CPU device type (device_type "cpu"); uses the default
+    # primary device ("cpu") and never stops the suite on errors.
     device_type = "cpu"
 
     # No critical error should stop CPU test suite
     def _should_stop_test_suite(self):
+        # [FUNCTION DOC] HELPER: Always returns false; no CPU error is fatal for the suite.
         return False
 
 
 class CUDATestBase(DeviceTypeTestBase):
+    # [CLASS DOC] Test base for CUDA (device_type "cuda"). Class state filled by setUpClass:
+    # primary_device (current CUDA device string), no_magma, no_cudnn and cudnn_version.
+    # Enables the CUDA memory-leak check and non-default-stream mode for its tests.
     device_type = "cuda"
     _do_cuda_memory_leak_check = True
     _do_cuda_non_default_stream = True
@@ -753,14 +868,20 @@ class CUDATestBase(DeviceTypeTestBase):
     no_cudnn: ClassVar[bool]
 
     def has_cudnn(self):
+        # [FUNCTION DOC] Returns true if cuDNN was found usable by setUpClass (inverse of the
+        # no_cudnn flag). Only valid after setUpClass has run.
         return not self.no_cudnn
 
     @classmethod
     def get_primary_device(cls):
+        # [FUNCTION DOC] Classmethod: returns the primary CUDA device string chosen in
+        # setUpClass (an attribute that does not exist before it runs).
         return cls.primary_device
 
     @classmethod
     def get_all_devices(cls):
+        # [FUNCTION DOC] Classmethod: returns the primary device string followed by the strings
+        # of all other visible CUDA devices (by index), so the primary is first.
         primary_device_idx = int(cls.get_primary_device().split(":")[1])
         num_devices = torch.cuda.device_count()
 
@@ -775,6 +896,10 @@ class CUDATestBase(DeviceTypeTestBase):
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Classmethod: initializes CUDA by allocating a small tensor, then
+        # records on the class whether MAGMA is missing, whether cuDNN is unusable (and its
+        # version if usable), and the current CUDA device as the primary device string.
+        # Side effects: initializes the CUDA context and sets class attributes.
         # has_magma shows up after cuda is initialized
         t = torch.ones(1).cuda()
         cls.no_magma = not torch.cuda.has_magma
@@ -792,13 +917,19 @@ lazy_ts_backend_init = False
 
 
 class LazyTestBase(DeviceTypeTestBase):
+    # [CLASS DOC] Test base for the lazy tensor device type (device_type "lazy"); only added
+    # to the generated classes when include_lazy is requested. Initializes the TorchScript
+    # lazy backend once per process, tracked by the module-level flag lazy_ts_backend_init.
     device_type = "lazy"
 
     def _should_stop_test_suite(self):
+        # [FUNCTION DOC] HELPER: Always returns false; no lazy error is fatal for the suite.
         return False
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Classmethod: imports the lazy modules and, the first time only,
+        # connects the TorchScript backend to the lazy key (global flag set to true).
         import torch._lazy
         import torch._lazy.metrics
         import torch._lazy.ts_backend
@@ -811,37 +942,51 @@ class LazyTestBase(DeviceTypeTestBase):
 
 
 class MPSTestBase(DeviceTypeTestBase):
+    # [CLASS DOC] Test base for Apple MPS (device_type "mps"); single device, primary device
+    # fixed to "mps:0" by setUpClass. Not enabled by default in generic instantiation.
     device_type = "mps"
     primary_device: ClassVar[str]
 
     @classmethod
     def get_primary_device(cls):
+        # [FUNCTION DOC] Classmethod: returns the primary device string set by setUpClass.
         return cls.primary_device
 
     @classmethod
     def get_all_devices(cls):
+        # [FUNCTION DOC] Classmethod: returns a list holding only the primary device, since one
+        # MPS device is supported.
         # currently only one device is supported on MPS backend
         prim_device = cls.get_primary_device()
         return [prim_device]
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Classmethod: sets the primary device to the fixed string "mps:0".
         cls.primary_device = "mps:0"
 
     def _should_stop_test_suite(self):
+        # [FUNCTION DOC] HELPER: Always returns false; no MPS error is fatal for the suite.
         return False
 
 
 class XPUTestBase(DeviceTypeTestBase):
+    # [CLASS DOC] Test base for Intel XPU (device_type "xpu"); primary device is the current
+    # XPU device chosen in setUpClass. Only added to generated classes when allow_xpu is set.
     device_type = "xpu"
     primary_device: ClassVar[str]
 
     @classmethod
     def get_primary_device(cls):
+        # [FUNCTION DOC] Classmethod: returns the primary device string set by setUpClass.
         return cls.primary_device
 
     @classmethod
     def get_all_devices(cls):
+        # [FUNCTION DOC] Classmethod: returns the primary device string followed by all other
+        # XPU devices by index.
+        # KNOWN ISSUE: the comment below about MPS was copied from the MPS class and does not
+        # match this code, which supports several devices.
         # currently only one device is supported on MPS backend
         primary_device_idx = int(cls.get_primary_device().split(":")[1])
         num_devices = torch.xpu.device_count()
@@ -857,26 +1002,39 @@ class XPUTestBase(DeviceTypeTestBase):
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Classmethod: sets the primary device to the current XPU device.
         cls.primary_device = f"xpu:{torch.xpu.current_device()}"
 
     def _should_stop_test_suite(self):
+        # [FUNCTION DOC] HELPER: Always returns false; no XPU error is fatal for the suite.
         return False
 
 
 class HPUTestBase(DeviceTypeTestBase):
+    # [CLASS DOC] Test base for Habana HPU (device_type "hpu"); primary device fixed to
+    # "hpu:0". Added to the generated classes when HPU support is detected.
+    # KNOWN ISSUE: defines no _should_stop_test_suite, which generated tests call after a
+    # RuntimeError.
     device_type = "hpu"
     primary_device: ClassVar[str]
 
     @classmethod
     def get_primary_device(cls):
+        # [FUNCTION DOC] Classmethod: returns the primary device string set by setUpClass.
         return cls.primary_device
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Classmethod: sets the primary device to the fixed string "hpu:0".
         cls.primary_device = "hpu:0"
 
 
 class PrivateUse1TestBase(DeviceTypeTestBase):
+    # [CLASS DOC] Test base for an out-of-tree backend registered as PrivateUse1. device_type
+    # starts as "privateuse1" and is overwritten in setUpClass with the registered backend
+    # name; device_mod holds that backend's torch module. Restriction bypass defaults to false.
+    # KNOWN ISSUE: defines no _should_stop_test_suite, which generated tests call after a
+    # RuntimeError.
     primary_device: ClassVar[str]
     device_mod = None
     device_type = "privateuse1"
@@ -884,10 +1042,13 @@ class PrivateUse1TestBase(DeviceTypeTestBase):
 
     @classmethod
     def get_primary_device(cls):
+        # [FUNCTION DOC] Classmethod: returns the primary device string set by setUpClass.
         return cls.primary_device
 
     @classmethod
     def get_all_devices(cls):
+        # [FUNCTION DOC] Classmethod: returns the primary device followed by the other devices
+        # of the backend module (by index), named with the backend's device type.
         primary_device_idx = int(cls.get_primary_device().split(":")[1])
         num_devices = cls.device_mod.device_count()
         prim_device = cls.get_primary_device()
@@ -901,6 +1062,9 @@ class PrivateUse1TestBase(DeviceTypeTestBase):
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Classmethod: sets device_type to the registered backend name, looks up
+        # the backend's module on torch, and sets the primary device from its current device.
+        # Raises an error if torch has no module for that backend name.
         cls.device_type = torch._C._get_privateuse1_backend_name()
         cls.device_mod = getattr(torch, cls.device_type, None)
         if cls.device_mod is None:
@@ -913,6 +1077,10 @@ class PrivateUse1TestBase(DeviceTypeTestBase):
 
 # Adds available device-type-specific test base classes
 def get_device_type_test_bases():
+    # [FUNCTION DOC] Builds the default list of test base classes. In Sandcastle/FB builds:
+    # CUDA when remote GPU is present and no sanitizer or MTIA is active, else CPU only.
+    # Elsewhere: CPU, plus CUDA if available, plus PrivateUse1 if a backend is registered.
+    # Returns the list; no side effects.
     # set type to List[Any] due to mypy list-of-union issue:
     # https://github.com/python/mypy/issues/3351
     test_bases: list[Any] = []
@@ -948,6 +1116,13 @@ device_type_test_bases = get_device_type_test_bases()
 
 
 def filter_desired_device_types(device_type_test_bases, except_for=None, only_for=None):
+    # [FUNCTION DOC] Filters test base classes by device type name. except_for removes bases
+    # whose device type is listed; only_for keeps just the listed ones; each may be a string
+    # or list. If a PrivateUse1 backend is registered, its real name in the filter lists is
+    # mapped to "privateuse1" before comparing. Returns a new list.
+    # Raises an error if a device appears in both lists.
+    # KNOWN ISSUE: a plain string passed for a list-typed argument is not split, and the
+    # membership test then becomes a substring test.
     # device type cannot appear in both except_for and only_for
     intersect = set(except_for if except_for else []) & set(
         only_for if only_for else []
@@ -965,6 +1140,8 @@ def filter_desired_device_types(device_type_test_bases, except_for=None, only_fo
         privateuse1_backend_name = torch._C._get_privateuse1_backend_name()
 
         def func_replace(x: str) -> str:
+            # [FUNCTION DOC] HELPER: Replaces the registered backend name in the string with
+            # "privateuse1".
             return x.replace(privateuse1_backend_name, "privateuse1")
 
         except_for = (
@@ -980,6 +1157,7 @@ def filter_desired_device_types(device_type_test_bases, except_for=None, only_fo
     else:
 
         def func_replace(x: str) -> str:
+            # [FUNCTION DOC] HELPER: Identity; no PrivateUse1 backend, so nothing to rename.
             return x
 
     if except_for:
@@ -1030,6 +1208,13 @@ PYTORCH_TESTING_DEVICE_FOR_CUSTOM_KEY = "PYTORCH_TESTING_DEVICE_FOR_CUSTOM"
 def get_desired_device_type_test_bases(
     except_for=None, only_for=None, include_lazy=False, allow_mps=False, allow_xpu=False
 ):
+    # [FUNCTION DOC] Returns the test base classes to instantiate for a test file. Starts from
+    # the module-level list, optionally adds MPS (allow_mps and available) and XPU (allow_xpu
+    # and available), always adds HPU if available, filters by except_for/only_for, optionally
+    # appends the lazy base (include_lazy; prints a notice instead in FB builds). Then adds
+    # device types named in the PYTORCH_TESTING_DEVICE_FOR_CUSTOM environment variable and
+    # applies the PYTORCH_TESTING_DEVICE_ONLY_FOR / _EXCEPT_FOR comma-separated variables.
+    # Returns a list; the custom-device step goes through a set so order is not guaranteed.
     # allow callers to specifically opt tests into being tested on MPS, similar to `include_lazy`
     test_bases = device_type_test_bases.copy()
     if allow_mps and TEST_MPS and MPSTestBase not in test_bases:
@@ -1058,6 +1243,7 @@ def get_desired_device_type_test_bases(
             desired_device_type_test_bases.append(LazyTestBase)
 
     def split_if_not_empty(x: str):
+        # [FUNCTION DOC] HELPER: Splits a comma-separated string into a list; empty gives [].
         return x.split(",") if x else []
 
     # run some cuda testcases on other devices if available
@@ -1105,6 +1291,15 @@ def instantiate_device_type_tests(
     allow_mps=False,
     allow_xpu=False,
 ):
+    # [FUNCTION DOC] Replaces a generic test template class in the given module scope with one
+    # generated class per desired device type (named template name plus upper-case device
+    # type). Each generated class derives from the device base and the template; template
+    # test methods are expanded via the base's instantiate_test (skipping excluded ones),
+    # other members are copied over, and setUpClass/tearDownClass call both the base's and the
+    # template's versions. Generated classes get the template's module name and are added to
+    # scope. Finally the generic test methods are deleted from the template.
+    # Side effects: mutates scope (deletes the template name) and the template class.
+    # Raises a KeyError if the template is not in scope.
     # Removes the generic test class from its enclosing scope so its tests
     # are not discoverable.
     del scope[generic_test_class.__name__]
@@ -1132,6 +1327,8 @@ def instantiate_device_type_tests(
         # NB: This should be done before instantiate_test() is called as that invokes setup.
         @classmethod
         def _setUpClass(cls):
+            # [FUNCTION DOC] HELPER: Combined class setup; first runs the device base's
+            # setUpClass (sets primary device), then the template class's setUpClass on cls.
             # This should always be called, whether or not the test class invokes
             # super().setUpClass(), to set the primary device.
             base.setUpClass()
@@ -1141,6 +1338,8 @@ def instantiate_device_type_tests(
 
         @classmethod
         def _tearDownClass(cls):
+            # [FUNCTION DOC] HELPER: Combined class teardown; runs the template class's
+            # tearDownClass on cls first, then the device base's tearDownClass.
             # We want to call the @classmethod defined in the generic base, but pass
             # it the device-specific class object (cls), hence the __func__ call.
             generic_test_class.tearDownClass.__func__(cls)
@@ -1200,6 +1399,9 @@ def instantiate_device_type_tests(
 #         when this is selected.
 # - any_common_cpu_cuda_one: Pick a dtype that supports both CPU and CUDA.
 class OpDTypes(Enum):
+    # [CLASS DOC] Enumeration of which dtype set an @ops test should run over: supported,
+    # unsupported, supported_backward, unsupported_backward, any_one, none, and
+    # any_common_cpu_cuda_one. Values are integers 0 to 6; supported is the default.
     supported = 0  # Test all supported dtypes (default)
     unsupported = 1  # Test only unsupported dtypes
     supported_backward = 2  # Test all supported backward dtypes
@@ -1231,6 +1433,8 @@ ANY_DTYPE_ORDER = (
 
 
 def _serialize_sample(sample_input):
+    # [FUNCTION DOC] HELPER: Returns a string for a sample input, using its summary method if
+    # it has one, else its string conversion.
     # NB: For OpInfos, SampleInput.summary() prints in a cleaner way.
     if getattr(sample_input, "summary", None) is not None:
         return sample_input.summary()
@@ -1250,15 +1454,27 @@ SkipSpec = namedtuple(
 
 
 def xfail(op_name, variant_name="", *, device_type=None, dtypes=None):
+    # [FUNCTION DOC] Creates a SkipSpec marking the op (and optional variant) as an expected
+    # failure, optionally limited to a device type and dtypes. Pure; returns the spec.
     return SkipSpec(op_name, variant_name, device_type, dtypes, True)
 
 
 def skip(op_name, variant_name="", *, device_type=None, dtypes=None):
+    # [FUNCTION DOC] Creates a SkipSpec marking the op (and optional variant) as skipped,
+    # optionally limited to a device type and dtypes. Pure; returns the spec.
     return SkipSpec(op_name, variant_name, device_type, dtypes, False)
 
 
 def skipOps(to_skip):
+    # [FUNCTION DOC] Decorator factory taking a list of skip specs (SkipSpec tuples, or
+    # objects with the same fields and an optional custom decorator). The returned decorator
+    # records, on the test function, a mapping from op full name (op plus optional variant) to
+    # a list of DecorateInfo entries (skip or expected-failure) scoped to the test's class and
+    # method name taken from its qualified name. The ops machinery applies them later.
     def wrapped(fn):
+        # [FUNCTION DOC] HELPER: Does the work of skipOps for one test function: merges the new
+        # entries into any existing override mapping stored on the function, stores it back
+        # and returns the same function. Imports DecorateInfo lazily.
         from torch.testing._internal.opinfo.core import DecorateInfo
 
         parts = fn.__qualname__.split(".")
@@ -1343,6 +1559,11 @@ def skipOps(to_skip):
 
 
 class ops(_TestParametrizer):
+    # [CLASS DOC] Decorator that parametrizes a test template over OpInfos and their dtypes.
+    # State: op_list (list of OpInfos), opinfo_dtypes (a dtype sequence or an OpDTypes
+    # choice), allowed_dtypes (optional set filter), skip_if_dynamo (wrap tests so they skip
+    # under Dynamo). Used with instantiate_device_type_tests only; the variant names combine
+    # op name, device and dtype.
     def __init__(
         self,
         op_list,
@@ -1351,6 +1572,8 @@ class ops(_TestParametrizer):
         allowed_dtypes: Sequence[torch.dtype] | None = None,
         skip_if_dynamo=True,
     ):
+        # [FUNCTION DOC] Stores the op list (copied into a list, so a generator is consumed
+        # once), the dtype selection, the allowed dtypes (as a set, or None) and the flag.
         self.op_list = list(op_list)
         self.opinfo_dtypes = dtypes
         self.allowed_dtypes = (
@@ -1359,6 +1582,16 @@ class ops(_TestParametrizer):
         self.skip_if_dynamo = skip_if_dynamo
 
     def _parametrize_test(self, test, generic_cls, device_cls):
+        # [FUNCTION DOC] Generator yielding (wrapped test, name, keyword args, decorator
+        # function) for every op and chosen dtype on the given device class. First applies the
+        # device class's op allowlist, then its op overrides (mutating this object's op list).
+        # Dtypes per op depend on opinfo_dtypes, then are intersected with allowed_dtypes.
+        # The test is wrapped to attach tracked-input info to failures, optionally skipped
+        # under Dynamo; matching sample skip rules are copied onto the wrapper.
+        # Raises an error if device_cls is None, on an unknown dtype choice, and (unless the
+        # DSL restriction environment variable is set) if the op list was empty.
+        # KNOWN ISSUE: the empty-result fallbacks assign an empty mapping where a set is
+        # expected, which breaks the later set intersection when allowed_dtypes is given.
         """Parameterizes the given test function across each op and its associated dtypes."""
         if device_cls is None:
             raise RuntimeError(
@@ -1448,6 +1681,9 @@ class ops(_TestParametrizer):
 
                     @wraps(test)
                     def test_wrapper(*args, **kwargs):
+                        # [FUNCTION DOC] HELPER: Calls the original test. Skip signals pass
+                        # through; other errors get a message naming the last tracked sample
+                        # input when repro printing is enabled. Always clears tracked input.
                         try:
                             return test(*args, **kwargs)
                         except unittest.SkipTest as e:
@@ -1512,14 +1748,24 @@ class ops(_TestParametrizer):
 #       probably define a new decorator instead (see below).
 #   (3) Prefer the existing decorators to defining the 'device_type' kwarg.
 class skipIf:
+    # [CLASS DOC] Decorator that skips a test when a condition holds. State: dep (a bool, or
+    # the name of a test-class attribute that must be falsy for the test to run), reason (skip
+    # message), and device_type (None for all devices, or a name / collection of names the
+    # skip is limited to). Conditions stack when several are applied.
     def __init__(self, dep, reason, device_type=None):
+        # [FUNCTION DOC] Stores the condition, the skip reason and the optional device filter.
         self.dep = dep
         self.reason = reason
         self.device_type = device_type
 
     def __call__(self, fn):
+        # [FUNCTION DOC] Wraps the test method. At call time, if the test's device type matches
+        # the filter (or no filter) and the condition holds (true bool, or a string naming an
+        # attribute that is truthy or missing on the test instance), raises a skip with the
+        # reason; otherwise runs the test and returns its result.
         @wraps(fn)
         def dep_fn(slf, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: The wrapper described by the enclosing call method.
             if (
                 self.device_type is None
                 or self.device_type == slf.device_type
@@ -1540,64 +1786,92 @@ class skipIf:
 
 # Skips a test on CPU if the condition is true.
 class skipCPUIf(skipIf):
+    # [CLASS DOC] skipIf restricted to the "cpu" device type.
     def __init__(self, dep, reason):
+        # [FUNCTION DOC] Initializes the parent with the device filter fixed to cpu.
         super().__init__(dep, reason, device_type="cpu")
 
 
 # Skips a test on CUDA if the condition is true.
 class skipCUDAIf(skipIf):
+    # [CLASS DOC] skipIf restricted to the "cuda" device type.
     def __init__(self, dep, reason):
+        # [FUNCTION DOC] Initializes the parent with the device filter fixed to cuda.
         super().__init__(dep, reason, device_type="cuda")
 
 
 # Skips a test on XPU if the condition is true.
 class skipXPUIf(skipIf):
+    # [CLASS DOC] skipIf restricted to the "xpu" device type.
     def __init__(self, dep, reason):
+        # [FUNCTION DOC] Initializes the parent with the device filter fixed to xpu.
         super().__init__(dep, reason, device_type="xpu")
 
 
 # Skips a test on XPU or CUDA if the condition is true.
 class skipGPUIf(skipIf):
+    # [CLASS DOC] skipIf restricted to the GPU device types listed in GPU_TYPES (CUDA, XPU).
     def __init__(self, dep, reason):
+        # [FUNCTION DOC] Initializes the parent with the device filter set to GPU_TYPES.
         super().__init__(dep, reason, device_type=GPU_TYPES)
 
 
 # Skips a test on Lazy if the condition is true.
 class skipLazyIf(skipIf):
+    # [CLASS DOC] skipIf restricted to the "lazy" device type.
     def __init__(self, dep, reason):
+        # [FUNCTION DOC] Initializes the parent with the device filter fixed to lazy.
         super().__init__(dep, reason, device_type="lazy")
 
 
 # Skips a test on Meta if the condition is true.
 class skipMetaIf(skipIf):
+    # [CLASS DOC] skipIf restricted to the "meta" device type.
     def __init__(self, dep, reason):
+        # [FUNCTION DOC] Initializes the parent with the device filter fixed to meta.
         super().__init__(dep, reason, device_type="meta")
 
 
 # Skips a test on MPS if the condition is true.
 class skipMPSIf(skipIf):
+    # [CLASS DOC] skipIf restricted to the "mps" device type.
     def __init__(self, dep, reason):
+        # [FUNCTION DOC] Initializes the parent with the device filter fixed to mps.
         super().__init__(dep, reason, device_type="mps")
 
 
 class skipHPUIf(skipIf):
+    # [CLASS DOC] skipIf restricted to the "hpu" device type.
     def __init__(self, dep, reason):
+        # [FUNCTION DOC] Initializes the parent with the device filter fixed to hpu.
         super().__init__(dep, reason, device_type="hpu")
 
 
 # Skips a test on XLA if the condition is true.
 class skipXLAIf(skipIf):
+    # [CLASS DOC] skipIf restricted to the "xla" device type.
     def __init__(self, dep, reason):
+        # [FUNCTION DOC] Initializes the parent with the device filter fixed to xla.
         super().__init__(dep, reason, device_type="xla")
 
 
 class skipPRIVATEUSE1If(skipIf):
+    # [CLASS DOC] skipIf restricted to the registered PrivateUse1 backend's device type name.
     def __init__(self, dep, reason):
+        # [FUNCTION DOC] Looks up the registered PrivateUse1 backend name at construction time
+        # and initializes the parent with the device filter set to it.
         device_type = torch._C._get_privateuse1_backend_name()
         super().__init__(dep, reason, device_type=device_type)
 
 
 def _has_sufficient_memory(device, size):
+    # [FUNCTION DOC] HELPER: Reports whether the device has at least size bytes free.
+    # For cuda/xpu/mtia: false if no accelerator or it is unavailable, true if the current
+    # accelerator is a different type, otherwise runs garbage collection, empties the cache and
+    # compares against free device memory (CUDA scaled by the per-process memory fraction).
+    # For cpu/mps: uses psutil available memory (sizes inflated for sanitizers and s390x),
+    # collecting garbage and clearing MPS caches first if short. Raises a skip for xla, unknown
+    # device types, or when psutil is missing. Returns a bool.
     device_ = torch.device(device)
     device_type = device_.type
     if device_type in ["cuda", "xpu", "mtia"]:
@@ -1663,6 +1937,9 @@ def _has_sufficient_memory(device, size):
 
 
 def _parse_size(size):
+    # [FUNCTION DOC] HELPER: Converts a size given as a string ending in GB (any case) to bytes
+    # (gibibytes times the leading integer); any non-string (number or callable) is returned
+    # unchanged. Raises an error for other string suffixes.
     if isinstance(size, str):
         if not size.endswith(("GB", "gb")):
             raise AssertionError(f"only bytes or GB supported, got {size!r}")
@@ -1671,6 +1948,8 @@ def _parse_size(size):
 
 
 def _test_device(self, device):
+    # [FUNCTION DOC] HELPER: Chooses which device to check: the explicit device if given, else
+    # the test instance's primary device if it has that method, else its device attribute.
     if device is not None:
         return device
     if hasattr(self, "get_primary_device"):
@@ -1679,6 +1958,10 @@ def _test_device(self, device):
 
 
 def largeTensorTest(size, device=None, inductor=TEST_WITH_TORCHINDUCTOR):
+    # [FUNCTION DOC] Decorator factory that skips a test when the device lacks memory for the
+    # test's total footprint. size is bytes, a "N GB" string, or a callable taking the test
+    # arguments. device overrides the checked device. With inductor on, a GPU run with the C++
+    # wrapper doubles the size. Raises a skip at call time when memory is insufficient.
     """Skip test if the device has insufficient memory to run the test
 
     size is the test's total memory footprint, and may be a number of bytes, a
@@ -1692,8 +1975,11 @@ def largeTensorTest(size, device=None, inductor=TEST_WITH_TORCHINDUCTOR):
     size = _parse_size(size)
 
     def inner(fn):
+        # [FUNCTION DOC] HELPER: Decorator returned by largeTensorTest; wraps the test function.
         @wraps(fn)
         def dep_fn(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Resolves the size and device, skips if memory is
+            # insufficient, otherwise runs the test and returns its result.
             size_bytes: int = size(self, *args, **kwargs) if callable(size) else size
             _device = _test_device(self, device)
 
@@ -1712,6 +1998,9 @@ def largeTensorTest(size, device=None, inductor=TEST_WITH_TORCHINDUCTOR):
 
 
 def largeMPSBufferTest(size, device=None):
+    # [FUNCTION DOC] Decorator factory that skips an MPS test when its largest single
+    # allocation (bytes, "N GB" string, or callable) would reach the MPS maximum buffer length.
+    # Does nothing on other devices. Raises a skip at call time when too large.
     """Skip test if MPS cannot allocate a single buffer of the given size
 
     Unlike `largeTensorTest`, size is the largest *individual* allocation the
@@ -1723,8 +2012,11 @@ def largeMPSBufferTest(size, device=None):
     size = _parse_size(size)
 
     def inner(fn):
+        # [FUNCTION DOC] HELPER: Decorator returned by largeMPSBufferTest; wraps the test.
         @wraps(fn)
         def dep_fn(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: On an MPS device, skips when the size is at or above the
+            # maximum buffer length; then runs the test and returns its result.
             _device = _test_device(self, device)
             if torch.device(_device).type == "mps":
                 size_bytes = size(self, *args, **kwargs) if callable(size) else size
@@ -1742,13 +2034,22 @@ def largeMPSBufferTest(size, device=None):
 
 
 class expectedFailure:
+    # [CLASS DOC] Decorator marking a test as expected to fail on a device type, optionally
+    # only for one dtype. State: device_type (None matches any) and dtype (None matches any).
+    # When matched, the test passes if it raises any exception and fails if it succeeds.
     def __init__(self, device_type, dtype=None):
+        # [FUNCTION DOC] Stores the device type and dtype filters.
         self.device_type = device_type
         self.dtype = dtype
 
     def __call__(self, fn):
+        # [FUNCTION DOC] Returns a wrapper around the test function (see the wrapper's notes).
         @wraps(fn)
         def efail_fn(slf, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Determines the test's device type (from the instance, or
+            # its device string if it has no device type) and dtype (keyword argument or
+            # attribute). If both match the filters, runs the test and swallows any exception,
+            # failing the test if no exception occurred. Otherwise runs the test normally.
             if (
                 not hasattr(slf, "device_type")
                 and hasattr(slf, "device")
@@ -1778,12 +2079,20 @@ class expectedFailure:
 
 
 class onlyOn:
+    # [CLASS DOC] Decorator that runs a test only on the given device type(s). State:
+    # device_type, a string or list; the check is a membership test, so for a plain string it
+    # is a substring test.
     def __init__(self, device_type: str | list):
+        # [FUNCTION DOC] Stores the allowed device type name or list.
         self.device_type = device_type
 
     def __call__(self, fn):
+        # [FUNCTION DOC] Returns a wrapper around the test function (see the wrapper's notes).
         @wraps(fn)
         def only_fn(slf, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: If the device type is not allowed: runs the test anyway
+            # when the class sets the bypass flag; in Sandcastle/FB prints a message to stderr
+            # and returns without running; otherwise raises a skip. If allowed, runs the test.
             if slf.device_type not in self.device_type:
                 if getattr(slf, "bypass_device_restrictions", False):
                     return fn(slf, *args, **kwargs)
@@ -1806,16 +2115,24 @@ class onlyOn:
 # Skips the test if the number of available devices of the variant's device
 # type is less than the 'num_required_devices' arg.
 class deviceCountAtLeast:
+    # [CLASS DOC] Decorator for multi-device tests. State: num_required_devices. Marks the
+    # test so the framework passes the list of all devices of the type as its device argument.
     def __init__(self, num_required_devices):
+        # [FUNCTION DOC] Stores the minimum number of devices needed.
         self.num_required_devices = num_required_devices
 
     def __call__(self, fn):
+        # [FUNCTION DOC] Sets the num_required_devices attribute on the test function (mutating
+        # it) and returns a wrapper that skips when fewer devices are given. Raises an error if
+        # the attribute is already set (applied twice).
         if hasattr(fn, "num_required_devices"):
             raise AssertionError(f"deviceCountAtLeast redefinition for {fn.__name__}")
         fn.num_required_devices = self.num_required_devices
 
         @wraps(fn)
         def multi_fn(slf, devices, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: If the devices list is too short: in Sandcastle/FB prints
+            # a message to stderr and returns; otherwise raises a skip. Else runs the test.
             if len(devices) < self.num_required_devices:
                 reason = f"fewer than {self.num_required_devices} devices detected"
                 if IS_SANDCASTLE or IS_FBCODE:
@@ -1833,8 +2150,11 @@ class deviceCountAtLeast:
 
 # Only runs the test on the native device type (currently CPU, CUDA, Meta and PRIVATEUSE1)
 def onlyNativeDeviceTypes(fn: Callable[_P, _T]) -> Callable[_P, _T]:
+    # [FUNCTION DOC] Decorator: wraps the test so it is skipped unless the device type is in
+    # NATIVE_DEVICES.
     @wraps(fn)
     def only_fn(self, *args: _P.args, **kwargs: _P.kwargs) -> _T:
+        # [FUNCTION DOC] HELPER: Raises a skip if the device type is not native; else runs it.
         if self.device_type not in NATIVE_DEVICES:
             reason = f"onlyNativeDeviceTypes: doesn't run on {self.device_type}"
             raise unittest.SkipTest(reason)
@@ -1846,9 +2166,15 @@ def onlyNativeDeviceTypes(fn: Callable[_P, _T]) -> Callable[_P, _T]:
 
 # Only runs the test on the native device types and devices specified in the devices list
 def onlyNativeDeviceTypesAnd(devices=None):
+    # [FUNCTION DOC] Decorator factory: the produced decorator skips the test unless the device
+    # type is native or in the given extra devices collection.
+    # KNOWN ISSUE: with the default of None, a non-native device type causes a membership test
+    # on None, which raises a type error instead of skipping.
     def decorator(fn):
+        # [FUNCTION DOC] HELPER: Wraps the test function with the device check.
         @wraps(fn)
         def only_fn(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Skips if the device type is neither native nor listed.
             if (
                 self.device_type not in NATIVE_DEVICES
                 and self.device_type not in devices
@@ -1881,7 +2207,12 @@ def onlyNativeDeviceTypesAnd(devices=None):
 # explicitly and computed using self.precision (e.g.
 # self.precision *2, max(1, self.precision)).
 class precisionOverride:
+    # [CLASS DOC] Decorator attaching per-dtype absolute tolerance overrides to a test. State:
+    # d, a mapping from torch dtype to a tolerance number. The framework applies the entry for
+    # the variant's dtype to the instance precision when the test runs.
     def __init__(self, d):
+        # [FUNCTION DOC] Validates and stores the mapping. Raises an error if it is not a
+        # mapping or has a key that is not a torch dtype.
         if not isinstance(d, dict):
             raise AssertionError(
                 "precisionOverride not given a dtype : precision dict!"
@@ -1893,6 +2224,8 @@ class precisionOverride:
         self.d = d
 
     def __call__(self, fn):
+        # [FUNCTION DOC] Sets the precision_overrides attribute on the test function (mutating
+        # it) and returns the same function.
         fn.precision_overrides = self.d
         return fn
 
@@ -1918,7 +2251,11 @@ tol = namedtuple("tol", ["atol", "rtol"])
 
 
 class toleranceOverride:
+    # [CLASS DOC] Decorator attaching per-dtype (atol, rtol) tolerance overrides to a test.
+    # State: d, a mapping from torch dtype to a tol pair. Takes priority over precisionOverride.
     def __init__(self, d):
+        # [FUNCTION DOC] Validates and stores the mapping. Raises an error if it is not a
+        # mapping, a key is not a torch dtype, or a value is not a tol pair.
         if not isinstance(d, dict):
             raise AssertionError("toleranceOverride not given a dtype : tol dict!")
         for dtype, prec in d.items():
@@ -1930,6 +2267,8 @@ class toleranceOverride:
         self.d = d
 
     def __call__(self, fn):
+        # [FUNCTION DOC] Sets the tolerance_overrides attribute on the test function (mutating
+        # it) and returns the same function.
         fn.tolerance_overrides = self.d
         return fn
 
@@ -1945,7 +2284,13 @@ class toleranceOverride:
 # @dtypes(torch.float32, torch.float64)
 # @dtypes((torch.long, torch.float32), (torch.int, torch.float64))
 class dtypes:
+    # [CLASS DOC] Decorator listing the dtypes (or tuples of dtypes) a test is instantiated
+    # for. State: args (the dtype variants) and device_type ("all" or a specific device type
+    # for device-specific overrides). The framework reads the per-device mapping stored on the
+    # test function under the dtypes attribute.
     def __init__(self, *args, device_type="all"):
+        # [FUNCTION DOC] Validates and stores the dtype variants. Either all are torch dtypes,
+        # or all are lists/tuples of torch dtypes. Raises an error otherwise.
         if len(args) > 0 and isinstance(args[0], (list, tuple)):
             for arg in args:
                 if not isinstance(arg, (list, tuple)):
@@ -1964,6 +2309,9 @@ class dtypes:
         self.device_type = device_type
 
     def __call__(self, fn):
+        # [FUNCTION DOC] Records the dtype variants on the test function in a mapping keyed by
+        # device type (mutating the function) and returns the same function. Raises an error
+        # if that device type already has dtypes recorded.
         d = getattr(fn, "dtypes", {})
         if self.device_type in d:
             raise AssertionError(f"dtypes redefinition for {self.device_type}")
@@ -1974,58 +2322,79 @@ class dtypes:
 
 # Overrides specified dtypes on the CPU.
 class dtypesIfCPU(dtypes):
+    # [CLASS DOC] dtypes override applying only to the cpu device type.
     def __init__(self, *args):
+        # [FUNCTION DOC] Initializes the parent with device type cpu.
         super().__init__(*args, device_type="cpu")
 
 
 # Overrides specified dtypes on CUDA.
 class dtypesIfCUDA(dtypes):
+    # [CLASS DOC] dtypes override applying only to the cuda device type.
     def __init__(self, *args):
+        # [FUNCTION DOC] Initializes the parent with device type cuda.
         super().__init__(*args, device_type="cuda")
 
 
 # Overrides specified dtypes on Intel GPU.
 class dtypesIfXPU(dtypes):
+    # [CLASS DOC] dtypes override applying only to the xpu device type.
     def __init__(self, *args):
+        # [FUNCTION DOC] Initializes the parent with device type xpu.
         super().__init__(*args, device_type="xpu")
 
 
 class dtypesIfMPS(dtypes):
+    # [CLASS DOC] dtypes override applying only to the mps device type.
     def __init__(self, *args):
+        # [FUNCTION DOC] Initializes the parent with device type mps.
         super().__init__(*args, device_type="mps")
 
 
 class dtypesIfHPU(dtypes):
+    # [CLASS DOC] dtypes override applying only to the hpu device type.
     def __init__(self, *args):
+        # [FUNCTION DOC] Initializes the parent with device type hpu.
         super().__init__(*args, device_type="hpu")
 
 
 class dtypesIfPRIVATEUSE1(dtypes):
+    # [CLASS DOC] dtypes override applying only to the registered PrivateUse1 backend's name.
     def __init__(self, *args):
+        # [FUNCTION DOC] Initializes the parent with the device type set to the backend name
+        # registered at construction time.
         super().__init__(*args, device_type=torch._C._get_privateuse1_backend_name())
 
 
 def onlyCPU(fn):
+    # [FUNCTION DOC] Decorator: runs the test only on the cpu device type (via onlyOn).
     return onlyOn("cpu")(fn)
 
 
 def onlyCUDA(fn):
+    # [FUNCTION DOC] Decorator: runs the test only on the cuda device type (via onlyOn).
     return onlyOn("cuda")(fn)
 
 
 def onlyMPS(fn):
+    # [FUNCTION DOC] Decorator: runs the test only on the mps device type (via onlyOn).
     return onlyOn("mps")(fn)
 
 
 def onlyXPU(fn):
+    # [FUNCTION DOC] Decorator: runs the test only on the xpu device type (via onlyOn).
     return onlyOn("xpu")(fn)
 
 
 def onlyHPU(fn):
+    # [FUNCTION DOC] Decorator: runs the test only on the hpu device type (via onlyOn).
     return onlyOn("hpu")(fn)
 
 
 def onlyPRIVATEUSE1(fn):
+    # [FUNCTION DOC] Decorator: looks up the registered PrivateUse1 backend at decoration time.
+    # If torch has no module for it, returns the test marked as unconditionally skipped;
+    # otherwise restricts the test to that device type (via onlyOn).
     device_type = torch._C._get_privateuse1_backend_name()
     device_mod = getattr(torch, device_type, None)
     if device_mod is None:
@@ -2035,10 +2404,12 @@ def onlyPRIVATEUSE1(fn):
 
 
 def onlyAccelerator(fn):
+    # [FUNCTION DOC] Decorator: wraps the test so it is skipped on cpu and meta device types.
     """Skip test if not running on an accelerator device (i.e., skip on CPU and meta)."""
 
     @wraps(fn)
     def only_fn(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Raises a skip on cpu or meta; otherwise runs the test.
         if self.device_type in ("cpu", "meta"):
             reason = "onlyAccelerator: doesn't run on CPU or meta devices"
             raise unittest.SkipTest(reason)
@@ -2048,8 +2419,11 @@ def onlyAccelerator(fn):
 
 
 def onlyCUDAAndPRIVATEUSE1(fn):
+    # [FUNCTION DOC] Decorator: wraps the test so it runs only on cuda or the registered
+    # PrivateUse1 backend's device type, skipping otherwise.
     @wraps(fn)
     def only_fn(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Raises a skip for other device types; else runs the test.
         if self.device_type not in ("cuda", torch._C._get_privateuse1_backend_name()):
             reason = f"onlyCUDAAndPRIVATEUSE1: doesn't run on {self.device_type}"
             raise unittest.SkipTest(reason)
@@ -2060,8 +2434,12 @@ def onlyCUDAAndPRIVATEUSE1(fn):
 
 
 def disablecuDNN(fn):
+    # [FUNCTION DOC] Decorator: wraps the test so it runs with cuDNN disabled on CUDA devices
+    # that have cuDNN; otherwise runs it unchanged.
     @wraps(fn)
     def disable_cudnn(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Runs the test inside a context with cuDNN turned off when the
+        # device is cuda and cuDNN exists; else runs it directly. Returns the test's result.
         if self.device_type == "cuda" and self.has_cudnn():
             with torch.backends.cudnn.flags(enabled=False):
                 return fn(self, *args, **kwargs)
@@ -2071,8 +2449,12 @@ def disablecuDNN(fn):
 
 
 def disableMkldnn(fn):
+    # [FUNCTION DOC] Decorator: wraps the test so it runs with mkldnn disabled when mkldnn is
+    # available; otherwise runs it unchanged.
     @wraps(fn)
     def disable_mkldnn(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Runs the test inside a context with mkldnn turned off when it
+        # is available; else runs it directly. Returns the test's result.
         if torch.backends.mkldnn.is_available():
             with torch.backends.mkldnn.flags(enabled=False):
                 return fn(self, *args, **kwargs)
@@ -2082,42 +2464,56 @@ def disableMkldnn(fn):
 
 
 def expectedFailureCPU(fn):
+    # [FUNCTION DOC] Decorator: marks the test as an expected failure on cpu.
     return expectedFailure("cpu")(fn)
 
 
 def expectedFailureCUDA(fn):
+    # [FUNCTION DOC] Decorator: marks the test as an expected failure on cuda.
     return expectedFailure("cuda")(fn)
 
 
 def expectedFailureIfRocm(fn):
+    # [FUNCTION DOC] Decorator: marks the test as an expected failure on cuda only when running
+    # on ROCm; otherwise returns the test unchanged.
     return expectedFailure("cuda")(fn) if TEST_WITH_ROCM else fn
 
 
 def expectedFailureXPU(fn):
+    # [FUNCTION DOC] Decorator: marks the test as an expected failure on xpu.
     return expectedFailure("xpu")(fn)
 
 
 def expectedFailureMeta(fn):
+    # [FUNCTION DOC] Decorator: marks the test as an expected failure on meta, and also skips it
+    # when running under Dynamo.
     return skipIfTorchDynamo()(expectedFailure("meta")(fn))
 
 
 def expectedFailureXLA(fn):
+    # [FUNCTION DOC] Decorator: marks the test as an expected failure on xla.
     return expectedFailure("xla")(fn)
 
 
 def expectedFailureHPU(fn):
+    # [FUNCTION DOC] Decorator: marks the test as an expected failure on hpu.
     return expectedFailure("hpu")(fn)
 
 
 def expectedFailureMPS(fn):
+    # [FUNCTION DOC] Decorator: marks the test as an expected failure on mps.
     return expectedFailure("mps")(fn)
 
 
 def expectedFailureMPSComplex(fn):
+    # [FUNCTION DOC] Decorator: marks the test as an expected failure on mps for complex64 only.
     return expectedFailure("mps", torch.complex64)(fn)
 
 
 def expectedFailureMPSPre15(fn):
+    # [FUNCTION DOC] Decorator: reads the macOS version at decoration time; if it is a known
+    # version below 15, marks the test as an expected failure on mps; otherwise (newer macOS,
+    # or not macOS) returns the test unchanged.
     import platform
 
     version = float(".".join(platform.mac_ver()[0].split(".")[:2]) or -1)
@@ -2129,6 +2525,7 @@ def expectedFailureMPSPre15(fn):
 
 
 def expectedFailureMPSPre14(fn):
+    # [FUNCTION DOC] Decorator: same as the pre-15 variant but with a threshold of macOS 14.
     import platform
 
     version = float(".".join(platform.mac_ver()[0].split(".")[:2]) or -1)
@@ -2141,11 +2538,13 @@ def expectedFailureMPSPre14(fn):
 
 # Skips a test on CPU if LAPACK is not available.
 def skipCPUIfNoLapack(fn):
+    # [FUNCTION DOC] Decorator: skips the test on cpu when torch was built without LAPACK.
     return skipCPUIf(not torch._C.has_lapack, "PyTorch compiled without Lapack")(fn)
 
 
 # Skips a test on CPU if FFT is not available.
 def skipCPUIfNoFFT(fn):
+    # [FUNCTION DOC] Decorator: skips the test on cpu when torch was built without FFT support.
     return skipCPUIf(not torch._C.has_spectral, "PyTorch is built without FFT support")(
         fn
     )
@@ -2153,11 +2552,13 @@ def skipCPUIfNoFFT(fn):
 
 # Skips a test on CPU if MKL is not available.
 def skipCPUIfNoMkl(fn):
+    # [FUNCTION DOC] Decorator: skips the test on cpu when torch was built without MKL.
     return skipCPUIf(not TEST_MKL, "PyTorch is built without MKL support")(fn)
 
 
 # Skips a test on CPU if MKL Sparse is not available (it's not linked on Windows).
 def skipCPUIfNoMklSparse(fn):
+    # [FUNCTION DOC] Decorator: skips the test on cpu on Windows or when MKL is missing.
     return skipCPUIf(
         IS_WINDOWS or not TEST_MKL, "PyTorch is built without MKL support"
     )(fn)
@@ -2165,6 +2566,7 @@ def skipCPUIfNoMklSparse(fn):
 
 # Skips a test on CPU if mkldnn is not available.
 def skipCPUIfNoMkldnn(fn):
+    # [FUNCTION DOC] Decorator: skips the test on cpu when mkldnn is unavailable.
     return skipCPUIf(
         not torch.backends.mkldnn.is_available(),
         "PyTorch is built without mkldnn support",
@@ -2173,22 +2575,28 @@ def skipCPUIfNoMkldnn(fn):
 
 # Skips a test on CUDA if MAGMA is not available.
 def skipCUDAIfNoMagma(fn):
+    # [FUNCTION DOC] Decorator: skips the test on cuda when the class flag no_magma is set, and
+    # additionally marks it to skip under non-default-stream mode (always true here).
     return skipCUDAIf("no_magma", "no MAGMA library detected")(
         skipCUDANonDefaultStreamIf(True)(fn)
     )
 
 
 def has_cusolver():
+    # [FUNCTION DOC] Returns true when not running on ROCm (assumes cuSOLVER exists then).
     return not TEST_WITH_ROCM
 
 
 def has_hipsolver():
+    # [FUNCTION DOC] Returns true when running on ROCm (assumes hipSOLVER exists then).
     return TEST_WITH_ROCM
 
 
 # Skips a test on CUDA if cuSOLVER is not available,
 # and on ROCm if MAGMA is not available.
 def skipCUDAIfNoCusolverROCMIfNoMagma(fn):
+    # [FUNCTION DOC] Decorator: on ROCm requires MAGMA (skip on cuda if missing); on CUDA
+    # requires cuSOLVER (via skipCUDAIfNoCusolver).
     if TEST_WITH_ROCM:
         return skipCUDAIfNoMagma(fn)
     else:
@@ -2197,6 +2605,8 @@ def skipCUDAIfNoCusolverROCMIfNoMagma(fn):
 
 # Skips a test on CUDA/ROCM if cuSOLVER/hipSOLVER is not available
 def skipCUDAIfNoCusolver(fn):
+    # [FUNCTION DOC] Decorator: skips the test on cuda when neither cuSOLVER nor hipSOLVER is
+    # available. KNOWN ISSUE: the helpers are exact complements, so this condition is never true.
     return skipCUDAIf(
         not has_cusolver() and not has_hipsolver(), "cuSOLVER not available"
     )(fn)
@@ -2204,6 +2614,8 @@ def skipCUDAIfNoCusolver(fn):
 
 # Skips a test if both cuSOLVER and MAGMA are not available
 def skipCUDAIfNoMagmaAndNoCusolver(fn):
+    # [FUNCTION DOC] Decorator: returns the test unchanged when cuSOLVER is assumed present;
+    # otherwise applies the MAGMA skip.
     if has_cusolver():
         return fn
     else:
@@ -2213,6 +2625,8 @@ def skipCUDAIfNoMagmaAndNoCusolver(fn):
 
 # Skips a test if both cuSOLVER/hipSOLVER and MAGMA are not available
 def skipCUDAIfNoMagmaAndNoLinalgsolver(fn):
+    # [FUNCTION DOC] Decorator: returns the test unchanged when cuSOLVER or hipSOLVER is
+    # assumed present; otherwise applies the MAGMA skip.
     if has_cusolver() or has_hipsolver():
         return fn
     else:
@@ -2222,7 +2636,11 @@ def skipCUDAIfNoMagmaAndNoLinalgsolver(fn):
 
 # Skips a test on CUDA when using ROCm.
 def skipCUDAIfRocm(func=None, *, msg="test doesn't currently work on the ROCm stack"):
+    # [FUNCTION DOC] Decorator usable bare or with a message: skips the test on cuda when
+    # running on ROCm. If a function is passed it is decorated directly; otherwise returns the
+    # decorator.
     def dec_fn(fn):
+        # [FUNCTION DOC] HELPER: Applies the ROCm skip with the given message to the test.
         reason = f"skipCUDAIfRocm: {msg}"
         return skipCUDAIf(TEST_WITH_ROCM, reason=reason)(fn)
 
@@ -2233,6 +2651,7 @@ def skipCUDAIfRocm(func=None, *, msg="test doesn't currently work on the ROCm st
 
 # Skips a test on CUDA when not using ROCm.
 def skipCUDAIfNotRocm(fn):
+    # [FUNCTION DOC] Decorator: skips the test on cuda when not running on ROCm.
     return skipCUDAIf(
         not TEST_WITH_ROCM, "test doesn't currently work on the CUDA stack"
     )(fn)
@@ -2240,9 +2659,14 @@ def skipCUDAIfNotRocm(fn):
 
 # Skips a test on CUDA if ROCm is unavailable or its version is lower than requested.
 def skipCUDAIfRocmVersionLessThan(version=None):
+    # [FUNCTION DOC] Decorator factory: on cuda devices, skips the test if not on ROCm, or the
+    # ROCm version is unknown, or version is None, or the ROCm version is below the given
+    # version tuple.
     def dec_fn(fn):
+        # [FUNCTION DOC] HELPER: Wraps the test with the version check.
         @wraps(fn)
         def wrap_fn(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Raises a skip when the check fails; else runs the test.
             if self.device_type == "cuda":
                 if not TEST_WITH_ROCM:
                     reason = "ROCm not available"
@@ -2267,9 +2691,13 @@ def skipCUDAIfRocmVersionLessThan(version=None):
 
 # Skips a test on CUDA if ROCm hipBLASLt is unavailable or its version is lower than requested.
 def skipCUDAIfRocmHipBlasltVersionLessThan(version=None):
+    # [FUNCTION DOC] Decorator factory: on cuda devices, skips the test if not on ROCm, or the
+    # hipBLASLt version is unknown, or version is None, or it is below the given version tuple.
     def dec_fn(fn):
+        # [FUNCTION DOC] HELPER: Wraps the test with the version check.
         @wraps(fn)
         def wrap_fn(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Raises a skip when the check fails; else runs the test.
             if self.device_type == "cuda":
                 if not TEST_WITH_ROCM:
                     reason = "ROCm not available"
@@ -2292,6 +2720,9 @@ def skipCUDAIfRocmHipBlasltVersionLessThan(version=None):
 
 # Skips a test on CUDA when using ROCm.
 def skipCUDAIfNotMiopenSuggestNHWC(fn):
+    # [FUNCTION DOC] Decorator: skips the test on cuda unless the MIOpen suggest-NHWC test flag
+    # is enabled.
+    # KNOWN ISSUE: the comment above this function says it skips on ROCm, which does not match.
     return skipCUDAIf(
         not TEST_WITH_MIOPEN_SUGGEST_NHWC,
         "test doesn't currently work without MIOpen NHWC activation",
@@ -2300,9 +2731,13 @@ def skipCUDAIfNotMiopenSuggestNHWC(fn):
 
 # Skips a test for specified CUDA versions, given in the form of a list of [major, minor]s.
 def skipCUDAVersionIn(versions: list[tuple[int, int]] | None = None):
+    # [FUNCTION DOC] Decorator factory: skips the test when the installed CUDA version tuple is
+    # in the given list. Runs the test normally when the version is (0, 0) (no CUDA or ROCm).
     def dec_fn(fn):
+        # [FUNCTION DOC] HELPER: Wraps the test with the version check.
         @wraps(fn)
         def wrap_fn(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Raises a skip when the version is listed; else runs it.
             version = _get_torch_cuda_version()
             if version == (0, 0):  # cpu or rocm
                 return fn(self, *args, **kwargs)
@@ -2318,9 +2753,15 @@ def skipCUDAVersionIn(versions: list[tuple[int, int]] | None = None):
 
 # Skips a test for CUDA versions less than specified, given in the form of [major, minor].
 def skipCUDAIfVersionLessThan(versions: tuple[int, int] | None = None):
+    # [FUNCTION DOC] Decorator factory: skips the test when the installed CUDA version tuple is
+    # below the given tuple; runs it normally when the version is (0, 0).
+    # KNOWN ISSUE: the skip message prints the installed version where the threshold is meant,
+    # and a None threshold makes the comparison raise a type error.
     def dec_fn(fn):
+        # [FUNCTION DOC] HELPER: Wraps the test with the version check.
         @wraps(fn)
         def wrap_fn(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Raises a skip when the version is too low; else runs it.
             version = _get_torch_cuda_version()
             if version == (0, 0):  # cpu or rocm
                 return fn(self, *args, **kwargs)
@@ -2336,9 +2777,14 @@ def skipCUDAIfVersionLessThan(versions: tuple[int, int] | None = None):
 
 # Skips a test on CUDA if cuDNN is unavailable or its version is lower than requested.
 def skipCUDAIfCudnnVersionLessThan(version=0):
+    # [FUNCTION DOC] Decorator factory: on cuda devices, skips the test if cuDNN is unavailable
+    # or its version is unknown or below the given number. Uses class attributes set by the
+    # CUDA test base's setUpClass.
     def dec_fn(fn):
+        # [FUNCTION DOC] HELPER: Wraps the test with the cuDNN check.
         @wraps(fn)
         def wrap_fn(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Raises a skip when the check fails; else runs the test.
             if self.device_type == "cuda":
                 if self.no_cudnn:
                     reason = "cuDNN not available"
@@ -2356,18 +2802,22 @@ def skipCUDAIfCudnnVersionLessThan(version=0):
 
 # Skips a test on CUDA if cuSparse generic API is not available
 def skipCUDAIfNoCusparseGeneric(fn):
+    # [FUNCTION DOC] Decorator: skips the test on cuda when the cuSPARSE generic API is absent.
     return skipCUDAIf(not TEST_CUSPARSE_GENERIC, "cuSparse Generic API not available")(
         fn
     )
 
 
 def skipCUDAIfNoHipsparseGeneric(fn):
+    # [FUNCTION DOC] Decorator: skips the test on cuda when the hipSPARSE generic API is absent.
     return skipCUDAIf(
         not TEST_HIPSPARSE_GENERIC, "hipSparse Generic API not available"
     )(fn)
 
 
 def skipCUDAIfNoSparseGeneric(fn):
+    # [FUNCTION DOC] Decorator: skips the test on cuda when neither the cuSPARSE nor the
+    # hipSPARSE generic API is available.
     return skipCUDAIf(
         not (TEST_CUSPARSE_GENERIC or TEST_HIPSPARSE_GENERIC),
         "Sparse Generic API not available",
@@ -2375,50 +2825,64 @@ def skipCUDAIfNoSparseGeneric(fn):
 
 
 def skipCUDAIfNoCudnn(fn):
+    # [FUNCTION DOC] Decorator: skips the test on cuda when cuDNN is unavailable (version 0).
     return skipCUDAIfCudnnVersionLessThan(0)(fn)
 
 
 def skipCUDAIfMiopen(fn):
+    # [FUNCTION DOC] Decorator: skips the test on cuda when torch is a HIP (MIOpen) build.
     return skipCUDAIf(torch.version.hip is not None, "Marked as skipped for MIOpen")(fn)
 
 
 def skipCUDAIfNoMiopen(fn):
+    # [FUNCTION DOC] Decorator: skips the test on cuda when not a HIP build, and also applies
+    # the no-cuDNN skip.
     return skipCUDAIf(torch.version.hip is None, "MIOpen is not available")(
         skipCUDAIfNoCudnn(fn)
     )
 
 
 def skipLazy(fn):
+    # [FUNCTION DOC] Decorator: unconditionally skips the test on the lazy device type.
     return skipLazyIf(True, "test doesn't work with lazy tensors")(fn)
 
 
 def skipMeta(fn):
+    # [FUNCTION DOC] Decorator: unconditionally skips the test on the meta device type.
     return skipMetaIf(True, "test doesn't work with meta tensors")(fn)
 
 
 def skipXLA(fn):
+    # [FUNCTION DOC] Decorator: unconditionally skips the test on the xla device type.
     return skipXLAIf(True, "Marked as skipped for XLA")(fn)
 
 
 def skipMPS(fn):
+    # [FUNCTION DOC] Decorator: unconditionally skips the test on the mps device type.
     return skipMPSIf(True, "test doesn't work on MPS backend")(fn)
 
 
 def skipHPU(fn):
+    # [FUNCTION DOC] Decorator: unconditionally skips the test on the hpu device type.
     return skipHPUIf(True, "test doesn't work on HPU backend")(fn)
 
 
 def skipXPU(fn):
+    # [FUNCTION DOC] Decorator: unconditionally skips the test on the xpu device type.
     return skipXPUIf(True, "test doesn't work on XPU backend")(fn)
 
 
 def skipPRIVATEUSE1(fn):
+    # [FUNCTION DOC] Decorator: unconditionally skips the test on the registered PrivateUse1
+    # backend's device type.
     return skipPRIVATEUSE1If(True, "test doesn't work on privateuse1 backend")(fn)
 
 
 # TODO: the "all" in the name isn't true anymore for quite some time as we have also have for example XLA and MPS now.
 #  This should probably enumerate all available device type test base classes.
 def get_all_device_types() -> list[str]:
+    # [FUNCTION DOC] Returns ["cpu"], plus "cuda" when CUDA is available.
+    # KNOWN ISSUE: despite the name it ignores other device types (see the TODO above).
     return ["cpu"] if not torch.cuda.is_available() else ["cpu", "cuda"]
 
 
