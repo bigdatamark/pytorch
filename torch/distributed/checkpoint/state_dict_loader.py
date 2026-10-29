@@ -1,5 +1,9 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
+# [MODULE DOC] Public load API for distributed checkpointing: load (in-place SPMD load into a state dict),
+# the deprecated load_state_dict, the internal _load_state_dict that runs the planner / storage reader
+# protocol, and _load_state_dict_from_keys which loads selected keys (or everything) into a fresh dict.
+# Defines a module-level root logger reference. No other import-time side effects.
 import inspect
 import logging
 import os
@@ -41,6 +45,9 @@ def load_state_dict(
     no_dist: bool = False,
     planner: LoadPlanner | None = None,
 ) -> None:
+    # [FUNCTION DOC] Deprecated entry point (emits a FutureWarning when called). Resets the storage reader and
+    # loads into the given state dict in place via the internal load routine under the profiling context,
+    # using the given process group, coordinator rank, no_dist flag and planner. Returns None.
     """This method is deprecated. Please switch to 'load'."""
     storage_reader.reset()
     with _profile():
@@ -66,6 +73,12 @@ def load(
     process_group: dist.ProcessGroup | None = None,
     no_dist: bool = False,
 ) -> None:
+    # [FUNCTION DOC] Load a checkpoint into a state dict in SPMD style, in place. If distributed is unavailable or
+    # uninitialized, forces no_dist and warns. Resolves the storage reader from the reader or checkpoint_id
+    # (errors if neither is usable). Iterates keys in sorted order so ranks agree; each Stateful value is
+    # replaced by its state_dict for loading, then after the internal load its load_state_dict is called with
+    # the loaded content; non-Stateful values are replaced in the caller's dict by the loaded values.
+    # Returns None. All ranks must pass the same keys or hangs/errors may occur.
     """
     Load a checkpoint into a distributed state dict in SPMD style.
 
@@ -208,6 +221,15 @@ def _load_state_dict(
     no_dist: bool = False,
     planner: LoadPlanner | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: core load routine. Builds a _DistWrapper and defaults the planner to the default load
+    # planner. Local step reads metadata (global first; on failure falls back to rank-local metadata when the
+    # reader accepts extra keywords, which turns collectives off), sets up planner and reader, creates and
+    # reader-prepares the local plan. Global step creates and reader-prepares the global plan. Plans are
+    # distributed with reduce_scatter (or directly on a single rank when collectives are off), then each rank
+    # finishes its plan and reads data; completion is synchronized by all_gather or a barrier.
+    # Raises AssertionError if no metadata could be read (message lists the underlying read failures).
+    # Mutates the given state dict in place through the planner.
+    # KNOWN ISSUE: the collectives decision is checked before the local step runs, so the fallback to rank-local metadata only takes effect for the later read synchronization step.
     torch._C._log_api_usage_once("torch.distributed.checkpoint.load_state_dict")
 
     distW = _DistWrapper(process_group, not no_dist, coordinator_rank)
@@ -224,6 +246,10 @@ def _load_state_dict(
 
     @_dcp_method_logger(**ckpt_kwargs)
     def local_step():
+        # [FUNCTION DOC] HELPER: per-rank planning step. Reads global metadata (logging a warning on failure), falls back
+        # to rank-local metadata if supported (disabling collectives), raises AssertionError with details if none
+        # is found, sets up planner and storage reader, creates the local plan and lets the reader prepare it.
+        # Records metadata and the collectives flag in the enclosing scope. Returns the local plan.
         nonlocal use_collectives
         nonlocal metadata
 
@@ -284,6 +310,8 @@ def _load_state_dict(
 
     @_dcp_method_logger(**ckpt_kwargs)
     def global_step(all_local_plans):
+        # [FUNCTION DOC] HELPER: coordinator planning step. Creates the global plan via the planner then lets the storage
+        # reader prepare it. Returns the per-rank plans.
         if planner is None:
             raise AssertionError("planner is None")
         all_local_plans = planner.create_global_plan(all_local_plans)
@@ -300,6 +328,8 @@ def _load_state_dict(
 
     @_dcp_method_logger(**ckpt_kwargs)
     def read_data():
+        # [FUNCTION DOC] HELPER: finish the planner's plan for the central plan, read data through the storage reader,
+        # wait for completion and return None. Raises AssertionError if planner or plan is missing.
         if planner is None:
             raise AssertionError("planner is None")
         if central_plan is None:
@@ -324,6 +354,10 @@ def _load_state_dict_from_keys(
     storage_reader: StorageReader | None = None,
     process_group: dist.ProcessGroup | None = None,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: load only the requested keys (a set, a single key string, or everything when None) from a
+    # checkpoint into a newly created dict and return it. Not distributed in effect: uses an empty-state-dict
+    # load planner on the resolved storage reader. Warns and sets no_dist when distributed is unavailable or
+    # uninitialized.
     """
     Load only the specified keys from the checkpoint, if no keys are specified, the entire
     checkpoint will be loaded. Note, this method completely loads the checkpoint into the

@@ -1,5 +1,10 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
+# [MODULE DOC] Public save API for distributed checkpointing: save (synchronous, SPMD style), async_save
+# (stages the state dict then uploads in a thread or process executor), the deprecated save_state_dict,
+# the AsyncCheckpointerType enum and AsyncSaveResponse result record, and the internal _save_state_dict
+# that drives the planner / storage writer protocol (local plan, global plan, write, finish).
+# No import-time side effects.
 import contextlib
 import inspect
 import os
@@ -50,6 +55,7 @@ __all__ = [
 
 
 class AsyncCheckpointerType(Enum):
+    # [CLASS DOC] Enum selecting where async checkpoint upload runs: THREAD or PROCESS.
     """Enum for async checkpointer type."""
 
     THREAD = "thread"
@@ -69,6 +75,9 @@ def save_state_dict(
     no_dist: bool = False,
     planner: SavePlanner | None = None,
 ) -> Metadata:
+    # [FUNCTION DOC] Deprecated entry point (emits a FutureWarning when called). Resets the storage writer,
+    # then saves the state dict under the profiling context via the internal save routine with the
+    # given process group, coordinator rank, no_dist flag and planner. Returns the checkpoint Metadata.
     """This method is deprecated. Please switch to 'save'."""
     storage_writer.reset()
 
@@ -96,6 +105,12 @@ def save(
     no_dist: bool = False,
     use_collectives: bool = True,
 ) -> Metadata:
+    # [FUNCTION DOC] Save a state dict in SPMD style: each rank writes its local shards. Wrapped by a
+    # logging decorator and an argument-order compatibility decorator. Logs API usage; if distributed is
+    # unavailable or uninitialized, forces no_dist and warns. Resolves the storage writer from the writer or
+    # checkpoint_id (reader disabled; errors if neither is usable), converts Stateful values to their
+    # state dicts, and runs the internal save. use_collectives False skips cross-rank synchronization
+    # (experimental, changes the format). Returns the Metadata.
     """
     Save a distributed model in SPMD style.
 
@@ -205,6 +220,9 @@ def save(
 
 @dataclass
 class AsyncSaveResponse:
+    # [CLASS DOC] Dataclass returned by async_save when staging is asynchronous: staging_completion is a
+    # future done when the local copy of the state dict is complete, upload_completion is a future done
+    # when the checkpoint has been fully saved.
     """This class contains futures for staging and upload completion.
     It is returned by async_save().
     staging_completion is a future that indicates when local copy
@@ -230,6 +248,13 @@ def async_save(
     no_dist: bool = False,
     use_collectives: bool = True,
 ) -> Future | AsyncSaveResponse:
+    # [FUNCTION DOC] Asynchronous save. Verifies (when distributed is initialized) that the process group has a
+    # CPU backend, else raises AssertionError. Picks a stager: the given one, the storage writer if it is
+    # an AsyncStager, or a newly created default stager that this function owns and closes after upload
+    # (or on failure). Converts Stateful values, stages the state dict, then runs the upload on a
+    # thread or process executor depending on async_checkpointer_type. If staging returned a future,
+    # returns an AsyncSaveResponse with a staging future and the upload future; otherwise optionally
+    # synchronizes staging and returns just the upload future.
     """Asynchronous version of ``save``. This code first de-stages the state_dict on to the
     staging storage (defaults to CPU memory), and then calls the `save` in a separate thread.
 
@@ -325,6 +350,7 @@ def async_save(
     owned_async_stager_closed = False
 
     def maybe_close_owned_async_stager() -> None:
+        # [FUNCTION DOC] HELPER: close the internally owned stager at most once (no-op if none or already closed).
         nonlocal owned_async_stager_closed
         if owned_async_stager is not None and not owned_async_stager_closed:
             owned_async_stager_closed = True
@@ -332,6 +358,8 @@ def async_save(
 
     @_dcp_method_logger(log_exceptions=True)
     def stage_state_dict() -> Future[STATE_DICT_TYPE] | STATE_DICT_TYPE:
+        # [FUNCTION DOC] HELPER: stage the (converted) state dict with the chosen stager; returns either a future
+        # of the staged state dict or the staged state dict itself.
         return async_stager.stage(state_dict)
 
     with contextlib.ExitStack() as stack:
@@ -369,6 +397,8 @@ def async_save(
             original_staging_future: Future[STATE_DICT_TYPE],
             return_staging_future: Future[None] = return_staging_future,
         ):
+            # [FUNCTION DOC] HELPER: done-callback copying the outcome of the staging future into the user-facing
+            # staging future: sets result None on success or the raised exception on failure.
             try:
                 original_staging_future.result()
                 return_staging_future.set_result(None)
@@ -388,6 +418,7 @@ def async_save(
 
         @_dcp_method_logger(log_exceptions=True)
         def maybe_synchronize_staging():
+            # [FUNCTION DOC] HELPER: if the stager asks for synchronization after execute, call its synchronize_staging.
             if async_stager.should_synchronize_after_execute:
                 async_stager.synchronize_staging()
 
@@ -397,11 +428,15 @@ def async_save(
 
 @_dcp_method_logger(log_exceptions=True)
 def _stateful_to_state_dict(state_dict: STATE_DICT_TYPE) -> STATE_DICT_TYPE:
+    # [FUNCTION DOC] HELPER: return a new dict with the same keys where each Stateful value is replaced by the
+    # result of its state_dict method and other values are kept (shallow copy). Each conversion is run
+    # through the method logger under a per-key name.
     """Creates a shallow copy of `state_dict` where `state_dict` is called for each Stateful object."""
     stateful_state_dict = {}
     for key, elem in state_dict.items():
         # Apply _dcp_method_logger to each state_dict() call
         def _elem_to_state_dict(elem):
+            # [FUNCTION DOC] HELPER: return the state_dict of a Stateful element, or the element unchanged.
             return elem.state_dict() if isinstance(elem, Stateful) else elem
 
         _elem_to_state_dict.__name__ = f"_stateful_to_state_dict.{key}"
@@ -421,6 +456,14 @@ def _save_state_dict(
     planner: SavePlanner | None = None,
     use_collectives: bool = True,
 ) -> Metadata:
+    # [FUNCTION DOC] HELPER: core save routine. Builds a _DistWrapper, defaults the planner to the default save
+    # planner, then runs: local step (set up planner and storage writer, create and storage-prepare the
+    # local plan), global step on the coordinator (create global plan, set global metadata, storage-prepare),
+    # plan distribution (reduce_scatter with collectives, otherwise single-rank direct calls), write step
+    # (finish plan, write data, wait for the future, return results), and finish step (storage writer
+    # finish with metadata). With collectives results are combined via all_reduce, otherwise a barrier is used.
+    # Passes rank and use_collectives to the writer when its set-up accepts extra keywords; warns when the
+    # planner set-up lacks the storage_meta parameter. Returns the global Metadata.
     torch._C._log_api_usage_once("torch.distributed.checkpoint.save_state_dict")
 
     distW = _DistWrapper(process_group, not no_dist, coordinator_rank)
@@ -438,6 +481,9 @@ def _save_state_dict(
 
     @_dcp_method_logger(**ckpt_kwargs)
     def local_step():
+        # [FUNCTION DOC] HELPER: per-rank planning step. Sets up the planner (with storage metadata when supported,
+        # else warns and uses the old signature), sets up the storage writer, creates the local plan and lets
+        # the writer prepare it. Returns the local plan.
         if planner is None:
             raise AssertionError("planner is None")
         storage_meta = storage_writer.storage_meta()
@@ -474,6 +520,9 @@ def _save_state_dict(
 
     @_dcp_method_logger(**ckpt_kwargs)
     def global_step(all_local_plans):
+        # [FUNCTION DOC] HELPER: coordinator planning step. Creates the global plan from all local plans via the
+        # planner (recording global metadata in the enclosing scope), then lets the storage writer prepare it.
+        # Returns the per-rank plans.
         nonlocal global_metadata
 
         if planner is None:
@@ -492,6 +541,9 @@ def _save_state_dict(
 
     @_dcp_method_logger(**ckpt_kwargs)
     def write_data():
+        # [FUNCTION DOC] HELPER: finish the planner's plan for the central plan, write data with the storage writer,
+        # block until the write future completes and return its value (list of WriteResult).
+        # Raises AssertionError if planner or plan is missing.
         if planner is None:
             raise AssertionError("planner is None")
         if central_plan is None:
@@ -504,6 +556,8 @@ def _save_state_dict(
 
     @_dcp_method_logger(**ckpt_kwargs)
     def finish_checkpoint(all_results):
+        # [FUNCTION DOC] HELPER: coordinator-side finalization. Calls the storage writer finish with the global
+        # metadata and all write results, and returns the metadata. Raises AssertionError if metadata is missing.
         if global_metadata is None:
             raise AssertionError("global_metadata is None")
         storage_writer.finish(metadata=global_metadata, results=all_results)
