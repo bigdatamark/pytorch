@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Script-style determinism check for the torchfuzz fuzzer: runs fuzzer.py several times with
+# one fixed seed and the "unbacked" template, and compares the generated program source.
+# Exits with status 0 when all runs match, 1 otherwise. No import-time side effects; the
+# work happens only when run as a script (main) or when the test function is called.
 """Test to verify fuzzer produces deterministic output with same seed."""
 
 import subprocess
@@ -7,6 +12,14 @@ from pathlib import Path
 
 
 def run_fuzzer_with_seed(seed):
+    # [FUNCTION DOC] HELPER: Runs fuzzer.py in this file's directory as a subprocess with the
+    # given seed and the unbacked template, and returns the program source it generated.
+    # Side effects: deletes all .py files in /tmp/torchfuzz first; prints diagnostics when
+    # the subprocess fails. The source is taken from the "Program Source" block of stdout,
+    # else from the file named on the "Running:" line, else from the newest fuzz_*.py file.
+    # Returns None (after printing a message) if no generated file exists.
+    # KNOWN ISSUE: if /tmp/torchfuzz does not exist, the last fallback globs a missing
+    # directory and yields no files, so None is returned rather than an error.
     """Run the fuzzer with a specific seed and return the generated code."""
     cmd = [sys.executable, "fuzzer.py", "--seed", str(seed), "--template", "unbacked"]
 
@@ -69,6 +82,11 @@ def run_fuzzer_with_seed(seed):
 
 
 def test_deterministic_output():
+    # [FUNCTION DOC] Runs the fuzzer three times with a fixed seed and compares the outputs.
+    # Returns True if all outputs are identical, False if any run produced no output or the
+    # outputs differ (printing the first differing line and any line-count mismatch).
+    # KNOWN ISSUE: reports failure by returning a bool instead of asserting, so a test
+    # runner that collects it as a test will treat a failure as a pass.
     """Test that the fuzzer produces identical output for the same seed."""
     seed = 13157  # Use the seed mentioned in the user's issue
     num_runs = 3
@@ -120,6 +138,8 @@ def test_deterministic_output():
 
 
 def main():
+    # [FUNCTION DOC] Script entry point: runs the determinism test, prints a verdict, and
+    # terminates the process with exit status 0 on success or 1 on failure.
     """Main function to run the determinism test."""
     print("Testing fuzzer determinism...")
     print("=" * 50)

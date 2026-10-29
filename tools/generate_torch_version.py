@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Computes the PyTorch version string and, when run as a script, writes torch/version.py.
+# Version sources are build environment variables, the sdist PKG-INFO file, or version.txt
+# plus the git commit. The script takes debug flag and CUDA/HIP/ROCm/XPU version options.
+# Import-time side effects: none (the file writing is under the main guard).
 from __future__ import annotations
 
 import argparse
@@ -15,6 +20,10 @@ RELEASE_PATTERN = re.compile(r"/v[0-9]+(\.[0-9]+)*(-rc[0-9]+)?/")
 
 
 def get_sha(pytorch_root: str | Path) -> str:
+    # [FUNCTION DOC] Returns the current source revision id of the checkout at pytorch_root:
+    # the full git commit hash if a git directory exists, else the Mercurial identify output
+    # if an hg directory exists. Returns the UNKNOWN marker if neither exists or the command
+    # fails (all errors are swallowed). Runs a subprocess.
     try:
         rev = None
         if os.path.exists(os.path.join(pytorch_root, ".git")):
@@ -33,6 +42,11 @@ def get_sha(pytorch_root: str | Path) -> str:
 
 
 def get_tag(pytorch_root: str | Path) -> str:
+    # [FUNCTION DOC] Returns the git tag that exactly matches the current commit if it looks
+    # like a release tag, otherwise the UNKNOWN marker (also on any error). Runs a git
+    # subprocess in pytorch_root.
+    # KNOWN ISSUE: the release pattern requires a slash before and after the version, which a
+    # plain tag name from git describe does not contain, so a normal tag likely never matches.
     try:
         tag = subprocess.run(
             ["git", "describe", "--tags", "--exact"],
@@ -49,6 +63,13 @@ def get_tag(pytorch_root: str | Path) -> str:
 
 
 def get_torch_version(sha: str | None = None) -> str:
+    # [FUNCTION DOC] Returns the version string for this source tree. Uses the build version
+    # and build number environment variables when set (a build number above 1 adds a post
+    # release suffix), else the sdist PKG-INFO version, else version.txt with a git-hash
+    # suffix of seven characters unless sha equals the UNKNOWN marker (a missing sha is
+    # looked up). The result is checked to be a valid version; for sdists, the source part
+    # must equal the PKG-INFO version. Raises an error if the build number is missing or the
+    # versions disagree; reads files and may run git.
     """Determine the torch version string.
 
     The version is determined from one of the following sources, in order of

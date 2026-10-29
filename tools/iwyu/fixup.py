@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Stream filter that post-processes include lines of include-what-you-use output: reads
+# standard input and writes to standard output, rewriting quoted includes to angle-bracket
+# includes and mapping C standard headers to their C++ counterparts. Other lines pass
+# through unchanged. Defines the two include regexes and the C-to-C++ header map.
 import re
 import sys
 
@@ -37,6 +42,13 @@ STD_C_HEADER_MAP = {
 
 
 def main() -> None:
+    # [FUNCTION DOC] Reads standard input line by line and echoes each line to standard
+    # output after fixing include directives. A quoted include becomes an angle-bracket
+    # include (its trailing text is kept as is). An angle-bracket include has its header
+    # replaced by the C++ equivalent when one is in the map, and a single space is inserted
+    # before any trailing text longer than a newline. All other lines are copied verbatim.
+    # KNOWN ISSUE: a quoted include is converted without the C-header mapping, so a quoted C
+    # header stays as the C header.
     for line in sys.stdin:
         # Convert all quoted includes to angle brackets
         match = QUOTE_INCLUDE_RE.match(line)

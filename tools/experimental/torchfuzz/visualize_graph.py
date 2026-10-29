@@ -1,5 +1,10 @@
 # mypy: ignore-errors
 
+# [MODULE DOC]
+# Visualization helpers for torchfuzz operation graphs. Provides conversion of an
+# OperationGraph to Graphviz DOT text, saving and rendering DOT files to PNG through the
+# external dot program, a combined pipeline, and an optional NetworkX/matplotlib renderer.
+# Import-time side effects: none beyond importing torchfuzz modules.
 """
 Visualization tools for operation stacks and graphs as DAGs.
 """
@@ -11,6 +16,10 @@ from torchfuzz.tensor_fuzzer import TensorSpec
 
 
 def save_and_render_dot(dot_content: str, filename: str = "operation_stack"):
+    # [FUNCTION DOC] Writes dot_content to a .dot file named after filename in the current
+    # directory or given path, then tries to render a PNG next to it with the dot command
+    # and prints a clickable file link on success. A missing dot program or a rendering
+    # failure is silently ignored. Returns nothing; raises only on file write errors.
     """
     Save DOT content to file and render as PNG/PDF.
 
@@ -41,6 +50,11 @@ def save_and_render_dot(dot_content: str, filename: str = "operation_stack"):
 def operation_graph_to_dot(
     graph: OperationGraph, title: str = "Operation Graph"
 ) -> str:
+    # [FUNCTION DOC] Builds and returns Graphviz DOT text for the graph. Each node gets a
+    # color by kind (argument, constant, aten op, other) and a label with id, op name,
+    # depth, dtype and, for tensor specs, size; the root node is highlighted in red. Edges
+    # run from each input node to its consumer and are labeled by input position. A legend
+    # cluster is appended. Pure function; does not mutate the graph.
     """
     Convert an operation graph to Graphviz DOT format for visualization.
 
@@ -138,6 +152,9 @@ def visualize_operation_graph(
     title: str = "Operation Graph",
     output_folder: str = ".",
 ):
+    # [FUNCTION DOC] Generates DOT text for the graph with the given title, then saves it as
+    # operation_graph.dot in output_folder and tries to render a PNG beside it. Side effects:
+    # file writes, possible subprocess call, console output. Returns nothing.
     """
     Complete visualization pipeline for an operation graph.
 
@@ -157,6 +174,12 @@ def visualize_operation_graph(
 
 
 def operation_graph_to_networkx(graph: OperationGraph):
+    # [FUNCTION DOC] Draws the operation graph with NetworkX and matplotlib: nodes colored
+    # by op kind, larger root node, labels of id and op name, spring layout. Saves the
+    # figure as operation_graph_networkx.png in the current directory, shows it
+    # interactively, and prints a confirmation. If networkx or matplotlib is missing, prints
+    # an install hint and returns without drawing. Returns nothing.
+    # KNOWN ISSUE: despite the name it does not return a NetworkX graph; it only renders.
     """
     Convert operation graph to NetworkX graph for Python visualization.
     Requires: pip install networkx matplotlib

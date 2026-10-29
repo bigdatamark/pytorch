@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Unit tests for the "streams" template of torchfuzz: checks that the template reuses the
+# default op set, uses the backward-enabled check, and that generated programs contain CUDA
+# stream creation, stream contexts, synchronization, backward calls and valid syntax.
+# Import-time side effect: prepends the parent directory to the module search path so the
+# torchfuzz package can be imported, and imports torch.
 """Tests for the streams fuzzing template codegen."""
 
 import os
@@ -19,7 +25,13 @@ from torchfuzz.ops_fuzzer import fuzz_operation_graph, fuzz_spec
 
 
 class TestStreamsFuzzTemplate(unittest.TestCase):
+    # [CLASS DOC] Test case covering code generation for the streams fuzz template. Stateless;
+    # each test generates a program from a seed through the _generate_code helper and
+    # inspects the resulting source text.
     def _generate_code(self, seed):
+        # [FUNCTION DOC] HELPER: Seeds the random and torch generators, fuzzes a spec and an
+        # operation graph (max depth 3) with the streams template, and returns the generated
+        # Python source string for that seed.
         random.seed(seed)
         torch.manual_seed(seed)
         target_spec = fuzz_spec("streams")
@@ -29,12 +41,16 @@ class TestStreamsFuzzTemplate(unittest.TestCase):
         return convert_graph_to_python_code(graph, seed=seed, template="streams")
 
     def test_template_inherits_default_ops(self):
+        # [FUNCTION DOC] Asserts the streams template has a non-empty supported op list that
+        # includes the add and matmul ops from the default template.
         template = make_template("streams")
         self.assertGreater(len(template.supported_ops), 0)
         self.assertIn("torch.add", template.supported_ops)
         self.assertIn("torch.matmul", template.supported_ops)
 
     def test_template_uses_backward_check(self):
+        # [FUNCTION DOC] Asserts the streams template's check object is an instance of the
+        # eager-vs-full-graph dynamic compile check that includes backward.
         from torchfuzz.cuda._checks import (
             EagerVsFullGraphDynamicCompileWithBackwardCheck,
         )
@@ -45,14 +61,18 @@ class TestStreamsFuzzTemplate(unittest.TestCase):
         )
 
     def test_codegen_creates_streams(self):
+        # [FUNCTION DOC] Asserts code generated for seed 999 creates a CUDA stream object.
         code = self._generate_code(seed=999)
         self.assertIn("torch.cuda.Stream()", code)
 
     def test_codegen_has_stream_context(self):
+        # [FUNCTION DOC] Asserts code generated for seed 999 enters a CUDA stream context.
         code = self._generate_code(seed=999)
         self.assertIn("with torch.cuda.stream(", code)
 
     def test_codegen_has_final_sync(self):
+        # [FUNCTION DOC] Asserts the seed 999 program makes the current stream wait on another
+        # stream or on an event, i.e. synchronizes streams before returning.
         code = self._generate_code(seed=999)
         # Should sync all streams before return (wait_stream or wait_event)
         self.assertTrue(
@@ -61,15 +81,19 @@ class TestStreamsFuzzTemplate(unittest.TestCase):
         )
 
     def test_codegen_has_backward(self):
+        # [FUNCTION DOC] Asserts the seed 999 program sums a result and calls backward on it.
         code = self._generate_code(seed=999)
         self.assertIn(".sum().backward()", code)
 
     def test_codegen_has_requires_grad(self):
+        # [FUNCTION DOC] Asserts the seed 999 program marks some argument as requiring grad.
         """Float tensor args should have requires_grad for backward testing."""
         code = self._generate_code(seed=999)
         self.assertIn("requires_grad_(True)", code)
 
     def test_codegen_cross_stream_sync(self):
+        # [FUNCTION DOC] Asserts the seed 999 program contains inter-stream synchronization,
+        # either a wait on a named stream or a wait on an event.
         """Seeds with cross-stream deps should have inter-stream sync."""
         # seed 999 produces a graph with ops on different streams
         code = self._generate_code(seed=999)
@@ -82,6 +106,9 @@ class TestStreamsFuzzTemplate(unittest.TestCase):
         )
 
     def test_codegen_event_based_sync(self):
+        # [FUNCTION DOC] Scans seeds 50 to 69 for a program that creates an event and waits on
+        # it; for the first such program also asserts an event record call exists. Fails if no
+        # seed in the range uses event-based synchronization.
         """Some seeds should use event-based synchronization."""
         found_events = False
         for seed in range(50, 70):
@@ -94,12 +121,15 @@ class TestStreamsFuzzTemplate(unittest.TestCase):
         self.assertTrue(found_events, "No seed in range produced event-based sync")
 
     def test_codegen_deterministic(self):
+        # [FUNCTION DOC] Generates code twice for seed 42 and asserts the two are identical.
         """Same seed should produce identical code."""
         code1 = self._generate_code(seed=42)
         code2 = self._generate_code(seed=42)
         self.assertEqual(code1, code2)
 
     def test_codegen_is_valid_python(self):
+        # [FUNCTION DOC] Compiles the seed 999 program source (without running it); a syntax
+        # error raises and fails the test.
         """Generated code should be syntactically valid Python."""
         code = self._generate_code(seed=999)
         compile(code, "<test>", "exec")

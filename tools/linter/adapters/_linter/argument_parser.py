@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Defines the command line parser shared by the token-based linters: an argparse parser
+# preloaded with a files list and the fix, lintrunner and verbose flags, and with epilog
+# printing that keeps line breaks. No import-time side effects.
 from __future__ import annotations
 
 import argparse
@@ -10,6 +14,9 @@ if TYPE_CHECKING:
 
 
 class ArgumentParser(argparse.ArgumentParser):
+    # [CLASS DOC] Argument parser with the standard linter options already registered:
+    # positional files, a fix flag (hidden in help unless the linter is a fixer), a lintrunner
+    # flag and a verbose flag. Keeps the epilog privately so it can be printed verbatim.
     """
     Adds better help formatting and default arguments to argparse.ArgumentParser
     """
@@ -23,6 +30,10 @@ class ArgumentParser(argparse.ArgumentParser):
         is_fixer: bool = False,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Builds the parser with the given program name, usage and description,
+        # passing no epilog to the base class (it is stored privately instead), then adds the
+        # files argument and the fix, lintrunner and verbose options. is_fixer controls whether
+        # the fix option appears in help. Extra keyword arguments go to the base class.
         super().__init__(prog, usage, description, None, **kwargs)
         self._epilog = epilog
 
@@ -40,6 +51,12 @@ class ArgumentParser(argparse.ArgumentParser):
         self.add_argument("-v", "--verbose", action="store_true", help=help)
 
     def exit(self, status: int = 0, message: str | None = None) -> Never:
+        # [FUNCTION DOC] Overrides exit so the epilog is printed with its original line breaks
+        # when help was requested on the command line, then defers to the base exit, which
+        # terminates the process with the given status and message.
+        # KNOWN ISSUE: operator precedence makes the condition "(epilog and status is zero and
+        # -h given) or --help given", so the epilog (possibly None) is printed whenever --help
+        # appears, even with a non-zero status or no epilog.
         """
         Overriding this method is a workaround for argparse throwing away all
         line breaks when printing the `epilog` section of the help message.

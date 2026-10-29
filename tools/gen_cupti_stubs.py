@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Build script that generates the CUPTI stub constants module for the profiler. It parses
+# the CUPTI activity header with libclang, collects per-kind activity field id enums and the
+# activity attribute enum, and renders them as Python classes into the output file, stamped
+# with the header hash and CUPTI API version. Skips generation (and deletes stale output)
+# when no suitable header is found. Import-time side effects: none.
 """Generate ``torch/profiler/_cupti/_cupti_stubs.py`` from the CUPTI ABI.
 
 The v2 / user-defined-record CUPTI path selects activity records by *field id*
@@ -56,6 +62,11 @@ _CUPTI_API_VERSION_RE = re.compile(
 
 
 def _field_ctype(raw_comment: str | None) -> str:
+    # [FUNCTION DOC] HELPER: Maps a field's doc comment to a decode type name. Scans comment
+    # lines for the first one ending in a semicolon (the C declaration) and classifies its
+    # leading type: character pointer gives the string type, float or double the float type,
+    # unsigned or size types the unsigned type, signed integer types the signed type, anything
+    # else unsigned. Returns the unsigned type when there is no comment or no declaration line.
     """The ``Ctype`` member name for a field, from its doc-comment declaration line.
     ``const char*`` -> CSTR, ``float``/``double`` -> FLOAT, signed ints -> INT, everything
     else (unsigned ints, and enum/struct typedefs whose width the runtime layout supplies)
@@ -79,12 +90,19 @@ def _field_ctype(raw_comment: str | None) -> str:
 
 @dataclass(frozen=True)
 class _FieldDef:
+    # [CLASS DOC] HELPER: Immutable record of one parsed field id: attribute name (sentinel and
+    # prefix removed), integer enumerator value, and decode type name (unsigned, signed,
+    # float or string).
     name: str  # attribute name, e.g. "REGISTERS_PER_THREAD"
     value: int
     ctype: str  # Ctype member name: "UINT" | "INT" | "FLOAT" | "CSTR"
 
 
 def _load_cindex():  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] HELPER: Imports the libclang python bindings and returns the cindex
+    # module after making sure a libclang library can be loaded (honoring an existing path in
+    # the LIBCLANG_PATH environment variable). Exits the process with an explanatory message
+    # if the bindings are missing or the library fails to load.
     """Import ``clang.cindex`` and ensure a ``libclang.so`` is loadable. The ``libclang`` wheel
     (a build dependency) bundles ``libclang.so`` and cindex loads it automatically; set
     ``LIBCLANG_PATH`` to override with a specific one."""
@@ -113,6 +131,14 @@ def _load_cindex():  # type: ignore[no-untyped-def]
 def parse_header(
     header: Path,
 ) -> tuple[dict[str, list[_FieldDef]], list[tuple[str, int]]]:
+    # [FUNCTION DOC] Parses the CUPTI activity header with libclang (C mode, include paths
+    # from the header directory and the CUDA home environment variables) and walks all typedefs.
+    # Returns an ordered mapping from activity kind name to its field definitions (enums named
+    # CUpti_Activity<Kind>FieldIds, count sentinels dropped, empty enums skipped) and a list of
+    # (attribute name, value) pairs from the activity attribute enum. Exits the process if
+    # either result is empty.
+    # KNOWN ISSUE: attribute sentinels are filtered by suffix match while field sentinels use
+    # exact match, so an attribute whose name merely ends in MAX would be dropped.
     """Parse the header via libclang. Returns (``<X>FieldIds`` class name -> its fields, in
     declaration order) and the CUpti_ActivityAttribute enumerators (name, value)."""
     cindex = _load_cindex()
@@ -176,6 +202,11 @@ def render(
     attrs: list[tuple[str, int]],
     header: Path,
 ) -> str:
+    # [FUNCTION DOC] Builds the text of the generated module: a generated-file banner with the
+    # header name, CUPTI API version (read from the sibling version header, else unknown) and
+    # sha256 of the header, a module docstring, an import, one class per activity kind with a
+    # field constant per entry, and an ActivityAttr class of integer constants. Returns the
+    # text ending in one newline. Reads the header files.
     digest = hashlib.sha256(header.read_bytes()).hexdigest()
     version_header = header.parent / "cupti_version.h"
     match = (
@@ -216,6 +247,9 @@ def render(
 
 
 def generate(output: Path, header: Path) -> None:
+    # [FUNCTION DOC] Parses the header, renders the module text, creates the output's parent
+    # directories, and writes the file only if it is missing or its content differs (so
+    # timestamps are preserved when nothing changed). Returns nothing.
     """Write the generated module from ``header`` (already resolved and version-gated by the
     caller via find_cupti_header). ``main`` skips this call entirely when no suitable header
     exists, so non-CUPTI builds proceed without the module."""
@@ -227,6 +261,11 @@ def generate(output: Path, header: Path) -> None:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point taking a required output path option. Adds the repository
+    # root to the module search path, locates a suitable CUPTI header, and either generates the
+    # stub module and prints a status line plus a machine-readable header path line, or, if no
+    # header is found, deletes any stale output file and prints a skip message. Side effects:
+    # changes sys.path, writes or removes files, prints to stdout.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()

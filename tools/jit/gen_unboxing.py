@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Build-time code generator for the TorchScript/JIT codegen-unboxing path. Given the native
+# functions list and an operator selector, writes UnboxingFunctions.h, UnboxingFunctions.cpp
+# and RegisterCodegenUnboxedKernels.cpp through a file manager. Contains two callable
+# generator dataclasses, the gen_unboxing driver and a command line main. No import-time
+# side effects beyond imports.
 # Generates RegisterCodegenUnboxedKernels.cpp, UnboxingFunctions.h and UnboxingFunctions.cpp.
 
 from __future__ import annotations
@@ -30,11 +36,20 @@ if TYPE_CHECKING:
 # Generates UnboxingFunctions.h & UnboxingFunctions.cpp.
 @dataclass(frozen=True)
 class ComputeUnboxingFunctions:
+    # [CLASS DOC] Frozen callable that turns one NativeFunction into C++ source text for the
+    # unboxing API. State: target (declaration or definition output) and the selector that
+    # decides which operators are emitted. Instances are callable with a native function.
     target: Literal[Target.DECLARATION, Target.DEFINITION]
     selector: SelectiveBuilder
 
     @method_with_native_function
     def __call__(self, f: NativeFunction) -> str:
+        # [FUNCTION DOC] Returns C++ text for one native function, or an empty string when the
+        # selector says the operator is not a root operator. For the declaration target,
+        # returns a declaration of a stack-based wrapper function. For the definition target,
+        # returns the wrapper body: it converts stack arguments into C++ values, drops them
+        # from the stack, calls the method or free function of the most faithful C++ signature,
+        # and packs any result back onto the stack. Raises if argument conversion fails.
         if not self.selector.is_root_operator(f"aten::{f.func.name}"):
             return ""
 
@@ -95,10 +110,19 @@ TORCH_API void {f.func.name.unambiguous_name()}(Stack & stack) {{
 # Generates RegisterCodegenUnboxedKernels.cpp.
 @dataclass(frozen=True)
 class ComputeCodegenUnboxedKernels:
+    # [CLASS DOC] Frozen callable that turns one NativeFunction into the C++ operator
+    # registration entry used in RegisterCodegenUnboxedKernels. State: the selector that
+    # filters operators. Instances are callable with a native function.
     selector: SelectiveBuilder
 
     @method_with_native_function
     def __call__(self, f: NativeFunction) -> str:
+        # [FUNCTION DOC] Returns an operator generator entry for the function, or an empty
+        # string if it is not a selected root operator. The entry lists each argument of the
+        # faithful non-method C++ signature (arguments without a default get a none value,
+        # others get a default expression, lists wrapped as an int array ref), the return
+        # names, and a lambda that records the function and calls the generated unboxing
+        # wrapper. Raises an error if an argument is not a plain argument.
         if not self.selector.is_root_operator(f"aten::{f.func.name}"):
             return ""
         # We unconditionally generate function wrappers,
@@ -165,7 +189,12 @@ def gen_unboxing(
     cpu_fm: FileManager,
     selector: SelectiveBuilder,
 ) -> None:
+    # [FUNCTION DOC] Writes the three generated files through cpu_fm: sharded
+    # UnboxingFunctions.cpp, unsharded UnboxingFunctions.h, and sharded
+    # RegisterCodegenUnboxedKernels.cpp. Sharding is used (5 and 10 shards) only when at
+    # least 100 operators are selected; otherwise one shard. Functions are grouped by root name.
     def key_func(fn: NativeFunction | NativeFunctionsGroup) -> str:
+        # [FUNCTION DOC] HELPER: Returns the root name used as the sharding key.
         return fn.root_name
 
     selected_op_num: int = len(selector.operators)
@@ -205,6 +234,12 @@ def gen_unboxing(
 
 
 def main(args: list[str]) -> None:
+    # [FUNCTION DOC] Command line entry. Parses args (source path, install dir, optional
+    # dependency output file, dry run, operator selection yaml, op registration allowlist or
+    # a test-only allowlist yaml file; the allowlist option takes priority over the yaml).
+    # Builds the selector, parses native_functions and tags yaml, runs gen_unboxing, and
+    # optionally writes the dependency file listing outputs. Side effects: reads yaml files,
+    # writes generated sources (unless dry run). Returns nothing.
     parser = argparse.ArgumentParser(description="Generate unboxing source files")
     parser.add_argument(
         "-s",

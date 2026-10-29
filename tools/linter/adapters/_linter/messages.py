@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Data types for linter output: LintSeverity (severity levels), LintMessage (the JSON record
+# sent to lintrunner) and LintResult (a finding that may carry a precise edit location and
+# nesting information, convertible to a LintMessage). No import-time side effects.
 from __future__ import annotations
 
 import dataclasses as dc
@@ -5,6 +9,8 @@ from enum import Enum
 
 
 class LintSeverity(str, Enum):
+    # [CLASS DOC] Enumeration of lintrunner severity levels (error, warning, advice,
+    # disabled); the values are the lowercase strings used in the JSON output.
     ERROR = "error"
     WARNING = "warning"
     ADVICE = "advice"
@@ -13,6 +19,9 @@ class LintSeverity(str, Enum):
 
 @dc.dataclass
 class LintMessage:
+    # [CLASS DOC] Record matching lintrunner's JSON message: required code, name and
+    # severity, and optional char, description, line, original, path and replacement. The
+    # asdict method converts it to a plain mapping.
     """This is a datatype representation of the JSON that gets sent to lintrunner
     as described here:
     https://docs.rs/lintrunner/latest/lintrunner/lint_message/struct.LintMessage.html
@@ -34,6 +43,10 @@ class LintMessage:
 
 @dc.dataclass
 class LintResult:
+    # [CLASS DOC] One linter finding. State: name (message), optional line, char and length
+    # locating a span, optional replacement text for that span (making it an edit), optional
+    # description and whole-file original, and is_recursive marking results nested inside an
+    # earlier result. Key methods: apply, contains, as_message, sort_key.
     """LintResult is a single result from a linter.
 
     Like LintMessage but the .length member allows you to make specific edits to
@@ -65,9 +78,15 @@ class LintResult:
 
     @property
     def is_edit(self) -> bool:
+        # [FUNCTION DOC] True when line, char, length and replacement are all present, i.e.
+        # the result describes a concrete text replacement.
         return None not in (self.char, self.length, self.line, self.replacement)
 
     def apply(self, lines: list[str]) -> None:
+        # [FUNCTION DOC] Applies the edit in place to the list of source lines: replaces the
+        # span of length characters starting at the column on the (one-based) line with the
+        # replacement text. Does nothing if the result is not a complete edit or is recursive.
+        # Mutates the given list.
         if not (
             self.char is None
             or self.length is None
@@ -81,6 +100,9 @@ class LintResult:
             lines[self.line - 1] = f"{before}{self.replacement}{after}"
 
     def contains(self, r: LintResult) -> bool:
+        # [FUNCTION DOC] True if r lies on the same line and its span is within this result's
+        # span. Raises an assertion error if either result lacks a line or char, or if this
+        # result lacks a length.
         if self.char is None or self.line is None:
             raise AssertionError("self.char and self.line must not be None")
         if r.char is None or r.line is None:
@@ -89,11 +111,18 @@ class LintResult:
 
     @property
     def end(self) -> int:
+        # [FUNCTION DOC] Column just past the span (char plus length). Raises an assertion
+        # error if char or length is missing.
         if self.char is None or self.length is None:
             raise AssertionError("self.char and self.length must not be None")
         return self.char + self.length
 
     def as_message(self, code: str, path: str) -> LintMessage:
+        # [FUNCTION DOC] Converts to a LintMessage with the given code and path and error
+        # severity, dropping the recursion flag and length. For edit results the replacement is
+        # cleared so lintrunner is not asked to apply it per span.
+        # KNOWN ISSUE: the explanatory comment inside is garbled (a word is missing after "one
+        # of our"), so the intent is only inferred.
         d = dc.asdict(self)
         d.pop("is_recursive")
         d.pop("length")
@@ -105,6 +134,8 @@ class LintResult:
         return LintMessage(code=code, path=path, severity=LintSeverity.ERROR, **d)
 
     def sort_key(self) -> tuple[int, int, str]:
+        # [FUNCTION DOC] Sort key of line, column and name, with missing line or column
+        # treated as minus one so location-less results sort first.
         line = -1 if self.line is None else self.line
         char = -1 if self.char is None else self.char
         return line, char, self.name
