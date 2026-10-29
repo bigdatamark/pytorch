@@ -1,5 +1,16 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for DTensor redistribution (placement changes) on device meshes.
+# Covers Shard, Replicate and Partial transitions with forward/backward numerics and
+# collective counts (via CommDebugMode), dtype casting of collectives, uneven and zero-
+# size shards, shard-order (ordered sharding) and strided-shard planning, min-cost graph
+# planning versus greedy planning, and the flattened-mesh merging of consecutive
+# reductions (_optimize_transform_infos). Also contains local-tensor-mode variants of
+# several test classes created at import time via create_local_tensor_test_class, and a
+# dispatch-mode tracer used to check collective dtypes.
+# Import-time side effects: instantiate_parametrized_tests is applied to
+# RedistributeTest and module-level local-tensor test classes are generated. Running as
+# a script calls run_tests.
 
 import contextlib
 import itertools
@@ -71,10 +82,20 @@ funcol = torch.ops.c10d_functional
 
 
 class RedistributeTest(DTensorContinuousTestBase):
+    # [CLASS DOC] Distributed tests (world_size 4) of DTensor.redistribute on a 1-D
+    # mesh, mostly Shard/Replicate/Partial transitions: checks result placements, local
+    # values, gradient placements and the number of collectives issued. Also covers
+    # dtype conversion options, planner reduce-op collection, uneven and empty shards,
+    # and all-gather view optimization. Parametrized by dtype where decorated; a local-
+    # tensor variant is generated below.
     world_size = 4
 
     @parametrize("dtype", [torch.float32, torch.cfloat])
     def test_shard_to_replicate_forward_backward(self, dtype):
+        # [FUNCTION DOC] Shard to Replicate for several uneven and even sizes on dim 0
+        # and 1. Forward must give the full tensor with exactly one
+        # all_gather_into_tensor; backward with an all-ones gradient must give a Shard-
+        # placed gradient of ones with no communication.
         # 1) test shard -> replicate forward
         device_mesh = self.build_device_mesh()
         replica_spec = [Replicate()]
@@ -118,6 +139,10 @@ class RedistributeTest(DTensorContinuousTestBase):
 
     @parametrize("dtype", [torch.float32, torch.cfloat])
     def test_shard_to_partial_sum_forward_backward(self, dtype):
+        # [FUNCTION DOC] Shard(1) to Partial(sum) forward is a local op (no
+        # communication) whose full_tensor equals the input; backward of a replicated
+        # all-ones gradient gives a Shard(1) gradient of ones with no communication.
+        # Runs over several sizes, including one smaller than world size.
         device_mesh = self.build_device_mesh()
         partial_spec = [Partial("sum")]
         input_sizes = [
@@ -158,6 +183,9 @@ class RedistributeTest(DTensorContinuousTestBase):
             self.assertEqual(comm_mode.get_total_counts(), 0)
 
     def test_shard_to_partial_sum_graph_based(self):
+        # [FUNCTION DOC] Shard to Partial(sum) under use_min_cost_redistribution_plan
+        # (graph-based planner) on a size not divisible by world size; the full tensor
+        # must equal the input.
         device_mesh = self.build_device_mesh()
         input_tensor = torch.randn(3, self.world_size * 3 + 1, device=self.device_type)
         shard_dtensor = distribute_tensor(input_tensor, device_mesh, [Shard(1)])
@@ -168,6 +196,8 @@ class RedistributeTest(DTensorContinuousTestBase):
         self.assertEqual(partial_dtensor.full_tensor(), input_tensor)
 
     def test_shard_to_non_sum_partial_raises(self):
+        # [FUNCTION DOC] Shard to Partial(avg) must raise RuntimeError mentioning that
+        # only Shard to Partial(sum) redistribution is supported.
         device_mesh = self.build_device_mesh()
         input_tensor = torch.randn(3, 12, device=self.device_type)
         shard_dtensor = distribute_tensor(input_tensor, device_mesh, [Shard(1)])
@@ -178,6 +208,8 @@ class RedistributeTest(DTensorContinuousTestBase):
             shard_dtensor.redistribute(device_mesh, [Partial("avg")])
 
     def test_replicate_to_replicate_forward_backward(self):
+        # [FUNCTION DOC] Replicate to Replicate is a no-op with no communication in
+        # forward and backward; the gradient stays Replicate and equals ones.
         device_mesh = self.build_device_mesh()
         replica_spec = [Replicate()]
         local_tensor = torch.randn(12, 3, device=self.device_type, requires_grad=True)
@@ -206,6 +238,8 @@ class RedistributeTest(DTensorContinuousTestBase):
 
     @parametrize("dtype", [torch.float32, torch.cfloat])
     def test_partial_to_partial_forward_backward(self, dtype):
+        # [FUNCTION DOC] Partial to Partial (same reduce op) is a no-op in forward and
+        # backward: no communication, placements preserved, gradient values equal ones.
         device_mesh = self.build_device_mesh()
         partial_spec = [Partial()]
 
@@ -246,6 +280,9 @@ class RedistributeTest(DTensorContinuousTestBase):
 
     @parametrize("dtype", [torch.float32, torch.cfloat])
     def test_replicate_to_local_partial_grad(self, dtype):
+        # [FUNCTION DOC] Redistribute Replicate to Replicate followed by to_local with
+        # grad_placements Partial: backward must trigger exactly one collective, an
+        # all_reduce.
         device_mesh = self.build_device_mesh()
         replica_spec = [Replicate()]
         local_tensor = torch.randn(
@@ -266,6 +303,9 @@ class RedistributeTest(DTensorContinuousTestBase):
         self.assertEqual(comm_mode.get_comm_counts()[funcol.all_reduce], 1)
 
     def test_replicate_to_shard_forward_backward(self):
+        # [FUNCTION DOC] Replicate to Shard: forward just takes the local chunk (no
+        # communication) and matches torch.chunk by rank; backward yields a Replicate
+        # gradient of ones using one all_gather_into_tensor.
         device_mesh = self.build_device_mesh()
         replica_spec = [Replicate()]
 
@@ -316,6 +356,9 @@ class RedistributeTest(DTensorContinuousTestBase):
 
     @parametrize("dtype", [torch.float32, torch.cfloat])
     def test_partial_to_replicate_forward_backward(self, dtype):
+        # [FUNCTION DOC] Partial to Replicate triggers one all_reduce (result is local
+        # value times world size); backward passes through with no communication and
+        # gives a ones gradient on the partial local tensor.
         # Although we don't allow user to reshard to produce a partial
         # placement (i.e. user can't reshard to partial), we do allow
         # replicate to partial internally, and also partial to replicate
@@ -354,6 +397,10 @@ class RedistributeTest(DTensorContinuousTestBase):
         self.assertEqual(comm_mode.get_total_counts(), 0)
 
     def test_replicate_to_replicate_forward_backward_datatype_conversion(self):
+        # [FUNCTION DOC] Replicate to Replicate with forward_dtype/backward_dtype
+        # options (bfloat16, float32 or None). No communication; forward output equals
+        # the input cast to the forward dtype, and the gradient is Replicate with value
+        # ones.
         device_mesh = self.build_device_mesh()
         replica_spec = [Replicate()]
 
@@ -410,6 +457,10 @@ class RedistributeTest(DTensorContinuousTestBase):
             self.assertEqual(comm_mode.get_total_counts(), 0)
 
     def test_shard_to_replicate_forward_backward_datatype_conversion(self):
+        # [FUNCTION DOC] Shard to Replicate with forward_dtype/backward_dtype
+        # combinations over several sizes. Forward result equals the input cast to
+        # forward dtype with one all_gather; backward gives a Shard gradient of ones
+        # with no communication.
         device_mesh = self.build_device_mesh()
         replica_spec = [Replicate()]
 
@@ -481,6 +532,10 @@ class RedistributeTest(DTensorContinuousTestBase):
                 self.assertEqual(comm_mode.get_total_counts(), 0)
 
     def test_replicate_to_partial(self):
+        # [FUNCTION DOC] Replicate to Partial: the public redistribute must raise
+        # RuntimeError (Can not redistribute). Calling Redistribute.apply directly with
+        # explicit dtype options works: the local tensor is divided by world size with
+        # no communication, on a 1-D mesh and on a 2-D mesh with both dims Partial.
         device_mesh = self.build_device_mesh()
         local_tensor = torch.randn(12, 3, device=self.device_type, requires_grad=True)
         partial_spec = Partial()
@@ -547,6 +602,9 @@ class RedistributeTest(DTensorContinuousTestBase):
 
     @parametrize("dtype", [torch.float32, torch.cfloat])
     def test_partial_to_shard(self, dtype):
+        # [FUNCTION DOC] Partial to Shard for even and uneven sizes on dim 0 and 1: must
+        # use one reduce_scatter_tensor, and each rank's local shard is a ones tensor
+        # (of the expected uneven chunk shape) times world size.
         device_mesh = self.build_device_mesh()
         partial_spec = [Partial()]
         my_rank = self.rank
@@ -584,6 +642,10 @@ class RedistributeTest(DTensorContinuousTestBase):
 
             @maybe_run_for_local_tensor
             def _compute_local_shape(rank) -> list[int]:
+                # [FUNCTION DOC] HELPER: Returns the local shard shape for the given
+                # rank: the input shape with the sharded dim replaced by that rank's
+                # chunk size (closure over input_size, shard_dim, chunk_sizes). Wrapped
+                # so that it runs per rank in local tensor mode.
                 local_shape = list(input_size)
                 local_shape[shard_dim] = chunk_sizes[rank]
                 return local_shape
@@ -612,6 +674,12 @@ class RedistributeTest(DTensorContinuousTestBase):
         placements_dst: list,
         should_use_view: bool,
     ):
+        # [FUNCTION DOC] HELPER: Shared body for the all-gather view optimization tests.
+        # On a 2x2 mesh, distributes a random global tensor with the source placements,
+        # redistributes to the destination placements under DebugMode, and checks the
+        # recorded ops: with should_use_view the trace must contain aten::view and no
+        # split or cat; otherwise it must contain split and cat. Also checks result
+        # placements and local values against a direct distribution.
         """
         Helper method to test all_gather optimization behavior.
 
@@ -653,6 +721,9 @@ class RedistributeTest(DTensorContinuousTestBase):
         self.assertEqual(result.to_local(), expected_dt.to_local())
 
     def test_all_gather_view_optimization_batch1(self):
+        # [FUNCTION DOC] Shard(1),Shard(1) to Shard(1),Replicate on shape (1, 8192,
+        # 6144): batch is 1 and gather dim is 1, so the all-gather must be expressed as
+        # a view without split/cat.
         """
         Test that all_gather with gather_dim=1 and batch=1 uses a pure view
         instead of split+cat. This optimization avoids unnecessary copies.
@@ -668,6 +739,8 @@ class RedistributeTest(DTensorContinuousTestBase):
         )
 
     def test_all_gather_no_optimization_gather_dim_not_1(self):
+        # [FUNCTION DOC] Same as the view test but sharded on dim 2: gather dim is not
+        # 1, so the split plus cat fallback is expected.
         """
         Test that all_gather with batch=1 but gather_dim != 1 still falls back
         to split+cat, since the view optimization only applies to gather_dim=1.
@@ -683,6 +756,8 @@ class RedistributeTest(DTensorContinuousTestBase):
         )
 
     def test_all_gather_split_cat_fallback_batch_gt_1(self):
+        # [FUNCTION DOC] Batch size 4 with gather dim 1: a view is not possible, so the
+        # split plus cat fallback is expected.
         """
         Test that all_gather with gather_dim=1 and batch>1 falls back to
         split+cat (not optimized to view since that would require a copy).
@@ -698,6 +773,9 @@ class RedistributeTest(DTensorContinuousTestBase):
         )
 
     def test_redistribute_negative_shard_dim(self):
+        # [FUNCTION DOC] Redistributing Shard(1) to Shard(-1) on a 2-D tensor:
+        # placements are normalized so the resulting placement's dim is 1 (not negative)
+        # before and after.
         device_mesh = self.build_device_mesh()
         local_tensor = torch.randn(12, 3, device=self.device_type, requires_grad=True)
         shard_spec = [Shard(1)]
@@ -709,6 +787,9 @@ class RedistributeTest(DTensorContinuousTestBase):
         self.assertEqual(reshard_tensor.placements[0].dim, 1)
 
     def test_shard_to_replicate_local_tensor_contiguous(self):
+        # [FUNCTION DOC] Regression test for issue 173041: Shard to Replicate with
+        # uneven sharded dims (including non-leading dims) must yield a contiguous local
+        # tensor and DTensor, with values equal to the original full tensor.
         # Regression test for https://github.com/pytorch/pytorch/issues/173041.
         # When the sharded dim is not evenly divisible by world_size the unpad
         # step in Shard._to_replicate_tensor uses narrow(), which on a non-leading
@@ -743,6 +824,9 @@ class RedistributeTest(DTensorContinuousTestBase):
             self.assertEqual(dt_back_rep.to_local(), full_tensor)
 
     def test_redistribute_uneven_sharding(self):
+        # [FUNCTION DOC] Distributes tensors that are uneven or smaller than the 2x2
+        # mesh with Shard(0),Shard(0) and Shard(0),Shard(1), and checks full_tensor
+        # reproduces the input.
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size).reshape(2, 2))
         data_to_test = [
             # uneven on last mesh dim
@@ -768,6 +852,12 @@ class RedistributeTest(DTensorContinuousTestBase):
     @skip_if_lt_x_gpu(4)
     @parametrize("dtype", [torch.float32, torch.cfloat])
     def test_redistribute_shard_dim_change(self, dtype):
+        # [FUNCTION DOC] Shard dim change (Shard(0) <-> Shard(1)) on a 1-D mesh and
+        # several 2-D/3-D mesh placement pairs. Result placements and local values must
+        # equal a direct distribution. On an accelerator the 1-D case expects one
+        # shard_dim_alltoall; on CPU one all_gather (unless local tensor mode). 2-D
+        # total collective counts are checked against a table unless local tensor mode
+        # is on. Needs at least 4 GPUs (skip decorator).
         # test 1d device mesh
         mesh_1d = self.build_device_mesh()
         data_to_test = [
@@ -868,6 +958,9 @@ class RedistributeTest(DTensorContinuousTestBase):
 
     @parametrize("dtype", [torch.float32, torch.cfloat])
     def test_shard_dim_alltoall(self, dtype):
+        # [FUNCTION DOC] Calls shard_dim_alltoall on a real tensor and on a meta tensor
+        # over a 2x2 mesh (mesh dim 0, scatter dim 1, gather dim 0) and checks that
+        # shape and stride agree.
         # init 2d mesh here so we can test when group_rank != global_rank
         mesh = init_device_mesh(self.device_type, (2, 2))
         tensor = torch.randn(12, self.world_size, device=self.device_type, dtype=dtype)
@@ -880,6 +973,9 @@ class RedistributeTest(DTensorContinuousTestBase):
         self.assertEqual(new_tensor.stride(), new_meta_tensor.stride())
 
     def test_one_chunk_mesh(self):
+        # [FUNCTION DOC] On a (4, 1) mesh where the second dim has size 1, any
+        # redistribute of the second placement among Shard/Replicate/Partial to
+        # Shard/Replicate must issue no communication and give the requested placements.
         # mesh size is 1 on second dim
         mesh = init_device_mesh(self.device_type, (4, 1))
 
@@ -899,6 +995,13 @@ class RedistributeTest(DTensorContinuousTestBase):
             self.assertEqual(out.placements, [Shard(0), dst])
 
     def test_redistribute_to_partial(self):
+        # [FUNCTION DOC] Table-driven check on a 2x2 mesh of which redistributions into
+        # Partial are allowed: Partial to Partial with the same reduce op succeeds,
+        # Replicate to Partial raises RuntimeError (Can not redistribute), as does
+        # changing the reduce op.
+        # KNOWN ISSUE: the case Shard(0),Shard(1) to Replicate,Partial is expected to
+        # succeed although it sits below the comment saying non-Partial to Partial is
+        # not allowed.
         mesh = init_device_mesh(self.device_type, (2, 2))
 
         tensor = torch.randn(12, 8, device=self.device_type)
@@ -930,6 +1033,9 @@ class RedistributeTest(DTensorContinuousTestBase):
                 self.assertEqual(out.placements, dst)
 
     def test_replicate_to_partial_different_reduce_ops(self):
+        # [FUNCTION DOC] Uses Redistribute.apply directly to do Replicate to Partial for
+        # each reduce op (sum, avg, min, max). Must not communicate; for sum the local
+        # tensor is divided by world size, for avg/min/max it is unchanged.
         """
         Test that Replicate -> Partial transitions work for all reduce op types.
 
@@ -985,6 +1091,12 @@ class RedistributeTest(DTensorContinuousTestBase):
                 )
 
     def test_replicate_to_partial_planner_reduce_op_collection(self):
+        # [FUNCTION DOC] Checks that the planner (from get_redistribute_planner) records
+        # exactly the reduce ops present in source and destination placements in
+        # partial_reduce_ops_in_target after generate_graph_based_transform_infos.
+        # Covers Replicate to Partial(min), Partial(max) to Replicate, and a 2-D mesh
+        # with sum and avg. Clears the planner's set before each case since planners are
+        # cached.
         """
         Test that the redistribution planner correctly collects reduce ops from
         src/dst placements and only considers those in graph exploration.
@@ -1088,6 +1200,10 @@ class RedistributeTest(DTensorContinuousTestBase):
         )
 
     def test_redistribute_zero_size_shards(self):
+        # [FUNCTION DOC] Tensor of size 2 on dim 0 sharded over 4 ranks leaves ranks 2
+        # and 3 empty (shape check skipped in local tensor mode). Shard(0) to Replicate
+        # and to Shard(1) must give local shapes (2, 8) and (2, 2) and keep the same
+        # full tensor.
         # Adding this test to ensure sharding works when tensor size < mesh size.
         # Tests correct redistribution with world size = 4, tensor dim size = 2,
         # ranks 2 & 3 have empty local shards.
@@ -1116,6 +1232,10 @@ class RedistributeTest(DTensorContinuousTestBase):
 
     @parametrize("dtype", [torch.float32])
     def test_shard_to_replicate_forward_backward_backward(self, dtype):
+        # [FUNCTION DOC] Double backward through Shard to Replicate: a DTensor times a
+        # replicated weight, ReLU, full_tensor and square. Verifies value, one
+        # all_gather in forward, one in the first backward, one in the second backward,
+        # and that the weight gradient equals the reference parameter gradient.
         # 1) test shard -> replicate forward
         device_mesh = self.build_device_mesh()
         replica_spec = [Replicate()]
@@ -1180,9 +1300,18 @@ instantiate_parametrized_tests(RedistributeTest)
 
 
 class MultiDimRedistributeTest(DTensorContinuousTestBase):
+    # [CLASS DOC] Tests on an 8-rank world covering redistribution on meshes of 1 to 3
+    # dims.
     world_size = 8
 
     def test_multi_dim_mesh(self):
+        # [FUNCTION DOC] Exhaustively redistributes between all Replicate/Shard/Partial
+        # placement combinations on a mesh and checks that full_tensor on rank 0 equals
+        # the original multiplied by the product of the Partial mesh dim sizes. Partial
+        # inputs are made by reinterpreting a replicated local tensor.
+        # KNOWN ISSUE: the loop variable mesh_shape is overwritten at the top of each
+        # iteration with a 2-D view, so the three listed shapes are never actually
+        # distinguished.
         devices = torch.arange(self.world_size)
         for mesh_shape in [devices, devices.view(4, 2), devices.view(2, 2, 2)]:
             mesh_shape = torch.arange(self.world_size).view(-1, 2)
@@ -1231,6 +1360,9 @@ class MultiDimRedistributeTest(DTensorContinuousTestBase):
                         self.assertEqual(local_full, expected)
 
     def test_redistribute_shard_dim_multi_dim_mesh(self):
+        # [FUNCTION DOC] On a 2x2x2 mesh, redistributes among several Shard placement
+        # pairs; checks placements, local values against a direct distribution and the
+        # total collective count against an expected table.
         mesh = init_device_mesh(self.device_type, (2, 2, 2))
         input_data = torch.randn((8, 8, 8), device=self.device_type)
 
@@ -1268,9 +1400,15 @@ class MultiDimRedistributeTest(DTensorContinuousTestBase):
 
 
 class DistributeWithDeviceOrderTest(DTensorContinuousTestBase):
+    # [CLASS DOC] Tests redistribution with explicit shard order (ShardOrderEntry),
+    # checking the traced transform path, planner choice, cost properties and flattened
+    # collectives on 8 ranks.
     world_size = 8
 
     def _extract_redistribute_trace_from_debug_mode(self, s: str) -> str:
+        # [FUNCTION DOC] HELPER: Extracts the redistribution trace text from a DebugMode
+        # debug string using a regular expression; returns an empty string if no trace
+        # is found.
         import re
 
         match = re.search(r"trace:\s*(.*)\)", s)
@@ -1281,6 +1419,10 @@ class DistributeWithDeviceOrderTest(DTensorContinuousTestBase):
             return ""
 
     def test_ordered_redistribute(self):
+        # [FUNCTION DOC] Distributes a tensor on a 2x2x2 mesh with a source shard order,
+        # redistributes with a destination order under DebugMode, and compares the
+        # recorded transform trace to an expected string for four cases. Local values
+        # must equal a direct distribution to the destination.
         """Test ordered redistribution with various sharding syntaxes"""
         torch.manual_seed(21)
         mesh = init_device_mesh(self.device_type, (2, 2, 2))
@@ -1367,6 +1509,10 @@ class DistributeWithDeviceOrderTest(DTensorContinuousTestBase):
             self.assertEqual(sharded_dt.to_local(), expected_dt.to_local())
 
     def test_force_min_cost_redistribution_plan(self):
+        # [FUNCTION DOC] Runs the same Shard(0) to Shard(1) all-mesh-dim redistribution
+        # with the graph-based planner enabled and then disabled (greedy), checking the
+        # distinct expected traces and the values. Clears the _gen_transform_infos cache
+        # between iterations so the second run is not served from cache.
         """
         Test that the disable_graph_based_transform context manager correctly controls
         the redistribution algorithm selection (graph-based vs greedy).
@@ -1435,6 +1581,9 @@ class DistributeWithDeviceOrderTest(DTensorContinuousTestBase):
             _gen_transform_infos.cache_clear()
 
     def test_generate_shard_orders(self):
+        # [FUNCTION DOC] Checks that generate_shard_orders yields no duplicates and that
+        # the count matches a combinatorial formula for a 3-dim mesh and tensor ranks 2,
+        # 3 and 4.
         """Check if `generate_shard_orders` generates unique sharding combinations"""
         import math
 
@@ -1475,6 +1624,10 @@ class DistributeWithDeviceOrderTest(DTensorContinuousTestBase):
 
     @unittest.skipIf(TEST_WITH_ROCM, "https://github.com/pytorch/pytorch/issues/168197")
     def test_ordered_distribute_all_combination(self):
+        # [FUNCTION DOC] Exhaustive correctness: for several shapes (even and uneven),
+        # distributes with every generated shard order and checks the full tensor; then
+        # chains redistributions from each order to the next and checks the full tensor
+        # each time. Skipped on ROCm.
         """Exhaustively test all possible sharding combinations and verify correctness"""
         torch.manual_seed(21)
 
@@ -1527,6 +1680,9 @@ class DistributeWithDeviceOrderTest(DTensorContinuousTestBase):
                     prev_sharded_dt = sharded_dt
 
     def test_graph_based_redistribute_cost(self):
+        # [FUNCTION DOC] Property test of redistribute_cost under the min-cost planner:
+        # for randomly paired shard orders and sampled intermediate orders, cost(src,
+        # dst) must not exceed cost(src, int) plus cost(int, dst).
         """
         This test verifies the correctness of
             1. redistribute_cost, and
@@ -1597,6 +1753,9 @@ class DistributeWithDeviceOrderTest(DTensorContinuousTestBase):
                         )
 
     def test_redistribute_cost_sort_key_uses_unbacked_hint(self):
+        # [FUNCTION DOC] With an unbacked symbolic int given a hint override of 8,
+        # _redistribute_cost_sort_key must order the cheaper symbolic cost below the
+        # costlier one, i.e. it sorts using the hint.
         shape_env = ShapeEnv()
         unbacked = shape_env.create_unbacked_symint()
         shape_env.var_to_hint_override[unbacked.node.expr] = 8
@@ -1610,6 +1769,11 @@ class DistributeWithDeviceOrderTest(DTensorContinuousTestBase):
         )
 
     def test_redistribute_partial_to_different_partial_not_supported(self):
+        # [FUNCTION DOC] redistribute_local_tensor from Partial(sum) to Partial(avg)
+        # must raise AssertionError saying redistribution from one partial type to
+        # another is unsupported.
+        # KNOWN ISSUE: a comment in the body mentions Partial(max) though the target is
+        # avg.
         # Test that redistributing from one Partial type to another raises an error
         device_mesh = self.build_device_mesh()
         local_tensor = torch.randn(4, 4, device=self.device_type)
@@ -1649,6 +1813,9 @@ class DistributeWithDeviceOrderTest(DTensorContinuousTestBase):
         "graph based redistribution"
     )
     def test_ordered_redistribute_for_special_placement(self):
+        # [FUNCTION DOC] Skipped test (unittest.skip): would redistribute Shard(1) to
+        # _MaskPartial on a 1-D mesh of 8 with an explicit shard order. It has no
+        # assertions.
         """Test ordered redistribution with special placement"""
         torch.manual_seed(21)
         mesh = init_device_mesh(self.device_type, (8,))
@@ -1666,6 +1833,9 @@ class DistributeWithDeviceOrderTest(DTensorContinuousTestBase):
         sharded_dt = redistribute(sharded_dt, mesh, tgt_placement, shard_order=None)
 
     def test_shard_order_same_data_as_strided_shard(self):
+        # [FUNCTION DOC] Checks that a _StridedShard(-2, split_factor 2) followed by
+        # Shard(-2) on a 4x2 mesh gives the same local shards as Shard(0),Shard(0) with
+        # a shard order of mesh dims (1, 0).
         device_mesh = init_device_mesh(self.device_type, (4, 2))
         x = torch.randn(8, 4, device=self.device_type)
         # specify right-to-left order use _StridedShard
@@ -1681,6 +1851,11 @@ class DistributeWithDeviceOrderTest(DTensorContinuousTestBase):
         self.assertEqual(x_ordered_dt.to_local(), x_strided_dt.to_local())
 
     def test_ordered_all_gather_with_flattening(self):
+        # [FUNCTION DOC] On a 2x2x2 mesh with all flattened submeshes, redistributing
+        # Shard(0) on all dims to fully replicated uses one flattened all_gather when
+        # the order is (0, 1, 2) and three separate all_gathers when the order is (1, 0,
+        # 2), since flattening would give a wrong order. Both results must equal the
+        # input.
         """Test that flattened all_gather produces correct results with non-ascending shard order.
 
         This test verifies that when we have a tensor sharded with non-ascending order
@@ -1761,6 +1936,10 @@ class DistributeWithDeviceOrderTest(DTensorContinuousTestBase):
         self.assertEqual(non_ascending_result.to_local(), input_data)
 
     def test_debug_mode_shows_optimized_trace(self):
+        # [FUNCTION DOC] Checks that DebugMode records the optimized (flattened)
+        # transform: for Shard(0),Shard(0) to fully replicated on a 4x2 mesh with a
+        # flattened A_B mesh, the trace contains the flattened arrow marker and no
+        # intermediate state. Prints the trace on rank 0. Result must equal the input.
         """Test that DebugMode captures the optimized (flattened) redistribution trace.
 
         This verifies that debug_mode.record_redistribute_calls receives the
@@ -1828,9 +2007,14 @@ class DistributeWithDeviceOrderTest(DTensorContinuousTestBase):
 
 
 class DistributeWithStridedShardTest(DTensorContinuousTestBase):
+    # [CLASS DOC] Tests redistribution involving _StridedShard placements on 8 ranks
+    # across 1-D, 2-D and 3-D meshes, including expected traces and error cases.
     world_size = 8
 
     def _extract_redistribute_trace_from_debug_mode(self, s: str) -> str:
+        # [FUNCTION DOC] HELPER: Extracts the redistribution trace text from a DebugMode
+        # debug string using a regular expression; returns an empty string if no trace
+        # is found.
         import re
 
         match = re.search(r"trace:\s*(.*)\)", s)
@@ -1841,6 +2025,10 @@ class DistributeWithStridedShardTest(DTensorContinuousTestBase):
             return ""
 
     def test_strided_shard_redistribution(self):
+        # [FUNCTION DOC] Redistributes _StridedShard to Replicate on 1-D and 2-D meshes
+        # (checking values and full_tensor), then on a 2x2x2 mesh for four
+        # source/destination pairs with shard orders, comparing the DebugMode trace to
+        # expected strings and the values to a direct distribution.
         torch.manual_seed(21)
         # 1D mesh: _StridedShard -> Replicate uses the greedy path's 1D shortcut
         mesh_1d = init_device_mesh(self.device_type, (self.world_size,))
@@ -1956,6 +2144,9 @@ class DistributeWithStridedShardTest(DTensorContinuousTestBase):
             self.assertEqual(sharded_dt.to_local(), expected_dt.to_local())
 
     def test_strided_shard_to_shard_redistribution(self):
+        # [FUNCTION DOC] Redistributes between _StridedShard and Shard (both directions)
+        # on 1-D, 2-D meshes and one 3-D case; local values must equal a direct
+        # distribution and the full tensor must equal the input.
         torch.manual_seed(42)
         mesh_1d = init_device_mesh(self.device_type, (self.world_size,))
         mesh_2d = init_device_mesh(self.device_type, (4, 2))
@@ -2033,6 +2224,9 @@ class DistributeWithStridedShardTest(DTensorContinuousTestBase):
         self.assertEqual(result_dt.to_local(), expected_dt.to_local())
 
     def test_partial_to_strided_shard_redistribution(self):
+        # [FUNCTION DOC] Partial(sum) to _StridedShard on 1-D and 2-D meshes: result
+        # local and full tensors must equal those of the reduced tensor (input times the
+        # reduction size) distributed directly.
         torch.manual_seed(42)
 
         # 1D mesh, Partial -> _StridedShard(0)
@@ -2066,6 +2260,9 @@ class DistributeWithStridedShardTest(DTensorContinuousTestBase):
         self.assertEqual(result_dt.full_tensor(), reduced_2d)
 
     def test_strided_shard_to_partial_raises(self):
+        # [FUNCTION DOC] Redistributing from _StridedShard to Partial(sum) must raise
+        # RuntimeError on 1-D and 2-D meshes, and also when a _StridedShard is retained
+        # while another dim goes from Shard to Partial.
         torch.manual_seed(42)
 
         # 1D mesh
@@ -2101,9 +2298,13 @@ class DistributeWithStridedShardTest(DTensorContinuousTestBase):
 
 
 class TransformInfoTest(TestCase):
+    # [CLASS DOC] Tests for _TransformInfo._comm_type_key.
     """Tests for _TransformInfo._comm_type_key method."""
 
     def test_comm_type_key(self):
+        # [FUNCTION DOC] Checks that _comm_type_key returns all_reduce, reduce_scatter,
+        # all_gather or all_to_all for communicating placement pairs and None for the
+        # local Replicate to Shard and Replicate to Partial transforms.
         """Test _comm_type_key returns correct keys for different placement transforms."""
         # Comm ops: return comm type string
         test_cases = [
@@ -2129,6 +2330,8 @@ class TransformInfoTest(TestCase):
             self.assertIsNone(info._comm_type_key())
 
     def test_comm_type_key_strided_shard(self):
+        # [FUNCTION DOC] Checks that _StridedShard yields the same comm type keys as
+        # Shard for reduce_scatter, all_gather and all_to_all pairs.
         """_StridedShard must produce the same comm type keys as Shard."""
         ss = _StridedShard(0, split_factor=2)
         test_cases = [
@@ -2147,6 +2350,9 @@ class TransformInfoTest(TestCase):
 
 
 class OptimizeFlattenedReductionsTest(TestCase):
+    # [CLASS DOC] Single-process tests of _optimize_transform_infos using the fake
+    # process group (8 ranks, rank 0). setUpClass creates the group and tearDownClass
+    # destroys it. No real communication.
     """Tests for _optimize_transform_infos helper.
 
     Uses fake process group since these tests don't perform actual communications.
@@ -2154,16 +2360,24 @@ class OptimizeFlattenedReductionsTest(TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] HELPER: Initializes a fake process group with a FakeStore, rank
+        # 0 and world size 8 after the base class setup.
         super().setUpClass()
         fake_store = FakeStore()
         dist.init_process_group("fake", store=fake_store, rank=0, world_size=8)
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] HELPER: Destroys the process group, then runs the base class
+        # teardown.
         dist.destroy_process_group()
         super().tearDownClass()
 
     def test_no_flattened_mesh_returns_original(self):
+        # [FUNCTION DOC] Without any flattened mesh, two all_reduces on mesh dims 0 and
+        # 2 are returned unchanged and one warning is logged (suboptimal, naming the
+        # placements, dim names, count and comm type). A second call must not log again.
+        # Patches the warned-issues cache with an empty set.
         """When no flattened mesh exists, original transforms are returned with a warning."""
         mesh = init_device_mesh("cpu", (2, 2, 2), mesh_dim_names=("A", "B", "C"))
 
@@ -2218,6 +2432,9 @@ class OptimizeFlattenedReductionsTest(TestCase):
                 )
 
     def test_consecutive_reductions_flattened(self):
+        # [FUNCTION DOC] Two all_reduces on consecutive dims 0 and 1 with a flattened
+        # A_B mesh merge into one _FlattenedTransformInfo whose original_mesh_dims is
+        # (0, 1).
         """Consecutive same-type reductions on consecutive mesh dims are flattened."""
         mesh = init_device_mesh("cpu", (2, 2, 2), mesh_dim_names=("A", "B", "C"))
         mesh["A", "B"]._flatten("A_B")
@@ -2248,6 +2465,8 @@ class OptimizeFlattenedReductionsTest(TestCase):
         self.assertEqual(result[0].original_mesh_dims, (0, 1))
 
     def test_non_consecutive_dims_not_merged(self):
+        # [FUNCTION DOC] All_reduces on dims 0 and 2 separated by an all_gather on dim 1
+        # are not merged: three plain _TransformInfo entries are returned.
         """Reductions on dims 0 and 2 with different op on dim 1 are NOT merged.
 
         Only consecutive same-type operations are merged to preserve correctness.
@@ -2287,6 +2506,8 @@ class OptimizeFlattenedReductionsTest(TestCase):
         self.assertTrue(all(isinstance(r, _TransformInfo) for r in result))
 
     def test_all_dims_flattened(self):
+        # [FUNCTION DOC] Three all_reduces on all dims with a flattened A_B_C mesh merge
+        # into one flattened transform with mesh dims (0, 1, 2).
         """All dims with same reduce_op are flattened when full mesh exists."""
         mesh = init_device_mesh("cpu", (2, 2, 2), mesh_dim_names=("A", "B", "C"))
         mesh["A", "B", "C"]._flatten("A_B_C")
@@ -2321,6 +2542,8 @@ class OptimizeFlattenedReductionsTest(TestCase):
         self.assertEqual(result[0].original_mesh_dims, (0, 1, 2))
 
     def test_single_reduction_not_flattened(self):
+        # [FUNCTION DOC] A single all_reduce is returned as a plain _TransformInfo even
+        # if a flattened mesh exists.
         """A single reduction is not flattened even if mesh exists."""
         mesh = init_device_mesh("cpu", (2, 2, 2), mesh_dim_names=("A", "B", "C"))
         mesh["A", "C"]._flatten("A_C")
@@ -2344,6 +2567,9 @@ class OptimizeFlattenedReductionsTest(TestCase):
         self.assertIsInstance(result[0], _TransformInfo)
 
     def test_redistribute_with_submesh_flattened(self):
+        # [FUNCTION DOC] Calls the public redistribute on a flattened submesh (cp, ep)
+        # of a 4-D root mesh with Partial,Partial to Replicate,Replicate; checks the
+        # result placements, exercising mesh dim interpretation relative to the submesh.
         """Test that redistribute works correctly with a flattened submesh.
 
         This exercises _get_flattened_mesh_by_layout through the public
@@ -2367,6 +2593,10 @@ class OptimizeFlattenedReductionsTest(TestCase):
         self.assertEqual(result.placements, (Replicate(), Replicate()))
 
     def test_reduce_scatter_with_intervening_shard_flattened(self):
+        # [FUNCTION DOC] Partial to Shard(0) on dims 0 and 2 with an unchanged Shard(0)
+        # on dim 1 between: flattening must be allowed (logical shape 2 divisible by
+        # flattened size 2) and give one flattened transform. Guards against counting
+        # the intervening shard twice.
         """Reduce-scatter SHOULD be flattened when intervening shard still allows even division.
 
         Scenario:
@@ -2419,6 +2649,9 @@ class OptimizeFlattenedReductionsTest(TestCase):
         self.assertIsInstance(result[0], _FlattenedTransformInfo)
 
     def test_reduce_scatter_with_prior_shard_flattened(self):
+        # [FUNCTION DOC] Partial to Shard(0) on dims 1 and 2 with a prior Shard(0) on
+        # dim 0 (logical shape 12, flattened size 4): flattening is allowed and gives
+        # one flattened transform with mesh dims (1, 2).
         """Reduce-scatter should be flattened when prior shard is already in logical_shape.
 
         Scenario:
@@ -2465,6 +2698,10 @@ class OptimizeFlattenedReductionsTest(TestCase):
         self.assertEqual(result[0].original_mesh_dims, (1, 2))
 
     def test_uneven_tensor_shape_returns_original_with_warning(self):
+        # [FUNCTION DOC] Reduce_scatter on a (2, 3) mesh with tensor size 10 not
+        # divisible by the flattened size 6: the original two transforms are returned
+        # and a warning containing reduce_scatter and not evenly divisible is logged
+        # once.
         """When tensor dim is not evenly divisible by flattened mesh, originals returned with warning.
 
         Scenario:
@@ -2519,6 +2756,7 @@ class OptimizeFlattenedReductionsTest(TestCase):
             self.assertIn("not evenly divisible", warning_msg)
 
     def test_empty_input(self):
+        # [FUNCTION DOC] An empty transform list yields an empty list.
         """Empty input returns empty output."""
         mesh = init_device_mesh("cpu", (2, 2, 2), mesh_dim_names=("A", "B", "C"))
 
@@ -2532,6 +2770,8 @@ class OptimizeFlattenedReductionsTest(TestCase):
         self.assertEqual(result, [])
 
     def test_all_gathers_grouped(self):
+        # [FUNCTION DOC] Two all_gathers listed in reverse mesh order (1 then 0) with a
+        # flattened A_B mesh merge into one flattened transform with mesh dims (0, 1).
         """Multiple all-gather operations are grouped and flattened."""
         mesh = init_device_mesh("cpu", (2, 2, 2), mesh_dim_names=("A", "B", "C"))
         mesh["A", "B"]._flatten("A_B")
@@ -2564,6 +2804,8 @@ class OptimizeFlattenedReductionsTest(TestCase):
         self.assertEqual(result[0].original_mesh_dims, (0, 1))
 
     def test_mixed_collective_types_not_grouped(self):
+        # [FUNCTION DOC] An all_reduce and an all_gather on dims 0 and 1 are different
+        # collective types and stay as two plain transforms.
         """Different collective types (allreduce vs all-gather) are not grouped."""
         mesh = init_device_mesh("cpu", (2, 2, 2), mesh_dim_names=("A", "B", "C"))
         mesh["A", "B"]._flatten("A_B")
@@ -2593,6 +2835,8 @@ class OptimizeFlattenedReductionsTest(TestCase):
         self.assertTrue(all(isinstance(r, _TransformInfo) for r in result))
 
     def test_mixed_sum_avg_partial_types_merged_allreduce(self):
+        # [FUNCTION DOC] Partial(sum) and Partial(avg) all_reduces on a 2x2 mesh with a
+        # flattened mesh merge into one flattened transform.
         """Mixed Partial types (sum vs avg) SHOULD be grouped for allreduce.
 
         When redistributing (Partial("sum"), Partial("avg")) -> (Replicate, Replicate),
@@ -2627,6 +2871,8 @@ class OptimizeFlattenedReductionsTest(TestCase):
         self.assertIsInstance(result[0], _FlattenedTransformInfo)
 
     def test_mixed_sum_avg_partial_types_merged_reduce_scatter(self):
+        # [FUNCTION DOC] Partial(sum) and Partial(avg) reduce_scatters to Shard(0) on a
+        # 2x2 mesh with a flattened mesh merge into one flattened transform.
         """Mixed Partial types (sum vs avg) SHOULD be grouped for reduce_scatter.
 
         When redistributing (Partial("sum"), Partial("avg")) -> (Shard(0), Shard(0)),
@@ -2661,6 +2907,13 @@ class OptimizeFlattenedReductionsTest(TestCase):
         self.assertIsInstance(result[0], _FlattenedTransformInfo)
 
     def test_reduce_scatter_ordering_uses_transform_order(self):
+        # [FUNCTION DOC] Reduce_scatter transforms listed in descending mesh dim order
+        # (1 then 0) are not flattened when only an ascending A_B mesh exists: two
+        # transforms remain and a warning mentioning non-ascending order and
+        # reduce_scatter is logged.
+        # KNOWN ISSUE: the docstring says the code sorts dims and that the test exposes
+        # the bug, but the assertions check the fixed behavior (no flattening plus
+        # warning).
         """Flattened mesh order must match transform_infos order for reduce_scatter.
 
         When transform_infos are in order (1, 0) - i.e., mesh_dim=1 first, then
@@ -2716,6 +2969,9 @@ class OptimizeFlattenedReductionsTest(TestCase):
             self.assertIn("reduce_scatter", warning_msg)
 
     def test_disable_optimization_context_manager(self):
+        # [FUNCTION DOC] Verifies that disable_redistribute_transform_optimization makes
+        # _optimize_transform_infos return the original objects unchanged, and that
+        # merging is restored after the context exits.
         """The disable_redistribute_transform_optimization context manager prevents merging."""
         mesh = init_device_mesh("cpu", (2, 2, 2), mesh_dim_names=("A", "B", "C"))
         mesh["A", "B"]._flatten("A_B")
@@ -2762,6 +3018,8 @@ class OptimizeFlattenedReductionsTest(TestCase):
 
 
 class MultiDimRedistributeOptimizationTest(DTensorContinuousTestBase):
+    # [CLASS DOC] Integration tests on 8 ranks for redistribute numerics and collective
+    # counts with flattened meshes.
     """Integration tests for multi-dimensional redistribute correctness and optimization.
 
     These tests verify numerical correctness of various redistribute patterns
@@ -2771,6 +3029,12 @@ class MultiDimRedistributeOptimizationTest(DTensorContinuousTestBase):
     world_size = 8
 
     def test_multi_dim_redistribute(self):
+        # [FUNCTION DOC] Runs a table of 2-D and 3-D mesh cases (with flattened
+        # submeshes). For each case, builds a source DTensor (Partial made by
+        # reinterpreting a replicated local tensor), redistributes with CommDebugMode,
+        # checks per-collective counts, result placements and that full_tensor equals
+        # the global tensor times the product of Partial mesh dim sizes. Uses a subTest
+        # per case.
         """Test various redistribute patterns for correctness and comm count optimization.
 
         Each test case is: (mesh_shape, flattened_dims, src_placements, dst_placements, expected_comm_counts)
@@ -2924,6 +3188,10 @@ class MultiDimRedistributeOptimizationTest(DTensorContinuousTestBase):
                 self.assertEqual(result_full, expected_full)
 
     def test_mixed_sum_avg_partial_numerics(self):
+        # [FUNCTION DOC] Checks that merging Partial(avg), Partial(avg), Partial(sum)
+        # uses one all_reduce (to Replicate) or one reduce_scatter (to Shard(0)), and
+        # that the result equals the global tensor times mesh size 8 divided by the
+        # product of avg dims only (4).
         """Test numerical correctness for mixed Partial("sum") and Partial("avg").
 
         This test verifies that when merging mixed sum/avg partials:
@@ -3012,6 +3280,8 @@ class MultiDimRedistributeOptimizationTest(DTensorContinuousTestBase):
 
 
 class FlattenedReductionIntegrationTest(DTensorContinuousTestBase):
+    # [CLASS DOC] Integration tests on 8 ranks that flattened meshes reduce the number
+    # of collectives for consecutive Partial reductions.
     """Integration tests for flattened reduction optimization.
 
     These tests verify that redistribute actually performs fewer communications
@@ -3021,6 +3291,13 @@ class FlattenedReductionIntegrationTest(DTensorContinuousTestBase):
     world_size = 8
 
     def test_merging_reductions(self):
+        # [FUNCTION DOC] Progressively flattens A_B_C, A_B and A_C and checks total
+        # collective counts: 1 for three Partial dims, 1 for two consecutive, 1 for
+        # Partial,Replicate,Partial, and 3 for Partial,Shard,Partial. Values are checked
+        # against ones scaled by the reduced size (and by the gathered size in the last
+        # case).
+        # KNOWN ISSUE: the comment before the last case says it CAN merge but the
+        # assertion expects 3 collectives (no merge).
         """Tests various combinations in the same test function to avoid setup time"""
         mesh = init_device_mesh(
             self.device_type, (2, 2, 2), mesh_dim_names=("A", "B", "C")
@@ -3116,6 +3393,8 @@ class FlattenedReductionIntegrationTest(DTensorContinuousTestBase):
 
 
 class UnevenFlattenedReduceScatterTest(DTensorContinuousTestBase):
+    # [CLASS DOC] Tests flattened reduce_scatter correctness with uneven tensor dims on
+    # a (2, 3) mesh with 6 ranks.
     """Test for correctness of flattened reduce_scatter with uneven tensor dimensions.
 
     When redistributing Partial,Partial → Shard(dim),Shard(dim) on a 2D mesh,
@@ -3126,6 +3405,10 @@ class UnevenFlattenedReduceScatterTest(DTensorContinuousTestBase):
     world_size = 6  # 2 x 3 mesh
 
     def test_partial_partial_to_shard_shard_uneven(self):
+        # [FUNCTION DOC] Partial,Partial to Shard(0),Shard(0) for a tensor of size 4 on
+        # a (2, 3) mesh with a flattened mesh available. Expected two-step layout: ranks
+        # 0,1,3,4 hold one element each (values 0,1,2,3 times 6) and ranks 2,5 are
+        # empty; the flattened optimization must not change this placement of data.
         """Test that Partial,Partial -> Shard(0),Shard(0) produces correct results with uneven dims.
 
         With mesh [2, 3] and tensor dim 0 size = 4:
@@ -3221,13 +3504,20 @@ DistributeWithDeviceOrderTestWithLocalTensor = create_local_tensor_test_class(
 
 
 class _CollectiveDtypeTracer(torch.utils._python_dispatch.TorchDispatchMode):
+    # [CLASS DOC] HELPER: TorchDispatchMode that records (op name, dtype of first tensor
+    # arg) for each _c10d_functional op seen, in the events list, and executes the op
+    # normally.
     """Records the dtype of the first tensor argument for each _c10d_functional op."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Initializes the base mode and an empty events list.
         super().__init__()
         self.events: list[tuple[str, torch.dtype]] = []
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] HELPER: Records the op name and first argument dtype when the
+        # op name contains _c10d_functional and the first arg is a tensor, then runs and
+        # returns the op result.
         kwargs = kwargs or {}
         name = str(func)
         if "_c10d_functional" in name and args and isinstance(args[0], torch.Tensor):
@@ -3235,10 +3525,15 @@ class _CollectiveDtypeTracer(torch.utils._python_dispatch.TorchDispatchMode):
         return func(*args, **kwargs)
 
     def dtypes_for(self, op_substr: str) -> list[torch.dtype]:
+        # [FUNCTION DOC] HELPER: Returns the dtypes of recorded events whose op name
+        # contains the given substring.
         return [dt for name, dt in self.events if op_substr in name]
 
 
 class RedistributeBackwardDtypeTest(TestCase):
+    # [CLASS DOC] Single-process (fake process group, world size 4) tests that
+    # redistribute's backward_dtype and forward_dtype control the dtype of the
+    # collectives.
     """Verify ``DTensor.redistribute(..., backward_dtype=...)`` actually runs the
     backward collective at the requested dtype.
 
@@ -3248,15 +3543,22 @@ class RedistributeBackwardDtypeTest(TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] HELPER: Initializes a fake process group with world size 4 and
+        # rank 0.
         super().setUpClass()
         dist.init_process_group("fake", store=FakeStore(), rank=0, world_size=4)
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] HELPER: Destroys the process group, then runs the base class
+        # teardown.
         dist.destroy_process_group()
         super().tearDownClass()
 
     def test_backward_dtype_runs_backward_collective_at_that_dtype(self):
+        # [FUNCTION DOC] Shard to Replicate with bfloat16 forward and backward dtypes:
+        # the traced all_gather and reduce_scatter run in bfloat16 while the local
+        # gradient stays float32.
         mesh = init_device_mesh("cpu", (4,), mesh_dim_names=("dp",))
         local = torch.randn(16, 8, dtype=torch.float32, requires_grad=True)
         dt = DTensor.from_local(local, mesh, [Shard(0)])
@@ -3279,6 +3581,9 @@ class RedistributeBackwardDtypeTest(TestCase):
         self.assertEqual(local.grad.dtype, torch.float32)
 
     def test_forward_and_backward_dtype_differ(self):
+        # [FUNCTION DOC] Forward dtype bfloat16 and backward dtype float32: all_gather
+        # is traced in bfloat16, reduce_scatter in float32, and the local gradient is
+        # float32.
         mesh = init_device_mesh("cpu", (4,), mesh_dim_names=("dp",))
         local = torch.randn(16, 8, dtype=torch.float32, requires_grad=True)
         dt = DTensor.from_local(local, mesh, [Shard(0)])
