@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Shared utilities for pipeline parallelism: tensor and DTensor metadata records
+# used to allocate and validate recv buffers, a DeviceMesh cache, the static/dynamic metadata
+# inference mode enum, argument flattening helpers, stage/rank mapping generators, and
+# metadata validation functions. Import-time side effect: creates the module logger only.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 
 from __future__ import annotations
@@ -25,6 +29,9 @@ logger = logging.getLogger(__name__)
 
 
 class GetMeshCallback(Protocol):
+    # [CLASS DOC] Protocol for a user-supplied callable that returns a DeviceMesh given mesh
+    # dimension names and an optional mesh layout. Used by _MeshCache to rebuild meshes whose
+    # descriptions arrived over P2P. Its call method is a one-line stub.
     """Callback to create/retrieve a DeviceMesh from its cache key components."""
 
     def __call__(
@@ -42,11 +49,16 @@ MeshCacheKey: TypeAlias = tuple[tuple[str, ...], _MeshLayout | None]
 
 
 class PipeliningMetadataError(RuntimeError):
+    # [CLASS DOC] Runtime error raised when pipeline stage metadata (shape, dtype, mesh, etc.)
+    # is missing, mismatched or cannot be resolved during pipeline communication.
     """Raised on metadata mismatches during pipeline communication."""
 
 
 @dataclass(frozen=True, slots=True)
 class _TensorMeta:
+    # [CLASS DOC] Immutable (frozen, slotted) record of a tensor's shape, stride, dtype and
+    # requires_grad, used to allocate recv buffers and validate received tensors. For DTensors
+    # the fields describe the local shard. Key methods: from_tensor, to_tensor, get_diff.
     """Tensor metadata for recv buffer allocation and validation.
 
     For plain tensors, these are the tensor's actual attributes.
@@ -61,6 +73,9 @@ class _TensorMeta:
 
     @staticmethod
     def from_tensor(tensor: torch.Tensor) -> _TensorMeta:
+        # [FUNCTION DOC] Static method. Builds a metadata record from a plain tensor (shape, stride,
+        # dtype, requires_grad). Raises PipeliningMetadataError if given a DTensor.
+        # KNOWN ISSUE: the docstring says TypeError is raised, but the code raises PipeliningMetadataError.
         """Create metadata from a plain tensor.
 
         Args:
@@ -84,6 +99,9 @@ class _TensorMeta:
         )
 
     def to_tensor(self, device: torch.device | str) -> torch.Tensor:
+        # [FUNCTION DOC] Allocates an uninitialized strided tensor on the given device matching this
+        # metadata. For floating-point dtypes, sets requires_grad to the recorded value; other dtypes
+        # are left without grad. Returns the tensor.
         """Reconstruct a tensor on ``device`` from this metadata.
 
         Args:
@@ -98,6 +116,9 @@ class _TensorMeta:
         return t
 
     def get_diff(self, other: _TensorMeta) -> list[str]:
+        # [FUNCTION DOC] Compares this metadata with another and returns a list of human-readable
+        # difference strings for shape, stride and dtype (empty list when equal). requires_grad is
+        # deliberately ignored because it is a runtime concern, not a metadata invariant.
         """Return field-by-field differences with ``other``.
 
         Args:
@@ -123,6 +144,10 @@ class _TensorMeta:
 
 @dataclass(frozen=True, slots=True)
 class _DTensorMeta(_TensorMeta):
+    # [CLASS DOC] Immutable extension of _TensorMeta for DTensors. Inherited fields describe the
+    # local shard; extra fields hold global shape/stride, placements, mesh dimension names and
+    # mesh layout. The DeviceMesh itself is not stored; it is looked up in a _MeshCache through
+    # mesh_cache_key. Key methods: from_dtensor, to_dtensor, get_diff.
     """DTensor metadata extending :class:`_TensorMeta` with distribution info.
 
     Inherited fields (shape, stride, etc.) are LOCAL shard attributes.
@@ -151,6 +176,9 @@ class _DTensorMeta(_TensorMeta):
 
     @staticmethod
     def from_dtensor(dtensor: DTensor) -> _DTensorMeta:
+        # [FUNCTION DOC] Static method. Builds a _DTensorMeta from a DTensor, recording local shard
+        # shape/stride, dtype, requires_grad, global shape/stride, placements, mesh dim names (empty
+        # tuple if unnamed) and the mesh layout.
         """Create metadata from a DTensor.
 
         Args:
@@ -180,10 +208,16 @@ class _DTensorMeta(_TensorMeta):
 
     @property
     def mesh_cache_key(self) -> MeshCacheKey:
+        # [FUNCTION DOC] Property returning the pair of mesh dimension names and mesh layout, used as
+        # the lookup key into a _MeshCache.
         """Cache key ``(mesh_dim_names, mesh_layout)`` for mesh lookup."""
         return (self.mesh_dim_names, self.mesh_layout)
 
     def to_dtensor(self, device: torch.device | str, mesh: DeviceMesh) -> DTensor:
+        # [FUNCTION DOC] Rebuilds a DTensor on the given device and mesh from this metadata: allocates
+        # an empty local tensor, wraps it via from_local with the stored placements and global
+        # shape/stride without running consistency checks, then enables requires_grad if recorded and
+        # the tensor is floating point. Returns the DTensor.
         """Reconstruct a DTensor on ``device`` with placements.
 
         Args:
@@ -209,6 +243,11 @@ class _DTensorMeta(_TensorMeta):
         return cast(DTensor, dt)
 
     def get_diff(self, other: _TensorMeta) -> list[str]:
+        # [FUNCTION DOC] Returns difference strings versus another metadata: base local-field
+        # differences plus, when other is also a _DTensorMeta, global shape/stride, placements, mesh dim
+        # names and mesh layout differences; if other is a plain _TensorMeta, adds a type-mismatch
+        # entry. Returns an empty list when equal. Calls the base class method explicitly because
+        # super() is unreliable with slotted dataclasses.
         """Return field-by-field differences, including DTensor-specific fields.
 
         Args:
@@ -261,6 +300,10 @@ TensorMeta: TypeAlias = _TensorMeta | _DTensorMeta
 # backward metadata inference or from user provided static metadata
 @dataclass(slots=True)
 class _StageMeta:
+    # [CLASS DOC] Mutable, slotted record of a stage's tensor metadata: inputs, outputs,
+    # input_grads and output_grads (each optional). Fields are filled incrementally during
+    # inference or from user-provided static metadata. Methods: has_any, has_dtensors,
+    # is_complete_for_forward.
     """Consolidated tensor metadata for a pipeline stage's forward and backward passes."""
 
     inputs: tuple[TensorMeta, ...] | None = None
@@ -269,6 +312,7 @@ class _StageMeta:
     output_grads: tuple[TensorMeta | None, ...] | None = None
 
     def has_any(self) -> bool:
+        # [FUNCTION DOC] Returns True if any of the four metadata fields is not None.
         """Check if any metadata field is populated."""
         return any(
             v is not None
@@ -276,6 +320,7 @@ class _StageMeta:
         )
 
     def has_dtensors(self) -> bool:
+        # [FUNCTION DOC] Returns True if any entry in the inputs or outputs metadata is a _DTensorMeta.
         """Check if any input/output metadata is DTensor type."""
         for metas in [self.inputs, self.outputs]:
             if metas and any(isinstance(m, _DTensorMeta) for m in metas if m):
@@ -283,12 +328,15 @@ class _StageMeta:
         return False
 
     def is_complete_for_forward(self) -> bool:
+        # [FUNCTION DOC] Returns True when both inputs and outputs metadata are populated.
         """Check if forward metadata is fully populated."""
         return self.inputs is not None and self.outputs is not None
 
 
 @dataclass(frozen=True, slots=True)
 class _StageForwardMeta:
+    # [CLASS DOC] Immutable message payload carrying the forward output metadata of stage i, which
+    # becomes the input metadata of stage i+1 during inference.
     """Forward metadata transmitted from stage *i* to stage *i+1* during inference."""
 
     forward_metas: tuple[TensorMeta, ...]  # Stage i's outputs → Stage i+1's inputs
@@ -296,6 +344,8 @@ class _StageForwardMeta:
 
 @dataclass(frozen=True, slots=True)
 class _StageBackwardMeta:
+    # [CLASS DOC] Immutable message payload carrying stage i's input-gradient metadata, which
+    # becomes stage i-1's output-gradient metadata during inference. Entries may be None.
     """Backward metadata transmitted from stage *i* to stage *i-1* during inference.
 
     Gradient placements may differ from forward activations
@@ -311,6 +361,8 @@ def _make_tensor_from_meta(
     meta: _TensorMeta,
     device: torch.device | str,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Returns an uninitialized tensor on the given device with exactly the
+    # shape, stride and dtype from the metadata.
     """Create a tensor from metadata.
 
     Args:
@@ -331,6 +383,9 @@ def _make_tensor_from_meta(
 def _derive_grad_metas(
     tensor_metas: tuple[TensorMeta, ...],
 ) -> tuple[TensorMeta | None, ...]:
+    # [FUNCTION DOC] HELPER: Maps a tuple of tensor metadata to gradient metadata: same shape,
+    # stride and dtype with requires_grad False. Entries that do not require grad become None.
+    # KNOWN ISSUE: DTensor metadata entries also become None (not mentioned in the docstring).
     """Derive gradient metadata from tensor metadata.
 
     Returns metadata with the same shape/stride/dtype but ``requires_grad=False``.
@@ -338,6 +393,8 @@ def _derive_grad_metas(
     """
 
     def derive_one(m: TensorMeta) -> TensorMeta | None:
+        # [FUNCTION DOC] HELPER: Derives gradient metadata for one entry; None if it does not require
+        # grad or is a DTensor meta, else a plain _TensorMeta without requires_grad.
         if not m.requires_grad:
             return None
         if isinstance(m, _DTensorMeta):
@@ -353,6 +410,9 @@ def _derive_grad_metas(
 
 
 class _MeshCache:
+    # [CLASS DOC] HELPER: Dict-backed cache of DeviceMesh objects keyed by mesh dim names and mesh
+    # layout. Misses are resolved through an optional user callback. Assumes all stages share the
+    # same rank tensor.
     """Cache for :class:`DeviceMesh` objects keyed by ``(mesh_dim_names, mesh_layout)``.
 
     Assumes all pipeline stages share the same rank tensor (true for
@@ -360,10 +420,14 @@ class _MeshCache:
     """
 
     def __init__(self, get_mesh_cb: GetMeshCallback | None = None) -> None:
+        # [FUNCTION DOC] HELPER: Initializes an empty cache and stores the optional mesh-creation callback.
         self._cache: dict[MeshCacheKey, DeviceMesh] = {}
         self._get_mesh_cb = get_mesh_cb
 
     def get_mesh(self, key: MeshCacheKey) -> DeviceMesh:
+        # [FUNCTION DOC] HELPER: Returns the cached mesh for the key; otherwise calls the callback to
+        # create it and caches the result. Raises PipeliningMetadataError if there is no callback or
+        # the callback returns None.
         """Return a cached mesh, or create one via the callback.
 
         Args:
@@ -398,10 +462,13 @@ class _MeshCache:
         return mesh
 
     def put(self, key: MeshCacheKey, mesh: DeviceMesh) -> None:
+        # [FUNCTION DOC] HELPER: Stores a mesh under the given key, overwriting any existing entry.
         """Add a mesh to the cache."""
         self._cache[key] = mesh
 
     def update_from_tensors(self, tensors: tuple[torch.Tensor | None, ...]) -> None:
+        # [FUNCTION DOC] HELPER: For each DTensor in the tuple (non-DTensors and None are skipped),
+        # caches its device mesh under its dim names and layout key unless already present.
         """Extract and cache meshes from any :class:`DTensor` instances in *tensors*."""
         for tensor in tensors:
             if isinstance(tensor, DTensor):
@@ -413,9 +480,11 @@ class _MeshCache:
                     self._cache[key] = mesh
 
     def __contains__(self, key: MeshCacheKey) -> bool:
+        # [FUNCTION DOC] HELPER: Membership test on the cache keys.
         return key in self._cache
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns the number of cached meshes.
         return len(self._cache)
 
 
@@ -425,6 +494,9 @@ class _MeshCache:
 
 
 class InferenceMode(Enum):
+    # [CLASS DOC] Enum of pipeline-wide metadata inference modes: STATIC (all metadata known, no
+    # runtime inference) and DYNAMIC (at least one stage needs runtime inference). Chosen
+    # collectively by the schedule so all ranks agree and avoid P2P hangs.
     """Pipeline-level metadata inference mode, determined collectively across all PP ranks.
 
     The mode is set by the schedule (not individual stages) because
@@ -445,6 +517,9 @@ class InferenceMode(Enum):
 
     @classmethod
     def needs_dynamic(cls, meta: _StageMeta, stage_has_backward: bool) -> bool:
+        # [FUNCTION DOC] Class method. Returns True if a stage needs dynamic inference: when forward
+        # metadata is incomplete, or when it involves DTensors with a backward pass and either grad
+        # metadata (input_grads or output_grads) is missing. Otherwise returns False.
         """Determine whether dynamic metadata inference is needed for a stage.
 
         Args:
@@ -481,6 +556,10 @@ class InferenceMode(Enum):
 
 
 def flatten_args(args, *, detach: bool = False):
+    # [FUNCTION DOC] Flattens nested arguments into a flat list of leaves. With detach False
+    # returns just the flat list. With detach True, tensors are detached but keep their
+    # requires_grad flag, and returns a pair: the original nested structure rebuilt from the
+    # detached leaves, and the flat detached list.
     """Flatten ``args`` into a list, optionally detaching tensors.
 
     Args:
@@ -508,6 +587,7 @@ def flatten_args(args, *, detach: bool = False):
 
 # Backward compatibility alias
 def flatten_args_detach(args):
+    # [FUNCTION DOC] Deprecated backward-compatible alias; calls flatten_args with detach True.
     """Flatten and detach. Deprecated: use ``flatten_args(args, detach=True)``."""
     return flatten_args(args, detach=True)
 
@@ -515,6 +595,10 @@ def flatten_args_detach(args):
 def generate_stage_to_rank_mapping(
     pp_size: int, num_stages: int, style: str = "loop"
 ) -> dict[int, int]:
+    # [FUNCTION DOC] Builds a mapping from stage index to pipeline rank. Style "loop" assigns
+    # stage modulo pp_size; style "v" zigzags ranks up then down in a V shape, keeping the rank
+    # unchanged at each border. Raises ValueError if the V style num_stages is not divisible by
+    # pp_size, or if the style is unknown.
     """
     Compute the stage id to rank mapping for either a looped or V-style schedule.
 
@@ -549,6 +633,8 @@ def generate_stage_to_rank_mapping(
 def generate_rank_to_stage_mapping(
     pp_size: int, num_stages: int, style: str = "loop"
 ) -> dict[int, list[int]]:
+    # [FUNCTION DOC] Inverts the stage-to-rank mapping into a mapping from rank to a sorted list
+    # of stage indices. Propagates ValueError from the stage-to-rank generator.
     """
     Compute the rank to stage id mapping for either a looped or V-style schedule.
 
@@ -574,6 +660,8 @@ def generate_rank_to_stage_mapping(
 
 @dataclass(slots=True)
 class PipeInfo:
+    # [CLASS DOC] Slotted dataclass describing a split pipeline: the FX graph, the number of
+    # stages, and whether the graph includes loss and backward.
     """
     Captures information for a pipeline (`Pipe` object).
     """
@@ -589,6 +677,8 @@ class PipeInfo:
 
 
 def extract_tensor_meta(tensor: torch.Tensor) -> TensorMeta:
+    # [FUNCTION DOC] Returns metadata for one tensor: a _DTensorMeta for a DTensor, otherwise a
+    # _TensorMeta.
     """Extract metadata from a tensor.
 
     Handles both plain Tensor and DTensor correctly: DTensors are
@@ -629,6 +719,10 @@ def extract_tensor_metas(
     *,
     allow_none: bool = False,
 ) -> tuple[TensorMeta | None, ...] | None:
+    # [FUNCTION DOC] Implementation of the overloaded extractor. Returns None if tensors is None;
+    # otherwise a tuple of metadata for each tensor, with None entries for non-tensors. Raises
+    # PipeliningMetadataError if a non-tensor entry exists while allow_none is False. The two
+    # preceding overloads are type-only stubs.
     """Extract metadata from a tuple of tensors.
 
     Args:
@@ -661,6 +755,8 @@ def extract_tensor_metas(
 
 
 def to_local_if_dtensor(tensor: torch.Tensor, detach: bool = False) -> torch.Tensor:
+    # [FUNCTION DOC] Optionally detaches the tensor first (for plain tensors too), then returns the
+    # local shard if it is a DTensor, or the tensor itself otherwise.
     """Convert a DTensor to its local shard, or return a plain tensor as-is.
 
     When ``detach=True``, the tensor is detached before conversion —
@@ -706,6 +802,9 @@ def validate_and_normalize_to_tuple(
     | None,
     allow_none: bool = False,
 ) -> tuple[torch.Tensor | None, ...] | tuple[torch.Tensor, ...] | None:
+    # [FUNCTION DOC] Implementation of the overloaded normalizer. Returns None for None, wraps a
+    # single tensor into a one-tuple, converts a list to a tuple. Raises PipeliningMetadataError for
+    # None elements when allow_none is False, non-tensor elements, or an unsupported container type.
     """Normalize ``args`` to a tuple and validate that all elements are tensors.
 
     Args:
@@ -758,6 +857,10 @@ def validate_metadata(
     raise_on_mismatch: bool = False,
     warn_on_mismatch: bool = False,
 ) -> list[str]:
+    # [FUNCTION DOC] Compares expected metadata against a tensor (its metadata is extracted) or
+    # metadata. If the two metadata types differ, returns a single type-mismatch message. Otherwise
+    # returns the expected metadata's list of differences (empty if matching). On mismatch, raises
+    # PipeliningMetadataError if raise_on_mismatch, and/or emits a UserWarning if warn_on_mismatch.
     """
     Compare expected metadata against actual tensor or metadata.
 
@@ -827,6 +930,11 @@ def validate_tensors_metadata(
     raise_on_mismatch: bool = True,
     warn_on_mismatch: bool = False,
 ) -> list[str]:
+    # [FUNCTION DOC] Element-wise validation of a tuple of expected metadata against actual tensors
+    # or metadata. A length mismatch or a None-versus-metadata mismatch produces a message that is
+    # raised (PipeliningMetadataError) if raise_on_mismatch, warned if warn_on_mismatch, and
+    # collected. Other entries are checked through validate_metadata. Returns the aggregated
+    # difference list. Note the default of raise_on_mismatch is True here.
     """Validate metadata for a tuple of tensors element-wise.
 
     Args:
@@ -882,6 +990,10 @@ def validate_static_arg_grad_correspondence(
     grads: tuple[torch.Tensor | None, ...],
     is_input: bool,
 ) -> None:
+    # [FUNCTION DOC] Checks that forward tensors and their gradients correspond for static mode:
+    # lengths must match, a tensor not requiring grad must have a None grad, a requiring-grad tensor
+    # with a None grad only triggers a UserWarning, and a DTensor requiring grad needs a DTensor
+    # or None grad. Violations of the hard rules raise PipeliningMetadataError.
     """
     Validate the args↔grads contract for static mode.
 

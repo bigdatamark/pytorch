@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Intermediate representation for pipeline parallelism. Defines Pipe, an
+# nn.Module made of sequential stage submodules (named with the submod_pp prefix) produced by
+# splitting a traced/exported model at pipe_split markers, plus SplitPoint, pipeline and
+# annotate_split_points for specifying the split, LossWrapper helpers, symbolic backward
+# insertion, and FX interpreters/serialization helpers. Import-time side effects: defines and
+# registers the custom operator pippy::_pipe_split with a fake implementation and marks it as
+# side-effectful in the FX node module so export preserves it.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 import copy
 import logging
@@ -40,6 +47,8 @@ PP_SUBMOD_PREFIX = "submod_pp"
 
 
 def get_submod_name(stage_idx: int):
+    # [FUNCTION DOC] Returns the submodule name for a stage index, the prefix joined with the
+    # index by an underscore.
     """Returns the name of the submod for a given stage index.
     For example, "submod_pp_0", "submod_pp_1", etc.
     """
@@ -47,6 +56,11 @@ def get_submod_name(stage_idx: int):
 
 
 def _find_loss_from_output_and_spec(output_val, spec_val):
+    # [FUNCTION DOC] HELPER: Recursively walks an output value and a matching loss specification
+    # (True marks the loss, False ignores, tuple/list/dict specs mirror the output structure) and
+    # returns the FX node that is the loss. Raises RuntimeError if a True spec points to a non-node,
+    # types, lengths or dict keys mismatch, no loss is found in a container, or the spec type is
+    # unsupported.
     if spec_val is False:
         return None
     if spec_val is True:
@@ -94,6 +108,11 @@ def _find_loss_from_output_and_spec(output_val, spec_val):
 
 
 def _find_loss_output(mod: torch.nn.Module, g: fx.Graph, output_loss_value_spec):
+    # [FUNCTION DOC] HELPER: Locates the loss in a graph's single output node. For a
+    # TrivialLossWrapper the whole output is the loss; with no spec, looks for a "loss" key in a dict
+    # output; otherwise resolves the given spec. Returns the loss node (or None), the output node,
+    # and the spec actually used (or None). Raises AssertionError if the graph does not have exactly
+    # one output node.
     output_nodes = [n for n in g.nodes if n.op == "output"]
     if not len(output_nodes) == 1:
         raise AssertionError(f"Expected 1 output node, got {len(output_nodes)}")
@@ -128,6 +147,14 @@ def _insert_stage_symbolic_backward(
     loss_node: fx.Node,
     output_node: fx.Node,
 ):
+    # [FUNCTION DOC] HELPER: Appends symbolic backward computation to a stage-split forward graph,
+    # in place, just before the output node. Scans for getitem nodes to reconstruct tuple outputs
+    # of each stage call, then walks the graph in reverse from the loss; for each live stage module
+    # call, inserts a call to stage_backward with its outputs, accumulated output grads, input
+    # nodes and live output indices, and records gradients per input (accumulating with a
+    # null-tolerant add when an input is used repeatedly, except for placeholders). Raises
+    # AssertionError if the forward graph has a non-getitem function call or a malformed getitem.
+    # Returns the graph.
     # Collect metadata about tuple output values. TODO: move this to split_module or FX IR
     tuples: dict[fx.Node, tuple] = {}
     for node in reversed(g.nodes):
@@ -172,6 +199,8 @@ def _insert_stage_symbolic_backward(
     val_to_grad: dict[fx.Node, fx.Node | None] = {loss_node: None}
 
     def assign_or_accumulate_grad(forward_node, grad_value):
+        # [FUNCTION DOC] HELPER: Records the gradient node for a forward node; if one exists already
+        # and the node is not a placeholder, inserts an accumulate call combining them.
         if forward_node in val_to_grad and forward_node.op != "placeholder":
             grad_value = g.call_function(
                 _null_coalesce_accumulate,
@@ -185,6 +214,7 @@ def _insert_stage_symbolic_backward(
                 continue
 
             def add_to_live_nodes(n):
+                # [FUNCTION DOC] HELPER: Marks a node as live (contributes to the loss) if not already present.
                 live_nodes.setdefault(n, None)
 
             fx.node.map_arg(node.args, add_to_live_nodes)
@@ -233,6 +263,8 @@ def _insert_stage_symbolic_backward(
 
 
 def _move_placeholders_to_front(graph: fx.Graph):
+    # [FUNCTION DOC] HELPER: Moves non-placeholder nodes that appear before the last placeholder
+    # to just after it so placeholders form a contiguous prefix. Mutates the graph in place.
     """Ensure all placeholder nodes form a contiguous prefix of the graph.
     split_module can interleave get_attr nodes with placeholders."""
     last_ph = None
@@ -254,11 +286,18 @@ def _move_placeholders_to_front(graph: fx.Graph):
 
 
 class PipeSequential(torch.nn.Sequential):
+    # [CLASS DOC] Sequential container whose forward calls pipe_split between consecutive
+    # submodules, so each child becomes its own pipeline stage. Create from a plain Sequential with
+    # from_sequential, which shallow-copies the children.
     @staticmethod
     def from_sequential(sequential_instance: torch.nn.Sequential):
+        # [FUNCTION DOC] Static method. Returns a PipeSequential holding shallow copies of the given
+        # Sequential's modules.
         return PipeSequential(*[copy.copy(m) for m in sequential_instance])
 
     def forward(self, input):
+        # [FUNCTION DOC] Runs each child module in order on the input, calling pipe_split after every
+        # child except the last. Returns the final output.
         for i, module in enumerate(self):
             input = module(input)
             if i != len(self) - 1:
@@ -267,6 +306,9 @@ class PipeSequential(torch.nn.Sequential):
 
 
 class LossWrapper(torch.nn.Module):
+    # [CLASS DOC] Abstract base module bundling a model (attribute module) and a loss function
+    # (attribute loss_fn). Subclasses override forward to define the connectivity from inputs
+    # through model and loss to the returned value, which is then backpropagated.
     """
     LossWrapper is a convenient abstract class that allows you to wrap up both
     your model as well as its loss function and specify the connectivity between
@@ -293,11 +335,14 @@ class LossWrapper(torch.nn.Module):
     """
 
     def __init__(self, module, loss_fn):
+        # [FUNCTION DOC] Stores the wrapped module and the loss function.
         super().__init__()
         self.module = module
         self.loss_fn = loss_fn
 
     def forward(self, *args, **kwargs):
+        # [FUNCTION DOC] Abstract; always raises NotImplementedError telling the user to override
+        # forward.
         raise NotImplementedError(
             "This instance of LossWrapper does not have an overridden"
             "forward(). Please implement forward() to specify the arguments, "
@@ -307,8 +352,12 @@ class LossWrapper(torch.nn.Module):
 
 
 class TrivialLossWrapper(LossWrapper):
+    # [CLASS DOC] Ready-made LossWrapper whose forward returns the loss of the module on x
+    # against targets. Its class attribute loss_spec is True, marking the single output as the loss.
     # pyrefly: ignore [bad-override]
     def forward(self, x, targets):
+        # [FUNCTION DOC] Runs the module on x and returns the loss function applied to the output and
+        # targets.
         model_out = self.module(x)
         return self.loss_fn(model_out, targets)
 
@@ -343,11 +392,15 @@ torch.library.define("pippy::_pipe_split", "() -> ()")
 
 @torch.library.impl("pippy::_pipe_split", "BackendSelect")
 def _pipe_split():
+    # [FUNCTION DOC] HELPER: Implementation of the custom operator that marks a split point; does
+    # nothing and returns None.
     return None
 
 
 @torch.library.register_fake("pippy::_pipe_split")  # type: ignore[no-redef]
 def _pipe_split():
+    # [FUNCTION DOC] HELPER: Fake (meta) implementation of the split marker operator; does
+    # nothing and returns None.
     return None
 
 
@@ -361,6 +414,8 @@ fx.node._side_effectful_functions.add(aten_pipe_split_alias)
 
 # User facing API
 def pipe_split():
+    # [FUNCTION DOC] User-facing marker for a stage boundary. Calls the registered custom operator
+    # so tracing/export records a split point; it does nothing when the model is run eagerly.
     """
     pipe_split is a special operator that is used to mark the boundary between
     stages in a module. It is used to split the module into stages. It is a
@@ -381,6 +436,9 @@ def pipe_split():
 
 
 class MultiUseParameterConfig(Enum):
+    # [CLASS DOC] Enum of policies for parameters used by multiple stages: TRANSMIT (send the value
+    # between stages) or REPLICATE (keep a copy on each stage). MultiUseParamSpec below is a type
+    # alias for either one policy or a per-parameter-name mapping of policies.
     TRANSMIT = 1
     REPLICATE = 2
 
@@ -389,6 +447,9 @@ MultiUseParamSpec = MultiUseParameterConfig | dict[str, MultiUseParameterConfig]
 
 
 class DetachExecutor(fx.Interpreter):
+    # [CLASS DOC] FX interpreter used to run the split module locally (testing). It detaches every
+    # requires-grad tensor passed to a stage module call, so boundary values become autograd
+    # leaves, and remembers the detached copies so the backward calls can be rerouted to them.
     """
     Special interpreter to run the split_gm in testing that detaches all inputs to
     a module invocation. This is needed so that the values at the boundary are
@@ -396,16 +457,24 @@ class DetachExecutor(fx.Interpreter):
     """
 
     def __init__(self, module, garbage_collect_values=True):
+        # [FUNCTION DOC] Initializes the interpreter. The garbage collection flag is always overridden
+        # to False so intermediate values stay alive; also creates the empty detached-value map.
+        # KNOWN ISSUE: the garbage_collect_values argument is ignored.
         garbage_collect_values = False
         super().__init__(module, garbage_collect_values)
         self.value_remap = {}
 
     def run(self, *args, initial_env=None):  # type: ignore[override]
+        # [FUNCTION DOC] Resets the detached-value map then runs the interpreter on the arguments.
         self.value_remap = {}
         return super().run(*args, initial_env=initial_env)
 
     def call_module(self, target, args, kwargs):
+        # [FUNCTION DOC] Runs a module call after replacing each requires-grad tensor in args and
+        # kwargs by a detached copy that requires grad (cached per original tensor in the map).
         def detach_tensors(a):
+            # [FUNCTION DOC] HELPER: Returns the cached detached requires-grad copy of a tensor needing
+            # grad, creating it on first use; other values are returned unchanged.
             if isinstance(a, torch.Tensor) and a.requires_grad:
                 if a not in self.value_remap:
                     new_val = a.detach().requires_grad_(True)
@@ -431,6 +500,8 @@ class DetachExecutor(fx.Interpreter):
         return super().call_module(target, args, kwargs)
 
     def call_function(self, target, args, kwargs):
+        # [FUNCTION DOC] Runs a function call; for stage_backward calls, replaces the input_values
+        # with their detached copies so gradients land on the tensors the stage actually used.
         # HACK to reroute saved input tensors to point to the detach()ed version
         if target is stage_backward:
             kwargs = dict(kwargs)
@@ -441,14 +512,21 @@ class DetachExecutor(fx.Interpreter):
 
 
 class _NodeReference:
+    # [CLASS DOC] HELPER: Placeholder holding the name of an FX node, used in serialized node args
+    # in place of real node objects.
     def __init__(self, name):
+        # [FUNCTION DOC] HELPER: Stores the node name.
         self.name = name
 
     name: str
 
 
 class _LinearNodeList:
+    # [CLASS DOC] HELPER: Picklable linear snapshot of an FX graph's nodes, with node references
+    # in args and kwargs replaced by name references. to_graph rebuilds a new graph.
     def __init__(self, node_list):
+        # [FUNCTION DOC] HELPER: Copies each node (without a graph) with name-reference args and kwargs
+        # and a shallow copy of metadata into a list.
         self.serialize_node_list = []
         for node in node_list:
             node_args = fx.node.map_arg(node.args, lambda n: _NodeReference(n.name))  # type: ignore[arg-type,return-value]
@@ -466,11 +544,14 @@ class _LinearNodeList:
             self.serialize_node_list.append(serialize_node)
 
     def to_graph(self):
+        # [FUNCTION DOC] HELPER: Rebuilds and returns a new FX graph by creating nodes in order and
+        # resolving name references back to the newly created nodes.
         graph = fx.Graph()
 
         ref_str_to_node: dict[str, fx.Node] = {}
 
         def ref_to_node(arg):
+            # [FUNCTION DOC] HELPER: Maps a name reference to the rebuilt node; other values are unchanged.
             if isinstance(arg, _NodeReference):
                 return ref_str_to_node[arg.name]
             else:
@@ -493,6 +574,9 @@ class _LinearNodeList:
 
 
 def _direct_serialization_deserialize(body, nodes):
+    # [FUNCTION DOC] HELPER: Reconstruction function used when unpickling a stage GraphModule:
+    # builds a dummy module from the saved attribute dictionary and returns a GraphModule over the
+    # rebuilt graph. Intended for RPC transmission only, not for persisting to disk.
     """
     Custom `__reduce__` method for serialization.
     DO AS I SAY -- NOT AS I DO. This violates the principle that
@@ -505,7 +589,9 @@ def _direct_serialization_deserialize(body, nodes):
     """
 
     class DummyModule(torch.nn.Module):
+        # [CLASS DOC] HELPER: Minimal module whose attribute dictionary is filled from a saved dict.
         def __init__(self, body):
+            # [FUNCTION DOC] HELPER: Initializes the module and copies the saved attributes into it.
             super().__init__()
             self.__dict__.update(body)
 
@@ -515,6 +601,8 @@ def _direct_serialization_deserialize(body, nodes):
 
 
 def _direct_serialization_reduce(self):
+    # [FUNCTION DOC] HELPER: Custom reduce for stage GraphModules: returns the deserialize function
+    # with the module's attribute dictionary (minus the graph) and a linear node list.
     serialization_dict = dict(self.__dict__)
     serialization_dict.pop("_graph")
     return (
@@ -527,6 +615,10 @@ def _modify_graph_op_device(
     gm: torch.fx.GraphModule,
     new_device: torch.device,
 ):
+    # [FUNCTION DOC] HELPER: Sets the device keyword of every function call node in the graph that
+    # has a different one to the new device, recursing into graph modules and unflattened
+    # interpreter submodules (logging a warning for other submodule types), and recompiles if
+    # anything changed. Mutates the module in place.
     """
     Modify the device argument of all "call_function" nodes in the graph.  This
     is useful for moving the graph to a different device. In particular for
@@ -559,6 +651,11 @@ def _modify_graph_op_device(
 
 
 class Pipe(torch.nn.Module):
+    # [CLASS DOC] A pipeline as a module: holds a split graph module whose children are stage
+    # submodules, the number of stages, whether loss and backward are included, and the loss spec.
+    # It detects parameters shared by several stages (replicated_params). Calling forward runs all
+    # stages sequentially on the local process through a DetachExecutor. Key methods: forward,
+    # get_stage_module, from_tracing, info, build_stage.
     def __init__(
         self,
         split_gm: fx.GraphModule,
@@ -566,6 +663,11 @@ class Pipe(torch.nn.Module):
         has_loss_and_backward: bool,
         loss_spec,
     ):
+        # [FUNCTION DOC] Stores the split module, a DetachExecutor, stage count, loss flag and loss spec.
+        # Checks all graph nodes are of allowed kinds (raises AssertionError otherwise), finds
+        # parameters shared by multiple stage submodules and deep-copies them to break aliasing, replaces
+        # the split module's forward with one that raises, and installs the direct-serialization reduce on
+        # each stage submodule class.
         # TODO: is there a way not to hard wire init?
         torch.nn.Module.__init__(self)
         self.split_gm: fx.GraphModule = split_gm
@@ -621,6 +723,8 @@ class Pipe(torch.nn.Module):
                 setattr(submod, atoms[-1], copy.deepcopy(getattr(submod, atoms[-1])))
 
         def throw(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Replacement forward for the split module; always raises RuntimeError
+            # telling the user to call the Pipe object instead.
             raise RuntimeError(
                 "To run pipeline locally, invoke the Pipe object directly, not `split_gm`"
             )
@@ -639,6 +743,10 @@ class Pipe(torch.nn.Module):
                 break
 
     def forward(self, *args, **kwargs):
+        # [FUNCTION DOC] Runs the whole pipeline locally. If keyword arguments are given, builds a
+        # signature from the graph placeholders (with defaults and star-argument kinds), binds and
+        # applies defaults, then executes the executor on the resulting ordered arguments. Returns the
+        # result.
         executor_args = args
         if len(kwargs) > 0:
             parameters = []
@@ -672,6 +780,8 @@ class Pipe(torch.nn.Module):
         return res
 
     def get_stage_module(self, stage_idx: int) -> torch.nn.Module:
+        # [FUNCTION DOC] Returns the stage submodule for a stage index. Raises ValueError if the index is
+        # out of range.
         """
         Return a stage module corresponding to `stage_idx` of the `pipe`.
         """
@@ -683,6 +793,8 @@ class Pipe(torch.nn.Module):
 
     @staticmethod
     def _number_and_count_forward_stages(gm: fx.GraphModule):
+        # [FUNCTION DOC] HELPER: Static method. Counts call-module nodes whose target starts with the
+        # stage prefix and records the stage index in each node's metadata. Returns the count.
         num_stages = 0
         found_idxs: dict[int, None] = {}
         for node in gm.graph.nodes:
@@ -711,6 +823,18 @@ class Pipe(torch.nn.Module):
         split_policy: Callable[[torch.fx.GraphModule], torch.fx.GraphModule]
         | None = None,
     ):
+        # [FUNCTION DOC] HELPER: Static method that converts an exported program of a model into a
+        # Pipe. Steps: get the module from the program (optionally applying a split policy to insert
+        # split markers automatically); dedupe get_attr nodes per target; drop consecutive duplicate
+        # pipe_split markers; split the graph into numbered stage submodules at the split operator
+        # (dropping the marker nodes inside stages); outline each stage into nested submodules; move
+        # parameters, buffers and lifted constants from the root into the stage submodules that use them
+        # (handling aliased state dict entries), sink them into the graph, and remove unused
+        # attributes and the root get_attr nodes; count stages. If output_loss_value_spec is given and a
+        # loss node is found, symbolic backward is inserted. Args: mod (original module), exported_program,
+        # multi_use_param_spec (see MultiUseParameterConfig), output_loss_value_spec (which output is the
+        # loss), split_policy (optional callable to split the module). Returns the Pipe.
+        # Raises AssertionError on unexpected graph structure or a non-tensor attribute.
         """
         Additionally, the ``output_loss_value_spec`` value can be specified to disambiguate
         which value in the output of `forward` is the loss value on which PiPPy should apply
@@ -757,6 +881,8 @@ class Pipe(torch.nn.Module):
         part_idx = 0
 
         def split_callback(n: fx.Node):
+            # [FUNCTION DOC] HELPER: Callback for split_module returning the current partition index; the
+            # index is incremented whenever a pipe_split call node is seen (nonlocal counter).
             nonlocal part_idx
             if (n.op, n.target) == (
                 "call_function",
@@ -792,6 +918,9 @@ class Pipe(torch.nn.Module):
 
         # TODO: backport this into split_module
         def delete_user_reference(node, user):
+            # [FUNCTION DOC] HELPER: Removes the one positional argument equal to the given root get_attr
+            # node from the submodule call node's args. Raises AssertionError if the user has keyword
+            # arguments or the node is not used exactly once.
             """
             Delete reference of `node` from `user`'s arg list.
             Args:
@@ -817,6 +946,9 @@ class Pipe(torch.nn.Module):
         to_delete = []
 
         def _recursive_getattr_with_parent(mod, fqn):
+            # [FUNCTION DOC] HELPER: Walks a dotted attribute path from a module. Returns the pair
+            # (parent module, attribute): (None, None) if an intermediate part is missing, (parent, None)
+            # if only the last attribute is missing.
             # Returns getattr call given a nested FQN, and the last parent
             atoms = fqn.split(".")
             for atom in atoms[:-1]:
@@ -833,6 +965,9 @@ class Pipe(torch.nn.Module):
             callee_name,
             param_fqn,
         ):
+            # [FUNCTION DOC] HELPER: Moves a parameter or buffer (by dotted name) from the root split module
+            # into the named stage submodule, preserving persistence, and queues the original attribute for
+            # deferred deletion. Raises AssertionError if the value is not a tensor or the callee already has it.
             """
             Move a parameter from the root module to a submodule.
             Args:
@@ -1040,6 +1175,7 @@ class Pipe(torch.nn.Module):
         )
 
     def print_readable(self):
+        # [FUNCTION DOC] Prints the root split module and each stage module in readable form.
         """
         Print the pipe in a human-readable format.
         This will print both the root pipe and each stage module.
@@ -1052,6 +1188,9 @@ class Pipe(torch.nn.Module):
         example_args: tuple[Any, ...],
         example_kwargs: dict[str, Any] | None = None,
     ) -> ExportedProgram:
+        # [FUNCTION DOC] HELPER: Static method that exports the module with example positional and
+        # keyword inputs and returns the exported program. Raises RuntimeError (chained to the original
+        # error) if the model cannot be captured as a full graph. Logs at info level.
         logger.info("Tracing model ...")
         try:
             ep = torch.export.export(mod, example_args, example_kwargs)
@@ -1073,6 +1212,12 @@ class Pipe(torch.nn.Module):
         example_kwargs: dict[str, Any] | None = None,
         split_policy: Callable[[fx.GraphModule], fx.GraphModule] | None = None,
     ):
+        # [FUNCTION DOC] Static method that traces a module with export and builds a Pipe from it, using
+        # the replicate strategy for shared parameters and no loss spec. Optionally applies a split
+        # policy. If the first stage takes the same number of arguments as the original model, copies
+        # the original input calling convention onto it (so keyword arguments work) and recompiles it;
+        # otherwise leaves its signature and logs an info message. Returns the Pipe. Raises RuntimeError
+        # if tracing fails.
         # If a param will be used in multiple pipeline stages, we default the strategy to REPLICATE'ing the param across
         # stages instead of TRANSMIT'ting it
         multi_use_param_spec = MultiUseParameterConfig.REPLICATE
@@ -1134,12 +1279,16 @@ class Pipe(torch.nn.Module):
         return pipe
 
     def __str__(self):
+        # [FUNCTION DOC] Returns the string form of the split graph module.
         return self.split_gm.__str__()
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns the repr of the split graph module.
         return self.split_gm.__repr__()
 
     def info(self) -> PipeInfo:
+        # [FUNCTION DOC] Returns a PipeInfo holding the split graph, stage count and the loss/backward flag.
+        # Deliberately does not reference the Pipe so other stages can be freed.
         """
         Get information about the pipe.
 
@@ -1160,6 +1309,10 @@ class Pipe(torch.nn.Module):
         device: torch.device,
         group: ProcessGroup | None = None,
     ) -> _PipelineStage:
+        # [FUNCTION DOC] Creates a pipeline stage object for the given stage index, device and optional
+        # process group. Moves hard-coded device keyword arguments in the stage graph to the device
+        # (logging a warning if the stage is not a GraphModule), then builds the stage with the pipe info.
+        # Raises ValueError if the stage index is out of range.
         """
         Create a `PipelineStage` given a stage index and distributed group.
         The `PipelineStage` can run with `PipelineSchedule`s.
@@ -1190,6 +1343,8 @@ class Pipe(torch.nn.Module):
 
 
 class SplitPoint(Enum):
+    # [CLASS DOC] Enum of where to place a split relative to a submodule's forward: BEGINNING
+    # (before it runs) or END (after it runs).
     """
     Enum representing the points at which a split can occur in the execution of a submodule.
     Attributes:
@@ -1204,16 +1359,21 @@ class SplitPoint(Enum):
 # For backward compatibility, we kept the PipeSplitWrapper class because `class
 # SplitPoint` used to be defined in this class.
 class PipeSplitWrapper:
+    # [CLASS DOC] HELPER: Backward-compatibility holder exposing SplitPoint as a class attribute.
     # Create a class alias for BC
     SplitPoint = SplitPoint
 
 
 def _split_before_forward(self, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Replacement forward used for splitting before a module: emits a split
+    # marker, then calls the original forward saved on the module.
     pipe_split()
     return self._orig_forward(*args, **kwargs)
 
 
 def _split_after_forward(self, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Replacement forward used for splitting after a module: calls the
+    # original forward and always emits a split marker afterwards, even if it raises.
     try:
         return self._orig_forward(*args, **kwargs)
     finally:
@@ -1221,6 +1381,10 @@ def _split_after_forward(self, *args, **kwargs):
 
 
 def annotate_split_points(mod: torch.nn.Module, spec: dict[str, SplitPoint]):
+    # [FUNCTION DOC] Annotates the module in place with split points. For each dotted submodule name
+    # in the spec, saves its original forward and replaces it with a wrapper that emits the split
+    # marker before or after it. Raises AttributeError if a parent module does not exist and
+    # ValueError for an unknown split type.
     # TODO: make this implementation out-of-place?
     for qualname, split_type in spec.items():
         atoms = qualname.split(".")
@@ -1251,6 +1415,10 @@ def pipeline(
     split_spec: dict[str, SplitPoint] | None = None,
     split_policy: Callable[[fx.GraphModule], fx.GraphModule] | None = None,
 ) -> Pipe:
+    # [FUNCTION DOC] Splits a module into pipeline stages and returns a Pipe. With a split spec,
+    # annotates the module and traces it; otherwise traces and uses the optional split policy. Args:
+    # module, example micro-batch positional and keyword inputs, split spec (submodule name to
+    # SplitPoint), split policy. Raises ValueError if both split spec and split policy are given.
     """
     Split a module based on a specification.
 

@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Backward-pass helpers for pipeline stages. Provides autograd-graph analysis
+# (reverse graph, reverse closure, parameter grouping) used to split backward into an
+# input-gradient step and a weight-gradient step, plus stage_backward_input,
+# stage_backward_weight, the combined stage_backward, and a null-tolerant accumulate helper.
+# Import-time side effect: creates the module logger.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 import collections
 import logging
@@ -16,6 +21,10 @@ logger = logging.getLogger(__name__)
 
 
 def _get_grad_fn_or_grad_acc(t: torch.Tensor) -> Node | None:
+    # [FUNCTION DOC] HELPER: Returns the autograd node for a tensor: its grad_fn, or for a leaf
+    # requiring grad its grad accumulator (obtained through a temporary view because accumulators
+    # are created lazily). Raises RuntimeError if a view of a grad-requiring leaf has no grad_fn
+    # (for example under no-grad mode).
     """
     Get the grad function or grad accumulator for a tensor.
 
@@ -40,6 +49,9 @@ def _get_grad_fn_or_grad_acc(t: torch.Tensor) -> Node | None:
 def reverse_closure(
     roots: list[Node], target_nodes: set[Node], reverse_edges_dict
 ) -> tuple[set[Node], set[Node]]:
+    # [FUNCTION DOC] Breadth-first walk over the reverse edges starting from the roots. Returns a
+    # pair: the set of visited nodes, and the set of target nodes that were reached. Target nodes
+    # are recorded but not expanded or added to the closure; None entries are skipped.
     """
     This function returns the reverse closure of the given roots,
     i.e. the set of nodes that can be reached from the roots by following the
@@ -69,6 +81,9 @@ def reverse_closure(
 
 
 def construct_reverse_graph(roots: list[Node]) -> dict[Node, list[Node]]:
+    # [FUNCTION DOC] Builds a mapping from each autograd node to the list of nodes that consume
+    # it (reverse of next_functions) by walking the graph breadth-first from the roots. None roots
+    # and None edges are skipped.
     q: collections.deque[Node] = collections.deque()
     root_seen: set[Node] = set()
     reverse_edges_dict: dict[Node, list[Node]] = collections.defaultdict(list)
@@ -89,6 +104,11 @@ def construct_reverse_graph(roots: list[Node]) -> dict[Node, list[Node]]:
 def get_param_groups(
     inputs: list[Node], params: list[Node], reverse_edges_dict
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] Groups parameter gradient nodes by the intermediate nodes they connect to.
+    # First computes the closure of the input nodes, then for each parameter finds which closure
+    # nodes it reaches; parameters sharing an intermediate are merged into one group. Returns a
+    # list of unique dictionaries with a set of params and a set of intermediates. Parameters that
+    # reach no intermediate (e.g. when inputs do not require grad) are not in any group.
     """
     Given a list of inputs and a list of parameters, return a list of parameter
     groups, where each group contains the parameters and the intermediates that
@@ -147,6 +167,9 @@ def _autograd_grad_for_inputs(
     retain_graph: bool = False,
     allow_unused: bool = False,
 ) -> tuple[torch.Tensor | None, ...]:
+    # [FUNCTION DOC] HELPER: Computes gradients of outputs with respect to only those inputs that
+    # are tensors requiring grad, calling autograd grad on that subset. Returns a tuple aligned
+    # with the inputs, with None for the others (all None without calling autograd if none qualify).
     """Compute input gradients, returning ``None`` for non-grad inputs."""
     # Some inputs may not be used or may not require gradients, so we filter them out
     # before calling autograd.grad and place None for those positions in the result.
@@ -180,6 +203,13 @@ def stage_backward_input(
     input_values: list[Any],
     weights: Iterator[Parameter],
 ) -> tuple[tuple[torch.Tensor | None, ...], list[dict[str, Any]]]:
+    # [FUNCTION DOC] Computes the gradients of the stage outputs (or loss) with respect to the stage
+    # inputs only, for the zero-bubble input-backward step. Outputs that need no grad are
+    # skipped. Registers prehooks on the intermediate nodes of each parameter group to save their
+    # incoming gradients, runs autograd grad keeping the graph, accumulates results into the
+    # inputs' grad fields, then detaches the outputs in place and removes the hooks. Returns the
+    # input gradients and the parameter groups for stage_backward_weight. Raises RuntimeError
+    # with debug info on any failure.
     """
     Compute the gradients for only the stage inputs with
     respect to the stage outputs (if non-last stage) or loss (if last stage)
@@ -230,7 +260,10 @@ def stage_backward_input(
             for i, intermediate in enumerate(intermediates):
 
                 def get_hook(param_group, i):
+                    # [FUNCTION DOC] HELPER: Returns a prehook closure bound to a parameter group and intermediate index.
                     def hook(grad_inputs):
+                        # [FUNCTION DOC] HELPER: Prehook that stores the gradient inputs of the intermediate into the
+                        # group's list of grads at the bound index, creating that list on first use.
                         if param_group.get("grads", None) is None:
                             param_group["grads"] = [None] * len(
                                 param_group["intermediates"]
@@ -281,6 +314,12 @@ def stage_backward_input(
 def stage_backward_weight(
     weights: Iterator[Parameter], param_groups: list[dict[str, Any]], retain_graph=False
 ) -> tuple[torch.Tensor | None, ...]:
+    # [FUNCTION DOC] Computes weight gradients from the state saved by stage_backward_input. For
+    # each parameter group, builds gradient edges from the saved intermediate grads (clamping them
+    # with temporary prehooks when a group has several intermediates), then runs autograd grad to
+    # the group's params and accumulates results into each weight's grad field. Removes the
+    # intermediates and grads entries from the groups, and removes the hooks. Returns a tuple of
+    # the weights' pre-existing grads (captured before accumulation).
     # map weights to param_group_weights
     grad_acc_to_weight = {}
     weight_grads: list[torch.Tensor | None] = []
@@ -349,6 +388,12 @@ def stage_backward(
     input_values,
     outputs_with_grads_idxs: list[int] | None = None,  # deprecated, not used
 ) -> tuple[torch.Tensor | None, ...]:
+    # [FUNCTION DOC] Runs the full backward for a stage: flattens the (possibly nested tuple, list
+    # or dict) output and its gradients into tensor lists, runs autograd backward on them which
+    # accumulates parameter grads, and returns the input gradients as a tuple (None for non
+    # tensors), clearing each input's grad field so memory can be freed early. The
+    # outputs_with_grads_idxs argument is deprecated and only selects subsets of the outputs.
+    # Raises RuntimeError with debug info on any failure.
     """
     This is a helper function to:
     1. compute the gradients for the stage inputs, and
@@ -376,6 +421,10 @@ def stage_backward(
             # Don't delete me- see [Note: ref cycle]
             extract_tensors_with_grads,
         ):
+            # [FUNCTION DOC] HELPER: Recursively collects output tensors that need grad and their matching
+            # gradients from nested tuples, lists and dicts, appending to the enclosing lists. It takes
+            # itself as an argument to avoid a reference cycle. Raises AssertionError on mismatched
+            # types, lengths or keys; non-tensor leaves are ignored.
             if isinstance(output_val, torch.Tensor):
                 if not output_val.requires_grad and output_val.grad_fn is None:
                     return
@@ -480,6 +529,7 @@ def stage_backward(
 # TODO: handling requires_grad=False dynamically. Can we analyze this during initial
 # IR emission?
 def _null_coalesce_accumulate(lhs, rhs):
+    # [FUNCTION DOC] HELPER: Returns the non-None one of two values, or their sum if both are present.
     """
     Coalesce two values, even if one of them is null, returning the non-null
     value.

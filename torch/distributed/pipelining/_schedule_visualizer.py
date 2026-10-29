@@ -1,4 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
+# [MODULE DOC] Debug/visualization tools for pipeline schedules. get_schedule_ops builds the
+# per-rank action lists of a schedule class using a mocked PipelineStage (optionally with
+# communication ops or dependency-based spacing), add_schedule_op_spacing inserts idle slots
+# according to cross-rank dependencies, and visualize_schedule draws the result with
+# matplotlib (imported lazily, so it is only needed when plotting). Defines the color and
+# width mapping per computation type. No import-time side effects beyond imports.
 
 """
 This visualizer requires matplotlib to be installed.
@@ -26,6 +32,8 @@ from torch.distributed.pipelining.stage import PipelineStage
 
 
 class OpKey(NamedTuple):
+    # [CLASS DOC] Named tuple key (stage index, computation type, microbatch index) identifying an
+    # operation for dependency and completion-time tracking in the spacing algorithm.
     stage_index: int
     computation_type: _ComputationType
     microbatch_index: int
@@ -40,6 +48,13 @@ def get_schedule_ops(
     with_comms: bool = False,
     defer_pp_recv: bool = False,
 ) -> list[list[_Action | None]]:
+    # [FUNCTION DOC] Returns the actions of a schedule as a list per rank. The schedule is a name
+    # (resolved through get_schedule_class) or a schedule class; it is instantiated with mocked
+    # stages (one stage for single-stage schedules, default 2 per rank for multi-stage ones), so
+    # no distributed setup is needed. With with_comms, a runtime prepares communication ops
+    # (defer_pp_recv controls RECV placement). With add_spacing, Nones are removed and re-inserted by
+    # dependency analysis. Raises ValueError for invalid schedules or when both add_spacing and
+    # with_comms are set, and AssertionError for invalid num_stages_per_rank.
     """
     Get all actions for a given schedule, pp_degree, and num_microbatches. The actions are returned in a list of lists
     where each inner list represents a rank and each element in the inner list represents an action.
@@ -125,12 +140,15 @@ def get_schedule_ops(
 
 
 class _ComputationTypeVisual:
+    # [CLASS DOC] HELPER: Plain holder of how one computation type is drawn: color, legend text
+    # and width in time units.
     def __init__(
         self,
         color: str,
         text: str = "",
         width: int = 1,
     ):
+        # [FUNCTION DOC] HELPER: Stores the color, width and text attributes.
         self.color = color
         self.width = width
         self.text = text
@@ -153,6 +171,12 @@ action_type_to_color_mapping = {
 def add_schedule_op_spacing(
     schedule: list[list[_Action | None]],
 ) -> list[list[_Action | None]]:
+    # [FUNCTION DOC] Simulates execution of the per-rank action lists and returns new lists with
+    # None idle slots inserted so each action starts only after its dependencies (forward needs
+    # the previous stage forward; backward needs next stage backward; weight needs input backward)
+    # have completed, using each computation type's width as duration. Returns the input unchanged
+    # if empty. Raises RuntimeError on deadlock or unknown computation types.
+    # KNOWN ISSUE: prints progress lines to stdout on every timestep and rank (leftover debug output).
     """
     Add spacing to the schedule based on dependencies between ranks.
 
@@ -191,6 +215,8 @@ def add_schedule_op_spacing(
     scheduled_ops: dict[OpKey, int] = {}
 
     def is_dependency_ready(dependency_key: OpKey, timestep: int) -> bool:
+        # [FUNCTION DOC] HELPER: True if the dependency has been scheduled and its completion time is
+        # at or before the timestep.
         """Check if a dependency operation has completed by the given timestep."""
         return (
             dependency_key in scheduled_ops
@@ -198,6 +224,10 @@ def add_schedule_op_spacing(
         )
 
     def get_dependencies(action: _Action) -> list[OpKey]:
+        # [FUNCTION DOC] HELPER: Returns the operation keys an action depends on: none for the first
+        # stage forward; previous stage forward for forwards and for last-stage backwards; next stage
+        # full-backward or input-backward for backwards; own input-backward for weight backward.
+        # Raises AssertionError if the microbatch index is None, RuntimeError for unknown types.
         """Get the list of dependencies for an action."""
         stage_idx = action.stage_index
         comp_type = action.computation_type
@@ -239,6 +269,10 @@ def add_schedule_op_spacing(
         raise RuntimeError(f"Unknown computation type: {comp_type}")
 
     def is_action_ready(action: _Action, timestep: int) -> bool:
+        # [FUNCTION DOC] HELPER: True if the action can start at the timestep. Forward needs all its
+        # dependencies done; backward kinds need any one dependency done; overlapped forward-backward
+        # needs every sub-action ready. Raises AssertionError for missing sub-actions and RuntimeError
+        # for unknown types.
         """Check if an action is ready to be scheduled at the given timestep."""
         # For OR dependencies (like backward), check if any dependency is satisfied
         if action.computation_type in (
@@ -265,6 +299,9 @@ def add_schedule_op_spacing(
             raise RuntimeError(f"Unknown computation type: {action.computation_type}")
 
     def schedule_action(action: _Action, rank: int, timestep: int) -> int:
+        # [FUNCTION DOC] HELPER: Appends the action to the rank's spaced schedule, records completion
+        # times of it (or each of its sub-actions cumulatively) in the shared completion table, and
+        # returns the action's completion time. Raises AssertionError if a microbatch index is None.
         """Schedule an action and return completion time."""
         spaced_schedule[rank].append(action)
         comp_type = action.computation_type
@@ -352,6 +389,12 @@ def visualize_schedule(
     schedule: list[list[_Action | None]],
     filename: str | None = None,
 ) -> None:
+    # [FUNCTION DOC] Draws the schedule as colored rectangles (one row per rank, widths by
+    # computation type, label is the action text) with a legend of the used types. Saves to the
+    # file if a filename is given, otherwise shows the plot. Requires matplotlib; sets the global
+    # font family in matplotlib settings.
+    # KNOWN ISSUE: the docstring lists a nonexistent add_schedule_spacing argument; the text weight
+    # is normal in both branches despite a comment saying compound actions use bold.
     """
     Visualize the schedule using matplotlib.
     The schedule is a list of lists where each inner list represents a rank and each element in the inner list represents an action.
