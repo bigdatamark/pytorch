@@ -1,4 +1,16 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Implementation of the masked reduction, normalization and related operations
+# exposed as torch.masked (sum, prod, cumsum, cumprod, amax, amin, argmax,
+# argmin, mean, median, logsumexp, logaddexp, norm, var, std, softmax,
+# log_softmax, softmin, normalize). Each op fills masked-out elements with the
+# operation's identity value (see _reduction_identity) via _combine_input_and_mask
+# and then calls the regular torch op; some ops also support sparse COO and CSR
+# layouts through scatter/segment helpers. Also holds helpers for building the
+# canonical mask, dim canonicalization and a sparse-aware where.
+# Import-time side effects: the docstring decorator copies docstrings from the
+# _docs module onto each decorated function (warning if one is missing) and
+# appends the function name to this module's __all__ (initially empty).
 import warnings
 from collections.abc import Callable
 from typing import Any, TYPE_CHECKING, TypeAlias, TypeVar
@@ -35,6 +47,11 @@ _P = ParamSpec("_P")
 
 
 def _apply_docstring_templates(func: Callable[_P, _T]) -> Callable[_P, _T]:
+    # [FUNCTION DOC] HELPER: Decorator. Looks up the pre-generated docstring named
+    # after the function in the _docs module and assigns it as the function's
+    # docstring; if none exists, emits a warning telling to run the update script.
+    # Always appends the function name to the module __all__ (side effect) and
+    # returns the same function object.
     """Decorator that applies docstring templates to function docstring
     and returns the function instance.
     """
@@ -57,6 +74,11 @@ def _apply_docstring_templates(func: Callable[_P, _T]) -> Callable[_P, _T]:
 
 
 def _generate_docstring(func):
+    # [FUNCTION DOC] HELPER: Used only by the docs update script. Builds the full
+    # docstring text of a masked op from internal templates (signature, description,
+    # identity-value text, argument docs, example) chosen by the op kind (reduction
+    # or normalization) derived from the function name, formatted with per-op data.
+    # Returns the formatted docstring string. No side effects.
     """A utility function called from tools/update_masked_docs.py
     script to update the module torch.masked._docs.py
     """
@@ -406,6 +428,15 @@ Example::
 
 
 def _reduction_identity(op_name: str, input: Tensor, *args):
+    # [FUNCTION DOC] HELPER: Returns the identity element of the named reduction as
+    # a scalar tensor with the input's dtype and device (module prefix of the name is
+    # ignored). Sum-like: 0; prod-like: 1; max-like: lowest value (negative infinity
+    # for floats, dtype minimum for signed ints and uint8); min-like: highest value;
+    # norm: 0, or infinity when ord is negative infinity (first extra arg, default 2);
+    # median: NaN; mean, var, std: None (ambiguous). Raises NotImplementedError for
+    # unsupported op names or dtypes (e.g. unsigned ints other than uint8, bool).
+    # KNOWN ISSUE: sum/prod identity ignores nothing, but max/min-like ops have no
+    # complex or bool handling and fall through to NotImplementedError.
     """Return identity value as scalar tensor of a reduction operation on
     given input, or None, if the identity value cannot be uniquely
     defined for the given input.
@@ -468,6 +499,10 @@ def _reduction_identity(op_name: str, input: Tensor, *args):
 
 
 def _canonical_dim(dim: DimOrDims, ndim: int) -> tuple[int, ...]:
+    # [FUNCTION DOC] HELPER: Normalizes a dim argument (None, int, or sequence) into
+    # a sorted tuple of non-negative dims. None or an empty tuple means all
+    # dimensions. A zero-dim input is treated as having one dim for range checks.
+    # Raises RuntimeError if a dim is repeated and IndexError if a dim is out of range.
     """Return dim argument as a tuple of sorted dim values."""
     dims: list[int] = []
     if dim == ():
@@ -493,6 +528,9 @@ def _canonical_dim(dim: DimOrDims, ndim: int) -> tuple[int, ...]:
 
 
 def _sparse_coo_flatten_indices(indices: Tensor, shape: tuple):
+    # [FUNCTION DOC] HELPER: Converts a 2-D sparse COO index tensor (one row per
+    # sparse dim, one column per element) into a 1-D tensor of row-major linear
+    # indices for the given sparse shape. Returns a new tensor; input is unchanged.
     # Flatted N-D indices to 1-D indices
     flat_indices = indices.new_zeros(indices.size(1))
     for d, sz in enumerate(shape):
@@ -502,6 +540,9 @@ def _sparse_coo_flatten_indices(indices: Tensor, shape: tuple):
 
 
 def _any(input: Tensor, dim: tuple, keepdim: bool):
+    # [FUNCTION DOC] HELPER: Logical any-reduction over several dims, applied one
+    # dim at a time starting from the last (workaround for missing tuple-dim support).
+    # Returns the reduced boolean tensor; with an empty dim tuple returns input as is.
     # Support torch.any with tuple dim argument.
     # Workaround of https://github.com/pytorch/pytorch/issues/56586
     r = input
@@ -511,6 +552,13 @@ def _any(input: Tensor, dim: tuple, keepdim: bool):
 
 
 def _sparse_coo_where(mask: Tensor, input: Tensor, fill_value: Tensor) -> Tensor:
+    # [FUNCTION DOC] HELPER: Sparse COO (including hybrid) version of where. Keeps
+    # input values at positions that are masked in by the mask, adds explicit zeros
+    # for masked-in positions missing from the input, and in the dense part of
+    # hybrid tensors replaces masked-out entries with fill_value. Uses set
+    # operations on flattened indices. Returns a coalesced sparse COO tensor.
+    # Raises AssertionError if input is not COO, layouts or shapes of mask and input
+    # differ, or their dense dims differ.
     """Sparse variant of torch.where. Supports sparse COO and hybrid sparse COO tensors.
 
     _sparse_coo_where implements the following invariant:
@@ -571,14 +619,21 @@ def _sparse_coo_where(mask: Tensor, input: Tensor, fill_value: Tensor) -> Tensor
     maskin_flat_indices = mask_flat_indices[mask_values.nonzero()[:, 0]]
 
     def intersection(i1, i2):
+        # [FUNCTION DOC] HELPER: Set intersection of two 1-D index tensors. Returns the
+        # sorted unique values of the concatenation and the positions (in that
+        # unique tensor) of values occurring more than once.
         union, counts = torch.cat([i1, i2]).unique(return_counts=True)
         return union, torch.where(counts.gt(1))
 
     def minus(i1, i2):
+        # [FUNCTION DOC] HELPER: Set difference of index tensors (i1 minus i2), assuming
+        # i1 and i2 each have unique entries. Returns the same pair as intersection.
         union, counts = torch.cat([i1, i2]).unique(return_counts=True)
         return intersection(union[torch.where(counts.eq(1))], i1)
 
     def _apply(a):
+        # [FUNCTION DOC] HELPER: Takes a pair of values tensor and selection and
+        # returns the selected elements of the values.
         obj, w = a
         return obj[w]
 
@@ -639,6 +694,13 @@ def _sparse_coo_scatter_reduction_helper(
     keepdim: bool,
     dtype: DType | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] HELPER: Reduces a sparse COO tensor (already masked, with
+    # identity-filled values) over the given dims using the torch function op
+    # (sum, prod, amax or amin; selected by the function name). Dense dims are
+    # reduced directly (only sum supported, otherwise returns NotImplemented),
+    # sparse dims by grouping equal remaining indices and scatter-reducing values.
+    # Values are cast to dtype first; keepdim keeps reduced dims with size 1.
+    # Returns a sparse COO tensor. Raises ValueError for any other op.
     reduce = op.__name__
     valid_reductions = ["sum", "prod", "amax", "amin"]
     if reduce not in valid_reductions:
@@ -759,6 +821,13 @@ def _sparse_csr_segment_reduction_helper(
     keepdim: bool,
     dtype: DType | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] HELPER: Reduces a masked sparse CSR (2-D) tensor over the given
+    # dims (none, one, or both) with sum, prod, mean, amax or amin chosen by the
+    # function name. Reducing dim 0 groups values by column; dim 1 uses a segment
+    # reduction per row; both dims yield a single element. Values are cast to dtype.
+    # Returns a sparse CSR tensor. Raises AssertionError if keepdim is false or dims
+    # are invalid, ValueError for an unsupported op.
+    # KNOWN ISSUE: with no dims the input is returned without the dtype cast.
     # Currently, while sparse CSR is always 2D with no dense dimensions keepdim must be True
     # FIXME: when dense dimensions are implemented for CSR tensors
     if not keepdim:
@@ -842,6 +911,8 @@ def _sparse_csr_segment_reduction_helper(
 
 
 def _sparse_csr_where(mask: Tensor, input: Tensor, fill_value: Tensor) -> Tensor:
+    # [FUNCTION DOC] HELPER: CSR version of the sparse where; converts mask and
+    # input to COO, applies the COO version and converts the result back to CSR.
     """Sparse variant of torch.where. Supports sparse CSR tensors."""
     # TODO: implement sparse CSR specific where operator for efficiency
     return _sparse_coo_where(
@@ -850,6 +921,9 @@ def _sparse_csr_where(mask: Tensor, input: Tensor, fill_value: Tensor) -> Tensor
 
 
 def _where(mask: Tensor, input: Tensor, fill_value: Tensor) -> Tensor:
+    # [FUNCTION DOC] HELPER: Dispatches on the mask layout: strided uses the regular
+    # where, sparse COO and sparse CSR use the sparse variants. Returns the selected
+    # tensor. Raises ValueError for any other layout.
     """torch.where with sparse inputs support.
 
     _where implements the following invariant:
@@ -886,6 +960,11 @@ def _where(mask: Tensor, input: Tensor, fill_value: Tensor) -> Tensor:
 
 
 def _input_mask(input: Tensor | MaskedTensor, *args, **kwargs) -> Tensor:
+    # [FUNCTION DOC] HELPER: Builds the boolean mask matching the input's shape and
+    # layout from the mask keyword argument: broadcasts it to the input shape,
+    # converts layout (dense/COO/CSR), coalesces COO, and casts to bool. Extra
+    # positional args are ignored. Raises ValueError for an unsupported input layout
+    # or a missing mask, IndexError if the mask has more dims than the input.
     """Return canonical input mask.
 
     A canonical input mask is defined as a boolean mask tensor that
@@ -973,6 +1052,11 @@ def _input_mask(input: Tensor | MaskedTensor, *args, **kwargs) -> Tensor:
 
 
 def _output_mask(op, input: Tensor, *args, **kwargs) -> Tensor:
+    # [FUNCTION DOC] HELPER: Computes the output mask of a masked op given as a
+    # function. For reductions (identified by name), the canonical input mask is
+    # any-reduced over the reduced dims honoring keepdim (norm skips its leading ord
+    # argument); for normalizations it is the canonical input mask itself.
+    # Raises ValueError if op is not a callable masked operation.
     """Return output mask of masked operation applied to given arguments."""
     if callable(op):
         is_reduction = op.__name__ in {
@@ -1019,7 +1103,16 @@ def _output_mask(op, input: Tensor, *args, **kwargs) -> Tensor:
 
 
 def _combine_input_and_mask(op, input: MaskedTensor | Tensor, mask, *args) -> Tensor:
+    # [FUNCTION DOC] HELPER: Replaces masked-out elements of input by the identity
+    # value of op. For a MaskedTensor input, uses its data and mask through an
+    # autograd function (gradient is wrapped back into a masked tensor with the same
+    # mask); otherwise uses the given mask, and returns input unchanged if it is None.
+    # Extra args go to the identity lookup (e.g. norm order). Raises ValueError if op
+    # is not callable.
     def helper(input, mask):
+        # [FUNCTION DOC] HELPER: Returns input unchanged when mask is None, otherwise
+        # canonicalizes the mask and selects input where masked in, identity elsewhere.
+        # Raises ValueError if op is not callable.
         if mask is None:
             return input
         canonical_mask = _input_mask(input, mask=mask)
@@ -1032,9 +1125,16 @@ def _combine_input_and_mask(op, input: MaskedTensor | Tensor, mask, *args) -> Te
             )
 
     class Combine(torch.autograd.Function):
+        # [CLASS DOC] HELPER: Autograd function applying the identity fill to data
+        # given mask. Forward returns the filled data; the mask is saved and marked
+        # non-differentiable. Backward returns the incoming gradient as a masked
+        # tensor with that mask, and no gradient for the mask.
         @staticmethod
         # pyrefly: ignore [bad-override]
         def forward(ctx, input, mask):
+            # [FUNCTION DOC] HELPER: Saves the mask on ctx (marking it non-differentiable
+            # if present) and returns input with masked-out elements replaced by the
+            # identity value. Mask may be None, meaning input is returned unchanged.
             """Return input with masked-out elements eliminated for the given operations."""
             ctx.save_for_backward(mask)
 
@@ -1046,6 +1146,9 @@ def _combine_input_and_mask(op, input: MaskedTensor | Tensor, mask, *args) -> Te
         @staticmethod
         # pyrefly: ignore [bad-override]
         def backward(ctx, grad_output):
+            # [FUNCTION DOC] HELPER: Wraps the gradient data (unwrapping it first if it is a
+            # masked tensor) into a masked tensor using the saved mask; returns that
+            # for input and None for mask.
             (mask,) = ctx.saved_tensors
             grad_data = (
                 grad_output.get_data() if is_masked_tensor(grad_output) else grad_output
@@ -1069,6 +1172,10 @@ def sum(
     dtype: DType | None = None,
     mask: Tensor | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Masked sum over dims (all if None); masked-out elements count
+    # as 0. Default dtype is the input dtype, with small ints and bool promoted to
+    # int64. Supports strided, sparse COO and sparse CSR layouts. Returns the sum
+    # tensor. Raises ValueError for any other layout.
     # __doc__ is generated by _apply_docstring_templates decorator
     if dtype is None:
         # promote integer types to int64 when output dtype is not specified
@@ -1122,6 +1229,11 @@ def prod(
     dtype: DType | None = None,
     mask: Tensor | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Masked product over dims (all if None); masked-out elements
+    # count as 1. Same dtype promotion as sum. Strided inputs are reduced one dim
+    # at a time. Sparse COO and CSR inputs require an explicit mask (since
+    # unspecified elements are zeros). Returns the product tensor. Raises
+    # ValueError for a missing mask on sparse input or an unsupported layout.
     # __doc__ is generated by _apply_docstring_templates decorator
     if dtype is None:
         # promote integer types to int64 when output dtype is not specified
@@ -1198,6 +1310,9 @@ def cumsum(
     dtype: DType | None = None,
     mask: Tensor | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Masked cumulative sum along one dim; masked-out elements count
+    # as 0 (their output positions are still filled, not masked). Output cast to
+    # dtype (default input dtype). Strided only; raises ValueError otherwise.
     if dtype is None:
         dtype = input.dtype
     dim_ = _canonical_dim(dim, input.ndim)[0]
@@ -1218,6 +1333,9 @@ def cumprod(
     dtype: DType | None = None,
     mask: Tensor | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Masked cumulative product along one dim; masked-out elements
+    # count as 1. Output cast to dtype (default input dtype). Strided only; raises
+    # ValueError otherwise.
     if dtype is None:
         dtype = input.dtype
     dim_ = _canonical_dim(dim, input.ndim)[0]
@@ -1239,6 +1357,10 @@ def amax(
     dtype: DType | None = None,
     mask: Tensor | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Masked maximum over dims (all if None); masked-out elements are
+    # replaced by the lowest value of the dtype. Result cast to dtype (default input
+    # dtype). Strided, sparse COO and sparse CSR layouts; sparse input requires an
+    # explicit mask. Raises ValueError for a missing sparse mask or other layout.
     """\
 {reduction_signature}
 
@@ -1289,6 +1411,11 @@ def amin(
     dtype: DType | None = None,
     mask: Tensor | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Masked minimum over dims (all if None); masked-out elements are
+    # replaced by the highest value of the dtype. Result cast to dtype (default input
+    # dtype). Strided, sparse COO and sparse CSR layouts; sparse input requires an
+    # explicit mask. Raises ValueError for a missing sparse mask or other layout.
+    # KNOWN ISSUE: the sparse COO missing-mask error message says amax instead of amin.
     """\
 {reduction_signature}
 
@@ -1339,6 +1466,9 @@ def argmax(
     dtype: DType | None = None,
     mask: Tensor | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Masked index of the maximum along a dim (flattened if None);
+    # masked-out elements are replaced by the lowest value. Index result is cast to
+    # dtype (default input dtype). Strided only; raises ValueError otherwise.
     """\
 {reduction_signature}
 {reduction_descr}
@@ -1365,6 +1495,9 @@ def argmin(
     dtype: DType | None = None,
     mask: Tensor | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Masked index of the minimum along a dim (flattened if None);
+    # masked-out elements are replaced by the highest value. Index result is cast to
+    # dtype (default input dtype). Strided only; raises ValueError otherwise.
     """\
 {reduction_signature}
 {reduction_descr}
@@ -1391,6 +1524,11 @@ def mean(
     dtype: DType | None = None,
     mask: Tensor | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Masked mean over dims: masked sum divided by the count of
+    # masked-in elements, so fully masked-out slices give NaN. Dtype defaults to the
+    # input dtype and must be floating point or complex. Strided inputs and sparse
+    # CSR (explicit mask required, via segment reduction) are supported.
+    # Raises ValueError for a bad dtype, a missing CSR mask or another layout.
     """\
 {reduction_signature}
 
@@ -1458,6 +1596,11 @@ def median(
     dtype: DType | None = None,
     mask: Tensor | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Masked median along one dim (default last), computed with the
+    # NaN-ignoring median after filling masked-out elements with NaN; fully masked
+    # rows give NaN. Non-float input is computed as float and cast back to dtype,
+    # raising ValueError if any row is fully masked out. Strided only; ValueError
+    # otherwise.
     """\
 {reduction_signature}
 {reduction_descr}
@@ -1501,6 +1644,9 @@ def logsumexp(
     dtype: DType | None = None,
     mask: Tensor | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Masked log-sum-exp over dims (all if None); masked-out elements
+    # are replaced by negative infinity (or dtype minimum for ints). Result cast to
+    # dtype (default input dtype). Strided only; raises ValueError otherwise.
     if dtype is None:
         dtype = input.dtype
     dim_ = _canonical_dim(dim, input.ndim)
@@ -1522,6 +1668,10 @@ def logaddexp(
     input_mask: Tensor | None = None,
     other_mask: Tensor | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Element-wise log of the sum of exponentials of two tensors, each
+    # with its own optional mask; masked-out elements become negative infinity before
+    # the operation. Result cast to dtype (default input dtype). Both inputs must be
+    # strided; raises ValueError otherwise. Not decorated, so not added to __all__.
     """logaddexp(input, other, *, dtype=None, input_mask=None, other_mask=None) -> Tensor
 
     Returns logaddexp of all the elements in the :attr:`input` and the :attr:`other`
@@ -1585,6 +1735,10 @@ def norm(
     dtype: DType | None = None,
     mask: Tensor | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Masked vector norm of given order over dims (all if None);
+    # masked-out elements are replaced by 0 (or infinity for negative infinite order).
+    # Result dtype defaults to the input dtype. Strided only; raises ValueError
+    # otherwise.
     """\
 {reduction_signature}
 
@@ -1622,6 +1776,12 @@ def _std_var(
     mask: Tensor | None,
     take_sqrt: bool | None,
 ) -> Tensor:
+    # [FUNCTION DOC] HELPER: Shared implementation of masked variance and standard
+    # deviation. Correction comes from unbiased (1 or 0) or correction_opt, default
+    # 1; giving both raises AssertionError. Computes masked mean, then masked sum of
+    # squared magnitudes divided by max(count minus correction, 0); optionally takes
+    # the square root. Fully masked-out slices give NaN. Non-float dtype defaults to
+    # float32. Strided only; raises ValueError otherwise.
     if unbiased is not None and correction_opt is not None:
         raise AssertionError("Only one of unbiased and correction may be given")
     correction = 1.0
@@ -1703,6 +1863,9 @@ def var(
     dtype: DType | None = None,
     mask: Tensor | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Masked sample variance over dims; delegates to the shared
+    # variance/std helper without square root. Accepts either unbiased or
+    # correction (not both). See that helper for details and errors.
     """\
 {reduction_signature}
 {reduction_descr}
@@ -1734,6 +1897,10 @@ def std(
     dtype: DType | None = None,
     mask: Tensor | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Masked sample standard deviation over dims; delegates to the
+    # shared variance/std helper with square root. Accepts either unbiased or
+    # correction (not both).
+    # KNOWN ISSUE: correction is typed as int only, while var also accepts float.
     """\
 {reduction_signature}
 {reduction_descr}
@@ -1762,6 +1929,9 @@ def softmax(
     dtype: DType | None = None,
     mask: Tensor | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Masked softmax along one dim; masked-out elements are filled
+    # with the lowest value so they get (near) zero weight. Output has the input
+    # shape, computed in dtype (default input dtype). Strided only; ValueError otherwise.
     if dtype is None:
         dtype = input.dtype
     dim_ = _canonical_dim(dim, input.ndim)[0]
@@ -1782,6 +1952,9 @@ def log_softmax(
     dtype: DType | None = None,
     mask: Tensor | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Masked log-softmax along one dim; masked-out elements are filled
+    # with the lowest value so they get very negative output. Computed in dtype
+    # (default input dtype). Strided only; raises ValueError otherwise.
     if dtype is None:
         dtype = input.dtype
     dim_ = _canonical_dim(dim, input.ndim)[0]
@@ -1802,6 +1975,9 @@ def softmin(
     dtype: DType | None = None,
     mask: Tensor | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Masked softmin along one dim; masked-out elements are filled
+    # with the highest value so they get (near) zero weight. Computed in dtype
+    # (default input dtype). Strided only; raises ValueError otherwise.
     if dtype is None:
         dtype = input.dtype
     dim_ = _canonical_dim(dim, input.ndim)[0]
@@ -1824,6 +2000,10 @@ def normalize(
     dtype: DType | None = None,
     mask: Tensor | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Masked normalization along one dim: divides the masked input
+    # (masked-out elements zeroed) by the masked norm of the given order, clamped
+    # below by eps. Norm computed in dtype (default input dtype). Strided only;
+    # raises ValueError otherwise.
     if dtype is None:
         dtype = input.dtype
     # TODO: eliminate mask_input as unnecessary when using masked divide.
