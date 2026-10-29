@@ -4,6 +4,13 @@
 # ruff: noqa
 # flake8: noqa
 
+# [MODULE DOC] Dynamo-patched copy of the CPython 3.13 list_tests module: a shared
+# CommonTest mixin of behavior tests (init, repr, indexing, slicing, append/extend/insert,
+# pop/remove/index, reverse, clear, copy, sort, in-place ops) meant to be mixed into list and
+# UserList test classes via a type2test attribute, run here under CPythonTestCase.
+# Import-time side effect: installs RedirectImportFinder at the front of sys.meta_path so
+# test.* helper modules resolve to their top-level equivalents.
+
 # Test copied from
 # https://raw.githubusercontent.com/python/cpython/refs/tags/v3.13.5/Lib/test/list_tests.py
 
@@ -30,7 +37,13 @@ redirect_imports = (
 )
 
 class RedirectImportFinder(importlib.abc.MetaPathFinder):
+    # [CLASS DOC] HELPER: Meta path finder that redirects selected 'test.' package imports
+    # (listed in redirect_imports) to the same-named top-level module, registering the redirect
+    # in sys.modules. Stateless; returns no spec for other names.
     def find_spec(self, fullname, path, target=None):
+        # [FUNCTION DOC] HELPER: Finder hook. For a module name in redirect_imports, imports the
+        # name with the 'test.' prefix removed, stores it in sys.modules under the original
+        # name and returns its spec; returns None if the import fails or name is not redirected.
         # Check if the import is the problematic one
         if fullname in redirect_imports:
             try:
@@ -63,8 +76,12 @@ from test.support import ALWAYS_EQ, NEVER_EQ, get_c_recursion_limit
 
 
 class CommonTest(seq_tests.CommonTest):
+    # [CLASS DOC] Mixin extending seq_tests.CommonTest with mutable-sequence tests; the
+    # concrete sequence class under test comes from self.type2test. Holds no state itself.
 
     def test_init(self):
+        # [FUNCTION DOC] Checks constructor/__init__ semantics: iterable optional, re-init clears
+        # or overwrites contents, and copy-construction yields a distinct but equal object.
         # Iterable arg is optional
         self.assertEqual(self.type2test([]), self.type2test())
 
@@ -84,18 +101,24 @@ class CommonTest(seq_tests.CommonTest):
         self.assertEqual(a, b)
 
     def test_getitem_error(self):
+        # [FUNCTION DOC] Checks that indexing a list with a string raises TypeError with the
+        # message about indices needing to be integers or slices.
         a = []
         msg = "list indices must be integers or slices"
         with self.assertRaisesRegex(TypeError, msg):
             a['a']
 
     def test_setitem_error(self):
+        # [FUNCTION DOC] Checks that assigning to a list item with a string index raises TypeError
+        # with the integers-or-slices message.
         a = []
         msg = "list indices must be integers or slices"
         with self.assertRaisesRegex(TypeError, msg):
             a['a'] = "python"
 
     def test_repr(self):
+        # [FUNCTION DOC] Checks str and repr of empty and plain sequences and of a self-containing
+        # sequence, which must render the recursive reference as an ellipsis in brackets.
         l0 = []
         l2 = [0, 1, 2]
         a0 = self.type2test(l0)
@@ -113,12 +136,17 @@ class CommonTest(seq_tests.CommonTest):
         self.assertEqual(repr(a2), "[0, 1, 2, [...], 3]")
 
     def test_repr_deep(self):
+        # [FUNCTION DOC] Builds nesting deeper than the C recursion limit and checks that repr
+        # raises RecursionError.
         a = self.type2test([])
         for i in range(get_c_recursion_limit() + 1):
             a = self.type2test([a])
         self.assertRaises(RecursionError, repr, a)
 
     def test_set_subscript(self):
+        # [FUNCTION DOC] Checks extended-slice assignment errors (zero step, non-iterable value,
+        # size mismatch with step, bad getitem args) raise ValueError/TypeError, and a valid
+        # stepped slice assignment produces the expected contents.
         a = self.type2test(range(20))
         self.assertRaises(ValueError, a.__setitem__, slice(0, 10, 0), [1,2,3])
         self.assertRaises(TypeError, a.__setitem__, slice(0, 10), 1)
@@ -130,6 +158,8 @@ class CommonTest(seq_tests.CommonTest):
                                             16, 17, 18, 19]))
 
     def test_reversed(self):
+        # [FUNCTION DOC] Checks reversed iteration order, StopIteration at exhaustion, empty input,
+        # and that the reversed iterator of a list has no length (len raises TypeError).
         a = self.type2test(range(20))
         r = reversed(a)
         self.assertEqual(list(r), self.type2test(range(19, -1, -1)))
@@ -140,6 +170,8 @@ class CommonTest(seq_tests.CommonTest):
         self.assertRaises(TypeError, len, reversed([1,2,3]))
 
     def test_setitem(self):
+        # [FUNCTION DOC] Checks item assignment with positive and negative indices, and IndexError
+        # for out-of-range indices and empty lists, and TypeError when called without arguments.
         a = self.type2test([0, 1])
         a[0] = 0
         a[1] = 100
@@ -173,6 +205,8 @@ class CommonTest(seq_tests.CommonTest):
         self.assertEqual(a, self.type2test([5,6,7,8,9]))
 
     def test_delitem(self):
+        # [FUNCTION DOC] Checks item deletion with positive and negative indices, IndexError on
+        # out-of-range or empty input, and TypeError for a missing argument.
         a = self.type2test([0, 1])
         del a[1]
         self.assertEqual(a, [0])
@@ -195,6 +229,8 @@ class CommonTest(seq_tests.CommonTest):
         self.assertRaises(TypeError, a.__delitem__)
 
     def test_setslice(self):
+        # [FUNCTION DOC] Checks slice assignment over many start/stop combinations (including
+        # negative), self-assignment, assignment into empty list from a tuple, TypeError cases.
         l = [0, 1]
         a = self.type2test(l)
 
@@ -241,6 +277,7 @@ class CommonTest(seq_tests.CommonTest):
         self.assertRaises(TypeError, a.__setitem__)
 
     def test_slice_assign_iterator(self):
+        # [FUNCTION DOC] Checks that slice assignment accepts an iterator as the right-hand side.
         x = self.type2test(range(5))
         x[0:3] = reversed(range(3))
         self.assertEqual(x, self.type2test([2, 1, 0, 3, 4]))
@@ -249,6 +286,7 @@ class CommonTest(seq_tests.CommonTest):
         self.assertEqual(x, self.type2test([2, 1, 0]))
 
     def test_delslice(self):
+        # [FUNCTION DOC] Checks slice deletion with positive, negative and open-ended bounds.
         a = self.type2test([0, 1])
         del a[1:2]
         del a[0:1]
@@ -290,6 +328,7 @@ class CommonTest(seq_tests.CommonTest):
         self.assertEqual(a, self.type2test([]))
 
     def test_append(self):
+        # [FUNCTION DOC] Checks append adds items at the end and raises TypeError without argument.
         a = self.type2test([])
         a.append(0)
         a.append(1)
@@ -299,6 +338,8 @@ class CommonTest(seq_tests.CommonTest):
         self.assertRaises(TypeError, a.append)
 
     def test_extend(self):
+        # [FUNCTION DOC] Checks extend with sequences, empty input, itself, strings, and errors
+        # (non-iterable, no argument); also an iterator with a huge length hint must not break it.
         a1 = self.type2test([0])
         a2 = self.type2test((0, 1))
         a = a1[:]
@@ -320,11 +361,16 @@ class CommonTest(seq_tests.CommonTest):
 
         # overflow test. issue1621
         class CustomIter:
+            # [CLASS DOC] HELPER: Iterator that is immediately exhausted but reports a huge
+            # length hint (maxsize), used for the extend overflow test.
             def __iter__(self):
+                # [FUNCTION DOC] HELPER: Returns self as the iterator.
                 return self
             def __next__(self):
+                # [FUNCTION DOC] HELPER: Always raises StopIteration (empty iterator).
                 raise StopIteration
             def __length_hint__(self):
+                # [FUNCTION DOC] HELPER: Returns the maximum integer as the length hint.
                 return sys.maxsize
         a = self.type2test([1,2,3,4])
         a.extend(CustomIter())
@@ -332,6 +378,8 @@ class CommonTest(seq_tests.CommonTest):
 
 
     def test_insert(self):
+        # [FUNCTION DOC] Checks insert at various positions, with negative index and with indices
+        # beyond either end (clamped to start or end), and TypeError without arguments.
         a = self.type2test([0, 1, 2])
         a.insert(0, -2)
         a.insert(1, -1)
@@ -347,6 +395,8 @@ class CommonTest(seq_tests.CommonTest):
         self.assertRaises(TypeError, a.insert)
 
     def test_pop(self):
+        # [FUNCTION DOC] Checks pop with default and explicit index, IndexError on out-of-range or
+        # empty list, and TypeError for too many arguments.
         a = self.type2test([-1, 0, 1])
         a.pop()
         self.assertEqual(a, [-1, 0])
@@ -360,6 +410,9 @@ class CommonTest(seq_tests.CommonTest):
         a = self.type2test([0, 10, 20, 30, 40])
 
     def test_remove(self):
+        # [FUNCTION DOC] Checks remove of first matching item, ValueError when absent, TypeError
+        # without argument, ALWAYS_EQ/NEVER_EQ semantics, and that exceptions raised by item
+        # comparison propagate and leave the list order and contents intact.
         a = self.type2test([0, 0, 1])
         a.remove(1)
         self.assertEqual(a, [0, 0])
@@ -387,10 +440,13 @@ class CommonTest(seq_tests.CommonTest):
         self.assertRaises(ValueError, a.remove, ALWAYS_EQ)
 
         class BadExc(Exception):
+            # [CLASS DOC] HELPER: Exception type raised by the comparison helpers below.
             pass
 
         class BadCmp:
+            # [CLASS DOC] HELPER: Item whose equality raises BadExc when compared to 2, else False.
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: Raises BadExc if other equals 2, otherwise returns False.
                 if other == 2:
                     raise BadExc()
                 return False
@@ -399,7 +455,9 @@ class CommonTest(seq_tests.CommonTest):
         self.assertRaises(BadExc, a.remove, BadCmp())
 
         class BadCmp2:
+            # [CLASS DOC] HELPER: Item whose equality comparison always raises BadExc.
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: Always raises BadExc.
                 raise BadExc()
 
         d = self.type2test('abcdefghcij')
@@ -423,6 +481,9 @@ class CommonTest(seq_tests.CommonTest):
         "__build_class__ with closed over objects not supported",
     )
     def test_index(self):
+        # [FUNCTION DOC] Runs the inherited index tests, then checks index with start/stop bounds
+        # after a removal, and that mutating the list from inside an item comparison during index
+        # ends in ValueError rather than a crash. Skipped under Dynamo (closure-capturing classes).
         super().test_index()
         a = self.type2test([-2, -1, 0, 0, 1, 2])
         a.remove(0)
@@ -431,9 +492,13 @@ class CommonTest(seq_tests.CommonTest):
 
         # Test modifying the list during index's iteration
         class EvilCmp:
+            # [CLASS DOC] HELPER: Item whose equality clears the referenced list (the victim) and
+            # returns False, to test mutation during iteration.
             def __init__(self, victim):
+                # [FUNCTION DOC] HELPER: Stores the list to be cleared as victim.
                 self.victim = victim
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: Deletes all elements of the victim list and returns False.
                 del self.victim[:]
                 return False
         a = self.type2test()
@@ -442,6 +507,7 @@ class CommonTest(seq_tests.CommonTest):
         self.assertRaises(ValueError, a.index, None)
 
     def test_reverse(self):
+        # [FUNCTION DOC] Checks in-place reverse, double reverse restores order, TypeError on args.
         u = self.type2test([-2, -1, 0, 1, 2])
         u2 = u[:]
         u.reverse()
@@ -452,6 +518,8 @@ class CommonTest(seq_tests.CommonTest):
         self.assertRaises(TypeError, u.reverse, 42)
 
     def test_clear(self):
+        # [FUNCTION DOC] Checks clear empties lists (also already-empty), list remains usable, and
+        # TypeError when given an argument.
         u = self.type2test([2, 3, 4])
         u.clear()
         self.assertEqual(u, [])
@@ -469,6 +537,8 @@ class CommonTest(seq_tests.CommonTest):
         self.assertRaises(TypeError, u.clear, None)
 
     def test_copy(self):
+        # [FUNCTION DOC] Checks copy returns an equal, independent, shallow copy and raises
+        # TypeError when given an argument.
         u = self.type2test([1, 2, 3])
         v = u.copy()
         self.assertEqual(v, [1, 2, 3])
@@ -493,6 +563,8 @@ class CommonTest(seq_tests.CommonTest):
         self.assertRaises(TypeError, u.copy, None)
 
     def test_sort(self):
+        # [FUNCTION DOC] Checks sort ordering, key functions built from comparison functions,
+        # TypeError for bad arguments, and ValueError when the list is modified while sorting.
         u = self.type2test([1, 0])
         u.sort()
         self.assertEqual(u, [0, 1])
@@ -504,6 +576,7 @@ class CommonTest(seq_tests.CommonTest):
         self.assertRaises(TypeError, u.sort, 42, 42)
 
         def revcmp(a, b):
+            # [FUNCTION DOC] HELPER: Reverse three-way comparison returning 0, 1 or -1.
             if a == b:
                 return 0
             elif a < b:
@@ -515,6 +588,7 @@ class CommonTest(seq_tests.CommonTest):
 
         # The following dumps core in unpatched Python 1.5:
         def myComparison(x,y):
+            # [FUNCTION DOC] HELPER: Three-way comparison of x mod 3 against y mod 7.
             xmod, ymod = x%3, y%7
             if xmod == ymod:
                 return 0
@@ -528,6 +602,8 @@ class CommonTest(seq_tests.CommonTest):
         self.assertRaises(TypeError, z.sort, 2)
 
         def selfmodifyingComparison(x,y):
+            # [FUNCTION DOC] HELPER: Three-way comparison that appends to list z as a side effect,
+            # modifying the list being sorted.
             z.append(1)
             if x == y:
                 return 0
@@ -541,11 +617,14 @@ class CommonTest(seq_tests.CommonTest):
         self.assertRaises(TypeError, z.sort, 42, 42, 42, 42)
 
     def test_slice(self):
+        # [FUNCTION DOC] Checks slice assignment replacing the first two characters with one item.
         u = self.type2test("spam")
         u[:2] = "h"
         self.assertEqual(u, list("ham"))
 
     def test_iadd(self):
+        # [FUNCTION DOC] Runs inherited iadd tests, then checks += keeps object identity, accepts
+        # any iterable, and raises TypeError for None.
         super().test_iadd()
         u = self.type2test([0, 1])
         u2 = u
@@ -559,6 +638,7 @@ class CommonTest(seq_tests.CommonTest):
         self.assertRaises(TypeError, u.__iadd__, None)
 
     def test_imul(self):
+        # [FUNCTION DOC] Runs inherited imul tests, then checks *= on an empty list keeps identity.
         super().test_imul()
         s = self.type2test([])
         oldid = id(s)
@@ -566,6 +646,8 @@ class CommonTest(seq_tests.CommonTest):
         self.assertEqual(id(s), oldid)
 
     def test_extendedslicing(self):
+        # [FUNCTION DOC] Checks extended slicing (steps, negative steps, big steps) for deletion
+        # and assignment, including assignment from itself reversed and a huge step (issue 7788).
         #  subscript
         a = self.type2test([0,1,2,3,4])
 
@@ -607,13 +689,19 @@ class CommonTest(seq_tests.CommonTest):
         del a[9::1<<333]
 
     def test_constructor_exception_handling(self):
+        # [FUNCTION DOC] Checks that a KeyboardInterrupt raised by an iterator propagates out of
+        # the list constructor.
         # Bug #1242657
         class F(object):
+            # [CLASS DOC] HELPER: Iterable whose iteration raises KeyboardInterrupt.
             def __iter__(self):
+                # [FUNCTION DOC] HELPER: Always raises KeyboardInterrupt.
                 raise KeyboardInterrupt
         self.assertRaises(KeyboardInterrupt, list, F())
 
     def test_exhausted_iterator(self):
+        # [FUNCTION DOC] Checks that exhausted list iterators stay empty after later appends while
+        # unexhausted ones see new items, and no crash when iterating an exhausted iterator.
         a = self.type2test([1, 2, 3])
         exhit = iter(a)
         empit = iter(a)

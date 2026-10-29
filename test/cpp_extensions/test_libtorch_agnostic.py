@@ -1,5 +1,16 @@
 # Owner(s): ["module: cpp"]
 
+# [MODULE DOC] Tests for the libtorch_agnostic (stable ABI) C++ extensions built at
+# different target versions (libtorch_agn_2_9 through libtorch_agn_2_14), in two
+# device-generic test classes: TestLibtorchAgnostic (CPU/CUDA) and
+# TestLibtorchAgnosticMetal (MPS). Each test imports the versioned extension, calls ops
+# from its ops module and compares against the equivalent eager torch result. Tests are
+# gated by torch version via skipIfTorchVersionLessThan.
+# Import-time side effects: none beyond defining the classes; at the end,
+# instantiate_device_type_tests generates the per-device test classes into this module globals
+# (MPS only for the Metal class). Extensions are compiled lazily in setUpClass via
+# install_cpp_extension when not already importable. Runs run_tests when executed as a script.
+
 import gc
 import math
 import sysconfig
@@ -29,6 +40,9 @@ from torch.testing._internal.common_utils import (
 
 
 def _torchVersionLessThan(major, minor):
+    # [FUNCTION DOC] HELPER: Returns True if the running torch version (major.minor parsed from
+    # torch.__version__, ignoring suffixes such as plus, a, b, rc) is older than the given major
+    # and minor. Pure function; no side effects.
     version_parts = torch.__version__.split(".")
     current_major = int(version_parts[0])
     current_minor = int(
@@ -38,9 +52,14 @@ def _torchVersionLessThan(major, minor):
 
 
 def skipIfTorchVersionLessThan(major, minor):
+    # [FUNCTION DOC] Test decorator factory: returns a decorator that wraps a test function with
+    # unittest skipIf, skipping when the running torch is older than major.minor. The skip
+    # reason names the required and current versions.
     """Skip test if PyTorch version is less than specified version."""
 
     def decorator(func):
+        # [FUNCTION DOC] HELPER: Applies the skipIf condition and reason computed by the
+        # enclosing factory to the decorated function and returns it.
         reason = f"Test requires PyTorch >= {major}.{minor}, current version is {torch.__version__}"
         return unittest.skipIf(_torchVersionLessThan(major, minor), reason)(func)
 
@@ -52,6 +71,11 @@ def skipIfTorchVersionLessThan(major, minor):
     "Cpython limited API not available, see https://github.com/python/cpython/issues/111506",
 )
 class TestLibtorchAgnostic(TestCase):
+    # [CLASS DOC] Device-generic test case exercising the versioned libtorch_agnostic
+    # extensions (2.9 to 2.14 targets). No instance state; setUpClass builds the extensions and
+    # each test imports the appropriate extension module and compares its ops against eager
+    # torch. Skipped entirely under the free-threaded (GIL disabled) CPython build since the
+    # limited API is unavailable.
     """
     Tests for versioned libtorch_agnostic extensions.
 
@@ -70,6 +94,11 @@ class TestLibtorchAgnostic(TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class-level setup: builds (via install_cpp_extension) and imports the
+        # 2.9 extension unconditionally, and the 2.10, 2.11, 2.12, 2.13 and 2.14 extensions only
+        # when the running torch version is at least that version; otherwise prints a skip
+        # message. An import failure triggers a build from the extension directory next to this
+        # file. Side effects: compiles and installs extensions, prints messages.
         # Build versioned extensions
         base_dir = Path(__file__).parent
 
@@ -140,6 +169,9 @@ class TestLibtorchAgnostic(TestCase):
 
     @onlyCPU
     def test_slow_sgd(self, device):
+        # [FUNCTION DOC] CPU only. Checks the stable-ABI out-of-place SGD op against the
+        # in-place fused SGD kernel on random parameter and gradient (weight decay 0.01, lr
+        # 0.001, no momentum); results must be equal.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         param = torch.rand(5, device=device)
@@ -167,9 +199,15 @@ class TestLibtorchAgnostic(TestCase):
 
     @onlyCUDA
     def test_identity_does_not_hog_memory(self, device):
+        # [FUNCTION DOC] CUDA only. Checks that the identity op returns the very same tensor
+        # object and that repeated calls do not leak CUDA memory (allocated memory returns to
+        # the initial value after each iteration).
         import libtorch_agn_2_9 as libtorch_agnostic
 
         def _run_identity(prior_mem):
+            # [FUNCTION DOC] HELPER: Allocates a tensor, asserts memory grew over the
+            # prior level, and raises AssertionError if the identity op does not return
+            # the same tensor.
             t = torch.rand(32, 32, device=device)
             self.assertGreater(torch.cuda.memory_allocated(device), prior_mem)
             identi_t = libtorch_agnostic.ops.identity(t)
@@ -184,6 +222,8 @@ class TestLibtorchAgnostic(TestCase):
             self.assertEqual(curr_mem, init_mem)
 
     def test_exp_neg_is_leaf(self, device):
+        # [FUNCTION DOC] Checks the op returning exp of one tensor, negation of another and the
+        # is_leaf flag of a third against eager results.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         t1 = torch.rand(2, 3, device=device)
@@ -196,6 +236,8 @@ class TestLibtorchAgnostic(TestCase):
         self.assertEqual(is_leaf, t3.is_leaf)
 
     def test_my_abs(self, device):
+        # [FUNCTION DOC] Checks my_abs equals torch.abs; on CUDA also checks repeated calls do
+        # not leak memory.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         t = torch.rand(32, 16, device=device) - 0.5
@@ -203,6 +245,8 @@ class TestLibtorchAgnostic(TestCase):
         self.assertEqual(res, torch.abs(t))
 
         def _make_cuda_tensors(prior_mem):
+            # [FUNCTION DOC] HELPER: Calls my_abs, asserts allocated CUDA memory exceeds the
+            # prior level and the result is correct.
             cuda_t = libtorch_agnostic.ops.my_abs(t)
             self.assertGreater(torch.cuda.memory_allocated(device), prior_mem)
             self.assertEqual(cuda_t, torch.abs(t))
@@ -215,6 +259,8 @@ class TestLibtorchAgnostic(TestCase):
                 self.assertEqual(curr_mem, init_mem)
 
     def test_neg_exp(self, device):
+        # [FUNCTION DOC] Checks neg_exp equals negation of exp; on CUDA also checks repeated
+        # calls do not leak memory.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         t = torch.rand(32, 16, device=device) - 0.5
@@ -222,6 +268,8 @@ class TestLibtorchAgnostic(TestCase):
         self.assertEqual(res, torch.neg(torch.exp(t)))
 
         def _make_cuda_tensors(prior_mem):
+            # [FUNCTION DOC] HELPER: Calls neg_exp, asserts allocated CUDA memory exceeds the
+            # prior level and the result is correct.
             cuda_res = libtorch_agnostic.ops.neg_exp(t)
             self.assertGreater(torch.cuda.memory_allocated(device), prior_mem)
             self.assertEqual(cuda_res, torch.neg(torch.exp(t)))
@@ -234,6 +282,8 @@ class TestLibtorchAgnostic(TestCase):
                 self.assertEqual(curr_mem, init_mem)
 
     def test_divide_neg_exp(self, device):
+        # [FUNCTION DOC] Checks divide_neg_exp equals negated input divided by its exp; on CUDA
+        # also checks for memory leaks.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         t = torch.zeros(2, 3, device=device) - 0.5
@@ -241,6 +291,8 @@ class TestLibtorchAgnostic(TestCase):
         self.assertEqual(res, torch.neg(t) / torch.exp(t))
 
         def _make_cuda_tensors(prior_mem):
+            # [FUNCTION DOC] HELPER: Calls divide_neg_exp, asserts allocated CUDA memory exceeds
+            # the prior level and the result is correct.
             cuda_res = libtorch_agnostic.ops.divide_neg_exp(t)
             self.assertGreater(torch.cuda.memory_allocated(device), prior_mem)
             self.assertEqual(cuda_res, torch.neg(t) / torch.exp(t))
@@ -253,6 +305,8 @@ class TestLibtorchAgnostic(TestCase):
                 self.assertEqual(curr_mem, init_mem)
 
     def test_is_contiguous(self, device):
+        # [FUNCTION DOC] Checks is_contiguous is true for a fresh tensor and false
+        # for its transpose.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         t = torch.rand(2, 7, device=device)
@@ -261,6 +315,8 @@ class TestLibtorchAgnostic(TestCase):
 
     @skipIfTorchVersionLessThan(2, 14)
     def test_has_storage(self, device):
+        # [FUNCTION DOC] Requires torch 2.14. Checks my_has_storage is true for a dense tensor
+        # and false for a sparse tensor.
         import libtorch_agn_2_14 as libtorch_agnostic
 
         t = torch.rand(2, 7, device=device)
@@ -280,6 +336,10 @@ class TestLibtorchAgnostic(TestCase):
         name_fn=lambda op, _: op.__name__,
     )
     def test_my_bitwise_ops(self, device, torch_op, other_high):
+        # [FUNCTION DOC] Parametrized over bitwise and, or, left shift and right shift
+        # (with a bound for the second operand). Requires torch 2.10. Checks the stable
+        # op my_<op> matches the torch op on same-shape int64 inputs and with a broadcast
+        # 1-D second operand.
         """Test bitwise_*.Tensor stable ops (same-shape + broadcasting)."""
         import libtorch_agn_2_10 as libtorch_agnostic
 
@@ -295,6 +355,8 @@ class TestLibtorchAgnostic(TestCase):
 
     @skipIfTorchVersionLessThan(2, 10)
     def test_my_permute(self, device):
+        # [FUNCTION DOC] Requires torch 2.10. Checks my_permute with negative dims matches torch
+        # permute and shares the data pointer, also for a non-contiguous view.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         t = torch.randn(2, 3, 4, device=device)
@@ -310,6 +372,9 @@ class TestLibtorchAgnostic(TestCase):
 
     @skipIfTorchVersionLessThan(2, 10)
     def test_my_view_dtype(self, device):
+        # [FUNCTION DOC] Requires torch 2.10. Checks my_view_dtype for same, smaller and larger
+        # element sizes: dtype, shape, values match torch view with dtype and the data pointer
+        # is shared.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         t = torch.randn(2, 4, device=device, dtype=torch.float32)
@@ -337,6 +402,8 @@ class TestLibtorchAgnostic(TestCase):
 
     @skipIfTorchVersionLessThan(2, 10)
     def test_my_index_select(self, device):
+        # [FUNCTION DOC] Requires torch 2.10. Checks my_index_select with a negative
+        # dim matches torch.index_select.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         t = torch.randn(3, 4, device=device)
@@ -346,6 +413,8 @@ class TestLibtorchAgnostic(TestCase):
 
     @skipIfTorchVersionLessThan(2, 10)
     def test_my_floor_divide(self, device):
+        # [FUNCTION DOC] Requires torch 2.10. Checks my_floor_divide against torch.floor_divide
+        # for int64 inputs, negated divisors and broadcasting divisors.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         a = torch.randint(-19, 20, (3, 4), device=device, dtype=torch.int64)
@@ -371,6 +440,8 @@ class TestLibtorchAgnostic(TestCase):
     @onlyCPU
     @skipIfTorchVersionLessThan(2, 10)
     def test_my_is_pinned_cpu_false(self, device):
+        # [FUNCTION DOC] CPU only, requires torch 2.10. Checks my_is_pinned is false for an
+        # ordinary CPU tensor.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         t = torch.randn(2, 3, device=device)
@@ -379,6 +450,8 @@ class TestLibtorchAgnostic(TestCase):
     @onlyCUDA
     @skipIfTorchVersionLessThan(2, 10)
     def test_my_is_pinned_cuda_true(self, device):
+        # [FUNCTION DOC] CUDA only, requires torch 2.10. Checks my_is_pinned is true for a
+        # pinned host tensor.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         pinned = torch.randn(2, 3, device="cpu", pin_memory=True)
@@ -390,6 +463,10 @@ class TestLibtorchAgnostic(TestCase):
     @onlyCPU
     @skipIfTorchVersionLessThan(2, 14)
     def test_pyobject_roundtrip(self, device):
+        # [FUNCTION DOC] CPU only, requires torch 2.14. Passes a raw Python object through the
+        # extension _interop module (from_pyobject then to_pyobject). Checks the returned object
+        # is a tensor, equal to and sharing storage with the input, so an in-place add on the
+        # input is visible in the output.
         import libtorch_agn_2_14 as libtorch_agnostic
 
         x = torch.randn(3, 4, device=device)
@@ -404,6 +481,8 @@ class TestLibtorchAgnostic(TestCase):
     @onlyCPU
     @skipIfTorchVersionLessThan(2, 14)
     def test_pyobject_sum(self, device):
+        # [FUNCTION DOC] CPU only, requires torch 2.14. Checks _interop pyobject_sum equals the
+        # tensor sum.
         import libtorch_agn_2_14 as libtorch_agnostic
 
         x = torch.randn(3, 4, device=device)
@@ -413,6 +492,8 @@ class TestLibtorchAgnostic(TestCase):
     @onlyCPU
     @skipIfTorchVersionLessThan(2, 14)
     def test_pyobject_to_parameter_type(self, device):
+        # [FUNCTION DOC] CPU only, requires torch 2.14. Checks _interop pyobject_to_type
+        # converts a tensor to the Parameter type while preserving values.
         import libtorch_agn_2_14 as libtorch_agnostic
 
         x = torch.randn(2, 2, device=device)
@@ -423,6 +504,9 @@ class TestLibtorchAgnostic(TestCase):
     @onlyCPU
     @skipIfTorchVersionLessThan(2, 14)
     def test_pyobject_non_tensor_raises(self, device):
+        # [FUNCTION DOC] CPU only, requires torch 2.14. Checks passing a non-tensor
+        # object to the _interop roundtrip raises RuntimeError mentioning that a
+        # torch.Tensor was expected.
         import libtorch_agn_2_14 as libtorch_agnostic
 
         with self.assertRaisesRegex(RuntimeError, "expected torch.Tensor"):
@@ -434,6 +518,9 @@ class TestLibtorchAgnostic(TestCase):
     # **{}): got AssertionError("tensor's device must be `meta`, got cpu instead")
     @xfailIfTorchDynamo
     def test_my_ones_like(self, device):
+        # [FUNCTION DOC] Checks my_ones_like produces CPU ones matching the input shape, and on
+        # CUDA also a device tensor without leaking memory. Expected to fail under Dynamo (see
+        # the TODO above about fake tensor device).
         import libtorch_agn_2_9 as libtorch_agnostic
 
         t = torch.rand(3, 1, device=device) - 0.5
@@ -441,6 +528,8 @@ class TestLibtorchAgnostic(TestCase):
         self.assertEqual(cpu_t, torch.ones_like(t, device="cpu"))
 
         def _make_cuda_tensors(prior_mem):
+            # [FUNCTION DOC] HELPER: Calls my_ones_like targeting the test device, asserts
+            # memory grew and values equal ones.
             cuda_t = libtorch_agnostic.ops.my_ones_like(t, device)
             self.assertGreater(torch.cuda.memory_allocated(device), prior_mem)
             self.assertEqual(cuda_t, torch.ones_like(t, device=device))
@@ -455,6 +544,8 @@ class TestLibtorchAgnostic(TestCase):
     @xfailIfTorchDynamo
     @skipIfTorchVersionLessThan(2, 11)  # Requires 2.11 for Float8_e8m0fnu support
     def test_my_ones_like_with_Float8_e8m0fnu(self, device):
+        # [FUNCTION DOC] Requires torch 2.11 (Float8_e8m0fnu support). Same checks as
+        # test_my_ones_like but for a float8_e8m0fnu input; expected to fail under Dynamo.
         import libtorch_agn_2_11 as libtorch_agnostic
 
         t = torch.zeros(3, 1, device=device, dtype=torch.float8_e8m0fnu)
@@ -462,6 +553,8 @@ class TestLibtorchAgnostic(TestCase):
         self.assertEqual(cpu_t, torch.ones_like(t, device="cpu"))
 
         def _make_cuda_tensors(prior_mem):
+            # [FUNCTION DOC] HELPER: Calls my_ones_like targeting the test device, asserts
+            # memory grew and values equal ones.
             cuda_t = libtorch_agnostic.ops.my_ones_like(t, device)
             self.assertGreater(torch.cuda.memory_allocated(device), prior_mem)
             self.assertEqual(cuda_t, torch.ones_like(t, device=device))
@@ -474,6 +567,8 @@ class TestLibtorchAgnostic(TestCase):
                 self.assertEqual(curr_mem, init_mem)
 
     def test_my_transpose(self, device):
+        # [FUNCTION DOC] Checks my_transpose matches torch.transpose and that an out-of-range
+        # dim raises RuntimeError mentioning an API call failure.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         t = torch.rand(2, 7, device=device)
@@ -484,6 +579,12 @@ class TestLibtorchAgnostic(TestCase):
             libtorch_agnostic.ops.my_transpose(t, 1, 2)
 
     def test_my_empty_like(self, device):
+        # [FUNCTION DOC] Checks my_empty_like returns a tensor equal to empty_like; enables
+        # deterministic algorithms temporarily so uninitialized memory is filled, restoring the
+        # previous setting afterwards.
+        # KNOWN ISSUE: the assertion on id wraps the comparison inside the call (id
+        # of a boolean), so it is always truthy and does not check that the output is
+        # a different object.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         deterministic = torch.are_deterministic_algorithms_enabled()
@@ -500,6 +601,8 @@ class TestLibtorchAgnostic(TestCase):
 
     @onlyCPU
     def test_my_zero_(self, device):
+        # [FUNCTION DOC] CPU only. Checks my_zero_ returns the same object as its input and
+        # zeroes it.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         t = torch.rand(2, 7, device=device)
@@ -508,6 +611,7 @@ class TestLibtorchAgnostic(TestCase):
         self.assertEqual(out, torch.zeros_like(t))
 
     def test_my_amax(self, device):
+        # [FUNCTION DOC] Checks my_amax equals amax along dim 0.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         t = torch.rand(2, 7, device=device)
@@ -515,6 +619,7 @@ class TestLibtorchAgnostic(TestCase):
         self.assertEqual(out, torch.amax(t, 0))
 
     def test_my_amax_vec(self, device):
+        # [FUNCTION DOC] Checks my_amax_vec equals amax over dims 0 and 1.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         t = torch.rand(2, 7, 5, device=device)
@@ -522,6 +627,7 @@ class TestLibtorchAgnostic(TestCase):
         self.assertEqual(out, torch.amax(t, (0, 1)))
 
     def test_my_is_cpu(self, device):
+        # [FUNCTION DOC] Checks my_is_cpu equals the tensor is_cpu attribute.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         t = torch.rand(2, 7, device=device)
@@ -529,6 +635,8 @@ class TestLibtorchAgnostic(TestCase):
         self.assertEqual(out, t.is_cpu)
 
     def test_fill_infinity(self, device):
+        # [FUNCTION DOC] Checks fill_infinity fills the input in place with infinity and returns
+        # the same object.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         t = torch.rand(3, 4, device=device)
@@ -540,6 +648,8 @@ class TestLibtorchAgnostic(TestCase):
 
     @onlyCPU
     def test_default_constructor(self):
+        # [FUNCTION DOC] CPU only. Checks test_default_constructor reports a defined tensor as
+        # defined and an undefined (default constructed) tensor as not defined.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         defined_tensor_is_defined = libtorch_agnostic.ops.test_default_constructor(True)
@@ -551,6 +661,8 @@ class TestLibtorchAgnostic(TestCase):
         self.assertFalse(undefined_tensor_is_defined)
 
     def test_my_pad(self, device):
+        # [FUNCTION DOC] Checks my_pad matches constant padding with amounts 1, 2, 2, 1 and
+        # value 0.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         t = torch.rand(2, 3, device=device)
@@ -559,6 +671,7 @@ class TestLibtorchAgnostic(TestCase):
         self.assertEqual(out, expected)
 
     def test_my_narrow(self, device):
+        # [FUNCTION DOC] Checks my_narrow on dim 0 (start 0, length 1) matches torch.narrow.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         t = torch.randn(2, 5, device=device)
@@ -572,6 +685,9 @@ class TestLibtorchAgnostic(TestCase):
 
     @onlyCPU
     def test_my_narrow_symint(self, device):
+        # [FUNCTION DOC] CPU only. Checks the my_narrow_symint op: output matches narrow,
+        # opcheck passes, and compiling with dynamic shapes yields a single frame, i.e. a second
+        # call with a different input shape does not recompile.
         op = torch.ops.libtorch_agn_2_9.my_narrow_symint
 
         t1 = torch.randn(4, 5, device=device)
@@ -588,6 +704,8 @@ class TestLibtorchAgnostic(TestCase):
         # Wrap in a function so shape computation happens inside the compiled
         # region — t.shape[0] becomes a symbolic SymInt during tracing
         def fn(t):
+            # [FUNCTION DOC] HELPER: Applies the symint narrow op to the input from index 2 with
+            # length size minus 2 along dim 0.
             return op(t, 0, 2, t.shape[0] - 2)
 
         cnt = CompileCounter()
@@ -606,6 +724,8 @@ class TestLibtorchAgnostic(TestCase):
     @onlyCUDA
     @deviceCountAtLeast(2)
     def test_device_guard(self, device):
+        # [FUNCTION DOC] CUDA only, needs at least 2 devices. Checks test_device_guard with
+        # index 1 returns that index.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         device_index = 1
@@ -615,6 +735,8 @@ class TestLibtorchAgnostic(TestCase):
     @onlyCUDA
     @deviceCountAtLeast(2)
     def test_device_guard_set_index(self, device):
+        # [FUNCTION DOC] CUDA only, needs at least 2 devices. Checks a device guard created with
+        # index 1 and then reset to index 0 reports current device 0.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         # This test creates a DeviceGuard with index 1, then sets it to index 0
@@ -624,6 +746,10 @@ class TestLibtorchAgnostic(TestCase):
 
     @onlyCUDA
     def test_stream(self, device):
+        # [FUNCTION DOC] CUDA only. Checks the extension reports the same stream id as the
+        # current CUDA stream while a new stream is active.
+        # KNOWN ISSUE: the device argument is overwritten with the current device index, and the
+        # expected id is read from stream 0 rather than that device.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         stream = torch.cuda.Stream()
@@ -638,6 +764,9 @@ class TestLibtorchAgnostic(TestCase):
     @skipIfTorchVersionLessThan(2, 13)
     @onlyCUDA
     def test_stream_native_handle(self, device):
+        # [FUNCTION DOC] Requires torch 2.13, CUDA only. For three distinct streams, checks the
+        # native handle returned by the extension matches the accelerator current stream native
+        # handle and is unique across streams.
         import libtorch_agn_2_13 as libtorch_agnostic
 
         device_idx = torch.cuda.current_device()
@@ -656,6 +785,9 @@ class TestLibtorchAgnostic(TestCase):
     @skipIfTorchVersionLessThan(2, 13)
     @onlyCUDA
     def test_kernel_launch_on_custom_stream(self, device):
+        # [FUNCTION DOC] Requires torch 2.13, CUDA only. Launches a fill kernel through the
+        # extension on a custom stream and checks the output equals the fill value after
+        # synchronizing the stream.
         import libtorch_agn_2_13 as libtorch_agnostic
 
         device_idx = torch.cuda.current_device()
@@ -674,6 +806,9 @@ class TestLibtorchAgnostic(TestCase):
 
     @skipIfTorchVersionLessThan(2, 13)
     def test_my_rand_with_generator(self, device):
+        # [FUNCTION DOC] Requires torch 2.13. Checks my_rand_with_generator matches torch.rand
+        # with an identically seeded generator, device follows the generator, generator state
+        # advances between calls and reseeding reproduces the output.
         import libtorch_agn_2_13 as libtorch_agnostic
 
         g1 = torch.Generator(device=device)
@@ -699,6 +834,8 @@ class TestLibtorchAgnostic(TestCase):
     @onlyCUDA
     @deviceCountAtLeast(2)
     def test_get_current_device_index(self, device):
+        # [FUNCTION DOC] CUDA only, needs 2 devices. Sets device 1 as current and checks the
+        # extension reports that index; restores the previous device afterwards.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         prev_device = torch.cuda.current_device()
@@ -713,6 +850,8 @@ class TestLibtorchAgnostic(TestCase):
             torch.cuda.set_device(prev_device)
 
     def test_my_new_empty_dtype_variant(self, device):
+        # [FUNCTION DOC] Checks my_new_empty_dtype_variant matches new_empty with shape 2x5 and
+        # bfloat16 (deterministic mode on temporarily), including device.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         deterministic = torch.are_deterministic_algorithms_enabled()
@@ -728,6 +867,8 @@ class TestLibtorchAgnostic(TestCase):
             torch.use_deterministic_algorithms(deterministic)
 
     def test_my_new_zeros_dtype_variant(self, device):
+        # [FUNCTION DOC] Checks my_new_zeros_dtype_variant matches new_zeros with shape 2x5 and
+        # float dtype, including device.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         t = torch.randn(3, 4, device=device)
@@ -736,6 +877,8 @@ class TestLibtorchAgnostic(TestCase):
         self.assertEqual(out, ref_out, exact_device=True)
 
     def test_my_copy_(self, device):
+        # [FUNCTION DOC] Checks my_copy_ copies source into destination, returns a tensor
+        # sharing the destination data pointer.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         dst = torch.empty(2, 5, device=device)
@@ -747,6 +890,8 @@ class TestLibtorchAgnostic(TestCase):
         self.assertEqual(result.data_ptr(), dst.data_ptr())
 
     def test_my_clone(self, device):
+        # [FUNCTION DOC] Checks my_clone equals clone, has different storage and
+        # the same strides.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         t = torch.randn(2, 5, device=device)
@@ -759,6 +904,8 @@ class TestLibtorchAgnostic(TestCase):
 
     @skipIfTorchVersionLessThan(2, 10)
     def test_my__foreach_mul_(self, device):
+        # [FUNCTION DOC] Requires torch 2.10. Checks in-place my__foreach_mul_ on a list of
+        # tensors matches torch._foreach_mul.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         N = 5
@@ -775,6 +922,9 @@ class TestLibtorchAgnostic(TestCase):
     @skipIfWindows(msg="ValueError: vector too long")
     @skipIfTorchVersionLessThan(2, 10)
     def test_my__foreach_mul(self, device):
+        # [FUNCTION DOC] Requires torch 2.10 (skipped on Windows). Checks my__foreach_mul
+        # returns a list matching torch._foreach_mul; on CUDA also checks no memory leak across
+        # repeated calls.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         N = 5
@@ -788,6 +938,8 @@ class TestLibtorchAgnostic(TestCase):
             self.assertEqual(result_t, expected_t)
 
         def _make_cuda_tensors(prior_mem):
+            # [FUNCTION DOC] HELPER: Calls my__foreach_mul, asserts CUDA memory grew and each
+            # result matches the eager result.
             cuda_res = libtorch_agnostic.ops.my__foreach_mul(tensors, others)
             self.assertGreater(torch.cuda.memory_allocated(device), prior_mem)
 
@@ -805,6 +957,8 @@ class TestLibtorchAgnostic(TestCase):
     @skipIfWindows(msg="ValueError: vector too long")
     @skipIfTorchVersionLessThan(2, 10)
     def test_make_tensor_clones_and_call_foreach(self, device):
+        # [FUNCTION DOC] Requires torch 2.10 (skipped on Windows). Checks the op that clones two
+        # tensors and calls foreach mul returns the squares of each input.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         t1 = torch.rand(2, 5, device=device)
@@ -816,6 +970,9 @@ class TestLibtorchAgnostic(TestCase):
     @skipIfTorchVersionLessThan(2, 10)
     @onlyCUDA
     def test_device(self, device):
+        # [FUNCTION DOC] CUDA only, requires torch 2.10. Exercises the stable Device API:
+        # construction from index or string, index getter and setter, equality, is_cpu and
+        # is_cuda, and RuntimeError for an index of 129 outside the int8 range.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         cuda_device = libtorch_agnostic.ops.test_device_constructor(
@@ -871,6 +1028,8 @@ class TestLibtorchAgnostic(TestCase):
     @onlyCUDA
     @deviceCountAtLeast(2)
     def test_tensor_device(self, device):
+        # [FUNCTION DOC] CUDA only, needs 2 devices, requires torch 2.10. Checks
+        # test_tensor_device returns the tensor device for CPU, default CUDA and cuda:1 tensors.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         t = torch.randn(2, 3)
@@ -889,6 +1048,10 @@ class TestLibtorchAgnostic(TestCase):
     @skipIfTorchVersionLessThan(2, 10)
     @onlyCPU
     def test_parallel_for(self, device):
+        # [FUNCTION DOC] CPU only, requires torch 2.10. Runs a parallel_for of given size
+        # and grain size; each output encodes thread id in the high bits and index in the
+        # low bits. Checks all indices are covered and the number of distinct threads equals
+        # the expected count.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         num_threads = torch.get_num_threads()
@@ -909,6 +1072,8 @@ class TestLibtorchAgnostic(TestCase):
     @skipIfTorchVersionLessThan(2, 10)
     @onlyCPU
     def test_get_num_threads(self, device):
+        # [FUNCTION DOC] CPU only, requires torch 2.10. Checks the extension reported thread
+        # count equals torch.get_num_threads.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         num_threads = libtorch_agnostic.ops.test_get_num_threads()
@@ -919,6 +1084,11 @@ class TestLibtorchAgnostic(TestCase):
     @parametrize("layout", [None, torch.strided, torch.sparse_coo])
     @parametrize("memory_format", [None, torch.channels_last, torch.contiguous_format])
     def test_my_empty(self, device, layout, memory_format):
+        # [FUNCTION DOC] Requires torch 2.10. Parametrized over layout (None, strided,
+        # sparse_coo) and memory format (None, channels_last, contiguous). Skips the invalid
+        # sparse plus memory_format combination. Compares my_empty against torch.empty for
+        # defaults, dtype, and dtype with device; checks layout and memory format, and on CUDA
+        # once also pinned memory. Deterministic mode is enabled temporarily and restored.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         deterministic = torch.are_deterministic_algorithms_enabled()
@@ -1003,6 +1173,8 @@ class TestLibtorchAgnostic(TestCase):
             torch.use_deterministic_algorithms(deterministic)
 
     def test_my_flatten(self, device):
+        # [FUNCTION DOC] Checks my_flatten with default, start dim, and start/end dim arguments
+        # against torch.flatten.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         t = torch.randn(2, 3, 4, device=device)
@@ -1021,6 +1193,9 @@ class TestLibtorchAgnostic(TestCase):
     @onlyCPU
     @xfailIfTorchDynamo
     def test_my_optional_tensor_ref(self, device):
+        # [FUNCTION DOC] CPU only, expected failure under Dynamo. Checks the op taking an
+        # optional tensor reference returns the input when provided and a zeros tensor of the
+        # given size when None.
         """Test TORCH_BOX with const std::optional<Tensor>& parameter."""
         import libtorch_agn_2_9 as libtorch_agnostic
 
@@ -1037,6 +1212,8 @@ class TestLibtorchAgnostic(TestCase):
 
     @skipIfTorchDynamo("no data pointer defined for FakeTensor, FunctionalTensor")
     def test_my_storage_offset(self, device):
+        # [FUNCTION DOC] Checks my_storage_offset is 0 for a fresh tensor, 4 for a one-row slice
+        # and 2 for an offset view; skipped under Dynamo (no data pointer for fake tensors).
         """Test storage_offset method on Tensor."""
         import libtorch_agn_2_9 as libtorch_agnostic
 
@@ -1060,6 +1237,8 @@ class TestLibtorchAgnostic(TestCase):
 
     @dtypes(*all_types_and(torch.float16, torch.bool))
     def test_my_element_size(self, device, dtype):
+        # [FUNCTION DOC] Parametrized over all standard dtypes plus float16 and bool. Checks
+        # my_element_size equals the tensor element_size.
         """Test element_size method on Tensor."""
         import libtorch_agn_2_9 as libtorch_agnostic
 
@@ -1069,6 +1248,8 @@ class TestLibtorchAgnostic(TestCase):
 
     @skipIfTorchVersionLessThan(2, 10)
     def test_my_reshape(self, device):
+        # [FUNCTION DOC] Requires torch 2.10. Checks my_reshape with explicit shape, inferred
+        # dimension and flatten against torch.reshape.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         t = torch.randn(2, 3, 4, device=device)
@@ -1087,6 +1268,8 @@ class TestLibtorchAgnostic(TestCase):
 
     @skipIfTorchVersionLessThan(2, 10)
     def test_my_view(self, device):
+        # [FUNCTION DOC] Requires torch 2.10. Checks my_view with explicit shape, inferred
+        # dimension and flatten against view.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         t = torch.randn(2, 3, 4, device=device)
@@ -1105,6 +1288,7 @@ class TestLibtorchAgnostic(TestCase):
 
     @skipIfTorchVersionLessThan(2, 10)
     def test_my_shape(self, device):
+        # [FUNCTION DOC] Requires torch 2.10. Checks my_shape returns the tensor shape.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         expected = (3, 5)
@@ -1114,6 +1298,8 @@ class TestLibtorchAgnostic(TestCase):
 
     @skipIfTorchVersionLessThan(2, 10)
     def test_my_sum(self, device):
+        # [FUNCTION DOC] Requires torch 2.10. Checks my_sum for one dim, several dims, keepdim,
+        # dtype override and no dims (sum of everything) against torch.sum.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         t = torch.randn(3, 4, 5, device=device)
@@ -1141,6 +1327,9 @@ class TestLibtorchAgnostic(TestCase):
 
     @skipIfTorchVersionLessThan(2, 10)
     def test_my_sum_out(self, device):
+        # [FUNCTION DOC] Requires torch 2.10. Checks my_sum_out writes into the provided output
+        # tensor, returns the same object and matches torch.sum for dim, keepdim, dtype and full
+        # reduction cases.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         t = torch.randn(3, 4, 5, device=device)
@@ -1168,6 +1357,8 @@ class TestLibtorchAgnostic(TestCase):
 
     @skipIfTorchVersionLessThan(2, 10)
     def test_my_sum_all(self, device):
+        # [FUNCTION DOC] Requires torch 2.10. Checks my_sum_all equals total sum and returns a
+        # scalar-shaped tensor.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         t = torch.randn(3, 4, 5, device=device)
@@ -1180,6 +1371,8 @@ class TestLibtorchAgnostic(TestCase):
 
     @skipIfTorchVersionLessThan(2, 10)
     def test_my_sum_dim1(self, device):
+        # [FUNCTION DOC] Requires torch 2.10. Checks my_sum_dim1 equals sum over dim 1 with
+        # shape 3x5.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         t = torch.randn(3, 4, 5, device=device)
@@ -1192,6 +1385,8 @@ class TestLibtorchAgnostic(TestCase):
 
     @skipIfTorchVersionLessThan(2, 10)
     def test_my_full(self, device):
+        # [FUNCTION DOC] Requires torch 2.10. Checks my_full with default, dtype, device, and
+        # both options against torch.full.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         # Test basic full with default parameters
@@ -1217,6 +1412,8 @@ class TestLibtorchAgnostic(TestCase):
         self.assertEqual(result_both, expected_both, exact_device=True)
 
     def test_mv_tensor_accessor(self, device):
+        # [FUNCTION DOC] Checks mv_tensor_accessor equals torch.mv for contiguous and for
+        # strided non-contiguous inputs.
         import libtorch_agn_2_9 as libtorch_agnostic
 
         m = torch.rand(3, 5, device=device)
@@ -1235,6 +1432,8 @@ class TestLibtorchAgnostic(TestCase):
     @skipIfTorchVersionLessThan(2, 10)
     @skipIfTorchDynamo("no data pointer defined for FakeTensor, FunctionalTensor")
     def test_get_any_data_ptr(self, device):
+        # [FUNCTION DOC] Requires torch 2.10, skipped under Dynamo. Checks get_any_data_ptr
+        # returns the tensor data pointer for both mutable and const access.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         t = torch.empty(2, 5, device=device, dtype=torch.float32)
@@ -1245,6 +1444,9 @@ class TestLibtorchAgnostic(TestCase):
             self.assertEqual(p, expected_p)
 
     def get_supported_dtypes_for_data_ptr(self):
+        # [FUNCTION DOC] HELPER: Returns the list of dtypes whose data pointers can be cast
+        # through the stable ABI: a fixed set for 2.10, plus float8_e8m0fnu when the running
+        # torch is 2.11 or newer.
         """Return a list of dtypes that are supported for casting Tensor data_ptrs.
 
         This is an intersection of supported dtypes in the stable ABI and the
@@ -1284,6 +1486,10 @@ class TestLibtorchAgnostic(TestCase):
     @skipIfTorchVersionLessThan(2, 10)
     @skipIfTorchDynamo("no data pointer defined for FakeTensor, FunctionalTensor")
     def test_get_template_any_data_ptr(self, device):
+        # [FUNCTION DOC] Requires torch 2.10, skipped under Dynamo. Uses the 2.10 extension for
+        # torch before 2.11, otherwise 2.11. For every supported dtype pair, the templated data
+        # pointer getter returns the pointer when the requested dtype matches and raises
+        # RuntimeError about the expected scalar type otherwise, for mutable and const access.
         if _torchVersionLessThan(2, 11):
             import libtorch_agn_2_10 as libtorch_agnostic
         else:
@@ -1313,6 +1519,8 @@ class TestLibtorchAgnostic(TestCase):
     @skipIfTorchVersionLessThan(2, 10)
     @onlyCUDA
     def test_my_get_curr_cuda_blas_handle(self, device):
+        # [FUNCTION DOC] CUDA only, requires torch 2.10. Checks the extension current cuBLAS
+        # handle equals torch.cuda.current_blas_handle.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         res = libtorch_agnostic.ops.my_get_curr_cuda_blas_handle()
@@ -1322,6 +1530,9 @@ class TestLibtorchAgnostic(TestCase):
     @skipIfWindows(msg="ValueError: vector too long")
     @skipIfTorchVersionLessThan(2, 10)
     def test_my_string_op(self, device):
+        # [FUNCTION DOC] Requires torch 2.10 (skipped on Windows). Checks my_string_op returns a
+        # vector of the strings with the queried dim, size or stride and the numeric value, and
+        # RuntimeError for an unsupported accessor.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         t = torch.empty(3, 4, 5, device=device)
@@ -1346,6 +1557,8 @@ class TestLibtorchAgnostic(TestCase):
     @skipIfWindows(msg="ValueError: vector too long")
     @skipIfTorchVersionLessThan(2, 10)
     def test_my__foreach_mul_vec(self, device):
+        # [FUNCTION DOC] Requires torch 2.10 (skipped on Windows). Checks the op taking const
+        # vector references of tensors matches torch._foreach_mul.
         """Test my__foreach_mul_vec which uses const std::vector<Tensor>& parameters."""
         import libtorch_agn_2_10 as libtorch_agnostic
 
@@ -1362,6 +1575,8 @@ class TestLibtorchAgnostic(TestCase):
     @skipIfWindows(msg="ValueError: vector too long")
     @skipIfTorchVersionLessThan(2, 10)
     def test_my_string_op_const_string_ref(self, device):
+        # [FUNCTION DOC] Requires torch 2.10 (skipped on Windows). Checks the string op variant
+        # taking a const string reference for dim and size accessors.
         """Test my_string_op_const_string_ref which uses const std::string& parameters."""
         import libtorch_agn_2_10 as libtorch_agnostic
 
@@ -1382,6 +1597,8 @@ class TestLibtorchAgnostic(TestCase):
     @skipIfWindows(msg="ValueError: vector too long")
     @skipIfTorchVersionLessThan(2, 10)
     def test_my_string_op_const_string_view_ref(self, device):
+        # [FUNCTION DOC] Requires torch 2.10 (skipped on Windows). Checks the string op variant
+        # taking a const string_view reference for dim and stride accessors.
         """Test my_string_op_const_string_view_ref which uses const std::string_view& parameters."""
         import libtorch_agn_2_10 as libtorch_agnostic
 
@@ -1404,6 +1621,8 @@ class TestLibtorchAgnostic(TestCase):
     @skipIfWindows(msg="ValueError: vector too long")
     @skipIfTorchVersionLessThan(2, 10)
     def test_my_string_op_string_ref(self, device):
+        # [FUNCTION DOC] Requires torch 2.10 (skipped on Windows). Checks the string op variant
+        # taking a non-const string reference for dim and size accessors.
         """Test my_string_op_string_ref which uses std::string& (non-const) parameters."""
         import libtorch_agn_2_10 as libtorch_agnostic
 
@@ -1424,6 +1643,8 @@ class TestLibtorchAgnostic(TestCase):
     @skipIfTorchVersionLessThan(2, 10)
     @onlyCPU
     def test_my_set_requires_grad(self, device):
+        # [FUNCTION DOC] CPU only, requires torch 2.10. Under no_grad, checks
+        # my_set_requires_grad flips requires_grad on and off on a tensor.
         """Test set_requires_grad method on Tensor."""
         import libtorch_agn_2_10 as libtorch_agnostic
 
@@ -1446,6 +1667,8 @@ class TestLibtorchAgnostic(TestCase):
     @skipIfTorchVersionLessThan(2, 10)
     @onlyCUDA
     def test_my_get_current_cuda_stream(self, device):
+        # [FUNCTION DOC] CUDA only, requires torch 2.10. Checks the extension current stream
+        # equals torch current stream.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         device_index = torch.device(device).index
@@ -1456,6 +1679,8 @@ class TestLibtorchAgnostic(TestCase):
     @skipIfTorchVersionLessThan(2, 10)
     @onlyCUDA
     def test_my_set_current_cuda_stream(self, device):
+        # [FUNCTION DOC] CUDA only, requires torch 2.10. Sets a new stream through the extension
+        # and checks torch sees it as current; restores the previous stream afterwards.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         device_index = torch.device(device).index
@@ -1472,6 +1697,9 @@ class TestLibtorchAgnostic(TestCase):
     @skipIfTorchVersionLessThan(2, 10)
     @onlyCUDA
     def test_my_get_cuda_stream_from_pool(self, device):
+        # [FUNCTION DOC] CUDA only, requires torch 2.10. Gets low and high priority pool
+        # streams, makes each current via the extension, and checks torch reports them; restores
+        # the previous stream.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         device_index = torch.device(device).index
@@ -1491,6 +1719,8 @@ class TestLibtorchAgnostic(TestCase):
     @skipIfTorchVersionLessThan(2, 10)
     @onlyCUDA
     def test_my_cuda_stream_synchronize(self, device):
+        # [FUNCTION DOC] CUDA only, requires torch 2.10. Smoke test: synchronizing the current
+        # stream through the extension does not raise.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         device_index = torch.device(device).index
@@ -1501,6 +1731,10 @@ class TestLibtorchAgnostic(TestCase):
     @skipIfTorchVersionLessThan(2, 10)
     @skipIfTorchDynamo("no data pointer defined for FakeTensor, FunctionalTensor")
     def test_my_from_blob(self, device):
+        # [FUNCTION DOC] Requires torch 2.10, skipped under Dynamo. Compiles a reference
+        # from_blob helper with load_inline (side effect: builds a C++ extension), then checks
+        # the stable my_from_blob matches it for a contiguous tensor (sharing the data pointer)
+        # and a transposed non-contiguous tensor.
         import libtorch_agn_2_10 as libtorch_agnostic
 
         # Create reference implementation using unstable torch::from_blob via load_inline
@@ -1557,6 +1791,8 @@ class TestLibtorchAgnostic(TestCase):
     @skipIfTorchVersionLessThan(2, 10)
     @onlyCUDA
     def test_std_cuda_check_success(self, device):
+        # [FUNCTION DOC] CUDA only, requires torch 2.10. Checks the CUDA check macro passes for
+        # a successful call and returns the current device index.
         """Test that STD_CUDA_CHECK works correctly for successful CUDA calls."""
         import libtorch_agn_2_10 as libtorch_agnostic
 
@@ -1568,6 +1804,11 @@ class TestLibtorchAgnostic(TestCase):
     @onlyCUDA
     @parametrize("show_cpp_stacktraces", [False, True])
     def test_std_cuda_check_error(self, device, show_cpp_stacktraces):
+        # [FUNCTION DOC] CUDA only, requires torch 2.10, parametrized on showing C++ stack
+        # traces. Runs a subprocess with TORCH_SHOW_CPP_STACKTRACES set to 1 or 0 and the
+        # current sys.path, invoking an op that fails the CUDA check with an invalid device
+        # ordinal. Checks the message (CUDA or HIP error text, GPU range hint) and the presence
+        # or absence of C++ trace markers.
         """Test that STD_CUDA_CHECK throws std::runtime_error with CUDA error message.
 
         When TORCH_SHOW_CPP_STACKTRACES=1, the error should include a C++ stack trace.
@@ -1625,6 +1866,8 @@ except RuntimeError as e:
     @skipIfTorchVersionLessThan(2, 10)
     @skipIfTorchDynamo(" Dynamo failed to run FX node with fake tensors")
     def test_my_to_device(self, device):
+        # [FUNCTION DOC] Requires torch 2.10, skipped under Dynamo. Checks my_to_device moves a
+        # CPU tensor to the test device.
         """Test to(device) convenience overload."""
         import libtorch_agn_2_10 as libtorch_agnostic
 
@@ -1637,6 +1880,8 @@ except RuntimeError as e:
 
     @skipIfTorchVersionLessThan(2, 10)
     def test_my_to_dtype(self, device):
+        # [FUNCTION DOC] Requires torch 2.10. Checks my_to_dtype converts float32 to float64 and
+        # to int32 like Tensor.to.
         """Test to(dtype) via the main to function."""
         import libtorch_agn_2_10 as libtorch_agnostic
 
@@ -1656,6 +1901,9 @@ except RuntimeError as e:
     @skipIfTorchVersionLessThan(2, 10)
     @skipIfTorchDynamo(" Dynamo failed to run FX node with fake tensors")
     def test_my_to_dtype_layout(self, device):
+        # [FUNCTION DOC] Requires torch 2.10, skipped under Dynamo. Checks my_to_dtype_layout
+        # for dtype, device, copy flag (new storage), dtype with device, channels_last memory
+        # format and all arguments omitted against Tensor.to.
         """Test the full to.dtype_layout op with various parameter combinations."""
         import libtorch_agn_2_10 as libtorch_agnostic
 
@@ -1706,6 +1954,8 @@ except RuntimeError as e:
 
     @skipIfTorchVersionLessThan(2, 10)
     def test_my_contiguous(self, device):
+        # [FUNCTION DOC] Requires torch 2.10. Checks my_contiguous makes a
+        # transposed tensor contiguous.
         """Test contiguous with default memory format."""
         import libtorch_agn_2_10 as libtorch_agnostic
 
@@ -1717,6 +1967,8 @@ except RuntimeError as e:
 
     @skipIfTorchVersionLessThan(2, 10)
     def test_my_contiguous_memory_format(self, device):
+        # [FUNCTION DOC] Requires torch 2.10. Checks my_contiguous_memory_format yields a
+        # channels_last-contiguous tensor.
         """Test contiguous with specified memory format."""
         import libtorch_agn_2_10 as libtorch_agnostic
 
@@ -1732,6 +1984,8 @@ except RuntimeError as e:
     @skipIfTorchVersionLessThan(2, 10)
     @onlyCUDA
     def test_std_cuda_kernel_launch_check_success(self, device):
+        # [FUNCTION DOC] CUDA only, requires torch 2.10. Checks the kernel launch check macro
+        # passes for a valid launch.
         """Test that STD_CUDA_KERNEL_LAUNCH_CHECK works correctly for successful kernel launches."""
         import libtorch_agn_2_10 as libtorch_agnostic
 
@@ -1744,6 +1998,10 @@ except RuntimeError as e:
         _get_torch_cuda_version() >= (13, 0), "To be resolved after branch cut"
     )
     def test_std_cuda_kernel_launch_check_error(self, device, show_cpp_stacktraces):
+        # [FUNCTION DOC] CUDA only, requires torch 2.10, parametrized on C++ stack traces,
+        # skipped for CUDA 13 or newer. Runs a subprocess invoking an op with an invalid launch
+        # configuration and checks the error message mentions an invalid configuration argument,
+        # with C++ trace markers only when requested.
         """Test that STD_CUDA_KERNEL_LAUNCH_CHECK throws std::runtime_error for invalid kernel launches.
 
         When TORCH_SHOW_CPP_STACKTRACES=1, the error should include a C++ stack trace.
@@ -1799,6 +2057,8 @@ except RuntimeError as e:
         "AssertionError(tensor's device must be `meta`, got cpu instead)"
     )
     def test_my_new_empty(self, device):
+        # [FUNCTION DOC] Requires torch 2.10, skipped under Dynamo. Checks my_new_empty with
+        # defaults, dtype, device and both against new_empty by shape, dtype and device.
         """Test new_empty with all kwargs."""
         import libtorch_agn_2_10 as libtorch_agnostic
 
@@ -1839,6 +2099,8 @@ except RuntimeError as e:
         "AssertionError(tensor's device must be `meta`, got cpu instead)"
     )
     def test_my_new_zeros(self, device):
+        # [FUNCTION DOC] Requires torch 2.10, skipped under Dynamo. Checks my_new_zeros with
+        # defaults, dtype, device and both against new_zeros.
         """Test new_zeros with all kwargs."""
         import libtorch_agn_2_10 as libtorch_agnostic
 
@@ -1869,6 +2131,7 @@ except RuntimeError as e:
         self.assertEqual(result_both, expected_both, exact_device=True)
 
     def test_my_unsqueeze(self, device):
+        # [FUNCTION DOC] Checks my_unsqueeze at dims 0, 1 and -1 for values and resulting shape.
         """Test unsqueeze op."""
         import libtorch_agn_2_9 as libtorch_agnostic
 
@@ -1893,6 +2156,7 @@ except RuntimeError as e:
         self.assertEqual(result_neg.shape, torch.Size([3, 4, 1]))
 
     def test_my_squeeze(self, device):
+        # [FUNCTION DOC] Checks my_squeeze on dims 1, 0 (no-op) and -2 for values and shape.
         """Test squeeze.dim op."""
         import libtorch_agn_2_9 as libtorch_agnostic
 
@@ -1917,6 +2181,7 @@ except RuntimeError as e:
         self.assertEqual(result_neg.shape, torch.Size([3, 4]))
 
     def test_my_select(self, device):
+        # [FUNCTION DOC] Checks my_select on dims 0, 1 and -1 for values and shape.
         """Test select.int op."""
         import libtorch_agn_2_9 as libtorch_agnostic
 
@@ -1941,6 +2206,8 @@ except RuntimeError as e:
         self.assertEqual(result_neg.shape, torch.Size([3, 4]))
 
     def test_my_matmul(self, device):
+        # [FUNCTION DOC] Checks my_matmul for 2D by 2D, vector by matrix, matrix by vector and
+        # batched cases against torch.matmul.
         """Test matmul op."""
         import libtorch_agn_2_9 as libtorch_agnostic
 
@@ -1975,6 +2242,8 @@ except RuntimeError as e:
 
     @skipIfTorchVersionLessThan(2, 10)
     def test_my_subtract(self, device):
+        # [FUNCTION DOC] Requires torch 2.10. Checks my_subtract with default alpha, alpha 2.0,
+        # alpha 0.5 and broadcasting against torch.subtract.
         """Test subtract.Tensor op."""
         import libtorch_agn_2_10 as libtorch_agnostic
 
@@ -2005,6 +2274,10 @@ except RuntimeError as e:
     @skipIfTorchVersionLessThan(2, 11)
     @skipIfTorchDynamo("no data pointer defined for FakeTensor, FunctionalTensor")
     def test_my_from_blob_with_deleter(self, device):
+        # [FUNCTION DOC] Requires torch 2.11, skipped under Dynamo. Builds a tensor from a raw
+        # pointer with a custom deleter, checks it aliases the original, the deleter count goes
+        # from 0 to 1 after deleting the tensor and collecting garbage, and on CUDA that memory
+        # returns to the initial level.
         """Test for from_blob with custom deleter (2.11 feature)."""
         import libtorch_agn_2_11 as libtorch_agnostic
 
@@ -2013,6 +2286,8 @@ except RuntimeError as e:
             init_mem = torch.cuda.memory_allocated(device)
 
         def inner():
+            # [FUNCTION DOC] HELPER: Resets the deleter counter, creates the blob tensor, checks
+            # values and pointer, drops it and verifies the deleter ran exactly once.
             libtorch_agnostic.ops.reset_deleter_call_count()
             self.assertEqual(libtorch_agnostic.ops.get_deleter_call_count(), 0)
 
@@ -2052,6 +2327,8 @@ except RuntimeError as e:
     @skipIfTorchVersionLessThan(2, 11)
     @skipIfTorchDynamo("no data pointer defined for FakeTensor, FunctionalTensor")
     def test_my_from_blob_with_lambda_deleter(self, device):
+        # [FUNCTION DOC] Requires torch 2.11, skipped under Dynamo. Same as the custom deleter
+        # test but the deleter is a capturing lambda with its own call counter.
         """Test for from_blob with capturing-lambda deleter (2.11 feature)."""
         import libtorch_agn_2_11 as libtorch_agnostic
 
@@ -2064,6 +2341,9 @@ except RuntimeError as e:
             init_mem = torch.cuda.memory_allocated(device)
 
         def inner():
+            # [FUNCTION DOC] HELPER: Resets the lambda deleter counter, creates the blob
+            # tensor, checks values and pointer, drops it and verifies the lambda deleter
+            # ran exactly once.
             reset_count()
             self.assertEqual(get_count(), 0)
 
@@ -2103,6 +2383,9 @@ except RuntimeError as e:
     @onlyCUDA
     @skipIfTorchVersionLessThan(2, 11)
     def test_my_from_blob_with_cuda_deleter_no_leak(self, device):
+        # [FUNCTION DOC] CUDA only, requires torch 2.11. Ten times creates a 4 MB tensor from
+        # cudaMalloc memory with a deleter, checks numel and device, frees it and checks
+        # allocated memory returns to the initial level.
         """Test that from_blob deleter properly frees cudaMalloc'd memory."""
         import libtorch_agn_2_11 as libtorch_agnostic
 
@@ -2125,6 +2408,8 @@ except RuntimeError as e:
     @onlyCUDA
     @skipIfTorchVersionLessThan(2, 11)
     def test_my_from_blob_with_cuda_lambda_deleter_no_leak(self, device):
+        # [FUNCTION DOC] CUDA only, requires torch 2.11. Same leak check using the lambda
+        # deleter variant of from_blob.
         """Test that from_blob lambda deleter properly frees cudaMalloc'd memory."""
         import libtorch_agn_2_11 as libtorch_agnostic
 
@@ -2149,6 +2434,8 @@ except RuntimeError as e:
     @skipIfTorchVersionLessThan(2, 12)
     @onlyCPU
     def test_tagged_op(self, device):
+        # [FUNCTION DOC] CPU only, requires torch 2.12. Checks the tagged_identity op carries
+        # the pointwise, pt2_compliant_tag and core tags.
         import libtorch_agn_2_12  # noqa: F401
 
         op = torch.ops.libtorch_agn_2_12.tagged_identity.default
@@ -2158,6 +2445,8 @@ except RuntimeError as e:
 
     @onlyCPU
     def test_my_layout(self, device):
+        # [FUNCTION DOC] CPU only. Checks my_layout reports true only for the matching layout
+        # for strided, sparse COO and sparse CSR tensors.
         """Test layout() method for various tensor layouts."""
         import libtorch_agn_2_9 as libtorch_agnostic
 
@@ -2184,6 +2473,9 @@ except RuntimeError as e:
     @skipIfTorchVersionLessThan(2, 13)
     @onlyCPU
     def test_set_python_module_meta_works(self, device):
+        # [FUNCTION DOC] Requires torch 2.13, CPU only. Checks an op whose Python module
+        # for meta implementation was registered runs on a meta tensor and preserves
+        # shape and device.
         import libtorch_agn_2_13  # noqa: F401
 
         x = torch.randn(3, device="meta")
@@ -2194,6 +2486,8 @@ except RuntimeError as e:
     @skipIfTorchVersionLessThan(2, 13)
     @onlyCPU
     def test_set_python_module_nonexistent_module(self, device):
+        # [FUNCTION DOC] Requires torch 2.13, CPU only. Checks calling a meta op whose
+        # registered Python module does not exist raises NotImplementedError naming that module.
         # When set_python_module points at a module that doesn't exist, the
         # meta call should fail with the configured module name in the error.
         import libtorch_agn_2_13  # noqa: F401
@@ -2207,6 +2501,8 @@ except RuntimeError as e:
     @skipIfTorchVersionLessThan(2, 13)
     @onlyCPU
     def test_set_python_module_registers_properly(self, device):
+        # [FUNCTION DOC] Requires torch 2.13, CPU only. Checks the dispatcher pystub mapping
+        # holds the registered module names for both ops and the op still runs on real tensors.
         import libtorch_agn_2_13  # noqa: F401
 
         # Confirm the dispatcher recorded the mapping for both ops.
@@ -2229,6 +2525,13 @@ except RuntimeError as e:
 
     @skipIfTorchVersionLessThan(2, 12)
     def test_my_exception_what(self, device):
+        # [FUNCTION DOC] Requires torch 2.12. Subtracts mismatched shapes through the 2.13
+        # extension. Checks the simple error check yields a call-site API failure message, the
+        # stable error check yields the detailed size mismatch message plus an originally-from
+        # annotation, and the exception what accessors return the message without and with a
+        # backtrace (more than 10 lines).
+        # KNOWN ISSUE: gated on torch 2.12 but imports the 2.13 extension, which is only built
+        # for torch 2.13 or newer.
         """Test exception what() handling."""
         import libtorch_agn_2_13 as libtorch_agnostic
 
@@ -2241,6 +2544,8 @@ except RuntimeError as e:
 
         # Function to generate an exception that uses TORCH_ERROR_CHECK internally.
         def make_exception_torch():
+            # [FUNCTION DOC] HELPER: Calls the subtract op using the simple error check on the
+            # outer tensors.
             libtorch_agnostic.ops.our_subtract_torch_error_check(a, b)
 
         # Regex to match the simple error.
@@ -2253,6 +2558,8 @@ except RuntimeError as e:
 
         # Function that generates an exception that uses STABLE_TORCH_ERROR_CODE_CHECK internally.
         def make_exception_stable():
+            # [FUNCTION DOC] HELPER: Calls the subtract op using the stable error code check on
+            # the outer tensors.
             libtorch_agnostic.ops.our_subtract_stable_error_check(a, b)
 
         # This is the actual string we'll expect.
@@ -2293,6 +2600,10 @@ except RuntimeError as e:
 
     @skipIfTorchVersionLessThan(2, 10)
     def test_dynamic_version_call_error_message(self, device):
+        # [FUNCTION DOC] Requires torch 2.10. Uses the 2.10 extension, which resolves the 2.13
+        # exception shims at runtime. Checks the simple check always gives the call-site
+        # message, and the stable check gives the simple message on torch older than 2.13 and
+        # the detailed annotated message on newer.
         """Exercise the dynamic version call (dlsym) path.
 
         our_subtract_stable_error_check lives in the 2.10 extension, which
@@ -2321,6 +2632,8 @@ except RuntimeError as e:
         )
 
         def make_exception_stable():
+            # [FUNCTION DOC] HELPER: Calls the subtract op using the stable error code check on
+            # the outer tensors.
             libtorch_agnostic.ops.our_subtract_stable_error_check(a, b)
 
         if _torchVersionLessThan(2, 13):
@@ -2352,10 +2665,14 @@ except RuntimeError as e:
 )
 @skipIfTorchVersionLessThan(2, 14)
 class TestLibtorchAgnosticMetal(TestCase):
+    # [CLASS DOC] MPS test case for the 2.14 extension (Metal argument-bytes ops). No instance
+    # state; skipped on free-threaded Python and torch older than 2.14.
     """MPS tests for versioned libtorch_agnostic extensions."""
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class-level setup: imports libtorch_agn_2_14, building it from the
+        # sibling extension directory via install_cpp_extension if the import fails.
         base_dir = Path(__file__).parent
 
         try:
@@ -2367,6 +2684,8 @@ class TestLibtorchAgnosticMetal(TestCase):
 
     @parametrize("scale,negate", [(0.5, False), (2.0, True)])
     def test_mps_set_arg_bytes(self, device, scale, negate):
+        # [FUNCTION DOC] Parametrized over scale and negate. Checks my_mps_scale_negate_clamp
+        # equals input times scale, optionally negated, clamped to the range minus 0.25 to 0.9.
         import libtorch_agn_2_14 as libtorch_agnostic
 
         x = torch.randn(1000, device=device, dtype=torch.float32)
@@ -2387,6 +2706,9 @@ class TestLibtorchAgnosticMetal(TestCase):
         ],
     )
     def test_mps_set_arg_bytes_validation(self, device, size, null_ptr, error):
+        # [FUNCTION DOC] Parametrized over size, null pointer flag and expected error. Calls the
+        # raw set-arg-bytes op; expects success for size 4096 and RuntimeError for a null
+        # pointer or size 0 or above 4096.
         import libtorch_agn_2_14 as libtorch_agnostic
 
         x = torch.randn(8, device=device, dtype=torch.float32)
@@ -2397,6 +2719,7 @@ class TestLibtorchAgnosticMetal(TestCase):
                 libtorch_agnostic.ops.my_mps_set_arg_bytes_raw(x, size, null_ptr)
 
     def test_mps_set_arg_bytes_lifetime(self, device):
+        # [FUNCTION DOC] Checks my_mps_set_arg_bytes_lifetime returns input times 3.
         import libtorch_agn_2_14 as libtorch_agnostic
 
         x = torch.randn(1000, device=device, dtype=torch.float32)
