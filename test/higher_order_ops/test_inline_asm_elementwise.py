@@ -1,4 +1,11 @@
 # Owner(s): ["module: higher order operators"]
+# [MODULE DOC] Tests for the inline_asm_elementwise higher-order operator on CUDA/ROCm devices.
+# Contains a table of parametrized assembly test cases (float32, packed and bf16 variants),
+# tests comparing eager (Jiterator) against Inductor-compiled results, reference-correctness
+# checks, error-handling tests, edge cases (empty, scalar, 4D, dynamic shapes, strides) and
+# tests forcing small Triton block sizes so pack padding helpers are emitted. Tests are skipped
+# without CUDA or SM70+; compiled paths need Triton. No import-time side effects beyond
+# building the TEST_CASES list and its name list.
 """
 Tests for inline_asm_elementwise higher-order operator.
 
@@ -31,6 +38,10 @@ from torch.utils._triton import has_triton
 
 @dataclass
 class AsmTestCase:
+    # [CLASS DOC] HELPER: Dataclass describing one inline asm test case: name, a zero-argument
+    # input generator, the asm string, constraint string, output dtype, a reference function
+    # used for approximate comparison, pack width (default 1), compile_only flag (skip eager
+    # comparison) and the minimum SM version (default 70).
     name: str
     input_gen_fn: Callable
     asm_str: str
@@ -285,12 +296,20 @@ TEST_CASE_NAMES = [tc.name for tc in TEST_CASES]
 @unittest.skipIf(not SM70OrLater, "Requires SM70+")
 @instantiate_parametrized_tests
 class TestInlineAsmElementwise(TestCase):
+    # [CLASS DOC] Parametrized tests that run every entry of TEST_CASES through
+    # the operator, checking eager-vs-compiled bitwise equality and correctness
+    # against each case's reference function.
     """Parametrized tests for inline_asm_elementwise."""
 
     @parametrize(
         "case_idx", list(range(len(TEST_CASES))), name_fn=lambda i: TEST_CASE_NAMES[i]
     )
     def test_eager_vs_compiled_bitwise(self, case_idx):
+        # [FUNCTION DOC] Runs one test case through Inductor and, unless the case is
+        # compile_only, also in eager mode. Skips on too-old SM, on ROCm archs lacking native
+        # bf16 conversion, or when Triton is missing. Non-compile_only cases assert the two
+        # results are equal; compile_only cases compare the compiled result to the reference
+        # within 1e-5 tolerances.
         """Verify eager and compiled produce bitwise identical results."""
         tc = TEST_CASES[case_idx]
         if not torch.version.hip and torch.cuda.get_device_capability() < (
@@ -316,6 +335,9 @@ class TestInlineAsmElementwise(TestCase):
         inputs = tc.input_gen_fn()
 
         def fn(*args):
+            # [FUNCTION DOC] HELPER: Local wrapper that forwards all positional tensors to the
+            # inline asm operator, using the asm string, constraints, dtype and pack width from
+            # the selected test case.
             return inline_asm_elementwise(
                 *args,
                 asm_str=tc.asm_str,
@@ -349,6 +371,10 @@ class TestInlineAsmElementwise(TestCase):
         "case_idx", list(range(len(TEST_CASES))), name_fn=lambda i: TEST_CASE_NAMES[i]
     )
     def test_correctness(self, case_idx):
+        # [FUNCTION DOC] Checks the operator result against the case's reference function (cast
+        # to float, tolerance 1e-5). compile_only cases run through Inductor (skipped without
+        # Triton); others run eagerly. Skips on too-old SM or ROCm archs without native bf16
+        # conversion; several ROCm issues are skipped via decorators.
         """Verify result matches reference function."""
         tc = TEST_CASES[case_idx]
         if not torch.version.hip and torch.cuda.get_device_capability() < (
@@ -374,6 +400,9 @@ class TestInlineAsmElementwise(TestCase):
         inputs = tc.input_gen_fn()
 
         def fn(*args):
+            # [FUNCTION DOC] HELPER: Local wrapper that forwards all positional tensors to the
+            # inline asm operator, using the asm string, constraints, dtype and pack width from
+            # the selected test case.
             return inline_asm_elementwise(
                 *args,
                 asm_str=tc.asm_str,
@@ -396,9 +425,11 @@ class TestInlineAsmElementwise(TestCase):
 
 @unittest.skipIf(not TEST_CUDA, "CUDA not available")
 class TestInlineAsmElementwiseErrors(TestCase):
+    # [CLASS DOC] Tests that invalid arguments to the operator raise the expected errors.
     """Tests for error handling."""
 
     def test_error_no_inputs(self):
+        # [FUNCTION DOC] Calling the operator with no tensor inputs must raise ValueError.
         with self.assertRaises(ValueError):
             inline_asm_elementwise(
                 asm_str="v_mov_b32 $0, 1.0"
@@ -409,6 +440,8 @@ class TestInlineAsmElementwiseErrors(TestCase):
             )
 
     def test_error_constraint_mismatch(self):
+        # [FUNCTION DOC] Two input tensors but a constraint string describing only one input
+        # must raise ValueError.
         x = torch.randn(100, device="cuda", dtype=torch.float32)
         y = torch.randn(100, device="cuda", dtype=torch.float32)
         with self.assertRaises(ValueError):
@@ -423,6 +456,8 @@ class TestInlineAsmElementwiseErrors(TestCase):
             )
 
     def test_error_mixed_dtypes(self):
+        # [FUNCTION DOC] A float32 and an int32 input together must raise
+        # ValueError (mixed dtypes).
         x = torch.randn(100, device="cuda", dtype=torch.float32)
         y = torch.randint(0, 10, (100,), device="cuda", dtype=torch.int32)
         with self.assertRaises(ValueError):
@@ -437,6 +472,7 @@ class TestInlineAsmElementwiseErrors(TestCase):
             )
 
     def test_error_cpu_tensor(self):
+        # [FUNCTION DOC] A CPU tensor input must raise RuntimeError.
         x = torch.randn(100, dtype=torch.float32)
         with self.assertRaises(RuntimeError):
             inline_asm_elementwise(
@@ -450,9 +486,13 @@ class TestInlineAsmElementwiseErrors(TestCase):
 @unittest.skipIf(not TEST_CUDA, "CUDA not available")
 @unittest.skipIf(not SM70OrLater, "Requires SM70+")
 class TestInlineAsmElementwiseEdgeCases(TestCase):
+    # [CLASS DOC] Edge-case tests: empty, scalar and 4D tensors, composition with regular ops,
+    # fake-tensor output strides and dynamic shapes.
     """Tests for edge cases."""
 
     def test_empty_tensor(self):
+        # [FUNCTION DOC] An empty float32 tensor passed through a move instruction yields an
+        # empty result of shape zero.
         x = torch.empty(0, device="cuda", dtype=torch.float32)
         result = inline_asm_elementwise(
             x,
@@ -463,6 +503,8 @@ class TestInlineAsmElementwiseEdgeCases(TestCase):
         self.assertEqual(result.shape, torch.Size([0]))
 
     def test_scalar_tensor(self):
+        # [FUNCTION DOC] A zero-dimensional tensor through a move instruction
+        # keeps shape and value.
         x = torch.tensor(3.14, device="cuda", dtype=torch.float32)
         result = inline_asm_elementwise(
             x,
@@ -474,6 +516,7 @@ class TestInlineAsmElementwiseEdgeCases(TestCase):
         self.assertEqual(result, x)
 
     def test_4d_tensor(self):
+        # [FUNCTION DOC] A 4D tensor through a move instruction keeps shape and values.
         x = torch.randn(2, 3, 4, 5, device="cuda", dtype=torch.float32)
         result = inline_asm_elementwise(
             x,
@@ -486,7 +529,12 @@ class TestInlineAsmElementwiseEdgeCases(TestCase):
 
     @xfailIfNoAcceleratorTriton
     def test_composition_with_pytorch_ops(self):
+        # [FUNCTION DOC] Compiles a function that doubles one input, runs an add
+        # through the operator and adds one; asserts compiled equals eager and
+        # equals the plain arithmetic result.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test: doubles x, adds y via inline asm,
+            # then adds 1.0.
             z = x * 2
             w = inline_asm_elementwise(
                 z,
@@ -510,6 +558,9 @@ class TestInlineAsmElementwiseEdgeCases(TestCase):
         self.assertEqual(eager_result, x * 2 + y + 1.0)
 
     def test_output_strides_mixed_inputs(self):
+        # [FUNCTION DOC] Builds the add operator on a contiguous and a transposed
+        # input, once for real tensors and once under FakeTensorMode, and asserts
+        # shape and stride match between them.
         """Verify fake mode output strides match eager (TensorIterator) strides."""
         from torch._subclasses.fake_tensor import FakeTensorMode
 
@@ -546,7 +597,11 @@ class TestInlineAsmElementwiseEdgeCases(TestCase):
 
     @xfailIfNoAcceleratorTriton
     def test_dynamic_shapes(self):
+        # [FUNCTION DOC] Compiles an inline asm add with dynamic shapes and checks the result
+        # equals eager for three different sizes.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test: elementwise add of x and
+            # y through inline asm.
             return inline_asm_elementwise(
                 x,
                 y,
@@ -571,9 +626,14 @@ class TestInlineAsmElementwiseEdgeCases(TestCase):
 @unittest.skipIf(not SM70OrLater, "Requires SM70+")
 @xfailIfNoAcceleratorTriton
 class TestInlineAsmPackPadding(TestCase):
+    # [CLASS DOC] Tests that when the forced Triton block size is smaller than the pack width,
+    # the generated code contains the pack and unpack padding helpers and results stay correct.
     """Test that pack padding works when block size < pack."""
 
     def test_pack2_xblock1_padding(self):
+        # [FUNCTION DOC] Forces block size 1 with pack width 2, compiles a pack-2 move, asserts
+        # the output equals the input and the generated code mentions the pack and unpack
+        # helpers in order.
         """Force XBLOCK=1 with pack=2 so padding is needed."""
         from torch._inductor.choices import InductorChoices
         from torch._inductor.codegen.triton import FixedTritonConfig
@@ -581,13 +641,19 @@ class TestInlineAsmPackPadding(TestCase):
         from torch.testing import FileCheck
 
         class ForceXBlock1(InductorChoices):
+            # [CLASS DOC] HELPER: Choices handler that overrides Triton kernel kwargs with a
+            # fixed config of block size 1 along X.
             def triton_kernel_kwargs(self, kernel_cls, features, groups, kernel_kwargs):
+                # [FUNCTION DOC] HELPER: Returns the given kernel kwargs plus a fixed Triton
+                # config with block size 1.
                 return {
                     **kernel_kwargs,
                     "fixed_config": FixedTritonConfig({"XBLOCK": 1}),
                 }
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function under test: pack-2 inline asm that copies two
+            # packed inputs to outputs.
             return inline_asm_elementwise(
                 x,
                 asm_str=(
@@ -613,6 +679,8 @@ class TestInlineAsmPackPadding(TestCase):
         FileCheck().check("inline_asm_pack").check("inline_asm_unpack").run(code)
 
     def test_pack4_xblock1_padding(self):
+        # [FUNCTION DOC] Same as the pack-2 test but with block size 1 and pack width 4; checks
+        # output equals input and the pack and unpack helpers appear in the generated code.
         """Force XBLOCK=1 with pack=4 so padding is needed."""
         from torch._inductor.choices import InductorChoices
         from torch._inductor.codegen.triton import FixedTritonConfig
@@ -620,13 +688,19 @@ class TestInlineAsmPackPadding(TestCase):
         from torch.testing import FileCheck
 
         class ForceXBlock1(InductorChoices):
+            # [CLASS DOC] HELPER: Choices handler that overrides Triton kernel kwargs with a
+            # fixed config of block size 1 along X.
             def triton_kernel_kwargs(self, kernel_cls, features, groups, kernel_kwargs):
+                # [FUNCTION DOC] HELPER: Returns the given kernel kwargs plus a fixed Triton
+                # config with block size 1.
                 return {
                     **kernel_kwargs,
                     "fixed_config": FixedTritonConfig({"XBLOCK": 1}),
                 }
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function under test: pack-4 inline asm
+            # copying four packed values.
             return inline_asm_elementwise(
                 x,
                 asm_str=(
@@ -657,6 +731,9 @@ class TestInlineAsmPackPadding(TestCase):
         FileCheck().check("inline_asm_pack").check("inline_asm_unpack").run(code)
 
     def test_pack4_xblock2_partial_padding(self):
+        # [FUNCTION DOC] Block size 2 with pack width 4: only partial padding is
+        # needed. Checks output equals input and the pack and unpack helpers are
+        # present in the generated code.
         """XBLOCK=2 < pack=4, so 1 round of padding is needed (not 2)."""
         from torch._inductor.choices import InductorChoices
         from torch._inductor.codegen.triton import FixedTritonConfig
@@ -664,13 +741,19 @@ class TestInlineAsmPackPadding(TestCase):
         from torch.testing import FileCheck
 
         class ForceXBlock2(InductorChoices):
+            # [CLASS DOC] HELPER: Choices handler that overrides Triton kernel kwargs with a
+            # fixed config of block size 2 along X.
             def triton_kernel_kwargs(self, kernel_cls, features, groups, kernel_kwargs):
+                # [FUNCTION DOC] HELPER: Returns the given kernel kwargs plus a fixed Triton
+                # config with block size 2.
                 return {
                     **kernel_kwargs,
                     "fixed_config": FixedTritonConfig({"XBLOCK": 2}),
                 }
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Function under test: pack-4 inline asm
+            # copying four packed values.
             return inline_asm_elementwise(
                 x,
                 asm_str=(
@@ -701,6 +784,9 @@ class TestInlineAsmPackPadding(TestCase):
         FileCheck().check("inline_asm_pack").check("inline_asm_unpack").run(code)
 
     def test_pack2_xblock1_yblock1_padding(self):
+        # [FUNCTION DOC] Forces X and Y block sizes of 1 with pack width 2 on a 2D-tiled kernel
+        # (second input transposed). Checks the result equals the sum and the code mentions
+        # YBLOCK then the pack and unpack helpers.
         """Force XBLOCK=1, YBLOCK=1 with pack=2 on a 2D-tiled kernel."""
         from torch._inductor.choices import InductorChoices
         from torch._inductor.codegen.triton import FixedTritonConfig
@@ -708,13 +794,19 @@ class TestInlineAsmPackPadding(TestCase):
         from torch.testing import FileCheck
 
         class ForceXY1(InductorChoices):
+            # [CLASS DOC] HELPER: Choices handler that overrides Triton kernel kwargs with a
+            # fixed config of block size 1 along both X and Y.
             def triton_kernel_kwargs(self, kernel_cls, features, groups, kernel_kwargs):
+                # [FUNCTION DOC] HELPER: Returns the given kernel kwargs plus a fixed config
+                # with X and Y blocks of 1.
                 return {
                     **kernel_kwargs,
                     "fixed_config": FixedTritonConfig({"XBLOCK": 1, "YBLOCK": 1}),
                 }
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Function under test: pack-2 inline asm adding
+            # two input pairs.
             return inline_asm_elementwise(
                 x,
                 y,
