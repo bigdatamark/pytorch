@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] HELPER: Debugging tools that detect Python reference cycles keeping CUDA tensors
+# alive and render them. Hooks the garbage collector to capture collectable garbage, builds a
+# graph of objects with labelled reference edges (adapted from refcycle), and emits Graphviz
+# text or a self-contained HTML page showing allocation stacks on hover. Main entry points:
+# warn_tensor_cycles, observe_tensor_cycles, observe_garbage, create_graph, to_dot, to_html.
+# Import-time side effects: creates a module logger and computes the cell type.
 import gc
 import sys
 from typing import Any, NamedTuple
@@ -13,9 +19,16 @@ import logging
 logger = logging.getLogger(__name__)
 
 def observe_garbage(observer):
+    # [FUNCTION DOC] Install a garbage collector callback that, after each collection, passes
+    # the list of saved garbage objects to observer, then frees them. While armed it turns on
+    # the save-all debug flag at collection start, and uses a profile hook to run the report
+    # outside the collector. Warns if CUDA memory changed while freeing. Registers an exit
+    # handler that disables the callback. Returns a function that removes the callback.
     enabled = True
 
     def disable() -> None:
+        # [FUNCTION DOC] HELPER: Exit handler that disables the callback so it does nothing
+        # during interpreter shutdown.
         # when GC runs during exit, things like `sys` will already be unloaded
         # so we have to disable the callback to avoid hitting errors.
         nonlocal enabled
@@ -23,6 +36,9 @@ def observe_garbage(observer):
     atexit.register(disable)
 
     def gc_callback(phase, info) -> None:
+        # [FUNCTION DOC] HELPER: Collector hook. On the start phase, enables save-all
+        # debugging. On the stop phase, installs a temporary profile function that runs the
+        # observer on the next call event, restoring the previous profile function.
         nonlocal enabled
         if not enabled:
             return
@@ -33,6 +49,10 @@ def observe_garbage(observer):
             self_return = [False]
 
             def do_collect(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Profile hook; ignores its first call, then restores
+                # the original hook, forces a full collection if needed, gives the saved
+                # garbage to the observer, clears it, resets debug flags, collects again and
+                # logs a warning if CUDA memory changed. Chains to the original hook.
                 nonlocal enabled
                 if not self_return[0]:
                     self_return[0] = True
@@ -67,6 +87,8 @@ def observe_garbage(observer):
 
     # provide a way to disarm the callback
     def remove() -> None:
+        # [FUNCTION DOC] HELPER: Unregister the collector callback; raises ValueError if it
+        # was already removed.
         gc.callbacks.remove(gc_callback)
     return remove
 
@@ -86,13 +108,20 @@ def observe_garbage(observer):
 # limitations under the License.
 
 def _get_cell_type():
+    # [FUNCTION DOC] HELPER: Return the closure cell type by building a throwaway closure.
     def f(x=None):
+        # [FUNCTION DOC] HELPER: Return a closure capturing x so a cell object exists.
         return lambda: x
     return type(f().__closure__[0])
 
 CellType = _get_cell_type()
 
 def annotated_references(obj):
+    # [FUNCTION DOC] Describe what obj refers to. Returns a mapping from the identity number
+    # of each referent to a list of text labels (attribute names, indexes, keys, locals),
+    # since several edges may reach one referent. Uses the object's type hierarchy to pick
+    # extraction rules for sequences, mappings, sets, functions, frames, cells, bound
+    # methods, weak references and descriptors, plus dict and class attributes.
     """
     Return known information about references held by the given object.
 
@@ -104,14 +133,18 @@ def annotated_references(obj):
     references: dict[int, list[str]] = {}
 
     def add_reference(name, obj) -> None:
+        # [FUNCTION DOC] HELPER: Record a labelled edge to the given object in the result.
         references.setdefault(id(obj), []).append(name)
 
     def add_attrs(*attrs) -> None:
+        # [FUNCTION DOC] HELPER: For each named attribute that the outer object has, record
+        # an edge labelled with that name.
         for attr in attrs:
             if hasattr(obj, attr):
                 add_reference(attr, getattr(obj, attr))
 
     def add_cell_references() -> None:
+        # [FUNCTION DOC] HELPER: Record the cell contents edge; empty cells are skipped.
         try:
             add_attrs("cell_contents")
         except ValueError:
@@ -122,6 +155,10 @@ def annotated_references(obj):
             pass
 
     def add_function_references() -> None:
+        # [FUNCTION DOC] HELPER: Record edges for function attributes such as defaults,
+        # closure, globals, code, name, module, annotations and keyword defaults.
+        # KNOWN ISSUE: a missing comma after the doc entry concatenates it with the qualified
+        # name entry into one nonexistent attribute, so neither is ever recorded.
         add_attrs("__defaults__",
                   "__closure__",
                   "__globals__",
@@ -135,22 +172,30 @@ def annotated_references(obj):
 
 
     def add_sequence_references() -> None:
+        # [FUNCTION DOC] HELPER: Record an edge labelled with the position for each item.
         for position, item in enumerate(obj):
             add_reference(f"[{position}]", item)
 
     def add_dict_references() -> None:
+        # [FUNCTION DOC] HELPER: For each entry, record an edge to the key labelled key and
+        # an edge to the value labelled with the key's representation.
         for key, value in obj.items():
             add_reference("key", key)
             add_reference(f"[{repr(key)}]", value)
 
     def add_set_references() -> None:
+        # [FUNCTION DOC] HELPER: Record an edge labelled element for each member.
         for elt in obj:
             add_reference("element", elt)
 
     def add_bound_method_references() -> None:
+        # [FUNCTION DOC] HELPER: Record edges to the bound instance and underlying function.
         add_attrs("__self__", "__func__", "im_class")
 
     def add_weakref_references() -> None:
+        # [FUNCTION DOC] HELPER: For plain weak references only, if the garbage collector
+        # reports exactly one referent, label it as the callback.
+        # A reference without a callback has no referents here, so nothing is recorded.
         # For subclasses of weakref, we can't reliably distinguish the
         # callback (if any) from other attributes.
         if type(obj) is weakref.ref:
@@ -161,6 +206,8 @@ def annotated_references(obj):
 
 
     def add_frame_references() -> None:
+        # [FUNCTION DOC] HELPER: Record edges for frame attributes (caller, code, builtins,
+        # globals, trace, locals) and, if the locals are a real dict, one edge per local.
         f_locals = obj.f_locals
         add_attrs("f_back", "f_code", "f_builtins", "f_globals", "f_trace", "f_locals")
         # Some badly-behaved code replaces the f_locals dict with
@@ -171,6 +218,8 @@ def annotated_references(obj):
                 add_reference(f"local {name}", local)
 
     def add_getset_descriptor_references() -> None:
+        # [FUNCTION DOC] HELPER: Record edges to the owning class, name and doc of a
+        # descriptor.
         add_attrs("__objclass__", "__name__", "__doc__")
 
     type_based_references = {
@@ -205,6 +254,11 @@ BASE_TYPES = (int, float, complex, type(None), str, bytes)
 FRAME_FILENAME_LIMIT = 32
 
 def object_annotation(obj):
+    # [FUNCTION DOC] Build a short, possibly multi-line label for a graph node describing obj:
+    # the representation for basic types, kind plus name for functions, methods, modules,
+    # types and frames (long file names truncated), element summaries for lists and tuples,
+    # size for dicts, liveness for weak references, and module-qualified type name (with
+    # shape for CUDA tensors) otherwise.
     """
     Return a string to be used for Graphviz nodes.
 
@@ -212,6 +266,8 @@ def object_annotation(obj):
     """
 
     def format_sequence(obj):
+        # [FUNCTION DOC] HELPER: Summarize up to the first eight items (representation for
+        # basic types, type name otherwise), with a count of the remainder if longer.
         body = ','.join(repr(x) if isinstance(x, BASE_TYPES) else type(x).__name__ for x in obj[:8])
         if len(obj) > 8:
             body = f'{body}, ...{len(obj) - 8}'
@@ -257,12 +313,22 @@ def object_annotation(obj):
 
 
 class Node(NamedTuple):
+    # [CLASS DOC] One graph node. Fields: label text, optional allocation context text, root
+    # flag (true when the object matched the filter, such as a CUDA tensor), and a mutable
+    # list of (edge label, target node index) pairs for outgoing references.
+    # (The field name referrents is misspelled but used consistently.)
     label: str
     context: str | None
     root: bool
     referrents: list[tuple[str, int]]
 
 def create_graph(objects, *, context=None, filter=None):
+    # [FUNCTION DOC] Build a list of Node from a collection of objects (weak proxies are
+    # dropped). Edges come from the collector's referents among the given objects, labelled
+    # via annotated_references ("?" when unknown). Roots are objects passing filter (default:
+    # CUDA tensors); context maps an object to allocation text (default: derived from a CUDA
+    # memory snapshot, which is taken on the call). Only nodes that can reach a root are kept,
+    # with indexes renumbered. Returns the filtered node list.
     if context is None:
         context = cuda_allocation_context()
     if filter is None:
@@ -309,10 +375,12 @@ def create_graph(objects, *, context=None, filter=None):
     return filtered
 
 def escape(n):
+    # [FUNCTION DOC] HELPER: Return n as a quoted, escaped JSON string literal.
     return json.dumps(n)
 
 
 def is_cuda_tensor(obj):
+    # [FUNCTION DOC] True if obj is a real (non-fake) tensor on a CUDA device.
     return (
         isinstance(obj, torch.Tensor) and
         obj.device.type == "cuda" and
@@ -320,6 +388,10 @@ def is_cuda_tensor(obj):
     )
 
 def cuda_allocation_context():
+    # [FUNCTION DOC] Take a snapshot of the CUDA caching allocator and return a function that
+    # maps a CUDA tensor to the formatted allocation stack of its storage (or None). Only
+    # active allocated blocks are indexed by start address; stacks are available only if
+    # memory history recording was enabled.
     snapshot = torch.cuda.memory._snapshot()
     addr_to_frame = {}
     for seg in snapshot['segments']:
@@ -331,6 +403,8 @@ def cuda_allocation_context():
             addr += blk['size']
 
     def object_context(obj):
+        # [FUNCTION DOC] HELPER: Return the allocation stack text for a CUDA tensor's storage
+        # address, or None for other objects or unknown addresses.
         if is_cuda_tensor(obj):
             addr = obj.untyped_storage().data_ptr()
             frames = addr_to_frame.get(addr)
@@ -340,6 +414,8 @@ def cuda_allocation_context():
     return object_context
 
 def to_dot(nodes):
+    # [FUNCTION DOC] Render nodes as Graphviz directed graph text, left to right. Root nodes
+    # are drawn red; each edge carries its label. Returns the text.
     lines = ["digraph GraphName {", "node [shape=rect];", 'rankdir=LR;']
     for i, n in enumerate(nodes):
         lines.append(f'{i} [label={escape(n.label)}, color={"red" if n.root else "black"}];')
@@ -462,6 +538,11 @@ document.getElementById('node{id}').addEventListener('mouseover', function(event
 }})
 """
 def to_html(nodes):
+    # [FUNCTION DOC] Produce a standalone HTML page from nodes: the Graphviz text is embedded
+    # in the template, with a hover listener per node that has allocation context. The page
+    # loads a rendering script from a CDN at view time. Returns the HTML string.
+    # KNOWN ISSUE: listeners target element ids numbered from one, relying on the renderer
+    # naming nodes that way; the graph text numbers nodes from zero.
     listeners = []
     for i, n in enumerate(nodes):
         if n.context is None:
@@ -472,9 +553,14 @@ def to_html(nodes):
     return _template.replace('$DOT', repr(dot)).replace('$LISTENERS', '\n'.join(listeners))
 
 def observe_tensor_cycles(callback):
+    # [FUNCTION DOC] Start CUDA memory history recording (global side effect, up to 100000
+    # entries) and watch the collector; whenever garbage containing CUDA tensors is found,
+    # call callback with the HTML visualization. Returns the function that stops watching.
     torch.cuda.memory._record_memory_history(max_entries=100000)
 
     def observer(garbage) -> None:
+        # [FUNCTION DOC] HELPER: If garbage is non-empty and holds a CUDA tensor, build the
+        # graph and pass its HTML to callback; otherwise log that none were found.
         if garbage:
             if not any(is_cuda_tensor(obj) for obj in garbage):
                 logger.info("No CUDA Tensors found in garbage")
@@ -484,6 +570,9 @@ def observe_tensor_cycles(callback):
 
 
 def warn_tensor_cycles():
+    # [FUNCTION DOC] Enable cycle reporting for CUDA tensors: each time such a cycle is
+    # collected, write an HTML visualization to a temporary file and log a warning with its
+    # path. Starts memory history recording. Returns the function that disables it.
     """
     Install a warning that reports whenever a cycle that is holding CUDA memory is observed.
 
@@ -499,6 +588,9 @@ def warn_tensor_cycles():
     logger.info("Watching Python reference cycles for CUDA Tensors.")
 
     def write_and_log(html) -> None:
+        # [FUNCTION DOC] HELPER: Write html to a named temporary file and log its path.
+        # KNOWN ISSUE: the temporary file is deleted when the block exits, so the logged path
+        # no longer exists by the time anyone reads the warning.
         with NamedTemporaryFile('w', suffix='.html') as f:
             f.write(html)
             logger.warning('Reference cycle includes a CUDA Tensor see visualization of cycle %s', f.name)

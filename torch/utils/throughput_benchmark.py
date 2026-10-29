@@ -1,9 +1,15 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Python wrapper around the C++ throughput benchmark. Provides ThroughputBenchmark
+# (drive a module with multiple calling threads and stored inputs), ExecutionStats (derived
+# latency and throughput numbers) and format_time. Importing it loads torch._C only.
 
 import torch._C
 
 
 def format_time(time_us=None, time_ms=None, time_s=None) -> str:
+    # [FUNCTION DOC] Format a duration given in exactly one unit (microseconds, milliseconds or
+    # seconds) as a string with three decimals and the largest fitting suffix (s, ms or us).
+    # Raises AssertionError unless exactly one argument is provided.
     """Define time formatting."""
     if sum([time_us is not None, time_ms is not None, time_s is not None]) != 1:
         raise AssertionError("Expected only one of time_us, time_ms, time_s is given.")
@@ -27,29 +33,40 @@ def format_time(time_us=None, time_ms=None, time_s=None) -> str:
 
 
 class ExecutionStats:
+    # [CLASS DOC] Read-only view over the C++ benchmark result plus the config that produced it.
+    # Holds the native stats object and the benchmark config; exposes average latency, iteration
+    # count and derived total time and iterations per second. Printing gives a readable report.
     def __init__(self, c_stats, benchmark_config) -> None:
+        # [FUNCTION DOC] Store the native stats object and the benchmark config.
         self._c_stats = c_stats
         self.benchmark_config = benchmark_config
 
     @property
     def latency_avg_ms(self):
+        # [FUNCTION DOC] Average latency per input example in milliseconds, from native stats.
         return self._c_stats.latency_avg_ms
 
     @property
     def num_iters(self):
+        # [FUNCTION DOC] Number of iterations actually executed across all threads.
         return self._c_stats.num_iters
 
     @property
     def iters_per_second(self):
+        # [FUNCTION DOC] Iterations divided by the derived total time, over all calling threads.
         """Return total number of iterations per second across all calling threads."""
         return self.num_iters / self.total_time_seconds
 
     @property
     def total_time_seconds(self):
+        # [FUNCTION DOC] Estimated wall time in seconds: iterations times average latency,
+        # divided by the number of calling threads (threads run concurrently).
         return self.num_iters * (
             self.latency_avg_ms / 1000.0) / self.benchmark_config.num_calling_threads
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Multi-line report: average latency, iteration count, iterations per
+        # second and total time, with times formatted by format_time.
         return '\n'.join([
             "Average latency per example: " + format_time(time_ms=self.latency_avg_ms),
             f"Total number of iterations: {self.num_iters}",
@@ -59,6 +76,9 @@ class ExecutionStats:
 
 
 class ThroughputBenchmark:
+    # [CLASS DOC] Wrapper around the native benchmark object (kept in a private attribute).
+    # Inputs are added once and stored natively; benchmark runs them from several threads
+    # and returns ExecutionStats. Accepts eager modules and scripted modules.
     """
     This class is a wrapper around a c++ component throughput_benchmark::ThroughputBenchmark.
 
@@ -94,12 +114,17 @@ class ThroughputBenchmark:
     """
 
     def __init__(self, module) -> None:
+        # [FUNCTION DOC] Create the native benchmark for the module; a ScriptModule is passed
+        # via its underlying C++ module, any other module is passed as is.
         if isinstance(module, torch.jit.ScriptModule):
             self._benchmark = torch._C.ThroughputBenchmark(module._c)
         else:
             self._benchmark = torch._C.ThroughputBenchmark(module)
 
     def run_once(self, *args, **kwargs):
+        # [FUNCTION DOC] Run the module once on a stored input and return its output.
+        # Arguments are forwarded to the native run_once (docstring says input id; the native
+        # call decides what the arguments mean). Useful as a sanity check.
         """
         Given input id (input_idx) run benchmark once and return prediction.
 
@@ -110,6 +135,8 @@ class ThroughputBenchmark:
         return self._benchmark.run_once(*args, **kwargs)
 
     def add_input(self, *args, **kwargs) -> None:
+        # [FUNCTION DOC] Store one set of module arguments in the native benchmark. During the
+        # run, threads pick randomly among all stored inputs. Returns nothing.
         """
         Store a single input to a module into the benchmark memory and keep it there.
 
@@ -125,6 +152,11 @@ class ThroughputBenchmark:
             num_warmup_iters=10,
             num_iters=100,
             profiler_output_path=""):
+        # [FUNCTION DOC] Build a native config from the arguments (threads, warmup iterations
+        # per thread, total iterations, optional profiler trace path), run the benchmark and
+        # return ExecutionStats. A non-empty path enables the autograd profiler during the
+        # main run and writes a trace file there (file I/O side effect).
+        # KNOWN ISSUE: the docstring omits num_calling_threads from the documented arguments.
         """
         Run a benchmark on the module.
 

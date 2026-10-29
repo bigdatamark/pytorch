@@ -1,10 +1,20 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] HELPER: Numpy image/video layout helpers for the TensorBoard writer.
+# Renders matplotlib figures to arrays, tiles image batches into a grid, converts tensors with
+# an arbitrary dimension-order string to height-width-channel layout, and packs a batch of
+# videos into a single grid-of-frames array. Imports numpy at import time; matplotlib is
+# imported lazily inside figure_to_image only.
 import numpy as np
 import numpy.typing as npt
 
 
 # Functions for converting
 def figure_to_image(figures, close=True):
+    # [FUNCTION DOC] Render one matplotlib figure, or a list of figures, to uint8 numpy arrays.
+    # Each figure is drawn with the Agg backend and returned as RGB in channel-first order
+    # (alpha dropped). A list yields a stacked array with a leading batch dimension. If close
+    # is true the figures are closed (pyplot state mutated). Needs matplotlib installed;
+    # raises ImportError otherwise.
     """Render matplotlib figure to numpy format.
 
     Note that this requires the ``matplotlib`` package.
@@ -20,6 +30,8 @@ def figure_to_image(figures, close=True):
     import matplotlib.backends.backend_agg as plt_backend_agg
 
     def render_to_rgb(figure):
+        # [FUNCTION DOC] HELPER: Draw a single figure on an Agg canvas and return its pixels
+        # as a channel-first RGB array; closes the figure when the enclosing close flag is set.
         canvas = plt_backend_agg.FigureCanvasAgg(figure)
         canvas.draw()
         data: npt.NDArray = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8)
@@ -39,6 +51,12 @@ def figure_to_image(figures, close=True):
 
 
 def _prepare_video(V):
+    # [FUNCTION DOC] HELPER: Pack a 5D batch-time-channel-height-width array into a 4D
+    # time-height-width-channel array. Converts uint8 input to float scaled to 0..1, pads the
+    # batch with zero videos up to a power of two, then tiles the batch into a rows-by-columns
+    # grid per frame. Returns the new array; the input is not modified.
+    # KNOWN ISSUE: when the batch size is already a power of two, the row count is derived from
+    # the original size, and the padded zero-filled videos use float64, promoting the dtype.
     """
     Convert a 5D tensor into 4D tensor.
 
@@ -54,6 +72,7 @@ def _prepare_video(V):
         V = np.float32(V) / 255.0
 
     def is_power2(num):
+        # [FUNCTION DOC] HELPER: Return true if num is a nonzero power of two.
         return num != 0 and ((num & (num - 1)) == 0)
 
     # pad to nearest power of 2, all at once
@@ -75,6 +94,10 @@ def _prepare_video(V):
 
 
 def make_grid(I, ncols=8):
+    # [FUNCTION DOC] Tile a numpy batch of images (N x 1 or 3 x H x W) into one 3-channel
+    # canvas, filling row by row with at most ncols images per row; unused cells stay zero.
+    # Single-channel input is replicated to three channels. Raises AssertionError if the input
+    # is not a numpy array or is not 4D with 3 channels after replication.
     # I: N1HW or N3HW
     if not isinstance(I, np.ndarray):
         raise AssertionError("plugin error, should pass numpy array here")
@@ -103,6 +126,13 @@ def make_grid(I, ncols=8):
 
 
 def convert_to_HWC(tensor, input_format):  # tensor: numpy array
+    # [FUNCTION DOC] Convert a numpy array to height-width-channel layout using a dimension
+    # string such as NCHW, CHW, HWC or HW (case-insensitive). 4D input is permuted and tiled
+    # into a grid; 3D input is permuted with a single channel replicated to three; 2D input is
+    # stacked into three identical channels. Raises AssertionError if the format repeats a
+    # letter or its length differs from the number of dimensions.
+    # KNOWN ISSUE: the duplicate check runs before upper-casing, so mixed-case repeats pass;
+    # lengths other than 2, 3 or 4 fall through and return None.
     if len(set(input_format)) != len(input_format):
         raise AssertionError(f"You can not use the same dimension shorthand twice. \
             input_format: {input_format}")

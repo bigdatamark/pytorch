@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Builders for TensorBoard Summary protocol buffers. Converts tensors, arrays and
+# Python values into scalar, histogram, image, video, audio, text, tensor, hyperparameter,
+# custom-layout, precision-recall curve and mesh summaries that the event writer serializes.
+# Also holds half-float bit conversion and a dtype-to-protobuf-field table. Import-time side
+# effects: requires the tensorboard and protobuf packages and creates a module logger.
 import json
 import logging
 import struct
@@ -52,6 +57,8 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 def half_to_int(f: float) -> int:
+    # [FUNCTION DOC] Reinterpret the bits of a 32-bit float as a signed 32-bit integer so it
+    # can be stored in the half value field of a tensor proto. Inverse of int_to_half.
     """Casts a half-precision float value into an integer.
 
     Converts a half precision floating point value, such as `torch.half` or
@@ -65,6 +72,8 @@ def half_to_int(f: float) -> int:
     return struct.unpack("i", buf)[0]
 
 def int_to_half(i: int) -> float:
+    # [FUNCTION DOC] Reinterpret a signed 32-bit integer's bits as a 32-bit float; undoes
+    # half_to_int.
     """Casts an integer value to a half-precision float.
 
     Converts an integer value obtained from half_to_int back into a floating
@@ -75,14 +84,20 @@ def int_to_half(i: int) -> float:
     return struct.unpack("f", buf)[0]
 
 def _tensor_to_half_val(t: torch.Tensor) -> list[int]:
+    # [FUNCTION DOC] HELPER: Flatten t and convert each element to its integer bit pattern.
     return [half_to_int(x) for x in t.flatten().tolist()]
 
 def _tensor_to_complex_val(t: torch.Tensor) -> list[float]:
+    # [FUNCTION DOC] HELPER: Flatten a complex tensor to a list of interleaved real and
+    # imaginary parts.
     return torch.view_as_real(t).flatten().tolist()
 
 def _tensor_to_list(t: torch.Tensor) -> list[Any]:
+    # [FUNCTION DOC] HELPER: Flatten t to a plain list of Python numbers.
     return t.flatten().tolist()
 
+# KNOWN ISSUE: the table below lists the uint8 dtype twice; the later entry (unsigned 32-bit
+# value field) silently replaces the earlier one (integer value field).
 # type maps: torch.Tensor type -> (protobuf type, protobuf val field)
 _TENSOR_TYPE_MAP = {
     torch.half: ("DT_HALF", "half_val", _tensor_to_half_val),
@@ -115,6 +130,8 @@ _TENSOR_TYPE_MAP = {
 
 
 def _calc_scale_factor(tensor) -> int:
+    # [FUNCTION DOC] HELPER: Return 1 for 8-bit unsigned data and 255 otherwise, i.e. the
+    # factor that maps the data range to 0..255. Accepts a tensor or numpy array.
     converted = tensor.numpy() if not isinstance(tensor, np.ndarray) else tensor
     return 1 if converted.dtype == np.uint8 else 255
 
@@ -130,6 +147,10 @@ def _draw_single_box(
     color_text="black",
     thickness=2,
 ):
+    # [FUNCTION DOC] HELPER: Draw a rectangle outline on a PIL image, with an optional filled
+    # label strip at the bottom-left corner holding display_str. Coordinates are pixel
+    # bounds; color and color_text are PIL colors. Mutates and returns the image. Requires
+    # Pillow.
     from PIL import ImageDraw, ImageFont
 
     font = ImageFont.load_default()
@@ -163,6 +184,15 @@ def _draw_single_box(
 
 
 def hparams(hparam_dict=None, metric_dict=None, hparam_domain_discrete=None):
+    # [FUNCTION DOC] Build the three summaries for the hyperparameter plugin: experiment
+    # description, session start info and session end info (success). hparam_dict maps names
+    # to numbers, strings, booleans or tensors; metric_dict supplies metric names;
+    # hparam_domain_discrete optionally maps names to lists of allowed values of the same
+    # type. Returns (experiment, session start, session end). Raises TypeError for non-mapping
+    # arguments or bad domain lists, ValueError for unsupported value types; logs a warning
+    # for the first two. None values are skipped.
+    # KNOWN ISSUE: the boolean branch comes after the number branch, so booleans (which are
+    # integers) are stored as numbers and the boolean branch is unreachable.
     """Output three `Summary` protocol buffers needed by hparams plugin.
 
     `Experiment` keeps the metadata of an experiment, such as the name of the
@@ -352,6 +382,11 @@ def hparams(hparam_dict=None, metric_dict=None, hparam_domain_discrete=None):
 
 
 def scalar(name, tensor, collections=None, new_style=False, double_precision=False):
+    # [FUNCTION DOC] Build a summary holding one scalar. The value is squeezed to a single
+    # number; old style stores a simple value, new style stores a tensor (single or double
+    # precision) with scalar plugin metadata. The collections argument is unused. Raises
+    # AssertionError if the value is not a single element.
+    # KNOWN ISSUE: the docstring says ValueError is raised, but the code raises AssertionError.
     """Output a `Summary` protocol buffer containing a single scalar value.
 
     The generated Summary has a Tensor.proto containing the input Tensor.
@@ -395,6 +430,9 @@ def scalar(name, tensor, collections=None, new_style=False, double_precision=Fal
 
 
 def tensor_proto(tag, tensor):
+    # [FUNCTION DOC] Build a summary containing the whole tensor as a tensor proto, using the
+    # dtype table to pick the proto type and value field. Raises ValueError if the tensor is
+    # 2 GiB or larger or its dtype is unsupported.
     """Outputs a `Summary` protocol buffer containing the full tensor.
     The generated Summary has a Tensor.proto containing the input Tensor.
     Args:
@@ -432,6 +470,9 @@ def tensor_proto(tag, tensor):
 
 
 def histogram_raw(name, min, max, num, sum, sum_squares, bucket_limits, bucket_counts):
+    # [FUNCTION DOC] Build a histogram summary directly from precomputed statistics: min,
+    # max, count, sum, sum of squares, upper bucket limits and per-bucket counts. No
+    # validation is done.
     # pylint: disable=line-too-long
     """Output a `Summary` protocol buffer with a histogram.
 
@@ -465,6 +506,9 @@ def histogram_raw(name, min, max, num, sum, sum_squares, bucket_limits, bucket_c
 
 
 def histogram(name, values, bins, max_bins=None):
+    # [FUNCTION DOC] Build a histogram summary from any-shaped values: converts to a float
+    # numpy array and builds the histogram proto with the given bins and optional cap on bin
+    # count. Raises ValueError for empty input.
     # pylint: disable=line-too-long
     """Output a `Summary` protocol buffer with a histogram.
 
@@ -487,6 +531,10 @@ def histogram(name, values, bins, max_bins=None):
 
 
 def make_histogram(values, bins, max_bins=None):
+    # [FUNCTION DOC] Compute a histogram proto from a numpy array: flatten, bin, optionally
+    # merge adjacent bins (padding counts) so there are at most max_bins, trim empty bins at
+    # both ends, and add an empty leading bin so the left limit is kept. Stores min, max,
+    # count, sum and sum of squares. Raises ValueError for empty input or an empty result.
     """Convert values into a histogram proto using logic from histogram.cc."""
     if values.size == 0:
         raise ValueError("The input has no element.")
@@ -543,6 +591,11 @@ def make_histogram(values, bins, max_bins=None):
 
 
 def image(tag, tensor, rescale=1, dataformats="NCHW"):
+    # [FUNCTION DOC] Build an image summary: convert the data to height-width-channel layout
+    # using the format string (batches are tiled into a grid), scale floats from 0..1 to
+    # 0..255 (8-bit data is kept), clip, then encode as PNG, resizing by rescale.
+    # KNOWN ISSUE: the docstring mentions max_images/max_outputs and a 3D height-width-channel
+    # input, but the code takes any layout described by dataformats and ignores those options.
     """Output a `Summary` protocol buffer with images.
 
     The summary has up to `max_images` summary values containing images. The
@@ -582,6 +635,10 @@ def image(tag, tensor, rescale=1, dataformats="NCHW"):
 def image_boxes(
     tag, tensor_image, tensor_boxes, rescale=1, dataformats="CHW", labels=None
 ):
+    # [FUNCTION DOC] Build an image summary with bounding boxes drawn on it. The image is
+    # converted to height-width-channel layout and scaled to 0..255; boxes are an array of
+    # corner coordinates (x min, y min, x max, y max) and labels optionally give a text per
+    # box. Rescale resizes the output.
     """Output a `Summary` protocol buffer with images."""
     tensor_image = make_np(tensor_image)
     tensor_image = convert_to_HWC(tensor_image, dataformats)
@@ -597,6 +654,8 @@ def image_boxes(
 
 
 def draw_boxes(disp_image, boxes, labels=None):
+    # [FUNCTION DOC] Draw each row of boxes (corner coordinates) in red on a PIL image, with
+    # the matching label if labels is given. Returns the image.
     # xyxy format
     num_boxes = boxes.shape[0]
     list_gt = range(num_boxes)
@@ -614,6 +673,10 @@ def draw_boxes(disp_image, boxes, labels=None):
 
 
 def make_image(tensor, rescale=1, rois=None, labels=None):
+    # [FUNCTION DOC] Encode a uint8 height-width-channel array as a PNG image proto.
+    # Optionally draws boxes (rois, labels), then resizes by rescale with Lanczos filtering.
+    # Requires Pillow.
+    # KNOWN ISSUE: the proto records the original height and width, not the rescaled size.
     """Convert a numpy representation of an image to Image protobuf."""
     from PIL import Image
 
@@ -640,6 +703,11 @@ def make_image(tensor, rescale=1, rois=None, labels=None):
 
 
 def video(tag, tensor, fps=4):
+    # [FUNCTION DOC] Build a summary holding a video from a 5D batch-time-channel-height-width
+    # tensor: tile the batch into a grid per frame, scale to 8-bit, and encode as a GIF at
+    # the given frame rate.
+    # KNOWN ISSUE: if the video package is missing, the encoder returns None and the summary
+    # is built with an empty image field.
     tensor = make_np(tensor)
     tensor = _prepare_video(tensor)
     # If user passes in uint8, then we don't need to rescale by 255
@@ -651,6 +719,10 @@ def video(tag, tensor, fps=4):
 
 
 def make_video(tensor, fps):
+    # [FUNCTION DOC] Encode a frames-height-width-channel uint8 array as a GIF image proto
+    # using the moviepy package, via a temporary file. Tries progressively older moviepy
+    # call signatures. If moviepy or its editor module cannot be imported, prints a message
+    # and returns None.
     try:
         import moviepy  # noqa: F401
     except ImportError:
@@ -690,6 +762,9 @@ def make_video(tensor, fps):
 
 
 def audio(tag, tensor, sample_rate=44100):
+    # [FUNCTION DOC] Build an audio summary from a mono waveform with values in -1..1: squeeze,
+    # clip out-of-range values (printing a warning), convert to 16-bit little-endian samples
+    # and wrap in a WAV container. Raises AssertionError if the result is not one-dimensional.
     array = make_np(tensor)
     array = array.squeeze()
     if abs(array).max() > 1:
@@ -722,6 +797,10 @@ def audio(tag, tensor, sample_rate=44100):
 
 
 def custom_scalars(layout):
+    # [FUNCTION DOC] Build the custom scalars dashboard config summary. Layout maps a category
+    # title to a mapping of chart title to a pair (kind, tags): kind "Margin" needs exactly
+    # three tags (value, lower, upper), any other kind is a multiline chart over the tag
+    # list. Raises AssertionError for a margin chart without three tags.
     categories = []
     for k, v in layout.items():
         charts = []
@@ -760,6 +839,8 @@ def custom_scalars(layout):
 
 
 def text(tag, text):
+    # [FUNCTION DOC] Build a text summary holding one UTF-8 string, tagged with the text
+    # summary suffix appended to tag, with text plugin metadata.
     plugin_data = SummaryMetadata.PluginData(
         plugin_name="text", content=TextPluginData(version=0).SerializeToString()
     )
@@ -777,6 +858,9 @@ def text(tag, text):
 def pr_curve_raw(
     tag, tp, fp, tn, fn, precision, recall, num_thresholds=127, weights=None
 ):
+    # [FUNCTION DOC] Build a precision-recall curve summary from precomputed arrays (true and
+    # false positives and negatives, precision, recall), stacked into a six-row float
+    # tensor. Thresholds above 127 are capped at 127. The weights argument is unused.
     if num_thresholds > 127:  # weird, value > 127 breaks protobuf
         num_thresholds = 127
     data = np.stack((tp, fp, tn, fn, precision, recall))
@@ -801,6 +885,9 @@ def pr_curve_raw(
 
 
 def pr_curve(tag, labels, predictions, num_thresholds=127, weights=None):
+    # [FUNCTION DOC] Build a precision-recall curve summary from binary labels and predicted
+    # probabilities in 0..1: computes the curve with compute_curve at up to 127 thresholds
+    # (capped) with optional weights, and stores it as a six-row float tensor.
     # weird, value > 127 breaks protobuf
     num_thresholds = min(num_thresholds, 127)
     data = compute_curve(
@@ -828,6 +915,11 @@ def pr_curve(tag, labels, predictions, num_thresholds=127, weights=None):
 
 # https://github.com/tensorflow/tensorboard/blob/master/tensorboard/plugins/pr_curve/summary.py
 def compute_curve(labels, predictions, num_thresholds=None, weights=None):
+    # [FUNCTION DOC] Compute precision-recall data. Predictions in 0..1 are bucketed into
+    # num_thresholds bins; weighted positives and negatives per bin are reverse-cumulated to
+    # get true/false positives at each threshold, then negatives, precision and recall are
+    # derived (denominators floored at a tiny value). Returns an array with rows tp, fp, tn,
+    # fn, precision, recall. num_thresholds must be given despite its default of None.
     _MINIMUM_COUNT = 1e-7
 
     if weights is None:
@@ -867,6 +959,10 @@ def compute_curve(labels, predictions, num_thresholds=None, weights=None):
 def _get_tensor_summary(
     name, display_name, description, tensor, content_type, components, json_config
 ):
+    # [FUNCTION DOC] HELPER: Build one mesh component summary value: convert tensor to a
+    # float tensor proto (it must be 3D), attach mesh plugin metadata built from the names,
+    # content type, component bitmask, shape and JSON config, and tag it with the plugin's
+    # instance name. Imports the mesh plugin lazily.
     """Create a tensor summary with summary metadata.
 
     Args:
@@ -924,6 +1020,8 @@ def _get_tensor_summary(
 
 
 def _get_json_config(config_dict):
+    # [FUNCTION DOC] HELPER: Serialize a config mapping to JSON with sorted keys; an empty
+    # JSON object text if None.
     """Parse and returns JSON string from python dictionary."""
     json_config = "{}"
     if config_dict is not None:
@@ -935,6 +1033,10 @@ def _get_json_config(config_dict):
 def mesh(
     tag, vertices, colors, faces, config_dict, display_name=None, description=None
 ):
+    # [FUNCTION DOC] Build a merged summary for a mesh or point cloud: one tensor summary per
+    # provided component among vertices, faces and colors (None ones are skipped), all
+    # sharing a component bitmask and the JSON form of config_dict. Imports the mesh plugin
+    # lazily.
     """Output a merged `Summary` protocol buffer with a mesh/point cloud.
 
     Args:

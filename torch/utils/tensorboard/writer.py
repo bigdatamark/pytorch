@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Public TensorBoard writing API. Defines FileWriter (asynchronous event file
+# writer around the TensorBoard library) and SummaryWriter (high-level logger that turns
+# scalars, histograms, images, audio, text, graphs, embeddings, curves and meshes into
+# summaries via the summary module and writes them). Exports FileWriter and SummaryWriter.
+# Import requires the tensorboard package; no other import-time side effects.
 """Provide an API for writing protocol buffers to event files to be consumed by TensorBoard for visualization."""
 from __future__ import annotations
 
@@ -42,6 +47,10 @@ __all__ = ["FileWriter", "SummaryWriter"]
 
 
 class FileWriter:
+    # [CLASS DOC] Thin wrapper over the library event file writer. Owns one event writer
+    # (attribute event_writer) that queues events and flushes them to a file in a log
+    # directory on a background schedule. Adds timestamping and step conversion, and helpers
+    # to wrap summaries and graphs into events. Can be closed and reopened.
     """Writes protocol buffers to event files to be consumed by TensorBoard.
 
     The `FileWriter` class provides a mechanism to create an event file in a
@@ -52,6 +61,10 @@ class FileWriter:
     """
 
     def __init__(self, log_dir, max_queue=10, flush_secs=120, filename_suffix="") -> None:
+        # [FUNCTION DOC] Create the event writer, which creates a new event file in log_dir
+        # (file system side effect). The directory may be any path-like value and is converted
+        # to text. max_queue bounds pending events, flush_secs sets the flush period and
+        # filename_suffix is added to event file names.
         """Create a `FileWriter` and an event file.
 
         On construction the writer creates a new event file in `log_dir`.
@@ -79,10 +92,14 @@ class FileWriter:
         )
 
     def get_logdir(self):
+        # [FUNCTION DOC] Return the log directory of the underlying event writer.
         """Return the directory where event file will be written."""
         return self.event_writer.get_logdir()
 
     def add_event(self, event, step=None, walltime=None) -> None:
+        # [FUNCTION DOC] Stamp an event protobuf with walltime (current time if None) and, if
+        # given, the step converted to an integer, then queue it for writing. Mutates the
+        # event.
         """Add an event to the event file.
 
         Args:
@@ -100,6 +117,8 @@ class FileWriter:
         self.event_writer.add_event(event)
 
     def add_summary(self, summary, global_step=None, walltime=None) -> None:
+        # [FUNCTION DOC] Wrap a summary protobuf in an event and queue it with the optional
+        # step and walltime.
         """Add a `Summary` protocol buffer to the event file.
 
         This method wraps the provided summary in an `Event` protocol buffer
@@ -116,6 +135,8 @@ class FileWriter:
         self.add_event(event, global_step, walltime)
 
     def add_graph(self, graph_profile, walltime=None) -> None:
+        # [FUNCTION DOC] Queue two events from a pair (graph definition, step stats): one with
+        # the serialized graph and one with the serialized run metadata under the tag step1.
         """Add a `Graph` and step stats protocol buffer to the event file.
 
         Args:
@@ -135,6 +156,8 @@ class FileWriter:
         self.add_event(event, None, walltime)
 
     def add_onnx_graph(self, graph, walltime=None) -> None:
+        # [FUNCTION DOC] Queue one event holding a serialized graph protobuf.
+        # KNOWN ISSUE: the docstring for walltime is garbled (contains stray text).
         """Add a `Graph` protocol buffer to the event file.
 
         Args:
@@ -146,6 +169,7 @@ class FileWriter:
         self.add_event(event, None, walltime)
 
     def flush(self) -> None:
+        # [FUNCTION DOC] Write all pending events to disk.
         """Flushes the event file to disk.
 
         Call this method to make sure that all pending events have been written to
@@ -154,6 +178,7 @@ class FileWriter:
         self.event_writer.flush()
 
     def close(self) -> None:
+        # [FUNCTION DOC] Flush pending events and close the event file.
         """Flushes the event file to disk and close the file.
 
         Call this method when you do not need the summary writer anymore.
@@ -161,6 +186,8 @@ class FileWriter:
         self.event_writer.close()
 
     def reopen(self) -> None:
+        # [FUNCTION DOC] Reopen a closed event writer; new events go to a new file. No effect
+        # if it was not closed.
         """Reopens the EventFileWriter.
 
         Can be called after `close()` to add more events in the same directory.
@@ -171,6 +198,13 @@ class FileWriter:
 
 
 class SummaryWriter:
+    # [CLASS DOC] High-level logger for TensorBoard. State: log_dir, queue and flush settings,
+    # an optional purge_step consumed on first writer creation, file_writer (default
+    # FileWriter, or None after close), all_writers (mapping from log directory to FileWriter,
+    # also holding per-tag writers made by add_scalars; None after close), default_bins for
+    # histograms, and a lazily created projector config. Each add_* method converts data into
+    # a summary and queues it; the default writer is recreated on demand after close. Usable
+    # as a context manager that closes on exit.
     """Writes entries directly to event files in the log_dir to be consumed by TensorBoard.
 
     The `SummaryWriter` class provides a high-level API to create an event file
@@ -189,6 +223,11 @@ class SummaryWriter:
         flush_secs=120,
         filename_suffix="",
     ) -> None:
+        # [FUNCTION DOC] Set up the writer. If log_dir is empty, a directory named from the
+        # current time, host name and comment is used under a runs folder. Stores settings,
+        # creates the default FileWriter (creating the directory and event file) and builds the
+        # default histogram bin edges: geometric steps of ten percent from a tiny value to a
+        # huge one, mirrored negative, plus zero. Logs API usage.
         """Create a `SummaryWriter` that will write out events and summaries to the event file.
 
         Args:
@@ -261,6 +300,9 @@ class SummaryWriter:
         self.default_bins = neg_buckets[::-1] + [0] + buckets
 
     def _get_file_writer(self):
+        # [FUNCTION DOC] HELPER: Return the default FileWriter, creating it (and the writer
+        # registry) if absent or closed. On the first creation with a purge step set, queues
+        # the version and session start events at that step, then clears the purge step.
         """Return the default FileWriter instance. Recreates it if closed."""
         if self.all_writers is None or self.file_writer is None:
             # pyrefly: ignore [bad-assignment]
@@ -286,6 +328,7 @@ class SummaryWriter:
         return self.file_writer
 
     def get_logdir(self):
+        # [FUNCTION DOC] Return the configured log directory (no file system access).
         """Return the directory where event files will be written."""
         return self.log_dir
 
@@ -297,7 +340,13 @@ class SummaryWriter:
         run_name=None,
         global_step=None,
     ) -> None:
+        # [FUNCTION DOC] Log hyperparameters and final metrics for comparison. Builds the three
+        # hyperparameter summaries, then opens a temporary writer in a subdirectory of the log
+        # directory named by run_name (current time if empty), writes the summaries and one
+        # scalar per metric there, and closes it. Raises TypeError unless both arguments are
+        # exactly plain dictionaries.
         """Add a set of hyperparameters to be compared in TensorBoard.
+
 
         Args:
             hparam_dict (dict): Each key-value pair in the dictionary is the
@@ -353,7 +402,12 @@ class SummaryWriter:
         new_style=False,
         double_precision=False,
     ) -> None:
+        # [FUNCTION DOC] Log one scalar under tag at an optional step and walltime. The new
+        # style and double precision flags choose the storage form. Queues a summary on the
+        # default writer. Raises AssertionError if the value is not a single element.
+        # KNOWN ISSUE: the docstring omits the double_precision argument.
         """Add scalar data to summary.
+
 
         Args:
             tag (str): Data identifier
@@ -386,6 +440,11 @@ class SummaryWriter:
         self._get_file_writer().add_summary(summary, global_step, walltime)
 
     def add_scalars(self, main_tag, tag_scalar_dict, global_step=None, walltime=None) -> None:
+        # [FUNCTION DOC] Log several scalars on one chart. For each (tag, value) pair, uses a
+        # dedicated FileWriter in a subdirectory named from the main tag and tag (created and
+        # cached in the writer registry on first use) and writes a scalar under the main tag.
+        # Walltime defaults to the current time. Raises AssertionError if the writer registry
+        # was cleared by close.
         """Add many scalar data to summary.
 
         Args:
@@ -437,7 +496,11 @@ class SummaryWriter:
         global_step=None,
         walltime=None,
     ) -> None:
+        # [FUNCTION DOC] Log a whole tensor as a tensor summary under tag. Raises ValueError for
+        # oversized tensors or unsupported dtypes.
+        # KNOWN ISSUE: the docstring example calls the scalar method instead of this one.
         """Add tensor data to summary.
+
 
         Args:
             tag (str): Data identifier
@@ -471,7 +534,11 @@ class SummaryWriter:
         walltime=None,
         max_bins=None,
     ) -> None:
+        # [FUNCTION DOC] Log a histogram of values. The special bins string "tensorflow" selects
+        # the writer's default bin edges; any other value is passed to the numpy histogram
+        # routine. max_bins optionally limits the bin count. Raises ValueError for empty input.
         """Add histogram to summary.
+
 
         Args:
             tag (str): Data identifier
@@ -518,7 +585,11 @@ class SummaryWriter:
         global_step=None,
         walltime=None,
     ) -> None:
+        # [FUNCTION DOC] Log a histogram from precomputed statistics (min, max, count, sum, sum
+        # of squares, bucket upper limits and counts). Raises ValueError if the two bucket
+        # sequences differ in length.
         """Add histogram with raw data.
+
 
         Args:
             tag (str): Data identifier
@@ -583,7 +654,10 @@ class SummaryWriter:
     def add_image(
         self, tag, img_tensor, global_step=None, walltime=None, dataformats="CHW"
     ) -> None:
+        # [FUNCTION DOC] Log one image; dataformats describes the dimension order (default
+        # channel, height, width). Needs Pillow. Queues an image summary.
         """Add image data to summary.
+
 
         Note that this requires the ``pillow`` package.
 
@@ -634,7 +708,10 @@ class SummaryWriter:
     def add_images(
         self, tag, img_tensor, global_step=None, walltime=None, dataformats="NCHW"
     ) -> None:
+        # [FUNCTION DOC] Log a batch of images tiled into one grid image (default format batch,
+        # channel, height, width). Needs Pillow. Same code path as add_image.
         """Add batched image data to summary.
+
 
         Note that this requires the ``pillow`` package.
 
@@ -686,7 +763,11 @@ class SummaryWriter:
         dataformats="CHW",
         labels=None,
     ) -> None:
+        # [FUNCTION DOC] Log an image with bounding boxes (rows of corner coordinates) drawn on
+        # it. A single label string is wrapped in a list; labels are dropped entirely if their
+        # count differs from the number of boxes. Needs Pillow.
         """Add image and draw bounding boxes on the image.
+
 
         Args:
             tag (str): Data identifier
@@ -734,7 +815,11 @@ class SummaryWriter:
         close: bool = True,
         walltime: float | None = None,
     ) -> None:
+        # [FUNCTION DOC] Render one figure or a list of figures to images and log them as an
+        # image (single figure) or image batch (list). Closes the figures if close is true.
+        # Needs matplotlib.
         """Render matplotlib figure into an image and add it to summary.
+
 
         Note that this requires the ``matplotlib`` package.
 
@@ -765,6 +850,8 @@ class SummaryWriter:
             )
 
     def add_video(self, tag, vid_tensor, global_step=None, fps=4, walltime=None) -> None:
+        # [FUNCTION DOC] Log a video from a batch-time-channel-height-width tensor, encoded as a
+        # GIF at the given frame rate. Needs moviepy; without it the encoder prints a message.
         """Add video data to summary.
 
         Note that this requires the ``moviepy`` package.
@@ -787,7 +874,10 @@ class SummaryWriter:
     def add_audio(
         self, tag, snd_tensor, global_step=None, sample_rate=44100, walltime=None
     ) -> None:
+        # [FUNCTION DOC] Log a mono waveform (values in -1..1) as a WAV audio summary at the
+        # given sample rate. Raises AssertionError if the squeezed data is not 1D.
         """Add audio data to summary.
+
 
         Args:
             tag (str): Data identifier
@@ -805,6 +895,7 @@ class SummaryWriter:
         )
 
     def add_text(self, tag, text_string, global_step=None, walltime=None) -> None:
+        # [FUNCTION DOC] Log a text string as a text summary.
         """Add text data to summary.
 
         Args:
@@ -824,13 +915,19 @@ class SummaryWriter:
         )
 
     def add_onnx_graph(self, prototxt) -> None:
+        # [FUNCTION DOC] Load an ONNX model from the given prototxt path (reads a file) and log
+        # its graph on the default writer.
         torch._C._log_api_usage_once("tensorboard.logging.add_onnx_graph")
         self._get_file_writer().add_onnx_graph(load_onnx_graph(prototxt))
 
     def add_graph(
         self, model, input_to_model=None, verbose=False, use_strict_trace=True
     ) -> None:
+        # [FUNCTION DOC] Trace the model on the example input (the tracer may run the model),
+        # convert the traced graph and its stats, and log them. verbose prints the graph;
+        # use_strict_trace is forwarded to the tracer.
         """Add graph data to summary.
+
 
         Args:
             model (torch.nn.Module): Model to draw.
@@ -849,6 +946,8 @@ class SummaryWriter:
 
     @staticmethod
     def _encode(rawstr):
+        # [FUNCTION DOC] HELPER: Percent-encode the percent sign, forward slash and backslash
+        # in a string so it is safe as a single path component.
         # I'd use urllib but, I'm unsure about the differences from python3 to python2, etc.
         retval = rawstr
         retval = retval.replace("%", f"%{ord('%'):02x}")
@@ -865,7 +964,17 @@ class SummaryWriter:
         tag="default",
         metadata_header=None,
     ) -> None:
+        # [FUNCTION DOC] Write projector data for a matrix of feature vectors. Saves, in a
+        # subdirectory named from the step (default 0) and encoded tag under the log
+        # directory: optional metadata table, optional sprite image and the matrix; then
+        # appends an embedding entry to the writer's projector config and rewrites the config
+        # file in the log directory. Prints a warning if the directory exists. Raises
+        # NotADirectoryError if the path is a file, AssertionError for mismatched counts or a
+        # non-2D matrix.
+        # KNOWN ISSUE: the matrix dimension check happens after metadata and sprite files are
+        # already written.
         """Add embedding projector data to summary.
+
 
         Args:
             mat (torch.Tensor or numpy.ndarray): A matrix which each row is the feature vector of the data point
@@ -971,6 +1080,9 @@ class SummaryWriter:
         weights=None,
         walltime=None,
     ) -> None:
+        # [FUNCTION DOC] Log a precision-recall curve from binary labels and predicted
+        # probabilities in 0..1, using up to 127 thresholds and optional weights.
+        # KNOWN ISSUE: the docstring omits the weights argument.
         """Add precision recall curve.
 
         Plotting a precision-recall curve lets you understand your model's
@@ -1024,7 +1136,10 @@ class SummaryWriter:
         weights=None,
         walltime=None,
     ) -> None:
+        # [FUNCTION DOC] Log a precision-recall curve from precomputed counts, precision and
+        # recall arrays. The weights argument is accepted but unused by the summary builder.
         """Add precision recall curve with raw data.
+
 
         Args:
             tag (str): Data identifier
@@ -1060,6 +1175,8 @@ class SummaryWriter:
     def add_custom_scalars_multilinechart(
         self, tags, category="default", title="untitled"
     ) -> None:
+        # [FUNCTION DOC] Log a dashboard layout with one multiline chart over the given scalar
+        # tags, in the given category and chart title.
         """Shorthand for creating multilinechart. Similar to ``add_custom_scalars()``, but the only necessary argument is *tags*.
 
         Args:
@@ -1078,7 +1195,10 @@ class SummaryWriter:
     def add_custom_scalars_marginchart(
         self, tags, category="default", title="untitled"
     ) -> None:
+        # [FUNCTION DOC] Log a dashboard layout with one margin chart from exactly three tags
+        # (value, lower, upper). Raises AssertionError for any other tag count.
         """Shorthand for creating marginchart.
+
 
         Similar to ``add_custom_scalars()``, but the only necessary argument is *tags*,
         which should have exactly 3 elements.
@@ -1099,6 +1219,10 @@ class SummaryWriter:
         self._get_file_writer().add_summary(custom_scalars(layout))
 
     def add_custom_scalars(self, layout) -> None:
+        # [FUNCTION DOC] Log a custom dashboard layout: mapping of category to charts, where
+        # each chart maps a title to a pair (kind, tags) with kind Multiline or Margin.
+        # KNOWN ISSUE: the docstring says it may be called only once per writer, but nothing
+        # enforces that.
         """Create special chart by collecting charts tags in 'scalars'.
 
         NOTE: This function can only be called once for each SummaryWriter() object.
@@ -1132,7 +1256,10 @@ class SummaryWriter:
         global_step=None,
         walltime=None,
     ) -> None:
+        # [FUNCTION DOC] Log a mesh or point cloud from vertices and optional colors and
+        # faces, with an optional rendering config mapping. Uses the mesh plugin.
         """Add meshes or 3D point clouds to TensorBoard.
+
 
         The visualization is based on Three.js,
         so it allows users to interact with the rendered object. Besides the basic definitions
@@ -1190,6 +1317,7 @@ class SummaryWriter:
         )
 
     def flush(self) -> None:
+        # [FUNCTION DOC] Flush every file writer in the registry; does nothing after close.
         """Flushes the event file to disk.
 
         Call this method to make sure that all pending events have been written to
@@ -1201,6 +1329,8 @@ class SummaryWriter:
             writer.flush()
 
     def close(self) -> None:
+        # [FUNCTION DOC] Flush and close every file writer, then clear the default writer and
+        # registry (they are recreated on demand). A second close is a no-op.
         if self.all_writers is None:
             return  # ignore double close
         for writer in self.all_writers.values():
@@ -1210,7 +1340,9 @@ class SummaryWriter:
         self.file_writer = self.all_writers = None
 
     def __enter__(self):
+        # [FUNCTION DOC] Context manager entry; returns the writer itself.
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # [FUNCTION DOC] Context manager exit; closes the writer and does not suppress errors.
         self.close()
