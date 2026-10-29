@@ -1,3 +1,5 @@
+# [MODULE DOC] Reusable encoders turning call parameters into JSON-serializable mappings for cache keys.
+# Currently only the encoder for the pad_mm should-pad decision.
 """
 Custom encoder functions
 
@@ -14,6 +16,8 @@ from torch._inductor.runtime.caching.utils import _encode_tensor, EncodedTensor
 
 
 class ShouldPadEncodedParams(TypedDict):
+    # [CLASS DOC] Typed mapping of the encoded should-pad parameters: encoded mat1/mat2/input tensor
+    # metadata, op name, padding-time exclusion flags and a tf32 flag.
     """TypedDict for encoded should_pad parameters."""
 
     mat1: EncodedTensor
@@ -32,6 +36,10 @@ def should_pad_params_encoder(
     op: torch._ops.OpOverloadPacket,
     input: Tensor | None = None,
 ) -> ShouldPadEncodedParams:
+    # [FUNCTION DOC] Encodes the arguments of the should-pad decision into a ShouldPadEncodedParams mapping.
+    # Tensors are reduced to shape, stride and dtype; op becomes a string; padding-time exclusion
+    # flags come from the pad_mm helper (imported lazily to avoid a circular import). tf32 is
+    # true only for float32 mat1 when the CUDA or mkldnn fp32 precision setting is tf32. Reads global backend state.
     """Encode parameters for _should_pad into a human-readable dict.
 
     This encoder extracts only the information needed for caching:

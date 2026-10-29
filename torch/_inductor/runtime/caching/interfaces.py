@@ -1,3 +1,8 @@
+# [MODULE DOC] High-level caching interfaces for Inductor runtime caching: memoizers that record
+# function results (encoded parameters -> encoded result) and replay them, in memory
+# (Memoizer, with JSON dump/prepopulate support) and on disk or remote (persistent classes),
+# plus DeferredRecording for results that become available later, encoder/decoder factory
+# protocols and dump data structures. Import-time side effect: creates the caching artifact logger.
 """Public interfaces for PyTorch Inductor runtime caching.
 
 This module provides high-level caching interfaces for memoization and
@@ -40,6 +45,7 @@ _EncodedR = TypeVar("_EncodedR")
 
 
 class CacheDumpEntry(TypedDict):
+    # [CLASS DOC] Typed mapping for one entry of a cache dump file: encoded params and encoded result.
     """A single cache entry in the dump format.
 
     Attributes:
@@ -52,6 +58,8 @@ class CacheDumpEntry(TypedDict):
 
 
 class CacheDump(TypedDict):
+    # [CLASS DOC] Typed mapping for the memoizer dump file: collections maps a sub_key (None for
+    # root entries) to key -> entry mappings, and cache_size is the total entry count.
     """The structure of the memoizer cache dump file.
 
     Cache entries are organized by sub_key in the collections field.
@@ -71,6 +79,7 @@ class CacheDump(TypedDict):
 
 @dataclass
 class CacheEntry:
+    # [CLASS DOC] Dataclass pairing the encoded parameters (for inspection) with the encoded result of one cached call.
     """A cache entry containing encoded parameters and result.
 
     This dataclass stores the encoded form of function parameters and
@@ -87,6 +96,8 @@ class CacheEntry:
 
 @dataclass
 class InterimResult(Generic[_R]):
+    # [CLASS DOC] Dataclass wrapper around a value produced by make_interim_result, so that an
+    # interim result of None is distinguishable from no interim result.
     """Wrapper for an available interim result from a DeferredRecording.
 
     When get_interim_result() returns an InterimResult, it means the
@@ -108,6 +119,10 @@ class InterimResult(Generic[_R]):
 
 @dataclass
 class DeferredRecording(Generic[_R, _EncodedR]):
+    # [CLASS DOC] Dataclass signalling that recording is deferred until finalize is called with the encoded result.
+    # State: list of pending callbacks (set to None once finalized), the stored encoded result, a lock,
+    # and an optional make_interim_result callable. Callbacks run in registration order while the lock is held,
+    # so they must not call back into the object (deadlock). Late registrations run immediately.
     """Signals that recording should happen at a later time.
 
     When returned from a custom_result_encoder, the memoizer will:
@@ -180,6 +195,8 @@ class DeferredRecording(Generic[_R, _EncodedR]):
     make_interim_result: Callable[[], _R] | None = field(default=None, repr=False)
 
     def finalize(self, encoded_result: _EncodedR) -> None:
+        # [FUNCTION DOC] Stores the encoded result, marks the recording finalized and runs all registered callbacks in order
+        # with the result, all under the lock. Raises RuntimeError if called more than once.
         """Finalize the deferred recording with the encoded result.
 
         This method should be called by the encoder (typically via a completion
@@ -217,6 +234,8 @@ class DeferredRecording(Generic[_R, _EncodedR]):
                 callback(encoded_result)
 
     def register_callback(self, callback: Callable[[_EncodedR], None]) -> None:
+        # [FUNCTION DOC] Registers a callback taking the encoded result. If already finalized the callback runs immediately with
+        # the stored result, else it is queued. Runs under the lock; callbacks must not re-enter this object.
         """Register a completion callback.
 
         This method is called by memoizers to register callbacks that
@@ -246,6 +265,8 @@ class DeferredRecording(Generic[_R, _EncodedR]):
                 self._callbacks.append(callback)
 
     def get_interim_result(self) -> InterimResult[_R] | None:
+        # [FUNCTION DOC] Under the lock, calls make_interim_result if set and returns its value wrapped in InterimResult; returns
+        # None if no callable was configured. The callable runs on every call, so new objects may be returned each time.
         """Try to get an interim result for use while deferred recording is pending.
 
         When a memoized function is called again with the same parameters while
@@ -276,6 +297,9 @@ class DeferredRecording(Generic[_R, _EncodedR]):
 
 
 class ResultEncoderFactory(Protocol[_P, _R, _EncodedR]):
+    # [CLASS DOC] Protocol for result encoder factories: a callable taking the unwrapped function and returning a
+    # function from call arguments to an encoder that turns a result into an encoded result or a DeferredRecording.
+    # The call method is a stub.
     """Protocol for custom result encoder factories.
 
     A result encoder factory is a callable with the following signature:
@@ -312,6 +336,8 @@ class ResultEncoderFactory(Protocol[_P, _R, _EncodedR]):
 
 # pyrefly: ignore [variance-mismatch]
 class ResultDecoderFactory(Protocol[_P, _R, _EncodedR]):
+    # [CLASS DOC] Protocol for result decoder factories: a callable taking the unwrapped function and returning a
+    # function from call arguments to a decoder that turns an encoded result back into a result. The call method is a stub.
     """Protocol for custom result decoder factories.
 
     A result decoder factory is a callable with the following signature:
@@ -347,6 +373,8 @@ class ResultDecoderFactory(Protocol[_P, _R, _EncodedR]):
 
 
 class _BaseMemoizer:
+    # [CLASS DOC] Base class for memoizers. Provides key generation and the memoize decorator that composes
+    # replay and record (both must be implemented by subclasses).
     """Base class for memoization interfaces.
 
     This class provides the common memoize method that orchestrates
@@ -359,6 +387,9 @@ class _BaseMemoizer:
         *args: object,
         **kwargs: object,
     ) -> str:
+        # [FUNCTION DOC] HELPER: Static method building a cache key: pickles either the raw (args, kwargs) or the output of the
+        # custom params encoder, hashes with SHA-256 and returns the first 32 hex characters.
+        # Raises whatever pickling raises for unpicklable parameters.
         """Generate a cache key from function parameters.
 
         Args:
@@ -390,6 +421,7 @@ class _BaseMemoizer:
         custom_params_encoder: Callable[_P, object] | None = None,
         custom_result_encoder: ResultEncoderFactory[_P, _R, _EncodedR] | None = None,
     ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+        # [FUNCTION DOC] Abstract: returns a decorator that records call results to the cache. Raises NotImplementedError here.
         """Record a function call result. Must be implemented by subclasses.
 
         This can be used standalone to cache results without necessarily
@@ -404,6 +436,7 @@ class _BaseMemoizer:
         custom_params_encoder: Callable[_P, object] | None = None,
         custom_result_decoder: ResultDecoderFactory[_P, _R, _EncodedR] | None = None,
     ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+        # [FUNCTION DOC] Abstract: returns a decorator that replays cached results. Raises NotImplementedError here.
         """Replay a cached function result. Must be implemented by subclasses.
 
         This can be used standalone to use cached values that are otherwise
@@ -419,6 +452,9 @@ class _BaseMemoizer:
         custom_result_encoder: ResultEncoderFactory[_P, _R, _EncodedR] | None = None,
         custom_result_decoder: ResultDecoderFactory[_P, _R, _EncodedR] | None = None,
     ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+        # [FUNCTION DOC] Returns a decorator that makes a function try replay first and on a cache miss (KeyError from replay)
+        # run and record it. The three optional arguments are the params encoder and result encoder/decoder factories passed through
+        # to record and replay. If the caching module is disabled in config the function is returned unchanged.
         """Memoize a function with record and replay functionality.
 
         This is a decorator that attempts to replay cached results first.
@@ -448,6 +484,8 @@ class _BaseMemoizer:
         """
 
         def wrapper(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+            # [FUNCTION DOC] Decorator body: if caching is disabled returns the function unchanged; otherwise builds replay and
+            # record wrappers and returns a function that replays and falls back to record on KeyError.
             """Wrap the function to enable memoization with replay and record.
 
             Args:
@@ -472,6 +510,9 @@ class _BaseMemoizer:
 
             @functools.wraps(fn)
             def inner(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+                # [FUNCTION DOC] Calls the replay wrapper; on a KeyError (cache miss) calls the record wrapper, which runs the
+                # original function and stores the result. Returns the cached or fresh result.
+                # KNOWN ISSUE: a KeyError raised by the replay path for other reasons also triggers recording.
                 """Attempt to replay from cache, or record on cache miss.
 
                 Args:
@@ -494,6 +535,9 @@ class _BaseMemoizer:
 
 
 class Memoizer(_BaseMemoizer):
+    # [CLASS DOC] In-memory memoizer storing CacheEntry objects (encoded params plus encoded result) in an in-memory
+    # cache. State: the cache, optional sub_key naming its section of the shared JSON dump, and a weak mapping of
+    # pending DeferredRecordings by key. Optionally dumps itself to a shared JSON file at exit and prepopulates from it.
     """In-memory memoization interface for caching function results.
 
     This class provides methods for recording, retrieving, and managing
@@ -513,6 +557,9 @@ class Memoizer(_BaseMemoizer):
     """
 
     def __init__(self, sub_key: str | None = None) -> None:
+        # [FUNCTION DOC] Creates the in-memory cache, stores the sub_key and the weak pending-deferred mapping, registers an exit
+        # handler to dump the cache when dump is enabled in config, prepopulates from an existing dump if configured, and registers
+        # itself with the fresh-cache clearing hook. Side effects: global exit hook registration.
         """Initialize the Memoizer instance with an in-memory cache.
 
         Args:
@@ -541,6 +588,7 @@ class Memoizer(_BaseMemoizer):
         clear_on_fresh_cache(self)
 
     def cache_clear(self) -> None:
+        # [FUNCTION DOC] Empties the in-memory cache (also invoked by the fresh cache context manager).
         """Clear the in-memory cache.
 
         This method resets the in-memory cache to empty. It is called by
@@ -554,6 +602,8 @@ class Memoizer(_BaseMemoizer):
         encoded_params: object,
         encoded_result: _EncodedR,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Callback for a finalized DeferredRecording: removes the key from the pending mapping and inserts
+        # a CacheEntry with the params and final encoded result.
         """Finalize a deferred recording by inserting the cache entry.
 
         This method is called when a DeferredRecording's finalize() method is invoked.
@@ -575,6 +625,7 @@ class Memoizer(_BaseMemoizer):
 
     @functools.cached_property
     def _shared_cache_filepath(self) -> Path:
+        # [FUNCTION DOC] HELPER: Cached property: path of the shared memoizer dump JSON in the inductor cache directory.
         """Get the shared cache filepath for memoizer cache dumps.
 
         Returns:
@@ -584,6 +635,7 @@ class Memoizer(_BaseMemoizer):
 
     @functools.cached_property
     def _shared_cache_lockfile(self) -> Path:
+        # [FUNCTION DOC] HELPER: Cached property: path of the lock file guarding the shared dump file.
         """Get the lock file path for the shared memoizer cache.
 
         Returns:
@@ -592,6 +644,8 @@ class Memoizer(_BaseMemoizer):
         return Path(cache_dir()) / "memoizer_cache.lock"
 
     def _read_dump_from_disk(self, filepath: Path | None = None) -> CacheDump | None:
+        # [FUNCTION DOC] HELPER: Reads and parses a dump JSON file (default: the shared dump). Returns the parsed data, or None if
+        # the file is missing or not valid JSON.
         """Read a cache dump from disk.
 
         Attempts to read and parse a cache JSON file.
@@ -614,6 +668,8 @@ class Memoizer(_BaseMemoizer):
             return None
 
     def _write_dump_to_disk(self, dump: CacheDump) -> None:
+        # [FUNCTION DOC] HELPER: Writes the dump as indented JSON to the shared dump file and logs the path. Any exception is
+        # caught and logged as a warning, never raised.
         """Write the cache dump to disk.
 
         Writes the provided dump to the shared cache JSON file and logs the result.
@@ -648,6 +704,9 @@ class Memoizer(_BaseMemoizer):
             )
 
     def _prepare_dump(self, existing_dump: CacheDump | None) -> CacheDump:
+        # [FUNCTION DOC] HELPER: Builds the dump structure: starts from the existing dump (or an empty one), merges this memoizer's
+        # entries (as params/result mappings) into the collection for its sub_key (stored under the text null when no sub_key,
+        # matching how JSON writes None keys), recomputes the total entry count and returns the dump.
         """Prepare a cache dump from the current Memoizer state.
 
         Takes the existing dump (if any) and merges it with the current
@@ -695,6 +754,9 @@ class Memoizer(_BaseMemoizer):
         return dump
 
     def _dump_to_disk(self) -> None:
+        # [FUNCTION DOC] HELPER: Exit hook. Does nothing if the cache is empty. Otherwise creates the cache directory, takes the shared
+        # file lock (default timeout, may raise FileLockTimeoutError), reads the existing dump, merges and writes it back.
+        # Side effects: file I/O on the shared dump file and a log message.
         """Dump the in-memory cache to a shared JSON file.
 
         This method is automatically called on program exit via atexit.
@@ -725,6 +787,8 @@ class Memoizer(_BaseMemoizer):
             self._write_dump_to_disk(dump)
 
     def _maybe_prepopulate_from_dump(self) -> None:
+        # [FUNCTION DOC] HELPER: If a dump file path is configured and the file is readable, loads the entries for this memoizer's
+        # sub_key into the in-memory cache and logs how many were loaded. Silent no-op when nothing is configured or found.
         """Pre-populate cache entries from a dump file if configured.
 
         Checks the CACHE_DUMP_FILE_PATH config option for a path to a JSON dump file
@@ -773,6 +837,7 @@ class Memoizer(_BaseMemoizer):
             )
 
     def _extract_entries_from_dump(self, dump: CacheDump) -> dict[str, CacheDumpEntry]:
+        # [FUNCTION DOC] HELPER: Returns the entries of the dump belonging to this sub_key (null key when none), or an empty mapping.
         """Extract cache entries from a dump based on sub_key.
 
         Args:
@@ -788,6 +853,8 @@ class Memoizer(_BaseMemoizer):
         return collections.get(lookup_key, {})
 
     def _populate_cache_from_entries(self, entries: dict[str, CacheDumpEntry]) -> None:
+        # [FUNCTION DOC] HELPER: Inserts a CacheEntry built from each dump entry's params and result into the in-memory cache
+        # (existing keys are kept).
         """Populate the in-memory cache from dump entries.
 
         Args:
@@ -805,6 +872,10 @@ class Memoizer(_BaseMemoizer):
         custom_params_encoder: Callable[_P, object] | None = None,
         custom_result_encoder: ResultEncoderFactory[_P, _R, _EncodedR] | None = None,
     ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+        # [FUNCTION DOC] Returns a decorator that runs the function, then stores its call in memory. The key comes from the params
+        # encoder (or raw pickled arguments). The result is optionally encoded by the result encoder factory. If the encoded
+        # result is a DeferredRecording, it is tracked as pending and storing is delegated to a completion callback; the original
+        # result is returned either way, never the encoded one. If caching is disabled, the function is returned unchanged.
         """Record a function call result with custom encoding.
 
         This is a decorator that wraps a function to enable memoization
@@ -831,6 +902,7 @@ class Memoizer(_BaseMemoizer):
         """
 
         def wrapper(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+            # [FUNCTION DOC] Decorator body: returns the function unchanged when caching is disabled, else the recording wrapper.
             """Wrap the function to enable memoization.
 
             Args:
@@ -845,6 +917,9 @@ class Memoizer(_BaseMemoizer):
 
             @functools.wraps(fn)
             def inner(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+                # [FUNCTION DOC] Runs the original function, computes the cache key and encoded params and result, then either registers a
+                # deferred-recording callback or inserts the cache entry (first write wins). Returns the original function result.
+                # Exceptions from the function or encoders propagate.
                 """Call the original function and cache the result.
 
                 Args:
@@ -913,6 +988,10 @@ class Memoizer(_BaseMemoizer):
         custom_params_encoder: Callable[_P, object] | None = None,
         custom_result_decoder: ResultDecoderFactory[_P, _R, _EncodedR] | None = None,
     ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+        # [FUNCTION DOC] Returns a decorator whose wrapped function never runs the original; it looks up the key in memory,
+        # decodes the stored encoded result with the decoder factory if given, or else returns it as is. If a deferred recording is
+        # pending for the key and offers an interim result, that is returned. Otherwise raises KeyError. If caching is disabled
+        # the wrapper always raises KeyError.
         """Replay a cached function result without executing the function.
 
         This is a decorator that retrieves cached results instead of executing
@@ -939,6 +1018,7 @@ class Memoizer(_BaseMemoizer):
         """
 
         def wrapper(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+            # [FUNCTION DOC] Decorator body: returns an always-miss function when caching is disabled, else the lookup wrapper.
             """Wrap the function to retrieve from cache.
 
             Args:
@@ -952,12 +1032,15 @@ class Memoizer(_BaseMemoizer):
 
                 @functools.wraps(fn)
                 def always_miss(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+                    # [FUNCTION DOC] HELPER: Replacement wrapper used when caching is disabled; always raises KeyError (cache miss).
                     raise KeyError("Caching is disabled")
 
                 return always_miss
 
             @functools.wraps(fn)
             def inner(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+                # [FUNCTION DOC] Looks up the key in memory and returns the decoded or raw cached result; falls back to a pending deferred
+                # recording's interim result. Raises KeyError on a miss. The original function is not called.
                 """Retrieve the cached result without calling the function.
 
                 Args:
@@ -1004,6 +1087,9 @@ class Memoizer(_BaseMemoizer):
 
 
 class PersistentMemoizer(_BaseMemoizer):
+    # [CLASS DOC] Two-level memoizer: an in-memory Memoizer in front of an on-disk cache of pickled CacheEntry objects stored
+    # under a sub-directory. Record writes both levels; replay checks memory first, then disk (and fills memory on a disk hit).
+    # State: the inner memoizer and the on-disk backend. Memory entries are dumped to JSON at exit by the inner memoizer.
     """Persistent memoization interface for caching function results to disk.
 
     This class provides methods for recording, retrieving, and managing
@@ -1024,6 +1110,8 @@ class PersistentMemoizer(_BaseMemoizer):
     """
 
     def __init__(self, sub_dir: PathLike[str] | None = None) -> None:
+        # [FUNCTION DOC] Creates the inner Memoizer (sub_key is the text of sub_dir or None) and the on-disk cache for sub_dir, and
+        # registers itself for fresh-cache clearing.
         """Initialize the PersistentMemoizer with two-level caching.
 
         Args:
@@ -1042,6 +1130,8 @@ class PersistentMemoizer(_BaseMemoizer):
         clear_on_fresh_cache(self)
 
     def cache_clear(self) -> None:
+        # [FUNCTION DOC] Deletes the on-disk cache directory tree if it exists, ignoring errors. The in-memory level is cleared
+        # by the inner memoizer's own registration.
         """Clear the on-disk cache.
 
         This method removes the on-disk cache directory. The in-memory cache
@@ -1061,6 +1151,9 @@ class PersistentMemoizer(_BaseMemoizer):
         custom_params_encoder: Callable[_P, object] | None = None,
         custom_result_encoder: ResultEncoderFactory[_P, _R, _EncodedR] | None = None,
     ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+        # [FUNCTION DOC] Returns a decorator that records through the inner memoizer (memory) and then persists the entry to disk.
+        # For deferred recordings, disk persistence is registered as an extra callback that runs after the memory callback. The original
+        # result is returned. If caching is disabled the function is returned unchanged.
         """Record a function call result with custom encoding to both caches.
 
         This is a decorator that wraps a function to enable memoization
@@ -1092,6 +1185,7 @@ class PersistentMemoizer(_BaseMemoizer):
         """
 
         def wrapper(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+            # [FUNCTION DOC] Decorator body: returns the function unchanged when caching is disabled, else the two-level recording wrapper.
             """Wrap the function to enable memoization.
 
             Args:
@@ -1111,6 +1205,8 @@ class PersistentMemoizer(_BaseMemoizer):
 
             @functools.wraps(fn)
             def inner(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+                # [FUNCTION DOC] Runs the memory-recording wrapper, then persists the entry to disk immediately, or via a callback when a
+                # deferred recording is pending for the key. Returns the original function result.
                 """Call the original function and cache the result in both caches.
 
                 Args:
@@ -1151,6 +1247,8 @@ class PersistentMemoizer(_BaseMemoizer):
         cache_key: str,
         _callback_result: object = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Pickles the CacheEntry found in the inner memoizer's memory cache for the key and inserts it into the
+        # disk cache. The callback result argument is ignored. Raises AssertionError if the entry is not in memory. Does not take the disk lock.
         """Persist a cache entry to disk.
 
         This method handles disk persistence for both immediate and deferred recordings:
@@ -1179,6 +1277,9 @@ class PersistentMemoizer(_BaseMemoizer):
         custom_params_encoder: Callable[_P, object] | None = None,
         custom_result_decoder: ResultDecoderFactory[_P, _R, _EncodedR] | None = None,
     ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+        # [FUNCTION DOC] Returns a decorator whose wrapper never runs the original function: tries memory replay first; on a miss reads
+        # the pickled entry from disk, copies it into memory, decodes it (decoder factory if given) and returns it.
+        # Raises KeyError on a complete miss; always raises KeyError when caching is disabled.
         """Replay a cached function result without executing the function.
 
         This is a decorator that retrieves cached results using a two-level
@@ -1207,6 +1308,7 @@ class PersistentMemoizer(_BaseMemoizer):
         """
 
         def wrapper(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+            # [FUNCTION DOC] Decorator body: returns an always-miss function when caching is disabled, else the two-level lookup wrapper.
             """Wrap the function to retrieve from cache.
 
             Args:
@@ -1220,6 +1322,7 @@ class PersistentMemoizer(_BaseMemoizer):
 
                 @functools.wraps(fn)
                 def always_miss(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+                    # [FUNCTION DOC] HELPER: Replacement wrapper used when caching is disabled; always raises KeyError (cache miss).
                     raise KeyError("Caching is disabled")
 
                 return always_miss
@@ -1231,6 +1334,9 @@ class PersistentMemoizer(_BaseMemoizer):
 
             @functools.wraps(fn)
             def inner(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+                # [FUNCTION DOC] Tries the memory replay; on KeyError reads and unpickles the disk entry, fills memory, decodes if a decoder
+                # is provided and returns the result. Raises KeyError if absent from both levels.
+                # KNOWN ISSUE: the disk read is done without taking the cache file lock.
                 """Retrieve the cached result without calling the function.
 
                 Checks memory cache first, then disk cache. Populates memory

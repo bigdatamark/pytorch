@@ -1,3 +1,6 @@
+# [MODULE DOC] Helpers used by inductor compile workers (subprocesses): loading generated python modules, pointing
+# triton at ptxas and libdevice, syncing cache-related environment variables, and worker entry points that compile
+# PyCodeCache-based kernels or warm the triton cache for a kernel. Module-level state: last applied cache env.
 from __future__ import annotations
 
 import functools
@@ -24,6 +27,10 @@ if TYPE_CHECKING:
 def _reload_python_module(
     key: str, path: str, set_sys_modules: bool = True
 ) -> ModuleType:
+    # [FUNCTION DOC] HELPER: Compiles the source file at path into a new module named after this module plus the key, sets its
+    # file and key attributes, runs the code in the module namespace and optionally registers it in the module table.
+    # Returns the module. Raises RuntimeError if compilation of the source fails (original error suppressed); errors while
+    # executing the module code propagate. Side effects: file read, module registration.
     with open(path) as f:
         try:
             code = compile(f.read(), path, "exec", dont_inherit=True)
@@ -42,6 +49,8 @@ def _reload_python_module(
 
 @functools.cache
 def _set_triton_ptxas_path() -> None:
+    # [FUNCTION DOC] HELPER: Cached (runs once). Unless TRITON_PTXAS_PATH is already set, looks for a ptxas binary in the torch bin
+    # directory and, if it is an executable file, exports the environment variable. Warns if it exists but is not executable.
     if os.environ.get("TRITON_PTXAS_PATH") is not None:
         return
     ptxas = Path(__file__).absolute().parents[2] / "bin" / "ptxas"
@@ -54,6 +63,8 @@ def _set_triton_ptxas_path() -> None:
 
 
 def _set_triton_libdevice_path() -> None:
+    # [FUNCTION DOC] HELPER: If the eager-numerics libdevice option or the emulate-precision-casts option is enabled in the inductor
+    # config, points triton at the CUDA toolkit libdevice (via the implementation helper); otherwise does nothing.
     """
     Use the CUDA toolkit's libdevice instead of Triton's bundled version.
     This ensures Triton's libdevice calls match CUDA eager numerics for bitwise
@@ -71,6 +82,9 @@ def _set_triton_libdevice_path() -> None:
 
 
 def _set_triton_libdevice_path_impl() -> None:
+    # [FUNCTION DOC] HELPER: Does nothing for non-CUDA torch builds or when triton knobs are unavailable. Uses TRITON_LIBDEVICE_PATH if
+    # set; keeps an existing triton setting; otherwise derives libdevice from CUDA_HOME, setting the triton knob and exporting the
+    # environment variable for subprocesses. Emits warnings (not errors) when CUDA_HOME or the file or cpp_extension is missing.
     import torch
 
     if torch.version.cuda is None:
@@ -129,6 +143,9 @@ _last_applied_cache_env: dict[str, str | None] | None = None
 
 
 def _apply_subprocess_env_and_clear_caches(extra_env: dict[str, str | None]) -> None:
+    # [FUNCTION DOC] HELPER: Applies the given environment mapping in the worker. If the cache-directory variables (inductor or triton
+    # cache dir) in the mapping changed since the last call, clears the in-process caches first and remembers the new values.
+    # Mutates a module-level global and the process environment.
     global _last_applied_cache_env
 
     cache_env = {
@@ -147,6 +164,10 @@ def _worker_compile_pycodecache_kernel(
     extra_env: dict[str, str | None],
     precompile_metadata: dict[str, Any] | None = None,
 ) -> tuple[str, str, int]:
+    # [FUNCTION DOC] HELPER: Worker entry point. Applies the environment, writes the source to the PyCodeCache, loads the module and checks it
+    # has a function named kernel name plus main suffix (else raises RuntimeError listing callables). If precompile metadata is
+    # given, calls the module's precompile function with it, or logs a warning when missing. Clears the line cache. Returns the cache
+    # key, the module path and the elapsed time in microseconds.
     """
     Subprocess worker for PyCodeCache-based kernel compilation.
 
@@ -200,6 +221,10 @@ def _worker_compile_triton(
     extra_env: dict[str, str | None],
     extra_config: dict[str, Any],
 ) -> tuple[CachingAutotuner, int]:
+    # [FUNCTION DOC] HELPER: Worker entry point for triton kernels. Sets the ptxas path, applies the environment (and syncs the triton libdevice
+    # knob if provided), then under a patched inductor config loads the kernel, reports the compiling phase to the watchdog and
+    # precompiles it with warm-cache-only while skipping GPU driver setup. Prepares the kernel for pickling and returns it with the
+    # elapsed microseconds. Logs triton builds (with the failure message) in all cases; exceptions propagate.
     _set_triton_ptxas_path()
     _apply_subprocess_env_and_clear_caches(extra_env)
     # Keep Triton's in-process knob in sync with the parent environment, including

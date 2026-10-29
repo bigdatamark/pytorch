@@ -1,3 +1,6 @@
+# [MODULE DOC] On-disk cache of compiled CuTe DSL kernels (object files) shared between compile worker processes and the
+# parent. Provides lookup (memory first, then disk) and store functions keyed by module path, config, runtime key, GPU
+# architecture and CUDA version, plus an ELF patch for a known loader crash. No import-time side effects besides the logger.
 """Disk cache for CuTe DSL compiled kernel artifacts.
 
 Persists compiled GPU binaries (CUBIN/PTX via TVM FFI) across process
@@ -24,6 +27,9 @@ log = logging.getLogger(__name__)
 
 
 def _fix_elf_dup_text_flags(data: bytes) -> bytes:
+    # [FUNCTION DOC] HELPER: Given bytes of a 64-bit little-endian ELF object, finds sections named .text and, if there are several, rewrites the
+    # flags of all but the first to those of the first (alloc plus exec). Returns the patched copy, or the input unchanged if it is not a
+    # suitable ELF, has no section table or has at most one .text section. Works around random crashes in the JIT loader (see cutlass issue 3162).
     """Harmonize flags on duplicate .text ELF sections.
 
     The CUTLASS MLIR compiler emits .o files with two .text sections:
@@ -60,6 +66,8 @@ def _fix_elf_dup_text_flags(data: bytes) -> bytes:
 
 
 def _cache_dir() -> Path:
+    # [FUNCTION DOC] HELPER: Returns the cache directory: a cutedsl compile cache folder under the inductor cache dir from the environment, or
+    # a default under the user home cache folder.
     cache_root = os.environ.get(
         "TORCHINDUCTOR_CACHE_DIR",
         os.path.join(os.path.expanduser("~"), ".cache", "torch_inductor"),
@@ -74,6 +82,8 @@ def _make_disk_key(
     device_index: int = 0,
     device_capability: tuple[int, int] | None = None,
 ) -> str:
+    # [FUNCTION DOC] HELPER: Builds the disk key: SHA-256 hex of the pickled tuple of module path, config key, runtime key, GPU compute
+    # capability (given, or queried from the device index if CUDA is available, else None) and CUDA version.
     import torch
 
     arch = device_capability
@@ -93,6 +103,9 @@ def disk_cache_get(
     device_index: int = 0,
     device_capability: tuple[int, int] | None = None,
 ) -> Any | None:
+    # [FUNCTION DOC] Returns the compiled function for the runtime key and device index: from the memory mapping if present, else by loading
+    # the object file for the disk key (patching its ELF flags in place if needed) with the CuTe runtime and caching it in memory.
+    # Returns None if the file is missing or loading fails (failures are logged at debug level and swallowed).
     """Look up a compiled CuTe DSL function, checking memory then disk."""
     mem_key = (runtime_key, device_index)
     if mem_key in mem_cache:
@@ -129,6 +142,10 @@ def disk_cache_set(
     device_index: int = 0,
     device_capability: tuple[int, int] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Stores the compiled function in the memory mapping, then exports it to an object file in a temporary file in the cache
+    # directory (creating it), patches the ELF flags and atomically renames it to the final name. If the function cannot export
+    # (attribute, runtime or type errors) the failure is logged at debug level, the temporary file is removed and only the memory cache
+    # is kept. Other exceptions propagate.
     """Store a compiled CuTe DSL function to memory and disk."""
     mem_key = (runtime_key, device_index)
     mem_cache[mem_key] = compiled_fn

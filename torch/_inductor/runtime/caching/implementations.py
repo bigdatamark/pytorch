@@ -1,3 +1,7 @@
+# [MODULE DOC] Concrete cache backends behind the _CacheImpl interface: in-memory, on-disk (files with a
+# version header, guarded by a file lock) and a remote fallback that raises NotImplementedError
+# unless an internal fb module provides a real one. Also defines the Hit wrapper and the
+# miss sentinel. Import-time side effect: tries to import the optional fb remote implementation.
 """Cache implementation classes
 
 This module provides concrete implementations of caching backends including
@@ -29,6 +33,7 @@ _V = TypeVar("_V")
 
 @dataclass
 class Hit(Generic[_V]):
+    # [CLASS DOC] Dataclass wrapping a cached value so a hit on a stored None differs from a miss (None).
     """Result wrapper for hits on cache get operations.
 
     Allows distinguishing between a cache miss and a cached None value.
@@ -44,6 +49,7 @@ class Hit(Generic[_V]):
 
 
 class Miss:
+    # [CLASS DOC] Sentinel type for a cache miss; a single shared instance named miss exists.
     """Sentinel class representing a cache miss.
 
     Used to distinguish between a cached None value and a cache miss
@@ -56,6 +62,9 @@ miss = Miss()
 
 
 class _CacheImpl(ABC, Generic[_V]):
+    # [CLASS DOC] Abstract base for cache backends. Holds a threading lock exposed through the lock
+    # property as a timeout-taking context manager factory. Subclasses implement get (returns a
+    # Hit or None) and insert (returns whether stored). Callers, not the backend, decide when to lock.
     """Abstract base class for cache implementations.
 
     This class defines the interface that all cache implementations must follow.
@@ -68,11 +77,14 @@ class _CacheImpl(ABC, Generic[_V]):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Creates the threading lock used by the default lock property.
         """Initialize the cache implementation with a threading lock."""
         self._lock: Lock = Lock()
 
     @property
     def lock(self) -> locks._LockProtocol:
+        # [FUNCTION DOC] Property returning a function that, given an optional timeout, yields a context manager
+        # holding the threading lock (raising LockTimeoutError on timeout). The lock is not taken by get or insert.
         """Get a context manager for acquiring the cache lock.
 
         Locking of the cache is not done by the implementation itself, but by the
@@ -90,12 +102,14 @@ class _CacheImpl(ABC, Generic[_V]):
         def _lock_with_timeout(
             timeout: float | None = None,
         ) -> locks._LockContextManager:
+            # [FUNCTION DOC] HELPER: Returns the context manager acquiring the instance threading lock with the timeout.
             return locks._acquire_lock_with_timeout(self._lock, timeout)
 
         return _lock_with_timeout
 
     @abstractmethod
     def get(self, key: str) -> Hit[_V] | None:
+        # [FUNCTION DOC] Abstract: look up the key and return a Hit with the value, or None on a miss.
         """Retrieve a value from the cache.
 
         Args:
@@ -108,6 +122,7 @@ class _CacheImpl(ABC, Generic[_V]):
 
     @abstractmethod
     def insert(self, key: str, value: _V) -> bool:
+        # [FUNCTION DOC] Abstract: store the value under the key; return True if stored, False if not.
         """Insert a key-value pair into the cache.
 
         Args:
@@ -120,6 +135,8 @@ class _CacheImpl(ABC, Generic[_V]):
 
 
 class _InMemoryCacheImpl(_CacheImpl[_V], Generic[_V]):
+    # [CLASS DOC] Backend storing values in a plain dictionary keyed by string. Fast but limited to the
+    # process lifetime. State: the _memory dictionary. Existing keys are never overwritten.
     """In-memory cache implementation using a dictionary.
 
     This implementation stores key-value pairs in a Python dictionary,
@@ -131,12 +148,14 @@ class _InMemoryCacheImpl(_CacheImpl[_V], Generic[_V]):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initializes the base lock and an empty dictionary.
         """Initialize the in-memory cache with an empty dictionary."""
         super().__init__()
         self._memory: dict[str, _V] = {}
 
     @override
     def get(self, key: str) -> Hit[_V] | None:
+        # [FUNCTION DOC] Returns a Hit holding the stored value if the key is present, otherwise None.
         """Retrieve a value from the in-memory cache.
 
         Args:
@@ -152,6 +171,7 @@ class _InMemoryCacheImpl(_CacheImpl[_V], Generic[_V]):
 
     @override
     def insert(self, key: str, value: _V) -> bool:
+        # [FUNCTION DOC] Stores the value only if the key is absent; returns True when stored, False when the key already exists (first write wins).
         """Insert a key-value pair into the in-memory cache.
 
         Args:
@@ -169,6 +189,10 @@ class _InMemoryCacheImpl(_CacheImpl[_V], Generic[_V]):
 
 
 class _OnDiskCacheImpl(_CacheImpl[bytes]):
+    # [CLASS DOC] Backend storing each entry as a file named by the key inside a cache sub-directory.
+    # Each file starts with a short version header (hash of the class version number); entries
+    # with a mismatching header are treated as stale and removed. Uses a cross-process file lock
+    # (dir.lock) instead of the thread lock. Values are bytes. First write wins.
     """On-disk cache implementation using file system storage.
 
     This implementation stores cached data as files on disk, with version
@@ -187,6 +211,9 @@ class _OnDiskCacheImpl(_CacheImpl[bytes]):
     _version_header_length: int = 4
 
     def __init__(self, sub_dir: PathLike[str] | None = None) -> None:
+        # [FUNCTION DOC] Sets the cache directory to the default cache directory plus the cache folder and the optional
+        # sub-directory, and creates the file lock object for the directory. No directories are created here.
+        # KNOWN ISSUE: does not call the base initializer, so the inherited threading lock is never created (unused here since lock is overridden).
         """Initialize the on-disk cache with a specified subdirectory.
 
         Args:
@@ -198,6 +225,7 @@ class _OnDiskCacheImpl(_CacheImpl[bytes]):
 
     @property
     def _base_dir(self) -> Path:
+        # [FUNCTION DOC] HELPER: Property returning the root on-disk cache path: the default inductor cache directory joined with the cache folder.
         """Get the base directory for cache storage.
 
         Returns:
@@ -209,6 +237,7 @@ class _OnDiskCacheImpl(_CacheImpl[bytes]):
         return Path(default_cache_dir(), "cache")
 
     def _fpath_from_key(self, key: str) -> Path:
+        # [FUNCTION DOC] HELPER: Returns the file path for a key inside the cache directory. The key is used as the file name unsanitized.
         """Generate a file path from a cache key.
 
         Args:
@@ -221,6 +250,7 @@ class _OnDiskCacheImpl(_CacheImpl[bytes]):
 
     @classmethod
     def _version_header(cls) -> bytes:
+        # [FUNCTION DOC] HELPER: Class method returning the leading bytes (header length) of the SHA-256 digest of the class version number.
         """Generate the version header bytes.
 
         Returns:
@@ -229,6 +259,7 @@ class _OnDiskCacheImpl(_CacheImpl[bytes]):
         return sha256(str(cls._version).encode()).digest()[: cls._version_header_length]
 
     def _version_header_matches(self, fp: BufferedReader) -> bool:
+        # [FUNCTION DOC] HELPER: Reads the header length from the file's current position and returns whether it equals the current version header.
         """Check if the file's version header matches the current version.
 
         Args:
@@ -240,6 +271,7 @@ class _OnDiskCacheImpl(_CacheImpl[bytes]):
         return fp.read(self._version_header_length) == self._version_header()
 
     def _write_version_header(self, fp: BufferedWriter) -> None:
+        # [FUNCTION DOC] HELPER: Writes the version header bytes to the open file.
         """Write the version header to a file.
 
         Args:
@@ -250,6 +282,8 @@ class _OnDiskCacheImpl(_CacheImpl[bytes]):
     @override
     @property
     def lock(self) -> locks._LockProtocol:
+        # [FUNCTION DOC] Property returning a function that, given an optional timeout, yields a context manager
+        # holding the directory file lock (raising FileLockTimeoutError on timeout).
         """Get a context manager for acquiring the file lock.
 
         Uses file locking to ensure thread safety across processes.
@@ -264,12 +298,16 @@ class _OnDiskCacheImpl(_CacheImpl[bytes]):
         def _lock_with_timeout(
             timeout: float | None = None,
         ) -> locks._LockContextManager:
+            # [FUNCTION DOC] HELPER: Returns the context manager acquiring the instance file lock with the timeout.
             return locks._acquire_flock_with_timeout(self._flock, timeout)
 
         return _lock_with_timeout
 
     @override
     def get(self, key: str) -> Hit[bytes] | None:
+        # [FUNCTION DOC] Returns a Hit with the file contents after the header, or None. Returns None if the file does not exist.
+        # If the header mismatches (or the payload is empty) the file is deleted and None is returned. Reads and may delete files.
+        # KNOWN ISSUE: an entry with an empty payload is also treated as stale and deleted.
         """Retrieve a value from the on-disk cache.
 
         Args:
@@ -302,6 +340,9 @@ class _OnDiskCacheImpl(_CacheImpl[bytes]):
 
     @override
     def insert(self, key: str, value: bytes) -> bool:
+        # [FUNCTION DOC] Writes the header and value to a new file named by the key, creating parent directories. Uses exclusive creation:
+        # if the file exists with a current header, nothing is written and False is returned; if it exists with a stale header it is
+        # deleted and rewritten. Returns True when written. Side effects: creates, deletes and writes files; callers should hold the lock.
         """Insert a key-value pair into the on-disk cache.
 
         Args:
@@ -348,6 +389,8 @@ try:
 except ModuleNotFoundError:
 
     class _RemoteCacheImpl(_CacheImpl[bytes]):
+        # [CLASS DOC] Fallback remote backend used when the internal fb implementation is missing. Every get or insert
+        # raises NotImplementedError. Class attributes: version number and has_strong_consistency (False). Its lock is a no-op.
         """Fallback remote cache implementation for non-Facebook environments.
 
         This is a no-op implementation that always raises NotImplementedError.
@@ -366,6 +409,7 @@ except ModuleNotFoundError:
         has_strong_consistency: bool = False
 
         def __init__(self) -> None:
+            # [FUNCTION DOC] Does nothing; no state or lock is created.
             """Initialize the fallback remote cache implementation.
 
             Note: We don't need to initialize any form of lock since this
@@ -375,6 +419,7 @@ except ModuleNotFoundError:
         @override
         @property
         def lock(self) -> locks._LockProtocol:
+            # [FUNCTION DOC] Property returning a function that, given an optional timeout (ignored), yields a no-op context manager.
             """Get a pseudo lock that does nothing.
 
             Most remote cache implementations don't have an ability to implement
@@ -392,12 +437,14 @@ except ModuleNotFoundError:
             def pseudo_lock(
                 timeout: float | None = None,
             ) -> Generator[None, None, None]:
+                # [FUNCTION DOC] HELPER: No-op context manager that yields immediately and ignores the timeout.
                 yield
 
             return pseudo_lock
 
         @override
         def get(self, key: str) -> Hit[bytes] | None:
+            # [FUNCTION DOC] Always raises NotImplementedError.
             """Raise NotImplementedError for remote cache get operations.
 
             Args:
@@ -410,6 +457,7 @@ except ModuleNotFoundError:
 
         @override
         def insert(self, key: str, value: bytes) -> bool:
+            # [FUNCTION DOC] Always raises NotImplementedError.
             """Raise NotImplementedError for remote cache insert operations.
 
             Args:

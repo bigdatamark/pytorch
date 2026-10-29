@@ -1,3 +1,7 @@
+# [MODULE DOC] Lock acquisition helpers with timeouts for threading locks and file locks.
+# Provides context-manager (auto release) and manual ("unsafe", caller releases) variants,
+# timeout mode constants (blocking, non-blocking, 60s default) and a helper that takes the
+# locks of several cache implementations together. No import-time side effects.
 """Lock acquisition utilities
 
 This module provides safe and unsafe lock acquisition functions for both threading.Lock
@@ -31,6 +35,8 @@ _LockContextManager: TypeAlias = _GeneratorContextManager[None, None, None]
 
 
 class _LockProtocol(Protocol):  # noqa: PYI046
+    # [CLASS DOC] Protocol for a lock factory: a callable taking an optional timeout and returning a
+    # context manager that holds the lock for its duration. The call method is a one-line stub.
     def __call__(self, timeout: float | None = None) -> _LockContextManager: ...
 
 
@@ -49,6 +55,9 @@ def _acquire_lock_with_timeout(
     lock: Lock,
     timeout: float | None = None,
 ) -> Generator[None, None, None]:
+    # [FUNCTION DOC] HELPER: Context manager. Acquires the threading lock with the timeout (None means the
+    # default of 60 seconds), yields while holding it, and always releases it afterwards.
+    # Raises LockTimeoutError if acquisition times out (nothing is released in that case).
     """Context manager that safely acquires a threading.Lock with timeout and automatically releases it.
 
     This function provides a safe way to acquire a lock with timeout support, ensuring
@@ -82,6 +91,8 @@ def _acquire_lock_with_timeout(
 
 
 def _unsafe_acquire_lock_with_timeout(lock: Lock, timeout: float | None = None) -> None:
+    # [FUNCTION DOC] HELPER: Acquires the threading lock using the timeout (None means the default) and leaves it held;
+    # the caller must release it. Raises LockTimeoutError if the lock was not obtained in time.
     """Acquire a threading.Lock with timeout without automatic release (unsafe).
 
     This function acquires a lock with timeout support but does NOT automatically
@@ -122,6 +133,8 @@ def _acquire_flock_with_timeout(
     flock: BaseFileLock,
     timeout: float | None = None,
 ) -> Generator[None, None, None]:
+    # [FUNCTION DOC] HELPER: Context manager. Acquires the file lock with the timeout (None means the default), yields
+    # while holding it and always releases it afterwards. Raises FileLockTimeoutError on timeout.
     """Context manager that safely acquires a FileLock with timeout and automatically releases it.
 
     This function provides a safe way to acquire a file lock with timeout support, ensuring
@@ -159,6 +172,8 @@ def _unsafe_acquire_flock_with_timeout(
     flock: BaseFileLock,
     timeout: float | None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Acquires the file lock using the timeout (None means the default) and leaves it held; the caller
+    # must release it. Converts the filelock Timeout into FileLockTimeoutError (chained).
     """Acquire a FileLock with timeout without automatic release (unsafe).
 
     This function acquires a file lock with timeout support but does NOT automatically
@@ -201,6 +216,9 @@ def _acquire_many_impl_locks_with_timeout(
     *impls: _CacheImpl,
     timeout: float | None = None,
 ) -> Generator[None, None, None]:
+    # [FUNCTION DOC] HELPER: Context manager that enters the lock of every given cache implementation in order
+    # (each with the same timeout) and yields while all are held; all are released in reverse
+    # order on exit, including on error. Raises a timeout error if any acquisition fails.
     with ExitStack() as stack:
         for impl in impls:
             stack.enter_context(impl.lock(timeout))

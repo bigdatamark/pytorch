@@ -1,3 +1,5 @@
+# [MODULE DOC] Exception hierarchy for the caching system: CacheError root, SystemError (runtime-style),
+# lock timeout errors, and UserError (also a TypeError) with key/value encoding and decoding errors.
 """Exception classes for PyTorch Inductor runtime caching.
 
 This module defines a hierarchy of exceptions used throughout the caching system.
@@ -11,6 +13,7 @@ from filelock import BaseFileLock
 
 
 class CacheError(Exception):
+    # [CLASS DOC] Root of all caching exceptions.
     """Base class for all caching-related errors.
 
     This is the root exception class for all custom exceptions raised by the caching
@@ -19,6 +22,8 @@ class CacheError(Exception):
 
 
 class SystemError(CacheError, RuntimeError):
+    # [CLASS DOC] Base for system-level cache failures (also a RuntimeError).
+    # KNOWN ISSUE: shadows the builtin SystemError name within this module.
     """Base class for system-level caching errors.
 
     This class represents errors that occur during cache operations, such as
@@ -28,6 +33,7 @@ class SystemError(CacheError, RuntimeError):
 
 
 class LockTimeoutError(SystemError):
+    # [CLASS DOC] Raised when a threading lock cannot be acquired within the timeout.
     """Error raised when a lock operation times out.
 
     This exception is raised when a lock operation exceeds the specified timeout
@@ -35,6 +41,7 @@ class LockTimeoutError(SystemError):
     """
 
     def __init__(self, lock: Lock, timeout: float) -> None:
+        # [FUNCTION DOC] Builds the error with a message naming the lock and the timeout in seconds.
         """Initialize the lock timeout error with detailed lock information.
 
         Args:
@@ -45,6 +52,7 @@ class LockTimeoutError(SystemError):
 
 
 class FileLockTimeoutError(SystemError):
+    # [CLASS DOC] Raised when a file lock cannot be acquired within the timeout.
     """Error raised when a file lock operation times out.
 
     This exception is raised when a file lock operation exceeds the specified timeout
@@ -52,6 +60,7 @@ class FileLockTimeoutError(SystemError):
     """
 
     def __init__(self, flock: BaseFileLock, timeout: float) -> None:
+        # [FUNCTION DOC] Builds the error with a message naming the file lock and the timeout in seconds.
         """Initialize the file lock timeout error with detailed lock information.
 
         Args:
@@ -64,6 +73,7 @@ class FileLockTimeoutError(SystemError):
 
 
 class UserError(CacheError, TypeError):
+    # [CLASS DOC] Base for user-facing cache errors; also a TypeError for compatibility.
     """Base class for user-facing cache errors that also inherit from TypeError.
 
     This class combines CacheError with TypeError to provide compatibility
@@ -73,6 +83,7 @@ class UserError(CacheError, TypeError):
 
 
 class KeyEncodingError(UserError):
+    # [CLASS DOC] Raised when a cache key cannot be encoded.
     """Base class for errors that occur during cache key encoding operations.
 
     Raised when cache keys cannot be properly encoded for storage or transmission.
@@ -81,6 +92,7 @@ class KeyEncodingError(UserError):
 
 
 class ValueEncodingError(UserError):
+    # [CLASS DOC] Raised when a cache value cannot be encoded.
     """Base class for errors that occur during cache value encoding operations.
 
     Raised when cache values cannot be properly encoded for storage or transmission.
@@ -89,6 +101,7 @@ class ValueEncodingError(UserError):
 
 
 class ValueDecodingError(UserError):
+    # [CLASS DOC] Raised when a cached value cannot be decoded.
     """Base class for errors that occur during cache value decoding operations.
 
     Raised when cached values cannot be properly decoded during retrieval.

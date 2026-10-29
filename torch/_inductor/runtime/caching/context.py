@@ -1,3 +1,8 @@
+# [MODULE DOC] Context providers for Inductor runtime caching.
+# Defines runtime and compile context collectors (config, determinism, matmul precision,
+# torch/triton/runtime versions, accelerator properties), an isolation schema selecting
+# which forms to include, and helpers to build a context dict and a 32-char hash key.
+# No import-time side effects beyond imports.
 """Context management for PyTorch Inductor runtime caching.
 
 This module provides context classes for collecting configuration and environment
@@ -16,6 +21,8 @@ import torch
 
 
 class _Context(ABC):
+    # [CLASS DOC] Abstract base for context providers; subclasses expose static
+    # collector methods and list their names via forms_of_context.
     """Abstract base class for context providers.
 
     Context providers collect specific configuration and environment information
@@ -25,6 +32,8 @@ class _Context(ABC):
     @staticmethod
     @abstractmethod
     def forms_of_context() -> Sequence[str]:
+        # [FUNCTION DOC] Abstract static method; returns the names of the context forms (collector
+        # method names) the subclass provides.
         """Return a sequence of context form names provided by this context class.
 
         Returns:
@@ -33,6 +42,9 @@ class _Context(ABC):
 
 
 class _RuntimeContext(_Context):
+    # [CLASS DOC] Provider of settings that affect runtime behavior only: inductor configs,
+    # torch determinism flags and CUDA matmul precision flags. All collectors are static and
+    # read live global state each call (no caching).
     """Context provider for runtime configuration and environment settings.
 
     Collects configuration settings that affect runtime behavior but not
@@ -43,6 +55,8 @@ class _RuntimeContext(_Context):
     @override
     @staticmethod
     def forms_of_context() -> Sequence[str]:
+        # [FUNCTION DOC] Returns a tuple of the three runtime form names: inductor_configs,
+        # torch_determinism_configs, cuda_matmul_precision_configs.
         """Return the runtime context forms provided by this class.
 
         Returns:
@@ -59,6 +73,8 @@ class _RuntimeContext(_Context):
 
     @staticmethod
     def inductor_configs() -> dict[str, object]:
+        # [FUNCTION DOC] Returns the portable Inductor config as a mapping, including private configs.
+        # Imports the inductor config module lazily.
         """Get portable Inductor configuration settings.
 
         Returns:
@@ -71,6 +87,8 @@ class _RuntimeContext(_Context):
 
     @staticmethod
     def torch_determinism_configs() -> dict[str, object]:
+        # [FUNCTION DOC] Returns a mapping of the deterministic-algorithms enabled flag, the warn-only flag,
+        # and the fill-uninitialized-memory setting (None if the attribute is missing).
         """Get PyTorch deterministic algorithm configuration settings.
 
         Returns:
@@ -91,6 +109,8 @@ class _RuntimeContext(_Context):
 
     @staticmethod
     def cuda_matmul_precision_configs() -> dict[str, object]:
+        # [FUNCTION DOC] Returns a mapping with the CUDA matmul fp32 precision setting and the fp16/bf16
+        # reduced-precision-reduction allowance flags.
         """Get CUDA matrix multiplication precision configuration settings.
 
         Returns:
@@ -111,6 +131,9 @@ class _RuntimeContext(_Context):
 
 
 class _CompileContext(_Context):
+    # [CLASS DOC] Provider of settings that affect compilation: torch version hash, triton version
+    # hash, runtime kind and version, and accelerator properties. Collectors are static and
+    # memoized with an unbounded cache, so values are computed once per process.
     """Context provider for compilation-related configuration and environment settings.
 
     Collects information that affects compilation behavior, such as PyTorch and Triton
@@ -120,6 +143,8 @@ class _CompileContext(_Context):
     @override
     @staticmethod
     def forms_of_context() -> Sequence[str]:
+        # [FUNCTION DOC] Returns a tuple of the five compile form names (torch_version_hash,
+        # triton_version_hash, runtime, runtime_version, accelerator_properties).
         """Return the compile context forms provided by this class.
 
         Returns:
@@ -141,6 +166,7 @@ class _CompileContext(_Context):
     @cache
     @staticmethod
     def torch_version_hash() -> str:
+        # [FUNCTION DOC] Returns the base64-encoded torch key bytes (from codecache) as a string. Memoized.
         """Get base64-encoded PyTorch version hash.
 
         Returns:
@@ -153,6 +179,7 @@ class _CompileContext(_Context):
     @cache
     @staticmethod
     def triton_version_hash() -> str | None:
+        # [FUNCTION DOC] Returns the triton key if triton is available, otherwise None. Memoized.
         """Get Triton version key if Triton is available.
 
         Returns:
@@ -165,6 +192,7 @@ class _CompileContext(_Context):
     @cache
     @staticmethod
     def runtime() -> str | None:
+        # [FUNCTION DOC] Returns "CUDA" if torch was built with CUDA, else "HIP" if built with HIP, else None. Memoized.
         """Determine the runtime type based on available backends.
 
         Returns:
@@ -175,6 +203,8 @@ class _CompileContext(_Context):
     @cache
     @staticmethod
     def runtime_version() -> str | None:
+        # [FUNCTION DOC] Returns the CUDA or HIP version string matching the detected runtime, or None
+        # when no runtime is detected. Memoized.
         """Get the version string for the detected runtime.
 
         Returns:
@@ -190,6 +220,9 @@ class _CompileContext(_Context):
     @cache
     @staticmethod
     def accelerator_properties() -> str | None:
+        # [FUNCTION DOC] Returns the textual representation of the current CUDA device properties if a
+        # runtime is built in and CUDA is available at runtime, otherwise None. Memoized, so it
+        # reflects the current device at first call only.
         """Get string representation of CUDA device properties.
 
         Returns:
@@ -204,12 +237,14 @@ class _CompileContext(_Context):
 
 
 class SelectedRuntimeContext(TypedDict):
+    # [CLASS DOC] Typed mapping of boolean flags selecting which runtime context forms to include.
     inductor_configs: bool
     torch_determinism_configs: bool
     cuda_matmul_precision_configs: bool
 
 
 class SelectedCompileContext(TypedDict):
+    # [CLASS DOC] Typed mapping of boolean flags selecting which compile context forms to include.
     torch_version_hash: bool
     triton_version_hash: bool
     runtime: bool
@@ -218,6 +253,8 @@ class SelectedCompileContext(TypedDict):
 
 
 class IsolationSchema(TypedDict):
+    # [CLASS DOC] Typed mapping with runtime_context and compile_context entries; each is True (all),
+    # False (none) or a per-form selection mapping.
     """Schema for specifying which context forms to include in cache isolation.
 
     Attributes:
@@ -239,6 +276,9 @@ _DEFAULT_ISOLATION_SCHEMA: IsolationSchema = IsolationSchema(
 def _collect_runtime_context(
     selection: SelectedRuntimeContext | bool,
 ) -> dict[str, object] | None:
+    # [FUNCTION DOC] HELPER: Collects the selected runtime context forms into a mapping of form name to
+    # value. Selection True includes all; a mapping includes forms whose flag is set. Returns
+    # None if nothing is selected.
     """Collect runtime context based on selection.
 
     Args:
@@ -258,6 +298,8 @@ def _collect_runtime_context(
 def _collect_compile_context(
     selection: SelectedCompileContext | bool,
 ) -> dict[str, object] | None:
+    # [FUNCTION DOC] HELPER: Same as the runtime collector but for compile context forms. Returns a mapping
+    # of form name to value, or None if nothing is selected.
     """Collect compile context based on selection.
 
     Args:
@@ -277,6 +319,8 @@ def _collect_compile_context(
 def _isolation_context(
     ischema: IsolationSchema = _DEFAULT_ISOLATION_SCHEMA,
 ) -> dict[str, object]:
+    # [FUNCTION DOC] HELPER: Builds a mapping with keys runtime_context and compile_context, each holding the
+    # collected form values or None, according to the isolation schema (default: everything).
     """Generate context data based on the isolation schema.
 
     Args:
@@ -295,6 +339,8 @@ def _isolation_context(
 
 
 def _isolation_key(ischema: IsolationSchema = _DEFAULT_ISOLATION_SCHEMA) -> str:
+    # [FUNCTION DOC] HELPER: Returns the first 32 hex characters of the SHA-256 of the key-sorted JSON dump of
+    # the isolation context. Raises a TypeError if a context value is not JSON serializable.
     """Generate a unique key for the given isolation schema.
 
     Args:

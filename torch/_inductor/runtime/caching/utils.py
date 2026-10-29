@@ -1,3 +1,5 @@
+# [MODULE DOC] Small helpers for the caching system: a fault-tolerant LRU cache decorator and a tensor
+# metadata encoder with its typed mapping.
 """Utility functions
 
 This module provides helper functions for LRU caching decorators used
@@ -18,6 +20,9 @@ R = TypeVar("R")
 
 
 def _lru_cache(fn: Callable[P, R]) -> Callable[P, R]:
+    # [FUNCTION DOC] HELPER: Decorator wrapping a function in an LRU cache (size 64, typed). If the cached call raises a
+    # TypeError (e.g. unhashable arguments) the original function is called uncached.
+    # KNOWN ISSUE: a TypeError raised inside the function itself also triggers a second, uncached call.
     """LRU cache decorator with TypeError fallback.
 
     Provides LRU caching with a fallback mechanism that calls the original
@@ -34,6 +39,7 @@ def _lru_cache(fn: Callable[P, R]) -> Callable[P, R]:
 
     @wraps(fn)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        # [FUNCTION DOC] HELPER: Calls the cached function; on TypeError falls back to calling the original.
         try:
             return cached_fn(*args, **kwargs)
         except TypeError:
@@ -43,6 +49,7 @@ def _lru_cache(fn: Callable[P, R]) -> Callable[P, R]:
 
 
 class EncodedTensor(TypedDict):
+    # [CLASS DOC] Typed mapping of tensor metadata: shape, stride and dtype string.
     """TypedDict for encoded tensor metadata."""
 
     shape: tuple[int, ...]
@@ -51,6 +58,7 @@ class EncodedTensor(TypedDict):
 
 
 def _encode_tensor(t: Tensor) -> EncodedTensor:
+    # [FUNCTION DOC] HELPER: Returns an EncodedTensor with the tensor's shape and stride as tuples and dtype as a string.
     """Encode a tensor's metadata into a JSON-serializable dict.
 
     Args:

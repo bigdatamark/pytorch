@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Coordinate descent autotuner for triton configs: CoordescTuner perturbs one config field at a time (block
+# sizes, warps, stages, ...), benchmarks neighbours via a caller supplied function and keeps improvements. Also has
+# get/set helpers for config fields. No import-time side effects besides creating the module logger.
 import copy
 import itertools
 import logging
@@ -26,6 +29,8 @@ log = logging.getLogger(__name__)
 
 
 def get_field(config, name):
+    # [FUNCTION DOC] Reads a field from a triton-style config: num_warps and num_stages are attributes, waves_per_eu defaults to
+    # eight divided by num_warps (integer) if absent, anything else comes from the kwargs mapping (None if missing).
     if name == "num_warps":
         return config.num_warps
     elif name == "num_stages":
@@ -37,6 +42,7 @@ def get_field(config, name):
 
 
 def set_field(config, name, value):
+    # [FUNCTION DOC] Writes a field on a triton-style config: num_warps and num_stages as attributes, others into kwargs. Mutates the config.
     if name == "num_warps":
         config.num_warps = value
     elif name == "num_stages":
@@ -46,6 +52,10 @@ def set_field(config, name, value):
 
 
 class CoordescTuner:
+    # [CLASS DOC] Coordinate descent tuner. State: mode flags (matmul, native matmul, mix order reduction; matmul and native matmul
+    # are mutually exclusive), a name, size hints, inductor metadata, frozen fields excluded from tuning, and a cache of benchmark timings
+    # keyed by hashable config. Main entry points: autotune (per-field descent with optional all-direction check) and
+    # autotune_single_field (static, one scalar value).
     """
     The coordinate descent tuner. Tune one field/coordinate at a time.
 
@@ -66,6 +76,8 @@ class CoordescTuner:
         inductor_meta: InductorMeta | None = None,
         frozen_fields=None,
     ):
+        # [FUNCTION DOC] Stores the flags, name, size hints, metadata (default empty) and frozen fields; creates an empty timing cache.
+        # Raises AssertionError if both is_mm and is_native_matmul are set.
         self.is_mm = is_mm  # we will tune num_stages for mm
 
         # Native matmul codegen assumes ZBLOCK=1 always.
@@ -86,11 +98,14 @@ class CoordescTuner:
         )
 
     def get_config_max(self, prefix: str) -> int:
+        # [FUNCTION DOC] Returns the maximum block size for a dimension prefix: the global triton limit, lowered to the size hint for that prefix if known.
         max_block = TRITON_MAX_BLOCK[prefix.upper()]
         size_hint = self.size_hints.get(prefix) if self.size_hints is not None else None
         return min(max_block, size_hint) if size_hint is not None else max_block
 
     def get_warpsmax(self):
+        # [FUNCTION DOC] Returns the maximum warp count: threads per block divided by warp size from the metadata when both are present,
+        # otherwise queries the device.
         # Avoid querying device directly if device properties are populated in inductor_meta
         warp_size = self.inductor_meta.get("warp_size")
         max_threads_per_block = self.inductor_meta.get("max_threads_per_block")
@@ -100,12 +115,16 @@ class CoordescTuner:
             return get_max_numwarps()
 
     def cache_benchmark_result(self, config, timing):
+        # [FUNCTION DOC] Records the timing for a config in the cache under its hashable form.
         self.cached_benchmark_results[triton_config_to_hashable(config)] = timing
 
     def lookup_in_cache(self, config):
+        # [FUNCTION DOC] Returns the cached timing for the config, or None if it was not benchmarked.
         return self.cached_benchmark_results.get(triton_config_to_hashable(config))
 
     def call_func(self, func, config):
+        # [FUNCTION DOC] Returns the cached timing for the config if present; otherwise calls the benchmark function, caches and returns its timing.
+        # Exceptions from the function propagate.
         found = self.lookup_in_cache(config)
         if found is not None:
             log.debug("  CACHED")
@@ -116,6 +135,9 @@ class CoordescTuner:
 
     @property
     def tunable_fields(self) -> list[str]:
+        # [FUNCTION DOC] Property returning the ordered list of field names to tune: optional combo-kernel fields from the metadata first, then
+        # block fields and num_warps, plus num_stages for matmul modes, waves_per_eu on HIP, NUM_STAGES for mix order reduction, with ZBLOCK
+        # removed for native matmul; frozen fields are filtered out. Evaluated on every access.
         out: list[str] = [
             "XBLOCK",
             "YBLOCK",
@@ -157,6 +179,9 @@ class CoordescTuner:
         return [f for f in out if f not in self.frozen_fields]
 
     def value_too_large(self, name: str, val: int) -> bool:
+        # [FUNCTION DOC] Returns whether a candidate value exceeds the limit for the field: per-field combo limits from the metadata first, then
+        # the block maximum for BLOCK fields, the warp maximum for num_warps, eight for waves_per_eu; other fields are never too large.
+        # KNOWN ISSUE: strip removes any of the characters in BLOCK from both ends rather than a suffix, which works for current names only by luck.
         field_limits = self.inductor_meta.get("combo_coordesc_field_limits")
         if isinstance(field_limits, dict) and name in field_limits:
             return val > field_limits[name]
@@ -173,6 +198,8 @@ class CoordescTuner:
         return False
 
     def value_too_small(self, name: str, val: int) -> bool:
+        # [FUNCTION DOC] Returns whether a candidate value is below the minimum: per-field minimums from the metadata for XBLOCK and R0_BLOCK,
+        # at least 16 for some blocks in native matmul mode, and always true for zero or negative values.
         min_block = None
         if name == "XBLOCK":
             min_block = self.inductor_meta.get("min_xblock")
@@ -190,6 +217,9 @@ class CoordescTuner:
         return val <= 0
 
     def get_neighbour_values(self, name, orig_val, radius=None, include_self=False):
+        # [FUNCTION DOC] Returns the neighbours of a value within the radius (default 1; at least 2 for NUM_STAGES). Doubling or adding one (stage
+        # fields) going up and halving or subtracting one going down, stopping at the first too-large or too-small value. Optionally appends
+        # the original value last. Raises AssertionError for a radius below 1.
         """
         Get neighbour values in 'radius' steps. The original value is not
         returned as its own neighbour.
@@ -206,6 +236,7 @@ class CoordescTuner:
             raise AssertionError(f"radius must be >= 1, got {radius}")
 
         def update(cur_val, inc=True):
+            # [FUNCTION DOC] HELPER: Steps a value up or down: plus or minus one for stage fields, double or integer half otherwise.
             if name in ["num_stages", "NUM_STAGES"]:
                 if inc:
                     return cur_val + 1
@@ -240,10 +271,13 @@ class CoordescTuner:
 
     @staticmethod
     def has_improvement(baseline, test):
+        # [FUNCTION DOC] Static. Returns true if the test timing exists and beats the baseline by more than 0.1 percent.
         threshold = 0.001  # 0.1%
         return test is not None and test < baseline * (1 - threshold)
 
     def is_valid_config(self, config) -> bool:
+        # [FUNCTION DOC] Returns whether a config satisfies mode constraints: for mix order reduction XBLOCK must not exceed RSPLIT_SIZE;
+        # for native matmul the block element count (using the persistent reduction block when R0_BLOCK is absent) must not exceed the triton tensor limit.
         if self.is_mix_order_reduction:
             # Mix order reduction has an extra constraint that
             # we should not tune XBLOCK beyond RSPLIT_SIZE
@@ -270,6 +304,9 @@ class CoordescTuner:
         # pyrefly: ignore [missing-attribute]
         config: "triton.Config",
     ) -> list["triton.Config"]:  # pyrefly: ignore [missing-attribute]
+        # [FUNCTION DOC] Builds the Cartesian product of neighbour values (radius from metadata, including the current value) over all tunable
+        # fields present on the config, and returns deep-copied valid candidates. Fields absent on the config are skipped.
+        # Raises AssertionError if a combination has an unexpected length.
         """Return the Cartesian product of neighbour values across every
         tunable field, as a list of valid candidate configs."""
         candidate_values_list = []
@@ -308,6 +345,8 @@ class CoordescTuner:
         best_config,
         best_timing,
     ):
+        # [FUNCTION DOC] Tries every config from get_all_tuning_directions against the best so far, adopting each improvement as it goes.
+        # Returns a tuple of whether anything improved, the best config and the best timing.
         """
         Check all directions. We only do this once the regular coordinate
         descent tuning find no better choices any more.
@@ -326,6 +365,8 @@ class CoordescTuner:
         return improved, best_config, best_timing
 
     def compare_config(self, func, candidate_config, best_config, best_timing):
+        # [FUNCTION DOC] Benchmarks the candidate (through the cache). Returns a pair of whether it improves on the best timing and the
+        # candidate timing; if the benchmark raises, returns false and infinity (exception logged at debug level, not propagated).
         """
         Check if candidate_config is better than best_config.
 
@@ -357,6 +398,8 @@ class CoordescTuner:
         config: "triton.Config",
         field: str,
     ) -> list["triton.Config"]:  # pyrefly: ignore [missing-attribute]
+        # [FUNCTION DOC] Returns valid deep-copied configs obtained by moving only the given field to each neighbour value.
+        # Raises AssertionError if the field is not present on the config.
         """Return every valid neighbour of ``config`` along ``field``
         only — the per-axis counterpart of ``get_neighbour_values``.
 
@@ -382,6 +425,9 @@ class CoordescTuner:
         baseline_config: "triton.Config",
         baseline_timing: float | None = None,
     ) -> "triton.Config":  # pyrefly: ignore  # missing-attribute
+        # [FUNCTION DOC] Runs coordinate descent from the baseline config: repeatedly sweeps each tunable field present on the best config,
+        # moving to improving neighbours immediately, until a sweep finds nothing; then, if enabled in the metadata, tries all directions
+        # once and continues if that improved. Benchmarks the baseline if its timing is not given. Returns the best config. Logs progress.
         """
         Perform coordinate descent autotuning starting from a baseline configuration.
         """
@@ -452,6 +498,9 @@ class CoordescTuner:
 
     @staticmethod
     def autotune_single_field(fn, init_val, min_val=None, max_val=None):
+        # [FUNCTION DOC] Static. Tunes one integer by repeatedly trying half and double of the current best (clamped to minimum, default 1,
+        # and maximum, default 2 to the 30th) and moving to a candidate whose benchmark result is lower, until no move helps. Results are
+        # memoized per call. Returns the best value.
         """
         fn is a function that takes the field value and returns the benchmarking result
         init_val is the starting point of autotuning.
@@ -462,6 +511,7 @@ class CoordescTuner:
         cache = {}
 
         def _bench(val):
+            # [FUNCTION DOC] HELPER: Returns the memoized benchmark result for a value, calling the function once per value.
             if val not in cache:
                 cache[val] = fn(val)
                 # print(f"split size {val} -> {cache[val]:.3f} ms")
