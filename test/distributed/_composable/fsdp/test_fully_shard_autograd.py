@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-GPU tests of fully_shard (FSDP2) autograd behavior: backward when some
+# forward outputs or submodules go unused, activations wrapped in non-tensor containers, and
+# per-parameter post-accumulate-grad hooks including optimizer-in-backward with and without CPU
+# offload. Each test trains a sharded model on local batch slices against a reference model on
+# the global batch and checks loss and sharded parameter parity. Defines TestFullyShardAutograd,
+# TestFullyShardPostAccGradHookMultiThread and TestFullyShardPostAccGradHookMultiProcess.
 
 import collections
 import copy
@@ -31,13 +37,20 @@ device_type = torch.device(get_devtype())
 
 
 class TestFullyShardAutograd(FSDPTest):
+    # [CLASS DOC] Multi-process tests (world size up to four ranks) of FSDP2 backward
+    # correctness against an unsharded reference model.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Number of ranks: the smaller of four and the available device count.
         return min(4, torch.get_device_module(device_type).device_count())
 
     def _reduce_1d_partial_grads(
         self, module: nn.Module, group: dist.ProcessGroup | None = None
     ) -> None:
+        # [FUNCTION DOC] HELPER: divides the gradients of all parameters that have one by the
+        # size of the given process group (default group when none is passed), converting summed
+        # per-rank gradients of the reference model into averages to match FSDP; modifies
+        # gradients in place.
         group = group or dist.distributed_c10d._get_default_group()
         for param in module.parameters():
             if param.grad is not None:
@@ -45,6 +58,8 @@ class TestFullyShardAutograd(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_unused_forward_output(self):
+        # [FUNCTION DOC] Runs the unused-forward-output check for each reshard_after_forward
+        # setting (true, false and an integer); needs at least two GPUs.
         """
         Tests that gradients propagate when running a backward where some
         forward output is not used to compute the loss, motivated by:
@@ -56,6 +71,10 @@ class TestFullyShardAutograd(FSDPTest):
         )
 
     def _test_unused_forward_output(self, reshard_after_forward: bool | int):
+        # [FUNCTION DOC] Wraps a two-output model with FSDP2, trains ten iterations comparing
+        # loss and sharded parameters with a reference model; the loss uses both outputs for the
+        # early iterations and only the first output afterwards, so the second output's gradient
+        # is absent. Gradient clearing alternates between setting to none and zeroing.
         torch.manual_seed(42)
         local_batch_size = 2
         global_batch_size, dim = (self.world_size * local_batch_size, 24)
@@ -91,6 +110,8 @@ class TestFullyShardAutograd(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_unused_forward_module(self):
+        # [FUNCTION DOC] Runs the unused-forward-module check for each reshard_after_forward
+        # setting; needs at least two GPUs.
         """
         Tests that gradients propagate when running a backward where some
         forward module is not used to compute the loss, motivated by:
@@ -102,6 +123,9 @@ class TestFullyShardAutograd(FSDPTest):
         )
 
     def _test_unused_forward_module(self, reshard_after_forward: bool | int):
+        # [FUNCTION DOC] Wraps a model whose second linear layer is never used with FSDP2 (each
+        # linear layer and the root sharded), trains ten iterations against a reference model
+        # and checks loss and sharded parameter parity every step.
         torch.manual_seed(42)
         local_batch_size, dim = (2, 24)
         global_batch_size = self.world_size * local_batch_size
@@ -133,6 +157,8 @@ class TestFullyShardAutograd(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_nontensor_activations(self):
+        # [FUNCTION DOC] Runs the non-tensor activation check for list, namedtuple, tuple and
+        # dict containers; needs at least two GPUs.
         """
         Tests that gradients propagate when running forward with nontensor
         data structures wrapping the activations. This is mainly to test the
@@ -144,14 +170,26 @@ class TestFullyShardAutograd(FSDPTest):
         )
 
     def _test_nontensor_activations(self, container_type: type):
+        # [FUNCTION DOC] Builds a stack of a converter into the given container type, three
+        # blocks that operate on the first element of the container, and a converter back to a
+        # tensor; shards every module and the root, then trains ten iterations checking loss and
+        # parameter parity with a reference.
         class Module(nn.Module):
+            # [CLASS DOC] HELPER: two-layer ReLU block that accepts a tensor wrapped in a list,
+            # namedtuple, tuple or dict and returns the transformed tensor wrapped in the same
+            # kind of container.
             def __init__(self, dim: int):
+                # [FUNCTION DOC] HELPER: creates two linear layers of the given width
+                # and a ReLU.
                 super().__init__()
                 self.lin1 = nn.Linear(dim, dim)
                 self.lin2 = nn.Linear(dim, dim)
                 self.relu = nn.ReLU()
 
             def forward(self, inp: Any):
+                # [FUNCTION DOC] HELPER: applies the block to the first element of the container
+                # (key x for dicts), rebuilding the same container type (namedtuple extra fields
+                # are kept); raises NotImplementedError for any other input type.
                 # Assume that the "0th" element of `inp` is a tensor, run some
                 # forward computation on it, and pack it back into the same
                 # data structure type as `inp`
@@ -169,14 +207,21 @@ class TestFullyShardAutograd(FSDPTest):
                     )
 
             def _forward(self, x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: applies linear, ReLU, linear, ReLU to a tensor.
                 return self.relu(self.lin2(self.relu(self.lin1(x))))
 
         class ToContainerType(nn.Module):
+            # [CLASS DOC] HELPER: module that wraps its input tensor in the configured
+            # container type.
             def __init__(self, container_type: type):
+                # [FUNCTION DOC] HELPER: stores the container type to produce.
                 super().__init__()
                 self.container_type = container_type
 
             def forward(self, x: torch.Tensor):
+                # [FUNCTION DOC] HELPER: returns the tensor wrapped in a list, a two-field
+                # namedtuple (second field ones), a tuple or a dict with key x; raises
+                # NotImplementedError for any other type.
                 if self.container_type is list:
                     return [x]
                 elif self.container_type is collections.namedtuple:
@@ -192,11 +237,17 @@ class TestFullyShardAutograd(FSDPTest):
                     )
 
         class FromContainerType(nn.Module):
+            # [CLASS DOC] HELPER: module that unwraps the first tensor from the configured
+            # container type.
             def __init__(self, container_type: type):
+                # [FUNCTION DOC] HELPER: stores the container type to unwrap.
                 super().__init__()
                 self.container_type = container_type
 
             def forward(self, x: torch.Tensor):
+                # [FUNCTION DOC] HELPER: returns the first element for list, namedtuple or tuple
+                # input and the value under key x for dict input; raises NotImplementedError for
+                # any other configured type.
                 if self.container_type in (list, collections.namedtuple, tuple):
                     return x[0]
                 elif self.container_type is dict:
@@ -243,14 +294,19 @@ class TestFullyShardAutograd(FSDPTest):
 
 
 class TestFullyShardPostAccGradHookMultiThread(FSDPTestMultiThread):
+    # [CLASS DOC] Two-rank multi-thread tests of post-accumulate-grad hooks on FSDP2 parameters.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Number of ranks: always two.
         return 2
 
     def test_post_acc_grad_hook_runs(self):
+        # [FUNCTION DOC] Shards a small MLP, registers a counting post-accumulate-grad hook on
+        # every parameter, runs one backward and checks each parameter's hook ran exactly once.
         param_name_to_hook_count = collections.defaultdict(int)
 
         def hook(param_name: str, param: torch.Tensor) -> None:
+            # [FUNCTION DOC] HELPER: increments the run count for the given parameter name.
             nonlocal param_name_to_hook_count
             param_name_to_hook_count[param_name] += 1
 
@@ -270,12 +326,18 @@ class TestFullyShardPostAccGradHookMultiThread(FSDPTestMultiThread):
 
 
 class TestFullyShardPostAccGradHookMultiProcess(FSDPTest):
+    # [CLASS DOC] Multi-process tests of optimizer-in-backward via post-accumulate-grad hooks on
+    # FSDP2 parameters (at most two ranks).
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Number of ranks: the smaller of two and the available device count.
         return min(torch.get_device_module(device_type).device_count(), 2)
 
     @skip_if_lt_x_gpu(2)
     def test_post_acc_grad_hook_optim_parity(self):
+        # [FUNCTION DOC] Runs the optimizer parity check with and without CPU offload; with
+        # offload the hook must see the reduced gradient rather than an in-flight copy. Needs at
+        # least two GPUs.
         """
         Tests parity of running the optimizer via the post-accumulate-grad
         hook vs. normally.
@@ -292,6 +354,11 @@ class TestFullyShardPostAccGradHookMultiProcess(FSDPTest):
         )
 
     def _test_post_acc_grad_hook_optim_parity(self, use_cpu_offload: bool):
+        # [FUNCTION DOC] Trains a transformer sharded with FSDP2 two ways: a reference using a
+        # normal optimizer and learning rate scheduler, and a test copy where a post-accumulate-
+        # grad hook steps a per-parameter optimizer and scheduler. After each of ten iterations
+        # checks losses and parameters are exactly equal. Returns early on HPU when offload is
+        # requested because pinned memory is unsupported.
         if use_cpu_offload and TEST_HPU:
             return  # pin_memory requires CUDA/XPU
         torch.manual_seed(42)
@@ -320,6 +387,8 @@ class TestFullyShardPostAccGradHookMultiProcess(FSDPTest):
             )
 
         def optim_hook(param: nn.Parameter) -> None:
+            # [FUNCTION DOC] HELPER: optimizer-in-backward hook: steps the parameter's own
+            # optimizer, clears its gradient and steps its learning rate scheduler.
             param_to_optim[param].step()
             param_to_optim[param].zero_grad()
             param_to_lr_scheduler[param].step()

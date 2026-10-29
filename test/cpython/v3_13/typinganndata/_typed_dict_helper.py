@@ -1,3 +1,6 @@
+# [MODULE DOC] HELPER: fixtures for get_type_hints on TypedDict classes inherited across modules.
+# Uses postponed annotations; defines Foo, a generic FooGeneric and VeryAnnotated (nested Annotated
+# around Required). No import-time side effects beyond class creation.
 """Used to test `get_type_hints()` on a cross-module inherited `TypedDict` class
 
 This script uses future annotations to postpone a type that won't be available
@@ -19,12 +22,17 @@ from typing import Annotated, Generic, Optional, Required, TypedDict, TypeVar
 OptionalIntType = Optional[int]
 
 class Foo(TypedDict):
+    # [CLASS DOC] HELPER: TypedDict with one key whose annotation is an alias for an optional int,
+    # resolved lazily because of postponed annotations.
     a: OptionalIntType
 
 T = TypeVar("T")
 
 class FooGeneric(TypedDict, Generic[T]):
+    # [CLASS DOC] HELPER: generic TypedDict whose single key is typed as the type variable or None.
     a: T | None
 
 class VeryAnnotated(TypedDict, total=False):
+    # [CLASS DOC] HELPER: non-total TypedDict whose single key stacks three Annotated layers
+    # around a Required int.
     a: Annotated[Annotated[Annotated[Required[int], "a"], "b"], "c"]

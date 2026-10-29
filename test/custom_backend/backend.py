@@ -1,3 +1,7 @@
+# [MODULE DOC] HELPER: builds and exports a module lowered to the custom_backend test backend.
+# Provides the library path lookup, a lowering helper and a tiny model; run as a program with
+# --export-module-to to load the shared library, lower the model and save it. No import-time
+# side effects.
 import argparse
 import os.path
 import sys
@@ -6,6 +10,9 @@ import torch
 
 
 def get_custom_backend_library_path():
+    # [FUNCTION DOC] HELPER: returns the absolute path of the custom backend shared library under
+    # the build directory of the current directory; file name depends on platform (dll on
+    # Windows, dylib on macOS, so otherwise). Raises AssertionError if the file is missing.
     """
     Get the path to the library containing the custom backend.
 
@@ -25,6 +32,11 @@ def get_custom_backend_library_path():
 
 
 def to_custom_backend(module):
+    # [FUNCTION DOC] HELPER: lowers a scripted module to the backend named custom_backend via the
+    # private C++ binding, compiling only forward with an empty compile spec; returns the lowered
+    # module.
+    # KNOWN ISSUE: the docstring names the binding for the test backend, but the code calls the
+    # general backend lowering binding with the backend name custom_backend.
     """
     This is a helper that wraps torch._C._jit_to_test_backend and compiles
     only the forward method with an empty compile spec.
@@ -42,16 +54,21 @@ def to_custom_backend(module):
 
 
 class Model(torch.nn.Module):
+    # [CLASS DOC] HELPER: stateless module computing the sum and difference of two inputs.
     """
     Simple model used for testing that to_backend API supports saving, loading,
     and executing in C++.
     """
 
     def forward(self, a, b):
+        # [FUNCTION DOC] HELPER: returns a tuple of (a + b, a - b).
         return (a + b, a - b)
 
 
 def main():
+    # [FUNCTION DOC] HELPER: parses the required --export-module-to option, loads the backend
+    # library into torch.ops (raises AssertionError if it is not listed as loaded), lowers a
+    # scripted Model and saves it to the given path.
     parser = argparse.ArgumentParser(description="Lower a Module to a custom backend")
     parser.add_argument("--export-module-to", required=True)
     options = parser.parse_args()

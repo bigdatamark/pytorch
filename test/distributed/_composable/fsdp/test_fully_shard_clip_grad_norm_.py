@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-GPU tests that clip_grad_norm_ on FSDP2 parameters (DTensor gradients)
+# matches a replicated reference model: 1D sharding with a transformer and 2D data parallel plus
+# tensor parallel with an MLP stack, over several norm types. Also checks the clipping
+# communicates with one all-reduce per mesh dimension. Defines a base test class and two world-
+# size specific classes.
 
 import copy
 import functools
@@ -29,6 +34,7 @@ device_type = torch.device(get_devtype())
 
 
 class _TestClipGradNormBase(FSDPTest):
+    # [CLASS DOC] HELPER: base class providing the shared clip-gradient-norm comparison routine.
     def _test_clip_grad_norm(
         self,
         max_norm: float | int,
@@ -40,6 +46,13 @@ class _TestClipGradNormBase(FSDPTest):
         inp: torch.Tensor,
         dp_mesh: DeviceMesh | None = None,
     ):
+        # [FUNCTION DOC] Runs ten iterations. Each iteration computes gradients on a reference
+        # model and the sharded model, checks that the gathered sharded gradients match the
+        # reference, checks some gradient norm exceeds max_norm so clipping is not vacuous,
+        # clips both with clip_grad_norm_, checks the total norms agree and that exactly one
+        # all-reduce per mesh dimension was issued, and checks every clipped gradient norm is at
+        # most max_norm and changed when non-zero. Uses a default 1D mesh over all ranks when
+        # dp_mesh is not given.
         vector_norm_fn = functools.partial(torch.linalg.vector_norm, ord=norm_type)
         dp_mesh = dp_mesh or init_device_mesh(device_type.type, (self.world_size,))
         torch.manual_seed(42 + dp_mesh.get_local_rank() + 1)
@@ -97,12 +110,17 @@ class _TestClipGradNormBase(FSDPTest):
 
 
 class TestClipGradNormWorldSize2(_TestClipGradNormBase):
+    # [CLASS DOC] Clip gradient norm tests with two ranks.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Number of ranks: the smaller of two and the available device count.
         return min(torch.get_device_module(device_type).device_count(), 2)
 
     @skip_if_lt_x_gpu(2)
     def test_clip_grad_norm_1d(self):
+        # [FUNCTION DOC] For each of norm types two, one and infinity, shards a dropout-free
+        # transformer per block and at the root against a replicated reference and runs the
+        # clipping comparison with maximum norm one. Needs at least two GPUs.
         for norm_type in (2, 1, float("inf")):
             torch.manual_seed(42)
             model_args = ModelArgs(dropout_p=0.0)
@@ -123,14 +141,21 @@ class TestClipGradNormWorldSize2(_TestClipGradNormBase):
 
 
 class TestClipGradNormWorldSize4(_TestClipGradNormBase):
+    # [CLASS DOC] Clip gradient norm tests with four ranks.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] Number of ranks: the smaller of four and the available device count.
         return min(torch.get_device_module(device_type).device_count(), 4)
 
     @skip_if_lt_x_gpu(4)
     @xfailIf(TEST_XPU)  # https://github.com/intel/torch-xpu-ops/issues/1661
     @skipIfRocmArch(MI350_ARCH)
     def test_clip_grad_norm_2d(self):
+        # [FUNCTION DOC] For each of norm types two, one, three and infinity, builds a two by
+        # two data and tensor parallel mesh and an MLP stack parallelized with FSDP2 and tensor
+        # parallelism against a reference replicated over the data parallel group; runs the
+        # clipping comparison with maximum norm 0.5. Needs four GPUs; expected to fail on XPU
+        # and skipped on a ROCm MI350 arch.
         for norm_type in (2, 1, 3, float("inf")):
             dp_size = 2
             global_mesh = init_device_mesh(
