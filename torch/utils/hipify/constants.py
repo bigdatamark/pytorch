@@ -1,3 +1,8 @@
+# [MODULE DOC] Integer constants once used to tag CUDA-to-HIP mapping entries with a conversion
+# type (CONV_*), a target API (API_*) or an unsupported marker (HIP_UNSUPPORTED).
+# Import-time side effect: emits a FutureWarning saying the module is unused since hipify 2.0.0.
+# KNOWN ISSUE: CONV_VERSION is assigned with a trailing comma, so it is the one-element tuple
+# holding 0 rather than the integer 0, unlike every other constant here.
 """Constants for annotations in the mapping.
 
 The constants defined here are used to annotate the mapping tuples in cuda_to_hip_mappings.py.

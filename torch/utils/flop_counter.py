@@ -1,4 +1,13 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Theoretical FLOP counting. Defines FlopCounterMode (a dispatch-mode context
+# manager that sums per-operator FLOP formulas, attributed per module via ModuleTracker), the
+# register_flop_formula decorator, formulas for matmul, convolution and attention (including
+# nested/varlen and flex attention helpers), and table-formatting helpers.
+# Import-time side effects: tries to import triton's JITFunction (logging a warning if missing
+# on a GPU build), builds the global flop_registry mapping, and registers the flex attention
+# formulas via _register_flex_attention_flops.
+# KNOWN ISSUE: flop_registry is first filled by decorators and then rebound to a literal mapping
+# that omits the varlen attention formulas, which are defined here but never registered.
 """Utilities for counting theoretical floating point operations.
 
 ``FlopCounterMode`` is a context manager that intercepts PyTorch operators and
@@ -117,6 +126,8 @@ except ImportError:
 aten = torch.ops.aten
 
 def get_shape(i):
+    # [FUNCTION DOC] Returns the shape of a tensor argument, or the argument itself unchanged
+    # if it is not a tensor. Used as the leaf mapper when converting formula inputs to shapes.
     if isinstance(i, torch.Tensor):
         return i.shape
     return i
@@ -124,19 +135,33 @@ def get_shape(i):
 flop_registry: dict[Any, Any] = {}
 
 def shape_wrapper(f):
+    # [FUNCTION DOC] HELPER: Wraps a formula f so it receives shapes instead of tensors. The
+    # wrapper maps tensors in the positional args, keyword args and out_val to their shapes and
+    # calls f with the output shape passed as the keyword argument out_shape.
     @wraps(f)
     def nf(*args, out_val=None, **kwargs):
+        # [FUNCTION DOC] HELPER: Converts args, kwargs and out_val to shapes and calls f.
         args, kwargs, out_shape = tree_map(get_shape, (args, kwargs, out_val))
         return f(*args, out_shape=out_shape, **kwargs)
     return nf
 
 def register_flop_formula(targets, get_raw=False) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    # [FUNCTION DOC] Returns a decorator that registers a FLOP formula for one target or a
+    # (nested) collection of targets in the global flop_registry. Targets must be operator
+    # overload packets, triton JIT functions or higher-order operators. Unless get_raw is true,
+    # the formula is wrapped so it sees shapes rather than tensors. The decorator returns the
+    # (possibly wrapped) formula. Raises ValueError for an unsupported target type and
+    # RuntimeError for a duplicate registration. Side effect: mutates flop_registry.
 
     def register_fun(flop_formula: Callable[_P, _T]) -> Callable[_P, _T]:
+        # [FUNCTION DOC] HELPER: Decorator body; optionally wraps the formula with shape_wrapper,
+        # registers it for every target and returns the formula.
         if not get_raw:
             flop_formula = shape_wrapper(flop_formula)
 
         def register(target) -> None:
+            # [FUNCTION DOC] HELPER: Validates one target's type and stores the formula for it in
+            # flop_registry. Raises ValueError for a bad type, RuntimeError if already registered.
             from torch._ops import HigherOrderOperator
 
             if not (isinstance(target, (torch._ops.OpOverloadPacket, _JITFunction, HigherOrderOperator))):
@@ -158,6 +183,8 @@ def register_flop_formula(targets, get_raw=False) -> Callable[[Callable[_P, _T]]
 
 @register_flop_formula(aten.mm)
 def mm_flop(a_shape, b_shape, *args, out_shape=None, **kwargs) -> int:
+    # [FUNCTION DOC] FLOPs of a matrix product of an (m, k) and a (k, n) shape: two operations
+    # per multiply-add, i.e. m * n * 2 * k. Raises AssertionError if the inner dimensions differ.
     """Count flops for matmul."""
     # Inputs should be a list of length 2.
     # Inputs contains the shapes of two matrices.
@@ -170,11 +197,15 @@ def mm_flop(a_shape, b_shape, *args, out_shape=None, **kwargs) -> int:
 
 @register_flop_formula(aten.addmm)
 def addmm_flop(self_shape, a_shape, b_shape, *args, **kwargs) -> int:
+    # [FUNCTION DOC] FLOPs of addmm: same as the matrix product of the two matrix shapes; the
+    # added bias or input shape is ignored.
     """Count flops for addmm."""
     return mm_flop(a_shape, b_shape)
 
 @register_flop_formula(aten.bmm)
 def bmm_flop(a_shape, b_shape, *args, **kwargs) -> int:
+    # [FUNCTION DOC] FLOPs of a batched matrix product of (b, m, k) and (b, k, n) shapes:
+    # b * m * n * 2 * k. Raises AssertionError if batch or inner dimensions differ.
     """Count flops for the bmm operation."""
     # Inputs should be a list of length 2.
     # Inputs contains the shapes of two tensor.
@@ -190,6 +221,8 @@ def bmm_flop(a_shape, b_shape, *args, **kwargs) -> int:
 
 @register_flop_formula(aten.baddbmm)
 def baddbmm_flop(self_shape, a_shape, b_shape, *args, **kwargs) -> int:
+    # [FUNCTION DOC] FLOPs of baddbmm: same as the batched matrix product of the two batched
+    # shapes; the added input shape is ignored.
     """Count flops for the baddbmm operation."""
     # Inputs should be a list of length 3.
     # Inputs contains the shapes of three tensors.
@@ -208,6 +241,8 @@ def _scaled_mm_flop(
     out_shape=None,
     **kwargs,
 ) -> int:
+    # [FUNCTION DOC] FLOPs of a scaled matrix product: same as the plain matrix product of the
+    # two operand shapes; scales, bias and dtype arguments are ignored.
     """Count flops for _scaled_mm."""
     return mm_flop(a_shape, b_shape)
 
@@ -218,6 +253,10 @@ def conv_flop_count(
     out_shape: list[int],
     transposed: bool = False,
 ) -> int:
+    # [FUNCTION DOC] FLOPs of a convolution given input, weight and output shapes (batch and
+    # channel first, then spatial dims). Computes product of spatial extents (taken from the
+    # input if transposed, else from the output) * product of filter sizes * batch * c_out *
+    # c_in * 2. Ignores bias and padding effects. Returns an integer.
     """Count flops for convolution.
 
     Note only multiplication is
@@ -256,6 +295,8 @@ def conv_flop_count(
                         aten._slow_conv2d_forward,
                         aten.convolution_overrideable])
 def conv_flop(x_shape, w_shape, _bias, _stride, _padding, _dilation, transposed, *args, out_shape=None, **kwargs) -> int:
+    # [FUNCTION DOC] Formula for forward convolution ops: delegates to conv_flop_count with the
+    # input, weight and output shapes and the transposed flag. Other arguments are ignored.
     """Count flops for convolution."""
     # pyrefly: ignore [bad-argument-type]
     return conv_flop_count(x_shape, w_shape, out_shape, transposed=transposed)
@@ -276,8 +317,13 @@ def conv_backward_flop(
         output_mask,
         out_shape,
         **kwargs) -> int:
+    # [FUNCTION DOC] Formula for convolution backward. Sums the cost of the input gradient (a
+    # convolution of the output gradient with the weight, with transposition flipped) if the
+    # first output mask entry is set, and of the weight gradient (a convolution of input and
+    # output gradient with channel/batch dims swapped) if the second is set. Returns an integer.
 
     def t(shape):
+        # [FUNCTION DOC] HELPER: Returns a shape list with the first two dimensions swapped.
         return [shape[1], shape[0]] + list(shape[2:])
     flop_count = 0
 
@@ -367,6 +413,10 @@ def conv_backward_flop(
     return flop_count
 
 def sdpa_flop_count(query_shape, key_shape, value_shape):
+    # [FUNCTION DOC] FLOPs of scaled dot-product attention forward for (batch, heads, seq, dim)
+    # shapes: the query-key score matmul plus the score-value matmul, with key/value heads
+    # broadcast to the query head count (GQA). Ignores softmax and masking. Raises
+    # AssertionError for incompatible shapes or when query heads are not a multiple of kv heads.
     """
     Count flops for self-attention.
 
@@ -398,12 +448,17 @@ def sdpa_flop_count(query_shape, key_shape, value_shape):
                         aten._scaled_dot_product_flash_attention,
                         aten._scaled_dot_product_cudnn_attention])
 def sdpa_flop(query_shape, key_shape, value_shape, *args, out_shape=None, **kwargs) -> int:
+    # [FUNCTION DOC] Formula for fused SDPA forward ops; delegates to sdpa_flop_count and does
+    # not account for causal masking.
     """Count flops for self-attention."""
     # NB: We aren't accounting for causal attention here
     return sdpa_flop_count(query_shape, key_shape, value_shape)
 
 
 def _offsets_to_lengths(offsets, max_len):
+    # [FUNCTION DOC] HELPER: Converts cumulative sequence offsets to a list of per-sequence
+    # lengths via differences. For fake, functional or meta offsets the values are unknown, so
+    # it returns the worst case: max_len repeated once per sequence.
     """
     If the offsets tensor is fake, then we don't know the actual lengths.
     In that case, we can just assume the worst case; each batch has max length.
@@ -426,6 +481,13 @@ def _unpack_flash_attention_nested_shapes(
     max_q,
     max_k,
 ) -> Iterator[tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...] | None]]:
+    # [FUNCTION DOC] HELPER: Generator yielding (query, key, value, grad_out) shapes for a flash
+    # attention call. With cumulative sequence offsets (jagged input of 3D tensors) it yields one
+    # 4D shape set per batch element using lengths from the offsets (worst case max length for
+    # fake inputs, an overestimate); otherwise yields the original shapes once. Grad_out shape is
+    # None when no gradient is given. Raises AssertionError on rank or shape mismatches.
+    # KNOWN ISSUE: the later checks that cum_seq_q is not None are dead code inside a branch that
+    # already requires it.
     """
     Given inputs to a flash_attention_(forward|backward) kernel, this will handle behavior for
     NestedTensor inputs by effectively unbinding the NestedTensor and yielding the shapes for
@@ -478,6 +540,12 @@ def _unpack_efficient_attention_nested_shapes(
     max_seqlen_q,
     max_seqlen_k,
 ) -> Iterator[tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...] | None]]:
+    # [FUNCTION DOC] HELPER: Same as the flash variant but for the memory-efficient attention
+    # kernels, whose jagged inputs are 4D tensors (total tokens, 1, heads, dim) and whose offsets
+    # are the cu_seqlens arguments. Yields (query, key, value, grad_out) shapes per batch element
+    # or the original shapes once. Raises AssertionError on rank or shape mismatches.
+    # KNOWN ISSUE: the later checks that cu_seqlens_q is not None are dead code inside a branch
+    # that already requires it.
     """
     Given inputs to a efficient_attention_(forward|backward) kernel, this will handle behavior for
     NestedTensor inputs by effectively unbinding the NestedTensor and yielding the shapes for
@@ -535,6 +603,9 @@ def _flash_attention_forward_flop(
     out_shape=None,
     **kwargs
 ) -> int:
+    # [FUNCTION DOC] Raw-argument formula for the flash attention forward op. Transposes dense 4D
+    # inputs to the (batch, heads, seq, dim) layout, expands jagged inputs per batch element, and
+    # sums the attention FLOPs of each. Ignores causal masking.
     """Count flops for self-attention."""
     # NB: We aren't accounting for causal attention here
     if cum_seq_q is None and query.ndim == 4:
@@ -571,6 +642,9 @@ def _efficient_attention_forward_flop(
     *args,
     **kwargs
 ) -> int:
+    # [FUNCTION DOC] Raw-argument formula for the memory-efficient attention forward op. Expands
+    # jagged inputs per batch element and sums the attention FLOPs of each. Ignores causal
+    # masking and the attention bias.
     """Count flops for self-attention."""
     # NB: We aren't accounting for causal attention here
     # in case this is a nested tensor, we unpack the individual batch elements
@@ -591,6 +665,10 @@ def _efficient_attention_forward_flop(
 
 
 def sdpa_backward_flop_count(grad_out_shape, query_shape, key_shape, value_shape):
+    # [FUNCTION DOC] FLOPs of attention backward for (batch, heads, seq, dim) shapes: recomputed
+    # scores plus the matmuls for the gradients of value, scores, query and key (five batched
+    # matmuls in total), with kv heads broadcast to query heads. Raises AssertionError for
+    # incompatible shapes or head counts.
     b, h_q, s_q, d_q = query_shape
     _b2, h_kv, s_k, _d2 = key_shape
     _b3, _h3, _s3, d_v = value_shape
@@ -631,6 +709,7 @@ def sdpa_backward_flop_count(grad_out_shape, query_shape, key_shape, value_shape
                         aten._scaled_dot_product_flash_attention_backward,
                         aten._scaled_dot_product_cudnn_attention_backward])
 def sdpa_backward_flop(grad_out_shape, query_shape, key_shape, value_shape, *args, out_shape=None, **kwargs) -> int:
+    # [FUNCTION DOC] Formula for fused SDPA backward ops; delegates to sdpa_backward_flop_count.
     """Count flops for self-attention backward."""
     return sdpa_backward_flop_count(grad_out_shape, query_shape, key_shape, value_shape)
 
@@ -649,6 +728,9 @@ def _flash_attention_backward_flop(
     *args,
     **kwargs,
 ) -> int:
+    # [FUNCTION DOC] Raw-argument formula for the flash attention backward op. Transposes dense 4D
+    # inputs to the (batch, heads, seq, dim) layout, expands jagged inputs per batch element, and
+    # sums the backward attention FLOPs of each. Ignores causal masking.
     if cum_seq_q is None and query.ndim == 4:
         grad_out = grad_out.transpose(-2, -3)
         query = query.transpose(-2, -3)
@@ -687,6 +769,9 @@ def _efficient_attention_backward_flop(
     *args,
     **kwargs,
 ) -> int:
+    # [FUNCTION DOC] Raw-argument formula for the memory-efficient attention backward op. Expands
+    # jagged inputs per batch element and sums the backward attention FLOPs of each. Ignores
+    # causal masking and the attention bias.
     # in case this is a nested tensor, we unpack the individual batch elements
     # and then sum the flops per batch element
     shapes = _unpack_efficient_attention_nested_shapes(
@@ -706,12 +791,17 @@ def _efficient_attention_backward_flop(
 
 
 def _register_flex_attention_flops() -> None:
+    # [FUNCTION DOC] HELPER: Registers FLOP formulas for the flex attention forward and backward
+    # higher-order operators (imported lazily). Each formula is the dense attention FLOP count
+    # scaled down by an optional sparsity hint from the node metadata. Mutates flop_registry.
     from torch._higher_order_ops.flex_attention import (
         flex_attention,
         flex_attention_backward,
     )
 
     def _get_sparsity_hint(kwargs: dict[str, Any]) -> float:
+        # [FUNCTION DOC] HELPER: Reads the sparsity hint from the custom metadata of the node
+        # metadata in kwargs, clamped to the range 0 to 1; returns 0.0 if absent.
         node_meta = kwargs.get("_node_meta")
         if node_meta is None:
             return 0.0
@@ -724,6 +814,8 @@ def _register_flex_attention_flops() -> None:
     def flex_attention_forward_flop(
         query, key, value, *args, out_val=None, **kwargs
     ) -> int:
+        # [FUNCTION DOC] Flex attention forward formula: dense attention FLOPs reduced by the
+        # sparsity fraction (truncated to an integer).
         flops = sdpa_flop_count(query.shape, key.shape, value.shape)
         sparsity = _get_sparsity_hint(kwargs)
         return int(flops * (1.0 - sparsity)) if sparsity > 0 else flops
@@ -732,6 +824,8 @@ def _register_flex_attention_flops() -> None:
     def flex_attention_backward_flop(
         query, key, value, out, logsumexp, grad_out, *args, out_val=None, **kwargs
     ) -> int:
+        # [FUNCTION DOC] Flex attention backward formula: dense attention backward FLOPs (using
+        # the output shape if grad_out is None) reduced by the sparsity fraction.
         grad_out_shape = grad_out.shape if grad_out is not None else out.shape
         flops = sdpa_backward_flop_count(
             grad_out_shape, query.shape, key.shape, value.shape
@@ -752,6 +846,9 @@ def _varlen_attn_forward_flop(
     out_val=None,
     **kwargs,
 ) -> int:
+    # [FUNCTION DOC] HELPER: Raw-argument formula for variable-length attention forward. Expands
+    # the packed inputs per sequence using the cumulative offsets (the query offsets are reused
+    # for keys if none are given) and sums the attention FLOPs. Not registered in this module.
     """Count flops for varlen_attn forward."""
     sizes = _unpack_flash_attention_nested_shapes(
         query=query,
@@ -781,6 +878,8 @@ def _varlen_attn_out_flop(
     out_val=None,
     **kwargs,
 ) -> int:
+    # [FUNCTION DOC] HELPER: Formula for the variable-length attention variant with an output
+    # buffer argument; ignores the buffer and delegates to the varlen forward formula.
     """Count flops for varlen_attn_out forward."""
     return _varlen_attn_forward_flop(
         query, key, value, cu_seq_q, cu_seq_k, max_q, max_k,
@@ -802,6 +901,8 @@ def _varlen_attn_backward_flop(
     out_val=None,
     **kwargs,
 ) -> int:
+    # [FUNCTION DOC] HELPER: Raw-argument formula for variable-length attention backward. Expands
+    # the packed inputs per sequence and sums the backward attention FLOPs.
     """Count flops for varlen_attn backward."""
     sizes = _unpack_flash_attention_nested_shapes(
         query=query,
@@ -847,6 +948,7 @@ _register_flex_attention_flops()
 
 
 def normalize_tuple(x):
+    # [FUNCTION DOC] Returns x unchanged if it is a tuple, otherwise a one-element tuple holding x.
     if not isinstance(x, tuple):
         return (x,)
     return x
@@ -856,6 +958,8 @@ def normalize_tuple(x):
 suffixes = ["", "K", "M", "B", "T"]
 # Thanks BingChat!
 def get_suffix_str(number):
+    # [FUNCTION DOC] Picks the magnitude suffix (none, K, M, B, T) for a number from its decimal
+    # digit count, such that values just over a power of 1000 stay in the lower unit.
     # Find the index of the appropriate suffix based on the number of digits
     # with some additional overflow.
     # i.e. 1.01B should be displayed as 1001M, not 1.001B
@@ -863,6 +967,9 @@ def get_suffix_str(number):
     return suffixes[index]
 
 def convert_num_with_suffix(number, suffix):
+    # [FUNCTION DOC] Divides number by the power of 1000 for the suffix and returns a string with
+    # three decimals followed by the suffix. Raises ValueError for an unknown suffix.
+    # KNOWN ISSUE: an inline comment says two decimal places but the format uses three.
     index = suffixes.index(suffix)
     # Divide the number by 1000^index and format it to two decimal places
     value = f"{number / 1000 ** index:.3f}"
@@ -870,13 +977,19 @@ def convert_num_with_suffix(number, suffix):
     return value + suffixes[index]
 
 def convert_to_percent_str(num, denom) -> str:
+    # [FUNCTION DOC] Formats num / denom as a percentage string with two decimals; returns "0%"
+    # when the denominator is zero.
     if denom == 0:
         return "0%"
     return f"{num / denom:.2%}"
 
 def _pytreeify_preserve_structure(f):
+    # [FUNCTION DOC] HELPER: Wraps f (taking flat positional args, returning a flat sequence) so
+    # that it accepts a nested structure, flattens it, calls f, and rebuilds the result in the
+    # original structure.
     @wraps(f)
     def nf(args):
+        # [FUNCTION DOC] HELPER: Flattens args, calls f, and unflattens the output to match.
         flat_args, spec = tree_flatten(args)
         out = f(*flat_args)
         return tree_unflatten(out, spec)
@@ -885,6 +998,11 @@ def _pytreeify_preserve_structure(f):
 
 
 class FlopCounterMode:
+    # [CLASS DOC] Context manager that counts FLOPs of operators run inside it. State: flop_counts
+    # (module name -> operator -> count, always including "Global"), depth and display options,
+    # the per-instance flop_registry (global registry plus custom mappings), a ModuleTracker for
+    # attribution, and the active dispatch mode (None outside the context). Not reentrant.
+    # Key methods: get_total_flops, get_flop_counts, get_table, __enter__, __exit__.
     """Count theoretical FLOPs for operators that run inside the context.
 
     ``FlopCounterMode`` uses ``TorchDispatchMode`` to intercept operations and
@@ -917,6 +1035,10 @@ class FlopCounterMode:
             depth: int = 2,
             display: bool = True,
             custom_mapping: dict[Any, Any] | None = None) -> None:
+        # [FUNCTION DOC] Sets up an empty counter. Args: mods (deprecated, warns if given), depth
+        # (module nesting shown in the table), display (print the table on exit), custom_mapping
+        # (extra operator -> formula entries, wrapped to receive shapes unless marked raw). The
+        # instance registry is a snapshot of the global registry merged with the custom entries.
         super().__init__()
         self.flop_counts: dict[str, dict[Any, int]] = defaultdict(lambda: defaultdict(int))
         self.depth = depth
@@ -933,9 +1055,12 @@ class FlopCounterMode:
         self.mod_tracker = ModuleTracker()
 
     def get_total_flops(self) -> int:
+        # [FUNCTION DOC] Returns the sum of all operator counts recorded under "Global".
         return sum(self.flop_counts['Global'].values())
 
     def get_flop_counts(self) -> dict[str, dict[Any, int]]:
+        # [FUNCTION DOC] Returns a plain-dict copy of the counts, mapping module name to a mapping
+        # of operator to FLOPs. The "Global" entry holds totals across all modules.
         """Return the flop counts as a dictionary of dictionaries.
 
         The outer
@@ -948,6 +1073,11 @@ class FlopCounterMode:
         return {k: dict(v) for k, v in self.flop_counts.items()}
 
     def get_table(self, depth=None):
+        # [FUNCTION DOC] Builds a text table (module, FLOP, percent of total) of the recorded
+        # counts, with operator rows under each module, limited to the given nesting depth
+        # (default: the instance depth). The Global row is shown first only if some FLOPs are not
+        # already covered by a module. Returns the formatted string; imports tabulate lazily and
+        # sets its whitespace-preserving option globally. Shows a zero row if nothing was counted.
         if depth is None:
             depth = self.depth
         if depth is None:
@@ -964,6 +1094,9 @@ class FlopCounterMode:
         is_global_subsumed = False
 
         def process_mod(mod_name, depth):
+            # [FUNCTION DOC] HELPER: Returns table rows for one module: a total row followed by
+            # one row per operator, indented by depth. Also records (nonlocal) whether this
+            # module's total already covers the global total.
             nonlocal is_global_subsumed
 
             total_flops = sum(self.flop_counts[mod_name].values())
@@ -1011,6 +1144,8 @@ class FlopCounterMode:
 
     # NB: This context manager is NOT reentrant
     def __enter__(self):
+        # [FUNCTION DOC] Clears previous counts, starts module tracking and activates the dispatch
+        # mode so operators are counted. Returns self. Re-entering while active is unsupported.
         self.flop_counts.clear()
         self.mod_tracker.__enter__()
         self.mode = _FlopCounterMode(self)
@@ -1018,6 +1153,9 @@ class FlopCounterMode:
         return self
 
     def __exit__(self, *args):
+        # [FUNCTION DOC] Deactivates the dispatch mode and module tracking, and prints the table
+        # to standard output if display is enabled. Returns the dispatch mode's exit result.
+        # Raises AssertionError if the context was never entered.
         if self.mode is None:
             raise AssertionError("Internal error: FlopCounter.__exit__ called but mode is None")
         b = self.mode.__exit__(*args)
@@ -1028,6 +1166,9 @@ class FlopCounterMode:
         return b
 
     def _count_flops(self, func_packet, out, args, kwargs):
+        # [FUNCTION DOC] HELPER: If a formula is registered for func_packet, evaluates it with the
+        # call arguments and output and adds the result to the count of every module currently
+        # on the tracker stack (including Global). Returns out unchanged.
         if func_packet in self.flop_registry:
             flop_count_func = self.flop_registry[func_packet]
             flop_count = flop_count_func(*args, **kwargs, out_val=out)  # type: ignore[operator]
@@ -1036,12 +1177,21 @@ class FlopCounterMode:
         return out
 
 class _FlopCounterMode(TorchDispatchMode):
+    # [CLASS DOC] HELPER: Dispatch mode used by FlopCounterMode. Holds a reference to the counter,
+    # intercepts operators (including higher-order ones), decomposes unregistered ones when
+    # possible, executes them and records FLOPs on the counter.
     supports_higher_order_operators = True
 
     def __init__(self, counter: FlopCounterMode) -> None:
+        # [FUNCTION DOC] HELPER: Stores the owning counter that receives the FLOP counts.
         self.counter = counter
 
     def _execute_with_isolated_flop_counting(self, branch_fn, operands):
+        # [FUNCTION DOC] HELPER: Runs branch_fn on operands under this mode, returning the result
+        # and a copy of the counts after execution, then restores the counter's earlier counts.
+        # KNOWN ISSUE: the copies are shallow, so inner per-operator mappings for module keys
+        # that already existed are shared and still mutated by the branch; the restore does not
+        # fully isolate them and the returned counts include earlier counts.
         """Execute a branch function and capture its FLOP counts without
         affecting self.counter.flop_counts
 
@@ -1062,6 +1212,13 @@ class _FlopCounterMode(TorchDispatchMode):
         return result, flop_counts
 
     def _handle_higher_order_ops(self, func, types, args, kwargs):
+        # [FUNCTION DOC] HELPER: Handles higher-order operators. For triton kernel wrappers,
+        # resolves the underlying JIT function and counts it via the registry. For conditionals,
+        # runs both branches in isolation and records the per-operator maximum of the two counts
+        # (an upper bound), returning the true-branch output. Returns NotImplemented for other
+        # operators or if a branch returns NotImplemented.
+        # KNOWN ISSUE: merged counts are applied with a mapping update that overwrites, rather
+        # than adds to, any existing count of the same operator under the same module key.
         is_triton = func in {torch.ops.higher_order.triton_kernel_wrapper_mutation,
                              torch.ops.higher_order.triton_kernel_wrapper_functional}
         if is_triton:
@@ -1123,6 +1280,10 @@ class _FlopCounterMode(TorchDispatchMode):
             return NotImplemented
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Dispatch hook. Skips size/stride/contiguity metadata queries (returns
+        # NotImplemented), routes higher-order operators to their handler, tries to decompose
+        # unregistered operators under this mode, otherwise runs the operator and counts its FLOPs
+        # by overload packet. Returns the operator output.
         kwargs = kwargs if kwargs else {}
 
         # Skip ops from non-standard dispatch_sizes_strides_policy such as NJT

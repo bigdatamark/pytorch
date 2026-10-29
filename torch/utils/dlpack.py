@@ -1,3 +1,6 @@
+# [MODULE DOC] DLPack interop helpers: the DLDeviceType enum of DLPack device codes, a read-only
+# tensor wrapper for DLPack export, and from_dlpack, which imports external tensors or capsules.
+# Also attaches documentation to the C-level to_dlpack function at import time (side effect).
 from typing import Any
 
 import torch
@@ -13,6 +16,9 @@ __all__ = [
 ]
 
 class DLDeviceType(enum.IntEnum):
+    # [CLASS DOC] Integer enumeration of DLPack device type codes, mirroring the DLPack
+    # specification header. Members compare equal to plain ints, so they can be matched against
+    # the device type half of the pair returned by a __dlpack_device__ method.
     # Enums as in DLPack specification (aten/src/ATen/dlpack.h)
     kDLCPU = 1,
     kDLCUDA = 2,
@@ -32,6 +38,10 @@ class DLDeviceType(enum.IntEnum):
 
 
 class ReadOnlyTensorWrapper(torch.Tensor):
+    # [CLASS DOC] Tensor subclass that shares storage with a source tensor and only allows the
+    # two DLPack protocol methods; any other torch function raises RuntimeError. Class attributes
+    # hold the const C exchange API and the allowed function set. Both export paths mark the
+    # exported data read-only. Holds no per-instance state of its own.
     r"""A zero-copy, read-only view of a tensor for DLPack interop only.
 
     Wrapping a tensor with ``ReadOnlyTensorWrapper`` declares the intent that
@@ -74,10 +84,15 @@ class ReadOnlyTensorWrapper(torch.Tensor):
 
     @staticmethod
     def __new__(cls, tensor: torch.Tensor) -> "ReadOnlyTensorWrapper":
+        # [FUNCTION DOC] Creates the wrapper by reinterpreting the given tensor as this subclass.
+        # No data is copied; storage is shared. Returns the new wrapper tensor.
         return tensor.as_subclass(cls)
 
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Gatekeeper for all torch functions applied to the wrapper. If func is one
+        # of the allowed DLPack methods, calls it with subclass dispatch disabled and returns the
+        # result. Otherwise raises RuntimeError naming the rejected function.
         if func in cls._DLPACK_ALLOWED:
             # Run as a plain tensor so the export internals (property accesses,
             # is_conj(), etc.) are not re-intercepted and re-blocked.
@@ -90,6 +105,9 @@ class ReadOnlyTensorWrapper(torch.Tensor):
         )
 
     def __dlpack__(self, *, max_version=None, **kwargs):  # type: ignore[override]
+        # [FUNCTION DOC] Exports the tensor as a DLPack capsule marked read-only. Defaults
+        # max_version to (1, 0), since only the versioned protocol can carry the read-only flag.
+        # Extra keyword arguments are forwarded to the base implementation. Returns the capsule.
         # The capsule path can only carry read-only on the versioned protocol.
         if max_version is None:
             max_version = (1, 0)
@@ -127,6 +145,16 @@ def from_dlpack(
     device: _Device | None = None,
     copy: bool | None = None
 ) -> 'torch.Tensor':
+    # [FUNCTION DOC] Converts an external tensor (object with __dlpack__) or a raw DLPack capsule
+    # to a torch.Tensor sharing memory. For objects: queries the producer device, validates the
+    # optional device (string or torch.device) and copy flag, adds the current CUDA/ROCm stream
+    # when applicable, then calls __dlpack__ with progressively fewer keyword arguments
+    # (max_version, then copy, then dl_device) as TypeErrors occur. Afterwards it clones if a copy
+    # was requested but the producer ignored it, and moves the tensor if the device differs.
+    # Raises ValueError for a cross-device move with copy=False, and AssertionError for a bad
+    # device type or for device/copy given together with a capsule.
+    # KNOWN ISSUE: a TypeError raised inside a producer for unrelated reasons is silently swallowed
+    # and retried with fewer arguments; the final attempt lets its error propagate.
     """from_dlpack(ext_tensor) -> Tensor
 
     Converts a tensor from an external library into a ``torch.Tensor``.
