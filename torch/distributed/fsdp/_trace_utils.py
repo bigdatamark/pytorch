@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Support for recording forward execution order of modules and parameters
+# via torch.fx symbolic tracing: a tracing config dataclass, record types, and a tracer
+# patcher that hooks call_module and create_proxy. No import-time side effects.
 import functools
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -11,6 +14,8 @@ import torch.nn as nn
 
 @dataclass
 class TracingConfig:
+    # [CLASS DOC] Dataclass holding symbolic tracing options: tracer (an fx Tracer, default a
+    # fresh torch.fx.Tracer) and optional concrete_args mapping passed to Tracer.trace.
     """
     This represents a symbolic tracing configuration.
 
@@ -34,6 +39,8 @@ class TracingConfig:
 
 
 class _ParamUsageInfo(NamedTuple):
+    # [CLASS DOC] HELPER: Immutable record of a module plus a list of (name, parameter) pairs
+    # used together, either parameters used directly in ops or a submodule's full set.
     """
     This is used for ``_ExecutionInfo.module_to_param_usage_infos`` to record
     execution information. The ``dict`` maps modules to a list of these
@@ -57,6 +64,9 @@ class _ParamUsageInfo(NamedTuple):
 
 
 class _ExecutionInfo:
+    # [CLASS DOC] HELPER: Mutable record of forward execution order gathered during tracing:
+    # current module, module forward order, per-module parameter usage lists, parameter
+    # first-use order, and a visited set kept in sync with that order.
     """
     This represents the execution order information from the forward pass.
 
@@ -79,6 +89,8 @@ class _ExecutionInfo:
     """
 
     def __init__(self, root_module: nn.Module) -> None:
+        # [FUNCTION DOC] HELPER: Initialize with root_module as current module and first entry of
+        # the forward order, an empty usage list for it, and empty parameter order/visited set.
         self.curr_module: nn.Module = root_module
         self.module_forward_order: list[nn.Module] = [root_module]
         self.module_to_param_usage_infos: dict[nn.Module, list[_ParamUsageInfo]] = {
@@ -89,11 +101,18 @@ class _ExecutionInfo:
 
 
 class _ExecOrderTracer:
+    # [CLASS DOC] HELPER: Patches an fx Tracer so tracing records execution order into an
+    # _ExecutionInfo kept in exec_info (None until patch_tracer is entered).
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Set exec_info to None.
         self.exec_info: _ExecutionInfo | None = None
 
     @contextmanager
     def patch_tracer(self, tracer: torch.fx.Tracer, root_module: nn.Module):
+        # [FUNCTION DOC] HELPER: Context manager that creates a fresh _ExecutionInfo for
+        # root_module and temporarily replaces the tracer's call_module and create_proxy with
+        # recording versions (bound to a name-to-parameter map of the root). Originals are
+        # restored on exit even if tracing raises. Mutates the tracer and self.exec_info.
         self.exec_info = _ExecutionInfo(root_module)
         orig_call_module = tracer.call_module
         orig_create_proxy = tracer.create_proxy
@@ -123,6 +142,11 @@ class _ExecOrderTracer:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> Any:
+        # [FUNCTION DOC] HELPER: Replacement for call_module. Appends module to the forward order;
+        # if it has parameters, records a usage entry for the current (parent) module; makes
+        # module current with an empty usage list, calls the original call_module, restores
+        # the previous current module, and returns the original result.
+        # Raises AssertionError if the parent module was not previously registered.
         """
         Overrides ``call_module`` to save execution information to
         ``exec_info``. Note that ``call_module`` is called during symbolic
@@ -172,6 +196,11 @@ class _ExecOrderTracer:
         type_expr: Any | None = None,
         proxy_factory_fn: Callable[[torch.fx.Node], torch.fx.Proxy] | None = None,
     ) -> torch.fx.Proxy:
+        # [FUNCTION DOC] HELPER: Replacement for create_proxy. Creates the proxy via the original,
+        # then records parameter usage for the current module: for function/method calls,
+        # any argument proxy whose target names a root parameter is collected as one usage
+        # group; for module calls, all of the current module's parameters are recorded.
+        # First-time parameters are appended to the parameter forward order. Returns proxy.
         """
         Overrides ``create_proxy`` to save execution information to
         ``exec_info``. Note that ``create_proxy`` is called during symbolic

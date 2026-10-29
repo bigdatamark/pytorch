@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Implements unsharding of FSDP parameters for summon_full_params-style use:
+# context managers that unshard (and optionally offload, write back, include grads) the
+# flat parameters of one or many FSDP states, plus helpers to register/deregister the flat
+# parameter and original parameters on a module. Defines FLAT_PARAM, the attribute name.
 import contextlib
 import warnings
 from collections.abc import Generator
@@ -36,6 +40,10 @@ def _writeback_to_local_shard(
     handle: FlatParamHandle,
     writeback_grad: bool,
 ):
+    # [FUNCTION DOC] HELPER: Under no-grad, copy this rank's shard of the unsharded flat parameter
+    # back into the stored local shard (and, if writeback_grad and a sharded grad exists, the
+    # grad shard). Sharded strategies use the unpadded shard; NO_SHARD uses the tensor as is.
+    # Raises AssertionError if a sharded grad exists but flat_param.grad is None.
     """
     For the handle, writes back this rank's shard of the unsharded
     flattened parameter to the sharded flattened parameter. If
@@ -47,6 +55,8 @@ def _writeback_to_local_shard(
     """
 
     def _get_shard(flat_param_or_grad: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Return this rank's unpadded shard of the tensor for sharded
+        # strategies, otherwise the tensor itself.
         if handle.uses_sharded_strategy:
             # For sharded strategies, get the *unpadded* shard instead of
             # the *padded* shard to persist user changes to the padding
@@ -73,6 +83,8 @@ def _writeback_to_local_shard(
 
 
 def _deregister_flat_param(state: _FSDPState, module: nn.Module) -> None:
+    # [FUNCTION DOC] HELPER: If the module has FSDP params, remove the flat parameter entry from
+    # the wrapped module's parameter mapping (no error if absent). Mutates the module.
     """
     De-registers the flattened parameter from the wrapped module, hiding it
     from ``nn.Module`` methods.
@@ -87,6 +99,8 @@ def _deregister_flat_param(state: _FSDPState, module: nn.Module) -> None:
 
 
 def _register_flat_param(state: _FSDPState, module: nn.Module) -> None:
+    # [FUNCTION DOC] HELPER: If the module has FSDP params, put the handle's flat parameter into
+    # the wrapped module's parameter mapping under FLAT_PARAM. Mutates the module.
     """
     Registers the flattened parameter to the wrapped module, making it
     visible to ``nn.Module`` methods.
@@ -103,6 +117,10 @@ def _register_flat_param(state: _FSDPState, module: nn.Module) -> None:
 
 @contextlib.contextmanager
 def _unflatten_as_params(state: _FSDPState, module: nn.Module) -> Generator:
+    # [FUNCTION DOC] HELPER: Context manager (flat parameter must be unsharded). With no handle it
+    # just yields. Otherwise deregisters the flat parameter, enters the handle's
+    # unflatten-as-params context, and on exit re-registers the flat parameter unless
+    # original parameters are in use.
     """
     Assumes that the flattened parameter is unsharded. When in the context,
     de-registers the flattened parameter and unflattens the original
@@ -131,6 +149,9 @@ def _validate_unshard_params_args(
     offload_to_cpu: bool,
     with_grads: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Validate argument combinations. Raises NotImplementedError for
+    # with_grads with offload_to_cpu or without original params, offload_to_cpu with
+    # NO_SHARD, and writeback with rank0_only. Warns if offload_to_cpu without rank0_only.
     if with_grads and (offload_to_cpu or not state._use_orig_params):
         raise NotImplementedError(
             f"with_grads={with_grads}, "
@@ -167,6 +188,13 @@ def _unshard_fsdp_state_params(
     offload_to_cpu: bool,
     with_grads: bool,
 ):
+    # [FUNCTION DOC] HELPER: Context manager unsharding the parameters of one FSDP state for the
+    # given module. Validates args, synchronizes the device, and yields untouched if there
+    # is no handle or it is already in summon state. Otherwise marks the handle as summoning,
+    # unshards in the current stream (plus grads if requested); on rank != 0 with rank0_only
+    # it reshards immediately and yields. Else optionally moves to CPU and unflattens, and
+    # on exit writes back (if writeback), reshards, and resets the handle to IDLE.
+    # Raises AssertionError if the handle is not IDLE at entry.
     """
     This unshards the parameters for a single FSDP state ``state`` that
     corresponds to ``module``.
@@ -245,6 +273,10 @@ def _unshard_params_for_summon(
     offload_to_cpu: bool,
     with_grads: bool,
 ):
+    # [FUNCTION DOC] HELPER: Context manager for one state: validates args, runs lazy init, and
+    # raises AssertionError if the state is in forward/backward or already summoning. Enters
+    # the per-state unshard context and sets training state to SUMMON_FULL_PARAMS for the
+    # duration, resetting it to IDLE on exit.
     _validate_unshard_params_args(
         state, writeback, rank0_only, offload_to_cpu, with_grads
     )
@@ -281,6 +313,9 @@ def _unshard_params(
     offload_to_cpu: bool,
     with_grads: bool,
 ):
+    # [FUNCTION DOC] HELPER: Context manager unsharding all FSDP-managed parameters under module
+    # (only module's own state when recurse is False; yields untouched if it has none).
+    # Enters a per-state summon context for each (state, module) pair in one exit stack.
     """
     This unshards FSDP-managed parameters for all modules with FSDP applied in
     the module tree rooted at ``module``.
@@ -310,6 +345,9 @@ def _unshard_params(
 
 
 def _deregister_orig_params(state: _FSDPState, module: nn.Module) -> None:
+    # [FUNCTION DOC] HELPER: No-op without a handle. Otherwise asserts (via _p_assert) that the
+    # state and handle agree on using original params, has the handle deregister the original
+    # parameters, and registers the flat parameter on the module.
     """
     Deregisters the original parameters; registers the ``FlatParameter``.
     """
@@ -326,6 +364,9 @@ def _deregister_orig_params(state: _FSDPState, module: nn.Module) -> None:
 
 
 def _register_orig_params(state: _FSDPState, module: nn.Module) -> None:
+    # [FUNCTION DOC] HELPER: No-op without a handle. Otherwise deregisters the flat parameter
+    # and restores original parameters as views: sharded views (and grad views) if the flat
+    # parameter is sharded, else unsharded views as parameters.
     """
     Deregisters the ``FlatParameter``; registers the original parameters.
     """

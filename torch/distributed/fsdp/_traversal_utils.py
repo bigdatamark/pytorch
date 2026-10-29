@@ -1,3 +1,7 @@
+# [MODULE DOC] Utilities to traverse a module tree and collect FSDP states, their owning
+# modules, and FlatParamHandles (deduplicated, depth-first, skipping subtrees of
+# incompatible composable APIs such as replicate). Must be imported as a module to
+# avoid circular imports. No import-time side effects.
 """
 NOTE: This file must be imported like
 ``import torch.distributed.fsdp._traversal_utils`` and not like
@@ -32,6 +36,8 @@ traversal, whereas ``nn.Module`` has ``nn.Module.modules()`` for traversal.
 
 
 def _composable(module: nn.Module) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if the module has no composable-API registry or its
+    # registry does not include replicate (i.e. fully_shard may compose with it).
     """
     Returns if ``module`` can compose with ``fully_shard``.
     """
@@ -48,6 +54,10 @@ def _composable(module: nn.Module) -> bool:
 def _get_fsdp_states_with_modules(
     module: nn.Module,
 ) -> tuple[list[_FSDPState], list[nn.Module]]:
+    # [FUNCTION DOC] Depth-first traverse the tree under module (children visited in
+    # modules() order, shared modules visited once) and return two parallel lists: the
+    # unique FSDP states found and the modules owning them. Does not descend into
+    # modules that are not composable (e.g. replicate). No mutation of the module.
     """
     Returns a tuple containing:
     1. A list of the ``_FSDPState`` instances in the module tree rooted at
@@ -94,12 +104,15 @@ def _get_fsdp_states_with_modules(
 
 
 def _get_fsdp_states(module: nn.Module) -> list[_FSDPState]:
+    # [FUNCTION DOC] HELPER: Return only the state list from _get_fsdp_states_with_modules.
     """See :func:`_get_fsdp_states_with_modules`."""
     fsdp_states, _ = _get_fsdp_states_with_modules(module)
     return fsdp_states
 
 
 def _get_fsdp_handles(module: nn.Module) -> list:
+    # [FUNCTION DOC] Return the non-None FlatParamHandle of every FSDP state found in the
+    # tree rooted at module, in traversal order.
     """
     Returns all ``FlatParamHandle`` s in the module tree rooted at ``module``
     following the rules in :func:`_get_fsdp_state`.

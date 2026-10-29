@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Helpers for FSDP state-dict sharding: build ShardedTensor or DTensor
+# objects by chunking a tensor along dim 0 across ranks, and all-gather a DTensor
+# back into a local tensor. No import-time side effects beyond imports.
 import copy
 import itertools
 import math
@@ -18,6 +21,9 @@ from torch.distributed.tensor import DeviceMesh, DTensor, Replicate, Shard as DS
 
 
 def _get_remote_device_str(rank, device_type, num_devices_per_node):
+    # [FUNCTION DOC] HELPER: Build a placement string "rank:R/device" for a rank. CPU has no
+    # index; HPU uses the current device index of the HPU module; other devices use rank
+    # modulo num_devices_per_node as the index. Returns the string.
     if device_type.lower() == "cpu":
         return f"rank:{rank}/{device_type}"
     elif device_type.lower() == "hpu":
@@ -34,6 +40,11 @@ def _create_chunk_sharded_tensor(
     pg: dist.ProcessGroup,
     device: torch.device | None = None,
 ) -> ShardedTensor:
+    # [FUNCTION DOC] HELPER: Chunk a tensor along dim 0 into world_size pieces and build a
+    # ShardedTensor whose metadata is computed locally (no communication). The local rank
+    # gets a cloned chunk as its only shard (none if there are fewer chunks than ranks).
+    # Placements come from the global ranks in pg and the device type (default device of
+    # pg unless device is given). Raises AssertionError on inconsistent metadata lengths.
     """
     Shard a tensor to chunks along the first dimension. The local rank will get its
     corresponding chunk as the local shard to create a ShardedTensor.
@@ -97,6 +108,10 @@ def _create_chunk_dtensor(
     rank: int,
     device_mesh: DeviceMesh,
 ) -> DTensor:
+    # [FUNCTION DOC] HELPER: Make a DTensor from a full tensor by detaching and cloning it,
+    # wrapping it as replicated on every mesh dim, then redistributing so the last mesh dim
+    # is sharded on tensor dim 0 (FSDP: shard; HSDP: replicate then shard). Involves
+    # a redistribute collective-free local chunking. Returns the DTensor.
     """
     Shard a tensor to chunks along the first dimension. The local rank will get its
     corresponding chunk as the local tensor to create a DTensor.
@@ -121,6 +136,9 @@ def _all_gather_dtensor(
     tensor: DTensor,
     root_mesh: DeviceMesh | None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: All-gather a DTensor along its last mesh dim by redistributing that
+    # placement to replicate, then return the resulting local tensor. Raises AssertionError
+    # if the tensor's device mesh is not root_mesh. Runs a collective.
     """
     All gather a DTensor in its sharded dimension and return the local tensor.
     """
