@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Core sharding spec abstractions: PlacementSpec, DevicePlacementSpec, the abstract ShardingSpec,
+# a registry of per-spec custom op overrides (with registration decorator and dispatch helpers),
+# EnumerableShardingSpec (explicit list of shards), and a helper inferring a spec from shard metadata.
+# Import-time side effect: creates the empty module-level custom-op registry. ShardedTensor is imported only
+# for type checking to avoid a circular import.
 import functools
 import operator
 from abc import ABC, abstractmethod
@@ -26,6 +31,8 @@ if TYPE_CHECKING:
 
 
 class PlacementSpec(ABC):  # noqa: B024
+    # [CLASS DOC] Abstract base class for describing the placement of an entity; has no members. Subclass for
+    # custom placements.
     """
     Base class representing the placement of an entity. Subclasses of this
     class can be used to specify customized placements which might not be
@@ -35,6 +42,8 @@ class PlacementSpec(ABC):  # noqa: B024
 
 @dataclass
 class DevicePlacementSpec(PlacementSpec):
+    # [CLASS DOC] Dataclass placing an entity on one device. Field device is a remote device; non-remote values
+    # (such as strings) are converted on construction.
     """
     Associates placement of an entity with a single device.
 
@@ -45,11 +54,15 @@ class DevicePlacementSpec(PlacementSpec):
     device: torch.distributed._remote_device
 
     def __post_init__(self):
+        # [FUNCTION DOC] Post-init: if device is not already a remote device object, converts it to one (may raise if the
+        # value is not a valid remote device description).
         if not isinstance(self.device, torch.distributed._remote_device):
             self.device = torch.distributed._remote_device(self.device)
 
 
 class ShardingSpec(ABC):
+    # [CLASS DOC] Abstract base class for sharding specifications. Subclasses must implement build_metadata (compute
+    # ShardedTensorMetadata for a global size) and shard (scatter a global tensor into a ShardedTensor).
     """
     Base class representing sharding specifications.
     """
@@ -60,6 +73,8 @@ class ShardingSpec(ABC):
         tensor_sizes: torch.Size,
         tensor_properties: sharded_tensor_meta.TensorProperties,
     ) -> sharded_tensor_meta.ShardedTensorMetadata:
+        # [FUNCTION DOC] Abstract: given a global tensor size and tensor properties, returns the ShardedTensorMetadata
+        # describing how the tensor is laid out across ranks.
         """
         Given a global tensor size, define how to shard a tensor like this shape
         across ranks, return ShardedTensorMetadata
@@ -79,6 +94,8 @@ class ShardingSpec(ABC):
         self, tensor: torch.Tensor, src_rank: int = 0, process_group=None
     ) -> "ShardedTensor":
         """
+        # [FUNCTION DOC] Abstract: shards a full tensor held on src_rank (default 0) across the ranks of process_group
+        # (default group when unset) and returns a ShardedTensor.
         Given a global tensor on src_rank, shard this tensor
         across ranks within the process group, return a ShardedTensor.
         Args:
@@ -101,6 +118,8 @@ _CUSTOM_SHARDING_SPEC_OPS: dict[str, dict[Callable, Callable]] = {}
 
 def _has_custom_op(sharding_spec, op):
     """
+    # [FUNCTION DOC] HELPER: Returns True if a custom op override is registered for the spec's class name and the
+    # given op in the module-level registry; False otherwise.
     Returns whether or not the ShardingSpec has a custom op implementation.
     """
     class_name = type(sharding_spec).__qualname__
@@ -113,6 +132,8 @@ def _has_custom_op(sharding_spec, op):
 def _dispatch_custom_op(
     sharding_spec, op: Callable, types, args, kwargs, process_group
 ):
+    # [FUNCTION DOC] HELPER: Calls the registered custom op for the spec's class with (types, args, kwargs,
+    # process_group) and returns its result. Raises RuntimeError if no override is registered.
     """
     Calls the custom op for this ShardingSpec if it exists.
     """
@@ -124,6 +145,10 @@ def _dispatch_custom_op(
 
 
 def custom_sharding_spec_op(sharding_spec_class, func):
+    # [FUNCTION DOC] Returns a decorator factory for registering a custom implementation of op func for the given
+    # sharding spec class. Side effect: creates the registry entry for the class name if absent. The returned
+    # partial applies the shared op registration helper to that class's op table. Note the registry is keyed by
+    # class qualified name.
     """
     Decorator to allow custom registration of ops.
     Args:
@@ -140,6 +165,9 @@ def custom_sharding_spec_op(sharding_spec_class, func):
 
 @dataclass
 class EnumerableShardingSpec(ShardingSpec):
+    # [CLASS DOC] Dataclass sharding spec that lists every shard explicitly via a list of ShardMetadata. Validated on
+    # construction: the list must be non-empty, all shards must have the same number of dimensions, and shards must
+    # not overlap (ValueError). build_metadata checks coverage of the tensor; shard is not implemented.
     """
     This is a type of PlacementSpec that allows users to specify a generic
     sharding scheme by enumerating exactly how each shard is laid out.
@@ -152,6 +180,8 @@ class EnumerableShardingSpec(ShardingSpec):
     shards: list[ShardMetadata]
 
     def __post_init__(self):
+        # [FUNCTION DOC] Post-init validation: raises ValueError for an empty shard list, for shards with differing
+        # numbers of dimensions, or when shards overlap.
         if len(self.shards) == 0:
             raise ValueError(f"Empty shard list provided: {self.shards}")
 
@@ -171,6 +201,8 @@ class EnumerableShardingSpec(ShardingSpec):
         tensor_sizes: torch.Size,
         tensor_properties: sharded_tensor_meta.TensorProperties,
     ) -> sharded_tensor_meta.ShardedTensorMetadata:
+        # [FUNCTION DOC] Verifies the shards fit exactly in tensor_sizes (ValueError otherwise) and returns a
+        # ShardedTensorMetadata built from the shards, tensor_sizes and tensor_properties.
         # check if shards form a valid tensor
         check_tensor(self.shards, tensor_sizes)
         return sharded_tensor_meta.ShardedTensorMetadata(
@@ -180,12 +212,19 @@ class EnumerableShardingSpec(ShardingSpec):
     def shard(
         self, tensor: torch.Tensor, src_rank: int = 0, process_group=None
     ) -> "ShardedTensor":
+        # [FUNCTION DOC] Not implemented; always raises NotImplementedError.
         # TODO: figure out a generic and efficient way to scatter the shards for EnumerableShardingSpec
         raise NotImplementedError("EnumerableShardingSpec.shard not implemented yet!")
 
 
 def _infer_sharding_spec_from_shards_metadata(shards_metadata):
     """
+    # [FUNCTION DOC] HELPER: Infers a spec from the list of shard metadata. If all non-zero offsets lie in one common
+    # dimension, builds a candidate ChunkShardingSpec with placements ordered by offset and compares the sorted shard
+    # sizes and offsets along that dimension with a true chunk split of the total length; returns the chunk spec when
+    # they match. Otherwise (multi-dimension sharding, mismatch) returns an EnumerableShardingSpec of the metadata.
+    # KNOWN ISSUE: the dimension check uses truthiness, so a sharding dimension of 0 is treated as unset and a later
+    # shard in another dimension may not be detected as a mismatch.
     Infer the sharding spec from the metadata of each shard of a ShardedTensor.
     If the tensor is sharded only on one dimension, we can then verify whether it's
     a ChunkShardingSpec or not. The way to verify it is to first get the total length

@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] HELPER: Utilities for building and validating ShardedTensor metadata: parsing remote devices,
+# validating gather destinations, flattening size arguments, comparing properties across shards and ranks,
+# building local and global metadata, and recomputing offsets/size for row-wise sharding.
+# No import-time side effects.
 import collections.abc
 import copy
 import itertools
@@ -21,6 +25,10 @@ if TYPE_CHECKING:
 
 
 def _parse_and_validate_remote_device(pg, remote_device):
+    # [FUNCTION DOC] HELPER: Validates a placement against process group pg and resolves it. Raises ValueError if
+    # remote_device is None, if its rank is not in the group's global ranks (check skipped when the rank is unset or
+    # the caller is not in the group) or if a worker name is unknown; raises RuntimeError if a worker name is given
+    # but RPC is not initialized. Returns a tuple of (rank or RPC worker id, device).
     if remote_device is None:
         raise ValueError("remote device is None")
 
@@ -58,6 +66,10 @@ def _validate_output_tensor_for_gather(
     size: torch.Size,
     dst_tensor: torch.Tensor | None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Validates the output tensor argument of a gather. On the destination rank, dst_tensor
+    # must be given and its size equal to size; on other ranks it must not be given. Raises ValueError otherwise.
+    # KNOWN ISSUE: the non-destination check uses the truthiness of a tensor, which is ambiguous for tensors with
+    # more than one element and can raise a different error.
     if dst_rank == my_rank:
         if dst_tensor is None:
             raise ValueError(
@@ -75,6 +87,8 @@ def _validate_output_tensor_for_gather(
 
 
 def _flatten_tensor_size(size) -> torch.Size:
+    # [FUNCTION DOC] HELPER: Normalizes size arguments (either several ints or a single sequence of ints) into a
+    # torch.Size. Raises TypeError if any dimension is not an int.
     """
     Checks if tensor size is valid, then flatten/return a torch.Size object.
     """
@@ -91,6 +105,9 @@ def _flatten_tensor_size(size) -> torch.Size:
 
 
 def _raise_if_mismatch(expected, actual, prop_name, ranks, is_local=True):
+    # [FUNCTION DOC] HELPER: Raises ValueError if expected differs from actual. In local mode, ranks is a single int
+    # and the message says local shards on that rank disagree; otherwise ranks is a two-element list and the message
+    # says the property differs between the two ranks. Raises AssertionError if ranks has the wrong shape.
     if is_local:
         if not isinstance(ranks, int):
             raise AssertionError
@@ -118,6 +135,11 @@ def build_metadata_from_local_shards(
     current_rank: int,
     pg: c10d.ProcessGroup,
 ) -> ShardedTensorMetadata:
+    # [FUNCTION DOC] Validates this rank's local shards and builds a ShardedTensorMetadata for them using
+    # global_size. Checks per shard: placement valid for pg, strided layout equal to the first shard, contiguous
+    # tensor, placement rank equals current_rank, device matches placement, and shard sizes, pin_memory, dtype and
+    # requires_grad consistent with the first shard. Raises ValueError on violations and AssertionError if there are
+    # no local shards. Memory format is recorded as contiguous.
     if len(local_shards) <= 0:
         raise AssertionError("must have local shards!")
     local_shard_metadatas: list[ShardMetadata] = []
@@ -208,6 +230,11 @@ def build_global_metadata(
     gathered_metadatas: Sequence[ShardedTensorMetadata | None],
     recalc_metadata: bool = False,
 ):
+    # [FUNCTION DOC] Merges per-rank metadata (entries may be None) into one global ShardedTensorMetadata: the first
+    # non-None entry is deep-copied, later ones must match in size, dtype, requires_grad and pin_memory (ValueError
+    # otherwise) and their shard metadata is appended. If recalc_metadata is set, offsets and size are recomputed
+    # along dimension 0. Then checks that shards do not overlap and cover the global size. Raises ValueError if all
+    # entries are None. Returns the global metadata.
     global_sharded_tensor_metadata = None
     global_metadata_rank = 0
 
@@ -283,6 +310,11 @@ def build_global_metadata(
 def recalc_global_sharded_tensor_metadata(
     global_sharded_tensor_metadata: ShardedTensorMetadata, sharded_dim: int
 ) -> None:
+    # [FUNCTION DOC] Mutates the metadata in place for row-wise style sharding along sharded_dim: assigns each shard
+    # an offset as the running sum of shard sizes (zero on the other dimensions) and sets the global size to the
+    # sum on the sharded dimension and the first shard's sizes elsewhere. Raises AssertionError if a shard has no
+    # placement. KNOWN ISSUE: sizes are summed in placement-rank order but offsets are assigned by list position, so
+    # they only agree if the shard list is already ordered by rank.
     # recalculate global ShardedTensorMetadata
 
     # reorder here in case shard metadata is not sorted on sharded_dim

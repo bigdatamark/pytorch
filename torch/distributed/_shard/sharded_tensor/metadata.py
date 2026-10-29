@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Metadata dataclasses for ShardedTensor: an encoding enum for memory formats (so they can be
+# pickled), TensorProperties (dtype, layout, requires_grad, memory format, pin_memory) and
+# ShardedTensorMetadata (per-shard metadata list, global size, tensor properties). No import-time side effects.
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -7,6 +10,8 @@ from torch.distributed._shard.metadata import ShardMetadata
 
 
 class MEM_FORMAT_ENCODING(Enum):
+    # [CLASS DOC] Enum of integer codes for torch memory formats (contiguous, channels last, preserve). Used only
+    # to make TensorProperties picklable because torch.memory_format objects cannot be pickled.
     TORCH_CONTIGUOUS_FORMAT = 0
     TORCH_CHANNELS_LAST = 1
     TORCH_PRESERVE_FORMAT = 2
@@ -14,6 +19,9 @@ class MEM_FORMAT_ENCODING(Enum):
 
 @dataclass
 class TensorProperties:
+    # [CLASS DOC] Dataclass of tensor creation properties: dtype (defaults to the default dtype at import time),
+    # layout, requires_grad, memory_format, pin_memory. Supports pickling via custom state methods that
+    # encode the memory format as MEM_FORMAT_ENCODING.
     """Properties used to create :class:`Tensor`"""
 
     # Regular tensor fields
@@ -24,6 +32,8 @@ class TensorProperties:
     pin_memory: bool = False
 
     def __getstate__(self):
+        # [FUNCTION DOC] Pickle support: returns a tuple of (dtype, layout, requires_grad, encoded memory format,
+        # pin_memory). Raises RuntimeError if the memory format is not contiguous, channels_last or preserve.
         # Since torch.memory_format cannot be pickled!
         memory_format = self.memory_format
         if memory_format == torch.contiguous_format:
@@ -47,6 +57,8 @@ class TensorProperties:
         self,
         state,
     ):
+        # [FUNCTION DOC] Pickle support: restores fields from the state tuple produced by the state getter and decodes
+        # the memory format encoding back to a torch memory format. Raises RuntimeError for an unknown encoding.
         (
             self.dtype,
             self.layout,
@@ -70,6 +82,8 @@ class TensorProperties:
 
     @staticmethod
     def create_from_tensor(tensor: torch.Tensor) -> "TensorProperties":
+        # [FUNCTION DOC] Static factory: builds TensorProperties from a tensor, copying dtype, layout, requires_grad and
+        # pinned status; memory format is always set to contiguous regardless of the tensor's actual strides.
         return TensorProperties(
             dtype=tensor.dtype,
             layout=tensor.layout,
@@ -82,6 +96,9 @@ class TensorProperties:
 @dataclass
 class ShardedTensorMetadata:
     """
+    # [CLASS DOC] Dataclass holding global metadata of a ShardedTensor: shards_metadata (list of ShardMetadata, one
+    # per shard across all ranks), size (overall torch.Size, default empty) and tensor_properties.
+    # KNOWN ISSUE: the size default is a single shared torch.Size instance (immutable, so harmless).
     Represents metadata for :class:`ShardedTensor`
     """
 

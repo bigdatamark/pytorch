@@ -1,9 +1,13 @@
+# [MODULE DOC] Defines the Sharder abstract interface for custom module sharding strategies that cannot be
+# expressed with a ShardingSpec. No import-time side effects.
 import abc
 
 import torch.nn as nn
 
 
 class Sharder(abc.ABC):
+    # [CLASS DOC] Abstract base class for custom sharding strategies. A ShardingPlan may hold a Sharder per module
+    # name; its shard method is called on the module and the returned module replaces the original.
     """
     This is an interface which allows user to create more advanced
     sharding strategies that are not easily be composed by the
@@ -16,6 +20,8 @@ class Sharder(abc.ABC):
 
     @abc.abstractmethod
     def shard(self, module: nn.Module) -> nn.Module:
+        # [FUNCTION DOC] Abstract method: takes an nn.Module, applies the implementation's sharding strategy and
+        # returns the sharded nn.Module. Subclasses must implement it.
         """
         Shard a module base on the implementation of this method, and
         return the sharded version of the module.

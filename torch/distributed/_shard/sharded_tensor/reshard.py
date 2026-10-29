@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Resharding helpers for ShardedTensor: finding a rank's position in a placement list, building
+# per-rank shard metadata for a chunk sharding spec, and two all-to-all based routines that move data between
+# ranks to change the sharding spec (same-dimension reshuffle vs different-dimension reshard).
+# No import-time side effects.
 import copy
 
 import torch
@@ -16,6 +20,8 @@ from .shard import Shard
 
 
 def get_idx_from_placements(placements, current_rank) -> int:
+    # [FUNCTION DOC] Returns the index of the first placement whose rank equals current_rank. Raises RuntimeError
+    # if the rank is not in the placements.
     """
     Return the position of the current rank in the given placements.
 
@@ -44,6 +50,10 @@ def build_reshard_metadata(
     sharding_spec: shard_spec.ShardingSpec,
     world_size: int,
 ) -> tuple[list[ShardMetadata], list[int]]:
+    # [FUNCTION DOC] Computes metadata for a tensor of size st_size chunked along the spec's dimension across
+    # world_size ranks. Returns a list indexed by rank of ShardMetadata (offsets, sizes, placement) and the list of
+    # ranks in placement order. Assumes the placements cover every rank in the world (entries for uncovered ranks
+    # stay empty); offsets accumulate along the sharded dimension.
     """
     Based the given sharding spec, we calculate the offset and local shard size.
     We then build a ShardMetadata on top of the calculation result.
@@ -86,6 +96,10 @@ def reshuffle_local_shard(
     resharding_spec: shard_spec.ShardingSpec,
     pg: ProcessGroup,
 ) -> tuple[list[Shard], list[ShardMetadata]]:
+    # [FUNCTION DOC] Reshards when the old and new specs shard the same dimension: builds the new metadata, computes
+    # input/output split sizes per rank, transposes the shard so the dimension is first, and exchanges data with a
+    # single all-to-all over group pg (autograd-enabled). Returns a one-element list with the new local Shard and
+    # the full metadata list. Requires an initialized process group; allocates a receive buffer.
     """
     Reshuffle the local shard directly when the reshard dim is same as the original
     sharding dim. Logically we do this in two step:
@@ -155,6 +169,11 @@ def reshard_local_shard(
     resharding_spec: shard_spec.ShardingSpec,
     pg: ProcessGroup,
 ) -> tuple[list[Shard], list[ShardMetadata]]:
+    # [FUNCTION DOC] Reshards when the new spec shards a different dimension than the old one: if placement ranks are
+    # not in ascending order, first reorders the local tensor along the new dimension; splits it per destination
+    # rank, allocates receive tensors sized by the old sharding, runs an autograd-enabled all-to-all over pg,
+    # reorders the received list by placement rank if needed and concatenates along the old sharding dimension.
+    # Returns a one-element list with the new local Shard and the full metadata list.
     """
     Reshard a sharded tensor given the ``resharding_spec``. When the reshard dim is
     different from the original sharding dim, we need to do two steps logically:

@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines ChunkShardingSpec, a sharding spec that splits a tensor along one dimension into
+# torch.chunk style contiguous chunks, one per placement, and can scatter a full tensor into a ShardedTensor.
+# ShardedTensor is imported only for type checking (and lazily inside shard) to avoid a circular import.
+# No import-time side effects.
 from dataclasses import dataclass
 from typing import cast, TYPE_CHECKING
 
@@ -25,6 +29,9 @@ if TYPE_CHECKING:
 
 @dataclass
 class ChunkShardingSpec(ShardingSpec):
+    # [CLASS DOC] Dataclass spec: dim (integer dimension to shard on; named dimensions are rejected) and placements
+    # (list of remote devices or strings convertible to them; its length is the number of chunks). Chunk sizes follow
+    # torch.chunk semantics, so trailing chunks may be smaller or empty. Implements build_metadata and shard.
     """
     This is a type of PlacementSpec that defines the placement as being sharded
     across multiple devices. In particular, it represents sharding a Tensor
@@ -54,6 +61,8 @@ class ChunkShardingSpec(ShardingSpec):
     placements: list[torch.distributed._remote_device | str]
 
     def __post_init__(self):
+        # [FUNCTION DOC] Post-init: validates dim, then converts in place any placement that is not a remote device
+        # object into one (mutating the given list).
         self._verify_dim(self.dim)
         for i, remote_device in enumerate(self.placements):
             if not isinstance(remote_device, torch.distributed._remote_device):
@@ -61,6 +70,8 @@ class ChunkShardingSpec(ShardingSpec):
 
     @staticmethod
     def _verify_dim(dim):
+        # [FUNCTION DOC] Static validator: raises NotImplementedError for a string (named) dimension and ValueError for
+        # any other non-int dim.
         # Validate the sharding spec.
         # TODO: support named dimension
         if isinstance(dim, str):
@@ -76,6 +87,11 @@ class ChunkShardingSpec(ShardingSpec):
         tensor_sizes: torch.Size,
         tensor_properties: sharded_tensor_meta.TensorProperties,
     ) -> sharded_tensor_meta.ShardedTensorMetadata:
+        # [FUNCTION DOC] Builds ShardedTensorMetadata for tensor_sizes: validates dim and its range (ValueError if out of
+        # range), then for each placement computes a ShardMetadata with offset split_size times index along dim, size
+        # equal to the chunk of that index and full size on other dims. Returns metadata with tensor_sizes and
+        # tensor_properties. KNOWN ISSUE: a negative dim is accepted by the range check and used as a list index, but
+        # offsets for the sharded dim are then only correct for the aliased positive dimension.
         tensor_num_dim = len(tensor_sizes)
 
         self._verify_dim(self.dim)
@@ -108,6 +124,14 @@ class ChunkShardingSpec(ShardingSpec):
     def shard(
         self, tensor: torch.Tensor, src_rank: int = 0, process_group=None
     ) -> "ShardedTensor":
+        # [FUNCTION DOC] Scatters a full tensor held on src_rank (a rank within process_group, or a global rank when the
+        # group is unset) into a ShardedTensor, one chunk per placement. Builds metadata from the tensor's properties;
+        # on the source rank narrows, detaches and clones each chunk (padding the smaller last chunk by resizing to the
+        # common scatter shape); every rank allocates a receive buffer for its own shard; runs a scatter collective
+        # (source converted to a global rank for non-default groups); trims the buffer to the real shard size, copies
+        # requires_grad from the input tensor and wraps it in a Shard. Returns a ShardedTensor built from local shards and
+        # global metadata, with this spec attached. Raises AssertionError if this rank has no shard or non-tensor
+        # entries are found. Requires an initialized process group; communicates collectively.
         """
         Args:
             src_rank: group rank relative to ``process_group``

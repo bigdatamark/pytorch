@@ -1,3 +1,6 @@
+# [MODULE DOC] Defines ShardingPlan, a dataclass describing how to shard a module (parameter specs or
+# Sharders, optional output specs, optional local-tensor outputs), and ShardingPlanner, an abstract class for
+# building plans from a module. No import-time side effects.
 import abc
 from dataclasses import dataclass
 
@@ -8,6 +11,10 @@ from torch.distributed._shard.sharding_spec import ShardingSpec
 
 @dataclass
 class ShardingPlan:
+    # [CLASS DOC] Dataclass with fields: plan (mapping from parameter or submodule name to a ShardingSpec or a
+    # Sharder), output_plan (optional mapping from module name to the ShardingSpec of its output; empty name means
+    # root module) and return_local_tensor (optional list of module names whose sharded output is converted back to
+    # a local tensor for data parallel use). No validation is done here.
     """
     Representation of a sharding plan, describes how to shard a module
     across hosts. `plan` is used to shard module parameters according to the spec provided,
@@ -67,6 +74,8 @@ class ShardingPlan:
 
 
 class ShardingPlanner(abc.ABC):
+    # [CLASS DOC] Abstract base class for planners that produce a ShardingPlan for a module; subclass to
+    # implement advanced strategies.
     """
     Default ShardingPlanner interface, can be extended and
     implement advanced sharding strategies.
@@ -74,6 +83,8 @@ class ShardingPlanner(abc.ABC):
 
     @abc.abstractmethod
     def build_plan(self, module: nn.Module) -> ShardingPlan:
+        # [FUNCTION DOC] Abstract method: given an nn.Module, decides how to shard it across ranks and returns a
+        # ShardingPlan. Subclasses must implement it.
         """
         Given an nn.Module, define how to shard the module across
         ranks, return a ShardingPlan

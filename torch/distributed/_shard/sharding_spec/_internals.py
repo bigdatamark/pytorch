@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] HELPER: Internal helpers for sharding specs: overlap detection between shards (pairwise, 1-D
+# interval and N-D sweep-line), validation that shards do not overlap and cover a tensor, and chunking
+# arithmetic that mirrors torch.chunk. No import-time side effects.
 import math
 import sys
 from bisect import bisect_right, insort
@@ -7,6 +10,8 @@ from torch.distributed._shard.metadata import ShardMetadata
 
 
 def _check_shard_metadata_pair_overlap(shard1: ShardMetadata, shard2: ShardMetadata):
+    # [FUNCTION DOC] HELPER: Returns True if two shards overlap, i.e. their extents intersect in every dimension,
+    # and False as soon as they are disjoint in one dimension. Uses the dimension count of the first shard.
     """
     Checks if two shards overlap.
     """
@@ -28,6 +33,11 @@ def _check_shard_metadata_pair_overlap(shard1: ShardMetadata, shard2: ShardMetad
 def _find_nd_overlapping_shards(
     shards: list[ShardMetadata], sharded_dims: list[int]
 ) -> tuple[int, int] | None:
+    # [FUNCTION DOC] HELPER: Finds an overlapping pair among shards partitioned over several dimensions using a sweep
+    # over the sharded dimension. The sweep dimension is the one with the largest extent of the first shard; shards
+    # are visited in offset order while an ordered list of active shards (by end position) is pruned and each new
+    # shard is checked against actives. Returns a pair of indices (earlier active, current) or None. Returns None for
+    # fewer than two shards or no sharded dims.
     """Find overlapping shards using sweep-line algorithm."""
     if len(shards) <= 1:
         return None
@@ -76,6 +86,8 @@ def _find_nd_overlapping_shards(
 def _find_1d_overlapping_shards(
     shards: list[ShardMetadata], dim: int
 ) -> tuple[int, int] | None:
+    # [FUNCTION DOC] HELPER: Finds an overlapping pair of shards when only one dimension is partitioned: sorts
+    # inclusive intervals along dim and compares neighbours. Returns a pair of shard indices or None.
     # (begin, end, index_in_shards). Begin and end are inclusive.
     intervals = [
         (s.shard_offsets[dim], s.shard_offsets[dim] + s.shard_sizes[dim] - 1, i)
@@ -89,6 +101,10 @@ def _find_1d_overlapping_shards(
 
 
 def validate_non_overlapping_shards_metadata(shards: list[ShardMetadata]):
+    # [FUNCTION DOC] Raises ValueError if any two shards overlap. Determines which dimensions differ among shards;
+    # no differing dimension means all shards are identical, which is accepted only if every shard has zero offsets
+    # and an empty (zero volume) size, otherwise shards 0 and 1 are reported; one differing dimension uses the
+    # 1-D interval check; more use the sweep-line check. Returns None when there are fewer than two shards.
     """
     Ensures none of the shards overlap with each other.
 
@@ -139,6 +155,9 @@ def validate_non_overlapping_shards_metadata(shards: list[ShardMetadata]):
 
 
 def check_tensor(shards_metadata, tensor_dims) -> None:
+    # [FUNCTION DOC] Checks that shards fit a tensor of the given dims: the number of dimensions must match, each
+    # shard must lie inside the tensor on every dimension, and total shard volume must equal tensor volume (which,
+    # given non-overlap, means full coverage). Raises ValueError otherwise. Assumes at least one shard.
     """
     Checks if the shards_metadata is compatible with the provided tensor dims.
 
@@ -187,6 +206,7 @@ def check_tensor(shards_metadata, tensor_dims) -> None:
 
 
 def get_split_size(dim_size, chunks):
+    # [FUNCTION DOC] Returns the chunk size torch.chunk would use: ceiling division of dim_size by chunks.
     """
     Computes the split size inline with ``torch.chunk``
 
@@ -201,6 +221,8 @@ def get_split_size(dim_size, chunks):
 
 
 def get_chunked_dim_size(dim_size, split_size, idx):
+    # [FUNCTION DOC] Returns the size of chunk number idx for a dimension of size dim_size split with split_size,
+    # clamped to zero for chunks past the end.
     """
     Computes the dim size of the chunk for provided ``idx`` given ``dim_size``
     and ``split_size``.
@@ -217,6 +239,10 @@ def get_chunked_dim_size(dim_size, split_size, idx):
 
 
 def get_chunk_sharding_params(sharding_dim_size, world_size, spec, rank):
+    # [FUNCTION DOC] Returns (start offset, chunk size) for the given rank under chunk sharding. Walks the spec's
+    # placements in order accumulating offsets using the chunk sizes of a split across world_size, and stops at the
+    # placement whose rank equals rank. KNOWN ISSUE: if the rank is not in the placements, the start is 0 and the
+    # size is that of the last chunk; with no placements the size is undefined and an error would occur.
     """
     Generate the start pos and offset length for the current rank for
     chunk sharding.

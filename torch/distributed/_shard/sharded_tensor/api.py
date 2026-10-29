@@ -1,4 +1,12 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines ShardedTensor, a torch.Tensor wrapper subclass representing a tensor sharded across
+# processes, and its base class ShardedTensorBase (spec, global metadata, local shards). Provides construction
+# from a spec, from local shards, from a local tensor or from global metadata; collectives such as gather,
+# reshard, cuda/cpu/to and pickling; dispatch of torch functions to registered sharded ops
+# (default table, custom table, or per sharding spec custom ops); and RRef registration of remote shards over RPC.
+# Import-time side effects: creates module-level state for tracking sharded tensors by id (a lock, a counter, a
+# map of weak references) and the registries of default and custom sharded ops. Also defines a helper
+# that allocates a tensor from size, device and tensor properties.
 from __future__ import annotations  # type: ignore[attr-defined]
 
 import copy
@@ -61,6 +69,9 @@ _CUSTOM_SHARDED_OPS: dict[Callable, Callable] = {}
 def _register_remote_shards(
     sharded_tensor_id: int, rrefs: list[rpc.RRef[Shard]], rpc_rank: int
 ):
+    # [FUNCTION DOC] HELPER: RPC callback run on a remote worker: under the global lock, looks up the live ShardedTensor
+    # for sharded_tensor_id and registers the given list of RRefs of shards owned by worker rpc_rank. Raises
+    # RuntimeError if the id is unknown or the weak reference is dead.
     with _sharded_tensor_lock:
         if sharded_tensor_id not in _sharded_tensor_map:
             raise RuntimeError(
@@ -75,11 +86,20 @@ def _register_remote_shards(
 
 
 class ShardedTensorBase(torch.Tensor):
+    # [CLASS DOC] Base class of ShardedTensor, a wrapper subclass of torch.Tensor with no storage of its own. Holds
+    # the sharding spec, the global ShardedTensorMetadata and the list of local Shard objects of this rank.
+    # Provides accessors, an experimental constructor from local shards plus global metadata, and a dispatch hook
+    # that always raises because c++ dispatch is unsupported.
     _sharding_spec: shard_spec.ShardingSpec
     _metadata: ShardedTensorMetadata
     _local_shards: list[Shard]
 
     def __new__(cls, sharding_spec: shard_spec.ShardingSpec, *size, **kwargs):
+        # [FUNCTION DOC] Constructs the wrapper tensor: logs API usage, requires a ShardingSpec (ValueError otherwise),
+        # flattens the size arguments, reads dtype, layout, pin_memory and requires_grad from keyword arguments (all four
+        # keys must be present, else KeyError; a missing dtype value falls back to the default dtype), builds global
+        # metadata from the spec and creates a wrapper subclass instance. Stores the spec, metadata and an empty list
+        # of local shards on it. Returns the new instance.
         # Use __new__ to construct a wrapper tensor, for recording tensor
         # properties and logging purposes.
         torch._C._log_api_usage_once("torch.distributed._shard.sharded_tensor")
@@ -121,6 +141,7 @@ class ShardedTensorBase(torch.Tensor):
         return r
 
     def metadata(self) -> ShardedTensorMetadata:
+        # [FUNCTION DOC] Returns the global metadata of the whole sharded tensor.
         """
         Returns a :class:`ShardedTensorMetadata` object corresponding to the
         metadata for the entire tensor.
@@ -128,6 +149,7 @@ class ShardedTensorBase(torch.Tensor):
         return self._metadata
 
     def local_shards(self) -> list[Shard]:
+        # [FUNCTION DOC] Returns the list of local Shard objects on this rank (empty if this rank holds none).
         """
         Returns a list of :class:`Shard' corresponding to the
         local shards for this rank. Returns an empty list if the current rank
@@ -142,6 +164,10 @@ class ShardedTensorBase(torch.Tensor):
         sharded_tensor_metadata: ShardedTensorMetadata,
         sharding_spec=None,
     ) -> ShardedTensorBase:
+        # [FUNCTION DOC] Class method building a ShardedTensor from this rank's local shards and a global metadata
+        # object. Experimental: does no cross-rank validation. Raises ValueError for empty shard metadata or a non-strided
+        # layout; infers the sharding spec from the shard metadata when not given; validates shards do not overlap and
+        # fit the global size; then stores the local shards. Returns the new tensor (always a ShardedTensor instance).
         """
         Initialize a ShardedTensorBase with local shards and a global
         ShardedTensorMetadata built on each rank.
@@ -185,6 +211,8 @@ class ShardedTensorBase(torch.Tensor):
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):  # type: ignore[override]
+        # [FUNCTION DOC] Always raises RuntimeError saying the object is used from c++ without a custom dispatch
+        # implementation.
         raise RuntimeError(
             f"A {cls.__name__} object is being used from c++ while calling {func.__module__}.{func.__name__} "
             "but the there is no custom __torch_dispatch__ implementation for it."
@@ -192,6 +220,12 @@ class ShardedTensorBase(torch.Tensor):
 
 
 class ShardedTensor(ShardedTensorBase):
+    # [CLASS DOC] A tensor sharded over multiple devices and processes, initialized SPMD style on every rank. Each
+    # rank stores only its local shards plus global metadata of all shards. State: sharding spec, metadata, local
+    # shards (from base), process group, init_rrefs flag, a global id (set only with rrefs) and a map of remote
+    # shard RRefs per worker. Does not provide tensor math; ops are routed through registered sharded op tables.
+    # Main API: local_shards, metadata, gather, reshard, size/sharding_spec accessors, local_tensor, and the
+    # _init_from_* class constructors.
     """
     ShardedTensor is an torch.Tensor subclass to represent Tensors that are sharded
     across multiple devices and multiple processes.
@@ -241,6 +275,9 @@ class ShardedTensor(ShardedTensorBase):
     """
 
     def __new__(cls, sharding_spec: shard_spec.ShardingSpec, *size, **kwargs):
+        # [FUNCTION DOC] Creates the wrapper instance by delegating to the base class constructor with the spec, size
+        # and keyword arguments (including dtype, layout, pin_memory and requires_grad, which must all be present).
+        # KNOWN ISSUE: constructing directly without all four keywords raises KeyError even though __init__ has defaults.
         self = super().__new__(cls, sharding_spec, *size, **kwargs)
         return self
 
@@ -256,6 +293,10 @@ class ShardedTensor(ShardedTensorBase):
         process_group=None,
         init_rrefs=False,
     ):
+        # [FUNCTION DOC] Initializes state (process group, rrefs flag), rejects non-strided layouts and non-contiguous
+        # memory formats with ValueError, records the memory format in the metadata, and allocates and appends a local
+        # shard tensor for every shard whose placement rank equals this process's global rank. Then runs post-init
+        # (registering the tensor id and initializing RPC when init_rrefs is set). Requires an initialized process group.
         # prepare initialization, initialize fields like
         # _process_group, _local_shards, etc.
         self._prepare_init(process_group=process_group, init_rrefs=init_rrefs)
@@ -288,6 +329,8 @@ class ShardedTensor(ShardedTensorBase):
         self._post_init()
 
     def _prepare_init(self, process_group=None, init_rrefs=False):
+        # [FUNCTION DOC] Sets instance state: init_rrefs flag, no sharded tensor id, normalized process group (default
+        # group when None) and an empty map of remote shards.
         self._init_rrefs = init_rrefs
         self._sharded_tensor_id = None
 
@@ -295,6 +338,8 @@ class ShardedTensor(ShardedTensorBase):
         self._remote_shards: dict[int, list[rpc.RRef[Shard]]] = {}
 
     def _post_init(self):
+        # [FUNCTION DOC] When init_rrefs is on: under the lock assigns the next global id, records a weak reference in the
+        # module map, raises RuntimeError if RPC is not initialized, then calls RPC initialization. Does nothing otherwise.
         # Initialize RPC if available.
         if self._init_rrefs:
             with _sharded_tensor_lock:
@@ -311,6 +356,7 @@ class ShardedTensor(ShardedTensorBase):
             self._init_rpc()
 
     def __del__(self):
+        # [FUNCTION DOC] Destructor: under the lock removes this tensor's id from the module map if it was registered.
         # Clean up the global map.
         with _sharded_tensor_lock:
             global _sharded_tensor_current_id, _sharded_tensor_map
@@ -321,6 +367,10 @@ class ShardedTensor(ShardedTensorBase):
                 _sharded_tensor_map.pop(self._sharded_tensor_id)  # type: ignore[call-overload]
 
     def _init_rpc(self):
+        # [FUNCTION DOC] Shares local shards with all other ranks via RPC: requires the process group rank equal the RPC
+        # rank (ValueError otherwise), gathers every worker's sharded tensor id, sends RRefs of own local shards to each
+        # other worker where they are registered, waits for completion, then does a barrier. Resets the remote shard map.
+        # Side effects: network communication.
         # Validate PG and RPC ranks match.
         pg_rank = dist.get_rank()
         rpc_rank = rpc.get_worker_info().id
@@ -369,6 +419,9 @@ class ShardedTensor(ShardedTensorBase):
         rpc.api._all_gather(None)
 
     def _get_preferred_device(self) -> torch.device:
+        # [FUNCTION DOC] Returns the device for collective buffers: current CUDA device for NCCL, CPU for Gloo, otherwise
+        # the first non-CPU device mapped to the backend in its configuration (with that device's current index),
+        # falling back to CPU.
         """
         Return the preferred device to be used when creating tensors for collectives.
         This method takes into account the associated process group
@@ -394,6 +447,11 @@ class ShardedTensor(ShardedTensorBase):
         enforce_dtype: bool = False,
         dtype: torch.dtype | None = None,
     ) -> None:
+        # [FUNCTION DOC] Collective, must be called on all ranks with the same dst. Gathers all shards into the full
+        # tensor out on rank dst (out required there and must be None elsewhere; validated). Each rank packs its
+        # non-empty local shards into a flat buffer of the largest per-rank size, a gather collective collects buffers
+        # to dst, which copies each shard into place. enforce_dtype is deprecated (warns, dtype taken from tensors);
+        # dtype sets the buffer dtype. Warns about zero-element shards. Raises ValueError/AssertionError on bad arguments.
         """
         Creates a full :class:`Tensor` on rank ``dst`` by gathering all shards of the
         sharded tensor.
@@ -415,6 +473,7 @@ class ShardedTensor(ShardedTensorBase):
         """
 
         def shard_size(shard_md):
+            # [FUNCTION DOC] HELPER: Returns the number of elements of a shard as the product of its sizes.
             return reduce(operator.mul, shard_md.shard_sizes)  # type: ignore[attr-defined]
 
         if enforce_dtype:
@@ -512,6 +571,11 @@ class ShardedTensor(ShardedTensorBase):
         self, memory_format=torch.preserve_format, process_group=None
     ) -> ShardedTensor:
         """
+        # [FUNCTION DOC] Returns a ShardedTensor whose shards all live on CPU. Raises RuntimeError unless memory_format is
+        # preserve or contiguous. If every shard placement is already CPU returns self unchanged. Otherwise copies each
+        # local shard to CPU with deep-copied metadata whose placement device is rewritten, rewrites the device of all
+        # placements in a deep copy of the global metadata, and builds a new ShardedTensor using process_group (default
+        # this tensor's group) and the same init_rrefs setting. The caller must supply a CPU-compatible group.
         Returns a copy of this object in CPU memory.
 
         If this ShardedTensor is already on CPU memory, then no copy is
@@ -571,6 +635,13 @@ class ShardedTensor(ShardedTensorBase):
         process_group=None,
     ) -> ShardedTensor:
         """
+        # [FUNCTION DOC] Returns a new ShardedTensor with local shards on the current accelerator device of each process.
+        # Raises RuntimeError for memory formats other than preserve/contiguous and AssertionError if device is given
+        # and is not a device whose index equals the current accelerator index. Moves local shard data (no copy if
+        # already there), rewrites placement devices in copied metadata, and rebuilds the tensor from local shards and
+        # global metadata with process_group (default: this one). A new object is always returned.
+        # KNOWN ISSUE: the assertion message talks about a device without an index although the check requires the
+        # index to equal the current device index.
         Returns a copy of this object in CUDA memory, if the original ShardedTensor
         is on CPU, we will move the local shard to the current GPU device of each
         process in a SPMD fashion.
@@ -634,6 +705,13 @@ class ShardedTensor(ShardedTensorBase):
         )
 
     def to(self, *args, **kwargs) -> ShardedTensor:
+        # [FUNCTION DOC] Converts dtype and/or device of the sharded tensor, accepting a dtype, device, string or int
+        # device, a tensor (use its dtype and device), a (device, dtype) pair, or keyword arguments dtype, device, copy,
+        # non_blocking, memory_format and process_group. Raises RuntimeError for an unsupported single argument. Non-CPU
+        # targets are forced to the current accelerator index, warning if a different index was requested. Returns self
+        # when nothing changes and copy is not requested; otherwise converts each local shard, updates a copy of the metadata
+        # (dtype and placement devices) and rebuilds the ShardedTensor from local shards and metadata.
+        # KNOWN ISSUE: the warning is also emitted when a non-CPU device is given without an index.
         current_device: torch.device
         if self._local_shards:
             current_device = self._local_shards[0].tensor.device
@@ -728,6 +806,7 @@ class ShardedTensor(ShardedTensorBase):
     def _normalize_pg(
         cls, process_group: dist.ProcessGroup | None
     ) -> dist.ProcessGroup:
+        # [FUNCTION DOC] Class method: returns the given process group, or the default group when None.
         if process_group is not None:
             return process_group
         return distributed_c10d._get_default_group()
@@ -740,6 +819,14 @@ class ShardedTensor(ShardedTensorBase):
         process_group=None,
         init_rrefs=False,
     ):
+        # [FUNCTION DOC] Class method building a ShardedTensor from this rank's local shards and the global size, with
+        # cross-rank validation. Step 1 validates local shards and builds local metadata (if the rank has shards); step 2
+        # all-gathers the local metadata objects (single rank skips the collective) and merges them into global
+        # metadata, checking consistency, overlap and coverage; step 3 infers a sharding spec, creates the tensor, and
+        # attaches the local shards and registers rrefs if requested. If any entry of global_size is None, it is treated
+        # as zero and global size and offsets are recalculated from the gathered shards (supports only sharding on
+        # dimension 0; this rank must have shards and exactly one global entry for its rank, else AssertionError) and the
+        # local shard's metadata is replaced. Collective. Returns the new ShardedTensor.
         # recalc metadata handles special ST creation cases like each rank only has tensor available
         # caller need to provide None on the unknown dimension of the global size
         # We will change None into zeros and go through the same amount of checks as before to create ST
@@ -840,6 +927,11 @@ class ShardedTensor(ShardedTensorBase):
         init_rrefs=False,
     ) -> ShardedTensor:
         """
+        # [FUNCTION DOC] Deprecated (emits FutureWarning). Class method building a ShardedTensor from one contiguous local
+        # tensor per rank, the sharding spec and the global size. Raises ValueError if the tensor is not contiguous.
+        # Builds metadata from the spec and the tensor's properties, makes a Shard for each placement whose rank is
+        # this process, and delegates to building from local shards and global metadata with the spec. Experimental:
+        # no cross-rank validation, relying on the user to supply a correctly sharded tensor.
         Initialize a ShardedTensor given only one local tensor, global sharded tensor
         size and sharding spec on each rank.
 
@@ -943,6 +1035,13 @@ class ShardedTensor(ShardedTensorBase):
         sharding_spec=None,
     ) -> ShardedTensor:
         """
+        # [FUNCTION DOC] Class method building a ShardedTensor from local shards and global metadata. Experimental:
+        # does not validate across ranks. Finds the shard metadata placed on this rank and raises RuntimeError if the
+        # count differs from the number of local shards; raises ValueError for empty metadata or a non-strided layout;
+        # infers the spec when none given; creates the tensor; checks each local shard (placement set, strided layout,
+        # contiguity, sizes, device, dtype, requires_grad and pin_memory agree with metadata, ValueError/AssertionError
+        # otherwise), then attaches the shards, checks overlap and fit to size, and initializes process group state and
+        # rrefs. Returns the ShardedTensor.
         Initialize a ShardedTensor with local shards and a global
         ShardedTensorMetadata built on each rank.
 
@@ -998,6 +1097,8 @@ class ShardedTensor(ShardedTensorBase):
         )
 
         def _raise_if_mismatch(expected, actual, prop_name, rank, is_property=False):
+            # [FUNCTION DOC] HELPER: Raises ValueError when expected differs from actual, naming the property, the rank and
+            # whether the expected value comes from a tensor property or from local shard metadata.
             tensor_property_or_metadata = (
                 "tensor property" if is_property else "local ShardMetadata"
             )
@@ -1074,6 +1175,7 @@ class ShardedTensor(ShardedTensorBase):
         return sharded_tensor
 
     def sharding_spec(self) -> shard_spec.ShardingSpec:
+        # [FUNCTION DOC] Returns the ShardingSpec of this tensor.
         """
         Returns the ShardingSpec for the tensor.
         """
@@ -1081,6 +1183,12 @@ class ShardedTensor(ShardedTensorBase):
 
     @deprecated(DEPRECATE_MSG, category=FutureWarning)
     def reshard(self, resharding_spec: shard_spec.ShardingSpec) -> ShardedTensor:
+        # [FUNCTION DOC] Deprecated (FutureWarning). Reshards in place to resharding_spec and returns self. Only
+        # ChunkShardingSpec on both sides (else NotImplementedError) and exactly one local shard (else
+        # NotImplementedError). If both specs shard the same dimension and have equal placements this is a no-op; if only
+        # placements differ, reshuffles the local shard with a single all-to-all; if the dimension differs, uses the
+        # generic reshard routine. On success replaces the local shards, the metadata's shard list and the spec on this
+        # object (mutation). Collective.
         """
         Reshard a sharded tensor given the ``resharding_spec``. For now, we only support
         single local shard.
@@ -1186,6 +1294,8 @@ class ShardedTensor(ShardedTensorBase):
         return self
 
     def local_tensor(self) -> torch.Tensor:
+        # [FUNCTION DOC] Returns the tensor of the single local shard. Raises NotImplementedError if this rank does not
+        # hold exactly one local shard.
         """
         Return local tensor for a sharded_tensor. For now we only support single local shard.
 
@@ -1202,7 +1312,14 @@ class ShardedTensor(ShardedTensorBase):
     @classmethod
     @deprecated(DEPRECATE_MSG, category=FutureWarning)
     def __torch_function__(cls, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Deprecated (FutureWarning) class method hooking torch function dispatch for sharded tensors.
+        # Finds the first ShardedTensor among the args and kwargs, then routes func to a handler: the custom user op table
+        # first, then a custom op of the tensor's sharding spec, then the default sharded op table; handlers receive
+        # types, args, kwargs and the process group. Raises RuntimeError if no ShardedTensor argument is found or no
+        # handler is registered.
         def dispatch(st: ShardedTensor, func: Callable):
+            # [FUNCTION DOC] HELPER: Chooses and calls the handler for func given st, in priority order custom user ops, the
+            # spec's custom ops, default sharded ops; raises RuntimeError if none is registered.
             # Dispatch to custom user provided op first if it exists.
             if func in _CUSTOM_SHARDED_OPS:
                 return _CUSTOM_SHARDED_OPS[func](types, args, kwargs, st._process_group)
@@ -1225,6 +1342,7 @@ class ShardedTensor(ShardedTensorBase):
         st_instance = None
 
         def find_sharded_tensor(e):
+            # [FUNCTION DOC] HELPER: Tree-map visitor that records the first ShardedTensor seen into the enclosing variable.
             nonlocal st_instance
             if st_instance is None and isinstance(e, ShardedTensor):
                 st_instance = e
@@ -1241,6 +1359,7 @@ class ShardedTensor(ShardedTensorBase):
         )
 
     def is_pinned(self) -> bool:  # type: ignore[override]
+        # [FUNCTION DOC] Returns the pin_memory flag recorded in the tensor properties of the metadata.
         """
         Returns True if the sharded tensor (each local shard) resides in pinned memory.
         """
@@ -1249,10 +1368,14 @@ class ShardedTensor(ShardedTensorBase):
     def _register_remote_shards(
         self, remote_shards: list[rpc.RRef[Shard]], rpc_rank: int
     ):
+        # [FUNCTION DOC] HELPER: Stores the list of RRefs to shards held by worker rpc_rank in the remote shards map
+        # (overwriting any previous entry).
         self._remote_shards[rpc_rank] = remote_shards
 
     def remote_shards(self) -> dict[int, list[rpc.RRef[Shard]]]:
         """
+        # [FUNCTION DOC] Returns the mapping from RPC rank to RRefs of the shards on that worker. Raises RuntimeError if
+        # the tensor was created without init_rrefs.
         Returns a Dict[int, RRef] with keys being the RPC rank and values
         being RRefs to shards on that rank. Need to initialize the
         RPC framework for this functionality.
@@ -1266,13 +1389,17 @@ class ShardedTensor(ShardedTensorBase):
         return self._remote_shards
 
     def __hash__(self):
+        # [FUNCTION DOC] Identity based hash (object id).
         return id(self)
 
     def __repr__(self) -> str:  # type: ignore[override]
+        # [FUNCTION DOC] Returns a string showing the class name and the global metadata.
         return f"ShardedTensor({self._metadata})"
 
     @dataclass
     class ProcessGroupState:
+        # [CLASS DOC] Dataclass recording process group info at pickling time: local and global rank and world size,
+        # used to validate the process group when unpickling.
         """
         State for ser-de of process group
         """
@@ -1283,6 +1410,8 @@ class ShardedTensor(ShardedTensorBase):
         global_world_size: int
 
     def __getstate__(self):
+        # [FUNCTION DOC] Pickle support: returns a tuple of local shards, metadata, a ProcessGroupState with local and
+        # global rank and world size, the sharding spec and the init_rrefs flag. Requires an initialized process group.
         pg_state = ShardedTensor.ProcessGroupState(
             distributed_c10d.get_rank(self._process_group),
             distributed_c10d.get_rank(),
@@ -1299,6 +1428,10 @@ class ShardedTensor(ShardedTensorBase):
         )
 
     def __setstate__(self, state):
+        # [FUNCTION DOC] Unpickle support: raises RuntimeError if the default process group is not initialized. Restores
+        # shards, metadata, spec and init_rrefs, sets the process group to the current sharding process group, verifies that
+        # the local and global rank and world size match those saved (RuntimeError otherwise) and runs post-init
+        # (re-registers id and rrefs). The sharded tensor id is reset to none first.
         self._sharded_tensor_id = None
         if not distributed_c10d.is_initialized():
             raise RuntimeError(
@@ -1354,6 +1487,8 @@ class ShardedTensor(ShardedTensorBase):
 def _create_tensor_from_params(
     *size, local_device, tensor_properties: TensorProperties
 ):
+    # [FUNCTION DOC] HELPER: Creates an uninitialized tensor via torch.empty with the given sizes on local_device,
+    # using dtype, layout, requires_grad, memory_format and pin_memory from tensor_properties. Returns it.
     """Helper to construct tensor from size, device and common params."""
     dtype = tensor_properties.dtype
     layout = tensor_properties.layout

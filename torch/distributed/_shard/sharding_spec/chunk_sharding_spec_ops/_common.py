@@ -1,5 +1,9 @@
 # mypy: allow-untyped-defs
 
+# [MODULE DOC] HELPER: Shared helpers for ChunkShardingSpec specific op implementations (embedding, linear and
+# similar): a spec type check, registration of ops that run on the single local tensor, and the collective
+# steps used for column-wise sharding (input all-gather, result redistribution with column rearrangement,
+# max_norm renormalization) and row-wise sharding (input masking). No import-time side effects beyond imports.
 import torch
 import torch.distributed as dist
 from torch.distributed._shard.sharded_tensor import ShardedTensor
@@ -19,6 +23,7 @@ from torch.distributed.nn.functional import (
 
 
 def _chunk_sharding_spec_check(spec, op):
+    # [FUNCTION DOC] HELPER: Raises NotImplementedError naming the op if spec is not a ChunkShardingSpec.
     """
     For the given op implementation check if the sharding spec is ChunkShardingSpec.
     """
@@ -31,6 +36,11 @@ def _chunk_sharding_spec_check(spec, op):
 def _register_sharded_op_on_local_tensor(
     op, early_stop_func=None, extra_check=None, customized_func=None
 ):
+    # [FUNCTION DOC] HELPER: Registers, for ChunkShardingSpec, an implementation of op that works on the sharded
+    # tensor's single local tensor, wrapped by the common sharded-op logic (early stop and extra check hooks).
+    # Optional customized_func receives args, kwargs and process group and returns the new local tensor, sharding
+    # spec and global size; otherwise the op is applied to the local tensor with the remaining arguments. Returns the
+    # registered implementation (result of the decorator chain).
     """
     Handles ``__torch_function__`` dispatch for ops which are performed on
     the single local tensor of the sharded tensor such as op like
@@ -58,6 +68,10 @@ def _register_sharded_op_on_local_tensor(
     @custom_sharding_spec_op(ChunkShardingSpec, op)
     @_sharded_op_common(op, early_stop_func, extra_check)
     def sharded_tensor_op_on_local_tensor(types, args=(), kwargs=None, pg=None):
+        # [FUNCTION DOC] HELPER: Implementation registered for the op. Takes the first argument as the sharded tensor
+        # and raises TypeError unless it has exactly one local shard. Computes the new local tensor (and possibly spec
+        # and size) as described by the registration, and returns a new ShardedTensor built from the contiguous local
+        # tensor, preserving the init_rrefs setting.
         # pyrefly: ignore [bad-index]
         st = args[0]
         sharding_spec = st.sharding_spec()
@@ -95,6 +109,11 @@ def _handle_col_wise_sharding_base(
     gathered_offsets=None,
     padding_idx=None,
 ):
+    # [FUNCTION DOC] HELPER: Column-wise sharding core. Applies op_func (with embedding / embedding_bag specific
+    # extra arguments when applicable) to each gathered input and the local weight shard, transposes each result so
+    # col_dim is first, then redistributes results among ranks with rearrangement and transposes back. Returns the
+    # final result tensor. KNOWN ISSUE: the input parameter is only forwarded to the redistribution helper, which
+    # does not use it.
     """
     For col-wise sharding of weight, lots of logic are common.
     So we extract the common logic and put in this function:
@@ -160,6 +179,10 @@ def _handle_col_wise_sharding_base(
 
 
 def _result_distribute_with_col_rearrange(results, input, world_size, weight, pg):
+    # [FUNCTION DOC] HELPER: Concatenates per-rank results and sends each rank its part with an all-to-all whose
+    # output split sizes follow the weight's chunk sharding along its sharding dimension. If the placement order
+    # differs from rank order, reorders the rows of the output with an index selection according to placement order.
+    # Returns the output tensor. Requires the weight to carry a chunk sharding spec and a process group.
     """
     For col-wise sharding of weight, we need to distribute
     results to each rank. We do them in this function.
@@ -229,6 +252,10 @@ def _handle_max_norm_col_wise(
     gathered_inputs,
     pg,
 ):
+    # [FUNCTION DOC] HELPER: Computes the max_norm renormalization for a column-wise sharded weight: sums powers of
+    # absolute values per row on the local shard, all-reduces them over pg to get the full row norms, limits the
+    # norm to max_norm only for rows referenced by the gathered inputs (others use infinity), guards against zero
+    # norms, and returns the rescaled local shard (contiguous). norm_type defaults to 2.0 when None.
     """
     For col-wise sharding of weight, we need to aggregate the
     norm across all ranks before we can perform the proper re-norm.
@@ -282,6 +309,8 @@ def _handle_max_norm_col_wise(
 
 
 def _all_gather_base_input(input, pg):
+    # [FUNCTION DOC] HELPER: All-gathers the input from every rank in pg into one tensor concatenated along
+    # dimension 0 using the base all-gather and returns it.
     """
     Use _all_gather_base to get a concatenated input from each rank.
 
@@ -300,6 +329,10 @@ def _all_gather_base_input(input, pg):
 
 
 def _handle_row_wise_mask(gather_inp, padding_idx, weight, world_size, rank):
+    # [FUNCTION DOC] HELPER: Prepares embedding lookup input for row-wise sharding. Finds this rank's start row and
+    # chunk size for the weight, subtracts the start from the gathered ids, and sets ids outside the local rows to
+    # chunk_size (an extra padding row). Adjusts padding_idx to local coordinates or None if it is not on this rank.
+    # Returns (lookup_input, padding_idx, padding_row) where padding_row is a zero row of the weight's embedding width.
     """
     Mask the input for embedding look-up for IDs which are not stored
     on the current rank. This function also adjust the ``padding_idx``
