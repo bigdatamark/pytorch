@@ -1,3 +1,8 @@
+# [MODULE DOC] TMA-based CuTeDSL scatter_add for the expanded 1D index pattern (rows of src added into
+# rows of out selected by a 1D index). One warp per CTA; a tile-mode TMA load stages a chunk of a source
+# row into a 2-stage shared-memory pipeline and a bulk reduce-add to global memory deposits it into the
+# output row. Requires sm_90+, fp32/fp16/bf16 and 16-byte aligned row bytes. Exposes tma_scatter_add_into,
+# row_shape_supported and min_d_divisor_for. Import time: builds the three bulk-reduce PTX wrappers.
 """TMA-based scatter_add for the ``index.unsqueeze(-1).expand(-1, N)`` pattern.
 
 Port of the CUDA C++ kernel from https://github.com/pytorch/pytorch/pull/182675
@@ -71,6 +76,7 @@ _SMEM_ALIGN_BYTES = 128
 
 
 def _round_up(x: int, m: int) -> int:
+    # [FUNCTION DOC] HELPER: Rounds x up to the next multiple of m.
     return (x + m - 1) // m * m
 
 
@@ -87,6 +93,8 @@ _bulk_reduce_add_bf16 = make_bulk_reduce_add("noftz.bf16")
 
 
 def _reduce_op_for(dtype):
+    # [FUNCTION DOC] HELPER: Selects the bulk reduce-add wrapper for a cute dtype (Float32, Float16, BFloat16);
+    # raises ValueError for any other dtype.
     if dtype is Float32:
         return _bulk_reduce_add_f32
     if dtype is Float16:
@@ -97,6 +105,10 @@ def _reduce_op_for(dtype):
 
 
 def _make_kernel(dtype, elem_bytes: int, chunk_elems: int, reduce_op):
+    # [FUNCTION DOC] HELPER: Builds the jitted launcher for a dtype-specialized scatter kernel. dtype, element
+    # bytes and chunk_elems (the static TMA box width, which sets smem stage stride aligned to 128 bytes)
+    # are compile-time; row width N and chunk count are runtime. Returns the launcher taking source, index,
+    # output, stream, N, num_chunks, chunks_per_cta, grid dims and the output row stride.
     """Build a dtype-specialized kernel closure. dtype/elem_bytes
     /chunk_elems are Python-time constants that the preprocessor folds
     at cute.compile time; ``N`` and ``num_chunks`` are runtime args so
@@ -140,6 +152,12 @@ def _make_kernel(dtype, elem_bytes: int, chunk_elems: int, reduce_op):
         chunks_per_cta: Int32,
         out_row_stride: Int64,
     ):
+        # [FUNCTION DOC] HELPER: Device kernel for one warp-sized CTA; only thread 0 drives. It allocates the
+        # smem buffer and a 2-stage TMA pipeline, then loops over assigned (entry, chunk) pairs: loads the
+        # source chunk by TMA (after checking the index is a valid output row, a device assert when
+        # assertions are enabled) and bulk-reduces the previously loaded chunk into out at index row and
+        # chunk offset, writing only the valid byte count for a partial last chunk. An epilogue drains the
+        # last outstanding load. blockIdx.x strides over rows, blockIdx.y partitions the chunk range.
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy, _ = cute.arch.block_idx()
         gdim_x, _, _ = cute.arch.grid_dim()
@@ -296,6 +314,9 @@ def _make_kernel(dtype, elem_bytes: int, chunk_elems: int, reduce_op):
         grid_y: Int32,
         out_row_stride: Int64,
     ):
+        # [FUNCTION DOC] HELPER: Jitted launcher: builds the tile-mode TMA descriptor over the source (box of
+        # one row by chunk_elems, out-of-range columns read as zero) and launches the kernel on a
+        # (grid_x, grid_y) grid with one warp per block.
         # Build the tile-mode TMA descriptor over the (M_src, N) source.
         # Both global dims are dynamic; the ``(1, chunk_elems)`` box is
         # static. TMA clamps OOB column reads to 0, so rows shorter than
@@ -326,6 +347,7 @@ def _make_kernel(dtype, elem_bytes: int, chunk_elems: int, reduce_op):
 
 
 def _chunk_elems_for(torch_dtype: torch.dtype) -> int:
+    # [FUNCTION DOC] HELPER: Static TMA box width in elements: 512 bytes divided by the dtype item size.
     """Compile-time ``chunk_elems`` (the static TMA box dim): always
     ``_MAX_CHUNK_BYTES // elem_bytes``. Since ``N`` is now a runtime arg
     the box can't shrink to fit small rows -- instead a short row loads
@@ -341,6 +363,9 @@ def _chunk_elems_for(torch_dtype: torch.dtype) -> int:
     key_fn=lambda torch_dtype: f"tma {torch_dtype}",
 )
 def _compile_tma_scatter(torch_dtype: torch.dtype):
+    # [FUNCTION DOC] HELPER: Cached compile of the TMA scatter launcher, one per torch dtype, using fake
+    # tensors with symbolic shapes, runtime N/chunk/grid args and the tvm-ffi and enable-assertions
+    # options (keeps index bounds asserts live). Returns the compiled callable.
     # N and num_chunks are runtime args, so one compile per dtype serves
     # every row length. chunk_elems (the static TMA box) depends only on
     # the dtype's element size.
@@ -381,6 +406,8 @@ def _compile_tma_scatter(torch_dtype: torch.dtype):
 
 
 def min_d_divisor_for(dtype: torch.dtype) -> int:
+    # [FUNCTION DOC] Returns the divisor that the row length D must satisfy for 16-byte alignment of the
+    # bulk reduce operands (16 divided by the dtype item size).
     """Smallest value D must be divisible by so ``cp.reduce.async.bulk``
     gmem operands stay 16-byte aligned: ``D * sizeof(dtype) % 16 == 0``,
     i.e. ``D % (16 / sizeof(dtype)) == 0``. fp32: %4, bf16/fp16: %8.
@@ -390,6 +417,7 @@ def min_d_divisor_for(dtype: torch.dtype) -> int:
 
 
 def row_shape_supported(dtype: torch.dtype, N: int) -> bool:
+    # [FUNCTION DOC] Host-side check: True if N times the dtype item size is a multiple of 16 bytes.
     """Host-side check: can the TMA kernel handle an N-element row?
 
     Only requirement is that ``row_bytes = N * elem_size`` is a multiple
@@ -403,6 +431,9 @@ def row_shape_supported(dtype: torch.dtype, N: int) -> bool:
 
 
 def _plan_grid(M: int, D: int, chunk_elems: int, sm: int) -> tuple[int, int, int]:
+    # [FUNCTION DOC] HELPER: Plans the launch grid for M rows, D columns on sm multiprocessors. If rows alone
+    # reach a target of 32 CTAs per SM, use a 1D grid (capped at 64 per SM) with all chunks per CTA;
+    # otherwise split the chunk axis across grid_y to fill the target. Returns (grid_x, grid_y, chunks_per_cta).
     """Pick ``(grid_x, grid_y, chunks_per_cta)``.
 
     Strategy: keep the classic 1D schedule (grid_y=1, whole chunk range
@@ -434,6 +465,10 @@ def tma_scatter_add_into(
     index_1d: torch.Tensor,
     src: torch.Tensor,
 ) -> None:
+    # [FUNCTION DOC] Host entry: in place adds each source row into the output row given by the 1D int64
+    # index (out row index_1d[i] += src row i). Both 2D tensors need unit inner stride; the compiled
+    # kernel for the dtype is looked up, the grid is planned from the device SM count, and it is launched.
+    # Side effect: mutates out. Row bytes must be a multiple of 16 (enforced by the caller's cond).
     """In-place: ``out[index_1d[i], :] += src[i, :]`` for every i.
 
     ``out`` / ``src`` are 2D with inner-dim stride 1 (outer row stride

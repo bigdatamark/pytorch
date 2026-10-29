@@ -1,3 +1,8 @@
+# [MODULE DOC] Vectorized CuTeDSL scatter_add using per-element atomics (fallback for pre-sm_90 GPUs).
+# Warp-per-source-row: each warp reads its index once and its lanes step through the row with 16-byte
+# vector loads, atomically adding into the indexed output row (scalar atomics for fp32, packed x2 atomics
+# for fp16/bf16). Supports fp32/fp16/bf16, 2D unit-inner-stride tensors. Exposes vec_scatter_add_into and
+# vec_elems_for. Import time: creates the two packed half atomic PTX wrappers.
 """Vectorized scatter_add with per-element atomics (pre-sm_90 fallback).
 
 Same input restriction as the TMA path (expanded-1D index, dim=0, 2D
@@ -41,6 +46,8 @@ _TORCH_TO_CUTE = {
 
 
 def _pack_half2_as_i32(val_a, val_b, elem_mlir_type, *, loc=None, ip=None):
+    # [FUNCTION DOC] HELPER: Packs two scalar half values into a two-element vector of the given MLIR element
+    # type and bitcasts it to a 32-bit integer, the operand layout the packed atomic instruction expects.
     """Build a <2 x elem> vector from two scalar halves and bitcast to i32.
     Matches the layout PTX red.global.add.noftz.{f16x2,bf16x2} expects."""
     vec_type = ir.VectorType.get([2], elem_mlir_type, loc=loc)
@@ -59,6 +66,8 @@ _packed_atomic_add_bf16x2 = make_packed_half_atomic_add("bf16x2")
 
 @dsl_user_op
 def _atomic_add_f16x2(ptr, val_a: Float16, val_b: Float16, *, loc=None, ip=None):
+    # [FUNCTION DOC] HELPER: DSL user op performing a packed two-element fp16 atomic add at the global
+    # pointer; no return value, mutates global memory.
     """Packed x2 f16 atomic add. Equivalent to atomicAdd(__half2*, ...)."""
     gmem_ptr_i64 = ptr.toint(loc=loc, ip=ip).ir_value()
     packed = _pack_half2_as_i32(val_a, val_b, Float16.mlir_type, loc=loc, ip=ip)
@@ -67,6 +76,8 @@ def _atomic_add_f16x2(ptr, val_a: Float16, val_b: Float16, *, loc=None, ip=None)
 
 @dsl_user_op
 def _atomic_add_bf16x2(ptr, val_a: BFloat16, val_b: BFloat16, *, loc=None, ip=None):
+    # [FUNCTION DOC] HELPER: DSL user op performing a packed two-element bf16 atomic add at the global
+    # pointer (needs sm_90+); no return value, mutates global memory.
     """Packed x2 bf16 atomic add (sm_90+)."""
     gmem_ptr_i64 = ptr.toint(loc=loc, ip=ip).ir_value()
     packed = _pack_half2_as_i32(val_a, val_b, BFloat16.mlir_type, loc=loc, ip=ip)
@@ -74,6 +85,9 @@ def _atomic_add_bf16x2(ptr, val_a: BFloat16, val_b: BFloat16, *, loc=None, ip=No
 
 
 def _make_kernel(dtype, elem_bytes: int, vec_elems: int, contig: bool):
+    # [FUNCTION DOC] HELPER: Builds the jitted launcher for a dtype-specialized vector scatter-add kernel.
+    # vec_elems is elements per 16-byte vector; contig selects the fast path where both row strides equal
+    # D. Returns the launcher (source, index, output, stream, num_entries, D, grid_x, strides).
     """Build a dtype-specialized vectorized scatter-add kernel.
 
     Each warp handles one source row. 32 lanes chunk through N, each lane
@@ -97,6 +111,10 @@ def _make_kernel(dtype, elem_bytes: int, vec_elems: int, contig: bool):
         src_row_stride: Int64,
         out_row_stride: Int64,
     ):
+        # [FUNCTION DOC] HELPER: Device kernel: each of 8 warps per block handles one source row at a time
+        # (grid-strided over rows). The warp validates the index (device assert when assertions are on),
+        # then lanes loop over D in 32-lane vector steps: vector-load from source into registers and
+        # atomically add into the output row, packed in pairs for halves, element-wise for fp32.
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         gdim, _, _ = cute.arch.grid_dim()
@@ -173,6 +191,7 @@ def _make_kernel(dtype, elem_bytes: int, vec_elems: int, contig: bool):
         src_row_stride: Int64,
         out_row_stride: Int64,
     ):
+        # [FUNCTION DOC] HELPER: Jitted launcher: launches the kernel on a 1D grid with 256 threads per block.
         _kernel(
             mSrc,
             mIndex,
@@ -195,6 +214,9 @@ def _make_kernel(dtype, elem_bytes: int, vec_elems: int, contig: bool):
     key_fn=lambda torch_dtype, contig: f"vec {torch_dtype} contig={contig}",
 )
 def _compile_vec_scatter(torch_dtype: torch.dtype, contig: bool):
+    # [FUNCTION DOC] HELPER: Cached compile of the vector scatter launcher per (dtype, contig), with symbolic
+    # shapes and runtime D; compiled with tvm-ffi and enable-assertions so index bounds checks stay live.
+    # Returns the compiled callable.
     # N is a runtime arg (``D``), never a compile-time constant here: the
     # kernel loops ``while off < D`` and loads fixed ``vec_elems`` chunks off
     # a raw iterator, so the inner dim can stay symbolic. One compile per
@@ -234,6 +256,7 @@ def _compile_vec_scatter(torch_dtype: torch.dtype, contig: bool):
 
 
 def vec_elems_for(dtype: torch.dtype) -> int:
+    # [FUNCTION DOC] Returns the number of elements in a 16-byte vector for the dtype (per lane per step).
     """Elements per lane per step (16-byte vector gather)."""
     return _VEC_BYTES // dtype.itemsize
 
@@ -243,6 +266,10 @@ def vec_scatter_add_into(
     index_1d: torch.Tensor,
     src: torch.Tensor,
 ) -> None:
+    # [FUNCTION DOC] Host entry: in place adds each source row into the output row selected by the 1D index.
+    # N must be divisible by vec_elems_for(dtype) (caller cond). Detects the contiguous case from strides,
+    # fetches the compiled kernel, sizes the grid as rows over 8 warps capped at 8 blocks per SM, launches.
+    # Side effect: mutates out with non-deterministic atomic accumulation order.
     """In-place: ``out[index_1d[i], :] += src[i, :]`` for every i.
 
     ``out`` / ``src`` are 2D with inner-dim stride 1; outer row stride

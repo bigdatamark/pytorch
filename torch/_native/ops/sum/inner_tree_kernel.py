@@ -1,3 +1,9 @@
+# [MODULE DOC] CuTeDSL inner-tree sum reduction kernels, a bitwise port of the CUDA inner-tree reduction.
+# Builds three execution shapes specialized on compile-time row width N: multirow (one thread per row for
+# tiny N), looped (warps per row, up to 3 batches inside one kernel) and two-kernel (partials kernel plus
+# linear accumulate kernel). Reproduces the CUDA add order (in-vector tree, ascending warp butterfly,
+# streaming tree carry). Compiled launchers are cached per config; inner_tree_sum_into is the host entry.
+# Imports cuda bindings and cutlass at import time; no other side effects.
 """CuTeDSL inner-tree sum reduction kernels.
 
 Bitwise port of the inner-tree reduction kernels in
@@ -80,6 +86,7 @@ _TORCH_TO_CUTE = {
 
 
 def _acc_for(in_dt):
+    # [FUNCTION DOC] HELPER: Accumulator cute dtype for an input cute dtype: Float64 for Float64, else Float32.
     return Float64 if in_dt is Float64 else Float32
 
 
@@ -102,6 +109,7 @@ _ACC_TORCH_DTYPE = {
 
 
 def _linear_reduce(vals):
+    # [FUNCTION DOC] HELPER: Trace-time left-to-right sum of a list of register values; returns the total.
     acc = vals[0]
     for i in range(1, len(vals)):
         acc = acc + vals[i]
@@ -109,6 +117,8 @@ def _linear_reduce(vals):
 
 
 def _inner_tree_reduce(vals):
+    # [FUNCTION DOC] HELPER: Trace-time pairwise tree sum of a list (strides 1,2,4,... combining neighbours
+    # in place on a copy); returns the first element. Matches the CUDA in-vector inner tree order.
     v = list(vals)
     n = len(v)
     stride = 1
@@ -122,10 +132,14 @@ def _inner_tree_reduce(vals):
 
 
 def _reduce_vec(vals, vec_size: int):
+    # [FUNCTION DOC] HELPER: Reduces one vector group with the tree order when vec_size is at least 4, else linearly.
     return _inner_tree_reduce(vals) if vec_size >= 4 else _linear_reduce(vals)
 
 
 def _streaming_push(tree, val, load: int, max_depth: int) -> None:
+    # [FUNCTION DOC] HELPER: Streaming inner-tree step: pops up to max_depth accumulators from the tree list
+    # (count = trailing zero bits of load+1), adding each to the carry on its left, then pushes the carry.
+    # Mutates the tree list in place; returns nothing.
     """Port of ``streaming_inner_tree_step``: merge count is the number of
     trailing zero bits of ``load + 1`` (``__ffs(load + 1) - 1``), capped at
     ``max_depth``. ``carry = tree_accs[--top] + carry`` keeps the existing
@@ -138,6 +152,8 @@ def _streaming_push(tree, val, load: int, max_depth: int) -> None:
 
 
 def _warp_butterfly(val):
+    # [FUNCTION DOC] HELPER: Warp-wide add reduction via shuffle-XOR butterfly with ascending offsets 1,2,4..16;
+    # every lane ends with the sum. Ascending order is required for bitwise parity with CUDA.
     """Ascending-offset shuffle-XOR butterfly add reduce (matches the CUDA
     ``warp_reduce`` ASCENDING direction)."""
     offset = 1
@@ -150,6 +166,8 @@ def _warp_butterfly(val):
 
 
 def _load_vec_static(mIn, row, base: int, N: int, vec_size: int, acc, zero):
+    # [FUNCTION DOC] HELPER: Loads vec_size elements of a row at a compile-time base (zero beyond N), converts
+    # to the accumulator type and reduces them. Used by the multirow path.
     """Load + reduce one vector group with compile-time ``base`` (multirow)."""
     vals = []
     for i in range(vec_size):
@@ -168,6 +186,8 @@ def _load_vec_dyn(
     acc: cutlass.Constexpr,
     zero,
 ):
+    # [FUNCTION DOC] HELPER: Jitted variant of the vector load/reduce with a runtime base offset; each element
+    # is bounds-checked against N and out-of-row elements contribute zero. Returns the reduced value.
     """Load + reduce one vector group with a runtime ``base`` (warp paths).
 
     ``@cute.jit`` so the per-element bounds check is lowered by the DSL
@@ -193,10 +213,15 @@ def _load_vec_dyn(
 
 
 def _make_multirow(in_dt, acc, out_dt, N: int, vec_size: int):
+    # [FUNCTION DOC] HELPER: Builds the multirow launcher: each thread (128 per block) sums one row using
+    # unrolled vector loads and the streaming tree, writing the output in dtype out_dt. N and vec_size
+    # are compile-time. Returns the jitted launch function (input, output, stream, num_outputs, grid).
     num_loads = _next_power_of_2(_ceil_div(N, vec_size))
 
     @cute.kernel
     def _kernel(mIn: cute.Tensor, mOut: cute.Tensor, num_outputs: Int32):
+        # [FUNCTION DOC] HELPER: Device kernel: thread computes its row, returns if beyond num_outputs, else
+        # accumulates all loads through the streaming tree and stores the converted result.
         tx, _, _ = cute.arch.thread_idx()
         bx, _, _ = cute.arch.block_idx()
         row = bx * Int32(_MULTIROW_THREADS) + tx
@@ -218,6 +243,7 @@ def _make_multirow(in_dt, acc, out_dt, N: int, vec_size: int):
         num_outputs: Int32,
         grid: Int32,
     ):
+        # [FUNCTION DOC] HELPER: Host-side jitted launcher: launches the kernel with the given grid and 128 threads per block.
         _kernel(mIn, mOut, num_outputs).launch(
             grid=[grid, 1, 1], block=[_MULTIROW_THREADS, 1, 1], stream=stream
         )
@@ -226,6 +252,9 @@ def _make_multirow(in_dt, acc, out_dt, N: int, vec_size: int):
 
 
 def _make_looped(in_dt, acc, out_dt, N: int, vec_size: int, p: InnerTreeParams):
+    # [FUNCTION DOC] HELPER: Builds the looped launcher: warps per row (num_warps) and rows_per_block rows per
+    # block cooperate, with up to num_batches batches reduced inside one kernel using per-batch compile-time
+    # geometry, cross-warp merge through shared memory, and a final add of batch sums. Returns the jitted launcher.
     wpr = p.num_warps  # warps_per_reduction == num_warps in launch_looped
     rows_per_block = p.rows_per_block
     total_warps = wpr * rows_per_block
@@ -243,6 +272,9 @@ def _make_looped(in_dt, acc, out_dt, N: int, vec_size: int, p: InnerTreeParams):
 
     @cute.kernel
     def _kernel(mIn: cute.Tensor, mOut: cute.Tensor, num_outputs: Int32):
+        # [FUNCTION DOC] HELPER: Device kernel: each warp loads/reduces its chunk per batch (zero beyond the
+        # row), merges warp sums via shared memory and barriers, accumulates batch sums, and warp 0 lane 0
+        # stores the row result if the row is active.
         tx, ty, _ = cute.arch.thread_idx()
         bx, _, _ = cute.arch.block_idx()
         lane = tx
@@ -314,6 +346,7 @@ def _make_looped(in_dt, acc, out_dt, N: int, vec_size: int, p: InnerTreeParams):
         num_outputs: Int32,
         grid: Int32,
     ):
+        # [FUNCTION DOC] HELPER: Host-side jitted launcher: block is 32 by total_warps threads, grid supplied.
         _kernel(mIn, mOut, num_outputs).launch(
             grid=[grid, 1, 1], block=[_WARP_SIZE, total_warps, 1], stream=stream
         )
@@ -322,6 +355,9 @@ def _make_looped(in_dt, acc, out_dt, N: int, vec_size: int, p: InnerTreeParams):
 
 
 def _make_two_partial(in_dt, acc, out_dt, N: int, vec_size: int, p: InnerTreeParams):
+    # [FUNCTION DOC] HELPER: Builds the partials kernel launcher for the two-kernel path: one block per
+    # (row, batch) pair reduces that batch's tile and stores one partial in the accumulator dtype.
+    # Full-batch and last-batch widths are precomputed. Returns the jitted launcher.
     wpr = p.num_warps
     num_batches = p.num_batches
     wle = _WARP_SIZE * vec_size
@@ -334,6 +370,7 @@ def _make_two_partial(in_dt, acc, out_dt, N: int, vec_size: int, p: InnerTreePar
     warp_chunk_full = eff * wle
 
     def _lpw(remaining: int) -> int:
+        # [FUNCTION DOC] HELPER: Loads-per-warp for a remaining element count: ceil division rounded up to a power of two when above 1.
         lpw = _ceil_div(remaining, wpr * wle)
         return _next_power_of_2(lpw) if lpw > 1 else lpw
 
@@ -341,6 +378,9 @@ def _make_two_partial(in_dt, acc, out_dt, N: int, vec_size: int, p: InnerTreePar
 
     @cute.kernel
     def _kernel(mIn: cute.Tensor, mPartials: cute.Tensor):
+        # [FUNCTION DOC] HELPER: Device kernel: derives row and batch from block id, reduces the warp chunk
+        # through the streaming tree and warp butterfly, merges warps via shared memory, and writes the partial
+        # from warp 0 lane 0. Grid is exact so there is no row bound check.
         # Grid is exactly num_outputs * num_batches, so no row bounds check.
         tx, ty, _ = cute.arch.thread_idx()
         bx, _, _ = cute.arch.block_idx()
@@ -410,6 +450,7 @@ def _make_two_partial(in_dt, acc, out_dt, N: int, vec_size: int, p: InnerTreePar
         stream: cuda.CUstream,
         grid: Int32,
     ):
+        # [FUNCTION DOC] HELPER: Host-side jitted launcher: block is 32 by num_warps threads, grid supplied.
         _kernel(mIn, mPartials).launch(
             grid=[grid, 1, 1], block=[_WARP_SIZE, wpr, 1], stream=stream
         )
@@ -418,8 +459,11 @@ def _make_two_partial(in_dt, acc, out_dt, N: int, vec_size: int, p: InnerTreePar
 
 
 def _make_two_accum(acc, out_dt, num_batches: int):
+    # [FUNCTION DOC] HELPER: Builds the accumulate launcher: one thread per row linearly sums that row's
+    # num_batches partials (runtime loop) in the accumulator dtype and stores the downcast result.
     @cute.kernel
     def _kernel(mPartials: cute.Tensor, mOut: cute.Tensor, num_outputs: Int32):
+        # [FUNCTION DOC] HELPER: Device kernel: sums partials for one row and writes the output; ignores rows beyond num_outputs.
         tx, _, _ = cute.arch.thread_idx()
         bx, _, _ = cute.arch.block_idx()
         row = bx * Int32(_ACCUM_THREADS) + tx
@@ -444,6 +488,7 @@ def _make_two_accum(acc, out_dt, num_batches: int):
         num_outputs: Int32,
         grid: Int32,
     ):
+        # [FUNCTION DOC] HELPER: Host-side jitted launcher: 128 threads per block, grid supplied.
         _kernel(mPartials, mOut, num_outputs).launch(
             grid=[grid, 1, 1], block=[_ACCUM_THREADS, 1, 1], stream=stream
         )
@@ -457,18 +502,21 @@ def _make_two_accum(acc, out_dt, num_batches: int):
 
 
 def _fake_2d(dt, N: int):
+    # [FUNCTION DOC] HELPER: Fake 2D tensor spec (symbolic rows, fixed N, symbolic row stride, unit column stride) for compile.
     return cute.runtime.make_fake_tensor(
         dt, (cute.sym_int(), N), stride=(cute.sym_int64(), 1)
     )
 
 
 def _fake_1d(dt):
+    # [FUNCTION DOC] HELPER: Fake 1D tensor spec with symbolic length and symbolic stride for compile.
     return cute.runtime.make_fake_tensor(
         dt, (cute.sym_int(),), stride=(cute.sym_int64(),)
     )
 
 
 def _fake_1d_contig(dt):
+    # [FUNCTION DOC] HELPER: Fake contiguous 1D tensor spec (symbolic length, stride 1) for compile.
     return cute.runtime.make_fake_tensor(dt, (cute.sym_int(),), stride=(1,))
 
 
@@ -477,6 +525,8 @@ def _fake_1d_contig(dt):
     key_fn=lambda torch_dtype, N: f"multirow {torch_dtype} N={N}",
 )
 def _compile_multirow(torch_dtype: torch.dtype, N: int):
+    # [FUNCTION DOC] HELPER: Cached compile of the multirow launcher for a torch dtype and row width N, using
+    # fake tensors with symbolic row count and strides and the tvm-ffi option. Returns the compiled callable.
     in_dt = _TORCH_TO_CUTE[torch_dtype]
     acc = _acc_for(in_dt)
     launcher = _make_multirow(in_dt, acc, in_dt, N, _vec_size(torch_dtype.itemsize))
@@ -507,6 +557,8 @@ def _compile_looped(
     rows_per_block: int,
     effective_loads: int,
 ):
+    # [FUNCTION DOC] HELPER: Cached compile of the looped launcher; the plan fields are repacked into an
+    # InnerTreeParams. Cache key is dtype, N, warps and batches. Returns the compiled callable.
     in_dt = _TORCH_TO_CUTE[torch_dtype]
     acc = _acc_for(in_dt)
     p = InnerTreeParams(
@@ -544,6 +596,8 @@ def _compile_two_partial(
     depth: int,
     effective_loads: int,
 ):
+    # [FUNCTION DOC] HELPER: Cached compile of the two-kernel partials launcher (rows per block fixed to 1,
+    # output in the accumulator dtype). Returns the compiled callable.
     in_dt = _TORCH_TO_CUTE[torch_dtype]
     acc = _acc_for(in_dt)
     p = InnerTreeParams(
@@ -572,6 +626,7 @@ def _compile_two_partial(
     ),
 )
 def _compile_two_accum(torch_dtype: torch.dtype, num_batches: int):
+    # [FUNCTION DOC] HELPER: Cached compile of the accumulate launcher for a dtype and batch count. Returns the compiled callable.
     out_dt = _TORCH_TO_CUTE[torch_dtype]
     acc = _acc_for(out_dt)
     launcher = _make_two_accum(acc, out_dt, num_batches)
@@ -587,6 +642,10 @@ def _compile_two_accum(torch_dtype: torch.dtype, num_batches: int):
 
 
 def inner_tree_sum_into(out: torch.Tensor, src: torch.Tensor) -> None:
+    # [FUNCTION DOC] Host entry: sums each row of the 2D source (inner stride 1) into the 1D out in place.
+    # Chooses multirow when N is small, looped when num_batches is at most the two-kernel threshold, else
+    # allocates an accumulator-dtype partials buffer and runs the partials then accumulate kernels.
+    # Launches on the current stream; unsupported dtypes would raise a KeyError from the dtype tables.
     """Compute ``out[r] = sum(src[r, :])`` for every row ``r``.
 
     ``src`` is a 2D ``(M, N)`` view with inner-dim stride 1 (outer row stride

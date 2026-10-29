@@ -1,3 +1,9 @@
+# [MODULE DOC] CuTeDSL fp32 top-K kernels. Provides topk_radix (fused radix-select for K 64..1024, one CTA
+# per row: four radix byte passes over a smem histogram, gather, cooperative bitonic sort, write) and
+# topk_register (register-resident top-K for K 16 or 32 with power-of-two N, one warp per row, Int64
+# value/index keys, local bitonic sort plus butterfly top-K merges). Also holds device helpers and cached
+# compile functions. Both return values (fp32) and int64 indices. No import-time side effects besides
+# decorators wrapping the compile functions in a cache.
 """CuTeDSL fp32 top-K kernels.
 
 Two kernels live here, picked by K and N in ``cutedsl_impl.py``:
@@ -53,6 +59,7 @@ _N_HIST_BINS: int = 256
 
 
 def _num_threads_for_k(k: int) -> int:
+    # [FUNCTION DOC] HELPER: Block size for the radix kernel: the larger of K and 256 histogram bins.
     """Pick block size for a given K.
 
     Bitonic sort in phase 3 assigns one element per thread, so we need
@@ -65,21 +72,27 @@ def _num_threads_for_k(k: int) -> int:
 
 @dsl_user_op
 def _elem_ptr(x: cute.Tensor, coord, *, loc=None, ip=None) -> cute.Pointer:
+    # [FUNCTION DOC] HELPER: DSL user op returning a pointer to the tensor element at a coordinate (iterator plus layout index).
     return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
 
 
 @dsl_user_op
 def _bitcast_f32_to_i32(val, *, loc=None, ip=None) -> Int32:
+    # [FUNCTION DOC] HELPER: DSL user op bitcasting an fp32 value to a 32-bit integer of the same bits.
     return Int32(llvm.bitcast(T.i32(), Float32(val).ir_value()))
 
 
 @dsl_user_op
 def _bitcast_i32_to_f32(val, *, loc=None, ip=None) -> Float32:
+    # [FUNCTION DOC] HELPER: DSL user op bitcasting a 32-bit integer to fp32 with the same bits.
     return Float32(llvm.bitcast(T.f32(), Int32(val).ir_value()))
 
 
 @cute.jit
 def _f32_to_radix_ord(val: Float32) -> Int32:
+    # [FUNCTION DOC] HELPER: Maps an fp32 value to a monotone Int32 ordinal (negatives invert bits except the
+    # sign, non-negatives keep bits) for MSB-first radix select; any NaN maps to the maximum ordinal 0x7FFFFFFF
+    # so NaN ranks first in largest-first order, as in aten.
     """Map fp32 to a monotone Int32 ordinal whose unsigned MSB->LSB byte
     order matches descending fp32 order. Negatives invert all bits;
     non-negatives keep their bits. With the byte-0 xor of 0x80 (applied
@@ -100,12 +113,15 @@ def _f32_to_radix_ord(val: Float32) -> Int32:
 
 
 def _smem_scalar(smem: cutlass.utils.SmemAllocator, dtype) -> cute.Tensor:
+    # [FUNCTION DOC] HELPER: Allocates a single-element shared-memory tensor (4-byte aligned) for a scalar bookkeeping slot.
     """Allocate a single-element smem tensor (scalar bookkeeping slot)."""
     return smem.allocate_tensor(dtype, cute.make_layout((1,)), byte_alignment=4)
 
 
 @cute.jit
 def _load_vec_f32(ptr: cute.Pointer, vec_elems: cutlass.Constexpr) -> cute.Tensor:
+    # [FUNCTION DOC] HELPER: Vectorized global-to-register load of vec_elems contiguous fp32 from a pointer;
+    # returns the register tensor. Width is static so the widest load instruction is chosen.
     """Vectorized gmem -> rmem load of ``vec_elems`` contiguous fp32.
 
     Cute picks the widest safe instruction (e.g. LDG.128 for a 4-wide
@@ -119,6 +135,8 @@ def _load_vec_f32(ptr: cute.Pointer, vec_elems: cutlass.Constexpr) -> cute.Tenso
 
 @cute.jit
 def _warp_inclusive_prefix(val: Int32, lane: Int32) -> Int32:
+    # [FUNCTION DOC] HELPER: Inclusive Hillis-Steele prefix sum of per-lane Int32 values across one warp using
+    # shuffle-up; lanes below the offset add nothing. Returns this lane's inclusive prefix.
     """Inclusive Hillis-Steele prefix sum across a single warp."""
     for i in cutlass.range_constexpr(int(math.log2(cute.arch.WARP_SIZE))):
         offset = 1 << i
@@ -137,6 +155,9 @@ def _block_excl_prefix_i32(
     warp: Int32,
     num_warps: cutlass.Constexpr,
 ) -> tuple[Int32, Int32]:
+    # [FUNCTION DOC] HELPER: Block-wide exclusive prefix sum of one Int32 per thread: warp scans, per-warp
+    # totals scanned by warp 0 in the scratch smem tensor (needs num_warps plus 1 slots, clobbered), then
+    # offsets added. Uses three block barriers. Returns (exclusive prefix, block total).
     """Block-wide exclusive prefix sum over per-thread ``val``.
 
     Returns ``(excl_pfx, total)``: ``excl_pfx`` is this thread's
@@ -176,6 +197,11 @@ def _block_excl_prefix_i32(
 
 
 class _RadixSelectTopK:
+    # [CLASS DOC] HELPER: Compile-time specialized (N, K, deterministic) one-CTA-per-row fused radix-select
+    # plus bitonic sort top-K. State is derived sizes: thread count, bitonic stage count, vector iterations
+    # over N in tiles of threads times 4, and the scalar tail start and iterations. Deterministic mode
+    # gathers by block prefix sums and sorts with a (ord, index) lexicographic comparator, matching aten;
+    # otherwise it uses smem atomics and an ord-only comparator. Methods: __call__ (launch) and kernel.
     """One-CTA-per-row fused radix-select + bitonic sort.
 
     ``N``, ``K`` and ``deterministic`` are specialised at compile time:
@@ -196,6 +222,8 @@ class _RadixSelectTopK:
     VEC: int = 4
 
     def __init__(self, N: int, K: int, deterministic: bool = True):
+        # [FUNCTION DOC] HELPER: Stores N, K and the deterministic flag and derives thread count, number of
+        # bitonic stages (log2 of K), vector iteration count and scalar tail geometry.
         self.N = N
         self.K = K
         self.deterministic = deterministic
@@ -216,6 +244,7 @@ class _RadixSelectTopK:
         mIndices: cute.Tensor,
         stream: cuda.CUstream,
     ):
+        # [FUNCTION DOC] HELPER: Jitted entry that launches the kernel with one block per input row and the planned thread count.
         M = mX.shape[0]
         self.kernel(mX, mValues, mIndices).launch(
             grid=[M, 1, 1],
@@ -225,6 +254,15 @@ class _RadixSelectTopK:
 
     @cute.kernel
     def kernel(self, mX: cute.Tensor, mValues: cute.Tensor, mIndices: cute.Tensor):
+        # [FUNCTION DOC] HELPER: Device kernel for one row. Phase 1: four MSB-to-LSB radix passes build a
+        # 256-bin smem histogram (only elements matching the decided prefix after the first pass); thread 0
+        # then finds the bin holding the K-th largest and updates prefix, mask and remaining count.
+        # Phase 2: initialise results to negative infinity and gather elements above the threshold plus the
+        # first remaining-count ties, by prefix sums (deterministic) or smem atomic counters. Phase 3:
+        # in-smem bitonic sort descending by ordinal (ties by lower index first when deterministic).
+        # Phase 4: threads below K write values and indices (Int32) to global memory.
+        # KNOWN ISSUE: the phase 3 comment mentions a composite Int64 key, but the code sorts parallel
+        # ordinal, value and index arrays instead.
         tidx, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
 
@@ -613,6 +651,8 @@ class _RadixSelectTopK:
 
 
 def _make_fake_tensor(dtype, shape, divisibility=1):
+    # [FUNCTION DOC] HELPER: Builds a fake tensor spec of the given dtype and shape for compile, with symbolic
+    # strides divisible by divisibility on all but the last (unit) dim and matching assumed alignment.
     stride = tuple(
         cute.sym_int64(divisibility=divisibility) if i != len(shape) - 1 else 1
         for i in range(len(shape))
@@ -630,6 +670,9 @@ def _make_fake_tensor(dtype, shape, divisibility=1):
     key_fn=lambda N, K, deterministic: f"radix N={N} K={K} det={deterministic}",
 )
 def _compile_topk_radix(N: int, K: int, deterministic: bool):
+    # [FUNCTION DOC] HELPER: Cached compile of the radix kernel for (N, K, deterministic) using fake
+    # tensors with a symbolic batch dimension, divisibility from gcd with 4, and the tvm-ffi option.
+    # Returns the compiled callable.
     batch_sym = cute.sym_int()
     div_n = math.gcd(4, N)
     div_k = math.gcd(4, K)
@@ -649,6 +692,10 @@ def _compile_topk_radix(N: int, K: int, deterministic: bool):
 def topk_radix(
     x: torch.Tensor, k: int, *, deterministic: bool = True
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Runs fused radix-select top-K on an fp32 2D contiguous input and returns (values fp32,
+    # indices int64), each of shape (M, K) sorted descending. The kernel writes int32 indices which are
+    # widened afterwards. Caller must ensure a supported K and N divisible by 4. Allocates outputs and
+    # launches on the current stream; the deterministic flag selects tie-breaking behavior.
     """Fused radix-select top-K for fp32 2D contiguous ``x``.
 
     Returns ``(values[M, K]: fp32, indices[M, K]: int64)`` with K sorted
@@ -675,6 +722,9 @@ def topk_radix(
 
 @cute.jit
 def _make_key(val: Float32, idx: Int32) -> Int64:
+    # [FUNCTION DOC] HELPER: Builds the Int64 sort key from a value and column index: the high 32 bits are the
+    # radix ordinal and the low 32 bits the bitwise complement of the index, so descending order gives
+    # value descending then index ascending. Real inputs keep keys away from the minimum Int64 sentinel.
     """Compose the descending-sort key: ``(ord_u32 << 32) | (~idx_u32)``.
 
     Sorting this Int64 descending gives ``(value desc, idx asc)`` -
@@ -689,6 +739,7 @@ def _make_key(val: Float32, idx: Int32) -> Int64:
 
 @cute.jit
 def _decode_key(key: Int64) -> tuple[Float32, Int32]:
+    # [FUNCTION DOC] HELPER: Inverse of _make_key: returns (fp32 value, Int32 index) decoded from the key.
     ord32 = Int32(key >> Int64(32))
     inv_idx = Int32(key & Int64(0xFFFFFFFF))
     val_bits = ord32 ^ ((ord32 >> Int32(31)) & Int32(0x7FFFFFFF))
@@ -697,6 +748,7 @@ def _decode_key(key: Int64) -> tuple[Float32, Int32]:
 
 @cute.jit
 def _cas_desc(arr: cute.Tensor, i: cutlass.Constexpr, j: cutlass.Constexpr) -> None:
+    # [FUNCTION DOC] HELPER: Compare-and-swap in place so that arr[i] holds the larger of positions i and j (descending order).
     a = arr[i]
     b = arr[j]
     if a < b:
@@ -706,6 +758,8 @@ def _cas_desc(arr: cute.Tensor, i: cutlass.Constexpr, j: cutlass.Constexpr) -> N
 
 @cute.jit
 def _bitonic_sort_desc(arr: cute.Tensor, n: cutlass.Constexpr) -> None:
+    # [FUNCTION DOC] HELPER: Fully unrolled in-register bitonic sort of n elements (power of two) into
+    # descending order, in place; does nothing when n is 1 or less.
     if const_expr(n > 1):
         num_stages = int(math.log2(n))
         for s in cutlass.range_constexpr(num_stages):
@@ -727,6 +781,7 @@ def _bitonic_sort_desc(arr: cute.Tensor, n: cutlass.Constexpr) -> None:
 
 @cute.jit
 def _bitonic_merge_desc(arr: cute.Tensor, n: cutlass.Constexpr) -> None:
+    # [FUNCTION DOC] HELPER: Unrolled merge of a bitonic sequence of length n into descending order in place.
     """Merge a bitonic sequence of length n into descending sorted."""
     if const_expr(n > 1):
         num_levels = int(math.log2(n))
@@ -741,6 +796,8 @@ def _bitonic_merge_desc(arr: cute.Tensor, n: cutlass.Constexpr) -> None:
 
 @cute.jit
 def _topk_merge_desc(a: cute.Tensor, b: cute.Tensor, K: cutlass.Constexpr) -> None:
+    # [FUNCTION DOC] HELPER: Keeps the K largest of two descending sorted K-length sequences in the first
+    # one: elementwise max against the reversed second sequence gives a bitonic sequence, then a bitonic merge sorts it.
     """Top-K of two K-sorted-descending sequences, in place into ``a``.
 
     ``a[i] <- max(a[i], b[K-1-i])`` yields a bitonic sequence in ``a``;
@@ -755,11 +812,15 @@ def _topk_merge_desc(a: cute.Tensor, b: cute.Tensor, K: cutlass.Constexpr) -> No
 
 
 class _RegisterTopK:
+    # [CLASS DOC] HELPER: Register-resident top-K for K 16 or 32 and power-of-two N: one warp per row,
+    # rows_per_cta warps per block (default 4). Each lane holds N/32 keys, sorts them, pads to K with a
+    # minimum sentinel, and merges top-K sets across the 5 butterfly shuffle rounds so lane 0 holds the row result.
     """Register-resident top-K. Each warp owns one row; ``ROWS_PER_CTA``
     warps per CTA. K in {16, 32}, N a power of 2 in [K, 2048].
     """
 
     def __init__(self, N: int, K: int, rows_per_cta: int = 4):
+        # [FUNCTION DOC] HELPER: Stores N and K and derives per-lane vector length, rows per CTA and threads per block.
         self.N = N
         self.K = K
         self.VEC = N // 32
@@ -774,6 +835,7 @@ class _RegisterTopK:
         mIndices: cute.Tensor,
         stream: cuda.CUstream,
     ):
+        # [FUNCTION DOC] HELPER: Jitted entry that launches one block per rows_per_cta rows.
         M = mX.shape[0]
         ROWS = const_expr(self.ROWS_PER_CTA)
         num_blocks = (M + ROWS - 1) // ROWS
@@ -785,6 +847,10 @@ class _RegisterTopK:
 
     @cute.kernel
     def kernel(self, mX: cute.Tensor, mValues: cute.Tensor, mIndices: cute.Tensor):
+        # [FUNCTION DOC] HELPER: Device kernel: each warp loads its row stripe (rows beyond the batch are
+        # clamped for loads and masked on stores), builds and sorts Int64 keys, extends to K with the
+        # sentinel, does butterfly top-K merges across the warp, and lane 0 decodes and writes values and
+        # Int32 indices for in-bounds rows.
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
 
@@ -844,6 +910,7 @@ class _RegisterTopK:
 
 @instrumented_cutedsl_cache("aten::topk", key_fn=lambda N, K: f"register N={N} K={K}")
 def _compile_topk_register(N: int, K: int):
+    # [FUNCTION DOC] HELPER: Cached compile of the register kernel for (N, K) with fake tensors and the tvm-ffi option. Returns the compiled callable.
     batch_sym = cute.sym_int()
     div_n = math.gcd(4, N)
     div_k = math.gcd(4, K)
@@ -861,6 +928,9 @@ def _compile_topk_register(N: int, K: int):
 
 
 def topk_register(x: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Runs register-resident top-K on an fp32 2D contiguous input; returns (values fp32,
+    # indices int64) of shape (M, K), sorted descending, with ties by lower index. Caller must ensure K in
+    # {16, 32} and N a power of two. Allocates outputs and launches on the current stream.
     """Register-resident top-K for fp32 2D contiguous ``x``.
 
     Returns ``(values[M, K]: fp32, indices[M, K]: int64)``, descending,

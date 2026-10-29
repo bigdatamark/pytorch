@@ -1,3 +1,6 @@
+# [MODULE DOC] Pure-Python planner for the inner-tree sum reduction: mirrors the C++ heuristics (warp count,
+# loads per warp, batch tile size, rows per block, tree depth) and exposes them as InnerTreeParams. Used by
+# the eager kernel and by Inductor (R0_BLOCK and split count). No import-time side effects beyond constants.
 from typing import NamedTuple
 
 
@@ -12,6 +15,7 @@ _K_TARGET_WARPS_PER_BLOCK = 8  # kTargetWarpsPerBlock
 
 
 def _previous_power_of_2(n: int) -> int:
+    # [FUNCTION DOC] HELPER: Largest power of two that is <= n (1 when n < 2).
     power = 1
     while power * 2 <= n:
         power <<= 1
@@ -19,6 +23,7 @@ def _previous_power_of_2(n: int) -> int:
 
 
 def _next_power_of_2(n: int) -> int:
+    # [FUNCTION DOC] HELPER: Smallest power of two that is >= n (1 when n <= 1).
     power = 1
     while power < n:
         power <<= 1
@@ -26,15 +31,19 @@ def _next_power_of_2(n: int) -> int:
 
 
 def _ceil_div(a: int, b: int) -> int:
+    # [FUNCTION DOC] HELPER: Integer ceiling division of a by b.
     return -(-a // b)
 
 
 def vec_size(itemsize: int) -> int:
+    # [FUNCTION DOC] Number of elements in a 16-byte vectorized load for the given item size (at least 1).
     """16-byte vectorized loads: fp32->4, fp64->2, fp16/bf16->8."""
     return max(1, 16 // max(1, itemsize))
 
 
 class InnerTreeParams(NamedTuple):
+    # [CLASS DOC] Immutable plan for an inner-tree reduction: warps per row, per-batch tile elements (Inductor
+    # R0_BLOCK), number of batches (split count), tree depth, rows per block and effective loads per warp.
     num_warps: int
     batch_total_elements: int  # Inductor R0_BLOCK (the per-batch tile).
     # Inductor split count: ceil(N / batch_total_elements).
@@ -47,6 +56,10 @@ class InnerTreeParams(NamedTuple):
 def compute_inner_tree_params(
     inputs_per_output: int, num_outputs: int, vec_size: int
 ) -> InnerTreeParams:
+    # [FUNCTION DOC] Computes the InnerTreeParams for reducing inputs_per_output elements per output row.
+    # Picks a power-of-two warp count (capped at 16) from the warp-load width, rounds loads per warp up to a
+    # power of two, caps them by the batch threshold, derives batch tile and batch count, packs several rows
+    # per block when few warps and few batches, and computes tree depth (at least 1). Pure; no exceptions.
     """Plan the inner-tree reduction for one row of inputs.
 
     ``vec_size`` is ``vec_size(itemsize)``. The result is the tiling used by

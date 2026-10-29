@@ -1,3 +1,8 @@
+# [MODULE DOC] CuTeDSL override registrations for aten topk and topk.values on CUDA. Chooses between a
+# register-resident kernel (K 16 or 32, power-of-two N in a per-K range) and a fused radix-select kernel
+# (K 64..1024, N large enough and divisible by 4), only for fp32, non-COW, contiguous inputs reduced over
+# the last axis with largest and sorted both true and at least one full wave of rows. Anything else falls
+# through to ATen. Kernels are imported lazily from cutedsl_kernels. No import-time side effects.
 """CuTeDSL override registrations for ``aten::topk``.
 
 Two kernels, picked by (K, N) - see ``cutedsl_kernels.py``:
@@ -76,10 +81,14 @@ _REGISTER_N_RANGE: dict[int, tuple[int, int]] = {
 
 
 def _is_pow2(x: int) -> bool:
+    # [FUNCTION DOC] HELPER: True if x is a positive power of two.
     return x > 0 and (x & (x - 1)) == 0
 
 
 def _kernel_for(k: int, n: int) -> str | None:
+    # [FUNCTION DOC] HELPER: Picks the kernel for (K, N): "register" when K is a register K and N is a power
+    # of two within the per-K range, "radix" when K is a radix K, N reaches the per-K multiple of K and N is
+    # divisible by 4, else None (fall back to ATen).
     """Pick the kernel for (K, N): "register", "radix", or None (aten)."""
     if k in _REGISTER_KS:
         n_min, n_max = _REGISTER_N_RANGE[k]
@@ -93,6 +102,8 @@ def _kernel_for(k: int, n: int) -> str | None:
 
 @functools.cache
 def _min_rows_for_full_wave(device_idx: int) -> int:
+    # [FUNCTION DOC] HELPER: Cached per device index; returns the SM count, the minimum row count for which
+    # the one-CTA-per-row kernels fill a full wave.
     """Row threshold below which the one-CTA-per-row kernel underutilises
     the GPU. A full wave is SM-count CTAs; below that, aten's multi-CTA
     kernel gets more parallelism out of the same rows and wins."""
@@ -102,6 +113,9 @@ def _min_rows_for_full_wave(device_idx: int) -> int:
 def _eligible(
     self: torch.Tensor, k: int, dim: int, largest: bool, sorted_: bool
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Common eligibility test: CUDA fp32, not COW, largest and sorted true, dim is the
+    # last axis of a contiguous tensor, a kernel exists for (K, N), and the row count is at least the SM
+    # count of the device. Returns bool; never raises.
     if not self.is_cuda or self.dtype != torch.float32:
         return False
     if any_cow(self):
@@ -131,6 +145,7 @@ def _cond(
     *args,
     **kwargs,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Dispatcher condition for topk; coerces arguments and delegates to _eligible.
     return _eligible(self, int(k), int(dim), bool(largest), bool(sorted))
 
 
@@ -144,6 +159,8 @@ def _out_cond(
     values: torch.Tensor,
     indices: torch.Tensor,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Dispatcher condition for topk.values: requires the base condition plus non-COW
+    # fp32 values and int64 indices outputs with shape equal to the input shape with last size K.
     if not _cond(self, k, dim, largest, sorted):
         return False
     if any_cow(values, indices):
@@ -157,6 +174,9 @@ def _out_cond(
 
 
 def _run(self: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Runs the selected kernel on the 2D flattened input and returns (values, indices)
+    # reshaped to the input layout. Radix uses the deterministic variant when deterministic algorithms are
+    # enabled. If the tensor is not on the current CUDA device the launch is wrapped in a device guard.
     from .cutedsl_kernels import topk_radix, topk_register
 
     self_2d = flatten_last_dim(self)
@@ -164,6 +184,7 @@ def _run(self: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     kernel = _kernel_for(k, N)
 
     def _launch() -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Launches the register kernel or the radix kernel (deterministic flag from global state) on the 2D view.
         if kernel == "register":
             return topk_register(self_2d, k)
         # Pick the deterministic kernel under torch.use_deterministic_algorithms
@@ -196,6 +217,8 @@ def _impl(
     *args,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Dispatcher implementation for topk; dim, largest and sorted are ignored since the
+    # condition guarantees last axis, largest, sorted. Returns (values, indices).
     return _run(self, int(k))
 
 
@@ -209,6 +232,8 @@ def _out_impl(
     values: torch.Tensor,
     indices: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Dispatcher implementation for topk.values: computes the result then copies into
+    # the provided values and indices tensors (mutated) and returns them.
     v, i = _run(self, int(k))
     values.copy_(v)
     indices.copy_(i)
@@ -216,6 +241,8 @@ def _out_impl(
 
 
 def register_to_dispatch() -> None:
+    # [FUNCTION DOC] Registers the topk and topk.values CUDA overrides through cutedsl_utils with multiple
+    # overrides allowed to coexist for each op.
     for op_symbol, cond, impl in (
         ("topk", _cond, _impl),
         ("topk.values", _out_cond, _out_impl),
