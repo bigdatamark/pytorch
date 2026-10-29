@@ -1,4 +1,7 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Device-generic tests of the default backend mapping and basic process
+# group creation in torch.distributed. Instantiates TestMiscCollectiveUtils for cpu,
+# cuda, mps and xpu at import time via instantiate_device_type_tests.
 
 import os
 
@@ -13,7 +16,11 @@ common backend API tests
 
 
 class TestMiscCollectiveUtils(TestCase):
+    # [CLASS DOC] Device-parametrized tests for dist.get_default_backend_for_device and
+    # creating a single-rank default process group on that backend.
     def test_device_to_backend_mapping(self, device) -> None:
+        # [FUNCTION DOC] Checks the default backend per device: nccl for cuda, gloo for cpu and
+        # mps, xccl for xpu; any other device must raise ValueError.
         """
         Test device to backend mapping
         """
@@ -42,6 +49,9 @@ class TestMiscCollectiveUtils(TestCase):
                 dist.get_default_backend_for_device(device)
 
     def test_create_pg(self, device) -> None:
+        # [FUNCTION DOC] Sets MASTER_ADDR and MASTER_PORT (29500) in os.environ, initializes a
+        # world-size-1 group via env:// with the default backend, checks the default group's
+        # backend name matches, then destroys the process group.
         """
         Test create process group
         """

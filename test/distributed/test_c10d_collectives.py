@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for backend-agnostic c10d collectives, run per backend.
+# It defines AbstractCollectivesTest on top of C10dBackendTest and, at import time,
+# calls instantiate_backend_tests to generate one concrete test class per entry of
+# C10D_BACKENDS. If torch.distributed is unavailable the module prints a message to
+# stderr and exits the process with status 0. Defines the reduce op tuples and the
+# ASYNC_OPS and COUNTS parameter grids used by the tests.
 
 import sys
 
@@ -40,12 +46,23 @@ INTEGER_REDUCE_OPS = (
 
 
 class AbstractCollectivesTest(C10dBackendTest):
+    # [CLASS DOC] Backend-independent collective test suite (broadcast, gather, scatter,
+    # all_to_all, reductions, barrier, split_group, coalescing, float8, complex).
+    # Relies on attributes from C10dBackendTest (rank, world_size, device, device_type,
+    # backend_name, dtypes, float8_dtypes, complex_dtypes, premul_sum_dtypes and the
+    # supports_* capability flags) and on _init_pg to create the process group. Rank r
+    # contributes the value r+1 (parity for bool), which the helpers use to build inputs
+    # and expected outputs.
     def _value(self, rank, dtype):
+        # [FUNCTION DOC] HELPER: Per-rank fill value: parity of rank as a bool for the bool
+        # dtype, otherwise rank + 1.
         if dtype == torch.bool:
             return bool(rank % 2)
         return rank + 1
 
     def _tensor(self, count, dtype, rank=None):
+        # [FUNCTION DOC] HELPER: Build a 1-D float32 tensor of length count filled with the rank's
+        # value (this rank by default), on the test device, then cast to dtype.
         rank = self.rank if rank is None else rank
         value = self._value(rank, dtype)
         return torch.full((count,), value, dtype=torch.float32, device=self.device).to(
@@ -53,9 +70,13 @@ class AbstractCollectivesTest(C10dBackendTest):
         )
 
     def _expected_tensor(self, count, dtype, rank):
+        # [FUNCTION DOC] HELPER: Expected content of the tensor contributed by the given rank;
+        # identical to the tensor that rank creates.
         return self._tensor(count, dtype, rank=rank)
 
     def _wait(self, work, async_op):
+        # [FUNCTION DOC] HELPER: Check the work handle against async_op. For async calls the
+        # handle must be non-None and is waited on; for sync calls it must be None.
         if async_op:
             self.assertIsNotNone(work)
             work.wait()
@@ -63,6 +84,9 @@ class AbstractCollectivesTest(C10dBackendTest):
             self.assertIsNone(work)
 
     def _reduce_ops(self, dtype):
+        # [FUNCTION DOC] HELPER: Reduce ops valid for dtype: float ops (sum, product, min, max,
+        # avg) for floating dtypes; otherwise integer ops, including bitwise ones only if the
+        # backend supports bitwise reductions (else just the first four).
         if dtype.is_floating_point:
             return FLOAT_REDUCE_OPS
         if self.supports_bitwise_reductions:
@@ -70,6 +94,8 @@ class AbstractCollectivesTest(C10dBackendTest):
         return INTEGER_REDUCE_OPS[:4]
 
     def _expected_reduce_value(self, dtype, op):
+        # [FUNCTION DOC] HELPER: Compute the scalar result of reducing every rank's value with op
+        # on the host. Raises AssertionError for an unhandled op.
         values = [self._value(rank, dtype) for rank in range(self.world_size)]
         if op == dist.ReduceOp.SUM:
             result = sum(values)
@@ -100,18 +126,24 @@ class AbstractCollectivesTest(C10dBackendTest):
         return result
 
     def _expected_reduce(self, count, dtype, op):
+        # [FUNCTION DOC] HELPER: Tensor of length count holding the expected reduction result,
+        # created as float32 and cast to dtype.
         value = self._expected_reduce_value(dtype, op)
         return torch.full((count,), value, dtype=torch.float32, device=self.device).to(
             dtype
         )
 
     def _test_broadcast(self, count, dtype, async_op):
+        # [FUNCTION DOC] HELPER: Broadcast from rank 0 and check that every rank ends with
+        # the tensor rank 0 contributed.
         tensor = self._tensor(count, dtype)
         work = dist.broadcast(tensor, src=0, async_op=async_op)
         self._wait(work, async_op)
         self.assertEqual(tensor, self._expected_tensor(count, dtype, rank=0))
 
     def _test_all_gather(self, count, dtype, async_op):
+        # [FUNCTION DOC] HELPER: all_gather into a list of per-rank tensors and compare each entry
+        # with the tensor the corresponding rank contributed.
         tensor = self._tensor(count, dtype)
         output = [torch.empty_like(tensor) for _ in range(self.world_size)]
         work = dist.all_gather(output, tensor, async_op=async_op)
@@ -120,6 +152,8 @@ class AbstractCollectivesTest(C10dBackendTest):
             self.assertEqual(result, self._expected_tensor(count, dtype, rank))
 
     def _test_all_gather_single(self, count, dtype, async_op):
+        # [FUNCTION DOC] HELPER: all_gather_single into one flat output and compare with the
+        # concatenation of all ranks' tensors.
         tensor = self._tensor(count, dtype)
         output = torch.empty(self.world_size * count, dtype=dtype, device=self.device)
         work = dist.all_gather_single(output, tensor, async_op=async_op)
@@ -133,6 +167,8 @@ class AbstractCollectivesTest(C10dBackendTest):
         self.assertEqual(output, expected)
 
     def _test_gather(self, count, dtype, async_op):
+        # [FUNCTION DOC] HELPER: gather to rank 0 with a list of outputs (only rank 0 provides
+        # them) and check the gathered per-rank tensors on rank 0.
         tensor = self._tensor(count, dtype)
         output = (
             [torch.empty_like(tensor) for _ in range(self.world_size)]
@@ -146,6 +182,8 @@ class AbstractCollectivesTest(C10dBackendTest):
                 self.assertEqual(result, self._expected_tensor(count, dtype, rank))
 
     def _test_gather_single(self, count, dtype, async_op):
+        # [FUNCTION DOC] HELPER: gather_single to rank 0 with both a flat output (concatenated)
+        # and a stacked output (world_size by count); rank 0 checks against cat or stack.
         tensor = self._tensor(count, dtype)
         expected = [
             self._expected_tensor(count, dtype, rank) for rank in range(self.world_size)
@@ -169,6 +207,8 @@ class AbstractCollectivesTest(C10dBackendTest):
                     )
 
     def _test_scatter(self, count, dtype, async_op):
+        # [FUNCTION DOC] HELPER: scatter from rank 0 (which supplies one tensor per rank) and
+        # check that each rank receives its own rank's tensor.
         output = torch.empty(count, dtype=dtype, device=self.device)
         inputs = (
             [
@@ -183,6 +223,8 @@ class AbstractCollectivesTest(C10dBackendTest):
         self.assertEqual(output, self._expected_tensor(count, dtype, self.rank))
 
     def _test_all_to_all(self, count, dtype, async_op):
+        # [FUNCTION DOC] HELPER: all_to_all with every rank sending its own tensor to all peers;
+        # output i must equal the tensor of rank i.
         inputs = [
             self._expected_tensor(count, dtype, self.rank)
             for _ in range(self.world_size)
@@ -194,6 +236,8 @@ class AbstractCollectivesTest(C10dBackendTest):
             self.assertEqual(result, self._expected_tensor(count, dtype, rank))
 
     def _test_all_to_all_single(self, count, dtype, async_op):
+        # [FUNCTION DOC] HELPER: all_to_all_single with equal splits; output chunk i must equal
+        # the tensor of rank i.
         inputs = torch.cat(
             [
                 self._expected_tensor(count, dtype, self.rank)
@@ -212,6 +256,8 @@ class AbstractCollectivesTest(C10dBackendTest):
         self.assertEqual(output, expected)
 
     def _test_transport_matrix(self, test):
+        # [FUNCTION DOC] HELPER: Run the given test callable over all counts, the backend's dtypes
+        # and sync/async modes, each in its own subtest.
         for count in COUNTS:
             for dtype in self.dtypes:
                 for async_op in ASYNC_OPS:
@@ -219,6 +265,9 @@ class AbstractCollectivesTest(C10dBackendTest):
                         test(count, dtype, async_op)
 
     def test_collective_preserves_current_device(self):
+        # [FUNCTION DOC] CUDA only: sets the current device to a different GPU than the PG's,
+        # runs all_reduce, and checks the current device is unchanged and the result is the
+        # world size (all ones summed). Skipped for non-CUDA backends.
         if self.device_type != "cuda":
             self.skipTest(f"{self.backend_name} does not use CUDA")
         self._init_pg()
@@ -232,14 +281,18 @@ class AbstractCollectivesTest(C10dBackendTest):
         self.assertEqual(tensor, torch.full_like(tensor, self.world_size))
 
     def test_broadcast(self):
+        # [FUNCTION DOC] Run broadcast over the count/dtype/async matrix.
         self._init_pg()
         self._test_transport_matrix(self._test_broadcast)
 
     def test_all_gather(self):
+        # [FUNCTION DOC] Run all_gather over the count/dtype/async matrix.
         self._init_pg()
         self._test_transport_matrix(self._test_all_gather)
 
     def test_all_gather_uneven(self):
+        # [FUNCTION DOC] all_gather with per-rank tensor sizes (rank+1 elements), sync and async.
+        # Skipped when the backend does not support uneven all-gather. Checks each output.
         if not self.supports_uneven_all_gather:
             self.skipTest(f"{self.backend_name} does not support uneven all-gather")
         self._init_pg()
@@ -257,6 +310,9 @@ class AbstractCollectivesTest(C10dBackendTest):
                     )
 
     def test_all_gather_mixed_devices(self):
+        # [FUNCTION DOC] CUDA only: all_gather where the last output tensor lives on another GPU
+        # and the current device was changed. Checks the current device stays that GPU before
+        # and after wait, then synchronizes both devices and checks all gathered values.
         if self.device_type != "cuda":
             self.skipTest(f"{self.backend_name} does not use CUDA")
         self._init_pg()
@@ -280,14 +336,19 @@ class AbstractCollectivesTest(C10dBackendTest):
             )
 
     def test_all_gather_single(self):
+        # [FUNCTION DOC] Run all_gather_single over the count/dtype/async matrix.
         self._init_pg()
         self._test_transport_matrix(self._test_all_gather_single)
 
     def test_gather(self):
+        # [FUNCTION DOC] Run gather over the count/dtype/async matrix.
         self._init_pg()
         self._test_transport_matrix(self._test_gather)
 
     def test_gather_single(self):
+        # [FUNCTION DOC] If the backend lacks gather_single, expects a RuntimeError saying so.
+        # Otherwise runs the gather_single matrix and checks that rank 0 gets an error when
+        # the output has the input's size instead of world_size times larger.
         self._init_pg()
         if not self.supports_gather_single:
             with self.assertRaisesRegex(RuntimeError, "does not support gather_single"):
@@ -305,6 +366,8 @@ class AbstractCollectivesTest(C10dBackendTest):
                 dist.gather_single(input, output, dst=0)
 
     def test_gather_into_tensor_deprecated(self):
+        # [FUNCTION DOC] Checks the deprecated gather_into_tensor still gathers correctly on rank 0
+        # and emits a FutureWarning about deprecation. Skipped without gather_single support.
         if not self.supports_gather_single:
             self.skipTest(f"{self.backend_name} does not support gather_single")
         self._init_pg()
@@ -326,14 +389,18 @@ class AbstractCollectivesTest(C10dBackendTest):
             self.assertEqual(output, expected)
 
     def test_scatter(self):
+        # [FUNCTION DOC] Run scatter over the count/dtype/async matrix.
         self._init_pg()
         self._test_transport_matrix(self._test_scatter)
 
     def test_all_to_all(self):
+        # [FUNCTION DOC] Run all_to_all over the count/dtype/async matrix.
         self._init_pg()
         self._test_transport_matrix(self._test_all_to_all)
 
     def test_all_to_all_rejects_mixed_devices(self):
+        # [FUNCTION DOC] CUDA only: all_to_all with one input on a different GPU must raise
+        # RuntimeError or ValueError mentioning a same-device requirement.
         if self.device_type != "cuda":
             self.skipTest(f"{self.backend_name} does not use CUDA")
         self._init_pg()
@@ -351,10 +418,13 @@ class AbstractCollectivesTest(C10dBackendTest):
             dist.all_to_all(outputs, inputs)
 
     def test_all_to_all_single(self):
+        # [FUNCTION DOC] Run all_to_all_single over the count/dtype/async matrix.
         self._init_pg()
         self._test_transport_matrix(self._test_all_to_all_single)
 
     def test_all_to_all_single_split_sizes(self):
+        # [FUNCTION DOC] all_to_all_single with uneven per-peer split sizes (input rank+dest+1,
+        # output src+rank+1), sync and async; checks each source's chunk value.
         self._init_pg()
         for async_op in ASYNC_OPS:
             input_splits = [
@@ -394,6 +464,9 @@ class AbstractCollectivesTest(C10dBackendTest):
             self.assertEqual(output, expected)
 
     def test_all_to_all_single_independent_empty_split_sizes(self):
+        # [FUNCTION DOC] all_to_all_single where only one side's split list is empty: empty input
+        # splits with explicit output splits, then explicit input splits with empty output
+        # splits (the empty side is divided equally); checks the received chunks.
         self._init_pg()
 
         input_count = self.rank + 1
@@ -447,6 +520,9 @@ class AbstractCollectivesTest(C10dBackendTest):
         self.assertEqual(output, expected)
 
     def test_all_to_all_single_invalid_split_sizes(self):
+        # [FUNCTION DOC] Checks all_to_all_single rejects bad split sizes (negative, wrong length,
+        # wrong sum) on either side with a RuntimeError mentioning splits, and that empty split
+        # lists with a size not divisible by the group size raise a does-not-divide error.
         self._init_pg()
         valid_splits = [2] * self.world_size
         invalid_splits = (
@@ -496,6 +572,8 @@ class AbstractCollectivesTest(C10dBackendTest):
             )
 
     def test_all_reduce(self):
+        # [FUNCTION DOC] all_reduce for every count, dtype, valid op and sync/async mode; the
+        # tensor on all ranks must equal the expected reduction.
         self._init_pg()
         for count in COUNTS:
             for dtype in self.dtypes:
@@ -512,6 +590,7 @@ class AbstractCollectivesTest(C10dBackendTest):
                             )
 
     def test_reduce(self):
+        # [FUNCTION DOC] reduce to rank 0 over count, dtype, op and async; only rank 0 checks.
         self._init_pg()
         for count in COUNTS:
             for dtype in self.dtypes:
@@ -529,6 +608,8 @@ class AbstractCollectivesTest(C10dBackendTest):
                                 )
 
     def test_reduce_scatter(self):
+        # [FUNCTION DOC] reduce_scatter with equal-size inputs over count, dtype, op and async;
+        # each rank's output must equal the expected reduction.
         self._init_pg()
         for count in COUNTS:
             for dtype in self.dtypes:
@@ -551,6 +632,7 @@ class AbstractCollectivesTest(C10dBackendTest):
                             )
 
     def test_reduce_scatter_uneven(self):
+        # [FUNCTION DOC] reduce_scatter with input sizes rank+1 (SUM); each rank checks its output.
         self._init_pg()
         sizes = [rank + 1 for rank in range(self.world_size)]
         for async_op in ASYNC_OPS:
@@ -574,6 +656,8 @@ class AbstractCollectivesTest(C10dBackendTest):
                 )
 
     def test_reduce_scatter_single(self):
+        # [FUNCTION DOC] reduce_scatter_single with a flat concatenated input over count, dtype,
+        # op and async; each rank checks its chunk.
         self._init_pg()
         for count in COUNTS:
             for dtype in self.dtypes:
@@ -598,6 +682,8 @@ class AbstractCollectivesTest(C10dBackendTest):
                             )
 
     def test_premul_sum(self):
+        # [FUNCTION DOC] all_reduce with PREMUL_SUM using a Python float and a tensor factor of
+        # 0.5; result must be 0.5 times the sum of rank values. Skipped without premul dtypes.
         if not self.premul_sum_dtypes:
             self.skipTest(f"{self.backend_name} does not support PREMUL_SUM")
         self._init_pg()
@@ -615,12 +701,15 @@ class AbstractCollectivesTest(C10dBackendTest):
                     self.assertEqual(tensor, torch.full_like(tensor, expected))
 
     def test_barrier(self):
+        # [FUNCTION DOC] Sync and async barrier return values are checked via _wait.
         self._init_pg()
         for async_op in ASYNC_OPS:
             work = dist.barrier(async_op=async_op)
             self._wait(work, async_op)
 
     def test_sync_barrier_blocks_host_on_stream(self):
+        # [FUNCTION DOC] CUDA only: enqueues a long sleep kernel, asserts the stream is busy,
+        # then a synchronous barrier must return None and leave the stream drained.
         # A synchronous barrier must host-block the CPU thread until prior work
         # on the current stream has completed, not merely stream-order after it.
         # Downstream code relies on this (e.g. the flashinfer trtllm one-shot
@@ -646,6 +735,9 @@ class AbstractCollectivesTest(C10dBackendTest):
         )
 
     def test_split_group(self):
+        # [FUNCTION DOC] CUDA only: sets the default PG bound device, initializes the communicator
+        # with an all_reduce, then split_group over the first half of ranks. Members must get a
+        # group with those ranks and a correct all_reduce; others get NON_GROUP_MEMBER.
         # split_group drives the backend's split() (ncclCommSplit under the
         # NCCL backends). gloo's backend supports splitting too, but only
         # reachable via a mixed cpu:gloo,cuda:nccl pg: dist.split_group requires
@@ -681,6 +773,8 @@ class AbstractCollectivesTest(C10dBackendTest):
         dist.barrier()
 
     def test_split_group_full_partition(self):
+        # [FUNCTION DOC] CUDA only, even world size: split_group partitioning all ranks into two
+        # halves; every rank gets its half's group and a correct all_reduce within it.
         # Partition the whole parent group into two subgroups; every rank is a
         # member of exactly one split and gets a live communicator. See
         # test_split_group for why this is restricted to the CUDA backends.
@@ -708,6 +802,8 @@ class AbstractCollectivesTest(C10dBackendTest):
         dist.barrier()
 
     def test_all_reduce_coalesced(self):
+        # [FUNCTION DOC] all_reduce_coalesced on three tensors of sizes 1 to 3 for each dtype and
+        # async mode; each must equal the SUM reduction.
         self._init_pg()
         for dtype in self.dtypes:
             for async_op in ASYNC_OPS:
@@ -724,6 +820,9 @@ class AbstractCollectivesTest(C10dBackendTest):
                         )
 
     def test_coalescing_manager(self):
+        # [FUNCTION DOC] Uses the coalescing manager (sync and async) to batch all_reduce,
+        # all_gather_single and reduce_scatter_single calls; checks the number of recorded works
+        # (1 for async, 0 otherwise), waits, and checks values. Skipped without coalescing support.
         if not self.supports_coalescing:
             self.skipTest(f"{self.backend_name} does not support coalescing")
         self._init_pg()
@@ -790,6 +889,8 @@ class AbstractCollectivesTest(C10dBackendTest):
                 self.assertEqual(output, torch.full_like(output, expected_value))
 
     def test_float8_transport(self):
+        # [FUNCTION DOC] Float8 transport for broadcast, gather/all_gather variants, scatter and
+        # all_to_all variants. Skipped without float8 dtypes or if the GPU is below sm90.
         if not self.float8_dtypes:
             self.skipTest(f"{self.backend_name} does not support Float8")
         if torch.cuda.get_device_capability(self.device) < (9, 0):
@@ -815,6 +916,8 @@ class AbstractCollectivesTest(C10dBackendTest):
                         test(4, dtype, async_op)
 
     def test_complex_collectives(self):
+        # [FUNCTION DOC] Complex dtypes: broadcast, and all_reduce/reduce with SUM and AVG, sync
+        # and async; reduce is checked only on rank 0.
         self._init_pg()
         for dtype in self.complex_dtypes:
             for async_op in ASYNC_OPS:
@@ -846,6 +949,8 @@ class AbstractCollectivesTest(C10dBackendTest):
                                 )
 
     def test_noncontiguous_all_to_all_error(self):
+        # [FUNCTION DOC] all_to_all_single with a non-contiguous (transposed) input must raise a
+        # ValueError saying tensors must be contiguous.
         self._init_pg()
         input = torch.ones(self.world_size, self.world_size, device=self.device).t()
         output = torch.empty_like(input.contiguous())
@@ -853,6 +958,9 @@ class AbstractCollectivesTest(C10dBackendTest):
             dist.all_to_all_single(output, input)
 
     def test_mismatched_dtypes(self):
+        # [FUNCTION DOC] all_gather_single, reduce_scatter_single and all_to_all_single with a
+        # float64 buffer and a float32 tensor must each raise RuntimeError, TypeError
+        # or ValueError.
         self._init_pg()
         input = torch.ones(4, device=self.device)
         output = torch.empty(
