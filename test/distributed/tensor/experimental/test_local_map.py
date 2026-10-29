@@ -1,5 +1,11 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for the experimental local_map wrapper, which runs a function on the local
+# tensors of DTensor arguments and wraps the result back into DTensors. Covers correctness,
+# output and input placement handling, input redistribution, gradient placements, multiple
+# meshes, and the spmd_types type-checking mode (single-process LocalTensorMode, multi-GPU and
+# multi-dimensional mesh variants). Import-time side effects: defines the module-level
+# placement lists, a funcol op alias, and one function already decorated with local_map.
 
 import unittest
 
@@ -40,21 +46,28 @@ replicate = [Replicate()]  # replicate placements on 1-d mesh
 
 
 def equal_allgather_forward(device_mesh, X, Y):
+    # [FUNCTION DOC] HELPER: Compares local X and Y for exact equality, all-gathers the boolean
+    # result across the mesh and returns a Python bool: True only if every rank's shards match.
     eq = torch.tensor([torch.equal(X, Y)], device=X.device)
     eq_gather = funcol.all_gather_single(eq, 0, device_mesh)
     return torch.all(eq_gather).item()
 
 
 def mm_all_gather_forward(device_mesh, A, B):
+    # [FUNCTION DOC] HELPER: Local matrix product of A and B, all-gathered along dim 0 over the
+    # mesh and waited on; returns the gathered tensor.
     local_mm_result = torch.mm(A, B)
     return funcol.all_gather_single(local_mm_result, 0, device_mesh).wait()
 
 
 def mm_forward(A, B):  # no device mesh needed since we don't do collective
+    # [FUNCTION DOC] HELPER: Plain local matrix product of A and B; no communication.
     return torch.mm(A, B)
 
 
 def mm_allreduce_forward(device_mesh, A, B):
+    # [FUNCTION DOC] HELPER: Local matrix product followed by a sum all-reduce over the mesh
+    # (waited on); returns the reduced tensor. Used with column/row sharded operands.
     partial_sum_tensor = torch.mm(A, B)
     return funcol.all_reduce(partial_sum_tensor, "sum", device_mesh).wait()
 
@@ -64,22 +77,33 @@ def mm_allreduce_forward(device_mesh, A, B):
     in_placements=(None, col_wise, row_wise),
 )
 def mm_allreduce_forward_decorated(device_mesh, A, B):
+    # [FUNCTION DOC] HELPER: Same body as mm_allreduce_forward, but wrapped at import time with
+    # local_map: replicated output placement; inputs: none for the mesh, column-sharded A,
+    # row-sharded B.
     partial_sum_tensor = torch.mm(A, B)
     return funcol.all_reduce(partial_sum_tensor, "sum", device_mesh).wait()
 
 
 def mul_forward(X, scalar):  # no device mesh needed since we don't do collective
+    # [FUNCTION DOC] HELPER: Multiplies tensor X by a scalar; no communication.
     return torch.mul(X, scalar)
 
 
 class TestLocalMap(DTensorTestBase):
+    # [CLASS DOC] Multi-process DTensor tests for local_map using a 1-D mesh of 2 ranks (one
+    # test needs 4 GPUs). Tests count collectives with CommDebugMode and compare with local math.
     @property
     def world_size(self):
+        # [FUNCTION DOC] Number of ranks used by this test class: 2.
         return 2
 
     # simple correctness check
     @with_comms
     def test_local_map_correctness(self):
+        # [FUNCTION DOC] Computes X @ W with X column-sharded and W row-sharded, both via a
+        # function returned by local_map and via the decorator form. Each must perform exactly
+        # one collective (output redistribution to replicate), give replicated placements and
+        # a local result equal to the reference product.
         device_mesh = init_device_mesh(
             device_type=self.device_type, mesh_shape=(self.world_size,)
         )
@@ -134,6 +158,10 @@ class TestLocalMap(DTensorTestBase):
     # check for `out_placements`
     @with_comms
     def test_local_map_out_placements(self):
+        # [FUNCTION DOC] Test 1: with no output placements, a function returning a Python bool
+        # passes through unwrapped (one all-gather; result false for different inputs). Test 2:
+        # with no DTensor arguments (plain tensors) the function runs directly and returns a
+        # plain tensor; the all-gather count is 1 and matches the reference product.
         # Test 1: wrap out into DTensor w/ `out_placements`
         device_mesh = init_device_mesh(
             device_type=self.device_type, mesh_shape=(self.world_size,)
@@ -181,6 +209,11 @@ class TestLocalMap(DTensorTestBase):
     # check for `in_placements` handling
     @with_comms
     def test_local_map_in_placements(self):
+        # [FUNCTION DOC] Exercises input placement handling: (1) explicit placements and (2)
+        # none given, both with zero communication and row-sharded output; (3) none for a
+        # non-tensor argument; (4)-(5) plain local tensors as inputs with none or partial
+        # placements and no output wrapping; (6) none for a DTensor argument raises
+        # AssertionError mentioning that placements are expected.
         device_mesh = init_device_mesh(
             device_type=self.device_type, mesh_shape=(self.world_size,)
         )
@@ -288,6 +321,9 @@ class TestLocalMap(DTensorTestBase):
     # check for `redistribute_inputs` handling
     @with_comms
     def test_local_map_redistribute(self):
+        # [FUNCTION DOC] With input redistribution allowed, mismatched shardings are
+        # redistributed (2 input collectives plus 1 output = 3) and the result is correct. With it
+        # disabled, calling raises ValueError telling the user to set redistribute_inputs.
         device_mesh = init_device_mesh(
             device_type=self.device_type, mesh_shape=(self.world_size,)
         )
@@ -336,6 +372,11 @@ class TestLocalMap(DTensorTestBase):
     # check for `in_grad_placements` handling
     @with_comms()
     def test_local_map_with_grad_placement(self):
+        # [FUNCTION DOC] Builds a reference gradient from two batch halves, then runs local_map
+        # with explicit input gradient placements, with the input DTensor either replicated
+        # (placement mismatch, so redistributed) or already row-sharded. Forward output and
+        # gradients of X and W must match the reference; grad placements equal the requested
+        # ones when no mismatch occurred. Seeds the RNG.
         """
         Test the gradient result is correct when we specify the right
         `in_grad_placements`.
@@ -397,6 +438,9 @@ class TestLocalMap(DTensorTestBase):
     @skip_if_lt_x_gpu(4)
     @with_comms
     def test_multi_mesh_inputs(self):
+        # [FUNCTION DOC] Needs at least 4 GPUs. Passes DTensors from a 1-D mesh and a 2-D mesh to
+        # a local_map function that targets the 2-D mesh. Expects no communication, a local
+        # output of shape (8, 4), and the output living on the 2-D mesh.
         """
         Test the function can be applied to accept DTensors that lives
         on different device meshes.
@@ -439,12 +483,18 @@ class TestLocalMap(DTensorTestBase):
 
 @unittest.skipUnless(dist._is_spmd_types_available(), "requires spmd_types")
 class TestLocalMapSpmdTypes(TestCase):
+    # [CLASS DOC] Single-process tests (skipped without spmd_types) of local_map with type
+    # checking on, using a fake process group of 2 ranks, a mesh with axis tp and a local tensor
+    # mode entered for each test. Class attributes: mesh, tp_axis (mesh axis for tp).
     """Single-process tests for local_map with spmd_types type checking."""
 
     WORLD_SIZE = 2
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Tears down any existing process group, resets spmd_types mesh-axis
+        # state, creates a fake-backend group of WORLD_SIZE ranks and a 1-D cpu mesh named tp,
+        # and stores the mesh and its tp axis on the class. Global state mutation.
         from spmd_types._mesh_axis import _reset
 
         if dist.is_initialized():
@@ -459,6 +509,7 @@ class TestLocalMapSpmdTypes(TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Destroys the process group if initialized and resets spmd_types state.
         from spmd_types._mesh_axis import _reset
 
         if dist.is_initialized():
@@ -466,6 +517,8 @@ class TestLocalMapSpmdTypes(TestCase):
         _reset()
 
     def setUp(self):
+        # [FUNCTION DOC] Resets spmd_types state and enters a LocalTensorMode with WORLD_SIZE
+        # simulated ranks (kept in self.mode, exited in tearDown).
         from spmd_types._mesh_axis import _reset
 
         _reset()
@@ -473,9 +526,14 @@ class TestLocalMapSpmdTypes(TestCase):
         self.mode.__enter__()
 
     def tearDown(self):
+        # [FUNCTION DOC] Exits the local tensor mode entered in setUp.
         self.mode.__exit__(None, None, None)
 
     def test_local_spmd_types(self):
+        # [FUNCTION DOC] Inside a type-checked local_map region, a sharded input is typed as
+        # varying and a replicated input as replicated (with partial grad), and their product is
+        # varying. A partial input stays partial after a scalar multiply. Checks are asserted
+        # inside the wrapped functions.
         """Verify local SPMD types inside the local_map region."""
         tp_axis = self.tp_axis
 
@@ -488,6 +546,8 @@ class TestLocalMapSpmdTypes(TestCase):
         )
 
         def mm_fn(X, W):
+            # [FUNCTION DOC] HELPER: Asserts local types of X (varying) and W (replicated) along
+            # the tp axis, multiplies them, asserts the output is varying and returns it.
             self.assertIs(spmd.get_local_type(X)[tp_axis], spmd.V)
             self.assertIs(spmd.get_local_type(W)[tp_axis], spmd.R)
             out = torch.mm(X, W)
@@ -510,6 +570,7 @@ class TestLocalMapSpmdTypes(TestCase):
         )
 
         def check_p(X):
+            # [FUNCTION DOC] HELPER: Doubles X and asserts the result is typed partial.
             X = X * 2
             self.assertIs(spmd.get_local_type(X)[tp_axis], spmd.P)
             return X
@@ -525,6 +586,9 @@ class TestLocalMapSpmdTypes(TestCase):
         wrapped(X_dt)
 
     def test_replicate_grad_typing(self):
+        # [FUNCTION DOC] For a replicated input, a partial gradient placement makes the local
+        # type replicated, while a replicated gradient placement makes it invariant. Verified
+        # by assertions inside the wrapped functions.
         """
         Replicate + grad Partial -> R (backward needs all-reduce).
         Replicate + grad Replicate -> I (backward is identity).
@@ -535,6 +599,7 @@ class TestLocalMapSpmdTypes(TestCase):
         )
 
         def check_fn(W):
+            # [FUNCTION DOC] HELPER: Asserts W has replicated local type on tp and returns it.
             self.assertIs(spmd.get_local_type(W)[tp_axis], spmd.R)
             return W
 
@@ -555,6 +620,7 @@ class TestLocalMapSpmdTypes(TestCase):
 
         # Replicate grad: infers invariant local type
         def check_fn(X):
+            # [FUNCTION DOC] HELPER: Asserts X has invariant local type on tp and returns it.
             self.assertIs(spmd.get_local_type(X)[tp_axis], spmd.I)
             return X
 
@@ -569,6 +635,9 @@ class TestLocalMapSpmdTypes(TestCase):
         wrapped(X_dt)
 
     def test_incompatible_in_grad_placements(self):
+        # [FUNCTION DOC] A replicated input with a sharded gradient placement cannot be
+        # represented by one SPMD type; calling raises ValueError with an expected explanatory
+        # message about the forward/backward placement pair.
         """Replicate fwd expects Partial or Replicate grad, not Shard."""
         X_dt = DTensor.from_local(
             torch.randn(4, 8), self.mesh, [Replicate()], run_check=False
@@ -596,9 +665,15 @@ If the forward and backward layouts intentionally diverge in a way not represent
         )
 
     def test_output_spmd_type_mismatch(self):
+        # [FUNCTION DOC] Table of identity functions where the inferred output SPMD type
+        # (varying, replicated, invariant, partial) disagrees with out_placements; each must
+        # raise ValueError with the expected "placement mismatch" message.
         """Output spmd type must be compatible with out_placements."""
 
         def check_mismatch(in_p, out_p, msg, in_grad_p=None):
+            # [FUNCTION DOC] HELPER: Wraps an identity function in type-checked local_map using
+            # the given input/output placements (and optional input grad placements), calls it on
+            # a DTensor with in_p and asserts ValueError with message msg.
             X_dt = DTensor.from_local(
                 torch.randn(4, 8), self.mesh, in_p, run_check=False
             )
@@ -656,6 +731,8 @@ If the forward and backward layouts intentionally diverge in a way not represent
         )
 
     def test_output_missing_spmd_type(self):
+        # [FUNCTION DOC] A function returning a tensor without any spmd type annotation makes
+        # the type-checked call raise ValueError with the expected "no annotation" message.
         """Output tensor with no spmd_types annotation should raise."""
         X_dt = DTensor.from_local(
             torch.randn(4, 8), self.mesh, [Shard(0)], run_check=False
@@ -663,6 +740,7 @@ If the forward and backward layouts intentionally diverge in a way not represent
         unannotated = torch.randn(4, 4)
 
         def fn(X):
+            # [FUNCTION DOC] HELPER: Ignores X and returns a captured unannotated tensor.
             return unannotated
 
         wrapped = local_map(
@@ -680,6 +758,8 @@ If the forward and backward layouts intentionally diverge in a way not represent
         )
 
     def test_output_tensor_requires_placements(self):
+        # [FUNCTION DOC] Type-checked local_map with no output placements for a tensor output
+        # raises ValueError saying placements are required for tensor outputs.
         X_dt = DTensor.from_local(
             torch.randn(4, 8), self.mesh, [Shard(0)], run_check=False
         )
@@ -699,6 +779,10 @@ If the forward and backward layouts intentionally diverge in a way not represent
         )
 
     def test_out_spmd_types_to_grad_placements(self):
+        # [FUNCTION DOC] Unit test of the private mapping from output SPMD types and output
+        # placements to backward grad placements: replicated -> partial; invariant -> replicate;
+        # partial -> replicate; varying shard -> same shard; varying with partial placement ->
+        # replicate. Compares against the expected tuple of one-element tuples.
         from torch.distributed.tensor.experimental._func_map import (
             _out_spmd_types_to_grad_placements,
         )
@@ -734,6 +818,8 @@ If the forward and backward layouts intentionally diverge in a way not represent
         )
 
     def test_unsupported_placement_type(self):
+        # [FUNCTION DOC] Using a strided-shard input placement with type checking on raises
+        # ValueError naming the unsupported placement type.
         """spmd_types=True should raise for unsupported placement types like _StridedShard."""
         from torch.distributed.tensor.placement_types import _StridedShard
 
@@ -759,14 +845,22 @@ If the forward and backward layouts intentionally diverge in a way not represent
 
 @unittest.skipUnless(dist._is_spmd_types_available(), "requires spmd_types")
 class TestLocalMapSpmdTypesMultiGPU(DTensorTestBase):
+    # [CLASS DOC] Multi-process (2 ranks) tests of type-checked local_map with real collectives
+    # and gradient behavior. Skipped without spmd_types.
     """Multi-GPU tests for local_map with spmd_types type checking."""
 
     @property
     def world_size(self):
+        # [FUNCTION DOC] Number of ranks used by this test class: 2.
         return 2
 
     @with_comms()
     def test_spmd_types_dp_matmul(self):
+        # [FUNCTION DOC] Data-parallel matmul with custom autograd functions. Step 1: buggy
+        # backward (no all-reduce of weight grad) without type checking gives a wrong W grad.
+        # Step 2: with type checking the buggy version raises the spmd type error. Step 3:
+        # the correct function with a type-check rule and all-reduce gives gradients equal to the
+        # single-node reference. Seeds RNG.
         """DP matmul with custom autograd functions.
 
         Data is Shard(0) (V), weights are Replicate (R). The correct backward
@@ -786,13 +880,19 @@ class TestLocalMapSpmdTypesMultiGPU(DTensorTestBase):
 
         @register_local_autograd_function
         class BuggyDPMatmul(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd function for a local matmul whose backward forgets to
+            # all-reduce the weight gradient (deliberately wrong); registered as a local
+            # autograd function with spmd_types.
             @staticmethod
             def forward(ctx, X, W):
+                # [FUNCTION DOC] HELPER: Saves X and W for backward and returns their product.
                 ctx.save_for_backward(X, W)
                 return torch.mm(X, W)
 
             @staticmethod
             def backward(ctx, grad_output):
+                # [FUNCTION DOC] HELPER: Returns input grad and weight grad from local products
+                # only (no cross-rank reduction for the weight grad).
                 X, W = ctx.saved_tensors
                 grad_X = torch.mm(grad_output, W.t())
                 grad_W = torch.mm(X.t(), grad_output)  # BUG: missing all-reduce
@@ -800,14 +900,20 @@ class TestLocalMapSpmdTypesMultiGPU(DTensorTestBase):
 
         @register_autograd_function
         class CorrectDPMatmul(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Data-parallel matmul autograd function whose backward
+            # all-reduces the weight gradient over the saved mesh; has a type-check forward rule
+            # requiring X varying and W invariant on the dp axis, output varying.
             @staticmethod
             def forward(ctx, X, W, mesh):
+                # [FUNCTION DOC] HELPER: Saves X, W and the mesh for backward; returns X @ W.
                 ctx.save_for_backward(X, W)
                 ctx.mesh = mesh
                 return torch.mm(X, W)
 
             @staticmethod
             def backward(ctx, grad_output):
+                # [FUNCTION DOC] HELPER: Returns the input grad, the sum all-reduced weight grad,
+                # and None for the mesh argument.
                 X, W = ctx.saved_tensors
                 grad_X = torch.mm(grad_output, W.t())
                 grad_W = funcol.all_reduce(
@@ -817,6 +923,8 @@ class TestLocalMapSpmdTypesMultiGPU(DTensorTestBase):
 
             @staticmethod
             def typecheck_forward(X, W, mesh):
+                # [FUNCTION DOC] HELPER: Type-check rule: asserts X varying and W invariant on
+                # the dp mesh axis, applies the function, asserts output varying, returns it.
                 dp = MeshAxis.of(mesh.get_group("dp"))
                 assert_type(X, {dp: spmd.V})
                 assert_type(W, {dp: spmd.I})
@@ -891,6 +999,11 @@ class TestLocalMapSpmdTypesMultiGPU(DTensorTestBase):
 
     @with_comms()
     def test_spmd_types_backward_grad_placements(self):
+        # [FUNCTION DOC] Checks backward grad handling of type-checked local_map: a grad that
+        # matches the expected placement needs no redistribution (strict explicit-redistribution
+        # context passes), while mismatched grads are redistributed implicitly (all-to-all,
+        # all-reduce, reduce-scatter counted with CommDebugMode). Also checks the resulting input
+        # grad placement and shape in the reduce-scatter case.
         """
         Matching grad_out placements need no redistribution; mismatched grads get implicitly redistributed.
         """
@@ -902,6 +1015,9 @@ class TestLocalMapSpmdTypesMultiGPU(DTensorTestBase):
 
         # S(0) @ R -> S(0) FWD: backward expects S(0) grad
         def s0_r_mm():
+            # [FUNCTION DOC] HELPER: Builds a row-sharded X and replicated W (requiring grad),
+            # runs a type-checked local_map matmul with sharded output, and returns the output
+            # DTensor together with the input DTensors.
             X = torch.randn(4, 8, device=self.device_type, requires_grad=True)
             X_dt = distribute_tensor(X, device_mesh, [Shard(0)])
             W = torch.randn(8, 4, device=self.device_type, requires_grad=True)
@@ -942,6 +1058,8 @@ class TestLocalMapSpmdTypesMultiGPU(DTensorTestBase):
         )
 
         def s1_s0_mm():
+            # [FUNCTION DOC] HELPER: Builds new column-sharded X and row-sharded W DTensors and
+            # applies the partial-output wrapped matmul; returns output, X_dt and W_dt.
             X = torch.randn(4, 8, device=self.device_type, requires_grad=True)
             X_dt = distribute_tensor(X, device_mesh, [Shard(1)])
             W = torch.randn(8, 4, device=self.device_type, requires_grad=True)
@@ -1009,12 +1127,17 @@ class TestLocalMapSpmdTypesMultiGPU(DTensorTestBase):
 
 @unittest.skipUnless(dist._is_spmd_types_available(), "requires spmd_types")
 class TestLocalMapSpmdTypesMesh(TestCase):
+    # [CLASS DOC] Single-process tests (skipped without spmd_types) of type-checked local_map on
+    # multi-dimensional meshes using a fake group of 4 ranks and a local tensor mode per test.
+    # Class attributes: mesh_2d (dp x tp, 2 by 2) and mesh_ep (1-D, 4 ranks).
     """Tests for local_map spmd_types with multi-dimensional meshes."""
 
     WORLD_SIZE = 4
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Destroys any existing process group, resets spmd_types state, creates a
+        # fake-backend group of 4 ranks and the two cpu meshes mesh_2d and mesh_ep on the class.
         from spmd_types._mesh_axis import _reset
 
         if dist.is_initialized():
@@ -1029,6 +1152,7 @@ class TestLocalMapSpmdTypesMesh(TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Destroys the process group if initialized and resets spmd_types state.
         from spmd_types._mesh_axis import _reset
 
         if dist.is_initialized():
@@ -1036,6 +1160,8 @@ class TestLocalMapSpmdTypesMesh(TestCase):
         _reset()
 
     def setUp(self):
+        # [FUNCTION DOC] Resets spmd_types state and enters a LocalTensorMode with WORLD_SIZE
+        # simulated ranks (kept in self.mode, exited in tearDown).
         from spmd_types._mesh_axis import _reset
 
         _reset()
@@ -1043,9 +1169,13 @@ class TestLocalMapSpmdTypesMesh(TestCase):
         self.mode.__enter__()
 
     def tearDown(self):
+        # [FUNCTION DOC] Exits the local tensor mode entered in setUp.
         self.mode.__exit__(None, None, None)
 
     def test_output_wrong_mesh(self):
+        # [FUNCTION DOC] A wrapped function that reinterprets its output onto a different mesh
+        # makes the type-checked call raise ValueError (no annotation found on the expected
+        # mesh dimension). Supporting a different mesh is a TODO in the docstring.
         """Output reinterpreted to a different mesh should raise.
 
         TODO: support local_map with a different device_mesh + placements
@@ -1060,6 +1190,7 @@ class TestLocalMapSpmdTypesMesh(TestCase):
         )
 
         def fn_reinterpret(X):
+            # [FUNCTION DOC] HELPER: Returns X reinterpreted onto the 1-D ep mesh.
             return spmd.reinterpret_mesh(X, self.mesh_ep)
 
         wrapped = local_map(

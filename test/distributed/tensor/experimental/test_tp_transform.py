@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for the experimental tensor_parallel_transformation, which rewrites an
+# exported program so selected modules run tensor-parallel. Contains small dummy models and a
+# multi-process DTensor test class that compares transformed output with the original model and
+# counts the c10d functional collectives inserted in the graph. No import-time side effects.
 from collections import defaultdict
 
 import torch
@@ -18,11 +22,15 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
 
 
 class MLPListModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Model holding a ModuleList of num_mlps MLPs, each Linear(6, 18),
+    # ReLU, Linear(18, 6) with optional bias on the last linear.
     """
     A dummy model with list of MLPs.
     """
 
     def __init__(self, num_mlps=3, bias=True):
+        # [FUNCTION DOC] HELPER: Creates num_mlps Sequential MLPs; bias applies only to the
+        # second linear of each MLP.
         super().__init__()
         self.mlps = torch.nn.ModuleList()
         for _ in range(num_mlps):
@@ -35,6 +43,8 @@ class MLPListModule(torch.nn.Module):
             )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Keeps the first half of the input along dim 1 (chunk into 2),
+        # runs it through every MLP in sequence, and adds a tensor of ones to the result.
         x = torch.chunk(x, 2, dim=1)[0]
         for mlp in self.mlps:
             x = mlp(x)
@@ -42,22 +52,33 @@ class MLPListModule(torch.nn.Module):
 
 
 class DummyModel(torch.nn.Module):
+    # [CLASS DOC] HELPER: Model with a Linear(3, 5) named fc and a constant buffer of bucket
+    # boundaries; its forward uses searchsorted, an op the transform has no sharding rule for.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates fc and registers the boundaries buffer [-1, 0, 1].
         super().__init__()
         self.fc = torch.nn.Linear(3, 5)
         self.register_buffer("boundaries", torch.tensor([-1.0, 0.0, 1.0]))
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Returns the bucket index of every fc output value within the
+        # boundaries buffer.
         return torch.searchsorted(self.boundaries, self.fc(x))
 
 
 class TensorParallelTest(DTensorTestBase):
+    # [CLASS DOC] Multi-process DTensor test case for tensor_parallel_transformation. Each test
+    # exports a model, transforms it, and compares outputs and collective counts.
     def setUp(self) -> None:
+        # [FUNCTION DOC] HELPER: Only delegates to the base class setup.
         super().setUp()
 
     def assert_has_c10d_ops(
         self, gm: torch.fx.GraphModule, expected_ops_count: dict[str, int]
     ) -> None:
+        # [FUNCTION DOC] HELPER: Walks the graph, counts call_function nodes whose target name
+        # contains c10d_functional keyed by target string, and asserts the counts mapping equals
+        # expected_ops_count exactly (so unexpected collectives also fail).
         actual_ops_count: dict[str, int] = defaultdict(int)
         for node in gm.graph.nodes:
             if node.op == "call_function":
@@ -67,6 +88,9 @@ class TensorParallelTest(DTensorTestBase):
 
     @with_comms
     def test_tp_transform_with_uncovered_op(self):
+        # [FUNCTION DOC] Exports DummyModel, applies column-wise parallelism to fc, and checks
+        # the transformed module matches the original output. Expects exactly one all_gather
+        # plus one wait_tensor, gathering the sharded fc result before the uncovered op.
         model = DummyModel().to(device=self.device_type)
         inputs = (torch.randn(7, 3, requires_grad=False).to(device=self.device_type),)
         with torch.no_grad():
@@ -96,6 +120,9 @@ class TensorParallelTest(DTensorTestBase):
 
     @with_comms
     def test_tp_transform_e2e(self):
+        # [FUNCTION DOC] Seeds RNG, exports a two-MLP model, shards each MLP column-wise then
+        # row-wise, runs under inference mode and checks output equality. Expects two
+        # all_reduce and two wait_tensor ops, one per MLP.
         torch.manual_seed(0)
         model = MLPListModule(2).to(device=self.device_type)
         inputs = (torch.randn((10, 12)).to(device=self.device_type),)
@@ -133,6 +160,8 @@ class TensorParallelTest(DTensorTestBase):
 
     @with_comms
     def test_tp_transform_no_bias(self):
+        # [FUNCTION DOC] Same as the end-to-end test but with one MLP whose last linear has no
+        # bias. Checks output equality and expects one all_reduce and one wait_tensor.
         torch.manual_seed(0)
         model = MLPListModule(1, bias=False).to(device=self.device_type)
         inputs = (torch.randn((10, 12)).to(device=self.device_type),)

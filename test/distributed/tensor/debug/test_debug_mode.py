@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for DebugMode (torch.utils._debug_mode), which records dispatched ops,
+# DTensor redistributions, compiled-region nodes, Triton kernels and optional tensor hashes. Has
+# four test classes: JSON log save/load, DTensor debug-string output (on a fake process group
+# with 8 ranks, CUDA required), utility hashing, and an NCCL multi-process collective logging
+# test. Import-time side effects: none beyond imports.
 
 import contextlib
 import json
@@ -50,18 +55,28 @@ from torch.utils._triton import has_triton_package
 
 
 class TestDebugModeLogSerialization(TestCase):
+    # [CLASS DOC] Tests that DebugMode logs survive save_logs / load_logs through JSON files,
+    # including hashes, recorded outputs and non-finite hash values. Stateless apart from
+    # per-test temporary directories.
     def _run_hashed_debug_mode(self, x):
+        # [FUNCTION DOC] HELPER: Runs sin then sum on x under DebugMode with tensor hash logging
+        # (inputs included) and returns the recorded log list.
         with DebugMode() as debug_mode, DebugMode.log_tensor_hashes(hash_inputs=True):
             x.sin().sum()
         return debug_mode.logs
 
     def test_save_load_empty_logs(self):
+        # [FUNCTION DOC] Saving an empty log list to a temp JSON file and loading it back
+        # returns an empty list.
         with tempfile.TemporaryDirectory() as tmpdir:
             path = os.path.join(tmpdir, "empty.json")
             DebugMode.save_logs([], path)
             self.assertEqual(DebugMode.load_logs(path), [])
 
     def test_save_load_redistribute_outer_call(self):
+        # [FUNCTION DOC] Round-trips a single hand-built outer redistribute call record through
+        # JSON. The loaded record must be a redistribute call, report as an outer call, and
+        # render to the same text as the original.
         call = _RedistributeCall(1, "S(0)", "R", None, 0)
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -74,6 +89,10 @@ class TestDebugModeLogSerialization(TestCase):
         self.assertEqual(loaded_call.render([]), call.render([]))
 
     def test_save_load_logs_for_hash_mismatch(self):
+        # [FUNCTION DOC] Records hashed logs for two different inputs and saves both. Loaded
+        # logs must render like the originals, show no mismatches against the in-memory logs,
+        # and keep tuple input hashes on op records. Comparing the two loaded runs must yield
+        # mismatches that include the sin op.
         x = torch.arange(16, dtype=torch.float32).reshape(4, 4)
         x_different = x + 1
 
@@ -113,6 +132,10 @@ class TestDebugModeLogSerialization(TestCase):
         self.assertIn("aten::sin", {mismatch["call"] for mismatch in mismatches})
 
     def test_save_load_logs_with_record_outputs(self):
+        # [FUNCTION DOC] Records logs with output recording and hashing enabled, checks some op
+        # record holds an output, then saves and reloads. Loaded records carry no raw recorded
+        # data (the record field is None) yet hash comparison against the originals finds no
+        # mismatches.
         x = torch.arange(16, dtype=torch.float32).reshape(4, 4)
 
         with (
@@ -141,10 +164,18 @@ class TestDebugModeLogSerialization(TestCase):
         self.assertEqual(DebugMode.check_hash_mismatches(logs, loaded_logs), [])
 
     def test_save_load_logs_with_nonfinite_hashes(self):
+        # [FUNCTION DOC] Uses a custom hash function that returns NaN, then infinity, and saves
+        # each log. The files must be strictly valid JSON (no NaN or Infinity literals), and
+        # loaded logs must restore NaN and infinite hashes. Comparing them reports mismatches
+        # whose hash fields are NaN and infinite respectively.
         def reject_nonstandard_json_constant(value):
+            # [FUNCTION DOC] HELPER: JSON parse_constant hook that fails the test whenever the
+            # parser meets a nonstandard constant such as NaN or Infinity.
             raise AssertionError(f"nonstandard JSON constant: {value}")
 
         def run_with_hash(hash_value):
+            # [FUNCTION DOC] HELPER: Runs sin and sum on a 4x4 float tensor under DebugMode with
+            # a hash function that always returns hash_value; returns the recorded logs.
             x = torch.arange(16, dtype=torch.float32).reshape(4, 4)
             with (
                 DebugMode() as debug_mode,
@@ -204,21 +235,30 @@ class TestDebugModeLogSerialization(TestCase):
 
 @requires_cuda
 class TestDTensorDebugMode(TestCase):
+    # [CLASS DOC] CUDA-only tests of DebugMode string output for DTensor ops, redistributions,
+    # compiled graphs, nn.Module annotations and hash checks. Each test uses a fake process group
+    # of world size 8 set up in setUp (rank 0) and torn down in tearDown.
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Turns on the dynamo option for canonical output-graph node order for
+        # the whole class (global config mutation, undone in tearDownClass).
         super().setUpClass()
         torch._dynamo.config.canonicalize_output_graph_node_order = True
 
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] Restores the canonical output-graph node order dynamo option to off.
         torch._dynamo.config.canonicalize_output_graph_node_order = False
         super().tearDownClass()
 
     def tearDown(self):
+        # [FUNCTION DOC] Runs base teardown then destroys the default process group.
         super().tearDown()
         dist.destroy_process_group()
 
     def setUp(self):
+        # [FUNCTION DOC] Initializes a fake-backend default process group (rank 0, world size 8,
+        # in-memory store) and sets the device type to cuda. Global state: process group.
         super().setUp()
         self.world_size = 8
         store = FakeStore()
@@ -228,6 +268,12 @@ class TestDTensorDebugMode(TestCase):
         self.device_type = "cuda"
 
     def test_debug_mode_mm(self):
+        # [FUNCTION DOC] Multiplies two DTensors sharded on dim 0 under DebugMode with torch
+        # function and id recording, and compares the debug string to an expected dump showing
+        # the implicit all-gather redistribution. Also checks record types, args_str-only
+        # storage, that a compiled aot_eager run records outputs and hashes matching eager,
+        # tuple hash functions (norm, hash_tensor) against direct computation, and edge cases
+        # (NaN, inf, complex, float8 and int8 hashes).
         mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
 
         x = torch.randn(1, 8, requires_grad=False)
@@ -265,6 +311,7 @@ class TestDTensorDebugMode(TestCase):
 
         # check recording hook
         def mm(x, y):
+            # [FUNCTION DOC] HELPER: Matrix-multiplies x and y and returns the sum of the result.
             return (x @ y).sum()
 
         eager_out = mm(x_dtensor, y_dtensor)
@@ -315,6 +362,8 @@ class TestDTensorDebugMode(TestCase):
         self.assertEqual(hash_(torch.ones(5, dtype=torch.int8)), 1)
 
     def test_debug_string_inside_context(self):
+        # [FUNCTION DOC] Checks that calling debug_string while the DebugMode context is still
+        # active gives the same text as calling it after the context exits.
         mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
 
         x = torch.randn(1, 8, requires_grad=False)
@@ -329,6 +378,10 @@ class TestDTensorDebugMode(TestCase):
         self.assertEqual(s0, s1)
 
     def test_debug_mode_backward(self):
+        # [FUNCTION DOC] Adds DTensors sharded on different dims, sums, and runs backward under
+        # DebugMode with stack traces. Uses substring checks (order of clone and detach is not
+        # deterministic) for forward ops, implicit redistribution with all-to-all, backward ops,
+        # split, _to_copy, and that the last op's stack trace mentions the backward call.
         mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
 
         x = torch.randn(1, 8, requires_grad=True)
@@ -410,13 +463,19 @@ class TestDTensorDebugMode(TestCase):
         self.assertTrue("z.sum().backward()" in debug_mode.operators[-1].stack_trace)
 
     def test_stack_trace_in_compiled_region(self):
+        # [FUNCTION DOC] Compiles a small module with aot_eager (full graph) and records forward
+        # and backward ops under DebugMode with the interpreter. Asserts that source lines of the
+        # model code appear in the stack traces of specific recorded op positions.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Two linears (8 to 4, 4 to 8) with an add, relu and sum.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates linear layers l1 and l2.
                 super().__init__()
                 self.l1 = torch.nn.Linear(8, 4)
                 self.l2 = torch.nn.Linear(4, 8)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds 2, applies l1, relu, l2, then returns the sum.
                 x = x + 2
                 x = self.l1(x)
                 x = x.relu()
@@ -452,6 +511,9 @@ class TestDTensorDebugMode(TestCase):
         self.assertTrue("x = x.relu()" in op_calls[12].stack_trace)
 
     def test_debug_mode_densor_redistribution_trace(self):
+        # [FUNCTION DOC] Uses a 4x2 mesh with explicit multi-mesh-dim shard order and multiplies
+        # DTensors sharded on both mesh dims. Compares the debug string with the expected dump
+        # of a two-step redistribution trace (all-gathers with chunk and cat) and sum.
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size).view(4, 2))
 
         x = torch.randn(16, 8, requires_grad=True)
@@ -485,6 +547,9 @@ class TestDTensorDebugMode(TestCase):
         )
 
     def test_debug_mode_explicit_redistribute(self):
+        # [FUNCTION DOC] Checks that user-called redistribute and full_tensor are logged with the
+        # explicit annotation (not implicit), via expected debug-string dumps; full_tensor also
+        # adds a view.
         """Test that explicit user-called redistribute shows [explicit] annotation."""
         mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
 
@@ -517,6 +582,9 @@ class TestDTensorDebugMode(TestCase):
         )
 
     def test_output_placements(self):
+        # [FUNCTION DOC] Runs topk on a DTensor sharded on the topk dim so the input must be
+        # redistributed, with output recording on. The expected dump must show the output
+        # placements for both outputs of the multi-output op.
         """Test that output placements are recorded for multi-output DTensor ops."""
         mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
 
@@ -545,6 +613,10 @@ class TestDTensorDebugMode(TestCase):
         )
 
     def test_debug_mode_einsum(self):
+        # [FUNCTION DOC] Runs einsum on two DTensors with partial/replicate placements on a 4x2
+        # mesh. Expected dump shows the decomposition (unsqueeze, permute, view, bmm) running
+        # directly on partial inputs, ending with a doubly partial-sum output and no
+        # redistribution.
         mesh = DeviceMesh(self.device_type, torch.arange(self.world_size).view(4, 2))
 
         # Create test tensors with mixed Partial placements: P(sum)R and RP(sum).
@@ -596,6 +668,8 @@ class TestDTensorDebugMode(TestCase):
         )
 
     def test_real_tensor(self):
+        # [FUNCTION DOC] Records a plain linear plus sum on a regular tensor with torch-function
+        # logging and checks the expected dump (nested aten calls under each torch-level call).
         x = torch.randn(8, 8, 8)
         linear = torch.nn.Linear(8, 8)
 
@@ -615,6 +689,9 @@ class TestDTensorDebugMode(TestCase):
         )
 
     def test_fake_tensor(self):
+        # [FUNCTION DOC] Creates fake tensors, runs matmul under DebugMode with fake-tensor
+        # recording and checks the dump labels them as fake and shows the view, mm and
+        # unsafe-view decomposition.
         with FakeTensorMode():
             x = torch.randn(8, 8)
             y = torch.randn(8, 8, 8)
@@ -634,6 +711,10 @@ class TestDTensorDebugMode(TestCase):
         )
 
     def test_tensor_attributes(self):
+        # [FUNCTION DOC] Sets custom Python attributes on input tensors and records matmul with
+        # attribute recording for two names and original-args storage. The dump must show the
+        # attributes only on the tensors carrying them, and the stored first arg must be the
+        # very same object as the input.
         x = torch.randn(8, 8)
         x.a1 = "x1"
         x.a2 = "x2"
@@ -664,12 +745,19 @@ class TestDTensorDebugMode(TestCase):
     @parametrize("has_inner_mode", [True, False])
     @parametrize("has_outer_mode", [True, False])
     def test_nested_debug_mode(self, has_inner_mode, has_outer_mode):
+        # [FUNCTION DOC] Parametrized over presence of an extra dispatch mode inside and outside
+        # DebugMode. Multiplies sharded DTensors and expects the implicit redistribution to
+        # still appear in the debug string regardless of mode nesting.
         class DummyTorchDispatchMode1(TorchDispatchMode):
+            # [CLASS DOC] HELPER: Pass-through dispatch mode used as the inner mode.
             def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                # [FUNCTION DOC] HELPER: Calls the op unchanged and returns its result.
                 return func(*args, **kwargs)
 
         class DummyTorchDispatchMode2(TorchDispatchMode):
+            # [CLASS DOC] HELPER: Pass-through dispatch mode used as the outer mode.
             def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                # [FUNCTION DOC] HELPER: Calls the op unchanged and returns its result.
                 return func(*args, **kwargs)
 
         mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
@@ -696,6 +784,8 @@ class TestDTensorDebugMode(TestCase):
         )
 
     def test_debug_mode_higher_order_cond(self):
+        # [FUNCTION DOC] Calls the cond higher-order op directly (avoids compilation) under
+        # DebugMode with torch-function recording and checks the call name is in the debug string.
         """Test DebugMode with higher order operation."""
         x = torch.randn(1, 8, requires_grad=True)
 
@@ -709,10 +799,14 @@ class TestDTensorDebugMode(TestCase):
         self.assertIn("torch.ops.higher_order.cond", debug_mode.debug_string())
 
     def test_compile(self):
+        # [FUNCTION DOC] Compiles a sin-cos function, then calls it inside DebugMode. The
+        # already-compiled calls record nothing (empty debug string) and the compile frame count
+        # stays at 1, so DebugMode causes no recompilation.
         cnt = CompileCounterWithBackend("inductor")
 
         @torch.compile(backend=cnt)
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns cos of sin of x.
             return x.sin().cos()
 
         x = torch.randn(8)
@@ -727,14 +821,21 @@ class TestDTensorDebugMode(TestCase):
         )  # check DebugMode doesn't trigger additional recompilations
 
     def test_annotate(self):
+        # [FUNCTION DOC] Checks DebugMode annotate markers and nn.Module recording in eager mode
+        # (expected dump shows module and annotation nesting), then compiles the module with
+        # aot_eager and inductor. Annotations survive inside the aot_eager region; the inductor
+        # run shows only the lowered addmm out call.
         x = torch.randn(8, 8)
 
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Single linear (8 to 8) module that emits an annotation.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates linear layer l1.
                 super().__init__()
                 self.l1 = torch.nn.Linear(8, 8)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds a Foo annotation to DebugMode, then applies l1.
                 DebugMode._annotate("Foo")
                 return self.l1(x)
 
@@ -775,22 +876,33 @@ class TestDTensorDebugMode(TestCase):
                 )
 
     def test_nn_module_in_eager(self):
+        # [FUNCTION DOC] Runs a nested module (Bar holding Foo and a linear) eagerly with module
+        # recording and checks the expected hierarchy of nn.Mod entries. Then runs forward and
+        # backward with stack traces and checks the forward stack trace of the last sum op
+        # (also in debug_string) mentions the source line. Finally checks that an eager-backend
+        # full-graph compile does not break on nn.Module recording.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Two chained linear layers (4 to 4), l1 then l2.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates linear layers l1 and l2.
                 super().__init__()
                 self.l1 = torch.nn.Linear(4, 4)
                 self.l2 = torch.nn.Linear(4, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies l1 then l2 to x.
                 return self.l2(self.l1(x))
 
         class Bar(torch.nn.Module):
+            # [CLASS DOC] HELPER: Wraps a Foo (abc) followed by a linear layer (xyz).
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the Foo submodule abc and linear xyz.
                 super().__init__()
                 self.abc = Foo()
                 self.xyz = torch.nn.Linear(4, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies abc then xyz to x.
                 return self.xyz(self.abc(x))
 
         mod = Bar()
@@ -835,30 +947,42 @@ class TestDTensorDebugMode(TestCase):
 
     @torch._functorch.config.patch(guess_tangent_strides_as_outputs=True)
     def test_nn_module_in_compiled_regions(self):
+        # [FUNCTION DOC] Checks module-call hierarchy in dumps when only a submodule is compiled
+        # with aot_eager, and when the whole model is compiled including backward (forward and
+        # backward compile regions, bwd-labelled modules). Compares against expected dumps.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Linear l1, relu, then linear l2 (all 4 to 4).
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates linear layers l1 and l2.
                 super().__init__()
                 self.l1 = torch.nn.Linear(4, 4)
                 self.l2 = torch.nn.Linear(4, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies l1, relu, then l2.
                 return self.l2(self.l1(x).relu())
 
         class Bar(torch.nn.Module):
+            # [CLASS DOC] HELPER: Adds 2.0 to the input then applies linear l3.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates linear layer l3.
                 super().__init__()
                 self.l3 = torch.nn.Linear(4, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns l3 applied to x plus 2.0.
                 return self.l3(x + 2.0)
 
         class Baz(torch.nn.Module):
+            # [CLASS DOC] HELPER: Composes a Foo (foo) followed by a Bar (bar).
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates submodules foo and bar.
                 super().__init__()
                 self.foo = Foo()
                 self.bar = Bar()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies foo then bar to x.
                 return self.bar(self.foo(x))
 
         # Only region of module is compiled, test nn.Mod call hierarchy
@@ -966,7 +1090,12 @@ class TestDTensorDebugMode(TestCase):
         )
 
     def test_record_function(self):
+        # [FUNCTION DOC] Compiles a matmul-add-sum function with aot_eager inside a profiler
+        # record_function scope named FWD, then runs backward. The expected dump shows the
+        # outer record-function entry wrapping the forward compile region, while a record_function
+        # inside the compiled function is ignored.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Computes x @ y, adds 1 inside a profiler scope, returns sum.
             z = x @ y
             with torch.profiler.record_function("this_is_ignored"):
                 z = z + 1
@@ -1003,8 +1132,13 @@ class TestDTensorDebugMode(TestCase):
         )
 
     def test_in_place_mutation(self):
+        # [FUNCTION DOC] Runs a module doing an add and then an in-place add on an integer
+        # tensor with output recording and input hashing. Expected dump shows input hash taken
+        # before each op, so the in-place op sees the already incremented value.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with only a forward method (no state).
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds 1, then adds 1 in place to the result; returns it.
                 y = x + 1
                 y.add_(1)
                 return y
@@ -1027,11 +1161,16 @@ class TestDTensorDebugMode(TestCase):
     @unittest.skipIf(not HAS_GPU, "requires GPU")
     @unittest.skipIf(not has_triton_package(), "requires triton")
     def test_triton_kernel_logs(self):
+        # [FUNCTION DOC] GPU and triton only. Compiles a function launching an autotuned Triton
+        # add kernel under DebugMode and checks at least one Triton kernel call was recorded and
+        # its rendering contains the triton marker.
         import triton
 
         from torch.testing._internal.triton_utils import add_kernel_autotuned
 
         def call_triton(x, y):
+            # [FUNCTION DOC] HELPER: Allocates a zero output like x and launches the autotuned
+            # add kernel over its elements (grid from the block size); returns the output.
             output = torch.zeros_like(x)
             n_elements = output.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)  # noqa: E731
@@ -1051,6 +1190,8 @@ class TestDTensorDebugMode(TestCase):
         self.assertIn("[triton]", triton_calls[0].render([]))
 
     def test_check_hash_mismatches(self):
+        # [FUNCTION DOC] Two identical hashed runs of sin and sum give no mismatches. A run on
+        # different data gives exactly two mismatches, for the sin and the sum ops in order.
         x = torch.randn(64, 64, device=GPU_TYPE)
         x_different = torch.randn(64, 64, device=GPU_TYPE)
 
@@ -1079,6 +1220,10 @@ class TestDTensorDebugMode(TestCase):
         "Being conservative, test peak memory is 25MB?",
     )
     def test_tensor_hash_redistribute(self):
+        # [FUNCTION DOC] Skipped without CUDA or with under 64MB device memory. Redistributes a
+        # sharded all-ones DTensor to replicated with hashing and checks the single all-gather
+        # record's hash equals the total element count across the world (hashing a collective
+        # gives the correct value).
         # test that hashing collectives gives correct results
         mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
 
@@ -1102,11 +1247,16 @@ class TestDTensorDebugMode(TestCase):
     @unittest.skipIf(not HAS_GPU, "requires GPU")
     @unittest.skipIf(not has_triton_package(), "requires triton")
     def test_check_triton_hash_mismatches(self):
+        # [FUNCTION DOC] GPU and triton only. Runs the same Triton add with hashed inputs twice
+        # with a differing second operand. Comparing logs with inputs must report mismatches of
+        # the triton kernel type, covering both input-hash and output-hash mismatches.
         import triton
 
         from torch.testing._internal.triton_utils import add_kernel_autotuned
 
         def call_triton(x, y):
+            # [FUNCTION DOC] HELPER: Allocates a zero output like x and launches the autotuned
+            # add kernel over its elements (grid from the block size); returns the output.
             output = torch.zeros_like(x)
             n_elements = output.numel()
             grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)  # noqa: E731
@@ -1139,6 +1289,9 @@ class TestDTensorDebugMode(TestCase):
         )
 
     def test_check_structure_mismatches(self):
+        # [FUNCTION DOC] Compares logs with different operators (sin vs cos) and with different
+        # lengths (sin vs sin then cos); expects check_hash_mismatches to raise ValueError with
+        # "Operators don't match" and "Log lengths don't match" respectively.
         x = torch.randn(32, 32, device=self.device_type)
 
         with DebugMode() as dm1, DebugMode.log_tensor_hashes():
@@ -1155,6 +1308,9 @@ class TestDTensorDebugMode(TestCase):
             DebugMode.check_hash_mismatches(dm1.logs, dm3.logs)
 
     def test_pretty_print_dtensor_make_fx(self):
+        # [FUNCTION DOC] Traces a forward and backward matmul of DTensors with make_fx in fake
+        # mode, removes dead nodes, recompiles and prints the graph as text. The text must show a
+        # DTensor-typed mm node with shape and placement annotation.
         mesh = DeviceMesh(self.device_type, list(range(self.world_size)))
 
         A = torch.randn(8, 32)
@@ -1163,6 +1319,8 @@ class TestDTensorDebugMode(TestCase):
         dB = distribute_tensor(B, mesh, [Replicate()]).requires_grad_()
 
         def f(dA, dB):
+            # [FUNCTION DOC] HELPER: Multiplies the matrices, sums, runs backward and returns the
+            # gradients of both inputs.
             dy = dA @ dB
             loss = dy.sum()
             loss.backward()
@@ -1181,15 +1339,20 @@ class TestDTensorDebugMode(TestCase):
 
     @torch._functorch.config.patch(guess_tangent_strides_as_outputs=True)
     def test_invoke_subgraph(self):
+        # [FUNCTION DOC] Compiles a function calling a nested compile region twice and compares
+        # forward and backward results with eager. The expected dump shows invoke_subgraph calls
+        # with enter and exit annotations for the forward and backward subgraphs; gradients match.
         # Test that DebugMode can trace the operations inside
         # invoke_subgraph HOP
 
         @torch.compiler.nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Nested compile region; returns sin of x.
             a = torch.sin(x)
             return a
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies gn, multiplies by 2, applies gn again, returns it.
             foo1 = gn(x)
             y = foo1 * 2
             foo2 = gn(y)
@@ -1246,21 +1409,27 @@ class TestDTensorDebugMode(TestCase):
 
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_nested_invoke_subgraph(self):
+        # [FUNCTION DOC] With single-use subgraph inlining disabled, compiles a function whose
+        # region calls an inner region. Output equals eager, and the expected dump shows the inner
+        # invoke_subgraph nested within the outer one.
         # Test that DebugMode can trace the operations inside
         # invoke_subgraph HOP
         @torch.compiler.nested_compile_region
         def ggn(x):
+            # [FUNCTION DOC] HELPER: Inner compile region; returns cos of x.
             a = torch.cos(x)
             return a
 
         @torch.compiler.nested_compile_region
         def gn(x):
+            # [FUNCTION DOC] HELPER: Outer region; adds 1, applies ggn, returns sin of the result.
             x = x + 1
             x = ggn(x)
             a = torch.sin(x)
             return a
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies the outer region gn and doubles the result.
             foo1 = gn(x)
             y = foo1 * 2
             return y
@@ -1293,9 +1462,13 @@ class TestDTensorDebugMode(TestCase):
 
 
 class TestDebugModeUtils(TestCase):
+    # [CLASS DOC] Tests for standalone hashing utilities of DebugMode; stateless.
+    # KNOWN ISSUE: the docstring mentions the NCCL backend but this class only tests hashing.
     """Test DebugMode with NCCL backend without using DTensor."""
 
     def test_hash_empty_tensor(self):
+        # [FUNCTION DOC] Hashes an empty tensor with hash_tensor_fn; must not raise, returning a
+        # tensor by default and a Python integer when scalar output is requested.
         t = torch.tensor([])
         # hash tensor fn should not error out with empty tensor
         out = torch.utils._debug_mode.hash_tensor_fn(t)
@@ -1305,15 +1478,21 @@ class TestDebugModeUtils(TestCase):
 
 
 class TestDTensorDebugModeNCCLBackend(MultiProcessTestCase):
+    # [CLASS DOC] Multi-process (2 ranks) NCCL tests that DebugMode logs and hashes plain and
+    # functional all-gather collectives. Each test creates and destroys its own process group.
     @property
     def world_size(self):
+        # [FUNCTION DOC] Number of spawned ranks: always 2 (collectives need at least two).
         return 2  # Need at least 2 ranks for collectives
 
     def setUp(self):
+        # [FUNCTION DOC] Runs base setup then spawns the worker processes.
         super().setUp()
         self._spawn_processes()
 
     def _init_process_group(self):
+        # [FUNCTION DOC] HELPER: In each worker, selects the CUDA device equal to the rank and
+        # creates an NCCL process group using a file store; stores the device string.
         """Initialize NCCL process group for each spawned process."""
         torch.cuda.set_device(self.rank)
         store = dist.FileStore(self.file_name, self.world_size)
@@ -1326,10 +1505,12 @@ class TestDTensorDebugModeNCCLBackend(MultiProcessTestCase):
         self.device = f"cuda:{self.rank}"
 
     def _destroy_process_group(self):
+        # [FUNCTION DOC] HELPER: Destroys the default process group.
         """Destroy the process group."""
         dist.destroy_process_group()
 
     def tearDown(self):
+        # [FUNCTION DOC] Runs base teardown, then deletes the file-store file, ignoring OS errors.
         super().tearDown()
         try:
             os.remove(self.file_name)
@@ -1339,6 +1520,10 @@ class TestDTensorDebugModeNCCLBackend(MultiProcessTestCase):
     @requires_nccl()
     @skip_if_lt_x_gpu(2)
     def test_allgather_base(self):
+        # [FUNCTION DOC] Needs NCCL and 2 GPUs. Each rank all-gathers a tensor filled with rank+1
+        # under DebugMode with input hashing. The debug string must name the all-gather-base op,
+        # the last log's output hash must equal the gathered tensor's norm hash, and each rank's
+        # slice must hold its contribution.
         self._init_process_group()
         tensor = torch.ones(10, 10, device=torch.device(self.device)) * (self.rank + 1)
         # Output size must be world_size * input_size
@@ -1365,6 +1550,10 @@ class TestDTensorDebugModeNCCLBackend(MultiProcessTestCase):
     @requires_nccl()
     @skip_if_lt_x_gpu(2)
     def test_allgather_base_async_op(self):
+        # [FUNCTION DOC] Same as the all-gather test but with the async flag: waits on the work
+        # handle, checks the op is logged and the input hash matches. The output hash check is
+        # disabled because the hash is taken before the async op completes.
+        # KNOWN ISSUE: output hash is incorrect for async collectives (see the TODO in the code).
         """Test all_gather_into_tensor with async_op=True."""
         self._init_process_group()
         tensor = torch.ones(10, 10, device=torch.device(self.device)) * (self.rank + 1)
@@ -1400,6 +1589,10 @@ class TestDTensorDebugModeNCCLBackend(MultiProcessTestCase):
     @requires_nccl()
     @skip_if_lt_x_gpu(2)
     def test_allgather_functional_with_async_collective_tensor(self):
+        # [FUNCTION DOC] Uses the functional all-gather (returns an async collective tensor) under
+        # DebugMode with hashing, waits for the result, and checks the last log's hash equals the
+        # result's norm hash, the functional op name is logged, and shape and per-rank slices
+        # are right.
         self._init_process_group()
         tensor = torch.ones(10, 10, device=torch.device(self.device)) * (self.rank + 1)
 

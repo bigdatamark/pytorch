@@ -1,5 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for the experimental register_sharding decorator, which installs a custom
+# DTensor sharding strategy for an operator. Covers softmax, argmax, ops with tensor keyword
+# outputs, and a custom op whose first argument is not a tensor. No import-time side effects
+# beyond defining the aten alias.
 import itertools
 
 import torch
@@ -17,7 +21,12 @@ aten = torch.ops.aten
 
 
 class TestRegisterSharding(DTensorTestBase):
+    # [CLASS DOC] Multi-process DTensor test case for register_sharding. Tests register
+    # strategies globally, so tearDown removes the custom ops they create.
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Runs base teardown, then destroys every entry in the custom op
+        # global registry whose key starts with test_dtensor:: and removes the test_dtensor
+        # namespace from torch.ops if present. Mutates global registry state.
         super().tearDown()
         # Clean up any custom ops registered during tests to avoid test pollution
         # This addresses the concern about proper deregistration of custom ops
@@ -32,6 +41,10 @@ class TestRegisterSharding(DTensorTestBase):
 
     @with_comms
     def test_softmax_fwd(self):
+        # [FUNCTION DOC] Removes the built-in softmax strategy, registers a custom one, checks
+        # the derived schema info has one static arg, then runs softmax on a 3-D tensor sharded
+        # on each dim for several softmax dims. Expects a replicated result when sharded dim
+        # equals the softmax dim, otherwise sharding preserved; both match the local result.
         # After registering the custom softmax sharding strategy,
         # the original entry would have been replaced.
         # The following line is for showcasing purpose only.
@@ -45,6 +58,9 @@ class TestRegisterSharding(DTensorTestBase):
             dim: int,
             half_to_float: torch.dtype,
         ):
+            # [FUNCTION DOC] HELPER: Strategy for softmax. Normalizes a negative dim, then
+            # returns a list of (output placements, input placements) options: all replicate,
+            # plus sharding on every dim other than the softmax dim. Non-tensor args get None.
             softmax_dim = dim if dim >= 0 else dim + x.ndim
 
             acceptable_shardings = []
@@ -93,8 +109,14 @@ class TestRegisterSharding(DTensorTestBase):
 
     @with_comms
     def test_argmax(self):
+        # [FUNCTION DOC] Registers a custom argmax strategy, checks the schema info marks one
+        # static arg even though the dim argument is optional, then runs argmax along dim 1
+        # with keepdim on an input sharded on dim 0. Expects the output to stay sharded on
+        # dim 0 and to match the local result.
         @register_sharding(aten.argmax.default)
         def custom_argmax_sharding(x, dim, keepdim):
+            # [FUNCTION DOC] HELPER: Strategy for argmax. Always allows full replication; when
+            # keepdim is set also allows sharding on any dim other than the reduced dim.
             acceptable_shardings = []
 
             all_replicate = ([Replicate()], [Replicate(), None, None])
@@ -131,12 +153,17 @@ class TestRegisterSharding(DTensorTestBase):
 
     @with_comms
     def test_register_sharding_for_tensor_kwargs(self):
+        # [FUNCTION DOC] Registers a replicate-only strategy for min.dim_min (tensor out
+        # arguments passed as keywords) and calls min with replicated DTensor out tensors.
+        # Expects DTensor results whose full tensors equal the local min values and indices.
         mesh = self.build_device_mesh()
         x = torch.randn(4, 4, device=self.device_type)
         x_dt = distribute_tensor(x, mesh, [Replicate()])
 
         @register_sharding(aten.min.dim_min)
         def min_dim_strategy(x, dim, keepdim, min, min_indices):
+            # [FUNCTION DOC] HELPER: Strategy offering one option only: both outputs and the
+            # tensor inputs (x, min, min_indices) replicated, scalar args given None.
             all_replicate = (
                 [Replicate(), Replicate()],
                 [Replicate(), None, None, Replicate(), Replicate()],
@@ -159,18 +186,26 @@ class TestRegisterSharding(DTensorTestBase):
 
     @with_comms
     def test_register_sharding_non_tensor_first_arg(self):
+        # [FUNCTION DOC] Regression test for issue 167915: defines a custom op taking a string
+        # then a tensor, registers a replicate-only strategy, and calls it with a replicated
+        # DTensor. Expects mesh lookup to succeed despite the non-tensor first arg and a
+        # DTensor result equal to the input. Registers a custom op (cleaned in tearDown).
         # Test that get_mesh_from_args works when the first arg is not a DTensor
         # Regression test for https://github.com/pytorch/pytorch/issues/167915
         @torch.library.custom_op("test_dtensor::scalar_first_arg", mutates_args=())
         def scalar_first_arg(name: str, x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op body; ignores the name and returns a clone of x.
             return x.clone()
 
         @scalar_first_arg.register_fake
         def _(name, x):
+            # [FUNCTION DOC] HELPER: Fake (meta) implementation; returns a clone of x.
             return x.clone()
 
         @register_sharding(torch.ops.test_dtensor.scalar_first_arg.default)
         def scalar_first_arg_sharding(name, x):
+            # [FUNCTION DOC] HELPER: Strategy returning a single option: replicated output and
+            # replicated tensor input, with None for the string argument.
             return [([Replicate()], [None, Replicate()])]
 
         mesh = self.build_device_mesh()
