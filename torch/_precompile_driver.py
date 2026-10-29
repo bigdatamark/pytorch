@@ -1,3 +1,11 @@
+# [MODULE DOC] Runtime driver source for torch.compiler.precompile artifacts, written as real code.
+# Never imported by torch at runtime or by generated artifacts: torch._precompile copies the
+# function bodies verbatim (via source inspection, emit path only) into the artifact's python_code
+# string, after the metadata constants and the compiled graph's call function. Contains the helpers
+# that extract params/buffers, validate structure and runtime inputs, run the graph (eager or
+# inductor flavor), scatter parameter grads, and rebuild the output pytree. Names such as
+# MODULE_POSITIONS, PARAM_NAMES, IN_SPEC and call are declared only under TYPE_CHECKING and resolve
+# against the artifact namespace at emit time. Import-time side effects: imports torch and pytree.
 """Runtime driver for torch.compiler.precompile artifacts, authored as real code.
 
 Nothing here is imported or run by torch at runtime, and the generated artifacts never
@@ -59,6 +67,10 @@ if TYPE_CHECKING:
 
 
 def _extract_param_buffers(mods):
+    # [FUNCTION DOC] HELPER: Collect params then buffers of all given modules, deduplicated by object
+    # identity (no duplicate removal inside each module, so tied tensors are interned once).
+    # Returns (pb, names): the tensor list and matching names, prefixed with the module index when
+    # more than one module is given. Must mirror torch._precompile._intern_param_buffers exactly.
     """Lift the runtime modules' params then buffers, interning by identity, in the
     same order as capture, so the list lines up with the compiled/captured graph. Returns
     (pb, names) where names mirrors PARAM_NAMES + BUFFER_NAMES. This ordering AND the
@@ -69,6 +81,8 @@ def _extract_param_buffers(mods):
     names = []
 
     def intern(mi, n, t):
+        # [FUNCTION DOC] HELPER: Append tensor t and its (possibly module-prefixed) name n to the
+        # enclosing lists unless a tensor with the same identity was already interned.
         if id(t) not in seen:
             seen.add(id(t))
             pb.append(t)
@@ -84,6 +98,8 @@ def _extract_param_buffers(mods):
 
 
 def _fail(msg):
+    # [FUNCTION DOC] HELPER: Lazily import PrecompileError and raise it with the given message.
+    # Never returns.
     # Imported lazily (only when a guard fails) so a normal run does not couple the
     # standalone artifact to torch._precompile's import surface.
     from torch._precompile import PrecompileError as _PrecompileError
@@ -92,6 +108,9 @@ def _fail(msg):
 
 
 def _check_structure(pb, names):
+    # [FUNCTION DOC] HELPER: Validate extracted params/buffers against the baked metadata. Checks that
+    # names (count and order) equal PARAM_NAMES plus BUFFER_NAMES, then that each tensor's shape,
+    # dtype string and device string match the baked example. Raises PrecompileError on any mismatch.
     # Verify the runtime model's extracted param/buffer NAMES match the baked
     # PARAM_NAMES + BUFFER_NAMES (count AND order/identity), so a reordered or
     # structurally-drifted same-count model is caught precisely (invariant 2) rather
@@ -133,6 +152,13 @@ def _check_structure(pb, names):
 
 
 def _eager_forward(*args):
+    # [FUNCTION DOC] Eager-backend entry point: runs the captured ATen graph on the given args.
+    # Validates positional arg count, that module positions hold nn.Modules, the runtime input pytree
+    # structure, leaf count, and each tensor's shape/dtype/device (all static) against the baked
+    # metadata, then checks module structure. Runs the graph under no_grad on params, buffers and
+    # flat inputs; if grad outputs exist, accumulates them onto the params' grad fields (setting or
+    # adding in place). Returns the outputs rebuilt into the traced function's output structure.
+    # Raises PrecompileError on any validation failure.
     """Run the captured ATen graph eagerly. Pass the same args the traced fn took --
     the module(s) in the same positions plus the runtime inputs. The module(s) must
     be structurally identical to the ones precompile traced (same param/buffer order
@@ -217,6 +243,16 @@ def _eager_forward(*args):
 
 
 def _inductor_forward(*args):
+    # [FUNCTION DOC] Inductor-backend entry point: runs the compiled call on the given args.
+    # Performs the same arg count, module, pytree, shape/dtype/device checks as the eager driver, plus
+    # per-dimension bounds checks for dynamic (None) dims, then validates module structure and calls
+    # the compiled graph with params, buffers and flat inputs. An AssertionError that looks like an
+    # assert_size_stride failure is converted to a PrecompileError explaining a layout or shape
+    # mismatch (with a note about shared shape ids when dynamic dims exist); other AssertionErrors
+    # propagate unchanged. Trailing grad outputs are accumulated onto params' grad fields. Returns the
+    # outputs rebuilt into the output pytree.
+    # KNOWN ISSUE: the bare raise after the final failure call is unreachable by design (the failure
+    # helper always raises); it exists only to satisfy static analysis.
     """Run the compiled computation. Pass the same args the traced fn took -- the
     module(s) in the same positions plus the runtime inputs. The module(s) must be
     structurally identical to the ones precompile traced (same param/buffer order
