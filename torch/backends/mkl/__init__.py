@@ -1,8 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Exposes torch.backends.mkl: an availability query and an on-demand oneMKL verbose-logging context manager.
+# Defines VERBOSE_OFF (0) and VERBOSE_ON (1) level constants. No import-time side effects.
 import torch
 
 
 def is_available():
+    # [FUNCTION DOC] Returns True if the build was compiled with MKL support, read from a compiled-extension flag.
     r"""Return whether PyTorch is built with MKL support."""
     return torch._C.has_mkl
 
@@ -12,6 +15,8 @@ VERBOSE_ON = 1
 
 
 class verbose:
+    # [CLASS DOC] Context manager that turns oneMKL verbose output on for the duration of a with block, so verbose messages can be limited to a chosen scope.
+    # State: the requested verbose level in the attribute enable. Entering raises an error if MKL cannot be put into verbose mode; exiting always switches verbosing off.
     """
     On-demand oneMKL verbosing functionality.
 
@@ -42,9 +47,12 @@ class verbose:
     """
 
     def __init__(self, enable):
+        # [FUNCTION DOC] Stores the requested verbose level (VERBOSE_OFF or VERBOSE_ON) in the attribute enable.
         self.enable = enable
 
     def __enter__(self):
+        # [FUNCTION DOC] On entry, does nothing when the level is off (returns None); otherwise asks MKL to enable verbose mode and raises AssertionError if that fails; returns the manager itself.
+        # Side effect: changes process-wide MKL verbose state.
         if self.enable == VERBOSE_OFF:
             return
         st = torch._C._verbose.mkl_set_verbose(self.enable)
@@ -55,5 +63,6 @@ class verbose:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # [FUNCTION DOC] On exit, unconditionally switches MKL verbose mode off (even if it was never enabled) and returns False so exceptions propagate.
         torch._C._verbose.mkl_set_verbose(VERBOSE_OFF)
         return False

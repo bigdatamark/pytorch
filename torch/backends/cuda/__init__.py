@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [PACKAGE DOC] Exposes torch.backends.cuda: CUDA build query, cuFFT plan cache management, cuBLAS settings (module-like object matmul), preferred linear algebra / BLAS / ROCm flash attention library selection, BLAS workspace sizing, and scaled-dot-product-attention (SDPA) backend enable/disable switches and capability checks.
+# Import-time side effects: builds lookup tables of backend names, re-exports the C++ SDPAParams and SDPBackend types (SDPAParams gets its reported module name set to this package), and creates the global singletons cufft_plan_cache and matmul.
+# The sdp_kernel context manager is deprecated in favor of the nn.attention one.
 import contextlib
 from typing import Any
 from typing_extensions import deprecated
@@ -41,6 +44,7 @@ __all__ = [
 
 
 def is_built():
+    # [FUNCTION DOC] Returns whether the build includes CUDA support (not whether a device is usable).
     r"""
     Return whether PyTorch is built with CUDA support.
 
@@ -51,22 +55,28 @@ def is_built():
 
 
 class cuFFTPlanCacheAttrContextProp:
+    # [CLASS DOC] HELPER: Descriptor like the shared ContextProp but passes the owning object's device_index attribute as the first argument to its getter and setter.
+    # If the setter is a string instead of a callable, assignment raises RuntimeError with that string as the message (used for read-only attributes).
     # Like regular ContextProp, but uses the `.device_index` attribute from the
     # calling object as the first argument to the getter and setter.
     def __init__(self, getter, setter):
+        # [FUNCTION DOC] HELPER: Stores the getter and the setter (callable or error-message string).
         self.getter = getter
         self.setter = setter
 
     def __get__(self, obj, objtype):
+        # [FUNCTION DOC] HELPER: Returns the getter's result for the owner's device index.
         return self.getter(obj.device_index)
 
     def __set__(self, obj, val):
+        # [FUNCTION DOC] HELPER: Assigns through the setter for the owner's device index, or raises RuntimeError with the stored message if the setter is a string.
         if isinstance(self.setter, str):
             raise RuntimeError(self.setter)
         self.setter(obj.device_index, val)
 
 
 class cuFFTPlanCache:
+    # [CLASS DOC] View of the C++ cuFFT plan cache for one CUDA device index. Attributes: size (read-only count of cached plans; assignment raises RuntimeError), max_size (get/set cache capacity), and a clear method that empties it.
     r"""
     Represent a specific plan cache for a specific `device_index`.
 
@@ -75,6 +85,7 @@ class cuFFTPlanCache:
     """
 
     def __init__(self, device_index):
+        # [FUNCTION DOC] Stores the device index this cache refers to.
         self.device_index = device_index
 
     size = cuFFTPlanCacheAttrContextProp(
@@ -88,10 +99,13 @@ class cuFFTPlanCache:
     )
 
     def clear(self):
+        # [FUNCTION DOC] Empties the plan cache for this device and returns whatever the C++ call returns.
         return torch._cufft_clear_plan_cache(self.device_index)
 
 
 class cuFFTPlanCacheManager:
+    # [CLASS DOC] Container of per-device cuFFT plan caches, created lazily on first indexing, one per visible CUDA device.
+    # Indexing by device returns that device's cuFFTPlanCache; attribute reads and writes on the manager itself are forwarded to the cache of the current device. A private flag distinguishes the construction phase (normal attribute setting) from afterwards (forwarding).
     r"""
     Represent all cuFFT plan caches, return the cuFFTPlanCache for a given device when indexed.
 
@@ -103,10 +117,13 @@ class cuFFTPlanCacheManager:
     __initialized = False
 
     def __init__(self):
+        # [FUNCTION DOC] Creates an empty cache list and marks the manager as initialized so later attribute writes are forwarded.
         self.caches = []
         self.__initialized = True
 
     def __getitem__(self, device):
+        # [FUNCTION DOC] Converts a device specifier to an index and returns the cuFFTPlanCache for it, creating all per-device caches on first use.
+        # Raises RuntimeError if the index is outside the range of visible CUDA devices.
         index = torch.cuda._utils._get_device_index(device)
         if index < 0 or index >= torch.cuda.device_count():
             raise RuntimeError(
@@ -120,9 +137,11 @@ class cuFFTPlanCacheManager:
         return self.caches[index]
 
     def __getattr__(self, name):
+        # [FUNCTION DOC] Forwards unknown attribute reads to the plan cache of the currently active CUDA device.
         return getattr(self[torch.cuda.current_device()], name)
 
     def __setattr__(self, name, value):
+        # [FUNCTION DOC] After construction, forwards attribute writes to the current device's plan cache; during construction, sets attributes normally.
         if self.__initialized:
             return setattr(self[torch.cuda.current_device()], name, value)
         else:
@@ -130,9 +149,15 @@ class cuFFTPlanCacheManager:
 
 
 class cuBLASModule:
+    # [CLASS DOC] Singleton-style facade (exposed as matmul) over global cuBLAS settings kept in the C++ core; has no state of its own.
+    # Readable and writable pseudo-attributes: allow_tf32, prefer_cublaslt_grouped_gemm, allow_fp16_reduced_precision_reduction (+ _split_k getter), allow_bf16_reduced_precision_reduction (+ _split_k getter), allow_fp16_accumulation, fp32_precision. Any other name raises AttributeError on both read and write.
+    # KNOWN ISSUE: the split_k names are readable but not writable (writes raise AttributeError); set them via the tuple form of the reduction attributes.
     @staticmethod
     def _parse_reduction_setting(value: Any, attr_name: str) -> tuple[bool, bool]:
+    # [FUNCTION DOC] HELPER: Normalizes a reduction setting into a pair of booleans (allow_reduced_precision, allow_splitk). A bare boolean gives (value, True); a one or two element list or tuple of booleans gives the first (and second, default True).
+    # Raises TypeError for an empty or over-long sequence, non-boolean elements, or any other type, with the attribute name in the message.
         def _ensure_bool(obj: Any, which: str) -> bool:
+        # [FUNCTION DOC] HELPER: Returns the object if it is a boolean, else raises TypeError naming the attribute and which element was wrong.
             if isinstance(obj, bool):
                 return obj
             raise TypeError(
@@ -156,6 +181,8 @@ class cuBLASModule:
         )
 
     def __getattr__(self, name):
+        # [FUNCTION DOC] Reads a cuBLAS setting from the C++ core by attribute name (see class doc for names); the _split_k variants return the second element of the stored pair.
+        # Note fp32_precision returns the current precision value for the cuda matmul category. Raises AttributeError for unknown names.
         if name == "allow_tf32":
             return torch._C._get_cublas_allow_tf32()
         elif name == "prefer_cublaslt_grouped_gemm":
@@ -187,6 +214,8 @@ class cuBLASModule:
         raise AttributeError("Unknown attribute " + name)
 
     def __setattr__(self, name, value):
+        # [FUNCTION DOC] Writes a cuBLAS setting to the C++ core by attribute name. The reduced-precision-reduction settings accept a bool or a tuple/list of bools (parsed by the helper, raising TypeError on bad input). Returns the C++ call's result. Raises AttributeError for unknown names.
+        # Side effect: changes process-wide cuBLAS behavior.
         if name == "allow_tf32":
             return torch._C._set_cublas_allow_tf32(value)
         elif name == "prefer_cublaslt_grouped_gemm":
@@ -225,6 +254,9 @@ _LinalgBackends_str = ", ".join(_LinalgBackends.keys())
 def preferred_linalg_library(
     backend: None | str | torch._C._LinalgBackend = None,
 ) -> torch._C._LinalgBackend:
+    # [FUNCTION DOC] Queries or overrides the preferred CUDA linear algebra library (default heuristic, cusolver, or magma).
+    # Args: backend as a name string, a C++ backend enum value, or None to only query. Returns the currently preferred backend enum. Raises RuntimeError for an unknown name or an argument of the wrong type. Side effect: sets global state when a value is given.
+    # Experimental; environment variable can set the initial value.
     r"""
     Override the heuristic PyTorch uses to choose between cuSOLVER and MAGMA for CUDA linear algebra operations.
 
@@ -296,6 +328,8 @@ _BlasBackends_str = ", ".join(_BlasBackends.keys())
 def preferred_blas_library(
     backend: None | str | torch._C._BlasBackend = None,
 ) -> torch._C._BlasBackend:
+    # [FUNCTION DOC] Queries or overrides the preferred BLAS library (default, cublas, cublaslt, ck; hipblas and hipblaslt are aliases for the first two).
+    # Args: backend as a name string, enum value, or None to only query. Returns the current preferred backend enum. Raises RuntimeError for an unknown name or wrong argument type. Side effect: sets global state when a value is given.
     r"""
     Override the library PyTorch uses for BLAS operations. Choose between cuBLAS, cuBLASLt, and CK [ROCm-only].
 
@@ -338,6 +372,7 @@ def preferred_blas_library(
 
 
 def cublas_workspace_size(size: None | int = None) -> int:
+    # [FUNCTION DOC] Optionally sets the cuBLAS workspace size in bytes (global setting, lazy per-handle effect, takes precedence over the environment configuration) and returns the current size. Negative sizes are rejected by the C++ layer.
     r"""Query or set the cuBLAS workspace size in bytes.
 
     When called with no arguments, returns the current workspace size.
@@ -357,6 +392,7 @@ def cublas_workspace_size(size: None | int = None) -> int:
 
 
 def cublaslt_workspace_size(size: None | int = None) -> int:
+    # [FUNCTION DOC] Optionally sets the cuBLASLt workspace size in bytes (global setting, lazy effect, overrides the environment variable) and returns the current size.
     r"""Query or set the cuBLASLt workspace size in bytes.
 
     When called with no arguments, returns the current workspace size.
@@ -379,6 +415,8 @@ def blas_workspace_size(
     size: None | int = None,
     backend: None | str | torch._C._BlasBackend = None,
 ) -> int:
+    # [FUNCTION DOC] Queries or sets the BLAS workspace size for a chosen backend. Resolves the backend (None means the current preferred one; names and enums accepted; the default value resolves to the platform default), then dispatches to the cuBLASLt or cuBLAS workspace function with the optional size and returns the size.
+    # Raises RuntimeError for an unknown backend name or type, or when the resolved backend is CK (no workspace concept).
     r"""Query or set the BLAS workspace size for a given backend.
 
     Convenience wrapper that dispatches to :func:`cublas_workspace_size` or
@@ -454,6 +492,9 @@ from torch._C import _SDPAParams as SDPAParams, _SDPBackend as SDPBackend
 def preferred_rocm_fa_library(
     backend: None | str | torch._C._ROCmFABackend = None,
 ) -> torch._C._ROCmFABackend:
+    # [FUNCTION DOC] [ROCm-only] Queries or overrides the backend used for Flash Attention (default, aotriton, ck). Args: backend as name, enum, or None to only query. Returns the preferred backend enum. Side effect: sets global state when given.
+    # Raises RuntimeError for an unknown name and ValueError for a wrong argument type.
+    # KNOWN ISSUE: inconsistent exception types for bad input compared with the sibling preferred_* functions, which raise RuntimeError for both cases.
     r"""
     [ROCm-only]
     Override the backend PyTorch uses in ROCm environments for Flash Attention. Choose between AOTriton and CK
@@ -497,6 +538,7 @@ SDPAParams.__name__ = "SDPAParams"
 
 
 def is_ck_sdpa_available() -> bool:
+    # [FUNCTION DOC] Returns whether composable_kernel can be used as the scaled-dot-product-attention backend (beta).
     r"""
     .. warning:: This flag is beta and subject to change.
 
@@ -508,6 +550,7 @@ def is_ck_sdpa_available() -> bool:
 
 
 def flash_sdp_enabled():
+    # [FUNCTION DOC] Returns whether the flash SDPA backend is globally enabled.
     r"""
     .. warning:: This flag is beta and subject to change.
 
@@ -517,6 +560,7 @@ def flash_sdp_enabled():
 
 
 def enable_flash_sdp(enabled: bool):
+    # [FUNCTION DOC] Globally enables or disables the flash SDPA backend (side effect on global state).
     r"""
     .. warning:: This flag is beta and subject to change.
 
@@ -526,6 +570,7 @@ def enable_flash_sdp(enabled: bool):
 
 
 def mem_efficient_sdp_enabled():
+    # [FUNCTION DOC] Returns whether the memory-efficient SDPA backend is globally enabled.
     r"""
     .. warning:: This flag is beta and subject to change.
 
@@ -535,6 +580,7 @@ def mem_efficient_sdp_enabled():
 
 
 def enable_mem_efficient_sdp(enabled: bool):
+    # [FUNCTION DOC] Globally enables or disables the memory-efficient SDPA backend (side effect on global state).
     r"""
     .. warning:: This flag is beta and subject to change.
 
@@ -544,6 +590,7 @@ def enable_mem_efficient_sdp(enabled: bool):
 
 
 def math_sdp_enabled():
+    # [FUNCTION DOC] Returns whether the math (reference) SDPA backend is globally enabled.
     r"""
     .. warning:: This flag is beta and subject to change.
 
@@ -553,6 +600,7 @@ def math_sdp_enabled():
 
 
 def enable_math_sdp(enabled: bool):
+    # [FUNCTION DOC] Globally enables or disables the math SDPA backend (side effect on global state).
     r"""
     .. warning:: This flag is beta and subject to change.
 
@@ -562,6 +610,7 @@ def enable_math_sdp(enabled: bool):
 
 
 def allow_fp16_bf16_reduction_math_sdp(enabled: bool):
+    # [FUNCTION DOC] Globally allows or disallows fp16/bf16 reduced-precision reduction in the math SDPA backend.
     r"""
     .. warning:: This flag is beta and subject to change.
 
@@ -571,6 +620,7 @@ def allow_fp16_bf16_reduction_math_sdp(enabled: bool):
 
 
 def fp16_bf16_reduction_math_sdp_allowed():
+    # [FUNCTION DOC] Returns whether fp16/bf16 reduction is allowed in the math SDPA backend.
     r"""
     .. warning:: This flag is beta and subject to change.
 
@@ -580,6 +630,7 @@ def fp16_bf16_reduction_math_sdp_allowed():
 
 
 def is_flash_attention_available() -> bool:
+    # [FUNCTION DOC] Returns whether this build includes FlashAttention for SDPA (False on non-CUDA builds).
     r"""Check if PyTorch was built with FlashAttention for scaled_dot_product_attention.
 
     Returns:
@@ -593,6 +644,7 @@ def is_flash_attention_available() -> bool:
 
 
 def can_use_flash_attention(params: SDPAParams, debug: bool = False) -> bool:
+    # [FUNCTION DOC] Returns whether FlashAttention can run for the given SDPA parameters (query/key/value, mask, dropout, causal flag); with debug true, logs a warning explaining why it cannot. False on non-CUDA builds.
     r"""Check if FlashAttention can be utilized in scaled_dot_product_attention.
 
     Args:
@@ -613,6 +665,7 @@ def can_use_flash_attention(params: SDPAParams, debug: bool = False) -> bool:
 
 
 def can_use_efficient_attention(params: SDPAParams, debug: bool = False) -> bool:
+    # [FUNCTION DOC] Returns whether the memory-efficient attention kernel can run for the given SDPA parameters; with debug true, logs the reason when it cannot. False on non-CUDA builds.
     r"""Check if efficient_attention can be utilized in scaled_dot_product_attention.
 
     Args:
@@ -633,6 +686,7 @@ def can_use_efficient_attention(params: SDPAParams, debug: bool = False) -> bool
 
 
 def can_use_cudnn_attention(params: SDPAParams, debug: bool = False) -> bool:
+    # [FUNCTION DOC] Returns whether cuDNN attention can run for the given SDPA parameters; with debug true, logs the reason when it cannot. False on non-CUDA builds.
     r"""Check if cudnn_attention can be utilized in scaled_dot_product_attention.
 
     Args:
@@ -653,6 +707,7 @@ def can_use_cudnn_attention(params: SDPAParams, debug: bool = False) -> bool:
 
 
 def cudnn_sdp_enabled():
+    # [FUNCTION DOC] Returns whether the cuDNN SDPA backend is globally enabled.
     r"""
     .. warning:: This flag is beta and subject to change.
 
@@ -662,6 +717,7 @@ def cudnn_sdp_enabled():
 
 
 def enable_cudnn_sdp(enabled: bool):
+    # [FUNCTION DOC] Globally enables or disables the cuDNN SDPA backend (side effect on global state).
     r"""
     .. warning:: This flag is beta and subject to change.
 
@@ -686,6 +742,8 @@ def sdp_kernel(
     enable_mem_efficient: bool = True,
     enable_cudnn: bool = True,
 ):
+    # [FUNCTION DOC] Deprecated context manager (emits a FutureWarning when called) that restricts SDPA to the backends whose enable flags are true (flash, math, memory-efficient, cudnn; all default True) by delegating to the nn.attention selection context manager, and yields its context object; previous state is restored on exit.
+    # KNOWN ISSUE: the docstring says three backends but four flags exist; the try/finally with a no-op finally adds nothing.
     r"""
     .. warning:: This flag is beta and subject to change.
 

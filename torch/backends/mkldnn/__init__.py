@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [PACKAGE DOC] Exposes torch.backends.mkldnn (oneDNN): availability queries, on-demand oneDNN verbose logging, and runtime flags (enabled, deterministic, allow_tf32, fp32_precision with matmul/conv/rnn sub-settings).
+# Provides set_flags and a flags context manager. Import-time side effect: replaces this module in the module registry with a property-intercepting module wrapper.
+# Defines VERBOSE_OFF (0), VERBOSE_ON (1), VERBOSE_ON_CREATION (2).
 import sys
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
@@ -15,11 +18,13 @@ from torch.backends import (
 
 
 def is_available():
+    # [FUNCTION DOC] Returns whether the build was compiled with MKL-DNN (oneDNN) support.
     r"""Return whether PyTorch is built with MKL-DNN support."""
     return torch._C._has_mkldnn
 
 
 def is_acl_available():
+    # [FUNCTION DOC] Returns whether the build was compiled with MKL-DNN plus Arm Compute Library support.
     r"""Return whether PyTorch is built with MKL-DNN + ACL support."""
     # pyrefly: ignore [missing-attribute]
     return torch._C._has_mkldnn_acl
@@ -31,6 +36,8 @@ VERBOSE_ON_CREATION = 2
 
 
 class verbose:
+    # [CLASS DOC] Context manager that enables oneDNN verbose output for the duration of a with block, limiting log volume to a chosen scope.
+    # State: requested verbose level in attribute level. Entering raises an error if verbose mode cannot be set; exiting always turns verbosing off.
     """
     On-demand oneDNN (former MKL-DNN) verbosing functionality.
 
@@ -62,9 +69,12 @@ class verbose:
     """
 
     def __init__(self, level):
+        # [FUNCTION DOC] Stores the requested verbose level (off, on, or on with kernel creation) in the attribute level.
         self.level = level
 
     def __enter__(self):
+        # [FUNCTION DOC] On entry, returns None without action if level is off; otherwise enables oneDNN verbose mode, raising AssertionError on failure, and returns the manager.
+        # Side effect: changes process-wide oneDNN verbose state.
         if self.level == VERBOSE_OFF:
             return
         st = torch._C._verbose.mkldnn_set_verbose(self.level)
@@ -75,6 +85,7 @@ class verbose:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # [FUNCTION DOC] On exit, unconditionally turns oneDNN verbose mode off and returns False so exceptions propagate.
         torch._C._verbose.mkldnn_set_verbose(VERBOSE_OFF)
         return False
 
@@ -82,6 +93,9 @@ class verbose:
 def set_flags(
     _enabled=None, _deterministic=None, _allow_tf32=None, _fp32_precision="none"
 ):
+    # [FUNCTION DOC] HELPER: Applies the given mkldnn settings (enabled, deterministic, allow_tf32 and fp32 precision) to global state and returns a tuple of the previous values for restoring.
+    # A None argument leaves the matching setting unchanged, except fp32 precision whose default is the string none, so calling with defaults resets precision to none.
+    # KNOWN ISSUE: the module-level fp32_precision property reads from the mkldnn backend but its setter targets the generic backend, an apparent mismatch.
     orig_flags = (
         torch._C._get_mkldnn_enabled(),
         torch._C._get_mkldnn_deterministic(),
@@ -101,6 +115,8 @@ def set_flags(
 
 @contextmanager
 def flags(enabled=False, deterministic=False, allow_tf32=True, fp32_precision="none"):
+    # [FUNCTION DOC] Context manager that temporarily sets mkldnn enabled (default False), deterministic (default False), allow_tf32 (default True) and fp32 precision (default none), then restores the previous values on exit even on error.
+    # Note the defaults differ from typical global defaults, so omitting arguments overrides them.
     with __allow_nonbracketed_mutation():
         orig_flags = set_flags(enabled, deterministic, allow_tf32, fp32_precision)
     try:
@@ -111,7 +127,9 @@ def flags(enabled=False, deterministic=False, allow_tf32=True, fp32_precision="n
 
 
 class MkldnnModule(PropModule):
+    # [CLASS DOC] Module wrapper installed in place of this module; exposes enabled, deterministic, allow_tf32 and fp32_precision as context-aware properties over C++ getters/setters, and matmul/conv/rnn as fp32 precision sub-settings.
     def is_available(self):
+        # [FUNCTION DOC] Method form of the availability query; returns whether mkldnn is built in.
         return is_available()
 
     enabled = ContextProp(torch._C._get_mkldnn_enabled, torch._C._set_mkldnn_enabled)

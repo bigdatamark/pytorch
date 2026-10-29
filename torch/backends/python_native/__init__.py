@@ -1,3 +1,6 @@
+# [PACKAGE DOC] User-facing control of the Python-native DSL operation overrides (triton, cutedsl and other registered DSLs) defined in torch._native: enable or disable whole DSLs, individual operations, or dispatch keys, with context managers for temporary changes.
+# Exports (as attributes of the replacement module object): available_dsls, all_dsls, get_dsl_operations, disable/enable_operations, disable/enable_dispatch_keys, operations_disabled, is_operation_disabled, is_dsl_disabled, and one DSLController attribute per registered DSL name.
+# Import-time side effect: replaces this module in the module registry with a PythonNativeModule instance. Registry access is lazy to avoid circular imports.
 """
 User-facing API for controlling DSL operation overrides.
 
@@ -40,6 +43,7 @@ from torch.backends import ContextProp, flags_frozen, PropModule
 
 @contextmanager
 def _preserve_filter_state():
+    # [FUNCTION DOC] HELPER: Context manager that snapshots the registry filter state (disabled DSL names, operation symbols, dispatch keys), yields the live filter state, and on exit restores all three sets to the snapshot, even on error. Mutates the shared filter state.
     """Context manager to save and restore registry filter state."""
     filter_state = _get_filter_state()
 
@@ -64,6 +68,7 @@ def _preserve_filter_state():
 
 
 def _get_dsl_registry():
+    # [FUNCTION DOC] HELPER: Imports lazily and returns the DSL registry object (lazy to avoid circular imports).
     """Lazy import to avoid circular imports."""
     from torch._native.dsl_registry import dsl_registry
 
@@ -71,6 +76,7 @@ def _get_dsl_registry():
 
 
 def _get_registry_functions():
+    # [FUNCTION DOC] HELPER: Lazily imports and returns a 4-tuple from the native registry: the function that disables op overrides, the function that re-enables them, the graph registry, and the filter state.
     """Lazy import of registry functions."""
     from torch._native.registry import (
         _filter_state,
@@ -83,11 +89,13 @@ def _get_registry_functions():
 
 
 def _get_filter_state():
+    # [FUNCTION DOC] HELPER: Returns the registry's global filter state object (fourth entry of the registry tuple).
     """Direct access to filter state."""
     return _get_registry_functions()[3]
 
 
 def _get_dsl_module(dsl_name: str):
+    # [FUNCTION DOC] HELPER: Looks up a registered DSL module by name through the DSL registry; raises ValueError listing all known DSLs if the name is not registered.
     """Get the registered DSL module for direct control.
 
     Uses the DSL registry to dynamically look up DSL modules instead of
@@ -116,29 +124,36 @@ def _get_dsl_module(dsl_name: str):
 
 
 class DSLController:
+    # [CLASS DOC] Handle for one named DSL, offering availability, version, backend and enabled state queries plus enable, disable and a temporary-disable context manager.
+    # State: only the DSL name; all real state lives in the shared registry.
     """Controller for a specific DSL."""
 
     def __init__(self, dsl_name: str):
+        # [FUNCTION DOC] Stores the DSL name.
         self._dsl_name = dsl_name
 
     @property
     def name(self) -> str:
+        # [FUNCTION DOC] Property returning the DSL name.
         return self._dsl_name
 
     @property
     def available(self) -> bool:
+        # [FUNCTION DOC] Property: asks the registry whether this DSL's runtime is available.
         """Check if DSL runtime is available."""
         registry = _get_dsl_registry()
         return registry.is_dsl_available(self._dsl_name)
 
     @property
     def version(self):
+        # [FUNCTION DOC] Property: returns the DSL version reported by the registry.
         """Get DSL version."""
         registry = _get_dsl_registry()
         return registry.get_dsl_version(self._dsl_name)
 
     @property
     def backend(self) -> str:
+        # [FUNCTION DOC] Property: returns the chosen lowering backend by calling the DSL module's chooser function; raises AttributeError if the DSL module has no such function.
         """Chosen lowering backend for DSLs that have one (e.g. helion)."""
         chosen = getattr(_get_dsl_module(self._dsl_name), "_chosen_backend", None)
         if chosen is None:
@@ -147,12 +162,14 @@ class DSLController:
 
     @property
     def enabled(self) -> bool:
+        # [FUNCTION DOC] Property: True unless this DSL's name is in the filter state's set of disabled DSLs.
         """Check if DSL is currently enabled."""
         filter_state = _get_filter_state()
         return self._dsl_name not in filter_state._dsl_names
 
     @enabled.setter
     def enabled(self, value: bool):
+        # [FUNCTION DOC] Property setter: enables (true value) or disables (false value) the DSL. Raises RuntimeError if global flags have been frozen.
         """Enable or disable the DSL."""
         if flags_frozen():
             raise RuntimeError(
@@ -165,17 +182,21 @@ class DSLController:
             self.disable()
 
     def disable(self):
+        # [FUNCTION DOC] Disables all operation overrides of this DSL by asking the DSL module to deregister them (mutates registry state).
         """Disable all operations for this DSL."""
         dsl_module = _get_dsl_module(self._dsl_name)
         dsl_module.deregister_op_overrides()
 
     def enable(self):
+        # [FUNCTION DOC] Re-enables all operation overrides of this DSL through the registry (mutates registry state).
         """Re-enable all operations for this DSL."""
         reenable_op_overrides = _get_registry_functions()[1]
         reenable_op_overrides(enable_dsl_names=self._dsl_name)
 
     @contextmanager
     def disabled(self):
+        # [FUNCTION DOC] Context manager: records whether the DSL was enabled, disables it for the body, and on exit re-enables it only if it had been enabled before.
+        # KNOWN ISSUE: unlike the public enabled setter, this does not check whether flags are frozen.
         """Context manager to temporarily disable DSL."""
         original_state = self.enabled
         try:
@@ -186,19 +207,23 @@ class DSLController:
                 self.enable()
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns a text form with the DSL name, availability and enabled status.
         status = "available" if self.available else "unavailable"
         enabled_status = "enabled" if self.enabled else "disabled"
         return f"DSLController({self._dsl_name}, {status}, {enabled_status})"
 
 
 class PythonNativeModule(PropModule):
+    # [CLASS DOC] Module replacement object for this package, built on the shared property-module base. Provides DSL listing, per-operation and per-dispatch-key enable/disable, and dynamic attribute access that returns a cached DSLController for any registered DSL name (and exposes a few private helpers for tests).
     """Main module for python_native DSL control."""
 
     def __init__(self, original_module):
+        # [FUNCTION DOC] Wraps the original module, reusing its name.
         super().__init__(original_module, original_module.__name__)
 
     @property
     def available_dsls(self) -> list[str]:
+        # [FUNCTION DOC] Property: names of DSLs whose runtime is available, as a list.
         """Get list of available DSLs."""
         registry = _get_dsl_registry()
         result = registry.list_available_dsls()
@@ -206,12 +231,14 @@ class PythonNativeModule(PropModule):
 
     @property
     def all_dsls(self) -> list[str]:
+        # [FUNCTION DOC] Property: names of all registered DSLs, as a list.
         """Get list of all registered DSLs."""
         registry = _get_dsl_registry()
         result = registry.list_all_dsls()
         return list(result) if not isinstance(result, list) else result
 
     def get_dsl_operations(self, dsl_name: str) -> list[str]:
+        # [FUNCTION DOC] Returns the sorted list of operation names registered by the named DSL, taken from the native registry.
         """Get list of operations registered by a specific DSL.
 
         Args:
@@ -230,6 +257,7 @@ class PythonNativeModule(PropModule):
         return get_dsl_operations(dsl_name)
 
     def disable_operations(self, *op_symbols: str):
+        # [FUNCTION DOC] Disables the named operations across all DSLs (mutates registry filter state).
         """Disable specific operations across all DSLs.
 
         Args:
@@ -249,6 +277,7 @@ class PythonNativeModule(PropModule):
         deregister_op_overrides(disable_op_symbols=list(op_symbols))
 
     def enable_operations(self, *op_symbols: str):
+        # [FUNCTION DOC] Re-enables the named operations across all DSLs (mutates registry filter state).
         """Re-enable specific operations across all DSLs.
 
         Args:
@@ -265,6 +294,7 @@ class PythonNativeModule(PropModule):
         reenable_op_overrides(enable_op_symbols=list(op_symbols))
 
     def disable_dispatch_keys(self, *dispatch_keys: str):
+        # [FUNCTION DOC] Disables operation overrides at the given dispatch keys such as CUDA or CPU (mutates registry filter state).
         """Disable operations at specific dispatch keys.
 
         Args:
@@ -279,6 +309,7 @@ class PythonNativeModule(PropModule):
         deregister_op_overrides(disable_dispatch_keys=list(dispatch_keys))
 
     def enable_dispatch_keys(self, *dispatch_keys: str):
+        # [FUNCTION DOC] Re-enables operation overrides at the given dispatch keys (mutates registry filter state).
         """Re-enable operations at specific dispatch keys.
 
         Args:
@@ -294,6 +325,7 @@ class PythonNativeModule(PropModule):
 
     @contextmanager
     def operations_disabled(self, *op_symbols: str):
+        # [FUNCTION DOC] Context manager that disables the named operations for the body and afterwards re-enables only those that were not already disabled before entry, even on error.
         """Context manager to temporarily disable operations.
 
         Args:
@@ -324,24 +356,29 @@ class PythonNativeModule(PropModule):
 
     @functools.lru_cache(maxsize=16)  # noqa: B019
     def _get_dsl_controller(self, name: str) -> "DSLController":
+        # [FUNCTION DOC] HELPER: Returns a DSLController for the name; results are cached per (module, name) with a bounded cache of 16 entries.
         """Get or create a DSL controller (cached)."""
         return DSLController(name)
 
     def _get_registry_functions(self):
+        # [FUNCTION DOC] HELPER: Exposes the registry function tuple for tests.
         """Expose registry functions for testing."""
         return _get_registry_functions()
 
     def is_operation_disabled(self, op_symbol: str) -> bool:
+        # [FUNCTION DOC] Returns True if the operation symbol is currently in the disabled set.
         """Check if an operation is currently disabled."""
         filter_state = _get_filter_state()
         return op_symbol in filter_state._op_symbols
 
     def is_dsl_disabled(self, dsl_name: str) -> bool:
+        # [FUNCTION DOC] Returns True if the DSL name is currently in the disabled set.
         """Check if a DSL is currently disabled."""
         filter_state = _get_filter_state()
         return dsl_name in filter_state._dsl_names
 
     def __getattr__(self, name: str):
+        # [FUNCTION DOC] Fallback attribute lookup: raises AttributeError for double-underscore names (avoids circular imports during torch startup), returns a cached DSLController for registered DSL names, returns certain private test helpers by name, and otherwise raises AttributeError.
         """Dynamic attribute access for DSL controllers."""
         # Skip dunder attributes to avoid triggering DSL registry lookups
         # during torch initialization. inspect.getmodule() calls
@@ -364,6 +401,7 @@ class PythonNativeModule(PropModule):
         raise AttributeError(f"module '{self.__name__}' has no attribute '{name}'")
 
     def __dir__(self):
+        # [FUNCTION DOC] Returns a sorted list of attribute names: the base ones, the public methods listed here, and all registered DSL names (DSL names are skipped silently if the registry cannot be queried).
         """Return available attributes including DSL names."""
         attrs = set(super().__dir__())
         attrs.update(

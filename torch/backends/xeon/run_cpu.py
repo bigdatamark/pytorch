@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Command-line launcher that runs a user script (single or multiple instances) on Intel Xeon CPUs with tuned thread and memory settings: core/NUMA selection, thread affinity, optional LD_PRELOAD of Intel OpenMP / tcmalloc / jemalloc, and numactl pinning.
+# Main contents: _CPUinfo (reads CPU topology), _Launcher (allocator/OpenMP setup, instance launching), an argument parser, and a main entry point; run as a module from the command line.
+# Import-time side effects: configures the root logging system at INFO level with a timestamped format and creates the module logger.
+# Environment variables the launcher may set: LD_PRELOAD, KMP_AFFINITY, KMP_BLOCKTIME, OMP_NUM_THREADS, MALLOC_CONF; values already present in the environment are respected.
 """
 This is a script for launching PyTorch inference on Intel(R) Xeon(R) Scalable Processors with optimal configurations.
 
@@ -146,9 +150,14 @@ logger = logging.getLogger(__name__)
 
 
 class _CPUinfo:
+    # [CLASS DOC] HELPER: Reads the machine's CPU topology (Linux only) and exposes physical and logical core ids grouped by NUMA node.
+    # State: cpuinfo (raw parsed rows of cpu, core, socket, node), node_nums, node_physical_cores and node_logical_cores (lists indexed by node id), and maps from physical and logical core id to node id.
     """Get CPU information, such as cores list and NUMA information."""
 
     def __init__(self, test_input=""):
+        # [FUNCTION DOC] HELPER: Builds the topology tables by running the system CPU listing tool (or by parsing the given test text instead when non-empty) and grouping cores by NUMA node; an empty node field is treated as node 0.
+        # Raises RuntimeError on Windows and macOS; on other non-Linux systems no tables are created. Side effect: runs a subprocess.
+        # KNOWN ISSUE: the row pattern accepts only a single-digit-or-empty node column prefix, and node count uses string comparison of node ids, so more than nine nodes may be mishandled.
         self.cpuinfo = []
         if platform.system() in ["Windows", "Darwin"]:
             raise RuntimeError(f"{platform.system()} is not supported!!!")
@@ -200,18 +209,21 @@ class _CPUinfo:
                 self.node_logical_cores.append(cur_node_logical_core)
 
     def _physical_core_nums(self):
+        # [FUNCTION DOC] HELPER: Returns the total number of physical cores across all nodes.
         overall_core_num = 0
         for phycisal_core_list in self.node_physical_cores:
             overall_core_num += len(phycisal_core_list)
         return overall_core_num
 
     def _logical_core_nums(self):
+        # [FUNCTION DOC] HELPER: Returns the total number of logical cores across all nodes.
         overall_core_num = 0
         for logical_core_list in self.node_logical_cores:
             overall_core_num += len(logical_core_list)
         return overall_core_num
 
     def get_node_physical_cores(self, node_id):
+        # [FUNCTION DOC] HELPER: Returns the list of physical core ids of one NUMA node; raises ValueError if the node id is out of range.
         if node_id < 0 or node_id > self.node_nums - 1:
             raise ValueError(
                 f"Invalid node id: {node_id}. Valid node ids: {list(range(len(self.node_physical_cores)))}"
@@ -219,6 +231,7 @@ class _CPUinfo:
         return self.node_physical_cores[node_id]
 
     def get_node_logical_cores(self, node_id):
+        # [FUNCTION DOC] HELPER: Returns the list of logical core ids of one NUMA node; raises ValueError if the node id is out of range.
         if node_id < 0 or node_id > self.node_nums - 1:
             raise ValueError(
                 f"Invalid node id: {node_id}. Valid node ids: {list(range(len(self.node_physical_cores)))}"
@@ -226,18 +239,21 @@ class _CPUinfo:
         return self.node_logical_cores[node_id]
 
     def get_all_physical_cores(self):
+        # [FUNCTION DOC] HELPER: Returns a flat list of all physical core ids over all nodes, in node order.
         all_cores = []
         for cores in self.node_physical_cores:
             all_cores.extend(cores)
         return all_cores
 
     def get_all_logical_cores(self):
+        # [FUNCTION DOC] HELPER: Returns a flat list of all logical core ids over all nodes, in node order.
         all_cores = []
         for cores in self.node_logical_cores:
             all_cores.extend(cores)
         return all_cores
 
     def numa_aware_check(self, core_list):
+        # [FUNCTION DOC] HELPER: Returns the list of distinct NUMA node ids that the given logical cores belong to, in first-seen order. Logs a warning when more than one node is spanned; raises RuntimeError if the result would be empty (empty core list). Raises KeyError for an unknown core id.
         """
         Check whether all cores in core_list are in the same NUMA node.
 
@@ -266,6 +282,7 @@ instance. Alternatively, please use --skip-cross-node-cores knob.",
 
 
 class _Launcher:
+    # [CLASS DOC] HELPER: Prepares the process environment (library preloads, memory allocator, OpenMP settings) and launches the instance processes. Holds the CPU topology in cpuinfo and a class-level message template for missing library files.
     r"""Class for launcher."""
 
     msg_lib_notfound = (
@@ -275,9 +292,12 @@ or /.local/lib/ or /usr/local/lib/ or /usr/local/lib64/ or /usr/lib or /usr/lib6
     )
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the launcher and reads the CPU topology (may raise RuntimeError on unsupported platforms).
         self.cpuinfo = _CPUinfo()
 
     def add_lib_preload(self, lib_type):
+        # [FUNCTION DOC] HELPER: Ensures the shared library of the given type (for example tcmalloc, jemalloc, iomp5) is in LD_PRELOAD. Searches in order the conda and virtualenv lib directories (if set), then the user local lib and system lib directories; if not already listed, prepends the first match to the LD_PRELOAD environment variable.
+        # Returns True if the library was already set or has now been added, else False. Side effect: mutates the process environment.
         """Enable TCMalloc/JeMalloc/intel OpenMP."""
         library_paths = []
         if "CONDA_PREFIX" in os.environ:
@@ -317,6 +337,7 @@ or /.local/lib/ or /usr/local/lib/ or /usr/local/lib64/ or /usr/lib or /usr/lib6
         return lib_set or lib_find
 
     def is_numactl_available(self):
+        # [FUNCTION DOC] HELPER: Returns True if running the numactl tool with a trivial pinned command succeeds (exit code zero); any failure to run it yields False.
         numactl_available = False
         try:
             cmd = ["numactl", "-C", "0", "-m", "0", "hostname"]
@@ -336,6 +357,8 @@ or /.local/lib/ or /usr/local/lib/ or /usr/local/lib64/ or /usr/lib or /usr/lib6
     def set_memory_allocator(
         self, enable_tcmalloc=True, enable_jemalloc=False, use_default_allocator=False
     ):
+        # [FUNCTION DOC] HELPER: Chooses and configures the memory allocator through LD_PRELOAD. Raises RuntimeError if both tcmalloc and jemalloc are requested. With tcmalloc or jemalloc requested explicitly, tries to preload it (warning if not found; for jemalloc also sets the malloc configuration variable when found). If the default-allocator flag is set, does nothing; otherwise tries tcmalloc first, then jemalloc, and warns about possible slowdown if neither is found.
+        # Side effect: mutates the process environment and logs.
         """
         Enable TCMalloc/JeMalloc with LD_PRELOAD and set configuration for JeMalloc.
 
@@ -388,10 +411,12 @@ or /.local/lib/ or /usr/local/lib/ or /usr/local/lib64/ or /usr/lib or /usr/lib6
             )
 
     def log_env_var(self, env_var_name=""):
+        # [FUNCTION DOC] HELPER: Logs the name and value of the named environment variable if it is set; otherwise does nothing.
         if env_var_name in os.environ:
             logger.info("%s=%s", env_var_name, os.environ[env_var_name])
 
     def set_env(self, env_name, env_value):
+        # [FUNCTION DOC] HELPER: Sets an environment variable to the given value unless it is already set; if already set to a different value, keeps the existing value and logs a warning that the user-provided value wins. Logs a warning when the given value is empty (and then fails with a type error if the variable is unset, since None cannot be stored). Logs the final value.
         if not env_value:
             logger.warning("%s is None", env_name)
         if env_name not in os.environ:
@@ -417,6 +442,8 @@ Value applied: %s. Value ignored: %s",
         enable_jemalloc=False,
         use_default_allocator=False,
     ):
+        # [FUNCTION DOC] HELPER: Configures the allocator (via the memory allocator setup) and, unless disabled, preloads Intel OpenMP: when found, optionally sets thread affinity (only if the affinity flag is true) and the block time variable; warns if the library is missing. Finally logs the preload variable.
+        # Side effect: mutates the process environment.
         """
         Set multi-thread configuration and enable Intel openMP and TCMalloc/JeMalloc.
 
@@ -443,6 +470,10 @@ Value applied: %s. Value ignored: %s",
      """
 
     def launch(self, args):
+        # [FUNCTION DOC] HELPER: Main driver. Takes the parsed command-line arguments and (1) normalizes ncores_per_instance into a list and infers the number of instances; (2) chooses the core list: user list (requires cores per instance), or all/one node's physical or logical cores, with rules for single instance, multi-instance throughput, even split, skipping cross-node cores, and explicit per-instance counts; latency mode (4 cores per instance) and throughput mode (one instance per node) override those settings; (3) falls back from numactl to taskset when numactl is unusable (exits the process with status -1 if taskset is also disabled); (4) sets allocator/OpenMP environment; (5) builds one command per instance (pinning prefix, interpreter with unbuffered flag unless no-python, optional module flag, program and its arguments), assigning contiguous core ranges, optionally split among local ranks when started under a distributed launcher, and per-instance thread count unless OMP_NUM_THREADS was already set; (6) starts the processes (only the selected rank if rank is given), tees output to logs, and waits for them.
+        # Raises ValueError/RuntimeError for inconsistent settings (mismatched instance/core counts, too many instances, missing core counts with a core list, cross-node constraints, too few cores per rank, sums over total cores). Mutates the args object.
+        # KNOWN ISSUE: two ValueError raises in the skip-cross-node-cores branch pass printf-style format arguments as extra exception arguments, so the message is never formatted.
+        # KNOWN ISSUE: the string literal just above this method is a stray expression, not a docstring.
         cores = []
         set_kmp_affinity = True
         enable_taskset = False
@@ -769,6 +800,7 @@ because the core number on this node is not dividable by %d.",
 
 
 def _add_memory_allocator_params(parser):
+    # [FUNCTION DOC] HELPER: Adds an argument group for memory allocator options to the parser: flags to enable tcmalloc, enable jemalloc, or use the default allocator (each accepted with dashes or underscores, default off).
     group = parser.add_argument_group("Memory Allocator Parameters")
     # allocator control
     group.add_argument(
@@ -795,6 +827,8 @@ def _add_memory_allocator_params(parser):
 
 
 def _add_multi_instance_params(parser):
+    # [FUNCTION DOC] HELPER: Adds the multi-instance argument group to the parser: cores per instance (one or more integers), number of instances, skip cross-node cores, rank, latency mode, throughput mode, node id, use logical cores, disable numactl, disable taskset, core list text, log directory, and log file prefix (all with dash and underscore spellings).
+    # KNOWN ISSUE: the log-path help text is truncated (reads 'Default path is , which means disable logging'); the rank default is the string -1 but is converted by the integer type.
     group = parser.add_argument_group("Multi-instance Parameters")
     # multi-instance control
     group.add_argument(
@@ -900,6 +934,7 @@ https://github.com/intel/intel-extension-for-pytorch/blob/master/docs/tutorials/
 
 
 def _add_kmp_iomp_params(parser):
+    # [FUNCTION DOC] HELPER: Adds the OpenMP argument group with a flag to disable preloading Intel OpenMP.
     group = parser.add_argument_group("IOMP Parameters")
     group.add_argument(
         "--disable-iomp",
@@ -911,6 +946,8 @@ def _add_kmp_iomp_params(parser):
 
 
 def create_args(parser=None):
+    # [FUNCTION DOC] Registers all launcher arguments on the given argparse parser: multi-instance flag, module flag, no-python flag, the allocator, OpenMP and multi-instance groups, a positional program path, and the remaining program arguments. Mutates the parser and returns nothing.
+    # KNOWN ISSUE: the docstring claims it returns an ArgumentParser and the parser default is None, but a parser is required and nothing is returned.
     """
     Parse the command line options.
 
@@ -965,6 +1002,7 @@ def create_args(parser=None):
 
 
 def main(args):
+    # [FUNCTION DOC] Entry point: takes parsed arguments. Raises RuntimeError on Windows/macOS, if both latency and throughput modes are set, or if a non-Python program is given without the no-python flag. Creates the log directory (or uses the null device when no log path is given), removes non-existent paths from LD_PRELOAD, runs the launcher, and logs at debug level any environment variables newly added during the run.
     env_before = set(os.environ.keys())
     if platform.system() in ["Windows", "Darwin"]:
         raise RuntimeError(f"{platform.system()} is not supported!!!")

@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Exposes torch.backends.opt_einsum: controls whether einsum uses the optional opt_einsum package to find an optimal contraction path.
+# Import-time side effects: tries to import opt_einsum (falls back to None), sets module state enabled (True if available) and strategy (auto if available, else None), and replaces this module in the module registry with a property-intercepting wrapper.
+# Exports availability query, package accessor, set_flags and a flags context manager.
 import sys
 import warnings
 from contextlib import contextmanager
@@ -16,6 +19,7 @@ except ImportError:
 
 @_lru_cache
 def is_available() -> bool:
+    # [FUNCTION DOC] Returns True if the opt_einsum package was imported successfully; result is cached.
     r"""Return a bool indicating if opt_einsum is currently available.
 
     You must install opt-einsum in order for torch to automatically optimize einsum. To
@@ -28,11 +32,13 @@ def is_available() -> bool:
 
 
 def get_opt_einsum() -> Any:
+    # [FUNCTION DOC] Returns the imported opt_einsum package or None when unavailable.
     r"""Return the opt_einsum package if opt_einsum is currently available, else None."""
     return _opt_einsum
 
 
 def _set_enabled(_enabled: bool) -> None:
+    # [FUNCTION DOC] HELPER: Sets the module-level enabled flag; raises ValueError when asked to enable while opt_einsum is not installed.
     if not is_available() and _enabled:
         raise ValueError(
             f"opt_einsum is not available, so setting `enabled` to {_enabled} will not reap "
@@ -45,10 +51,12 @@ def _set_enabled(_enabled: bool) -> None:
 
 
 def _get_enabled() -> bool:
+    # [FUNCTION DOC] HELPER: Returns the module-level enabled flag.
     return enabled
 
 
 def _set_strategy(_strategy: str) -> None:
+    # [FUNCTION DOC] HELPER: Sets the module-level contraction strategy. Raises ValueError if opt_einsum is unavailable, if it is not enabled, or if the value is not one of auto, greedy, optimal.
     if not is_available():
         raise ValueError(
             f"opt_einsum is not available, so setting `strategy` to {_strategy} will not be meaningful. "
@@ -70,11 +78,13 @@ def _set_strategy(_strategy: str) -> None:
 
 
 def _get_strategy() -> str:
+    # [FUNCTION DOC] HELPER: Returns the module-level strategy string.
     # pyrefly: ignore [bad-return]
     return strategy
 
 
 def set_flags(_enabled=None, _strategy=None):
+    # [FUNCTION DOC] HELPER: Applies the given enabled and strategy values (None means leave unchanged) through the validating setters and returns a tuple of the previous enabled flag and previous strategy (None if opt_einsum unavailable). Raises ValueError from the setters.
     orig_flags = (enabled, None if not is_available() else strategy)
     if _enabled is not None:
         _set_enabled(_enabled)
@@ -85,6 +95,7 @@ def set_flags(_enabled=None, _strategy=None):
 
 @contextmanager
 def flags(enabled=None, strategy=None):
+    # [FUNCTION DOC] Context manager that temporarily sets enabled and/or strategy (None leaves each unchanged) and restores the previous values on exit, even on error.
     with __allow_nonbracketed_mutation():
         orig_flags = set_flags(enabled, strategy)
     try:
@@ -101,6 +112,7 @@ def flags(enabled=None, strategy=None):
 
 
 class OptEinsumModule(PropModule):
+    # [CLASS DOC] Module wrapper installed in place of this module; exposes enabled (always) and strategy (only when opt_einsum is available; otherwise it is a plain None attribute) as context-aware properties.
     global enabled
     enabled = ContextProp(_get_enabled, _set_enabled)
     global strategy
