@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Default save and load planners for distributed checkpoint, plus the plan-building functions they use.
+# DefaultSavePlanner (optional state-dict flattening, sharded tensor flattening, deduplication, and plan caching across
+# calls via class-level caches), DefaultLoadPlanner (resharding-aware reads, partial loads, backward compatibility with
+# pre-2.4 key formats), _EmptyStateDictLoadPlanner (rebuilds a state dict from metadata), create_default_local/global
+# load/save plan functions, and global plan validation (bounds, overlap and coverage of tensor chunks).
+# Import-time side effect: creates the module logger.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 
 import dataclasses
@@ -69,6 +75,10 @@ __all__ = [
 
 # TODO: Update docstrings for default_planner.py
 class DefaultSavePlanner(SavePlanner):
+    # [CLASS DOC] Default planner for saving. State: flatten_state_dict and flatten_sharded_tensors flags, mappings (flattened
+    # key to original path), dedup_save_to_lowest_rank, plan caching flag and cache key (the class name), and after set-up the
+    # state_dict, is_coordinator, plan, global_plan and metadata. Plan caching uses class-level dictionaries shared by all
+    # instances of SavePlanner, keyed by class name, so a repeated save can skip sending unchanged plans.
     mappings: FLATTEN_MAPPING
 
     def __init__(
@@ -79,6 +89,8 @@ class DefaultSavePlanner(SavePlanner):
         dedup_save_to_lowest_rank: bool = False,
         enable_plan_caching: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Stores the options. dedup_replicated_tensors is deprecated and only triggers a warning. The cache key is the
+        # class name and plan caching is enabled only when enable_plan_caching is true.
         self.flatten_state_dict = flatten_state_dict
         self.flatten_sharded_tensors = flatten_sharded_tensors
         self.mappings = {}
@@ -98,6 +110,8 @@ class DefaultSavePlanner(SavePlanner):
         storage_meta: StorageMeta | None = None,
         is_coordinator: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Prepares the state dict: flattens nested containers (recording mappings) and sharded tensors as configured,
+        # then stores the result and the coordinator flag. storage_meta is unused.
         if self.flatten_state_dict:
             state_dict, self.mappings = flatten_state_dict(state_dict)
         if self.flatten_sharded_tensors:
@@ -106,6 +120,9 @@ class DefaultSavePlanner(SavePlanner):
         self.is_coordinator = is_coordinator
 
     def create_local_plan(self) -> SavePlan:
+        # [FUNCTION DOC] Builds the local save plan from the state dict; when flattening, attaches the key mappings as planner data.
+        # With caching on, if the plan equals the cached one an empty unusable plan is returned to avoid sending it; otherwise the plan
+        # is held as pending until finish_plan. Returns the plan. Side effects: sets self.plan, may set the pending plan.
         plan = create_default_local_save_plan(self.state_dict, self.is_coordinator)
         if self.flatten_state_dict:
             plan = dataclasses.replace(plan, planner_data=self.mappings)
@@ -134,11 +151,15 @@ class DefaultSavePlanner(SavePlanner):
         return self.plan
 
     def _dedup_save_plans(self, all_plans: list[SavePlan]) -> list[SavePlan]:
+        # [FUNCTION DOC] HELPER: Removes duplicate write items across ranks' plans, optionally favoring the lowest rank.
         return dedup_save_plans(all_plans, self.dedup_save_to_lowest_rank)
 
     def _create_global_plan(
         self, all_plans: list[SavePlan]
     ) -> tuple[list[SavePlan], Metadata]:
+        # [FUNCTION DOC] HELPER: Dedups plans, builds the global plan and metadata, merges per-rank key mappings into the metadata's planner
+        # data when flattening, and validates the result. Raises ValueError with a joined, possibly truncated (500 characters) error summary
+        # if validation fails. Returns (global plan, metadata).
         deduped_plans = self._dedup_save_plans(all_plans)
 
         global_plan, metadata = create_default_global_save_plan(deduped_plans)
@@ -164,6 +185,10 @@ class DefaultSavePlanner(SavePlanner):
     def _create_global_plan_with_caching(
         self, all_plans: list[SavePlan]
     ) -> tuple[list[SavePlan], list[SavePlan], Metadata]:
+        # [FUNCTION DOC] HELPER: Plan-caching variant of global planning. With no cache, builds and validates the global plan, caches inputs,
+        # plan and metadata, and the delta equals the full plan. With cache and no usable (changed) local plans, returns empty delta plans and
+        # the cached global plan and metadata. Otherwise merges changed local plans into cached ones, rebuilds, updates caches, and returns a
+        # delta containing only plans that changed. Returns (delta, global plan, metadata). Mutates class-level caches.
         """
         Create global plan with caching.
         Returns a tuple of global_plan_delta, global_plan, metadata.
@@ -224,6 +249,8 @@ class DefaultSavePlanner(SavePlanner):
     def create_global_plan(
         self, all_plans: list[SavePlan]
     ) -> tuple[list[SavePlan], Metadata]:
+        # [FUNCTION DOC] Coordinator step. Creates the global plan and metadata (through the caching path when enabled) and stores them on
+        # the planner. Returns (plans to scatter, metadata); with caching the plans are only the changed ones.
         global_plan_delta: list[SavePlan] = []
         if self._enable_plan_caching:
             # If the plans are cached, we only need to send the global plan delta to be scattered
@@ -244,6 +271,8 @@ class DefaultSavePlanner(SavePlanner):
         return global_plan_delta, self.metadata
 
     def _finish_plan_with_caching(self, new_plan: SavePlan) -> SavePlan:
+        # [FUNCTION DOC] HELPER: If the new plan is unusable (empty marker), returns the cached final plan; otherwise caches and returns the
+        # new plan. Mutates the class-level final plan cache.
         finished_plan: SavePlan = new_plan
 
         if not new_plan.usable:
@@ -254,6 +283,8 @@ class DefaultSavePlanner(SavePlanner):
         return finished_plan
 
     def finish_plan(self, new_plan: SavePlan) -> SavePlan:
+        # [FUNCTION DOC] Finalizes this rank's plan. With caching, resolves the cached final plan and promotes the pending local plan into
+        # the class-level cache (only after global planning succeeded). Stores and returns the plan.
         finished_plan: SavePlan = new_plan
 
         if self._enable_plan_caching:
@@ -273,14 +304,18 @@ class DefaultSavePlanner(SavePlanner):
         return self.plan
 
     def resolve_data(self, write_item: WriteItem) -> torch.Tensor | io.BytesIO:
+        # [FUNCTION DOC] Returns the data to write for an item: looks up the object in the state dict and converts byte items to a stream.
         object = self.lookup_object(write_item.index)
         return self.transform_object(write_item, object)
 
     def lookup_object(self, index: MetadataIndex) -> Any:
+        # [FUNCTION DOC] Finds the state dict object for an index. Extension point for subclasses.
         """Extension from the planner interface to make it easy to extend the default planner."""
         return find_state_dict_object(self.state_dict, index)
 
     def transform_object(self, write_item: WriteItem, object: Any):
+        # [FUNCTION DOC] Returns the object unchanged, except byte-type items are serialized with torch save into an in-memory byte stream
+        # which is returned. Extension point for subclasses.
         """Extension from the planner interface to make it easy to extend the default planner."""
         if write_item.type == WriteItemType.BYTE_IO:
             bytes = io.BytesIO()
@@ -290,6 +325,9 @@ class DefaultSavePlanner(SavePlanner):
 
 
 class DefaultLoadPlanner(LoadPlanner):
+    # [CLASS DOC] Default planner for loading. State: flatten_state_dict, flatten_sharded_tensors, allow_partial_load, original_state_dict
+    # (the user's dict), mappings (flattened key to path), and after set-up state_dict (possibly flattened), metadata, is_coordinator.
+    # Loads in place into the tensors of the state dict, handling resharding through the read items.
     """
     DefaultLoadPlanner that adds multiple features on top of LoadPlanner.
 
@@ -309,6 +347,7 @@ class DefaultLoadPlanner(LoadPlanner):
         flatten_sharded_tensors: bool = True,
         allow_partial_load: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Stores the options and empty original state dict and mappings.
         self.flatten_state_dict = flatten_state_dict
         self.flatten_sharded_tensors = flatten_sharded_tensors
         self.original_state_dict = {}
@@ -321,6 +360,8 @@ class DefaultLoadPlanner(LoadPlanner):
         metadata: Metadata | None = None,
         is_coordinator: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Prepares loading: initializes the state dict, remembers the original, flattens sharded tensors and nested
+        # containers as configured, and stores the working dict, metadata and coordinator flag.
         _init_state_dict(state_dict)
         self.original_state_dict = state_dict
 
@@ -335,6 +376,10 @@ class DefaultLoadPlanner(LoadPlanner):
         self.is_coordinator = is_coordinator
 
     def create_local_plan(self) -> LoadPlan:
+        # [FUNCTION DOC] Builds the local load plan. Raises AssertionError if metadata is missing. When flattening, detects checkpoints saved
+        # before version 2.4: if checkpoint keys are missing from the current flattened keys, temporarily switches the global derived version
+        # to the old one, re-flattens the original dict, and uses the old-format dict if its keys overlap the missing ones. Then delegates to
+        # the default local plan builder, which enforces missing-key errors unless partial loads are allowed. Returns the plan.
         if self.metadata is None:
             raise AssertionError("self.metadata is not None")
         if self.flatten_state_dict:
@@ -375,12 +420,16 @@ class DefaultLoadPlanner(LoadPlanner):
         )
 
     def create_global_plan(self, global_plan: list[LoadPlan]) -> list[LoadPlan]:
+        # [FUNCTION DOC] Returns the default global load plan (the input unchanged).
         return create_default_global_load_plan(global_plan)
 
     def finish_plan(self, new_plan: LoadPlan) -> LoadPlan:
+        # [FUNCTION DOC] Returns the plan unchanged.
         return new_plan
 
     def load_bytes(self, read_item: ReadItem, value: io.BytesIO) -> None:
+        # [FUNCTION DOC] Deserializes a byte item with unrestricted torch load and stores it: into the original nested state dict through the
+        # saved key mapping when flattening, otherwise directly into the state dict under the item's destination key.
         if self.flatten_state_dict:
             set_element(
                 self.original_state_dict,
@@ -393,22 +442,29 @@ class DefaultLoadPlanner(LoadPlanner):
             )
 
     def resolve_tensor(self, read_item: ReadItem):
+        # [FUNCTION DOC] Returns the destination tensor slice for a read item: looks up the tensor, then narrows it to the item's range.
         tensor = self.lookup_tensor(read_item.dest_index)
         return self.transform_tensor(read_item, tensor)
 
     def commit_tensor(self, read_item: ReadItem, tensor: torch.Tensor) -> None:
+        # [FUNCTION DOC] No-op hook called after a tensor has been filled; subclasses may override.
         pass
 
     def lookup_tensor(self, index: MetadataIndex) -> torch.Tensor:
+        # [FUNCTION DOC] Finds the state dict tensor for an index. Extension point for subclasses.
         """Extension from the planner interface to make it easy to extend the default planner."""
         return find_state_dict_object(self.state_dict, index)
 
     def transform_tensor(self, read_item: ReadItem, tensor: torch.Tensor):
+        # [FUNCTION DOC] Narrows the tensor to the read item's destination offsets and lengths and returns the view. Extension point.
         """Extension from the planner interface to make it easy to extend the default planner."""
         return narrow_tensor_by_index(tensor, read_item.dest_offsets, read_item.lengths)
 
 
 class _EmptyStateDictLoadPlanner(DefaultLoadPlanner):
+    # [CLASS DOC] HELPER: Load planner for an empty state dict that rebuilds it from checkpoint metadata, creating empty tensors of the saved
+    # sizes and dtypes (and nested structure from planner data). Optional keys filter limits which entries are rebuilt. Used for
+    # conversion to torch save files; holds the entire state in memory.
     """
     Extension of DefaultLoadPlanner, which rebuilds state_dict from the saved metadata.
     Useful for loading in state_dict without first initializing a model, such as
@@ -423,10 +479,14 @@ class _EmptyStateDictLoadPlanner(DefaultLoadPlanner):
     """
 
     def __init__(self, keys=None, *args, **kwargs):
+        # [FUNCTION DOC] Stores the optional key filter and forwards remaining arguments to the base planner.
         self.keys = keys
         super().__init__(*args, **kwargs)
 
     def _should_include_key(self, key: str, metadata: Metadata) -> bool:
+        # [FUNCTION DOC] HELPER: Decides if a metadata key is wanted. True when no filter is set, when the key is listed, or when any
+        # dotted prefix of the key's original nested path is listed. Returns a bool.
+        # KNOWN ISSUE: assumes planner data contains the key; with missing planner data this raises an error instead of returning False.
         if self.keys is None:
             return True
 
@@ -455,6 +515,9 @@ class _EmptyStateDictLoadPlanner(DefaultLoadPlanner):
         metadata: Metadata | None = None,
         is_coordinator: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Requires an empty state dict and metadata (raises AssertionError otherwise). For each selected metadata entry creates
+        # an empty tensor (or keeps the bytes marker) and inserts it into the state dict, at the nested path from planner data when present.
+        # Then runs the default set-up. Mutates the passed state dict.
         if state_dict:
             raise AssertionError("not state_dict")
         if metadata is None:
@@ -478,6 +541,10 @@ class _EmptyStateDictLoadPlanner(DefaultLoadPlanner):
 def create_default_local_load_plan(
     state_dict: dict[str, Any], metadata: Metadata, strict: bool = True
 ) -> LoadPlan:
+    # [FUNCTION DOC] Builds the local load plan: for every state dict entry, finds its metadata, then creates read items.
+    # Missing keys raise RuntimeError if strict, else are skipped. For tensor entries with a size, raises ValueError if the saved size differs from
+    # the current (global) size. For DTensors read items are created only on ranks in the mesh. Returns a LoadPlan.
+    # KNOWN ISSUE: the descriptive text after the first statement is a plain string expression, not a docstring.
     requests = []
     """
     Create the ``LoadPlan`` used by DefaultLoadPlanner.
@@ -525,6 +592,7 @@ def create_default_local_load_plan(
 def create_default_global_load_plan(
     all_plans: list[LoadPlan],
 ) -> list[LoadPlan]:
+    # [FUNCTION DOC] Returns the input local load plans unchanged; the default load needs no global coordination.
     """
     Create global load plan used by DefaultLoadPlanner.
 
@@ -537,6 +605,8 @@ def create_default_global_load_plan(
 def create_default_local_save_plan(
     state_dict: dict[str, Any], is_coordinator: bool
 ) -> SavePlan:
+    # [FUNCTION DOC] Builds a local save plan with write items for each state dict entry. DTensors contribute only on ranks that are
+    # part of their mesh; other values contribute on every rank (deduplication happens later). is_coordinator is not used here. Returns a SavePlan.
     """
     Create the ``SavePlan`` used by DefaultSavePlanner.
 
@@ -565,6 +635,10 @@ def create_default_global_save_plan(
     all_plans: list[SavePlan],
     rewrite_index_hints: bool = True,
 ) -> tuple[list[SavePlan], Metadata]:
+    # [FUNCTION DOC] Builds the global save plan and metadata. Walks every item of every plan: byte items yield bytes metadata; tensor
+    # (shard) items accumulate a chunk list per name using the first item's properties and size; non-shard items seen twice raise AssertionError;
+    # missing tensor data or chunk raises AssertionError. If rewrite_index_hints, items get an index equal to their chunk position. Returns the
+    # rewritten plans and the Metadata.
     """
     Create the global plan and metadata used by DefaultSavePlanner.
 
@@ -618,6 +692,7 @@ def create_default_global_save_plan(
 
 
 def _create_default_local_metadata(state_dict: STATE_DICT_TYPE) -> Metadata:
+    # [FUNCTION DOC] HELPER: Builds the Metadata that the default planner would produce for a state dict, using a metadata-only plan.
     """Return the ``Metadata`` if DefaultSavePlanner was used to checkpoint ``state_dict``."""
     plan = _create_default_metadata_only_plan(state_dict)
     _, md = create_default_global_save_plan([plan])
@@ -625,6 +700,7 @@ def _create_default_local_metadata(state_dict: STATE_DICT_TYPE) -> Metadata:
 
 
 def _check_box_overlap(box0: ChunkStorageMetadata, box1: ChunkStorageMetadata) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if two chunks overlap in every dimension (uses the first chunk's dimension count).
     """Check if two boxes overlap. Tuples are (offset, lengths)."""
     # For each dim of each shard, check if one shard resides on the other
     # end of second shard with respect to that dim. As an example for a 2D
@@ -643,6 +719,8 @@ def _check_box_overlap(box0: ChunkStorageMetadata, box1: ChunkStorageMetadata) -
 def _check_box_bounds(
     outer_box_size: torch.Size, inner_box: ChunkStorageMetadata
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if the inner chunk lies fully inside the outer tensor size: non-negative offsets and sizes and
+    # offset plus size within the bound in each dimension.
     for i in range(len(outer_box_size)):
         if inner_box.offsets[i] < 0:
             return False
@@ -655,6 +733,9 @@ def _check_box_bounds(
 
 
 def _validate_global_plan(global_plan: list[SavePlan], metadata: Metadata) -> list[str]:
+    # [FUNCTION DOC] HELPER: Validates global plan metadata and returns a list of error messages (empty if valid; each also logged as a
+    # warning). For each non-scalar tensor checks chunk bounds, pairwise overlap (via a sweep along the largest dimension), and, when more
+    # than one rank plan exists, that total chunk volume equals the tensor volume.
     """Validate the global plan and return a list of error messages (empty if valid)."""
     errors: list[str] = []
     for key, value in metadata.state_dict_metadata.items():

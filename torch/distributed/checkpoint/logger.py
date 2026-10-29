@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Logging utilities for distributed checkpoint (DCP).
+# Provides a decorator that emits structured start/end/exception log records around DCP
+# methods, helpers that build the record (checkpoint id, call uuid, writer/reader/planner
+# class names), and a helper to attach a stream handler to the root logger.
+# Import-time side effect: creates/fetches the DCP c10d logger and stores it in a module global.
 import functools
 import logging
 import time
@@ -25,6 +30,10 @@ _P = ParamSpec("_P")
 
 
 def _msg_dict_from_dcp_method_args(*args, **kwargs) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Builds the DCP-specific part of a log record from keyword arguments only.
+    # Takes checkpoint_id from the keyword or, if absent, from the checkpoint_id attribute of the
+    # storage writer/reader. Returns a mapping with checkpoint_id (string or None), a fresh unique uuid
+    # string, and class names of storage_writer, storage_reader and planner when given. Positional args are ignored.
     """
     Extracts log data from dcp method args
     """
@@ -60,6 +69,8 @@ def _msg_dict_from_dcp_method_args(*args, **kwargs) -> dict[str, Any]:
 
 
 def _get_msg_dict(func_name, *args, **kwargs) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Merges the DCP record fields with the generic c10d record fields for func_name
+    # and returns the combined mapping (c10d values win on key clashes).
     msg_dict = _msg_dict_from_dcp_method_args(*args, **kwargs)
     msg_dict.update(c10d_logger._get_msg_dict(func_name, *args, **kwargs))
 
@@ -69,11 +80,18 @@ def _get_msg_dict(func_name, *args, **kwargs) -> dict[str, Any]:
 def _dcp_method_logger(
     log_exceptions: bool = False, **wrapper_kwargs: Any
 ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:  # pyre-ignore
+    # [FUNCTION DOC] HELPER: Decorator factory. The wrapped function logs a debug "start" record, then runs,
+    # then logs a debug "end" record with elapsed nanoseconds. If log_exceptions is true, any exception is
+    # logged as an error record with its message before being re-raised. wrapper_kwargs are merged into the
+    # kwargs used only for building the log record. Returns the decorator; the result of the call passes through.
     """This method decorator logs the start, end, and exception of wrapped events."""
 
     def decorator(func: Callable[_P, _T]):
+        # [FUNCTION DOC] HELPER: Wraps func with the start/end/exception logging described above.
         @functools.wraps(func)
         def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+            # [FUNCTION DOC] HELPER: Logs, calls func with the original args, re-raises any exception, returns its result.
+            # Side effect: writes records to the module-level DCP logger.
             msg_dict = _get_msg_dict(
                 func.__name__, *args, **{**wrapper_kwargs, **kwargs}
             )
@@ -111,6 +129,8 @@ def _dcp_method_logger(
 
 
 def _init_logger(rank: int):
+    # [FUNCTION DOC] HELPER: Configures the root logger at INFO level and adds a stream handler whose format
+    # is prefixed with the given rank. Side effect: mutates the global logger; repeated calls add duplicate handlers.
     logger.setLevel(logging.INFO)
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)

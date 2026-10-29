@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Local file system storage for distributed checkpoint.
+# Defines FileSystemWriter / FileSystemReader (the default StorageWriter / StorageReader), an abstract file system
+# interface and its local implementation (FileSystemBase, FileSystem), serialization format enum (torch save or
+# safetensors), storage bookkeeping records, tensor loaders that copy tensors to CPU (serial or overlapping with a
+# device stream), stream-transform wrappers for extensions, and the threaded file-writing worker. A checkpoint is a
+# directory with data files (.distcp, one per rank or per item) plus a pickled .metadata file (or per-rank metadata
+# files when collectives are off). Import-time side effects: none beyond definitions and constants.
 import collections
 import dataclasses
 import io
@@ -73,6 +80,8 @@ CURRENT_DCP_VERSION: Final[str] = "1.0.0"
 
 @dataclass
 class _StorageInfo:
+    # [CLASS DOC] HELPER: Per-entry storage record: relative file path, byte offset, byte length and optional transform descriptors.
+    # Pickling omits fields that are None, keeping files compatible with versions that lack the descriptors.
     """This is the per entry storage info."""
 
     relative_path: str
@@ -81,15 +90,18 @@ class _StorageInfo:
     transform_descriptors: Sequence[str] | None = None
 
     def __getstate__(self):
+        # [FUNCTION DOC] HELPER: Pickling hook: returns the instance attributes excluding those that are None.
         return {k: v for k, v in self.__dict__.items() if v is not None}
 
 
 @dataclass
 class _StoragePrefix:
+    # [CLASS DOC] HELPER: Planner storage data holding the file name prefix assigned to a rank's plan.
     prefix: str
 
 
 class SerializationFormat(Enum):
+    # [CLASS DOC] Enum of on-disk tensor formats: TORCH_SAVE (pickle based) and SAFETENSORS.
     TORCH_SAVE = "torch_save"
     SAFETENSORS = "safetensors"
 
@@ -98,35 +110,46 @@ DEFAULT_SUFFIX = ".distcp"
 
 
 def _generate_uuid() -> str:
+    # [FUNCTION DOC] HELPER: Returns a new random UUID as a string (used for save and load ids).
     return str(uuid.uuid4())
 
 
 class _TensorLoader(ABC):
+    # [CLASS DOC] HELPER: Abstract interface for collecting tensors (by size and a user object) and yielding CPU tensors with their objects.
     @abstractmethod
     def add(self, size: int, obj: object) -> None:
+        # [FUNCTION DOC] HELPER: Abstract: register an object of the given byte size to be loaded.
         pass
 
     @abstractmethod
     def start_loading(self) -> None:
+        # [FUNCTION DOC] HELPER: Abstract: begin loading the registered objects.
         pass
 
     @abstractmethod
     def values(self) -> Iterator[tuple[torch.Tensor, object]]:
+        # [FUNCTION DOC] HELPER: Abstract: iterate over (CPU tensor, object) pairs.
         pass
 
 
 class _SerialCpuLoader(_TensorLoader):
+    # [CLASS DOC] HELPER: Loader that resolves each item one at a time, in insertion order, copying to CPU on demand.
     def __init__(self, resolve_fun: Callable) -> None:
+        # [FUNCTION DOC] HELPER: Stores the resolve function and an empty item list.
         self.resolve_fun = resolve_fun
         self.items: list[tuple[int, object]] = []
 
     def add(self, size: int, obj: object) -> None:
+        # [FUNCTION DOC] HELPER: Appends (size, object) to the pending items.
         self.items.append((size, obj))
 
     def start_loading(self) -> None:
+        # [FUNCTION DOC] HELPER: No-op; loading happens lazily during iteration.
         pass
 
     def values(self) -> Iterator[tuple[torch.Tensor, object]]:
+        # [FUNCTION DOC] HELPER: Yields (tensor, object) for each item: resolves, detaches, moves to CPU, and clones if the tensor is a small view
+        # of a larger storage so only the needed bytes are kept.
         for _, obj in self.items:
             tensor = self.resolve_fun(obj).detach()
             tensor = tensor.cpu()
@@ -140,12 +163,17 @@ class _SerialCpuLoader(_TensorLoader):
 
 
 class _OverlappingCpuLoader(_TensorLoader):
+    # [CLASS DOC] HELPER: Loader that overlaps device-to-CPU copies with consumption. Items are sorted by size and copied asynchronously on a
+    # stream while the number of in-flight bytes stays below a threshold; completed copies are drained after a stream synchronize.
+    # State: resolve function, items, in-flight byte count, queue of copied items, cursor, started flag, device type/module, stream.
     def __init__(
         self,
         resolve_fun: Callable,
         stream: torch.Stream | None = None,
         inflight_threshhold: int = 1_000_000,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Picks the device type (from the stream or the available accelerator), the stream (given or current), and makes it wait
+        # on the current stream if different. Stores the in-flight threshold in bytes.
         self.resolve_fun = resolve_fun
         self.items: list[tuple[int, object]] = []
         self.inflight_threshhold = inflight_threshhold
@@ -165,9 +193,12 @@ class _OverlappingCpuLoader(_TensorLoader):
 
     @property
     def _done(self) -> bool:
+        # [FUNCTION DOC] HELPER: True when every item has been scheduled for copying.
         return self.idx >= len(self.items)
 
     def _drain(self) -> list[tuple[torch.Tensor, object]]:
+        # [FUNCTION DOC] HELPER: If in-flight bytes reach the threshold, synchronizes the stream and pops copied items until below it. Returns the popped
+        # (tensor, object) pairs.
         drained = []
         if self.in_flight_data >= self.inflight_threshhold:
             self.stream.synchronize()
@@ -178,6 +209,8 @@ class _OverlappingCpuLoader(_TensorLoader):
         return drained
 
     def _refill(self) -> None:
+        # [FUNCTION DOC] HELPER: On the stream, resolves and detaches items and copies device tensors to CPU without blocking (CPU tensors are cloned if they
+        # are views of larger storage) until the threshold is reached or no items remain; tracks in-flight bytes.
         with self.device_module.stream(self.stream):
             while not self._done and self.in_flight_data < self.inflight_threshhold:
                 _, obj = self.items[self.idx]
@@ -202,6 +235,7 @@ class _OverlappingCpuLoader(_TensorLoader):
                 self.in_flight_data += tensor.numel() * tensor.element_size()
 
     def _finish(self) -> Iterable[tuple[torch.Tensor, object]]:
+        # [FUNCTION DOC] HELPER: Synchronizes the stream if anything is queued and returns the remaining queued items. Raises AssertionError if items remain.
         if not self._done:
             raise AssertionError("_finish called before all items were processed")
         if len(self.current_items) > 0:
@@ -209,11 +243,13 @@ class _OverlappingCpuLoader(_TensorLoader):
         return self.current_items
 
     def add(self, size: int, obj: object) -> None:
+        # [FUNCTION DOC] HELPER: Registers an item. Raises RuntimeError if loading has already started.
         if self.started:
             raise RuntimeError("cannot add items after loading started")
         self.items.append((size, obj))
 
     def start_loading(self) -> None:
+        # [FUNCTION DOC] HELPER: First call sorts items by size ascending and starts the first copies; later calls do nothing.
         if self.started:
             return
         self.started = True
@@ -221,6 +257,7 @@ class _OverlappingCpuLoader(_TensorLoader):
         self._refill()
 
     def values(self) -> Iterator[tuple[torch.Tensor, object]]:
+        # [FUNCTION DOC] HELPER: Starts loading and yields all (tensor, object) pairs, interleaving drain and refill, then the remainder.
         self.start_loading()
         while not self._done:
             drained = self._drain()
@@ -231,6 +268,7 @@ class _OverlappingCpuLoader(_TensorLoader):
 
 
 class _StorageWriterTransforms:
+    # [CLASS DOC] HELPER: Wraps the stream transform extensions applied when writing; the default is no extensions. Experimental.
     """
     This is experimental, and will likely move elsewhere in the
     future.  It lives here to minimize changes while we are still
@@ -240,6 +278,7 @@ class _StorageWriterTransforms:
     def __init__(
         self, extensions: Sequence[StreamTransformExtension] | None = None
     ) -> None:
+        # [FUNCTION DOC] HELPER: Stores the extensions; None means the default (empty tuple).
         """
         If the extensions arg is None, this means the implementation
         should provide whatever defaults it chooses.  An empty
@@ -251,6 +290,8 @@ class _StorageWriterTransforms:
     def transform_save_stream(
         self, write_item: WriteItem, raw_stream: io.IOBase
     ) -> tuple[IO[bytes], list[str]]:
+        # [FUNCTION DOC] HELPER: Wraps the raw stream so closing it only flushes (so it can be reused for appended items), then layers each extension's
+        # transform on top. Returns the outermost writable stream and the list of extension descriptors in reverse order.
         # In order to avoid leaking fds, transformers' close must
         # cascade to wrapped streams, but since this function can
         # append to the raw stream, we can't close the actual stream.
@@ -259,16 +300,21 @@ class _StorageWriterTransforms:
         # are appended.
 
         class NoCloseWriter(io.IOBase):
+            # [CLASS DOC] HELPER: Writable wrapper over a raw stream whose close flushes but does not close the underlying stream.
             def __init__(self, raw: io.IOBase):
+                # [FUNCTION DOC] HELPER: Stores the wrapped stream.
                 self.raw = raw
 
             def writeable(self) -> bool:
+                # [FUNCTION DOC] HELPER: Always returns True.
                 return True
 
             def write(self, b: Buffer) -> int:
+                # [FUNCTION DOC] HELPER: Forwards the bytes to the wrapped stream and returns the count written.
                 return self.raw.write(b)
 
             def close(self):
+                # [FUNCTION DOC] HELPER: Flushes this wrapper and the underlying stream without closing it.
                 self.flush()
                 self.raw.flush()
                 # but not close.
@@ -282,6 +328,7 @@ class _StorageWriterTransforms:
 
 
 def _item_size(item: WriteItem) -> int:
+    # [FUNCTION DOC] HELPER: Returns the byte size of a tensor write item (element count times element size). Raises AssertionError if no tensor data.
     size = 1
     if item.tensor_data is None:
         raise AssertionError("WriteItem tensor_data must not be None")
@@ -294,6 +341,8 @@ def _item_size(item: WriteItem) -> int:
 
 
 def _split_by_size_and_type(bins: int, items: list[WriteItem]) -> list[list[WriteItem]]:
+    # [FUNCTION DOC] HELPER: Splits write items into the given number of buckets: one bucket returns all items; otherwise byte-stream items are
+    # spread round-robin and tensor items are assigned largest-first to the currently lightest bucket. Returns the list of buckets.
     if bins == 1:
         return [items]
 
@@ -325,6 +374,10 @@ def _write_item(
     storage_key: str,
     serialization_format: SerializationFormat,
 ) -> WriteResult:
+    # [FUNCTION DOC] HELPER: Writes one item to the stream through the extension transforms. Byte items write their buffer; tensors are written with torch
+    # save when that format is selected (for safetensors the data is written later by the caller). Records the starting offset and length
+    # (stream growth, or raw tensor size for safetensors tensors). Raises AssertionError on a wrong data type or a non-CPU tensor.
+    # Returns a WriteResult carrying a _StorageInfo; transform descriptors are omitted when there are none.
     offset = stream.tell()
 
     (transform_to, transform_descriptors) = transforms.transform_save_stream(
@@ -383,6 +436,10 @@ def _write_files_from_queue(
     thread_count: int,
     serialization_format: SerializationFormat,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Worker for writing files: repeatedly takes (path, name, items) from file_queue until empty. Chooses an overlapping loader only for a
+    # single-thread setup with an available accelerator and a positive threshold, else a serial loader. For each file writes byte items, then tensors
+    # (written in loader order), and for safetensors serializes all tensors with DCP metadata in one write. Optionally flushes and fsyncs (warns if
+    # unsupported), closes the stream and puts the list of WriteResults on result_queue. Raises AssertionError if a tensor is not on CPU.
     try:
         while True:
             file_name, storage_key, write_items = file_queue.get_nowait()
@@ -483,6 +540,8 @@ def _write_files_from_queue(
 
 
 class FileSystemBase(ABC):
+    # [CLASS DOC] Abstract interface for the file operations used by checkpointing: create_stream (context manager), concat_path, rename,
+    # init_path, mkdir, validate_checkpoint_id (class method), exists and rm_file. All are abstract one-line stubs.
     @contextmanager
     @abstractmethod
     def create_stream(
@@ -515,38 +574,46 @@ class FileSystemBase(ABC):
 
 
 class FileSystem(FileSystemBase):
+    # [CLASS DOC] Local file system implementation of FileSystemBase using pathlib; paths are converted to Path objects as needed.
     @contextmanager
     def create_stream(
         self, path: str | os.PathLike, mode: str
     ) -> Generator[io.IOBase, None, None]:
+        # [FUNCTION DOC] Context manager that opens the path in the given mode and yields the stream; closes it on exit.
         if not isinstance(path, Path):
             path = Path(path)
         with path.open(mode) as stream:
             yield cast(io.IOBase, stream)
 
     def concat_path(self, path: str | os.PathLike, suffix: str) -> str | os.PathLike:
+        # [FUNCTION DOC] Returns the path joined with the suffix as a Path.
         if not isinstance(path, Path):
             path = Path(path)
         return path / suffix
 
     def init_path(self, path: str | os.PathLike) -> str | os.PathLike:
+        # [FUNCTION DOC] Returns the path converted to a Path.
         if not isinstance(path, Path):
             path = Path(path)
         return path
 
     def rename(self, path: str | os.PathLike, new_path: str | os.PathLike) -> None:
+        # [FUNCTION DOC] Renames the path to new_path.
         if not isinstance(path, Path):
             path = Path(path)
 
         path.rename(cast(Path, new_path))
 
     def mkdir(self, path: str | os.PathLike) -> None:
+        # [FUNCTION DOC] Creates the directory including parents; no error if it exists.
         if not isinstance(path, Path):
             path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
 
     @classmethod
     def validate_checkpoint_id(cls, checkpoint_id: str | os.PathLike) -> bool:
+        # [FUNCTION DOC] Class method. Returns True for Path objects; False for strings containing a URL scheme separator; otherwise True if any existing
+        # ancestor directory is writable, else False.
         if isinstance(checkpoint_id, Path):
             return True
 
@@ -560,22 +627,29 @@ class FileSystem(FileSystemBase):
         return False
 
     def exists(self, path: str | os.PathLike) -> bool:
+        # [FUNCTION DOC] Returns whether the path exists.
         if not isinstance(path, Path):
             path = Path(path)
         return path.exists()
 
     def rm_file(self, path: str | os.PathLike) -> None:
+        # [FUNCTION DOC] Deletes the file; raises if it does not exist.
         if not isinstance(path, Path):
             path = Path(path)
         path.unlink()
 
     def ls(self, path: str | os.PathLike) -> list[str]:
+        # [FUNCTION DOC] Returns the string paths of the entries of a directory.
         if not isinstance(path, Path):
             path = Path(path)
         return [str(p) for p in path.iterdir()]
 
 
 class _FileSystemWriter(StorageWriter):
+    # [CLASS DOC] HELPER: Base StorageWriter that writes plan items to files in a directory and then a pickled metadata file. Assumes the target is
+    # an empty or new directory and atomic file creation. State: fs, path, single_file_per_rank, sync_files, thread_count,
+    # per_thread_copy_ahead, save_id (fresh uuid per save), overwrite, transforms, serialization_format, rank and use_collectives
+    # (set in set_up_storage_writer).
     """
     Basic implementation of StorageWriter using file IO.
 
@@ -602,6 +676,8 @@ class _FileSystemWriter(StorageWriter):
         *args: Any,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC] Stores options, creates the local file system and path, a fresh save id and the stream transforms. Rank is unset and
+        # collectives default to enabled. KNOWN ISSUE: the docstring mentions only some of the arguments (extra positional/keyword args are ignored).
         """
         Initialize the writer pointing to `path`.
 
@@ -631,6 +707,7 @@ class _FileSystemWriter(StorageWriter):
         self.use_collectives: bool = True
 
     def reset(self, checkpoint_id: str | os.PathLike | None = None) -> None:
+        # [FUNCTION DOC] Resets for a new save: optionally changes the path and always generates a new save id.
         if checkpoint_id:
             self.path = self.fs.init_path(checkpoint_id)
         self.save_id = _generate_uuid()
@@ -638,10 +715,12 @@ class _FileSystemWriter(StorageWriter):
     def set_up_storage_writer(
         self, is_coordinator: bool, *args: Any, **kwargs: Any
     ) -> None:
+        # [FUNCTION DOC] Records rank and use_collectives from keyword arguments (the coordinator flag is unused).
         self.rank = kwargs.get("rank")
         self.use_collectives = kwargs.get("use_collectives", True)
 
     def _metadata_exists(self) -> bool:
+        # [FUNCTION DOC] HELPER: Checks whether metadata already exists: the global metadata file with collectives, else the rank 0 file.
         if self.use_collectives:
             # A global checkpoint metadata file
             metadata_path = self._get_metadata_path(rank=None)
@@ -653,6 +732,8 @@ class _FileSystemWriter(StorageWriter):
         return self.fs.exists(metadata_path)
 
     def prepare_local_plan(self, plan: SavePlan) -> SavePlan:
+        # [FUNCTION DOC] Creates the directory. If a checkpoint exists: warns when overwrite is true, else raises RuntimeError. Without collectives and with a
+        # rank, tags the plan with a rank specific file prefix. Returns the plan. Side effect: mkdir.
         self.fs.mkdir(self.path)
         if self._metadata_exists():
             if self.overwrite:
@@ -673,6 +754,7 @@ class _FileSystemWriter(StorageWriter):
         return plan
 
     def prepare_global_plan(self, plans: list[SavePlan]) -> list[SavePlan]:
+        # [FUNCTION DOC] Assigns a distinct file prefix (by rank position) to every plan that has no storage data. Returns the new plans.
         new_plans = [
             dataclasses.replace(plan, storage_data=_StoragePrefix(f"__{i}_"))
             if plan.storage_data is None
@@ -686,10 +768,13 @@ class _FileSystemWriter(StorageWriter):
         plan: SavePlan,
         planner: SavePlanner,
     ) -> Future[list[WriteResult]]:
+        # [FUNCTION DOC] Names files from the plan's prefix and a counter, puts one file per size-balanced bucket (single file per rank) or per item into a queue,
+        # and delegates to _write_data. Returns a Future of WriteResults.
         storage_plan: _StoragePrefix = plan.storage_data
         file_count = 0
 
         def gen_file():
+            # [FUNCTION DOC] HELPER: Returns the next file name (prefix, running count, distributed suffix) and increments the count.
             nonlocal file_count
             file_name = f"{storage_plan.prefix}{file_count}{DEFAULT_SUFFIX}"
             file_count += 1
@@ -714,6 +799,8 @@ class _FileSystemWriter(StorageWriter):
         planner: SavePlanner,
         file_queue: queue.Queue,
     ) -> Future[list[WriteResult]]:
+        # [FUNCTION DOC] Starts thread_count minus one worker threads plus runs one worker in the calling thread over the file queue, joins the threads,
+        # and collects all results into an already completed Future. Side effect: writes files.
         result_queue: queue.Queue = queue.Queue()
 
         threads = []
@@ -760,6 +847,9 @@ class _FileSystemWriter(StorageWriter):
             return fut
 
     def finish(self, metadata: Metadata, results: list[list[WriteResult]]) -> None:
+        # [FUNCTION DOC] Completes the save on the coordinator: sets metadata version, collects storage data from all write results, attaches storage meta, writes
+        # the pickled metadata to a temporary file (optionally flushed and fsynced), removes any older metadata file, and renames the temporary file
+        # into place. Uses a rank specific name when collectives are off.
         metadata.version = CURRENT_DCP_VERSION
 
         storage_md = {}
@@ -798,14 +888,17 @@ class _FileSystemWriter(StorageWriter):
         self.fs.rename(tmp_path, metadata_path)
 
     def storage_meta(self) -> StorageMeta | None:
+        # [FUNCTION DOC] Returns StorageMeta with this writer's checkpoint id and save id.
         return StorageMeta(checkpoint_id=self.checkpoint_id, save_id=self.save_id)
 
     def _get_metadata_path(self, rank: int | None = None) -> os.PathLike:
+        # [FUNCTION DOC] HELPER: Returns the global metadata path, or the rank specific one when a rank is given.
         filename = f"{_metadata_fn}" if rank is None else f"__{rank}{_metadata_fn}"
         return cast(Path, self.fs.concat_path(self.path, filename))
 
     @property
     def checkpoint_id(self) -> str | os.PathLike:
+        # [FUNCTION DOC] Property: the checkpoint directory path.
         """
         return the checkpoint_id that will be used to save the checkpoint.
         """
@@ -813,10 +906,12 @@ class _FileSystemWriter(StorageWriter):
 
     @classmethod
     def validate_checkpoint_id(cls, checkpoint_id: str | os.PathLike) -> bool:
+        # [FUNCTION DOC] Class method delegating to the local file system check.
         return FileSystem.validate_checkpoint_id(checkpoint_id)
 
 
 class _StorageReaderTransforms:
+    # [CLASS DOC] HELPER: Wraps the extension registry used to build read-side stream transforms. Experimental.
     """
     This is experimental, and will likely move elsewhere in the
     future.  It lives here to minimize changes while we are still
@@ -824,6 +919,7 @@ class _StorageReaderTransforms:
     """
 
     def __init__(self, extension_registry: ExtensionRegistry | None = None) -> None:
+        # [FUNCTION DOC] HELPER: Stores the registry or creates an empty one.
         self.extension_registry = (
             ExtensionRegistry() if extension_registry is None else extension_registry
         )
@@ -834,6 +930,8 @@ class _StorageReaderTransforms:
         transform_descriptors: Sequence[str],
         raw_stream: IO[bytes],
     ) -> IO[bytes]:
+        # [FUNCTION DOC] HELPER: Looks up extensions from the descriptors and wraps the raw stream with each stream transform extension's read transform.
+        # Returns the final stream.
         extensions = self.extension_registry.from_descriptor_list(transform_descriptors)
         transform_from = raw_stream
         for ex in extensions:
@@ -843,11 +941,14 @@ class _StorageReaderTransforms:
 
 
 class FileSystemReader(StorageReader):
+    # [CLASS DOC] Default StorageReader for the local file system. State: fs, path, storage_data (index to storage info, set from metadata), load_id
+    # (fresh uuid per load), transforms, rank and use_collectives.
     def __init__(
         self,
         path: str | os.PathLike,
         _extension_registry: ExtensionRegistry | None = None,  # EXPERIMENTAL
     ) -> None:
+        # [FUNCTION DOC] Creates the file system and path, empty storage data, a new load id, and read transforms from the optional registry.
         super().__init__()
         self.fs = FileSystem()
         self.path = self.fs.init_path(path)
@@ -858,15 +959,21 @@ class FileSystemReader(StorageReader):
         self.use_collectives = True
 
     def _slice_file(self, file, sinfo: _StorageInfo) -> IO[bytes]:
+        # [FUNCTION DOC] HELPER: Returns a bounded view of a file limited to the entry's offset and length.
         return cast(IO[bytes], _create_file_view(file, sinfo.offset, sinfo.length))
 
     def reset(self, checkpoint_id: str | os.PathLike | None = None) -> None:
+        # [FUNCTION DOC] Clears cached storage data, optionally changes the path, and generates a new load id.
         self.storage_data = {}
         if checkpoint_id:
             self.path = self.fs.init_path(checkpoint_id)
         self.load_id = _generate_uuid()
 
     def read_data(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:
+        # [FUNCTION DOC] Groups the plan's read items by file, opens each file once, and for every item reads its slice through the extension transforms.
+        # Byte items are handed to the planner as a stream; tensor items are loaded (making the data seekable first) with weights-only torch load
+        # on CPU, narrowed to the requested range, checked for size equality (AssertionError otherwise), copied into the planner's target tensor
+        # and committed. Returns an already completed Future. Side effect: in-place tensor writes.
         # group requests by file
         per_file: dict[str, list[ReadItem]] = {}
         for read_item in plan.items:
@@ -927,11 +1034,14 @@ class FileSystemReader(StorageReader):
         return fut
 
     def _get_metadata_path(self, rank: int | None = None) -> os.PathLike:
+        # [FUNCTION DOC] HELPER: Returns the global metadata path, or the rank specific one when a rank is given.
         filename = f"{_metadata_fn}" if rank is None else f"__{rank}{_metadata_fn}"
         return cast(Path, self.fs.concat_path(self.path, filename))
 
     # Implementing the abstract function in StorageReader
     def read_metadata(self, *args: Any, **kwargs: Any) -> Metadata:
+        # [FUNCTION DOC] Reads and unpickles the metadata file (rank specific if the rank keyword is given), ensures storage meta exists and records
+        # this reader's load id. Returns the Metadata.
         rank = kwargs.get("rank")
         path = self._get_metadata_path(rank)
         with self.fs.create_stream(path, "rb") as metadata_file:
@@ -946,6 +1056,8 @@ class FileSystemReader(StorageReader):
     def set_up_storage_reader(
         self, metadata: Metadata, is_coordinator: bool, *args: Any, **kwargs: Any
     ) -> None:
+        # [FUNCTION DOC] Takes storage data from the metadata and records rank and use_collectives from keyword arguments. Raises AssertionError if
+        # the metadata has no storage data.
         self.storage_data = metadata.storage_data
         self.rank = kwargs.get("rank")
         self.use_collectives = kwargs.get("use_collectives", True)
@@ -953,13 +1065,16 @@ class FileSystemReader(StorageReader):
             raise AssertionError("storage_data must not be None in metadata")
 
     def prepare_local_plan(self, plan: LoadPlan) -> LoadPlan:
+        # [FUNCTION DOC] Returns the plan unchanged.
         return plan
 
     def prepare_global_plan(self, plans: list[LoadPlan]) -> list[LoadPlan]:
+        # [FUNCTION DOC] Returns the plans unchanged.
         return plans
 
     @property
     def checkpoint_id(self) -> str | os.PathLike:
+        # [FUNCTION DOC] Property: the checkpoint directory path.
         """
         return the checkpoint_id that will be used to load the checkpoint.
         """
@@ -967,10 +1082,13 @@ class FileSystemReader(StorageReader):
 
     @classmethod
     def validate_checkpoint_id(cls, checkpoint_id: str | os.PathLike) -> bool:
+        # [FUNCTION DOC] Class method delegating to the local file system check.
         return FileSystem.validate_checkpoint_id(checkpoint_id)
 
 
 class FileSystemWriter(_FileSystemWriter, BlockingAsyncStager):
+    # [CLASS DOC] Public storage writer using local files; combines the basic file writer with a blocking async stager. Writes one file per rank
+    # (or per item) and a metadata file (global with collectives, rank local otherwise). Adds the cache_staged_state_dict option.
     """
     Basic implementation of StorageWriter using file IO.
 
@@ -997,6 +1115,7 @@ class FileSystemWriter(_FileSystemWriter, BlockingAsyncStager):
         _extensions: Sequence[StreamTransformExtension] | None = None,
         serialization_format: SerializationFormat = SerializationFormat.TORCH_SAVE,
     ) -> None:
+        # [FUNCTION DOC] Initializes the file writer and the blocking stager with the given options.
         """
         Initialize the writer pointing to `path`.
 
@@ -1031,6 +1150,7 @@ class FileSystemWriter(_FileSystemWriter, BlockingAsyncStager):
         )
 
     def stage(self, state_dict: STATE_DICT_TYPE) -> STATE_DICT_TYPE:
+        # [FUNCTION DOC] Stages the state dict for async saving. Sets the copy-ahead to zero (the state is already on CPU) and returns the stager result.
         """Override of AsyncStager.stage"""
         # in the async case, the state dict is already on CPU, so maintaining this
         # buffer makes no sense

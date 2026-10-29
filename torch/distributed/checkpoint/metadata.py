@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Data classes describing the on-disk metadata of a distributed checkpoint.
+# Defines chunk, tensor and bytes storage metadata, tensor properties (with pickling support for
+# memory formats), StorageMeta, the checkpoint-wide Metadata, and MetadataIndex lookup keys, plus the
+# STORAGE_TYPES and STATE_DICT_TYPE aliases. No import-time side effects beyond definitions.
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -22,6 +26,7 @@ __all__ = [
 
 @dataclass
 class ChunkStorageMetadata:
+    # [CLASS DOC] Describes one chunk (a rectangular slice) of a tensor by its offsets and sizes.
     """
     Each chunk is expected to have the same properties of the TensorStorageMetadata
     that includes it.
@@ -32,6 +37,7 @@ class ChunkStorageMetadata:
 
 
 class _MEM_FORMAT_ENCODING(Enum):
+    # [CLASS DOC] HELPER: Enum encoding torch memory formats as integers so they can be pickled.
     """Describe the memory format of a tensor."""
 
     TORCH_CONTIGUOUS_FORMAT = 0
@@ -41,6 +47,8 @@ class _MEM_FORMAT_ENCODING(Enum):
 
 @dataclass
 class TensorProperties:
+    # [CLASS DOC] Tensor attributes (dtype, layout, requires_grad, memory_format, pin_memory) saved with a checkpoint.
+    # All but dtype are deprecated. Custom pickling replaces the unpicklable memory_format with an enum encoding.
     """Properties used to create :class:`Tensor`"""
 
     # Regular tensor fields
@@ -55,6 +63,8 @@ class TensorProperties:
     pin_memory: bool = False
 
     def __getstate__(self):
+        # [FUNCTION DOC] Pickling hook: returns a tuple of the fields with memory_format replaced by its enum encoding.
+        # Raises RuntimeError if memory_format is not contiguous, channels-last or preserve.
         # Since torch.memory_format cannot be pickled!
         memory_format = self.memory_format
         if memory_format == torch.contiguous_format:
@@ -78,6 +88,8 @@ class TensorProperties:
         self,
         state,
     ):
+        # [FUNCTION DOC] Unpickling hook: restores the fields from the state tuple and decodes the memory format enum.
+        # Raises RuntimeError on an unknown encoding.
         (
             self.dtype,
             self.layout,
@@ -101,6 +113,8 @@ class TensorProperties:
 
     @staticmethod
     def create_from_tensor(tensor: torch.Tensor) -> "TensorProperties":
+        # [FUNCTION DOC] Builds a TensorProperties from a tensor's dtype, layout, requires_grad and pinned state;
+        # memory_format is always recorded as contiguous.
         return TensorProperties(
             dtype=tensor.dtype,
             layout=tensor.layout,
@@ -112,6 +126,7 @@ class TensorProperties:
 
 @dataclass
 class TensorStorageMetadata:
+    # [CLASS DOC] Metadata for a saved tensor: its properties, full size, and the list of chunks that make it up.
     properties: TensorProperties
     size: torch.Size
     chunks: list[ChunkStorageMetadata]
@@ -119,6 +134,7 @@ class TensorStorageMetadata:
 
 @dataclass
 class BytesStorageMetadata:
+    # [CLASS DOC] Marker metadata for a non-tensor (opaque bytes) entry; carries no fields.
     pass
 
 
@@ -128,6 +144,7 @@ STATE_DICT_TYPE = dict[str, StatefulT | Any]
 
 @dataclass
 class StorageMeta:
+    # [CLASS DOC] Identifies a checkpoint: checkpoint_id, save_id, load_id and the list of module names; all optional.
     checkpoint_id: str | os.PathLike | None = None
     save_id: str | None = None
     load_id: str | None = None
@@ -136,6 +153,8 @@ class StorageMeta:
 
 @dataclass
 class Metadata:
+    # [CLASS DOC] Top-level checkpoint metadata: mapping from state-dict key to storage metadata, plus opaque
+    # planner_data, storage_data, optional StorageMeta and version. Planner/storage plugins own compatibility of their data.
     """This class represents the metadata of the checkpoint."""
 
     # Keys are the same from the `state_dict` used.
@@ -152,6 +171,8 @@ class Metadata:
 
 @dataclass(frozen=True)
 class MetadataIndex:
+    # [CLASS DOC] Frozen lookup key: fully qualified name, optional tensor offset, and optional index hint.
+    # The index hint is excluded from hashing and equality; it only speeds up chunk searches.
     """This class represents a lookup key for items in a state dict or Metadata."""
 
     fqn: str
@@ -178,6 +199,8 @@ class MetadataIndex:
         offset: Sequence[int] | None = None,
         index: int | None = None,
     ):
+        # [FUNCTION DOC] Sets fqn, index and offset on the frozen instance via object-level attribute setting;
+        # offset, if given, is converted to a torch.Size.
         # We must use object.__setattr__ due to frozen=True
         object.__setattr__(self, "fqn", fqn)
         object.__setattr__(self, "index", index)

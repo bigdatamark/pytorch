@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Runnable example of asynchronous distributed checkpointing with FSDP.
+# Trains a small model on every GPU, saves with async_save every SAVE_PERIOD epochs, injects a fault
+# every FAULT_PERIOD epochs, and reloads from the last checkpoint. Run as a script: it deletes
+# CHECKPOINT_DIR and spawns one process per CUDA device. Import has no side effects beyond constants.
 # Owner(s): ["oncall: distributed"]
 
 import os
@@ -29,10 +33,13 @@ CHECKPOINT_DIR = f"~/{os.environ.get('LOGNAME', '')}/checkpoint"
 
 class InjectedException(Exception):
     pass
+    # [CLASS DOC] Exception raised deliberately to simulate a trainer fault.
 
 
 class Model(torch.nn.Module):
+    # [CLASS DOC] Small five-layer linear network with relu activations and a sigmoid output.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Creates the five linear layers (8->32->128->64->8->1).
         super().__init__()
         self.net1 = nn.Linear(8, 32)
         self.net2 = nn.Linear(32, 128)
@@ -41,6 +48,7 @@ class Model(torch.nn.Module):
         self.net5 = nn.Linear(8, 1)
 
     def forward(self, x):
+        # [FUNCTION DOC] Applies relu after the first four layers and sigmoid after the last; returns the output.
         x = F.relu(self.net1(x))
         x = F.relu(self.net2(x))
         x = F.relu(self.net3(x))
@@ -50,6 +58,8 @@ class Model(torch.nn.Module):
 
 
 def _init_model(rank, world_size):
+    # [FUNCTION DOC] HELPER: Builds a device mesh, wraps a CUDA model in FSDP (original params), creates an Adam
+    # optimizer, and patches model/optimizer to be stateful for checkpointing. Returns (model, optimizer).
     device_mesh = init_device_mesh(DEVICE, (world_size,))
 
     # Create a dummy model and wrap it in FSDP
@@ -67,11 +77,13 @@ def _init_model(rank, world_size):
 
 
 def _print(msg):
+    # [FUNCTION DOC] HELPER: Prints msg only on rank 0.
     if dist.get_rank() == 0:
         print(msg)
 
 
 def _input():
+    # [FUNCTION DOC] HELPER: Returns random CUDA inputs (128x8) and labels that are 1 where the row sum is at least 4, else 0.
     x = torch.rand(128, 8, device="cuda")
     y = torch.zeros(128, 1, device="cuda")
 
@@ -81,6 +93,10 @@ def _input():
 
 
 def run(rank, world_size):
+    # [FUNCTION DOC] Per-process entry point. Sets rendezvous env vars, initializes the process group, builds the
+    # model, then loops over epochs: train step, async checkpoint save every SAVE_PERIOD epochs (waiting on the
+    # previous save future first; raises AssertionError if it is not a Future), and a fault every FAULT_PERIOD epochs.
+    # On the injected fault it syncs ranks, prints the traceback, waits for pending save, and reloads state.
     # Set up world pg
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12355"

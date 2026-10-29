@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Conversion between DCP checkpoints and single-file torch.save checkpoints.
+# Provides dcp_to_torch_save, torch_save_to_dcp, a storage reader that loads a torch.save file on the
+# coordinator and broadcasts tensors to all ranks (BroadcastingTorchSaveReader), and a load planner that
+# builds metadata from the given state dict (DynamicMetaLoadPlanner). Running the module as a script
+# exposes a command line converter taking mode, source path and destination path.
 import argparse
 import os
 from enum import Enum
@@ -38,6 +43,10 @@ __all__ = [
 
 class BroadcastingTorchSaveReader(StorageReader):
     """
+    # [CLASS DOC] StorageReader for a torch.save file. The coordinator rank loads the whole file on CPU; every
+    # rank then receives each requested tensor by broadcast and copies its slice into the target. Only tensors are
+    # supported. State: checkpoint_id (file path), coordinator_rank, and is_coordinator (set in set_up_storage_reader).
+    # Meant to be paired with DynamicMetaLoadPlanner.
     StorageReader for reading a Torch Save file. This reader will read the entire checkpoint
     on the coordinator rank, and then broadcast and shard each tensor to all ranks.
 
@@ -61,17 +70,25 @@ class BroadcastingTorchSaveReader(StorageReader):
         checkpoint_id: str | os.PathLike | None = None,
         coordinator_rank: int = 0,
     ) -> None:
+        # [FUNCTION DOC] Stores checkpoint_id and coordinator_rank. is_coordinator is not set until set_up_storage_reader.
         self.checkpoint_id = checkpoint_id
         self.coordinator_rank = coordinator_rank
 
     # pyrefly: ignore [bad-override]
     def read_metadata(self) -> Metadata:
+        # [FUNCTION DOC] Returns an empty Metadata; real metadata is built by the planner since the file has none.
         """Extends the default StorageReader to support building the metadata file"""
         # Metadata is built in planner.set_up_planner, since we are not actually reading metadata from
         # the disk
         return Metadata(state_dict_metadata={})
 
     def read_data(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:
+        # [FUNCTION DOC] Executes the load plan. Coordinator loads the file (flattening it if the planner flattens state
+        # dicts); for each item, the coordinator moves its tensor to the default process-group device, other ranks allocate
+        # an empty tensor like the planner's entry, then the tensor is broadcast from the coordinator, narrowed to the item's
+        # offsets and lengths, and copied into the planner's target tensor and committed. Raises RuntimeError for byte
+        # (non-tensor) items and AssertionError on size mismatch or missing checkpoint_id. Returns an already-completed Future.
+        # Side effects: collective broadcasts (all ranks must participate), in-place tensor writes.
         """
         Reads torch save data on the coordinator rank, and broadcast afterwards
         this incurrs a communication cost, but avoids having to load
@@ -127,6 +144,8 @@ class BroadcastingTorchSaveReader(StorageReader):
 
     # pyrefly: ignore [bad-override]
     def set_up_storage_reader(self, metadata: Metadata, is_coordinator: bool) -> None:
+        # [FUNCTION DOC] Records whether this rank is the coordinator. Raises AssertionError if the coordinator flag is set
+        # but the rank differs from coordinator_rank, or if checkpoint_id is unset. metadata is unused.
         """Implementation of the StorageReader method"""
         self.is_coordinator = is_coordinator
         if self.is_coordinator:
@@ -142,24 +161,30 @@ class BroadcastingTorchSaveReader(StorageReader):
             )
 
     def prepare_local_plan(self, plan: LoadPlan) -> LoadPlan:
+        # [FUNCTION DOC] Returns the plan unchanged.
         """Implementation of the StorageReader method"""
         return plan
 
     def prepare_global_plan(self, global_plan: list[LoadPlan]) -> list[LoadPlan]:
+        # [FUNCTION DOC] Returns the global plan unchanged.
         """Implementation of the StorageReader method"""
         return global_plan
 
     def reset(self, checkpoint_id: str | os.PathLike | None = None) -> None:
+        # [FUNCTION DOC] Resets the reader to a new checkpoint_id.
         """Implementation of the StorageReader method"""
         self.checkpoint_id = checkpoint_id
 
     @classmethod
     def validate_checkpoint_id(cls, checkpoint_id: str | os.PathLike) -> bool:
+        # [FUNCTION DOC] Returns True if the given id is an existing regular file.
         """Implementation of the StorageReader method"""
         return os.path.isfile(checkpoint_id)
 
 
 class DynamicMetaLoadPlanner(DefaultLoadPlanner):
+    # [CLASS DOC] DefaultLoadPlanner variant that builds Metadata from the state dict being loaded instead of reading
+    # it from storage, so formats without a metadata file (such as torch.save) can be loaded. Tensors only.
     """
     Extension of DefaultLoadPlanner, which creates a new Metadata object based on the passed in state dict,
     avoiding the need to read metadata from disk. This is useful when reading formats which don't have a
@@ -186,6 +211,8 @@ class DynamicMetaLoadPlanner(DefaultLoadPlanner):
         metadata: Metadata | None = None,
         is_coordinator: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Runs the default setup, then builds tensor storage metadata (dtype, size, chunk list) for every
+        # entry of the state dict and stores it as the planner's metadata. Raises RuntimeError if any value is not a tensor.
         """Setups of the planner, extnding default behavior by creating the Metadata object from the state dict"""
         super().set_up_planner(state_dict, metadata, is_coordinator)
 
@@ -209,6 +236,9 @@ def dcp_to_torch_save(
     dcp_checkpoint_dir: str | os.PathLike,
     torch_save_path: str | os.PathLike,
 ):
+    # [FUNCTION DOC] Converts a DCP checkpoint directory to one torch.save file: loads the whole checkpoint into a plain
+    # state dict without distributed coordination (no process group needed) and saves it to torch_save_path. Returns None.
+    # Holds the whole checkpoint in memory.
     """
     Given a directory containing a DCP checkpoint, this function will convert it into a
     Torch save file.
@@ -234,6 +264,8 @@ def torch_save_to_dcp(
     torch_save_path: str | os.PathLike,
     dcp_checkpoint_dir: str | os.PathLike,
 ):
+    # [FUNCTION DOC] Converts a torch.save file to a DCP checkpoint directory: loads the file (unrestricted unpickling)
+    # and writes it with a filesystem writer without distributed coordination. Returns None.
     """
     Given the location of a torch save file, converts it into a DCP checkpoint.
 
@@ -256,6 +288,7 @@ def torch_save_to_dcp(
 if __name__ == "__main__":
 
     class FormatMode(Enum):
+        # [CLASS DOC] HELPER: Enum of the two command line conversion modes.
         TORCH_TO_DCP = "torch_to_dcp"
         DCP_TO_TORCH = "dcp_to_torch"
 

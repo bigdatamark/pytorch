@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Storage writer and reader for checkpoints in the HuggingFace safetensors format.
+# HuggingFaceStorageWriter extends FileSystemWriter to write safetensors files (optionally one file per
+# rank, an index json for rank-0 saves, or consolidation of shards into full files).
+# HuggingFaceStorageReader extends FileSystemReader to rebuild checkpoint metadata from safetensors file
+# headers and to read tensor slices, optionally with several threads. The safetensors package is imported lazily.
 import dataclasses
 import json
 import logging
@@ -47,6 +52,10 @@ __all__ = ["HuggingFaceStorageWriter", "HuggingFaceStorageReader"]
 
 
 class HuggingFaceStorageWriter(FileSystemWriter):
+    # [CLASS DOC] FileSystemWriter fixed to the safetensors serialization format. State: fqn_to_index_mapping (tensor name to
+    # output file number), save_distributed (each rank writes its own shard), enable_consolidation (merge shards into full files
+    # after saving; shards then go into a sharded subdirectory and consolidated_output_path holds the original path), and
+    # thread_count_consolidation. Without distribution, rank 0 writes the full state and finish writes an index json.
     """
     A writer that writes to storage in the huggingface safetensors format.
     """
@@ -60,6 +69,9 @@ class HuggingFaceStorageWriter(FileSystemWriter):
         enable_consolidation: bool = False,
         thread_count_consolidation: int = 1,
     ) -> None:
+        # [FUNCTION DOC] Configures the base writer for safetensors and stores the options. If consolidation is enabled, remembers
+        # the original path as the consolidated output path and redirects writes to a sharded subdirectory of it.
+        # KNOWN ISSUE: the docstring says path is where the checkpoint will be read from; it is where it is written.
         """
         Initialize the huggingface writer pointing to path.
 
@@ -93,6 +105,8 @@ class HuggingFaceStorageWriter(FileSystemWriter):
         self.thread_count_consolidation = thread_count_consolidation
 
     def prepare_global_plan(self, plans: list[SavePlan]) -> list[SavePlan]:
+        # [FUNCTION DOC] Returns a copy of each rank's plan whose storage_data holds the file index mapping (when configured) and,
+        # when saving distributed, a one-based shard index equal to the plan's position in the list.
         new_plans = []
         for i, plan in enumerate(plans, start=1):
             storage_data: dict[str, Any] = {}
@@ -110,6 +124,9 @@ class HuggingFaceStorageWriter(FileSystemWriter):
         plan: SavePlan,
         planner: SavePlanner,
     ) -> Future[list[WriteResult]]:
+        # [FUNCTION DOC] Writes this rank's plan. An empty plan returns an already-completed Future with no results. Otherwise
+        # groups write items into files by the index mapping (single file if none), names each file from its index, the highest
+        # index and the shard index, queues them and delegates to the base class writer. Returns a Future of WriteResult lists.
         if len(plan.items) == 0:
             fut: Future = Future()
             fut.set_result([])
@@ -137,6 +154,10 @@ class HuggingFaceStorageWriter(FileSystemWriter):
         return super()._write_data(planner, file_queue)
 
     def finish(self, metadata: Metadata, results: list[list[WriteResult]]) -> None:
+        # [FUNCTION DOC] Finalizes the save. Distributed without consolidation: logs and does nothing. Distributed with consolidation:
+        # merges the sharded files into the output directory using the index mapping (all tensors to file 1 if none) and the
+        # consolidation thread count. Otherwise writes a json index file with total byte size and a map from tensor name to file,
+        # built from all ranks' write results. Side effect: file I/O.
         if self.save_distributed and not self.enable_consolidation:
             # if we are saving distributed, without consolidating,
             # then we have no metadata to write because a metadata
@@ -178,6 +199,8 @@ class HuggingFaceStorageWriter(FileSystemWriter):
     def _split_by_storage_plan(
         self, storage_plan: dict[str, int] | None, items: list[WriteItem]
     ) -> dict[int, list[WriteItem]]:
+        # [FUNCTION DOC] HELPER: Groups write items by output file index using the mapping from tensor name; with no mapping all items
+        # go to file 1. Raises a KeyError if an item name is missing from the mapping. Returns a mapping from index to item list.
         # storage_plan is a map from key to index
         if storage_plan is None:
             return {1: items}
@@ -196,15 +219,19 @@ class HuggingFaceStorageWriter(FileSystemWriter):
 
     @property
     def metadata_path(self) -> str:
+        # [FUNCTION DOC] Returns the file name of the index json (not a full path).
         return _metadata_fn
 
 
 class HuggingFaceStorageReader(FileSystemReader):
     """
+    # [CLASS DOC] FileSystemReader for safetensors checkpoints. Metadata is derived from file headers (and optional DCP sharding
+    # info stored in file metadata), and tensors are read as slices. State: thread_count for parallel file reads.
     A reader that reads a checkpoint in the huggingface safetensors format.
     """
 
     def __init__(self, path: str, thread_count: int = 1) -> None:
+        # [FUNCTION DOC] Initializes the base reader for path and stores thread_count.
         """
         Initialize the huggingface reader pointing to path.
 
@@ -217,6 +244,8 @@ class HuggingFaceStorageReader(FileSystemReader):
         self.thread_count = thread_count
 
     def _process_read_request(self, f, req: ReadItem, planner: LoadPlanner) -> None:
+        # [FUNCTION DOC] HELPER: Reads the requested slice (by offsets and lengths) of one tensor from an open safetensors file, copies it
+        # into the planner's target tensor and commits it. Raises AssertionError if sizes differ.
         """Helper function to process a single read request."""
         # Create slices for each dimension based on offsets and lengths
         slices = tuple(
@@ -240,6 +269,9 @@ class HuggingFaceStorageReader(FileSystemReader):
         result_queue: queue.Queue,
         planner: LoadPlanner,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Thread worker. Repeatedly takes (file name, requests) from file_queue until it is empty, processes each
+        # request, and puts a completion marker on result_queue per file. Does not catch other errors; a failing worker thread dies silently
+        # and the shortfall is detected by the caller.
         from safetensors import safe_open  # type: ignore[import]
 
         try:
@@ -253,6 +285,9 @@ class HuggingFaceStorageReader(FileSystemReader):
             pass
 
     def read_data(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:
+        # [FUNCTION DOC] Groups read items by file using stored storage info, then reads them: sequentially if thread_count is at most 1 or
+        # only one file is involved, otherwise with worker threads sharing a queue. Raises AssertionError if not all files were processed
+        # in the threaded path. Returns an already-completed Future. Side effect: writes into planner target tensors.
         from safetensors import safe_open  # type: ignore[import]
 
         per_file: dict[str, list[ReadItem]] = {}
@@ -311,6 +346,9 @@ class HuggingFaceStorageReader(FileSystemReader):
 
     # pyrefly: ignore [bad-override]
     def read_metadata(self) -> Metadata:
+        # [FUNCTION DOC] Scans the checkpoint directory for safetensors files and builds Metadata: per tensor name the dtype, full size and
+        # list of chunks (offsets from DCP sharding info if present, otherwise zeros), and storage data mapping each chunk to its file, shape
+        # and dtype. Sets the storage metadata load id. Returns the Metadata.
         from safetensors import safe_open  # type: ignore[import]
         from safetensors.torch import _getdtype  # type: ignore[import]
 

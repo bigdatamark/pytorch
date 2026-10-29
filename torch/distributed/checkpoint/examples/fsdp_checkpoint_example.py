@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Runnable example that saves and loads an FSDP model and optimizer with distributed checkpoint.
+# Saves sharded model and optimizer state, then loads them into a second model and prints parameters before and
+# after. Run as a script: it deletes CHECKPOINT_DIR and spawns one process per CUDA device.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 
 """
@@ -24,10 +27,13 @@ CHECKPOINT_DIR = f"/scratch/{os.environ.get('LOGNAME', '')}/checkpoint"
 
 
 def opt_at(opt, idx):
+    # [FUNCTION DOC] HELPER: Returns the idx-th per-parameter optimizer state entry (in insertion order).
     return list(opt.state.values())[idx]
 
 
 def init_model():
+    # [FUNCTION DOC] HELPER: Builds an FSDP-wrapped linear layer on the current rank's GPU, runs one forward/backward and
+    # one Adam step so optimizer state exists. Returns (model, optimizer).
     model = FSDP(torch.nn.Linear(4, 4).cuda(dist.get_rank()))
     optim = torch.optim.Adam(model.parameters(), lr=0.1)
     model(torch.rand(4, 4)).sum().backward()
@@ -37,6 +43,8 @@ def init_model():
 
 
 def print_params(stage, model_1, model_2, optim_1, optim_2):
+    # [FUNCTION DOC] HELPER: Prints, for this rank, the full parameters of both models and the Adam moment state of both
+    # optimizers, labelled with the stage string.
     with FSDP.summon_full_params(model_1), FSDP.summon_full_params(model_2):
         print(
             f"{stage} --- rank: {dist.get_rank()}\n"
@@ -56,6 +64,9 @@ def print_params(stage, model_1, model_2, optim_1, optim_2):
 
 
 def run_fsdp_checkpoint_example(rank, world_size):
+    # [FUNCTION DOC] Per-process entry point. Initializes the process group, saves sharded model and optimizer state of
+    # model 1, creates model 2, loads the sharded model state into it, loads the sharded optimizer state, prints parameters
+    # before and after loading, and destroys the process group. Side effects: env vars, files in CHECKPOINT_DIR.
     # Set up world pg
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12355"
