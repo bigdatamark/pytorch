@@ -36,6 +36,9 @@ device_type = acc.type if (acc := torch.accelerator.current_accelerator()) else 
 
 
 def get_cur_mem(rank, result, prefix):
+    # [FUNCTION DOC] HELPER: Stores the accelerator's currently allocated memory, rounded to
+    # whole MB, in the result mapping under the key prefix. The rank argument is unused. On
+    # CUDA it first clears cuBLAS workspaces so they do not count. Mutates result.
     """Collect memory allocated values in a result dict in MB"""
     if TEST_CUDA:
         torch._C._cuda_clearCublasWorkspaces()
@@ -43,7 +46,13 @@ def get_cur_mem(rank, result, prefix):
 
 
 class Model(nn.Module):
+    # [CLASS DOC] HELPER: Image model with a stem (conv, batchnorm, relu), blocks (three
+    # conv/batchnorm/relu groups, global pooling, flatten) and a linear head to 10 outputs.
+    # With with_fsdp each batchnorm is individually wrapped in FSDP; with with_checkpoint the
+    # blocks run under reentrant activation checkpointing in forward.
     def __init__(self, hidden_dim, with_fsdp=False, with_checkpoint=False):
+        # [FUNCTION DOC] HELPER: Builds stem, blocks (width hidden_dim) and head, wrapping
+        # each batchnorm in FSDP when with_fsdp is true, and stores the with_checkpoint flag.
         super().__init__()
         if with_fsdp:
             self.stem = nn.Sequential(
@@ -90,6 +99,8 @@ class Model(nn.Module):
         self.with_checkpoint = with_checkpoint
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Runs stem, then blocks (through reentrant checkpoint if
+        # with_checkpoint is set), then head, and returns the result.
         if self.with_checkpoint:
             return self.head(checkpoint(self.blocks, self.stem(x), use_reentrant=True))
         else:
@@ -97,6 +108,9 @@ class Model(nn.Module):
 
 
 def create_model(with_fsdp, with_checkpoint, model_hidden_dim):
+    # [FUNCTION DOC] HELPER: Seeds the RNG with 0 and returns a Model. When with_fsdp is true
+    # the stem, blocks and head submodules are each additionally wrapped in FSDP (the caller
+    # wraps the top level). Side effect: resets the global torch seed.
     torch.manual_seed(0)
     model = Model(model_hidden_dim, with_fsdp, with_checkpoint)
     if with_fsdp:
@@ -108,11 +122,20 @@ def create_model(with_fsdp, with_checkpoint, model_hidden_dim):
 
 
 class TestFSDPMemory(FSDPTest):
+    # [CLASS DOC] Two-rank multi-process test case that trains an FSDP-wrapped Model and
+    # compares recorded memory at each phase of each iteration against expected values
+    # derived from the sharded model size. Key methods: _dist_train and test_fsdp_memory.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Property giving the number of ranks to spawn; always 2.
         return 2
 
     def _dist_train(self, with_checkpoint, expected, model_hidden_dim, iterations):
+        # [FUNCTION DOC] HELPER: Trains a fully FSDP-wrapped Model with SGD (momentum 0.9) for
+        # the given number of iterations on a random 2x3x224x224 batch, recording allocated
+        # memory at six points per iteration (start, after fwd, loss, bwd, step, done) with
+        # gradients set to None at the end of each. Then asserts every recorded value is
+        # within 1 MB of the expected mapping and that the key sets are identical.
         gpu_id = self.rank
         batch = torch.randn(size=(2, 3, 224, 224)).to(device_type)
 
@@ -151,6 +174,9 @@ class TestFSDPMemory(FSDPTest):
             get_cur_mem(gpu_id, results, f"iter {iteration}: done")
 
         def cmp(results, expected):
+            # [FUNCTION DOC] HELPER: Asserts the two mappings have equal keys, then returns a
+            # string listing each key whose value differs from expected by more than 1 MB
+            # (empty string when all match).
             ret = ""
             self.assertEqual(results.keys(), expected.keys())
             for k, v in results.items():
@@ -166,6 +192,11 @@ class TestFSDPMemory(FSDPTest):
     @skip_if_lt_x_gpu(2)
     @parametrize("ckpt", ["no_ckpt", "ckpt"])
     def test_fsdp_memory(self, ckpt):
+        # [FUNCTION DOC] Test (2 GPUs, skipped on HPU): measures the unsharded model size,
+        # derives the sharded size, builds the expected per-phase memory mapping for 4
+        # iterations (fixed constants for activations: 51 MB with checkpointing, 340 MB
+        # without; optimizer state adds one sharded size after the first step), and runs
+        # _dist_train to compare. Parametrized by ckpt being "ckpt" or "no_ckpt".
         # hidden_dim 128: model size ~4MB
         model_hidden_dim = 128
 

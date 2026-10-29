@@ -40,7 +40,12 @@ device_type = acc.type if (acc := torch.accelerator.current_accelerator()) else 
 
 
 class Model(torch.nn.Module):
+    # [CLASS DOC] HELPER: Small feed-forward test model: layer0 (3 to 5), layer1 (a sequential
+    # of three linear layers, 5 to 4 to 4 to 4), layer2 (4 to 2), layer3 (2 to 2), with a
+    # shared relu after each stage. Also offers get_input, get_loss and run_backward hooks
+    # in the interface the test helpers expect.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates layer0, layer1 (three linears), layer2, layer3 and relu.
         super().__init__()
         self.layer0 = torch.nn.Linear(3, 5)
         layer1_modules = [
@@ -54,6 +59,8 @@ class Model(torch.nn.Module):
         self.relu = torch.nn.ReLU()
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies layer0 to layer3 in order, with relu after each, and
+        # returns the final activation.
         z = self.relu(self.layer0(x))
         z = self.relu(self.layer1(z))
         z = self.relu(self.layer2(z))
@@ -61,28 +68,40 @@ class Model(torch.nn.Module):
         return z
 
     def get_input(self, device):
+        # [FUNCTION DOC] HELPER: Returns a one-element tuple with a random 8x3 tensor on device.
         return (torch.randn((8, 3)).to(device),)
 
     def get_loss(self, input, output):
+        # [FUNCTION DOC] HELPER: Returns the sum of all elements of output; input is unused.
         return output.sum()
 
     def run_backward(self, loss):
+        # [FUNCTION DOC] HELPER: Runs backward on the loss.
         loss.backward()
 
 
 class IgnoredModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Module holding a single random in_dim by out_dim weight parameter
+    # and no layers; its forward is a matrix product. Used as a module to be ignored by FSDP.
     def __init__(self, in_dim: int, out_dim: int) -> None:
+        # [FUNCTION DOC] HELPER: Creates the random weight parameter of shape (in_dim, out_dim).
         super().__init__()
         self.weight = torch.nn.Parameter(torch.randn((in_dim, out_dim)))
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Returns the matrix product of x and the weight.
         return x @ self.weight
 
 
 class ModelWithIgnoredModules(Model):
+    # [CLASS DOC] HELPER: Model whose layer1 is rebuilt as two linear layers, then
+    # num_ignored IgnoredModule(4, 4) instances, then a final linear layer, so the number of
+    # parameters in layer1 varies with num_ignored.
     """Adds a variable number of :class:`IgnoredModule` to ``self.layer1``."""
 
     def __init__(self, num_ignored: int) -> None:
+        # [FUNCTION DOC] HELPER: Builds the base Model, then replaces layer1 as described in
+        # the class. Raises AssertionError if num_ignored is negative.
         if not (num_ignored >= 0):
             raise AssertionError(f"Expected num_ignored >= 0, got {num_ignored}")
         super().__init__()
@@ -95,11 +114,18 @@ class ModelWithIgnoredModules(Model):
 
 
 class TestFSDPIgnoredModules(FSDPTestContinuous):
+    # [CLASS DOC] Multi-process test case (up to 2 ranks) for FSDP ignored_modules and
+    # ignored_states. Each scenario has a public test_ entry that sweeps options through
+    # run_subtests and a private _test_ method that does the work.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Property giving min(device count, 2) as the number of ranks.
         return min(torch.accelerator.device_count(), 2)
 
     def _train_model(self, model, optim, num_iters, device=torch.device(device_type)):
+        # [FUNCTION DOC] HELPER: Runs num_iters training steps: gets an input from the
+        # (unwrapped, if FSDP) model, runs forward, computes the loss on device, runs the
+        # model's backward helper and steps the optimizer. Gradients are not zeroed.
         for _ in range(num_iters):
             module = model.module if isinstance(model, FSDP) else model
             inp = module.get_input(device)
@@ -110,6 +136,8 @@ class TestFSDPIgnoredModules(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_ignored_modules_transformer(self):
+        # [FUNCTION DOC] Test driver (2+ GPUs): runs the transformer scenario over use_orig_params,
+        # ignore via modules vs. via states, and auto wrap on/off.
         """Tests that ignored modules' parameters are not flattened for a
         transformer model with shared parameters."""
         self.run_subtests(
@@ -127,6 +155,12 @@ class TestFSDPIgnoredModules(FSDPTestContinuous):
         ignore_modules: bool,  # as opposed to `ignored_states`
         use_auto_wrap: bool,
     ):
+        # [FUNCTION DOC] HELPER: Wraps a transformer test model in FSDP ignoring its
+        # transformer submodule (given as modules or as that module's parameters; optionally
+        # with a linear-layer auto wrap policy after unsharing the output projection weight).
+        # Sums the sizes of all flat parameters (minus alignment padding when
+        # use_orig_params) with full params summoned and asserts it equals the parameter count
+        # of the model minus the transformer's. Finally trains 3 steps with Adam.
         # Initialize an FSDP-wrapped transformer model that has FSDP ignore
         # the `nn.Transformer` module's parameters
         model: nn.Module = TransformerWithSharedParams.init(
@@ -187,6 +221,8 @@ class TestFSDPIgnoredModules(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_ignored_modules_nested(self):
+        # [FUNCTION DOC] Test driver (2+ GPUs): runs the nested scenario over use_orig_params
+        # and ignoring via modules vs. via states.
         """Tests that passing a module with nested FSDP modules does not
         error and still ignores non-FSDP modules' parameters."""
         self.run_subtests(
@@ -198,6 +234,11 @@ class TestFSDPIgnoredModules(FSDPTestContinuous):
         )
 
     def _test_ignored_modules_nested(self, use_orig_params: bool, ignore_modules: bool):
+        # [FUNCTION DOC] HELPER: Wraps one linear inside layer1 with FSDP, then wraps the whole
+        # Model ignoring layer1 (as module or as its parameters). Asserts the root's single
+        # flat parameter holds exactly the non-layer1 element count (padding removed when
+        # use_orig_params), then trains 3 steps with Adam.
+        # KNOWN ISSUE: the numel assertion is duplicated inside and after the padding branch.
         # Initialize an FSDP-wrapped nested model that first wraps the nested
         # sequential's second linear layer (`layer1[1]`) and then wraps the
         # overall model while ignoring the nested sequential (`layer1`)
@@ -237,6 +278,9 @@ class TestFSDPIgnoredModules(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_ignored_states_auto_wrap(self):
+        # [FUNCTION DOC] Test driver (2+ GPUs): runs the auto wrap scenario with two policies
+        # (transformer policy and module policy, both wrapping Sequential) and with or
+        # without ignoring the bias of the middle layer1 linear in addition to its weight.
         transformer_policy = functools.partial(
             transformer_auto_wrap_policy, transformer_layer_cls={nn.Sequential}
         )
@@ -249,6 +293,11 @@ class TestFSDPIgnoredModules(FSDPTestContinuous):
         )
 
     def _test_ignored_states_auto_wrap(self, policy, ignore_bias: bool):
+        # [FUNCTION DOC] HELPER: Wraps Model with the policy and ignored parameters (weight, and
+        # bias if ignore_bias) of layer1's middle linear, without orig params. Computes the
+        # expected per-rank flat parameter sizes for layer1 and for the rest of the root
+        # (ceil of unsharded count over world size) and asserts the actual flat parameters
+        # are no larger.
         model = Model().to(device_type)
         ignored_states = [model.layer1[1].weight]
         if ignore_bias:
@@ -286,6 +335,11 @@ class TestFSDPIgnoredModules(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_ignored_modules_invalid(self):
+        # [FUNCTION DOC] Test (2+ GPUs): ignoring an already FSDP-wrapped submodule is expected
+        # to raise ValueError, and ignoring the top-level module itself must emit a
+        # UserWarning that all parameters will be ignored (using a fresh model).
+        # KNOWN ISSUE: the msg argument given to the error assertion is only the failure
+        # message, it is not matched against the raised error text.
         """Tests that passing an FSDP module as an ignored module or the
         top-level module itself errors."""
         model = Model().to(device_type)
@@ -310,6 +364,8 @@ class TestFSDPIgnoredModules(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_diff_ignored_modules_across_ranks(self):
+        # [FUNCTION DOC] Test driver (2+ GPUs): runs the cross-rank scenario over whether the
+        # root receives the ignored modules and whether they are given as modules or states.
         """
         Tests ignoring different modules across ranks.
 
@@ -333,6 +389,10 @@ class TestFSDPIgnoredModules(FSDPTestContinuous):
         pass_ignored_modules_to_root: bool,
         ignore_modules: bool,
     ):
+        # [FUNCTION DOC] HELPER: Each rank builds a model with rank+1 ignored modules in layer1
+        # so flat parameter layouts differ across ranks. Wraps layer1 (ignoring those modules)
+        # and layer3 with FSDP, then the root (optionally also ignoring all of them), and
+        # trains 3 Adam steps to check nothing hangs or errors.
         # To exercise different `FlatParameter` enumerations across ranks,
         # we wrap `layer3` with FSDP, where `layer3` is registered as a module
         # after `layer1`, which has the variable number of ignored modules
@@ -373,6 +433,10 @@ class TestFSDPIgnoredModules(FSDPTestContinuous):
     @skip_if_lt_x_gpu(2)
     @parametrize("ignore_modules", [True, False])
     def test_ignored_modules_not_under_wrapped_root(self, ignore_modules: bool):
+        # [FUNCTION DOC] Test (2+ GPUs): takes layer1's children after the first as ignored
+        # modules (or their parameters) and passes the same set to FSDP wrappers of both
+        # layer1 and layer3, so for layer3 the ignored items are not under its root. Trains 3
+        # Adam steps and expects no error.
         model = Model().to(device_type)
         ignored_modules = list(model.layer1.children())[1:]
 
@@ -402,6 +466,8 @@ class TestFSDPIgnoredModules(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(1)
     def test_ignored_states_check(self):
+        # [FUNCTION DOC] Test driver (1+ GPU): runs the argument validation scenario for both
+        # ignored_modules and ignored_states.
         """
         Tests that passing invalid ``ignored_modules`` or ``ignored_states``
         raises an appropriate error.
@@ -412,6 +478,9 @@ class TestFSDPIgnoredModules(FSDPTestContinuous):
         )
 
     def _test_ignored_states_check(self, ignore_modules: bool):
+        # [FUNCTION DOC] HELPER: Asserts ValueError with specific messages for invalid
+        # arguments: ignored_modules given as parameters; both ignored_modules and
+        # ignored_states together; and ignored_states mixing modules and parameters.
         model = Model().to(device_type)
         ignored_modules = list(model.layer1.children())[1:]
         ignored_params = {p for m in ignored_modules for p in m.parameters()}

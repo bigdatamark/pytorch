@@ -69,27 +69,39 @@ device_type = (
 
 
 class MyModel(nn.Module):
+    # [CLASS DOC] HELPER: Two 2x2 linear layers a and b; forward adds the two inputs and
+    # applies a then b.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates linear layers a and b (2 to 2).
         super().__init__()
         self.a = nn.Linear(2, 2)
         self.b = nn.Linear(2, 2)
 
     def forward(self, x, y):
+        # [FUNCTION DOC] HELPER: Returns b(a(x + y)).
         return self.b(self.a(x + y))
 
 
 class TestFSDPMiscMultiProcess(FSDPTestContinuous):
+    # [CLASS DOC] Two-rank multi-process test case with assorted FSDP behavior checks that
+    # need real collectives; see the individual tests for the scenarios. Most need 2 GPUs.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Property giving the number of ranks; always 2.
         return 2
 
     @property
     def process_group(self):
+        # [FUNCTION DOC] HELPER: Property returning the default (world) process group.
         return dist.distributed_c10d._get_default_group()
 
     @skip_if_lt_x_gpu(2)
     @parametrize("use_index", [True, False])
     def test_fsdp_device_id(self, use_index):
+        # [FUNCTION DOC] Test (2 GPUs): wraps NestedWrappedModule with device_id given as an
+        # integer index or a device object. Checks the flat parameters land on that device
+        # for a CPU module, that a module already on it is accepted, and that a device
+        # without an explicit index on a GPU module emits a UserWarning.
         """
         Tests the FSDP ``device_id`` argument:
           - Wrapping a CPU module should move the module to the GPU matching
@@ -106,6 +118,9 @@ class TestFSDPMiscMultiProcess(FSDPTestContinuous):
         )
 
         def _check_device_matches(module, device_id):
+            # [FUNCTION DOC] HELPER: Collects the devices of all flat parameters in module,
+            # asserts there is at least one and exactly one distinct device, and asserts it
+            # equals device_id (an index is converted to a device of the current type).
             """Checks that the ``FlatParameter``s in ``module`` have device
             matching ``device_id``."""
             devices = {
@@ -159,10 +174,20 @@ class TestFSDPMiscMultiProcess(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_fsdp_zero2_eval_with_prefetch(self):
+        # [FUNCTION DOC] Test (2 GPUs): trains an FSDP model (SHARD_GRAD_OP, forward prefetch,
+        # original params, linear and conv layers wrapped) and an identical DDP model for 5
+        # steps on the same random inputs and seeds, requiring close losses and input grads;
+        # then evaluates both under no_grad for 5 batches requiring close losses; then
+        # trains 5 more steps again requiring close losses and grads.
+        # KNOWN ISSUE: the input tensor is shared by both models, so its grad accumulates in
+        # place and both stored grads are the same tensor; the grads comparison is trivially true.
         # Test FSDP validation with SHARD_GRAD_OP and forward_prefetch
 
         class Mnist(nn.Module):
+            # [CLASS DOC] HELPER: Small MNIST-style CNN (two convs, dropouts, layer norm, two
+            # linear layers) whose forward takes images and labels and returns the loss.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv, dropout, linear and layer norm layers.
                 super().__init__()
                 self.conv1 = nn.Conv2d(1, 32, 3, 1)
                 self.conv2 = nn.Conv2d(32, 64, 3, 1)
@@ -173,6 +198,9 @@ class TestFSDPMiscMultiProcess(FSDPTestContinuous):
                 self.ln = nn.LayerNorm(9216)
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Runs convs with relu, pooling, dropout, flatten, layer
+                # norm and the linear layers on images x, then returns the cross entropy of the
+                # log-softmax output against labels y.
                 x = self.conv1(x)
                 x = torch.nn.functional.relu(x)
                 x = self.conv2(x)
@@ -279,17 +307,27 @@ class TestFSDPMiscMultiProcess(FSDPTestContinuous):
     @parametrize("use_second_layer", [True, False])
     @parametrize("sharding_strategy", [ShardingStrategy.NO_SHARD, None])
     def test_fsdp_module_no_compute_grad(self, use_second_layer, sharding_strategy):
+        # [FUNCTION DOC] Test (2 GPUs): wraps a two-layer model with every layer in its own FSDP
+        # unit. Runs 4 forward/backward passes where the loss only uses the first layer's
+        # output, and asserts the first unit's flat parameter gets a gradient while the second
+        # (used in forward or not) gets none. Parametrized by use_second_layer and by
+        # NO_SHARD vs. the default strategy.
         # When use_second_layer=True, b is involved in forward computation but does
         # not receive grad in backward. Otherwise, b is not involved in forward
         # computation.
 
         class MyModel(nn.Module):
+            # [CLASS DOC] HELPER: Two 10x10 linear layers a and b; b only runs when
+            # use_second_layer (from the enclosing test) is true.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates linear layers a and b.
                 super().__init__()
                 self.a = nn.Linear(10, 10)
                 self.b = nn.Linear(10, 10)
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns a(x); if use_second_layer, returns the pair
+                # (a(x), b(y)) instead.
                 out1 = self.a(x)
                 if use_second_layer:
                     out2 = self.b(y)
@@ -320,6 +358,8 @@ class TestFSDPMiscMultiProcess(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_fsdp_not_all_outputs_used_in_loss(self):
+        # [FUNCTION DOC] Test driver (2 GPUs): runs the unused-output scenario for FULL_SHARD,
+        # SHARD_GRAD_OP and NO_SHARD.
         self.run_subtests(
             {
                 "sharding_strategy": [
@@ -334,18 +374,29 @@ class TestFSDPMiscMultiProcess(FSDPTestContinuous):
     def _test_fsdp_not_all_outputs_used_in_loss(
         self, sharding_strategy: ShardingStrategy
     ):
+        # [FUNCTION DOC] HELPER: Trains an FSDP copy (lin1 and root wrapped) and a local copy
+        # of a two-output module for 6 SGD steps; the first 2 losses use both outputs, later
+        # ones only the first output. After each step checks the root unit is resharded,
+        # parameters equal the local copy's, and parameters actually changed. Ends with a barrier.
         class MyModule(nn.Module):
+            # [CLASS DOC] HELPER: Two 4x4 linear layers applied to the same input, returning
+            # both outputs as a tuple.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates linear layers lin1 and lin2.
                 super().__init__()
                 self.lin1 = nn.Linear(4, 4)
                 self.lin2 = nn.Linear(4, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the pair (lin1(x), lin2(x)).
                 a = self.lin1(x)
                 b = self.lin2(x)
                 return (a, b)
 
         def _check_resharded(fsdp_module):
+            # [FUNCTION DOC] HELPER: If the module has a flat parameter handle, asserts that
+            # for sharded strategies the unsharded padded storage is freed (size zero), and
+            # that the flat parameter again points at the local shard memory.
             handle = fsdp_module._handle
             if not handle:
                 return
@@ -357,6 +408,8 @@ class TestFSDPMiscMultiProcess(FSDPTestContinuous):
             self.assertEqual(param.data_ptr(), param._local_shard.data_ptr())
 
         def _check_equal(local, fsdp):
+            # [FUNCTION DOC] HELPER: Summons full parameters of the FSDP module and asserts
+            # each is close to the matching parameter of the local module.
             with FSDP.summon_full_params(fsdp):
                 for p1, p2 in zip(fsdp.parameters(), local.parameters()):
                     torch.testing.assert_close(p1, p2)
@@ -410,6 +463,9 @@ class TestFSDPMiscMultiProcess(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_fsdp_optim_overlap_no_use_orig_params_error(self):
+        # [FUNCTION DOC] Test (2 GPUs): registers an in-backward SGD optimizer on the
+        # parameters of an FSDP model built with use_orig_params false; running forward must
+        # raise RuntimeError saying overlap is only supported with use_orig_params true.
         fsdp_overlap = FSDP(
             MyModel().to(device=device_type),
             auto_wrap_policy=always_wrap_policy,
@@ -432,6 +488,11 @@ class TestFSDPMiscMultiProcess(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_fsdp_optimizer_overlap(self):
+        # [FUNCTION DOC] Test (2 GPUs): for CPU offload on and off, compares a regular FSDP
+        # model stepped by an ordinary SGD optimizer with an identical copy whose parameters
+        # use an in-backward SGD optimizer. Over 6 steps asserts the overlapped model's
+        # handles have no sharded grad, its parameters change each step, parameters equal the
+        # regular model's, and gradients are None on both after the step.
         torch.manual_seed(0)
         for cpu_offload in [True, False]:
             offload = CPUOffload(offload_params=cpu_offload)
@@ -539,6 +600,9 @@ class TestFSDPMiscMultiProcess(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_fsdp_cpu_training(self):
+        # [FUNCTION DOC] Test (2 GPUs): over a gloo process group, trains an FSDP CPU model
+        # (NO_SHARD, FULL_SHARD, SHARD_GRAD_OP in turn) and a DDP reference with Adam for 10
+        # steps on the same input, asserting equal losses at every step.
         """Tests FSDP training on CPU."""
         gloo_pg = dist.new_group(backend="gloo")
         for ss in [
@@ -572,6 +636,9 @@ class TestFSDPMiscMultiProcess(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_summon_full_params_offload_to_cpu_on_cpu_model(self):
+        # [FUNCTION DOC] Test driver (2 GPUs): creates a gloo group and runs the CPU offload
+        # summon scenario over FULL_SHARD and SHARD_GRAD_OP, use_orig_params on/off and
+        # writeback on/off.
         """
         Tests ``summon_full_params(offload_to_cpu=True)`` when the FSDP compute
         device is already CPU. There, the unsharded ``FlatParameter`` is already
@@ -600,6 +667,11 @@ class TestFSDPMiscMultiProcess(FSDPTestContinuous):
         use_orig_params: bool,
         writeback: bool,
     ):
+        # [FUNCTION DOC] HELPER: Wraps a CPU copy of MyModel in FSDP over the gloo group and
+        # summons full params with offload_to_cpu. Asserts the summoned parameters are on CPU
+        # and equal the reference; with writeback adds 1 to every parameter inside. After exit
+        # asserts parameters are on CPU and a second summon sees the reference values plus 1
+        # only if writeback was enabled.
         torch.manual_seed(42)
         ref_model = MyModel()
         ref_params = dict(ref_model.named_parameters())
@@ -633,6 +705,10 @@ class TestFSDPMiscMultiProcess(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_fsdp_cpu_init_stays_on_cpu(self):
+        # [FUNCTION DOC] Test (2 GPUs): wraps a CPU NestedWrappedModule in FSDP, expecting a
+        # UserWarning that the module is on CPU, and asserts all parameters stay on CPU. Then
+        # moves the model to the accelerator and runs forward and backward with a CPU input,
+        # which FSDP must move to the device. Sets the current device index to the rank.
         # Move me to MT test once warning logging and backward collective issue
         # is resolved.
         """Tests that passing a CPU module to FSDP preserves that the wrapped
@@ -662,6 +738,10 @@ class TestFSDPMiscMultiProcess(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_cpu_init_with_sync_module_states(self):
+        # [FUNCTION DOC] Test (2 GPUs): wrapping a CPU module with sync_module_states must
+        # raise ValueError about CPU parameters or buffers. With device_id given it must
+        # succeed even with extra CPU buffers filled with the rank value, after which every
+        # rank's buffers are zeros (rank 0's values) and live on the accelerator device.
         """
         Tests that passing ``sync_module_states=True`` raises an error for
         a CPU module since the synchronization requires GPU communication,
@@ -670,6 +750,7 @@ class TestFSDPMiscMultiProcess(FSDPTestContinuous):
         """
 
         def init_nested_wrapped_module():
+            # [FUNCTION DOC] HELPER: Returns a fresh unwrapped NestedWrappedModule on CPU.
             return NestedWrappedModule.init(
                 self.process_group,
                 FSDPInitMode.NO_FSDP,
@@ -718,22 +799,35 @@ class TestFSDPMiscMultiProcess(FSDPTestContinuous):
 
 
 class TestFSDPMiscMultiThread(FSDPTestMultiThread):
+    # [CLASS DOC] Two-rank multi-threaded test case with assorted FSDP construction and
+    # device placement checks (device_id, ignored modules, sync_module_states, homogeneous
+    # attributes, unsupported containers). Threads share the process, so tests that set
+    # environment variables or the current device affect each other.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Property giving the number of ranks; always 2.
         return 2
 
     @property
     def process_group(self):
+        # [FUNCTION DOC] HELPER: Property returning the default (world) process group.
         return dist.distributed_c10d._get_default_group()
 
     @skip_if_lt_x_gpu(2)
     def test_fsdp_namedtuple(self):
+        # [FUNCTION DOC] Test (2 GPUs): passes a namedtuple of tensors that require grad
+        # through an FSDP-wrapped identity module and asserts every returned tensor has
+        # backward hooks registered, i.e. FSDP handled the namedtuple output.
         class MyModule(nn.Module):
+            # [CLASS DOC] HELPER: Module with an unused 100x100 linear whose forward returns its
+            # input unchanged.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear layer lin.
                 super().__init__()
                 self.lin = nn.Linear(100, 100)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns x unchanged.
                 return x
 
         m = MyModule().to(device=device_type)
@@ -757,6 +851,8 @@ class TestFSDPMiscMultiThread(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(2)
     def test_device_id_auto_wrap(self):
+        # [FUNCTION DOC] Test driver (2 GPUs): runs the device_id propagation scenario with
+        # the wrap policy given as a callable and as a ModuleWrapPolicy.
         """Tests that ``auto_wrap_policy`` propagates ``device_id`` to all
         nested FSDP instances."""
         self.run_subtests(
@@ -765,6 +861,9 @@ class TestFSDPMiscMultiThread(FSDPTestMultiThread):
         )
 
     def _test_device_id_auto_wrap(self, use_callable: bool):
+        # [FUNCTION DOC] HELPER: Wraps a transformer test model by encoder/decoder layer
+        # (policy as callable or ModuleWrapPolicy) with device_id set, and asserts every
+        # resulting FSDP instance has the compute device equal to that accelerator index.
         module_classes = {TransformerEncoderLayer, TransformerDecoderLayer}
         if use_callable:
             auto_wrap_policy = functools.partial(
@@ -791,6 +890,8 @@ class TestFSDPMiscMultiThread(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(2)
     def test_fsdp_device_id_cpu_offload(self):
+        # [FUNCTION DOC] Test driver (2 GPUs): runs the device_id plus parameter CPU offload
+        # scenario with use_orig_params on and off.
         """
         Tests FSDP when specifying both ``device_id`` and parameter CPU
         offloading.
@@ -801,8 +902,14 @@ class TestFSDPMiscMultiThread(FSDPTestMultiThread):
         )
 
     def _test_fsdp_device_id_cpu_offload(self, use_orig_params: bool):
+        # [FUNCTION DOC] HELPER: Wraps a model with nested FSDP units (Sequential wrapped, root
+        # also owning a linear) using CPU parameter offload and a device_id, and asserts every
+        # flat parameter handle's flat parameter is on CPU.
         class MyModel(nn.Module):
+            # [CLASS DOC] HELPER: A sequential of two 10x10 linears followed by a third
+            # 10x10 linear.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the sequential (seq) and the linear (lin).
                 super().__init__()
                 self.seq = nn.Sequential(
                     nn.Linear(10, 10),
@@ -811,6 +918,7 @@ class TestFSDPMiscMultiThread(FSDPTestMultiThread):
                 self.lin = nn.Linear(10, 10)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies seq then lin to x.
                 return self.lin(self.seq(x))
 
         model = MyModel()
@@ -830,6 +938,9 @@ class TestFSDPMiscMultiThread(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(2)
     def test_module_device_mismatches_device_id(self):
+        # [FUNCTION DOC] Test (2 GPUs): builds and wraps a module already on the rank's device
+        # with device_id fixed to 0. Rank 0 must succeed; other ranks must raise ValueError
+        # naming the mismatching devices. Sets the current device index to the rank.
         """Tests that specifying a ``device_id`` argument to FSDP for a GPU
         module that does not match the GPU device ID raises an error."""
         # TODO: override FSDP MT Thread _run to set this instead of here for
@@ -857,13 +968,18 @@ class TestFSDPMiscMultiThread(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(2)
     def test_cpu_gpu_module(self):
+        # [FUNCTION DOC] Test (2 GPUs): a module with one layer on the accelerator and one on
+        # CPU can be wrapped when device_id is given (all parameters then end up on the
+        # accelerator), and raises RuntimeError asking for device_id when it is not.
         """Tests a CPU + GPU module supported if device_id is passed
         in, errors if device_id is not.
         """
         torch.accelerator.set_device_index(self.rank)
 
         class CPUGPUModule(nn.Module):
+            # [CLASS DOC] HELPER: Module with layer a on the accelerator and layer b on CPU.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates 1x1 linears a (moved to device) and b (CPU).
                 super().__init__()
                 self.a = nn.Linear(1, 1).to(device=device_type)
                 self.b = nn.Linear(1, 1)
@@ -881,10 +997,15 @@ class TestFSDPMiscMultiThread(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(2)
     def test_fsdp_ignored_module_meta(self):
+        # [FUNCTION DOC] Test (2 GPUs): wraps a meta-device module with one layer ignored, with
+        # and without a param_init_fn that materializes modules, and asserts the ignored
+        # layer's parameters remain on the meta device. Sets the current device index to rank.
         torch.accelerator.set_device_index(self.rank)
 
         class CPUGPUModule(nn.Module):
+            # [CLASS DOC] HELPER: Module with two 1x1 linear layers a and b.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates linear layers a and b.
                 super().__init__()
                 self.a = nn.Linear(1, 1)
                 self.b = nn.Linear(1, 1)
@@ -911,8 +1032,13 @@ class TestFSDPMiscMultiThread(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(2)
     def test_fsdp_device_id_no_move_ignored_params_and_bufs(self):
+        # [FUNCTION DOC] Test (2 GPUs): wraps a CPU module with device_id while ignoring one
+        # layer (which also has a buffer), and asserts the ignored layer's parameters and
+        # buffers stay on CPU.
         class CPUGPUModule(nn.Module):
+            # [CLASS DOC] HELPER: Module with two 1x1 linears a and b; a also carries a buffer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates linears a and b and a buffer of ones on a.
                 super().__init__()
                 self.a = nn.Linear(1, 1)
                 self.b = nn.Linear(1, 1)
@@ -927,12 +1053,19 @@ class TestFSDPMiscMultiThread(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(2)
     def test_multigpu_module(self):
+        # [FUNCTION DOC] Test (2 GPUs): wrapping a module whose layers sit on two different
+        # CUDA devices must raise RuntimeError saying FSDP supports only single device modules.
+        # KNOWN ISSUE: uses cuda directly, so it is not device generic.
         """
         Module on multiple GPUs wrapped in FSDP should raise an error.
         """
 
         class MultiGPUModule(nn.Module):
+            # [CLASS DOC] HELPER: Module with layer a on this rank's CUDA device and layer b
+            # on the next rank's device.
             def __init__(self, rank):
+                # [FUNCTION DOC] HELPER: Stores the rank and creates 1x1 linears a and b on
+                # CUDA devices rank and rank+1 (modulo world size).
                 super().__init__()
                 self.rank = rank
                 self.a = nn.Linear(1, 1).cuda(self.rank)
@@ -945,6 +1078,10 @@ class TestFSDPMiscMultiThread(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(2)
     def test_no_params(self):
+        # [FUNCTION DOC] Test (2 GPUs): wraps a parameter-free module on CPU, on the device,
+        # and on CPU with device_id; all must succeed. Wrapping a device module with device_id
+        # 0 must succeed on rank 0 and raise ValueError about inconsistent devices on others.
+        # Sets the current device index to the rank.
         """
         Test that device_id and cpu init work if module has no params
         (they are effective noops, but ensure FSDP does not assume module
@@ -980,13 +1117,21 @@ class TestFSDPMiscMultiThread(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(2)
     def test_fsdp_same_model_across_ranks(self):
+        # [FUNCTION DOC] Test (2 GPUs): builds per-rank different models (rank-seeded weights
+        # and buffers), asserts they differ across ranks, wraps with sync_module_states
+        # (once for a device model, once for a CPU model plus device_id) and asserts parameters
+        # and buffers are identical across ranks once full params are summoned.
         """
         FSDP broadcasts model from rank 0 to ensure it starts off with the same
         values.
         """
 
         class MyModel(nn.Module):
+            # [CLASS DOC] HELPER: Module whose weights and buffer depend on the rank given at
+            # construction, so models differ between ranks.
             def __init__(self, rank):
+                # [FUNCTION DOC] HELPER: Seeds the CPU and device RNGs with the rank, then
+                # creates a bias-free 10x10 linear and a one-element buffer holding the rank.
                 super().__init__()
                 # Seed via rank to make model different across ranks
                 torch.manual_seed(rank)
@@ -1024,6 +1169,10 @@ class TestFSDPMiscMultiThread(FSDPTestMultiThread):
     @unittest.skipIf(IS_LINUX, "https://github.com/pytorch/pytorch/issues/105024")
     @skip_if_lt_x_gpu(2)
     def test_homogeneous_attributes(self):
+        # [FUNCTION DOC] Test driver (2 GPUs, skipped on Linux for a tracked issue): checks that
+        # the hard-coded list of homogeneous attributes (use_orig_params, limit_all_gathers,
+        # full precision in eval) matches the library's HOMOGENEOUS_ATTR_NAMES, then runs the
+        # heterogeneity check for each attribute.
         """
         Tests that passing heterogeneous values for attributes designated as
         homogeneous raises an error.
@@ -1049,6 +1198,11 @@ class TestFSDPMiscMultiThread(FSDPTestMultiThread):
         )
 
     def _test_homogeneous_attributes(self, attr_name_and_values: tuple[str, Any, Any]):
+        # [FUNCTION DOC] HELPER: Wraps an inner submodule and the outer model with different
+        # values of the attribute (for the full-precision attribute, by setting an environment
+        # variable between the two wraps) and asserts the first forward raises ValueError
+        # saying it expects one homogeneous value. Side effect: may leave the
+        # FSDP_USE_FULL_PREC_IN_EVAL environment variable set.
         model = NestedWrappedModule.init(
             self.process_group,
             FSDPInitMode.NO_FSDP,
@@ -1077,6 +1231,9 @@ class TestFSDPMiscMultiThread(FSDPTestMultiThread):
     @unittest.skipIf(IS_LINUX, "https://github.com/pytorch/pytorch/issues/137948")
     @skip_if_lt_x_gpu(2)
     def test_fsdp_unsupported_module_cls(self):
+        # [FUNCTION DOC] Test (2 GPUs, skipped on Linux for a tracked issue): wrapping a
+        # ModuleList and a ModuleDict (containers without forward) must warn that FSDP will
+        # not all-gather parameters for such containers.
         regex = r"FSDP will not all-gather parameters for containers that do not implement forward"
         model = nn.ModuleList([MLP(8, torch.device("cpu")) for _ in range(3)])
         with self.assertWarnsRegex(UserWarning, regex):
@@ -1089,12 +1246,18 @@ class TestFSDPMiscMultiThread(FSDPTestMultiThread):
 
 
 class TestFSDPMiscWorldSize1(FSDPTestMultiThread):
+    # [CLASS DOC] Single-rank multi-threaded test case for FSDP behavior specific to world
+    # size 1: strategy fallback warnings, device mismatch errors, and the unsafe setattr switch.
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Property giving the number of ranks; always 1.
         return 1
 
     @skip_if_lt_x_gpu(1)
     def test_world_size_1_sharding_strategy_warning(self):
+        # [FUNCTION DOC] Test (1 GPU): with world size 1, explicitly passing NO_SHARD must not
+        # emit the "switching to NO_SHARD" UserWarning, while FULL_SHARD (explicit or default)
+        # and SHARD_GRAD_OP must emit it with the strategy name.
         """
         Tests that FSDP issues a warning when it switches to using ``NO_SHARD``
         when the world size is 1.
@@ -1139,6 +1302,11 @@ class TestFSDPMiscWorldSize1(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(1)
     def test_training_device_mismatch_errors(self):
+        # [FUNCTION DOC] Test (1 GPU): a CPU module wrapped without a device move must raise
+        # RuntimeError at forward telling the user to move it to the GPU; a module with
+        # parameter CPU offload that was moved to the GPU must raise RuntimeError telling the
+        # user not to move it from CPU.
+        # KNOWN ISSUE: the expected messages hardcode cuda:0, so it fails on other accelerators.
         """
         Tests that, when training starts, if FSDP parameters are not on the
         expected device, then an informative error is raised. This applies for
@@ -1170,6 +1338,8 @@ class TestFSDPMiscWorldSize1(FSDPTestMultiThread):
 
     @skip_if_lt_x_gpu(2)
     def test_unsafe_setattr(self):
+        # [FUNCTION DOC] Test driver (2 GPUs): runs the unsafe setattr scenario with
+        # use_orig_params on and off.
         """
         Tests that the environment variable for using unsafe setattr gates as
         expected.
@@ -1180,19 +1350,29 @@ class TestFSDPMiscWorldSize1(FSDPTestMultiThread):
         )
 
     def _test_unsafe_setattr(self, use_orig_params: bool):
+        # [FUNCTION DOC] HELPER: Wraps a module that records whether its attribute-setting
+        # override ran, and runs forward under three settings of the unsafe setattr
+        # environment variable: unset (override runs), "1" (override skipped) and "0"
+        # (override runs). Side effect: leaves the variable set to "0" afterwards.
         called_setattr_override = False
 
         class SetattrLinear(nn.Module):
+            # [CLASS DOC] HELPER: Matrix-product layer with a single weight whose attribute
+            # setter records (in the enclosing test's flag) that it was called.
             def __init__(self, in_dim: int, out_dim: int, device: torch.device) -> None:
+                # [FUNCTION DOC] HELPER: Creates the random in_dim by out_dim weight on device.
                 super().__init__()
                 self.weight = nn.Parameter(
                     torch.randn((in_dim, out_dim), device=device)
                 )
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Returns the matrix product of x and the weight.
                 return x @ self.weight
 
             def __setattr__(self, name: str, value: Any) -> None:
+                # [FUNCTION DOC] HELPER: Sets the enclosing flag to true, then performs the
+                # normal attribute assignment and returns its result.
                 nonlocal called_setattr_override
                 called_setattr_override = True
                 return super().__setattr__(name, value)

@@ -55,6 +55,9 @@ device_type = acc.type if (acc := torch.accelerator.current_accelerator()) else 
 
 @contextlib.contextmanager
 def patch_allreduce(new_allreduce):
+    # [FUNCTION DOC] HELPER: Context manager that replaces the all_reduce function of
+    # torch.distributed with new_allreduce for the duration of the block and always restores
+    # the original afterwards, even on error. Side effect: mutates global module state.
     """
     Patches dist.all_reduce with a new all_reduce and
     restores upon exiting.
@@ -69,6 +72,11 @@ def patch_allreduce(new_allreduce):
 
 @contextlib.contextmanager
 def patch_reduce_scatter(new_reduce_scatter):
+    # [FUNCTION DOC] HELPER: Context manager that replaces the reduce_scatter_single function
+    # of torch.distributed with new_reduce_scatter for the duration of the block and always
+    # restores the original afterwards. Side effect: mutates global module state.
+    # KNOWN ISSUE: the docstring says it patches reduce_scatter_tensor, but the code patches
+    # reduce_scatter_single.
     """
     Patches dist.reduce_scatter_single with a new reduce_scatter_tensor and
     restores upon exiting.
@@ -82,32 +90,48 @@ def patch_reduce_scatter(new_reduce_scatter):
 
 
 class MyModel(nn.Module):
+    # [CLASS DOC] HELPER: Small module made of three sequential 10x10 linear layers
+    # (lin1, lin2, lin3) with no activations, used as a simple FSDP target.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the three 10x10 linear layers.
         super().__init__()
         self.lin1 = nn.Linear(10, 10)
         self.lin2 = nn.Linear(10, 10)
         self.lin3 = nn.Linear(10, 10)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies lin1, lin2 and lin3 in order to x and returns it.
         return self.lin3(self.lin2(self.lin1(x)))
 
 
 class ShardingStrategyMode(Enum):
+    # [CLASS DOC] HELPER: Enum choosing how the test model is wrapped: ALL_HYBRID_SHARD uses
+    # the hybrid strategy everywhere; MIXED_HYBRID_FULL_SHARD uses it only for the
+    # transformer submodule and FULL_SHARD for the outer wrapper.
     ALL_HYBRID_SHARD = auto()
     MIXED_HYBRID_FULL_SHARD = auto()
 
 
 class TestFSDPHybridShard(FSDPTestContinuous):
+    # [CLASS DOC] Multi-process test case for FSDP hybrid sharding. Uses all available
+    # devices (at least 2) as the world. Covers argument validation, process group setup,
+    # collective counts, parity with plain FSDP, and state dict / sync_module_states with
+    # explicit shard and replicate groups. Key helpers: _init_fsdp_model and _init_hsdp_model.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Property returning the device count, but at least 2.
         return max(torch.accelerator.device_count(), 2)
 
     @property
     def process_group(self):
+        # [FUNCTION DOC] HELPER: Property returning the default (world) process group.
         return dist.distributed_c10d._get_default_group()
 
     @skip_if_lt_x_gpu(2)
     def test_raises_manual_wrap_hybrid_shard_when_none_policy(self):
+        # [FUNCTION DOC] Test: wrapping a model with HYBRID_SHARD or _HYBRID_SHARD_ZERO2 but
+        # without a process group tuple or device mesh must raise ValueError saying it
+        # requires explicit specification of process group or device_mesh.
         model = MyModel().to(device_type)
         err_ctx = self.assertRaisesRegex(
             ValueError,
@@ -122,6 +146,11 @@ class TestFSDPHybridShard(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(4)
     def test_hsdp_save_load_state_dict(self):
+        # [FUNCTION DOC] Test (4+ GPUs): splits ranks into two shard groups (lower and upper
+        # half) and strided replicate groups pairing one rank from each half, wraps MyModel
+        # with HYBRID_SHARD using that tuple, and takes one AdamW step. Checks the model's
+        # process groups equal the supplied ones, takes sharded model and optimizer state
+        # dicts, and loads them into a fresh identically wrapped model and optimizer.
         model = MyModel().to(device_type)
         num_node_devices = torch.accelerator.device_count()
         shard_rank_lists = (
@@ -179,6 +208,10 @@ class TestFSDPHybridShard(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(4)
     def test_hsdp_sync_module_state(self):
+        # [FUNCTION DOC] Test (4+ GPUs): builds the same shard and replicate groups as the
+        # state dict test, sets every linear weight to the local rank value, wraps with
+        # HYBRID_SHARD and sync_module_states, and asserts that all weights became 0 (rank
+        # 0's values) everywhere, so states were broadcast across both group levels.
         model = MyModel().to(device_type)
         num_node_devices = torch.accelerator.device_count()
         shard_rank_lists = (
@@ -222,6 +255,8 @@ class TestFSDPHybridShard(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_invalid_pg_specification_raises(self):
+        # [FUNCTION DOC] Test: wrapping with an auto wrap policy, HYBRID_SHARD and a single
+        # process group (not a tuple) must raise ValueError saying a pair was expected.
         pol = ModuleWrapPolicy({nn.Linear})
         model = MyModel().to(device_type)
         with self.assertRaisesRegex(
@@ -239,6 +274,9 @@ class TestFSDPHybridShard(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_fsdp_hybrid_shard_basic_setup(self):
+        # [FUNCTION DOC] Test driver (2+ GPUs): runs _test_fsdp_hybrid_shard_basic_setup over
+        # the grid of both hybrid strategies, both wrapping modes, use_orig_params on/off and
+        # device mesh vs. default groups.
         """
         Tests basic functionality of HYBRID_SHARD and _HYBRID_SHARD_ZERO2:
             1. Inter and intra-node process groups are correctly setup
@@ -268,6 +306,13 @@ class TestFSDPHybridShard(FSDPTestContinuous):
         use_orig_params: bool,
         use_device_mesh: bool,
     ):
+        # [FUNCTION DOC] HELPER: Builds an HSDP model (optionally via a 1 x world_size device
+        # mesh) and checks that every hybrid-strategy FSDP module shares one intra-node group
+        # spanning the world and one single-rank inter-node group; non-hybrid modules are only
+        # allowed in the mixed mode and must use FULL_SHARD. Then runs one forward/backward
+        # with all_reduce and reduce_scatter_single counted via patches and asserts the counts
+        # equal the number of flat parameter handles (all-reduce counts only the transformer's
+        # handles in mixed mode, reduce-scatter counts all handles).
         if use_device_mesh:
             device_mesh = init_device_mesh(device_type, (1, self.world_size))
         else:
@@ -315,6 +360,8 @@ class TestFSDPHybridShard(FSDPTestContinuous):
         orig_rs = dist.reduce_scatter_single
 
         def patched_collective(orig_collective, counter, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Wrapper that increments the counter entry keyed by the
+            # original collective, then calls and returns the original with all arguments.
             counter[orig_collective] += 1
             return orig_collective(*args, **kwargs)
 
@@ -344,6 +391,8 @@ class TestFSDPHybridShard(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(4)
     def test_fsdp_hybrid_shard_parity(self):
+        # [FUNCTION DOC] Test driver (4+ GPUs): runs _test_fsdp_hybrid_shard_parity for both
+        # hybrid strategies and use_orig_params on/off.
         self.run_subtests(
             {
                 "hsdp_sharding_strategy": [
@@ -358,6 +407,10 @@ class TestFSDPHybridShard(FSDPTestContinuous):
     def _test_fsdp_hybrid_shard_parity(
         self, hsdp_sharding_strategy: ShardingStrategy, use_orig_params: bool
     ):
+        # [FUNCTION DOC] HELPER: Builds a plain FSDP model and an HSDP model (intra/inter-node
+        # groups created with shard size 2) and trains both with Adam for 5 steps on the same
+        # per-rank input, asserting the losses are equal at every step. Raises AssertionError
+        # if the HSDP model has no replication (inter-node group size is 1 or less).
         fsdp_model = self._init_fsdp_model(use_orig_params)
         global_pg = dist.distributed_c10d._get_default_group()
         hsdp_pgs = _init_intra_and_inter_node_groups(global_pg, 2)
@@ -384,6 +437,9 @@ class TestFSDPHybridShard(FSDPTestContinuous):
             self.assertEqual(losses[0], losses[1])
 
     def _init_fsdp_model(self, use_orig_params: bool) -> nn.Module:
+        # [FUNCTION DOC] HELPER: Returns a deterministic TransformerWithSharedParams wrapped
+        # recursively by FSDP (default strategy) with encoder and decoder layers as wrap
+        # units, over the default process group.
         auto_wrap_policy = ModuleWrapPolicy(
             {TransformerEncoderLayer, TransformerDecoderLayer},
         )
@@ -409,6 +465,13 @@ class TestFSDPHybridShard(FSDPTestContinuous):
         hsdp_process_groups: tuple[dist.ProcessGroup, dist.ProcessGroup] | None = None,
         hsdp_device_mesh: Optional = None,
     ):
+        # [FUNCTION DOC] HELPER: Builds a deterministic transformer test model sharded with
+        # the given hybrid strategy, using either a pair of process groups or a device mesh
+        # (at most one may be given, else AssertionError). ALL_HYBRID_SHARD wraps every
+        # encoder/decoder layer and the root hybrid; MIXED_HYBRID_FULL_SHARD wraps only the
+        # transformer submodule hybrid and the root with FULL_SHARD. Returns the wrapped model.
+        # KNOWN ISSUE: sharding_strategy_mode is annotated as str but an enum is passed; any
+        # other value would leave hsdp_model unbound.
         if not (hsdp_process_groups is None or hsdp_device_mesh is None):
             raise AssertionError(
                 "Expected hsdp_process_groups or hsdp_device_mesh to be None"
@@ -452,21 +515,34 @@ class TestFSDPHybridShard(FSDPTestContinuous):
 
 
 class TestHSDPSyncModuleStates(FSDPTestMultiThread):
+    # [CLASS DOC] Four-rank multi-threaded test case checking that HSDP sync_module_states
+    # also broadcasts buffers when only rank 0 holds real data and other ranks use meta.
     class _ModelWithBuffer(nn.Module):
+        # [CLASS DOC] HELPER: Module with a 10x10 linear layer followed by a 1d batchnorm
+        # (which carries running-stat buffers), both created on the given device.
         def __init__(self, device):
+            # [FUNCTION DOC] HELPER: Creates the linear and batchnorm layers on device.
             super().__init__()
             self.lin = nn.Linear(10, 10, device=device)
             self.bn = nn.BatchNorm1d(10, device=device)
 
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Applies the linear layer then batchnorm to x.
             return self.bn(self.lin(x))
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Property giving the number of ranks; always 4.
         return 4
 
     @skip_if_lt_x_gpu(1)
     def test_hsdp_buffer_sync_from_meta_device(self):
+        # [FUNCTION DOC] Test: on a 2 x 2 device mesh, rank 0 builds the model on the real
+        # device with batchnorm running_mean 42 and running_var 7 while other ranks use meta
+        # device. Wraps with HYBRID_SHARD, use_orig_params, sync_module_states and a
+        # param_init_fn that materializes meta modules with to_empty. Asserts every rank's
+        # buffers end up with rank 0's values (regression test for the FSDP_SYNCED flag not
+        # being reset between the inter-node and intra-node broadcasts).
         """Test that HSDP sync_module_states correctly broadcasts buffers
         when only rank 0 has real weights and other ranks use meta device.
 
@@ -493,6 +569,9 @@ class TestHSDPSyncModuleStates(FSDPTestMultiThread):
             model = self._ModelWithBuffer(device="meta")
 
         def param_init_fn(module):
+            # [FUNCTION DOC] HELPER: If the module directly owns any meta parameter or buffer,
+            # moves its own tensors (non-recursive) to uninitialized storage on the real
+            # device; otherwise does nothing.
             if any(p.is_meta for p in module.parameters(recurse=False)) or any(
                 b.is_meta for b in module.buffers(recurse=False)
             ):

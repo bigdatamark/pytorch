@@ -29,21 +29,32 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 
 class TestInput(FSDPTestContinuous):
+    # [CLASS DOC] Single-rank multi-process test case covering FSDP handling of list and
+    # dict forward inputs: training works with them, and container identity is preserved.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Property giving the number of ranks to spawn; always 1.
         return 1
 
     @skip_if_lt_x_gpu(1)
     @parametrize("input_cls", [subtest(dict, name="dict"), subtest(list, name="list")])
     def test_input_type(self, device, input_cls):
+        # [FUNCTION DOC] Test: wraps a small linear model in FSDP and trains it for 5 SGD
+        # steps where each input is either a one-element list or a dict keyed "in" holding a
+        # random tensor that requires grad. Passes if forward, backward and step succeed.
         """Test FSDP with input being a list or a dict, only single GPU."""
 
         class Model(Module):
+            # [CLASS DOC] HELPER: Module with one 4x4 linear layer whose forward accepts
+            # either a list (uses the first element) or a dict (uses the "in" entry).
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the single 4x4 linear layer.
                 super().__init__()
                 self.layer = Linear(4, 4)
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Extracts the tensor from the list or dict input and
+                # applies the layer; raises AssertionError if input is neither a list nor dict.
                 if isinstance(input, list):
                     input = input[0]
                 else:
@@ -75,16 +86,26 @@ class TestInput(FSDPTestContinuous):
     @skip_if_lt_x_gpu(1)
     @parametrize("input_cls", [subtest(dict, name="dict"), subtest(list, name="list")])
     def test_input_identity_preserved(self, device, input_cls):
+        # [FUNCTION DOC] Test: runs one FSDP forward with a list or dict input on a model
+        # that mutates its input (appends a tensor to the list, or adds an "added" key to the
+        # dict). Asserts the caller's own container shows the mutation, i.e. FSDP did not
+        # copy the container.
         """
         Test that FSDP preserves object identity for container inputs.
         """
 
         class MutatingModel(Module):
+            # [CLASS DOC] HELPER: Module with one 4x4 linear layer whose forward mutates its
+            # list or dict input in place by adding a random tensor before using entry 0 or "in".
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the single 4x4 linear layer.
                 super().__init__()
                 self.layer = Linear(4, 4)
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Appends (list) or inserts under "added" (dict) a
+                # random 4x4 tensor on the input's device, then applies the layer to the first
+                # element or the "in" entry. Side effect: mutates the caller's container.
                 if isinstance(input, list):
                     input.append(torch.randn(4, 4, device=input[0].device))
                     x = input[0]

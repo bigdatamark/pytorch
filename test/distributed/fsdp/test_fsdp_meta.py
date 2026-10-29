@@ -46,6 +46,9 @@ device_type = acc.type if (acc := torch.accelerator.current_accelerator()) else 
 
 
 def _reset_params_if_meta(is_meta: bool, model: nn.Module):
+    # [FUNCTION DOC] HELPER: When is_meta is true, calls reset_parameters on every submodule
+    # (including the model) that defines it, in place, so a regularly initialized model gets
+    # the same deterministic values a meta-initialized one would. Does nothing otherwise.
     # For torchdistX init, we don't need to call reset_params, as
     # deferred_init(model).materialize() is equivalent to model().
     if is_meta:
@@ -57,14 +60,20 @@ def _reset_params_if_meta(is_meta: bool, model: nn.Module):
 
 
 class MyLinear(nn.Linear):
+    # [CLASS DOC] HELPER: Linear layer whose reset_parameters is deterministic: it reseeds
+    # the RNG and re-initializes only the weight with a shape-dependent xavier init (bias is
+    # left untouched; tests use bias-free layers).
     """
     Linear layer with deterministic reset_parameters for testing.
     """
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Passes all arguments through to the linear layer constructor.
         super().__init__(*args, **kwargs)
 
     def reset_parameters(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Seeds the global RNG with 42 and re-initializes the weight with
+        # xavier uniform (gain 1.0) without tracking gradients. Arguments are ignored.
         torch.manual_seed(42)
         with torch.no_grad():
             # Use an initialization method that depends on shape
@@ -72,29 +81,43 @@ class MyLinear(nn.Linear):
 
 
 class MyBuffer(nn.Module):
+    # [CLASS DOC] HELPER: Module holding only a 3x3 buffer (no parameters) whose
+    # reset_parameters deterministically fills the buffer.
     def __init__(self, device: torch.device):
+        # [FUNCTION DOC] HELPER: Registers an uninitialized 3x3 buffer on the given device.
         super().__init__()
         self.buf = torch.nn.Buffer(torch.empty((3, 3), device=device))
 
     def reset_parameters(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Seeds the global RNG with 42 and fills the buffer with xavier
+        # uniform values (gain 0.5). Arguments are ignored.
         torch.manual_seed(42)
         # Use an initialization method that depends on shape
         torch.nn.init.xavier_uniform_(self.buf, 0.5)
 
 
 class MyModel(nn.Module):
+    # [CLASS DOC] HELPER: Two bias-free 2x2 MyLinear layers (lin1, lin2) plus a MyBuffer
+    # module (buf_mod) that only contributes a buffer; forward applies lin1 then lin2.
     def __init__(self, device: torch.device):
+        # [FUNCTION DOC] HELPER: Creates lin1, lin2 and buf_mod on the given device.
         super().__init__()
         self.lin1 = MyLinear(2, 2, bias=False, device=device)
         self.lin2 = MyLinear(2, 2, bias=False, device=device)
         self.buf_mod = MyBuffer(device)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies lin1 then lin2 to x (the buffer module is unused).
         return self.lin2(self.lin1(x))
 
 
 class NestedModel(nn.Module):
+    # [CLASS DOC] HELPER: Model with lin1 and a MyModel (l3) wrapped via the wrap() helper
+    # (which wraps with FSDP only inside an enable_wrap context), plus an unwrapped lin2.
+    # Forward is lin1, lin2, then l3.
     def __init__(self, device):
+        # [FUNCTION DOC] HELPER: Creates lin1 and l3 (each passed through wrap, a no-op outside
+        # enable_wrap) and a plain lin2, all on the given device.
         super().__init__()
         self.lin1 = MyLinear(2, 2, bias=False, device=device)
         self.lin1 = wrap(self.lin1)
@@ -103,10 +126,15 @@ class NestedModel(nn.Module):
         self.l3 = wrap(self.l3)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies lin1, lin2 and l3 in order to x.
         return self.l3(self.lin2(self.lin1(x)))
 
 
 def _init_with_reset_params(module: nn.Module):
+    # [FUNCTION DOC] HELPER: FSDP param_init_fn. If the module directly owns a meta parameter
+    # or buffer, allocates uninitialized storage for it on the current accelerator device
+    # (non-recursive) and calls its reset_parameters; otherwise does nothing. Raises
+    # AttributeError if such a module lacks reset_parameters.
     """
     to_empty + reset_parameters() init function example for modules
     initialized with device="meta"
@@ -124,6 +152,9 @@ def _init_with_reset_params(module: nn.Module):
 
 
 def _init_with_torchdistX(module: nn.Module):
+    # [FUNCTION DOC] HELPER: FSDP param_init_fn using torchdistx. Materializes the module's
+    # deferred-init tensors, skipping nested FSDP instances. Raises AssertionError if
+    # torchdistx could not be imported.
     """
     torchdistX-based deferred module initialization function example
     using ``materialize_module``.
@@ -132,21 +163,31 @@ def _init_with_torchdistX(module: nn.Module):
         raise AssertionError("Expected _TORCHDISTX_AVAIL to be True")
 
     def check_fn(k):
+        # [FUNCTION DOC] HELPER: Predicate for materialize_module: true for modules that are
+        # not FSDP instances.
         return not isinstance(k, FSDP)
 
     deferred_init.materialize_module(module, check_fn=check_fn)
 
 
 class TestFSDPWithMetaDevice(FSDPTestContinuous):
+    # [CLASS DOC] Two-rank multi-process test case for FSDP with meta-device and deferred
+    # initialization. Shared logic lives in _test_simple_model_with_meta_device,
+    # _test_nested_model_with_meta_device and _test_bad_arg; the public tests plug in
+    # different model factories and init functions.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Property giving the number of ranks; always 2.
         return 2
 
     @property
     def process_group(self):
+        # [FUNCTION DOC] HELPER: Property returning the default (world) process group.
         return dist.distributed_c10d._get_default_group()
 
     def _compare_fsdp(self, fsdp1, fsdp2):
+        # [FUNCTION DOC] HELPER: Summons full parameters of both FSDP models and asserts every
+        # pair of corresponding parameters is numerically close (allclose).
         with FSDP.summon_full_params(fsdp1):
             with FSDP.summon_full_params(fsdp2):
                 for p1, p2 in zip(fsdp1.parameters(), fsdp2.parameters()):
@@ -155,6 +196,11 @@ class TestFSDPWithMetaDevice(FSDPTestContinuous):
                     )
 
     def _test_simple_model_with_meta_device(self, meta_module_fn, init_fn=None):
+        # [FUNCTION DOC] HELPER: Builds the model with meta_module_fn and wraps it in FSDP
+        # (always-wrap policy, then again as a single unit) with param_init_fn=init_fn.
+        # Builds a regular on-device MyModel (reset if the meta model was meta) wrapped the
+        # same way, asserts parameters match, runs forward, backward and an SGD step on both
+        # with a random input and asserts parameters still match.
         # Create model on meta device and wrap with FSDP.
         model = meta_module_fn()
         is_meta = next(model.parameters()).is_meta
@@ -200,7 +246,10 @@ class TestFSDPWithMetaDevice(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_simple_model_with_meta_device_reset_params(self):
+        # [FUNCTION DOC] Test (2 GPUs): simple model created on the meta device, initialized by
+        # to_empty plus reset_parameters through param_init_fn.
         def meta_module_fn():
+            # [FUNCTION DOC] HELPER: Returns a MyModel on the meta device.
             return MyModel(device="meta")
 
         self._test_simple_model_with_meta_device(
@@ -209,7 +258,10 @@ class TestFSDPWithMetaDevice(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_simple_model_with_meta_device_default_init(self):
+        # [FUNCTION DOC] Test (2 GPUs): simple meta-device model with no param_init_fn, relying
+        # on FSDP's default materialization.
         def meta_module_fn():
+            # [FUNCTION DOC] HELPER: Returns a MyModel on the meta device.
             return MyModel(device="meta")
 
         self._test_simple_model_with_meta_device(meta_module_fn)
@@ -220,7 +272,10 @@ class TestFSDPWithMetaDevice(FSDPTestContinuous):
         "Test requires torchdistX: https://github.com/pytorch/torchdistX",
     )
     def test_simple_model_with_torchdistX_default_init(self):
+        # [FUNCTION DOC] Test (2 GPUs, needs torchdistx): simple model built with deferred_init
+        # and no param_init_fn.
         def meta_module_fn():
+            # [FUNCTION DOC] HELPER: Returns a deferred-init MyModel for the current device type.
             return deferred_init.deferred_init(MyModel, device=device_type)
 
         self._test_simple_model_with_meta_device(meta_module_fn)
@@ -231,7 +286,10 @@ class TestFSDPWithMetaDevice(FSDPTestContinuous):
         "Test requires torchdistX: https://github.com/pytorch/torchdistX",
     )
     def test_simple_model_with_torchdistX_init_fn(self):
+        # [FUNCTION DOC] Test (2 GPUs, needs torchdistx): deferred-init simple model
+        # materialized by the torchdistx-based param_init_fn.
         def meta_module_fn():
+            # [FUNCTION DOC] HELPER: Returns a deferred-init MyModel for the current device type.
             return deferred_init.deferred_init(MyModel, device=device_type)
 
         self._test_simple_model_with_meta_device(
@@ -241,6 +299,11 @@ class TestFSDPWithMetaDevice(FSDPTestContinuous):
     def _test_nested_model_with_meta_device(
         self, auto_wrap, meta_module_fn, init_fn=None
     ):
+        # [FUNCTION DOC] HELPER: Builds a NestedModel with meta_module_fn and wraps it either
+        # with an always-wrap policy (auto_wrap) or with the wrap() helper inside an enable_wrap
+        # context using init_fn. Builds a regular on-device NestedModel (reset if the first was
+        # meta), wraps it comparably, asserts parameters match, runs forward, backward and SGD
+        # step on both, and asserts they still match.
         if auto_wrap:
             module = meta_module_fn()
             is_meta = (
@@ -293,7 +356,10 @@ class TestFSDPWithMetaDevice(FSDPTestContinuous):
     @skip_if_lt_x_gpu(2)
     @parametrize("auto_wrap", [True, False])
     def test_nested_model_with_meta_device_reset_params(self, auto_wrap):
+        # [FUNCTION DOC] Test (2 GPUs): nested meta-device model initialized with the
+        # reset_parameters-based param_init_fn, with auto wrap on and off.
         def meta_module_fn():
+            # [FUNCTION DOC] HELPER: Returns a NestedModel on the meta device.
             return NestedModel(device="meta")
 
         self._test_nested_model_with_meta_device(
@@ -305,7 +371,10 @@ class TestFSDPWithMetaDevice(FSDPTestContinuous):
     @skip_if_lt_x_gpu(2)
     @parametrize("auto_wrap", [True, False])
     def test_nested_model_with_meta_device_default_init(self, auto_wrap):
+        # [FUNCTION DOC] Test (2 GPUs): nested meta-device model with no param_init_fn, with
+        # auto wrap on and off.
         def meta_module_fn():
+            # [FUNCTION DOC] HELPER: Returns a NestedModel on the meta device.
             return NestedModel(device="meta")
 
         self._test_nested_model_with_meta_device(
@@ -320,7 +389,10 @@ class TestFSDPWithMetaDevice(FSDPTestContinuous):
     )
     @parametrize("auto_wrap", [True, False])
     def test_nested_model_with_torchdistX_default_init(self, auto_wrap):
+        # [FUNCTION DOC] Test (2 GPUs, needs torchdistx): nested deferred-init model with no
+        # param_init_fn, with auto wrap on and off.
         def meta_module_fn():
+            # [FUNCTION DOC] HELPER: Returns a deferred-init NestedModel for the device type.
             return deferred_init.deferred_init(NestedModel, device=device_type)
 
         self._test_nested_model_with_meta_device(
@@ -334,7 +406,10 @@ class TestFSDPWithMetaDevice(FSDPTestContinuous):
     )
     @parametrize("auto_wrap", [True, False])
     def test_nested_model_with_torchdistX_init_fn(self, auto_wrap):
+        # [FUNCTION DOC] Test (2 GPUs, needs torchdistx): nested deferred-init model materialized
+        # by the torchdistx-based param_init_fn, with auto wrap on and off.
         def meta_module_fn():
+            # [FUNCTION DOC] HELPER: Returns a deferred-init NestedModel for the device type.
             return deferred_init.deferred_init(NestedModel, device=device_type)
 
         self._test_nested_model_with_meta_device(
@@ -344,6 +419,9 @@ class TestFSDPWithMetaDevice(FSDPTestContinuous):
         )
 
     def _test_bad_arg(self, meta_module_fn):
+        # [FUNCTION DOC] HELPER: Builds a module via meta_module_fn and asserts that wrapping
+        # it with a non-callable param_init_fn (the integer 42) raises ValueError mentioning
+        # that it has to be callable.
         mod = meta_module_fn()
         with self.assertRaisesRegex(ValueError, "to be callable"):
             FSDP(mod, param_init_fn=42)
@@ -354,54 +432,76 @@ class TestFSDPWithMetaDevice(FSDPTestContinuous):
         "Test requires torchdistX: https://github.com/pytorch/torchdistX",
     )
     def test_bad_arg_torchdistx(self):
+        # [FUNCTION DOC] Test (2 GPUs, needs torchdistx): bad param_init_fn check on a
+        # deferred-init nested model.
         def meta_module_fn():
+            # [FUNCTION DOC] HELPER: Returns a deferred-init NestedModel for the device type.
             return deferred_init.deferred_init(NestedModel, device_type)
 
         self._test_bad_arg(meta_module_fn)
 
     @skip_if_lt_x_gpu(2)
     def test_bad_arg_meta(self):
+        # [FUNCTION DOC] Test (2 GPUs): bad param_init_fn check on a meta-device nested model.
         def meta_module_fn():
+            # [FUNCTION DOC] HELPER: Returns a NestedModel on the meta device.
             return NestedModel(device="meta")
 
         self._test_bad_arg(meta_module_fn)
 
     @skip_if_lt_x_gpu(2)
     def test_meta_device_with_mixed_precision(self):
+        # [FUNCTION DOC] Test (2 GPUs): wraps a meta-device model whose linear layers are
+        # individually wrapped, with MixedPrecision (param float32, reduce float16), a
+        # param_init_fn that materializes and initializes modules, and an explicit device id.
+        # Passes if construction raises no error.
         """
         Tests meta device initialization with a ``param_init_fn`` when
         specifying mixed precision with ``param_dtype=torch.float32``.
         """
 
         class FakeLinear(nn.Module):
+            # [CLASS DOC] HELPER: Module with only a random in_dim by out_dim weight
+            # parameter; forward is a matrix product (a linear layer that is not nn.Linear).
             def __init__(
                 self, in_dim: int, out_dim: int, device: torch.device | str
             ) -> None:
+                # [FUNCTION DOC] HELPER: Creates the random weight on the given device.
                 super().__init__()
                 self.weight = nn.Parameter(
                     torch.randn((in_dim, out_dim), device=device)
                 )
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Returns the matrix product of x and the weight.
                 return x @ self.weight
 
         class Model(nn.Module):
+            # [CLASS DOC] HELPER: Meta-device model of an nn.Linear (5 to 5), a relu and a
+            # FakeLinear (5 to 5); also provides a per-module init function.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates lin1, lin2 and relu; both layers on meta.
                 super().__init__()
                 self.lin1 = nn.Linear(5, 5, device="meta")
                 self.lin2 = FakeLinear(5, 5, device="meta")
                 self.relu = nn.ReLU()
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Applies lin1, relu, then lin2 to x.
                 return self.lin2(self.relu(self.lin1(x)))
 
             def _module_init_fn(self, module: nn.Module):
+                # [FUNCTION DOC] HELPER: For nn.Linear modules only, fills the weight with
+                # normal values (mean 0, std 0.1) and zeroes the bias if present.
                 if isinstance(module, nn.Linear):
                     torch.nn.init.normal_(module.weight, mean=0.0, std=0.1)
                     if module.bias is not None:
                         torch.nn.init.zeros_(module.bias)
 
         def _param_init_fn(module: nn.Module) -> None:
+            # [FUNCTION DOC] HELPER: Moves the module's tensors (recursively) to uninitialized
+            # storage on the accelerator device, then applies the model's per-module init.
+            # KNOWN ISSUE: to_empty is not generally correct for meta init (see issue 90465).
             # TODO: `module.to_empty()` is not generally correct for meta
             # device initialization.
             # https://github.com/pytorch/pytorch/issues/90465

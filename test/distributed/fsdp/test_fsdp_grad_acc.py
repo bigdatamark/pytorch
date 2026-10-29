@@ -42,6 +42,9 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 @dataclass
 class _GradAccConfig:
+    # [CLASS DOC] HELPER: Dataclass describing one segment of a gradient accumulation schedule:
+    # a count of consecutive iterations (num_iters) and whether they run inside no_sync()
+    # (use_no_sync). Its repr has no spaces so the generated test names parse cleanly.
     """
     This configures how gradients are accumulated in :meth:`_test_grad_acc`.
     Each instance of this class represents ``num_iters``-many consecutive
@@ -58,6 +61,8 @@ class _GradAccConfig:
     num_iters: int
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns a space-free string of the form (use_no_sync=..,
+        # num_iters=..) with the two fields, used in parametrized test names.
         # Override to remove any spaces in the string to appease the internal
         # build's test name parser
         return f"(use_no_sync={self.use_no_sync},num_iters={self.num_iters})"
@@ -65,6 +70,8 @@ class _GradAccConfig:
 
 @dataclass
 class _GradAccConfigs:
+    # [CLASS DOC] HELPER: Dataclass wrapping a list of _GradAccConfig segments so that the
+    # whole schedule can be passed to parametrize with a space-free repr in test names.
     """
     This wraps a :class:`list` of :class:`_GradAccConfig` instances with the
     sole purpose of overriding :meth:`__repr__` to remove spaces.
@@ -73,17 +80,24 @@ class _GradAccConfigs:
     configs: list[_GradAccConfig]
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns the reprs of all wrapped configs joined by commas
+        # inside square brackets, without spaces.
         # Override to remove any spaces in the string to appease the internal
         # build's test name parser
         return "[" + ",".join(config.__repr__() for config in self.configs) + "]"
 
 
 class TestGradAcc(FSDPTestContinuous):
+    # [CLASS DOC] Two-rank multi-process test case that checks FSDP gradient accumulation
+    # correctness (with and without no_sync, with and without CPU offload) against a
+    # concatenated-batch reference. Key methods: _test_grad_acc (the core check),
+    # _get_subtest_config (prefetch and sharding grid), and the two test_ entry points.
     """Tests ``FullyShardedDataParallel``'s gradient accumulation via both its
     ``no_sync()`` context manager and without the context manager."""
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Property giving the number of ranks to spawn; always 2.
         return 2
 
     def _test_grad_acc(
@@ -95,6 +109,16 @@ class TestGradAcc(FSDPTestContinuous):
         sharding_strategy: ShardingStrategy,
         use_orig_params: bool,
     ):
+        # [FUNCTION DOC] HELPER: Core check. Builds a recursively wrapped
+        # TransformerWithSharedParams FSDP model on CUDA with the given offload, prefetch,
+        # sharding and use_orig_params settings, and creates distinct permuted copies of one
+        # input batch (one per accumulation iteration). Reference gradients come from a
+        # single backward over the batches concatenated along batch_dim. Accumulated
+        # gradients come from running each batch separately, inside no_sync() for the
+        # segments of configs that request it; the final iteration always syncs. Asserts
+        # the summed loss and every gradient (device, size, dtype, values) match, then runs
+        # an SGD step. Raises AssertionError if generated batches are not distinct.
+        # Side effect: zeroes and overwrites gradients of the model.
         """
         Tests gradient accumulation by comparing a run that trains sequentially
         through some batches while accumulating gradients with a run that
@@ -143,6 +167,8 @@ class TestGradAcc(FSDPTestContinuous):
         # Generate the sequence of batches, each containing the same data
         # but permuted
         def permute_tensor(x: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Returns a tensor of the same shape as x whose elements
+            # are a random permutation of all of x's elements (flattened, shuffled, reshaped).
             return x.view(-1)[torch.randperm(x.numel())].view_as(x)
 
         batch: tuple[torch.Tensor, ...] = fsdp_model.module.get_input(device)
@@ -215,6 +241,9 @@ class TestGradAcc(FSDPTestContinuous):
         optim.step()
 
     def _get_subtest_config(self) -> dict[str, list[Any]]:
+        # [FUNCTION DOC] HELPER: Returns a mapping for run_subtests with backward_prefetch
+        # values (none, BACKWARD_PRE, BACKWARD_POST) and sharding_strategy values
+        # (FULL_SHARD, SHARD_GRAD_OP, NO_SHARD).
         """Returns a subtest configuration that subtests prefetching."""
         return {
             "backward_prefetch": [
@@ -255,6 +284,9 @@ class TestGradAcc(FSDPTestContinuous):
         configs: _GradAccConfigs,
         use_orig_params: bool,
     ):
+        # [FUNCTION DOC] Test (needs 2 GPUs): for two interleavings of no_sync and plain
+        # segments (3 iterations each) and use_orig_params on or off, runs the accumulation
+        # check over all prefetch and sharding combinations with CPU offload disabled.
         """
         Tests gradient accumulation without parameter CPU offloading.
 
@@ -280,6 +312,9 @@ class TestGradAcc(FSDPTestContinuous):
         self,
         use_orig_params: bool,
     ):
+        # [FUNCTION DOC] Test (needs 2 GPUs): runs the accumulation check using only a
+        # no_sync segment of 3 iterations, with parameter CPU offload enabled, over all
+        # prefetch and sharding combinations, for use_orig_params on or off.
         """
         Tests gradient accumulation with parameter CPU offloading.
 
