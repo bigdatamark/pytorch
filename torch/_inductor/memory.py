@@ -1,3 +1,7 @@
+# [MODULE DOC] Memory estimation and memory-aware reordering of Inductor scheduler nodes.
+# Defines data classes holding per-buffer / per-node memory planning info, functions that compute buffer sizes
+# and lifetimes, estimate peak memory for a node order, and (below) schedule-ordering algorithms (topological,
+# min-memory DFS, reorder-for-peak-memory) that try to lower peak memory. Import-time side effect: creates a module logger.
 from __future__ import annotations
 
 import collections
@@ -31,6 +35,7 @@ torch_log = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class PeakMemoryResult:
+    # [CLASS DOC] Result of a peak-memory ordering attempt: the node order, its estimated peak memory in bytes, and the name of the method that produced it.
     order: list[BaseSchedulerNode]
     peak_memory: int
     method: str
@@ -38,6 +43,9 @@ class PeakMemoryResult:
 
 @dataclasses.dataclass
 class MemoryPlanningInfoForBuffer:
+    # [CLASS DOC] Memory planning info for one buffer: bytes allocated at creation (size_alloc), bytes freed at deletion (size_free),
+    # successor nodes that determine lifetime (succ_nodes, excludes fake weak deps) and successor nodes used for ordering
+    # (succ_nodes_for_ordering, includes them). Invariant: succ_nodes is a subset in size of succ_nodes_for_ordering.
     size_alloc: int = 0
     size_free: int = 0
     # succ_nodes used for buffer lifetime/freeing (excludes is_fake WeakDeps)
@@ -50,6 +58,7 @@ class MemoryPlanningInfoForBuffer:
     )
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Validate (via torch._check) that succ_nodes is not larger than succ_nodes_for_ordering; raises an error otherwise.
         torch._check(
             len(self.succ_nodes) <= len(self.succ_nodes_for_ordering),
             lambda: f"succ_nodes must be a subset of succ_nodes_for_ordering. "
@@ -59,6 +68,8 @@ class MemoryPlanningInfoForBuffer:
 
 @dataclasses.dataclass
 class MemoryPlanningInfoForNode:
+    # [CLASS DOC] Memory planning info for one scheduler node: its schedule index, bytes it allocates (size), the buffers it reads
+    # (pred_buffers), predecessor nodes and successor nodes.
     index: int = 0
     size: int = 0
     pred_buffers: OrderedSet[SchedulerBuffer | FreeableInputBuffer] = dataclasses.field(
@@ -74,15 +85,18 @@ class MemoryPlanningInfoForNode:
 
 @dataclasses.dataclass
 class FreeableInputBuffer:
+    # [CLASS DOC] A graph-input buffer that can be freed after its last use; holds its name and its MemoryPlanningInfoForBuffer (mpi_buffer). Hashable by name.
     name: str
     mpi_buffer: MemoryPlanningInfoForBuffer = dataclasses.field(
         default_factory=MemoryPlanningInfoForBuffer
     )
 
     def get_name(self) -> str:
+        # [FUNCTION DOC] Return the buffer name.
         return self.name
 
     def __hash__(self) -> int:
+        # [FUNCTION DOC] Hash by buffer name.
         return hash(self.name)
 
 
@@ -90,6 +104,9 @@ def get_freeable_input_buf(
     nodes: list[BaseSchedulerNode],
     graph_inputs: OrderedSet[str],
 ) -> dict[str, FreeableInputBuffer]:
+    # [FUNCTION DOC] Scan nodes' reads for graph inputs that are freeable (not in the non-freeable set) and build a FreeableInputBuffer per
+    # name, recording its size hint and successor nodes (for lifetime, skipping fake weak deps; and for ordering, all deps).
+    # Returns a mapping from buffer name to FreeableInputBuffer.
     """
     Create and keep track of all input buffers that can be freed during the program
 
@@ -98,6 +115,7 @@ def get_freeable_input_buf(
     """
 
     def _dep_size_hint(dep: Dep) -> int:
+    # [FUNCTION DOC] HELPER: Return the size hint (bytes) of a dependency from the graph.
         return V.graph.get_dep_size_hint(dep)
 
     # get freeable input buffers' successor nodes for memory lifetime (excludes is_fake WeakDeps)
@@ -138,6 +156,9 @@ def get_freeable_input_buf(
 def compute_size_for_scheduler_buffer(
     name_to_buf: dict[str, SchedulerBuffer],
 ) -> dict[str, tuple[int, int]]:
+    # [FUNCTION DOC] Compute (size_alloc, size_free) in bytes for every scheduler buffer. Mutated-name and NoneLayout buffers cost zero;
+    # a MultiOutputLayout buffer allocates the sum of its MultiOutput users' sizes while those users allocate zero and free their own
+    # size; other buffers allocate and free numel times dtype size. Returns a mapping from buffer name to the tuple.
     """
     Compute the size of each scheduler buffer, including (1) memory allocated when
     it is created and (2) memory deallocated when it is freed.
@@ -185,6 +206,8 @@ def compute_size_for_scheduler_buffer(
     def _compute_and_update_buf_size(
         sched_buf: SchedulerBuffer, user_of_MultiOutputLayout: bool = False
     ) -> int:
+        # [FUNCTION DOC] HELPER: Recursively compute and record one buffer's (alloc, free) sizes in the enclosing mapping and return
+        # the size it accounts for. user_of_MultiOutputLayout makes the buffer allocate zero since its parent allocated it.
         if sched_buf.get_name() in V.graph.scheduler.mutation_real_name:
             sched_buf_to_size[sched_buf.get_name()] = (0, 0)
             return 0
@@ -227,6 +250,9 @@ def assign_memory_planning_info_for_scheduler_buffers(
     nodes: list[BaseSchedulerNode],
     name_to_buf: dict[str, SchedulerBuffer],
 ) -> None:
+    # [FUNCTION DOC] Fill the mpi_buffer attribute of each scheduler buffer: sizes plus successor nodes derived from nodes' unmet dependencies.
+    # Successors of in-place-mutated names are merged into the original real buffer (processed in reverse so merges are transitive).
+    # Mutates the buffers; returns None.
     """
     For each SchedulerBuffer, assign its size info and successor nodes.
     A buffer's successor nodes determines when a buffer can be freed.
@@ -278,6 +304,8 @@ def assign_memory_planning_info_for_scheduler_nodes(
     name_to_buf: dict[str, SchedulerBuffer],
     name_to_freeable_input_buf: dict[str, FreeableInputBuffer],
 ) -> None:
+    # [FUNCTION DOC] Fill the mpi_node attribute of each node: its index, allocated size, predecessor/successor nodes (derived from output buffers'
+    # successor sets, with self links removed) and predecessor buffers (including freeable input buffers). Mutates nodes; returns None.
     """
     Assign to each scheduler node its predecessor and successor nodes.
     """
@@ -336,6 +364,7 @@ def assign_memory_planning_info_for_scheduler_nodes(
 # map each scheduler buffer to its size, start step, and end step
 @dataclasses.dataclass
 class BufferInfo:
+    # [CLASS DOC] Lifetime record of one buffer: alloc and free sizes and start step and end step in the schedule (end_step is -1 for graph outputs, which are never freed).
     buffer: SchedulerBuffer | FreeableInputBuffer
     size_alloc: int
     size_free: int
@@ -352,6 +381,9 @@ def compute_memory_timeline(
     dict[BaseSchedulerNode, int],
     dict[FreeableInputBuffer | SchedulerBuffer, BaseSchedulerNode],
 ]:
+    # [FUNCTION DOC] Compute a BufferInfo for every freeable input buffer (live from step 0) and every scheduler buffer (live from its defining step) with
+    # end step as the last successor step (the defining step if unused, -1 for graph outputs). Returns the list of BufferInfo, a mapping from node to step, and a
+    # mapping from buffer to the node of its last use. Raises AssertionError if expected last-use nodes are missing.
     """
     Compute buffer allocation and deallocation sizes and map their
     lifetime to the node schedule
@@ -372,6 +404,7 @@ def compute_memory_timeline(
     def _get_end_step_and_snode(
         buf: FreeableInputBuffer | SchedulerBuffer,
     ) -> tuple[int, BaseSchedulerNode | None]:
+        # [FUNCTION DOC] HELPER: Return the largest step among a buffer's successor nodes and that node, or (-1, None) if it has no successors.
         max_step: int = -1
         max_step_snode: BaseSchedulerNode | None = None
         succ_nodes = buf.mpi_buffer.succ_nodes
@@ -438,6 +471,8 @@ def compute_memory_timeline(
 def peak_memory_from_buf_info_list(
     buf_info_list: list[BufferInfo], num_steps: int
 ) -> tuple[int, list[int]]:
+    # [FUNCTION DOC] From buffer lifetimes build per-step allocation deltas (frees are skipped for end_step -1), then accumulate. Returns the peak
+    # memory and the list of live memory after each step (length num_steps plus one).
     """Compute peak and per-step live memory from buffer lifetimes.
 
     Skip the free for graph-output buffers (`end_step == -1`); otherwise
@@ -463,6 +498,8 @@ def peak_memory_from_buf_info_list(
 def live_memory_before_steps_from_buf_info_list(
     buf_info_list: list[BufferInfo], num_steps: int
 ) -> list[int]:
+    # [FUNCTION DOC] Return live bytes before each step runs: freeable inputs count from the start, other buffers become live the step after their start step,
+    # and frees apply after the end step. Result has num_steps plus one entries.
     """Compute live bytes before each scheduler step runs."""
     delta = [0] * (num_steps + 1)
     cur_memory = 0
@@ -488,6 +525,7 @@ def estimate_peak_memory(
     name_to_freeable_input_buf: dict[str, FreeableInputBuffer],
     graph_outputs: OrderedSet[str],
 ) -> tuple[int, list[int]]:
+    # [FUNCTION DOC] Estimate peak memory of nodes in the given execution order using buffer lifetimes. Returns (peak memory, memory per step).
     """
     Given a list of nodes in their execution order, estimate the peak memory, by
     keeping track of the liveliness of SchedulerBuffers and FreeableInputBuffers.
@@ -511,6 +549,9 @@ def estimate_region_peak_memory(
     graph_outputs: OrderedSet[str],
     cur_memory: int = 0,
 ) -> int:
+    # [FUNCTION DOC] Estimate the peak memory within a window of the schedule for a hypothetical order. For each node (step from step_of) add its outputs' alloc
+    # and free outputs with no successors, and free pred buffers whose last consumer is this node (graph outputs are never freed); then scan from cur_memory (live bytes at the
+    # window start), allocating before freeing. Raises AssertionError if a node's step is outside the region or a pred buffer has no successors. Returns the peak.
     """Peak memory inside `[region_start, region_end]` for the
     hypothetical post-reorder schedule.
 
@@ -562,6 +603,7 @@ def estimate_region_peak_memory(
 
 @dataclasses.dataclass
 class SNodeMemory:
+    # [CLASS DOC] Bytes allocated and bytes freed at one scheduler step.
     size_alloc: int
     size_free: int
 
@@ -576,6 +618,8 @@ def estimate_peak_memory_allocfree(
     dict[BaseSchedulerNode, SNodeMemory],
     dict[FreeableInputBuffer | SchedulerBuffer, BaseSchedulerNode],
 ]:
+    # [FUNCTION DOC] Variant of estimate_peak_memory that tracks alloc and free separately per node (peak is after alloc, before free).
+    # Returns peak memory, per-step (post-alloc, post-free) memory, mapping from node to SNodeMemory, and mapping from buffer to the node of its last use.
     """
     Alternative version of estimate_peak_memory, that respects the fact,
     that every SchedulerNode has multiple phases:
@@ -633,6 +677,11 @@ def topological_sort_lpmf(
     name_to_buf: dict[str, SchedulerBuffer],
     graph_outputs: OrderedSet[str],
 ) -> list[BaseSchedulerNode]:
+    # [FUNCTION DOC] Greedy "least peak memory first" topological sort. Tracks per-node unmet predecessors and per-buffer remaining users, keeps
+    # live and max memory, and at each step picks among ready nodes: if config.size_threshold_for_succ_based_strategy is positive and all ready nodes
+    # are larger than it, the node whose earliest successor comes first; otherwise the node minimizing (size if above the memory gap else 0, net
+    # memory growth, original index). Updates memory-to-free as buffers approach their last use. Raises AssertionError on inconsistent degrees.
+    # Returns the new node order. KNOWN ISSUE: the final check that iterations exceed the node count can never be true because the loop is bounded.
     """
     A bfs-based greedy topological order. LPMF stands for "Least Peak Memory First".
 
@@ -654,10 +703,12 @@ def topological_sort_lpmf(
     """
 
     class NodeInfo(TypedDict):
+        # [CLASS DOC] HELPER: TypedDict of scheduling state per node: remaining unmet predecessor count (indegree) and bytes freed when the node runs.
         indegree: int
         memory_to_free: int
 
     class BufferInfo(TypedDict):
+        # [CLASS DOC] HELPER: TypedDict of per-buffer state: number of remaining users (outdegree). Shadows the module-level BufferInfo dataclass inside this function.
         outdegree: int
 
     node_info: dict[BaseSchedulerNode, NodeInfo] = dict()
@@ -777,6 +828,8 @@ def topological_sort_lpmf(
 
 
 def topological_sort_bfs(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+    # [FUNCTION DOC] FIFO-style BFS topological sort: among ready nodes, a heap picks the one whose predecessors executed earliest (sorted list of
+    # predecessor execution orders, ties by original index). Returns the new order. Raises AssertionError on inconsistent indegree and RuntimeError if the loop overruns.
     """
     A BFS topological sort that selects nodes whose dependencies are executed the
     earliest. This follows a FIFO idea. Specifically, at every iteration, for each node
@@ -787,6 +840,7 @@ def topological_sort_bfs(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNo
     """
 
     class NodeInfo(TypedDict):
+        # [CLASS DOC] HELPER: TypedDict of per-node state: remaining unmet predecessors (indegree) and its position in the new schedule (order, -1 until scheduled).
         indegree: int
         order: int
 
@@ -794,15 +848,18 @@ def topological_sort_bfs(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNo
 
     @dataclasses.dataclass
     class NodeWithPriority:
+        # [CLASS DOC] HELPER: Heap entry pairing a node with its priority list; ordering compares priority lists, breaking ties by the node's original schedule index.
         priority: list[int]
         node: BaseSchedulerNode
 
         def __lt__(self, other: NodeWithPriority) -> bool:
+            # [FUNCTION DOC] HELPER: Less-than for heap ordering: compare priority lists, falling back to original index when equal.
             if self.priority == other.priority:
                 return self.node.mpi_node.index < other.node.mpi_node.index
             return self.priority < other.priority
 
     def _node_priority(node: BaseSchedulerNode) -> list[int]:
+        # [FUNCTION DOC] HELPER: Return the sorted unique execution orders of a ready node's predecessors. Raises AssertionError if the node still has unmet predecessors.
         # priority is the order in which predecessor nodes are executed
         if node_info[node]["indegree"] != 0:
             raise AssertionError(
@@ -855,6 +912,8 @@ def topological_sort_bfs(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNo
 
 
 def topological_sort_dfs(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+    # [FUNCTION DOC] DFS topological sort that visits nodes in ascending priority (own size plus sizes of buffers read) and recursively emits each node's
+    # dependencies (also ordered by that priority) before the node. Returns the new order.
     """
     This is a DFS topological sort. The setup is similar to `topological_sort_schedule`
     in scheduler.py. The difference is the order nodes are visited in the outer loop.
@@ -869,6 +928,7 @@ def topological_sort_dfs(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNo
     size_with_reads: dict[BaseSchedulerNode, int] = dict()
 
     def visit(n: BaseSchedulerNode) -> None:
+        # [FUNCTION DOC] HELPER: Depth-first visit; marks n seen, visits its unmet-dependency producer nodes in priority order, then appends n to the result.
         if n not in seen:
             seen.add(n)
             dep_nodes = [
@@ -897,6 +957,8 @@ def topological_sort_dfs(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNo
 
 
 def validate_graph_acyclic(nodes: list[BaseSchedulerNode]) -> None:
+    # [FUNCTION DOC] Check the predecessor graph of nodes for cycles with a white/gray/black depth-first search. Raises RuntimeError with the cycle path
+    # when found, and AssertionError if a node is its own predecessor. Returns None.
     """
     Validate that the graph is acyclic by checking predecessor relationships.
 
@@ -913,6 +975,7 @@ def validate_graph_acyclic(nodes: list[BaseSchedulerNode]) -> None:
     path: list[BaseSchedulerNode] = []  # Track current DFS path
 
     def dfs_visit(node: BaseSchedulerNode) -> None:
+    # [FUNCTION DOC] HELPER: Recursive coloring DFS step over predecessor nodes; raises RuntimeError when it reaches a node currently on the path.
         if color[node] == BLACK:
             return
 
@@ -948,6 +1011,8 @@ def validate_unique_buffer_names(
     name_to_buf: dict[str, SchedulerBuffer],
     name_to_freeable_input_buf: dict[str, FreeableInputBuffer],
 ) -> None:
+    # [FUNCTION DOC] Verify every node output buffer is present in name_to_buf and maps to the same buffer object, and that no output name collides with a freeable
+    # input buffer name. Raises RuntimeError describing the problem. Returns None.
     """
     Validate that for each node's output buffer, the name_to_buf mapping is correct.
     For each output buffer buf, we should have name_to_buf[buf.get_name()] == buf.
@@ -991,6 +1056,8 @@ def prepare_planning_info(
     graph_inputs: OrderedSet[str],
     graph_outputs: OrderedSet[str],
 ) -> tuple[int, dict[str, FreeableInputBuffer]]:
+    # [FUNCTION DOC] Compute freeable input buffers, assign memory planning info to buffers and nodes, and estimate peak memory for the current order.
+    # Returns (estimated peak memory, mapping from name to FreeableInputBuffer). Mutates mpi_buffer / mpi_node attributes.
     """
     Prepare planning info. As nodes are scheduled one at a time, these help
     keep track of when a buffer can be freed, and when a node can be scheduled
@@ -1025,6 +1092,10 @@ def reorder_for_peak_memory(
         topological_sort_dfs,
     ],
 ) -> list[BaseSchedulerNode]:
+    # [FUNCTION DOC] Reorder nodes to reduce estimated peak memory. Prepares planning info, optionally exports the graph for a simulator (config.reorder_for_peak_memory_debug),
+    # validates the graph (errors are logged and re-raised except in fbcode), then tries each method (lpmf takes extra args, others only nodes), checks the order length,
+    # estimates peak memory, logs results and emits a signpost event. Returns the order with the lowest estimate, the baseline included.
+    # Failures of an individual method are logged and re-raised outside fbcode. KNOWN ISSUE: mutable default list for methods (lint-suppressed, never mutated).
     """
     Try a few heuristics based topological sort algorithms, and pick the one whose
     resulting topological order has the lowest peak memory estimation.
@@ -1112,12 +1183,15 @@ def export_graph_for_simulator(
     graph_inputs: OrderedSet[str],
     graph_outputs: OrderedSet[str],
 ) -> None:
+    # [FUNCTION DOC] Debugging aid: build a JSON description of the graph (buffers with sizes, input/output flags and dependencies, and nodes with buffer names)
+    # and log it as a structured trace artifact named after the graph being compiled plus a fused suffix. Side effect: structured trace logging; returns None.
     """
     This is for debugging purposes. It will dump a json file that records graph information.
     The graph can then be used in a simulator: https://fburl.com/code/3l3d3qi4
     """
 
     class ORMBuffer(TypedDict):
+        # [CLASS DOC] HELPER: TypedDict describing a buffer in the exported simulator graph (name, sizes, input/output flags, dependency names).
         name: str
         size_alloc: int
         size_free: int
@@ -1128,10 +1202,12 @@ def export_graph_for_simulator(
         unmet_deps: list[str]
 
     class ORMNode(TypedDict):
+        # [CLASS DOC] HELPER: TypedDict describing a node in the exported graph (name and the buffer names it defines).
         name: str
         buffer_names: list[str]
 
     class ORMGraph(TypedDict):
+        # [CLASS DOC] HELPER: TypedDict for the exported graph holding its node and buffer lists.
         nodes: list[ORMNode]
         buffers: list[ORMBuffer]
 

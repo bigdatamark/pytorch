@@ -1,3 +1,8 @@
+# [MODULE DOC] Global counters and CSV metric tables for Inductor compilation statistics.
+# Holds module-level counters (kernel counts, bytes accessed, fusion/reordering counts), a reset
+# function, helpers to save/apply counter deltas across cache hits, and a registry of named
+# MetricTable objects that append rows to CSV files when enabled via config.enabled_metric_tables.
+# Import-time side effect: registers the built-in metric tables in REGISTERED_METRIC_TABLES.
 from __future__ import annotations
 
 import csv
@@ -42,6 +47,7 @@ cpp_to_dtype_count = 0
 
 @dataclasses.dataclass
 class CppOuterLoopFusedCount:
+    # [CLASS DOC] Dataclass recording one outer-loop fusion in the C++ backend: number of inner kernels and local buffers.
     inner_kernel_number: int
     local_buffer_number: int = 0
 
@@ -65,6 +71,8 @@ codegen_nested_reduction: int = 0
 
 # reset all counters
 def reset() -> None:
+    # [FUNCTION DOC] Reset every module-level counter to zero and clear the tracking lists
+    # (nodes_num_elem, node_runtimes, cpp_outer_loop_fused_inner_counts). Mutates module globals; returns None.
     global generated_kernel_count
     global generated_cpp_vec_kernel_count
     global num_bytes_accessed, nodes_num_elem
@@ -100,6 +108,8 @@ def reset() -> None:
 
 @dataclass
 class CachedMetricsDeltas:
+    # [CLASS DOC] Dataclass of the counter values that are saved with cache entries (e.g. FxGraphCache)
+    # and re-applied on a cache hit. Field names must match module-level counter names.
     """
     The subset of metrics we want update across cache hits, e.g., the
     FxGraphCache.
@@ -114,22 +124,27 @@ class CachedMetricsDeltas:
 
 
 def get_metric_fields() -> list[str]:
+    # [FUNCTION DOC] Return the list of counter names (fields of CachedMetricsDeltas).
     return [field.name for field in dataclasses.fields(CachedMetricsDeltas)]
 
 
 class CachedMetricsHelper:
     """
+    # [CLASS DOC] Snapshots the cached-metric counters at construction and later computes the deltas
+    # accumulated since then; also applies saved deltas to the live counters.
     A helper class to help calculate and apply counter deltas for those
     metrics we want to save with cache entries (e.g., FxGraphCache) and
     apply on a cache hit.
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Record the current value of every cached metric counter (read from module globals) in cached_metrics.
         self.cached_metrics = {}
         for metric in get_metric_fields():
             self.cached_metrics[metric] = globals()[metric]
 
     def get_deltas(self) -> CachedMetricsDeltas:
+        # [FUNCTION DOC] Return a CachedMetricsDeltas holding current counter value minus the snapshot, for each cached metric.
         delta_metrics = {}
         for metric in get_metric_fields():
             delta_metrics[metric] = globals()[metric] - self.cached_metrics[metric]
@@ -138,6 +153,7 @@ class CachedMetricsHelper:
 
     @staticmethod
     def apply_deltas(delta: CachedMetricsDeltas) -> None:
+        # [FUNCTION DOC] Add each field of the given deltas to the matching module-level counter (mutates globals).
         for metric in get_metric_fields():
             globals()[metric] += getattr(delta, metric)
 
@@ -147,12 +163,18 @@ REGISTERED_METRIC_TABLES: dict[str, MetricTable] = {}
 
 @dataclass
 class MetricTable:
+    # [CLASS DOC] A named CSV table with fixed column names. Tracks how many rows were added; rows
+    # are only written when the table name is listed in the enabled metric tables config. Output goes
+    # to a file named metric_table_<name>.csv in the current directory.
     table_name: str
     column_names: list[str]
 
     num_rows_added: int = 0
 
     def add_row(self, row_fn: Callable[[], dict[str, str | float | None]]) -> None:
+        # [FUNCTION DOC] Append one row if this table is enabled. row_fn lazily produces a mapping from
+        # column name to value (str, float or None); its keys must exactly match column_names or an
+        # AssertionError is raised. A leading model-name column (benchmark name) is prepended. Writes to the CSV file.
         if self.table_name not in enabled_metric_tables():
             return
 
@@ -172,15 +194,19 @@ class MetricTable:
         self._write_row(row)
 
     def output_filename(self) -> str:
+        # [FUNCTION DOC] Return the CSV file name for this table.
         return f"metric_table_{self.table_name}.csv"
 
     def write_header(self) -> None:
+        # [FUNCTION DOC] Create or truncate the CSV file and write the header row (model_name plus column names).
         filename = self.output_filename()
         with open(filename, "w") as fd:
             writer = csv.writer(fd, lineterminator="\n")
             writer.writerow(["model_name"] + self.column_names)
 
     def _write_row(self, row: list[str | float | None]) -> None:
+        # [FUNCTION DOC] HELPER: Append a row to the CSV file. Writes the header first if this is the first
+        # row and the file does not exist; floats are formatted with six decimals and None becomes empty. Mutates row and num_rows_added.
         filename = self.output_filename()
         if self.num_rows_added == 0 and not os.path.exists(filename):
             self.write_header()
@@ -202,6 +228,7 @@ class MetricTable:
 
     @staticmethod
     def register_table(name: str, column_names: list[str]) -> None:
+        # [FUNCTION DOC] Create a MetricTable with the given name and columns and store it in the global registry.
         table = MetricTable(name, column_names)
         REGISTERED_METRIC_TABLES[name] = table
 
@@ -291,6 +318,8 @@ MetricTable.register_table(
 
 
 def _parse_kernel_fn_code(kernel_module_code: str) -> str:
+    # [FUNCTION DOC] HELPER: Load the generated kernel module code via PyCodeCache, find its Triton kernel
+    # and return the source text of the undecorated-by-jit python function. Side effect: compiles/loads the module.
     """
     The kernel_module_code is the python module that contains kernel function code.
     kernel function is the proper triton kernel function annotated with
@@ -307,6 +336,7 @@ def _parse_kernel_fn_code(kernel_module_code: str) -> str:
 
 
 def _parse_kernel_line_of_code(proper_kernel_fn_code: str) -> int:
+    # [FUNCTION DOC] HELPER: Return the number of source lines of the kernel function (decorators already excluded).
     """
     Return the line of code for the kernel excluding the decorators.
     """
@@ -314,6 +344,8 @@ def _parse_kernel_line_of_code(proper_kernel_fn_code: str) -> int:
 
 
 def _parse_size_hints(kernel_module_code: str, kernel_category: str) -> str | None:
+    # [FUNCTION DOC] HELPER: Extract the size_hints list text from kernel module code with a regular
+    # expression; None for foreach kernels. Raises AssertionError if not found.
     if kernel_category == "foreach":
         # foreach kernel does not have size_hints
         return None
@@ -324,6 +356,8 @@ def _parse_size_hints(kernel_module_code: str, kernel_category: str) -> str | No
 
 
 def _parse_reduction_hint(kernel_category: str, kernel_module_code: str) -> str | None:
+    # [FUNCTION DOC] HELPER: Extract the ReductionHint name from kernel module code for reduction and
+    # persistent_reduction kernels, None otherwise. Raises AssertionError if missing.
     if kernel_category not in ("reduction", "persistent_reduction"):
         return None
     m = re.search(r"reduction_hint=ReductionHint\.(\w*),", kernel_module_code)
@@ -333,10 +367,14 @@ def _parse_reduction_hint(kernel_category: str, kernel_module_code: str) -> str 
 
 
 def _count_pattern(proper_kernel_fn_code: str, pattern: str) -> int:
+    # [FUNCTION DOC] HELPER: Count occurrences of a substring in the kernel function source.
     return proper_kernel_fn_code.count(pattern)
 
 
 def _count_args(proper_kernel_fn_code: str) -> int:
+    # [FUNCTION DOC] HELPER: Count kernel parameters by splitting the text between the parentheses of the
+    # first line on commas. Raises AssertionError if the first line is not a def line.
+    # KNOWN ISSUE: a trailing comma or empty parameter list would miscount, and the split ignores nesting.
     def_line = proper_kernel_fn_code.splitlines()[0]
     if not def_line.startswith("def "):
         raise AssertionError(
@@ -350,6 +388,7 @@ def _count_args(proper_kernel_fn_code: str) -> int:
 
 
 def _parse_proper_kernel_fn_code(kernel_fn_code: str) -> str:
+    # [FUNCTION DOC] HELPER: Strip decorators by returning the source from the first def keyword onward.
     """
     Skip decorators.
     """
@@ -358,6 +397,8 @@ def _parse_proper_kernel_fn_code(kernel_fn_code: str) -> str:
 
 
 def _parse_numel(proper_kernel_fn_code: str, numel_arg_name: str) -> int | None:
+    # [FUNCTION DOC] HELPER: Find an assignment of an integer literal to the named numel argument in the
+    # kernel source; return the integer or None if not burned in.
     m = re.search(f"{numel_arg_name} = ([\\d]+)", proper_kernel_fn_code)
     if m:
         return int(m.group(1))
@@ -368,6 +409,8 @@ def _parse_numel(proper_kernel_fn_code: str, numel_arg_name: str) -> int | None:
 def _parse_kernel_args_num_gb(
     kernel_fn_code: str, kernel_category: str
 ) -> float | None:
+    # [FUNCTION DOC] HELPER: Parse the kernel_num_gb value from the inductor_meta text; return a float, or
+    # None when absent (e.g. benchmarking/profiling disabled, or foreach kernels). kernel_category is unused.
     """
     inductor meta looks like:
         inductor_meta={... 'mutated_arg_names': [], 'no_x_dim': False, 'kernel_num_gb': 2.0},
@@ -389,6 +432,10 @@ def _parse_kernel_args_num_gb(
 def log_kernel_metadata(
     kernel_name: str, kernel_path: str, kernel_module_code: str
 ) -> None:
+    # [FUNCTION DOC] Log one kernel_metadata row for a generated Triton kernel: category, size hints,
+    # reduction hint, line count, counts of loads/stores/loops/atomic adds, argument count, numels and
+    # GB moved, all parsed from the source text. Only does work when the table row is evaluated (table enabled)
+    # besides the up-front parsing, which can raise AssertionError on unexpected source.
     """
     A utility to log kernel metadata. We may parse metadata from kernel source code here.
 
@@ -431,6 +478,8 @@ def log_kernel_metadata(
 
 
 def purge_old_log_files() -> None:
+    # [FUNCTION DOC] Delete old CSV files for all enabled metric tables and write fresh headers. Intended
+    # to run once in the parent benchmark process. Side effects: file deletion and creation.
     """
     Purge the old log file at the beginning when the benchmark script runs.
     Should do it in the parent process rather than the child processes running
@@ -446,11 +495,14 @@ def purge_old_log_files() -> None:
 
 
 def enabled_metric_tables() -> OrderedSet[str]:
+    # [FUNCTION DOC] Return the ordered set of table names enabled by config.enabled_metric_tables.
     return enabled_metric_tables_impl(config.enabled_metric_tables)
 
 
 @lru_cache
 def enabled_metric_tables_impl(config_str: str) -> OrderedSet[str]:
+    # [FUNCTION DOC] HELPER: Cached parser of the comma-separated table-name config string into an
+    # ordered set; blank entries are ignored. Raises AssertionError for unregistered names.
     enabled: OrderedSet[str] = OrderedSet()
     for name in config_str.split(","):
         name = name.strip()
@@ -463,10 +515,12 @@ def enabled_metric_tables_impl(config_str: str) -> OrderedSet[str]:
 
 
 def is_metric_table_enabled(name: str) -> bool:
+    # [FUNCTION DOC] Return whether the named table is enabled.
     return name in enabled_metric_tables()
 
 
 def get_metric_table(name: str) -> MetricTable:
+    # [FUNCTION DOC] Return the registered MetricTable by name; raises AssertionError if not registered.
     if name not in REGISTERED_METRIC_TABLES:
         raise AssertionError(f"Metric table {name} is not defined")
     return REGISTERED_METRIC_TABLES[name]
@@ -486,6 +540,8 @@ MetricTable.register_table(
 def log_kernel_autotune_result(
     kernel_path: str, kernel_name: str, config: Config, latency: float
 ) -> None:
+    # [FUNCTION DOC] Log one kernel_autotune row (kernel path, name, triton config string, latency in ms)
+    # if that table is enabled.
     get_metric_table("kernel_autotune").add_row(
         lambda: {
             "kernel_path": kernel_path,

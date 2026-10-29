@@ -1,3 +1,7 @@
+# [MODULE DOC] Inductor IR nodes for oneDNN (mkldnn) fused extern kernels on CPU/XPU: convolution,
+# transposed convolution, quantized convolution and linear/matmul with unary/binary post-ops, plus
+# helper functions that prepare inputs, constant args and output layouts for each node's create().
+# Nodes are ExternKernelAlloc subclasses that call torch.ops.mkldnn / torch.ops.onednn ops (or AOTI shims).
 # mypy: allow-untyped-defs
 from collections.abc import Sequence
 from typing import Any, Optional
@@ -42,6 +46,12 @@ def _prepare_convolution_fusion_create(
     quantize_args: list["TensorBox"] | None = None,
     other: Optional["TensorBox"] = None,
 ):
+    # [FUNCTION DOC] HELPER: Shared preparation for convolution post-op fusion create() methods. Realizes
+    # x, weight, bias; under fake mode infers output size (forward conv or transposed conv) after validating and
+    # padding padding/stride/dilation/output_padding lists; forces x (and other) to channels-last stride order;
+    # picks output strides (contiguous for dynamic shapes or xpu cases, else channels last); optionally adds
+    # quantization scale/zero-point inputs. Returns (inputs, constant_args, kernel_layout, req_stride_order, other).
+    # Raises AssertionError on invalid arg lengths, device mismatch or unsupported device.
     """
     This function is a helper function to prepare inputs, layout and constant args
     for convolution post-op fusion's create function, including deciding the output
@@ -54,6 +64,9 @@ def _prepare_convolution_fusion_create(
     def _conv_input_size(
         output_size, weight_size, padding, output_padding, stride, dilation, groups
     ):
+        # [FUNCTION DOC] HELPER: Compute the conv input size from output size, weight size, padding, output padding,
+        # stride, dilation and groups (port of the ATen helper used for transposed conv). Returns a list of ints.
+        # Raises AssertionError if dims differ or are not greater than 2.
         if len(output_size) != len(weight_size):
             raise AssertionError("Expect input dim == weight dim")
         dim = len(output_size)
@@ -78,6 +91,8 @@ def _prepare_convolution_fusion_create(
 
     # Port from aten/src/ATen/native/ConvUtils.h: _conv_output_size
     def _conv_output_size(input_size, weight_size, padding, stride, dilation=None):
+        # [FUNCTION DOC] HELPER: Compute the conv output size (batch, out channels, spatial dims) from input size, weight
+        # size, padding, stride and optional dilation (port of the ATen helper). Returns a list.
         has_dilation = dilation is not None
         dim = len(input_size)
         output_size = []
@@ -101,6 +116,8 @@ def _prepare_convolution_fusion_create(
         prepacked_weight,
         groups,
     ):
+        # [FUNCTION DOC] HELPER: Given the prepacked deconv weight, return the original weight size in input/output channel
+        # order, accounting for groups (the prepacked layout merges groups into the first dim). Raises AssertionError if dim <= 2.
         prepacked_weight_size = prepacked_weight.size()
         dim = len(prepacked_weight_size)
         if dim <= 2:
@@ -252,6 +269,10 @@ def _prepare_linear_fusion_create(
     other: Optional["TensorBox"] = None,
     binary_sum: bool = False,
 ):
+    # [FUNCTION DOC] HELPER: Shared preparation for linear post-op fusion create() methods. Realizes inputs,
+    # computes the 2D-or-more output size from x and the already-transposed weight, requires x (and other when
+    # binary_sum) in contiguous stride order, adds optional quantization inputs and bias, and builds a FixedLayout.
+    # Returns (inputs, constant_args, kernel_layout, req_stride_order, other). Raises AssertionError on device mismatch.
     """
     This function is a helper function to prepare inputs, layout and constant args
     for linear post-op fusion's create function. The function only supports the CPU device
@@ -312,6 +333,8 @@ def _prepare_linear_fusion_create(
 
 
 def _create_output_node(packed):
+# [FUNCTION DOC] HELPER: Wrap a packed extern kernel's result in a MultiOutput node: the packed node's layout is
+# replaced with MultiOutputLayout and its outputs list set to the new node, which is returned.
     output_ir = MultiOutput(
         packed.get_layout(),
         packed,
@@ -323,12 +346,15 @@ def _create_output_node(packed):
 
 
 class ConvolutionUnary(ExternKernelAlloc):
+    # [CLASS DOC] IR node for the mkldnn pointwise-fused convolution (convolution plus unary post-op). Calls
+    # torch.ops.mkldnn._convolution_pointwise; device_type records the input device for the AOTI shim name.
     def __init__(
         self,
         layout,
         inputs,
         constant_args=(),
     ) -> None:
+        # [FUNCTION DOC] Record the input device type and initialize the extern kernel with the mkldnn convolution pointwise op and its AOTI C++ kernel name.
         self.device_type = get_device_type(inputs[0])
         super().__init__(
             layout,
@@ -340,6 +366,7 @@ class ConvolutionUnary(ExternKernelAlloc):
         )
 
     def codegen(self, wrapper):
+        # [FUNCTION DOC] Emit the extra AOTI shim header include for this device type, then run the base ExternKernelAlloc codegen.
         wrapper.include_extra_header(
             f"torch/csrc/inductor/aoti_torch/c/shim_{self.device_type}.h"
         )
@@ -359,6 +386,8 @@ class ConvolutionUnary(ExternKernelAlloc):
         scalars: list[Any] | None,
         algorithm,
     ):
+        # [FUNCTION DOC] Build the node: prepare inputs/layout via the convolution helper, append attr, scalars (converted to
+        # optional) and algorithm as constant args, and return the MultiOutput wrapper of the packed node.
         (
             inputs,
             constant_args,
@@ -382,6 +411,8 @@ class ConvolutionUnary(ExternKernelAlloc):
 
 
 class ConvolutionBinary(ExternKernelAlloc):
+    # [CLASS DOC] IR node for mkldnn convolution fused with a binary post-op (e.g. add with another tensor) and optional
+    # unary post-op. Calls torch.ops.mkldnn._convolution_pointwise.binary; stores cpp_constant_args.
     def __init__(
         self,
         layout,
@@ -389,6 +420,7 @@ class ConvolutionBinary(ExternKernelAlloc):
         constant_args=(),
         cpp_constant_args=(),
     ) -> None:
+        # [FUNCTION DOC] Record device type, initialize the extern kernel with the binary-pointwise conv op and AOTI name, and store cpp_constant_args.
         self.device_type = get_device_type(inputs[0])
         super().__init__(
             layout,
@@ -401,6 +433,7 @@ class ConvolutionBinary(ExternKernelAlloc):
         self.cpp_constant_args = cpp_constant_args
 
     def codegen(self, wrapper):
+        # [FUNCTION DOC] Emit the extra AOTI shim header include for this device type, then run the base ExternKernelAlloc codegen.
         wrapper.include_extra_header(
             f"torch/csrc/inductor/aoti_torch/c/shim_{self.device_type}.h"
         )
@@ -423,6 +456,8 @@ class ConvolutionBinary(ExternKernelAlloc):
         unary_scalars: list[Any] | None,
         unary_algorithm: str | None,
     ):
+        # [FUNCTION DOC] Build the node: prepare convolution inputs, force the other tensor into the required stride order and
+        # insert it as the second input, append binary/unary attributes as constant args, and return the MultiOutput wrapper.
         (
             inputs,
             constant_args,
@@ -451,12 +486,16 @@ class ConvolutionBinary(ExternKernelAlloc):
 
 
 class ConvolutionBinaryInplace(ExternKernelAlloc):
+    # [CLASS DOC] IR node for mkldnn convolution with in-place binary post-op, mutating the other input. Inputs are
+    # reordered so the mutated tensor is first; mutation_outputs track both original inputs.
     def __init__(
         self,
         kernel_layout,
         inputs,
         constant_args=(),
     ) -> None:
+        # [FUNCTION DOC] Reorder inputs so other (mutated tensor) comes first, initialize the extern kernel with the in-place
+        # binary conv op, and register MutationOutput nodes for the two original inputs.
         # Due to constraint of op.call, other (Tensor&) should be at input[0]
         self.device_type = get_device_type(inputs[0])
         reordered_inputs = [inputs[1], inputs[0]] + inputs[2:]
@@ -476,12 +515,14 @@ class ConvolutionBinaryInplace(ExternKernelAlloc):
         ]
 
     def codegen(self, wrapper):
+        # [FUNCTION DOC] Emit the extra AOTI shim header include for this device type, then run the base ExternKernelAlloc codegen.
         wrapper.include_extra_header(
             f"torch/csrc/inductor/aoti_torch/c/shim_{self.device_type}.h"
         )
         super().codegen(wrapper)
 
     def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        # [FUNCTION DOC] Return an empty ordered set: this node defines no unbacked symbols.
         return OrderedSet()
 
     @classmethod
@@ -501,6 +542,8 @@ class ConvolutionBinaryInplace(ExternKernelAlloc):
         unary_scalars: list[Any] | None,
         unary_algorithm: str | None,
     ):
+        # [FUNCTION DOC] Build the node with a NoneLayout and return the mutated tensor (the node's first, reordered input)
+        # rather than a new output, since the op mutates other in place.
         (
             inputs,
             constant_args,
@@ -532,12 +575,15 @@ class ConvolutionBinaryInplace(ExternKernelAlloc):
 
 
 class ConvolutionTransposeUnary(ExternKernelAlloc):
+    # [CLASS DOC] IR node for mkldnn transposed convolution (deconvolution) with a unary post-op. Calls
+    # torch.ops.mkldnn._convolution_transpose_pointwise.
     def __init__(
         self,
         layout,
         inputs,
         constant_args=(),
     ) -> None:
+        # [FUNCTION DOC] Record the input device type and initialize the extern kernel with the transpose pointwise conv op and AOTI name.
         self.device_type = get_device_type(inputs[0])
         super().__init__(
             layout,
@@ -549,6 +595,7 @@ class ConvolutionTransposeUnary(ExternKernelAlloc):
         )
 
     def codegen(self, wrapper):
+        # [FUNCTION DOC] Emit the extra AOTI shim header include for this device type, then run the base ExternKernelAlloc codegen.
         wrapper.include_extra_header(
             f"torch/csrc/inductor/aoti_torch/c/shim_{self.device_type}.h"
         )
@@ -569,6 +616,8 @@ class ConvolutionTransposeUnary(ExternKernelAlloc):
         scalars: list[Any] | None,
         algorithm,
     ):
+        # [FUNCTION DOC] Build the node: prepare inputs with transposed=True and output_padding, append attr, scalars
+        # and algorithm as constant args, and return the MultiOutput wrapper.
         transposed = True
         (
             inputs,
@@ -602,12 +651,16 @@ class ConvolutionTransposeUnary(ExternKernelAlloc):
 
 
 class QConvPointWisePT2E(ExternKernelAlloc):
+    # [CLASS DOC] IR node for PT2E quantized convolution with pointwise post-ops (torch.ops.onednn.qconv_pointwise.tensor).
+    # Tracks whether a bias input is present (has_bias, inferred from the input count).
     def __init__(
         self,
         layout,
         inputs,
         constant_args=(),
     ) -> None:
+        # [FUNCTION DOC] Record device type, set has_bias when there are five inputs, and initialize the extern kernel with the
+        # quantized conv op. Input and constant-arg ordering depends on whether bias is given (see the docstring).
         """
         if bias is not None
             - inputs = [x, w, b, weight_scale, weight_zp]
@@ -630,6 +683,7 @@ class QConvPointWisePT2E(ExternKernelAlloc):
         )
 
     def codegen(self, wrapper):
+        # [FUNCTION DOC] Emit the shim header include, run base codegen, and emit output size asserts when the layout is a concrete Layout.
         wrapper.include_extra_header(
             f"torch/csrc/inductor/aoti_torch/c/shim_{self.device_type}.h"
         )
@@ -658,6 +712,9 @@ class QConvPointWisePT2E(ExternKernelAlloc):
         scalars,
         algorithm,
     ):
+        # [FUNCTION DOC] Build the node: prepare conv inputs with quantization args, swap padding and stride constants to the
+        # functional conv order, append output scale/zero point/dtype, attr, scalars and algorithm; if output_dtype is float32 or
+        # bfloat16 override the layout dtype. Returns the QConvPointWisePT2E node. Raises AssertionError if output_dtype is None.
         transposed = False
         output_padding = None
         (
@@ -709,12 +766,16 @@ class QConvPointWisePT2E(ExternKernelAlloc):
 
 
 class QConvPointWiseBinaryPT2E(ExternKernelAlloc):
+    # [CLASS DOC] IR node for PT2E quantized convolution with a binary post-op (only sum is supported) which mutates the
+    # accumulator input in place (idx_for_inplace_sum is the input index of accum).
     def __init__(
         self,
         layout,
         inputs,
         constant_args=(),
     ) -> None:
+        # [FUNCTION DOC] Record device type, has_bias (eight inputs) and the in-place sum input index, then initialize the extern
+        # kernel with the qconv2d_pointwise binary tensor op. Input/constant-arg ordering depends on bias presence (see docstring).
         """
         Needs input/weight/output qparams
         if bias is not None
@@ -741,6 +802,7 @@ class QConvPointWiseBinaryPT2E(ExternKernelAlloc):
         )
 
     def codegen(self, wrapper):
+        # [FUNCTION DOC] Emit the shim header include, run base codegen, and emit output size asserts when the layout is a concrete Layout.
         wrapper.include_extra_header(
             f"torch/csrc/inductor/aoti_torch/c/shim_{self.device_type}.h"
         )
@@ -749,9 +811,11 @@ class QConvPointWiseBinaryPT2E(ExternKernelAlloc):
             self.codegen_size_asserts(wrapper)
 
     def get_mutation_names(self) -> Sequence[str]:
+        # [FUNCTION DOC] Return the name of the accumulator input that is mutated in place.
         return [self.input_name(self.idx_for_inplace_sum)]
 
     def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        # [FUNCTION DOC] Return an empty ordered set: this node defines no unbacked symbols.
         return OrderedSet()
 
     @classmethod
@@ -780,6 +844,9 @@ class QConvPointWiseBinaryPT2E(ExternKernelAlloc):
         unary_scalars,
         unary_algorithm,
     ):
+        # [FUNCTION DOC] Build the node: prepare conv inputs (including the accumulator), swap padding/stride constants, append
+        # quantization and post-op args, require binary_attr to be sum (AssertionError otherwise), mark the accumulator buffer as
+        # mutated, and return the accumulator input since it is modified in place. Layout is NoneLayout.
         transposed = False
         output_padding = None
         (
@@ -839,12 +906,14 @@ class QConvPointWiseBinaryPT2E(ExternKernelAlloc):
 
 
 class MKLPackedLinear(ExternKernelAlloc):
+    # [CLASS DOC] IR node for MKL packed linear (torch.ops.mkl._mkl_linear) with prepacked weight; includes the CPU shim header.
     def __init__(
         self,
         layout,
         inputs,
         constant_args=(),
     ) -> None:
+        # [FUNCTION DOC] Initialize the extern kernel with the mkl linear op.
         super().__init__(
             layout,
             inputs,
@@ -854,11 +923,15 @@ class MKLPackedLinear(ExternKernelAlloc):
         )
 
     def codegen(self, wrapper):
+        # [FUNCTION DOC] Include the CPU shim header and run base codegen.
         wrapper.include_extra_header("torch/csrc/inductor/aoti_torch/c/shim_cpu.h")
         super().codegen(wrapper)
 
     @classmethod
     def create(cls, x, packed_w, orig_w, B, batch_size):
+        # [FUNCTION DOC] Build the node: realize x and original weight with stride-1 requirement, compute output size as batch dims
+        # plus out features, use packed weight, orig weight and constant batch_size (bias optional, else None constant). Returns a node
+        # with FixedLayout on x's device; raises AssertionError if x has no device.
         x = cls.require_stride1(cls.realize_input(x))
         orig_w = cls.require_stride1(cls.realize_input(orig_w))
         *m, _ = x.get_size()
@@ -883,12 +956,14 @@ class MKLPackedLinear(ExternKernelAlloc):
 
 
 class LinearUnary(ExternKernelAlloc):
+    # [CLASS DOC] IR node for mkldnn linear with unary post-op (torch.ops.mkldnn._linear_pointwise).
     def __init__(
         self,
         layout,
         inputs,
         constant_args=(),
     ) -> None:
+        # [FUNCTION DOC] Record input device type and initialize the extern kernel with the linear pointwise op and AOTI name.
         self.device_type = get_device_type(inputs[0])
         super().__init__(
             layout,
@@ -900,6 +975,7 @@ class LinearUnary(ExternKernelAlloc):
         )
 
     def codegen(self, wrapper):
+        # [FUNCTION DOC] Emit the extra AOTI shim header include for this device type, then run the base ExternKernelAlloc codegen.
         wrapper.include_extra_header(
             f"torch/csrc/inductor/aoti_torch/c/shim_{self.device_type}.h"
         )
@@ -907,6 +983,8 @@ class LinearUnary(ExternKernelAlloc):
 
     @classmethod
     def create(cls, x, w, B, attr, scalars, algorithm):
+        # [FUNCTION DOC] Build the node: realize and make x, w (and bias if given) contiguous, compute output size, pass attr,
+        # scalars (default -1 list) and algorithm as constants, and return the MultiOutput wrapper. Raises AssertionError if x has no device.
         x = cls.require_contiguous(cls.realize_input(x))
         w = cls.require_contiguous(cls.realize_input(w))
 
@@ -937,10 +1015,12 @@ class LinearUnary(ExternKernelAlloc):
         return _create_output_node(packed)
 
     def apply_constraint(self):
+        # [FUNCTION DOC] No-op override: no input layout constraints are applied.
         pass
 
 
 class LinearBinary(ExternKernelAlloc):
+    # [CLASS DOC] IR node for mkldnn linear with binary post-op (torch.ops.mkldnn._linear_pointwise.binary); class attribute kernel names the op.
     kernel = "torch.ops.mkldnn._linear_pointwise.binary"
 
     def __init__(
@@ -949,6 +1029,7 @@ class LinearBinary(ExternKernelAlloc):
         inputs,
         constant_args=(),
     ) -> None:
+        # [FUNCTION DOC] Record input device type and initialize the extern kernel with the binary linear pointwise op and AOTI name.
         self.device_type = get_device_type(inputs[0])
         super().__init__(
             layout,
@@ -960,6 +1041,7 @@ class LinearBinary(ExternKernelAlloc):
         )
 
     def codegen(self, wrapper):
+        # [FUNCTION DOC] Emit the extra AOTI shim header include for this device type, then run the base ExternKernelAlloc codegen.
         wrapper.include_extra_header(
             f"torch/csrc/inductor/aoti_torch/c/shim_{self.device_type}.h"
         )
@@ -967,6 +1049,8 @@ class LinearBinary(ExternKernelAlloc):
 
     @classmethod
     def create(cls, x, y, w, B, attr):
+        # [FUNCTION DOC] Build the node: make x, y, w (and bias if given) contiguous, compute output size, pass attr as constant,
+        # and return the MultiOutput wrapper. Raises AssertionError if x has no device.
         x = cls.require_contiguous(cls.realize_input(x))
         y = cls.require_contiguous(cls.realize_input(y))
         w = cls.require_contiguous(cls.realize_input(w))
@@ -997,10 +1081,13 @@ class LinearBinary(ExternKernelAlloc):
         return _create_output_node(packed)
 
     def apply_constraint(self):
+        # [FUNCTION DOC] No-op override: no input layout constraints are applied.
         pass
 
 
 class QLinearPointwisePT2E(ExternKernelAlloc):
+    # [CLASS DOC] IR node for PT2E quantized linear with unary post-op (torch.ops.onednn.qlinear_pointwise.tensor);
+    # has_bias records whether a bias input was provided.
     def __init__(
         self,
         layout,
@@ -1008,6 +1095,7 @@ class QLinearPointwisePT2E(ExternKernelAlloc):
         constant_args=(),
         has_bias=True,
     ) -> None:
+        # [FUNCTION DOC] Record device type and has_bias, and initialize the extern kernel with the qlinear pointwise op and AOTI name. Arg ordering depends on bias presence (see docstring).
         """
         if bias is not None
             - inputs = [x, w, b, weight_scale, weight_zp]
@@ -1032,6 +1120,7 @@ class QLinearPointwisePT2E(ExternKernelAlloc):
         )
 
     def codegen(self, wrapper):
+        # [FUNCTION DOC] Emit the shim header include, run base codegen, and emit output size asserts when the layout is a concrete Layout.
         wrapper.include_extra_header(
             f"torch/csrc/inductor/aoti_torch/c/shim_{self.device_type}.h"
         )
@@ -1057,6 +1146,9 @@ class QLinearPointwisePT2E(ExternKernelAlloc):
         post_op_args,
         post_op_algorithm,
     ):
+        # [FUNCTION DOC] Build the node: prepare linear inputs with quantization args, append output scale/zero point/dtype and
+        # post-op name/args/algorithm as constants; if output_dtype is float32 or bfloat16 override the layout dtype. Raises
+        # AssertionError if output_dtype is None. Returns the new node.
         (inputs, constant_args, kernel_layout, _, _) = _prepare_linear_fusion_create(
             cls,
             qx,
@@ -1090,6 +1182,8 @@ class QLinearPointwisePT2E(ExternKernelAlloc):
 
 
 class QLinearPointwiseBinaryPT2E(ExternKernelAlloc):
+    # [CLASS DOC] IR node for PT2E quantized linear with binary post-op (op qlinear_pointwise.binary_tensor). With a sum
+    # binary op the other input is mutated in place (idx_for_inplace_sum).
     def __init__(
         self,
         layout,
@@ -1097,6 +1191,8 @@ class QLinearPointwiseBinaryPT2E(ExternKernelAlloc):
         constant_args=(),
         has_bias=True,
     ) -> None:
+        # [FUNCTION DOC] Record device type, has_bias and the in-place sum input index, then initialize the extern kernel.
+        # KNOWN ISSUE: the docstring lists inputs as x, w, x_scale, ... but the helper actually orders them x, x_scale, x_zp, w, w_scale, w_zp, other.
         """
         if bias is not None
             - inputs = [x, w, x_scale, x_zp, weight_scale, weight_zp, x2, bias]
@@ -1120,6 +1216,7 @@ class QLinearPointwiseBinaryPT2E(ExternKernelAlloc):
         )
 
     def codegen(self, wrapper):
+        # [FUNCTION DOC] Emit the shim header include, run base codegen, and emit output size asserts when the layout is a concrete Layout.
         wrapper.include_extra_header(
             f"torch/csrc/inductor/aoti_torch/c/shim_{self.device_type}.h"
         )
@@ -1128,6 +1225,8 @@ class QLinearPointwiseBinaryPT2E(ExternKernelAlloc):
             self.codegen_size_asserts(wrapper)
 
     def get_mutation_names(self) -> Sequence[str]:
+        # [FUNCTION DOC] Return the name of the mutated input (the other tensor) when the binary post-op is sum, else an empty list.
+        # Raises AssertionError if that input is not an IRNode.
         binary_post_op = self.constant_args[-5]
         if binary_post_op == "sum":
             input = self.inputs[self.idx_for_inplace_sum]
@@ -1159,6 +1258,9 @@ class QLinearPointwiseBinaryPT2E(ExternKernelAlloc):
         unary_post_op_args,
         unary_post_op_algorithm,
     ):
+        # [FUNCTION DOC] Build the node: prepare linear inputs including other, append quantization and post-op args. For a sum
+        # post-op mark other's buffer mutated, create the node with NoneLayout and return the mutated other input. Otherwise
+        # optionally override layout dtype for float32/bfloat16 output and return the new node. Raises AssertionError if output_dtype is None.
         (
             inputs,
             constant_args,
@@ -1215,12 +1317,14 @@ class QLinearPointwiseBinaryPT2E(ExternKernelAlloc):
 
 
 class MkldnnRnnLayer(ExternKernelAlloc):
+    # [CLASS DOC] IR node for torch.ops.aten.mkldnn_rnn_layer (one LSTM layer); its multiple outputs are exposed as MultiOutput nodes.
     def __init__(
         self,
         layout,
         inputs,
         constant_args=(),
     ) -> None:
+        # [FUNCTION DOC] Initialize the extern kernel with the mkldnn rnn layer op.
         super().__init__(
             layout,
             inputs,
@@ -1249,6 +1353,9 @@ class MkldnnRnnLayer(ExternKernelAlloc):
         batch_first: bool,
         train: bool,
     ):
+        # [FUNCTION DOC] Build the node: realize inputs and weights with stride-1 requirement and freeze layouts of x, hx, cx;
+        # require a 3D input (AssertionError otherwise); compute output, hy, cy shapes and contiguous strides plus a dummy last output
+        # required by the C shim; create the packed node with MultiOutputLayout and return the list of four MultiOutput nodes.
         # pyrefly: ignore [bad-assignment]
         x = cls.require_stride1(cls.realize_input(x))
         # If batch_first, x has been permuted in lstm before entering the mkldnn_rnn_layer.
@@ -1303,6 +1410,8 @@ class MkldnnRnnLayer(ExternKernelAlloc):
         )
 
         def get_strides_of_lstm_output(output_shape, batch_first):
+        # [FUNCTION DOC] HELPER: Return contiguous strides for the 3D lstm output shape; raises AssertionError if not 3D.
+        # KNOWN ISSUE: batch_first is accepted but never used.
             if len(output_shape) != 3:
                 raise AssertionError("Expect output_shape to be 3D")
             return FlexibleLayout.contiguous_strides(output_shape)
@@ -1336,18 +1445,22 @@ class MkldnnRnnLayer(ExternKernelAlloc):
         return output_ir
 
     def codegen(self, wrapper):
+        # [FUNCTION DOC] Include the CPU shim header and return the base codegen result.
         wrapper.include_extra_header("torch/csrc/inductor/aoti_torch/c/shim_cpu.h")
         return super().codegen(wrapper)
 
 
 # Add this IR so that we can include shim_cpu.h for cpp_wrapper
 class WeightInt4PackMatmul(ExternKernelAlloc):
+    # [CLASS DOC] IR node for the int4 packed-weight matmul on CPU (quantized.int4mm_packed_weight_cpu); exists so the CPU shim
+    # header is included for cpp_wrapper. Inputs are x, w, group size and scales/zeros; no constant args.
     def __init__(
         self,
         layout,
         inputs,
         constant_args=(),
     ) -> None:
+        # [FUNCTION DOC] Validate there are exactly 4 inputs and no constant args (AssertionError otherwise) and initialize the extern kernel.
         """
         inputs = [x, w, qGroupSize, qScalesAndZeros]
         constant_args = ()
@@ -1366,6 +1479,7 @@ class WeightInt4PackMatmul(ExternKernelAlloc):
         )
 
     def codegen(self, wrapper):
+        # [FUNCTION DOC] Include the CPU shim header, run base codegen, and emit output size asserts when the layout is a concrete Layout.
         wrapper.include_extra_header("torch/csrc/inductor/aoti_torch/c/shim_cpu.h")
         super().codegen(wrapper)
 
@@ -1380,6 +1494,8 @@ class WeightInt4PackMatmul(ExternKernelAlloc):
         qGroupSize: "TensorBox",
         qScalesAndZeros: "TensorBox",
     ):
+        # [FUNCTION DOC] Build the node: output size is x batch dims plus the weight's first dim, with contiguous strides and x's
+        # device and dtype in a FixedLayout. Returns the new node.
         inputs = [x, w, qGroupSize, qScalesAndZeros]
         *m, _ = x.get_size()
         n, _ = w.get_size()
