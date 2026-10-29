@@ -1,3 +1,7 @@
+# [MODULE DOC] Inductor lowerings for quantized ops: defines ExternKernelChoice objects for the
+# int8/int4 weight-only packed matmuls, plus functions that register fallbacks for quantized ops and
+# register weight-only-quantized matmul lowerings (ATen and C++ GEMM template choices autotuned).
+# Import-time side effects: creates the ExternKernelChoice instances and torch.ops aliases.
 import logging
 from typing import Any
 
@@ -36,6 +40,8 @@ aten = torch.ops.aten
 
 
 def register_quantized_ops() -> None:
+    # [FUNCTION DOC] Marks quantized max_pool2d and the fbgemm fp16 pack/linear ops as needing
+    # realized inputs and registers them as fallback (extern kernel) lowerings. Mutates lowering registries.
     from . import lowering
 
     lowering.add_needs_realized_inputs(
@@ -51,6 +57,9 @@ def register_quantized_ops() -> None:
 
 
 def register_woq_mm_ops() -> None:
+    # [FUNCTION DOC] Registers lowerings for weight-only-quantized matmuls: the int8 pack mm and the
+    # int4 pack mm for CPU (both defined as nested functions below), and fallback lowerings for the
+    # dynamic 4-bit quantized matmul and weight packing ops. Mutates the global lowering registry.
     """Register weight-only quantized matmul lowerings."""
     from . import lowering
     from .lowering import expand, register_lowering
@@ -63,6 +72,10 @@ def register_woq_mm_ops() -> None:
         *,
         layout: Any = None,
     ) -> Any:
+        # [FUNCTION DOC] Lowering for int8 weight-only matmul. Computes matmul args, requires
+        # mat1 of bfloat16/float16/float and mat2 of int8 (raises AssertionError otherwise). Builds
+        # choices: the ATen extern kernel if ATen GEMM is allowed, plus a C++ GEMM template with a
+        # per-channel scale multiply epilogue when applicable. Returns the autotuned selected node.
         _, _, _, layout, mat1, mat2 = mm_args(
             input, weight, layout=layout, mat2_transposed=True
         )
@@ -86,6 +99,7 @@ def register_woq_mm_ops() -> None:
         # scale is applied as an epilogue, and the scale tensor is expanded (with a view op)
         # for broadcasting, as it's 1D.
         def _mul_epilogue(buf: torch.Tensor) -> Any:
+            # [FUNCTION DOC] HELPER: Epilogue that multiplies the matmul buffer by the scale tensor expanded to the output size.
             return create_epilogue_with_attr(
                 buf, "mul", other=realize_inputs(expand(scale, layout.size))
             )
@@ -113,6 +127,11 @@ def register_woq_mm_ops() -> None:
         *,
         layout: Any = None,
     ) -> Any:
+        # [FUNCTION DOC] Lowering for int4 packed-weight matmul on CPU. Requires mat1 of
+        # bfloat16/float16/float and mat2 of uint8 (raises AssertionError otherwise). Registers the
+        # group size as a graph tensor constant, builds choices from the ATen kernel and, under
+        # max-autotune with a suitable contiguous weight, the C++ WOQ int4 GEMM template. Autotunes
+        # with custom example-input generators for the packed weight and group size; returns the node.
         _, _, _, layout, mat1, mat2 = mm_args(
             input, weight, layout=layout, use_4x2_dim=True, mat2_transposed=True
         )
@@ -161,6 +180,7 @@ def register_woq_mm_ops() -> None:
         # define functions to generate example inputs for weight and group size
         # otherwise, autotuner generates example inputs of all zeros for them
         def get_example_weight(x: torch._inductor.ir.IRNode) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Builds a random uint8 example tensor with the node's size and device for autotuning; raises AssertionError if the layout is not contiguous.
             if not x.get_layout().is_contiguous():
                 raise AssertionError("expected x to have a contiguous layout")
             shape = x.get_size()

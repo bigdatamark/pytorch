@@ -1,3 +1,6 @@
+# [PACKAGE DOC] Inductor runtime caching package. Re-exports the cache submodules (config, encoders,
+# memoizers), the isolation/context types, the cache exception hierarchy and the Memoizer and
+# PersistentMemoizer interfaces; the public names are listed in __all__.
 from . import config, encoders, memoizers
 from .context import IsolationSchema, SelectedCompileContext, SelectedRuntimeContext
 from .exceptions import (

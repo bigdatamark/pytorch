@@ -1,3 +1,8 @@
+# [MODULE DOC] Benchmarking utilities for Inductor autotuning: a device-agnostic Benchmarker (CPU
+# timing, generic dispatch via a per-device-type registry, CUDA-graph timing), a GPU benchmark lock hook,
+# decorators for counting calls and optionally distorting results in tests, and the GPU-specific
+# TritonBenchmarker / InductorBenchmarker classes defined below. Import-time side effects: creates the
+# benchmarking artifact logger and registers default benchmarkers for cpu, cuda and xpu.
 import contextlib
 import functools
 import inspect
@@ -30,6 +35,8 @@ T = TypeVar("T")
 
 
 def _get_default_gpu_device_type() -> str:
+    # [FUNCTION DOC] HELPER: Returns the single available GPU device type among cuda, xpu and mtia,
+    # defaulting to cuda when none is available. Raises AssertionError if more than one is available.
     avail_gpus = [
         device_type
         for device_type in GPU_BENCHMARK_DEVICE_TYPES
@@ -43,6 +50,8 @@ def _get_default_gpu_device_type() -> str:
 
 
 def _normalize_gpu_device_type(device_type: str | torch.device | None) -> str:
+    # [FUNCTION DOC] HELPER: Converts None, a device string or a torch.device into a device type
+    # string; None yields the default GPU type.
     if device_type is None:
         return _get_default_gpu_device_type()
     if isinstance(device_type, torch.device):
@@ -57,6 +66,8 @@ _gpu_benchmark_lock_context: _GpuBenchmarkLockContext | None = None
 def set_gpu_benchmark_lock_context(
     context_factory: _GpuBenchmarkLockContext | None,
 ) -> _GpuBenchmarkLockContext | None:
+    # [FUNCTION DOC] Sets the process-global factory for the GPU benchmark lock context (None clears
+    # it) and returns the previous factory so callers can restore it.
     """Override the process-local GPU benchmark lock context.
 
     This lets benchmark harnesses provide the context used by Inductor GPU
@@ -72,6 +83,8 @@ def set_gpu_benchmark_lock_context(
 
 @contextlib.contextmanager
 def maybe_gpu_benchmark_lock() -> Iterator[None]:
+    # [FUNCTION DOC] Context manager that enters the registered GPU benchmark lock context if one is
+    # set, otherwise does nothing.
     """Optionally enter the registered GPU benchmark lock context."""
     context_factory = _gpu_benchmark_lock_context
     if context_factory is None:
@@ -82,8 +95,10 @@ def maybe_gpu_benchmark_lock() -> Iterator[None]:
 
 
 def gpu_benchmark_lock(fn: Callable[P, T]) -> Callable[P, T]:
+    # [FUNCTION DOC] Decorator that runs the wrapped function inside the optional GPU benchmark lock context.
     @wraps(fn)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+        # [FUNCTION DOC] HELPER: Calls the wrapped function while holding the optional lock context.
         with maybe_gpu_benchmark_lock():
             return fn(*args, **kwargs)
 
@@ -103,6 +118,9 @@ def register_benchmarker(
     *,
     override: bool = False,
 ) -> None:
+    # [FUNCTION DOC] Registers a benchmarking function for a device type in the global dispatch
+    # registry. Raises ValueError for an empty or non-string device type, or if already registered
+    # without override; raises TypeError if fn is not callable. Mutates global state.
     """
     Register a device-type specific benchmarker.
 
@@ -125,6 +143,9 @@ def register_benchmarker(
 
 
 def may_distort_benchmarking_result(fn: Callable[..., Any]) -> Callable[..., Any]:
+    # [FUNCTION DOC] Test-only decorator. If the test config distort_benchmarking_result is empty (checked at decoration time),
+    # returns fn unchanged; otherwise returns a wrapper that distorts the timing results (a float, or
+    # a list/tuple of floats) with the configured method: "inverse" (reciprocal, 0 for zero) or "random".
     from torch._inductor import config
 
     if config.test_configs.distort_benchmarking_result == "":
@@ -133,6 +154,8 @@ def may_distort_benchmarking_result(fn: Callable[..., Any]) -> Callable[..., Any
     def distort(
         ms: list[float] | tuple[float, ...] | float,
     ) -> list[float] | tuple[float, ...] | float:
+        # [FUNCTION DOC] HELPER: Recursively distorts timing values per the configured method. Raises
+        # AssertionError for non-float leaves and RuntimeError for an unknown method.
         if isinstance(ms, (list, tuple)):
             return type(ms)(distort(val) for val in ms)  # type: ignore[misc]
 
@@ -152,6 +175,7 @@ def may_distort_benchmarking_result(fn: Callable[..., Any]) -> Callable[..., Any
     def wrapper(
         *args: list[Any], **kwargs: dict[str, Any]
     ) -> list[float] | tuple[float, ...] | float:
+        # [FUNCTION DOC] HELPER: Calls the wrapped benchmark function and returns its distorted result.
         ms = fn(*args, **kwargs)
 
         return distort(ms)
@@ -160,6 +184,7 @@ def may_distort_benchmarking_result(fn: Callable[..., Any]) -> Callable[..., Any
 
 
 def may_ban_benchmarking() -> None:
+    # [FUNCTION DOC] Raises RuntimeError (with guidance text) when Inductor's deterministic mode is on, to forbid non-vetted benchmarking; otherwise does nothing.
     if torch._inductor.config.deterministic:
         raise RuntimeError("""In the deterministic mode of Inductor, we will avoid those
         benchmarkings that would cause non-deterministic results. Only benchmarkings in the vetted
@@ -177,6 +202,8 @@ def may_ban_benchmarking() -> None:
 def time_and_count(
     fn: Callable[Concatenate[Any, P], T],
 ) -> Callable[Concatenate[Any, P], T]:
+    # [FUNCTION DOC] Decorator for Benchmarker methods: each call increments an inductor dynamo
+    # counter named after the instance's class and the method, then runs the method unchanged.
     """
     Wraps `fn` to increment the appropriate dynamo counters. It is expected that `fn`
     is a method of `Benchmarker` or one of its subclasses; typing limitations prevent
@@ -188,6 +215,7 @@ def time_and_count(
 
     @wraps(fn)
     def wrapper(self: Any, *args: P.args, **kwargs: P.kwargs) -> T:
+        # [FUNCTION DOC] HELPER: Bumps the per-method benchmarking counter and delegates to the wrapped method.
         fn_qual_name = f"{self.__class__.__name__}.{fn.__name__}"
         counters["inductor"][f"benchmarking.{fn_qual_name}"] += 1
         return fn(self, *args, **kwargs)
@@ -201,7 +229,12 @@ class Benchmarker:
     inductor generated callables.
     """
 
+    # [CLASS DOC] Stateless base benchmarker. benchmark() resolves the device (explicit or inferred
+    # from tensor arguments) and dispatches to a registered per-device function, else the CPU or
+    # GPU path. benchmark_cpu is implemented here; benchmark_gpu must be provided by subclasses.
     def infer_device(self, *fn_args: Any, **fn_kwargs: Any) -> torch.device:
+        # [FUNCTION DOC] Finds the common device of all tensors in the (nested) positional and keyword
+        # arguments. Raises ValueError if tensors span multiple devices or if there are no tensors.
         inferred_device: torch.device | None = None
         for arg_or_kwarg in chain(fn_args, fn_kwargs.values()):
             # Some callables take nested structures as arguments so use the
@@ -234,6 +267,12 @@ class Benchmarker:
         device: str | torch.device | None = None,
         **kwargs: Any,
     ) -> float:
+        # [FUNCTION DOC] Benchmarks fn and returns its runtime in milliseconds. The device is the
+        # given device, else inferred from the arguments (ValueError if both args and kwargs are None
+        # without a device, or inference fails). Wraps fn and its arguments into a no-arg callable,
+        # pops warmup/rep from kwargs (defaults from inductor config), and, inside the debug-mode
+        # benchmarking scope, uses the registered benchmarker for the device type, else the CPU path
+        # for cpu and the GPU path for all other devices.
         """Benchmark `fn(*fn_args, *fn_kwargs)` and return the runtime, in milliseconds (the
         actual runtime calculation is dictated by the benchmarking implementation, but may be
         one of [mean, median, minimum, etc.]). Functions as a convenience wrapper around
@@ -287,12 +326,14 @@ class Benchmarker:
         if len(fn_args) == 0 and len(fn_kwargs) == 0:
             # Keep a true zero-arg callable type to satisfy type checkers.
             def _callable() -> Any:
+                # [FUNCTION DOC] HELPER: Calls fn with no arguments.
                 return fn()
         else:
             _args = fn_args
             _kwargs = fn_kwargs
 
             def _callable() -> Any:
+                # [FUNCTION DOC] HELPER: Calls fn with the captured arguments.
                 return fn(*_args, **_kwargs)
 
         warmup = kwargs.pop("warmup", inductor_config.inductor_default_autotune_warmup)
@@ -318,6 +359,9 @@ class Benchmarker:
     def benchmark_cpu(
         self: Self, _callable: Callable[[], Any], warmup: int = 20, rep: int = 100
     ) -> float:
+        # [FUNCTION DOC] Times a CPU callable: runs it repeatedly for the warmup duration (ms), then
+        # for the rep duration (ms), measuring each call with a wall-clock counter. Returns the median
+        # per-call time in milliseconds.
         """Benchmark the CPU callable, `_callable`, and return the median runtime,
         in milliseconds.
 
@@ -335,6 +379,7 @@ class Benchmarker:
         """
 
         def run_for(ms: int) -> list[float]:
+            # [FUNCTION DOC] HELPER: Calls the callable in a loop until more than ms milliseconds have elapsed (at least once); returns each call's duration in ms.
             timings = []
             run_start_t = time.perf_counter()
             while True:
@@ -351,6 +396,7 @@ class Benchmarker:
 
     @time_and_count
     def benchmark_gpu(self: Self, *args: Any, **kwargs: Any) -> float:
+        # [FUNCTION DOC] Abstract GPU benchmark entry; the base class always raises NotImplementedError.
         raise NotImplementedError
 
     @time_and_count
@@ -361,6 +407,11 @@ class Benchmarker:
         grad_to_none: list[torch.Tensor] | None = None,
         **kwargs: Any,
     ) -> float:
+        # [FUNCTION DOC] Benchmarks a CUDA callable via graph replay. Warms up once, runs it on a side
+        # stream (clearing gradients of grad_to_none first), captures it into a CUDA graph, then times
+        # the graph's replay with benchmark_gpu (extra kwargs forwarded; gradient clearing is not
+        # forwarded since it is captured in the graph). Runs under the GPU benchmark lock and
+        # synchronizes the device several times. Returns milliseconds.
         """Benchmark a GPU callable using CUDA graph capture and replay.
 
         This captures the callable into a CUDA graph and benchmarks the graph replay,
@@ -400,15 +451,18 @@ class Benchmarker:
 
 # Make built-in defaults explicit via the registry
 def _default_cpu_bench(self, f, *, warmup, rep, **kw):
+    # [FUNCTION DOC] HELPER: Registry entry for cpu devices; delegates to the benchmarker's benchmark_cpu.
     return self.benchmark_cpu(f, warmup=warmup, rep=rep, **kw)
 
 
 def _default_cuda_bench(self, f, *, warmup, rep, **kw):
+    # [FUNCTION DOC] HELPER: Registry entry for cuda devices; delegates to benchmark_gpu with device_type defaulted to cuda.
     kw.setdefault("device_type", "cuda")
     return self.benchmark_gpu(f, warmup=warmup, rep=rep, **kw)
 
 
 def _default_xpu_bench(self, f, *, warmup, rep, **kw):
+    # [FUNCTION DOC] HELPER: Registry entry for xpu devices; delegates to benchmark_gpu with device_type defaulted to xpu.
     kw.setdefault("device_type", "xpu")
     return self.benchmark_gpu(f, warmup=warmup, rep=rep, **kw)
 
@@ -424,11 +478,17 @@ def _get_callable_device_kernel_time_us(
     rep: int,
     profiler_device_type: Any,
 ) -> float:
+    # [FUNCTION DOC] HELPER: Computes total device (GPU) kernel time in microseconds attributable to the
+    # profiled benchmark callable. Finds the CPU profiler events named for the callable (RuntimeError
+    # if their count differs from rep), collects their ids and descendants plus correlation ids of any
+    # CPU events inside the callable's time windows, then sums durations of device events of the given
+    # device type linked to those ids (excluding user annotations and context sync events).
     from torch.autograd import DeviceType
 
     benchmark_event_ids: OrderedSet[int] = OrderedSet()
 
     def collect_cpu_event_ids(event: Any) -> None:
+        # [FUNCTION DOC] HELPER: Recursively adds the ids of a CPU event and all its CPU children to the id set; non-CPU events are ignored.
         if event.device_type != DeviceType.CPU:
             return
 
@@ -497,8 +557,11 @@ def _get_callable_device_kernel_time_us(
 
 
 class TritonBenchmarker(Benchmarker):
+    # [CLASS DOC] GPU benchmarker built on Triton's do_bench. Provides the lazily imported do_bench
+    # and a benchmark_gpu that filters kwargs to do_bench's parameters and returns milliseconds.
     @cached_property
     def triton_do_bench(self: Self) -> Callable[..., Any]:
+        # [FUNCTION DOC] Cached property returning Triton's do_bench function. Raises NotImplementedError if Triton is not installed.
         """Lazily import Triton's `do_bench`."""
         try:
             from triton.testing import do_bench
@@ -516,6 +579,12 @@ class TritonBenchmarker(Benchmarker):
         is_vetted_benchmarking: bool = False,
         **kwargs: Any,
     ) -> float:
+        # [FUNCTION DOC] Times a GPU callable with Triton's do_bench. Unless vetted, first calls the
+        # deterministic-mode ban check (may raise RuntimeError). Drops kwargs that do_bench does not
+        # accept. Returns the first quantile if quantiles is given, the do_bench result for the
+        # requested return_mode, else the median. An "invalid configuration" error yields infinity
+        # (with a warning) so autotuning skips the config; other errors propagate. Locked, counted,
+        # and optionally distorted for tests.
         """Benchmark the GPU callable, `_callable`, and return the runtime, in milliseconds.
 
         Arguments:
@@ -559,18 +628,26 @@ class TritonBenchmarker(Benchmarker):
 
 
 class InductorBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
+    # [CLASS DOC] Custom event-based GPU benchmarker: flushes the cache before each timed run,
+    # estimates runtime first to bound the iteration count, and reports min or all event timings.
+    # State: _in_cudagraph_benchmark guards against re-entering CUDA graph benchmarking.
     def __init__(self: Self) -> None:
+        # [FUNCTION DOC] Initializes the base class and clears the CUDA-graph re-entry flag.
         super().__init__()
         self._in_cudagraph_benchmark = False
 
     @cached_property
     def L2_cache_size(self: Self) -> int:
+        # [FUNCTION DOC] Cached property: the current device's cache size in bytes from get_device_cache_size.
         """Get the L2 cache size, in bytes, of the current device."""
         return self.get_device_cache_size()
 
     def get_device_cache_size(
         self: Self, device_type: str | torch.device | None = None
     ) -> int:
+        # [FUNCTION DOC] Returns the cache size in bytes used for flushing. Uses an already cached
+        # L2_cache_size value if present; otherwise queries the current device's properties for the
+        # L2 or last-level cache size, falling back to 256 MB when unreported.
         """Get the L2/global cache size, in bytes, of the current device."""
         if "L2_cache_size" in self.__dict__:
             return self.__dict__["L2_cache_size"]
@@ -588,6 +665,7 @@ class InductorBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
     def get_event_pairs(
         self: Self, iters: int, device_type: str | torch.device | None = None
     ) -> list[tuple[Any, Any]]:
+        # [FUNCTION DOC] Creates iters (start, end) pairs of timing-enabled device events for the given device type.
         """Get `iters` pairs of device events."""
         device_interface = get_interface_for_device(
             _normalize_gpu_device_type(device_type)
@@ -603,6 +681,7 @@ class InductorBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
     def get_event_pairs_min_timing(
         self: Self, event_pairs: list[tuple[Any, Any]]
     ) -> float:
+        # [FUNCTION DOC] Returns the smallest elapsed time in ms across the recorded event pairs (ValueError if the list is empty).
         """Get the minimum timing, in milliseconds, for a group of event pairs."""
         return min(
             [
@@ -618,6 +697,8 @@ class InductorBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
         grad_to_none: list[torch.Tensor] | None = None,
         **kwargs: Any,
     ) -> float:
+        # [FUNCTION DOC] Runs the base CUDA-graph benchmark with the re-entry flag set, so the inner
+        # benchmark_gpu call does not try CUDA-graph benchmarking again; always clears the flag afterwards.
         # Prevent benchmark_gpu from re-entering this method
         # when autotune_cudagraph_benchmarking is enabled.
         self._in_cudagraph_benchmark = True
@@ -645,6 +726,14 @@ class InductorBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
         device_type: str | torch.device | None = None,
         **kwargs: Any,
     ) -> float | list[float]:
+        # [FUNCTION DOC] Event-based GPU timing. Unless vetted, runs the deterministic-mode ban check.
+        # For cuda with cudagraph benchmarking and max-autotune enabled (and not re-entrant), first tries
+        # the CUDA graph path, falling back with a warning on RuntimeError. Otherwise synchronizes, warms
+        # up once, allocates a cache-sized buffer, estimates runtime over estimation_iters (zeroing the
+        # buffer to flush cache and clearing grad_to_none gradients before each run), shrinks
+        # benchmark_iters to fit max_benchmark_duration, does memory warmup, then times benchmark_iters runs.
+        # Returns the list of all timings for return_mode "all", or the smaller of the estimate and the
+        # best timing for "min" (milliseconds). Raises ValueError for any other mode.
         """Benchmark a GPU callable using a custom benchmarking implementation.
 
         Arguments:
@@ -783,6 +872,9 @@ class InductorBenchmarker(TritonBenchmarker):  # noqa: docstring_linter
 class TorchProfilerBenchmarker(InductorBenchmarker):  # noqa: docstring_linter
     """Benchmarker that uses torch.profiler for GPU kernel benchmarking."""
 
+    # [CLASS DOC] Benchmarker that measures device kernel time of the callable via torch.profiler,
+    # reusing the cache-flush and event-estimation helpers from InductorBenchmarker.
+
     @time_and_count
     @gpu_benchmark_lock
     def benchmark_gpu(  # type: ignore[override]
@@ -798,6 +890,15 @@ class TorchProfilerBenchmarker(InductorBenchmarker):  # noqa: docstring_linter
         device_type: str | torch.device | None = None,
         **kwargs: Any,
     ) -> float:
+        # [FUNCTION DOC] Profiler-based GPU timing. Synchronizes, warms up once, allocates a cache-flush
+        # buffer (256 MB on ROCm, else the device cache size), estimates runtime with event pairs to cap
+        # rep by max_benchmark_duration, does memory warmup, then profiles rep runs, each wrapped in a
+        # record_function region named for the callable (flushing the buffer and clearing grad_to_none
+        # gradients before each). Sums the callable regions' device time from raw kineto events, falling
+        # back to correlating kernels with the CPU events; raises AssertionError if no device time is
+        # found. Returns the mean time per run in ms. Modes min, mean and max all return the mean;
+        # other modes raise ValueError.
+        # KNOWN ISSUE: the warmup argument is ignored, and the deterministic-mode ban check is not applied.
         """Benchmark a GPU callable using torch.profiler.
 
         Arguments:
@@ -943,6 +1044,8 @@ class TorchProfilerBenchmarker(InductorBenchmarker):  # noqa: docstring_linter
 
 
 def _make_default_benchmarker() -> Benchmarker:
+    # [FUNCTION DOC] HELPER: Builds the module-level default benchmarker: the profiler-based one if
+    # configured, else the experimental event-based one if configured, else the Triton do_bench one.
     if inductor_config.use_torch_profiler_benchmarker:
         return TorchProfilerBenchmarker()
     if inductor_config.use_experimental_benchmarker:

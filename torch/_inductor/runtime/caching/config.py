@@ -1,3 +1,7 @@
+# [MODULE DOC] Configuration for the Inductor caching module: environment-variable readers, a
+# versioned (JustKnobs/env/OSS-default) boolean config helper, the IS_CACHING_MODULE_ENABLED switch,
+# and the memoizer cache dump / pre-populate settings (IS_DUMP_MEMOIZER_CACHE_ENABLED,
+# CACHE_DUMP_FILE_PATH). Import-time side effects: none beyond defining module constants.
 import os
 from collections.abc import Callable
 from functools import cache, partial
@@ -11,6 +15,7 @@ T = TypeVar("T")
 
 
 def _is_force_disable_caches() -> bool:
+    # [FUNCTION DOC] HELPER: Returns the inductor config force_disable_caches flag; the config module is imported lazily to avoid a circular import.
     """Check if caching is force disabled via inductor config.
 
     This defers importing torch._inductor.config to avoid circular imports.
@@ -25,6 +30,8 @@ def _is_force_disable_caches() -> bool:
 
 @cache
 def _env_var_val(env_var: str, default: T) -> str | T:
+    # [FUNCTION DOC] HELPER: Returns the environment variable's string value, or the default if unset.
+    # Memoized per (name, default), so later environment changes are not observed.
     """Get the value of an environment variable or return the default.
 
     Args:
@@ -39,6 +46,8 @@ def _env_var_val(env_var: str, default: T) -> str | T:
 
 @cache
 def _env_var_config(env_var: str, default: bool) -> bool:
+    # [FUNCTION DOC] HELPER: Boolean environment flag. Returns true only if the variable is set to
+    # the string "1" (any other set value is false); returns the default when unset. Memoized.
     env_val = _env_var_val(env_var, None)
     if env_val is not None:
         return env_val == "1"
@@ -52,6 +61,10 @@ def _versioned_config(
     oss_default: bool,
     env_var_override: str | None = None,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Resolves a boolean feature flag by priority: (1) the override
+    # environment variable if set ("1" means true), (2) in fbcode, true when the local version is at
+    # least the JustKnobs version and that version is nonzero (zero means lookup failure, so disabled),
+    # (3) the OSS default. Memoized.
     """
     A versioned configuration utility that determines boolean settings based on:
     1. Environment variable override (highest priority)
@@ -98,6 +111,7 @@ _CACHING_MODULE_ENV_VAR_OVERRIDE: str = "TORCHINDUCTOR_ENABLE_CACHING_MODULE"
 
 
 def _is_caching_module_enabled_base() -> bool:
+    # [FUNCTION DOC] HELPER: Returns the versioned-config result for the caching module, ignoring force_disable_caches.
     """Base check for caching module enablement via versioned config."""
     return _versioned_config(
         _CACHING_MODULE_VERSION_JK,
@@ -108,6 +122,8 @@ def _is_caching_module_enabled_base() -> bool:
 
 
 def IS_CACHING_MODULE_ENABLED() -> bool:
+    # [FUNCTION DOC] Returns true when the caching module is enabled by versioned config and the
+    # inductor force_disable_caches option is not set; otherwise false.
     """Check if the caching module is enabled.
 
     Returns False if:

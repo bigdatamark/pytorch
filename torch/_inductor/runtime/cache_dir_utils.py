@@ -1,3 +1,6 @@
+# [MODULE DOC] Helpers for locating Inductor on-disk cache directories (general cache, per-user
+# default, Triton cache) and a context manager to temporarily override the cache directory.
+# Kept free of torch dependencies at import time. No import-time side effects.
 import getpass
 import os
 import re
@@ -12,6 +15,9 @@ from torch._environment import is_fbcode
 
 
 def cache_dir() -> str:
+    # [FUNCTION DOC] Returns the absolute Inductor cache directory: the TORCHINDUCTOR_CACHE_DIR
+    # environment variable if set, else the per-user default. Side effects: writes the resolved
+    # absolute path back into the environment variable and creates the directory if missing.
     cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
     if cache_dir is None:
         cache_dir = default_cache_dir()
@@ -22,6 +28,9 @@ def cache_dir() -> str:
 
 
 def default_cache_dir() -> str:
+    # [FUNCTION DOC] Returns the default per-user cache path: a directory named torchinductor_<user>
+    # under the system temp dir (or /var/tmp in fbcode). The username comes from getpass, falling
+    # back to a uid-based or "unknown_user" name, and path-unsafe characters are replaced by underscores.
     try:
         username = getpass.getuser()
     except (KeyError, ModuleNotFoundError, OSError):
@@ -35,6 +44,8 @@ def default_cache_dir() -> str:
 
 
 def triton_cache_dir(device: int) -> str:
+    # [FUNCTION DOC] Returns the Triton cache directory for a device index: TRITON_CACHE_DIR if set,
+    # otherwise a "triton/<device>" subdirectory of the Inductor cache dir (which creates it).
     if (directory := os.getenv("TRITON_CACHE_DIR")) is not None:
         return directory
     return os.path.join(
@@ -46,6 +57,9 @@ def triton_cache_dir(device: int) -> str:
 
 @contextmanager
 def temporary_cache_dir(directory: str) -> Generator[None, None, None]:
+    # [FUNCTION DOC] Context manager that points TORCHINDUCTOR_CACHE_DIR at the given directory for
+    # the duration of the block. In-memory Inductor caches are cleared on entry and on exit, and the
+    # previous environment value is restored (or removed if it was unset) even on error.
     from torch._inductor.utils import clear_caches
 
     original = os.environ.get("TORCHINDUCTOR_CACHE_DIR")

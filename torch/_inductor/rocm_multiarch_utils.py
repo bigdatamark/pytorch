@@ -1,3 +1,7 @@
+# [MODULE DOC] Utilities to compile LLVM IR (from Triton) into per-architecture ROCm code objects
+# and bundle them into one multi-arch fat binary using ROCm's clang and clang-offload-bundler.
+# Contents: tool lookup, target arch discovery, IR sanitizing, per-arch compile, bundling, and the
+# end-to-end workflow. Import-time side effects: creates a module logger.
 """
 ROCm Multi-Architecture Support Utilities
 Compile LLVM IR to multi-arch bundles that HIP can load automatically.
@@ -16,6 +20,8 @@ log = logging.getLogger(__name__)
 
 
 def get_rocm_compiler() -> str:
+    # [FUNCTION DOC] Returns the path of ROCm's clang under the detected ROCM_HOME (llvm/bin/clang).
+    # Raises RuntimeError if ROCM_HOME is unset or the compiler file does not exist.
     """
     Get path to ROCm's clang compiler.
     Uses PyTorch's ROCM_HOME detection.
@@ -44,6 +50,8 @@ def get_rocm_compiler() -> str:
 
 
 def get_rocm_bundler() -> str:
+    # [FUNCTION DOC] Returns the path of clang-offload-bundler under ROCM_HOME (llvm/bin).
+    # Raises RuntimeError if ROCM_HOME is unset or the bundler file does not exist.
     """
     Get path to clang-offload-bundler.
     Uses PyTorch's ROCM_HOME detection.
@@ -73,6 +81,10 @@ def get_rocm_bundler() -> str:
 
 
 def get_rocm_target_archs() -> list[str]:
+    # [FUNCTION DOC] Returns the list of GPU architectures to target. Priority: the PYTORCH_ROCM_ARCH
+    # environment variable (separated by commas or semicolons; the architecture of every visible
+    # CUDA/HIP device is appended if missing), then the inductor rocm target_archs config if non-empty,
+    # then the torch arch list. Errors reading the config are swallowed.
     env_archs = os.environ.get("PYTORCH_ROCM_ARCH", "").strip()
     if env_archs:
         archs = [arch.strip() for arch in env_archs.replace(";", ",").split(",")]
@@ -103,6 +115,9 @@ def get_rocm_target_archs() -> list[str]:
 
 
 def _sanitize_llvm_ir_for_rocm(llvm_ir_path: str) -> str:
+    # [FUNCTION DOC] HELPER: Reads the LLVM IR file and strips the nocreateundeforpoison attribute and
+    # dwarfAddressSpace metadata field that ROCm's clang cannot parse. If nothing changed, returns the
+    # original path; otherwise writes a sibling file with a .sanitized.ll suffix and returns its path.
     """
     Sanitize LLVM IR to be compatible with ROCm's clang.
 
@@ -142,6 +157,10 @@ def _sanitize_llvm_ir_for_rocm(llvm_ir_path: str) -> str:
 def compile_llvm_ir_to_code_object(
     llvm_ir_path: str, output_path: str, target_arch: str
 ) -> bool:
+    # [FUNCTION DOC] Compiles one LLVM IR file to a single-arch code object by invoking ROCm clang
+    # for the amdgcn target with the given cpu architecture, after sanitizing the IR. Creates the
+    # output directory. Returns False if the input is missing, clang is unavailable, the compiler
+    # fails, or no output appears; True on success. Runs a subprocess; may write a sanitized file.
     """
     Compile unbundled LLVM IR to a single-arch code object.
 
@@ -191,6 +210,10 @@ def compile_llvm_ir_to_code_object(
 
 
 def create_multiarch_bundle(code_objects: dict, output_bundle_path: str) -> bool:
+    # [FUNCTION DOC] Bundles per-arch code objects (mapping arch to file path) into one fat binary via
+    # clang-offload-bundler, with a dummy host entry and 4096-byte alignment required by the HIP
+    # runtime. Missing code object files are skipped. Returns False if the mapping is empty, the
+    # bundler is unavailable, no device entry remains, or the bundler fails; True on success.
     """
     Bundle multiple architecture code objects into a single multi-arch bundle.
 
@@ -261,6 +284,10 @@ def create_multiarch_bundle(code_objects: dict, output_bundle_path: str) -> bool
 def compile_multiarch_bundle_from_llvm_ir(
     llvm_ir_path: str, output_bundle_path: str, target_archs: list[str] | None = None
 ) -> bool:
+    # [FUNCTION DOC] End-to-end entry point: compiles the LLVM IR for each target arch (default from
+    # get_rocm_target_archs) into temporary .co files next to the output bundle, bundles the ones that
+    # compiled, then deletes the temporary files (errors ignored). Returns False if no arch compiled
+    # or bundling failed, else True.
     """
     Complete workflow: LLVM IR → multiple code objects → bundle.
 

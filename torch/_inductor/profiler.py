@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Profiler integration for Inductor: post-processes Chrome traces exported by the
+# torch profiler to attach Inductor kernel stack traces (provenance) to kernel events, and provides
+# inductor_trace_handler, an on_trace_ready handler that writes (optionally gzipped) trace files.
+# Public export: inductor_trace_handler. Import-time side effects: creates a module logger and the
+# set of flow event types.
 import ast
 import gzip
 import json
@@ -25,11 +30,15 @@ _profile_flow_types = OrderedSet(["fwdbwd", "ac2g"])
 
 
 class _EventItem:
+    # [CLASS DOC] HELPER: Wraps one Chrome trace event dict (attribute e) together with its time
+    # interval: start is the event timestamp and end is start plus duration (0 if absent).
     def __init__(self, event):
+        # [FUNCTION DOC] HELPER: Stores the event and computes its start and end times.
         self.e = event
         self.start, self.end = self._interval_of()
 
     def _interval_of(self):
+        # [FUNCTION DOC] HELPER: Returns (start, end) from the event's ts and optional dur fields.
         start = self.e["ts"]
         duration = self.e.get("dur", 0)
         return start, start + duration
@@ -39,6 +48,10 @@ def _find_events_covered_in(
     events: list[dict[str, Any]],
     top_level_events: list[dict[str, Any]],
 ):
+    # [FUNCTION DOC] HELPER: For each top-level event, finds the other events (of categories such as
+    # cuda_runtime, cpu_op, python_function, kernel launch/driver/memset, and without a CallFrom arg)
+    # on the same thread whose interval lies fully inside the nearest top-level event starting at or
+    # before them. Returns a mapping from top-level event uid to an ordered set of covered uids.
     """Find events covered in top level events.
 
     Returns a dict mapping top-level event uid to covered event uids.
@@ -81,7 +94,12 @@ def _find_events_covered_in(
 
 
 class _InductorTraceProcessor:
+    # [CLASS DOC] HELPER: Stateless processor that annotates a Chrome trace dict with Inductor
+    # kernel stack traces. Main entry is add_to_chrome_trace; other methods map events to uids,
+    # follow profiler flow events, and decide whether a kernel is Triton or extern.
     def _assign_uniq_id_to_event(self, trace):
+        # [FUNCTION DOC] HELPER: Ensures each trace event has a unique "uid" (its list index), marks the
+        # trace as uid_assigned (mutates it), and returns a mapping from uid to event. Idempotent.
         if trace.get("uid_assigned"):
             return {event["uid"]: event for event in trace["traceEvents"]}
         uid_2_events = {}
@@ -92,6 +110,10 @@ class _InductorTraceProcessor:
         return uid_2_events
 
     def _build_flow_mapping(self, trace, flow_events):
+        # [FUNCTION DOC] HELPER: Scans trace events in order; each flow start/finish event ("s"/"f"
+        # of a flow type) is attributed to the preceding event's uid and paired by flow id. Returns
+        # two mappings (source uid to destination uid, and the reverse) containing only complete
+        # pairs; both are empty if there are no flow events.
         """Build src/dst event mappings from profiler flow events."""
         if not flow_events:
             return {}, {}
@@ -127,9 +149,12 @@ class _InductorTraceProcessor:
         return src2dst, dst2src
 
     def _maybe_triton_call(self, kernel_name):
+        # [FUNCTION DOC] HELPER: True if the kernel name starts with the triton_ prefix.
         return kernel_name.startswith("triton_")
 
     def _has_kernel_info(self, compile_info, graph_key, kernel_name):
+        # [FUNCTION DOC] HELPER: True if the graph's recorded kernel info contains the kernel name,
+        # either exactly or as a key beginning with the name followed by a colon.
         graph_info = compile_info.get(graph_key, {})
         if kernel_name in graph_info:
             return True
@@ -137,6 +162,9 @@ class _InductorTraceProcessor:
         return any(name.startswith(kernel_prefix) for name in graph_info)
 
     def _maybe_extern_call(self, event, compile_info, fwd_key, bw_keys, need_bw):
+        # [FUNCTION DOC] HELPER: Heuristic that an event is an extern (non-generated) kernel: true when
+        # its name has no recorded info in the forward graph and, if backward is needed, in none of
+        # the backward graphs.
         kernel_name = event["name"]
         return not self._has_kernel_info(compile_info, fwd_key, kernel_name) and (
             not need_bw
@@ -147,6 +175,14 @@ class _InductorTraceProcessor:
         )
 
     def add_to_chrome_trace(self, origin_trace):
+        # [FUNCTION DOC] Annotates the trace in place with a "stack" arg on kernel events that
+        # originate from Inductor-compiled regions. Returns the trace unchanged if no compile kernel
+        # information is recorded. Locates compiled-region events (including backward regions, which
+        # are matched to their forward region through flow links), finds ops covered by those regions
+        # and by extern-kernel calls, maps ops to GPU kernel events via flow links or External id, and
+        # assigns stacks for Triton kernels by name, extern kernels by extern name, falling back to a
+        # graph's single stack. Logs a warning for unrecognized non-Triton kernels. Regions without
+        # compile info are skipped.
         """Add Inductor kernel stack information to a Chrome trace."""
         from torch._inductor.debug import get_kernel_information_jsons
 
@@ -199,6 +235,8 @@ class _InductorTraceProcessor:
                 kernel_uids_by_external_id[external_id].append(event["uid"])
 
         def _related_compile_region(compile_event):
+            # [FUNCTION DOC] HELPER: For a backward compile event, finds the forward compiled-region
+            # event enclosing its flow source event (scanning preceding regions). Raises ValueError if none.
             src_event = uid_2_events[dst2src[compile_event["uid"]]]
             src_item = _EventItem(src_event)
             idx = bisect_left(compiled_event_starts, src_item.start) - 1
@@ -215,6 +253,7 @@ class _InductorTraceProcessor:
             raise ValueError(f"Cannot find compile region for {compile_event}")
 
         def _parse_compile_region_key(key):
+            # [FUNCTION DOC] HELPER: Parses a stringified (name, is_backward) key; returns the pair, or None if unparsable or of the wrong shape/types.
             try:
                 parsed_key = ast.literal_eval(key)
             except (SyntaxError, ValueError):
@@ -229,6 +268,9 @@ class _InductorTraceProcessor:
             return parsed_key
 
         def _backward_graph_keys(compile_info, compile_name):
+            # [FUNCTION DOC] HELPER: Returns candidate backward graph keys for a compile region name:
+            # the exact backward key if present in compile_info, else that key plus every non-empty
+            # backward graph key whose name starts with the region name plus an underscore.
             bw_graph_key = str((compile_name, True))
             keys = [bw_graph_key]
             if bw_graph_key in compile_info:
@@ -247,11 +289,14 @@ class _InductorTraceProcessor:
             return keys
 
         def _stack_from_kernel_info(kernel_info):
+            # [FUNCTION DOC] HELPER: Extracts stack traces from kernel info (the stack_traces field of a mapping, else the value itself).
             if isinstance(kernel_info, dict):
                 return kernel_info.get("stack_traces")
             return kernel_info
 
         def _stack_for_kernel(compile_info, graph_key, kernel_name):
+            # [FUNCTION DOC] HELPER: Looks up the stack for a kernel in a graph's info by exact name or
+            # by a colon-suffixed name prefix; returns None when not found.
             graph_info = compile_info.get(graph_key, {})
             kernel_info = graph_info.get(kernel_name)
             if kernel_info is None:
@@ -263,6 +308,8 @@ class _InductorTraceProcessor:
             return _stack_from_kernel_info(kernel_info)
 
         def _single_stack_for_graph(compile_info, graph_key):
+            # [FUNCTION DOC] HELPER: Returns the stack of a graph if exactly one of its kernels has a
+            # stack; otherwise (none or several) returns None.
             stacks = [
                 stack
                 for stack in (
@@ -276,6 +323,8 @@ class _InductorTraceProcessor:
             return None
 
         def _assign_stack(event, compile_info, fwd_key, bw_keys, kernel_name):
+            # [FUNCTION DOC] HELPER: Sets the event's "stack" arg from the named kernel's stack, trying
+            # backward graphs first, then the forward graph. Returns True if assigned, else False.
             for bw_key in bw_keys:
                 stack = _stack_for_kernel(compile_info, bw_key, kernel_name)
                 if stack is not None:
@@ -288,6 +337,8 @@ class _InductorTraceProcessor:
             return False
 
         def _assign_single_stack(event, compile_info, fwd_key, bw_keys):
+            # [FUNCTION DOC] HELPER: Sets the event's "stack" arg to a graph's unique stack, trying
+            # backward graphs then the forward graph. Returns True if assigned, else False.
             for bw_key in bw_keys:
                 stack = _single_stack_for_graph(compile_info, bw_key)
                 if stack is not None:
@@ -300,6 +351,8 @@ class _InductorTraceProcessor:
             return False
 
         def _kernel_events_for_op(op_id):
+            # [FUNCTION DOC] HELPER: Returns the kernel events launched by an op: the flow destination
+            # if one exists, else all kernels sharing the op's External id; empty list if none.
             if op_id in src2dst:
                 return [uid_2_events[src2dst[op_id]]]
             external_id = uid_2_events[op_id].get("args", {}).get("External id")
@@ -311,6 +364,7 @@ class _InductorTraceProcessor:
             ]
 
         def _extern_kernel_name(name):
+            # [FUNCTION DOC] HELPER: Extracts an identifier starting with "extern" that is followed by a comma from an event name; returns the name unchanged if there is no match.
             match = re.search(r"\b(extern\w+)\s*,", name)
             return match.group(1) if match else name
 
@@ -391,6 +445,11 @@ class _InductorTraceProcessor:
 
 
 def _add_inductor_provenance(path):
+    # [FUNCTION DOC] HELPER: Reads the exported Chrome trace JSON at path, adds Inductor stack
+    # provenance via the trace processor, and rewrites the file. Skips (with a warning) when the
+    # event count exceeds the configured maximum, and when cpp_wrapper is enabled; warns if unique
+    # kernel names are off. Non-memory failures are logged and swallowed; MemoryError is logged and
+    # re-raised. Always clears the recorded kernel information in a finally block.
     from torch._inductor.debug import get_kernel_information_jsons
 
     try:
@@ -446,6 +505,12 @@ def inductor_trace_handler(
     use_gzip: bool = False,
     use_python_export: bool = False,
 ):
+    # [FUNCTION DOC] Builds and returns an on_trace_ready handler for the torch profiler. The handler
+    # exports a Chrome trace named <worker>.<time_ns>.pt.trace.json (plus .gz if use_gzip) into
+    # dir_name, creating the directory (RuntimeError on failure) and defaulting worker_name to
+    # hostname_pid. When kineto is available and provenance-to-timeline is configured, Inductor
+    # stack provenance is added to the exported file; with the CUPTI monitor path, it just exports
+    # and clears recorded kernel information.
     """
     Outputs tracing files with Inductor provenance to dir_name.
 
@@ -458,6 +523,9 @@ def inductor_trace_handler(
     from torch.profiler import kineto_available
 
     def handler_fn(prof) -> None:
+        # [FUNCTION DOC] HELPER: Profiler callback that writes one trace file for the given profiler
+        # object as described in inductor_trace_handler. Side effects: may create the output
+        # directory, sets the shared worker name on first use, writes files, clears kernel info.
         nonlocal worker_name
         if not os.path.isdir(dir_name):
             try:

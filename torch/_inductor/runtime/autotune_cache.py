@@ -1,3 +1,7 @@
+# [MODULE DOC] Autotune config caching for Inductor Triton kernels: AutotuneCache coordinates local
+# file and remote (Redis/internal) lookups of the best kernel config, AutotuneCacheBundler batches
+# local entries into one remote bundle, plus helpers to apply cached configs to candidate configs.
+# Import-time side effects: registers AutotuneCacheArtifact with the cache artifact factory.
 """
 PyTorch Inductor Autotuning Cache System
 
@@ -64,6 +68,9 @@ _InductorMetaTy = InductorMeta
 
 
 def inductor_meta_from_config() -> _InductorMetaTy:
+    # [FUNCTION DOC] Builds the inductor metadata mapping from current inductor config: local/remote/
+    # bundled autotune cache flags, coordinate descent tuning, fbcode flag, ROCm flag (true on HIP,
+    # else None) and the Triton backend hash (None if Triton is missing or driver lookup raises a RuntimeError).
     from torch._inductor import config
 
     backend_hash = None
@@ -92,8 +99,11 @@ def inductor_meta_from_config() -> _InductorMetaTy:
 
 @CacheArtifactFactory.register
 class AutotuneCacheArtifact(CacheArtifact):
+    # [CLASS DOC] Cache artifact type "autotune": represents a best-config JSON entry that can be
+    # serialized into an artifact bundle and written back into the local Inductor cache directory.
     @override
     def populate_cache(self) -> None:
+        # [FUNCTION DOC] Writes the artifact content as a file named by its key under the Inductor cache directory.
         autotune_cache = LocalCacheBackend()
         key = os.path.join(cache_dir(), self.key)
         autotune_cache._put(key, self.content)
@@ -101,11 +111,14 @@ class AutotuneCacheArtifact(CacheArtifact):
     @override
     @staticmethod
     def type() -> str:
+        # [FUNCTION DOC] Returns the artifact type name, "autotune".
         return "autotune"
 
     @override
     @staticmethod
     def encode(content: JsonDataTy) -> bytes:
+        # [FUNCTION DOC] Serializes JSON-compatible content to JSON bytes. Raises AssertionError if
+        # the content is already bytes or the serde does not produce bytes.
         if isinstance(content, bytes):
             raise AssertionError("content must not be bytes before encoding")
         serde = RemoteCacheJsonSerde()
@@ -121,6 +134,10 @@ class AutotuneCacheArtifact(CacheArtifact):
 class AutotuneCache:
     """Coordinates local and remote autotune cache lookups for one kernel."""
 
+    # [CLASS DOC] Per-kernel autotune cache handle. Fields: configs_hash (identifies the candidate
+    # config set), local_cache and remote_cache (each a cache plus its key, or None), and an
+    # artifact_recorder. Supports pickling for async compile workers (the remote cache is rebuilt
+    # on unpickling). Key methods: create, read_best, save.
     configs_hash: str
     local_cache: tuple[RemoteCache[JsonDataTy], str] | None = None
     remote_cache: tuple[RemoteCache[JsonDataTy], str] | None = None
@@ -131,6 +148,9 @@ class AutotuneCache:
     def create(
         inductor_meta: _InductorMetaTy, filename: str, configs_hash: str
     ) -> AutotuneCache | None:
+        # [FUNCTION DOC] Builds an AutotuneCache for the kernel source file, computing the cache key
+        # and a local key beside the file, creating an artifact recorder, and setting up local and
+        # remote caches according to inductor_meta. Returns None if neither cache is usable.
         cache = AutotuneCache(configs_hash)
         key = AutotuneCache._prepare_key(filename)
         local_cache_key = AutotuneCache._make_local_cache_key(
@@ -150,6 +170,8 @@ class AutotuneCache:
 
     @staticmethod
     def _prepare_key(filename: str) -> str:
+        # [FUNCTION DOC] HELPER: Derives the base cache key from the file's base name (already a
+        # source hash) plus the configured cache key tag, passed through the autotune key strategy.
         from torch.compiler import config as cconfig
 
         # base of filename is already sha256 hash the source contents
@@ -158,6 +180,8 @@ class AutotuneCache:
 
     @staticmethod
     def _make_local_cache_key(dirname: str, cache_key: str) -> str:
+        # [FUNCTION DOC] HELPER: Returns the local cache file path: the directory joined with a hash of
+        # the key combined with the torch key (so torch changes invalidate entries) and a .best_config suffix.
         """
         [Note: torch_key in autotune cache key]
         Include torch_key() in the cache key so that different versions
@@ -172,15 +196,21 @@ class AutotuneCache:
 
     @staticmethod
     def _artifact_key_from_local_cache_key(local_cache_key: str) -> str:
+        # [FUNCTION DOC] HELPER: Returns the last two path components (directory and file) of the local cache key as the artifact key.
         return os.path.join(*local_cache_key.split(os.sep)[-2:])
 
     def _record_artifact(self, data: JsonDataTy) -> None:
+        # [FUNCTION DOC] HELPER: Records the data with the artifact recorder if one exists (older pickled instances may lack it).
         # Older pickled AutotuneCache instances may not have this field.
         if recorder := getattr(self, "artifact_recorder", None):
             recorder.record(data)
 
     # Read the best config options from the most local cache and return it.
     def _read(self) -> dict[str, JsonDataTy] | None:
+        # [FUNCTION DOC] HELPER: Returns the cached best-config mapping, trying the local cache first
+        # (after syncing the bundler; a hit is re-added to the bundler and recorded as an artifact;
+        # an empty mapping falls through) then the remote cache. Returns None on miss. Raises
+        # AssertionError if the local entry is not a mapping.
         if local_cache := self.local_cache:
             cache, key = local_cache
             AutotuneCacheBundler.sync()
@@ -213,6 +243,8 @@ class AutotuneCache:
     def read_best(
         self, inductor_meta: _InductorMetaTy, configs: list[Config]
     ) -> Config | None:
+        # [FUNCTION DOC] Reads the cached best config and maps it to one of the candidate configs
+        # (or a new config built from it) via the cached-autotuning loader. Returns None on a miss.
         if best := self._read():
             return _load_cached_autotuning(
                 best, self.configs_hash, configs, inductor_meta
@@ -223,6 +255,8 @@ class AutotuneCache:
     def _setup_local_cache(
         self, inductor_meta: _InductorMetaTy, cache_key: str
     ) -> None:
+        # [FUNCTION DOC] HELPER: Unless autotune_local_cache is disabled in the metadata (default
+        # enabled), creates the local autotune cache and stores it with the given key.
         if not inductor_meta.get("autotune_local_cache", True):
             return
 
@@ -238,6 +272,10 @@ class AutotuneCache:
     def _setup_remote_autotune_cache(
         self, inductor_meta: _InductorMetaTy, cache_key: str
     ) -> None:
+        # [FUNCTION DOC] HELPER: If the remote autotune cache is enabled and a string backend_hash is
+        # in the metadata (missing hash: logged and skipped; non-string: AssertionError), builds a
+        # remote cache key from the torch key, backend hash, configs hash and a salt, creates the
+        # cache, and stores it along with the full key and fbcode flag (kept for pickling).
         if not _should_use_remote_autotune_cache(inductor_meta):
             return
 
@@ -282,6 +320,8 @@ class AutotuneCache:
     # process, but we need to run AutotuneCache.save on the parent process
     # when actually doing autotuning.
     def __getstate__(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Returns the pickle state: the instance dict with the remote cache handle
+        # replaced by only its key string (handles may not be serializable).
         # The remote cache handles themselves may not be serializable
         # So clear it and reconstruct it on setstate
         remote_cache = getattr(self, "remote_cache", None)
@@ -292,6 +332,9 @@ class AutotuneCache:
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
+        # [FUNCTION DOC] Restores state and, if a remote cache key was pickled, recreates the remote
+        # cache from the saved full key and fbcode flag; logs a warning and clears it on failure.
+        # Raises AssertionError if the pickled fields are inconsistent or missing.
         # Reconstruct the remote cache on the parent class
         self.__dict__.update(state)
         if self.remote_cache is not None:
@@ -328,6 +371,10 @@ class AutotuneCache:
         found_by_coordesc: bool = False,
         triton_cache_hash: str | None = None,
     ) -> None:
+        # [FUNCTION DOC] Persists a chosen Triton config: builds a JSON record (config kwargs, warps,
+        # stages, configs hash, coordinate-descent flag, time in ms, triton cache hash, optional extra
+        # options and warp-specialization fields), records it as an artifact, writes it to the local
+        # cache and the bundler, and writes it to the remote cache. Cache write errors propagate.
         data: dict[str, JsonDataTy] = {
             # pyrefly: ignore [missing-attribute]
             **config.kwargs,
@@ -378,6 +425,10 @@ class _AutotuneCacheBundlerImpl:
     Caches a set of local autotune entries together in a single cache.
     """
 
+    # [CLASS DOC] HELPER: Collects local autotune cache entries (mapping from file basename to JSON
+    # data) for one compilation and writes them as one remote entry under a single key; on a remote
+    # hit it expands the bundle back into the local autotune cache. Attributes: _key, _cache, _entries.
+
     _key: str
     _cache: RemoteCache[JsonDataTy]
 
@@ -385,21 +436,25 @@ class _AutotuneCacheBundlerImpl:
     _entries: dict[str, JsonDataTy]
 
     def end_compile(self) -> None:
+        # [FUNCTION DOC] HELPER: Writes all collected entries to the remote cache under the bundle key, if there are any.
         # TODO: Do we need to compute time_taken_ms and encode that somehow?
         if self._entries:
             self._cache.put(self._key, self._entries)
 
     def put(self, basename: str, data: JsonDataTy) -> None:
+        # [FUNCTION DOC] HELPER: Records (or overwrites) the entry for the given file basename.
         # Do we need to worry about duplicates? We only have a single local fs
         # entry - so probably not.
         self._entries[basename] = data
 
     def __init__(self, key: str, cache: RemoteCache[JsonDataTy]) -> None:
+        # [FUNCTION DOC] HELPER: Stores the bundle key and remote cache and starts with no entries.
         self._key = key
         self._cache = cache
         self._entries = {}
 
     def sync(self) -> None:
+        # [FUNCTION DOC] HELPER: Currently a no-op placeholder for waiting on an asynchronous cache load.
         # We don't currently use this - but we could async load starting at
         # `begin_compile` and wait for the load to be finished here.
         pass
@@ -408,6 +463,10 @@ class _AutotuneCacheBundlerImpl:
     def _should_use_bundled_autotune_remote_cache(
         cls, inductor_meta: _InductorMetaTy
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Decides whether bundled remote autotune caching applies. False if the
+        # local cache is disabled; otherwise the explicit bundled_autotune_remote_cache setting if
+        # present; otherwise only in fbcode, outside unit tests and non-HIP, when the internal cache
+        # version meets the JustKnobs version (False if the internal module is absent).
         # The bundled autotune cache is only available if you've also got local
         # caching enabled (because we feed the bundled data to the local cache).
         if not inductor_meta.get("autotune_local_cache", True):
@@ -439,6 +498,10 @@ class _AutotuneCacheBundlerImpl:
         return REMOTE_CACHE_VERSION >= jk
 
     def _load_cache(self) -> bool:
+        # [FUNCTION DOC] HELPER: Fetches the bundle from the remote cache; returns False if missing or
+        # not a mapping. Otherwise writes each entry into the local autotune cache at its
+        # reconstructed path, sums any saved-time values and extends the distributed timeout by that
+        # total, and returns True.
         from torch._inductor import codecache
 
         # The single key is defined on construction of the cache.
@@ -469,10 +532,12 @@ class _AutotuneCacheBundlerImpl:
 
     @staticmethod
     def _get_is_fbcode(inductor_meta: _InductorMetaTy) -> bool:
+        # [FUNCTION DOC] HELPER: Returns the is_fbcode flag from the metadata as a bool (default false).
         return bool(inductor_meta.get("is_fbcode", False))
 
     @staticmethod
     def _get_backend_hash(inductor_meta: _InductorMetaTy) -> str:
+        # [FUNCTION DOC] HELPER: Returns backend_hash from the metadata; raises KeyError if absent and AssertionError if not a string.
         backend_hash = inductor_meta["backend_hash"]
         if not isinstance(backend_hash, str):
             raise AssertionError(
@@ -484,12 +549,18 @@ class _AutotuneCacheBundlerImpl:
 class AutotuneCacheBundler:
     """Manages one bundled autotune cache write scope for a compile context."""
 
+    # [CLASS DOC] Public facade over bundled autotune caching. Keeps a class-level weak mapping (with
+    # a lock) from CompileContext to an AutotuneCacheBundler instance, each holding an optional
+    # active bundler implementation. Class methods begin_compile, end_compile, sync and put operate
+    # on the bundler of the current compile context and are no-ops when none is active.
+
     _context_bundlers: weakref.WeakKeyDictionary[
         CompileContext, AutotuneCacheBundler
     ] = weakref.WeakKeyDictionary()
     _context_bundlers_lock = threading.Lock()
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Creates a holder with no active bundler implementation.
         self._bundler: _AutotuneCacheBundlerImpl | None = None
 
     @classmethod
@@ -499,6 +570,9 @@ class AutotuneCacheBundler:
         *,
         create: bool,
     ) -> AutotuneCacheBundler | None:
+        # [FUNCTION DOC] HELPER: Under the lock, returns the bundler holder registered for the compile
+        # context, creating one when create is true and none exists. Returns None if ctx is None or
+        # nothing exists and create is false. Raises AssertionError on an unexpected stored type.
         if ctx is None:
             return None
 
@@ -515,6 +589,7 @@ class AutotuneCacheBundler:
 
     @classmethod
     def has_active_compile(cls, compile_context: CompileContext | None) -> bool:
+        # [FUNCTION DOC] Returns true if the given compile context has an active bundler between begin_compile and end_compile.
         context_bundler = cls._get_context_bundler(compile_context, create=False)
         return context_bundler is not None and context_bundler._bundler is not None
 
@@ -529,6 +604,12 @@ class AutotuneCacheBundler:
         code: str | None = None,
         code_hash: str | None = None,
     ) -> None:
+        # [FUNCTION DOC] Starts bundling for the current compile context. Exactly one of code (hashed
+        # after stripping comments) or code_hash is required, else AssertionError; also raises
+        # AssertionError if a bundler is already active. Returns silently if bundled caching is not
+        # enabled, no compile context exists, or the cache cannot be created. Otherwise tries to load the
+        # bundle for the key (code hash, backend hash, salt) into the local cache; only on a miss does
+        # it keep the bundler active to collect entries.
         if code is not None:
             if code_hash is not None:
                 raise AssertionError("Cannot specify both code and code_hash")
@@ -592,6 +673,8 @@ class AutotuneCacheBundler:
     # those and put it into the cache.
     @classmethod
     def end_compile(cls) -> None:
+        # [FUNCTION DOC] Finishes bundling for the current compile context: detaches the active
+        # bundler (if any) and writes its collected entries to the remote cache.
         if not (
             context_bundler := cls._get_context_bundler(
                 CompileContext.try_get(), create=False
@@ -604,6 +687,7 @@ class AutotuneCacheBundler:
 
     @classmethod
     def sync(cls) -> None:
+        # [FUNCTION DOC] Calls sync on the current compile context's active bundler, if any.
         if not (
             context_bundler := cls._get_context_bundler(
                 CompileContext.try_get(), create=False
@@ -615,6 +699,8 @@ class AutotuneCacheBundler:
 
     @classmethod
     def put(cls, filename: str, data: JsonDataTy) -> None:
+        # [FUNCTION DOC] Adds a local autotune cache entry to the active bundler of the current
+        # compile context, keyed by the file's base name; does nothing if no bundler is active.
         if not (
             context_bundler := cls._get_context_bundler(
                 CompileContext.try_get(), create=False
@@ -636,11 +722,15 @@ class AutotuneCacheBundler:
 # Remove the comments from the code (which include things like run ids and file
 # paths) and then hash the result.
 def _comment_stripped_hash(code: str) -> str:
+    # [FUNCTION DOC] HELPER: Removes hash-style comments from each line of source and returns the codecache code hash of the result.
     code = re.sub(r"#.*$", "", code, count=0, flags=re.MULTILINE)
     return torch._inductor.codecache.code_hash(code)
 
 
 def _should_use_remote_autotune_cache(inductor_meta: _InductorMetaTy) -> bool:
+    # [FUNCTION DOC] HELPER: Decides if the remote autotune cache applies: the explicit
+    # autotune_remote_cache setting wins if present; otherwise only in fbcode, outside unit tests and
+    # non-HIP, when the internal cache version meets the JustKnobs version (False if the internal module is missing).
     if (config := inductor_meta.get("autotune_remote_cache")) is not None:
         return bool(config)
     if not inductor_meta.get("is_fbcode"):
@@ -664,6 +754,10 @@ def _reconstruct_triton_config(
     best_config: dict[str, Any],
     extra_options: JsonDataTy | None,
 ) -> Config:
+    # [FUNCTION DOC] HELPER: Builds a Triton Config from a cached mapping: removes num_warps and
+    # num_stages (plus warp-specialization fields when supported) from the mapping (mutating it),
+    # uses the remaining entries as kernel kwargs, and attaches the extra options. Raises KeyError if
+    # num_warps or num_stages is missing.
     num_warps = best_config.pop("num_warps")
     num_stages = best_config.pop("num_stages")
     config_args: dict[str, Any] = {
@@ -690,6 +784,11 @@ def _load_cached_autotuning(
     configs: list[Config],
     inductor_meta: _InductorMetaTy,
 ) -> Config | None:
+    # [FUNCTION DOC] Converts a cached best-config mapping into a Config. Returns None if the mapping
+    # is None or its stored configs hash differs from configs_hash. Strips bookkeeping fields (time,
+    # triton cache hash, extra options, coordinate-descent flag; mutating the mapping). Unless found by
+    # coordinate descent, returns the single candidate config whose kwargs, warps and stages match
+    # (with extra options attached); otherwise reconstructs a new Config, flagging coordinate-descent results.
     if best_config is None:
         return None
     if best_config.pop("configs_hash", None) != configs_hash:
@@ -737,6 +836,7 @@ def _load_cached_autotuning(
 
 
 def _splitext_nodot(basename: str) -> tuple[str, str]:
+    # [FUNCTION DOC] HELPER: Splits a file name into root and extension, with the extension returned without its leading dot.
     root, ext = os.path.splitext(basename)
     if ext:
         ext = ext[1:]
