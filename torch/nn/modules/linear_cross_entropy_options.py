@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Defines LinearCrossEntropyOptions, a frozen dataclass configuring the chunked implementation
+# of the fused linear plus cross entropy loss (chunk size or heuristic, accumulation policy
+# and dtype), along with helpers that resolve "auto" settings for a concrete call.
+# Exports LinearCrossEntropyOptions via __all__. No import-time side effects beyond
+# defining the valid accumulation policy names.
 import dataclasses
 from typing import Literal
 
@@ -11,6 +17,9 @@ _VALID_ACC_POLICIES = ("auto", "accurate", "compact")
 
 
 def _auto_acc_policy(device_type: str | None, dtype: torch.dtype) -> str:
+    # [FUNCTION DOC] HELPER: Resolves the automatic accumulation policy. Returns the string
+    # "accurate" when the device type is cpu and dtype is float16 or bfloat16, otherwise
+    # "compact" (including when device type is None). Pure function.
     """Resolve the ``acc_policy`` ``"auto"`` sentinel from device and dtype.
 
     Only CPU + low-precision input (fp16/bf16) picks ``"accurate"``: there
@@ -28,6 +37,13 @@ def _auto_acc_policy(device_type: str | None, dtype: torch.dtype) -> str:
 
 @dataclasses.dataclass(slots=True, frozen=True)
 class LinearCrossEntropyOptions:
+    # [CLASS DOC]
+    # Immutable (frozen, slotted) options record for the chunked linear cross entropy path.
+    # Fields: allow_retain_graph (keep gradient buffers for repeated backward),
+    # batch_chunk_size (rows per chunk or None), chunking_method ("auto", "aspect_ratio",
+    # "aspect_ratio:N" or None), acc_policy ("auto", "accurate", "compact") and acc_dtype
+    # (accumulation dtype or None). Values are validated on construction; "auto"/None
+    # sentinels are resolved per call by the internal _adjust, which returns a new instance.
     """Configuration for the chunked implementation of
     :func:`linear_cross_entropy`.
 
@@ -139,6 +155,12 @@ class LinearCrossEntropyOptions:
     """
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Validates fields after dataclass construction and raises ValueError for: an
+        # acc_policy outside the allowed names; a chunking_method that is not None, "auto",
+        # or "aspect_ratio" optionally followed by a colon and a positive integer; a
+        # batch_chunk_size that is neither None nor a positive int; an acc_dtype that is
+        # not None or one of float16, bfloat16, float32, float64. No mutation.
         if self.acc_policy not in _VALID_ACC_POLICIES:
             raise ValueError(
                 f"invalid acc_policy: {self.acc_policy!r}; expected one of "
@@ -173,6 +195,8 @@ class LinearCrossEntropyOptions:
 
     @staticmethod
     def _ceil_div(a: int, b: int) -> int:
+        # [FUNCTION DOC] HELPER: Integer ceiling division of a by b, using negated floor
+        # division. Intended for non-negative a and positive b; b of zero raises ZeroDivisionError.
         """ceil(a / b) for non-negative integers."""
         return -(-a // b)
 
@@ -180,6 +204,10 @@ class LinearCrossEntropyOptions:
     def _resolve_auto_acc_dtype(
         dtype: torch.dtype, device: torch.device | None
     ) -> torch.dtype | None:
+        # [FUNCTION DOC] HELPER: Picks the automatic accumulation dtype. Returns None if
+        # device is None or dtype is not float16/bfloat16. For cuda devices returns float32 when
+        # CUDA is available and the compute capability is at least 7 (float16) or 8 (bfloat16),
+        # else None; for cpu returns float32; any other device type gives None.
         """Return fp32 for fp16/bf16 input on hardware with a working
         mixed-precision mm path (CUDA SM 7.0+ for fp16, SM 8.0+ for bf16,
         and CPU); ``None`` otherwise (caller falls back to input dtype).
@@ -206,6 +234,11 @@ class LinearCrossEntropyOptions:
         num_classes: int,
         method: str | None = None,
     ) -> int:
+        # [FUNCTION DOC] HELPER: Computes a chunk size for the aspect_ratio heuristic (method
+        # defaults to self.chunking_method). The target is num_batches divided by the ceiling
+        # of num_classes over in_features, rounded up to a power of two, divided by the optional
+        # factor after the colon, and capped at num_batches. Raises AssertionError for any
+        # other method name. Pure computation.
         """Compute batch_chunk_size from chunking_method given input shapes.
 
         Pass ``method`` to use a post-``_adjust`` resolved value (e.g. when
@@ -234,6 +267,14 @@ class LinearCrossEntropyOptions:
         device=None,
         prob_target=False,
     ):
+        # [FUNCTION DOC] HELPER: Returns a new options instance with every auto/None setting
+        # made concrete for a call with the given sizes, dtype and optional device. Resolves
+        # acc_policy via the automatic rule; an explicit batch_chunk_size turns automatic chunking
+        # off; automatic chunking becomes aspect_ratio, and under the compact policy the chunk
+        # size is further capped by a power of two memory bound (smaller for probability
+        # targets). acc_dtype defaults to float32 on supported hardware under the auto policy,
+        # else the input dtype. Final batch_chunk_size is at least 1. Raises ValueError when an
+        # explicit batch_chunk_size disagrees with the size computed from chunking_method.
         """Resolve ``"auto"`` sentinels and ``None`` defaults against a
         specific call site; returns a fully concrete options instance.
 

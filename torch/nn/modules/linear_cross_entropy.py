@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Chunked (memory-bounded) implementation of fused linear plus cross entropy: the logits
+# are computed one batch chunk at a time so the full batch by classes matrix is never built.
+# Contents: helper tensor factories, a per-call context (_ChunkContext) and per-chunk views
+# (_ChunkViews) that hide dtype/device/precision-policy dispatch, a shared accumulator loop
+# that produces loss and gradients, and two registered custom ops (scalar reduction, and
+# reduction none) with fake-tensor, vmap and autograd registrations.
+# Import-time side effects: registers the custom ops torch_nn::_linear_cross_entropy_batch_chunked
+# and torch_nn::_linear_cross_entropy_batch_chunked_no_reduction and their fake, vmap and autograd
+# rules with the library. Exports nothing publicly (empty __all__).
 import dataclasses
 from functools import cached_property
 
@@ -8,6 +18,9 @@ __all__ = []
 
 
 def _make_empty(shape, dtype, device, when=True):
+    # [FUNCTION DOC] HELPER: Allocates an uninitialized, non-grad tensor of the given shape,
+    # dtype and device; when the flag is false returns instead an empty tensor of the same
+    # rank with every dimension zero, so unused buffers keep a uniform type.
     # when=False returns a rank-matching empty (shape (0,)*len(shape)).
     return torch.empty(
         shape if when else (0,) * len(shape),
@@ -18,6 +31,8 @@ def _make_empty(shape, dtype, device, when=True):
 
 
 def _make_zeros(shape, dtype, device, when=True):
+    # [FUNCTION DOC] HELPER: Same as the empty-tensor factory but zero-filled when the flag
+    # is true; when false returns a zero-sized tensor of matching rank.
     return torch.zeros(
         shape if when else (0,) * len(shape),
         device=device,
@@ -27,6 +42,12 @@ def _make_zeros(shape, dtype, device, when=True):
 
 
 def _linear_cross_entropy_batch_chunked_setup_context(ctx, inputs, output):
+    # [FUNCTION DOC] HELPER: Autograd setup hook for the scalar-reduction op. Reads the
+    # trailing flags (allow_retain_graph and the three compute flags) from inputs, disables
+    # gradient materialization for unused outputs, records the flags on ctx, and stashes
+    # detached copies of the precomputed input, weight and bias gradients (or None when not
+    # computed) from the op output. Detaching avoids a reference cycle with the autograd node.
+    # Mutates ctx only.
     (
         *_,
         allow_retain_graph,
@@ -59,6 +80,11 @@ def _linear_cross_entropy_batch_chunked_setup_context(ctx, inputs, output):
 
 @dataclasses.dataclass
 class _ChunkViews:
+    # [CLASS DOC] HELPER: Plain record of the tensors for one loop iteration (chunk offset
+    # and size, input, target, class-weight and logits slices, accumulation-dtype input copy)
+    # plus a back reference to the _ChunkContext. Its properties pick the correct operand or
+    # scratch buffer from the context's dispatch flags; cached ones are computed lazily once
+    # per chunk and must be first accessed in the order the loop requires.
     """Per-iteration tensor views; each property picks the right operand
     or scratch from ctx dispatch flags so call sites read raw.
     """
@@ -74,6 +100,10 @@ class _ChunkViews:
 
     @cached_property
     def prob_wt(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Probability-target path only. Returns the chunk of class
+        # weight times target probabilities: the raw target chunk when no scratch is needed,
+        # otherwise the scratch buffer filled with the product (or a plain copy when no class
+        # weight). Side effect: writes into the shared scratch buffer.
         # Prob path: (B, V) weight*target at the logits dtype -- the dense
         # analogue of the index path's per-row ``weight_chunk``. A view of
         # ``target_chunk`` when no scratch is needed.
@@ -89,6 +119,8 @@ class _ChunkViews:
 
     @property
     def input(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Returns the accumulation-dtype copy of the input chunk when
+        # the forward matmul needs it, else the original input chunk.
         return (
             self.input_chunk_acc
             if self.ctx.forward_uses_acc_input
@@ -97,6 +129,8 @@ class _ChunkViews:
 
     @property
     def linear_weight(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Returns the original linear weight when the forward matmul
+        # uses the CUDA mixed-dtype output path, otherwise the cast copy of the weight.
         ctx = self.ctx
         return (
             ctx.linear_weight
@@ -106,12 +140,16 @@ class _ChunkViews:
 
     @property
     def input_grad_logits(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Logits operand for the input-gradient matmul: the
+        # downcast logits when that path is flagged, else the logits themselves.
         if self.ctx.input_grad_uses_logits_lw:
             return self.logits_downcast
         return self.logits
 
     @property
     def input_grad_linear_weight(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Weight operand for the input-gradient matmul: the original
+        # weight when the downcast-logits path is flagged, else the cast weight copy.
         ctx = self.ctx
         return (
             ctx.linear_weight
@@ -121,6 +159,8 @@ class _ChunkViews:
 
     @property
     def weight_grad_input(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Input operand for the weight-gradient matmul: the original
+        # input chunk on CUDA when the matmul is mixed dtype, else the accumulation-dtype copy.
         ctx = self.ctx
         if ctx.is_cuda and not ctx.weight_grad_mm_same_dtype:
             return self.input_chunk
@@ -128,6 +168,9 @@ class _ChunkViews:
 
     @property
     def logits_upcast(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Returns the logits as-is on CUDA or when dtypes already match
+        # for the weight-gradient matmul; otherwise copies them into the accumulation-dtype
+        # scratch buffer (side effect: writes that buffer) and returns that view.
         # Non-CUDA mixed-dtype: copy into logits_acc_buf for matching-dtype mm.
         ctx = self.ctx
         if ctx.is_cuda or ctx.weight_grad_mm_same_dtype:
@@ -136,6 +179,9 @@ class _ChunkViews:
 
     @cached_property
     def grad_input_chunk(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Destination slice for this chunk's input gradient: a scratch
+        # buffer view when the buffer-and-copy path is flagged (committed later by the
+        # context's chunk loop), otherwise a direct view into the full input-gradient tensor.
         # Buf-and-copy commit happens in ctx.chunks() post-yield.
         ctx = self.ctx
         if ctx.alloc_input_grad_acc_buf:
@@ -144,6 +190,9 @@ class _ChunkViews:
 
     @cached_property
     def bias_grad_acc(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Accumulator for the bias gradient: the accumulation-dtype
+        # per-chunk scratch when allocated (committed and zeroed after each chunk), otherwise
+        # the final bias-gradient tensor accumulated into directly.
         # ``ctx.linear_bias_grad_chunk`` is an acc_dtype scratch that
         # accumulates the per-chunk sum + index_add at acc precision,
         # then commits to ``grad_linear_bias`` (input dtype) via the
@@ -159,6 +208,9 @@ class _ChunkViews:
 
     @cached_property
     def logits_downcast(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Logits converted to the linear weight dtype when the loop is
+        # flagged to cache that conversion, else the logits unchanged. Cached on first access,
+        # so it must be first read after all in-place edits to the logits.
         # Lazy: first access must come AFTER in-place mods to self.logits.
         ctx = self.ctx
         if ctx.loop_caches_logits_downcast:
@@ -168,6 +220,14 @@ class _ChunkViews:
 
 @dataclasses.dataclass
 class _ChunkContext:
+    # [CLASS DOC] HELPER: Per-call state for the chunked loop, created by the build
+    # classmethod. Holds sizes, dtypes (input, accumulation, weight-chunk, grad-input, cast),
+    # the input/target/class-weight/linear-weight/bias tensors, reduction mode, probability-
+    # target flag and loss scale, the logits and scratch buffers, and a set of boolean dispatch
+    # flags (alloc_*, forward_uses_*, etc.) decided once from device, dtype and accumulation
+    # policy. Optional buffers are lazily created cached properties, rank-matching empty when
+    # unused. Key methods: chunks (iterator with post-chunk commits), bind_chunk, and math
+    # wrappers mm, shifted_logits, dotgather, sumexp_, sum, div, mul, to.
     """Per-call state for the chunked loop, built once via ``build``.
     Methods hide dtype/device/acc_policy dispatch behind single math ops;
     dispatch-free per-iter math is inlined into the loop body. Buffers
@@ -230,10 +290,14 @@ class _ChunkContext:
 
     @cached_property
     def _mask(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Boolean tensor marking target entries equal to ignore_index.
         return self.target == self.ignore_index
 
     @cached_property
     def corrected_target(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Target safe for indexing. Probability targets and in-range
+        # ignore_index return the target unchanged; otherwise ignored positions are replaced by
+        # class zero so gather, select and add-by-index stay in bounds (their weight is zero).
         # Replace out-of-range ignore_index values with 0 lazily so
         # downstream index_select / index_add_ stay in bounds.
         if self.is_prob_target:
@@ -245,6 +309,11 @@ class _ChunkContext:
 
     @cached_property
     def neg_weight_target(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Per-row weight vector for the index-target path, zero on
+        # ignored rows and the class weight (or one) elsewhere. For mean it is divided by the
+        # negated sum of weights (NaN if that sum is zero); for sum it is negated; for none it
+        # stays positive in forward and, when a per-sample upstream gradient is present, is
+        # negated and multiplied by it. Returns a freshly built tensor in the weight-chunk dtype.
         # Per-row weighting: -(weight[target] if weight else 1) / d on
         # unmasked positions, 0 on masked positions. d = sum of unmasked
         # weights for "mean", 1 for "sum".
@@ -281,12 +350,16 @@ class _ChunkContext:
 
     @cached_property
     def linear_weight_cast(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: The linear weight converted to the cast dtype if that differs
+        # from the input dtype, otherwise the original weight (no copy).
         if self.linear_weight_cast_dtype != self.dtype:
             return self.linear_weight.to(self.linear_weight_cast_dtype)
         return self.linear_weight
 
     @cached_property
     def weight_row(self) -> torch.Tensor | None:
+        # [FUNCTION DOC] HELPER: Class weights as a one-row matrix in the logits dtype for
+        # broadcasting over probability-target chunks; None when no class weight was given.
         # (1, V) class-weight row at the logits dtype, broadcast against
         # each (B, V) target chunk on the prob path. None when no class
         # weight was passed.
@@ -299,6 +372,8 @@ class _ChunkContext:
 
     @cached_property
     def prob_target_buf(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Scratch matrix shaped like the logits buffer for per-chunk
+        # weight times target on the probability path; zero-sized when not needed.
         # (B, V) scratch at the logits dtype holding weight*target per
         # chunk on the prob path; rank-empty when target_chunk is usable
         # directly (no class weight, matching dtype).
@@ -311,6 +386,8 @@ class _ChunkContext:
 
     @cached_property
     def linear_bias_cast(self) -> torch.Tensor | None:
+        # [FUNCTION DOC] HELPER: Linear bias converted to the logits buffer dtype (no copy if
+        # equal); None when no bias was supplied.
         # ``linear_bias`` is added to per-chunk logits, so its dtype
         # must match the logits buffer (which may be acc_dtype on the
         # upcast path). ``None`` when the user passed no bias -- the
@@ -323,6 +400,8 @@ class _ChunkContext:
 
     @cached_property
     def weight_grad_chunk(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Accumulation-dtype scratch of shape classes by features for
+        # the per-chunk weight gradient; zero-sized on the direct (compact) path.
         # (V, F) acc_dtype accumulator for keep-path weight-grad mm;
         # rank-empty on the direct (compact) path.
         return _make_empty(
@@ -334,6 +413,8 @@ class _ChunkContext:
 
     @cached_property
     def logits_acc_buf(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Accumulation-dtype scratch with the logits buffer's shape,
+        # used on non-CUDA mixed-dtype paths; zero-sized otherwise.
         # (B, V) scratch for non-CUDA mixed-dtype logits_upcast.
         return _make_empty(
             (self.logits_buf.shape[0], self.num_classes),
@@ -344,6 +425,8 @@ class _ChunkContext:
 
     @cached_property
     def input_grad_acc_buf(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Per-chunk scratch (chunk rows by features) for the input
+        # gradient on the buffer-and-copy path; zero-sized otherwise.
         # (B, F) scratch for input-grad addmm on the buf-and-copy path
         # (CPU mixed-dtype, MPS).
         return _make_empty(
@@ -355,6 +438,8 @@ class _ChunkContext:
 
     @cached_property
     def input_chunk_acc_buf(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Accumulation-dtype scratch for an upcast copy of each input
+        # chunk; zero-sized when no upcast is needed.
         return _make_empty(
             (self.logits_buf.shape[0], self.in_features),
             self.acc_dtype,
@@ -364,6 +449,8 @@ class _ChunkContext:
 
     @cached_property
     def grad_input(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Uninitialized full-size input-gradient tensor (every row is
+        # later written by the chunk loop); zero-sized if the input gradient is not requested.
         return _make_empty(
             self.input.shape,
             self.grad_input_dtype,
@@ -373,6 +460,8 @@ class _ChunkContext:
 
     @cached_property
     def grad_linear_weight(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Zero-initialized weight-gradient accumulator in the input
+        # dtype with the weight's shape; zero-sized if not requested.
         return _make_zeros(
             self.linear_weight.shape,
             self.dtype,
@@ -382,6 +471,8 @@ class _ChunkContext:
 
     @cached_property
     def grad_linear_bias(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Zero-initialized bias-gradient accumulator in the input dtype
+        # shaped like the weight without its last dimension; zero-sized if not requested.
         # Same shape invariant as ``linear_bias``:
         # ``linear_bias.shape == linear_weight.shape[:-1]``. Final
         # accumulator in input dtype to match ``grad_linear_weight``.
@@ -394,6 +485,9 @@ class _ChunkContext:
 
     @cached_property
     def linear_bias_grad_chunk(self) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Zero-initialized accumulation-dtype scratch for the bias
+        # gradient within one chunk; committed to the final tensor and re-zeroed after each
+        # chunk. Zero-sized when the mixed-precision scratch is not used.
         # ``linear_weight.shape[:-1]`` acc_dtype per-chunk scratch,
         # mirroring ``weight_grad_chunk``'s role for
         # ``grad_linear_weight``: the sub_ + index_add_ pair
@@ -428,6 +522,14 @@ class _ChunkContext:
         compute_linear_bias_grad: bool,
         loss_grad_output: torch.Tensor | None = None,
     ) -> "_ChunkContext":
+        # [FUNCTION DOC] HELPER: Validates arguments and computes all dtype and dispatch flags,
+        # then allocates the logits and scratch buffers and returns a populated context.
+        # Raises TypeError for a probability target whose dtype differs from the input or a
+        # non-int64 index target; RuntimeError for a wrong probability-target shape, a
+        # mismatched bias shape, or an unsupported accumulation dtype (only float32 with
+        # float16/bfloat16 input, or equal dtypes); NotImplementedError for label smoothing,
+        # an unknown reduction, or none reduction with probability targets. Mean reduction with
+        # probability targets scales by one over the row count (NaN if zero rows).
         # ===== Validation =====
         is_prob_target = target.dtype.is_floating_point
         if is_prob_target:
@@ -617,6 +719,12 @@ class _ChunkContext:
         )
 
     def chunks(self):
+        # [FUNCTION DOC] HELPER: Generator over consecutive batch chunks (size set by the
+        # logits buffer's row count; last may be smaller), yielding a _ChunkViews for each.
+        # After the consumer resumes it commits deferred results: copies the scratch input
+        # gradient into the full tensor, and adds the downcast bias scratch into the final bias
+        # gradient and zeroes the scratch. Consumers must not break out early or the final
+        # commit is skipped.
         """Yield a ``_ChunkViews`` per iter. Post-yield, run the
         scratch-to-final commits that the loop body deferred: the
         buf-and-copy input-grad slice into ``grad_input`` (skipped on
@@ -643,6 +751,10 @@ class _ChunkContext:
                 chunk.bias_grad_acc.zero_()
 
     def bind_chunk(self, bchunk_start: int, bchunk_size: int) -> _ChunkViews:
+        # [FUNCTION DOC] HELPER: Builds the views for rows starting at bchunk_start of length
+        # bchunk_size: slices of input, corrected target, per-row weights (none on the
+        # probability path) and logits buffer; copies the input chunk into the upcast scratch
+        # when that is allocated. Returns a _ChunkViews; writes the scratch as a side effect.
         input_chunk = self.input.narrow(0, bchunk_start, bchunk_size)
         target_chunk = self.corrected_target.narrow(0, bchunk_start, bchunk_size)
         # The prob loop derives its per-chunk row weighting from
@@ -670,6 +782,8 @@ class _ChunkContext:
         )
 
     def mm(self, mat1: torch.Tensor, mat2: torch.Tensor, *, out: torch.Tensor) -> None:
+        # [FUNCTION DOC] HELPER: Matrix product written into out; uses the mixed-dtype output
+        # form when the first operand's dtype differs from out's. Returns nothing.
         # Mismatched dtype: cuBLAS ``out_dtype=`` upcasts inside the matmul.
         if mat1.dtype == out.dtype:
             torch.mm(mat1, mat2, out=out)
@@ -677,6 +791,10 @@ class _ChunkContext:
             torch.mm(mat1, mat2, out_dtype=out.dtype, out=out)
 
     def shifted_logits(self, chunk: _ChunkViews) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Forward prelude for a chunk. Writes input times transposed
+        # weight (plus bias if any) into the chunk's logits view, then subtracts each row's
+        # maximum in place for numerical stability. Returns that logits view. Side effects:
+        # overwrites the logits buffer and the shared row scratch.
         # Per-chunk forward prelude shared by all three chunk loops (none /
         # prob / index): logits = input @ weight.T (+ bias), shifted by the
         # per-row max for softmax stability. Writes into ``chunk.logits``.
@@ -693,9 +811,15 @@ class _ChunkContext:
     def dotgather(
         self, weight: torch.Tensor, x: torch.Tensor, indices: torch.Tensor
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Gathers one column per row of x at the given class indices,
+        # converts to the weight dtype, and returns the dot product with the per-row weights
+        # (a scalar tensor). Pure computation.
         return weight.dot(x.gather(1, indices.unsqueeze(1)).squeeze(1).to(weight.dtype))
 
     def sumexp_(self, x: torch.Tensor, dim: int) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Exponentiates x IN PLACE (destroying its previous values) and
+        # returns the sum along dim, accumulated in float32 for float16 input and in the
+        # accumulation dtype otherwise.
         # The denom sums num_classes terms in (0, 1] (shifted logits <= 0).
         # fp16: accumulate in fp32 -- the sum overflows fp16's 65504 for a large
         # vocabulary (-> inf). bf16 stays in acc_dtype: it shares fp32's exponent
@@ -706,6 +830,8 @@ class _ChunkContext:
         return x.exp_().sum(dim, dtype=reduce_dtype)
 
     def sum(self, x: torch.Tensor, dim: int) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Sums x along dim in the accumulation dtype on mixed-precision
+        # paths, else in the input dtype. Returns the reduced tensor.
         # Reduce ``x`` along ``dim`` at acc_dtype on mixed-precision
         # paths and at input dtype otherwise -- the precision
         # contract callers see is "as accurate as the active policy
@@ -716,6 +842,10 @@ class _ChunkContext:
         return x.sum(dim, dtype=target_dtype)
 
     def div(self, num: torch.Tensor, den: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Elementwise num over den written into the shared row scratch
+        # (a view sized to num) and returned; on MPS with differing dtypes uses a compute-then-
+        # copy fallback. Side effect: overwrites the scratch, so the result is only valid until
+        # the next use of that scratch.
         factor = self.tmp.narrow(0, 0, num.shape[0])
         # MPS lacks fused cross-dtype torch.div(out=); copy_ fallback.
         if self.input.device.type == "mps" and (
@@ -727,6 +857,10 @@ class _ChunkContext:
         return factor
 
     def mul(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Scales each row of x by the matching entry of w. Mixed-
+        # precision: multiplies x in place. Otherwise, if classes are at least features, writes
+        # into the leading columns of the logits buffer (clobbering logits), else returns a new
+        # tensor. Callers must read logits-derived values before calling.
         # Pick a destination from in-flight scratch when possible.
         if self.use_acc_dtype:
             return x.mul_(w.unsqueeze(1))
@@ -741,6 +875,9 @@ class _ChunkContext:
         return x * w.unsqueeze(1)
 
     def to(self, x: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Returns x converted to dtype (x itself if already that dtype).
+        # When flagged, the conversion is written into reinterpreted logits-buffer storage to
+        # avoid an allocation (clobbers the logits buffer); otherwise a normal conversion.
         # Reuse logits_buf storage as cast destination when its bytes/row fits.
         if x.dtype == dtype:
             return x
@@ -772,6 +909,16 @@ def _linear_cross_entropy_batch_chunked_accumulator(
     compute_linear_bias_grad: bool,
     loss_grad_output: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Core chunked loop. Raises RuntimeError if acc_policy is still
+    # auto or acc_dtype is None; builds the context (which validates inputs), then loops
+    # over batch chunks computing shifted logits, log-sum-exp loss terms and, as requested,
+    # gradients for input, weight and bias. Three branches: none-reduction forward (returns a
+    # per-sample loss vector and empty gradients), probability-target loop, and the index-
+    # target loop. Returns the tuple (loss, grad_input, grad_linear_weight, grad_linear_bias),
+    # unrequested gradients being zero-sized tensors. Mean reduction with zero rows gives NaN.
+    # KNOWN ISSUE: the docstring lists an amax context method and says the body has no inline
+    # device or dtype branches, but amax is not a method (torch.amax is called directly) and
+    # the probability loop has inline half-precision and MPS branches.
     """Chunked loop shared by all three custom-op entry points; returns
     ``(loss, grad_input, grad_linear_weight, grad_linear_bias)``.
 
@@ -1095,6 +1242,12 @@ def _linear_cross_entropy_batch_chunked(
     compute_linear_weight_grad: bool,
     compute_linear_bias_grad: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Custom op for mean/sum reduction. First guards against graphs traced
+    # with a compute flag false while the matching tensor requires grad at run time (raises
+    # RuntimeError each for input, weight, bias), and against a floating-point target that
+    # requires grad (RuntimeError). Then runs the accumulator and returns (loss, grad_input,
+    # grad_linear_weight, grad_linear_bias), with gradients precomputed for backward.
+    # allow_retain_graph is not used here; it is consumed in setup_context.
     """Scalar-reduction (mean/sum) chunked op: precomputes the loss and
     gradients in forward, backward scales by the upstream gradient. The
     chunked math lives in ``_linear_cross_entropy_batch_chunked_accumulator``.
@@ -1177,6 +1330,10 @@ def _(
     compute_linear_weight_grad,
     compute_linear_bias_grad,
 ):
+    # [FUNCTION DOC] HELPER: Fake-tensor (shape/dtype) rule for the scalar op. Returns a
+    # scalar loss in the input dtype plus empty tensors for the three gradients, full-sized
+    # when the corresponding compute flag is set and zero-sized otherwise. Raises
+    # NotImplementedError for any reduction other than mean or sum.
     if reduction in {"mean", "sum"}:
         result = torch.empty((), dtype=input.dtype, device=input.device)
     else:
@@ -1220,6 +1377,9 @@ def _(
 
 @_linear_cross_entropy_batch_chunked.register_vmap
 def _vmap(info, in_dims, *args):
+    # [FUNCTION DOC] HELPER: Batching rule for the scalar op using a slow per-sample loop:
+    # moves each batched tensor's batch dimension to the front, calls the op once per sample,
+    # and stacks the four outputs. Returns the output tuple and output batch dims (all zero).
     """vmap rule (slow path: per-sample Python loop). A fold-into-num_batches
     fast path is now possible for both ops via the reduction='none' chunked op
     (``_linear_cross_entropy_batch_chunked_no_reduction``); left as a follow-up.
@@ -1252,6 +1412,12 @@ def _vmap(info, in_dims, *args):
 def _linear_cross_entropy_batch_chunked_backward(
     ctx, grad_output, _gi_grad, _gw_grad, _gb_grad
 ):
+    # [FUNCTION DOC] HELPER: Backward for the scalar op. Returns a tuple with one slot per op
+    # input (15) holding None except: input gradient (slot 0), weight gradient (slot 1) and
+    # bias gradient (slot 3), each the stashed precomputed gradient times the upstream scalar.
+    # If the upstream gradient is None returns all None. Without allow_retain_graph the
+    # stashed tensors are consumed and scaled in place, so a second backward raises
+    # RuntimeError; with it, new tensors are returned and the stash is kept.
     result = [None] * _NUM_OP_INPUTS
     # set_materialize_grads(False): grad_output is None when backward is
     # driven only through the (unsupported) grad outputs -- no gradient
@@ -1328,6 +1494,9 @@ def _linear_cross_entropy_batch_chunked_no_reduction(
     acc_policy: str,
     acc_dtype: torch.dtype,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Custom op for none reduction. Runs the accumulator with no gradients
+    # requested, label smoothing 0 and reduction none, and returns only the per-sample loss
+    # vector (one entry per batch row). Gradients are recomputed in backward.
     """reduction='none' chunked forward: returns per-sample loss ``(N,)``.
 
     Gradients are not precomputed (the per-sample upstream grad is
@@ -1356,6 +1525,10 @@ def _linear_cross_entropy_batch_chunked_no_reduction(
 
 
 def _linear_cross_entropy_batch_chunked_no_reduction_setup_context(ctx, inputs, output):
+    # [FUNCTION DOC] HELPER: Autograd setup hook for the none-reduction op. Saves detached
+    # input, linear weight, target, bias and class weight for backward (detached so saved
+    # views do not keep the base parameter alive), and records ignore_index, batch chunk
+    # size, accumulation policy and dtype as ctx attributes. Mutates ctx only.
     (
         input,
         linear_weight,
@@ -1399,6 +1572,8 @@ def _(
     acc_policy: str,
     acc_dtype,
 ):
+    # [FUNCTION DOC] HELPER: Fake-tensor rule for the none-reduction op: returns an empty
+    # tensor with the batch dimension of the input and the input dtype and device.
     return torch.empty(
         input.shape[:1], dtype=input.dtype, device=input.device, requires_grad=False
     )
@@ -1406,6 +1581,9 @@ def _(
 
 @_linear_cross_entropy_batch_chunked_no_reduction.register_vmap
 def _vmap_no_reduction(info, in_dims, *args):
+    # [FUNCTION DOC] HELPER: Batching rule for the none-reduction op using a slow per-sample
+    # loop: moves batch dims to the front, calls the op per sample, stacks the loss vectors.
+    # Returns the stacked tensor and output batch dim zero.
     """vmap rule (slow path: per-sample Python loop, mirrors the
     scalar-reduction op). Stacks the per-sample ``(N,)`` losses.
     """
@@ -1429,6 +1607,13 @@ def _vmap_no_reduction(info, in_dims, *args):
 
 
 def _linear_cross_entropy_batch_chunked_no_reduction_backward(ctx, grad_output):
+    # [FUNCTION DOC] HELPER: Backward for the none-reduction op. grad_output is the per-
+    # sample upstream gradient vector. Decides from needs_input_grad which of input, weight
+    # and bias gradients are wanted (bias only if one was given); if none, returns all None.
+    # Otherwise recomputes the chunked gradients from saved tensors via the accumulator with
+    # the upstream vector folded in, and returns a tuple of nine slots holding the gradients
+    # at positions 0 (input), 1 (weight) and 3 (bias), None elsewhere. Supports repeated
+    # backward since nothing is consumed.
     # grad_output is the per-sample upstream grad (N,). Forward arg order:
     # (input, linear_weight, target, linear_bias, weight, ignore_index,
     #  batch_chunk_size, acc_policy, acc_dtype).

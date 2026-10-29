@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Instance normalization layers: a shared private base (_InstanceNorm) plus the 1d, 2d and 3d
+# public variants and their lazy counterparts that infer num_features from the first input.
+# Builds on the batch norm base classes and the functional instance norm op.
+# Exports the six public classes via __all__. No import-time side effects.
 
 import warnings
 
@@ -19,6 +24,12 @@ __all__ = [
 
 
 class _InstanceNorm(_NormBase):
+    # [CLASS DOC] HELPER: Shared base of all instance norm modules.
+    # Inherits parameters and buffers (weight, bias, running_mean, running_var,
+    # num_batches_tracked) from the batch norm base. Subclasses must supply the
+    # input-dimension check and the number of dims of an unbatched input.
+    # Normalizes each sample and channel separately; running stats are used only
+    # when tracking is enabled and the module is in eval mode.
     def __init__(
         self,
         num_features: int,
@@ -31,6 +42,10 @@ class _InstanceNorm(_NormBase):
         *,
         bias: bool = True,  # for backward compatibility
     ) -> None:
+        # [FUNCTION DOC]
+        # Forwards num_features, eps, momentum, affine, track_running_stats, bias and the
+        # device/dtype factory options to the batch norm base initializer.
+        # Differs from batch norm only in defaults: affine and track_running_stats are False.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(
             num_features,
@@ -43,15 +58,25 @@ class _InstanceNorm(_NormBase):
         )
 
     def _check_input_dim(self, input):
+        # [FUNCTION DOC] HELPER: Abstract hook; subclasses validate input rank and raise
+        # an error for unsupported ranks. The base version always raises NotImplementedError.
         raise NotImplementedError
 
     def _get_no_batch_dim(self):
+        # [FUNCTION DOC] HELPER: Abstract hook; subclasses return the number of dims of
+        # an unbatched input. The base version always raises NotImplementedError.
         raise NotImplementedError
 
     def _handle_no_batch_input(self, input):
+        # [FUNCTION DOC] HELPER: Adds a leading batch dimension of size one, applies
+        # instance normalization, then removes that dimension. Returns the normalized tensor.
         return self._apply_instance_norm(input.unsqueeze(0)).squeeze(0)
 
     def _apply_instance_norm(self, input):
+        # [FUNCTION DOC] HELPER: Calls the functional instance norm with the module's
+        # running stats, weight, bias, eps and momentum (0.0 if momentum is None).
+        # Instance statistics are used when in training mode or when running stats are not
+        # tracked. Side effect: may update the running stat buffers in place.
         return F.instance_norm(
             input,
             self.running_mean,
@@ -73,6 +98,11 @@ class _InstanceNorm(_NormBase):
         unexpected_keys,
         error_msgs,
     ) -> None:
+        # [FUNCTION DOC] HELPER: State dict loading override handling old checkpoints.
+        # If the checkpoint has no version info and this module does not track running
+        # stats, any running_mean/running_var keys found are removed from state_dict and a
+        # single error message is appended to error_msgs. Then defers to the base loader.
+        # Mutates state_dict and error_msgs; returns nothing.
         version = local_metadata.get("version", None)
         # at version 1: removed running_mean and running_var when
         # track_running_stats=False (default)
@@ -110,6 +140,11 @@ class _InstanceNorm(_NormBase):
         )
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC]
+        # Validates the input rank, then checks that the channel dimension matches
+        # num_features. On mismatch: raises ValueError if affine is set, otherwise only emits
+        # a warning (num_features is unused without affine). Unbatched inputs are given a
+        # temporary batch dimension. Returns the normalized tensor, same shape as input.
         self._check_input_dim(input)
 
         feature_dim = input.dim() - self._get_no_batch_dim()
@@ -134,6 +169,10 @@ class _InstanceNorm(_NormBase):
 
 
 class InstanceNorm1d(_InstanceNorm):
+    # [CLASS DOC]
+    # Instance normalization over 2D (unbatched, channels by length) or 3D (batched)
+    # input. State and behavior come from the base class; this class only fixes the
+    # accepted ranks (2 or 3) and the unbatched rank (2).
     r"""Applies Instance Normalization.
 
     This operation applies Instance Normalization
@@ -205,14 +244,20 @@ class InstanceNorm1d(_InstanceNorm):
     """
 
     def _get_no_batch_dim(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 2, the rank of an unbatched input.
         return 2
 
     def _check_input_dim(self, input) -> None:
+        # [FUNCTION DOC] HELPER: Raises ValueError unless the input has 2 or 3 dimensions.
         if input.dim() not in (2, 3):
             raise ValueError(f"expected 2D or 3D input (got {input.dim()}D input)")
 
 
 class LazyInstanceNorm1d(_LazyNormBase, _InstanceNorm):
+    # [CLASS DOC]
+    # Lazy variant of InstanceNorm1d: num_features is inferred from the channel dimension
+    # of the first input, then the instance converts itself into InstanceNorm1d
+    # (cls_to_become). Same accepted ranks (2 or 3) as the non-lazy class.
     r"""A :class:`torch.nn.InstanceNorm1d` module with lazy initialization of the ``num_features`` argument.
 
     The ``num_features`` argument of the :class:`InstanceNorm1d` is inferred from the ``input.size(1)``.
@@ -244,14 +289,19 @@ class LazyInstanceNorm1d(_LazyNormBase, _InstanceNorm):
     cls_to_become = InstanceNorm1d  # type: ignore[assignment]
 
     def _get_no_batch_dim(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 2, the rank of an unbatched input.
         return 2
 
     def _check_input_dim(self, input) -> None:
+        # [FUNCTION DOC] HELPER: Raises ValueError unless the input has 2 or 3 dimensions.
         if input.dim() not in (2, 3):
             raise ValueError(f"expected 2D or 3D input (got {input.dim()}D input)")
 
 
 class InstanceNorm2d(_InstanceNorm):
+    # [CLASS DOC]
+    # Instance normalization over 3D (unbatched) or 4D (batched) image-like input. Fixes
+    # accepted ranks (3 or 4) and the unbatched rank (3); behavior is in the base class.
     r"""Applies Instance Normalization.
 
     This operation applies Instance Normalization
@@ -325,14 +375,19 @@ class InstanceNorm2d(_InstanceNorm):
     """
 
     def _get_no_batch_dim(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 3, the rank of an unbatched input.
         return 3
 
     def _check_input_dim(self, input) -> None:
+        # [FUNCTION DOC] HELPER: Raises ValueError unless the input has 3 or 4 dimensions.
         if input.dim() not in (3, 4):
             raise ValueError(f"expected 3D or 4D input (got {input.dim()}D input)")
 
 
 class LazyInstanceNorm2d(_LazyNormBase, _InstanceNorm):
+    # [CLASS DOC]
+    # Lazy variant of InstanceNorm2d: num_features is inferred from the first input, then
+    # the instance converts itself into InstanceNorm2d (cls_to_become). Ranks 3 or 4.
     r"""A :class:`torch.nn.InstanceNorm2d` module with lazy initialization of the ``num_features`` argument.
 
     The ``num_features`` argument of the :class:`InstanceNorm2d` is inferred from the ``input.size(1)``.
@@ -365,14 +420,19 @@ class LazyInstanceNorm2d(_LazyNormBase, _InstanceNorm):
     cls_to_become = InstanceNorm2d  # type: ignore[assignment]
 
     def _get_no_batch_dim(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 3, the rank of an unbatched input.
         return 3
 
     def _check_input_dim(self, input) -> None:
+        # [FUNCTION DOC] HELPER: Raises ValueError unless the input has 3 or 4 dimensions.
         if input.dim() not in (3, 4):
             raise ValueError(f"expected 3D or 4D input (got {input.dim()}D input)")
 
 
 class InstanceNorm3d(_InstanceNorm):
+    # [CLASS DOC]
+    # Instance normalization over 4D (unbatched) or 5D (batched) volumetric input. Fixes
+    # accepted ranks (4 or 5) and the unbatched rank (4); behavior is in the base class.
     r"""Applies Instance Normalization.
 
     This operation applies Instance Normalization
@@ -445,14 +505,19 @@ class InstanceNorm3d(_InstanceNorm):
     """
 
     def _get_no_batch_dim(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 4, the rank of an unbatched input.
         return 4
 
     def _check_input_dim(self, input) -> None:
+        # [FUNCTION DOC] HELPER: Raises ValueError unless the input has 4 or 5 dimensions.
         if input.dim() not in (4, 5):
             raise ValueError(f"expected 4D or 5D input (got {input.dim()}D input)")
 
 
 class LazyInstanceNorm3d(_LazyNormBase, _InstanceNorm):
+    # [CLASS DOC]
+    # Lazy variant of InstanceNorm3d: num_features is inferred from the first input, then
+    # the instance converts itself into InstanceNorm3d (cls_to_become). Ranks 4 or 5.
     r"""A :class:`torch.nn.InstanceNorm3d` module with lazy initialization of the ``num_features`` argument.
 
     The ``num_features`` argument of the :class:`InstanceNorm3d` is inferred from the ``input.size(1)``.
@@ -485,8 +550,10 @@ class LazyInstanceNorm3d(_LazyNormBase, _InstanceNorm):
     cls_to_become = InstanceNorm3d  # type: ignore[assignment]
 
     def _get_no_batch_dim(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns 4, the rank of an unbatched input.
         return 4
 
     def _check_input_dim(self, input) -> None:
+        # [FUNCTION DOC] HELPER: Raises ValueError unless the input has 4 or 5 dimensions.
         if input.dim() not in (4, 5):
             raise ValueError(f"expected 4D or 5D input (got {input.dim()}D input)")

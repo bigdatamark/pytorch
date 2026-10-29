@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Defines the Fold (col2im) and Unfold (im2col) modules, thin Module wrappers around
+# the functional fold and unfold operations that combine or extract sliding local blocks.
+# Exports Fold and Unfold via __all__. No import-time side effects.
 import torch.nn.functional as F
 from torch import Tensor
 from torch.nn.common_types import _size_any_t
@@ -9,6 +13,15 @@ __all__ = ["Fold", "Unfold"]
 
 
 class Fold(Module):
+    # [CLASS DOC]
+    # Parameter-free module that sums sliding local blocks (shape batch, channels times
+    # kernel volume, number of blocks) back into a larger tensor of spatial shape output_size.
+    # State: output_size, kernel_size, dilation, padding, stride (ints or tuples),
+    # all listed in __constants__. Key methods: forward (delegates to functional fold),
+    # extra_repr.
+    # KNOWN ISSUE: the class docstring is written as a parenthesized group of adjacent
+    # string literals split in odd places (one non-raw segment contains a unicode escape);
+    # it works but is fragile to edit.
     (
         r"""Combines an array of sliding local blocks into a large containing tensor.
 
@@ -139,6 +152,10 @@ class Fold(Module):
         padding: _size_any_t = 0,
         stride: _size_any_t = 1,
     ) -> None:
+        # [FUNCTION DOC]
+        # Initializes the base Module and stores output_size, kernel_size, dilation
+        # (default 1), padding (default 0) and stride (default 1) unchanged.
+        # No validation; invalid values surface in forward.
         super().__init__()
         self.output_size = output_size
         self.kernel_size = kernel_size
@@ -147,6 +164,10 @@ class Fold(Module):
         self.stride = stride
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC]
+        # Calls the functional fold with the stored output_size, kernel_size, dilation,
+        # padding and stride; returns the combined tensor with overlapping values summed.
+        # Shape/argument errors are raised by the functional op.
         """
         Runs the forward pass.
         """
@@ -160,6 +181,9 @@ class Fold(Module):
         )
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC]
+        # Returns a string listing output_size, kernel_size, dilation, padding and
+        # stride, formatted from the instance attribute mapping.
         """
         Return the extra representation of the module.
         """
@@ -172,6 +196,14 @@ class Fold(Module):
 
 
 class Unfold(Module):
+    # [CLASS DOC]
+    # Parameter-free module that extracts sliding local blocks from a batched input and
+    # flattens each into a column, producing shape batch, channels times kernel volume,
+    # number of blocks (im2col for two spatial dims).
+    # State: kernel_size, dilation, padding, stride (ints or tuples), all in
+    # __constants__. Key methods: forward (delegates to functional unfold), extra_repr.
+    # KNOWN ISSUE: same fragile split-string docstring layout as Fold; also the warning
+    # says only 4-D input is supported.
     (
         r"""Extracts sliding local blocks from a batched input tensor.
 
@@ -311,6 +343,9 @@ class Unfold(Module):
         padding: _size_any_t = 0,
         stride: _size_any_t = 1,
     ) -> None:
+        # [FUNCTION DOC]
+        # Initializes the base Module and stores kernel_size, dilation (default 1),
+        # padding (default 0) and stride (default 1) unchanged. No validation.
         super().__init__()
         self.kernel_size = kernel_size
         self.dilation = dilation
@@ -318,6 +353,9 @@ class Unfold(Module):
         self.stride = stride
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC]
+        # Calls the functional unfold with the stored kernel_size, dilation, padding
+        # and stride; returns the tensor of extracted blocks. Errors come from the op.
         """
         Runs the forward pass.
         """
@@ -326,6 +364,9 @@ class Unfold(Module):
         )
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC]
+        # Returns a string listing kernel_size, dilation, padding and stride, formatted
+        # from the instance attribute mapping.
         """
         Return the extra representation of the module.
         """

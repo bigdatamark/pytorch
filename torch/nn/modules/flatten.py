@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines the Flatten and Unflatten modules, thin Module wrappers around the tensor
+# flatten and unflatten operations for use inside Sequential containers.
+# Exports Flatten and Unflatten via __all__. No import-time side effects.
 
 from torch import Tensor
 from torch.types import _size
@@ -10,6 +14,12 @@ __all__ = ["Flatten", "Unflatten"]
 
 
 class Flatten(Module):
+    # [CLASS DOC]
+    # Parameter-free module that merges a contiguous range of dimensions
+    # (start_dim through end_dim, inclusive) of its input into one dimension.
+    # State: integer attributes start_dim and end_dim, both listed in __constants__.
+    # Key methods: forward delegates to the tensor flatten method; extra_repr
+    # reports both dims.
     r"""
     Flattens a contiguous range of dims into a tensor.
 
@@ -44,17 +54,25 @@ class Flatten(Module):
     end_dim: int
 
     def __init__(self, start_dim: int = 1, end_dim: int = -1) -> None:
+        # [FUNCTION DOC]
+        # Stores start_dim (default 1) and end_dim (default -1) after base Module
+        # initialization. No validation is performed here.
         super().__init__()
         self.start_dim = start_dim
         self.end_dim = end_dim
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC]
+        # Returns the input with dimensions start_dim..end_dim merged into one.
+        # Errors for out-of-range dims are raised by the underlying tensor operation.
         """
         Runs the forward pass.
         """
         return input.flatten(self.start_dim, self.end_dim)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC]
+        # Returns a string listing start_dim and end_dim, used in the module repr.
         """
         Returns the extra representation of the module.
         """
@@ -62,6 +80,12 @@ class Flatten(Module):
 
 
 class Unflatten(Module):
+    # [CLASS DOC]
+    # Parameter-free module that expands one dimension (dim) of its input into
+    # several dimensions given by unflattened_size.
+    # State: integer dim and a tuple/list of ints unflattened_size, both in
+    # __constants__. The constructor validates that unflattened_size is a
+    # tuple or list of ints. Key methods: forward, extra_repr.
     r"""
     Unflattens a tensor dim expanding it to a desired shape. For use with :class:`~nn.Sequential`.
 
@@ -105,12 +129,20 @@ class Unflatten(Module):
     unflattened_size: _size
 
     def __init__(self, dim: int, unflattened_size: _size) -> None:
+        # [FUNCTION DOC]
+        # Initializes the base Module, validates unflattened_size via the helper
+        # (raises TypeError if not a tuple/list of ints), then stores dim and
+        # unflattened_size.
         super().__init__()
         self._require_tuple_int(unflattened_size)
         self.dim = dim
         self.unflattened_size = unflattened_size
 
     def _require_tuple_int(self, input) -> None:
+        # [FUNCTION DOC] HELPER: Validation of the unflattened_size argument.
+        # Returns None if input is a tuple or list whose elements are all ints.
+        # Raises TypeError naming the offending element type and position, or the
+        # overall type if input is neither tuple nor list.
         if isinstance(input, (tuple, list)):
             for idx, elem in enumerate(input):
                 if not isinstance(elem, int):
@@ -124,12 +156,17 @@ class Unflatten(Module):
         )
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC]
+        # Returns the input with dimension dim split into the sizes in
+        # unflattened_size. Size mismatches are reported by the tensor operation.
         """
         Runs the forward pass.
         """
         return input.unflatten(self.dim, self.unflattened_size)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC]
+        # Returns a string listing dim and unflattened_size, used in the module repr.
         """
         Returns the extra representation of the module.
         """

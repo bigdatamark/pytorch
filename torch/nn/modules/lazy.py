@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Provides LazyModuleMixin, the mixin behind lazy modules whose parameter shapes are inferred
+# from the first forward input, plus a private typing Protocol used only to satisfy type checkers.
+# Exports LazyModuleMixin via __all__. No import-time side effects.
 import itertools
 from typing import Any, Protocol
 
@@ -10,6 +14,10 @@ __all__ = ["LazyModuleMixin"]
 
 
 class _LazyProtocol(Protocol):
+    # [CLASS DOC] HELPER: Typing-only protocol describing the attributes and methods the
+    # mixin expects from the module it is combined with (hook registration, parameter and
+    # buffer mappings, load and initialize hook handles). Never instantiated at runtime.
+    # Its members are one-line stubs, so they carry no per-function comments.
     """This class is used to avoid errors with mypy checks for the attributes in a mixin.
 
     https://mypy.readthedocs.io/en/latest/more_types.html#mixin-classes
@@ -51,6 +59,14 @@ class _LazyProtocol(Protocol):
 
 
 class LazyModuleMixin:
+    # [CLASS DOC]
+    # Mixin placed before a Module base to defer parameter creation until the first call.
+    # On construction it registers a forward pre-hook (_initialize_hook) that infers and
+    # materializes parameters, and a load-state-dict pre-hook (_load_hook) that lets
+    # initialized checkpoints load into uninitialized modules. Both hooks and their
+    # attributes are removed after successful initialization, and the instance class is
+    # swapped to cls_to_become when set. Subclasses must implement initialize_parameters.
+    # Lazy modules cannot be replicated for data parallel use.
     r"""A mixin for modules that lazily initialize parameters, also known as "lazy modules".
 
     .. warning::
@@ -170,6 +186,11 @@ class LazyModuleMixin:
     cls_to_become: type[Any] | None = None
 
     def __init__(self: _LazyProtocol, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Passes all arguments to the next class in the method resolution order, then
+        # registers the lazy load-state-dict pre-hook and the forward pre-hook (called with
+        # keyword arguments) that triggers parameter inference, storing both handles on the
+        # instance. Side effect: hooks are attached to the module.
         # Mypy doesn't like this super call in a mixin
         super().__init__(*args, **kwargs)  # type: ignore[misc]
         # pyrefly: ignore [read-only]
@@ -180,6 +201,10 @@ class LazyModuleMixin:
         )
 
     def _save_to_state_dict(self: _LazyProtocol, destination, prefix, keep_vars):
+        # [FUNCTION DOC] HELPER: Writes own parameters and persistent buffers into the
+        # destination mapping under prefixed names, skipping None entries and
+        # non-persistent buffers. Initialized tensors are detached unless keep_vars is set;
+        # uninitialized (lazy) entries are stored as-is. Mutates destination only.
         # This should be ideally implemented as a hook,
         # but we should override `detach` in the UninitializedParameter to return itself
         # which is not clean
@@ -204,6 +229,11 @@ class LazyModuleMixin:
         unexpected_keys,
         error_msgs,
     ):
+        # [FUNCTION DOC] HELPER: Load-state-dict pre-hook. For each own parameter and buffer
+        # that is still uninitialized while the incoming state dict holds an initialized
+        # value for the same prefixed key, materializes the local one with the incoming shape
+        # (without gradient tracking). Other keys are left alone; the missing/unexpected/error
+        # lists are not touched. Side effect: converts lazy parameters to real ones.
         """load_state_dict pre-hook function for lazy buffers and parameters.
 
         The purpose of this hook is to adjust the current state and/or
@@ -227,6 +257,9 @@ class LazyModuleMixin:
                             param.materialize(input_param.shape)
 
     def initialize_parameters(self: _LazyProtocol, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Abstract hook that subclasses override to materialize parameters from the
+        # forward inputs. The base version always raises NotImplementedError naming the class.
         r"""Initialize parameters according to the input batch properties.
 
         This adds an interface to isolate parameter initialization from the
@@ -237,6 +270,9 @@ class LazyModuleMixin:
         )
 
     def has_uninitialized_params(self: _LazyProtocol):
+        # [FUNCTION DOC]
+        # Returns True if any own parameter or buffer (not submodules) is still lazy
+        # (uninitialized), otherwise False. Pure query, no side effects.
         r"""Check if a module has parameters that are not initialized."""
         # This is to avoid the JIT to track this parameter and force
         # custom modules __setstate__ to add it
@@ -250,6 +286,14 @@ class LazyModuleMixin:
     # torchrec tests the code consistency with the following code
     # fmt: off
     def _infer_parameters(self: _LazyProtocol, module, args, kwargs=None):
+        # [FUNCTION DOC] HELPER: Forward pre-hook body. Calls the module's
+        # initialize_parameters with the forward args and kwargs (empty if none), raises
+        # RuntimeError if anything remains uninitialized, then removes both hooks, deletes
+        # their handle attributes, and swaps the module class to cls_to_become when set.
+        # Side effects: mutates module state and its class. Returns nothing.
+        # KNOWN ISSUE: the docstring says the module is put in evaluation mode and a full
+        # forward pass is run, but the code does neither; it only calls initialize_parameters.
+        # The error message uses the name of self rather than module (usually the same object).
         r"""Infers the size and initializes the parameters according to the provided input batch.
 
         Given a module that contains parameters that were declared inferable
@@ -272,6 +316,8 @@ class LazyModuleMixin:
     # fmt: on
 
     def _replicate_for_data_parallel(self: _LazyProtocol):
+        # [FUNCTION DOC] HELPER: Always raises RuntimeError, since modules with uninitialized
+        # parameters cannot be replicated; tells the user to run a dummy forward pass first.
         raise RuntimeError(
             "Modules with uninitialized parameters can't be used with `DataParallel`. "
             "Run a dummy forward pass to correctly initialize the modules"
