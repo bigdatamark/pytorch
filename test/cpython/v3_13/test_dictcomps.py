@@ -4,6 +4,9 @@
 # ruff: noqa
 # flake8: noqa
 
+# [MODULE DOC] Port of CPython 3.13 test_dictcomps run under the Dynamo CPython test harness.
+# Defines DictComprehensionTest covering dict comprehension semantics. Run via run_tests.
+
 # Test copied from
 # https://raw.githubusercontent.com/python/cpython/refs/tags/v3.13.5/Lib/test/test_dictcomps.py
 
@@ -26,8 +29,12 @@ g = "Global variable"
 
 
 class DictComprehensionTest(CPythonTestCase):
+    # [CLASS DOC] Test case for dict comprehension semantics: results, scoping, evaluation
+    # order, error locations.
 
     def test_basics(self):
+        # [FUNCTION DOC] Checks simple and nested filtered dict comprehensions produce
+        # the expected dicts.
         expected = {0: 10, 1: 11, 2: 12, 3: 13, 4: 14, 5: 15, 6: 16, 7: 17,
                     8: 18, 9: 19}
         actual = {k: k + 10 for k in range(10)}
@@ -38,6 +45,8 @@ class DictComprehensionTest(CPythonTestCase):
         self.assertEqual(actual, expected)
 
     def test_scope_isolation(self):
+        # [FUNCTION DOC] Checks the comprehension loop variable does not leak into or overwrite
+        # an enclosing local variable.
         k = "Local Variable"
 
         expected = {0: None, 1: None, 2: None, 3: None, 4: None, 5: None,
@@ -57,6 +66,8 @@ class DictComprehensionTest(CPythonTestCase):
         self.assertEqual(actual, expected)
 
     def test_scope_isolation_from_global(self):
+        # [FUNCTION DOC] Checks the comprehension loop variable does not leak into or overwrite
+        # a module global.
         expected = {0: None, 1: None, 2: None, 3: None, 4: None, 5: None,
                     6: None, 7: None, 8: None, 9: None}
         actual = {g: None for g in range(10)}
@@ -74,6 +85,7 @@ class DictComprehensionTest(CPythonTestCase):
         self.assertEqual(actual, expected)
 
     def test_global_visibility(self):
+        # [FUNCTION DOC] Checks a comprehension can read a module global.
         expected = {0: 'Global variable', 1: 'Global variable',
                     2: 'Global variable', 3: 'Global variable',
                     4: 'Global variable', 5: 'Global variable',
@@ -83,6 +95,7 @@ class DictComprehensionTest(CPythonTestCase):
         self.assertEqual(actual, expected)
 
     def test_local_visibility(self):
+        # [FUNCTION DOC] Checks a comprehension can read an enclosing local variable.
         v = "Local variable"
         expected = {0: 'Local variable', 1: 'Local variable',
                     2: 'Local variable', 3: 'Local variable',
@@ -94,6 +107,8 @@ class DictComprehensionTest(CPythonTestCase):
         self.assertEqual(v, "Local variable")
 
     def test_illegal_assignment(self):
+        # [FUNCTION DOC] Checks compiling assignment or augmented assignment to a dict
+        # comprehension raises SyntaxError with the expected messages.
         with self.assertRaisesRegex(SyntaxError, "cannot assign"):
             compile("{x: y for y, x in ((1, 2), (3, 4))} = 5", "<test>",
                     "exec")
@@ -103,6 +118,8 @@ class DictComprehensionTest(CPythonTestCase):
                     "exec")
 
     def test_evaluation_order(self):
+        # [FUNCTION DOC] Checks keys are evaluated before values, per element, in iteration
+        # order, by recording calls.
         expected = {
             'H': 'W',
             'e': 'o',
@@ -121,6 +138,8 @@ class DictComprehensionTest(CPythonTestCase):
         actual_calls = []
 
         def add_call(pos, value):
+            # [FUNCTION DOC] HELPER: records the position label and value in the enclosing call
+            # log and returns the value.
             actual_calls.append((pos, value))
             return value
 
@@ -133,6 +152,8 @@ class DictComprehensionTest(CPythonTestCase):
         self.assertEqual(actual_calls, expected_calls)
 
     def test_assignment_idiom_in_comprehensions(self):
+        # [FUNCTION DOC] Checks the idiom of binding names through single-element
+        # lists inside comprehensions.
         expected = {1: 1, 2: 4, 3: 9, 4: 16}
         actual = {j: j*j for i in range(4) for j in [i+1]}
         self.assertEqual(actual, expected)
@@ -144,26 +165,35 @@ class DictComprehensionTest(CPythonTestCase):
         self.assertEqual(actual, expected)
 
     def test_star_expression(self):
+        # [FUNCTION DOC] Checks starred unpacking in the iterable expression of a comprehension.
         expected = {0: 0, 1: 1, 2: 4, 3: 9}
         self.assertEqual({i: i*i for i in [*range(4)]}, expected)
         self.assertEqual({i: i*i for i in (*range(4),)}, expected)
 
     def test_exception_locations(self):
+        # [FUNCTION DOC] Checks that exceptions raised when creating, iterating or advancing a
+        # bad iterator report the iterator expression's source location in the traceback.
         # The location of an exception raised from __init__ or
         # __next__ should should be the iterator expression
         def init_raises():
+            # [FUNCTION DOC] HELPER: runs a comprehension over an iterator whose constructor
+            # raises; returns the exception.
             try:
                 {x:x for x in BrokenIter(init_raises=True)}
             except Exception as e:
                 return e
 
         def next_raises():
+            # [FUNCTION DOC] HELPER: runs a comprehension over an iterator whose next step
+            # raises; returns the exception.
             try:
                 {x:x for x in BrokenIter(next_raises=True)}
             except Exception as e:
                 return e
 
         def iter_raises():
+            # [FUNCTION DOC] HELPER: runs a comprehension over an iterator whose iter method
+            # raises; returns the exception.
             try:
                 {x:x for x in BrokenIter(iter_raises=True)}
             except Exception as e:
