@@ -1,3 +1,14 @@
+# [MODULE DOC] Static data tables used by the hipify tool to translate CUDA source code to
+# ROCm/HIP. Defines ordered mappings from CUDA names to HIP names: MATH_TRANSPILATIONS
+# (std math calls replaced only in device code), CUDA_TYPE_NAME_MAP (types),
+# CUDA_INCLUDE_MAP (header paths), CUDA_IDENTIFIER_MAP (functions, constants, enums),
+# CUDA_SPECIAL_MAP, PYTORCH_SPECIFIC_MAPPINGS, C10_MAPPINGS, and the Caffe2 mappings
+# (CAFFE2_SPECIFIC_MAPPINGS, CAFFE2_PATH_MAPPINGS). Values are the HIP replacement string
+# or a tuple of the replacement plus API-type metadata. CUDA_TO_HIP_MAPPINGS lists all
+# tables (except the math one) in the order they are applied.
+# Import-time side effect: reads the IS_FBCODE environment variable to set _IS_FBCODE,
+# which selects the rccl header form (_RCCL_HEADER) used inside the tables. No functions
+# or classes are defined.
 import collections
 import os
 
