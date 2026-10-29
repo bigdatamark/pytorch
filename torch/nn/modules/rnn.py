@@ -1,5 +1,12 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Recurrent layers of torch.nn: the shared RNNBase (parameter creation, flat-weight cache,
+# input/hidden validation, pickling support), the multi-layer sequence modules RNN, LSTM, GRU
+# (thin wrappers over the _VF fused kernels, accepting dense or PackedSequence input), and the
+# single-step RNNCellBase, RNNCell, LSTMCell, GRUCell. Exports are listed in __all__.
+# Import-time side effects: builds the module-level mapping _rnn_impls from mode name to the
+# _VF rnn_tanh / rnn_relu functions. No other global state is touched.
 import math
 import numbers
 import warnings
@@ -34,6 +41,8 @@ _rnn_impls = {
 
 
 def _apply_permutation(tensor: Tensor, permutation: Tensor, dim: int = 1) -> Tensor:
+    # [FUNCTION DOC] HELPER: Reorders tensor along dimension dim (default 1, the batch
+    # dimension of hidden states) using the index tensor permutation; returns a new tensor.
     return tensor.index_select(dim, permutation)
 
 
@@ -42,10 +51,19 @@ def _apply_permutation(tensor: Tensor, permutation: Tensor, dim: int = 1) -> Ten
     category=FutureWarning,
 )
 def apply_permutation(tensor: Tensor, permutation: Tensor, dim: int = 1) -> Tensor:
+    # [FUNCTION DOC] Deprecated public alias of _apply_permutation; emits a FutureWarning via
+    # the deprecated decorator when called, then returns the reordered tensor.
     return _apply_permutation(tensor, permutation, dim)
 
 
 class RNNBase(Module):
+    # [CLASS DOC] Shared base of RNN, LSTM and GRU. Holds the hyperparameters (mode, input_size,
+    # hidden_size, num_layers, bias, batch_first, dropout, bidirectional, proj_size) and one
+    # Parameter set per layer and direction, registered as attributes named like weight_ih_l0,
+    # weight_hh_l0, bias_ih_l0, bias_hh_l0, weight_hr_l0, with a reverse suffix for direction 1.
+    # Also keeps _flat_weights_names, _all_weights, the cached _flat_weights list and weak
+    # references to them so changed weights (for example via functional_call) are detected.
+    # Invariant: _flat_weights stays aligned with _flat_weights_names. forward is not defined here.
     r"""Base class for RNN modules (RNN, LSTM, GRU).
 
     Implements aspects of RNNs shared by the RNN, LSTM, and GRU classes, such as module initialization
@@ -95,6 +113,14 @@ class RNNBase(Module):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] Validates hyperparameters, then creates uninitialized weight and bias
+        # Parameters for every layer and direction (gate size is 4x hidden for LSTM, 3x for GRU,
+        # 1x for the RNN modes; with projections the recurrent weight width and later-layer
+        # input width use proj_size, and a projection weight is added). Registers them as
+        # attributes, records their names, builds the flat-weight cache and initializes values.
+        # Raises ValueError for bad dropout, non-positive sizes, proj_size out of range or an
+        # unknown mode; TypeError for non-bool bias/batch_first or non-int sizes. Warns when
+        # dropout is non-zero with a single layer.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.mode = mode
@@ -218,6 +244,9 @@ class RNNBase(Module):
         self.reset_parameters()
 
     def _init_flat_weights(self) -> None:
+        # [FUNCTION DOC] HELPER: Rebuilds the cached _flat_weights list from the current
+        # attributes (None for missing names), refreshes the weak references, and calls
+        # flatten_parameters to repack for cuDNN when possible.
         self._flat_weights = [
             getattr(self, wn) if hasattr(self, wn) else None
             for wn in self._flat_weights_names
@@ -228,6 +257,9 @@ class RNNBase(Module):
         self.flatten_parameters()
 
     def __setattr__(self, attr, value) -> None:
+        # [FUNCTION DOC] Normal attribute assignment, plus: when attr is one of the registered
+        # weight names, the matching slot of the _flat_weights cache is replaced by the new
+        # value so the cache does not go stale. Side effect: mutates _flat_weights.
         if hasattr(self, "_flat_weights_names") and attr in self._flat_weights_names:
             # keep self._flat_weights up to date if you do self.weight = ...
             idx = self._flat_weights_names.index(attr)
@@ -235,6 +267,10 @@ class RNNBase(Module):
         super().__setattr__(attr, value)
 
     def flatten_parameters(self) -> None:
+        # [FUNCTION DOC] Repacks all weights into one contiguous cuDNN buffer. Silently returns
+        # (no-op) unless every weight is a CUDA tensor of one dtype acceptable to cuDNN, the
+        # cache is complete, and no two weights alias the same storage. Otherwise, under no_grad
+        # and on the weights' device, calls the cuDNN flatten op in place on _flat_weights.
         """Reset parameter data pointer so that they can use faster code paths.
 
         Right now, this works only if the module is on the GPU and cuDNN is enabled.
@@ -295,6 +331,9 @@ class RNNBase(Module):
                     )
 
     def _apply(self, fn, recurse=True):
+        # [FUNCTION DOC] Applies fn to parameters and buffers (as in .to or .cuda) through the
+        # base Module, then rebuilds the flat-weight cache because parameters may have been
+        # replaced. Returns the module. Clears the weak references before the base call.
         self._flat_weight_refs = []
         ret = super()._apply(fn, recurse)
 
@@ -306,11 +345,18 @@ class RNNBase(Module):
         return ret
 
     def reset_parameters(self) -> None:
+        # [FUNCTION DOC] Re-initializes every parameter in place from a uniform distribution
+        # over minus to plus the reciprocal of the square root of hidden_size (zero range if
+        # hidden_size is not positive).
         stdv = 1.0 / math.sqrt(self.hidden_size) if self.hidden_size > 0 else 0
         for weight in self.parameters():
             init.uniform_(weight, -stdv, stdv)
 
     def check_input(self, input: Tensor, batch_sizes: Tensor | None) -> None:
+        # [FUNCTION DOC] Validates the input tensor: its dtype must equal the weight dtype
+        # (skipped under TorchScript or autocast) else ValueError; it must have 2 dims for
+        # packed data (batch_sizes given) or 3 otherwise, and its last size must equal
+        # input_size, else RuntimeError. No side effects.
         if not torch.jit.is_scripting():
             if (
                 input.dtype != self._flat_weights[0].dtype  # type: ignore[union-attr]
@@ -333,6 +379,9 @@ class RNNBase(Module):
     def get_expected_hidden_size(
         self, input: Tensor, batch_sizes: Tensor | None
     ) -> tuple[int, int, int]:
+        # [FUNCTION DOC] Returns the expected hidden state shape as a triple of layers times
+        # directions, mini-batch size (from the first batch size if packed, else from the
+        # batch dimension of input) and proj_size when projections are on, else hidden_size.
         if batch_sizes is not None:
             mini_batch = int(batch_sizes[0])
         else:
@@ -358,10 +407,15 @@ class RNNBase(Module):
         expected_hidden_size: tuple[int, int, int],
         msg: str = "Expected hidden size {}, got {}",
     ) -> None:
+        # [FUNCTION DOC] Raises RuntimeError, formatted from msg with the expected and actual
+        # shapes, if the size of hx differs from expected_hidden_size; otherwise does nothing.
         if hx.size() != expected_hidden_size:
             raise RuntimeError(msg.format(expected_hidden_size, list(hx.size())))
 
     def _weights_have_changed(self):
+        # [FUNCTION DOC] HELPER: Returns True if any current weight attribute is a different
+        # object from the one remembered by the weak references (for example after
+        # functional_call swapped them); False otherwise.
         # Returns True if the weight tensors have changed since the last forward pass.
         # This is the case when used with torch.func.functional_call(), for example.
         weights_changed = False
@@ -377,17 +431,24 @@ class RNNBase(Module):
     def check_forward_args(
         self, input: Tensor, hidden: Tensor, batch_sizes: Tensor | None
     ) -> None:
+        # [FUNCTION DOC] Runs check_input, then compares the hidden state size with the
+        # expected size; raises ValueError or RuntimeError on mismatch.
         self.check_input(input, batch_sizes)
         expected_hidden_size = self.get_expected_hidden_size(input, batch_sizes)
 
         self.check_hidden_size(hidden, expected_hidden_size)
 
     def permute_hidden(self, hx: Tensor, permutation: Tensor | None):
+        # [FUNCTION DOC] Returns hx unchanged when permutation is None, else hx reordered along
+        # its batch dimension (used to sort/unsort hidden states for packed sequences).
         if permutation is None:
             return hx
         return _apply_permutation(hx, permutation)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Builds the repr suffix: input and hidden size, then only those options
+        # that differ from their defaults (proj_size, num_layers, bias, batch_first, dropout,
+        # bidirectional), formatted from the instance dictionary.
         s = "{input_size}, {hidden_size}"
         if self.proj_size != 0:
             s += ", proj_size={proj_size}"
@@ -404,11 +465,16 @@ class RNNBase(Module):
         return s.format(**self.__dict__)
 
     def _update_flat_weights(self) -> None:
+        # [FUNCTION DOC] HELPER: Called at the start of forward. Outside TorchScript, rebuilds
+        # the flat-weight cache if any weight object was swapped since it was built.
         if not torch.jit.is_scripting():
             if self._weights_have_changed():
                 self._init_flat_weights()
 
     def __getstate__(self):
+        # [FUNCTION DOC] Pickling hook: refreshes the flat-weight cache if weights changed,
+        # then returns a shallow copy of the instance dictionary without the weak references
+        # (which cannot be pickled).
         # If weights have been changed, update the _flat_weights in __getstate__ here.
         self._update_flat_weights()
         # Don't serialize the weight references.
@@ -417,6 +483,13 @@ class RNNBase(Module):
         return state
 
     def __setstate__(self, d):
+        # [FUNCTION DOC] Unpickling hook with backward compatibility: restores state, accepts
+        # an old all_weights entry, defaults proj_size to 0 for modules saved before it
+        # existed, rebuilds the weight name lists when they are in the old non-string format,
+        # and recreates the flat-weight cache and weak references.
+        # KNOWN ISSUE: in the legacy branch for no bias with projections, the names list is
+        # extended with a nested list (weights[:2] + [weights[-1:]]) instead of flat names,
+        # unlike the _all_weights entry built just above; likely a latent bug in a rare path.
         super().__setstate__(d)
         if "all_weights" in d:
             self._all_weights = d["all_weights"]
@@ -469,12 +542,16 @@ class RNNBase(Module):
 
     @property
     def all_weights(self) -> list[list[Parameter]]:
+        # [FUNCTION DOC] Property: for each layer and direction, the list of its Parameters
+        # looked up by the recorded names.
         return [
             [getattr(self, weight) for weight in weights]
             for weights in self._all_weights
         ]
 
     def _replicate_for_data_parallel(self):
+        # [FUNCTION DOC] HELPER: DataParallel hook; makes the replica and gives it its own copies
+        # of the flat-weight and name lists so replicas do not share the cache. Returns replica.
         replica = super()._replicate_for_data_parallel()
         # Need to copy these caches, otherwise the replica will share the same
         # flat weights list.
@@ -484,6 +561,10 @@ class RNNBase(Module):
 
 
 class RNN(RNNBase):
+    # [CLASS DOC] Multi-layer Elman RNN with a tanh or ReLU non-linearity, built on RNNBase.
+    # The nonlinearity attribute selects mode RNN_TANH or RNN_RELU. Accepts batched, unbatched
+    # or PackedSequence input; forward returns the output sequence and the final hidden state.
+    # The proj_size option is rejected (LSTM only).
     r"""__init__(input_size,hidden_size,num_layers=1,nonlinearity='tanh',bias=True,batch_first=False,dropout=0.0,bidirectional=False,device=None,dtype=None)
 
     Apply a multi-layer Elman RNN with :math:`\tanh` or :math:`\text{ReLU}`
@@ -635,6 +716,11 @@ class RNN(RNNBase):
     def __init__(self, *args, **kwargs) -> None: ...
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] Takes the RNNBase arguments with an extra nonlinearity option (fourth
+        # positional argument or keyword, default tanh). Maps it to mode RNN_TANH or RNN_RELU
+        # and forwards the remaining arguments to RNNBase. Raises ValueError if proj_size is
+        # given or the nonlinearity is not tanh or relu.
+        # KNOWN ISSUE: self.nonlinearity is assigned before the base Module constructor runs.
         if "proj_size" in kwargs:
             raise ValueError(
                 "proj_size argument is only supported for LSTM, not RNN or GRU"
@@ -673,6 +759,12 @@ class RNN(RNNBase):
         pass
 
     def forward(self, input, hx=None):
+        # [FUNCTION DOC] Runs the RNN over input, a 2D unbatched, 3D batched or PackedSequence
+        # tensor, with optional initial hidden state hx (zeros if omitted; sorted into packed
+        # order for packed input). Unbatched input gets a temporary batch dimension. Validates
+        # dimensions (ValueError for input, RuntimeError for hx) and shapes, calls the matching
+        # fused tanh or ReLU kernel, and returns (output, final hidden) with the packed form
+        # and original ordering restored. Refreshes the flat-weight cache first.
         """
         Runs the forward pass.
         """
@@ -828,6 +920,10 @@ class RNN(RNNBase):
 
 
 class LSTM(RNNBase):
+    # [CLASS DOC] Multi-layer long short-term memory network on RNNBase (mode LSTM), with optional
+    # output projection (proj_size). The state is a pair of hidden and cell tensors. Overrides
+    # the hidden-state checks and permutation to handle that pair; forward calls the fused
+    # LSTM kernel and supports batched, unbatched and PackedSequence input.
     r"""__init__(input_size,hidden_size,num_layers=1,bias=True,batch_first=False,dropout=0.0,bidirectional=False,proj_size=0,device=None,dtype=None)
 
     Apply a multi-layer long short-term memory (LSTM) RNN to an input sequence.
@@ -1008,11 +1104,15 @@ class LSTM(RNNBase):
     def __init__(self, *args, **kwargs) -> None: ...
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] Forwards all arguments to RNNBase with mode fixed to LSTM.
         super().__init__("LSTM", *args, **kwargs)
 
     def get_expected_cell_size(
         self, input: Tensor, batch_sizes: Tensor | None
     ) -> tuple[int, int, int]:
+        # [FUNCTION DOC] Returns the expected cell state shape: layers times directions,
+        # mini-batch size (from batch_sizes if packed, else from input), and hidden_size
+        # (never proj_size, since the cell state is not projected).
         if batch_sizes is not None:
             mini_batch = int(batch_sizes[0])
         else:
@@ -1034,6 +1134,9 @@ class LSTM(RNNBase):
         hidden: tuple[Tensor, Tensor],  # type: ignore[override]
         batch_sizes: Tensor | None,
     ) -> None:
+        # [FUNCTION DOC] Validates the input, then the hidden state (first element) against the
+        # expected hidden size and the cell state (second element) against the expected cell
+        # size; raises ValueError or RuntimeError on mismatch.
         self.check_input(input, batch_sizes)
         self.check_hidden_size(
             hidden[0],
@@ -1052,6 +1155,8 @@ class LSTM(RNNBase):
         hx: tuple[Tensor, Tensor],
         permutation: Tensor | None,
     ) -> tuple[Tensor, Tensor]:
+        # [FUNCTION DOC] Returns the (hidden, cell) pair unchanged when permutation is None,
+        # else both tensors reordered along the batch dimension.
         if permutation is None:
             return hx
         return _apply_permutation(hx[0], permutation), _apply_permutation(
@@ -1079,6 +1184,13 @@ class LSTM(RNNBase):
         pass
 
     def forward(self, input, hx=None):
+        # [FUNCTION DOC] Runs the LSTM over a 2D unbatched, 3D batched or PackedSequence input
+        # with optional (h_0, c_0) (zeros if omitted; hidden uses proj_size width when
+        # projecting). Unbatched state is given a batch dimension. Raises ValueError for
+        # bad input rank and RuntimeError for bad state rank or shape. Calls the fused LSTM
+        # kernel and returns (output, (h_n, c_n)) in the original batch order.
+        # KNOWN ISSUE: for packed input, check_forward_args is never called, so supplied or
+        # default states are not shape-validated there (the dense path validates).
         self._update_flat_weights()
 
         orig_input = input
@@ -1204,6 +1316,9 @@ class LSTM(RNNBase):
 
 
 class GRU(RNNBase):
+    # [CLASS DOC] Multi-layer gated recurrent unit network on RNNBase (mode GRU). Single hidden
+    # state; supports batched, unbatched and PackedSequence input and calls the fused GRU
+    # kernel. The proj_size option is rejected (LSTM only).
     r"""__init__(input_size,hidden_size,num_layers=1,bias=True,batch_first=False,dropout=0.0,bidirectional=False,device=None,dtype=None)
 
     Apply a multi-layer gated recurrent unit (GRU) RNN to an input sequence.
@@ -1351,6 +1466,8 @@ class GRU(RNNBase):
     def __init__(self, *args, **kwargs) -> None: ...
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] Forwards all arguments to RNNBase with mode fixed to GRU. Raises
+        # ValueError if proj_size is passed as a keyword.
         if "proj_size" in kwargs:
             raise ValueError(
                 "proj_size argument is only supported for LSTM, not RNN or GRU"
@@ -1376,6 +1493,11 @@ class GRU(RNNBase):
         pass
 
     def forward(self, input, hx=None):
+        # [FUNCTION DOC] Runs the GRU over a 2D unbatched, 3D batched or PackedSequence input
+        # with optional initial hidden state hx (zeros if omitted). Unbatched input gets a
+        # temporary batch dimension. Raises ValueError for bad input rank and RuntimeError for
+        # bad hx rank or shape. Calls the fused GRU kernel and returns (output, final hidden)
+        # with packed form and original batch order restored.
         self._update_flat_weights()
 
         orig_input = input
@@ -1482,6 +1604,9 @@ class GRU(RNNBase):
 
 
 class RNNCellBase(Module):
+    # [CLASS DOC] Base of the single-step cells. Stores input_size, hidden_size, bias and the
+    # Parameters weight_ih and weight_hh (num_chunks times hidden_size rows), plus bias_ih and
+    # bias_hh when bias is on, otherwise registered as None. Subclasses define forward.
     __constants__ = ["input_size", "hidden_size", "bias"]
 
     input_size: int
@@ -1501,6 +1626,9 @@ class RNNCellBase(Module):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] Stores sizes and bias flag, creates uninitialized weight (and bias)
+        # Parameters whose first dimension is num_chunks times hidden_size (gate count), or
+        # registers the biases as None, then initializes values via reset_parameters.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.input_size = input_size
@@ -1526,6 +1654,8 @@ class RNNCellBase(Module):
         self.reset_parameters()
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Repr suffix with input and hidden size, plus bias when not True and
+        # nonlinearity when present and not tanh, formatted from the instance dictionary.
         s = "{input_size}, {hidden_size}"
         if "bias" in self.__dict__ and self.bias is not True:
             s += ", bias={bias}"
@@ -1534,12 +1664,17 @@ class RNNCellBase(Module):
         return s.format(**self.__dict__)
 
     def reset_parameters(self) -> None:
+        # [FUNCTION DOC] Re-initializes every parameter in place from a uniform distribution
+        # over minus to plus the reciprocal of the square root of hidden_size (zero range if
+        # hidden_size is not positive).
         stdv = 1.0 / math.sqrt(self.hidden_size) if self.hidden_size > 0 else 0
         for weight in self.parameters():
             init.uniform_(weight, -stdv, stdv)
 
 
 class RNNCell(RNNCellBase):
+    # [CLASS DOC] One Elman RNN step with tanh or ReLU, chosen by the nonlinearity attribute
+    # (one gate chunk). forward maps (input, hidden) to the next hidden state.
     r"""An Elman RNN cell with tanh or ReLU non-linearity.
 
     .. math::
@@ -1606,11 +1741,17 @@ class RNNCell(RNNCellBase):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] Builds the base cell with one gate chunk and records nonlinearity.
+        # The value is not validated here; forward raises for unknown values.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(input_size, hidden_size, bias, num_chunks=1, **factory_kwargs)
         self.nonlinearity = nonlinearity
 
     def forward(self, input: Tensor, hx: Tensor | None = None) -> Tensor:
+        # [FUNCTION DOC] Computes the next hidden state from input (1D or 2D) and optional hx
+        # (1D or 2D, zeros if omitted). Unbatched tensors get a temporary batch dimension that
+        # is removed from the result. Raises ValueError for bad ranks and RuntimeError for an
+        # unknown nonlinearity. Returns the new hidden state.
         if input.dim() not in (1, 2):
             raise ValueError(
                 f"RNNCell: Expected input to be 1D or 2D, got {input.dim()}D instead"
@@ -1659,6 +1800,8 @@ class RNNCell(RNNCellBase):
 
 
 class LSTMCell(RNNCellBase):
+    # [CLASS DOC] One LSTM step (four gate chunks). forward maps input and an optional
+    # (hidden, cell) pair to the next (hidden, cell) pair.
     r"""A long short-term memory (LSTM) cell.
 
     .. math::
@@ -1726,12 +1869,16 @@ class LSTMCell(RNNCellBase):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] Builds the base cell with four gate chunks.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(input_size, hidden_size, bias, num_chunks=4, **factory_kwargs)
 
     def forward(
         self, input: Tensor, hx: tuple[Tensor, Tensor] | None = None
     ) -> tuple[Tensor, Tensor]:
+        # [FUNCTION DOC] Computes the next (hidden, cell) from input (1D or 2D) and optional
+        # hx pair (each 1D or 2D; zeros for both if omitted). Unbatched tensors get a temporary
+        # batch dimension removed from the results. Raises ValueError for bad ranks.
         if input.dim() not in (1, 2):
             raise ValueError(
                 f"LSTMCell: Expected input to be 1D or 2D, got {input.dim()}D instead"
@@ -1769,6 +1916,8 @@ class LSTMCell(RNNCellBase):
 
 
 class GRUCell(RNNCellBase):
+    # [CLASS DOC] One GRU step (three gate chunks). forward maps input and an optional hidden
+    # state to the next hidden state.
     r"""A gated recurrent unit (GRU) cell.
 
     .. math::
@@ -1838,10 +1987,14 @@ class GRUCell(RNNCellBase):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] Builds the base cell with three gate chunks.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(input_size, hidden_size, bias, num_chunks=3, **factory_kwargs)
 
     def forward(self, input: Tensor, hx: Tensor | None = None) -> Tensor:
+        # [FUNCTION DOC] Computes the next hidden state from input (1D or 2D) and optional hx
+        # (1D or 2D, zeros if omitted). Unbatched tensors get a temporary batch dimension that
+        # is removed from the result. Raises ValueError for bad ranks.
         if input.dim() not in (1, 2):
             raise ValueError(
                 f"GRUCell: Expected input to be 1D or 2D, got {input.dim()}D instead"

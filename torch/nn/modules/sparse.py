@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Lookup-table layers of torch.nn: Embedding (index to vector lookup) and EmbeddingBag (sum,
+# mean or max reduction over bags of embeddings without materializing them). Both are thin
+# wrappers over the functional embedding operations. Exports are listed in __all__.
+# No import-time side effects beyond defining the classes.
 
 import torch
 from torch import Tensor
@@ -12,6 +17,11 @@ __all__ = ["Embedding", "EmbeddingBag"]
 
 
 class Embedding(Module):
+    # [CLASS DOC] Learnable table of num_embeddings vectors of size embedding_dim, stored in the
+    # Parameter weight. Optional padding_idx (normalized to non-negative, row kept at zero and
+    # excluded from gradients), max_norm/norm_type renormalization, scale_grad_by_freq and
+    # sparse gradients. forward looks up rows by integer index tensor.
+    # KNOWN ISSUE: class annotation freeze is declared but never assigned anywhere.
     r"""A simple lookup table that stores embeddings of a fixed dictionary and size.
 
     This module is often used to store word embeddings and retrieve them using indices.
@@ -145,6 +155,11 @@ class Embedding(Module):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] Stores the options and normalizes a negative padding_idx by adding
+        # num_embeddings; raises AssertionError if padding_idx is out of range or if a given
+        # _weight does not have shape (num_embeddings, embedding_dim). Creates weight as a new
+        # normal-initialized Parameter (padding row zeroed) or wraps _weight; requires_grad is
+        # the opposite of _freeze.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.num_embeddings = num_embeddings
@@ -177,15 +192,22 @@ class Embedding(Module):
         self.sparse = sparse
 
     def reset_parameters(self) -> None:
+        # [FUNCTION DOC] Re-initializes weight in place from a standard normal distribution,
+        # then zeroes the padding row if padding_idx is set.
         init.normal_(self.weight)
         self._fill_padding_idx_with_zero()
 
     def _fill_padding_idx_with_zero(self) -> None:
+        # [FUNCTION DOC] HELPER: Without gradient tracking, fills the padding_idx row of weight
+        # with zeros; does nothing when padding_idx is None.
         if self.padding_idx is not None:
             with torch.no_grad():
                 self.weight[self.padding_idx].fill_(0)
 
     def forward(self, input: Tensor) -> Tensor:
+        # [FUNCTION DOC] Returns the rows of weight selected by the integer index tensor input,
+        # shape input shape plus embedding_dim, via the functional embedding. Note that with
+        # max_norm set, the weight is renormalized in place as a side effect.
         return F.embedding(
             input,
             self.weight,
@@ -197,6 +219,8 @@ class Embedding(Module):
         )
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Repr suffix: sizes plus only the non-default options (padding_idx,
+        # max_norm, norm_type, scale_grad_by_freq, sparse), formatted from the instance dict.
         s = "{num_embeddings}, {embedding_dim}"
         if self.padding_idx is not None:
             s += ", padding_idx={padding_idx}"
@@ -221,6 +245,10 @@ class Embedding(Module):
         scale_grad_by_freq=False,
         sparse=False,
     ):
+        # [FUNCTION DOC] Class method building an instance whose weight is the given 2D tensor
+        # embeddings (rows become num_embeddings, columns embedding_dim); with freeze true the
+        # weight does not require gradients. Other options are passed through. Raises
+        # AssertionError if embeddings is not 2D. Returns the new instance.
         r"""Create Embedding instance from given 2-dimensional FloatTensor.
 
         Args:
@@ -265,6 +293,10 @@ class Embedding(Module):
 
 
 class EmbeddingBag(Module):
+    # [CLASS DOC] Like Embedding but reduces variable-size bags of looked-up vectors with mode
+    # sum, mean or max in one fused operation. State: Parameter weight, mode, max_norm,
+    # norm_type, scale_grad_by_freq, sparse, include_last_offset and a normalized
+    # padding_idx. forward takes flat indices plus offsets, or 2D indices of equal-length bags.
     r"""Compute sums or means of 'bags' of embeddings, without instantiating the intermediate embeddings.
 
     For bags of constant length, no :attr:`per_sample_weights`, no indices equal to :attr:`padding_idx`,
@@ -382,6 +414,10 @@ class EmbeddingBag(Module):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] Stores the options, normalizing a negative padding_idx by adding
+        # num_embeddings (AssertionError if out of range). Creates weight as a new
+        # normal-initialized Parameter or wraps _weight (AssertionError on wrong shape).
+        # The mode string is not validated here.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.num_embeddings = num_embeddings
@@ -414,10 +450,14 @@ class EmbeddingBag(Module):
         self.include_last_offset = include_last_offset
 
     def reset_parameters(self) -> None:
+        # [FUNCTION DOC] Re-initializes weight in place from a standard normal distribution,
+        # then zeroes the padding row if padding_idx is set.
         init.normal_(self.weight)
         self._fill_padding_idx_with_zero()
 
     def _fill_padding_idx_with_zero(self) -> None:
+        # [FUNCTION DOC] HELPER: Without gradient tracking, fills the padding_idx row of weight
+        # with zeros; does nothing when padding_idx is None.
         if self.padding_idx is not None:
             with torch.no_grad():
                 self.weight[self.padding_idx].fill_(0)
@@ -428,6 +468,11 @@ class EmbeddingBag(Module):
         offsets: Tensor | None = None,
         per_sample_weights: Tensor | None = None,
     ) -> Tensor:
+        # [FUNCTION DOC] Reduces bags of embeddings with the configured mode and returns one
+        # vector per bag. A 2D input means equal-length bags and offsets must be absent; a 1D
+        # input needs offsets giving each bag start. Optional per_sample_weights (sum mode
+        # only) scale entries. Delegates to the functional embedding_bag, which validates the
+        # arguments; max_norm renormalizes weight in place.
         """Forward pass of EmbeddingBag.
 
         Args:
@@ -473,6 +518,9 @@ class EmbeddingBag(Module):
         )
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC] Repr suffix: sizes, non-default max_norm, norm_type and
+        # scale_grad_by_freq, always the mode, and padding_idx if set. Every instance attribute
+        # is formatted with its repr, so the mode appears quoted.
         s = "{num_embeddings}, {embedding_dim}"
         if self.max_norm is not None:
             s += ", max_norm={max_norm}"
@@ -498,6 +546,10 @@ class EmbeddingBag(Module):
         include_last_offset: bool = False,
         padding_idx: int | None = None,
     ) -> "EmbeddingBag":
+        # [FUNCTION DOC] Class method building an instance whose weight is the given 2D tensor
+        # embeddings (rows become num_embeddings, columns embedding_dim) with the other options
+        # passed through; afterwards sets weight requires_grad to the opposite of freeze.
+        # Raises AssertionError if embeddings is not 2D. Returns the new instance.
         r"""Create EmbeddingBag instance from given 2-dimensional FloatTensor.
 
         Args:
