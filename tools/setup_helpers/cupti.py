@@ -1,3 +1,7 @@
+# [MODULE DOC] Helper for locating a CUPTI header file (cupti_activity.h) whose API version is
+# new enough for the CUPTI stub code generator. Main contents: a minimum-version constant, a
+# private version parser, and find_cupti_header which searches an environment override, staged
+# CI header directories and the nvidia.cu13 package. No import-time side effects beyond imports.
 """Locate a sufficiently-new CUPTI header (``cupti_activity.h``) for the CUPTI
 field-id codegen (``tools/gen_cupti_stubs.py``), which parses the header to emit
 ``torch/profiler/_cupti/_cupti_stubs.py``. Kept as a small standalone helper the
@@ -19,6 +23,9 @@ _MIN_CUPTI_API_VERSION = 130300
 
 
 def _cupti_api_version(include_dir: Path) -> int | None:
+    # [FUNCTION DOC] HELPER: Read the CUPTI API version macro from the version header in the
+    # given include directory. Returns the integer value, or None if the header file is
+    # absent or the macro line cannot be matched.
     """Parse ``CUPTI_API_VERSION`` from ``cupti_version.h`` in ``include_dir``
     (None if the version header is absent or the macro can't be parsed)."""
     version_header = include_dir / "cupti_version.h"
@@ -33,6 +40,12 @@ def _cupti_api_version(include_dir: Path) -> int | None:
 
 
 def find_cupti_header() -> Path | None:
+    # [FUNCTION DOC] Search candidate include directories for cupti_activity.h with an
+    # adequate API version. Order: the CUPTI_INCLUDE_DIR environment variable, staged redist
+    # header directories under /usr/local (highest version first), then the include
+    # directory of the nvidia.cu13 package if importable. Returns the header path of the
+    # first candidate that has the file and a version at or above the minimum, else None.
+    # Reads the environment and filesystem only.
     """Locate ``cupti_activity.h`` whose ``CUPTI_API_VERSION`` is at least
     ``_MIN_CUPTI_API_VERSION``. Candidate include dirs, in priority order:
 
@@ -55,6 +68,9 @@ def find_cupti_header() -> Path | None:
     # CUPTI redist headers staged into the CI Docker image by install_cuda.sh.
     # Several cupti-headers-<major.minor> dirs may coexist; prefer the highest.
     def _version_key(p: Path) -> tuple[int, ...]:
+        # [FUNCTION DOC] HELPER: Sort key for a staged headers directory: the numeric dotted
+        # components of the name after the cupti-headers- prefix as a tuple (non-numeric
+        # components are skipped).
         suffix = p.name.removeprefix("cupti-headers-")
         return tuple(int(x) for x in suffix.split(".") if x.isdigit())
 

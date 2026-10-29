@@ -1,3 +1,8 @@
+# [MODULE DOC] Driver for the autograd, Python-binding and related code generation used by the
+# PyTorch build. Exposes generate_code (runs the autograd, pybinding and annotated-args
+# generators for a chosen subset), selector helpers for selective build, and a command-line main
+# that also generates functionalization view-meta classes and optionally the lazy TorchScript
+# backend. Import-time: imports yaml and prefers its C safe loader.
 from __future__ import annotations
 
 import argparse
@@ -30,6 +35,16 @@ def generate_code(
     force_schema_registration: bool = False,
     operator_selector: Any = None,
 ) -> None:
+    # [FUNCTION DOC] Run the code generators and write outputs under gen_dir. Args: gen_dir;
+    # native_functions_path and tags_path (default to the in-repo yaml files); install_dir
+    # (default is the torch/csrc directory under gen_dir, with Python outputs under the
+    # generated testing directory; when given it is used for both); subset, one of
+    # pybindings, libtorch or python to run only that generator (any other falsy value runs
+    # all three); disable_autograd; operator_selector (default is the no-op selector that
+    # keeps all operators). Creates output directories and writes generated files. Returns
+    # None.
+    # KNOWN ISSUE: force_schema_registration is accepted but never used. An unrecognized
+    # non-empty subset silently generates nothing.
     from tools.autograd.gen_annotated_fn_args import gen_annotated
     from tools.autograd.gen_autograd import gen_autograd, gen_autograd_python
 
@@ -79,6 +94,10 @@ def generate_code(
 def get_selector_from_legacy_operator_selection_list(
     selected_op_list_path: str,
 ) -> Any:
+    # [FUNCTION DOC] Build an operator selector from a legacy YAML list of selected operator
+    # names. Reads the file at the given path, strips the overload suffix from every name,
+    # and marks all operators as root operators and as used for training. Returns the
+    # selector. Raises yaml or file errors on bad input.
     with open(selected_op_list_path) as f:
         # strip out the overload part
         # It's only for legacy config - do NOT copy this code!
@@ -110,6 +129,11 @@ def get_selector(
     selected_op_list_path: str | None,
     operators_yaml_path: str | None,
 ) -> Any:
+    # [FUNCTION DOC] Choose the selective-build operator selector. Args:
+    # selected_op_list_path (legacy list) and operators_yaml_path (model yaml); at most one
+    # may be given, otherwise AssertionError is raised. With neither, returns the no-op
+    # selector (all operators kept). Side effect: inserts the repository root at the front
+    # of the module search path.
     # cwrap depends on pyyaml, so we can't import it earlier
     REPO_ROOT = Path(__file__).absolute().parents[2]
     sys.path.insert(0, str(REPO_ROOT))
@@ -131,6 +155,17 @@ def get_selector(
 
 
 def main() -> None:
+    # [FUNCTION DOC] Command-line entry point. Parses options (native functions and tags
+    # paths, gen dir, deprecated install dir, subset, disable-autograd, selection files,
+    # lazy backend and per-operator header flags), builds the selector, calls generate_code,
+    # then generates functionalization view-meta classes and, if requested, the lazy
+    # TorchScript backend through the torchgen lazy generator. Creates directories and
+    # writes generated sources. Raises AssertionError if an expected directory or input file
+    # is missing.
+    # KNOWN ISSUE: the aten path is derived from native_functions_path, which is
+    # dereferenced before use, so omitting that option fails with a TypeError. The subset
+    # help text omits the python value. The force-schema-registration option is parsed but
+    # has no effect.
     parser = argparse.ArgumentParser(description="Autogenerate code")
     parser.add_argument("--native-functions-path")
     parser.add_argument("--tags-path")

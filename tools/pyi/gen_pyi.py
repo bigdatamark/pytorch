@@ -1,3 +1,13 @@
+# [MODULE DOC] Generator for the PyTorch type stub (pyi) files. Combines hand-written templates
+# with signatures derived from native_functions.yaml, deprecated.yaml and tags.yaml, plus
+# hand-written hints for hand-bound functions, operator dunder methods, legacy tensor classes,
+# dtype names, dispatch keys, tags and structseq return types, and writes the stubs for
+# torch._C, torch._VF, torch.return_types, torch.nn.functional and torch._C._nn. Docstrings for
+# functions are harvested from the docs modules using mocks. Command-line entry point is main;
+# no import-time side effects beyond imports and module constants (parameter lists, operator
+# name tuples, blocklist).
+# KNOWN ISSUE: the module docstring says only torch and torch.Tensor are handled, but the
+# generator also covers nn.functional, the C nn functions and return types.
 """
 This module implements generation of type stubs for PyTorch,
 enabling use of autocomplete in IDEs like PyCharm, which otherwise
@@ -59,12 +69,19 @@ def get_py_torch_functions(
     python_funcs: Sequence[PythonSignatureNativeFunctionPair],
     method: bool = False,
 ) -> Sequence[PythonSignatureGroup]:
+    # [FUNCTION DOC] Select the overload groups to bind either as functions of the torch
+    # module or, when method is true, as methods of Tensor. Keeps only signatures that
+    # should have a Python binding, are not placed in a Python submodule, and have the
+    # function (or method) variant, then groups overloads by name. Args: python_funcs,
+    # method. Returns a sequence of signature groups. Pure.
     """
     Get declarations (grouped by name) which should be generated
     as either functions in the "torch" module or methods on Tensor.
     """
 
     def should_bind_function(python_func: PythonSignatureNativeFunctionPair) -> bool:
+        # [FUNCTION DOC] HELPER: Predicate: the signature is bound, not in a submodule,
+        # and has a function variant.
         return (
             should_generate_py_binding(python_func.function)
             and not python_func.function.python_module
@@ -72,6 +89,8 @@ def get_py_torch_functions(
         )
 
     def should_bind_method(python_func: PythonSignatureNativeFunctionPair) -> bool:
+        # [FUNCTION DOC] HELPER: Predicate: the signature is bound, not in a submodule,
+        # and has a method variant.
         return (
             should_generate_py_binding(python_func.function)
             and not python_func.function.python_module
@@ -238,6 +257,13 @@ all_ops = binary_ops + comparison_ops + unary_ops + to_py_type_ops
 
 
 def sig_for_ops(opname: str) -> list[str]:
+    # [FUNCTION DOC] Return the stub lines for a hand-bound special method named with double
+    # underscores on both sides, such as the arithmetic, logic, shift, comparison, unary and
+    # conversion dunder methods. Arithmetic in-place variants get a lint suppression marker
+    # (except the legacy in-place division); symmetric comparisons get two lines
+    # (tensor-like and object overloads). Raises AssertionError if the name is not wrapped
+    # in double underscores and ValueError if the operator is unknown. Pure; returns a list
+    # of strings.
     """sig_for_ops(opname : str) -> list[str]
 
     Returns signatures for operator special functions (__add__ etc.)"""
@@ -292,6 +318,11 @@ def sig_for_ops(opname: str) -> list[str]:
 
 
 def generate_type_hints(sig_group: PythonSignatureGroup) -> list[str]:
+    # [FUNCTION DOC] Produce the stub signature strings for one overload group. Returns an
+    # empty list for blocklisted non-deprecated names. For deprecated signatures that have
+    # an out variant it first emits the functional form; then emits the main signature
+    # (including the out argument when an out variant exists), and finally an extra vararg
+    # form if the signature supports one. Pure; returns a list of strings.
     type_hints: list[str] = []
 
     # Some deprecated ops that are on the blocklist are still included in pyi
@@ -323,6 +354,13 @@ def generate_type_hints(sig_group: PythonSignatureGroup) -> list[str]:
 
 
 def get_max_pool_dispatch(name: str, arg_list: list[str]) -> dict[str, list[str]]:
+    # [FUNCTION DOC] Build the three overloaded stubs of a max pooling function whose
+    # argument templates contain the return-indices placeholder. One overload has the flag
+    # false and returns a tensor; two have it true (once positional, with earlier defaults
+    # stripped and a positional-only marker, once keyword-only) and return a pair of
+    # tensors. Args: name and the list of argument templates. Returns a mapping from the
+    # name to the list of three signature strings. Raises ValueError if the placeholder is
+    # missing from the argument list.
     flag_pos = arg_list.index("{return_indices}")
     # If return_indices is positional arg, everything before should have no default
     arg_list_positional = (
@@ -367,6 +405,14 @@ def get_max_pool_dispatch(name: str, arg_list: list[str]) -> dict[str, list[str]
 
 
 def gen_nn_functional(fm: FileManager) -> None:
+    # [FUNCTION DOC] Generate and write the stubs for the neural network functional
+    # namespace. Builds hand-written signature hints for the C level nn functions (pooling,
+    # padding, upsampling, losses and others, with 2D and 3D variants), merges them with the
+    # hints dispatched from the Python functional module, sorts them, and renders the
+    # templates for torch/nn/functional.pyi and torch/_C/_nn.pyi through the given file
+    # manager. Args: fm, the file manager used for output. Side effects: writes two files.
+    # Returns None.
+    # KNOWN ISSUE: a comment notes the list of C nn function hints is not exhaustive.
     INPUT = "input: Tensor"
     KERNEL_SIZE = "kernel_size: _int | _size"
     STRIDE_PADDING = [
@@ -966,9 +1012,18 @@ We gather the docstrings for torch with the following steps:
 
 
 def gather_docstrs() -> dict[str, str]:
+    # [FUNCTION DOC] Collect the docstrings registered by the torch docs modules without
+    # importing real torch. Temporarily patches the module table and search path, replaces
+    # torch and its C extension with mocks whose docstring-adding function records each
+    # docstring (stripped) under the mock's name, imports the two docs modules to trigger
+    # registration, and returns the mapping from name to text. If the docs modules cannot be
+    # found it only emits a warning and returns what was collected (possibly empty). Module
+    # table and path are restored on exit.
     docstrs = {}
 
     def mock_add_docstr(func: Mock, docstr: str) -> None:
+        # [FUNCTION DOC] HELPER: Replacement for the docstring-adding function: store
+        # the stripped docstring in the enclosing mapping keyed by the mock's name.
         docstrs[func._extract_mock_name()] = docstr.strip()
 
     # sys.modules and sys.path are restored after the context manager exits
@@ -992,6 +1047,12 @@ def gather_docstrs() -> dict[str, str]:
 
 
 def add_docstr_to_hint(docstr: str, hint: str) -> str:
+    # [FUNCTION DOC] Attach a docstring to a stub line. Args: docstr (cleaned of indentation
+    # and stripped) and hint. If the hint is a function or method (contains an ellipsis) it
+    # must end with one, otherwise AssertionError is raised; the ellipsis is replaced by an
+    # indented raw triple-quoted docstring body, with trailing whitespace removed from each
+    # line. For attributes and properties the raw docstring is placed on the line after the
+    # hint. Returns the new text.
     docstr = inspect.cleandoc(docstr).strip()
     if "..." in hint:  # function or method
         if not hint.endswith("..."):
@@ -1012,6 +1073,16 @@ def gen_pyi(
     deprecated_yaml_path: str,
     fm: FileManager,
 ) -> None:
+    # [FUNCTION DOC] Main generator. Args: native_yaml_path, tags_yaml_path,
+    # deprecated_yaml_path and fm, the file manager. Builds the stub text for top-level
+    # torch functions (hand-written entries plus those derived from the parsed native
+    # functions), Tensor methods (including operator dunder methods and properties),
+    # structseq return type definitions, legacy tensor classes, dtype names, an all-symbols
+    # list, dispatch key and tag hints. Docstrings are attached to function hints where
+    # available. Raises AssertionError if two different definitions use the same structseq
+    # name. Writes torch/_C/__init__.pyi, torch/_C/_VariableFunctions.pyi, torch/_VF.pyi and
+    # torch/return_types.pyi from templates through fm, then calls gen_nn_functional.
+    # Returns None.
     """gen_pyi()
 
     This function generates a pyi file for torch.
@@ -1497,6 +1568,10 @@ def gen_pyi(
                 structseqs[tuple_name] = tuple_def
 
     def replace_special_case(hint: str) -> str:
+        # [FUNCTION DOC] HELPER: Apply small textual fixes to a generated hint: replace
+        # the mean reduction enum spelling with its integer value one (must match the
+        # C++ reduction enum), and make a bare tensor default of none an optional tensor
+        # type. Returns the new hint.
         # NB: Keep this in sync with enum in aten/src/ATen/core/Reduction.h
         hint = hint.replace("at::Reduction::Mean", "1")
         hint = hint.replace(": Tensor = None", ": Tensor | None = None")
@@ -2088,6 +2163,10 @@ def gen_pyi(
 
 
 def main() -> None:
+    # [FUNCTION DOC] Command-line entry point. Parses options for the native functions, tags
+    # and deprecated yaml paths, output directory and template directory, creates a file
+    # manager that really writes files, and runs gen_pyi. Exits with an argparse error on
+    # bad usage.
     parser = argparse.ArgumentParser(description="Generate type stubs for PyTorch")
     parser.add_argument(
         "--native-functions-path",

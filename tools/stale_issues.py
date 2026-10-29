@@ -1,3 +1,10 @@
+# [MODULE DOC] Command-line helper for managing stale issues in the pytorch/pytorch repository
+# through the gh CLI. Subcommands: list (least recently updated open issues, optional label and
+# age filters), labels (all repo labels), collaborator-check (exit status reports whether a user
+# is a collaborator), and subscription save/restore (remember and later undo the notification
+# subscription state of an issue, stored as small files in a runtime directory). Import-time:
+# computes the subscription state directory path from the XDG runtime directory or a per-user
+# temp directory.
 import argparse
 import calendar
 import json
@@ -10,6 +17,13 @@ from datetime import date, timedelta
 
 
 def parse_older_than(s):
+    # [FUNCTION DOC] Convert a relative age such as '2 months' (a number plus days, weeks,
+    # months or years, singular or plural) into the cutoff date that many units before
+    # today. Raises argparse.ArgumentTypeError for any other format. Month arithmetic clamps
+    # the day to the target month length; the year case subtracts whole years with the day
+    # capped at 28.
+    # KNOWN ISSUE: the year case caps the day at 28 even when the original day is later, so
+    # the result can differ from the exact calendar date.
     """Parse a relative time string like '2 months' into a cutoff date."""
     m = re.fullmatch(r"(\d+)\s*(days?|weeks?|months?|years?)", s.strip())
     if not m:
@@ -33,6 +47,11 @@ def parse_older_than(s):
 
 
 def gh_issue_list(search, label, limit):
+    # [FUNCTION DOC] Run the gh issue list command against pytorch/pytorch with the given
+    # search string, an optional single label (labels given this way are ANDed by gh) and a
+    # maximum count. Returns the decoded list of issue mappings (number, title, updatedAt,
+    # labels, url). On a nonzero gh exit it prints the error text to standard error and
+    # exits the process with status 1.
     """Fetch issues from gh issue list for a single label (or no label)."""
     cmd = [
         "gh",
@@ -57,6 +76,9 @@ def gh_issue_list(search, label, limit):
 
 
 def gh_issue_count(search_query):
+    # [FUNCTION DOC] Ask the GitHub search API for the total number of issues matching the
+    # query. Returns the count as a string, or a question mark if the gh call fails. Does
+    # not raise on failure.
     """Get total issue count via GitHub search API."""
     result = subprocess.run(
         [
@@ -79,6 +101,13 @@ def gh_issue_count(search_query):
 
 
 def cmd_list(args):
+    # [FUNCTION DOC] Subcommand handler for list. Builds a search sorted by oldest update,
+    # optionally restricted to issues not updated since the cutoff from the older-than
+    # option. With several labels it queries each separately, merges without duplicates,
+    # sorts by update time and truncates to the limit (OR semantics). Prints each issue's
+    # number, date, title, url and labels, then a line with the shown count and the total
+    # open count from the search API (approximate and prefixed with a tilde for several
+    # labels, a question mark when unavailable). Exits the process if gh fails.
     search = "sort:updated-asc"
     if args.older_than:
         cutoff = parse_older_than(args.older_than)
@@ -133,6 +162,9 @@ def cmd_list(args):
 
 
 def cmd_labels(args):
+    # [FUNCTION DOC] Subcommand handler for labels. Pages through the repository labels API,
+    # 100 per page, until an empty page, exiting with status 1 on a gh error. Prints each
+    # label name with its description sorted case-insensitively, then the total count.
     page = 1
     labels = []
     while True:
@@ -174,6 +206,9 @@ SUBSCRIPTION_DIR = os.path.join(
 
 
 def gh_graphql(query):
+    # [FUNCTION DOC] Run a GraphQL query through gh api and return the decoded JSON
+    # response. On a nonzero exit it prints the error to standard error and exits the
+    # process with status 1.
     result = subprocess.run(
         ["gh", "api", "graphql", "-f", f"query={query}"],
         capture_output=True,
@@ -186,10 +221,16 @@ def gh_graphql(query):
 
 
 def subscription_state_path(issue_number):
+    # [FUNCTION DOC] Return the path of the JSON file in the subscription state directory
+    # used to remember the state for the given issue number.
     return os.path.join(SUBSCRIPTION_DIR, f"{issue_number}.json")
 
 
 def cmd_subscription_save(args):
+    # [FUNCTION DOC] Subcommand handler for subscription save. Looks up the node id of the
+    # issue, queries the viewer's current subscription state, creates the state directory if
+    # needed and writes the node id and state to the issue's state file, then prints them.
+    # Exits with status 1 if the gh lookup fails.
     result = subprocess.run(
         ["gh", "api", f"repos/pytorch/pytorch/issues/{args.issue}", "--jq", ".node_id"],
         capture_output=True,
@@ -212,6 +253,15 @@ def cmd_subscription_save(args):
 
 
 def cmd_subscription_restore(args):
+    # [FUNCTION DOC] Subcommand handler for subscription restore. Requires a saved state
+    # file (otherwise prints an error and exits with status 1) and deletes it. If the saved
+    # state was already subscribed it does nothing further. Otherwise it polls up to 30
+    # times, one second apart, until the issue shows as subscribed (an automatic
+    # subscription from a prior action), then sends a mutation setting the subscription to
+    # unsubscribed and prints a confirmation.
+    # KNOWN ISSUE: the state file is deleted before the restore succeeds, so a failure
+    # part-way loses the saved state; other original states (such as ignored) are restored
+    # as unsubscribed.
     path = subscription_state_path(args.issue)
     if not os.path.exists(path):
         print(f"No saved state for #{args.issue}", file=sys.stderr)
@@ -244,6 +294,10 @@ def cmd_subscription_restore(args):
 
 
 def cmd_collaborator_check(args):
+    # [FUNCTION DOC] Subcommand handler for collaborator-check. Queries the collaborator
+    # endpoint for the user name silently; prints whether the user is a collaborator and
+    # exits with status 1 when the call fails (the user is not a collaborator or the lookup
+    # failed).
     result = subprocess.run(
         [
             "gh",
@@ -262,6 +316,10 @@ def cmd_collaborator_check(args):
 
 
 def main():
+    # [FUNCTION DOC] Build the argument parser with the list, labels, collaborator-check and
+    # subscription (save, restore) subcommands, each bound to its handler, parse the command
+    # line and call the selected handler. Subcommand is required; invalid usage exits with
+    # an argparse error.
     parser = argparse.ArgumentParser(
         description="Tools for managing stale issues in pytorch/pytorch"
     )

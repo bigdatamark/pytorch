@@ -1,3 +1,7 @@
+# [MODULE DOC] Script that generates a GNU ld linker script which places a prioritized list of
+# text symbols first in the text section, for link-time optimization. Uses the output of the
+# linker verbose mode. Run as a command with optional --filein and --fout options; no
+# import-time side effects.
 import argparse
 import os
 import subprocess
@@ -7,6 +11,15 @@ from pathlib import Path
 def gen_linker_script(
     filein: str = "cmake/prioritized_text.txt", fout: str = "cmake/linker_script.ld"
 ) -> None:
+    # [FUNCTION DOC] Build a linker script from the linker's default script and a priority
+    # list. Args: filein, path to a text file of symbol names (one per line, blank lines
+    # ignored); fout, output path (parent directories are created). Runs the linker named by
+    # the LD environment variable (default ld) in verbose mode, takes the default script
+    # found between the two long separator lines, and writes it to fout with a block of text
+    # sections for each prioritized symbol inserted two lines after the start of the text
+    # section definition. Raises AssertionError unless exactly one text section start is
+    # found; a failing linker call raises a subprocess error; a missing separator pair
+    # raises an IndexError.
     with open(filein) as f:
         prioritized_text = f.readlines()
         prioritized_text = [

@@ -1,3 +1,8 @@
+# [MODULE DOC] CI script that examines test reports from the rerun-disabled-tests workflow,
+# aggregates per-test green and red counts, decides which disabled tests could be re-enabled
+# versus still flaky, and uploads the records to S3 for the HUD. Command-line options: workflow
+# run id, run attempt and repo. Depends on upload helpers in tools.stats; no import-time side
+# effects beyond imports.
 from __future__ import annotations
 
 import argparse
@@ -28,6 +33,14 @@ SEPARATOR = ";"
 def process_report(
     report: Path,
 ) -> dict[str, dict[str, int]]:
+    # [FUNCTION DOC] Parse one xunit report and count reruns per test. Args: report, path to
+    # an XML file. Returns a mapping from a test id (name, class name and file joined by a
+    # semicolon) to a mapping with num_green and num_red counts. Test cases that are skipped
+    # for other reasons, or lack name, class or file, are ignored; a rerun-skip carries its
+    # counts as JSON in the skip message (invalid JSON counts as zero), a failure adds one
+    # red, anything else adds one green.
+    # KNOWN ISSUE: the docstring says it returns a list of re-enable and flaky tests, but
+    # the function returns a mapping of counts.
     """
     Return a list of disabled tests that should be re-enabled and those that are still
     flaky (failed or skipped)
@@ -106,6 +119,12 @@ def process_report(
 def get_test_reports(
     repo: str, workflow_run_id: int, workflow_run_attempt: int
 ) -> Generator[Path, None, None]:
+    # [FUNCTION DOC] Generator that downloads the test-reports artifacts of a workflow run
+    # into a temporary directory, unzips them, and yields the path of every XML file found.
+    # Args: repo (unused), workflow_run_id, workflow_run_attempt. Side effects: changes the
+    # process working directory into the temporary directory and does not restore it; prints
+    # the directory; the directory is deleted when the generator finishes.
+    # KNOWN ISSUE: the yielded paths are relative to the changed directory.
     """
     Gather all the test reports from S3 and GHA. It is currently not possible to guess which
     test reports are from rerun_disabled_tests workflow because the name doesn't include the
@@ -125,6 +144,10 @@ def get_test_reports(
 
 
 def get_disabled_test_name(test_id: str) -> tuple[str, str, str, str]:
+    # [FUNCTION DOC] Split a test id built by process_report into its parts. Returns four
+    # strings: the display name in flaky-bot format (name with the class in parentheses),
+    # the name, the class name and the file name. Raises ValueError if the id does not have
+    # exactly three semicolon-separated parts.
     """
     Follow flaky bot convention here, if that changes, this will also need to be updated
     """
@@ -142,6 +165,9 @@ def prepare_record(
     num_red: int = 0,
     num_green: int = 0,
 ) -> tuple[Any, dict[str, Any]]:
+    # [FUNCTION DOC] Build one result record. Returns a pair: a key tuple of workflow id,
+    # attempt, name, class name and file name, and a mapping with those fields plus flaky,
+    # num_green and num_red. No side effects.
     """
     Prepare the record to save onto S3
     """
@@ -172,6 +198,12 @@ def save_results(
     workflow_run_attempt: int,
     all_tests: dict[str, dict[str, int]],
 ) -> None:
+    # [FUNCTION DOC] Classify the aggregated tests and upload them. A test should be
+    # re-enabled when it has at least one green and zero red runs; all others are still
+    # flaky. Builds a record per test, prints the lists of tests to re-enable and
+    # still-flaky tests with failure ratios, and uploads the records to S3 under the
+    # rerun_disabled_tests name. Args: workflow id, attempt and the aggregated mapping.
+    # Returns None.
     """
     Save the result to S3, which then gets put into the HUD backend database
     """
@@ -232,6 +264,12 @@ def save_results(
 
 
 def main(repo: str, workflow_run_id: int, workflow_run_attempt: int) -> None:
+    # [FUNCTION DOC] Main flow: for every report from the workflow run, process it, skip
+    # reports that do not come from a rerun-disabled-tests run, and sum green and red counts
+    # per test across reports, then save the results. Args: repo, workflow_run_id,
+    # workflow_run_attempt.
+    # KNOWN ISSUE: the repo argument is ignored; the loop reads the module-level parsed
+    # arguments instead of the function parameters, so it only works when run as a script.
     """
     Find the list of all disabled tests that should be re-enabled
     """

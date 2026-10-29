@@ -1,3 +1,7 @@
+# [MODULE DOC] Script that expands a version header template: reads a version string from a file
+# and replaces the major, minor and patch placeholders in the template, writing the result to
+# the output path. Command-line options: template path, version path, output path (all
+# required). No import-time side effects.
 from __future__ import annotations
 
 import argparse
@@ -9,6 +13,12 @@ Version = tuple[int, int, int]
 
 
 def parse_version(version: str) -> Version:
+    # [FUNCTION DOC] Parse a version string into a tuple of three integers. Anything from
+    # the first character that is not a digit or dot onward (such as a revision or hash
+    # suffix) is discarded. Raises ValueError if a component is not numeric.
+    # KNOWN ISSUE: the result is only cast, not checked, to have three parts; a version with
+    # fewer or more components yields a tuple of a different length and the caller unpacking
+    # it would fail.
     """
     Parses a version string into (major, minor, patch) version numbers.
 
@@ -30,6 +40,9 @@ def parse_version(version: str) -> Version:
 
 
 def apply_replacements(replacements: dict[str, str], text: str) -> str:
+    # [FUNCTION DOC] Apply each before-to-after text substitution from the mapping, in
+    # insertion order, to the text and return the result. Later replacements see the effect
+    # of earlier ones.
     """
     Applies the given replacements within the text.
 
@@ -46,6 +59,12 @@ def apply_replacements(replacements: dict[str, str], text: str) -> str:
 
 
 def main(args: argparse.Namespace) -> None:
+    # [FUNCTION DOC] Generate the header. Reads and strips the version string from
+    # args.version_path, parses it, creates the output directory if needed, then streams the
+    # template at args.template_path line by line to args.output_path with the three version
+    # placeholders replaced. Side effects: file reads and writes, directory creation.
+    # KNOWN ISSUE: os.makedirs fails with an error if the output path has no directory
+    # component.
     with open(args.version_path) as f:
         version = f.read().strip()
     (major, minor, patch) = parse_version(version)
