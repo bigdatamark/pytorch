@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Policy and communication-interface definitions for fully_shard: mixed precision,
+# offload, data-parallel mesh dimension selection, and abstract AllGather/ReduceScatter
+# comm primitives. Only defines types; no import-time side effects beyond a reduce-op alias.
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -12,6 +15,10 @@ _ReduceOp = dist.ReduceOp | dist.ReduceOp.RedOpType
 
 @dataclass(frozen=True)
 class MixedPrecisionPolicy:
+    # [CLASS DOC] Frozen dataclass configuring module-level mixed precision for FSDP.
+    # Fields: param_dtype (compute and all-gather dtype), reduce_dtype (gradient reduction dtype),
+    # output_dtype (cast for forward outputs), cast_forward_inputs (cast float inputs to param_dtype).
+    # A None dtype means keep the original/compute dtype.
     """
     This configures FSDP's mixed precision. Unlike autocast, this applies mixed
     precision at the module level, not op level, which means low-precision
@@ -55,6 +62,8 @@ class MixedPrecisionPolicy:
 
 
 class Comm(ABC):
+    # [CLASS DOC] Abstract base for communication primitives; subclasses decide how and where
+    # communication buffers are allocated (allocate) and what happens when the comm is invoked.
     """
     Interface for communication primitives.
     A primitive primarily needs to handle 3 tasks, namely:
@@ -80,6 +89,8 @@ class Comm(ABC):
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Abstract method: allocate and return an uninitialized tensor buffer of the given
+        # size, dtype and device for use by a communication call (e.g. from a custom memory pool).
         """
         This handles the "how to allocate memory" part.
 
@@ -98,6 +109,9 @@ class Comm(ABC):
 
 
 class AllGather(Comm):
+    # [CLASS DOC] Abstract interface for an all-gather primitive; instances are callable with
+    # (output_tensor, input_tensor, group, async_op) and return a Work handle or None.
+    # The abstract call method is a one-line stub.
     """
     Interface for all_gather comm primitive
     """
@@ -113,6 +127,9 @@ class AllGather(Comm):
 
 
 class ReduceScatter(Comm):
+    # [CLASS DOC] Abstract interface for a reduce-scatter primitive; instances are callable with
+    # (output_tensor, input_tensor, group, op, async_op) and return a Work handle or None.
+    # The abstract call method is a one-line stub.
     """
     Interface for reduce_scatter comm primitive
     """
@@ -130,6 +147,9 @@ class ReduceScatter(Comm):
 
 @dataclass
 class DataParallelMeshDims:
+    # [CLASS DOC] Dataclass naming the mesh dimensions of a full SPMD DeviceMesh used for FSDP
+    # sharding (shard) and replication (replicate, HSDP/DDP). Each is a name, a tuple of names to be
+    # flattened, or None. At least one must be set. Properties normalize them to tuples.
     """
     Specifies which dimensions of a full SPMD :class:`DeviceMesh` correspond to
     data parallelism when using :func:`fully_shard` whose parameters are already
@@ -149,6 +169,8 @@ class DataParallelMeshDims:
     replicate: str | tuple[str, ...] | None = None
 
     def __post_init__(self):
+        # [FUNCTION DOC] Validation hook run after dataclass init.
+        # Raises ValueError if both shard and replicate are None.
         if self.shard is None and self.replicate is None:
             raise ValueError(
                 "At least one of shard or replicate must be set in DataParallelMeshDims"
@@ -156,6 +178,8 @@ class DataParallelMeshDims:
 
     @property
     def shard_names(self) -> tuple[str, ...]:
+        # [FUNCTION DOC] Property: the shard mesh dimension names as a tuple (empty if shard is None,
+        # single-element tuple if shard is a string).
         if self.shard is None:
             return ()
         if isinstance(self.shard, str):
@@ -164,6 +188,8 @@ class DataParallelMeshDims:
 
     @property
     def replicate_names(self) -> tuple[str, ...]:
+        # [FUNCTION DOC] Property: the replicate mesh dimension names as a tuple (empty if replicate is None,
+        # single-element tuple if replicate is a string).
         if self.replicate is None:
             return ()
         if isinstance(self.replicate, str):
@@ -173,6 +199,7 @@ class DataParallelMeshDims:
 
 @dataclass
 class OffloadPolicy:
+    # [CLASS DOC] Base policy meaning no offloading; the default value of the offload_policy argument.
     """
     This base class represents the policy of no offloading and is only used as
     the default value for the ``offload_policy`` arg.
@@ -181,6 +208,8 @@ class OffloadPolicy:
 
 @dataclass
 class CPUOffloadPolicy(OffloadPolicy):
+    # [CLASS DOC] Offload policy moving parameters, gradients and optimizer states to CPU.
+    # Field pin_memory (default True) controls whether the sharded CPU memory is pinned.
     """
     This offload policy offloads parameters, gradients, and optimizer states to
     CPU. Sharded parameters are copied host-to-device before all-gather. The
