@@ -1,5 +1,13 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Tests for FSDP optimizer state checkpointing APIs: full, sharded and generic
+# optim_state_dict, the matching load paths (shard_full, scatter_full, flatten_sharded,
+# optim_state_dict_to_load) and rekey_optim_state_dict. Defines small nested and dummy models
+# with varied wrapping, plus a test class that compares FSDP-produced optimizer state with that
+# of an equivalent unwrapped model, including halved world size, multiple param groups,
+# unmanaged parameters and use_orig_params. At import it exits early if distributed is
+# unavailable or dev-asan is on, and defines the device type and state dict type list.
+
 import bisect
 import sys
 from collections.abc import Callable
@@ -60,6 +68,9 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 
 class _OSDCommMethod(Enum):
+    # [CLASS DOC] HELPER: Selects which API pair a load test uses to obtain the per-rank
+    # optimizer state dict: broadcast of a full dict then shard, scatter of a full dict,
+    # flatten of a sharded dict, or the generic optim_state_dict / to_load pair.
     """Method for communicating the optimizer state dict for internal tests."""
 
     BROADCAST_OBJECT_LIST = auto()
@@ -69,6 +80,8 @@ class _OSDCommMethod(Enum):
 
 
 class _ModelClass(Enum):
+    # [CLASS DOC] HELPER: Selects the model family used by a test: the hand-written nested
+    # model or the shared-parameter transformer.
     """Different model type to test."""
 
     NESTED = auto()
@@ -76,9 +89,13 @@ class _ModelClass(Enum):
 
 
 class Bias(torch.nn.Module):
+    # [CLASS DOC] HELPER: Tiny module holding one seeded random bias vector parameter that
+    # is added to its input.
     """This module applies a 1D additive bias with dimension ``dim``."""
 
     def __init__(self, dim: int) -> None:
+        # [FUNCTION DOC] HELPER: Seeds the RNG with zero and creates the bias parameter of
+        # length dim. Raises an error if dim is not positive.
         super().__init__()
         if not (dim > 0):
             raise AssertionError(f"Expected dim > 0, but got {dim}")
@@ -86,10 +103,13 @@ class Bias(torch.nn.Module):
         self.bias = torch.nn.Parameter(torch.randn((dim,)))
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Returns the input plus the bias (broadcast).
         return x + self.bias
 
 
 class BlockA(torch.nn.Module):
+    # [CLASS DOC] HELPER: Block with the parameter order bias module, weight, bias module,
+    # used to give FSDP flattening an interesting nested structure.
     """
     Used to define interesting nested structure for FSDP wrapping.
     BlockA
@@ -101,6 +121,9 @@ class BlockA(torch.nn.Module):
     """
 
     def __init__(self, in_dim: int, out_dim: int) -> None:
+        # [FUNCTION DOC] HELPER: Seeds the RNG and creates two Bias modules around a random
+        # in_dim by out_dim weight, plus a ReLU. Raises an error if either dimension is not
+        # positive.
         super().__init__()
         if not all(v > 0 for v in (in_dim, out_dim)):
             raise AssertionError(
@@ -113,6 +136,8 @@ class BlockA(torch.nn.Module):
         self.relu = torch.nn.ReLU()
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Matrix-multiplies by the weight, then applies bias 0, ReLU
+        # and bias 1 in turn; returns the result.
         x = x @ self.weight
         x = self.bias_module0(x)
         x = self.relu(x)  # ensure biases have different gradients
@@ -121,6 +146,8 @@ class BlockA(torch.nn.Module):
 
 
 class BlockB(torch.nn.Module):
+    # [CLASS DOC] HELPER: Block with the parameter order weight, bias module, bias module;
+    # same computation as BlockA but different registration order for flattening tests.
     """
     Used to define interesting nested structure for FSDP wrapping.
     BlockB
@@ -132,6 +159,8 @@ class BlockB(torch.nn.Module):
     """
 
     def __init__(self, in_dim: int, out_dim: int) -> None:
+        # [FUNCTION DOC] HELPER: Seeds the RNG, creates a random in_dim by out_dim weight first,
+        # then two Bias modules and a ReLU. Raises an error if either dimension is not positive.
         super().__init__()
         if not all(v > 0 for v in (in_dim, out_dim)):
             raise AssertionError(
@@ -144,6 +173,8 @@ class BlockB(torch.nn.Module):
         self.relu = torch.nn.ReLU()
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Matrix-multiplies by the weight, then applies bias 0, ReLU
+        # and bias 1 in turn; returns the result.
         x = x @ self.weight
         x = self.bias_module0(x)
         x = self.relu(x)  # ensure biases have different gradients
@@ -152,7 +183,14 @@ class BlockB(torch.nn.Module):
 
 
 class NestedModel(torch.nn.Module):
+    # [CLASS DOC] HELPER: Test model of three chained blocks (two BlockB, then a sequential of
+    # BlockA, BlockA, BlockB) plus a top-level bias, with ReLUs between. Provides the input,
+    # loss and backward hooks that the FSDP test helpers expect, static wrapping recipes
+    # (wrap, wrap_alt, wrap_with_unmanaged_params), a helper to fake optimizer state for an
+    # unmanaged parameter, and two deliberately reordered parameter groups.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Builds block0 (5 to 3), block1 (3 to 7), a bias of size 5,
+        # block2 (7 to 9, 9 to 9, 9 to 5) and a ReLU.
         super().__init__()
         self.block0 = BlockB(5, 3)
         self.block1 = BlockB(3, 7)
@@ -165,6 +203,8 @@ class NestedModel(torch.nn.Module):
         self.relu = torch.nn.ReLU()
 
     def forward(self, x) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Applies block0, block1 and block2, each followed by ReLU,
+        # then adds the top-level bias; returns the output tensor.
         x = self.relu(self.block0(x))
         x = self.relu(self.block1(x))
         x = self.relu(self.block2(x))
@@ -172,13 +212,18 @@ class NestedModel(torch.nn.Module):
         return x
 
     def get_input(self, device):
+        # [FUNCTION DOC] HELPER: Returns a one-element tuple holding a random batch of 8 by 5
+        # on the given device (uses the current global RNG state).
         BATCH_SIZE = 8
         return (torch.randn((BATCH_SIZE, 5)).to(device),)
 
     def get_loss(self, inp, output):
+        # [FUNCTION DOC] HELPER: Returns the sum of the output as the scalar loss; the input
+        # is ignored.
         return output.sum()
 
     def run_backward(self, loss):
+        # [FUNCTION DOC] HELPER: Runs backward on the loss.
         loss.backward()
 
     @staticmethod
@@ -188,6 +233,11 @@ class NestedModel(torch.nn.Module):
         ignore_modules: bool = False,
         fsdp_kwargs: dict[str, Any] | None = None,
     ) -> torch.nn.Module:
+        # [FUNCTION DOC] HELPER: Wraps parts of the model in place with FSDP on the given
+        # process group and extra keyword arguments: bias modules of block1 and block2[1]
+        # individually, then block1, block2[1] and block2[2] as units. If ignore_modules is
+        # set, block2[2]'s first bias module is passed as an ignored module. block0 and the
+        # top level are left unwrapped. Returns the same model object.
         if fsdp_kwargs is None:
             fsdp_kwargs = {}
         # Flatten Bias0; then flatten weight and Bias1 together into `block1`
@@ -225,6 +275,8 @@ class NestedModel(torch.nn.Module):
         group: dist.ProcessGroup | None = None,
         fsdp_kwargs: dict[str, Any] | None = None,
     ) -> torch.nn.Module:
+        # [FUNCTION DOC] HELPER: Alternative wrapping that wraps only block0 (its first bias
+        # module and then the block) with FSDP in place; returns the same model object.
         if fsdp_kwargs is None:
             fsdp_kwargs = {}
         model.block0.bias_module0 = FSDP(
@@ -241,6 +293,10 @@ class NestedModel(torch.nn.Module):
         add_to_fsdp_module: bool,
         group=None,
     ) -> tuple[torch.nn.Module, list[torch.nn.Parameter]]:
+        # [FUNCTION DOC] HELPER: Registers one random 5 by 5 parameter named unmanaged_param on
+        # either block2[2] (to be wrapped by FSDP) or the root model (not wrapped), then calls
+        # the regular wrap. Returns the wrapped model and a one-element list with the new
+        # parameter.
         """Registers unmanaged parameters before wrapping with :meth:`wrap`."""
         device = next(model.parameters()).device
         unmanaged_param = torch.nn.Parameter(torch.randn(5, 5, device=device))
@@ -257,6 +313,11 @@ class NestedModel(torch.nn.Module):
 
     @staticmethod
     def add_unmanaged_param_entry(osd, unmanaged_param, step) -> None:
+        # [FUNCTION DOC] HELPER: Mutates an Adam optimizer state dict with one param group by
+        # picking the first skipped parameter ID (or the next ID after the last), adding a
+        # state entry with the given step and random exp_avg and exp_avg_sq on the same device
+        # as existing state, and inserting the ID into the group's sorted ID list. Raises an
+        # error if IDs are not strictly increasing where a gap occurs.
         """Adds an entry for the unmanaged parameter ``unmanaged_param``
         assuming Adam optimizer and a single parameter group."""
         # The unmanaged parameters should be passed to this method in
@@ -291,11 +352,14 @@ class NestedModel(torch.nn.Module):
     # NOTE: We exclude `self.bias` from either parameter group to test the
     # case where the optimizer input does not include all model parameters
     def param_group0(self) -> list[torch.nn.Parameter]:
+        # [FUNCTION DOC] HELPER: Returns block1's parameters as the first optimizer group.
         # Use `block1`'s parameters for the first parameter group to deviate
         # from the `model.parameters()` order
         return list(self.block1.parameters())
 
     def param_group1(self) -> list[torch.nn.Parameter]:
+        # [FUNCTION DOC] HELPER: Returns block2's parameters followed by block0's as the second
+        # optimizer group; the top-level bias is in neither group.
         # Deviate from the `model.parameters()` order further by rearranging
         # `block2`'s parameters to be before `block0`'s parameters
         return list(self.block2.parameters()) + list(self.block0.parameters())
@@ -304,7 +368,11 @@ class NestedModel(torch.nn.Module):
 # Simple and boring model to test interface and some corner cases that do not
 # require complicated wrapping strategy.
 class TestDummyModel(torch.nn.Module):
+    # [CLASS DOC] HELPER: Four-stage MLP (8 to 16 to 32 to 64 to 8) used for interface and
+    # corner case tests that need no special wrapping; can freeze the first linear layer.
     def __init__(self, no_grad: bool = False):
+        # [FUNCTION DOC] HELPER: Seeds the RNG and builds the four stages; if no_grad is
+        # true the first layer's weight and bias have requires_grad turned off.
         super().__init__()
         torch.manual_seed(0)
         self.net1 = nn.Sequential(nn.Linear(8, 16), nn.ReLU())
@@ -315,14 +383,23 @@ class TestDummyModel(torch.nn.Module):
         self.net4 = nn.Sequential(nn.ReLU(), nn.Linear(64, 8))
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies the four stages in order and returns the output.
         return self.net4(self.net3(self.net2(self.net1(x))))
 
     def get_input(self):
+        # [FUNCTION DOC] HELPER: Returns a random 8 by 8 batch on the test device.
         return torch.rand(8, 8, device=device_type)
 
 
 class TestFSDPOptimState(FSDPTest):
+    # [CLASS DOC] Multi-process tests of FSDP optimizer state dict save, load and rekey APIs.
+    # Holds a mapping from model class enum to its initializer. Helpers build wrapped or plain
+    # models with optimizers, step them, broadcast full dicts, and compare state and param
+    # groups; test methods cover nested and transformer models, halved world size, unmanaged
+    # parameters, deprecation warnings, empty/none/no-shard/no-grad state and interfaces.
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Passes arguments to the base test case and builds the mapping
+        # from model class enum values to the nested and transformer initializer methods.
         super().__init__(*args, **kwargs)
         self._model_class = {
             _ModelClass.NESTED: self._init_nested_model,
@@ -340,6 +417,11 @@ class TestFSDPOptimState(FSDPTest):
         use_diff_optim_inputs: bool = False,
         fsdp_kwargs: dict[str, Any] | None = None,
     ):
+        # [FUNCTION DOC] HELPER: Creates a nested model on the device, optionally wrapped with
+        # the alternative or standard FSDP recipe. Builds optimizer input as either a flat
+        # parameter list or two param groups (the second with weight decay 0.9); on odd ranks
+        # with use_diff_optim_inputs the parameter order is reversed. Returns the model, the
+        # optimizer (lr 0.01) and the optimizer input.
         model = NestedModel().to(device)
         if wrap:
             model = (
@@ -373,6 +455,11 @@ class TestFSDPOptimState(FSDPTest):
         use_multiple_param_groups: bool = False,
         use_diff_optim_inputs: bool = False,
     ):
+        # [FUNCTION DOC] HELPER: Builds the shared-parameter transformer (recursively wrapped
+        # with FSDP on the group, default group if none, or unwrapped), initialized
+        # deterministically on the device, with an optimizer over all parameters. Returns
+        # model, optimizer and None for optimizer input. Raises NotImplementedError if multiple
+        # param groups or differing optimizer inputs are requested.
         if use_multiple_param_groups or use_diff_optim_inputs:
             # Keep these as arguments for parity with `_init_nested_model()`;
             # these settings are not implemented since the transformer is
@@ -397,6 +484,9 @@ class TestFSDPOptimState(FSDPTest):
         device: torch.device = torch.device(device_type),
         num_iters: int = 1,
     ) -> list[float]:
+        # [FUNCTION DOC] HELPER: Seeds the RNG, then for num_iters iterations zeroes grads,
+        # draws input from the (possibly wrapped) module, runs forward, loss, backward and an
+        # optimizer step. Returns the per-iteration loss values as floats.
         """Performs a forward pass, backward pass, and optimizer step
         ``num_iters``-many times, and returns the per-iteration losses."""
         torch.manual_seed(0)  # set seed for determinism
@@ -413,6 +503,8 @@ class TestFSDPOptimState(FSDPTest):
         return losses
 
     def _broadcast_full_osd(self, full_osd: dict[str, Any], group=None):
+        # [FUNCTION DOC] HELPER: Broadcasts the dict as a pickled object from rank 0 over the
+        # group and returns the received copy (rank 0 gets its own back).
         """Broadcasts the full optimizer state dict in place of using
         ``torch.save()`` and ``torch.load()`` so that all ranks can have it."""
         obj_list = [full_osd]
@@ -429,6 +521,9 @@ class TestFSDPOptimState(FSDPTest):
         state1: dict[str, Any],
         state2: dict[str, Any],
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Returns true if both per-parameter state mappings have the same
+        # keys, matching value types, and equal values (tensors compared on CPU by shape and
+        # elementwise closeness, others by equality); otherwise false.
         """Checks if ``state1`` and ``state2`` contain the same mappings."""
         if set(state1.keys()) != set(state2.keys()):
             return False
@@ -457,6 +552,10 @@ class TestFSDPOptimState(FSDPTest):
         ref_osd,
         check_same_param_keys: bool,
     ):
+        # [FUNCTION DOC] HELPER: Asserts the "state" section of the FSDP dict matches the
+        # reference after gathering any sharded tensors. With check_same_param_keys it requires
+        # identical keys and equal values per key. Otherwise it only requires equal counts and
+        # that every FSDP entry matches at least one reference entry (quadratic search).
         """Checks that ``full_osd`` and ``ref_osd`` have the same "state" part.
         If ``check_same_param_keys=True``, then checks that the parameter keys
         match (e.g. when both should be parameter names), and does not check
@@ -507,6 +606,11 @@ class TestFSDPOptimState(FSDPTest):
         ref_osd,
         check_same_param_keys: bool,
     ):
+        # [FUNCTION DOC] HELPER: Asserts both dicts have param_groups and, pairwise over groups,
+        # the same option keys and equal values, skipping the params list unless
+        # check_same_param_keys is set.
+        # KNOWN ISSUE: the group-count check passes the reference length as the failure message
+        # of a truth assertion, so it never compares the counts; zip also hides extra groups.
         """Checks that ``full_osd`` and ``ref_osd`` have the same
         "param_groups" part. If ``check_same_param_keys=True`, then checks that
         the parameter keys match (e.g. when both should be parameter names),
@@ -542,6 +646,9 @@ class TestFSDPOptimState(FSDPTest):
         rank0_only: bool,
         use_diff_optim_inputs: bool,
     ) -> None:
+        # [FUNCTION DOC] Parametrized over state dict type, param groups, rank0_only and
+        # differing optimizer inputs; runs the nested comparison with and without the
+        # deprecated optimizer input argument.
         """
         Tests :meth:`full_optim_state_dict` and meth:`sharded_optim_state_dict`
         by comparing the returned dict for an FSDP-wrapped model with that of
@@ -570,6 +677,11 @@ class TestFSDPOptimState(FSDPTest):
         use_diff_optim_inputs: bool,
         use_optim_input: bool,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Trains a wrapped and an unwrapped nested model for three
+        # iterations, obtains the full or sharded FSDP optimizer state dict, and asserts losses
+        # are identical and that param groups and state match the unwrapped optimizer's state
+        # dict ignoring parameter keys. Non-zero ranks with rank0_only must get an empty dict;
+        # the sharded plus rank0_only combination is skipped as unsupported.
         if rank0_only and state_dict_type == StateDictType.SHARDED_STATE_DICT:
             return  # not supported
         NUM_ITERS = 3
@@ -627,6 +739,10 @@ class TestFSDPOptimState(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_full_optim_state_dict_keys(self):
+        # [FUNCTION DOC] Wraps a nested model with an ignored module and activation
+        # checkpointing on sequential modules, takes one step, and asserts the keys of the full
+        # optimizer state dict equal the keys of the full model state dict and contain no
+        # checkpoint wrapper prefix.
         """Tests that the parameter keys returned by
         :meth:`full_optim_state_dict` match those of :meth:`state_dict` with
         full ``state_dict_type`` for a non-FSDP-root model with nested FSDP
@@ -653,6 +769,9 @@ class TestFSDPOptimState(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_full_optim_state_dict_nested_invalid(self):
+        # [FUNCTION DOC] Builds the optimizer on nonzero ranks without the last parameter, takes
+        # three steps, and asserts the full optimizer state dict call raises a runtime error
+        # saying each rank needs at least rank 0's optimizer states.
         """Tests that :meth:`full_optim_state_dict` raises an error when
         nonzero ranks are missing the optimizer state for parameters on rank
         0."""
@@ -682,6 +801,9 @@ class TestFSDPOptimState(FSDPTest):
         wrap_alt: bool,
         use_diff_optim_inputs: bool,
     ):
+        # [FUNCTION DOC] Parametrized over param groups, alternate wrapping and differing
+        # optimizer inputs; runs the load test with broadcast-then-shard (with and without
+        # optimizer input), then the generic optim_state_dict path with a full state dict config.
         """Tests :meth:`shard_full_optim_state_dict` for a non-FSDP-root model
         with nested FSDP instances."""
         self.run_subtests(
@@ -712,6 +834,9 @@ class TestFSDPOptimState(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_shard_full_optim_state_dict_nested_halve_world_size(self):
+        # [FUNCTION DOC] Runs the broadcast-then-shard load test and the generic path with the
+        # hardest settings (multiple groups, differing inputs, alternate wrapping) when loading
+        # into a group with half the ranks.
         """Tests :meth:`shard_full_optim_state_dict` for a non-FSDP-root model
         with nested FSDP instances when loading into a new process group with
         halved world size."""
@@ -747,6 +872,8 @@ class TestFSDPOptimState(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_shard_full_optim_state_dict_transformer(self) -> None:
+        # [FUNCTION DOC] Runs the broadcast-then-shard load test (halved world size) and the
+        # generic full-state-dict path on the shared-parameter transformer.
         """Tests :meth:`shard_full_optim_state_dict` for an FSDP-root
         transformer model with shared parameters."""
         self.run_subtests(
@@ -783,6 +910,9 @@ class TestFSDPOptimState(FSDPTest):
         wrap_alt: bool,
         use_diff_optim_inputs: bool,
     ):
+        # [FUNCTION DOC] Parametrized over param groups, alternate wrapping and differing
+        # optimizer inputs; runs the scatter-full-dict load test, then the generic path with a
+        # rank0_only full optimizer config.
         """Tests :meth:`scatter_full_optim_state_dict` for a non-FSDP-root
         model with nested FSDP instances."""
         self.run_subtests(
@@ -813,6 +943,8 @@ class TestFSDPOptimState(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_scatter_full_optim_state_dict_nested_halve_world_size(self):
+        # [FUNCTION DOC] Runs the scatter load test and the rank0_only generic path with the
+        # hardest settings when loading into a group with half the ranks.
         """Tests :meth:`scatter_full_optim_state_dict` for a non-FSDP-root
         model with nested FSDP instances when loading into a new process group
         with halved world size."""
@@ -848,6 +980,8 @@ class TestFSDPOptimState(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_scatter_full_optim_state_dict_transformer(self) -> None:
+        # [FUNCTION DOC] Runs the scatter load test (halved world size) and the rank0_only
+        # generic path on the shared-parameter transformer.
         """Tests :meth:`scatter_full_optim_state_dict` for an FSDP-root
         transformer model with shared parameters."""
         self.run_subtests(
@@ -876,6 +1010,8 @@ class TestFSDPOptimState(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_flatten_sharded_optim_state_dict_nested(self) -> None:
+        # [FUNCTION DOC] Runs the flatten-sharded-dict load test and the generic path with a
+        # sharded state dict config on the nested model with alternate wrapping.
         """Tests :meth:`flatten_sharded_optim_state_dict` for an FSDP-root
         nested model."""
         self._test_load_optim_state(
@@ -905,6 +1041,8 @@ class TestFSDPOptimState(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_flatten_sharded_optim_state_dict_transformer(self) -> None:
+        # [FUNCTION DOC] Runs the flatten-sharded-dict load test and the generic path with a
+        # sharded state dict config on the shared-parameter transformer.
         """Tests :meth:`flatten_sharded_optim_state_dict` for an FSDP-root
         transformer model."""
         self._test_load_optim_state(
@@ -932,6 +1070,9 @@ class TestFSDPOptimState(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_use_orig_params(self) -> None:
+        # [FUNCTION DOC] Runs the generic optim_state_dict load test with use_orig_params on
+        # the nested model for full (with and without rank0_only, halved or full world size,
+        # both wrappings) and sharded (full world size only) state dict types.
         """Tests :meth:`optim_state_dict` for an FSDP-root nested model."""
         self.run_subtests(
             {
@@ -999,6 +1140,13 @@ class TestFSDPOptimState(FSDPTest):
         num_iters: int,
         **new_model_kwargs,
     ):
+        # [FUNCTION DOC] HELPER: Trains a first wrapped model, saves its optimizer state dict
+        # using the API selected by osd_comm_method (with the deprecated optimizer input when
+        # requested). Optionally builds a half-size group (ranks outside it return early),
+        # trains a second model, and converts both dicts into per-rank form for the second
+        # model by broadcast+shard, scatter, flatten or to_load. Asserts both match the second
+        # model's local optimizer state dict (param groups and state, same keys), then loads
+        # one and trains again.
         """
         (1) Runs a model with full world size for K iterations to generate a
         full/sharded optimizer state dict;
@@ -1160,6 +1308,9 @@ class TestFSDPOptimState(FSDPTest):
         state_dict_type: StateDictType,
         add_to_fsdp_module: bool,
     ):
+        # [FUNCTION DOC] Parametrized over state dict type and whether the extra parameter goes
+        # in an FSDP-wrapped module; runs the unmanaged-parameter check (the deprecated
+        # optimizer input variant only for full state dicts).
         """
         Tests :meth:`shard_full_optim_state_dict` when there are unmanaged
         parameters.
@@ -1194,6 +1345,11 @@ class TestFSDPOptimState(FSDPTest):
         add_to_fsdp_module: bool,
         use_optim_input: bool,
     ):
+        # [FUNCTION DOC] HELPER: Saves a full or sharded optimizer state dict from a normal
+        # wrapped model, then loads it into a model with one extra parameter. If the parameter
+        # lives in an FSDP-wrapped module, asserts a ValueError about scalar state having to
+        # agree within a flat parameter. Otherwise shards or flattens the dict, adds a fake
+        # entry for the extra parameter, and asserts the optimizer accepts the result.
         NUM_ITERS = 1
         # Create a normal wrapped model
         model, optim, optim_input = self._init_nested_model(wrap=True)
@@ -1276,6 +1432,8 @@ class TestFSDPOptimState(FSDPTest):
         state_dict_type: StateDictType,
         use_multiple_param_groups: bool,
     ):
+        # [FUNCTION DOC] Parametrized over state dict type and param groups; runs the rekey
+        # to IDs check, using the deprecated optimizer input variant only for full dicts.
         """Tests :meth:`rekey_optim_state_dict` with the new keys being
         parameter IDs by checking that a wrapped model (i.e. with FSDP modules)
         can rekey its optimizer state dict to match that of an equivalent
@@ -1298,6 +1456,12 @@ class TestFSDPOptimState(FSDPTest):
         use_multiple_param_groups: bool,
         use_optim_input: bool,
     ):
+        # [FUNCTION DOC] HELPER: Trains a wrapped and an unwrapped nested model, obtains the
+        # wrapped model's full (broadcast to all ranks) or sharded optimizer state dict, rekeys
+        # it by parameter ID using the unwrapped model, and asserts it equals the unwrapped
+        # optimizer's state dict. For non-sharded dicts also loads it and trains further.
+        # KNOWN ISSUE: this non-test helper is decorated with the minimum-GPU skip decorator,
+        # which is meaningless there and may skip or mis-wrap the call.
         NUM_ITERS = 3
         # Run a wrapped model for a few iterations
         model1, optim1, optim_input1 = self._init_nested_model(
@@ -1359,6 +1523,8 @@ class TestFSDPOptimState(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_rekey_optim_state_dict_to_names(self):
+        # [FUNCTION DOC] Runs the rekey to names check with and without the deprecated
+        # optimizer input argument.
         """Tests :meth:`rekey_optim_state_dict` with the new keys being
         parameter names by checking that a non-wrapped model (i.e. without FSDP
         modules) can rekey its optimizer state dict to match the expected
@@ -1376,6 +1542,10 @@ class TestFSDPOptimState(FSDPTest):
         use_multiple_param_groups: bool,
         use_optim_input: bool,
     ):
+        # [FUNCTION DOC] HELPER: Trains wrapped and unwrapped nested models, rekeys the
+        # unwrapped optimizer state dict to parameter names, shards it for the wrapped model,
+        # asserts it matches the wrapped optimizer's per-rank state dict, then loads it and
+        # trains further.
         NUM_ITERS = 3
         # Run a wrapped model for a few iterations
         model1, optim1, optim_input1 = self._init_nested_model(
@@ -1442,10 +1612,15 @@ class TestFSDPOptimState(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_optim_input_warning(self):
+        # [FUNCTION DOC] Runs every optimizer state API that accepts the deprecated optimizer
+        # input argument under a context asserting a FutureWarning matching the deprecation
+        # message; the sharded and flatten-sharded APIs are excluded.
         """Tests that passing the ``optim_input`` argument into optimizer state
         checkpointing APIs issues a warning."""
 
         def should_check_method(method_name: str):
+            # [FUNCTION DOC] HELPER: Returns false for the two APIs that lack the deprecated
+            # argument, true otherwise.
             # Check every method since they all accept `optim_input`
             return method_name not in (
                 "sharded_optim_state_dict",
@@ -1453,6 +1628,8 @@ class TestFSDPOptimState(FSDPTest):
             )
 
         def get_warning_context():
+            # [FUNCTION DOC] HELPER: Returns a context manager asserting a FutureWarning whose
+            # text matches the optimizer input deprecation message.
             warning_regex = "`optim_input` argument is deprecated"
             return self.assertWarnsRegex(
                 expected_warning=FutureWarning, expected_regex=warning_regex
@@ -1468,6 +1645,11 @@ class TestFSDPOptimState(FSDPTest):
         context_fn: Callable,
         fsdp_kwargs: dict[str, Any] | None,
     ):
+        # [FUNCTION DOC] HELPER: Trains a wrapped nested model two steps, then calls each
+        # optimizer state API (sharded, flatten sharded, full, shard full, scatter full, and
+        # rekey to IDs and to names on an unwrapped model) inside the context returned by
+        # context_fn, skipping those for which should_check_method_fn returns false.
+        # Falls back to an empty dict if the sharded call was skipped.
         """
         Runs through all optimizer state checkpointing APIs with a context
         manager instantiated by ``context_fn``. Certain APIs can be skipped
@@ -1548,6 +1730,10 @@ class TestFSDPOptimState(FSDPTest):
     @skip_if_lt_x_gpu(2)
     @parametrize("state_dict_type", STATE_DICT_TYPES)
     def test_save_load_without_0th_param_state(self, state_dict_type: StateDictType):
+        # [FUNCTION DOC] Uses a model whose forward skips the first linear layer so the first
+        # parameter has no optimizer state. After one Adam step, saves a full or sharded
+        # optimizer dict, converts it back to per-rank form, loads it and takes another step,
+        # checking nothing raises.
         """
         Tests saving and loading an optim state dict for Adam optimizer (i.e.
         any optimizer with a "step" key in its state) when the first parameter
@@ -1555,13 +1741,16 @@ class TestFSDPOptimState(FSDPTest):
         """
 
         class Model(nn.Module):
+            # [CLASS DOC] HELPER: Two linear layers of which only the second is used in forward.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates two 5 by 5 linear layers and a ReLU.
                 super().__init__()
                 self.lin1 = nn.Linear(5, 5)
                 self.lin2 = nn.Linear(5, 5)
                 self.relu = nn.ReLU()
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Applies only the second linear layer and ReLU.
                 # Do not use `lin1`, which is the parameter passed to the
                 # optimizer and the one checked for "step" state to see if it
                 # is tensor or float
@@ -1604,8 +1793,14 @@ class TestFSDPOptimState(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_compatible_with_trec(self):
+        # [FUNCTION DOC] Compares FSDP optimizer state dicts of a model-parallel-like model
+        # (FSDP dense part plus rank-specific sparse parts) under a plain Adam and under a
+        # named optimizer: after one batch the dicts must match, and after training the named
+        # one further, round-tripping through to_load and optim_state_dict must again match.
         class DenseModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Four-stage MLP used as the FSDP-wrapped dense part.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Builds the four stages (8, 16, 32, 64 to 8 wide).
                 super().__init__()
                 self.net1 = nn.Sequential(nn.Linear(8, 16), nn.ReLU())
                 self.net2 = nn.Sequential(nn.Linear(16, 32), nn.ReLU())
@@ -1613,10 +1808,16 @@ class TestFSDPOptimState(FSDPTest):
                 self.net4 = nn.Sequential(nn.ReLU(), nn.Linear(64, 8))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the four stages in order.
                 return self.net4(self.net3(self.net2(self.net1(x))))
 
         class FakeMPModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Emulates model parallelism: an FSDP dense model (using
+            # original params) on all ranks plus a small sparse net that exists on rank 0 as
+            # sparse0 and on other ranks as sparse1.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Seeds the RNG, wraps a dense model in FSDP, and
+                # creates the rank-specific sparse sequential.
                 super().__init__()
                 torch.manual_seed(0)
                 self.dense = FSDP(DenseModel().to(device_type), use_orig_params=True)
@@ -1626,6 +1827,8 @@ class TestFSDPOptimState(FSDPTest):
                     self.sparse1 = nn.Sequential(nn.Linear(8, 8), nn.ReLU())
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies this rank's sparse net, sums the result across
+                # ranks with an all-reduce, then applies the dense model.
                 if dist.get_rank() == 0:
                     sparse = self.sparse0(x)
                 else:
@@ -1690,13 +1893,21 @@ class TestFSDPOptimState(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_optim_state_without_param_groups(self):
+        # [FUNCTION DOC] Strips param_groups from a local optimizer state dict, passes it
+        # through FSDP optim_state_dict and asserts the output has no param_groups. After
+        # training further, converts it back with to_load, restores the saved groups by hand,
+        # loads it, and asserts the optimizer state dict equals the original and that FSDP
+        # state still matches.
         class SimpleModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: One linear plus ReLU stage with seeded initialization.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Seeds the RNG and builds a 2 to 4 linear with ReLU.
                 super().__init__()
                 torch.manual_seed(0)
                 self.net1 = nn.Sequential(nn.Linear(2, 4), nn.ReLU())
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the single stage.
                 return self.net1(x)
 
         model = FSDP(SimpleModel().to(device_type))
@@ -1752,6 +1963,8 @@ class TestFSDPOptimState(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_with_empty_optimizer_state(self):
+        # [FUNCTION DOC] Asserts that FSDP optim_state_dict on an optimizer that has not yet
+        # stepped returns a state section equal to the local optimizer's (empty).
         model = FSDP(TestDummyModel().to(device_type))
         optim = torch.optim.Adam(model.parameters(), lr=1e-2)
         state_dict = optim.state_dict()
@@ -1768,6 +1981,12 @@ class TestFSDPOptimState(FSDPTest):
         num_iters: int,
         **new_model_kwargs,
     ):
+        # [FUNCTION DOC] HELPER: Same flow as the main load helper but using only the generic
+        # API: sets the given state dict type and configs on both models, trains a first model,
+        # saves its optimizer dict, optionally trains a second model on a half-size group
+        # (other ranks return early), and converts both saved dicts with to_load for the
+        # second model. Asserts both equal the second model's local optimizer state dict, then
+        # loads one and trains again.
         """
         (1) Runs a model with full world size for K iterations to generate a
         full/sharded optimizer state dict;
@@ -1864,10 +2083,16 @@ class TestFSDPOptimState(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_interface_arguments(self):
+        # [FUNCTION DOC] Exercises the optim_state_dict arguments: passing a precomputed local
+        # dict, load_directly on to_load, default output (no sharded tensors, CPU), sharded
+        # config without CPU offload (sharded tensors on device), and full config with
+        # rank0_only (empty on other ranks, CPU tensors on rank 0).
         model = FSDP(TestDummyModel().to(device_type))
         optim = torch.optim.Adam(model.parameters(), lr=1e-2)
 
         def step():
+            # [FUNCTION DOC] HELPER: One forward, backward (using the loss as its own gradient
+            # argument) and optimizer step.
             loss = model(model.get_input())
             loss.backward(loss)
             optim.step()
@@ -1933,7 +2158,12 @@ class TestFSDPOptimState(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_state_dict_with_none_tensor_state(self):
+        # [FUNCTION DOC] Runs the custom-state round trip for both use_orig_params values and
+        # for Adam (tensor state) and SGD (no tensor state).
         def _run_test(use_orig_params, optimizer_has_tensor_state):
+            # [FUNCTION DOC] HELPER: After a step, adds a float and a None entry to every
+            # parameter's state, converts through FSDP optim_state_dict and to_load, and
+            # asserts both custom values survive unchanged.
             model = FSDP(
                 TestDummyModel().to(device_type), use_orig_params=use_orig_params
             )
@@ -1943,6 +2173,7 @@ class TestFSDPOptimState(FSDPTest):
             optim = optimizer_cls(model.parameters(), lr=1e-2)
 
             def step():
+                # [FUNCTION DOC] HELPER: One forward, backward and optimizer step.
                 loss = model(model.get_input())
                 loss.backward(loss)
                 optim.step()
@@ -1970,7 +2201,11 @@ class TestFSDPOptimState(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_with_no_shard(self):
+        # [FUNCTION DOC] Runs the no-shard round-trip check for both use_orig_params values.
         def _run_test(use_orig_params: bool) -> None:
+            # [FUNCTION DOC] HELPER: With the no-shard strategy, steps once, converts the
+            # optimizer state dict through FSDP and back, loads it, and asserts the optimizer
+            # state dict equals the original.
             model = FSDP(
                 TestDummyModel().to(device_type),
                 sharding_strategy=ShardingStrategy.NO_SHARD,
@@ -1979,6 +2214,7 @@ class TestFSDPOptimState(FSDPTest):
             optim = torch.optim.Adam(model.parameters(), lr=1e-2)
 
             def step():
+                # [FUNCTION DOC] HELPER: One forward, backward and optimizer step.
                 loss = model(model.get_input())
                 loss.backward(loss)
                 optim.step()
@@ -1999,6 +2235,9 @@ class TestFSDPOptimState(FSDPTest):
 
     @skip_if_lt_x_gpu(2)
     def test_no_grad(self):
+        # [FUNCTION DOC] Trains a model whose first layer's requires-grad flag alternates each
+        # of five iterations, and each time round-trips the optimizer state dict through FSDP
+        # (loading directly) and asserts the optimizer state is unchanged.
         model = TestDummyModel(no_grad=True).to(device_type)
         fsdp_model = FSDP(deepcopy(model), use_orig_params=True)
         fsdp_optim = torch.optim.Adam(fsdp_model.parameters(), lr=1e-2)

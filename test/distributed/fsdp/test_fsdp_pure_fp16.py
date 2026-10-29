@@ -1,5 +1,10 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Tests for FSDP training with a pure half-precision (float16) model: parity with
+# a reference run, and the dtypes of parameters, gradients and FSDP handle attributes when
+# explicit mixed precision may also be set. Exits at import if distributed is unavailable or
+# dev-asan is on; instantiates the device-generic tests for cuda/hpu/xpu.
+
 import sys
 
 import torch
@@ -37,8 +42,11 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 
 class TestPureFP16(FSDPTestContinuous):
+    # [CLASS DOC] Multi-process FSDP tests for models whose parameters are float16.
     @skip_if_lt_x_gpu(2)
     def test_pure_fp16_training(self):
+        # [FUNCTION DOC] Runs the pure-fp16 parity check with parameter CPU offload both on
+        # and off via the subtest runner.
         """Tests pure FP16 training, including when the parameter's dtype is
         changed after FSDP initialization and before training."""
         self.run_subtests(
@@ -52,6 +60,9 @@ class TestPureFP16(FSDPTestContinuous):
         )
 
     def _test_pure_fp16_training(self, cpu_offload: CPUOffload):
+        # [FUNCTION DOC] HELPER: Compares FSDP against the reference for a recursively wrapped
+        # nested module in fp16 for a single iteration (one step avoids NaNs since no gradient
+        # scaler is used), with the given CPU offload config. Fails on mismatch.
         self._test_fsdp_parity(
             NestedWrappedModule,
             FSDPInitMode.RECURSIVE,
@@ -64,6 +75,9 @@ class TestPureFP16(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_fp16_dtypes(self):
+        # [FUNCTION DOC] Runs the dtype check over every combination of converting to half
+        # before or after FSDP init, use_orig_params, and three mixed precision configs
+        # (default, fp16 param with fp32 reduce, fp32 param only).
         """
         Tests that both user-facing parameter/gradient dtypes and internal
         saved dtype attributes are as expected when using an FP16 model
@@ -93,6 +107,12 @@ class TestPureFP16(FSDPTestContinuous):
         use_orig_params: bool,
         mixed_precision: MixedPrecision,
     ):
+        # [FUNCTION DOC] HELPER: Builds a nested module, converts it to half either before or
+        # after wrapping with FSDP, runs one forward/backward on half inputs, then asserts that
+        # parameters and gradients are float16 and that each handle's flat parameter, gradient
+        # and saved original dtype are float16. Forward/backward param dtype and reduce dtype
+        # follow mixed_precision when set (reduce dtype falls back to the param dtype if only
+        # that is set), otherwise float16.
         model = NestedWrappedModule.init(
             self.process_group,
             FSDPInitMode.NO_FSDP,

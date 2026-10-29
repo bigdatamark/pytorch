@@ -1,5 +1,11 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] Tests for ShardedGradScaler: single-process unit tests of scaling, sparse
+# unscaling and skipping the optimizer step on infs (using a dummy process group), and
+# multi-GPU tests of parity with DDP and of found-inf propagation across ranks. Defines the
+# parametrization grid (cpu offload, sharding strategy, mixed precision, use_orig_params) and
+# readable subtest names. Exits at import if distributed is unavailable or dev-asan is on.
+
 import copy
 import functools
 import itertools
@@ -77,11 +83,16 @@ subtest_name = functools.partial(subtest_name, test_name_mapping)
 
 
 class TestShardGradScaler(TestCase):
+    # [CLASS DOC] Single-process unit tests of ShardedGradScaler behavior using a dummy
+    # process group of size one; skipped when no AMP-capable device exists.
     @unittest.skipIf(
         amp_definitely_not_available() and not TEST_XPU,
         "no supported device (cuda, xla, xpu) found",
     )
     def test_grad_scaling(self):
+        # [FUNCTION DOC] Scales a nested structure of tensors (single tensor, tuple, list)
+        # with init scale 2 and asserts every element is multiplied by 2 and that the scale
+        # tensor ends up on the same device as the inputs.
         pg = DummyProcessGroup(0, 1)
         scaler = ShardedGradScaler(
             device=device_type, init_scale=2.0, process_group=pg, enabled=True
@@ -101,6 +112,10 @@ class TestShardGradScaler(TestCase):
         "no supported device (cuda, xla, xpu) found",
     )
     def test_scaling_unscaling_sparse(self):
+        # [FUNCTION DOC] Calls the private unscale routine on sparse COO gradients. Asserts a
+        # finite gradient is halved with found-inf 0, a gradient containing an infinite value
+        # sets found-inf to 1, and a float16 gradient whose duplicate entries overflow when
+        # coalesced also sets found-inf to 1.
         pg = DummyProcessGroup(0, 1)
         scaler = ShardedGradScaler(
             device=device_type, init_scale=2.0, process_group=pg, enabled=True
@@ -149,6 +164,8 @@ class TestShardGradScaler(TestCase):
         "no supported device (cuda, xla, xpu) found",
     )
     def test_inf_gradients_skip_optim_step(self):
+        # [FUNCTION DOC] Gives a tensor an infinite gradient, calls the scaler step on an SGD
+        # optimizer, and asserts the step is skipped (returns None).
         pg = DummyProcessGroup(0, 1)
         scaler = ShardedGradScaler(
             device=device_type, init_scale=2.0, process_group=pg, enabled=True
@@ -163,7 +180,11 @@ class TestShardGradScaler(TestCase):
 
 
 class TestShardedGradScalerParityWithDDP(FSDPTestContinuous):
+    # [CLASS DOC] Multi-GPU tests comparing FSDP with ShardedGradScaler against DDP with the
+    # regular grad scaler, including found-inf handling across ranks.
     def _get_init_modes_for_test(self, cpu_offload):
+        # [FUNCTION DOC] HELPER: Returns device-init modes to test: after and before wrapping,
+        # plus never (model stays on CPU) only when parameters are CPU-offloaded.
         modes = [DEVICEInitMode.DEVICE_AFTER, DEVICEInitMode.DEVICE_BEFORE]
         # Note that DEVICEInitMode.DEVICE_NEVER works currently only with CPU
         # offload as we explicitly bring the param back to CUDA device. In
@@ -183,6 +204,10 @@ class TestShardedGradScalerParityWithDDP(FSDPTestContinuous):
         mixed_precision: str | None,
         use_orig_params: str | None,
     ):
+        # [FUNCTION DOC] Parametrized over the config grid. Builds fp16 mixed precision when
+        # requested, picks the non-uniform requires-grad model with a conservative initial
+        # scale when use_orig_params is enabled (else the nested model), and for each device
+        # init mode runs the FSDP-vs-reference parity check with the sharded grad scaler.
         init_modes = self._get_init_modes_for_test(cpu_offload)
         mp = (
             MixedPrecision(
@@ -221,6 +246,10 @@ class TestShardedGradScalerParityWithDDP(FSDPTestContinuous):
         cpu_offload: CPUOffload = CPUOffload(offload_params=False),
         use_orig_params: bool = False,
     ):
+        # [FUNCTION DOC] HELPER: Builds a deterministic shared-parameter transformer, a DDP
+        # copy of it with Adam as reference, and an FSDP version (auto-wrapping transformer
+        # encoder/decoder layers, given CPU offload and use_orig_params) with its own Adam.
+        # Returns the FSDP model, its optimizer, the DDP model and its optimizer.
         model = TransformerWithSharedParams.init(
             self.process_group,
             FSDPInitMode.NO_FSDP,
@@ -249,6 +278,8 @@ class TestShardedGradScalerParityWithDDP(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_sharded_grad_scaler_found_inf(self):
+        # [FUNCTION DOC] Runs the found-inf check for both use_orig_params values and both
+        # CPU offload settings.
         self.run_subtests(
             {
                 "use_orig_params": [False, True],
@@ -265,6 +296,12 @@ class TestShardedGradScalerParityWithDDP(FSDPTestContinuous):
         use_orig_params: bool,
         cpu_offload: CPUOffload,
     ):
+        # [FUNCTION DOC] HELPER: For ten iterations steps both the DDP reference (regular
+        # scaler) and FSDP (sharded scaler) models. On even iterations injects an infinite
+        # gradient (on the reference, and only on rank 0 for FSDP so other ranks must learn of
+        # it through collectives) and asserts the scale is backed off and parameters are
+        # unchanged; on odd iterations asserts the scale is unchanged and parameters changed.
+        # After each iteration asserts the scaled losses of the two models are equal.
         model, optim, ref_model, ref_optim = self._build_model_and_optim(
             cpu_offload=cpu_offload,
             use_orig_params=use_orig_params,
