@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines the Wishart distribution over symmetric positive definite matrices
+# (an ExponentialFamily member) parameterized by degrees of freedom and one of
+# covariance, precision or Cholesky scale factor, sampled with the Bartlett
+# decomposition. Also has private helpers: multivariate digamma and an
+# epsilon clamp. Exports Wishart. Defines module constant _log_2. No import-time
+# side effects.
 import math
 import warnings
 
@@ -17,6 +24,9 @@ _log_2 = math.log(2)
 
 
 def _mvdigamma(x: Tensor, p: int) -> Tensor:
+    # [FUNCTION DOC] HELPER: Multivariate digamma of dimension p: sums the
+    # digamma of x minus half of each index from zero to p-1. Raises
+    # AssertionError unless every element of x exceeds (p-1)/2.
     if not x.gt((p - 1) / 2).all():
         raise AssertionError("Wrong domain for multivariate digamma function.")
     return torch.digamma(
@@ -26,11 +36,21 @@ def _mvdigamma(x: Tensor, p: int) -> Tensor:
 
 
 def _clamp_above_eps(x: Tensor) -> Tensor:
+    # [FUNCTION DOC] HELPER: Clamps x from below at the machine epsilon of its
+    # dtype; assumes positive input.
     # We assume positive input for this function
     return x.clamp(min=torch.finfo(x.dtype).eps)
 
 
 class Wishart(ExponentialFamily):
+    # [CLASS DOC]
+    # Wishart distribution over positive definite matrices. State: df (tensor
+    # over batch), one of scale_tril/covariance_matrix/precision_matrix as given
+    # (the others computed lazily and cached), _unbroadcasted_scale_tril (the
+    # Cholesky factor used by all computations), _batch_dims (negative indices of
+    # batch axes) and _dist_chi2 (Chi2 distribution for Bartlett sampling).
+    # Invariant: df exceeds dimension minus one. Supports rsample, log_prob,
+    # entropy, mean, mode, variance and exponential-family natural parameters.
     r"""
     Creates a Wishart distribution parameterized by a symmetric positive definite matrix :math:`\Sigma`,
     or its Cholesky decomposition :math:`\mathbf{\Sigma} = \mathbf{L}\mathbf{L}^\top`
@@ -70,6 +90,10 @@ class Wishart(ExponentialFamily):
 
     @property
     def arg_constraints(self):
+        # [FUNCTION DOC]
+        # Mapping of parameter names to constraints: matrices must be positive
+        # definite or lower Cholesky, and df must exceed the matrix dimension
+        # minus one.
         return {
             "covariance_matrix": constraints.positive_definite,
             "precision_matrix": constraints.positive_definite,
@@ -85,6 +109,13 @@ class Wishart(ExponentialFamily):
         scale_tril: Tensor | None = None,
         validate_args: bool | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Requires exactly one of covariance_matrix, precision_matrix or
+        # scale_tril (else AssertionError) with at least two dims (else
+        # ValueError). Determines batch shape from the matrix leading dims and df
+        # (a number becomes a tensor), requires df above dimension minus one
+        # (ValueError), warns if df is below the dimension, derives the Cholesky
+        # factor, and builds the Chi2 distribution for Bartlett sampling.
         if (
             (covariance_matrix is not None)
             + (scale_tril is not None)
@@ -158,6 +189,10 @@ class Wishart(ExponentialFamily):
         )
 
     def expand(self, batch_shape, _instance=None):
+        # [FUNCTION DOC]
+        # Returns a new Wishart with df, Cholesky factor and whichever of the
+        # matrix parameters were already materialized expanded to batch_shape,
+        # recomputing batch dims and the Chi2 helper; validation setting copied.
         new = self._get_checked_instance(Wishart, _instance)
         batch_shape = torch.Size(batch_shape)
         cov_shape = batch_shape + self.event_shape
@@ -191,12 +226,17 @@ class Wishart(ExponentialFamily):
 
     @lazy_property
     def scale_tril(self) -> Tensor:
+        # [FUNCTION DOC]
+        # Cached lower Cholesky factor expanded to batch plus event shape.
         return self._unbroadcasted_scale_tril.expand(
             self._batch_shape + self._event_shape
         )
 
     @lazy_property
     def covariance_matrix(self) -> Tensor:
+        # [FUNCTION DOC]
+        # Cached covariance: the Cholesky factor times its transpose, expanded
+        # to batch plus event shape.
         return (
             self._unbroadcasted_scale_tril
             @ self._unbroadcasted_scale_tril.transpose(-2, -1)
@@ -204,6 +244,9 @@ class Wishart(ExponentialFamily):
 
     @lazy_property
     def precision_matrix(self) -> Tensor:
+        # [FUNCTION DOC]
+        # Cached precision: inverse of the covariance via a Cholesky solve
+        # against the identity, expanded to batch plus event shape.
         identity = torch.eye(
             self._event_shape[-1],
             device=self._unbroadcasted_scale_tril.device,
@@ -215,16 +258,25 @@ class Wishart(ExponentialFamily):
 
     @property
     def mean(self) -> Tensor:
+        # [FUNCTION DOC]
+        # Mean matrix: df times the covariance matrix.
         return self.df.view(self._batch_shape + (1, 1)) * self.covariance_matrix
 
     @property
     def mode(self) -> Tensor:
+        # [FUNCTION DOC]
+        # Mode matrix: (df - dimension - 1) times the covariance matrix, with
+        # NaN where that factor is not positive. Mutates the temporary factor
+        # only.
         factor = self.df - self.covariance_matrix.shape[-1] - 1
         factor[factor <= 0] = nan
         return factor.view(self._batch_shape + (1, 1)) * self.covariance_matrix
 
     @property
     def variance(self) -> Tensor:
+        # [FUNCTION DOC]
+        # Elementwise variance: df times (squared covariance entries plus the
+        # outer product of the covariance diagonal with itself).
         V = self.covariance_matrix  # has shape (batch_shape x event_shape)
         diag_V = V.diagonal(dim1=-2, dim2=-1)
         return self.df.view(self._batch_shape + (1, 1)) * (
@@ -232,6 +284,11 @@ class Wishart(ExponentialFamily):
         )
 
     def _bartlett_sampling(self, sample_shape=torch.Size()):
+        # [FUNCTION DOC] HELPER: Draws Wishart samples via the Bartlett
+        # decomposition: a lower-triangular matrix with square roots of chi2
+        # draws (clamped above epsilon) on the diagonal and standard normals
+        # below it, multiplied by the Cholesky factor; returns the product of
+        # the result with its transpose. Consumes RNG state.
         p = self._event_shape[-1]  # has singleton shape
 
         # Implemented Sampling using Bartlett decomposition
@@ -251,6 +308,16 @@ class Wishart(ExponentialFamily):
     def rsample(
         self, sample_shape: _size = torch.Size(), max_try_correction=None
     ) -> Tensor:
+        # [FUNCTION DOC]
+        # Draws reparameterized samples with Bartlett sampling, then retries
+        # samples flagged as singular up to max_try_correction times (default 10,
+        # or 3 while tracing, where all samples are redrawn with a where-select
+        # instead of data-dependent indexing). Warns when singular samples are
+        # found outside tracing. Returns samples that may still be singular.
+        # KNOWN ISSUE: the initial singularity flag is the support check result
+        # itself, not its negation as in the retry loops, so the flag is
+        # inverted on the first pass (valid samples get resampled, singular ones
+        # are kept).
         r"""
         .. warning::
             In some cases, sampling algorithm based on Bartlett decomposition may return singular matrix samples.
@@ -301,6 +368,11 @@ class Wishart(ExponentialFamily):
         return sample
 
     def log_prob(self, value):
+        # [FUNCTION DOC]
+        # Log density of positive definite matrix value using the Cholesky
+        # factor, multivariate log-gamma of df/2, the log determinant of value
+        # and a trace term computed with a Cholesky solve. Optionally validates
+        # value. Returns a tensor over the batch shape.
         if self._validate_args:
             self._validate_sample(value)
         nu = self.df  # has shape (batch_shape)
@@ -322,6 +394,10 @@ class Wishart(ExponentialFamily):
         )
 
     def entropy(self):
+        # [FUNCTION DOC]
+        # Differential entropy from the log determinant of the Cholesky factor,
+        # multivariate log-gamma and multivariate digamma of df/2, and df times
+        # dimension over 2. Raises AssertionError (via digamma) for invalid df.
         nu = self.df  # has shape (batch_shape)
         p = self._event_shape[-1]  # has singleton shape
         return (
@@ -339,12 +415,17 @@ class Wishart(ExponentialFamily):
 
     @property
     def _natural_params(self) -> tuple[Tensor, Tensor]:
+        # [FUNCTION DOC] HELPER: Exponential-family natural parameters: minus
+        # half the precision matrix and (df - dimension - 1) / 2.
         nu = self.df  # has shape (batch_shape)
         p = self._event_shape[-1]  # has singleton shape
         return -self.precision_matrix / 2, (nu - p - 1) / 2
 
     # pyrefly: ignore [bad-override]
     def _log_normalizer(self, x, y):
+        # [FUNCTION DOC] HELPER: Log normalizer as a function of the natural
+        # parameters x (matrix) and y (scalar): uses the log determinant of
+        # minus two x, log two times dimension and the multivariate log-gamma.
         p = self._event_shape[-1]
         return (y + (p + 1) / 2) * (
             -torch.linalg.slogdet(-2 * x).logabsdet + _log_2 * p

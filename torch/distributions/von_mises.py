@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines the circular VonMises distribution plus helpers: polynomial
+# approximations of the log modified Bessel functions of order 0 and 1 (module
+# coefficient tables) and a rejection sampler (Best and Fisher). Exports
+# VonMises. No import-time side effects besides decorating the sampler for
+# scripting when tracing.
 import math
 
 import torch
@@ -13,6 +19,9 @@ __all__ = ["VonMises"]
 
 
 def _eval_poly(y, coef):
+    # [FUNCTION DOC] HELPER: Evaluates a polynomial with coefficients in
+    # ascending order at y using Horner's scheme. Copies coef first, so the
+    # input list is not mutated. Returns a value shaped like y.
     coef = list(coef)
     result = coef.pop()
     while coef:
@@ -66,6 +75,10 @@ _COEF_LARGE = [_I0_COEF_LARGE, _I1_COEF_LARGE]
 
 
 def _log_modified_bessel_fn(x, order=0):
+    # [FUNCTION DOC] HELPER: Approximates the log of the modified Bessel
+    # function of the first kind, order 0 or 1, for positive x. Uses a
+    # polynomial in (x/3.75) squared below 3.75 and an asymptotic form above,
+    # selected elementwise. Raises AssertionError for other orders.
     """
     Returns ``log(I_order(x))`` for ``x > 0``,
     where `order` is either 0 or 1.
@@ -91,6 +104,12 @@ def _log_modified_bessel_fn(x, order=0):
 
 @torch.jit.script_if_tracing
 def _rejection_sample(loc, concentration, proposal_r, x):
+    # [FUNCTION DOC] HELPER: Best-Fisher rejection sampler. Repeatedly draws
+    # three uniform values per element (consuming RNG state), accepts those
+    # meeting the acceptance tests, and writes accepted angles into x until all
+    # elements are done. Returns the angles shifted by loc and wrapped to the
+    # range from minus pi to pi. May loop for a long time for tiny
+    # concentrations in low precision.
     done = torch.zeros(x.shape, dtype=torch.bool, device=loc.device)
     # pyrefly: ignore [bad-assignment, missing-attribute]
     while not done.all():
@@ -108,6 +127,12 @@ def _rejection_sample(loc, concentration, proposal_r, x):
 
 
 class VonMises(Distribution):
+    # [CLASS DOC]
+    # Circular von Mises distribution with real loc (angle) and positive
+    # concentration, broadcast together; scalar events. No reparameterized
+    # sampling. Samples via rejection sampling in double precision with cached
+    # lazy double-precision parameters. Mean and mode equal loc; variance is the
+    # circular variance.
     """
     A circular von Mises distribution.
 
@@ -136,12 +161,20 @@ class VonMises(Distribution):
         concentration: Tensor,
         validate_args: bool | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Broadcasts loc and concentration into tensors stored on the instance;
+        # batch shape is the broadcast shape and event shape is empty.
+        # Validation errors come from the base class.
         self.loc, self.concentration = broadcast_all(loc, concentration)
         batch_shape = self.loc.shape
         event_shape = torch.Size()
         super().__init__(batch_shape, event_shape, validate_args)
 
     def log_prob(self, value):
+        # [FUNCTION DOC]
+        # Log density: concentration times cosine of (value - loc), minus log
+        # of two pi, minus the log modified Bessel function of order 0 at the
+        # concentration. Optionally validates value.
         if self._validate_args:
             self._validate_sample(value)
         log_prob = self.concentration * torch.cos(value - self.loc)
@@ -154,14 +187,19 @@ class VonMises(Distribution):
 
     @lazy_property
     def _loc(self) -> Tensor:
+        # [FUNCTION DOC] HELPER: Cached double-precision copy of loc.
         return self.loc.to(torch.double)
 
     @lazy_property
     def _concentration(self) -> Tensor:
+        # [FUNCTION DOC] HELPER: Cached double-precision copy of concentration.
         return self.concentration.to(torch.double)
 
     @lazy_property
     def _proposal_r(self) -> Tensor:
+        # [FUNCTION DOC] HELPER: Cached proposal parameter of the Best-Fisher
+        # sampler computed from the double-precision concentration; uses a
+        # second order Taylor expansion where concentration is below 1e-5.
         kappa = self._concentration
         tau = 1 + (1 + 4 * kappa**2).sqrt()
         rho = (tau - (2 * tau).sqrt()) / (2 * kappa)
@@ -172,6 +210,10 @@ class VonMises(Distribution):
 
     @torch.no_grad()
     def sample(self, sample_shape=torch.Size()):
+        # [FUNCTION DOC]
+        # Draws samples (no gradients) of the extended shape using the rejection
+        # sampler in double precision, then casts back to the dtype of loc.
+        # Consumes RNG state. Results lie in the range from minus pi to pi.
         """
         The sampling algorithm for the von Mises distribution is based on the
         following paper: D.J. Best and N.I. Fisher, "Efficient simulation of the
@@ -188,6 +230,11 @@ class VonMises(Distribution):
         ).to(self.loc.dtype)
 
     def expand(self, batch_shape, _instance=None):
+        # [FUNCTION DOC]
+        # Tries the base class expand; if it raises NotImplementedError, builds
+        # a new VonMises from expanded loc and concentration, preserving the
+        # validate_args setting.
+        # KNOWN ISSUE: _instance is ignored in both paths.
         try:
             return super().expand(batch_shape)
         except NotImplementedError:
@@ -198,6 +245,8 @@ class VonMises(Distribution):
 
     @property
     def mean(self) -> Tensor:
+        # [FUNCTION DOC]
+        # Circular mean, which is loc.
         """
         The provided mean is the circular one.
         """
@@ -205,10 +254,15 @@ class VonMises(Distribution):
 
     @property
     def mode(self) -> Tensor:
+        # [FUNCTION DOC]
+        # Mode, which is loc.
         return self.loc
 
     @lazy_property
     def variance(self) -> Tensor:  # type: ignore[override]
+        # [FUNCTION DOC]
+        # Cached circular variance: one minus the ratio of Bessel functions of
+        # order 1 and order 0 at the concentration (via log differences).
         """
         The provided variance is the circular one.
         """

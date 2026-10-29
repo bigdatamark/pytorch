@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Shared helpers for torch.distributions: broadcasting of mixed number/tensor
+# arguments, logits/probabilities conversion, probability clamping, a lazy
+# caching property descriptor, sum over trailing dims, standard normal sampling
+# and lower-triangular matrix/vector conversion. Defines the module constant
+# euler_constant. No import-time side effects beyond imports and TypeVars.
 from collections.abc import Callable, Sequence
 from functools import update_wrapper
 from typing import Any, Final, Generic, overload, TypeVar
@@ -25,6 +31,12 @@ __all__ = [
 # FIXME: Use (*values: *Ts) -> tuple[Tensor for T in Ts] if Mapping-Type is ever added.
 #   See https://github.com/python/typing/issues/1216#issuecomment-2126153831
 def broadcast_all(*values: Tensor | Number) -> tuple[Tensor, ...]:
+    # [FUNCTION DOC]
+    # Broadcasts a mix of numbers and tensor-like objects to a common shape.
+    # Numbers become tensors using the dtype and device of the first real
+    # tensor argument, or the default dtype if there is none. Returns a tuple
+    # of broadcast tensors. Raises ValueError if any value is neither a number
+    # nor tensor-like.
     r"""
     Given a list of values (possibly containing numbers), returns a list where each
     value is broadcasted based on the following rules:
@@ -64,6 +76,10 @@ def _standard_normal(
     dtype: _dtype | None,
     device: Device | None,
 ) -> Tensor:
+    # [FUNCTION DOC] HELPER: Returns a tensor of the given shape, dtype and
+    # device filled with standard normal samples (consumes RNG state). Under
+    # tracing it uses the two-argument normal op as a workaround instead of
+    # the in-place fill.
     if torch._C._get_tracing_state():
         # [JIT WORKAROUND] lack of support for .normal_()
         return torch.normal(
@@ -74,6 +90,9 @@ def _standard_normal(
 
 
 def _sum_rightmost(value: Tensor, dim: int) -> Tensor:
+    # [FUNCTION DOC] HELPER: Sums over the dim rightmost dimensions of value by
+    # flattening them and reducing; returns value unchanged when dim is zero.
+    # Behavior for negative dim is not defined.
     r"""
     Sum out ``dim`` many rightmost dimensions of a given tensor.
 
@@ -88,6 +107,10 @@ def _sum_rightmost(value: Tensor, dim: int) -> Tensor:
 
 
 def logits_to_probs(logits: Tensor, is_binary: bool = False) -> Tensor:
+    # [FUNCTION DOC]
+    # Converts logits to probabilities: elementwise sigmoid when binary,
+    # otherwise softmax along the last dimension. Returns a tensor of the same
+    # shape.
     r"""
     Converts a tensor of logits into probabilities. Note that for the
     binary case, each value denotes log odds, whereas for the
@@ -100,6 +123,10 @@ def logits_to_probs(logits: Tensor, is_binary: bool = False) -> Tensor:
 
 
 def clamp_probs(probs: Tensor) -> Tensor:
+    # [FUNCTION DOC]
+    # Clamps probabilities into the closed range from eps to one minus eps,
+    # where eps is the machine epsilon of the input dtype (so zero and one are
+    # avoided). Returns a new tensor.
     """Clamps the probabilities to be in the open interval `(0, 1)`.
 
     The probabilities would be clamped between `eps` and `1 - eps`,
@@ -126,6 +153,9 @@ def clamp_probs(probs: Tensor) -> Tensor:
 
 
 def probs_to_logits(probs: Tensor, is_binary: bool = False) -> Tensor:
+    # [FUNCTION DOC]
+    # Clamps probs away from zero and one, then returns the log odds when
+    # binary or the plain log otherwise (unnormalized logits).
     r"""
     Converts a tensor of probabilities into logits. For the binary case,
     this denotes the probability of occurrence of the event indexed by `1`.
@@ -143,6 +173,11 @@ R = TypeVar("R", covariant=True)
 
 
 class lazy_property(Generic[T, R]):
+    # [CLASS DOC]
+    # Non-data descriptor decorator that computes a method once per instance
+    # and caches the result by storing it as an instance attribute of the same
+    # name, which shadows the descriptor afterwards. State: wrapped (the
+    # method). Accessed on the class it returns a property-like wrapper.
     r"""
     Used as a decorator for lazy loading of class attributes. This uses a
     non-data descriptor that calls the wrapped method to compute the property on
@@ -151,6 +186,8 @@ class lazy_property(Generic[T, R]):
     """
 
     def __init__(self, wrapped: Callable[[T], R]) -> None:
+        # [FUNCTION DOC] HELPER: Stores the wrapped method and copies its
+        # metadata (name, docstring) onto the descriptor.
         self.wrapped: Callable[[T], R] = wrapped
         update_wrapper(self, wrapped)  # type:ignore[arg-type]
 
@@ -165,6 +202,11 @@ class lazy_property(Generic[T, R]):
     def __get__(
         self, instance: T | None, obj_type: Any = None
     ) -> "R | _lazy_property_and_property[T, R]":
+        # [FUNCTION DOC]
+        # Descriptor access. On the class (no instance) returns a combined
+        # lazy/property wrapper of the method. On an instance, computes the
+        # value with gradients enabled, stores it as an instance attribute under
+        # the method name (side effect: caches it) and returns it.
         if instance is None:
             return _lazy_property_and_property(self.wrapped)
         with torch.enable_grad():
@@ -174,6 +216,9 @@ class lazy_property(Generic[T, R]):
 
 
 class _lazy_property_and_property(lazy_property[T, R], property):
+    # [CLASS DOC] HELPER: Object returned when a lazy_property is read from the
+    # class; it is both a lazy_property and a builtin property so documentation
+    # tools and distribution argument validation both recognize it.
     """We want lazy properties to look like multiple things.
 
     * property when Sphinx autodoc looks
@@ -181,10 +226,17 @@ class _lazy_property_and_property(lazy_property[T, R], property):
     """
 
     def __init__(self, wrapped: Callable[[T], R]) -> None:
+        # [FUNCTION DOC] HELPER: Initializes only the builtin property part with
+        # the wrapped method; lazy_property.__init__ is deliberately skipped.
         property.__init__(self, wrapped)
 
 
 def tril_matrix_to_vec(mat: Tensor, diag: int = 0) -> Tensor:
+    # [FUNCTION DOC]
+    # Extracts the lower-triangular entries (up to the diag-th diagonal) of a
+    # square matrix or batch of matrices in row order into a vector along the
+    # last dimension. Raises ValueError when diag is outside the range from
+    # minus n to n-1 (check skipped while tracing).
     r"""
     Convert a `D x D` matrix or a batch of matrices into a (batched) vector
     which comprises of lower triangular elements from the matrix in row order.
@@ -199,6 +251,14 @@ def tril_matrix_to_vec(mat: Tensor, diag: int = 0) -> Tensor:
 
 
 def vec_to_tril_matrix(vec: Tensor, diag: int = 0) -> Tensor:
+    # [FUNCTION DOC]
+    # Inverse of tril_matrix_to_vec: solves for the matrix size n from the last
+    # dimension length, then builds a zero matrix of shape batch plus n by n and
+    # fills the lower-triangular positions with vec in row order. Raises
+    # ValueError if the length cannot form such a matrix (skipped when tracing).
+    # KNOWN ISSUE: the check compares round(n) minus n against eps, which is
+    # only positive when n rounds up, so non-integer n that rounds down (and
+    # small deviations) are not rejected.
     r"""
     Convert a vector or a batch of vectors into a batched `D x D`
     lower triangular matrix containing elements from the vector in row order.

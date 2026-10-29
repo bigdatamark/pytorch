@@ -1,3 +1,12 @@
+# [PACKAGE DOC]
+# torch.export public API: ahead-of-time capture of an nn.Module into an
+# ExportedProgram (export, draft_export), saving and loading of programs
+# (save, load, backed by the pt2 archive format with a legacy zip fallback),
+# and registration of dataclasses as pytree input/output types. Re-exports
+# related classes from submodules: dynamic shape specs (Dim, dims, Constraint,
+# AdditionalInputs, ShapesCollection), ExportedProgram and its signatures,
+# CustomDecompTable, default_decompositions, and unflatten helpers. Import-time
+# side effect: imports torch.export.custom_ops to register export custom ops.
 import logging
 import os
 import warnings
@@ -67,6 +76,15 @@ def export(
     preserve_module_call_signature: tuple[str, ...] = (),
     prefer_deferred_runtime_asserts_over_guards: bool = False,
 ) -> ExportedProgram:
+    # [FUNCTION DOC]
+    # Traces mod with example args/kwargs ahead of time into an ExportedProgram
+    # holding a functional ATen graph, using optional dynamic_shapes, strict
+    # mode choice and module-call-signature preservation; delegates to the
+    # internal _export in pre-dispatch mode. Returns the ExportedProgram. On any
+    # failure it re-raises the same exception; for errors draft_export can
+    # diagnose (data-dependent guards, unsupported operators, user errors,
+    # constraint violations, missing fake implementations) it first appends a
+    # hint to the exception message (mutating its args).
     """
     :func:`export` takes any nn.Module along with example inputs, and produces a traced graph representing
     only the Tensor computation of the function in an Ahead-of-Time (AOT) fashion,
@@ -271,6 +289,11 @@ def save(
     opset_version: dict[str, int] | None = None,
     pickle_protocol: int = DEFAULT_PICKLE_PROTOCOL,
 ) -> None:
+    # [FUNCTION DOC]
+    # Saves an ExportedProgram to a path or file-like object as a pt2 archive
+    # under the key model, with optional extra files, opset versions and pickle
+    # protocol. Raises TypeError if ep is not an ExportedProgram. Side effect:
+    # writes to f.
     """
 
     .. warning::
@@ -341,6 +364,18 @@ def load(
     extra_files: dict[str, Any] | None = None,
     expected_opset_version: dict[str, int] | None = None,
 ) -> ExportedProgram:
+    # [FUNCTION DOC]
+    # Loads an ExportedProgram from a path or file-like object. First tries the
+    # pt2 archive loader (a RuntimeError is logged and treated as an empty
+    # archive); on success copies any archived extra files into the caller's
+    # extra_files mapping and returns the program stored under model. Otherwise
+    # falls back to the legacy zip format: checks the version entry, reads the
+    # serialized program, state dict, constants, example inputs and extra files,
+    # and deserializes. Raises RuntimeError for a missing or mismatched version
+    # and AssertionError for a bad version length or missing parts. Uses
+    # pickle, so untrusted input is unsafe.
+    # KNOWN ISSUE: extra_files given as None or as an empty mapping is replaced
+    # by a fresh dict, so loaded extra files are then not visible to the caller.
     """
 
     .. warning::
@@ -499,6 +534,11 @@ def draft_export(
     strict: bool = False,
     prefer_deferred_runtime_asserts_over_guards: bool = False,
 ) -> ExportedProgram:
+    # [FUNCTION DOC]
+    # Like export, but tries to always return an ExportedProgram and produce a
+    # report of soundness issues, by delegating to the internal draft export
+    # implementation. Raises NotImplementedError if dynamic_shapes uses the new
+    # ShapesSpec or ParamsSpec API.
     """
     A version of torch.export.export which is designed to consistently produce
     an ExportedProgram, even if there are potential soundness issues, and to
@@ -530,6 +570,10 @@ def register_dataclass(
     *,
     serialized_type_name: str | None = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # Registers a dataclass type with the pytree utilities so it can be an
+    # export input or output, optionally with a serialized type name needed to
+    # serialize its tree spec. Side effect: mutates global pytree registry.
     """
     Registers a dataclass as a valid input/output type for :func:`torch.export.export`.
 
