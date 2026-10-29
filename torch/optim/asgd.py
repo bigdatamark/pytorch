@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Averaged Stochastic Gradient Descent (ASGD) optimizer. Defines the ASGD class, the
+# functional entry point asgd (choosing between single-tensor and foreach implementations;
+# no fused variant) and the private implementations. Each parameter keeps a decaying step
+# size (eta), an averaging coefficient (mu) and a running average (ax) of its iterates.
+# Supports L2 weight decay, maximize, capturable, complex parameters and tensor lr.
+# Import-time side effect: assigns ASGD.__doc__.
 from typing import cast
 
 import torch
@@ -27,6 +34,13 @@ __all__ = ["ASGD", "asgd"]
 
 
 class ASGD(Optimizer):
+    # [CLASS DOC]
+    # Optimizer implementing Averaged SGD. Group options: lr, lambd (decay term), alpha (power
+    # for the eta schedule), t0 (averaging start point), weight_decay, foreach, maximize,
+    # differentiable, capturable. Per-parameter state, created lazily on the first step:
+    # "step" and "mu" and "eta" (scalar tensors on the parameter device), and "ax" (running
+    # average, same shape as the parameter). Sparse gradients are rejected.
+    # Key methods: step, _init_group.
     def __init__(
         self,
         params: ParamsT,
@@ -40,6 +54,10 @@ class ASGD(Optimizer):
         differentiable: bool = False,
         capturable: bool = False,
     ) -> None:
+        # [FUNCTION DOC]
+        # Validates arguments, raising ValueError for a tensor lr that is not single-element,
+        # or negative lr or weight_decay (lambd, alpha and t0 are not validated). Builds the
+        # defaults mapping and calls the base constructor. No state is created here.
         if isinstance(lr, Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be 1-element")
         if not 0.0 <= lr:
@@ -61,6 +79,10 @@ class ASGD(Optimizer):
         super().__init__(params, defaults)
 
     def __setstate__(self, state):
+        # [FUNCTION DOC]
+        # Restores state after unpickling or loading. Fills missing group options with
+        # defaults and converts non-tensor "step", "eta" and "mu" state values into scalar
+        # float tensors on the parameter device. Mutates self in place.
         super().__setstate__(state)
         for group in self.param_groups:
             group.setdefault("foreach", None)
@@ -85,6 +107,10 @@ class ASGD(Optimizer):
                         )
 
     def _init_group(self, group, params_with_grad, grads, mus, axs, etas, state_steps):
+        # [FUNCTION DOC] HELPER: For one param group, appends each parameter with a gradient,
+        # its gradient and its state tensors (mu, ax, eta, step) to the output lists, lazily
+        # creating state: step zero, eta equal to the group lr, mu one, ax zeros. Raises
+        # RuntimeError for sparse gradients. Returns whether any collected parameter is complex.
         has_complex = False
         for p in group["params"]:
             if p.grad is not None:
@@ -124,6 +150,12 @@ class ASGD(Optimizer):
 
     @_use_grad_for_differentiable
     def step(self, closure=None):
+        # [FUNCTION DOC]
+        # Performs one optimization step. Runs the accelerator graph capture health check,
+        # optionally re-evaluates the closure with gradients enabled, then for each param
+        # group gathers tensors via _init_group and calls the functional asgd with the group
+        # options (note the argument order passes averages before mus). Updates parameters
+        # and state in place. Returns the loss or None.
         """Perform a single optimization step.
 
         Args:
@@ -212,6 +244,14 @@ def _single_tensor_asgd(
     capturable: bool,
     has_complex: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Reference per-parameter ASGD update. When capturable, raises
+    # AssertionError unless params, mus, etas and steps are on a supported device type. For
+    # each parameter: negates the gradient if maximizing, increments the step, adds L2
+    # weight decay, shrinks the parameter by the decay term scaled by eta and subtracts
+    # eta times the gradient, updates the running average ax (a plain copy while mu is one,
+    # else an interpolation weighted by mu), then recomputes eta from lr, lambd, alpha and
+    # the step, and mu as the reciprocal of the larger of one and step minus t0. Complex
+    # values use a real view. Mutates params, ax, eta, mu and steps in place.
     if not torch.jit.is_scripting():
         lr = _to_scalar(lr)
 
@@ -292,6 +332,12 @@ def _multi_tensor_asgd(
     capturable: bool,
     has_complex: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Foreach (batched) ASGD update. Returns early for empty input;
+    # raises AssertionError if differentiable or, when capturable, if devices are
+    # unsupported. Groups tensors by device and dtype; per group handles complex views,
+    # maximize, step increment, weight decay folded with the lambd decay term into one
+    # intermediate, the parameter update, the running average update, and recomputation
+    # of eta and mu (tensor math when capturable). Mutates all state in place.
     if len(params) == 0:
         return
 
@@ -442,6 +488,12 @@ def asgd(
     alpha: float,
     weight_decay: float,
 ) -> None:
+    # [FUNCTION DOC]
+    # Functional ASGD entry point over parallel lists of params, grads, averages, mus, etas
+    # and step tensors. When foreach is unspecified it is chosen automatically where
+    # supported. Raises RuntimeError if foreach is requested under TorchScript. Dispatches to
+    # the multi-tensor or single-tensor implementation, which update everything in place.
+    # Returns nothing.
     r"""Functional API that performs asgd algorithm computation.
 
     See :class:`~torch.optim.ASGD` for details.

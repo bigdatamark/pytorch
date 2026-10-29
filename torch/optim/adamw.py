@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# AdamW optimizer: a thin specialization of Adam with decoupled weight decay always enabled
+# (default weight_decay 1e-2). Defines the AdamW class and the functional wrapper adamw, which
+# forwards to the Adam functional API with decoupled weight decay turned on. Import-time side
+# effect: assigns AdamW.__doc__.
 from torch import Tensor
 
 from .adam import Adam, adam
@@ -17,6 +22,11 @@ __all__ = ["AdamW", "adamw"]
 
 
 class AdamW(Adam):
+    # [CLASS DOC]
+    # Adam subclass whose decoupled_weight_decay option is always True: weight decay shrinks
+    # parameters directly instead of being added to the gradient. State and update logic are
+    # inherited from Adam. Invariant: every param group has decoupled_weight_decay set to True,
+    # including after loading state.
     def __init__(
         self,
         params: ParamsT,
@@ -32,6 +42,10 @@ class AdamW(Adam):
         differentiable: bool = False,
         fused: bool | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Same arguments as Adam, except weight_decay defaults to 1e-2 and there is no
+        # decoupled_weight_decay argument. Delegates to the Adam constructor with decoupled
+        # weight decay forced on; validation errors come from the base class.
         super().__init__(
             params,
             lr,
@@ -51,6 +65,10 @@ class AdamW(Adam):
     # guarantees that decoupled_weight_decay will always be True for loading any state into
     # AdamW
     def __setstate__(self, state: StateDict) -> None:
+        # [FUNCTION DOC]
+        # Restores state via the Adam implementation, then forces decoupled_weight_decay to
+        # True in every param group (so older checkpoints lacking or disabling it still behave
+        # as AdamW). Mutates self in place.
         super().__setstate__(state)
         for group in self.param_groups:
             group["decoupled_weight_decay"] = True
@@ -151,6 +169,10 @@ def adamw(
     eps: float,
     maximize: bool,
 ) -> None:
+    # [FUNCTION DOC]
+    # Functional AdamW entry point. Takes the same lists and options as the Adam functional
+    # API (without a decoupled weight decay argument) and forwards them with decoupled weight
+    # decay set to true. Errors and in-place updates are those of the Adam functional API.
     r"""Functional API that performs AdamW algorithm computation.
 
     See :class:`~torch.optim.AdamW` for details.

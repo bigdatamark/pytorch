@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Adam optimizer. Defines the Adam class (first and second moment running averages with bias
+# correction, optional AMSGrad, L2 or decoupled weight decay, maximize), the functional entry
+# point adam that dispatches among single-tensor, multi-tensor (foreach) and fused
+# implementations, and the private implementations of each. Supports tensor lr/betas in
+# some modes, capturable (graph-capture friendly) step tracking, and complex parameters.
+# Import-time side effect: assigns the long math/args docstring to Adam.__doc__.
 from typing import cast
 
 import torch
@@ -32,6 +39,13 @@ __all__ = ["Adam", "adam"]
 
 
 class Adam(Optimizer):
+    # [CLASS DOC]
+    # Optimizer implementing Adam (and AdamW behavior when decoupled_weight_decay is set).
+    # Group options: lr, betas, eps, weight_decay, amsgrad, maximize, foreach, capturable,
+    # differentiable, fused, decoupled_weight_decay. Per-parameter state, created lazily on
+    # the first step with a gradient: "step" (scalar tensor, on the parameter device when
+    # capturable or fused, otherwise on CPU), "exp_avg", "exp_avg_sq" and, with amsgrad,
+    # "max_exp_avg_sq". Sparse gradients are rejected. Key methods: step, _init_group.
     def __init__(
         self,
         params: ParamsT,
@@ -48,6 +62,13 @@ class Adam(Optimizer):
         fused: bool | None = None,
         decoupled_weight_decay: bool = False,
     ) -> None:
+        # [FUNCTION DOC]
+        # Validates arguments and raises ValueError for: a tensor lr or tensor betas with
+        # foreach and not capturable, tensors that are not single-element, negative lr, eps
+        # or weight_decay, betas outside zero to one, or betas that mix floats and tensors.
+        # Converts betas to scalars via the scalar helper, builds the defaults mapping and
+        # calls the base constructor. For fused mode, raises RuntimeError if differentiable
+        # or foreach is also set, and marks the optimizer as supporting AMP grad scaling.
         if isinstance(lr, Tensor):
             if foreach and not capturable:
                 raise ValueError(
@@ -113,6 +134,11 @@ class Adam(Optimizer):
                 raise RuntimeError("`fused` and `foreach` cannot be `True` together.")
 
     def __setstate__(self, state):
+        # [FUNCTION DOC]
+        # Restores state after unpickling or loading. Fills missing group options with
+        # defaults and converts any non-tensor "step" values to scalar float tensors, placed
+        # on the parameter device when capturable or fused, else left on the default device.
+        # Mutates self in place.
         super().__setstate__(state)
         for group in self.param_groups:
             group.setdefault("amsgrad", False)
@@ -146,6 +172,12 @@ class Adam(Optimizer):
         max_exp_avg_sqs,
         state_steps,
     ):
+        # [FUNCTION DOC] HELPER: For one param group, appends each parameter that has a
+        # gradient, its gradient and its state tensors (exp_avg, exp_avg_sq, max_exp_avg_sq
+        # if amsgrad, step) to the output lists, lazily initializing state to zeros. Raises
+        # RuntimeError for sparse gradients, for a step requiring grad in differentiable mode,
+        # and for a tensor lr with foreach and not capturable. Returns whether any parameter
+        # with a gradient is complex.
         has_complex = False
         for p in group["params"]:
             if p.grad is not None:
@@ -213,6 +245,12 @@ class Adam(Optimizer):
 
     @_use_grad_for_differentiable
     def step(self, closure=None):
+        # [FUNCTION DOC]
+        # Performs one optimization step. Runs the accelerator graph capture health check,
+        # optionally re-evaluates the closure with gradients enabled to get the loss, then
+        # for each param group gathers tensors via _init_group and calls the functional adam
+        # with the group options and any AMP grad_scale/found_inf. Updates parameters and
+        # state in place. Returns the loss from the closure or None.
         """Perform a single optimization step.
 
         Args:
@@ -366,6 +404,14 @@ def _single_tensor_adam(
     differentiable: bool,
     decoupled_weight_decay: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Reference per-parameter Adam update. Raises if grad_scale or
+    # found_inf is given, under TorchScript requires float lr and betas, and when capturable
+    # requires params and steps on a supported device type. For each parameter: negates the
+    # gradient if maximizing, increments the step, applies decoupled (multiplicative) or L2
+    # weight decay, updates both moment averages, then applies the bias corrected update
+    # (tensor math when capturable or differentiable, scalar math otherwise), using the
+    # running maximum of the second moment when amsgrad. Complex values use a real view.
+    # Mutates params, moments and steps in place.
     if grad_scale is not None or found_inf is not None:
         raise AssertionError("Expected grad_scale and found_inf to be None")
 
@@ -572,6 +618,13 @@ def _multi_tensor_adam(
     differentiable: bool,
     decoupled_weight_decay: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Foreach (batched) Adam update. Returns early for empty input.
+    # Raises RuntimeError/ValueError when lr, beta1 or beta2 is a tensor without capturable
+    # or not single-element, and AssertionError for unsupported devices under capturable, for
+    # grad_scale/found_inf given, or for differentiable. Groups tensors by device and dtype
+    # and, per group, handles complex views, maximize, step increment, weight decay, moment
+    # updates, bias correction (tensor based when capturable) and the parameter update.
+    # Mutates params, moments and steps in place.
     if len(params) == 0:
         return
 
@@ -821,6 +874,11 @@ def _fused_adam(
     differentiable: bool,
     decoupled_weight_decay: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Fused Adam/AdamW update using fused kernels (AdamW kernel when
+    # decoupled weight decay is set). Returns early for empty input; raises RuntimeError if
+    # differentiable. Per device/dtype group, moves grad_scale, found_inf and a tensor lr to
+    # the device, increments steps, runs the kernel, and reverts the step increment when
+    # found_inf is set. Mutates params, moments and steps in place.
     if not params:
         return
     if differentiable:
@@ -926,6 +984,13 @@ def adam(
     eps: float,
     maximize: bool,
 ) -> None:
+    # [FUNCTION DOC]
+    # Functional Adam entry point over parallel lists of params, grads, moments and step
+    # tensors. If neither fused nor foreach is given, foreach is chosen automatically where
+    # supported, except when lr is a tensor and not capturable (fused is never auto chosen).
+    # Raises RuntimeError if steps are not tensors (check skipped while compiling) or if
+    # foreach/fused is used under TorchScript. Dispatches to the fused, multi-tensor or
+    # single-tensor implementation, which update everything in place. Returns nothing.
     r"""Functional API that performs Adam algorithm computation.
 
     See :class:`~torch.optim.Adam` for details.

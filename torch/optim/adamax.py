@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Adamax optimizer, a variant of Adam that uses an exponentially weighted infinity norm in
+# place of the second moment. Defines the Adamax class, the functional entry point adamax
+# (choosing between single-tensor and foreach implementations; no fused variant), and the
+# private implementations. Supports L2 weight decay, maximize, capturable steps, complex
+# parameters and tensor lr. Import-time side effect: assigns Adamax.__doc__.
 from typing import cast
 
 import torch
@@ -27,6 +33,12 @@ __all__ = ["Adamax", "adamax"]
 
 
 class Adamax(Optimizer):
+    # [CLASS DOC]
+    # Optimizer implementing Adamax. Group options: lr, betas, eps, weight_decay, foreach,
+    # maximize, differentiable, capturable. Per-parameter state is created lazily on the
+    # first step with a gradient: "step" (scalar tensor, on the parameter device when
+    # capturable, else CPU), "exp_avg" (first moment) and "exp_inf" (infinity norm estimate).
+    # Sparse gradients are rejected. Key methods: step, _init_group.
     def __init__(
         self,
         params: ParamsT,
@@ -40,6 +52,10 @@ class Adamax(Optimizer):
         differentiable: bool = False,
         capturable: bool = False,
     ) -> None:
+        # [FUNCTION DOC]
+        # Validates arguments, raising ValueError for a tensor lr that is not single-element,
+        # negative lr, eps or weight_decay, or betas outside zero to one. Builds the defaults
+        # mapping and calls the base constructor. No state is created here.
         if isinstance(lr, Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be 1-element")
         if not 0.0 <= lr:
@@ -66,6 +82,10 @@ class Adamax(Optimizer):
         super().__init__(params, defaults)
 
     def __setstate__(self, state):
+        # [FUNCTION DOC]
+        # Restores state after unpickling or loading. Fills missing group options with
+        # defaults and converts non-tensor "step" values into scalar float tensors (placed on
+        # the parameter device when the group is capturable). Mutates self in place.
         super().__setstate__(state)
         for group in self.param_groups:
             group.setdefault("foreach", None)
@@ -87,6 +107,10 @@ class Adamax(Optimizer):
     def _init_group(
         self, group, params_with_grad, grads, exp_avgs, exp_infs, state_steps
     ):
+        # [FUNCTION DOC] HELPER: For one param group, appends each parameter with a gradient,
+        # its gradient and its state tensors (exp_avg, exp_inf, step) to the output lists,
+        # lazily creating zero state. Raises RuntimeError for sparse gradients. Returns whether
+        # any collected parameter is complex.
         has_complex = False
         for p in group["params"]:
             if p.grad is None:
@@ -121,6 +145,11 @@ class Adamax(Optimizer):
 
     @_use_grad_for_differentiable
     def step(self, closure=None):
+        # [FUNCTION DOC]
+        # Performs one optimization step. Runs the accelerator graph capture health check,
+        # optionally re-evaluates the closure with gradients enabled, then for each param
+        # group gathers tensors via _init_group and calls the functional adamax with the
+        # group options. Updates parameters and state in place. Returns the loss or None.
         """Performs a single optimization step.
 
         Args:
@@ -240,6 +269,13 @@ def _single_tensor_adamax(
     capturable: bool,
     has_complex: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Reference per-parameter Adamax update. When capturable, raises
+    # AssertionError unless params and steps are on a supported device type. For each
+    # parameter: negates the gradient if maximizing, increments the step, adds L2 weight
+    # decay, updates the first moment by interpolation, updates the infinity norm as the
+    # elementwise maximum of the decayed norm and absolute gradient plus eps (a concatenate
+    # and reduce form when differentiable), then moves the parameter by the bias corrected
+    # step (tensor math when capturable). Complex values use a real view. Mutates in place.
     if not torch.jit.is_scripting():
         lr = _to_scalar(lr)
 
@@ -320,6 +356,11 @@ def _multi_tensor_adamax(
     capturable: bool,
     has_complex: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Foreach (batched) Adamax update. Raises AssertionError if
+    # differentiable or, when capturable, if devices are unsupported; returns early for empty
+    # input. Groups tensors by device and dtype and per group handles complex views,
+    # maximize, step increment, weight decay, moment and infinity norm updates, and the
+    # bias corrected parameter update. Mutates params, moments and steps in place.
     if differentiable:
         raise AssertionError("_foreach ops don't support autograd")
 
@@ -442,6 +483,12 @@ def adamax(
     lr: float | Tensor,
     weight_decay: float,
 ) -> None:
+    # [FUNCTION DOC]
+    # Functional Adamax entry point over parallel lists of params, grads, exp_avgs, exp_infs
+    # and step tensors. Raises RuntimeError if steps are not tensors (check skipped while
+    # compiling) or if foreach is requested under TorchScript. When foreach is unspecified
+    # it is chosen automatically where supported. Dispatches to the multi-tensor or
+    # single-tensor implementation, which update everything in place. Returns nothing.
     r"""Functional API that performs adamax algorithm computation.
 
     See :class:`~torch.optim.Adamax` for details.

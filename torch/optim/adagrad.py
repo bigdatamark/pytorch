@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Adagrad optimizer. Defines the Adagrad class (per-parameter accumulated squared gradients
+# used to scale the learning rate), the functional entry point adagrad that chooses between
+# single-tensor, multi-tensor (foreach) and fused implementations, and the private
+# implementations of each. Supports sparse gradients (single-tensor path only), complex
+# parameters (except fused), maximize, lr decay, weight decay, and tensor learning rates.
+# Import-time side effect: assigns the long math/args docstring to Adagrad.__doc__.
 from typing import cast
 
 import torch
@@ -26,6 +33,12 @@ __all__ = ["Adagrad", "adagrad"]
 
 
 class Adagrad(Optimizer):
+    # [CLASS DOC]
+    # Optimizer implementing Adagrad. Hyperparameters (lr, lr_decay, weight_decay, eps,
+    # initial_accumulator_value, foreach, maximize, differentiable, fused) live in the
+    # defaults and per-group settings. Per-parameter state is "step" (scalar tensor count of
+    # updates) and "sum" (running sum of squared gradients, same shape as the parameter).
+    # State is created eagerly in the constructor. Key methods: step, share_memory.
     def __init__(
         self,
         params: ParamsT,
@@ -40,6 +53,15 @@ class Adagrad(Optimizer):
         differentiable: bool = False,
         fused: bool | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Validates hyperparameters (tensor lr must have one element; lr, lr_decay,
+        # weight_decay, initial_accumulator_value and eps must be non-negative) and raises
+        # ValueError otherwise. Builds the defaults mapping, calls the base constructor, and
+        # for fused mode rejects differentiable or foreach (RuntimeError) and marks the
+        # optimizer as needing a device/dtype check and as supporting AMP grad scaling.
+        # Finally initializes "step" (float scalar tensor; on the parameter device when
+        # fused) and "sum" (filled with the initial value, complex-valued for complex params)
+        # for every parameter.
         if isinstance(lr, Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be 1-element")
         if not 0.0 <= lr:
@@ -98,6 +120,12 @@ class Adagrad(Optimizer):
                 )
 
     def __setstate__(self, state):
+        # [FUNCTION DOC]
+        # Restores state after unpickling or load_state_dict. Fills missing group options
+        # (foreach, maximize, differentiable, fused) with defaults and converts any non-tensor
+        # "step" values into scalar float tensors of the proper dtype. Mutates self in place.
+        # KNOWN ISSUE: the trailing fallback loop uses the "fused" value of the last group
+        # for all states (and never sets a device), which may be wrong with mixed groups.
         super().__setstate__(state)
         #  define "fused" for
         #  MYPY error: Name "fused" may be undefined
@@ -133,6 +161,9 @@ class Adagrad(Optimizer):
                 )
 
     def share_memory(self) -> None:
+        # [FUNCTION DOC]
+        # Moves every parameter's "sum" state tensor into shared memory (for multiprocessing).
+        # Mutates the state tensors in place; returns nothing.
         """Calls tensor.share_memory_() on the state sum tensors."""
         for group in self.param_groups:
             for p in group["params"]:
@@ -140,6 +171,10 @@ class Adagrad(Optimizer):
                 state["sum"].share_memory_()
 
     def _init_group(self, group, params_with_grad, grads, state_sums, state_steps):
+        # [FUNCTION DOC] HELPER: Collects, for one param group, the parameters that have a
+        # gradient into the four output lists (params, grads, sums, steps), lazily creating
+        # missing state. Runs the fused device/dtype check once. Returns a pair of flags:
+        # whether any gradient is sparse and whether any parameter is complex.
         has_sparse_grad, has_complex = False, False
         for p in group["params"]:
             if p.grad is not None:
@@ -187,6 +222,12 @@ class Adagrad(Optimizer):
 
     @_use_grad_for_differentiable
     def step(self, closure=None):
+        # [FUNCTION DOC]
+        # Performs one optimization step. If a closure is given it is re-run with gradients
+        # enabled to compute the loss. For each param group, gathers parameters with
+        # gradients and calls the functional adagrad with the group options (plus grad_scale
+        # and found_inf when set by an AMP scaler). Updates parameters and state in place.
+        # Returns the closure loss or None.
         """Perform a single optimization step.
 
         Args:
@@ -303,6 +344,13 @@ def adagrad(
     eps: float,
     maximize: bool,
 ) -> None:
+    # [FUNCTION DOC]
+    # Functional Adagrad entry point operating on parallel lists of params, grads, sum
+    # tensors and step tensors. Raises RuntimeError if a step entry is not a tensor, or if
+    # foreach/fused is requested under TorchScript. When neither fused nor foreach is
+    # specified, foreach is chosen automatically where supported (fused is never auto
+    # chosen). Dispatches to the fused, multi-tensor or single-tensor implementation, which
+    # update params, sums and steps in place. Returns nothing.
     r"""Functional API that performs Adagrad algorithm computation.
 
     See :class:`~torch.optim.Adagrad` for details.
@@ -357,6 +405,8 @@ def adagrad(
 
 
 def _make_sparse(grad, grad_indices, values):
+    # [FUNCTION DOC] HELPER: Builds a sparse COO tensor with the given indices and values and
+    # the same size as the reference gradient.
     size = grad.size()
     return torch.sparse_coo_tensor(grad_indices, values, size)
 
@@ -378,6 +428,12 @@ def _single_tensor_adagrad(
     differentiable: bool,
     has_complex: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Reference per-parameter Adagrad update. For each parameter:
+    # increments the step, negates the gradient when maximizing, adds weight decay (error
+    # for sparse gradients), computes the decayed learning rate, accumulates squared
+    # gradients into the sum and moves the parameter by lr * grad / (sqrt(sum) + eps).
+    # Handles sparse gradients (coalesced, masked update) and complex values (via real
+    # view). Raises if grad_scale or found_inf is given. Mutates params, sums and steps.
     if grad_scale is not None or found_inf is not None:
         raise AssertionError("Expected grad_scale and found_inf to be None")
 
@@ -447,6 +503,11 @@ def _multi_tensor_adagrad(
     differentiable: bool,
     has_complex: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Foreach (batched) Adagrad update. Raises if differentiable or if
+    # grad_scale/found_inf is given; returns early for empty input. Groups tensors by
+    # device and dtype; groups containing sparse gradients fall back to the single-tensor
+    # path, others use batched operations for step increment, maximize, weight decay,
+    # sum accumulation and the parameter update. Mutates params, sums and steps in place.
     if differentiable:
         raise AssertionError("_foreach ops don't support autograd")
     if grad_scale is not None or found_inf is not None:
@@ -558,6 +619,11 @@ def _fused_adagrad(
     differentiable: bool,
     has_complex: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Fused Adagrad update using the fused kernel. Returns early for
+    # empty input; raises RuntimeError for sparse gradients, complex parameters or
+    # differentiable mode. Per device/dtype group, moves grad_scale, found_inf and a tensor lr
+    # to that device, increments steps, runs the fused kernel, and undoes the step increment
+    # when found_inf is set. Mutates params, sums and steps in place.
     if not params:
         return
     if has_sparse_grad or has_complex:

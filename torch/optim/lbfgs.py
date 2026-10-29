@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# L-BFGS optimizer. Contains the LBFGS class (limited-memory BFGS over all parameters
+# flattened into one vector, single param group only, optional strong Wolfe line search),
+# plus two private numeric helpers: cubic interpolation of a step length and a strong Wolfe
+# line search ported from the Lua torch optim library. Import-time side effect: assigns
+# LBFGS.__doc__.
 
 import torch
 from torch import Tensor
@@ -10,6 +16,11 @@ __all__ = ["LBFGS"]
 
 
 def _cubic_interpolate(x1, f1, g1, x2, f2, g2, bounds=None):
+    # [FUNCTION DOC] HELPER: Given two points with function values (f) and derivatives (g),
+    # returns the minimizer of the cubic through them, clamped to the bounds (default: the
+    # interval between the two points). If the discriminant is negative (no real minimizer),
+    # returns the midpoint of the bounds. The inputs are expected to be scalar tensors or
+    # numbers; no side effects.
     # ported from https://github.com/torch/optim/blob/master/polyinterp.lua
     # Compute bounds of interpolation area
     if bounds is not None:
@@ -40,6 +51,16 @@ def _cubic_interpolate(x1, f1, g1, x2, f2, g2, bounds=None):
 def _strong_wolfe(
     obj_func, x, t, d, f, g, gtd, c1=1e-4, c2=0.9, tolerance_change=1e-9, max_ls=25
 ):
+    # [FUNCTION DOC] HELPER: Strong Wolfe line search along direction d from the point x with
+    # initial step t, current loss f, gradient g and directional derivative gtd. obj_func
+    # evaluates loss and gradient at a trial step. Phase one expands the step until it
+    # brackets a point satisfying the sufficient decrease (c1) and curvature (c2) conditions;
+    # phase two zooms in by cubic interpolation until the conditions hold, the bracket is
+    # smaller than tolerance_change, or max_ls iterations are used. Returns the new loss,
+    # new gradient, chosen step and number of function evaluations. No parameter mutation
+    # besides what obj_func does.
+    # KNOWN ISSUE: if the first loop exhausts max_ls, the bracket directional derivatives are
+    # never defined, so the zoom phase relies on the iteration guard to skip using them.
     # ported from https://github.com/torch/optim/blob/master/lswolfe.lua
     d_norm = d.abs().max()
     g = g.clone(memory_format=torch.contiguous_format)
@@ -204,6 +225,15 @@ def _strong_wolfe(
 
 
 class LBFGS(Optimizer):
+    # [CLASS DOC]
+    # L-BFGS optimizer operating on the concatenation of all parameters (complex parameters
+    # contribute their real and imaginary parts). Requires exactly one param group. Options:
+    # lr, max_iter, max_eval, tolerance_grad, tolerance_change, history_size, line_search_fn
+    # (None or the strong Wolfe search), maximize. Holds a cached total element count. Its
+    # only state is global and is stored under the first parameter: counters (func_evals,
+    # n_iter) and the history needed to resume (direction, step, curvature pairs, scaling,
+    # previous gradient and loss). Key methods: step (requires a closure), flat gradient helpers.
+    # KNOWN ISSUE: the argument docs say parameters must be real, but the code handles complex.
     r"""Implements L-BFGS algorithm."""
 
     def __init__(
@@ -219,6 +249,11 @@ class LBFGS(Optimizer):
         *,
         maximize: bool = False,
     ) -> None:
+        # [FUNCTION DOC]
+        # Validates lr (single-element if a tensor, non-negative) raising ValueError, defaults
+        # max_eval to five quarters of max_iter, builds the defaults mapping and calls the base
+        # constructor. Raises ValueError if more than one param group results. Stores the
+        # parameter list and initializes the element count cache to empty.
         if isinstance(lr, Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be 1-element")
         if not 0.0 <= lr:
@@ -246,6 +281,8 @@ class LBFGS(Optimizer):
         self._numel_cache = None
 
     def _numel(self):
+        # [FUNCTION DOC] HELPER: Returns the total number of scalar elements over all
+        # parameters (complex counts double), computing it once and caching it.
         if self._numel_cache is None:
             self._numel_cache = sum(
                 2 * p.numel() if torch.is_complex(p) else p.numel()
@@ -255,6 +292,10 @@ class LBFGS(Optimizer):
         return self._numel_cache
 
     def _gather_flat_grad(self):
+        # [FUNCTION DOC] HELPER: Concatenates all parameter gradients into one flat vector.
+        # Missing gradients become zeros, sparse gradients are densified, complex gradients
+        # are viewed as real pairs. Negates the result in place when maximizing. Returns the
+        # new flat tensor.
         views = []
         for p in self._params:
             if p.grad is None:
@@ -272,6 +313,9 @@ class LBFGS(Optimizer):
         return flat_grad
 
     def _add_grad(self, step_size, update) -> None:
+        # [FUNCTION DOC] HELPER: Adds step_size times the corresponding slice of the flat
+        # update vector to each parameter in place (complex parameters via a real view).
+        # Raises AssertionError if the consumed element count differs from the total count.
         offset = 0
         for p in self._params:
             if torch.is_complex(p):
@@ -284,13 +328,21 @@ class LBFGS(Optimizer):
             raise AssertionError(f"Expected offset {offset} to equal {self._numel()}")
 
     def _clone_param(self):
+        # [FUNCTION DOC] HELPER: Returns a list of contiguous copies of all parameters, used
+        # to restore the starting point during line search.
         return [p.clone(memory_format=torch.contiguous_format) for p in self._params]
 
     def _set_param(self, params_data) -> None:
+        # [FUNCTION DOC] HELPER: Copies each tensor of the given list into the matching
+        # parameter in place (lists must have equal length, else an error is raised).
         for p, pdata in zip(self._params, params_data, strict=True):
             p.copy_(pdata)
 
     def _directional_evaluate(self, closure, x, t, d):
+        # [FUNCTION DOC] HELPER: Evaluates the objective at the point reached by moving
+        # parameters along direction d by step t. Calls the closure, converts the loss to a
+        # float (negated when maximizing), gathers the flat gradient, then restores the
+        # parameters to the saved values x. Returns the loss and flat gradient.
         self._add_grad(t, d)
         loss = float(closure())
         if self.param_groups[0].get("maximize", False):
@@ -301,6 +353,18 @@ class LBFGS(Optimizer):
 
     @torch.no_grad()
     def step(self, closure):  # type: ignore[override]
+        # [FUNCTION DOC]
+        # Runs up to max_iter L-BFGS iterations (no gradient tracking, closure always run with
+        # gradients). Raises AssertionError if there is not exactly one group, and
+        # RuntimeError for an unsupported line search name. With no parameters it just returns
+        # the closure result. Returns early with the first loss if the gradient is already
+        # within tolerance. Each iteration builds a descent direction (negative gradient first,
+        # then the two-loop recursion over stored curvature pairs, keeping only pairs with
+        # positive curvature and at most history_size), picks a step (scaled initially, else
+        # lr, or from the strong Wolfe search), moves the parameters, re-evaluates the loss
+        # unless on the last iteration, and stops on evaluation budget, tolerance, flat
+        # progress or loss change. Persists history in the global state. Returns the loss
+        # of the first closure evaluation.
         """Perform a single optimization step.
 
         Args:
@@ -451,6 +515,9 @@ class LBFGS(Optimizer):
                     x_init = self._clone_param()
 
                     def obj_func(x, t, d):
+                        # [FUNCTION DOC] HELPER: Callback for the line search; evaluates loss
+                        # and flat gradient at step t along d from the saved point x via the
+                        # directional evaluate method, then restores the parameters.
                         return self._directional_evaluate(closure, x, t, d)
 
                     loss, flat_grad, t, ls_func_evals = _strong_wolfe(
