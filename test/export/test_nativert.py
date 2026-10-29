@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: export"]
+# [MODULE DOC] Tests that run exported programs through the native C++ runtime (nativert). Provides
+# a helper that decomposes a program, packages it as a pt2 archive, runs it with the C++ model
+# runner and compares to eager results, mocked export functions that call that helper after every
+# export, a factory creating generated variants of the main export test class, and AOTI-delegate
+# and scalar-overload tests. Generated variants are only created in fbcode builds, and the main
+# block skips running on XPU.
 
 
 import copy
@@ -35,11 +41,19 @@ test_classes = {}
 
 
 def _use_real_inputs(ep):
+    # [FUNCTION DOC] HELPER: Returns a shallow copy of an exported program in which fake tensors in
+    # the example inputs, state dict and constants are replaced by random real tensors of the same
+    # shape, device and requires_grad (parameters are rewrapped as parameters). Example inputs are
+    # replaced only when at least one fake tensor was found. Uses the update method to produce the
+    # final program.
     ep = copy.copy(ep)
 
     has_fake_tensor = False
 
     def _to_real_tensor(t):
+        # [FUNCTION DOC] HELPER: Converts one value. A parameter is rebuilt from its converted
+        # data; a fake tensor sets a flag in the enclosing function and becomes a random real
+        # tensor with same shape, device and gradient flag; anything else is returned unchanged.
         if isinstance(t, torch.nn.Parameter):
             return torch.nn.Parameter(_to_real_tensor(t.data))
         if isinstance(t, FakeTensor):
@@ -68,6 +82,9 @@ def _use_real_inputs(ep):
 
 
 def _is_supported_types(arg) -> bool:
+    # [FUNCTION DOC] HELPER: Returns whether the argument is made only of types the runner can take
+    # directly: tensors, ints, floats, bools, strings and None, nested in lists, tuples and dicts.
+    # Lists and dicts must additionally hold values of a single type. Anything else gives false.
     if isinstance(arg, list):
         return (
             all(_is_supported_types(a) for a in arg)
@@ -89,6 +106,15 @@ def _is_supported_types(arg) -> bool:
 
 
 def run_with_nativert(ep):
+    # [FUNCTION DOC] HELPER: Runs an exported program through the native runtime and checks it
+    # against eager. Deep-copies and decomposes the program, makes inputs real, writes a pt2
+    # archive to a temporary file (flushing it), evaluates the module in eager mode (any exception
+    # there skips the test) and runs the C++ model runner with the same seeds, using flat inputs
+    # when the arguments are not of directly supported types. Raises AssertionError on count, type,
+    # shape, dtype or device mismatch, and uses assert_close for tensors (equal_nan) and equality
+    # otherwise. A RuntimeError mentioning an unknown pytree node type is swallowed since pytree
+    # types cannot be registered in Python tests; other RuntimeErrors propagate. Returns the
+    # original program.
     # Downstream tests might mutate the exported program in subtle ways, so
     # we need to make a copy here.
     ep_infer = copy.deepcopy(ep)
@@ -167,6 +193,9 @@ def run_with_nativert(ep):
 
 
 def mocked_nativert_export_strict(*args, **kwargs):
+    # [FUNCTION DOC] HELPER: Replacement export function: calls the real export in strict mode
+    # unless the caller passed a strict keyword, runs the native runtime check on the result and
+    # returns the program.
     if "strict" in kwargs:
         ep = export(*args, **kwargs)
     else:
@@ -177,6 +206,9 @@ def mocked_nativert_export_strict(*args, **kwargs):
 
 
 def mocked_nativert_export_nonstrict(*args, **kwargs):
+    # [FUNCTION DOC] HELPER: Replacement export function: calls the real export in non-strict mode
+    # unless the caller passed a strict keyword, runs the native runtime check on the result and
+    # returns the program.
     if "strict" in kwargs:
         ep = export(*args, **kwargs)
     else:
@@ -187,6 +219,11 @@ def mocked_nativert_export_nonstrict(*args, **kwargs):
 
 
 def make_dynamic_cls(cls, strict=False):
+    # [FUNCTION DOC] HELPER: Creates a NativeRT-prefixed variant of a test class using the strict
+    # or non-strict mocked export, with matching name suffix and expected-failure marker, and tests
+    # that are expected failures are skipped unless nothing else fails. Registers it in the module
+    # mapping and module globals (required for discovery) and fixes its module attribute. Unlike
+    # the sibling modules it returns nothing.
     cls_prefix = "NativeRT"
 
     if strict:
@@ -218,41 +255,63 @@ def make_dynamic_cls(cls, strict=False):
 @unittest.skipIf(not torchdynamo.is_dynamo_supported(), "dynamo isn't support")
 @unittest.skipIf(not is_fbcode(), "FBcode only for now")
 class TestNativeRT(TestCase):
+    # [CLASS DOC] Native runtime tests, running only in fbcode on non-Windows with Dynamo support.
+    # Builds at class definition time a list of parameter tuples (device, module, sample inputs)
+    # for cpu and, when CUDA with Triton exists, cuda, covering a single-output model, a
+    # multi-output model and a nested-tuple input model.
     @staticmethod
     def get_module():
+        # [FUNCTION DOC] HELPER: Static factory returning a linear plus relu module (four
+        # features).
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Linear layer followed by relu.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear layer and relu.
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4)
                 self.relu = torch.nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer then relu.
                 return self.relu(self.linear(x))
 
         return M()
 
     @staticmethod
     def get_module_multi_output():
+        # [FUNCTION DOC] HELPER: Static factory returning a module that returns the activation and
+        # the input.
         class MMultiOutput(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning a pair of the relu(linear) output and the
+            # unchanged input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear layer and relu.
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4)
                 self.relu = torch.nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns a tuple of the relu(linear) result and the input.
                 return (self.relu(self.linear(x)), x)
 
         return MMultiOutput()
 
     @staticmethod
     def get_model_pytree():
+        # [FUNCTION DOC] HELPER: Static factory returning a module that takes a nested tuple input.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with two linear layers applied to a nested tuple of three
+            # tensors.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the two linear layers.
                 super().__init__()
                 self.linear1 = torch.nn.Linear(4, 4)
                 self.linear2 = torch.nn.Linear(4, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Unpacks the input into one tensor and a pair, applies the
+                # first linear to the first and the second linear to each of the other two, and
+                # returns a nested tuple of the results.
                 x1, (x2, x3) = x
                 y1 = self.linear1(x1)
                 y2 = self.linear2(x2)
@@ -294,6 +353,12 @@ class TestNativeRT(TestCase):
 
     @parameterized.expand(parameters)
     def test_aoti(self, device, m, sample_inputs):
+        # [FUNCTION DOC] Parameterized over device, module and inputs. Exports the module, lowers
+        # it to an AOTI backend delegate, packages the original and delegate programs into a pt2
+        # archive in a temporary file, runs the delegate with the C++ model runner and compares
+        # results with eager outputs, as in the shared helper (counts, types, shapes, dtypes,
+        # devices, values). Eager failures cause a skip; unknown pytree node RuntimeErrors are
+        # ignored.
         MODEL_NAME = "model"
         BACKEND_ID = "aoti"
 
@@ -380,7 +445,13 @@ class TestNativeRT(TestCase):
 @unittest.skipIf(not torchdynamo.is_dynamo_supported(), "dynamo isn't support")
 @unittest.skipIf(not is_fbcode(), "FBcode only for now")
 class TestSelectScalarOverload(TestCase):
+    # [CLASS DOC] Test case (fbcode only) checking that the runtime rewrites scalar overload calls
+    # on load.
     def test_floor_divide_default_scalar(self) -> None:
+        # [FUNCTION DOC] Exports a floor division of an integer tensor by a constant, confirms the
+        # graph has the default overload node with a scalar argument, then runs the program through
+        # the native runtime helper so the load-time overload selection is exercised end to end
+        # against eager.
         # PT2 export lowers `x // 10` to aten.floor_divide.default with a scalar
         # Int argument (the #90923 Scalar->Tensor broadcast).  Its default
         # schema is (Tensor, Tensor), so nativert's boxed C10Kernel dispatch
@@ -388,7 +459,9 @@ class TestSelectScalarOverload(TestCase):
         # rewrites the node to floor_divide.Scalar during load.  Running the
         # exported program through nativert exercises that pass end to end.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning floor division of its input by ten.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the floor division of the input by ten.
                 return torch.floor_divide(x, 10)
 
         ep = export(M(), (torch.randint(0, 1000, (999,), dtype=torch.long),))

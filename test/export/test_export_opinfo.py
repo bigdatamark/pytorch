@@ -1,6 +1,11 @@
 # Owner(s): ["oncall: export"]
 # ruff: noqa: F841
 # flake8: noqa
+# [MODULE DOC] Export-vs-fake-CUDA OpInfo tests. Defines sets of OpInfo names expected to fail
+# export, builds a helper that exports each op on fake CUDA-device tensors while running on CPU,
+# and a CUDA-only class that runs scripts in subprocesses with no visible GPUs. At import time it
+# builds the failure sets (adding CPU-only-build entries when the CUDA backend is not built), the
+# selected op subset, and instantiates device-generic test classes.
 
 import itertools
 import subprocess
@@ -81,12 +86,20 @@ fake_decomposition_failures = {
 
 
 def _test_export_helper(self, dtype, op):
+    # [FUNCTION DOC] HELPER: Exports one operator under a fake tensor mode for every sample input
+    # (first 100 only) with all tensors moved to a fake cuda device, and checks the resulting
+    # graph. Arguments: the test case, a dtype, and an OpInfo. Samples with non-tensor positional
+    # args are skipped; a device keyword is rewritten to the fake CUDA device. For every
+    # call_function node whose recorded value is a FakeTensor, asserts its device equals the fake
+    # CUDA device. Raises whatever export raises.
     sample_inputs_itr = op.sample_inputs("cpu", dtype, requires_grad=False)
 
     mode = FakeTensorMode(allow_non_fake_inputs=True)
     target_device = "cuda:0"
 
     def to_fake_device(x):
+        # [FUNCTION DOC] HELPER: Nested converter that moves a tensor to the fake target device;
+        # returns the new (fake) tensor.
         return x.to(target_device)
 
     # Limit to first 100 inputs so tests don't take too long
@@ -107,7 +120,12 @@ def _test_export_helper(self, dtype, op):
             )
 
             class Module(torch.nn.Module):
+                # [CLASS DOC] HELPER: Throwaway module created per sample input; wraps the operator
+                # under test so it can be exported with the sample's keyword arguments captured
+                # from the enclosing scope.
                 def forward(self, *args):
+                    # [FUNCTION DOC] HELPER: Calls the operator with the positional inputs and the
+                    # captured keyword arguments and returns its result.
                     return op.op(*args, **kwargs)
 
             m = Module()
@@ -124,10 +142,15 @@ def _test_export_helper(self, dtype, op):
 
 
 class TestExportOpInfo(TestCase):
+    # [CLASS DOC] Device-generic (CPU only) test case that runs the fake-CUDA export check over the
+    # whole OpInfo database for float dtype.
     @ops(op_db, allowed_dtypes=(torch.float,))
     @skipOps(export_failures | fake_export_failures)
     @unittest.skipIf(IS_FBCODE, "tests broken with unexpected successes internally")
     def test_fake_export(self, device, dtype, op):
+        # [FUNCTION DOC] Runs the shared export helper for one op on the CPU instance; ops listed
+        # in the export and fake-export failure sets are expected failures. Skipped in fbcode
+        # because of unexpected successes.
         _test_export_helper(self, dtype, op)
 
 
@@ -148,6 +171,8 @@ selected_op_db = [op for op in op_db if op.name in selected_ops]
 
 @skipIfRocmVersionAtLeast([7, 14])
 class TestExportOnFakeCuda(TestCase):
+    # [CLASS DOC] CUDA-only tests, skipped on newer ROCm, that emulate a CPU-only machine with a
+    # CUDA-enabled build by launching subprocesses with no visible CUDA devices.
     # In CI, this test runs on a CUDA machine with cuda build
     # We set CUDA_VISIBLE_DEVICES="" to simulate a CPU machine with cuda build
     # Running this on all ops in op_db is too slow, so we only run on a selected subset
@@ -159,6 +184,10 @@ class TestExportOnFakeCuda(TestCase):
     )
     @ops(selected_op_db, allowed_dtypes=(torch.float,))
     def test_fake_export(self, device, dtype, op):
+        # [FUNCTION DOC] For one selected op, writes a standalone script that repeats the fake CUDA
+        # export check using plain assertions, runs it in a subprocess with no visible CUDA
+        # devices, and asserts that its decoded stdout is empty (failure surfaces as a non-zero
+        # exit raising an error). Skipped on Windows.
         test_script = f"""\
 import torch
 import itertools
@@ -228,6 +257,11 @@ for op in ops:
         "Failing on Windows, device_count() changes from 0 to 1 ",
     )
     def test_preserve_original_behavior(self):
+        # [FUNCTION DOC] Runs a subprocess script with no visible CUDA devices that counts failures
+        # of several real CUDA calls, asserts CUDA is unavailable with zero devices and all calls
+        # failed, then does a fake-mode CUDA computation, and re-checks that real CUDA calls still
+        # fail after leaving the mode. Test asserts the subprocess output is empty. Skipped without
+        # CUDA build or on Windows.
         test_script = f"""\
 import torch
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode

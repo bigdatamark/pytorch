@@ -1,3 +1,10 @@
+# [MODULE DOC] Tests for export passes and graph utilities: runtime assertion insertion,
+# functionalization, effect token removal, auto-functionalized removal, set-grad and autocast
+# replacement with higher-order operators, sequential splitting and inlining, constant and
+# script-object handling, device movement, view-to-view-copy replacement, and partitioner support.
+# Top of file also has a docstring asking pytest not to rewrite assertions. Defines helper
+# operator-support classes, model fixtures with torchbind attributes, and factories producing
+# pre-dispatch modules for context-manager tests.
 """
 PYTEST_DONT_REWRITE (prevents pytest from rewriting assertions, which interferes
 with test_functionalization_with_native_python_assertion)
@@ -58,6 +65,8 @@ from torch.utils import _pytree as pytree
 
 
 def count_call_function(graph: torch.fx.Graph, target: torch.ops.OpOverload) -> int:
+    # [FUNCTION DOC] HELPER: Counts the call_function nodes in a graph whose target equals the
+    # given operator overload and returns the integer count.
     count = 0
     for node in graph.nodes:
         if node.op == "call_function" and node.target == target:
@@ -66,20 +75,32 @@ def count_call_function(graph: torch.fx.Graph, target: torch.ops.OpOverload) -> 
 
 
 class _AddOperatorSupport(OperatorSupport):
+    # [CLASS DOC] HELPER: Operator support policy that accepts only call_function nodes whose
+    # target is the python add operator.
     def is_node_supported(self, submodules, node: torch.fx.Node) -> bool:
+        # [FUNCTION DOC] HELPER: Returns true only for call_function nodes calling the python add
+        # operator; submodules are ignored.
         return node.op == "call_function" and node.target == operator.add
 
 
 class _AtenAddOperatorSupport(OperatorSupport):
+    # [CLASS DOC] HELPER: Operator support policy that accepts only call_function nodes targeting
+    # the aten add Tensor overload.
     def is_node_supported(self, submodules, node: torch.fx.Node) -> bool:
+        # [FUNCTION DOC] HELPER: Returns true only for call_function nodes targeting aten add
+        # Tensor; submodules are ignored.
         return node.op == "call_function" and node.target == torch.ops.aten.add.Tensor
 
 
 def _to_partition_names(partitions: list[Partition]) -> list[set[str]]:
+    # [FUNCTION DOC] HELPER: Converts a list of partitions to a list of sets holding the node names
+    # of each partition, so tests can compare partitions independent of order inside a partition.
     return [{n.name for n in p.nodes} for p in partitions]
 
 
 def _get_output_names(gm: torch.fx.GraphModule) -> list[str]:
+    # [FUNCTION DOC] HELPER: Finds the output node of a graph module, flattens its args with pytree
+    # and returns the string form of each leaf, in order.
     output_node = next(n for n in gm.graph.nodes if n.op == "output")
     args = pytree.tree_leaves(output_node.args)
     # if isinstance(args, tuple) and len(args) == 1:
@@ -88,13 +109,21 @@ def _get_output_names(gm: torch.fx.GraphModule) -> list[str]:
 
 
 class ModelsWithScriptObjectAttr:
+    # [CLASS DOC] HELPER: Namespace holding nested module fixtures that own torchbind script
+    # objects as attributes, directly, in containers, and in submodules. Not instantiated itself.
     class Simple(torch.nn.Module):
+        # [CLASS DOC] HELPER: Module with a single script object attribute.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Creates the script object attribute with two integer fields.
             super().__init__()
             self.attr = torch.classes._TorchScriptTesting._Foo(10, 20)
 
     class SimpleWithAttrInContainer(torch.nn.Module):
+        # [CLASS DOC] HELPER: Module with a script object attribute plus a list attribute holding
+        # script objects, one in a set and one in a dict.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Creates the single script object attribute and the list of
+            # script objects containing a set and a mapping.
             super().__init__()
             self.attr = torch.classes._TorchScriptTesting._Foo(10, 20)
             self.pytree_attr2 = [
@@ -106,7 +135,11 @@ class ModelsWithScriptObjectAttr:
             ]
 
     class NestedWithAttrInContainer(torch.nn.Module):
+        # [CLASS DOC] HELPER: Module with a script object attribute, a container attribute of
+        # script objects, and two submodules: a simple one and one with container attributes.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Creates the script object attribute, the container attribute
+            # and both submodules.
             super().__init__()
             self.attr = torch.classes._TorchScriptTesting._Foo(10, 20)
             self.pytree_attr2 = [
@@ -120,7 +153,11 @@ class ModelsWithScriptObjectAttr:
             self.sub_mod2 = ModelsWithScriptObjectAttr.SimpleWithAttrInContainer()
 
     class MoreNestedWithAttrInContainer(torch.nn.Module):
+        # [CLASS DOC] HELPER: Like the nested fixture but one level deeper: its second submodule is
+        # itself the nested fixture.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Creates the script object attribute, the container attribute,
+            # a simple submodule and a nested-fixture submodule.
             super().__init__()
             self.attr = torch.classes._TorchScriptTesting._Foo(10, 20)
             self.pytree_attr2 = [
@@ -135,10 +172,19 @@ class ModelsWithScriptObjectAttr:
 
 
 def _set_grad_enabled_tests():
+    # [FUNCTION DOC] HELPER: Builds a dictionary of cases for set-grad tests. Each value is a
+    # triple of an eager module, its pre-dispatch exported module, and example inputs. Cases cover
+    # a raw grad-mode setter op, context managers, a multi-dependency variant, each also traced
+    # under an ambient no-grad setting. Exports run at call time, with the new experimental tracer
+    # config enabled.
     from torch.export._trace import _export
 
     class SetGradOp(torch.nn.Module):
+        # [CLASS DOC] HELPER: Module that flips grad mode by calling the low-level setter between
+        # computations.
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Adds one, turns grad on and sums a sine, turns grad off and
+            # adds one, turns grad on again and subtracts one; returns the last two results.
             x = x + 1
             torch._C._set_grad_enabled(True)
             c = x.sin().sum()
@@ -149,7 +195,11 @@ def _set_grad_enabled_tests():
             return d, e
 
     class SetGradCtxManager(torch.nn.Module):
+        # [CLASS DOC] HELPER: Module using grad-enabling and no-grad context managers around three
+        # stages.
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Same stages as the setter module but with context managers;
+            # returns two results.
             x = x + 1
             with torch.enable_grad():
                 c = x.sin().sum()
@@ -160,7 +210,11 @@ def _set_grad_enabled_tests():
             return d, e
 
     class SetGradCtxManagerMultiDep(torch.nn.Module):
+        # [CLASS DOC] HELPER: Module with context-managed stages carrying two independent
+        # dependency chains.
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Computes sine and cosine sums under enable-grad, adds one to
+            # each under no-grad, subtracts one under enable-grad; returns four values.
             x = x + 1
             with torch.enable_grad():
                 c1 = x.sin().sum()
@@ -176,6 +230,9 @@ def _set_grad_enabled_tests():
     x = torch.randn(2, 2)
 
     def _get_predispatch_module(mod, args, ambient_grad_enabled=True):
+        # [FUNCTION DOC] HELPER: Exports with pre-dispatch tracing under the given ambient grad
+        # mode (default enabled) using the experimental tracer config, and returns the unlifted
+        # module.
         with torch.set_grad_enabled(ambient_grad_enabled):
             with config.patch(use_new_tracer_experimental=True):
                 return _export(mod, args, pre_dispatch=True).module()
@@ -211,10 +268,16 @@ def _set_grad_enabled_tests():
 
 
 def _with_autocast_tests():
+    # [FUNCTION DOC] HELPER: Builds a dictionary of autocast cases (plain, multi-dependency, split,
+    # nested), each a triple of eager module, pre-dispatch exported module and example inputs.
     from torch.export._trace import _export
 
     class WithAutocastOp(torch.nn.Module):
+        # [CLASS DOC] HELPER: Module with alternating enabled, disabled and enabled CPU autocast
+        # regions.
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Adds one, then sine sum under autocast, adds one with autocast
+            # disabled, subtracts one under autocast; returns two values.
             x = x + 1
             with torch.autocast(device_type="cpu", enabled=True):
                 c = x.sin().sum()
@@ -225,7 +288,11 @@ def _with_autocast_tests():
             return d, e
 
     class WithAutocastOpMultiDep(torch.nn.Module):
+        # [CLASS DOC] HELPER: Autocast module with two independent dependency chains in each
+        # region.
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Same region pattern as the single-chain module with sine and
+            # cosine sums; returns four values.
             x = x + 1
             with torch.autocast(device_type="cpu", enabled=True):
                 c1 = x.sin().sum()
@@ -239,7 +306,11 @@ def _with_autocast_tests():
             return d1, d2, e1, e2
 
     class SplitAutocastOp(torch.nn.Module):
+        # [CLASS DOC] HELPER: Module with two separate autocast regions with an unguarded operation
+        # between them.
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Sine sum under autocast, adds one outside, subtracts one under
+            # autocast; returns two values.
             x = x + 1
             with torch.autocast(device_type="cpu", enabled=True):
                 c = x.sin().sum()
@@ -249,7 +320,10 @@ def _with_autocast_tests():
             return d, e
 
     class NestedAutocastOp(torch.nn.Module):
+        # [CLASS DOC] HELPER: Module with an autocast-disabled region nested inside an enabled one.
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Sine sum in an enabled region, adds one in a nested disabled
+            # region, subtracts one in a later enabled region; returns two values.
             x = x + 1
             with torch.autocast(device_type="cpu", enabled=True):
                 c = x.sin().sum()
@@ -262,6 +336,7 @@ def _with_autocast_tests():
     x = torch.randn(2, 2)
 
     def _get_predispatch_module(mod, args):
+        # [FUNCTION DOC] HELPER: Exports with pre-dispatch tracing and returns the unlifted module.
         return _export(mod, args, pre_dispatch=True).module()
 
     return {
@@ -289,10 +364,16 @@ def _with_autocast_tests():
 
 
 def _with_mixed_autocast_set_grad_tests():
+    # [FUNCTION DOC] HELPER: Builds a dictionary with one case mixing grad-mode setter calls and an
+    # autocast region, as a triple of eager module, pre-dispatch module and inputs.
     from torch.export._trace import _export
 
     class WithAutocastSetGradOp(torch.nn.Module):
+        # [CLASS DOC] HELPER: Module that turns grad on and off by setter calls and uses a disabled
+        # autocast region.
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Adds one, sine with grad on, cosine with grad off, adds one in
+            # a disabled autocast region, subtracts one; returns two values.
             x = x + 1
             torch._C._set_grad_enabled(True)
             c = x.sin()
@@ -306,6 +387,8 @@ def _with_mixed_autocast_set_grad_tests():
     x = torch.randn(2, 2)
 
     def _get_predispatch_module(mod, args):
+        # [FUNCTION DOC] HELPER: Exports with pre-dispatch tracing under the experimental tracer
+        # config and returns the unlifted module.
         with torch._export.config.patch(use_new_tracer_experimental=True):
             ep = _export(mod, args, pre_dispatch=True).module()
             return ep
@@ -320,10 +403,17 @@ def _with_mixed_autocast_set_grad_tests():
 
 
 def _sequential_split_inline_tests():
+    # [FUNCTION DOC] HELPER: Builds a dictionary of cases for sequential split and inline tests,
+    # each a pair of a pre-dispatch module with grad-setter delimiter nodes inserted at every
+    # second or third (or every) call, and example inputs. Uses a simple and a multi-dependency
+    # module.
     from torch.export._trace import _export
 
     class Simple(torch.nn.Module):
+        # [CLASS DOC] HELPER: Straight-line module computing a sine sum and two arithmetic steps.
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Adds one, takes a sine sum, adds one, subtracts one; returns
+            # two values.
             x = x + 1
             c = x.sin().sum()
             d = c + 1
@@ -331,7 +421,10 @@ def _sequential_split_inline_tests():
             return d, e
 
     class MultiDep(torch.nn.Module):
+        # [CLASS DOC] HELPER: Module with two independent chains over two inputs.
         def forward(self, x1, x2):
+            # [FUNCTION DOC] HELPER: Applies add, sine or cosine, add and subtract on two inputs
+            # separately; returns four values.
             x1 = x1 + 1
             x2 = x2 + 1
             c1 = x1.sin()
@@ -343,9 +436,13 @@ def _sequential_split_inline_tests():
             return d1, d2, e1, e2
 
     def _get_predispatch_module(mod, args):
+        # [FUNCTION DOC] HELPER: Exports with pre-dispatch tracing and returns the unlifted module.
         return _export(mod, args, pre_dispatch=True).module()
 
     def _insert_dilimiter_nodes(gm: torch.fx.GraphModule, step: int = 1):
+        # [FUNCTION DOC] HELPER: Inserts a grad-mode setter call before every step-th call_function
+        # node of the module, alternating enabled and disabled values by insertion index. Mutates
+        # and returns the module.
         insert_locs = []
         for i, node in enumerate(
             nodes_filter(gm.graph.nodes, lambda n: n.op == "call_function")
@@ -374,7 +471,12 @@ def _sequential_split_inline_tests():
 @skipIfTorchDynamo("recursively running dynamo on export is unlikely")
 @unittest.skipIf(not is_dynamo_supported(), "Dynamo not supported")
 class TestPasses(TestCase):
+    # [CLASS DOC] Tests for export passes. The setup builds the case dictionaries for set-grad,
+    # autocast, mixed and sequential-split tests and initializes torchbind implementations;
+    # teardown clears them. Skipped under Dynamo or when unsupported.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Calls the base setup, then builds the four case dictionaries and
+        # initializes torchbind implementations.
         super().setUp()
         self.MIXED_AUTOCAST_SET_GRAD_TESTS = _with_mixed_autocast_set_grad_tests()
         self.SEQUENTIAL_SPLIT_INLINE_TESTS = _sequential_split_inline_tests()
@@ -383,6 +485,8 @@ class TestPasses(TestCase):
         init_torchbind_implementations()
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Clears the four case dictionaries and then calls the base
+        # teardown.
         self.SEQUENTIAL_SPLIT_INLINE_TESTS.clear()
         self.SET_GRAD_ENABLED_TESTS.clear()
         self.WITH_AUTOCAST_TESTS.clear()
@@ -390,16 +494,24 @@ class TestPasses(TestCase):
         super().tearDown()
 
     def _check_node_users_in_the_same_graph(self, gm):
+        # [FUNCTION DOC] HELPER: Asserts that every user of every node in the graph module belongs
+        # to the same graph.
         for node in gm.graph.nodes:
             for user in node.users:
                 self.assertTrue(user.graph is gm.graph)
 
     def test_runtime_assert_one_dim(self) -> None:
+        # [FUNCTION DOC] Exports a cosine module with a bounded dynamic dimension (strict) and
+        # checks the resulting module raises AssertionError with a guard-failed message for an
+        # out-of-range size and returns the right values for an in-range size.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning cosine of its input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Only calls the base constructor.
                 super().__init__()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns cosine of the input.
                 return x.cos()
 
         x = torch.zeros(2, 2, 3)
@@ -421,11 +533,20 @@ class TestPasses(TestCase):
         )
 
     def test_runtime_assert_multiple_dims(self) -> None:
+        # [FUNCTION DOC] Exports (strict) a module of two inputs with a bounded dynamic dimension
+        # on the first input, an unbounded-above dynamic leading dimension on both, and checks that
+        # running with an out-of-range size fails with a guard-failed AssertionError message for
+        # the upper bound on the first input and for the lower bound on the second input.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning the sum of cosine of the first input and sine of
+            # the second input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Only calls the base constructor.
                 super().__init__()
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the sum of cosine of the first input plus the sine
+                # sum of the second.
                 return x.cos().sum() + y.sin().sum()
 
         x = torch.zeros(4, 2, 3)
@@ -456,11 +577,21 @@ class TestPasses(TestCase):
             ep.module()(torch.zeros(4, 2, 3), torch.ones(2, 5, 5))
 
     def test_runtime_assert_some_dims_not_specified(self) -> None:
+        # [FUNCTION DOC] Same module as the multi-dim runtime assert test but the second input has
+        # no dynamic shapes. Checks the bounded dimension still raises a guard-failed error, that
+        # the unspecified input is specialized to its example size (an error when the size
+        # differs), and that a size of one on a dimension without a recorded lower-bound guard
+        # still matches eager output.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning the sum of cosine of one input and sine of the
+            # other.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Only calls the base constructor.
                 super().__init__()
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the cosine sum of the first input plus the sine
+                # sum of the second.
                 return x.cos().sum() + y.sin().sum()
 
         x = torch.zeros(4, 2, 3)
@@ -498,11 +629,20 @@ class TestPasses(TestCase):
         self.assertEqual(gm_result_for_1_size, eager_result_for_1_size)
 
     def test_runtime_assert_some_inps_not_used(self) -> None:
+        # [FUNCTION DOC] Module that ignores its first input. Exports with the unused input static
+        # and the second input dynamic in one dimension. Checks that the static unused input still
+        # gets size guards (an error on mismatch), that the second input's first dimension is
+        # specialized, and that a matching call equals eager output. The comment mentions a size of
+        # one but the final call uses the original shapes.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning the cosine sum of only its second input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Only calls the base constructor.
                 super().__init__()
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the cosine sum of the second input; the first is
+                # unused.
                 return y.cos().sum()
 
         x = torch.zeros(4, 2, 3)
@@ -535,11 +675,19 @@ class TestPasses(TestCase):
         self.assertEqual(gm_result_for_1_size, eager_result_for_1_size)
 
     def test_view_to_view_copy(self) -> None:
+        # [FUNCTION DOC] Exports a module that reshapes with a view and checks the graph has
+        # exactly one aten view before the view-to-view-copy replacement pass and none after
+        # applying it.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module taking a same-shape view of its input and returning the
+            # cosine sum.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Only calls the base constructor.
                 super().__init__()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Views the input with its own shape and returns the cosine
+                # sum.
                 z = x.view(x.shape)
                 return z.cos().sum()
 
@@ -552,8 +700,15 @@ class TestPasses(TestCase):
         self.assertEqual(count_call_function(ep.graph, torch.ops.aten.view.default), 0)
 
     def test_functionalization_with_view_copy(self) -> None:
+        # [FUNCTION DOC] Exports a module with an in-place add followed by a view, applies the
+        # view-copy replacement pass, and checks there are no view nodes left and at least one
+        # view-copy node.
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with an in-place add on a temporary, a view and cosines of
+            # input and view.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds four, adds four in place, views, returns the sum of
+                # cosines of the input and the view.
                 y = x + 4
                 y.add_(4)
                 z = y.view(y.shape)
@@ -571,6 +726,10 @@ class TestPasses(TestCase):
         )
 
     def test_views_op_having_view_copy(self) -> None:
+        # [FUNCTION DOC] Walks every registered aten operator schema, splitting names into operator
+        # and overload (default when none; more than two parts raises AssertionError). For
+        # operators tagged core that are view ops, asserts a view-copy counterpart can be found for
+        # the schema.
         schemas = torch._C._dispatch_get_registrations_for_dispatch_key("")
         aten_schemas = [s[6:] for s in schemas if s.startswith("aten::")]
 
@@ -591,12 +750,20 @@ class TestPasses(TestCase):
                 self.assertIsNotNone(get_view_copy_of_view_op(op_overload._schema))
 
     def test_custom_obj_tuple_out(self):
+        # [FUNCTION DOC] Exports (non-strict) a module that calls two torchbind custom ops, one
+        # returning a tuple, strips effect tokens from the program, verifies it and checks that
+        # eager, exported and token-free outputs are all close.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module owning a torchbind object and chaining a tuple-returning
+            # custom op with a second custom op.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the torchbind object attribute.
                 super().__init__()
                 self.attr = torch.classes._TorchScriptTesting._Foo(10, 20)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Calls the tuple-returning custom op, adds the two outputs,
+                # passes the sum to the second custom op and returns that.
                 a = torch.ops._TorchScriptTesting.takes_foo_tuple_return(self.attr, x)
                 y = a[0] + a[1]
                 b = torch.ops._TorchScriptTesting.takes_foo(self.attr, y)
@@ -618,12 +785,20 @@ class TestPasses(TestCase):
         self.assertTrue(torch.allclose(orig_res, without_token_res))
 
     def test_remove_effect_token_kwargs(self):
+        # [FUNCTION DOC] Exports (non-strict), decomposes, and removes effect tokens from a program
+        # where custom ops are called with keyword arguments, then compares the printed graph code
+        # with an expected string showing the keyword calls and no tokens.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module like the tuple-out module but calling the custom ops with
+            # keyword arguments.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the torchbind object attribute.
                 super().__init__()
                 self.attr = torch.classes._TorchScriptTesting._Foo(10, 20)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Calls the tuple-returning op with keyword arguments, adds
+                # the outputs and calls the second op with keywords.
                 a = torch.ops._TorchScriptTesting.takes_foo_tuple_return(
                     foo=self.attr, x=x
                 )
@@ -648,6 +823,9 @@ def forward(self, obj_attr, x):
         )
 
     def test_fakify_script_objects(self):
+        # [FUNCTION DOC] For each script-object fixture module, gathers constant attribute names,
+        # enters the fakify-script-objects context under a fake mode, and checks the fake attribute
+        # mapping has the same size and maps each fake back to the real object with the same name.
         for m in [
             ModelsWithScriptObjectAttr.Simple(),
             ModelsWithScriptObjectAttr.SimpleWithAttrInContainer(),
@@ -673,6 +851,9 @@ def forward(self, obj_attr, x):
     # TODO: _gather_constants doesn't recursively look into the pytree containers.
     @unittest.expectedFailure
     def test_fakify_script_objects_properly_handle_containers(self):
+        # [FUNCTION DOC] Expected failure: with the container fixture, the fakified constant
+        # attributes should include both the direct and the container attribute, but gathering does
+        # not look inside containers. Marked as expected failure.
         m = ModelsWithScriptObjectAttr.SimpleWithAttrInContainer()
         fake_mode = FakeTensorMode(
             shape_env=ShapeEnv(tracked_fakes=[]),
@@ -689,11 +870,19 @@ def forward(self, obj_attr, x):
             self.assertTrue("pytree_attr2" in fake_constant_attrs.values())
 
     def test_runtime_assert_inline_constraints_for_item(self) -> None:
+        # [FUNCTION DOC] Exports (strict) a module that reads a scalar and constrains it between
+        # two and five. Checks an out-of-range value gives a RuntimeError about a failed runtime
+        # assertion on the upper bound and an in-range value equals eager.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module reading a scalar from its input with lower and upper bound
+            # checks.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Only calls the base constructor.
                 super().__init__()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Reads a scalar from the input, checks it lies between two
+                # and five, returns it.
                 b = x.item()
                 torch._check(b >= 2)
                 torch._check(b <= 5)
@@ -712,11 +901,21 @@ def forward(self, obj_attr, x):
         self.assertEqual(mod(new_inp), ep.module()(new_inp))
 
     def test_runtime_assert_inline_constraints_for_nonzero(self) -> None:
+        # [FUNCTION DOC] Exports (strict) a module that applies nonzero and constrains the result
+        # length between three and five, with a dynamic input dimension. Checks the graph has two
+        # scalar assert nodes and no symbolic range constraint nodes, that too few or too many
+        # nonzero entries give RuntimeError messages on the failed bound, and that an in-range
+        # input equals eager.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning nonzero indices with bound checks on their
+            # count.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Only calls the base constructor.
                 super().__init__()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Computes nonzero, checks the count lies between three and
+                # five, returns it.
                 b = x.nonzero()
                 torch._check(b.shape[0] >= 3)
                 torch._check(b.shape[0] <= 5)
@@ -758,18 +957,30 @@ def forward(self, obj_attr, x):
     @unittest.expectedFailure
     # TODO(pianpwk): add back runtime asserts to subgraphs
     def test_runtime_assert_inline_constraints_for_cond(self) -> None:
+        # [FUNCTION DOC] Expected failure (runtime asserts are not yet carried into subgraphs;
+        # skipped on Windows). Exports (strict) a conditional module and expects an out-of-range
+        # value in a branch to raise a RuntimeError mentioning the inline constraint.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward runs a conditional on a predicate with two
+            # branches that each read a scalar, bound it between two and five, and subtract it.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Only calls the base constructor.
                 super().__init__()
 
             def forward(self, pred, x, y):
+                # [FUNCTION DOC] HELPER: Defines both branch functions and returns the conditional
+                # result.
                 def true_fn(x, y):
+                    # [FUNCTION DOC] HELPER: True branch: reads a scalar from the first input,
+                    # checks it is within two to five, returns the first input minus it.
                     b = x.item()
                     torch._check(b >= 2)
                     torch._check(b <= 5)
                     return x - b
 
                 def false_fn(x, y):
+                    # [FUNCTION DOC] HELPER: False branch: reads a scalar from the second input,
+                    # checks it is within two to five, returns the second input minus it.
                     c = y.item()
                     torch._check(c >= 2)
                     torch._check(c <= 5)
@@ -789,8 +1000,15 @@ def forward(self, obj_attr, x):
             ep.module()(torch.tensor(False), torch.tensor([6]), torch.tensor([6]))
 
     def test_math_ops(self):
+        # [FUNCTION DOC] Exports (strict) a module converting ceiling and floor of a scalar input
+        # into tensors, then runs the deprecated pass base over the exported graph module; passes
+        # if no error is raised.
         class Module(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning one-element tensors of the ceiling and the floor
+            # of the input's scalar value.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns a pair of tensors holding ceiling and floor of the
+                # scalar from the input.
                 return (
                     torch.tensor([math.ceil(x.item())]),
                     torch.tensor([math.floor(x.item())]),
@@ -802,6 +1020,12 @@ def forward(self, obj_attr, x):
         _ExportPassBaseDeprecatedDoNotUse()(ep.graph_module)
 
     def test_predispatch_set_grad(self):
+        # [FUNCTION DOC] Compares pre-dispatch exported modules against eager and against expected
+        # generated code for set-grad cases (raw setter op and context manager, each with and
+        # without ambient no-grad, plus the multi-dependency variants). Each case first checks that
+        # all node users are in the same graph and that eager and exported outputs agree. The
+        # expected code shows grad-mode regions replaced by calls to the set-grad higher-order
+        # operator with a submodule.
         mod_orig, mod, args = self.SET_GRAD_ENABLED_TESTS["op"]
         self._check_node_users_in_the_same_graph(mod)
         self.assertEqual(mod_orig(*args), mod(*args))
@@ -935,6 +1159,9 @@ def forward(self, x):
         )
 
     def test_sequential_split(self):
+        # [FUNCTION DOC] For each sequential-split case, counts set-grad delimiter nodes before
+        # splitting, splits the module at those nodes, counts set-grad submodules in the result,
+        # and checks the counts are equal and the outputs of both modules match.
         for gm, args in self.SEQUENTIAL_SPLIT_INLINE_TESTS.values():
             set_grad_counts = nodes_count(gm.graph.nodes, _is_set_grad_enabled_node)
             new_gm = sequential_split(gm, _is_set_grad_enabled_node)
@@ -945,6 +1172,10 @@ def forward(self, x):
             self.assertEqual(gm(*args), new_gm(*args))
 
     def test_sequential_split_graph(self):
+        # [FUNCTION DOC] Splits the multi-dependency step-two case at its set-grad delimiter nodes,
+        # checks output equality and compares the expected code of the split module and three of
+        # its submodules, which contain the setter call and the operations until the next
+        # delimiter.
         gm, args = self.SEQUENTIAL_SPLIT_INLINE_TESTS["multi_dep_step2"]
 
         new_gm = sequential_split(gm, _is_set_grad_enabled_node)
@@ -1002,6 +1233,10 @@ def forward(self, sin, cos):
         )
 
     def test_predispatch_autocast_and_set_grad(self):
+        # [FUNCTION DOC] For the mixed autocast and set-grad case, checks node users, eager
+        # equality and expected code of the module and two nested submodules: the set-grad region
+        # wraps a submodule containing a cosine, a wrapped autocast-disabled submodule and a
+        # subtraction.
         mod_orig, mod, args = self.MIXED_AUTOCAST_SET_GRAD_TESTS["multi_ctx_manager"]
         self._check_node_users_in_the_same_graph(mod)
         self.assertEqual(mod_orig(*args), mod(*args))
@@ -1042,6 +1277,10 @@ def forward(self, cos):
         )
 
     def test_predispatch_autocast(self):
+        # [FUNCTION DOC] For the nested, plain, and multi-dependency autocast cases, checks node
+        # users are in the same graph, eager equality, and expected code for the module and each
+        # submodule: autocast regions become calls to the autocast higher-order operator on
+        # submodules with the matching enabled flag.
         mod_orig, mod, args = self.WITH_AUTOCAST_TESTS["ctx_manager_nested"]
         self._check_node_users_in_the_same_graph(mod)
         self.assertEqual(mod_orig(*args), mod(*args))
@@ -1225,6 +1464,10 @@ def forward(self, add_1):
         )
 
     def test_inline_(self):
+        # [FUNCTION DOC] For each sequential-split case, splits the module at delimiters, inlines
+        # every call_module node back into the graph through a node map, and checks the readable
+        # source is identical to the original one. Then copies the guards function onto the inlined
+        # module and checks outputs match.
         for gm, args in self.SEQUENTIAL_SPLIT_INLINE_TESTS.values():
             before_str = gm.print_readable(print_output=False)
             new_gm = sequential_split(gm, _is_set_grad_enabled_node)
@@ -1238,6 +1481,11 @@ def forward(self, add_1):
             self.assertEqual(gm(*args), new_gm(*args))
 
     def test_remove_auto_functionalized_pass(self) -> None:
+        # [FUNCTION DOC] Defines in a scoped test library a custom mutating operator with meta and
+        # explicit-autograd implementations, exports a module that mutates a buffer through it
+        # (strict), removes auto-functionalized calls with the unsafe pass, and checks no node
+        # targets the auto-functionalized operator or item access, and no output spec arg name
+        # contains getitem.
         with _scoped_library("DO_NOT_USE_TEST_ONLY", "DEF") as lib:
             lib.define("custom_mutator(Tensor x, Tensor(a!) y) -> Tensor")
 
@@ -1246,6 +1494,8 @@ def forward(self, add_1):
                 x: torch.Tensor,
                 y: torch.Tensor,
             ) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Meta kernel returning an empty tensor like the first
+                # argument.
                 return torch.empty_like(x)
 
             @impl(lib, "custom_mutator", "CompositeExplicitAutograd")
@@ -1253,14 +1503,21 @@ def forward(self, add_1):
                 x: torch.Tensor,
                 y: torch.Tensor,
             ) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Real kernel: adds one to the second argument in place and
+                # returns the first argument plus it.
                 return x + y.add_(1)
 
             class M(torch.nn.Module):
+                # [CLASS DOC] HELPER: Module with a zero buffer that passes the input and buffer to
+                # the custom mutator.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Registers a one-element zero buffer.
                     super().__init__()
                     self.state = torch.nn.Buffer(torch.zeros(1))
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Calls the custom mutating operator with the input and
+                    # the buffer and returns its result.
                     return torch.ops.DO_NOT_USE_TEST_ONLY.custom_mutator(x, self.state)
 
             mod = M()
@@ -1277,6 +1534,10 @@ def forward(self, add_1):
                 self.assertFalse("getitem" in spec.arg.name)
 
     def test_remove_auto_functionalized_pass_tuple(self) -> None:
+        # [FUNCTION DOC] Like the single-output test but the custom operator returns a tuple of two
+        # tensors. Exports (strict), decomposes, applies the unsafe removal pass and compares the
+        # graph's text with an expected string with the mutated buffer as a returned output and two
+        # item accesses.
         with _scoped_library("DO_NOT_USE_TEST_ONLY", "DEF") as lib:
             lib.define(
                 "custom_mutator_tuple(Tensor x, Tensor(a!) y) -> (Tensor, Tensor)"
@@ -1287,6 +1548,8 @@ def forward(self, add_1):
                 x: torch.Tensor,
                 y: torch.Tensor,
             ):
+                # [FUNCTION DOC] HELPER: Meta kernel returning two empty tensors like the first
+                # argument.
                 return (torch.empty_like(x), torch.empty_like(x))
 
             @impl(lib, "custom_mutator_tuple", "CompositeExplicitAutograd")
@@ -1294,14 +1557,21 @@ def forward(self, add_1):
                 x: torch.Tensor,
                 y: torch.Tensor,
             ):
+                # [FUNCTION DOC] HELPER: Real kernel: returns the first argument and the first
+                # argument plus the second after adding one to it in place.
                 return (x, x + y.add_(1))
 
             class M(torch.nn.Module):
+                # [CLASS DOC] HELPER: Module with a zero buffer that passes the input and buffer to
+                # the tuple-returning custom mutator.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Registers a one-element zero buffer.
                     super().__init__()
                     self.state = torch.nn.Buffer(torch.zeros(1))
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Calls the tuple-returning custom mutating operator
+                    # with the input and the buffer and returns its result.
                     return torch.ops.DO_NOT_USE_TEST_ONLY.custom_mutator_tuple(
                         x, self.state
                     )
@@ -1326,8 +1596,15 @@ default](args = (%x, %b_state), kwargs = {})
 
     @unittest.skipIf(not TEST_CUDA, "requires cuda")
     def test_move_device_to(self):
+        # [FUNCTION DOC] Requires CUDA. Exports a module calling device-to with an explicit cuda
+        # device, moves the program to cuda via the device pass, recompiles and compares generated
+        # code with expected output where the metadata assertion, the to call and the add use cuda.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that moves its input to a cuda device with float dtype and
+            # doubles it by self-addition.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Calls the aten to-device operator and returns the sum of
+                # the result with itself.
                 x = torch.ops.aten.to.device(x, device="cuda:0", dtype=torch.float32)
                 return x + x
 
@@ -1347,8 +1624,15 @@ def forward(self, x):
 
     @unittest.skipIf(not TEST_CUDA, "requires cuda")
     def test_move_device_submod(self):
+        # [FUNCTION DOC] Requires CUDA. Exports a module with an autocast region containing a
+        # device move, applies the device pass, recompiles the autocast submodule and compares its
+        # code with expected output using a cuda device.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a CUDA bfloat16 autocast region that moves the input
+            # to cuda and doubles it.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Inside autocast, moves the input to cuda and returns the
+                # sum of the result with itself.
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     x = x.to(device="cuda:0")
                     return x + x
@@ -1369,12 +1653,21 @@ def forward(self, arg0_1):
 
     @unittest.skipIf(not TEST_CUDA, "requires cuda")
     def test_move_to_device_pass(self):
+        # [FUNCTION DOC] Requires CUDA. Exports a GRU model on CPU (strict), moves it to cuda by
+        # device object, checks outputs live on cuda, moves it back by string to CPU, then to cuda
+        # again using a mapping from device names to target names, checking output devices each
+        # time.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a batch-first GRU returning its final states.
             def __init__(self, size=4, h_dim=10):
+                # [FUNCTION DOC] HELPER: Creates the GRU layer with the given input and hidden
+                # sizes.
                 super().__init__()
                 self.rnn = torch.nn.GRU(size, h_dim, batch_first=True)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs the GRU on the input and returns only the final
+                # hidden states.
                 _, states = self.rnn(x)
                 return states
 
@@ -1405,12 +1698,20 @@ def forward(self, arg0_1):
 
     @unittest.skipIf(not TEST_CUDA, "requires cuda")
     def test_move_device_example_inputs(self):
+        # [FUNCTION DOC] Requires CUDA. Exports a linear model with positional and keyword example
+        # inputs, checks the stored example inputs start on CPU, applies the device pass to a cuda
+        # device, and checks the positional and keyword example inputs of the new program are on
+        # cuda.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a linear layer added to two extra inputs.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the linear layer of four features.
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4)
 
             def forward(self, x, y, z):
+                # [FUNCTION DOC] HELPER: Applies the linear layer to the first input and adds the
+                # other two inputs.
                 return self.linear(x) + y + z
 
         # Create model with example inputs on CPU

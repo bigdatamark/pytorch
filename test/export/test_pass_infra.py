@@ -1,4 +1,7 @@
 # Owner(s): ["oncall: export"]
+# [MODULE DOC] Tests of the export pass infrastructure: running a no-op pass base class
+# transformation on exported programs and checking graph structure, node names and graph signature
+# updates, plus the graph module replace hook used to keep the signature in sync with renames.
 import copy
 import unittest
 
@@ -13,15 +16,25 @@ from torch.testing._internal.common_utils import IS_WINDOWS, run_tests, TestCase
 
 @unittest.skipIf(not is_dynamo_supported(), "Dynamo not supported")
 class TestPassInfra(TestCase):
+    # [CLASS DOC] Pass infrastructure tests, skipped when Dynamo is unsupported.
     def test_export_pass_base(self) -> None:
+        # [FUNCTION DOC] Exports a model with concatenation and tensor split (strict), applies a
+        # pass base subclass that changes nothing, and checks every call_function node keeps a
+        # non-empty stack trace and the node count, ops and targets match the original graph.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module concatenating the input with itself and splitting it into
+            # two sections.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Concatenates the input with itself and returns the aten
+                # split-by-sections result with two sections.
                 y = torch.cat([x, x])
                 return torch.ops.aten.tensor_split.sections(y, 2)
 
         f = Foo()
 
         class NullPass(_ExportPassBaseDeprecatedDoNotUse):
+            # [CLASS DOC] HELPER: Pass subclass with no overrides, so it should reproduce the graph
+            # unchanged.
             pass
 
         ep = export(f, (torch.ones(3, 2),), strict=True)
@@ -43,18 +56,31 @@ class TestPassInfra(TestCase):
 
     @unittest.skipIf(IS_WINDOWS, "Windows not supported")
     def test_cond(self) -> None:
+        # [FUNCTION DOC] Exports (strict) a model using a conditional with data-dependent checks on
+        # scalar values in both branches and runs the do-nothing pass base transform on it; passes
+        # if no error is raised. Skipped on Windows.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward runs a cond over two tensors with branch
+            # functions that read a scalar from a tensor, check it lies between two and five, and
+            # subtract or add.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Just calls the base constructor.
                 super().__init__()
 
             def forward(self, pred, x, y):
+                # [FUNCTION DOC] HELPER: Defines two branch functions and returns the cond result
+                # for the predicate and the two tensors.
                 def true_fn(x, y):
+                    # [FUNCTION DOC] HELPER: True branch: reads the scalar from the first tensor,
+                    # checks it is within two to five, returns the difference of the tensors.
                     b = x.item()
                     torch._check(b >= 2)
                     torch._check(b <= 5)
                     return x - y
 
                 def false_fn(x, y):
+                    # [FUNCTION DOC] HELPER: False branch: reads the scalar from the second tensor,
+                    # checks it is within two to five, returns the sum of the tensors.
                     c = y.item()
                     torch._check(c >= 2)
                     torch._check(c <= 5)
@@ -71,10 +97,17 @@ class TestPassInfra(TestCase):
         )
 
     def test_node_name_stability(self) -> None:
+        # [FUNCTION DOC] Checks node names are unchanged for a model with a parameter, two buffers
+        # (one mutated in forward) and two inputs after a do-nothing pass transform: names are
+        # compared pairwise over before and after graphs.
         # Tests that graph nodes stay the same for nodes that are not touched
         # during transformation
         class CustomModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with one parameter and two buffers; forward computes an
+            # affine-like combination of inputs and mutates the second buffer in place.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates a parameter and two buffers with fixed scalar
+                # values.
                 super().__init__()
 
                 # Define a parameter
@@ -85,6 +118,9 @@ class TestPassInfra(TestCase):
                 self.my_buffer2 = torch.nn.Buffer(torch.tensor(4.0))
 
             def forward(self, x1, x2):
+                # [FUNCTION DOC] HELPER: Computes input one plus the parameter times buffer one
+                # plus input two times buffer two, adds one to buffer two in place, and returns the
+                # combination.
                 # Use the parameter, buffers, and both inputs in the forward method
                 output = (
                     x1 + self.my_parameter
@@ -107,10 +143,15 @@ class TestPassInfra(TestCase):
             self.assertEqual(before_node.name, after_node.name)
 
     def test_graph_signature_updated_after_transformation(self) -> None:
+        # [FUNCTION DOC] Applies a function pass that renames every call_function node by appending
+        # a suffix, via the program transform helper, and checks that all user output names in the
+        # new graph signature contain the suffix and differ from the old signature's.
         # Checks that pass infra correctly updates graph signature
         # after transformations.
         class CustomModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a parameter and two buffers combined with two inputs.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the parameter and two buffers.
                 super().__init__()
 
                 self.my_parameter = torch.nn.Parameter(torch.tensor(2.0))
@@ -119,6 +160,8 @@ class TestPassInfra(TestCase):
                 self.my_buffer2 = torch.nn.Buffer(torch.tensor(4.0))
 
             def forward(self, x1, x2):
+                # [FUNCTION DOC] HELPER: Returns the first input plus the parameter times buffer
+                # one plus the second input times buffer two.
                 # Use the parameter, buffers, and both inputs in the forward method
                 output = (
                     x1 + self.my_parameter
@@ -137,6 +180,8 @@ class TestPassInfra(TestCase):
         from torch.fx.passes.infra.pass_base import PassResult
 
         def modify_input_output_pass(gm):
+            # [FUNCTION DOC] HELPER: Pass function: renames each call_function node by appending a
+            # suffix, recompiles the graph module and returns a pass result marked as modified.
             for node in gm.graph.nodes:
                 if node.op == "call_function":
                     node.name = node.name + "_modified"
@@ -153,8 +198,14 @@ class TestPassInfra(TestCase):
         self.assertNotEqual(new_signature.user_outputs, old_signature.user_outputs)
 
     def test_replace_hook_basic(self) -> None:
+        # [FUNCTION DOC] Renames nodes with a pass run on a deep copy of the graph module, while a
+        # replace hook taken from a deep-copied graph signature is installed on the module. Checks
+        # that user outputs of the copied signature get the suffix and differ from the original
+        # signature.
         class CustomModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a parameter and two buffers combined with two inputs.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the parameter and two buffers.
                 super().__init__()
 
                 self.my_parameter = torch.nn.Parameter(torch.tensor(2.0))
@@ -163,6 +214,8 @@ class TestPassInfra(TestCase):
                 self.my_buffer2 = torch.nn.Buffer(torch.tensor(4.0))
 
             def forward(self, x1, x2):
+                # [FUNCTION DOC] HELPER: Returns the first input plus the parameter times buffer
+                # one plus the second input times buffer two.
                 # Use the parameter, buffers, and both inputs in the forward method
                 output = (
                     x1 + self.my_parameter
@@ -174,6 +227,8 @@ class TestPassInfra(TestCase):
         ep_before = export(my_module, inputs, strict=True)
 
         def replace_pass(gm):
+            # [FUNCTION DOC] HELPER: Pass function: appends a suffix to the name of every
+            # call_function node, recompiles and returns a modified pass result.
             for node in gm.graph.nodes:
                 if node.op == "call_function":
                     node.name = node.name + "_modified"
