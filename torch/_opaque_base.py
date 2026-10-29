@@ -1,3 +1,7 @@
+# [MODULE DOC] Deprecated compatibility shim: re-exports CustomClassBase and
+# CustomClassBaseMeta from torch._custom_class_base under the old names
+# OpaqueBase and OpaqueBaseMeta.
+# Import-time side effect: logs a deprecation warning on the module logger.
 import logging
 
 

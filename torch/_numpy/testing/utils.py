@@ -1,5 +1,12 @@
 # mypy: ignore-errors
 
+# [MODULE DOC] Testing utilities for torch._numpy, adapted from numpy.testing.
+# Provides assertion helpers (equality, approximate equality, array comparison,
+# ULP-based comparison, warnings assertions), warning-capturing context managers
+# (clear_and_catch_warnings, suppress_warnings), temp file/dir helpers, and
+# platform flags (IS_WASM, IS_PYPY, IS_PYSTON, HAS_REFCOUNT).
+# Import-time side effects: computes the platform flags and sets verbose to 0.
+
 """
 Utility function to facilitate testing.
 
@@ -68,6 +75,9 @@ HAS_REFCOUNT = getattr(sys, "getrefcount", None) is not None and not IS_PYSTON
 
 
 def assert_(val, msg=""):
+    # [FUNCTION DOC] Assertion that survives optimized mode. Raises an
+    # AssertionError when val is falsy; msg may be a string or a callable
+    # (called lazily on failure; if calling it raises TypeError, msg is used as is).
     """
     Assert that works in release mode.
     Accepts callable msg to allow deferring evaluation until failure.
@@ -88,14 +98,17 @@ def assert_(val, msg=""):
 
 
 def gisnan(x):
+    # [FUNCTION DOC] HELPER: elementwise NaN test via torch._numpy.isnan.
     return np.isnan(x)
 
 
 def gisfinite(x):
+    # [FUNCTION DOC] HELPER: elementwise finiteness test via torch._numpy.isfinite.
     return np.isfinite(x)
 
 
 def gisinf(x):
+    # [FUNCTION DOC] HELPER: elementwise infinity test via torch._numpy.isinf.
     return np.isinf(x)
 
 
@@ -107,6 +120,11 @@ def build_err_msg(
     names=("ACTUAL", "DESIRED"),
     precision=8,
 ):
+    # [FUNCTION DOC] Builds a failure message string: header, then err_msg
+    # (appended to the header line if short and single-line, else on its own line),
+    # then, if verbose, one line per array labelled by names, using the repr
+    # (truncated to 3 lines plus an ellipsis if longer; repr failures are reported inline).
+    # The precision argument is unused.
     msg = ["\n" + header]
     if err_msg:
         if err_msg.find("\n") == -1 and len(err_msg) < 79 - len(header):
@@ -134,6 +152,12 @@ def build_err_msg(
 
 
 def assert_equal(actual, desired, err_msg="", verbose=True):
+    # [FUNCTION DOC] Recursively asserts equality of scalars, strings, dtypes,
+    # dicts, lists/tuples and arrays (arrays delegate to assert_array_equal).
+    # NaNs in the same place compare equal; signed zeros are distinguished;
+    # complex values are compared by real and imaginary parts.
+    # Returns True for two Nones or equal dtypes, otherwise None.
+    # Raises AssertionError on the first mismatch.
     """
     Raises an AssertionError if two objects are not equal.
 
@@ -284,6 +308,8 @@ def assert_equal(actual, desired, err_msg="", verbose=True):
 
 
 def print_assert_equal(test_string, actual, desired):
+    # [FUNCTION DOC] Raises AssertionError if actual != desired, with a message
+    # made of test_string plus pretty-printed actual and desired values.
     """
     Test if two objects are equal, and print an error message if test fails.
 
@@ -329,6 +355,12 @@ def print_assert_equal(test_string, actual, desired):
 
 
 def assert_almost_equal(actual, desired, decimal=7, err_msg="", verbose=True):
+    # [FUNCTION DOC] Asserts two items agree within 1.5 * 10**-decimal in absolute
+    # difference. Arrays, lists and tuples delegate to assert_array_almost_equal;
+    # complex values are checked by parts; non-finite values must match (both NaN
+    # or equal). Raises AssertionError on mismatch.
+    # KNOWN ISSUE: in the complex branch, when no error is raised the code falls
+    # through to the real-valued checks instead of returning.
     """
     Raises an AssertionError if two items are not equal up to desired
     precision.
@@ -410,6 +442,8 @@ def assert_almost_equal(actual, desired, decimal=7, err_msg="", verbose=True):
         usecomplex = False
 
     def _build_err_msg():
+        # [FUNCTION DOC] HELPER: builds the "not almost equal to N decimals"
+        # message from the enclosing actual, desired, err_msg and verbose.
         header = f"Arrays are not almost equal to {decimal:d} decimals"
         return build_err_msg([actual, desired], err_msg, verbose=verbose, header=header)
 
@@ -455,6 +489,11 @@ def assert_almost_equal(actual, desired, decimal=7, err_msg="", verbose=True):
 
 
 def assert_approx_equal(actual, desired, significant=7, err_msg="", verbose=True):
+    # [FUNCTION DOC] Asserts two scalars agree to the given number of significant
+    # digits: both are converted to float, scaled by a power of ten based on their
+    # mean magnitude, and the scaled difference must be below 10**-(significant-1).
+    # Non-finite values must match. Raises AssertionError on mismatch.
+    # Uses real numpy (imported locally), not torch._numpy.
     """
     Raises an AssertionError if two items are not equal up to significant
     digits.
@@ -575,6 +614,11 @@ def assert_array_compare(
     *,
     strict=False,
 ):
+    # [FUNCTION DOC] Generic elementwise array comparison driver. Converts x and y
+    # to arrays, checks shape (or shape and dtype when strict), verifies nan/inf
+    # positions agree (per equal_nan/equal_inf), then applies the comparison
+    # callable to the remaining values and raises AssertionError with a
+    # mismatch report (counts, max absolute/relative difference) on failure.
     __tracebackhide__ = True  # Hide traceback for py.test
     from torch._numpy import all, array, asarray, bool_, inf, isnan, max
 
@@ -582,12 +626,16 @@ def assert_array_compare(
     y = asarray(y)
 
     def array2string(a):
+        # [FUNCTION DOC] HELPER: string form of an array.
         return str(a)
 
     # original array for output formatting
     ox, oy = x, y
 
     def func_assert_same_pos(x, y, func=isnan, hasval="nan"):
+        # [FUNCTION DOC] HELPER: checks func (nan or inf detector) is true at the
+        # same positions in x and y, raising AssertionError otherwise; returns
+        # the boolean mask of such positions (or a scalar bool for 0-d input).
         """Handling nan/inf.
 
         Combine results of running func on x and y, checking that they are True
@@ -742,6 +790,10 @@ def assert_array_compare(
 
 
 def assert_array_equal(x, y, err_msg="", verbose=True, *, strict=False):
+    # [FUNCTION DOC] Asserts two array-likes have equal shape and values, using
+    # assert_array_compare with equality; NaNs at the same positions count as
+    # equal, a scalar is broadcast unless strict (which also requires equal
+    # dtypes). Raises AssertionError on mismatch.
     """
     Raises an AssertionError if two array_like objects are not equal.
 
@@ -849,6 +901,10 @@ def assert_array_equal(x, y, err_msg="", verbose=True, *, strict=False):
 
 
 def assert_array_almost_equal(x, y, decimal=6, err_msg="", verbose=True):
+    # [FUNCTION DOC] Asserts two array-likes have equal shape and elements within
+    # 1.5 * 10**-decimal absolute difference, via assert_array_compare with a
+    # local comparison function. Matching NaN/inf positions are treated as equal.
+    # Raises AssertionError on mismatch.
     """
     Raises an AssertionError if two objects are not equal up to desired
     precision.
@@ -930,6 +986,9 @@ def assert_array_almost_equal(x, y, decimal=6, err_msg="", verbose=True):
     from torch._numpy import any as npany, float_, issubdtype, number, result_type
 
     def compare(x, y):
+        # [FUNCTION DOC] HELPER: elementwise closeness test. Requires infinities
+        # to sit at the same places (drops them before comparing), casts y to an
+        # inexact dtype, and returns whether abs(x - y) is below the tolerance.
         try:
             if npany(gisinf(x)) or npany(gisinf(y)):
                 xinfid = gisinf(x)
@@ -967,6 +1026,10 @@ def assert_array_almost_equal(x, y, decimal=6, err_msg="", verbose=True):
 
 
 def assert_array_less(x, y, err_msg="", verbose=True):
+    # [FUNCTION DOC] Asserts every element of x is strictly less than the
+    # corresponding element of y (shapes must match unless one is 0-d); NaNs in
+    # the same places are ignored, infinities are not special-cased.
+    # Raises AssertionError on mismatch.
     """
     Raises an AssertionError if two array_like objects are not ordered by less
     than.
@@ -1055,6 +1118,9 @@ def assert_array_less(x, y, err_msg="", verbose=True):
 
 
 def assert_string_equal(actual, desired):
+    # [FUNCTION DOC] Asserts two strings are equal. Raises AssertionError if
+    # either argument is not a string, or with a difflib-based line diff when
+    # they differ.
     """
     Test if two strings are equal.
 
@@ -1130,7 +1196,10 @@ import unittest
 
 
 class _Dummy(unittest.TestCase):
+    # [CLASS DOC] HELPER: throwaway TestCase subclass, instantiated once as _d
+    # solely to borrow the assertRaisesRegex method.
     def nop(self):
+        # [FUNCTION DOC] HELPER: no-op test method required to instantiate TestCase.
         pass
 
 
@@ -1138,6 +1207,9 @@ _d = _Dummy("nop")
 
 
 def assert_raises_regex(exception_class, expected_regexp, *args, **kwargs):
+    # [FUNCTION DOC] Thin wrapper over unittest assertRaisesRegex: either calls
+    # the given callable and checks it raises exception_class with a message
+    # matching expected_regexp, or returns a context manager doing the same.
     """
     assert_raises_regex(exception_class, expected_regexp, callable, *args,
                         **kwargs)
@@ -1159,6 +1231,10 @@ def assert_raises_regex(exception_class, expected_regexp, *args, **kwargs):
 
 
 def decorate_methods(cls, decorator, testmatch=None):
+    # [FUNCTION DOC] Replaces, in place on cls, each public function defined in
+    # the class's own namespace whose name matches testmatch (string or compiled
+    # regex; default matches names containing "test") with decorator(function).
+    # Private names (leading underscore) are skipped. Returns None.
     """
     Apply a decorator to all methods in a class matching a regular expression.
 
@@ -1206,6 +1282,10 @@ def decorate_methods(cls, decorator, testmatch=None):
 
 
 def _assert_valid_refcount(op):
+    # [FUNCTION DOC] HELPER: with real numpy, applies op repeatedly to two arrays
+    # with garbage collection disabled and asserts the refcount of the integer 1
+    # did not drop. Returns True immediately when refcounts are unavailable.
+    # Re-enables gc afterwards.
     """
     Check that ufuncs don't mishandle refcount of object `1`.
     Used in a few regression tests.
@@ -1242,6 +1322,10 @@ def assert_allclose(
     verbose=True,
     check_dtype=False,
 ):
+    # [FUNCTION DOC] Asserts actual and desired are close: elementwise
+    # abs(difference) <= atol + rtol * abs(desired), through assert_array_compare
+    # with isclose (equal_nan controls NaN handling). With check_dtype, differing
+    # dtypes raise AssertionError first. Raises AssertionError on mismatch.
     """
     Raises an AssertionError if two objects are not equal up to desired
     tolerance.
@@ -1300,6 +1384,7 @@ def assert_allclose(
     __tracebackhide__ = True  # Hide traceback for py.test
 
     def compare(x, y):
+        # [FUNCTION DOC] HELPER: elementwise isclose with the enclosing rtol, atol, equal_nan.
         return np.isclose(x, y, rtol=rtol, atol=atol, equal_nan=equal_nan)
 
     actual, desired = asanyarray(actual), asanyarray(desired)
@@ -1321,6 +1406,9 @@ def assert_allclose(
 
 
 def assert_array_almost_equal_nulp(x, y, nulp=1):
+    # [FUNCTION DOC] Asserts abs(x - y) <= nulp * spacing of the larger magnitude,
+    # elementwise, using real numpy. Raises AssertionError (message includes the
+    # max ULP difference for real inputs). Returns None.
     """
     Compare two arrays relatively to their spacing.
 
@@ -1385,6 +1473,9 @@ def assert_array_almost_equal_nulp(x, y, nulp=1):
 
 
 def assert_array_max_ulp(a, b, maxulp=1, dtype=None):
+    # [FUNCTION DOC] Asserts all elements of a and b differ by at most maxulp
+    # units in the last place (optionally cast to dtype first). Returns the array
+    # of ULP differences; raises AssertionError if any exceeds maxulp.
     """
     Check that all items of arrays differ in at most N Units in the Last Place.
 
@@ -1439,6 +1530,10 @@ def assert_array_max_ulp(a, b, maxulp=1, dtype=None):
 
 
 def nulp_diff(x, y, dtype=None):
+    # [FUNCTION DOC] Returns, per element, the number of representable floats
+    # between x and y, by differencing their sign-magnitude integer
+    # representations (real numpy). Raises NotImplementedError for complex input
+    # and ValueError on shape mismatch.
     """For each item in x and y, return the number of representable floating
     points between them.
 
@@ -1493,6 +1588,7 @@ def nulp_diff(x, y, dtype=None):
         raise ValueError(f"x and y do not have the same shape: {x.shape} - {y.shape}")
 
     def _diff(rx, ry, vdt):
+        # [FUNCTION DOC] HELPER: absolute difference of two integer arrays, cast to dtype vdt.
         diff = np.asarray(rx - ry, dtype=vdt)
         return np.abs(diff)
 
@@ -1502,6 +1598,9 @@ def nulp_diff(x, y, dtype=None):
 
 
 def _integer_repr(x, vdt, comp):
+    # [FUNCTION DOC] HELPER: views float array x as signed integers of type vdt
+    # and maps negative values to sign-magnitude order (comp minus value), so
+    # integer differences count ULPs. Mutates the viewed data in place for arrays.
     # Reinterpret binary representation of the float as sign-magnitude:
     # take into account two's-complement representation
     # See also
@@ -1517,6 +1616,8 @@ def _integer_repr(x, vdt, comp):
 
 
 def integer_repr(x):
+    # [FUNCTION DOC] Returns the sign-magnitude integer interpretation of a
+    # float16/32/64 numpy array; raises ValueError for other dtypes.
     """Return the signed-magnitude interpretation of the binary representation
     of x."""
     import numpy as np
@@ -1533,6 +1634,8 @@ def integer_repr(x):
 
 @contextlib.contextmanager
 def _assert_warns_context(warning_class, name=None):
+    # [FUNCTION DOC] HELPER: context manager that records warnings of the given
+    # class while the body runs and raises AssertionError on exit if none occurred.
     __tracebackhide__ = True  # Hide traceback for py.test
     with suppress_warnings() as sup:
         l = sup.record(warning_class)
@@ -1543,6 +1646,9 @@ def _assert_warns_context(warning_class, name=None):
 
 
 def assert_warns(warning_class, *args, **kwargs):
+    # [FUNCTION DOC] With no extra args returns a context manager asserting the
+    # warning is raised; otherwise calls the first extra arg with the rest and
+    # returns its result, raising AssertionError if the warning was not emitted.
     """
     Fail unless the given callable throws the specified warning.
 
@@ -1598,6 +1704,8 @@ def assert_warns(warning_class, *args, **kwargs):
 
 @contextlib.contextmanager
 def _assert_no_warnings_context(name=None):
+    # [FUNCTION DOC] HELPER: context manager recording all warnings in the body
+    # (filter set to always) and raising AssertionError on exit if any occurred.
     __tracebackhide__ = True  # Hide traceback for py.test
     with warnings.catch_warnings(record=True) as l:
         warnings.simplefilter("always")
@@ -1608,6 +1716,9 @@ def _assert_no_warnings_context(name=None):
 
 
 def assert_no_warnings(*args, **kwargs):
+    # [FUNCTION DOC] With no args returns a context manager asserting no warnings
+    # are emitted; otherwise calls the first arg with the rest and returns its
+    # result, raising AssertionError if any warning was emitted.
     """
     Fail if the given callable produces any warnings.
 
@@ -1644,6 +1755,10 @@ def assert_no_warnings(*args, **kwargs):
 
 
 def _gen_alignment_data(dtype=float32, type="binary", max_size=24):
+    # [FUNCTION DOC] HELPER: generator yielding (output, input(s), description)
+    # tuples of arrays with varied offsets, sizes and aliasing (out of place,
+    # in place, overlapping views) to exercise vectorized kernels. type is
+    # "unary" (one input) or "binary" (two inputs); any other value yields nothing.
     """
     generator producing data with different alignment and offsets
     to test simd vectorization
@@ -1675,6 +1790,7 @@ def _gen_alignment_data(dtype=float32, type="binary", max_size=24):
             if type == "unary":
 
                 def inp():
+                    # [FUNCTION DOC] HELPER: fresh arange of size s sliced from offset o.
                     return arange(s, dtype=dtype)[o:]
 
                 out = empty((s,), dtype=dtype)[o:]
@@ -1710,6 +1826,7 @@ def _gen_alignment_data(dtype=float32, type="binary", max_size=24):
             if type == "binary":
 
                 def inp1():
+                    # [FUNCTION DOC] HELPER: fresh arange of size s sliced from offset o.
                     return arange(s, dtype=dtype)[o:]
 
                 inp2 = inp1
@@ -1806,11 +1923,14 @@ def _gen_alignment_data(dtype=float32, type="binary", max_size=24):
 
 
 class IgnoreException(Exception):
+    # [CLASS DOC] Marker exception signalling a test is skipped because a feature is disabled.
     "Ignoring this exception due to disabled feature"
 
 
 @contextlib.contextmanager
 def tempdir(*args, **kwargs):
+    # [FUNCTION DOC] Context manager creating a temporary directory (mkdtemp,
+    # arguments forwarded), yielding its path and recursively deleting it on exit.
     """Context manager to provide a temporary test folder.
 
     All arguments are passed as this to the underlying tempfile.mkdtemp
@@ -1826,6 +1946,8 @@ def tempdir(*args, **kwargs):
 
 @contextlib.contextmanager
 def temppath(*args, **kwargs):
+    # [FUNCTION DOC] Context manager creating a temporary file (mkstemp, arguments
+    # forwarded), closing its descriptor, yielding the path and removing the file on exit.
     """Context manager for temporary files.
 
     Context manager that returns the path to a closed temporary file. Its
@@ -1847,6 +1969,10 @@ def temppath(*args, **kwargs):
 
 
 class clear_and_catch_warnings(warnings.catch_warnings):
+    # [CLASS DOC] warnings.catch_warnings subclass that, on entry, saves and
+    # clears the __warningregistry__ of the given modules (plus class_modules)
+    # so warnings can fire afresh, and restores the saved registries on exit.
+    # State: modules (set) and _warnreg_copies (module to saved registry copy).
     """Context manager that resets warning registry for catching warnings
 
     Warnings can be slippery, because, whenever a warning is triggered, Python
@@ -1893,11 +2019,16 @@ class clear_and_catch_warnings(warnings.catch_warnings):
     class_modules = ()
 
     def __init__(self, record=False, modules=()):
+        # [FUNCTION DOC] Stores the union of modules and class_modules, prepares
+        # an empty registry-copy mapping, and forwards record to the base class.
         self.modules = set(modules).union(self.class_modules)
         self._warnreg_copies = {}
         super().__init__(record=record)
 
     def __enter__(self):
+        # [FUNCTION DOC] For each tracked module with a warning registry, saves a
+        # copy and clears it, then enters the base context manager and returns
+        # its result (the warning list when recording).
         for mod in self.modules:
             if hasattr(mod, "__warningregistry__"):
                 mod_reg = mod.__warningregistry__
@@ -1906,6 +2037,8 @@ class clear_and_catch_warnings(warnings.catch_warnings):
         return super().__enter__()
 
     def __exit__(self, *exc_info):
+        # [FUNCTION DOC] Exits the base context manager, then clears each tracked
+        # module's warning registry and restores any copy saved on entry.
         super().__exit__(*exc_info)
         for mod in self.modules:
             if hasattr(mod, "__warningregistry__"):
@@ -1915,6 +2048,13 @@ class clear_and_catch_warnings(warnings.catch_warnings):
 
 
 class suppress_warnings:
+    # [CLASS DOC] Context manager and decorator that suppresses and/or records
+    # warnings matching filters (category, message regex, optional module), and
+    # forwards unmatched warnings to the outer handler per forwarding_rule
+    # (always, once, module, location). Not thread safe; cannot be entered twice.
+    # State: _suppressions (persistent filters), _tmp_suppressions (added while
+    # entered), _tmp_modules, _forwarded signatures, log (all recorded warnings).
+    # Entering replaces warnings.showwarning and copies warnings.filters; exiting restores both.
     """
     Context manager and decorator doing much the same as
     ``warnings.catch_warnings``.
@@ -1992,6 +2132,8 @@ class suppress_warnings:
     """
 
     def __init__(self, forwarding_rule="always"):
+        # [FUNCTION DOC] Initializes empty filter state and stores the forwarding
+        # rule; raises ValueError if it is not one of always, module, once, location.
         self._entered = False
 
         # Suppressions are either instance or defined inside one with block:
@@ -2002,6 +2144,9 @@ class suppress_warnings:
         self._forwarding_rule = forwarding_rule
 
     def _clear_registries(self):
+        # [FUNCTION DOC] HELPER: invalidates warning caches so filter changes
+        # take effect; uses warnings._filters_mutated when available, otherwise
+        # clears __warningregistry__ of each module in _tmp_modules.
         if hasattr(warnings, "_filters_mutated"):
             # clearing the registry should not be necessary on new pythons,
             # instead the filters should be mutated.
@@ -2014,6 +2159,11 @@ class suppress_warnings:
                 module.__warningregistry__.clear()
 
     def _filter(self, category=Warning, message="", module=None, record=False):
+        # [FUNCTION DOC] HELPER: registers a suppression entry (category, message,
+        # compiled case-insensitive regex, module, record list). When entered it
+        # also installs an "always" warnings filter and goes to the temporary list;
+        # otherwise it goes to the persistent list. Returns the new record list
+        # if record is true, else None.
         if record:
             record = []  # The log where to store warnings
         else:
@@ -2040,6 +2190,8 @@ class suppress_warnings:
         return record
 
     def filter(self, category=Warning, message="", module=None):
+        # [FUNCTION DOC] Adds a suppressing (non-recording) filter; applied
+        # immediately if entered, with temporary scope. Returns None.
         """
         Add a new suppressing filter or apply it if the state is entered.
 
@@ -2062,6 +2214,8 @@ class suppress_warnings:
         self._filter(category=category, message=message, module=module, record=False)
 
     def record(self, category=Warning, message="", module=None):
+        # [FUNCTION DOC] Adds a recording filter and returns the list that will be
+        # filled with matching warnings (also appended to self.log).
         """
         Append a new recording filter or apply it if the state is entered.
 
@@ -2093,6 +2247,11 @@ class suppress_warnings:
         )
 
     def __enter__(self):
+        # [FUNCTION DOC] Enters the context: raises RuntimeError if already
+        # entered; saves and copies the global warnings filters and showwarning,
+        # resets the log and temporary state, clears record lists, installs
+        # "always" filters for stored suppressions, and hooks showwarning to
+        # _showwarning. Returns self.
         if self._entered:
             raise RuntimeError("cannot enter suppress_warnings twice.")
 
@@ -2124,6 +2283,8 @@ class suppress_warnings:
         return self
 
     def __exit__(self, *exc_info):
+        # [FUNCTION DOC] Restores the original showwarning and warnings filters,
+        # clears registries, marks the object as not entered and drops saved state.
         warnings.showwarning = self._orig_show
         warnings.filters = self._filters
         self._clear_registries()
@@ -2134,6 +2295,13 @@ class suppress_warnings:
     def _showwarning(
         self, message, category, filename, lineno, *args, use_warnmsg=None, **kwargs
     ):
+        # [FUNCTION DOC] HELPER: replacement for warnings.showwarning. Checks
+        # suppressions newest first; on a category and message match (and module
+        # file match when given) records the warning if requested and swallows it.
+        # Unmatched warnings are forwarded to the original handler per the
+        # forwarding rule (deduplicated by signature unless "always").
+        # KNOWN ISSUE: when use_warnmsg is given it calls self._orig_showmsg,
+        # which is never defined in this class.
         for cat, _, pattern, mod, rec in (self._suppressions + self._tmp_suppressions)[
             ::-1
         ]:
@@ -2184,6 +2352,8 @@ class suppress_warnings:
             self._orig_showmsg(use_warnmsg)
 
     def __call__(self, func):
+        # [FUNCTION DOC] Decorator form: returns a wrapper that runs func inside
+        # this context manager.
         """
         Function decorator to apply certain suppressions to a whole
         function.
@@ -2191,6 +2361,7 @@ class suppress_warnings:
 
         @wraps(func)
         def new_func(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: calls func with the suppression context active.
             with self:
                 return func(*args, **kwargs)
 
@@ -2199,6 +2370,11 @@ class suppress_warnings:
 
 @contextlib.contextmanager
 def _assert_no_gc_cycles_context(name=None):
+    # [FUNCTION DOC] HELPER: context manager that disables gc, fully collects
+    # garbage, runs the body with gc debug save-all, then collects again and
+    # raises AssertionError listing objects found in reference cycles. Does
+    # nothing when refcounting is unavailable. Raises RuntimeError if garbage
+    # cannot be fully collected beforehand. Restores gc state afterwards.
     __tracebackhide__ = True  # Hide traceback for py.test
 
     # not meaningful to test if there is no refcounting
@@ -2251,6 +2427,9 @@ def _assert_no_gc_cycles_context(name=None):
 
 
 def assert_no_gc_cycles(*args, **kwargs):
+    # [FUNCTION DOC] With no args returns a context manager asserting no
+    # reference cycles are created; otherwise calls the first arg with the rest
+    # (discarding the result) and raises AssertionError if cycles were created.
     """
     Fail if the given callable produces any reference cycles.
 
@@ -2286,6 +2465,8 @@ def assert_no_gc_cycles(*args, **kwargs):
 
 
 def break_cycles():
+    # [FUNCTION DOC] Runs garbage collection (several extra passes on PyPy so
+    # finalizers run) to release reference cycles. Side effect: gc collection.
     """
     Break reference cycles by calling gc.collect
     Objects can call other objects' methods (for instance, another object's
@@ -2304,12 +2485,17 @@ def break_cycles():
 
 
 def requires_memory(free_bytes):
+    # [FUNCTION DOC] Decorator factory: wrapped tests are skipped (pytest.skip)
+    # when check_free_memory reports less than free_bytes available, and are
+    # marked expected-failure if they raise MemoryError. Imports pytest.
     """Decorator to skip a test if not enough memory is available"""
     import pytest
 
     def decorator(func):
+        # [FUNCTION DOC] HELPER: wraps func with the memory check.
         @wraps(func)
         def wrapper(*a, **kw):
+            # [FUNCTION DOC] HELPER: skips, runs func, or xfails on MemoryError.
             msg = check_free_memory(free_bytes)
             if msg is not None:
                 pytest.skip(msg)
@@ -2326,6 +2512,11 @@ def requires_memory(free_bytes):
 
 
 def check_free_memory(free_bytes):
+    # [FUNCTION DOC] Returns None if at least free_bytes of memory is available,
+    # else a message string. Available memory comes from the NPY_AVAILABLE_MEM
+    # environment variable (parsed with _parse_size; invalid values raise
+    # ValueError) or from _get_mem_available; unknown memory counts as
+    # insufficient.
     """
     Check whether `free_bytes` amount of memory is currently free.
     Returns: None if enough memory available, otherwise error message
@@ -2361,6 +2552,9 @@ def check_free_memory(free_bytes):
 
 
 def _parse_size(size_str):
+    # [FUNCTION DOC] HELPER: parses a size string such as "12 GB" or "4kib"
+    # (decimal and binary suffixes, case-insensitive) into an integer byte count;
+    # raises ValueError for malformed input.
     """Convert memory size strings ('12 GB' etc.) to float"""
     suffixes = {
         "": 1,
@@ -2391,6 +2585,8 @@ def _parse_size(size_str):
 
 
 def _get_mem_available():
+    # [FUNCTION DOC] HELPER: returns available memory in bytes via psutil if
+    # installed, else from /proc/meminfo on Linux; returns None if unknown.
     """Return available memory in bytes, or None if unknown."""
     try:
         import psutil
@@ -2416,6 +2612,9 @@ def _get_mem_available():
 
 
 def _no_tracing(func):
+    # [FUNCTION DOC] HELPER: decorator that runs func with the Python trace
+    # function disabled, restoring it afterwards; returns func unchanged if
+    # tracing is unsupported.
     """
     Decorator to temporarily turn off tracing for the duration of a test.
     Needed in tests that check refcounting, otherwise the tracing itself
@@ -2427,6 +2626,7 @@ def _no_tracing(func):
 
         @wraps(func)
         def wrapper(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: calls func with tracing off, then restores the trace.
             original_trace = sys.gettrace()
             try:
                 sys.settrace(None)
@@ -2438,6 +2638,7 @@ def _no_tracing(func):
 
 
 def _get_glibc_version():
+    # [FUNCTION DOC] HELPER: returns the glibc version string, or "0.0" if it cannot be determined.
     try:
         ver = os.confstr("CS_GNU_LIBC_VERSION").rsplit(" ")[1]
     except Exception:
@@ -2450,4 +2651,6 @@ _glibcver = _get_glibc_version()
 
 
 def _glibc_older_than(x):
+    # [FUNCTION DOC] HELPER: true if the glibc version is known and is
+    # lexicographically (string) smaller than x.
     return _glibcver != "0.0" and _glibcver < x
