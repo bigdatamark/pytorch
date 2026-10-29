@@ -1,4 +1,11 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for packaging AOTInductor outputs into pt2 archives and loading them back.
+# Contains a skip decorator factory driven by the test case device and cpp-only flag, a compile
+# helper (export, package, load), and one parameterized test class run for cpu and the GPU type,
+# each with and without the cpp-only package mode. Tests cover direct and directory loading,
+# metadata, multi-model packages, buffers, shared and user-managed weights, standalone cmake
+# builds, the exporter package API, and error handling. Skipped on macOS; the script entry only
+# runs tests when a GPU exists or on macOS.
 import copy
 import functools
 import gc
@@ -38,9 +45,18 @@ from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU
 
 
 def skipif(predicate: Callable[[str, bool], bool], reason: str):
+    # [FUNCTION DOC] HELPER: Decorator factory. Takes a predicate over the test device and the
+    # cpp-only flag plus a skip reason, and returns a decorator that wraps a test method so it
+    # first calls the predicate with the instance's attributes and skips the test with the reason
+    # when it returns true; otherwise it runs the test.
     def decorator(func):
+        # [FUNCTION DOC] HELPER: Wraps one test function while preserving its metadata, returning
+        # the wrapper.
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Skips the test if the predicate holds for this instance's
+            # device and cpp-only flag; otherwise calls the original test with all arguments and
+            # returns its result.
             if predicate(self.device, self.package_cpp_only):
                 self.skipTest(reason)
             return func(self, *args, **kwargs)
@@ -59,6 +75,9 @@ def compile(
     package_path=None,
     inductor_configs=None,
 ) -> AOTICompiledModel:
+    # [FUNCTION DOC] HELPER: Exports the model non-strictly with optional kwargs and dynamic
+    # shapes, packages it with AOTInductor (to the given path or a default one, with optional
+    # inductor configs) and loads the resulting package, returning the compiled-model object.
     ep = torch.export.export(
         model,
         args,
@@ -99,6 +118,10 @@ def compile(
     params: f"{cls.__name__}{'Cpp' if params['package_cpp_only'] else ''}_{params['device']}",
 )
 class TestAOTInductorPackage(TestCase):
+    # [CLASS DOC] Parameterized test case (the decorator creates one class per device and cpp-only
+    # combination, named by device and a cpp marker) holding the packaging tests. Instances
+    # provide the attributes device and package_cpp_only; helper methods compile, compare against
+    # eager, and drive cmake builds of packaged C++ sources.
     def check_model(
         self: TestCase,
         model,
@@ -108,6 +131,11 @@ class TestAOTInductorPackage(TestCase):
         atol=None,
         rtol=None,
     ) -> AOTICompiledModel:
+        # [FUNCTION DOC] HELPER: Compares a compiled package against eager. Under no-grad it
+        # seeds, moves the model to the device, computes the reference on copies, forces the
+        # cpp-only config from the instance (mutating the passed config dict), compiles into a
+        # temporary pt2 file, runs the loaded model, and asserts equality with the tolerances.
+        # Returns the loaded compiled model.
         with torch.no_grad():
             torch.manual_seed(0)
             model = model.to(self.device)
@@ -134,6 +162,8 @@ class TestAOTInductorPackage(TestCase):
         return compiled_model
 
     def check_package_cpp_only(self: TestCase) -> None:
+        # [FUNCTION DOC] HELPER: Skips the test unless this instance is the cpp-only variant and
+        # both cmake and make are found on the path.
         """
         Check if cmake and make are available.
         Skip self.package_cpp_only=False tests
@@ -146,6 +176,11 @@ class TestAOTInductorPackage(TestCase):
             raise unittest.SkipTest("make is not available")
 
     def cmake_compile_and_run(self, base_dir):
+        # [FUNCTION DOC] HELPER: Given a directory with generated sources, builds them with cmake
+        # and make in a new build subdirectory (the torch install location is prepended to the
+        # cmake prefix path), then runs the built main program from that directory and returns the
+        # completed process with captured text output. Raises on any failed subprocess; the build
+        # directory must not already exist.
         custom_env = os.environ.copy()
         custom_env["CMAKE_PREFIX_PATH"] = ":".join(
             [str(Path(torch.__file__).parent)]
@@ -172,6 +207,11 @@ class TestAOTInductorPackage(TestCase):
         return result
 
     def cmake_compile(self, model, example_inputs, options, tmp_dir):
+        # [FUNCTION DOC] HELPER: Exports the model, AOT-compiles and packages it with the given
+        # options, extracts the archive into the given directory, locates the model source folder
+        # inside, and builds it with cmake and make in a new build subfolder. Asserts the folder
+        # exists and no build folder exists beforehand. Returns the build path and the model
+        # source path.
         """
         Exports model, compiles it using AOTInductor, extracts the
         generated files to tmp_dir, and builds the C++ code using CMake and Make.
@@ -211,8 +251,11 @@ class TestAOTInductorPackage(TestCase):
         return build_path, tmp_path
 
     def test_add(self):
+        # [FUNCTION DOC] Compiles and compares a model that adds two inputs.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning the sum of its two inputs.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the sum of the two inputs.
                 return x + y
 
         example_inputs = (
@@ -222,15 +265,24 @@ class TestAOTInductorPackage(TestCase):
         self.check_model(Model(), example_inputs)
 
     def test_int64_floor_divide_tensor_constant_divisor(self):
+        # [FUNCTION DOC] Skips unless the device is cuda. Compares a compiled model that
+        # floor-divides an int64 input by an int64 tensor constant (value 3) stored on the module,
+        # using negative, zero and positive inputs.
         if self.device != "cuda":
             raise unittest.SkipTest("requires CUDA")
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding an int64 scalar tensor divisor and floor-dividing
+            # the input by it.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Stores the int64 tensor constant 3 as the
+                # divisor attribute.
                 super().__init__()
                 self.divisor = torch.tensor(3, dtype=torch.int64)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the floor division of the input by the
+                # stored divisor.
                 return torch.floor_divide(x, self.divisor)
 
         example_inputs = (
@@ -239,11 +291,17 @@ class TestAOTInductorPackage(TestCase):
         self.check_model(Model(), example_inputs)
 
     def test_remove_intermediate_files(self):
+        # [FUNCTION DOC] Compiles a model with strict export inside a fresh inductor cache context
+        # so generated intermediate files (such as kernel binaries) are deleted on exit, then
+        # loads the package and checks the output equals eager. Verifies the package does not
+        # depend on those cached paths at run time.
         # For CUDA, generated cpp files contain absolute path to the generated cubin files.
         # With the package artifact, that cubin path should be overridden at the run time,
         # so removing those intermediate files in this test to verify that.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning the sum of two inputs.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the sum of the two inputs.
                 return x + y
 
         example_inputs = (
@@ -273,12 +331,23 @@ class TestAOTInductorPackage(TestCase):
             self.assertEqual(actual, expected)
 
     def test_load_package_from_directory(self):
+        # [FUNCTION DOC] Packages a linear model, extracts the archive to a directory, loads it
+        # from the directory and checks outputs. Then extracts another copy, renames the model
+        # folder, and expects a runtime error when loading the old model name. Moves all contents
+        # into a nested folder and checks that loading from the root still finds and runs the
+        # model. After deleting the loaded models and collecting garbage, asserts the directory
+        # still exists and is non-empty, i.e. directory-based loads do not delete files. Temporary
+        # directories are removed in finally blocks.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a 10 by 10 linear layer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(10, 10)
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the first input plus the linear layer applied to
+                # the second.
                 return x + self.linear(y)
 
         example_inputs = (
@@ -360,12 +429,18 @@ class TestAOTInductorPackage(TestCase):
                     shutil.rmtree(temp_dir)
 
     def test_linear(self):
+        # [FUNCTION DOC] Compares a compiled linear-plus-add model with eager via the
+        # shared check.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a 10 by 10 linear layer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(10, 10)
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the first input plus the linear layer applied to
+                # the second.
                 return x + self.linear(y)
 
         example_inputs = (
@@ -380,14 +455,24 @@ class TestAOTInductorPackage(TestCase):
         "Test is only supported on CUDA {}.{}+".format(*TRITON_PTXAS_VERSION),
     )
     def test_compile_after_package(self):
+        # [FUNCTION DOC] Skipped in FB code, or on CUDA older than the ptxas-compatible
+        # version; requires the cpp-only variant and cmake. Packages with kernel binaries
+        # embedded, extracts and builds the sources, and on GPU asserts no raw kernel binary
+        # files remain and that kernel objects are present either per kernel or as one combined
+        # object file. Then asserts the shared library was built, loads it and checks the
+        # result is close to eager.
         self.check_package_cpp_only()
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a 10 by 10 linear layer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(10, 10)
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the first input plus the linear layer applied to
+                # the second.
                 return x + self.linear(y)
 
         with torch.no_grad():
@@ -429,16 +514,24 @@ class TestAOTInductorPackage(TestCase):
     @requires_triton_ptxas_compat
     @unittest.skipIf(IS_FBCODE, "cmake won't work in fbcode")
     def test_compile_after_package_multi_arch(self):
+        # [FUNCTION DOC] Requires a GPU device, triton ptxas compatibility, cpp-only mode and
+        # cmake; skipped in FB code. Packages with embedded kernel binaries and multi-architecture
+        # kernel emission, builds with cmake, asserts the shared library exists, loads it and
+        # checks closeness to eager.
         if self.device != GPU_TYPE:
             raise unittest.SkipTest(f"Only meant to test {GPU_TYPE}")
         self.check_package_cpp_only()
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a 10 by 10 linear layer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(10, 10)
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the first input plus the linear layer applied to
+                # the second.
                 return x + self.linear(y)
 
         with torch.no_grad():
@@ -473,15 +566,24 @@ class TestAOTInductorPackage(TestCase):
     @requires_triton_ptxas_compat
     @torch._inductor.config.patch("test_configs.use_libtorch", True)
     def test_compile_after_package_static(self):
+        # [FUNCTION DOC] Skipped in FB code; needs triton ptxas compatibility, test config using
+        # libtorch, and cmake (standalone compile forces cpp-only). Builds a standalone static
+        # library three ways: default name expecting the default model static library, a given
+        # model name expecting a library with that name, and an invalid name containing a slash,
+        # which must raise an error whose message mentions an invalid model name.
         # compile_standalone will set package_cpp_only=True
         self.check_package_cpp_only()
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a 10 by 10 linear layer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(10, 10)
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the first input plus the linear layer applied to
+                # the second.
                 return x + self.linear(y)
 
         with torch.no_grad():
@@ -532,14 +634,20 @@ class TestAOTInductorPackage(TestCase):
     @requires_triton_ptxas_compat
     @torch._inductor.config.patch("test_configs.use_libtorch", True)
     def test_compile_standalone_cos(self):
+        # [FUNCTION DOC] Skipped in FB code; needs triton ptxas compatibility, libtorch test
+        # config and cmake. Builds a standalone static library for a cosine model named cos and
+        # asserts the library file with that name is produced.
         # compile_standalone will set package_cpp_only=True
         self.check_package_cpp_only()
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module applying cosine to its input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Only calls the parent constructor.
                 super().__init__()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the cosine of the input.
                 return torch.cos(x)
 
         with torch.no_grad():
@@ -565,17 +673,30 @@ class TestAOTInductorPackage(TestCase):
     @requires_triton_ptxas_compat
     @torch._inductor.config.patch("test_configs.use_libtorch", True)
     def test_compile_with_exporter(self):
+        # [FUNCTION DOC] Skipped in FB code; needs the cpp-only variant, cmake, ptxas
+        # compatibility and the libtorch config. Registers an add model and a subtract model in
+        # an exporter package with a placeholder overload, runs each on ones, then for both
+        # settings of whether to package example inputs it compiles and packages to a temp dir,
+        # builds and runs the generated program, and when example inputs were packaged asserts
+        # the program prints the expected 3 by 3 tensors (all twos, all zeros) with the
+        # device-specific type tag.
         self.check_package_cpp_only()
 
         class Model1(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning the sum of its inputs.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the sum of the two inputs.
                 return x + y
 
         class Model2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning the difference of its inputs.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the first input minus the second.
                 return x - y
 
         def default(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Placeholder overload implementation that accepts anything and
+            # returns None.
             return None
 
         example_inputs = (
@@ -615,18 +736,27 @@ class TestAOTInductorPackage(TestCase):
     @unittest.skipIf(IS_FBCODE, "cmake won't work in fbcode")
     @torch._inductor.config.patch("test_configs.use_libtorch", True)
     def test_compile_with_exporter_weights(self):
+        # [FUNCTION DOC] Same setup as the exporter test but with a single linear model: packages
+        # it with the exporter API, builds and runs the generated program, loads the saved output
+        # module file produced by it and asserts its first parameter equals the eager model output
+        # on ones, which for this model checks weight round-tripping.
         self.check_package_cpp_only()
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a 3 by 3 linear layer.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the linear layer.
                 super().__init__()
                 self.fc1 = torch.nn.Linear(3, 3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the linear layer applied to the input.
                 x = self.fc1(x)
                 return x
 
         def default(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Placeholder overload implementation that accepts anything and
+            # returns None.
             return None
 
         example_inputs = (torch.ones(3, 3).to(self.device),)
@@ -654,12 +784,22 @@ class TestAOTInductorPackage(TestCase):
             self.assertEqual(expected_res, true_res)
 
     def test_metadata(self):
+        # [FUNCTION DOC] Compiles a model with custom metadata and checks it can be read back.
+        # Reads metadata straight from the package file, from an extracted directory, and from
+        # that directory after moving contents into a nested folder, each time expecting the same
+        # mapping containing the custom entry. Verifies every key and value of the current device
+        # information appears in the stored metadata, loads the package, checks outputs against
+        # eager, and checks the loaded model getter also returns the custom entry.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a 10 by 10 linear layer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(10, 10)
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the first input plus the linear layer applied to
+                # the second.
                 return x + self.linear(y)
 
         example_inputs = (
@@ -734,9 +874,15 @@ class TestAOTInductorPackage(TestCase):
         self.assertEqual(loaded_metadata.get("dummy"), "moo")
 
     def test_bool_input(self):
+        # [FUNCTION DOC] Compares a model that takes a boolean second input and picks multiply or
+        # add by it; the compiled code specializes on the example value (true).
         # Specialize on whichever branch the example input for b is
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning the square of x when the flag is true and the
+            # doubled x otherwise.
             def forward(self, x, b):
+                # [FUNCTION DOC] HELPER: Branches on the flag: returns the product of x with
+                # itself if true, else x plus x.
                 if b:
                     return x * x
                 else:
@@ -746,16 +892,24 @@ class TestAOTInductorPackage(TestCase):
         self.check_model(Model(), example_inputs)
 
     def test_multiple_methods(self):
+        # [FUNCTION DOC] Compiles two different models (concatenation with dynamic sizes, and a
+        # scaled input using a device tensor) with the packaging option into raw AOTInductor
+        # outputs, bundles both into one pt2 archive under two names, loads each by name and
+        # asserts both match their eager exported modules.
         options = {
             "aot_inductor.package": True,
             "aot_inductor.package_cpp_only": self.package_cpp_only,
         }
 
         class Model1(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module concatenating two inputs along the first dimension.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Only calls the parent constructor.
                 super().__init__()
 
             def forward(self, a, b):
+                # [FUNCTION DOC] HELPER: Returns the concatenation of the inputs along
+                # dimension zero.
                 return torch.cat([a, b], dim=0)
 
         dim0_a = Dim("dim0_a", min=1, max=10)
@@ -773,11 +927,17 @@ class TestAOTInductorPackage(TestCase):
         )
 
         class Model2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module scaling the input by the square root of three times the
+            # last dimension size, computed with a device tensor.
             def __init__(self, device):
+                # [FUNCTION DOC] HELPER: Stores the device.
                 super().__init__()
                 self.device = device
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Creates a float tensor holding the last dimension size on
+                # the device, takes the square root of three times it, and returns the input
+                # scaled by it.
                 t = torch.tensor(x.size(-1), device=self.device, dtype=torch.float)
                 t = torch.sqrt(t * 3)
                 return x * t
@@ -800,6 +960,9 @@ class TestAOTInductorPackage(TestCase):
 
     @unittest.skipIf(not HAS_GPU, "requires gpu")
     def test_duplicate_calls(self):
+        # [FUNCTION DOC] Skipped without a GPU. Runs the shared check on a GPU-input model, then
+        # compiles the same concatenation model once for the GPU and once for cpu inputs, packages
+        # both into one archive, loads each and asserts each matches eager.
         options = {
             "aot_inductor.package": True,
         }
@@ -807,10 +970,14 @@ class TestAOTInductorPackage(TestCase):
         device = GPU_TYPE
 
         class Model1(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module concatenating two inputs along the first dimension.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Only calls the parent constructor.
                 super().__init__()
 
             def forward(self, a, b):
+                # [FUNCTION DOC] HELPER: Returns the concatenation of the inputs along
+                # dimension zero.
                 return torch.cat([a, b], dim=0)
 
         dim0_a = Dim("dim0_a", min=1, max=10)
@@ -855,11 +1022,18 @@ class TestAOTInductorPackage(TestCase):
         )
 
     def test_specified_output_dir(self):
+        # [FUNCTION DOC] Compiles a concatenation model with an explicit output path option and
+        # packaging enabled, packages the files into an archive, loads it by name and asserts
+        # closeness to eager.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module concatenating two inputs along the first dimension.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Only calls the parent constructor.
                 super().__init__()
 
             def forward(self, a, b):
+                # [FUNCTION DOC] HELPER: Returns the concatenation of the inputs along
+                # dimension zero.
                 return torch.cat([a, b], dim=0)
 
         example_inputs = (
@@ -884,11 +1058,17 @@ class TestAOTInductorPackage(TestCase):
         )
 
     def test_save_buffer(self):
+        # [FUNCTION DOC] Compiles and packages into an in-memory byte buffer instead of a file,
+        # then loads the package from the buffer twice and asserts each load is close to eager.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module concatenating two inputs along the first dimension.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Only calls the parent constructor.
                 super().__init__()
 
             def forward(self, a, b):
+                # [FUNCTION DOC] HELPER: Returns the concatenation of the inputs along
+                # dimension zero.
                 return torch.cat([a, b], dim=0)
 
         example_inputs = (
@@ -910,12 +1090,20 @@ class TestAOTInductorPackage(TestCase):
         "No support for cpp only",
     )
     def test_package_without_weight(self):
+        # [FUNCTION DOC] Skipped in cpp-only mode. Compiles a linear model keeping tensor
+        # constants but not packaging them in the shared object, asserts the compiled model
+        # reports constant names equal to the state dict keys, loads the weights with a
+        # full-update check, and asserts outputs match eager on new inputs.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping one linear layer from k to n features on a
+            # given device.
             def __init__(self, n, k, device):
+                # [FUNCTION DOC] HELPER: Creates the linear layer on the device.
                 super().__init__()
                 self.linear = torch.nn.Linear(k, n, device=device)
 
             def forward(self, a):
+                # [FUNCTION DOC] HELPER: Returns the linear layer applied to the input.
                 return self.linear(a)
 
         M, N, K = 128, 2048, 4096
@@ -944,12 +1132,21 @@ class TestAOTInductorPackage(TestCase):
         "No support for cpp only",
     )
     def test_package_user_managed_weight(self):
+        # [FUNCTION DOC] Skipped in cpp-only mode. Compiles a linear model with weights outside
+        # the shared object; loads weights with copying (not user managed) and checks eager
+        # equality, then scales the eager weights in place and asserts the compiled output is
+        # unchanged. Recompiles and loads with user-managed weights, checks equality, scales
+        # weights in place again and asserts the compiled output now follows the eager model.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping one linear layer from k to n features on a
+            # given device.
             def __init__(self, n, k, device):
+                # [FUNCTION DOC] HELPER: Creates the linear layer on the device.
                 super().__init__()
                 self.linear = torch.nn.Linear(k, n, device=device)
 
             def forward(self, a):
+                # [FUNCTION DOC] HELPER: Returns the linear layer applied to the input.
                 return self.linear(a)
 
         M, N, K = 128, 4096, 4096
@@ -997,8 +1194,12 @@ class TestAOTInductorPackage(TestCase):
         self.assertEqual(new_output, expected)
 
     def test_deepcopy_compiled_model(self):
+        # [FUNCTION DOC] Compiles an add model, deep copies the compiled object, and asserts both
+        # original and copy match eager.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning the sum of its inputs.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the sum of the two inputs.
                 return x + y
 
         example_inputs = (
@@ -1023,12 +1224,20 @@ class TestAOTInductorPackage(TestCase):
         "No support for cpp only",
     )
     def test_update_weights(self):
+        # [FUNCTION DOC] Skipped in cpp-only mode. Compiles a linear model via the shared check,
+        # loads a new random state dict into the eager model, pushes the same weights into the
+        # compiled model with a full-update check, and asserts the compiled output matches the
+        # updated eager model.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping one linear layer from k to n features on a
+            # given device.
             def __init__(self, n, k, device):
+                # [FUNCTION DOC] HELPER: Creates the linear layer on the device.
                 super().__init__()
                 self.linear = torch.nn.Linear(k, n, device=device)
 
             def forward(self, a):
+                # [FUNCTION DOC] HELPER: Returns the linear layer applied to the input.
                 return self.linear(a)
 
         M, N, K = 128, 2048, 4096
@@ -1055,6 +1264,14 @@ class TestAOTInductorPackage(TestCase):
         "No support for cpp only",
     )
     def test_package_shared_weights(self):
+        # [FUNCTION DOC] Skipped in cpp-only mode. Two modules share a buffer parameter and a
+        # buffer sliced from another; they mutate them in place and return them. Both are compiled
+        # with constants stored on disk in pickled-weights format and bundled in one archive, then
+        # loaded with weights from disk so runners share storage. Asserts the first run yields
+        # values incremented by one, the second runner sees increments accumulated (total of four
+        # on the sliced buffer), and earlier returned results do not change. Then loads
+        # user-provided state dicts into the contents and asserts the first runner again returns
+        # incremented values and the source modules reflect them.
         options = {
             "aot_inductor.package": True,
             "aot_inductor.package_cpp_only": self.package_cpp_only,
@@ -1064,23 +1281,35 @@ class TestAOTInductorPackage(TestCase):
         }
 
         class Bar(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a buffer attribute and a registered buffer;
+            # forward increments both by one in place and returns them.
             def __init__(self, p1, p2):
+                # [FUNCTION DOC] HELPER: Stores the first tensor as an attribute and registers the
+                # second as a buffer.
                 super().__init__()
                 self.p1 = p1
                 self.register_buffer("p2", p2)
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Adds one to both stored tensors in place and returns
+                # the pair.
                 self.p1 += 1
                 self.p2 += 1
                 return self.p1, self.p2
 
         class Bar2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Like the first module but registers a one-row slice of the
+            # second tensor and increments both by three.
             def __init__(self, p1, p2):
+                # [FUNCTION DOC] HELPER: Stores the first tensor and registers a slice of the
+                # second as a buffer.
                 super().__init__()
                 self.p1 = p1
                 self.register_buffer("p2", p2[2:3])
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Adds three to both stored tensors in place and returns
+                # the pair.
                 self.p1 += 3
                 self.p2 += 3
                 return self.p1, self.p2
@@ -1139,6 +1368,10 @@ class TestAOTInductorPackage(TestCase):
         "No support for cpp only",
     )
     def test_package_weights_on_disk_nested_module(self):
+        # [FUNCTION DOC] Skipped in cpp-only mode. Packages a module that has a nested linear
+        # layer with on-disk pickled weights, loads the package with weights read from disk and
+        # asserts the runner output equals eager. Checks that packaged weight names use the
+        # original dotted parameter name rather than the flattened node name.
         options = {
             "aot_inductor.package": True,
             "aot_inductor.package_cpp_only": self.package_cpp_only,
@@ -1151,11 +1384,14 @@ class TestAOTInductorPackage(TestCase):
         # This unit test tests that we package the right weight name
         # `liear.weight`, but not `linear_weight`
         class Bar(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with one 3 by 3 linear layer.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(3, 3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the linear layer applied to the input.
                 return self.linear(x)
 
         x = torch.randn(3, 3).to(self.device)
@@ -1169,8 +1405,13 @@ class TestAOTInductorPackage(TestCase):
         self.assertEqual(loaded1(x), bar1(x))
 
     def test_loading_wrong_model(self):
+        # [FUNCTION DOC] Packages an add-one model, then tries to load it under a model name that
+        # does not exist in the archive and expects a runtime error stating that no generated cpp
+        # or shared object was found for that model.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module adding one to its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input plus one.
                 return x + 1
 
         example_inputs = (torch.randn(10, 10, device=self.device),)

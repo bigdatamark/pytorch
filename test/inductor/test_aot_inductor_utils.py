@@ -1,4 +1,10 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Shared helpers for AOTInductor tests: a wrapper module for plain callables, a
+# utility class with legacy (shared library) and package-based compile, load and run helpers, and
+# three check functions meant to be attached to test classes as methods (compare compiled against
+# eager, same for several input sets, count a string in generated C++). No import-time side
+# effects other than imports; the type-checking-only import is skipped at runtime. Running the
+# file directly invokes the test runner.
 
 import copy
 import os
@@ -26,15 +32,23 @@ if TYPE_CHECKING:
 
 
 class WrapperModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Module that wraps any callable so plain functions can be exported. Holds
+    # the callable as the attribute model and forwards all positional and keyword arguments to it.
     def __init__(self, model):
+        # [FUNCTION DOC] HELPER: Stores the wrapped callable.
         super().__init__()
         self.model = model
 
     def forward(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Calls the wrapped callable with the given arguments and returns
+        # its result.
         return self.model(*args, **kwargs)
 
 
 class AOTIRunnerUtil:
+    # [CLASS DOC] HELPER: Namespace of static methods (no state) that compile models with
+    # AOTInductor and load or run them. Legacy methods produce and load a shared library path; the
+    # non-legacy ones go through the export, package and load flow.
     @staticmethod
     def legacy_compile(
         model,
@@ -43,6 +57,12 @@ class AOTIRunnerUtil:
         dynamic_shapes=None,
         disable_constraint_solver=False,
     ):
+        # [FUNCTION DOC] HELPER: Exports a model to a graph module and AOT compiles it to a shared
+        # library, returning its path. Wraps non-module callables first. Uses pre-dispatch export
+        # when that inductor option is set, otherwise the older export-to-IR path with the new
+        # tracer config patched on and fully qualified names not restored; the constraint solver
+        # can be disabled by argument. In FB code it adds a thrift extern node serializer to the
+        # options (creating them if absent). Compilation runs without gradients.
         if not isinstance(model, torch.nn.Module):
             model = WrapperModule(model)
         # The exact API is subject to change
@@ -79,6 +99,12 @@ class AOTIRunnerUtil:
 
     @staticmethod
     def legacy_load_runner(device, so_path: str) -> "AOTIModelContainerRunner":
+        # [FUNCTION DOC] HELPER: Creates a model container runner for a compiled library. In FB
+        # code the library (and a matching json of extern kernel nodes, if present) is copied to
+        # a fresh temporary directory first to avoid stale dynamic-loading handles, and the
+        # pybind runner is returned. Otherwise returns the CPU, XPU, MPS or CUDA runner
+        # depending on the device string (any other value is treated as CUDA), each created with
+        # one model instance.
         if IS_FBCODE:
             from .fb import test_aot_inductor_model_runner_pybind  # @manual
 
@@ -110,11 +136,19 @@ class AOTIRunnerUtil:
 
     @staticmethod
     def legacy_load(device, so_path):
+        # [FUNCTION DOC] HELPER: Loads a compiled library as a callable. In FB code it builds a
+        # runner and returns a function that reads the stored call spec, flattens args and kwargs
+        # by the input tree spec, keeps only tensors, runs the runner and rebuilds the output by
+        # the output tree spec. Elsewhere it returns the result of the export module loader for
+        # the path and device. A TODO notes the two paths should be unified.
         # TODO: unify fbcode and oss behavior to only use torch._export.aot_load
         if IS_FBCODE:
             runner = AOTIRunnerUtil.legacy_load_runner(device, so_path)
 
             def optimized(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Callable returned for FB code: flattens inputs using the
+            # saved call spec, filters to tensors, runs the runner and unflattens outputs into the
+            # original structure.
                 call_spec = runner.get_call_spec()
                 in_spec = pytree.treespec_loads(call_spec[0])
                 out_spec = pytree.treespec_loads(call_spec[1])
@@ -136,6 +170,9 @@ class AOTIRunnerUtil:
         dynamic_shapes=None,
         disable_constraint_solver=False,
     ):
+        # [FUNCTION DOC] HELPER: Compiles the model through the legacy path, loads the library for
+        # the device, and returns the result of calling it on the example inputs. Options, dynamic
+        # shapes and the constraint solver flag are passed through to compile.
         so_path = AOTIRunnerUtil.legacy_compile(
             model,
             example_inputs,
@@ -153,6 +190,10 @@ class AOTIRunnerUtil:
         inductor_configs: dict[str, Any] | None = None,
         dynamic_shapes: dict[str, Any] | tuple[Any] | list[Any] | None = None,
     ):
+        # [FUNCTION DOC] HELPER: Exports the model (wrapping non-modules) in strict mode with
+        # deferred runtime asserts preferred over guards, under no-grad with the new tracer config
+        # patched, then packages it with AOTInductor using the given inductor configs. Returns the
+        # path to the produced package.
         if not isinstance(model, torch.nn.Module):
             # This should really be the default behavior of torch.export.export
             model = WrapperModule(model)
@@ -181,6 +222,8 @@ class AOTIRunnerUtil:
         inductor_configs: dict[str, Any] | None = None,
         dynamic_shapes: dict[str, Any] | tuple[Any] | list[Any] | None = None,
     ):
+        # [FUNCTION DOC] HELPER: Compiles the model to a package, loads the package and returns
+        # the result of calling the loaded model on the example inputs.
         package_path = AOTIRunnerUtil.compile(
             model,
             example_inputs,
@@ -197,6 +240,8 @@ class AOTIRunnerUtil:
         inductor_configs: dict[str, Any] | None = None,
         dynamic_shapes: dict[str, Any] | tuple[Any] | list[Any] | None = None,
     ):
+        # [FUNCTION DOC] HELPER: Compiles a package using the first set of example inputs, loads
+        # it, then calls it once for every set of inputs and returns the list of outputs in order.
         package_path = AOTIRunnerUtil.compile(
             model,
             list_example_inputs[0],
@@ -220,6 +265,13 @@ def check_model(
     rtol=None,
     move_model_to_device=True,
 ):
+    # [FUNCTION DOC] HELPER: Check method for test classes (first parameter is the test case).
+    # Under no-grad and with the stack-allocation and minimal-arrayref options taken from the test
+    # case, it seeds the random generator, optionally moves the model to the test device, and if
+    # all tensor inputs are on cpu clones them to the test device preserving strides and offset.
+    # It runs a deep copy of the model on copied inputs as the reference, reseeds, runs the
+    # AOTInductor path, and asserts the outputs are equal with the given tolerances. The options
+    # argument is forwarded as the inductor configs.
     with (
         torch.no_grad(),
         config.patch(
@@ -266,6 +318,10 @@ def check_model_with_multiple_inputs(
     options=None,
     dynamic_shapes=None,
 ):
+    # [FUNCTION DOC] HELPER: Check method like the single-input one but for a list of input
+    # tuples. Moves the model to the test device, computes eager reference outputs on copied
+    # inputs, runs the compiled package on every input set, and asserts the output lists match
+    # according to the dynamo same-comparison helper.
     with (
         torch.no_grad(),
         config.patch(
@@ -296,6 +352,9 @@ def code_check_count(
     target_str: str,
     target_count: int,
 ):
+    # [FUNCTION DOC] HELPER: Check method that AOT compiles the model with the stack-allocation
+    # and minimal-arrayref options from the test case, reads the generated C++ file next to the
+    # produced path, and asserts the target string appears exactly the target number of times.
     with (
         torch.no_grad(),
         config.patch(

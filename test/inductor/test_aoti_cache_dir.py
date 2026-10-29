@@ -1,4 +1,6 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Regression test that AOTInductor packaging works when the inductor cache directory
+# is given as a relative path through the environment. No import-time side effects beyond imports.
 
 import os
 import tempfile
@@ -11,13 +13,26 @@ from torch._inductor.utils import clear_caches
 
 
 class TestAOTICacheDir(TestCase):
+    # [CLASS DOC] Single-test case class checking cache-directory normalization during packaging.
     def test_aoti_compile_package_with_relative_cache_dir(self):
+        # [FUNCTION DOC] Exports a small linear-plus-relu model with a dynamic batch dimension
+        # while the current directory is a fresh temporary directory and the cache-dir environment
+        # variable is the relative name cache. Compiles and packages it, then asserts the returned
+        # path equals the requested package path, the package file exists, and the environment
+        # variable was rewritten to the absolute cache path. Side effects: changes the working
+        # directory, patches the environment, clears inductor caches before and after; the
+        # original working directory is restored in a finally block.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Tiny module with one linear layer (10 to 16 features) followed
+            # by a relu.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Builds the single linear submodule.
                 super().__init__()
                 self.linear = torch.nn.Linear(10, 16)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer to the input and then relu;
+                # returns the tensor.
                 return torch.relu(self.linear(x))
 
         with tempfile.TemporaryDirectory() as tmpdir:

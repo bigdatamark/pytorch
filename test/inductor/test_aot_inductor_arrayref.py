@@ -1,4 +1,11 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] AOTInductor tests for the CPU stack-allocation and minimal array-reference wrapper
+# variants. Imports the shared AOTInductor test template and helpers (falling back to non-package
+# imports), skips or exits early on Windows CI or missing dependencies, defines a table of tests
+# expected to fail or be skipped per variant, and copies every template test into two CPU test
+# classes under variant-specific name suffixes. The minimal-arrayref variant is only populated
+# when running inside FB code. Also holds an extra template with arrayref-specific code-generation
+# checks and a regression test for CPU wrapper class selection.
 import sys
 import unittest
 
@@ -47,6 +54,10 @@ except (unittest.SkipTest, ImportError):
 
 
 def fail_stack_allocation(is_skip=False):
+    # [FUNCTION DOC] HELPER: Builds a failure marker for tests that do not work with stack
+    # allocation. It applies to both the stack-allocation suffix and the
+    # stack-allocation-plus-minimal-arrayref suffix; when the argument asks for it the test is
+    # skipped, otherwise it is an expected failure.
     return TestFailure(
         (
             "cpu_with_stack_allocation",
@@ -57,6 +68,9 @@ def fail_stack_allocation(is_skip=False):
 
 
 def fail_minimal_arrayref_interface(is_skip=False):
+    # [FUNCTION DOC] HELPER: Builds a failure marker that applies only to the
+    # stack-allocation-plus-minimal-arrayref suffix. The skip flag selects skip versus
+    # expected failure.
     return TestFailure(
         ("cpu_with_stack_allocation_and_minimal_arrayref_interface",),
         is_skip=is_skip,
@@ -64,21 +78,38 @@ def fail_minimal_arrayref_interface(is_skip=False):
 
 
 class AOTInductorArrayRefTestsTemplate(AOTInductorTestsTemplate):
+    # [CLASS DOC] Mixin template of extra tests, derived from the main AOTInductor template, that
+    # check generated C++ for the arrayref wrapper. It relies on the target class to supply
+    # device, the stack-allocation flag, the minimal-arrayref flag and the code counting helper.
+    # Only copied into the minimal-arrayref class.
     def test_proxy_executor_runtime_lookup_handles_arrayref_tensor_inputs(self):
+        # [FUNCTION DOC] Registers a custom op with a fake implementation that returns two
+        # tensors, wraps it in a model that sums them, and compiles and runs it under the
+        # configured stack-allocation and minimal-arrayref options while capturing generated C++.
+        # Checks that the C++ compiles (running builds it), the result is close to eager, and
+        # that the generated code contains the proxy executor call and the
+        # borrow-arrayref-as-tensor conversion.
         @torch.library.custom_op(
             "aoti_arrayref_test::proxy_executor_tensor_arg", mutates_args=()
         )
         def proxy_executor_tensor_arg(
             x: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
+            # [FUNCTION DOC] HELPER: Custom op implementation returning the input plus one and the
+            # input plus two as a pair.
             return x + 1, x + 2
 
         @proxy_executor_tensor_arg.register_fake
         def _(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            # [FUNCTION DOC] HELPER: Fake (meta) implementation for the custom op; returns two
+            # empty tensors shaped like the input.
             return torch.empty_like(x), torch.empty_like(x)
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that calls the custom op and adds its two outputs.
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Calls the registered custom op and returns the sum of its
+                # two results.
                 y, z = torch.ops.aoti_arrayref_test.proxy_executor_tensor_arg(x)
                 return y + z
 
@@ -103,8 +134,16 @@ class AOTInductorArrayRefTestsTemplate(AOTInductorTestsTemplate):
         ).run(code)
 
     def test_thread_local_cached_output_uses_brace_init(self):
+        # [FUNCTION DOC] Compiles (without running) a model whose output is a reinterpreted view
+        # of a matmul, under the configured options, and uses a pattern check on the generated C++
+        # to verify that the thread-local cached output is initialized with brace initialization
+        # of an owning tensor handle.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning a one-tuple holding a bit-reinterpretation to a
+            # 32-bit integer view of a matmul.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Multiplies the two inputs as matrices and returns a tuple
+                # with the int32 view of the product.
                 z = torch.matmul(x, y)
                 return (z.view(torch.int32),)
 
@@ -128,8 +167,15 @@ class AOTInductorArrayRefTestsTemplate(AOTInductorTestsTemplate):
         ).run(code)
 
     def test_thread_local_cached_output_uses_brace_init_multi_output(self):
+        # [FUNCTION DOC] Same as the single-output brace-initialization test, but the model
+        # returns two outputs, so the generated C++ must contain two thread-local cached outputs,
+        # each brace-initialized with an owning tensor handle.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning two differently typed views of one
+            # matmul result.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the matmul product viewed as int32 and
+                # as float16.
                 z = torch.matmul(x, y)
                 return z.view(torch.int32), z.view(torch.float16)
 
@@ -155,12 +201,21 @@ class AOTInductorArrayRefTestsTemplate(AOTInductorTestsTemplate):
         ).run(code)
 
     def test_simple_v2_interface(self):
+        # [FUNCTION DOC] Compiles a linear-plus-add model and verifies the generated C++ contains
+        # the second-version minimal arrayref interface with the expected input count of two and
+        # output count of one and the matching size checks. Also asserts, via the code counting
+        # helper, that the first-version minimal arrayref entry point appears exactly once.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with one 10 by 10 linear layer; forward adds the first
+            # input to the linear layer applied to the second.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(10, 10)
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the first input plus the linear transform of
+                # the second.
                 return x + self.linear(y)
 
         example_inputs = (
@@ -317,6 +372,10 @@ CPU_TEST_FAILURES = {
 
 
 class AOTInductorTestABICompatibleCpuWithStackAllocation(TestCase):
+    # [CLASS DOC] Empty target class (only configuration attributes) that receives the copied
+    # template tests for the CPU stack-allocation variant. Attributes set the cpu device,
+    # reuse the shared check helpers, enable stack allocation and disable the minimal
+    # arrayref interface.
     device = "cpu"
     device_type = "cpu"
     check_model = check_model
@@ -337,6 +396,9 @@ copy_tests(
 class AOTInductorTestABICompatibleCpuWithStackAllocationAndMinimalArrayRefInterface(
     TestCase
 ):
+    # [CLASS DOC] Target class for the CPU variant with both stack allocation and the minimal
+    # arrayref interface enabled. Carries only configuration attributes and shared check helpers;
+    # test methods are attached via the copy helper when running in FB code.
     device = "cpu"
     device_type = "cpu"
     check_model = check_model
@@ -366,7 +428,14 @@ if IS_FBCODE:
 
 
 class TestCppWrapperCpuSelection(TestCase):
+    # [CLASS DOC] Test case holding a regression test for how the CPU C++ wrapper class is
+    # selected from configuration.
     def test_cpu_cpp_wrapper_follows_current_stack_allocation_config(self):
+        # [FUNCTION DOC] After initializing backend registration, asserts that the wrapper code
+        # generator returned for the cpu device with the C++ wrapper enabled is the
+        # array-reference wrapper when stack allocation is allowed and the plain CPU wrapper when
+        # it is disallowed, using config patches for each case. Guards against the choice being
+        # frozen at first registration.
         # Regression test: the CPU cpp wrapper class (CppWrapperCpu vs
         # CppWrapperCpuArrayRef) must track the current allow_stack_allocation
         # config at each compile. It used to be frozen at the process's first

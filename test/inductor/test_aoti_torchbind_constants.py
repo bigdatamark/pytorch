@@ -1,4 +1,8 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests that torchbind (custom class) constants embedded in an AOTInductor package
+# are reachable after loading through the package loader accessor for custom objects. Determines
+# the device from CUDA availability at import time (module level flag) and skips on CUDA builds
+# lacking triton.
 
 import unittest
 
@@ -13,6 +17,9 @@ HAS_CUDA = torch.cuda.is_available()
 
 
 class TestTorchbindAOTI(TestCase):
+    # [CLASS DOC] Test case verifying the loader exposes live torchbind objects from a
+    # compiled package. Holds no state of its own; each test builds, exports, compiles and
+    # loads its own model.
     """Verify that torchbind constants embedded in an AOTI .pt2 are reachable
     via AOTIModelPackageLoader.get_custom_objs() after load.
 
@@ -24,24 +31,39 @@ class TestTorchbindAOTI(TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] HELPER: Class-level setup. Loads the torchbind test library and registers
+        # fake classes needed by export tracing, then runs the base class setup.
         # Loads the test torchbind library AND registers fake classes for
         # _Foo / _TensorQueue / etc. needed by torch.export tracing.
         init_torchbind_implementations()
         super().setUpClass()
 
     def _make_model(self):
+        # [FUNCTION DOC] HELPER: Returns a fresh module that holds one torchbind Foo object
+        # constructed with 10 and 20 as an attribute; its forward adds the input to the result of
+        # the object's tensor-add method.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module owning a torchbind Foo attribute, used as the
+            # export target.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the torchbind Foo attribute with initial values
+                # 10 and 20.
                 super().__init__()
                 self.attr = torch.classes._TorchScriptTesting._Foo(10, 20)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the Foo tensor-add result on the input plus
+                # the input.
                 return self.attr.add_tensor(x) + x
 
         return M()
 
     @unittest.skipIf(HAS_CUDA and not HAS_TRITON, "requires triton on CUDA builds")
     def test_custom_objs_exposed_through_loader(self):
+        # [FUNCTION DOC] Exports the model, compiles it into a package, loads it with the package
+        # loader and asserts the custom-objects mapping is non-empty and that its first value
+        # looks like a torchbind script object (instance of the script object type or having a
+        # type attribute).
         device = "cuda" if HAS_CUDA else "cpu"
         m = self._make_model().to(device)
         x = torch.randn(2, 3, device=device)
@@ -67,6 +89,11 @@ class TestTorchbindAOTI(TestCase):
 
     @unittest.skipIf(HAS_CUDA and not HAS_TRITON, "requires triton on CUDA builds")
     def test_mutating_custom_obj_after_load_affects_run(self):
+        # [FUNCTION DOC] Compiles and loads the model, checks the baseline output equals 30
+        # times the input plus the input, then finds the Foo object among the loader custom
+        # objects by qualified class name and increments it by 5. Re-running must give 40 times
+        # the input plus the input, proving the returned objects share ownership with the
+        # executor's live state.
         # The central contract: IValues returned by get_custom_objs() share
         # intrusive_ptr ownership with the live entries inside
         # OSSProxyExecutor::custom_objs_, so mutating state on the returned
@@ -104,9 +131,14 @@ class TestTorchbindAOTI(TestCase):
 
     @unittest.skipIf(HAS_CUDA and not HAS_TRITON, "requires triton on CUDA builds")
     def test_custom_objs_empty_when_no_torchbind(self):
+        # [FUNCTION DOC] Compiles and loads a model with no torchbind attributes and asserts the
+        # loader returns an empty mapping of custom objects.
         # A plain model with no torchbind attrs should yield an empty map.
         class Plain(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module without any torchbind attribute; forward adds one to
+            # the input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input plus one.
                 return x + 1
 
         device = "cuda" if HAS_CUDA else "cpu"

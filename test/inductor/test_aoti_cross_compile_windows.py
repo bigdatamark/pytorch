@@ -1,4 +1,13 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for cross-compiling AOTInductor packages from Linux for Windows GPU targets.
+# A framework builds, from model configuration records, a compile test (run on Linux; exports a
+# model and writes a package using Windows cross-target options) and a load test (run on Windows;
+# loads that package and compares with eager). A class decorator discovers model definition
+# methods and attaches both tests under generated names. A second test case checks the helper that
+# creates a MinGW import library for the CUDA runtime, using mocks and temporary directories. When
+# run as a script it consumes two custom command-line options for the package directory and the
+# Windows torch library directory before handing control to the test runner, and runs tests only
+# when a GPU is available.
 import os
 import platform
 import shutil
@@ -19,6 +28,10 @@ from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU, requires_g
 
 @dataclass
 class ModelTestConfig:
+    # [CLASS DOC] HELPER: Dataclass describing one model test case: a name, the model class, a
+    # tuple of example input tensors, optional dynamic shape specs, optional extra inductor
+    # config overrides, and relative and absolute tolerances (both default to 1e-4) for
+    # comparing outputs.
     """Configuration for a model test case."""
 
     name: str
@@ -31,6 +44,10 @@ class ModelTestConfig:
 
 
 class WindowsCrossCompilationTestFramework:
+    # [CLASS DOC] HELPER: Static-style factory (class-level state only) that produces compile
+    # and load test functions for the cross-compilation workflow. State is shared through
+    # class attributes: a lazily created base directory for packages and the path to Windows
+    # torch libraries.
     """
     Framework for testing cross-compilation from Linux to Windows.
 
@@ -42,6 +59,9 @@ class WindowsCrossCompilationTestFramework:
 
     @classmethod
     def base_path(cls) -> Path:
+        # [FUNCTION DOC] HELPER: Returns the base directory for package files, creating a
+        # fresh temporary directory with a cross-compile prefix on first use and caching it on
+        # the class.
         """Get or create the base path for package files."""
         if cls._base_path is None:
             cls._base_path = Path(tempfile.mkdtemp(prefix="aoti_cross_compile_"))
@@ -49,16 +69,24 @@ class WindowsCrossCompilationTestFramework:
 
     @classmethod
     def set_base_path(cls, path: Path | str | None = None) -> None:
+        # [FUNCTION DOC] HELPER: Sets the cached base directory from a path or string; passing
+        # nothing (or an empty value) clears it so a new temporary directory is created on
+        # next use.
         """Set the base path for package files."""
         cls._base_path = Path(path) if path else None
 
     @classmethod
     def set_win_torch_libs_path(cls, path: str | None = None) -> None:
+        # [FUNCTION DOC] HELPER: Stores the directory holding Windows torch libraries (or clears
+        # it with nothing).
         """Set the path for Windows torch libs."""
         cls._win_torch_libs_path = path
 
     @classmethod
     def get_package_path(cls, model_name: str) -> str:
+        # [FUNCTION DOC] HELPER: Ensures the base directory exists and returns, as a string, the
+        # path of the package file for the model name, formed by appending the windows suffix and
+        # the pt2 extension.
         """Get the path for a model's .pt2 package file."""
         package_dir = cls.base_path()
         package_dir.mkdir(parents=True, exist_ok=True)
@@ -66,6 +94,8 @@ class WindowsCrossCompilationTestFramework:
 
     @classmethod
     def get_win_torch_libs_path(cls) -> str:
+        # [FUNCTION DOC] HELPER: Returns the Windows torch libs path as a string; raises a runtime
+        # error if it was never set.
         """Get the path for Windows torch libs."""
         if cls._win_torch_libs_path is None:
             raise RuntimeError("Windows torch libs path not set")
@@ -73,9 +103,18 @@ class WindowsCrossCompilationTestFramework:
 
     @classmethod
     def create_compile_test(cls, config: ModelTestConfig):
+        # [FUNCTION DOC] HELPER: Returns a test function (to be installed as a method) for the
+        # given model config. The function itself does the compile step.
         """Create a compile test method for a model configuration."""
 
         def compile_test(self):
+            # [FUNCTION DOC] HELPER: Test body for Linux-side cross compilation. Skips on Windows
+            # and in FB code, requires the Windows CUDA home environment variable, then under
+            # no-grad builds the model on the GPU device, moves inputs there, exports with the
+            # config dynamic shapes, and calls the AOTInductor compile-and-package with
+            # cross-target windows options (no precompiled headers, constants stored as a binary
+            # blob on disk and not in the shared object, the Windows libs path), merged with any
+            # config overrides. Asserts the package file exists at the expected path.
             if platform.system() == "Windows":
                 raise unittest.SkipTest(
                     "This test should run on Linux for cross-compilation"
@@ -129,9 +168,15 @@ class WindowsCrossCompilationTestFramework:
 
     @classmethod
     def create_load_test(cls, config: ModelTestConfig):
+        # [FUNCTION DOC] HELPER: Returns a test function (to be installed as a method) for the
+        # given model config. The function itself does the load and compare step.
         """Create a load test method for a model configuration."""
 
         def load_test(self):
+            # [FUNCTION DOC] HELPER: Test body for Windows-side loading. Skips on non-Windows, in
+            # FB code, without a GPU, or when the package file produced by the compile step is
+            # missing. Otherwise builds the model on the GPU, loads the package, runs both on the
+            # same inputs under no-grad and asserts outputs are close with the config tolerances.
             if platform.system() != "Windows":
                 raise unittest.SkipTest("This test should run on Windows")
 
@@ -176,6 +221,12 @@ class WindowsCrossCompilationTestFramework:
 
 
 def auto_generate_tests(test_class):
+    # [FUNCTION DOC] HELPER: Class decorator. Scans attributes whose names start with the
+    # define prefix, calls each on an uninitialized instance, and keeps those returning a
+    # config record (any exception is swallowed and that method ignored). For each kept one it
+    # installs a compile test and a load test, named by the model name with the compile or load
+    # suffix, wrapped with the requires-GPU decorator and given step docstrings. Mutates and
+    # returns the class.
     """
     Class decorator to automatically generate compile/load test methods
     from _define_* methods that return ModelTestConfig.
@@ -223,6 +274,9 @@ def auto_generate_tests(test_class):
 
 @auto_generate_tests
 class TestAOTInductorWindowsCrossCompilation(TestCase):
+    # [CLASS DOC] Test case whose compile and load tests are generated by the decorator from the
+    # three define methods below (simple MLP, small CNN, small transformer). It defines no test
+    # methods directly.
     """
     Test class for AOT Inductor Windows cross-compilation.
 
@@ -231,10 +285,15 @@ class TestAOTInductorWindowsCrossCompilation(TestCase):
     """
 
     def _define_simple(self):
+        # [FUNCTION DOC] HELPER: Defines a small two-layer MLP with sigmoid output and returns its
+        # config: name simple, GPU input of batch 8 by 10 features, dynamic batch dimension from 1
+        # to 1024, default tolerances.
         """Define the Simple model and its test configuration."""
 
         class Simple(torch.nn.Module):
+            # [CLASS DOC] HELPER: MLP: linear 10 to 16, relu, linear 16 to 1, sigmoid.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the two linear layers, relu and sigmoid.
                 super().__init__()
                 self.fc1 = torch.nn.Linear(10, 16)
                 self.relu = torch.nn.ReLU()
@@ -242,6 +301,7 @@ class TestAOTInductorWindowsCrossCompilation(TestCase):
                 self.sigmoid = torch.nn.Sigmoid()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the layers in order and returns the result.
                 x = self.fc1(x)
                 x = self.relu(x)
                 x = self.fc2(x)
@@ -256,10 +316,16 @@ class TestAOTInductorWindowsCrossCompilation(TestCase):
         )
 
     def _define_simple_cnn(self):
+        # [FUNCTION DOC] HELPER: Defines a small CNN and returns its config: name simple_cnn,
+        # GPU input of shape 2 by 3 by 32 by 32, dynamic batch from 1 to 16, tolerances relaxed
+        # to 1e-3.
         """Define the SimpleCNN model and its test configuration."""
 
         class SimpleCNN(torch.nn.Module):
+            # [CLASS DOC] HELPER: CNN: 3 to 16 channel convolution with kernel 3, relu, adaptive
+            # average pool to one pixel, flatten, linear 16 to 10.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the convolution, relu, pooling and linear layers.
                 super().__init__()
                 self.conv1 = torch.nn.Conv2d(3, 16, 3)
                 self.relu = torch.nn.ReLU()
@@ -267,6 +333,8 @@ class TestAOTInductorWindowsCrossCompilation(TestCase):
                 self.fc = torch.nn.Linear(16, 10)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs convolution, relu, pooling, flatten from dimension
+                # one and the linear layer; returns the result.
                 x = self.conv1(x)
                 x = self.relu(x)
                 x = self.pool(x)
@@ -284,10 +352,18 @@ class TestAOTInductorWindowsCrossCompilation(TestCase):
         )
 
     def _define_transformer(self):
+        # [FUNCTION DOC] HELPER: Defines a small transformer-style model and returns its config:
+        # name transformer, GPU input of shape 4 by 16 by 128, dynamic batch from 1 to 32,
+        # tolerances 1e-3.
         """Define the SimpleTransformer model and its test configuration."""
 
         class SimpleTransformer(torch.nn.Module):
+            # [CLASS DOC] HELPER: Transformer-like model: embedding linear, multi-head attention,
+            # layer norms, feed-forward network, mean pooling over the sequence and an output
+            # linear layer.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Creates the embedding, 8-head batch-first attention, two
+                # layer norms, feed-forward block and output layers.
                 super().__init__()
                 self.embedding = torch.nn.Linear(128, 256)
                 self.attention = torch.nn.MultiheadAttention(256, 8, batch_first=True)
@@ -301,6 +377,9 @@ class TestAOTInductorWindowsCrossCompilation(TestCase):
                 self.output = torch.nn.Linear(256, 10)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Embeds input, applies self-attention with residual and
+                # norm, feed-forward with residual and norm, averages over the sequence dimension
+                # and applies the output layer.
                 # x shape: (batch, seq_len, input_dim)
                 x = self.embedding(x)
                 attn_out, _ = self.attention(x, x, x)
@@ -322,9 +401,14 @@ class TestAOTInductorWindowsCrossCompilation(TestCase):
 
 
 class TestEnsureMingwCudartImportLib(TestCase):
+    # [CLASS DOC] Unit tests for the helper that creates a MinGW-compatible CUDA runtime import
+    # library. Each test builds a temporary fake CUDA home and library directory in setup and uses
+    # patched environment and subprocess calls.
     """Unit tests for _ensure_mingw_cudart_import_lib."""
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Creates a temporary directory containing a fake CUDA home with a
+        # bin/x64 folder and an empty library directory; stores the paths on the test.
         super().setUp()
         self.tmp_dir = tempfile.mkdtemp(prefix="test_mingw_cudart_")
         self.cuda_home = os.path.join(self.tmp_dir, "cuda")
@@ -333,20 +417,28 @@ class TestEnsureMingwCudartImportLib(TestCase):
         os.makedirs(self.lib_dir, exist_ok=True)
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Removes the temporary directory tree (ignoring errors) and calls
+        # the parent teardown.
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
         super().tearDown()
 
     def _create_fake_dll(self, version: str = "130") -> str:
+        # [FUNCTION DOC] HELPER: Creates an empty cudart DLL file with the given version suffix
+        # (default 130) in the fake bin/x64 folder and returns its path.
         dll_path = os.path.join(self.cuda_home, "bin", "x64", f"cudart64_{version}.dll")
         Path(dll_path).touch()
         return dll_path
 
     def _create_fake_cudart_lib(self) -> str:
+        # [FUNCTION DOC] HELPER: Creates an empty cudart.lib file in the fake library directory
+        # and returns its path.
         lib_path = os.path.join(self.lib_dir, "cudart.lib")
         Path(lib_path).touch()
         return lib_path
 
     def test_noop_when_no_windows_cuda_home(self):
+        # [FUNCTION DOC] With the Windows CUDA home variable removed, the helper called with the
+        # library dir returns an empty list and creates no libcudart.a.
         """Should skip gracefully when WINDOWS_CUDA_HOME is not set."""
         env = os.environ.copy()
         env.pop("WINDOWS_CUDA_HOME", None)
@@ -356,6 +448,8 @@ class TestEnsureMingwCudartImportLib(TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.lib_dir, "libcudart.a")))
 
     def test_noop_when_libcudart_a_already_exists(self):
+        # [FUNCTION DOC] When libcudart.a already exists in the library directory, the helper
+        # returns an empty list and leaves the file in place.
         """Should skip generation if libcudart.a already exists."""
         existing = os.path.join(self.lib_dir, "libcudart.a")
         Path(existing).touch()
@@ -366,6 +460,9 @@ class TestEnsureMingwCudartImportLib(TestCase):
 
     @patch("torch._inductor.cpp_builder._create_msvc_gs_stubs_lib", return_value=None)
     def test_gs_stubs_fallback_when_no_dll_found(self, mock_stubs):
+        # [FUNCTION DOC] With a cudart.lib but no cudart DLL, the helper is expected to call
+        # the stub-library creation function once with the library directory (mocked to
+        # return nothing).
         """Should attempt GS stubs fallback when no cudart64_*.dll is found."""
         self._create_fake_cudart_lib()
         with patch.dict(os.environ, {"WINDOWS_CUDA_HOME": self.cuda_home}):
@@ -377,6 +474,8 @@ class TestEnsureMingwCudartImportLib(TestCase):
         return_value="msvc_gs_stubs",
     )
     def test_gs_stubs_returned_when_no_dll(self, mock_stubs):
+        # [FUNCTION DOC] With a cudart.lib but no DLL and the stub creation function mocked to
+        # return a name, the helper returns a list holding that name.
         """Should return the stubs library name when DLL is unavailable."""
         self._create_fake_cudart_lib()
         with patch.dict(os.environ, {"WINDOWS_CUDA_HOME": self.cuda_home}):
@@ -384,6 +483,8 @@ class TestEnsureMingwCudartImportLib(TestCase):
         self.assertEqual(result, ["msvc_gs_stubs"])
 
     def test_noop_when_no_writable_dir_with_cudart_lib(self):
+        # [FUNCTION DOC] With a DLL present but no cudart.lib in the library directory, the helper
+        # returns an empty list and creates no libcudart.a.
         """Should skip gracefully when no writable directory contains cudart.lib."""
         self._create_fake_dll()
         with patch.dict(os.environ, {"WINDOWS_CUDA_HOME": self.cuda_home}):
@@ -393,6 +494,10 @@ class TestEnsureMingwCudartImportLib(TestCase):
 
     @patch("subprocess.run")
     def test_successful_generation(self, mock_run: MagicMock):
+        # [FUNCTION DOC] With both DLL and cudart.lib present and subprocess mocked, the helper
+        # returns an empty list and runs two commands: first gendef with a dash argument and the
+        # DLL path, then the MinGW dlltool with definition, library, and DLL-name options naming
+        # the DLL file.
         """Should call gendef and dlltool when all conditions are met."""
         dll_path = self._create_fake_dll()
         self._create_fake_cudart_lib()
@@ -425,6 +530,9 @@ class TestEnsureMingwCudartImportLib(TestCase):
     )
     @patch("subprocess.run", side_effect=FileNotFoundError("gendef not found"))
     def test_gs_stubs_fallback_on_gendef_not_found(self, mock_run, mock_stubs):
+        # [FUNCTION DOC] With DLL and lib present but the subprocess call raising file-not-found
+        # (gendef missing) and stubs mocked to a name, the helper returns a list with that name
+        # and calls the stub creation exactly once.
         """Should fall back to GS stubs when gendef is not installed."""
         self._create_fake_dll()
         self._create_fake_cudart_lib()
@@ -437,6 +545,9 @@ class TestEnsureMingwCudartImportLib(TestCase):
 
     @patch("subprocess.run")
     def test_bin_x64_fallback_to_bin(self, mock_run: MagicMock):
+        # [FUNCTION DOC] After removing bin/x64 and putting the DLL directly in bin, with
+        # subprocess mocked, the helper still finds it: two commands run and the first (gendef)
+        # includes the DLL path.
         """Should fall back to bin/ when bin/x64/ does not exist."""
         shutil.rmtree(os.path.join(self.cuda_home, "bin", "x64"))
         bin_dir = os.path.join(self.cuda_home, "bin")
