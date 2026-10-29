@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: distributed checkpointing"]
+
+# [MODULE DOC] Tests for CheckpointReader in the experimental distributed checkpoint
+# package: full reads, device mapping, missing paths, extra keyword arguments, partial
+# reads into a template state dict, reporting of missing keys, and dtype preservation.
+# Each test works on a temporary directory holding a per-rank checkpoint file.
+
 import os
 import shutil
 import tempfile
@@ -13,7 +19,12 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 
 class TestCheckpointReader(TestCase):
+    # [CLASS DOC] Test case for CheckpointReader. Fixtures: a temp directory, rank 0 of 1,
+    # a reader, a nested state dict with tensors, lists, epoch and step, and that state dict
+    # saved as the rank-0 checkpoint file inside a "checkpoint" subdirectory.
     def setUp(self):
+        # [FUNCTION DOC] Creates the temp directory, rank info, reader and sample state
+        # dict, and saves the state dict to the per-rank checkpoint file on disk.
         super().setUp()
         # Create a temporary directory for test checkpoints
         self.temp_dir = tempfile.mkdtemp()
@@ -54,6 +65,12 @@ class TestCheckpointReader(TestCase):
         torch.save(self.state_dict, checkpoint_file)
 
     def move_tensors_to_device(self, state_dict: Any, device: str) -> Any:
+        # [FUNCTION DOC] HELPER: Recursively copies dicts and lists, moving each tensor to
+        # CUDA if the device argument is "cpu" and to CPU for any other value. Non-tensor
+        # leaves are returned unchanged.
+        # KNOWN ISSUE: the direction is inverted relative to the argument (device names
+        # the current device, not the target) and the docstring says it always moves to
+        # CUDA. The method is not used by any test here.
         """
         Recursively move all tensors in a nested dictionary to CUDA.
 
@@ -76,6 +93,10 @@ class TestCheckpointReader(TestCase):
             return state_dict
 
     def deep_compare(self, obj1: Any, obj2: Any) -> bool:
+        # [FUNCTION DOC] HELPER: Structural equality. Dicts must have equal key sets and
+        # equal values; lists/tuples must have equal length and elementwise equality;
+        # tensors compare with exact tensor equality; anything else uses plain equality.
+        # Returns a bool.
         if isinstance(obj1, dict) and isinstance(obj2, dict):
             if obj1.keys() != obj2.keys():
                 return False
@@ -92,10 +113,14 @@ class TestCheckpointReader(TestCase):
             return obj1 == obj2
 
     def tearDown(self):
+        # [FUNCTION DOC] Recursively deletes the temporary directory. Does not call the base
+        # class teardown.
         # Clean up the temporary directory
         shutil.rmtree(self.temp_dir)
 
     def test_read_checkpoint(self):
+        # [FUNCTION DOC] Reads the full checkpoint and checks no keys are reported missing
+        # and the loaded state deeply equals the saved one.
         """Test that read correctly reads a checkpoint file."""
 
         # Call read
@@ -110,6 +135,10 @@ class TestCheckpointReader(TestCase):
         # No hooks to verify since we removed them
 
     def test_read_with_map_location(self):
+        # [FUNCTION DOC] Reads with map_location set to cuda when available, else cpu, and
+        # checks scalar values and that the weight tensor lands on that device type.
+        # KNOWN ISSUE: the same read and the same assertions are repeated twice verbatim,
+        # and the docstring mentions cpu only.
         """Test that read correctly uses the map_location parameter."""
         # Call read with map_location='cpu'
         map_location = "cuda" if torch.cuda.is_available() else "cpu"
@@ -135,6 +164,8 @@ class TestCheckpointReader(TestCase):
         self.assertEqual(read_state_dict["model"]["weight"].device.type, map_location)
 
     def test_read_nonexistent_checkpoint(self):
+        # [FUNCTION DOC] Reading a directory that does not exist must raise
+        # FileNotFoundError.
         """Test that read raises FileNotFoundError for a nonexistent checkpoint."""
         # Set up a path to a nonexistent checkpoint
         nonexistent_path = os.path.join(self.temp_dir, "nonexistent_checkpoint")
@@ -144,12 +175,18 @@ class TestCheckpointReader(TestCase):
             self.reader.read(nonexistent_path)
 
     def test_read_with_kwargs(self):
+        # [FUNCTION DOC] Passes an unrecognized keyword argument to read and only checks
+        # that it does not raise; the result is not inspected.
         """Test that read correctly passes kwargs."""
         # Call read with additional kwargs
         kwargs = {"extra": "value"}
         self.reader.read(self.checkpoint_path, **kwargs)
 
     def test_partial_read(self):
+        # [FUNCTION DOC] Reads with a template state dict naming only optimizer, epoch and
+        # part of the model. Checks the requested entries are filled from the checkpoint
+        # (model weight, optimizer, epoch 5) and that unrequested entries (model bias, step)
+        # are absent.
         """Test that read with state_dict correctly loads only the requested keys."""
         # Create a partial state dictionary with only some keys
         partial_state_dict = {}
@@ -183,6 +220,8 @@ class TestCheckpointReader(TestCase):
         self.assertNotIn("step", updated_state_dict)
 
     def test_partial_read_missing_keys(self):
+        # [FUNCTION DOC] Reads with a template containing keys not in the checkpoint and
+        # checks the second return value lists those top-level keys but not existing ones.
         """Test that partial_read correctly reports missing keys."""
         # Create a partial state dictionary with keys that don't exist in the checkpoint
         partial_state_dict = {
@@ -205,6 +244,9 @@ class TestCheckpointReader(TestCase):
         self.assertNotIn("model", missing_keys)
 
     def test_partial_read_different_dtypes(self):
+        # [FUNCTION DOC] Saves a second checkpoint with float32, float64, int32, int64 and
+        # bool tensors, reads it with a template requesting all of them, and checks each
+        # result has the original dtype and values.
         """Test that partial_read correctly handles different tensor dtypes."""
         # Create a state dictionary with tensors of different dtypes
         dtype_state_dict = {

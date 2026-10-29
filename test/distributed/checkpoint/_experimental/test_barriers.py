@@ -1,5 +1,9 @@
 # Owner(s): ["oncall: distributed checkpointing"]
 
+# [MODULE DOC] Unit tests for TCPStoreBarrier in the experimental distributed checkpoint
+# package. Both torch.distributed.TCPStore and the elastic store barrier helper are
+# replaced with mocks, so no sockets or processes are used.
+
 import unittest.mock as mock
 
 from torch.distributed.checkpoint._experimental.barriers import TCPStoreBarrier
@@ -8,9 +12,15 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 
 class TestBarriers(TestCase):
+    # [CLASS DOC] Tests that TCPStoreBarrier builds its store with the expected arguments
+    # and that each barrier execution writes the rank key and calls the store barrier with
+    # a key prefix suffixed by an incrementing sequence number.
     @mock.patch("torch.distributed.TCPStore")
     @mock.patch("torch.distributed.elastic.utils.store.barrier")
     def test_tcpstore_barrier_initialization(self, _, mock_tcpstore):
+        # [FUNCTION DOC] Constructs a barrier for rank 0 of 4 with mocked store classes and
+        # asserts the TCPStore constructor was called once with host, port, world size,
+        # any timeout, and is_master true because the rank is 0.
         """Test that TCPStoreBarrier initializes correctly."""
         # Setup
         timeout_barrier_init_secs = 60
@@ -49,6 +59,10 @@ class TestBarriers(TestCase):
     @mock.patch("torch.distributed.TCPStore")
     @mock.patch("torch.distributed.elastic.utils.store.barrier")
     def test_execute_barrier(self, mock_barrier, mock_tcpstore):
+        # [FUNCTION DOC] Runs execute_barrier twice on a barrier with a mocked store. Checks
+        # the first call sets the rank0 key to "0" and calls the barrier with the prefix
+        # plus "0", and the second call uses "1" for both, showing the sequence number
+        # increments per execution.
         """Test that execute_barrier calls the barrier function correctly."""
         # Setup
         barrier_prefix = "test_barrier"

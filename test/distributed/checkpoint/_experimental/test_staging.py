@@ -1,5 +1,11 @@
 # Owner(s): ["oncall: distributed checkpointing"]
 
+# [MODULE DOC] Tests for DefaultStager and CheckpointStagerConfig in the experimental
+# distributed checkpoint package: synchronous versus asynchronous (future-returning)
+# staging, option combinations, accelerator tensors, resource cleanup and repeated use.
+# Import-time side effect: instantiates device-type specific test classes (including XPU)
+# into this module's globals; GPU-only tests are skipped without an accelerator.
+
 from concurrent.futures import Future
 from unittest import skipIf
 
@@ -13,7 +19,12 @@ from torch.testing._internal.common_utils import run_tests, TEST_ACCELERATOR, Te
 
 
 class TestDefaultStager(TestCase):
+    # [CLASS DOC] Device-generic test case for DefaultStager. Each test builds a stager
+    # from a CheckpointStagerConfig, stages a state dict (returned directly when sync,
+    # as a Future when async) and closes the stager.
     def setUp(self) -> None:
+        # [FUNCTION DOC] Builds a sample state dict with a linear layer state dict,
+        # optimizer params, epoch, step, a random tensor and a nested mapping.
         super().setUp()
         # Create a test state dictionary with various data types
         self.state_dict = {
@@ -27,6 +38,8 @@ class TestDefaultStager(TestCase):
 
     @skipIf(not TEST_ACCELERATOR, reason="requires GPU")
     def test_sync_staging(self) -> None:
+        # [FUNCTION DOC] With async staging off, stage returns a dict directly; checks it
+        # contains the expected keys and scalar values, then closes the stager.
         """Test synchronous staging."""
         options = CheckpointStagerConfig(use_async_staging=False)
         stager = DefaultStager(options)
@@ -50,6 +63,9 @@ class TestDefaultStager(TestCase):
 
     @skipIf(not TEST_ACCELERATOR, reason="requires GPU")
     def test_async_staging(self) -> None:
+        # [FUNCTION DOC] With async staging on, stage returns a Future; waits for it and
+        # checks the resulting dict has the expected keys and scalar values. Closes the
+        # stager.
         """Test asynchronous staging."""
         options = CheckpointStagerConfig(use_async_staging=True)
         stager = DefaultStager(options)
@@ -73,6 +89,8 @@ class TestDefaultStager(TestCase):
         stager.close()
 
     def test_cuda_non_blocking_without_cuda(self) -> None:
+        # [FUNCTION DOC] Skipped when an accelerator exists. Otherwise requesting
+        # non-blocking copy must make DefaultStager construction raise AssertionError.
         """Test that non-blocking copy fails when CUDA is not available."""
         if torch.accelerator.is_available():
             self.skipTest("CUDA is available, cannot test CUDA unavailable scenario")
@@ -82,6 +100,10 @@ class TestDefaultStager(TestCase):
             DefaultStager(options)
 
     def test_different_option_combinations(self) -> None:
+        # [FUNCTION DOC] Runs staging under several configs (all off, pinned only, shared
+        # memory only, plus async-only and non-blocking-only when an accelerator exists),
+        # each in a subtest. Expects a Future for async configs and a dict otherwise, checks
+        # the model key is present, and closes each stager.
         """Test various combinations of staging options."""
         test_cases = [
             # All disabled
@@ -146,6 +168,9 @@ class TestDefaultStager(TestCase):
 
     @skipIf(not TEST_ACCELERATOR, reason="requires GPU")
     def test_cuda_tensors_staging(self) -> None:
+        # [FUNCTION DOC] Stages a state dict mixing accelerator and CPU tensors with sync
+        # staging; raises AssertionError if the result is not a dict and checks the three
+        # top-level keys are present. Does not verify tensors actually ended up on CPU.
         """Test staging with CUDA tensors."""
         # Create state dict with CUDA tensors
         device = torch.accelerator.current_accelerator()
@@ -174,6 +199,8 @@ class TestDefaultStager(TestCase):
 
     @skipIf(not TEST_ACCELERATOR, reason="requires GPU")
     def test_resource_cleanup(self) -> None:
+        # [FUNCTION DOC] Checks the stager's internal state dict stager exists, then closes
+        # the stager. Nothing is asserted after close.
         """Test that resources are properly cleaned up."""
         options = CheckpointStagerConfig(use_async_staging=False)
         stager = DefaultStager(options)
@@ -185,6 +212,9 @@ class TestDefaultStager(TestCase):
         stager.close()
 
     def test_multiple_staging_operations(self) -> None:
+        # [FUNCTION DOC] Reuses one sync stager for three different state dicts (linear,
+        # conv, optimizer settings), using pinned memory and non-blocking copy only if an
+        # accelerator exists, and checks each result is a dict containing the input keys.
         """Test multiple staging operations with the same stager."""
         options = CheckpointStagerConfig(
             use_async_staging=False,

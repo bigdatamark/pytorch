@@ -1,5 +1,12 @@
 # Owner(s): ["oncall: distributed"]
 
+# [MODULE DOC] HELPER: Shared infrastructure for backend-parameterized c10d tests. Defines
+# dtype groups, a frozen BackendConfig capability record, the C10D_BACKENDS table (gloo,
+# nccl-legacy, nccl2, nccl-lazy) and CUDA_BACKENDS subset, a C10dBackendTest mixin that
+# spawns two processes and initializes a process group, and instantiate_backend_tests,
+# which generates one skip-guarded MultiProcessTestCase subclass per backend into a module
+# namespace. Import-time side effects: builds the constant tables only.
+
 import os
 import unittest
 from dataclasses import dataclass
@@ -38,6 +45,11 @@ COMPLEX_DTYPES = (
 
 @dataclass(frozen=True)
 class BackendConfig:
+    # [CLASS DOC] HELPER: Immutable description of one c10d backend under test: its name,
+    # device type, boolean capability flags (coalescing, bitwise reductions, CUDA graph
+    # barrier, dropped P2P work, sequence numbers, collective timing, work sequence number,
+    # work result, single-tensor gather, uneven all-gather) and the dtype tuples it
+    # supports (standard, float8, premul-sum, complex). Tests read these to gate cases.
     name: str
     device_type: str
     supports_coalescing: bool = False
@@ -124,21 +136,31 @@ CUDA_BACKENDS = tuple(
 
 
 class C10dBackendTest:
+    # [CLASS DOC] HELPER: Mixin placed before MultiProcessTestCase by
+    # instantiate_backend_tests. Expects the generated class attributes backend_name and
+    # device_type plus the base class rank, file_name. Fixes world size at 2, spawns
+    # worker processes in setUp, and provides _init_pg to join a file-store process group.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Property; always 2 processes.
         return 2
 
     @property
     def device(self):
+        # [FUNCTION DOC] HELPER: Property; the CUDA device indexed by this rank for cuda
+        # backends, otherwise a device of the configured type without an index.
         if self.device_type == "cuda":
             return torch.device(self.device_type, self.rank)
         return torch.device(self.device_type)
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Calls the base setUp and then spawns the worker processes.
         super().setUp()
         self._spawn_processes()
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Destroys the default process group if initialized, calls
+        # the base teardown, then removes the store file, ignoring OS errors.
         if dist.is_initialized():
             dist.destroy_process_group()
         super().tearDown()
@@ -148,6 +170,9 @@ class C10dBackendTest:
             pass
 
     def _init_pg(self):
+        # [FUNCTION DOC] HELPER: For cuda backends sets the current CUDA device to this
+        # rank, then initializes the default process group with the test's backend name
+        # over a FileStore at the test's temp file, with a 60 second timeout. Global state.
         if self.device_type == "cuda":
             torch.cuda.set_device(self.rank)
         store = dist.FileStore(self.file_name, self.world_size)
@@ -161,6 +186,12 @@ class C10dBackendTest:
 
 
 def instantiate_backend_tests(namespace, suite_name, base_class, backends):
+    # [FUNCTION DOC] HELPER: For each BackendConfig creates a test class named from the
+    # backend (words title-cased) plus suite_name and "Test", deriving from base_class and
+    # MultiProcessTestCase with the config fields copied as class attributes and the
+    # module set to the caller's. Classes are skipped if the backend is unavailable, and
+    # for cuda backends also if fewer than 2 GPUs. Each is stored in the namespace mapping
+    # (mutated in place) so test discovery finds it. Returns nothing.
     for backend in backends:
         backend_name = backend.name.replace("-", " ").title().replace(" ", "")
         class_name = f"{backend_name}{suite_name}Test"

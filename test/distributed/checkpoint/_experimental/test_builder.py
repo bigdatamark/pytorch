@@ -1,5 +1,9 @@
 # Owner(s): ["oncall: distributed checkpointing"]
 
+# [MODULE DOC] Tests for the experimental checkpoint builder factory functions
+# make_sync_checkpointer and make_async_checkpointer: they check the returned checkpointer
+# type and a real save/load round trip on a temporary directory (single rank, no barrier).
+
 import os
 import shutil
 import tempfile
@@ -21,7 +25,12 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 
 class TestMakeCheckpointer(TestCase):
+    # [CLASS DOC] Test case for the checkpointer factories. State per test: a temporary
+    # directory, a single-rank RankInfo and a small state dict (a linear layer state dict,
+    # optimizer param groups, epoch 5, step 1000).
     def setUp(self) -> None:
+        # [FUNCTION DOC] Creates the temp directory, the rank info (world size 1, rank 0)
+        # and the sample state dict used by every test.
         super().setUp()
         # Create a temporary directory for checkpoints
         self.temp_dir = tempfile.mkdtemp()
@@ -41,10 +50,15 @@ class TestMakeCheckpointer(TestCase):
         }
 
     def tearDown(self) -> None:
+        # [FUNCTION DOC] Recursively deletes the temporary directory. Does not call the base
+        # class teardown.
         # Clean up the temporary directory
         shutil.rmtree(self.temp_dir)
 
     def test_make_sync_checkpointer(self) -> None:
+        # [FUNCTION DOC] Builds a sync checkpointer with barriers disabled, checks the type,
+        # saves (returns None in sync mode), checks the per-rank checkpoint file exists, and
+        # loads back verifying the epoch value.
         """Test creating a synchronous checkpointer using make_sync_checkpointer."""
 
         # Create sync checkpointer using factory function with no barrier
@@ -70,6 +84,10 @@ class TestMakeCheckpointer(TestCase):
         self.assertEqual(loaded_state_dict["epoch"], 5)
 
     def test_make_sync_checkpointer_with_config_first(self) -> None:
+        # [FUNCTION DOC] Same flow as the basic sync test (type, save returns None, file
+        # exists) using a different directory; no load check.
+        # KNOWN ISSUE: despite the name, nothing here tests argument order, since both
+        # arguments are passed by keyword; it duplicates the basic test.
         """Test creating a synchronous checkpointer with config as first parameter."""
         # Create sync checkpointer with config as first parameter
         config = CheckpointerConfig(barrier_config=BarrierConfig(barrier_type=None))
@@ -92,6 +110,9 @@ class TestMakeCheckpointer(TestCase):
         self.assertTrue(os.path.exists(checkpoint_file))
 
     def test_make_sync_checkpointer_with_custom_config(self) -> None:
+        # [FUNCTION DOC] Builds a sync checkpointer passing arguments in the opposite
+        # keyword order with a no-barrier config; checks type, save result, file existence
+        # and a load round trip. Largely duplicates the basic sync test.
         """Test creating a synchronous checkpointer with a custom config."""
         # Create a custom config with no barrier
         config = CheckpointerConfig(barrier_config=BarrierConfig(barrier_type=None))
@@ -120,6 +141,10 @@ class TestMakeCheckpointer(TestCase):
         self.assertEqual(loaded_state_dict["epoch"], 5)
 
     def test_make_async_checkpointer(self) -> None:
+        # [FUNCTION DOC] Builds an async checkpointer whose staging uses non-blocking copy
+        # and pinned memory only when an accelerator is available. Saves, expecting stage
+        # and write futures, waits on both, checks the checkpoint file and load round trip,
+        # and always closes the checkpointer in a finally block.
         """Test creating an asynchronous checkpointer using make_async_checkpointer."""
         # Create async checkpointer using factory function with default parameters
         config: CheckpointerConfig = CheckpointerConfig()

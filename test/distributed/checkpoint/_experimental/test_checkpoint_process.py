@@ -1,5 +1,11 @@
 # Owner(s): ["oncall: distributed checkpointing"]
 
+# [MODULE DOC] Tests for CheckpointProcess in the experimental distributed checkpoint
+# package: the request/response data types, the process config defaults, and a real child
+# process that runs a CheckpointWriter (init, write with plain/future state dicts, init
+# timeout and failure, graceful/forced close, broken pipe, shared-memory tensors across
+# processes). Also defines module-level init functions that must be picklable for the
+# child process. Spawns subprocesses and writes to temporary directories during tests.
 
 import os
 import tempfile
@@ -24,6 +30,9 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 
 def subprocess_init_fn(name: str, parent_pid: int) -> None:
+    # [FUNCTION DOC] HELPER: Child-process init hook for the happy path. Raises
+    # AssertionError if the name is not "test-checkpointer", if it runs in the parent's
+    # own process, or if the current process's parent is not the given parent pid.
     """Initialize the subprocess with some basic checks.
 
     This is similar to the subprocess_init_routine in checkpointing_test.py.
@@ -37,6 +46,8 @@ def subprocess_init_fn(name: str, parent_pid: int) -> None:
 
 
 def failing_subprocess_init_fn(name: str, parent_pid: int) -> None:
+    # [FUNCTION DOC] HELPER: Child-process init hook that ignores its arguments and always
+    # raises RuntimeError, used to test init failure propagation.
     """Initialize function that raises an exception."""
     # Acknowledge parameters to avoid unused variable warnings
     _ = name
@@ -45,12 +56,16 @@ def failing_subprocess_init_fn(name: str, parent_pid: int) -> None:
 
 
 def timedout_subprocess_init_fn(**kwargs: Any) -> None:
+    # [FUNCTION DOC] HELPER: Child-process init hook that ignores its keyword arguments
+    # and sleeps 3 seconds, to exceed a short init timeout.
     # Acknowledge parameters to avoid unused variable warnings
     _ = kwargs
     time.sleep(3)  # Simulate a long initialization
 
 
 def ckpt_writer_init_fn(**kwargs: Any) -> CheckpointWriter:
+    # [FUNCTION DOC] HELPER: Module-level (picklable) factory run in the child process.
+    # Returns a CheckpointWriter built from the config and rank_info keyword arguments.
     """Initialize a CheckpointWriter in the subprocess.
 
     This function is called in the subprocess to create a CheckpointWriter instance.
@@ -63,6 +78,8 @@ def ckpt_writer_init_fn(**kwargs: Any) -> CheckpointWriter:
 
 
 def failing_ckpt_writer_init_fn(**kwargs: Any) -> CheckpointWriter:
+    # [FUNCTION DOC] HELPER: Writer factory that ignores arguments and always raises
+    # RuntimeError. Not used by any test in this file.
     """Initialize function that raises an exception."""
     # Acknowledge parameters to avoid unused variable warnings
     _ = kwargs
@@ -70,10 +87,19 @@ def failing_ckpt_writer_init_fn(**kwargs: Any) -> CheckpointWriter:
 
 
 def shared_tensor_verifier_init_fn(**kwargs: Any) -> CheckpointWriter:
+    # [FUNCTION DOC] HELPER: Writer factory run in the child process. Defines a
+    # CheckpointWriter subclass whose write checks tensors in the received state dict are
+    # in shared memory and returns the instance built from config and rank_info arguments.
     """Initialize a CheckpointWriter that verifies shared memory tensors."""
 
     class SharedTensorVerifier(CheckpointWriter):
+        # [CLASS DOC] HELPER: CheckpointWriter that does not write files. Its write method
+        # asserts tensors arriving through inter-process transfer are shared-memory
+        # tensors and stamps the shared tensor so the parent can detect same-memory access.
         def __init__(self, config=None, rank_info=None, **init_kwargs):
+            # [FUNCTION DOC] HELPER: Calls the base writer constructor with the given or a
+            # default writer config, the rank info, and no barrier or commit hook; extra
+            # keyword arguments are ignored.
             # Acknowledge unused kwargs to avoid linting warnings
             _ = init_kwargs
             super().__init__(
@@ -84,6 +110,11 @@ def shared_tensor_verifier_init_fn(**kwargs: Any) -> CheckpointWriter:
             )
 
         def write(self, state_dict, path, **__):
+            # [FUNCTION DOC] HELPER: Ignores the path. If a shared tensor entry exists,
+            # raises AssertionError unless it is in shared memory, then sets its first
+            # element to 42.0 (visible to the parent). If a regular tensor entry exists,
+            # raises AssertionError unless it has also been moved to shared memory. Returns
+            # None.
             # Acknowledge parameters to avoid unused variable warnings
             _ = path
 
@@ -115,21 +146,29 @@ def shared_tensor_verifier_init_fn(**kwargs: Any) -> CheckpointWriter:
 
 
 class TestRequestTypes(TestCase):
+    # [CLASS DOC] Tests the RequestType enum and the WorkerRequest and WorkerResponse
+    # records used for parent-child communication.
     """Test the request/response data structures."""
 
     def test_request_type_enum(self) -> None:
+        # [FUNCTION DOC] Checks the string values of the PING, WRITE_CHECKPOINT and
+        # TERMINATE_PROCESS request types.
         """Test RequestType enum values."""
         self.assertEqual(RequestType.PING.value, "ping")
         self.assertEqual(RequestType.WRITE_CHECKPOINT.value, "write_checkpoint")
         self.assertEqual(RequestType.TERMINATE_PROCESS.value, "exit")
 
     def test_worker_request(self) -> None:
+        # [FUNCTION DOC] Builds a WorkerRequest and checks the request type and payload
+        # fields are stored.
         """Test WorkerRequest dataclass."""
         request = WorkerRequest(request_type=RequestType.PING, payload={"test": "data"})
         self.assertEqual(request.request_type, RequestType.PING)
         self.assertEqual(request.payload["test"], "data")
 
     def test_worker_response(self) -> None:
+        # [FUNCTION DOC] Builds a WorkerResponse and checks request type, success flag,
+        # empty error message and payload are stored.
         """Test WorkerResponse dataclass."""
         response = WorkerResponse(
             request_type=RequestType.PING,
@@ -144,9 +183,12 @@ class TestRequestTypes(TestCase):
 
 
 class TestCheckpointProcessConfig(TestCase):
+    # [CLASS DOC] Tests the defaults and overrides of CheckpointProcessConfig.
     """Test CheckpointProcessConfig configuration."""
 
     def test_default_options(self) -> None:
+        # [FUNCTION DOC] Checks defaults: 30 second init timeout and 60 second shutdown
+        # timeout.
         """Test default CheckpointProcessConfig."""
         options = CheckpointProcessConfig()
         # Test default values
@@ -154,6 +196,7 @@ class TestCheckpointProcessConfig(TestCase):
         self.assertEqual(options.subprocess_shutdown_timeout_secs, 60)
 
     def test_custom_options(self) -> None:
+        # [FUNCTION DOC] Checks explicit init (10) and shutdown (30) timeouts are kept.
         """Test custom CheckpointProcessConfig."""
         options = CheckpointProcessConfig(
             subprocess_init_timeout_secs=10, subprocess_shutdown_timeout_secs=30
@@ -163,7 +206,13 @@ class TestCheckpointProcessConfig(TestCase):
 
 
 class TestCheckpointProcess(TestCase):
+    # [CLASS DOC] Integration tests that start a real CheckpointProcess (child process
+    # hosting a CheckpointWriter). Fixtures: a single-rank RankInfo, a default writer
+    # config and a small state dict. Most tests wait for process_creation_future, use the
+    # process, and close it to terminate the child.
     def setUp(self) -> None:
+        # [FUNCTION DOC] Creates the rank info (world size 1, rank 0), default writer
+        # config and sample state dict shared by the tests.
         super().setUp()
         """Set up common test fixtures."""
         self.rank_info = RankInfo(
@@ -185,6 +234,10 @@ class TestCheckpointProcess(TestCase):
         writer_init_fn_override=None,
         subprocess_init_timeout_secs=30,
     ):
+        # [FUNCTION DOC] HELPER: Starts and returns a CheckpointProcess using the fixtures.
+        # Optional overrides replace the child init function, its arguments (default name
+        # "test-checkpointer" and current pid) and the writer factory; the init timeout is
+        # set in the process config. Side effect: spawns a child process.
         """Helper to create CheckpointProcess."""
         config = CheckpointProcessConfig(
             subprocess_init_timeout_secs=subprocess_init_timeout_secs,
@@ -207,6 +260,8 @@ class TestCheckpointProcess(TestCase):
         )
 
     def test_checkpoint_process_initialization(self) -> None:
+        # [FUNCTION DOC] Starts the process, waits for creation, checks the child is
+        # alive, closes it, and checks the child is no longer alive.
         """Test that CheckpointProcess initializes and closes correctly."""
         checkpoint_process = self._create_checkpoint_process()
 
@@ -222,6 +277,9 @@ class TestCheckpointProcess(TestCase):
         self.assertFalse(checkpoint_process.process.processes[0].is_alive())
 
     def test_checkpoint_write_sync_state_dict(self) -> None:
+        # [FUNCTION DOC] Writes a plain state dict through the child process into a temp
+        # directory, checks a future is returned, waits for it, then loads the per-rank file
+        # and verifies model, optimizer, epoch and step. Closes the process.
         """Test writing a checkpoint with synchronous state dict."""
         checkpoint_process = self._create_checkpoint_process()
 
@@ -257,6 +315,9 @@ class TestCheckpointProcess(TestCase):
         checkpoint_process.close()
 
     def test_checkpoint_write_future_state_dict(self) -> None:
+        # [FUNCTION DOC] Passes a Future (resolved after a short delay by a thread pool)
+        # as the state dict, waits for the write to finish and checks the checkpoint file
+        # exists. Shuts down the executor and closes the process.
         """Test writing a checkpoint with Future state dict."""
         checkpoint_process = self._create_checkpoint_process()
 
@@ -294,6 +355,8 @@ class TestCheckpointProcess(TestCase):
         checkpoint_process.close()
 
     def test_checkpoint_write_with_kwargs(self) -> None:
+        # [FUNCTION DOC] Writes with extra keyword arguments, expecting them to be accepted
+        # and forwarded without error, and checks the checkpoint file exists.
         """Test checkpoint writing with additional kwargs."""
         checkpoint_process = self._create_checkpoint_process()
 
@@ -323,6 +386,9 @@ class TestCheckpointProcess(TestCase):
         checkpoint_process.close()
 
     def test_subprocess_initialization_timeout(self) -> None:
+        # [FUNCTION DOC] Uses a child init that sleeps 3 seconds with a 1 second timeout;
+        # waiting on the creation future must raise TimeoutError whose message contains
+        # "Timed out". The process is not closed afterwards.
         """Test subprocess initialization timeout."""
 
         # Create checkpoint process with a very short timeout by mocking the initialization
@@ -338,6 +404,8 @@ class TestCheckpointProcess(TestCase):
         self.assertIn("Timed out", str(cm.exception))
 
     def test_subprocess_initialization_failure(self) -> None:
+        # [FUNCTION DOC] Uses a child init that raises; waiting on the creation future must
+        # raise RuntimeError. The process is not closed afterwards.
         """Test subprocess initialization failure."""
         checkpoint_process = self._create_checkpoint_process(
             subprocess_init_fn_override=failing_subprocess_init_fn
@@ -349,6 +417,8 @@ class TestCheckpointProcess(TestCase):
             checkpoint_process.process_creation_future.result()
 
     def test_graceful_termination(self) -> None:
+        # [FUNCTION DOC] Starts the process, checks it is alive, closes it and checks it
+        # has stopped (same checks as the initialization test).
         """Test graceful termination of subprocess."""
         checkpoint_process = self._create_checkpoint_process()
 
@@ -358,6 +428,10 @@ class TestCheckpointProcess(TestCase):
         self.assertFalse(checkpoint_process.process.processes[0].is_alive())
 
     def test_forced_termination(self) -> None:
+        # [FUNCTION DOC] Replaces the process join method with one that reports a timeout,
+        # then closes, intending to trigger the forced kill path.
+        # KNOWN ISSUE: makes no assertion about the process state afterwards (a comment
+        # admits it may be flaky), so it only checks that close does not raise.
         """Test forced termination when graceful termination fails."""
         checkpoint_process = self._create_checkpoint_process()
 
@@ -379,6 +453,9 @@ class TestCheckpointProcess(TestCase):
         # Note: This test might be flaky depending on timing
 
     def test_communication_error_handling(self):
+        # [FUNCTION DOC] Closes the parent end of the pipe to the child, then a write must
+        # raise RuntimeError whose message contains "Child process terminated unexpectedly".
+        # The process is not closed afterwards.
         """Test handling of communication errors."""
         checkpoint_process = self._create_checkpoint_process()
 
@@ -396,6 +473,11 @@ class TestCheckpointProcess(TestCase):
         self.assertIn("Child process terminated unexpectedly", str(cm.exception))
 
     def test_shared_memory_tensor_ipc(self):
+        # [FUNCTION DOC] Uses the verifier writer in the child. Sends a state dict with a
+        # shared-memory tensor and a regular tensor, waits for the write (any child
+        # assertion failure fails the test), checks the shared tensor kept its data pointer
+        # and sharing status, and that the child's marker value 42.0 is visible in the
+        # parent, proving both processes use the same memory. Closes the process.
         """Test that shared memory tensors are backed by the same memory across processes."""
 
         checkpoint_process = self._create_checkpoint_process(

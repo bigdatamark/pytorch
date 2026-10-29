@@ -1,5 +1,12 @@
 # Owner(s): ["oncall: distributed checkpointing"]
 
+# [MODULE DOC] Tests for SyncCheckpointer and AsyncCheckpointer in the experimental
+# distributed checkpoint package. One class runs the same save/load scenarios against both
+# checkpointer kinds (basic round trip, map location, partial and nested loads, strict
+# mode, kwargs); another covers async-only behavior (future results, ordering, error
+# propagation). Real async tests spawn a checkpoint subprocess and use temporary
+# directories; module-level init functions must be picklable for that subprocess.
+
 import os
 import shutil
 import tempfile
@@ -32,6 +39,9 @@ from torch.testing._internal.common_utils import run_tests, skipIfRocm, TestCase
 
 
 def subprocess_init_fn(name: str, parent_pid: int) -> None:
+    # [FUNCTION DOC] HELPER: Child-process init hook for the async checkpointer. Raises
+    # AssertionError if the name is not "test-async-checkpointer", if it runs in the
+    # parent's own process, or if its parent process is not the given pid.
     """Initialize the subprocess for async checkpointer tests."""
     if name != "test-async-checkpointer":
         raise AssertionError(f"Unexpected subprocess name: {name}")
@@ -42,6 +52,8 @@ def subprocess_init_fn(name: str, parent_pid: int) -> None:
 
 
 def ckpt_writer_init_fn(**kwargs) -> CheckpointWriter:
+    # [FUNCTION DOC] HELPER: Module-level (picklable) factory run in the child process;
+    # returns a CheckpointWriter built from the config and rank_info keyword arguments.
     """Initialize a CheckpointWriter in the subprocess."""
     return CheckpointWriter(
         config=kwargs.get("config"),
@@ -50,9 +62,14 @@ def ckpt_writer_init_fn(**kwargs) -> CheckpointWriter:
 
 
 class TestCheckpointer(TestCase):
+    # [CLASS DOC] Runs each scenario in subtests for a sync and an async checkpointer
+    # (created fresh per scenario and always closed). Fixtures: temp directory, rank 0 of
+    # 1, writer config, reader and a small sample state dict.
     """Parameterized tests that work with both sync and async checkpointers."""
 
     def setUp(self):
+        # [FUNCTION DOC] Creates the temp directory, rank info, writer config, reader and
+        # sample state dict.
         super().setUp()
         # Create a temporary directory for checkpoints
         self.temp_dir = tempfile.mkdtemp()
@@ -78,10 +95,14 @@ class TestCheckpointer(TestCase):
         }
 
     def tearDown(self):
+        # [FUNCTION DOC] Recursively deletes the temporary directory. Does not call the base
+        # class teardown.
         # Clean up the temporary directory
         shutil.rmtree(self.temp_dir)
 
     def _create_sync_checkpointer(self) -> SyncCheckpointer:
+        # [FUNCTION DOC] HELPER: Returns a SyncCheckpointer wrapping a plain CheckpointWriter
+        # (no barrier or hooks) and the shared reader.
         """Create a synchronous checkpointer."""
         writer = CheckpointWriter(
             config=self.writer_config,
@@ -90,6 +111,10 @@ class TestCheckpointer(TestCase):
         return SyncCheckpointer(writer, self.reader)
 
     def _create_async_checkpointer(self) -> AsyncCheckpointer:
+        # [FUNCTION DOC] HELPER: Builds an AsyncCheckpointer from an async staging
+        # DefaultStager (shared memory on, pinned memory and non-blocking copy off) and a
+        # CheckpointProcess running a CheckpointWriter in a child process. Blocks until the
+        # child has initialized. Side effect: spawns the child process.
         """Create an asynchronous checkpointer."""
         # Create staging config for async operations
         # Use conservative settings to avoid CUDA issues in test environment
@@ -135,6 +160,8 @@ class TestCheckpointer(TestCase):
         )
 
     def _get_checkpointers(self):
+        # [FUNCTION DOC] HELPER: Returns a list of (label, checkpointer) pairs, one sync and
+        # one async, both newly created (the async one spawns a child process).
         """Get both sync and async checkpointers for parameterized testing."""
         return [
             ("sync", self._create_sync_checkpointer()),
@@ -142,11 +169,16 @@ class TestCheckpointer(TestCase):
         ]
 
     def _save_checkpoint(self, checkpointer: Checkpointer, path, state_dict, **kwargs):
+        # [FUNCTION DOC] HELPER: Saves via the checkpointer and normalizes the result to a
+        # (stage future, write future) pair, using two None values when save returned None
+        # (the sync case).
         """Save checkpoint and handle both sync/async return values."""
         result = checkpointer.save(path, state_dict, **kwargs)
         return (None, None) if result is None else result
 
     def _wait_for_save(self, stage_future, write_future):
+        # [FUNCTION DOC] HELPER: Blocks on the write future then the stage future, skipping
+        # whichever is None; re-raises any exception stored in a future.
         """Wait for save operation to complete."""
         if write_future is not None:
             write_future.result()
@@ -154,6 +186,9 @@ class TestCheckpointer(TestCase):
             stage_future.result()
 
     def test_save_and_load_basic(self):
+        # [FUNCTION DOC] For each checkpointer kind: saves, waits, checks the per-rank file
+        # exists, loads, and verifies model, optimizer, epoch and step. Closes the
+        # checkpointer.
         """Test basic save and load functionality for both sync and async."""
         for checkpointer_type, checkpointer in self._get_checkpointers():
             with self.subTest(checkpointer_type=checkpointer_type):
@@ -187,6 +222,8 @@ class TestCheckpointer(TestCase):
                     checkpointer.close()
 
     def test_load_with_map_location(self):
+        # [FUNCTION DOC] For each kind: saves, then loads with the default map location set
+        # to cpu and checks the model key and epoch value.
         """Test loading with map_location for both sync and async."""
         for checkpointer_type, checkpointer in self._get_checkpointers():
             with self.subTest(checkpointer_type=checkpointer_type):
@@ -214,6 +251,9 @@ class TestCheckpointer(TestCase):
                     checkpointer.close()
 
     def test_partial_load(self):
+        # [FUNCTION DOC] For each kind: saves the full state, loads with a template naming
+        # only model and epoch, and checks epoch equals 5 and step and optimizer are
+        # absent from the result.
         """Test partial loading for both sync and async."""
         for checkpointer_type, checkpointer in self._get_checkpointers():
             with self.subTest(checkpointer_type=checkpointer_type):
@@ -250,6 +290,9 @@ class TestCheckpointer(TestCase):
                     checkpointer.close()
 
     def test_load_strict_mode(self):
+        # [FUNCTION DOC] For each kind: saves only a model, then loads with a template that
+        # also asks for a missing key. Strict loading must raise RuntimeError mentioning
+        # "missing keys"; non-strict loading succeeds and returns the model.
         """Test strict mode loading for both sync and async."""
         for checkpointer_type, checkpointer in self._get_checkpointers():
             with self.subTest(checkpointer_type=checkpointer_type):
@@ -289,6 +332,9 @@ class TestCheckpointer(TestCase):
                     checkpointer.close()
 
     def test_save_with_kwargs(self):
+        # [FUNCTION DOC] For each kind: saves and checks the checkpoint file exists. The
+        # sync case passes arbitrary extra keyword arguments through to the writer; the
+        # async case deliberately passes none, so async kwargs forwarding is not tested.
         """Test save with additional kwargs for both sync and async."""
         for checkpointer_type, checkpointer in self._get_checkpointers():
             with self.subTest(checkpointer_type=checkpointer_type):
@@ -329,6 +375,10 @@ class TestCheckpointer(TestCase):
                     checkpointer.close()
 
     def test_nested_dict_partial_load(self):
+        # [FUNCTION DOC] For each kind: saves a two-level nested state dict, loads with a
+        # nested template requesting one layer weight and one metadata entry, and checks
+        # the requested values (tensor closeness, epoch 10) are present while sibling
+        # entries are absent.
         """Test loading nested dictionaries partially for both sync and async."""
         for checkpointer_type, checkpointer in self._get_checkpointers():
             with self.subTest(checkpointer_type=checkpointer_type):
@@ -396,9 +446,14 @@ class TestCheckpointer(TestCase):
 
 
 class TestAsyncCheckpointerSpecific(TestCase):
+    # [CLASS DOC] Tests for behavior unique to AsyncCheckpointer: futures returned from
+    # save, ordering of consecutive saves, error propagation from the write future and
+    # future results. Same fixtures as the parameterized class.
     """Tests specific to AsyncCheckpointer functionality."""
 
     def setUp(self):
+        # [FUNCTION DOC] Creates the temp directory, rank info, writer config, reader and
+        # sample state dict.
         super().setUp()
         # Create a temporary directory for checkpoints
         self.temp_dir = tempfile.mkdtemp()
@@ -424,10 +479,15 @@ class TestAsyncCheckpointerSpecific(TestCase):
         }
 
     def tearDown(self):
+        # [FUNCTION DOC] Recursively deletes the temporary directory. Does not call the base
+        # class teardown.
         # Clean up the temporary directory
         shutil.rmtree(self.temp_dir)
 
     def _create_async_checkpointer(self) -> AsyncCheckpointer:
+        # [FUNCTION DOC] HELPER: Same construction as the parameterized class helper: async
+        # staging DefaultStager plus a CheckpointProcess child running a CheckpointWriter;
+        # waits for the child to initialize and returns the AsyncCheckpointer.
         """Helper method to create AsyncCheckpointer with real components."""
         # Create staging config for async operations
         # Use conservative settings to avoid CUDA issues in test environment
@@ -474,6 +534,8 @@ class TestAsyncCheckpointerSpecific(TestCase):
 
     @skipIfRocm(msg="https://github.com/pytorch/pytorch/issues/179976")
     def test_async_returns_futures(self):
+        # [FUNCTION DOC] Saving asynchronously returns a pair of Future objects (stage and
+        # write); waits for both and closes the checkpointer. Skipped on ROCm.
         """Test that async save returns futures."""
         checkpointer = self._create_async_checkpointer()
         checkpoint_path = os.path.join(self.temp_dir, "checkpoint_futures")
@@ -497,6 +559,9 @@ class TestAsyncCheckpointerSpecific(TestCase):
             checkpointer.close()
 
     def test_async_sequential_saves_wait(self):
+        # [FUNCTION DOC] Issues two saves back to back (the second with a modified epoch of
+        # 10) without waiting, then waits for both writes and checks each checkpoint file
+        # holds the epoch of its own state dict (5 and 10).
         """Test that sequential async saves wait for previous operations."""
         checkpointer = self._create_async_checkpointer()
 
@@ -540,6 +605,8 @@ class TestAsyncCheckpointerSpecific(TestCase):
             checkpointer.close()
 
     def test_async_multiple_saves_ordering(self):
+        # [FUNCTION DOC] Issues three saves with epochs 1 to 3 without waiting in between,
+        # waits for all futures, and checks each checkpoint file contains its own epoch.
         """Test that multiple async saves maintain proper ordering."""
         checkpointer = self._create_async_checkpointer()
 
@@ -581,6 +648,10 @@ class TestAsyncCheckpointerSpecific(TestCase):
             checkpointer.close()
 
     def test_async_error_handling(self):
+        # [FUNCTION DOC] Builds an AsyncCheckpointer from mocks: staging returns a completed
+        # future and the process write returns a future holding a RuntimeError. Saving does
+        # not raise; the exception surfaces only when the write future's result is read,
+        # with the message "Write failed". No real I/O happens.
         """Test error handling in async operations."""
         # Create checkpointer with mocked components to simulate errors
         mock_stager = Mock()
@@ -617,6 +688,8 @@ class TestAsyncCheckpointerSpecific(TestCase):
             checkpointer.close()
 
     def test_async_future_results(self):
+        # [FUNCTION DOC] Saves asynchronously and checks both futures complete with a None
+        # result: the stage future is a completion signal only, not a data carrier.
         """Test the results returned by async futures."""
         checkpointer = self._create_async_checkpointer()
         checkpoint_path = os.path.join(self.temp_dir, "checkpoint_results")
