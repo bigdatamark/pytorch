@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Provides a process-wide recorder of CUDA-graph topology for the CUPTI profiler: per-node
+# predecessor lists, event handles of event-record nodes, and host-function names/addresses
+# of host nodes, all keyed by graph node id. It is armed once early (before graphs are
+# instantiated) via a graph-instantiate hook, and its maps persist for the whole process so
+# per-window observers can read topology recorded before they existed. Import-time side
+# effects: none beyond defining the class and a test reset helper.
 """Process-global CUDA-graph node->node dependency recorder for the CUPTI profiler.
 
 The topology of a CUDA graph is only readable (via ``get_graph_data()``) while its
@@ -29,6 +36,13 @@ if TYPE_CHECKING:
 
 
 class _GraphDependencyRecorder:
+    # [CLASS DOC] HELPER:
+    # Process-wide singleton (construction returns the one shared instance, guarded by a
+    # class-level lock). State: deps (node id to predecessor node ids), event_record_events
+    # (node id to event handle for event-record nodes), host_fns (node id to name and address
+    # for host nodes), and a private hook handle (unset until armed). The maps are shared by
+    # reference with observers and only grow, except for purging done elsewhere by exec id.
+    # Key method: arm.
     """Persistent recorder of graph_node_id -> predecessor graph_node_ids edges.
 
     Process-wide singleton, like ``CuptiMonitor``: ``_GraphDependencyRecorder()`` returns
@@ -42,6 +56,9 @@ class _GraphDependencyRecorder:
     _instance_lock = threading.Lock()
 
     def __new__(cls) -> Self:
+        # [FUNCTION DOC] HELPER:
+        # Singleton constructor. Under the class lock, creates and initializes the instance
+        # on first call, stores it on the class, and always returns that one instance.
         with cls._instance_lock:
             if cls._instance is None:
                 inst = super().__new__(cls)
@@ -50,6 +67,9 @@ class _GraphDependencyRecorder:
             return cls._instance
 
     def _init(self) -> None:
+        # [FUNCTION DOC] HELPER:
+        # Creates the three empty maps (dependencies, event handles, host functions) and an
+        # unset hook handle. Called once by the singleton constructor.
         self.deps: dict[int, list[int]] = {}
         # graph_node_id -> cudaEvent_t handle for event-record nodes. The CUPTI record for the
         # node (a CUDA_EVENT activity) carries no event handle, so this is the only way to tag
@@ -62,6 +82,10 @@ class _GraphDependencyRecorder:
         self._handle: Any = None
 
     def arm(self) -> None:
+        # [FUNCTION DOC]
+        # Registers the graph-instantiate hook from torch.cuda.graphs so later graph
+        # instantiations are recorded. Idempotent. Side effect: lazy import and storing the
+        # hook handle. Graphs instantiated before arming are not recorded.
         """Register the graph-instantiate hook once (idempotent)."""
         if self._handle is not None:
             return
@@ -70,6 +94,15 @@ class _GraphDependencyRecorder:
         self._handle = register_graph_instantiate_hook(self._on_instantiate)
 
     def _on_instantiate(self, torch_cuda_graph: Any) -> None:
+        # [FUNCTION DOC] HELPER:
+        # Instantiate hook. Reads the graph's node data and silently returns on runtime,
+        # attribute or key errors. Builds three maps from the nodes: node id to predecessor
+        # node ids (only nodes having dependencies), node id to event handle (event-record
+        # nodes with a nonzero handle), and node id to host function name and address (host
+        # nodes). Returns without change if all three are empty; otherwise merges them into
+        # the recorder and adds the exec graph id (upper 32 bits of any recorded node id) to
+        # the graph object's set of recorded exec ids so the destroy hook can purge entries.
+        # This class has no purge method; removal is done by an external destroy hook.
         # We hold the live graph here, so get_graph_data() works during instantiate()
         # for both keep_graph modes (the template is destroyed only afterwards). Raises
         # when cuda.bindings / a recent driver is unavailable -- degrade to no records.
@@ -110,6 +143,9 @@ class _GraphDependencyRecorder:
 
 
 def _reset_for_test() -> None:
+    # [FUNCTION DOC] HELPER:
+    # Test-only reset. Under the singleton lock, removes the instantiate hook if registered
+    # and clears the stored singleton so the next construction starts unarmed and empty.
     """Test-only: unregister the instantiate hook and drop the singleton, so the next
     ``_GraphDependencyRecorder()`` starts unarmed with empty maps."""
     with _GraphDependencyRecorder._instance_lock:

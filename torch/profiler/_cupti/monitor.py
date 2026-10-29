@@ -1,4 +1,14 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# In-process CUPTI activity monitor and multiplexer. Defines the CuptiMonitor singleton, which
+# owns the single CUPTI subscription, a native buffer pool and decode worker, and fans decoded
+# per-kind columns out to registered observers at flush time. Also contains the clock helper
+# that maps record timestamps to unix nanoseconds, the observer and callback-handler record
+# types, a registry of subscriber callbacks, external-correlation id management, optional
+# PM-sampling plumbing, and module-level functions to enable early hardware tracing, configure
+# the singleton, read its config, and reset for tests. Import-time effects: requires the
+# cupti-python package and torch's native profiler bindings (the CUPTI monitor submodule is
+# looked up at import); defines module constants only and starts nothing.
 from __future__ import annotations
 
 import ctypes
@@ -62,6 +72,10 @@ _FENCE_FIELDS = frozenset({Sync.KIND.id, _FENCE_END_FIELD})
 
 
 def _has_active_cuda_context() -> bool:
+    # [FUNCTION DOC] HELPER:
+    # Reports whether the calling thread has a current CUDA driver context. Returns false if
+    # the cuda bindings package cannot be imported or the driver is not initialized; true when
+    # a context is current. Raises RuntimeError for any other driver error from the query.
     try:
         from cuda.bindings import (  # pyrefly: ignore[missing-import]
             driver as cuda_driver,
@@ -77,10 +91,16 @@ def _has_active_cuda_context() -> bool:
 
 
 def _cuda_version_string() -> str:
+    # [FUNCTION DOC] HELPER:
+    # Returns torch's CUDA version text, or an empty string when torch has no CUDA version.
     return torch.version.cuda or ""
 
 
 def _deref_cstr(ptr: int) -> str:
+    # [FUNCTION DOC] HELPER:
+    # Reads the NUL-terminated C string at the given raw memory address and returns it as
+    # text, replacing undecodable bytes. A zero address (or a null read) yields an empty
+    # string. Dereferences arbitrary memory, so an invalid nonzero address can crash.
     if not ptr:
         return ""
     value = ctypes.cast(ptr, ctypes.c_char_p).value
@@ -94,6 +114,10 @@ _CallbackFns = tuple[Callable[..., None], ...]
 
 
 class _CallbackHandler(NamedTuple):
+    # [CLASS DOC] HELPER:
+    # Immutable token for a registered subscriber-callback consumer with three fields: the
+    # callback domain, the callback id, and the function to invoke with domain, id and the
+    # raw callback-data pointer. Returned by registration and passed back to unregister.
     """A registered consumer of one CUPTI *subscriber callback*: the ``(domain, cbid)`` it
     wants and the ``fn(domain, cbid, cbdata)`` to invoke.
 
@@ -109,6 +133,11 @@ class _CallbackHandler(NamedTuple):
 
 
 class _Observer:
+    # [CLASS DOC] HELPER:
+    # Registration record for one consumer of decoded activity records. Attributes: the set of
+    # activity kinds it wants, a mapping from kind to the set of field ids it wants, and its
+    # callback, which receives a mapping of kind to mapping of field id to column once per
+    # drain. Created by the monitor's register method; compared by identity.
     """A registered consumer of the monitor's records: the activity kinds it
     requested, its per-kind field selection (``{kind: frozenset(field_ids)}``), and
     its ``callback(columns)`` -- invoked once per drain (at flush time) with the
@@ -120,6 +149,9 @@ class _Observer:
         fields: Mapping[ActivityKind, frozenset[int]],
         callback: Callable[..., None],
     ) -> None:
+        # [FUNCTION DOC] HELPER:
+        # Stores the kinds as a frozen set, copies the per-kind field map into a plain
+        # mapping, and keeps the callback. No validation or side effects.
         self.activities: frozenset[ActivityKind] = frozenset(activities)
         # activity -> the set of field ids wanted for it (the columns to demux).
         self.fields: dict[ActivityKind, frozenset[int]] = dict(fields)
@@ -127,6 +159,14 @@ class _Observer:
 
 
 class _SynchronizedClock:
+    # [CLASS DOC] HELPER:
+    # Converts CUPTI record timestamps to unix-epoch nanoseconds. State: whether the timestamp
+    # callback is active (records are on the profiler approx clock) or not (records on the
+    # native clock, required to equal the realtime clock), the injected native-clock reader,
+    # and calibration anchors (native, unix and approx nanoseconds) plus a ticks-to-ns scale.
+    # Invariant: while the native anchor is zero (uncalibrated or reset) all conversions are
+    # the identity; zero timestamps always map to zero. Key methods: calibrate, the convert
+    # functions (scalar and array), now_record_ns, reset.
     """Maps CUPTI record timestamps to unix-epoch ns on kineto's axis.
 
     CUPTI stamps records with cuptiGetTimestamp, which is CLOCK_REALTIME -- the very clock
@@ -150,6 +190,9 @@ class _SynchronizedClock:
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER:
+        # Starts uncalibrated: callback inactive, native clock reader returning zero, all
+        # anchors zero, scale one, so every conversion is the identity.
         self._callback_active = False
         self._native_is_realtime = False
         self._native_now: Callable[[], int] = lambda: 0
@@ -166,6 +209,16 @@ class _SynchronizedClock:
         native_now: Callable[[], int],
         converter: Any = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER:
+        # Calibrates the clock at session start. Keyword args: callback_active (whether
+        # records carry approx-clock ticks), native_now (callable returning the native CUPTI
+        # clock in ns), converter (optional approx-to-unix converter, built from the profiler
+        # bindings when needed and absent). Brackets one native read between two realtime
+        # reads to learn whether the native clock is realtime. With the callback active, pairs
+        # a native read with the midpoint of two approx reads, records the unix time for that
+        # point and recovers the converter's slope from two evaluations a large span apart.
+        # Without it, anchors at the current realtime and uses identity. Raises RuntimeError
+        # if the callback is inactive and the native clock is not realtime. Mutates anchors.
         self._callback_active = callback_active
         self._native_now = native_now
         # cuptiGetTimestamp is CLOCK_REALTIME iff it lands inside a clock_gettime bracket.
@@ -214,18 +267,29 @@ class _SynchronizedClock:
     # so the record dispatch lives in CuptiMonitor.convert_time[_array], not here.
 
     def convert_approx(self, value: int) -> int:
+        # [FUNCTION DOC] HELPER:
+        # Converts one approx-clock tick value to unix ns using the anchor and scale. Zero
+        # and the uncalibrated state return the input unchanged. Returns an int.
         # Approx-clock tick -> unix ns via the recovered converter slope.
         if value == 0 or self._native_ns == 0:
             return value
         return self._unix_ns + int((value - self._approx_ns) * self._scale)
 
     def convert_unix(self, value: int) -> int:
+        # [FUNCTION DOC] HELPER:
+        # Converts one native-clock value to unix ns by adding the constant offset between the
+        # unix and native anchors. Zero and the uncalibrated state return the input unchanged.
         # Native cuptiGetTimestamp clock (CLOCK_REALTIME) -> unix ns: a constant offset.
         if value == 0 or self._native_ns == 0:
             return value
         return value - self._native_ns + self._unix_ns
 
     def convert_approx_array(self, values: np.ndarray) -> np.ndarray:
+        # [FUNCTION DOC] HELPER:
+        # Vectorized approx-tick to unix-ns conversion over an array. Returns a new signed
+        # 64-bit array; zero entries stay zero; uncalibrated input is returned as converted
+        # to that type only. The delta is scaled in floating point and added to the integer
+        # unix anchor to avoid precision loss.
         # Vectorized convert_approx. Keep the delta in float (small magnitude) and add the unix
         # anchor as int64 -- adding at the ~1e18 unix magnitude in float64 would lose ~us.
         out = values.astype(np.int64)
@@ -236,6 +300,10 @@ class _SynchronizedClock:
         return np.where(out == 0, out, self._unix_ns + delta)
 
     def convert_unix_array(self, values: np.ndarray) -> np.ndarray:
+        # [FUNCTION DOC] HELPER:
+        # Vectorized native-clock to unix-ns conversion: adds the constant offset to every
+        # nonzero entry of an array and returns a new signed 64-bit array (identity when
+        # uncalibrated; zeros stay zero).
         # Vectorized convert_unix.
         out = values.astype(np.int64)
         if self._native_ns == 0:
@@ -244,6 +312,10 @@ class _SynchronizedClock:
         return np.where(out == 0, out, out + offset)
 
     def now_record_ns(self) -> int:
+        # [FUNCTION DOC] HELPER:
+        # Returns the current time on the clock records use: zero before calibration, the
+        # profiler approx time when the callback is active, realtime when the native clock is
+        # realtime, else a fresh native clock read.
         # Current record-clock value: the approx clock when the callback is active, else the
         # native cuptiGetTimestamp clock (read cheaply via clock_gettime when it is realtime).
         # 0 before calibration.
@@ -256,19 +328,39 @@ class _SynchronizedClock:
         return self._native_now()
 
     def reset(self) -> None:
+        # [FUNCTION DOC] HELPER:
+        # Returns the clock to the uncalibrated state (native anchor zero and a zero-returning
+        # native reader) so conversions become the identity. Other anchors are left as is.
         self._native_ns = 0
         self._native_now = lambda: 0
 
     @property
     def unix_anchor_ns(self) -> int:
+        # [FUNCTION DOC] HELPER:
+        # Property: the unix-epoch ns value recorded at calibration (zero if never calibrated).
         return self._unix_ns
 
     @property
     def approx_anchor_ns(self) -> int:
+        # [FUNCTION DOC] HELPER:
+        # Property: the approx-clock tick value recorded at calibration (zero when the
+        # callback is inactive or never calibrated).
         return self._approx_ns
 
 
 class CuptiMonitor:
+    # [CLASS DOC]
+    # Process-wide singleton engine and multiplexer for CUPTI activity data. Class-level
+    # state: the singleton and its lock, and process settings (buffer size, flush and drain
+    # periods, approx-timestamp flag, configured flag) that the instance snapshots when first
+    # built. Instance state: the CUPTI wrapper and subscriber handle, enabled field selection
+    # per kind, observer list, subscriber-callback registry with arm refcounts, drain thread
+    # and locks, external-correlation id counters, stacks and chain snapshots, external
+    # metadata store, the clock, and PM-sampling consumers. Invariants: at most one CUPTI
+    # subscription; the monitor runs while at least one observer is registered; the
+    # subscription is released only when no observers, session or callback handlers remain.
+    # Key methods: register/unregister, start/stop, flush, callback handler registration,
+    # external-correlation push/pop, request_pm_sampling, stats, session_info.
     """Process-wide CUPTI monitor / multiplexer singleton. Like PmSampler, ``CuptiMonitor()``
     returns the one instance (constructed on first call); its settings are snapshotted from
     the class config -- set via ``cupti_monitor.configure()`` before first use -- not from
@@ -290,6 +382,10 @@ class CuptiMonitor:
     _configured: bool = False
 
     def __new__(cls) -> Self:
+        # [FUNCTION DOC]
+        # Singleton constructor. Under the class lock, builds and initializes the instance on
+        # first call (snapshotting the class settings) and marks the configuration as locked.
+        # Always returns the same instance. Takes no arguments.
         with cls._instance_lock:
             if cls._instance is None:
                 inst = super().__new__(cls)
@@ -300,6 +396,12 @@ class CuptiMonitor:
             return cls._instance
 
     def _init(self) -> None:
+        # [FUNCTION DOC] HELPER:
+        # One-time instance setup. Copies the class settings (buffer size, cadences) into
+        # instance attributes, obtains the CUPTI wrapper (loading libcupti), and creates all
+        # empty state: no subscriber, empty selection, observer list, callback registry,
+        # locks, drain stop event, external-correlation bookkeeping, a fresh clock, and PM
+        # consumer table. Starts no threads and calls no CUPTI entry points.
         cls = type(self)
         # The monitor is the engine and the multiplexer: it owns the single CUPTI
         # subscription + buffer pool + native decode worker, which demuxes each
@@ -424,6 +526,13 @@ class CuptiMonitor:
         self._pm_lock = threading.Lock()
 
     def _ensure_subscribed(self) -> int:
+        # [FUNCTION DOC] HELPER:
+        # Returns the subscriber handle, creating the CUPTI subscription if none is held.
+        # Raises RuntimeError if the loaded libcupti is older than the minimum, or if the
+        # subscribe fails (with an explanatory message when sole-subscriber mode was requested
+        # for the approx timestamp callback; otherwise the CUPTI error is re-raised). On
+        # success installs the single dispatch trampoline and tries to arm the approx
+        # timestamp callback, recording whether it engaged. Side effects: CUPTI subscription.
         """Take the process's one CUPTI subscription if we don't already hold it, and return
         the handle.
 
@@ -478,6 +587,11 @@ class CuptiMonitor:
         return self._subscriber
 
     def register_callbacks(self) -> None:
+        # [FUNCTION DOC]
+        # Prepares the activity path: ensures the subscription, turns on user-defined records
+        # and registers the native buffer request/complete callback addresses. Idempotent
+        # (does nothing when already registered). Propagates errors from subscribing or from
+        # the CUPTI wrapper. Sets the registered flag on success.
         if self._callbacks_registered:
             return
         native = _cupti_monitor_native
@@ -494,6 +608,11 @@ class CuptiMonitor:
     def _dispatch_callback(
         self, _userdata: int, domain: int, cbid: int, cbdata: int
     ) -> None:
+        # [FUNCTION DOC] HELPER:
+        # The single CUPTI callback entry point. Looks up handlers for the domain and callback
+        # id (lock-free read of an immutable tuple) and calls each with domain, id and the raw
+        # data pointer. Exceptions from a handler are logged and swallowed so one failure
+        # neither reaches CUPTI nor blocks other handlers. Runs on the application thread.
         """The subscription's single ``CUpti_CallbackFunc``: fan out to the handlers
         registered for ``(domain, cbid)``.
 
@@ -513,6 +632,12 @@ class CuptiMonitor:
     def register_callback_handler(
         self, domain: int, cbid: int, fn: Callable[..., None]
     ) -> _CallbackHandler:
+        # [FUNCTION DOC]
+        # Registers a function for one subscriber callback identified by domain and callback
+        # id, bringing up the shared subscription if needed (errors from that propagate), and
+        # appends the function to the handlers for that key by replacing the stored tuple under
+        # the callback lock. Does not enable the callback; see arm_callback. Returns a
+        # _CallbackHandler token for later unregistration.
         """Register ``fn(domain, cbid, cbdata)`` for one CUPTI ``(domain, cbid)`` subscriber
         callback; returns a token for :meth:`unregister_callback_handler`.
 
@@ -534,6 +659,12 @@ class CuptiMonitor:
         return handler
 
     def unregister_callback_handler(self, handler: _CallbackHandler) -> None:
+        # [FUNCTION DOC]
+        # Removes the handler's function from its key's handler tuple. When none remain, drops
+        # the key, clears its arm count and disables the callback in CUPTI if subscribed.
+        # Then releases the subscription if now idle. Idempotent.
+        # KNOWN ISSUE: removal compares by function identity, so registering the same function
+        # twice for one key and unregistering one token removes both registrations.
         """Remove a handler from :meth:`register_callback_handler`. Idempotent.
 
         When the last handler for a ``(domain, cbid)`` goes away the callback is disabled
@@ -555,6 +686,9 @@ class CuptiMonitor:
         self._release_subscriber_if_idle()
 
     def arm_callback(self, domain: int, cbid: int) -> None:
+        # [FUNCTION DOC]
+        # Increments the arm count for a callback key, ensuring the subscription exists, and
+        # enables the callback in CUPTI on the first arm. Raises on subscribe or CUPTI errors.
         """Enable one ``(domain, cbid)`` callback, refcounted: CUPTI is told to enable on the
         first arm and to disable on the last :meth:`disarm_callback`, so consumers scoping the
         same callback to different windows don't disable each other."""
@@ -567,6 +701,9 @@ class CuptiMonitor:
                 self._cupti.enable_callback(subscriber, domain, cbid, True)
 
     def disarm_callback(self, domain: int, cbid: int) -> None:
+        # [FUNCTION DOC]
+        # Decrements the arm count for a callback key; at zero removes the entry and disables
+        # the callback in CUPTI (if subscribed). Does nothing if the key is not armed.
         """Drop one arm refcount for ``(domain, cbid)``, disabling the callback at zero.
         No-op when it is not armed."""
         with self._callback_lock:
@@ -582,6 +719,12 @@ class CuptiMonitor:
                 self._cupti.enable_callback(self._subscriber, domain, cbid, False)
 
     def _release_subscriber_if_idle(self) -> None:
+        # [FUNCTION DOC] HELPER:
+        # Tears down the subscription only when there are no observers, no active session and
+        # no callback handlers, and a subscription exists. Disables all armed callbacks and
+        # clears the arm counts, restores the default timestamp source if the approx callback
+        # was active, unsubscribes, and clears the subscriber handle and trampoline. Otherwise
+        # does nothing. Takes the callback lock.
         """Unsubscribe once neither activity observers nor callback handlers need CUPTI.
 
         The subscription is shared, so it outlives the activity session in both directions:
@@ -606,6 +749,14 @@ class CuptiMonitor:
             self._callback_trampoline = None
 
     def start(self) -> None:
+        # [FUNCTION DOC]
+        # Starts an activity session. Raises RuntimeError if already started, or if libcupti
+        # lacks the record iterator or (when background flushing is configured) the flush
+        # function. Steps: reset and size the native buffer pool, register callbacks and
+        # subscribe, calibrate the clock, configure and start the native decode worker with
+        # the subscriber, function addresses, fence kind/field and self-flush cadence, and
+        # start a daemon drain thread when the drain period is nonnegative. Kinds and fields
+        # are enabled later as observers register. Sets the started flag.
         if self._started:
             raise RuntimeError("CUPTI monitor is already started")
         _cupti_monitor_native.reset_buffers()
@@ -673,6 +824,13 @@ class CuptiMonitor:
         self._started = True
 
     def stop(self) -> None:
+        # [FUNCTION DOC]
+        # Ends the session; does nothing if not started. Stops and joins the drain thread
+        # (warning if it does not exit in 5 s), tail-drains PM sampling, performs a synchronous
+        # flush, stops the native decoder, dispatches the residue, disables all enabled kinds,
+        # disarms user-defined records, resets state flags, releases the subscription if idle,
+        # snapshots the allocated buffer count, resets native buffers and the clock. Never
+        # calls the global CUPTI finalize. Delivers final data to observers as a side effect.
         if not self._started:
             return
         # Stop the Python drain loop. The decode thread keeps running (and self-flushing
@@ -723,6 +881,14 @@ class CuptiMonitor:
         self._clock.reset()
 
     def flush(self, *, sync: bool = False, timeout_s: float = 5.0) -> None:
+        # [FUNCTION DOC]
+        # Hands completed CUPTI buffers to the decoder and dispatches decoded columns to
+        # observers. Plain mode: flush, add newly dropped-record counts, drain and dispatch.
+        # Sync mode (timeout_s bounds the wait): temporarily enables the synchronization kind,
+        # captures CUPTI's clock, device-synchronizes, then repeatedly flushes until the
+        # decoder has seen a sync record at or past that point, giving up with a warning at
+        # the deadline; if no CUDA sync point is available it only flushes. Always restores the
+        # fence kind and drains and dispatches at the end. Never uses forced flushes.
         """Flush CUPTI's activity buffers to the processing worker.
 
         Both paths issue ``cuptiActivityFlushAll(0)`` -- which hands over COMPLETED
@@ -785,6 +951,10 @@ class CuptiMonitor:
             self._drain_and_dispatch()
 
     def _begin_fence_kind(self) -> bool:
+        # [FUNCTION DOC] HELPER:
+        # Enables the synchronization kind with its fence fields for a fence. Returns false
+        # without change if it is already enabled or there is no subscriber; otherwise flushes
+        # pending records, enables the kind, records it in the enabled map and returns true.
         """Enable + make decodable the SYNCHRONIZATION sync-point kind for the
         duration of a fence. Returns True if this call enabled it (so _end removes
         it); False if it was already enabled (an observer wanted it -- leave it)."""
@@ -799,6 +969,9 @@ class CuptiMonitor:
         return True
 
     def _end_fence_kind(self, added: bool) -> None:
+        # [FUNCTION DOC] HELPER:
+        # Undoes the fence enable when the flag says this fence added it: flushes, disables
+        # the kind if subscribed, and removes it from the enabled map. No-op otherwise.
         """Undo _begin_fence_kind (no-op if the kind was already enabled)."""
         if not added:
             return
@@ -811,6 +984,10 @@ class CuptiMonitor:
         self._enabled = {k: v for k, v in self._enabled.items() if k != _FENCE_KIND}
 
     def _fence_sync_point(self) -> int | None:
+        # [FUNCTION DOC] HELPER:
+        # Captures CUPTI's clock and then device-synchronizes, returning the captured
+        # timestamp as the fence target. Returns None if there is no subscriber or if the
+        # clock read or synchronize fails for any reason (all exceptions are swallowed).
         """Establish a deterministic fence point for ``flush(sync=True)``: capture
         CUPTI's clock, then device-sync. The sync both drains outstanding GPU work
         and produces a SYNCHRONIZATION record with a timestamp past the captured
@@ -833,6 +1010,9 @@ class CuptiMonitor:
             return None
 
     def convert_time(self, value: int) -> int:
+        # [FUNCTION DOC]
+        # Converts one record timestamp to unix-epoch ns, treating it as approx-clock ticks
+        # when the timestamp callback is active and as native realtime otherwise.
         """Convert a record-clock timestamp to unix-epoch ns. Records ride the approx clock
         while the timestamp callback is engaged, else CLOCK_REALTIME."""
         if self._timestamp_callback_active:
@@ -840,22 +1020,35 @@ class CuptiMonitor:
         return self._clock.convert_unix(value)
 
     def convert_time_array(self, values: np.ndarray) -> np.ndarray:
+        # [FUNCTION DOC]
+        # Array version of convert_time; returns a new signed 64-bit array of unix ns.
         """Vectorized :meth:`convert_time` over a whole record column."""
         if self._timestamp_callback_active:
             return self._clock.convert_approx_array(values)
         return self._clock.convert_unix_array(values)
 
     def now_unix_ns(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the current record-clock time converted to unix-epoch ns (zero-valued input
+        # before calibration passes through unchanged).
         """Current time on the record clock, converted to unix-epoch ns."""
         return self.convert_time(self._clock.now_record_ns())
 
     def now_record_ns(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the current value of the record clock, unconverted, for comparing against
+        # raw decoded record timestamps; zero before calibration. Delegates to the clock.
         """Current value of the record clock -- the unconverted timebase of decoded record
         START/END. Use this (not now_unix_ns) to stamp a window boundary compared against raw
         record timestamps. Returns 0 before the session is calibrated."""
         return self._clock.now_record_ns()
 
     def _try_arm_approx_timestamp_callback(self, sub_handle: int) -> bool:
+        # [FUNCTION DOC] HELPER:
+        # Attempts to make CUPTI stamp records with the profiler approx clock. Returns false
+        # when the feature is not opted in, when an older libcupti would mishandle an
+        # existing CUDA context (logs a warning), or when CUPTI rejects the attribute (logs a
+        # warning). Returns true when engaged (logs info). Side effect: sets a CUPTI attribute.
         """Best-effort: hand CUPTI the profiler's approx-clock timestamp callback so it
         stamps activity records on kineto's exact timebase directly. Opt-in via
         configure(use_approx_timestamps=True) (and only as the sole subscriber); returns False --
@@ -891,6 +1084,13 @@ class CuptiMonitor:
         activities: ActivitiesSpec,
         callback: Callable[..., None],
     ) -> _Observer:
+        # [FUNCTION DOC]
+        # Registers an observer. Args: activities (either a collection of kinds meaning all
+        # fields, or a mapping from kind to field ids or the text all) and callback (called
+        # once per drain with a mapping from kind to mapping from field id to column).
+        # Starts the monitor if it is not started, then reconciles the enabled selection. If
+        # starting or selection fails, removes the observer again and re-raises. Returns the
+        # observer token for unregister.
         """Register an observer. ``activities`` is either an iterable of
         ``ActivityKind`` (meaning "all fields") or a field map ``{ActivityKind:
         iterable of field ids | "all"}`` selecting the fields per kind.
@@ -921,6 +1121,9 @@ class CuptiMonitor:
         return obs
 
     def unregister(self, obs: _Observer) -> None:
+        # [FUNCTION DOC]
+        # Removes an observer (no-op if unknown). If it was the last one, stops the monitor;
+        # otherwise reconciles the enabled selection to the remaining observers.
         """Unregister an observer; drops kinds/fields no longer wanted by anyone,
         and the monitor stops once the last observer leaves. Idempotent."""
         with self._lock:
@@ -938,6 +1141,12 @@ class CuptiMonitor:
     def request_pm_sampling(
         self, sink: Callable[[dict[str, Any]], None], metrics: Iterable[str]
     ) -> None:
+        # [FUNCTION DOC]
+        # Registers a sink as a consumer of PM sampling for the given metric names on the
+        # current device via the per-device sampler singleton. Does nothing if CUDA is
+        # unavailable, no metrics are given, or the sink is already registered. A failure to
+        # add the consumer is logged as a warning and swallowed. Under the PM lock, stores the
+        # sampler and the consumer handle keyed by sink.
         """Register ``sink`` as a PM-sampling consumer wanting ``metrics`` on the current device.
         The shared per-device session samples the union of all consumers' metrics; the first
         consumer starts it (see PmSampler.configure() for interval/look-back). Frames arrive on the
@@ -963,6 +1172,10 @@ class CuptiMonitor:
     def _deliver_pm(
         self, sink: Callable[[dict[str, Any]], None], frame: dict[str, Any] | None
     ) -> None:
+        # [FUNCTION DOC] HELPER:
+        # Delivers one polled PM frame to a sink. Ignores an empty frame. Copies the frame,
+        # converts its start timestamps from the native clock to unix ns, and calls the sink;
+        # sink exceptions are logged and swallowed.
         # Convert the sampler's raw CUPTI-clock timestamps into the trace clock (the observer buckets
         # frames by trace-time start_ns), then push to the observer's sink. No-op on an empty poll.
         if frame is None:
@@ -978,6 +1191,10 @@ class CuptiMonitor:
             logger.exception("PM sampling sink error")
 
     def release_pm_sampling(self, sink: Callable[[dict[str, Any]], None]) -> None:
+        # [FUNCTION DOC]
+        # Unregisters a PM consumer. Under the PM lock, removes it; if it existed, polls it
+        # one last time and delivers the frame, then detaches it. Clears the sampler reference
+        # when no consumers remain. Idempotent for unknown sinks.
         """Unregister a PM-sampling consumer; the session disables once the last one leaves.
         Idempotent. Polls the consumer one last time before removing so its final samples land
         (removal itself delivers nothing)."""
@@ -990,6 +1207,9 @@ class CuptiMonitor:
                 self._pm_sampler = None
 
     def _poll_pm_sampler(self) -> None:
+        # [FUNCTION DOC] HELPER:
+        # Under the PM lock, polls every registered PM consumer and delivers each frame to its
+        # sink. Called on each drain.
         """Poll every PM consumer on the monitor's drain cadence (folded into
         _drain_and_dispatch) -- pulling the HW ring before it overflows. The final poll at
         release/stop catches the tail."""
@@ -998,6 +1218,9 @@ class CuptiMonitor:
                 self._deliver_pm(sink, handle.poll())
 
     def _stop_pm_sampler(self) -> None:
+        # [FUNCTION DOC] HELPER:
+        # At monitor stop, under the PM lock: clears the sampler reference and the consumer
+        # table, then for each former consumer polls once, delivers the frame, and detaches it.
         """Poll then unregister the monitor's PM consumers (final delivery + disable when the last
         leaves). Called at monitor stop in case observers have not released yet."""
         with self._pm_lock:
@@ -1011,6 +1234,11 @@ class CuptiMonitor:
     def _normalize_activities(
         self, activities: ActivitiesSpec
     ) -> tuple[frozenset[ActivityKind], dict[ActivityKind, frozenset[int]]]:
+        # [FUNCTION DOC] HELPER:
+        # Turns a registration request into a pair: the set of activity kinds and a mapping
+        # from kind to its field-id set. A mapping request resolves each kind's selection; a
+        # plain collection of kinds means all supported fields of each kind. Invalid kind
+        # values raise from the enum conversion.
         """Resolve a registration request to ``(kinds, fields)``: the
         ``ActivityKind`` set plus the per-activity field-id selection
         (``"all"``/``None`` -> the kind's full supported set; ``*_FIELD_KIND`` id 0
@@ -1031,6 +1259,12 @@ class CuptiMonitor:
     def _resolve_fields(
         kind: ActivityKind, sel: Iterable[int] | str | None
     ) -> frozenset[int]:
+        # [FUNCTION DOC] HELPER:
+        # Resolves one kind's field selection to a frozen set of ids. None or the text all
+        # means every registered field of that kind (empty if the kind is unknown); otherwise
+        # the ids are converted to ints. The mandatory kind field id (zero) is always added.
+        # KNOWN ISSUE: any other string besides all is treated as an iterable of characters
+        # and fails with a conversion error rather than a clear message.
         if sel is None or sel == "all":
             resolved = frozenset(f for f in FIELD_REGISTRY.get(kind, frozenset()))
         else:
@@ -1038,6 +1272,12 @@ class CuptiMonitor:
         return resolved | {0}  # FIELD_KIND (0) is required for enable + demux
 
     def _apply_selection(self) -> None:
+        # [FUNCTION DOC] HELPER:
+        # Brings CUPTI's enabled kinds and fields in line with the union of all observers'
+        # selections, preserving an in-progress fence kind. Calls reconfigure and updates the
+        # enabled map only when the target differs. Then, once each and only if a subscription
+        # exists, turns on kernel latency timestamps when the queued kernel field is selected
+        # and device timestamps for CUDA_EVENT records when that field is selected.
         """Reconcile CUPTI's enabled per-field selection to the current observer
         field union. Run only here -- when observers register/deregister -- never
         per buffer. No demux layout is computed: each completed buffer carries
@@ -1074,6 +1314,12 @@ class CuptiMonitor:
                 self._device_ts_enabled = True
 
     def _reconfigure(self, target: dict[int, frozenset[int]]) -> None:
+        # [FUNCTION DOC] HELPER:
+        # Applies a minimal diff from the current enabled map to the target map (kind to field
+        # set). Does nothing without a subscription. Disables kinds that were removed or whose
+        # fields changed, flushes pending records if any were disabled, then enables added and
+        # changed kinds with their new field sets. Unchanged kinds are left untouched. Does not
+        # update the enabled map itself; the caller does.
         # Reconcile the per-field selection to ``target`` with a minimal diff: only
         # touch kinds that are being removed or whose field selection changed. Kinds
         # whose selection is unchanged stay enabled -- toggling them off/on is needless
@@ -1102,12 +1348,18 @@ class CuptiMonitor:
             self._cupti.activity_enable(sub, kind, target[kind])
 
     def _disable(self, kinds: Iterable[int]) -> None:
+        # [FUNCTION DOC] HELPER:
+        # Disables each given activity kind on the subscription; does nothing without one.
         sub = self._subscriber
         if sub is not None:
             for kind in kinds:
                 self._cupti.activity_disable(sub, kind)
 
     def _field_union(self) -> dict[ActivityKind, frozenset[int]]:
+        # [FUNCTION DOC] HELPER:
+        # Returns, per activity kind, the union of field ids wanted by all observers (read
+        # under the lock). If any observer wants CUDA_EVENT, also adds the synchronization
+        # kind with its fence fields, since CUPTI emits event records only alongside it.
         """The per-activity field selection wanted across all observers."""
         union: dict[ActivityKind, frozenset[int]] = {}
         with self._lock:
@@ -1123,6 +1375,11 @@ class CuptiMonitor:
         return union
 
     def stats(self) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Returns a snapshot mapping with: started flag, list of enabled kinds, buffers
+        # completed (decoded), buffers allocated (live count while started, else the snapshot
+        # taken at stop), buffers pending, valid decoded megabytes, dropped record total, and
+        # observer count. Reads native counters under the monitor lock.
         with self._lock:
             return {
                 "started": self._started,
@@ -1139,6 +1396,10 @@ class CuptiMonitor:
             }
 
     def _thread_push_stack(self) -> list[tuple[int, bool]]:
+        # [FUNCTION DOC] HELPER:
+        # Returns the calling thread's list of active external-correlation frames (id and
+        # whether CUPTI accepted the push), creating an empty list in thread-local storage
+        # on first use. The list is mutated in place by push and pop.
         """This thread's live LIFO of active external-correlation frames --
         ``(id, cupti_ok)``, where cupti_ok records whether CUPTI accepted that push --
         so pop unwinds CUPTI + the native mirror only for frames that actually took.
@@ -1149,6 +1410,12 @@ class CuptiMonitor:
         return stack
 
     def push_external_correlation_id(self) -> int | None:
+        # [FUNCTION DOC]
+        # Allocates a new process-unique id, pushes it to CUPTI (subscriber-aware) and onto
+        # this thread's frame list, and stores a snapshot of the whole active id chain keyed
+        # by the new id. If CUPTI accepted the push, also notes it in the native mirror.
+        # Returns the id, or None when the monitor is not started. A rejected push is still
+        # recorded so pops stay balanced.
         """Allocate a process-unique external-correlation id, record it as this
         thread's new innermost active context, and push it onto CUPTI's external-
         correlation stack. Every CUDA activity recorded until the matching pop gets an
@@ -1187,6 +1454,10 @@ class CuptiMonitor:
         return external_id
 
     def pop_external_correlation_id(self) -> int | None:
+        # [FUNCTION DOC]
+        # Pops this thread's innermost frame and queues its id for delayed chain cleanup.
+        # Pops CUPTI and the native mirror only if that push was accepted. Returns the popped
+        # id, or None when not started or the thread has no active frame.
         """Pop this thread's innermost active external-correlation frame (balances a
         push). Unwinds CUPTI + the native mirror only when that push was accepted by
         CUPTI, so a rejected push -- or an over-pop, which no-ops -- never unwinds the
@@ -1209,6 +1480,10 @@ class CuptiMonitor:
         return external_id
 
     def external_id_chain(self, innermost_id: int) -> tuple[int, ...]:
+        # [FUNCTION DOC]
+        # Returns the tuple of ids (outermost to innermost) that were active when the given
+        # id was pushed, read under the lock. Falls back to a one-element tuple of the given
+        # id when no snapshot exists (already cleaned up or never pushed here).
         """The full active-id stack (outermost..innermost) captured when
         ``innermost_id`` was pushed -- every external-correlation context active for
         an op CUPTI tagged with ``innermost_id``. A consumer maps a kernel's
@@ -1221,6 +1496,10 @@ class CuptiMonitor:
             return self._id_chains.get(innermost_id, (innermost_id,))
 
     def _gc_external_chains(self) -> None:
+        # [FUNCTION DOC] HELPER:
+        # Advances the two-generation cleanup of popped chain snapshots under the lock: deletes
+        # snapshots for ids popped at least two drains ago and promotes the currently pending
+        # popped ids to be deleted next time. Returns early if nothing is queued.
         """Advance the popped-chain GC one generation: drop chains popped two drains
         ago (their records are delivered + dispatched by now) and promote this cycle's
         popped ids to be dropped next. Called once per drain, so a popped id's chain
@@ -1234,6 +1513,9 @@ class CuptiMonitor:
             self._chains_gc_pending = []
 
     def current_external_correlation_id(self) -> int | None:
+        # [FUNCTION DOC]
+        # Returns the id on top of this thread's external-correlation stack as read from the
+        # native mirror, or None if the stack is empty (a zero id counts as empty).
         """The external-correlation id on top of THIS thread's stack (last pushed,
         not yet popped), or None. Reads the native host-side mirror of CUPTI's
         stack (CUPTI exposes push/pop but no peek). Lets a consumer on the same
@@ -1243,6 +1525,9 @@ class CuptiMonitor:
         return cur if cur else None
 
     def take_external_metadata(self) -> dict[int, str]:
+        # [FUNCTION DOC]
+        # Returns the accumulated mapping from external id to metadata text and resets the
+        # stored mapping to empty, under the lock, so each blob is handed out once.
         """Move out the {external_id: metadata blob} accumulated from drains since
         the last call. An observer's external-correlation join consumes this to
         attach the blob onto its kernel events (keyed by the same external id a
@@ -1253,6 +1538,10 @@ class CuptiMonitor:
             return meta
 
     def add_collective_metadata(self, **fields: Any) -> None:
+        # [FUNCTION DOC]
+        # Serializes the keyword fields to JSON text and hands it to the native layer to merge
+        # into the current collective's metadata. Does nothing when no fields are given.
+        # Errors from JSON serialization (non-serializable values) propagate.
         """Merge extra metadata into the CURRENT collective's entry (the most-recently-
         pushed external-correlation id on this thread), recursively (nested dicts
         combine; on a leaf conflict the later value wins). The seam for a backend to
@@ -1269,6 +1558,12 @@ class CuptiMonitor:
             _cupti_monitor_native.metadata_put_external(json.dumps(fields))
 
     def session_info(self) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Returns a mapping describing the capture: CUPTI version, CUDA version text, whether
+        # early hardware tracing is on, a timestamp mode label, the clock's unix and approx
+        # anchors, buffer size, and flush and drain periods in ns, and the libcupti soname.
+        # KNOWN ISSUE: the timestamp mode label is always the approximate-clock string, even
+        # when the approx timestamp callback is off and records use the realtime clock.
         """Monitor/session metadata for consumers that need to describe the
         capture: versions, clock calibration, and buffer config. Call after
         start() so the clock fields are populated."""
@@ -1286,6 +1581,11 @@ class CuptiMonitor:
         }
 
     def _drain_and_dispatch_loop(self) -> None:
+        # [FUNCTION DOC] HELPER:
+        # Body of the background drain thread. Waits on the stop event with a period floored
+        # at 1 ms; each time it times out while started, adds dropped-record counts and drains
+        # and dispatches. Exits when the stop event is set. Any exception is logged and ends
+        # the thread.
         # cuptiActivityFlushAll is driven off-thread by the native flusher; this loop
         # only drains the decoded columns + dispatches them (GIL work) -- the same work
         # flush(sync=False) does after its flush, minus the flush itself.
@@ -1301,6 +1601,12 @@ class CuptiMonitor:
             logger.exception("CUPTI monitor drain thread died")
 
     def _drain_and_dispatch(self) -> None:
+        # [FUNCTION DOC] HELPER:
+        # Under the drain lock, takes the decoded groups and external metadata from the native
+        # decoder, merges metadata into the store, converts each group to columns, packs groups
+        # into frames holding at most one group per kind, and dispatches each frame to a
+        # snapshot of the observers. Then advances chain cleanup. Outside the lock, polls PM
+        # sampling and checks buffer backpressure. Groups with no columns are skipped.
         """Drain the column groups the native decoder accumulated and fan them out
         to the observers. The native worker does the per-buffer decode GIL-free;
         this only views the drained bytes as their dtype and dispatches, so it is
@@ -1346,6 +1652,13 @@ class CuptiMonitor:
     def _columns_from_native(
         self, kind: int, fields: Mapping[int, tuple[int, bytes]]
     ) -> dict[int, Any]:
+        # [FUNCTION DOC] HELPER:
+        # Converts one native group (field id to width and raw bytes) to a mapping from field
+        # id to a column. String fields of width 8 become object arrays of text by
+        # dereferencing pointers. Other fields of width 1, 2, 4 or 8 become writable numpy
+        # arrays typed by the field's registered ctype (unsigned by default, with unsigned as
+        # fallback for unsupported float or string cases). Wider fields keep only their first
+        # 8 bytes as unsigned 64-bit values. Fields of other widths are omitted.
         """Turn one native group's ``{field_id: (field_size, bytes)}`` into
         ``{field_id: column}``: numeric fields are viewed per their :class:`Ctype`
         (unsigned/signed/float) at the captured width; const char* (string) fields are
@@ -1383,6 +1696,9 @@ class CuptiMonitor:
         return cols
 
     def _maybe_warn_backpressure(self) -> None:
+        # [FUNCTION DOC] HELPER:
+        # Logs a single warning (once per monitor) when the number of allocated native buffers
+        # reaches the threshold, indicating the decoder is not keeping up.
         if self._outstanding_warned:
             return
         allocated = _cupti_monitor_native.allocated_buffers()
@@ -1398,6 +1714,11 @@ class CuptiMonitor:
     def _dispatch_observers(
         self, decoded: dict[int, dict[int, Any]], observers: list[_Observer]
     ) -> None:
+        # [FUNCTION DOC] HELPER:
+        # Fans one frame (kind to columns) out to observers. For each observer builds a chunk
+        # with only the kinds and fields it selected, skipping kinds absent from the frame or
+        # missing any requested field, and calls its callback if the chunk is nonempty.
+        # Callback exceptions are not caught here and propagate to the caller.
         """Hand each observer the already-demuxed columns sliced to its selection.
         Pure fan-out -- no buffer access, so observer callbacks need not finish
         before the buffer is recycled."""
@@ -1421,6 +1742,11 @@ class CuptiMonitor:
                 obs.callback(chunk)
 
     def _account_dropped_records(self, ctx: int, stream_id: int) -> None:
+        # [FUNCTION DOC] HELPER:
+        # Adds the number of newly reported dropped records for the given context and stream
+        # to the running total; does nothing without a subscription.
+        # KNOWN ISSUE: the query result is added each call; if CUPTI reports a cumulative
+        # count rather than a delta, repeated calls would over-count.
         if self._subscriber is None:
             return
         self._dropped_records += self._cupti.activity_get_num_dropped_records(
@@ -1432,6 +1758,11 @@ _hes_enabled = False
 
 
 def enable_hes_early() -> None:
+    # [FUNCTION DOC]
+    # Turns on CUPTI hardware event sampling tracing once per process, before any CUDA
+    # context exists. Idempotent. Raises RuntimeError if CUDA is already initialized or a
+    # context is current, or if driver initialization fails. Side effects: initializes the
+    # CUDA driver, enables hardware tracing in libcupti, sets the module flag.
     global _hes_enabled
     if _hes_enabled:
         return
@@ -1454,6 +1785,8 @@ def enable_hes_early() -> None:
 
 
 def is_hes_enabled() -> bool:
+    # [FUNCTION DOC]
+    # Returns whether enable_hes_early has completed in this process.
     return _hes_enabled
 
 
@@ -1464,6 +1797,12 @@ def configure(
     background_drain_period_s: float | None = None,
     use_approx_timestamps: bool | None = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # Sets the class-level settings of the monitor singleton: buffer size, flush and drain
+    # periods (negative means caller-driven), and the approx-timestamp opt-in. Keyword-only;
+    # unset (None) arguments keep current values. First call wins: once configured or once
+    # the singleton exists, later calls log a warning and change nothing. Marks the
+    # configuration as locked. Runs under the class lock.
     """Set the process-wide CUPTI monitor settings the singleton snapshots when first
     constructed (via CuptiMonitor()). First-come-first-serve (like
     PmSampler.configure): locked once this lands OR the singleton is built, so a later call
@@ -1489,6 +1828,10 @@ def configure(
 
 
 def get_config() -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Returns a mapping of the current class-level settings (buffer size, both periods, the
+    # approx-timestamp flag, whether the config is locked) plus a capability flag that is
+    # always true, signalling support for shared subscriber-callback handlers.
     """The process-wide config the singleton will snapshot (or snapshotted): buffer_size,
     the two cadences, the approx-clock flag, and whether configure()/construction has pinned
     it (first-come-first-serve)."""
@@ -1506,6 +1849,9 @@ def get_config() -> dict[str, Any]:
 
 
 def _reset_for_test() -> None:
+    # [FUNCTION DOC] HELPER:
+    # Test-only. Under the class lock, discards the singleton and restores all class-level
+    # settings and the configured flag to their defaults. Does not stop a live session.
     """Test-only: drop the singleton and reset the config to defaults so a test can build a
     freshly-configured monitor. Callers must have torn down any live session first."""
     with CuptiMonitor._instance_lock:

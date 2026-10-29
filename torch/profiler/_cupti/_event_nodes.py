@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Maps CUPTI CUDA_EVENT activity records back to the event-record nodes of the CUDA graph
+# that produced them. Contains the process-wide _EventNodeRecorder singleton (records each
+# graph's event-record node ids in node-id order at graph instantiate), the pure
+# resolve_window function (positional per-launch join of records to nodes), and a test reset
+# helper. The join is by position within a launch, never by event id. Import-time side
+# effects: none beyond defining the class and a tuple of node types that are refused.
 """Passive bridge: map a CUDA_EVENT record back to the CUDA-graph event-record node.
 
 CUPTI emits a ``CUDA_EVENT`` activity record for each event-record node executed in a
@@ -59,6 +66,13 @@ _OPAQUE_BODY_NODE_TYPES = ("child_graph", "conditional")
 
 
 class _EventNodeRecorder:
+    # [CLASS DOC] HELPER:
+    # Process-wide singleton (construction returns the one shared instance, guarded by a
+    # class-level lock). State: graph_event_nodes maps an exec graph id to the list of
+    # event-record node ids (tools ids) of that graph in node-id order; a private handle to
+    # the instantiate hook registration (none until armed). Invariant: only graphs without
+    # child-graph or conditional nodes and with at least one event node are present.
+    # Key methods: arm, purge_exec_ids.
     """Process-global record of each CUDA graph's event-record nodes, in node-id order.
 
     Process-wide singleton armed once via :meth:`arm` (before graphs are captured), like
@@ -71,6 +85,10 @@ class _EventNodeRecorder:
     _instance_lock = threading.Lock()
 
     def __new__(cls) -> Self:
+        # [FUNCTION DOC] HELPER:
+        # Singleton constructor. Under the class lock, creates the instance on first call
+        # (initializing its state) and stores it on the class; always returns that one
+        # instance. Thread-safe. Takes no arguments.
         with cls._instance_lock:
             if cls._instance is None:
                 inst = super().__new__(cls)
@@ -79,10 +97,18 @@ class _EventNodeRecorder:
             return cls._instance
 
     def _init(self) -> None:
+        # [FUNCTION DOC] HELPER:
+        # Sets up an empty graph-to-event-node mapping and an unset hook handle. Called once
+        # by the singleton constructor.
         self.graph_event_nodes: dict[int, list[int]] = {}
         self._handle: Any = None
 
     def arm(self) -> None:
+        # [FUNCTION DOC]
+        # Registers the graph-instantiate hook (from torch.cuda.graphs) so every later graph
+        # instantiate is recorded. Idempotent: does nothing if already armed. Side effect:
+        # imports torch.cuda.graphs lazily and stores the hook handle. Graphs instantiated
+        # before arming are never recorded (no backfill).
         """Register the graph-instantiate hook once (idempotent).
 
         Must be called BEFORE the graphs of interest are captured: the hook fires at
@@ -97,6 +123,12 @@ class _EventNodeRecorder:
         self._handle = register_graph_instantiate_hook(self._on_instantiate)
 
     def _on_instantiate(self, torch_cuda_graph: Any) -> None:
+        # [FUNCTION DOC] HELPER:
+        # Instantiate hook. Reads the graph's node data; silently returns on runtime,
+        # attribute or key errors (bindings or driver unavailable), if any node is a child
+        # graph or conditional node, or if there are no event-record nodes. Otherwise stores
+        # the event-record node ids (in node-id order) under the exec graph id and adds that
+        # id to the graph object's set of recorded exec ids so the destroy hook can purge it.
         # Template is live here (both keep_graph modes), so get_graph_data() works. Degrade to
         # no record when cuda.bindings / a recent driver is unavailable.
         try:
@@ -117,6 +149,9 @@ class _EventNodeRecorder:
         torch_cuda_graph._recorded_exec_ids.add(exec_graph_id)
 
     def purge_exec_ids(self, exec_ids: set[int]) -> None:
+        # [FUNCTION DOC]
+        # Removes the recorded event-node lists for each given exec graph id; ids that are
+        # not present are ignored. Mutates the recorder's mapping; returns nothing.
         """Drop recorded state for destroyed graphs (called from the graph-destroy hook)."""
         for eid in exec_ids:
             self.graph_event_nodes.pop(eid, None)
@@ -127,6 +162,15 @@ def resolve_window(
     corr_exec_pairs: Any,
     event_rows: list[tuple[int, int]],
 ) -> list[int | None]:
+    # [FUNCTION DOC]
+    # Resolves each CUDA_EVENT record of one export window to a graph node id. Inputs: the
+    # recorder, an iterable of (correlation id, graph node id) pairs for graphed work records
+    # (the exec graph id is the upper 32 bits of the node id; zero node ids are skipped), and
+    # a list of (correlation id, sync id) rows. Groups rows by correlation id (one launch),
+    # sorts each group by sync id, and assigns the k-th row the k-th recorded event node of
+    # that launch's exec graph. Returns a list aligned to the rows with None for any launch
+    # whose exec graph is unknown/unrecorded or whose row count differs from the node count.
+    # Pure apart from reading the recorder; raises nothing itself.
     """Resolve one export window's CUDA_EVENT records to graph event-record nodes.
 
     ``corr_exec_pairs`` is ``(correlation_id, graph_node_id)`` for the window's graphed work
@@ -163,6 +207,9 @@ def resolve_window(
 
 
 def _reset_for_test() -> None:
+    # [FUNCTION DOC] HELPER:
+    # Test-only reset. Under the singleton lock, removes the instantiate hook if one was
+    # registered and clears the stored singleton so the next construction starts fresh.
     """Test-only: unregister the instantiate hook and drop the singleton, so the next
     ``_EventNodeRecorder()`` starts unarmed with an empty map."""
     with _EventNodeRecorder._instance_lock:
