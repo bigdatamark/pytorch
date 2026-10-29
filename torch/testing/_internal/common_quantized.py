@@ -1,5 +1,14 @@
 # mypy: ignore-errors
 
+# [MODULE DOC]
+# Test utilities for quantization: numpy reference quantize/dequantize/requantize helpers,
+# dynamic qparam calculators, SNR measurement, qengine context managers and decorators,
+# fake-quantize reference implementations, and sub-byte float (fp4/fp6, MX format) packing
+# and block-scale swizzle helpers.
+# Import-time side effects: builds the module-level list supported_qengines from the quantized
+# backend, then removes qnnpack (flaky/unsupported on PPC, TSAN, macOS, Windows) and removes
+# fbgemm and x86 on ARM64.
+
 r"""Importing this file includes common utility methods for checking quantized
 tensors and modules.
 """
@@ -21,12 +30,20 @@ if IS_ARM64:
 
 def _conv_output_shape(input_size, kernel_size, padding, stride, dilation,
                        output_padding=0):
+    # [FUNCTION DOC] HELPER: Computes the convolution output size along one dimension using
+    # numpy floor arithmetic; inputs are the input size, kernel size, padding, stride, dilation
+    # and output_padding. Returns a numpy floating value. No side effects.
+    # KNOWN ISSUE: output_padding is added after the division by stride, which differs from the
+    # usual transposed-convolution formula; it is only correct for the default of zero.
     """Computes the output shape given convolution parameters."""
     return np.floor((input_size + 2 * padding - kernel_size - (kernel_size - 1)
                      * (dilation - 1)) / stride) + 2 * output_padding + 1
 
 # Quantization references
 def _quantize(x, scale, zero_point, qmin=None, qmax=None, dtype=np.uint8):
+    # [FUNCTION DOC] HELPER: Reference numpy quantization. Divides by scale, adds zero_point,
+    # rounds, clips to [qmin, qmax] and casts to dtype. qmin/qmax default to the integer
+    # limits of dtype. Returns a new array of the given dtype; inputs are not mutated.
     """Quantizes a numpy array."""
     if qmin is None:
         qmin = np.iinfo(dtype).min
@@ -39,12 +56,17 @@ def _quantize(x, scale, zero_point, qmin=None, qmax=None, dtype=np.uint8):
 
 
 def _dequantize(qx, scale, zero_point):
+    # [FUNCTION DOC] HELPER: Reference numpy dequantization. Casts the quantized array to float,
+    # subtracts zero_point and multiplies by scale. Returns a new float array.
     """Dequantizes a numpy array."""
     x = (qx.astype(float) - zero_point) * scale
     return x
 
 
 def _requantize(x, multiplier, zero_point, qmin=0, qmax=255, qtype=np.uint8):
+    # [FUNCTION DOC] HELPER: Reference numpy requantization. Multiplies the intermediate values
+    # by multiplier, rounds, adds zero_point, clips to [qmin, qmax] and casts to qtype.
+    # Returns a new array; inputs are not mutated.
     """Requantizes a numpy array, i.e., intermediate int32 or int16 values are
     converted back to given type"""
     qx = (x * multiplier).round() + zero_point
@@ -52,6 +74,12 @@ def _requantize(x, multiplier, zero_point, qmin=0, qmax=255, qtype=np.uint8):
     return qx
 
 def _calculate_dynamic_qparams(X, dtype, reduce_range=False, qscheme=torch.per_tensor_affine):
+    # [FUNCTION DOC] Computes per-tensor dynamic quantization parameters from the min and max of
+    # X (a tensor or numpy array; tensors are converted to numpy). dtype must be qint8 or
+    # quint8 (symmetric scheme requires qint8); reduce_range halves the integer range.
+    # Returns a list of [scale as float, zero_point as int]. Constant input gives scale 1,
+    # zero_point 0. Symmetric uses zero_point 0; affine includes zero in the range and clamps
+    # zero_point. Raises AssertionError for an unsupported qscheme or symmetric non-qint8.
     """Calculate the dynamic quantization parameters (scale, zero_point)
     according to the min and max element of the tensor"""
     if qscheme not in (torch.per_tensor_affine, torch.per_tensor_symmetric):
@@ -99,6 +127,12 @@ def _calculate_dynamic_qparams(X, dtype, reduce_range=False, qscheme=torch.per_t
     return [float(scale), int(zero_point)]
 
 def _calculate_dynamic_per_channel_qparams(X, dtype):
+    # [FUNCTION DOC] HELPER: Computes affine quantization parameters for each entry along the
+    # first dimension of X (tensor or numpy array), using the integer range of dtype.
+    # Returns a pair of numpy arrays (scales as float64, zero_points as int64), one entry per
+    # channel. Constant input gives scale 1 and zero_point 0.
+    # KNOWN ISSUE: the loop computes min and max over the whole of X for every channel instead
+    # of over the slice for channel i, so all channels get identical values.
     """Calculate the dynamic quantization parameters (scale, zero_point)
     according to the min and max element of the tensor"""
     if isinstance(X, torch.Tensor):
@@ -125,6 +159,11 @@ def _calculate_dynamic_per_channel_qparams(X, dtype):
     return scale, zero_point
 
 def _snr(x, x_hat):
+    # [FUNCTION DOC] HELPER: Computes signal power, noise power and SNR in dB between a
+    # reference x and an approximation x_hat. Lists or tuples are handled recursively and give
+    # a nested list of results. Quantized tensors are dequantized first. Raises AssertionError
+    # if sequence lengths differ. If the noise norm is zero, returns (0.0, inf, inf), which
+    # puts inf in the noise slot rather than the signal.
     """Calculates the signal to noise ratio and returns the signal and noise
     power, as well as the SNR in dB.
     If the input is a list/tuple this function is called recursively on each
@@ -154,6 +193,9 @@ def _snr(x, x_hat):
 
 @contextmanager
 def override_quantized_engine(qengine):
+    # [FUNCTION DOC] Context manager that sets the global quantized backend engine to qengine
+    # for the duration of the block and restores the previous engine on exit, even on error.
+    # Side effect: mutates the global torch.backends.quantized.engine setting.
     previous = torch.backends.quantized.engine
     torch.backends.quantized.engine = qengine
     try:
@@ -163,6 +205,9 @@ def override_quantized_engine(qengine):
 
 @contextmanager
 def override_cpu_allocator_for_qnnpack(qengine_is_qnnpack):
+    # [FUNCTION DOC] Context manager that, when the flag is true, installs the default mobile
+    # CPU allocator for the duration of the block and always removes it on exit. When the flag
+    # is false it does nothing. Side effect: changes the global CPU allocator.
     try:
         if qengine_is_qnnpack:
             torch._C._set_default_mobile_cpu_allocator()
@@ -175,7 +220,13 @@ def override_cpu_allocator_for_qnnpack(qengine_is_qnnpack):
 # Currently for some of the tests it seems to have inconsistent params
 # for fbgemm vs qnnpack.
 def override_qengines(qfunction):
+    # [FUNCTION DOC] Decorator that wraps a test function so it runs once for every engine in
+    # supported_qengines, each time inside override_quantized_engine. Returns the wrapper; the
+    # wrapped function's return value is discarded.
+    # KNOWN ISSUE: the wrapper does not preserve the wrapped function's name or metadata.
     def test_fn(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapper that loops over supported engines and calls the
+        # decorated function with the given arguments under each engine.
         for qengine in supported_qengines:
             with override_quantized_engine(qengine):
                 # qfunction should not return anything.
@@ -183,16 +234,22 @@ def override_qengines(qfunction):
     return test_fn
 
 def qengine_is_fbgemm():
+    # [FUNCTION DOC] HELPER: Returns True if the active quantized engine is fbgemm.
     return torch.backends.quantized.engine == 'fbgemm'
 def qengine_is_qnnpack():
+    # [FUNCTION DOC] HELPER: Returns True if the active quantized engine is qnnpack.
     return torch.backends.quantized.engine == 'qnnpack'
 def qengine_is_onednn():
+    # [FUNCTION DOC] HELPER: Returns True if the active quantized engine is onednn.
     return torch.backends.quantized.engine == 'onednn'
 def qengine_is_x86():
+    # [FUNCTION DOC] HELPER: Returns True if the active quantized engine is x86.
     return torch.backends.quantized.engine == 'x86'
 
 # Helper function used to simulate per-channel fake-quant against any axis
 def _permute_to_axis_zero(X, axis):
+    # [FUNCTION DOC] HELPER: Swaps dimension axis with dimension 0 of tensor X. Returns a pair
+    # of the permuted view and the permutation list (which is its own inverse).
     new_axis_list = list(range(X.dim()))
     new_axis_list[axis] = 0
     new_axis_list[0] = axis
@@ -202,6 +259,9 @@ def _permute_to_axis_zero(X, axis):
 # Reference method for fake quantize
 # Note: because scale/zero_point are left as float in the actual kernel, this mimics how fake_quant works for float16/64
 def _fake_quantize_per_channel_affine_reference(X, per_channel_scale, per_channel_zero_point, axis, quant_min, quant_max):
+    # [FUNCTION DOC] HELPER: Reference per-channel affine fake quantization along axis. Computes
+    # in float32 per channel: round(x/scale + zero_point), clamp to [quant_min, quant_max],
+    # then map back to float. Returns a tensor of the input shape and original dtype.
     dtype = X.dtype
     X, permute_axis_list = _permute_to_axis_zero(X.to(torch.float32), axis)
     res = torch.zeros_like(X)
@@ -216,6 +276,10 @@ def _fake_quantize_per_channel_affine_reference(X, per_channel_scale, per_channe
 # Reference method for the gradient of the fake quantize operator
 # Note: because scale/zero_point are left as float in the actual kernel, this mimics how fake_quant works for float16/64
 def _fake_quantize_per_channel_affine_grad_reference(dY, X, per_channel_scale, per_channel_zero_point, axis, quant_min, quant_max):
+    # [FUNCTION DOC] HELPER: Reference gradient of per-channel fake quantization. Quantizes X
+    # per channel along axis in float32, builds a mask of elements whose quantized value lies
+    # in [quant_min, quant_max], and passes dY through where the mask holds, zero elsewhere.
+    # Returns a tensor shaped like dY with the dtype of X.
     dtype = X.dtype
     X, permute_axis_list = _permute_to_axis_zero(X.to(torch.float32), axis)
     Xq = torch.zeros_like(X)
@@ -228,6 +292,8 @@ def _fake_quantize_per_channel_affine_grad_reference(dY, X, per_channel_scale, p
     return res.to(dtype)
 
 def to_tensor(X, device):
+    # [FUNCTION DOC] HELPER: Converts X (tensor or array-like) to a float32 tensor on device.
+    # A tensor input is detached and cloned first, so the caller's tensor is never aliased.
     if not isinstance(X, torch.Tensor):
         X = torch.tensor(X)
     else:
@@ -237,6 +303,7 @@ def to_tensor(X, device):
 # copy-pasted from
 # https://github.com/pytorch/ao/blob/bc4f51da86956275da7db0da6e420c506df97820/torchao/prototype/custom_fp_utils.py#L27C1-L142C29
 def _n_ones(n: int) -> int:
+    # [FUNCTION DOC] HELPER: Returns an integer whose lowest n bits are all set.
     return (1 << n) - 1
 
 EBITS_F32, MBITS_F32 = 8, 23
@@ -245,6 +312,12 @@ F32_EXP_BIAS = _n_ones(EBITS_F32 - 1)
 # copy-pasted from
 # https://github.com/pytorch/ao/blob/bc4f51da86956275da7db0da6e420c506df97820/torchao/prototype/custom_fp_utils.py#L27C1-L142C29
 def _f32_to_floatx_unpacked(x: Tensor, ebits: int, mbits: int) -> Tensor:
+    # [FUNCTION DOC] HELPER: Converts a float32 tensor to a sub-byte float format with ebits
+    # exponent bits and mbits mantissa bits, returned as uint8 with the encoding in the low
+    # bits. Works on the magnitude with bit tricks (denormal, normal and saturate branches
+    # merged with masks, round-to-nearest-even), then reattaches the sign. Out-of-range values
+    # saturate to the max magnitude; NaN and inf are not supported.
+    # Raises AssertionError if the dtype is not float32 or 1 + ebits + mbits exceeds 8.
     """Convert FP32 numbers to sub-byte floating point numbers with the given
     number of exponent and mantissa bits.
 
@@ -367,6 +440,11 @@ def _f32_to_floatx_unpacked(x: Tensor, ebits: int, mbits: int) -> Tensor:
 # copy-pasted from
 # https://github.com/pytorch/ao/blob/29488018d99af7f7339f06353c6b5bbeae8a1493/torchao/prototype/custom_fp_utils.py#L147
 def _floatx_unpacked_to_f32(x: Tensor, ebits: int, mbits: int) -> Tensor:
+    # [FUNCTION DOC] HELPER: Inverse of the unpacking conversion. Takes a uint8 tensor holding a
+    # sub-byte float with ebits/mbits in the low bits and returns a float32 tensor. Rebiases the
+    # exponent for normal values, maps zero to zero, and rebuilds denormals as normal float32
+    # values (a shortcut for one mantissa bit, a loop over mantissa values otherwise).
+    # Raises AssertionError if dtype is not uint8 or 1 + ebits + mbits exceeds 8.
     """Convert sub-byte floating point numbers with the given number of exponent
     and mantissa bits to FP32.
 
@@ -460,6 +538,7 @@ def _floatx_unpacked_to_f32(x: Tensor, ebits: int, mbits: int) -> Tensor:
 
 # copied from https://github.com/drisspg/transformer_nuggets/blob/main/transformer_nuggets/mx/to_blocked.py
 def ceil_div(a, b):
+    # [FUNCTION DOC] HELPER: Integer division of a by b rounded up.
     return (a + b - 1) // b
 
 # NVIDIA Blackwell HW requires scales for MX/NV blocked formats to be in a 128x4 tile layout,
@@ -467,6 +546,10 @@ def ceil_div(a, b):
 # for non-gemm purposes (like testing), we need to de-swizzle them, then they can be applied much
 # more naturally.
 def from_blocked(input, input_scales, blocksize) -> torch.Tensor:
+    # [FUNCTION DOC] Reference (slow, loop based) de-swizzling of block scales. input is the
+    # data matrix, input_scales the flat swizzled scale buffer in the 128x4 tile layout, and
+    # blocksize the number of data columns per scale. Returns a 2D scale tensor with one scale
+    # per row per block, on the input's device and the scales' dtype.
     # Matrix is in a 128x4 pattern, internally blocked as 32x4x4 nonsense.
     # Output should be [input.size(0, input.size(1) // blocksize] scales
     output_scales = torch.zeros(
@@ -505,6 +588,8 @@ def from_blocked(input, input_scales, blocksize) -> torch.Tensor:
     return output_scales
 
 def from_blocked_format(x_mxfp8, scales_unswizzled, blocksize=32):
+    # [FUNCTION DOC] Dequantizes block-scaled data: repeats each scale blocksize times along
+    # dimension 1, multiplies with the data in float32, and returns a bfloat16 tensor.
     # expand scales
     scales = torch.repeat_interleave(scales_unswizzled, blocksize, dim=1)
 
@@ -513,6 +598,9 @@ def from_blocked_format(x_mxfp8, scales_unswizzled, blocksize=32):
     return x_f32.to(torch.bfloat16)
 
 def to_blocked(input_matrix) -> torch.Tensor:
+    # [FUNCTION DOC] Swizzles a 2D scale matrix into the cuBLAS block-scaling layout. Pads rows
+    # up to a multiple of 128 and columns up to a multiple of 4 with zeros (only when needed),
+    # regroups into tiles, and returns a flattened 1D tensor. Input is not mutated.
     """
     Rearrange a large matrix by breaking it into blocks and applying the rearrangement pattern.
 
@@ -547,12 +635,18 @@ def to_blocked(input_matrix) -> torch.Tensor:
 
 
 def down_size(size):
+    # [FUNCTION DOC] HELPER: Returns a shape tuple with the last dimension halved. Raises
+    # AssertionError if the last dimension is odd.
     if size[-1] % 2 != 0:
         raise AssertionError(f"{size} last dim not divisible by two")
     return (*size[:-1], size[-1] // 2)
 
 
 def pack_uint4(uint8_data) -> torch.Tensor:
+    # [FUNCTION DOC] Packs pairs of 4-bit values held in uint8 elements into single bytes along
+    # the last dimension: the even element goes in the low nibble, the odd one in the high
+    # nibble. Returns a tensor with the last dimension halved. Raises AssertionError if the
+    # last dimension is odd.
     # converting to uint8 for operations
     shape = uint8_data.shape
     if shape[-1] % 2 != 0:
@@ -566,6 +660,9 @@ FP4_EBITS, FP4_MBITS = 2, 1
 
 
 def _bfloat16_to_float4_e2m1fn_x2(x):
+    # [FUNCTION DOC] HELPER: Converts a bfloat16 tensor to the packed float4 e2m1 dtype by
+    # casting to float32, encoding to 4-bit, packing two values per byte and reinterpreting.
+    # Raises AssertionError if the input is not bfloat16.
     if x.dtype != torch.bfloat16:
         raise AssertionError(f"Expected x.dtype to be torch.bfloat16, got {x.dtype}")
     x = _f32_to_floatx_unpacked(x.float(), FP4_EBITS, FP4_MBITS)
@@ -580,6 +677,14 @@ def to_mxfp(
     block_size: int = 32,
     format: str = "mxfp8",
 ):
+    # [FUNCTION DOC] Quantizes a contiguous bfloat16 or float32 tensor to an MX format. The last
+    # dimension is split into blocks of block_size; each block gets a power-of-two e8m0 scale
+    # (rounded up from block max over the format max) and the data is scaled and saturated.
+    # format is "mxfp8" (float8 e4m3) or "mxfp4" (packed float4, last dim halved).
+    # Returns (scales as float8 e8m0 with the block dim removed, quantized data).
+    # Raises AssertionError for unsupported dtype, non-divisible last dim or non-contiguous input.
+    # KNOWN ISSUE: any other format string leaves max_pos unset and fails with a NameError-style
+    # unbound local error instead of a clear message.
     if data_hp.dtype not in (torch.bfloat16, torch.float):
         raise AssertionError(f"{data_hp.dtype} is not supported yet")
     if data_hp.shape[-1] % block_size != 0:
@@ -612,6 +717,10 @@ def to_mxfp(
         max_abs: torch.Tensor,
         max_pos: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Computes the biased e8m0 exponent per block as the ceiling of
+        # log2 of (max_abs / max_pos), clamped to the representable range (NaN maps to 0xFF),
+        # and returns it with data multiplied by the reciprocal scale and clamped to
+        # [-max_pos, max_pos]. Returns (uint8 exponents, scaled float32 data).
         E8M0_EXPONENT_BIAS = 127
         descale = max_abs / max_pos
         exponent = torch.where(
@@ -657,6 +766,10 @@ def to_mxfp(
 
 # Source: https://github.com/pytorch/ao/blob/568c1932a16ae9f30d48da214a88dc0013e98ed8/torchao/prototype/moe_training/utils.py#L310
 def generate_jagged_offs(E, M, multiple_of=16, dtype=torch.int32, device="cuda"):
+    # [FUNCTION DOC] Builds a sorted 1D tensor of E cumulative offsets: E-1 distinct random
+    # multiples of multiple_of drawn from [multiple_of, M), followed by M as the last value.
+    # Returns it cast to dtype and moved to device. Uses Python's global random state.
+    # Raises ValueError if M is not divisible by multiple_of or E exceeds the candidate count.
     """
     Utility function for tests and benchmarks.
 
