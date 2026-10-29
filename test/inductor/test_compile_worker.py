@@ -1,4 +1,10 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for the inductor compile worker infrastructure: the subprocess pool (jobs,
+# exceptions, crashes, sidecar death handling, quiesce/wakeup, logging, shutdown), the pool
+# watchdog that reports slow jobs through structured tracing, the idle Timer, propagation of
+# cache-related environment variables to worker processes, libdevice path handling, and warm-cache
+# triton worker compiles. Most pool tests are skipped on Windows. The main block runs tests only
+# when a CPU test environment is available.
 import json
 import operator
 import os
@@ -27,11 +33,18 @@ from torch.testing._internal.inductor_utils import HAS_CPU, HAS_TRITON
 
 
 class TestCompileWorker(TestCase):
+    # [CLASS DOC] Behavioral tests of the process pool used for parallel compilation. Pools are
+    # created through an overridable factory so a subclass can vary construction; every test shuts
+    # its pool down in a finally clause.
     def make_pool(self, size):
+        # [FUNCTION DOC] HELPER: Factory for the pool under test: returns a subprocess pool with
+        # the given number of workers. Overridden by subclasses to change pool options.
         return SubprocPool(size)
 
     @skipIfWindows(msg="pass_fds not supported on Windows.")
     def test_basic_jobs(self):
+        # [FUNCTION DOC] Submits an add job and a subtract job to a two-worker pool and checks the
+        # results are 101 and 99.
         pool = self.make_pool(2)
         try:
             a = pool.submit(operator.add, 100, 1)
@@ -43,6 +56,8 @@ class TestCompileWorker(TestCase):
 
     @skipIfWindows(msg="pass_fds not supported on Windows.")
     def test_exception(self):
+        # [FUNCTION DOC] A job that raises the pool's test exception must surface from its future
+        # as a subprocess exception whose message names the test exception class.
         pool = self.make_pool(2)
         try:
             a = pool.submit(raise_testexc)
@@ -56,6 +71,8 @@ class TestCompileWorker(TestCase):
 
     @skipIfWindows(msg="pass_fds not supported on Windows.")
     def test_crash(self):
+        # [FUNCTION DOC] A job that exits the worker process abruptly must make the future raise
+        # some exception; afterwards the pool must still accept and correctly run new jobs.
         pool = self.make_pool(2)
         try:
             with self.assertRaises(Exception):
@@ -72,6 +89,10 @@ class TestCompileWorker(TestCase):
 
     @skipIfWindows(msg="pass_fds not supported on Windows.")
     def test_sidecar_death_fails_pending_futures(self):
+        # [FUNCTION DOC] After warming the pool, submits a long sleep job and kills the sidecar
+        # process. The liveness watchdog must fail the pending future within 60 seconds with an
+        # exception rather than hang (a timeout is a test failure, and no exception at all is also
+        # a failure).
         # If the sidecar (SubprocMain) process dies, its forked compile workers
         # keep the write pipe open, so the parent never sees EOF and would
         # otherwise block forever in _recv_msg. The liveness watchdog must
@@ -96,6 +117,10 @@ class TestCompileWorker(TestCase):
 
     @skipIfWindows(msg="pass_fds not supported on Windows.")
     def test_sidecar_death_eofs_without_watchdog(self):
+        # [FUNCTION DOC] Disables the pool health monitor via a patch, then kills the sidecar
+        # while a long job is pending. The pending future must still fail with an exception within
+        # 60 seconds, which only works if the result pipe reaches end of file because no process
+        # holds its write end.
         # With the liveness watchdog disabled, sidecar death must still fail
         # pending futures via a clean pipe EOF -- which only happens if neither
         # the parent nor the compile workers keep the result pipe's write end
@@ -120,6 +145,9 @@ class TestCompileWorker(TestCase):
 
     @skipIfWindows(msg="pass_fds not supported on Windows.")
     def test_spawn_pool_basic_jobs(self):
+        # [FUNCTION DOC] Runs the add/subtract jobs on a pool created with the spawn kind,
+        # guarding against a regression where closing inherited descriptors in workers was not
+        # limited to forked workers and wedged spawned pools.
         # compile_fx_subproc.py runs the pool with kind=SPAWN. The worker
         # fd-close must be gated to fork; otherwise a spawned worker closes an
         # unrelated (reused) fd and wedges the pool via a BrokenProcessPool loop.
@@ -134,6 +162,9 @@ class TestCompileWorker(TestCase):
 
     @skipIfWindows(msg="pass_fds not supported on Windows.")
     def test_watchdog_fails_futures_when_no_eof(self):
+        # [FUNCTION DOC] Disables the pool result reader thread via a patch (so end of file can
+        # never be observed), starts a long job and kills the sidecar. The health monitor alone
+        # must fail the pending future within 60 seconds.
         # Isolate the liveness watchdog from the fd/EOF fix. Disabling _read_thread
         # kills the result-pipe path entirely, standing in for the "sidecar dies
         # but EOF never arrives" case: with that path dead, only _health_monitor
@@ -159,6 +190,8 @@ class TestCompileWorker(TestCase):
 
     @skipIfWindows(msg="pass_fds not supported on Windows.")
     def test_quiesce(self):
+        # [FUNCTION DOC] Submits a job, calls quiesce then wakeup on the pool, submits another
+        # job, and checks both complete with the expected results.
         pool = self.make_pool(2)
         try:
             a = pool.submit(operator.add, 100, 1)
@@ -173,6 +206,10 @@ class TestCompileWorker(TestCase):
     @unittest.skipIf(IS_LINUX, "https://github.com/pytorch/pytorch/issues/176968")
     @skipIfWindows(msg="pass_fds not supported on Windows.")
     def test_quiesce_repeatedly(self):
+        # [FUNCTION DOC] Skipped on Linux (tracked issue) and on Windows. Calls quiesce and wakeup
+        # repeatedly, including two quiesce calls in a row, between job submissions, and checks
+        # results of the add job and the last subtract job. Only the second subtract future is
+        # checked, the first is overwritten.
         pool = SubprocPool(2)
         try:
             a = pool.submit(operator.add, 100, 1)
@@ -190,6 +227,9 @@ class TestCompileWorker(TestCase):
 
     @skipIfWindows(msg="pass_fds not supported on Windows.")
     def test_logging(self):
+        # [FUNCTION DOC] Sets job-name and rank environment variables and a worker log path
+        # environment variable pointing to a temporary file (side effect: these os.environ values
+        # are not restored), creates a pool, submits a job, and asserts the log file exists.
         os.environ["MAST_HPC_JOB_NAME"] = "test_job"
         os.environ["ROLE_RANK"] = "0"
         with tempfile.NamedTemporaryFile(delete=True) as temp_log:
@@ -203,6 +243,11 @@ class TestCompileWorker(TestCase):
 
     @skipIfWindows(msg="pass_fds not supported on Windows.")
     def test_shutdown_kills_wedged_worker(self):
+        # [FUNCTION DOC] Runs a child Python interpreter (with a temporary working directory and
+        # 180 second timeout) that creates a pool, warms it, submits a job that ignores SIGTERM
+        # and sleeps, then times pool shutdown, requiring it to finish in under 120 seconds. The
+        # test asserts the child exited with status 0 (reporting stdout and stderr on failure) and
+        # printed the shutdown confirmation.
         # A compile worker that ignores SIGTERM must not stall pool teardown:
         # the sidecar has to escalate to SIGKILL rather than block indefinitely
         # in pool.shutdown(wait=True) (which the parent only bounds at 300s).
@@ -245,6 +290,12 @@ class TestCompileWorker(TestCase):
 
     @skipIfWindows(msg="pass_fds not supported on Windows.")
     def test_shutdown_terminates_sidecar_worker_pool(self):
+        # [FUNCTION DOC] Runs a child Python interpreter that warms a pool, submits a job that
+        # creates a sentinel file once running and then sleeps 120 seconds, waits (up to 60
+        # seconds) for the sentinel, then shuts down with the sidecar wait timeout reduced to 30
+        # seconds, killing the sidecar and re-raising on timeout. The parent passes the sentinel
+        # path through the environment and asserts exit status 0 and the shutdown confirmation in
+        # stdout, so shutdown must terminate in-flight work instead of waiting for it.
         code = textwrap.dedent(
             """
             import operator
@@ -319,11 +370,19 @@ class TestCompileWorker(TestCase):
 
 @config.patch("quiesce_async_compile_time", 0.1)
 class TestCompileWorkerWithTimer(TestCompileWorker):
+    # [CLASS DOC] Reruns every TestCompileWorker test with the quiesce-after-idle compile time
+    # config patched to 0.1 seconds and pools created in quiesce mode.
     def make_pool(self, size):
+        # [FUNCTION DOC] HELPER: Returns a pool with the given worker count created with quiescing
+        # enabled.
         return SubprocPool(size, quiesce=True)
 
 
 class TestCompileWorkerWatchdog(TestCase):
+    # [CLASS DOC] Tests for the sidecar watchdog that periodically reports jobs running longer
+    # than a (test-shortened) interval to the parent as structured-trace artifacts named for
+    # compile worker status. The tests patch the structured trace function used by the pool module
+    # to capture those reports.
     # The sidecar runs a watchdog that, every interval (shortened to 1s here via
     # env), reports jobs still running past that interval to the parent, which
     # turns them into a "compile_worker_status" structured-trace artifact -- so a
@@ -331,10 +390,18 @@ class TestCompileWorkerWatchdog(TestCase):
     # wedging. See subproc_pool.SubprocMain._watchdog_loop.
     @skipIfWindows(msg="pass_fds not supported on Windows.")
     def test_watchdog_reports_slow_jobs(self):
+        # [FUNCTION DOC] With a 1 second watchdog interval, a pool runs an 8 second sleep job
+        # while the tracing function is replaced by a recorder. Waits up to 30 seconds for a
+        # status report, lets the job finish, then asserts at least one report was captured and
+        # the last one shows elapsed time of at least 1 second.
         reports = []
         got_report = Event()
 
         def fake_trace_structured(name, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Replacement for the trace function: ignores everything except
+            # artifact events whose metadata name is the compile worker status; for those it
+            # decodes the JSON payload, appends it to the enclosing list, and sets the event that
+            # wakes the waiting test.
             if name != "artifact":
                 return
             metadata = kwargs.get("metadata_fn", dict)()
@@ -365,9 +432,15 @@ class TestCompileWorkerWatchdog(TestCase):
 
     @skipIfWindows(msg="pass_fds not supported on Windows.")
     def test_watchdog_silent_for_fast_jobs(self):
+        # [FUNCTION DOC] With a 1 second interval, warms a pool first (so cold start cost is not
+        # reported), then with the recording trace function installed runs a fast job and sleeps
+        # 2.5 seconds. Asserts that no status report was recorded.
         reports = []
 
         def fake_trace_structured(name, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Replacement for the trace function: for artifact events named
+            # as compile worker status, appends the metadata (not the payload) to the enclosing
+            # list; all other events are ignored.
             if name != "artifact":
                 return
             metadata = kwargs.get("metadata_fn", dict)()
@@ -400,6 +473,10 @@ class TestCompileWorkerWatchdog(TestCase):
 
     @skipIfWindows(msg="pass_fds not supported on Windows.")
     def test_watchdog_reports_worker_phase(self):
+        # [FUNCTION DOC] A job that reports the querying-cache heartbeat phase and sleeps 8
+        # seconds must produce a status report whose phase is the cache-querying phase. The test
+        # waits up to 30 seconds for it, then asserts such reports exist and the last one includes
+        # the phase elapsed time and worker pid.
         # A worker that reports a heartbeat phase should have that phase surface
         # in the STATUS report (Phase 2: shared-memory phase heartbeat).
         from torch._inductor.compile_worker.subproc_pool import (
@@ -411,6 +488,9 @@ class TestCompileWorkerWatchdog(TestCase):
         got_phase = Event()
 
         def fake_trace_structured(name, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Replacement for the trace function: for compile worker status
+            # artifacts it decodes and records the payload, and sets the waiting event when the
+            # record's phase is the cache-querying phase.
             if name != "artifact":
                 return
             metadata = kwargs.get("metadata_fn", dict)()
@@ -448,12 +528,18 @@ class TestCompileWorkerWatchdog(TestCase):
 
     @skipIfWindows(msg="pass_fds not supported on Windows.")
     def test_watchdog_reports_queued_job(self):
+        # [FUNCTION DOC] Uses a one-worker pool and submits two long sleep jobs so the second must
+        # wait in the queue. Asserts that within 30 seconds a status report with the queued phase
+        # is produced.
         # A job submitted while every worker is busy sits in the pool queue with
         # no heartbeat slot, and must be reported with phase="queued".
         reports = []
         got_queued = Event()
 
         def fake_trace_structured(name, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Replacement for the trace function: for compile worker status
+            # artifacts it decodes and records the payload, and sets the waiting event when the
+            # record's phase is queued.
             if name != "artifact":
                 return
             metadata = kwargs.get("metadata_fn", dict)()
@@ -484,12 +570,17 @@ class TestCompileWorkerWatchdog(TestCase):
 
     @skipIfWindows(msg="pass_fds not supported on Windows.")
     def test_watchdog_duration_only_for_spawn_pool(self):
+        # [FUNCTION DOC] With a spawn-kind pool (no heartbeat buffer) and a long sleep job, waits
+        # up to 30 seconds for a status report and asserts the last report has an elapsed time
+        # field but no phase field.
         # Spawn pools don't get the heartbeat buffer, so the watchdog reports
         # duration only -- no phase (it can't tell queued from running).
         reports = []
         got_report = Event()
 
         def fake_trace_structured(name, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Replacement for the trace function: for compile worker status
+            # artifacts it decodes and records the payload, and sets the waiting event.
             if name != "artifact":
                 return
             metadata = kwargs.get("metadata_fn", dict)()
@@ -520,10 +611,16 @@ class TestCompileWorkerWatchdog(TestCase):
 
 
 class TestTimer(TestCase):
+    # [CLASS DOC] Tests for the idle Timer from the compile worker package, which calls a callback
+    # after a period of inactivity following recorded calls. Tests shorten the timer's internal
+    # sleep time and always stop the timer at the end.
     def test_basics(self):
+        # [FUNCTION DOC] Timer with a 0.1 second interval and callback that sets an event; after
+        # one recorded call the event must be set within 4 seconds. The timer is then stopped.
         done = Event()
 
         def doit():
+            # [FUNCTION DOC] HELPER: Timer callback that sets the enclosing event.
             done.set()
 
         t = Timer(0.1, doit)
@@ -533,9 +630,13 @@ class TestTimer(TestCase):
         t.quit()
 
     def test_repeated_calls(self):
+        # [FUNCTION DOC] Records a call and waits for the callback event, ten times in a row,
+        # clearing the event between rounds, to check the timer can fire repeatedly. The timer is
+        # then stopped.
         done = Event()
 
         def doit():
+            # [FUNCTION DOC] HELPER: Timer callback that sets the enclosing event.
             done.set()
 
         t = Timer(0.1, doit)
@@ -547,9 +648,12 @@ class TestTimer(TestCase):
         t.quit()
 
     def test_never_fires(self):
+        # [FUNCTION DOC] A timer with a very long interval (999) that records a call must not fire
+        # within 4 seconds. The timer is then stopped.
         done = Event()
 
         def doit():
+            # [FUNCTION DOC] HELPER: Timer callback that sets the enclosing event.
             done.set()
 
         t = Timer(999, doit)
@@ -559,9 +663,12 @@ class TestTimer(TestCase):
         t.quit()
 
     def test_spammy_calls(self):
+        # [FUNCTION DOC] With a 1 second interval timer, records 400 calls in a tight loop and
+        # checks the callback still fires within 4 seconds. The timer is then stopped.
         done = Event()
 
         def doit():
+            # [FUNCTION DOC] HELPER: Timer callback that sets the enclosing event.
             done.set()
 
         t = Timer(1, doit)
@@ -573,19 +680,31 @@ class TestTimer(TestCase):
 
 
 class _FakeTritonKernel:
+    # [CLASS DOC] HELPER: Fake triton kernel recording whether it was precompiled (storing the
+    # warm-cache-only flag) and whether it was prepared for pickling. Both flags start false.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Initializes the precompiled and prepared-for-pickle flags to
+        # false.
         self.precompiled = False
         self.prepared_for_pickle = False
 
     def precompile(self, *, warm_cache_only):
+        # [FUNCTION DOC] HELPER: Stores the warm-cache-only keyword argument in the precompiled
+        # attribute.
         self.precompiled = warm_cache_only
 
     def prepare_for_pickle(self):
+        # [FUNCTION DOC] HELPER: Marks the kernel as prepared for pickling.
         self.prepared_for_pickle = True
 
 
 class TestSubprocessEnv(TestCase):
+    # [CLASS DOC] Tests that cache-related environment settings are sent to, and applied (or
+    # cleared) inside, compile worker processes, using fake pools and temporary directories. Tests
+    # save and restore the relevant environment variables themselves.
     def assert_path_in_dir(self, path, expected_dir):
+        # [FUNCTION DOC] HELPER: Asserts that the given path lies inside the expected directory,
+        # comparing absolute paths via their common path.
         expected_dir = os.path.abspath(expected_dir)
         self.assertEqual(
             os.path.commonpath([os.path.abspath(path), expected_dir]),
@@ -593,20 +712,34 @@ class TestSubprocessEnv(TestCase):
         )
 
     def test_pycodecache_kernel_compile_sends_full_cache_env(self):
+        # [FUNCTION DOC] With the inductor cache dir set and the triton and cutlass dirs unset in
+        # the environment, and the process pool replaced by a recording fake, compiling a cutedsl
+        # kernel and a universal gemm kernel must each submit the worker compile function once
+        # (two calls total), with a fourth argument equal to a mapping of the three environment
+        # variable names to current values (unset ones as none). The environment is restored
+        # afterwards.
         from torch._inductor.async_compile import AsyncCompile
         from torch._inductor.runtime.compile_tasks import (
             _worker_compile_pycodecache_kernel,
         )
 
         class FakeFuture:
+            # [CLASS DOC] HELPER: Fake future whose result is a fixed key, a temp kernel path and
+            # zero.
             def result(self):
+                # [FUNCTION DOC] HELPER: Returns the tuple of key, kernel path and a zero.
                 return "key", "/tmp/kernel.py", 0
 
         class FakePool:
+            # [CLASS DOC] HELPER: Fake process pool that records each submitted function with its
+            # arguments.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Starts with an empty call list.
                 self.calls = []
 
             def submit(self, fn, *args):
+                # [FUNCTION DOC] HELPER: Records the function and argument tuple and returns a
+                # fake future.
                 self.calls.append((fn, args))
                 return FakeFuture()
 
@@ -651,6 +784,13 @@ class TestSubprocessEnv(TestCase):
                     os.environ[key] = value
 
     def test_worker_compile_pycodecache_kernel_clears_cache_env(self):
+        # [FUNCTION DOC] Calls the worker pycodecache compile function twice in a temp directory
+        # with the last-applied-environment marker reset. First call with an explicit cache dir
+        # and triton dir: output path must be under the cache dir, environment variables set
+        # accordingly, cutlass variable absent. Second call with all none: output path must be
+        # under the default cache dir and different from the first, and the triton and cutlass
+        # variables must be absent (cleared). The environment and the module marker are restored
+        # afterwards.
         import torch._inductor.runtime.compile_tasks as compile_tasks
         from torch._inductor.runtime.cache_dir_utils import default_cache_dir
 
@@ -704,20 +844,31 @@ class TestSubprocessEnv(TestCase):
                     os.environ[key] = value
 
     def test_nvgemm_precompile_sends_full_cache_env(self):
+        # [FUNCTION DOC] With the cache env set as in the cutedsl test and a fake process pool,
+        # one nvgemm precompile request must submit exactly one call of the worker autotuning
+        # precompile function whose sixth argument equals the mapping of the three cache
+        # environment variables to current values (unset as none). The environment is restored.
         from torch._inductor.async_compile import AsyncCompile
         from torch._inductor.codegen.nv_universal_gemm.nv_universal_gemm_kernel import (
             _worker_nvgemm_autotuning_precompile,
         )
 
         class FakeFuture:
+            # [CLASS DOC] HELPER: Fake future whose result is a pair of none and zero.
             def result(self):
+                # [FUNCTION DOC] HELPER: Returns none and zero.
                 return None, 0
 
         class FakePool:
+            # [CLASS DOC] HELPER: Fake process pool that records each submitted function with its
+            # arguments.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Starts with an empty call list.
                 self.calls = []
 
             def submit(self, fn, *args):
+                # [FUNCTION DOC] HELPER: Records the function and argument tuple and returns a
+                # fake future.
                 self.calls.append((fn, args))
                 return FakeFuture()
 
@@ -765,6 +916,11 @@ class TestSubprocessEnv(TestCase):
                     os.environ[key] = value
 
     def test_worker_nvgemm_precompile_clears_cache_env(self):
+        # [FUNCTION DOC] Resets the last-applied-environment marker and mocks the nvgemm compile,
+        # fp4 dtype registration and cluster patching. Calls the worker nvgemm precompile twice
+        # with fake metadata and a fake cuda context: first with cache and triton dirs set
+        # (environment must match, cutlass absent), then with all none (all three variables must
+        # be absent from the environment). The environment and marker are restored afterwards.
         import torch
         import torch._inductor.runtime.compile_tasks as compile_tasks
         from torch._inductor.codegen.nv_universal_gemm import (
@@ -841,6 +997,11 @@ class TestSubprocessEnv(TestCase):
                     os.environ[key] = value
 
     def test_worker_compile_triton_clears_libdevice_path(self):
+        # [FUNCTION DOC] Skips if triton is unavailable. Runs the worker triton compile on the
+        # fake kernel class with a libdevice path in the environment mapping; asserts the kernel
+        # was precompiled and prepared for pickling and that both the environment variable and the
+        # triton nvidia knob equal the path. A second run with none must remove the environment
+        # variable and set the knob to none. The old environment value and knob are restored.
         try:
             from triton import knobs
         except ImportError:
@@ -878,6 +1039,12 @@ class TestSubprocessEnv(TestCase):
             knobs.nvidia.libdevice_path = old_knob
 
     def test_serialized_fx_compile_restores_subprocess_env(self):
+        # [FUNCTION DOC] Sets a parent value for a test environment variable and runs the
+        # serialized FX compile child entry point with an input whose deserialize step records
+        # that the variable is absent (the child environment mapping clears it), sets another
+        # variable and raises a private exception. The test expects the exception to propagate,
+        # then asserts the parent variable is restored and the variable set in the child is
+        # removed again. Both variables are restored at the end.
         from torch._inductor.compile_fx_ext import _SerializedFxCompile
 
         key = "TEST_INDUCTOR_SUBPROCESS_ENV"
@@ -888,12 +1055,19 @@ class TestSubprocessEnv(TestCase):
         os.environ.pop(mutated_key, None)
 
         class StopAfterEnvCheck(Exception):
+            # [CLASS DOC] HELPER: Sentinel exception used to stop the child compile after the
+            # environment check.
             pass
 
         testcase = self
 
         class Input:
+            # [CLASS DOC] HELPER: Fake compile input whose deserialize step checks the child
+            # environment and raises the sentinel exception.
             def deserialize(self):
+                # [FUNCTION DOC] HELPER: Asserts via the outer test case that the test variable is
+                # not in the environment, sets the mutation marker variable to a child value, and
+                # raises the sentinel exception.
                 testcase.assertNotIn(key, os.environ)
                 os.environ[mutated_key] = "child-value"
                 raise StopAfterEnvCheck
@@ -915,18 +1089,27 @@ class TestSubprocessEnv(TestCase):
 
 
 class TestSetTritonLibdevicePath(TestCase):
+    # [CLASS DOC] Tests that compiling with eager-numerics related options sets the triton
+    # libdevice path knob, plus bitwise comparisons with eager for pow and erf. These need CUDA, a
+    # CUDA home with libdevice, and triton.
     @config.patch({"compile_threads": 1, "emulate_precision_casts": True})
     def test_emulate_precision_casts_sets_libdevice_path(self):
+        # [FUNCTION DOC] With emulate precision casts and one compile thread, runs the shared
+        # libdevice path check.
         """Test eager numerics mode sets libdevice path for CUDA libdevice calls."""
         self._test_libdevice_path_with_compilation()
 
     @config.patch({"compile_threads": 1, "eager_numerics.use_pytorch_libdevice": True})
     def test_libdevice_path_no_subprocess(self):
+        # [FUNCTION DOC] With the pytorch-libdevice eager numerics option and one compile thread,
+        # runs the shared libdevice path check.
         """Test libdevice path is set with compile_threads=1 (no subprocess)."""
         self._test_libdevice_path_with_compilation()
 
     @config.patch("eager_numerics.use_pytorch_libdevice", True)
     def test_libdevice_path_default_threads(self):
+        # [FUNCTION DOC] With the pytorch-libdevice option and default compile threads, runs the
+        # shared libdevice path check.
         """Test libdevice path is set with default compile_threads (subprocess)."""
         self._test_libdevice_path_with_compilation()
 
@@ -939,6 +1122,10 @@ class TestSetTritonLibdevicePath(TestCase):
         }
     )
     def test_pow_bitwise_precision(self):
+        # [FUNCTION DOC] Skips unless CUDA, CUDA_HOME and the system libdevice file exist. With
+        # eager-numerics libdevice and division rounding, precision casts and one compile thread,
+        # compiles pow on random float tensors and requires the result to be bitwise equal (zero
+        # tolerances) to eager.
         """Test that compiled pow matches eager bitwise with system libdevice."""
         import torch
         from torch.utils.cpp_extension import CUDA_HOME
@@ -962,6 +1149,9 @@ class TestSetTritonLibdevicePath(TestCase):
 
     @config.patch({"compile_threads": 1, "emulate_precision_casts": True})
     def test_erf_bitwise_precision_with_emulate_precision_casts(self):
+        # [FUNCTION DOC] Skips unless CUDA, CUDA_HOME and the system libdevice file exist. With
+        # precision cast emulation and one compile thread, compiles erf on five float values
+        # (including values near plus and minus 3.92) and requires bitwise equality with eager.
         """Test that erf matches eager bitwise when eager numerics mode is active."""
         import torch
         from torch.utils.cpp_extension import CUDA_HOME
@@ -988,6 +1178,7 @@ class TestSetTritonLibdevicePath(TestCase):
         )
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies erf to the input.
             return torch.erf(x)
 
         eager_result = fn(values)
@@ -995,6 +1186,10 @@ class TestSetTritonLibdevicePath(TestCase):
         self.assertEqual(eager_result, compiled_result, atol=0, rtol=0)
 
     def _test_libdevice_path_with_compilation(self):
+        # [FUNCTION DOC] HELPER: Skips unless CUDA, CUDA_HOME and the libdevice bitcode file are
+        # present. Compiles a small function using pow on a CUDA tensor, then reads the triton
+        # nvidia libdevice path knob and asserts it is set, ends with the libdevice bitcode file
+        # name, and is an existing file.
         import torch
         from torch.utils.cpp_extension import CUDA_HOME
 
@@ -1011,6 +1206,7 @@ class TestSetTritonLibdevicePath(TestCase):
         # Compile a simple function that uses pow (which uses libdevice)
         @torch.compile
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled function: raises the input to the power 2.0.
             return torch.pow(x, 2.0)
 
         x = torch.randn(10, device="cuda", dtype=torch.float32)
@@ -1031,31 +1227,52 @@ class TestSetTritonLibdevicePath(TestCase):
 
 
 class TestTritonCompileWorker(TestCase):
+    # [CLASS DOC] Tests that the triton worker compile helper skips GPU driver selection during
+    # warm-cache compiles and restores it afterwards.
     @unittest.skipIf(not HAS_TRITON, "requires triton")
     def test_worker_compile_triton_warm_cache_skips_gpu_driver_setup(self):
+        # [FUNCTION DOC] Skipped without triton. Patches the triton backend registry with a driver
+        # whose activity check raises. A fake kernel (whose precompile calls the driver setup) is
+        # loaded through the worker compile helper: the result must be that kernel, precompile
+        # must have been called once with warm-cache-only true, and it must be prepared for
+        # pickling. Afterwards calling the driver setup directly must raise again, showing the
+        # skip was scoped to the call.
         from torch._inductor.runtime import triton_helpers
         from torch._inductor.runtime.compile_tasks import _worker_compile_triton
 
         class RaisingDriver:
+            # [CLASS DOC] HELPER: Fake triton driver whose activity check always raises a runtime
+            # error about zero active drivers.
             @staticmethod
             def is_active():
+                # [FUNCTION DOC] HELPER: Always raises RuntimeError claiming there are no active
+                # drivers.
                 raise RuntimeError("0 active drivers ([]). There should only be one.")
 
         class FakeKernel:
+            # [CLASS DOC] HELPER: Fake kernel that records the warm-cache-only values passed to
+            # precompile and whether it was prepared for pickling.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Starts with an empty record of precompile calls and the
+                # prepared flag false.
                 self.precompile_calls = []
                 self.prepared = False
 
             def precompile(self, warm_cache_only=False):
+                # [FUNCTION DOC] HELPER: Records the warm-cache-only argument and invokes the
+                # triton helpers GPU driver setup.
                 self.precompile_calls.append(warm_cache_only)
                 triton_helpers.set_driver_to_gpu()
 
             def prepare_for_pickle(self):
+                # [FUNCTION DOC] HELPER: Sets the prepared flag.
                 self.prepared = True
 
         kernel = FakeKernel()
 
         def load_kernel():
+            # [FUNCTION DOC] HELPER: Kernel loader: invokes the GPU driver setup and returns the
+            # fake kernel.
             triton_helpers.set_driver_to_gpu()
             return kernel
 
@@ -1072,15 +1289,25 @@ class TestTritonCompileWorker(TestCase):
 
     @unittest.skipIf(not HAS_TRITON, "requires triton")
     def test_worker_compile_triton_restores_gpu_driver_setup_after_error(self):
+        # [FUNCTION DOC] Skipped without triton. With the raising fake driver registered and a
+        # loader that calls driver setup then raises ValueError, the worker compile helper must
+        # propagate that error, and afterwards calling the driver setup directly must again raise
+        # the zero-drivers error, so the skip is restored after failure.
         from torch._inductor.runtime import triton_helpers
         from torch._inductor.runtime.compile_tasks import _worker_compile_triton
 
         class RaisingDriver:
+            # [CLASS DOC] HELPER: Fake triton driver whose activity check always raises a runtime
+            # error about zero active drivers.
             @staticmethod
             def is_active():
+                # [FUNCTION DOC] HELPER: Always raises RuntimeError claiming there are no active
+                # drivers.
                 raise RuntimeError("0 active drivers ([]). There should only be one.")
 
         def load_kernel():
+            # [FUNCTION DOC] HELPER: Kernel loader: invokes the GPU driver setup (which the helper
+            # skips) and then raises ValueError reporting that compilation failed.
             triton_helpers.set_driver_to_gpu()
             raise ValueError("compile failed")
 
