@@ -1,3 +1,8 @@
+# [MODULE DOC] Constraint generation for gradual type migration on fx graphs.
+# Holds a global table mapping call targets (functions, method names, module classes) to inference rules, each producing constraints
+# over tensor and dimension variables for one node; ConstraintGenerator drives the rules over a whole graph.
+# Also defines MAX_TENSOR_RANK (4) and re-exported helper builders listed in __all__. Import-time side effect: registers all rules in the global table
+# (registering a duplicate target raises an error).
 import operator
 import warnings
 from collections.abc import Callable, Iterable, Sequence
@@ -118,7 +123,12 @@ __all__ = [
 def register_inference_rule(
     call_target: Target,
 ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    # [FUNCTION DOC] HELPER: Decorator factory that registers an inference rule for a call target (function, method name or module class).
+    # The returned decorator stores the function in the global rule table and returns it unchanged.
+    # Raises RuntimeError at decoration time if the target already has a registered rule.
     def register(fn: Callable[_P, _T]) -> Callable[_P, _T]:
+        # [FUNCTION DOC] HELPER: Decorator body: adds fn to the global inference rule table under call_target and returns fn.
+        # Raises RuntimeError if call_target is already registered. Side effect: mutates the global rule table.
         if call_target in _INFERENCE_RULES:
             raise RuntimeError(f"Inference rule already registered for {call_target}!")
         _INFERENCE_RULES[call_target] = fn  # pyrefly: ignore[unsupported-operation]
@@ -130,6 +140,11 @@ def register_inference_rule(
 def generate_flatten_constraints(
     start_dim: int, end_dim: int, input: TVar, flattened: TVar, n: int, counter: int
 ) -> tuple[Conj, int]:
+    # [FUNCTION DOC] Builds the constraint set for flattening a rank-n input into a tensor between start_dim and end_dim.
+    # Creates n fresh dimension variables, requires the input to equal a tensor of those dims, adds a
+    # product constraint relating the flattened tensor to the dims, and adds natural-number constraints.
+    # A start_dim of -1 means n; other negative values use their absolute value; a negative end_dim is
+    # normalized from the end and then made exclusive. Returns (conjunction, updated counter).
     d, counter = gen_tensor_dims(n, counter)
     c1 = BinConstraintT(input, TensorType(d), op_eq)
     start_dim = n if start_dim == -1 else abs(start_dim)
@@ -143,6 +158,10 @@ def generate_flatten_constraints(
 def get_attr_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for attribute access on a tensor node.
+    # Only the device attribute is supported: output shape equals the input shape (equality constraint).
+    # Raises AssertionError if the arguments are not a node and a string, NotImplementedError for any other attribute.
+    # Side effect: records a fresh tensor variable for the node in the symbol mapping.
     """
     If the attribute is "device" then the tensor shape is preserved
     """
@@ -166,6 +185,11 @@ def get_attr_inference_rule(
 def bmm_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for batched matrix multiplication.
+    # Produces one disjunction of four cases: all of input1, input2 and output are Dyn; only input1 is Dyn
+    # (output batch/last dim taken from input2, middle dim Dyn); only input2 is Dyn (symmetric); or both are
+    # rank-3 tensors with consistent batch dims, output batch as the greatest upper bound of the two batch dims,
+    # and output shape batch x rows(input1) x cols(input2). Raises AssertionError if args are not nodes.
     """
     Constraints that match the input to a size 3 tensor
     and switch the dimensions according to the rules
@@ -240,6 +264,11 @@ def bmm_inference_rule(
 def index_select_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for index_select.
+    # Arg 0 is the input tensor node, arg 1 the integer dimension, arg 2 the index tensor node.
+    # The index tensor must be a rank-1 tensor or Dyn; for each possible input rank up to the maximum an
+    # IndexSelect constraint is generated that replaces the selected dimension by the index length (or Dyn).
+    # Returns a single disjunction over the two cases. Raises AssertionError on wrongly typed arguments.
     """
     We constrain the second argument to a vector or Dyn.
     The output replaces the input with the shape of the vector
@@ -308,6 +337,12 @@ def index_select_inference_rule(
 def expand_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for expand.
+    # Treats expand like a broadcast between the input and a synthetic tensor whose shape is given by the
+    # remaining args (ints or dimension-variable nodes). Adds broadcasting constraints, an equality fixing the
+    # output rank to the number of size args, natural-number constraints and non-negativity of node sizes.
+    # Raises AssertionError for non-node input or size args that are neither node nor int (nodes must map to dimension variables).
+    # KNOWN ISSUE: the constraints parameter is shadowed by the broadcasting result, so the caller list is ignored.
     """
     We generate the exact constraints as we do for tensor additions but we constraint
     the rank of this expression to be equal to len(n.args[1:]) so that only
@@ -381,6 +416,11 @@ def expand_inference_rule(
 def equality_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for shape-preserving or shape-creating ops (gelu, dropout, softmax, detach, to, int, long, contiguous, ones, zeros).
+    # If arg 0 is a node with a tensor variable, output equals input. If it is a node with dimension variables, all
+    # args must be dimension variables and the output is a tensor of those dims. If arg 0 is a tuple (at most 4 entries),
+    # the output is a tensor whose dims are the symbols of the entries. Otherwise raises NotImplementedError.
+    # KNOWN ISSUE: tuple entries and dimension args are looked up in the symbol mapping, so plain int sizes would fail.
     """
     We generate the constraint: input = output
     """
@@ -416,6 +456,9 @@ def equality_inference_rule(
 def transpose_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for transpose (modeled as two index selects).
+    # Args: input node, two integer dims. Result is a disjunction: input and output both Dyn, or a Transpose
+    # constraint for each possible rank up to the maximum. Raises AssertionError on wrong argument types or if the input is not a tensor variable.
     """
     Can be considered as a sequence of two index selects, so we generate constraints accordingly
     """
@@ -453,6 +496,10 @@ def transpose_inference_rule(
 def type_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for type_as.
+    # Requires both args to be nodes with tensor variables; the first must be consistent with the second and the output equals the second.
+    # KNOWN ISSUE: docstring says input = output, but the output is constrained to equal the type_as argument (arg 1), not the input.
+    # Raises AssertionError on wrong argument kinds.
     """
     We generate the constraint: input = output
     """
@@ -482,6 +529,9 @@ def type_inference_rule(
 def masked_fill_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for masked_fill_.
+    # Handled like a tensor addition: when both args are tensor variables, returns broadcasting constraints with a fresh output variable.
+    # Raises NotImplementedError if either symbol is not a tensor variable, AssertionError if args are not nodes.
     """
     Similar to addition. For now we implement the constraints when
     the argument is a boolean tensor. There is also a case for when
@@ -513,6 +563,9 @@ def masked_fill_inference_rule(
 def embedding_inference_rule_functional(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for the functional embedding call.
+    # Arg 0 is the index input, arg 1 the weight. Constrains the weight to a rank-2 tensor with fresh dims (static shape, no matching)
+    # and delegates to the shared embedding rule using the second weight dim as embedding size. Returns weight equality plus those constraints.
     if not isinstance(n.args[0], Node):
         raise AssertionError(f"Expected Node, got {type(n.args[0])}")
 
@@ -536,6 +589,9 @@ def embedding_inference_rule(
     constraints: list[Constraint],
     counter: int,
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for the Embedding module.
+    # Output shape equals the input shape with the module's embedding_dim appended. Delegates to gen_embedding_rules.
+    # Raises AssertionError if arg 0 is not a node.
     """
     The output shape differs from the input shape in the last dimension
     """
@@ -547,6 +603,9 @@ def embedding_inference_rule(
 def gen_embedding_rules(
     n: Node, symbols: _SymbolDict, embedding_dim: int | DVar, counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] HELPER: Shared embedding constraint builder.
+    # Creates the output variable; result is a disjunction of: input and output both Dyn, or input a tensor of rank 1 to
+    # (maximum rank minus one) with the output being the same dims plus embedding_dim at the end, with natural-number constraints. Returns (constraints, counter).
     embedding_output, counter = gen_tvar(counter)
     symbols[n] = embedding_output
     embedding_input = symbols[n.args[0]]  # pyrefly: ignore[bad-index]
@@ -580,6 +639,7 @@ def gen_embedding_rules(
 def tensor_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for tensor creation: produces no constraints (scalars unsupported) and leaves the counter unchanged.
     """
     If the tensor is a scalar, we will skip it since we
     do not support scalars yet. We will add support in the future
@@ -593,6 +653,10 @@ def tensor_inference_rule(
 def view_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for reshape and view methods.
+    # Builds the target shape from the remaining args (node symbols or ints); each -1 becomes a fresh dimension variable.
+    # Adds an equality for the output type, a CanReshape constraint from the source, and not-Dyn constraints for every target dim.
+    # KNOWN ISSUE: the extra stride condition for view (see TODO) is not implemented.
     """
     Similar to reshape but with an extra condition on the strides
     """
@@ -637,6 +701,10 @@ def view_inference_rule(
 def size_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for size.
+    # With one arg, the result equals the input tensor variable. With two args where the second is an int, the result is a dimension
+    # variable: either the input is Dyn and the dim is Dyn, or a GetItem constraint per possible rank with a natural-number result.
+    # Raises NotImplementedError for a non-int index or any other argument count (the TODO notes the Dyn case is under review).
     """
     The constraint is just lhs = rhs.
     Ex: size = input_ids.size()
@@ -682,6 +750,9 @@ def size_inference_rule(
 
 
 def range_check(i: int, n: int) -> T | F:
+    # [FUNCTION DOC] HELPER: Returns a true or false constraint object stating whether index i is valid for a list of size n.
+    # For non-negative i it is true when i is less than n.
+    # KNOWN ISSUE: for negative i it is true only when i >= n, which can never hold for positive n (should compare with minus n); also the docstring says Boolean but constraint objects are returned.
     """
     Checks if an index i is within range of a size n list
     Args:
@@ -700,6 +771,10 @@ def range_check(i: int, n: int) -> T | F:
 def cumsum_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for cumsum.
+    # Output shape equals input shape. Result is a disjunction: both Dyn, or for each rank up to the maximum, both equal the same dims with
+    # a range check on the dim argument (positional or keyword) and natural-number constraints.
+    # Raises AssertionError if the input is not a node or the dim is not an int.
     """
     Input and output shapes should be equal
     We should verify that the index is valid
@@ -741,6 +816,8 @@ def cumsum_inference_rule(
 def assert_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for the internal assert-is-none call: produces no constraints.
+    # Raises AssertionError if the node has any users.
     if len(n.users) != 0:
         raise AssertionError(f"Expected no users, got {len(n.users)}")
     return [], counter  # pyrefly: ignore[implicit-any]
@@ -750,6 +827,11 @@ def assert_inference_rule(
 def getitem_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for indexing with the getitem operator.
+    # Int index: output is a fresh dimension variable; Dyn input gives Dyn output, otherwise GetItem constraints per rank plus non-negativity.
+    # Tuple index: output is a fresh tensor variable; Dyn input gives Dyn output, otherwise GetItemTensor constraints per rank.
+    # If the indexed node has no symbol in the tuple case, returns no constraints (TODO in code). The int case requires a tensor variable (AssertionError otherwise).
+    # Raises RuntimeError for other index kinds.
     if not isinstance(n.args[0], Node):
         raise AssertionError(f"Expected Node, got {type(n.args[0])}")
 
@@ -818,6 +900,12 @@ def getitem_inference_rule(
 def gt_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for greater-than.
+    # Node vs node: tensor variables give broadcasting constraints with a fresh output; dimension variables give a boolean variable equal to the comparison
+    # (for flow analysis only); otherwise RuntimeError (sort mismatch). Node vs int: dimension variable gives the boolean comparison; a tensor variable
+    # with an int triggers a warning, the node's symbol is replaced by a fresh dimension variable and the comparison is built.
+    # Other cases raise NotImplementedError. Side effect: may overwrite a symbol and emit a warning.
+    # KNOWN ISSUE: a bare statement reading the symbol after reassignment has no effect.
     if not isinstance(n.args[0], (Node, int)):
         raise AssertionError(f"Expected Node or int, got {type(n.args[0])}")
     if not isinstance(n.args[1], (Node, int)):
@@ -883,6 +971,9 @@ def gt_inference_rule(
 def eq_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for equality comparison.
+    # Node vs node: tensor variables give broadcasting constraints with a fresh output; dimension variables give a boolean variable equal to the comparison
+    # (flow analysis only); otherwise RuntimeError. Node vs int: only dimension variables are supported. Other cases raise NotImplementedError.
     if not isinstance(n.args[0], (Node, int)):
         raise AssertionError(f"Expected Node or int, got {type(n.args[0])}")
     if not isinstance(n.args[1], (Node, int)):
@@ -926,6 +1017,11 @@ def eq_inference_rule(
 def neq_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for not-equal between a tensor node and a tuple of three or four sizes (work in progress; only the false-condition case works).
+    # Builds a boolean variable equal to: the input has that rank and at least one dimension pair is non-Dyn and different.
+    # Other tuple lengths raise NotImplementedError; arg types are checked with AssertionError.
+    # KNOWN ISSUE: in the size 4 case the fourth dimension check tests the third input dim against Dyn instead of the fourth.
+    # KNOWN ISSUE: a boolean variable is generated twice per branch (first one unused), the size 3 case generates four dims but uses three, and the node itself gets no symbol.
     """
     Translates to inconsistent in gradual types.
     To prove inequality, we should prove that
@@ -1056,6 +1152,9 @@ def neq_inference_rule(
 def lt_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for less-than; mirrors the greater-than rule without the tensor-with-int repair.
+    # Node vs node: tensors give broadcasting constraints with a fresh output; dimension variables give a boolean variable equal to the comparison.
+    # Node vs int requires a dimension variable. Otherwise RuntimeError or NotImplementedError.
     if not isinstance(n.args[0], (Node, int)):
         raise AssertionError(f"Expected Node or int, got {type(n.args[0])}")
     if not isinstance(n.args[1], (Node, int)):
@@ -1103,6 +1202,8 @@ def lt_inference_rule(
 def full_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for full.
+    # Arg 0 is an iterable of sizes (ints or nodes with symbols); the output is a tensor with those dims. Raises AssertionError if arg 0 is not iterable.
     full, counter = gen_tvar(counter)
     symbols[n] = full
     res = []
@@ -1123,6 +1224,10 @@ def full_inference_rule(
 def arange_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for arange with a single end argument (start 0, step 1).
+    # Output is a rank-1 tensor with a fresh length dimension. Either some bound is Dyn and the length is Dyn, or none is Dyn and the length equals
+    # (end - start) divided by step. Raises NotImplementedError for other argument counts.
+    # KNOWN ISSUE: the end argument is looked up in the symbol mapping, so a literal int end would fail; the TODO about index normalization is open.
     start = 0
     step = 1
 
@@ -1169,6 +1274,9 @@ def arange_inference_rule(
 def gen_broadcasting_constraints(
     e1: TVar, e2: TVar, symbols: _SymbolDict, counter: int, output_var: TVar
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] HELPER: Builds the three constraints for broadcasting two tensor variables into output_var.
+    # Creates two extra tensor variables for the broadcast operands; returns a greatest-upper-bound constraint on the output, an ApplyBroadcasting
+    # constraint and a consistency constraint between the operands, plus the updated counter.
     # additional vars that don't correspond to expressions
     e11, counter = gen_tvar(counter)
     e22, counter = gen_tvar(counter)
@@ -1188,6 +1296,11 @@ def gen_broadcasting_constraints(
 def broadcasting_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:  # pyrefly: ignore[bad-return]
+    # [FUNCTION DOC] Inference rule for add, mul and ne (function and method forms).
+    # Node-node: both tensor variables give broadcasting constraints with a fresh output, otherwise NotImplementedError.
+    # Node-number: a tensor variable gives output equal input; a dimension variable gives output equal to the arithmetic result (add or mul) and non-negative.
+    # Number-node: symmetric. Both scalar raises NotImplementedError.
+    # KNOWN ISSUE: op_code stays unset for ne, and in the node-number branch a symbol that is neither tensor nor dimension falls through and returns nothing.
     op_code = None
     if n.target is operator.add or n.target is torch.add:
         op_code = op_add
@@ -1269,6 +1382,9 @@ def broadcasting_inference_rule(
 def flatten_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for flatten.
+    # Defaults start_dim 1 and end_dim -1, overridden by int args 1 and 2. Result is a disjunction: input and output Dyn, or flatten constraints for each rank up to the maximum.
+    # Raises AssertionError on wrongly typed args.
     if not isinstance(n.args[0], Node):
         raise AssertionError(f"Expected Node, got {type(n.args[0])}")
 
@@ -1315,6 +1431,8 @@ def flatten_inference_rule(
 def layer_norm_functional(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for functional layer_norm: delegates to the shared layer-norm constraint builder using arg 1 as the normalized shape.
+    # Raises AssertionError if arg 0 is not a node.
     """
     We generate the constraint: input = output
     """
@@ -1336,6 +1454,8 @@ def layer_norm_inference_rule(
     constraints: list[Constraint],
     counter: int,
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for the LayerNorm module: output shape equals input shape and the trailing input dims must be consistent with the module normalized_shape.
+    # Raises AssertionError if arg 0 is not a node.
     """
     Input and output shapes should be equal.
     Input should be consistent with the normalized_shape
@@ -1350,6 +1470,8 @@ def layer_norm_inference_rule(
 def gen_layer_norm_constraints(
     n: Node, normalized_shape: Sequence[int], symbols: _SymbolDict, counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] HELPER: Shared layer-norm builder. Disjunction of: input and output Dyn, or for each rank both equal the same dims, trailing dims consistent with normalized_shape
+    # (see add_layer_norm_constraints) and natural-number constraints. Returns (constraints, counter).
     output, counter = gen_tvar(counter)
     symbols[n] = output
     input = symbols[n.args[0]]  # pyrefly: ignore[bad-index]
@@ -1385,6 +1507,7 @@ def relu_inference_rule(
     constraints: list[Constraint],
     counter: int,
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for ReLU and Dropout modules: output equals input, which must be a tensor variable (AssertionError otherwise).
     """
     Input and output shapes should be equal.
     """
@@ -1406,6 +1529,8 @@ def linear_inference_rule(
     constraints: list[Constraint],
     counter: int,
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for the Linear module: delegates to linear_constraints with the module in_features and out_features.
+    # Raises AssertionError if arg 0 is not a node.
     """
     Input and output sizes should be the same except for the last dimension
     If the input is Dyn, then so should the output
@@ -1421,6 +1546,7 @@ def linear_inference_rule(
 def torch_dim_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for the dim method. Output is a dimension variable: Dyn if the input is Dyn, otherwise the rank (1 to maximum) matching an input tensor of that rank.
     if not isinstance(n.args[0], Node):
         raise AssertionError(f"Expected Node, got {type(n.args[0])}")
     my_dim, counter = gen_dvar(counter)
@@ -1450,6 +1576,8 @@ def torch_dim_inference_rule(
 def torch_linear_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for the functional linear call. Constrains the weight (arg 1) to a rank-2 tensor with fresh dims and uses the
+    # second dim as in_features and the first as out_features in linear_constraints. Returns the weight equality plus those constraints.
     if not isinstance(n.args[0], Node):
         raise AssertionError(f"Expected Node, got {type(n.args[0])}")
     weight_dims, counter = gen_tensor_dims(2, counter)
@@ -1471,6 +1599,8 @@ def linear_constraints(
     symbols: _SymbolDict,
     counter: int,
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] HELPER: Shared linear builder. Disjunction of: input and output Dyn, or for each rank input and output are tensors whose leading dims
+    # are equal, last input dim is consistent with in_features, last output dim equals out_features, plus natural-number constraints.
     linear_output, counter = gen_tvar(counter)
     symbols[n] = linear_output
     linear_input = symbols[n.args[0]]  # pyrefly: ignore[bad-index]
@@ -1504,6 +1634,8 @@ def linear_constraints(
 def add_layer_norm_constraints(
     input_dim: list[DVar], normalized_dim: list[int]
 ) -> list[Constraint]:
+    # [FUNCTION DOC] HELPER: Returns consistency constraints between the trailing input dims and the normalized dims, aligned from the end.
+    # Returns a single false constraint if normalized_dim is longer than input_dim.
     """
     The constraints say that the type has the form: ``[*, 1024, 1024]``
     while the normalized_dim have the form ``[1024, 1024]``.
@@ -1530,6 +1662,8 @@ def add_linear_constraints(
     in_features: int | DVar,
     out_features: int | DVar,
 ) -> list[Constraint]:
+    # [FUNCTION DOC] HELPER: Per-dimension constraints for linear: all leading dims of the two lists are equal, last dim of dims1 is consistent with in_features,
+    # last dim of dims2 equals out_features. Raises AssertionError if the lists differ in length.
     if len(dims1) != len(dims2):
         raise AssertionError(f"Expected same length, got {len(dims1)} vs {len(dims2)}")
     constraints: list[Constraint] = []
@@ -1547,6 +1681,8 @@ def add_linear_constraints(
 def reshape_inference_rule(
     n: Node, symbols: _SymbolDict, constraints: list[Constraint], counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for torch.reshape. The target shape (arg 1) maps -1 to Dyn; output equals that tensor type and a CanReshape constraint links the source.
+    # Raises AssertionError if arg 0 is not a node.
     if not isinstance(n.args[0], Node):
         raise AssertionError(f"Expected Node, got {type(n.args[0])}")
 
@@ -1571,6 +1707,8 @@ def batchnorm_inference_rule(
     constraints: list[Constraint],
     counter: int,
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for BatchNorm2d. Input must match a rank-4 tensor of fresh dims (or all Dyn) and output equals input; adds natural-number constraints.
+    # The module instance is unused.
     if not isinstance(n.args[0], Node):
         raise AssertionError(f"Expected Node, got {type(n.args[0])}")
 
@@ -1600,6 +1738,7 @@ def adaptive_inference_rule(
     constraints: list[Constraint],
     counter: int,
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for AdaptiveAvgPool2d. Input matches a rank-4 tensor; output keeps the first two dims and uses the module output_size for the last two. Adds natural-number constraints.
     if not isinstance(n.args[0], Node):
         raise AssertionError(f"Expected Node, got {type(n.args[0])}")
 
@@ -1643,6 +1782,8 @@ def conv2d_inference_rule(
     constraints: list[Constraint],
     counter: int,
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for Conv2d. Input matches a rank-4 tensor, in_channels must be consistent with the second dim, and a CalcConv constraint
+    # carries output channels, kernel, padding, stride and dilation of the module. Adds natural-number constraints.
     if not isinstance(n.args[0], Node):
         raise AssertionError(f"Expected Node, got {type(n.args[0])}")
 
@@ -1683,6 +1824,7 @@ def maxpool_inference_rule(
     constraints: list[Constraint],
     counter: int,
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] Inference rule for MaxPool2d. Input matches a rank-4 tensor and a CalcMaxPool constraint carries kernel, padding, stride and dilation. Adds natural-number constraints.
     if not isinstance(n.args[0], Node):
         raise AssertionError(f"Expected Node, got {type(n.args[0])}")
     maxpool, counter = gen_tvar(counter)
@@ -1710,7 +1852,14 @@ def maxpool_inference_rule(
 
 
 class ConstraintGenerator:
+    # [CLASS DOC] Walks an fx graph and produces gradual-typing constraints using the registered inference rules.
+    # State: traced (module), traced_params (mapping of parameter name to tensor), constraints (list passed to rules; never populated),
+    # symbol_dict (mapping from node to its type or dimension variable, filled while generating) and graph (taken from the traced module when it has one, else the given graph).
+    # Key methods: generate_constraints (whole graph) and generate_constraints_node (one node).
+    # KNOWN ISSUE: the constraints list is passed to rules but nothing appends to it, despite the docstring of generate_constraints.
     def __init__(self, traced: torch.nn.Module, graph: Graph | None = None) -> None:
+        # [FUNCTION DOC] Stores the traced module, a mapping of its named parameters, an empty constraints list and symbol dictionary, and the graph
+        # (the module's own graph attribute if present, else the graph argument).
         self.traced = traced  # traced or tracer.root
         self.traced_params = dict(self.traced.named_parameters())
         self.constraints = []
@@ -1718,6 +1867,9 @@ class ConstraintGenerator:
         self.graph = traced.graph if hasattr(traced, "graph") else graph
 
     def generate_constraints(self, counter: int = 0) -> tuple[Conj, int]:
+        # [FUNCTION DOC] Iterates over every node of the graph in order, collecting constraints from generate_constraints_node and threading the counter.
+        # Returns (conjunction of all constraints, final counter). Side effect: fills symbol_dict.
+        # KNOWN ISSUE: docstring claims self.constraints is populated, but it is not.
         """
         Iterate through every node and generate constraints
         Effect: self.constraints will be populated with the final constraints
@@ -1736,6 +1888,11 @@ class ConstraintGenerator:
     def generate_constraints_node(
         self, n: Node, counter: int
     ) -> tuple[list[Constraint], int]:
+        # [FUNCTION DOC] Generates constraints for one node by its op kind.
+        # placeholder: fresh tensor variable; declared type (or Dyn, or the example value shape for parameters) is a precision bound of the variable, and its rank is at most the maximum.
+        # call_function and call_method: dispatches on target in the rule table; call_module: dispatches on module class; get_attr: tensor parameters with nonzero rank get an equality to their static shape, others produce nothing;
+        # output: nothing. Raises RuntimeError if no rule is registered, NotImplementedError for unknown ops, AssertionError if a parameter placeholder lacks example_value.
+        # KNOWN ISSUE: docstring lists only reshape, add and conv2d as supported; many more rules exist.
         """
         Generate constraints the given node:
         Currently supported operations:

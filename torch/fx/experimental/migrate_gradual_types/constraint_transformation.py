@@ -1,3 +1,7 @@
+# [MODULE DOC] Rewrites high-level gradual-typing constraints into simpler ones.
+# Keeps a global table from constraint classes to transformation functions (registered at import time) and exposes transform_constraint as the dispatcher.
+# Covers transpose, index select, get item, binary tensor and dimension constraints, conjunction/disjunction, greatest upper bounds, conv/maxpool/flatten calculations,
+# reshape and broadcasting, plus helper builders listed in __all__. Import-time side effect: populates the transformation table.
 import copy
 import itertools
 from collections.abc import Callable, Sequence
@@ -93,7 +97,11 @@ _TRANSFORMATION_RULES: dict[type, _TransformFn] = {}
 def register_transformation_rule(
     call_target: type[Constraint],
 ) -> Callable[[_TransformFn], _TransformFn]:
+    # [FUNCTION DOC] HELPER: Decorator factory registering a transformation function for a constraint class in the global rule table.
+    # The decorator returns the function unchanged and raises RuntimeError if the class already has a rule.
     def register(fn: _TransformFn) -> _TransformFn:
+        # [FUNCTION DOC] HELPER: Decorator body: stores fn in the global transformation table under call_target and returns fn.
+        # Raises RuntimeError on a duplicate registration. Side effect: mutates the global table.
         if call_target in _TRANSFORMATION_RULES:
             raise RuntimeError(
                 f"Transformation rule already registered for {call_target}!"
@@ -105,6 +113,8 @@ def register_transformation_rule(
 
 
 def valid_index(index: int, dims: list[DVar]) -> Constraint:
+    # [FUNCTION DOC] HELPER: Returns a true constraint if the index can be used on the list of dims, otherwise a false constraint (an out-of-range lookup is caught).
+    # Negative indices follow list semantics.
     """
     Given a list of dimensions, checks if an index is valid in the list
     """
@@ -117,6 +127,9 @@ def valid_index(index: int, dims: list[DVar]) -> Constraint:
 
 @register_transformation_rule(Transpose)
 def transform_transpose(constraint: Constraint, counter: int) -> tuple[Constraint, int]:
+    # [FUNCTION DOC] Rewrites a Transpose constraint for a concrete rank into plain constraints.
+    # Creates fresh dims for the rank, requires the input to equal them, and if both indices are valid swaps them in a copy to form the output tensor.
+    # Returns (conjunction of input equality, natural-number constraints, index validity and output equality; counter). Raises TypeError for a wrong constraint type.
     """
     Similar to a sequence of two index-selects
     """
@@ -148,6 +161,9 @@ def transform_transpose(constraint: Constraint, counter: int) -> tuple[Constrain
 def transform_index_select(
     constraint: Constraint, counter: int
 ) -> tuple[Constraint, int]:
+    # [FUNCTION DOC] Rewrites an IndexSelect constraint for a concrete rank: fresh dims for the input, validity check of the index, and an output tensor where the
+    # dimension at the index is replaced by dim_replace (unchanged when the index is invalid, leaving a false constraint in the conjunction).
+    # Returns (conjunction, counter). Raises TypeError for a wrong constraint type.
     """
     The constraints consider the given tensor size, checks if the index is valid
     and if so, generates a constraint for replacing the input dimension
@@ -180,6 +196,8 @@ def transform_index_select(
 
 @register_transformation_rule(GetItem)
 def transform_get_item(constraint: Constraint, counter: int) -> tuple[Constraint, int]:
+    # [FUNCTION DOC] Rewrites a GetItem constraint (non-Dyn input of a known rank) into: input equals a tensor of fresh dims, natural-number constraints, index validity,
+    # and when valid the result dimension equals the dimension at the index. Returns (conjunction, counter). Raises TypeError for a wrong constraint type.
     """
     generate an equality of the form:
     t = [a1, ..., an]
@@ -218,6 +236,7 @@ def transform_get_item(constraint: Constraint, counter: int) -> tuple[Constraint
 
 
 def valid_index_tensor(index: tuple[None | slice, ...], dims: list[DVar]) -> Constraint:
+    # [FUNCTION DOC] HELPER: Returns a false constraint if the tuple index contains more slice entries than there are dims, else a true constraint.
     """
     if the slice instances exceed the length of the dimensions
     then this is a type error so we return False
@@ -236,6 +255,11 @@ def valid_index_tensor(index: tuple[None | slice, ...], dims: list[DVar]) -> Con
 def transform_get_item_tensor(
     constraint: Constraint, counter: int
 ) -> tuple[Constraint, int]:
+    # [FUNCTION DOC] Rewrites a GetItemTensor constraint whose index is a tuple of None and default slices.
+    # Each None adds a dimension of size 1 at its position, each default slice keeps one input dim, and remaining input dims fill the unset positions in order.
+    # Returns false if the resulting rank exceeds 4; otherwise a conjunction of input equality, result equality, natural-number constraints and index validity.
+    # Raises NotImplementedError for other index entries, AssertionError if the index is not a tuple, TypeError for a wrong constraint type.
+    # KNOWN ISSUE: the first dim_index assignment is unused, and the check that slices fit uses only the count of slices, not positions.
     """
     When the index is a tuple, then the output will be a tensor
     TODO: we have to check if this is the case for all HF models
@@ -306,6 +330,11 @@ def transform_get_item_tensor(
 def generate_binconstraint_t(
     constraint: Constraint, counter: int
 ) -> tuple[Constraint, int]:
+    # [FUNCTION DOC] Transforms a tensor binary constraint by its operator.
+    # Precision: Dyn on the left gives true; a fully static tensor becomes equality; otherwise fresh dims with dimension precision constraints, equality of the right side and 1 <= dim bounds.
+    # Matching: right side must be a rank-4 tensor; left is either all Dyn or equals that tensor. Consistency: Dyn on either side or equal-rank tensors with dimension consistency.
+    # Less-or-equal with an int right side: left is Dyn or a tensor of each rank up to that bound. Other operators are returned unchanged.
+    # Returns (constraint, counter); raises TypeError for a wrong type, AssertionError if a right side has the wrong type.
     """
     Transform binary constraints for tensors
     """
@@ -403,6 +432,8 @@ def generate_binconstraint_t(
 def generate_binconstraint_d(
     constraint: Constraint, counter: int
 ) -> tuple[Constraint, int]:
+    # [FUNCTION DOC] Transforms a dimension binary constraint. Precision: an int left side becomes equality, Dyn on the left becomes true, else unchanged.
+    # Consistency becomes a disjunction of equality or either side being Dyn. Other operators are unchanged. Returns (constraint, counter); raises TypeError for a wrong type.
     """
     Transform binary constraints for dimensions
     """
@@ -434,6 +465,7 @@ def generate_binconstraint_d(
 
 @register_transformation_rule(Conj)
 def generate_conj(constraint: Constraint, counter: int) -> tuple[Constraint, int]:
+    # [FUNCTION DOC] Transforms a conjunction by recursively transforming each conjunct, threading the counter. Raises TypeError for a wrong constraint type.
     """
     Transform conjunctions
     """
@@ -448,6 +480,7 @@ def generate_conj(constraint: Constraint, counter: int) -> tuple[Constraint, int
 
 @register_transformation_rule(Disj)
 def generate_disj(constraint: Constraint, counter: int) -> tuple[Constraint, int]:
+    # [FUNCTION DOC] Transforms a disjunction by recursively transforming each disjunct, threading the counter. Raises TypeError for a wrong constraint type.
     """
     Transform disjunctions
     """
@@ -462,6 +495,8 @@ def generate_disj(constraint: Constraint, counter: int) -> tuple[Constraint, int
 
 @register_transformation_rule(TGreatestUpperBound)
 def generate_gub(constraint: Constraint, counter: int) -> tuple[Constraint, int]:
+    # [FUNCTION DOC] Transforms a tensor greatest-upper-bound constraint into a disjunction: either one operand is Dyn and the result is Dyn, or (per rank up to the maximum)
+    # equalities to tensors of fresh dims with a dimension greatest-upper-bound per position. Raises TypeError for a wrong constraint type.
     """
     Transform greatest upper bound for tensors. Results in equality and Greatest Upper Bound
     on dimensions
@@ -487,6 +522,8 @@ def generate_gub(constraint: Constraint, counter: int) -> tuple[Constraint, int]
 
 @register_transformation_rule(DGreatestUpperBound)
 def generate_d_gub(constraint: Constraint, counter: int) -> tuple[Constraint, int]:
+    # [FUNCTION DOC] Transforms a dimension greatest-upper-bound into a disjunction: first operand Dyn and result equals second; second Dyn and result equals first; or both equal and the result equals them.
+    # Raises TypeError for a wrong constraint type.
     """
     Transform greatest upper bound for dimensions into equality constraints
     """
@@ -515,6 +552,8 @@ def generate_d_gub(constraint: Constraint, counter: int) -> tuple[Constraint, in
 
 @register_transformation_rule(CalcConv)
 def generate_calc_conv(constraint: Constraint, counter: int) -> tuple[Constraint, int]:
+    # [FUNCTION DOC] Transforms a CalcConv constraint into a conjunction over a rank-4 result of fresh dims: the conv result equals that tensor; the channel dim equals c_out and is not Dyn;
+    # the batch dim equals the first matched input dim; the last two dims come from calc_last_two_dims; all dims are non-negative. Raises TypeError for a wrong constraint type.
     if not isinstance(constraint, CalcConv):
         raise TypeError(type(constraint))
     d, counter = gen_tensor_dims(4, counter)
@@ -552,6 +591,8 @@ def generate_calc_conv(constraint: Constraint, counter: int) -> tuple[Constraint
 def generate_calc_maxpool(
     constraint: Constraint, counter: int
 ) -> tuple[Constraint, int]:
+    # [FUNCTION DOC] Transforms a CalcMaxPool constraint into a conjunction over a rank-4 result of fresh dims: result equals that tensor; first two dims equal the matched input dims;
+    # last two come from calc_last_two_dims; all dims are non-negative. Raises TypeError for a wrong constraint type.
     """
     Transform maxpool constraints
     """
@@ -584,6 +625,10 @@ def generate_calc_maxpool(
 def generate_calc_product(
     constraint: Constraint, counter: int
 ) -> tuple[Constraint, int]:
+    # [FUNCTION DOC] Transforms a CalcProduct (flatten) constraint. Splits the dims into before, flattened-middle and after parts and enumerates every Dyn/not-Dyn possibility for the middle dims.
+    # If any middle dim is Dyn the flattened dim is Dyn; otherwise a fresh dim equals the product of the middle dims and is not Dyn. Results with more than 4 dims become false.
+    # A boundary check (start non-negative, start less than end, end at most the rank) is evaluated immediately and conjoined as true or false. Returns (constraint, counter).
+    # Raises TypeError for a wrong constraint type.
     """
     Transform flatten constraints
     """
@@ -658,6 +703,10 @@ def generate_calc_product(
 
 @register_transformation_rule(CanReshape)
 def generate_reshape(constraint: Constraint, counter: int) -> tuple[Constraint, int]:
+    # [FUNCTION DOC] Transforms a CanReshape constraint using four fresh dims. The source is Dyn, or a tensor of rank 1 to 4 whose dims satisfy a size relation to the target,
+    # with all dims non-negative. Fully static target: product equality per dim possibility (gen_all_reshape_possibilities). Target with one Dyn: the product of the non-Dyn target dims must divide the input product
+    # whenever the input dims are known. Returns (constraint, counter); raises TypeError for a wrong constraint type.
+    # KNOWN ISSUE: d4_eq_dyn and d4_neq_dyn are built from the third dim variable instead of the fourth, so the rank-4 case checks the wrong dimension.
     """
     Transform reshape constraints
     """
@@ -797,6 +846,9 @@ def generate_reshape(constraint: Constraint, counter: int) -> tuple[Constraint, 
 def generate_broadcasting(
     constraint: Constraint, counter: int
 ) -> tuple[Constraint, int]:
+    # [FUNCTION DOC] Transforms an ApplyBroadcasting constraint: either input being Dyn passes both inputs through to the broadcast results, or for each rank 1 to 4 a disjunction
+    # of the no-padding case and the padding of either input, built by gen_broadcasting_constraints, conjoined with all natural-number constraints.
+    # Returns (constraint, counter); raises TypeError for a wrong constraint type.
     """
     Transform broadcasting constraints
     """
@@ -875,6 +927,8 @@ def generate_broadcasting(
 def transform_constraint(
     constraint: Constraint, counter: int
 ) -> tuple[Constraint, int]:
+    # [FUNCTION DOC] Entry point: looks up the transformation rule by the exact class of the constraint and applies it; constraints of unregistered classes are returned unchanged.
+    # Returns (transformed constraint, counter).
     """
     Transforms a constraint into a simpler constraint.
     Ex: precision and consistency are transformed to equality
@@ -895,6 +949,9 @@ def transform_constraint(
 def calc_last_two_dims(
     constraint: CalcConv | CalcMaxPool, d: list[DVar]
 ) -> tuple[Constraint, Constraint]:
+    # [FUNCTION DOC] Builds the constraints for the last two output dims of a convolution or maxpool from the matched input dims and the padding, kernel, stride and dilation
+    # (ints are expanded to pairs). Each dim is either both Dyn, or both not Dyn with output equal to ((in + 2*padding - dilation*(kernel-1) - 1) / stride) + 1.
+    # Returns the pair of constraints. Raises AssertionError if the constraint is not CalcConv or CalcMaxPool.
     """
     Generates constraints for the last two dimensions of a convolution or a maxpool output
     Args:
@@ -969,6 +1026,8 @@ def calc_last_two_dims(
 def generate_all_int_dyn_dim_possibilities(
     my_list: list[DVar],
 ) -> list[tuple[BinConstraintD, ...]]:
+    # [FUNCTION DOC] HELPER: For a list of dims, returns every combination (cartesian product) choosing for each dim either equal-to-Dyn or not-equal-to-Dyn,
+    # as tuples of dimension constraints. An empty list yields one empty combination.
     """
     Generate all possibilities of being equal or not equal to dyn for my_list
     Args:
@@ -993,6 +1052,7 @@ def generate_all_int_dyn_dim_possibilities(
 def is_target_div_by_dim(
     target: Sequence[DVar | int | _DynType], dim: DVar | Prod
 ) -> BinConstraintD:
+    # [FUNCTION DOC] HELPER: Returns a constraint stating the product of the target dims modulo dim equals zero.
     """
     Generate constraints to check if the target dimensions are divisible by the input dimensions
     Args:
@@ -1008,6 +1068,7 @@ def is_target_div_by_dim(
 def is_dim_div_by_target(
     target: Sequence[DVar | int | _DynType], dim: DVar | Prod
 ) -> BinConstraintD:
+    # [FUNCTION DOC] HELPER: Returns a constraint stating dim modulo the product of the target dims equals zero.
     """
     Generate constraints to check if the input dimensions is divisible by the target dimensions
     Args:
@@ -1023,6 +1084,9 @@ def is_dim_div_by_target(
 def gen_all_reshape_possibilities(
     list_of_dims: list[DVar], target: Sequence[DVar | int | _DynType]
 ) -> Constraint:
+    # [FUNCTION DOC] For every Dyn/not-Dyn combination of the input dims, builds a conjunction: no known dims gives only the combination; some known dims adds that the target product is divisible by
+    # the product of known dims; all known dims adds that the input product equals the target product. Returns the disjunction of all combinations.
+    # Raises AssertionError if a generated item is not a dimension constraint.
     """
     Consider all possibilities what the input dimensions could be (number or dynamic)
     Then generate the appropriate constraints using multiplication or mod depending on the possibility
@@ -1075,6 +1139,8 @@ def broadcast_dim(
     index: int,
     padding: bool = False,
 ) -> Constraint:
+    # [FUNCTION DOC] HELPER: Constraints for broadcasting at one index of the first input. Without padding: that dim equals 1, both results are equal at the index and equal the second input dim.
+    # With padding the first input has no dim there, so the dim-equals-1 constraint is omitted. Raises AssertionError if the first input entry is missing but padding is false.
     """
     Apply broadcasting to the 'index' dimension of tensor_input1.
     Args:
@@ -1122,6 +1188,9 @@ def apply_padding(
     d12: list[DVar],
     counter: int,
 ) -> tuple[Constraint, int]:
+    # [FUNCTION DOC] Considers the case where input 1 has fewer dims than input 2. For each shorter rank, fresh dims for input 1 are created, the leading result dims are broadcast with simulated missing dims,
+    # and the remaining dims use the no-padding broadcasting possibilities; all are conjoined with the tensor equalities and natural-number constraints.
+    # Returns (disjunction over shorter ranks, counter). Raises AssertionError if the padded length mismatches input 2.
     """
     We are considering the possibility where one input has less dimensions than
     another input, so we apply padding to the broadcasted results
@@ -1188,6 +1257,7 @@ def apply_padding(
 def no_broadcast_dim_with_index(
     d1: list[DVar], d2: list[DVar], d3: list[DVar], d4: list[DVar], i: int
 ) -> Constraint:
+    # [FUNCTION DOC] HELPER: Constraints for no broadcasting at index i: either both inputs are 1 or both are not 1, and each broadcast result equals its input at i.
     """
     Args:
         d1: input 1
@@ -1225,6 +1295,7 @@ def no_broadcast_dim_with_index(
 def gen_lists_of_dims(
     num_tensors: int, dim_size: int, counter: int
 ) -> tuple[list[list[DVar]], int]:
+    # [FUNCTION DOC] HELPER: Creates num_tensors lists of dim_size fresh dimension variables. Returns (list of lists, counter).
     """
     Generate lists of DVar to represent tensor dimensions
     Args:
@@ -1254,6 +1325,7 @@ def create_equality_constraints_for_broadcasting(
     d11: list[DVar],
     d12: list[DVar],
 ) -> list[BinConstraintT]:
+    # [FUNCTION DOC] HELPER: Returns four equality constraints binding each of the two inputs and two broadcast results to tensors of the given dimension lists.
     """
     Create equality constraints for when no broadcasting occurs
     Args:
@@ -1280,6 +1352,8 @@ def create_equality_constraints_for_broadcasting(
 def gen_consistency_constraints(
     constraint: BinConstraintT, counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] For each rank 1 to the maximum builds a conjunction: both sides of the consistency constraint equal tensors of fresh dims, dimension consistency position by position,
+    # and natural-number constraints. Returns (list of those conjunctions, counter).
     """
     Args:
         constraint: Consistency constraint on tensors
@@ -1317,6 +1391,9 @@ def gen_consistency_constraints(
 def gen_greatest_upper_bound(
     constraint: TGreatestUpperBound, counter: int
 ) -> tuple[list[Constraint], int]:
+    # [FUNCTION DOC] For each rank 1 to the maximum builds a conjunction: operands and result equal tensors of fresh dims, natural-number constraints and a dimension greatest-upper-bound per position.
+    # Returns (list of conjunctions, counter). Raises AssertionError if lengths differ.
+    # KNOWN ISSUE: the inner loop reuses the outer loop variable i; harmless here since the outer value is not used afterwards.
     """
     Args:
         constraint: Greatest upper bound on tensors
@@ -1361,6 +1438,7 @@ def gen_greatest_upper_bound(
 def generate_all_broadcasting_possibilities_no_padding(
     d1: list[DVar], d2: list[DVar], d11: list[DVar], d12: list[DVar]
 ) -> Constraint:
+    # [FUNCTION DOC] HELPER: For equal-length dim lists, builds for every position a disjunction of broadcasting input 1, broadcasting input 2 or no broadcasting, and conjoins the positions.
     """
     Generate broadcasting constraints assuming no padding. Broadcasting can happen at any dimension.
     We look at all combinations for all dimensions in d1 and d2
@@ -1391,6 +1469,8 @@ def generate_all_broadcasting_possibilities_no_padding(
 def gen_broadcasting_constraints(
     e1: TVar, e2: TVar, e11: TVar, e12: TVar, i: int, counter: int
 ) -> tuple[Constraint, Constraint, Constraint, list[BinConstraintD], int]:
+    # [FUNCTION DOC] Simulates broadcasting of e1 and e2 into e11 and e12 for result rank i, using four lists of fresh dims.
+    # Returns (no-padding constraint, padding-on-first-input constraint, padding-on-second-input constraint, natural-number constraints, counter).
     """
     Simulates broadcasting on e1 and e2 and returns the results
     respectively in e11 and e12. Because of gradual types,

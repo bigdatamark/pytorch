@@ -1,3 +1,8 @@
+# [MODULE DOC] Operator symbols used by the gradual-typing constraint system.
+# Defines module-level string constants naming the arithmetic operators (add, sub, mul, div, mod),
+# comparison operators (eq, neq, lt, gt, leq) and the gradual-typing relations (implication,
+# matching, consistency, precision) used as the op field of binary constraints.
+# Matching, precision and leq use non-ASCII unicode symbols as their values. No import-time side effects.
 op_add = "+"
 op_sub = "-"
 op_mul = "*"
