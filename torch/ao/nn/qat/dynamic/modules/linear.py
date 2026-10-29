@@ -1,3 +1,4 @@
+# [MODULE DOC] Defines the dynamic QAT Linear module. No import-time side effects.
 from typing import Optional, TYPE_CHECKING
 
 import torch
@@ -11,6 +12,9 @@ __all__ = ["Linear"]
 
 
 class Linear(torch.ao.nn.qat.Linear):
+    # [CLASS DOC] Linear module with a weight FakeQuantize for dynamic quantization
+    # aware training. Same interface as the QAT Linear; requires the activation observer
+    # in the qconfig to be memoryless.
     r"""
     A linear module attached with FakeQuantize modules for weight,
     used for dynamic quantization aware training.
@@ -32,6 +36,9 @@ class Linear(torch.ao.nn.qat.Linear):
         device: int | str | torch.device | None = None,
         dtype: str | None = None,
     ) -> None:
+        # [FUNCTION DOC] Initializes the base QAT Linear, then validates the qconfig.
+        # Raises ValueError if the qconfig activation observer is not memoryless (a
+        # moving-average observer with averaging constant 1).
         super().__init__(in_features, out_features, bias, qconfig, device, dtype)
         if not torch.ao.quantization.qconfig._activation_is_memoryless(qconfig):  # type: ignore[arg-type]
             raise ValueError(

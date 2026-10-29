@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Quantizable MultiheadAttention module that exposes explicit Linear layers
+# and quant/dequant stubs so observers can be attached. Importing torch.jit here avoids
+# a circular import. No other import-time side effects.
 import warnings
 
 import torch
@@ -11,6 +14,13 @@ __all__ = ["MultiheadAttention"]
 
 
 class MultiheadAttention(nn.MultiheadAttention):
+    # [CLASS DOC] Quantizable MultiheadAttention: reimplements nn.MultiheadAttention
+    # with explicit linear_Q, linear_K, linear_V and out_proj Linear layers, a
+    # FloatFunctional for query scaling, and QuantStub/DeQuantStub modules, so that
+    # observers can be inserted by the quantization flow (float -> observed; the
+    # conversion to quantized lives elsewhere). _FLOAT_MODULE is nn.MultiheadAttention.
+    # Methods: from_float, dequantize, forward. KNOWN ISSUE: the long string after
+    # _FLOAT_MODULE is not a real docstring because it follows an assignment.
     _FLOAT_MODULE = nn.MultiheadAttention
 
     r"""Quantizable implementation of the MultiheadAttention.
@@ -72,6 +82,11 @@ class MultiheadAttention(nn.MultiheadAttention):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] Initializes the float base, then replaces projections with
+        # separate Linear layers: linear_Q (embed_dim to embed_dim), linear_K (kdim to
+        # embed_dim), linear_V (vdim to embed_dim) and out_proj. Adds q_scaling_product
+        # (FloatFunctional) and the quant/dequant stubs for attn output, attn weights,
+        # q, k and v.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(
             embed_dim,
@@ -112,10 +127,18 @@ class MultiheadAttention(nn.MultiheadAttention):
         self.dequant_v = torch.ao.quantization.DeQuantStub()
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: returns the display name QuantizableMultiheadAttention.
         return "QuantizableMultiheadAttention"
 
     @classmethod
     def from_float(cls, other):
+        # [FUNCTION DOC] Classmethod: builds an observed module from a float
+        # nn.MultiheadAttention (exact type) that has a qconfig. Dropout is passed
+        # through to the constructor, bias_k/bias_v/out_proj parameters are shared, and
+        # in_proj weights/biases are split into the Q/K/V linears (slices of in_proj
+        # when q/k/v share an embed dim, otherwise from the separate proj weights). Puts
+        # the result in eval mode and runs quantization prepare in place. Raises
+        # AssertionError on wrong type or missing qconfig. Returns the prepared module.
         if type(other) is not cls._FLOAT_MODULE:
             raise AssertionError(
                 f"Expected type {cls._FLOAT_MODULE}, got {type(other)}"
@@ -197,6 +220,13 @@ class MultiheadAttention(nn.MultiheadAttention):
 
     @torch.jit.unused
     def dequantize(self):
+        # [FUNCTION DOC] Converts a (quantized) module back to a float
+        # nn.MultiheadAttention: dequantizes bias_k/bias_v, out_proj and Q/K/V weights
+        # and packs them into the float module (in_proj slices or separate proj
+        # weights). Raises AssertionError if the q/k/v same-embed-dim flags differ or if
+        # a Q/K/V bias is not all zero when in_proj_bias is used. KNOWN ISSUE: when the
+        # float module has no in_proj_bias in the separate-weights branch, the code
+        # clears bias on self's linear layers instead of the float module fp.
         r"""Utility to convert the quantized MHA back to float.
 
         The motivation for this is that it is not trivial to convert the weights
@@ -285,6 +315,9 @@ class MultiheadAttention(nn.MultiheadAttention):
 
     @classmethod
     def from_observed(cls, other):
+        # [FUNCTION DOC] Classmethod: always raises NotImplementedError; this class only
+        # supports float to observed, the quantized conversion is done by the quantized
+        # MultiheadAttention.
         # The whole flow is float -> observed -> quantized
         # This class does float -> observed only
         # See nn.quantized.MultiheadAttention
@@ -305,6 +338,9 @@ class MultiheadAttention(nn.MultiheadAttention):
         average_attn_weights: bool = True,
         is_causal: bool = False,
     ) -> tuple[Tensor, Tensor | None]:
+        # [FUNCTION DOC] Public forward: delegates all arguments (query, key, value,
+        # masks, need_weights, average_attn_weights, is_causal) to _forward_impl and
+        # returns (attention output, attention weights or None).
         r"""
         Note::
             Please, refer to :func:`~torch.nn.MultiheadAttention.forward` for more
@@ -373,6 +409,18 @@ class MultiheadAttention(nn.MultiheadAttention):
         average_attn_weights: bool = True,
         is_causal: bool = False,
     ) -> tuple[Tensor, Tensor | None]:
+        # [FUNCTION DOC] HELPER: core attention computation. Validates arguments (raises
+        # AssertionError if is_causal is set, if both attn_mask and is_causal are given,
+        # or on size mismatches; RuntimeError on bad attn_mask shape/dims), converts
+        # byte masks to bool with a deprecation warning, transposes when batch_first,
+        # applies Q/K/V linears, scales q, appends bias_k/bias_v and optional zero
+        # attention, splits into heads, dequantizes q/k/v, computes masked softmax
+        # attention weights with dropout, multiplies by v, re-quantizes via stubs,
+        # applies out_proj. Returns the output and, if need_weights, the weights
+        # (averaged over heads if requested) else None. KNOWN ISSUE: the batch_first
+        # path reshapes the head-merged output directly to batch-first layout without
+        # transposing, which may mix heads and positions. Static k/v are always None so
+        # those branches are dead.
         # This version will not deal with the static key/value pairs.
         # Keeping it here for future changes.
         #

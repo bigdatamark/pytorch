@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Quantized fused Conv2d+Add and Conv2d+Add+ReLU modules (ConvAdd2d,
+# ConvAddReLU2d). Defines a module-level alias for the reverse-repeat-padding helper. No
+# other import-time side effects.
 import torch
 import torch.ao.nn.intrinsic
 import torch.ao.nn.intrinsic.qat
@@ -10,6 +13,10 @@ _reverse_repeat_padding = nnq.modules.conv._reverse_repeat_padding
 
 
 class ConvAdd2d(nnq.Conv2d):
+    # [CLASS DOC] Quantized fused module for convolution and element-wise addition;
+    # subclass of the quantized Conv2d with the same packed parameters, scale and
+    # zero_point. _FLOAT_MODULE is the float fused ConvAdd2d. Forward takes a second
+    # tensor to add.
     r"""
     A ConvAdd2d module is a fused module of Conv2d and Add
 
@@ -36,6 +43,9 @@ class ConvAdd2d(nnq.Conv2d):
         device=None,
         dtype=None,
     ):
+        # [FUNCTION DOC] Forwards all convolution arguments (channels, kernel size,
+        # stride, padding, dilation, groups, bias, padding_mode, device, dtype) to the
+        # base class.
         super().__init__(
             in_channels,
             out_channels,
@@ -51,6 +61,11 @@ class ConvAdd2d(nnq.Conv2d):
         )
 
     def forward(self, input, extra_input):  # type: ignore[override]
+        # [FUNCTION DOC] Runs fused convolution and element-wise addition: pads the
+        # input manually when padding_mode is not zeros, then calls the quantized
+        # conv2d_add op with extra_input, packed params, scale and zero_point. Raises
+        # ValueError if input is not 4-dimensional (N, C, H, W). Returns the quantized
+        # output.
         r"""Applies fused quantized Conv2d and addition."""
         # Temporarily using len(shape) instead of ndim due to JIT issue
         # https://github.com/pytorch/pytorch/issues/23890
@@ -66,10 +81,13 @@ class ConvAdd2d(nnq.Conv2d):
         )
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: returns the display name QuantizedConvAdd2d.
         return "QuantizedConvAdd2d"
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):  # type: ignore[override]
+        # [FUNCTION DOC] Classmethod: converts a float fused module via the parent
+        # from_float.
         r"""Creates a quantized module from a float module."""
         return super().from_float(
             mod, use_precomputed_fake_quant=use_precomputed_fake_quant
@@ -77,11 +95,18 @@ class ConvAdd2d(nnq.Conv2d):
 
     @classmethod
     def from_reference(cls, ref_qconv, output_scale, output_zero_point):
+        # [FUNCTION DOC] Classmethod: builds the module from a reference fused module
+        # (uses its first element, the reference conv) with the given output scale and
+        # zero point.
         r"""Creates a quantized module from a reference module."""
         return super().from_reference(ref_qconv[0], output_scale, output_zero_point)
 
 
 class ConvAddReLU2d(nnq.Conv2d):
+    # [CLASS DOC] Quantized fused module for convolution, addition and ReLU; subclass of
+    # the quantized Conv2d with the same packed parameters, scale and zero_point.
+    # _FLOAT_MODULE is the float fused ConvAddReLU2d. Forward takes a second tensor to
+    # add.
     r"""
     A ConvAddReLU2d module is a fused module of Conv2d, Add and Relu
 
@@ -108,6 +133,9 @@ class ConvAddReLU2d(nnq.Conv2d):
         device=None,
         dtype=None,
     ):
+        # [FUNCTION DOC] Forwards all convolution arguments (channels, kernel size,
+        # stride, padding, dilation, groups, bias, padding_mode, device, dtype) to the
+        # base class.
         super().__init__(
             in_channels,
             out_channels,
@@ -123,6 +151,11 @@ class ConvAddReLU2d(nnq.Conv2d):
         )
 
     def forward(self, input, extra_input):  # type: ignore[override]
+        # [FUNCTION DOC] Runs fused convolution, addition and ReLU: pads the input
+        # manually when padding_mode is not zeros, then calls the quantized
+        # conv2d_add_relu op with extra_input, packed params, scale and zero_point.
+        # Raises ValueError if input is not 4-dimensional (N, C, H, W). Returns the
+        # quantized output.
         r"""Applies fused quantized Conv2d, addition, and ReLU."""
         # Temporarily using len(shape) instead of ndim due to JIT issue
         # https://github.com/pytorch/pytorch/issues/23890
@@ -138,10 +171,13 @@ class ConvAddReLU2d(nnq.Conv2d):
         )
 
     def _get_name(self):
+        # [FUNCTION DOC] HELPER: returns the display name QuantizedConvAddReLU2d.
         return "QuantizedConvAddReLU2d"
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):  # type: ignore[override]
+        # [FUNCTION DOC] Classmethod: converts a float fused module via the parent
+        # from_float.
         r"""Creates a quantized module from a float module."""
         return super().from_float(
             mod, use_precomputed_fake_quant=use_precomputed_fake_quant
@@ -149,5 +185,8 @@ class ConvAddReLU2d(nnq.Conv2d):
 
     @classmethod
     def from_reference(cls, ref_qconv, output_scale, output_zero_point):
+        # [FUNCTION DOC] Classmethod: builds the module from a reference fused module
+        # (uses its first element, the reference conv) with the given output scale and
+        # zero point.
         r"""Creates a quantized module from a reference module."""
         return super().from_reference(ref_qconv[0], output_scale, output_zero_point)

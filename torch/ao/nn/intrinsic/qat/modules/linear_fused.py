@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] QAT fused Linear+BatchNorm1d module (LinearBn1d). No import-time side
+# effects.
 import torch
 import torch.ao.nn.intrinsic as nni
 import torch.nn as nn
@@ -14,6 +16,11 @@ __all__ = [
 
 
 class LinearBn1d(nn.modules.linear.Linear, nni._FusedModule):
+    # [CLASS DOC] QAT module fusing Linear and BatchNorm1d with a weight FakeQuantize.
+    # State: bn (a BatchNorm1d over out_features), weight_fake_quant, qconfig, freeze_bn
+    # flag. Forward scales the weight by the BN running statistics before fake-
+    # quantizing, then undoes the scaling and applies BN. Provides freeze/update of BN
+    # stats, from_float and to_float.
     r"""
     A LinearBn1d module is a module fused from Linear and BatchNorm1d, attached
     with FakeQuantize modules for weight, used in quantization aware training.
@@ -46,6 +53,11 @@ class LinearBn1d(nn.modules.linear.Linear, nni._FusedModule):
         freeze_bn=False,
         qconfig=None,
     ):
+        # [FUNCTION DOC] Builds the Linear, a BatchNorm1d(out_features) with affine and
+        # running stats, and the weight fake-quant from qconfig. Raises AssertionError
+        # if qconfig is falsy. freeze_bn is forced True when the module is not in
+        # training mode. Re-creates the bias parameter, resets BN parameters, then
+        # freezes or updates BN stats according to the training flag and freeze_bn.
         nn.modules.linear.Linear.__init__(self, in_features, out_features, bias)
         if not qconfig:
             raise AssertionError("qconfig must be provided for QAT module")
@@ -70,24 +82,35 @@ class LinearBn1d(nn.modules.linear.Linear, nni._FusedModule):
             self.freeze_bn_stats()
 
     def reset_running_stats(self):
+        # [FUNCTION DOC] Resets the BN running statistics.
         self.bn.reset_running_stats()
 
     def reset_bn_parameters(self):
+        # [FUNCTION DOC] Resets BN running stats, initializes the BN weight uniformly
+        # and zeroes the BN bias.
         self.bn.reset_running_stats()
         init.uniform_(self.bn.weight)
         init.zeros_(self.bn.bias)
 
     def update_bn_stats(self):
+        # [FUNCTION DOC] Unfreezes BN: clears freeze_bn and puts the BN submodule in
+        # training mode. Returns self.
         self.freeze_bn = False
         self.bn.training = True
         return self
 
     def freeze_bn_stats(self):
+        # [FUNCTION DOC] Freezes BN: sets freeze_bn and puts the BN submodule in eval
+        # mode. Returns self.
         self.freeze_bn = True
         self.bn.training = False
         return self
 
     def forward(self, input):
+        # [FUNCTION DOC] Computes fused linear+BN for QAT. Scales the weight per output
+        # feature by bn weight / running std, fake-quantizes it, applies the linear op
+        # with zero bias, divides by the scale, adds the original bias, then applies BN.
+        # Raises AssertionError if bn.running_var is None. Returns the BN output.
         if self.bn.running_var is None:
             raise AssertionError("self.bn.running_var must not be None")
 
@@ -131,6 +154,8 @@ class LinearBn1d(nn.modules.linear.Linear, nni._FusedModule):
         return bn_out
 
     def train(self, mode=True):
+        # [FUNCTION DOC] Sets the training flag; propagates to children only when BN is
+        # not frozen, so a frozen BN stays in eval mode. Returns self.
         """
         Batchnorm's training behavior is using the self.training flag. Prevent
         changing it if BN is frozen. This makes sure that calling `model.train()`
@@ -144,6 +169,10 @@ class LinearBn1d(nn.modules.linear.Linear, nni._FusedModule):
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
+        # [FUNCTION DOC] Classmethod: builds the QAT module from a float fused
+        # LinearBn1d, sharing its weight, bias and BN parameters/buffers (no copy).
+        # Raises AssertionError if the type is not LinearBn1d or qconfig is missing or
+        # falsy. use_precomputed_fake_quant is unused.
         r"""Create a qat module from a float module or qparams_dict
 
         Args:
@@ -182,6 +211,9 @@ class LinearBn1d(nn.modules.linear.Linear, nni._FusedModule):
         return qat_linearbn
 
     def to_float(self):
+        # [FUNCTION DOC] Converts to a plain float Linear by folding the BN running
+        # stats into weight and bias. Raises AssertionError if BN running stats are
+        # None. Returns the Linear.
         linear = torch.nn.Linear(self.in_features, self.out_features)
         if self.bn.running_var is None or self.bn.running_mean is None:
             raise AssertionError(

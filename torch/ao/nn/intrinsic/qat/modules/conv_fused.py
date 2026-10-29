@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] QAT fused Conv+BatchNorm(+ReLU) modules for 1d/2d/3d (ConvBnNd,
+# ConvBnReLUNd, ConvReLUNd) with a shared private base, plus module-level helpers
+# update_bn_stats and freeze_bn_stats. Defines _BN_CLASS_MAP from dimension to BatchNorm
+# class. No other import-time side effects.
 import math
 from typing import ClassVar
 
@@ -34,6 +38,11 @@ _BN_CLASS_MAP = {
 
 
 class _ConvBnNd(nn.modules.conv._ConvNd, nni._FusedModule):
+    # [CLASS DOC] HELPER: shared base of the QAT fused Conv+BatchNorm modules. State: bn
+    # (BatchNorm of the matching dimension), weight_fake_quant, qconfig, freeze_bn flag
+    # and a switch to use the slow, more accurate forward. Forward folds BN running
+    # stats into the fake-quantized conv weight. Handles state_dict version 1 to 2
+    # migration, from_float and to_float. Serialization _version is 2.
     _version = 2
     _FLOAT_MODULE: ClassVar[type[nn.modules.conv._ConvNd]]
 
@@ -62,6 +71,12 @@ class _ConvBnNd(nn.modules.conv._ConvNd, nni._FusedModule):
         qconfig=None,
         dim=2,
     ):
+        # [FUNCTION DOC] HELPER: initializes the conv without bias, requires qconfig
+        # (AssertionError if falsy), creates bn for the given dim, the weight fake-
+        # quant, and re-creates the bias parameter if requested. Resets BN parameters
+        # (plus conv bias init), then freezes or updates BN stats depending on training
+        # mode and freeze_bn; freeze_bn is forced True when not training. Initially the
+        # slow path is disabled.
         nn.modules.conv._ConvNd.__init__(
             self,
             in_channels,
@@ -101,9 +116,13 @@ class _ConvBnNd(nn.modules.conv._ConvNd, nni._FusedModule):
         self._enable_slow_path_for_better_numerical_stability = False
 
     def reset_running_stats(self):
+        # [FUNCTION DOC] Resets BN running statistics.
         self.bn.reset_running_stats()
 
     def reset_bn_parameters(self):
+        # [FUNCTION DOC] Resets BN running stats, initializes BN weight uniformly and BN
+        # bias to zero, then (if a conv bias exists) re-initializes the conv bias
+        # uniformly within +/- 1/sqrt(fan_in).
         self.bn.reset_running_stats()
         init.uniform_(self.bn.weight)
         init.zeros_(self.bn.bias)
@@ -114,21 +133,31 @@ class _ConvBnNd(nn.modules.conv._ConvNd, nni._FusedModule):
             init.uniform_(self.bias, -bound, bound)
 
     def update_bn_stats(self):
+        # [FUNCTION DOC] Unfreezes BN: clears freeze_bn and sets the BN submodule to
+        # training. Returns self.
         self.freeze_bn = False
         self.bn.training = True
         return self
 
     def freeze_bn_stats(self):
+        # [FUNCTION DOC] Freezes BN: sets freeze_bn and sets the BN submodule to eval.
+        # Returns self.
         self.freeze_bn = True
         self.bn.training = False
         return self
 
     def _forward(self, input):
+        # [FUNCTION DOC] HELPER: dispatches to the slow path if the numerical-stability
+        # flag is set, otherwise to the approximate path.
         if self._enable_slow_path_for_better_numerical_stability:
             return self._forward_slow(input)
         return self._forward_approximate(input)
 
     def _forward_approximate(self, input):
+        # [FUNCTION DOC] HELPER: single-pass fused conv-BN. Scales the weight by bn
+        # weight / running std, fake-quantizes it, convolves with a zero bias, divides
+        # by the scale, adds the original conv bias, and applies BN. Raises
+        # AssertionError if bn.running_var is None.
         """Approximated method to fuse conv and bn. It requires only one forward pass.
         conv_orig = conv / scale_factor where scale_factor = bn.weight / running_std
         """
@@ -159,6 +188,13 @@ class _ConvBnNd(nn.modules.conv._ConvNd, nni._FusedModule):
         return conv
 
     def _forward_slow(self, input):
+        # [FUNCTION DOC] HELPER: more accurate two-pass fused conv-BN. In training:
+        # convolves with the raw weight to get batch statistics and updates BN stats,
+        # convolves again with the fake-quantized scaled weight, rescales by
+        # running_std/batch_std. In eval: uses running stats only. Adds a fused bias
+        # (beta - gamma * mean / std) and a zero-valued bias term so the conv bias
+        # participates in the loss (avoids DDP unused-parameter errors). Raises
+        # AssertionError if BN running stats are None.
         """
         A more accurate but slow method to compute conv bn fusion, following https://arxiv.org/pdf/1806.08342.pdf
         It requires two forward passes but handles the case bn.weight == 0
@@ -266,9 +302,12 @@ class _ConvBnNd(nn.modules.conv._ConvNd, nni._FusedModule):
         return conv_bn
 
     def forward(self, input):
+        # [FUNCTION DOC] Runs the fused conv-BN forward (_forward).
         return self._forward(input)
 
     def train(self, mode=True):
+        # [FUNCTION DOC] Sets the training flag; propagates to children only when BN is
+        # not frozen so a frozen BN stays in eval. Returns self.
         """
         Batchnorm's training behavior is using the self.training flag. Prevent
         changing it if BN is frozen. This makes sure that calling `model.train()`
@@ -312,6 +351,11 @@ class _ConvBnNd(nn.modules.conv._ConvNd, nni._FusedModule):
         unexpected_keys,
         error_msgs,
     ):
+        # [FUNCTION DOC] Backward-compatible loader: for state dicts with version None
+        # or 1, renames the old BN keys (gamma, beta, running_mean, running_var,
+        # num_batches_tracked) to the nested bn.* names; tolerates already-v2 keys saved
+        # under version 1 and records missing keys when strict. Then calls the parent
+        # loader. Mutates state_dict in place.
         version = local_metadata.get("version", None)
         if version is None or version == 1:
             # BN related parameters and buffers were moved into the BN module for v2
@@ -351,6 +395,10 @@ class _ConvBnNd(nn.modules.conv._ConvNd, nni._FusedModule):
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
+        # [FUNCTION DOC] Classmethod: builds the QAT module from a float fused ConvBn
+        # module (exact _FLOAT_MODULE type) with a valid qconfig, sharing the conv
+        # weight/bias and BN parameters/buffers. Raises AssertionError on wrong type or
+        # missing/falsy qconfig. use_precomputed_fake_quant is unused.
         r"""Create a qat module from a float module or qparams_dict
 
         Args: `mod` a float module, either produced by torch.ao.quantization utilities
@@ -397,6 +445,11 @@ class _ConvBnNd(nn.modules.conv._ConvNd, nni._FusedModule):
         return qat_convbn
 
     def to_float(self):
+        # [FUNCTION DOC] Converts to a float module: builds the float conv with detached
+        # weight/bias copies, folds BN into it if a float BN class is set, and wraps
+        # conv and relu in the fused float module when a relu class is set; sets the
+        # training flag. Raises AssertionError if BN running stats are None. Returns the
+        # float module.
         cls = type(self)
         conv = cls._FLOAT_CONV_MODULE(  # type: ignore[attr-defined]
             self.in_channels,
@@ -443,6 +496,9 @@ class _ConvBnNd(nn.modules.conv._ConvNd, nni._FusedModule):
 
 
 class ConvBn1d(_ConvBnNd, nn.Conv1d):
+    # [CLASS DOC] QAT module fusing Conv1d and BatchNorm1d with a weight FakeQuantize.
+    # Class attributes name the float conv, BN, (no) relu and fused float module used by
+    # from_float/to_float. Behavior comes from the shared base.
     r"""
     A ConvBn1d module is a module fused from Conv1d and BatchNorm1d,
     attached with FakeQuantize modules for weight,
@@ -487,6 +543,10 @@ class ConvBn1d(_ConvBnNd, nn.Conv1d):
         freeze_bn=False,
         qconfig=None,
     ):
+        # [FUNCTION DOC] Expands kernel_size, stride, padding and dilation to 1d tuples
+        # with _single and calls the shared base initializer (non-transposed, zero
+        # output padding, dim=1). bias defaults to None so no conv bias unless
+        # requested. qconfig is required.
         kernel_size = _single(kernel_size)
         stride = _single(stride)
         padding = _single(padding)
@@ -513,6 +573,9 @@ class ConvBn1d(_ConvBnNd, nn.Conv1d):
 
 
 class ConvBnReLU1d(ConvBn1d):
+    # [CLASS DOC] QAT module fusing Conv1d, BatchNorm1d and ReLU. Same as ConvBn1d with
+    # _FLOAT_RELU_MODULE set and forward applying relu after the fused conv-BN; to_float
+    # yields the fused float ConvReLU1d.
     r"""
     A ConvBnReLU1d module is a module fused from Conv1d, BatchNorm1d and ReLU,
     attached with FakeQuantize modules for weight,
@@ -538,16 +601,21 @@ class ConvBnReLU1d(ConvBn1d):
     _FUSED_FLOAT_MODULE: ClassVar[type[nn.Module] | None] = nni.ConvReLU1d
 
     def forward(self, input):
+        # [FUNCTION DOC] Applies the fused conv-BN forward and then ReLU.
         r"""Performs forward pass through fused Conv1d, BatchNorm1d, and ReLU."""
         return F.relu(self._forward(input))
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
+        # [FUNCTION DOC] Classmethod: builds the QAT module from a float fused module
+        # via the parent from_float.
         r"""Creates a QAT module from a floating point module."""
         return super().from_float(mod, use_precomputed_fake_quant)
 
 
 class ConvReLU1d(nnqat.Conv1d, nni._FusedModule):
+    # [CLASS DOC] QAT module fusing Conv1d and ReLU with a weight FakeQuantize (no BN).
+    # Float counterparts are declared by class attributes (BN is None, relu is ReLU).
     r"""A ConvReLU1d module is a fused module of Conv1d and ReLU, attached with
     FakeQuantize modules for weight for
     quantization aware training.
@@ -578,6 +646,9 @@ class ConvReLU1d(nnqat.Conv1d, nni._FusedModule):
         padding_mode="zeros",
         qconfig=None,
     ):
+        # [FUNCTION DOC] Initializes the QAT conv base with all convolution arguments
+        # and qconfig; raises AssertionError if qconfig is falsy; stores qconfig and
+        # builds weight_fake_quant.
         super().__init__(
             in_channels,
             out_channels,
@@ -597,6 +668,8 @@ class ConvReLU1d(nnqat.Conv1d, nni._FusedModule):
         self.weight_fake_quant = self.qconfig.weight()
 
     def forward(self, input):
+        # [FUNCTION DOC] Convolves with the fake-quantized weight and bias, then applies
+        # ReLU.
         r"""Performs forward pass through fused Conv1d and ReLU."""
         return F.relu(
             self._conv_forward(input, self.weight_fake_quant(self.weight), self.bias)
@@ -604,6 +677,8 @@ class ConvReLU1d(nnqat.Conv1d, nni._FusedModule):
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):  # type: ignore[override]
+        # [FUNCTION DOC] Classmethod: builds the QAT module from a float fused module
+        # via the parent from_float.
         r"""Creates a QAT module from a floating point module."""
         return super().from_float(
             mod, use_precomputed_fake_quant=use_precomputed_fake_quant
@@ -611,6 +686,9 @@ class ConvReLU1d(nnqat.Conv1d, nni._FusedModule):
 
 
 class ConvBn2d(_ConvBnNd, nn.Conv2d):
+    # [CLASS DOC] QAT module fusing Conv2d and BatchNorm2d with a weight FakeQuantize.
+    # Class attributes name the float conv, BN, (no) relu and fused float module used by
+    # from_float/to_float. Behavior comes from the shared base.
     r"""
     A ConvBn2d module is a module fused from Conv2d and BatchNorm2d,
     attached with FakeQuantize modules for weight,
@@ -655,6 +733,10 @@ class ConvBn2d(_ConvBnNd, nn.Conv2d):
         freeze_bn=False,
         qconfig=None,
     ):
+        # [FUNCTION DOC] Expands kernel_size, stride, padding and dilation to 2d tuples
+        # with _pair and calls the shared base initializer (non-transposed, zero output
+        # padding, dim=2). bias defaults to None so no conv bias unless requested.
+        # qconfig is required.
         kernel_size = _pair(kernel_size)
         stride = _pair(stride)
         padding = _pair(padding)
@@ -681,6 +763,9 @@ class ConvBn2d(_ConvBnNd, nn.Conv2d):
 
 
 class ConvBnReLU2d(ConvBn2d):
+    # [CLASS DOC] QAT module fusing Conv2d, BatchNorm2d and ReLU. Same as ConvBn2d with
+    # _FLOAT_RELU_MODULE set and forward applying relu after the fused conv-BN; to_float
+    # yields the fused float ConvReLU2d.
     r"""
     A ConvBnReLU2d module is a module fused from Conv2d, BatchNorm2d and ReLU,
     attached with FakeQuantize modules for weight,
@@ -706,16 +791,21 @@ class ConvBnReLU2d(ConvBn2d):
     _FUSED_FLOAT_MODULE: ClassVar[type[nni.ConvReLU2d] | None] = nni.ConvReLU2d
 
     def forward(self, input):
+        # [FUNCTION DOC] Applies the fused conv-BN forward and then ReLU.
         r"""Performs forward pass through fused Conv2d, BatchNorm2d, and ReLU."""
         return F.relu(self._forward(input))
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
+        # [FUNCTION DOC] Classmethod: builds the QAT module from a float fused module
+        # via the parent from_float.
         r"""Creates a QAT module from a floating point module."""
         return super().from_float(mod, use_precomputed_fake_quant)
 
 
 class ConvReLU2d(nnqat.Conv2d, nni._FusedModule):
+    # [CLASS DOC] QAT module fusing Conv2d and ReLU with a weight FakeQuantize (no BN).
+    # Float counterparts are declared by class attributes (BN is None, relu is ReLU).
     r"""A ConvReLU2d module is a fused module of Conv2d and ReLU, attached with
     FakeQuantize modules for weight for
     quantization aware training.
@@ -746,6 +836,9 @@ class ConvReLU2d(nnqat.Conv2d, nni._FusedModule):
         padding_mode="zeros",
         qconfig=None,
     ):
+        # [FUNCTION DOC] Initializes the QAT conv base with all convolution arguments
+        # and qconfig; raises AssertionError if qconfig is falsy; stores qconfig and
+        # builds weight_fake_quant.
         super().__init__(
             in_channels,
             out_channels,
@@ -765,6 +858,8 @@ class ConvReLU2d(nnqat.Conv2d, nni._FusedModule):
         self.weight_fake_quant = self.qconfig.weight()
 
     def forward(self, input):
+        # [FUNCTION DOC] Convolves with the fake-quantized weight and bias, then applies
+        # ReLU.
         r"""Performs forward pass through fused Conv2d and ReLU."""
         return F.relu(
             self._conv_forward(input, self.weight_fake_quant(self.weight), self.bias)
@@ -772,6 +867,8 @@ class ConvReLU2d(nnqat.Conv2d, nni._FusedModule):
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):  # type: ignore[override]
+        # [FUNCTION DOC] Classmethod: builds the QAT module from a float fused module
+        # via the parent from_float.
         r"""Creates a QAT module from a floating point module."""
         return super().from_float(
             mod, use_precomputed_fake_quant=use_precomputed_fake_quant
@@ -779,6 +876,9 @@ class ConvReLU2d(nnqat.Conv2d, nni._FusedModule):
 
 
 class ConvBn3d(_ConvBnNd, nn.Conv3d):
+    # [CLASS DOC] QAT module fusing Conv3d and BatchNorm3d with a weight FakeQuantize.
+    # Class attributes name the float conv, BN, (no) relu and fused float module used by
+    # from_float/to_float. Behavior comes from the shared base.
     r"""
     A ConvBn3d module is a module fused from Conv3d and BatchNorm3d,
     attached with FakeQuantize modules for weight,
@@ -823,6 +923,10 @@ class ConvBn3d(_ConvBnNd, nn.Conv3d):
         freeze_bn=False,
         qconfig=None,
     ):
+        # [FUNCTION DOC] Expands kernel_size, stride, padding and dilation to 3d tuples
+        # with _triple and calls the shared base initializer (non-transposed, zero
+        # output padding, dim=3). bias defaults to None so no conv bias unless
+        # requested. qconfig is required.
         kernel_size = _triple(kernel_size)
         stride = _triple(stride)
         padding = _triple(padding)
@@ -849,6 +953,9 @@ class ConvBn3d(_ConvBnNd, nn.Conv3d):
 
 
 class ConvBnReLU3d(ConvBn3d):
+    # [CLASS DOC] QAT module fusing Conv3d, BatchNorm3d and ReLU. Same as ConvBn3d with
+    # _FLOAT_RELU_MODULE set and forward applying relu after the fused conv-BN; to_float
+    # yields the fused float ConvReLU3d.
     r"""
     A ConvBnReLU3d module is a module fused from Conv3d, BatchNorm3d and ReLU,
     attached with FakeQuantize modules for weight,
@@ -873,11 +980,14 @@ class ConvBnReLU3d(ConvBn3d):
     _FUSED_FLOAT_MODULE: ClassVar[type[nni.ConvReLU3d] | None] = nni.ConvReLU3d
 
     def forward(self, input):
+        # [FUNCTION DOC] Applies the fused conv-BN forward and then ReLU.
         r"""Performs forward pass through fused Conv3d, BatchNorm3d, and ReLU."""
         return F.relu(ConvBn3d._forward(self, input))
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
+        # [FUNCTION DOC] Classmethod: builds the QAT module from a float fused module
+        # via the parent from_float.
         r"""Creates a QAT module from a floating point module."""
         return super().from_float(
             mod, use_precomputed_fake_quant=use_precomputed_fake_quant
@@ -885,6 +995,8 @@ class ConvBnReLU3d(ConvBn3d):
 
 
 class ConvReLU3d(nnqat.Conv3d, nni._FusedModule):
+    # [CLASS DOC] QAT module fusing Conv3d and ReLU with a weight FakeQuantize (no BN).
+    # Float counterparts are declared by class attributes (BN is None, relu is ReLU).
     r"""A ConvReLU3d module is a fused module of Conv3d and ReLU, attached with
     FakeQuantize modules for weight for
     quantization aware training.
@@ -915,6 +1027,9 @@ class ConvReLU3d(nnqat.Conv3d, nni._FusedModule):
         padding_mode="zeros",
         qconfig=None,
     ):
+        # [FUNCTION DOC] Initializes the QAT conv base with all convolution arguments
+        # and qconfig; raises AssertionError if qconfig is falsy; stores qconfig and
+        # builds weight_fake_quant.
         super().__init__(
             in_channels,
             out_channels,
@@ -934,6 +1049,8 @@ class ConvReLU3d(nnqat.Conv3d, nni._FusedModule):
         self.weight_fake_quant = self.qconfig.weight()
 
     def forward(self, input):
+        # [FUNCTION DOC] Convolves with the fake-quantized weight and bias, then applies
+        # ReLU.
         r"""Performs forward pass through fused Conv3d and ReLU."""
         return F.relu(
             self._conv_forward(input, self.weight_fake_quant(self.weight), self.bias)
@@ -941,6 +1058,8 @@ class ConvReLU3d(nnqat.Conv3d, nni._FusedModule):
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):  # type: ignore[override]
+        # [FUNCTION DOC] Classmethod: builds the QAT module from a float fused module
+        # via the parent from_float.
         r"""Creates a QAT module from a floating point module."""
         return super().from_float(
             mod, use_precomputed_fake_quant=use_precomputed_fake_quant
@@ -948,6 +1067,9 @@ class ConvReLU3d(nnqat.Conv3d, nni._FusedModule):
 
 
 def update_bn_stats(mod):
+    # [FUNCTION DOC] Module-level utility for model.apply: if the module is exactly one
+    # of the ConvBn or ConvBnReLU QAT classes (1d/2d/3d), unfreezes its BN stats
+    # (enables BN updates). Other modules are ignored.
     if type(mod) in {
         ConvBnReLU1d,
         ConvBnReLU2d,
@@ -960,6 +1082,9 @@ def update_bn_stats(mod):
 
 
 def freeze_bn_stats(mod):
+    # [FUNCTION DOC] Module-level utility for model.apply: if the module is exactly one
+    # of the ConvBn or ConvBnReLU QAT classes (1d/2d/3d), freezes its BN stats. Other
+    # modules are ignored.
     if type(mod) in {
         ConvBnReLU1d,
         ConvBnReLU2d,

@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] QAT convolution modules (Conv1d, Conv2d, Conv3d) built on a private
+# shared base that fake-quantizes weights. No import-time side effects.
 from typing import ClassVar, Literal
 
 import torch
@@ -12,6 +14,10 @@ __all__ = ["Conv1d", "Conv2d", "Conv3d"]
 
 
 class _ConvNd(nn.modules.conv._ConvNd):
+    # [CLASS DOC] HELPER: shared base of the QAT convolutions. Adds qconfig and a weight
+    # FakeQuantize (weight_fake_quant) to the float conv base; subclasses set
+    # _FLOAT_MODULE and _FLOAT_CONV_MODULE. Provides forward, a from_float builder and
+    # to_float (also handles fused conv-relu subclasses).
     _FLOAT_MODULE: ClassVar[type[nn.modules.conv._ConvNd]]
 
     def __init__(
@@ -31,6 +37,9 @@ class _ConvNd(nn.modules.conv._ConvNd):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: initializes the float conv base with the given
+        # geometry, then stores qconfig and builds weight_fake_quant. Raises
+        # AssertionError if qconfig is falsy.
         factory_kwargs = {"device": device, "dtype": dtype}
         nn.modules.conv._ConvNd.__init__(
             self,
@@ -53,10 +62,18 @@ class _ConvNd(nn.modules.conv._ConvNd):
         self.weight_fake_quant = qconfig.weight(factory_kwargs=factory_kwargs)
 
     def forward(self, input):
+        # [FUNCTION DOC] Convolves the input with the fake-quantized weight and the
+        # float bias.
         return self._conv_forward(input, self.weight_fake_quant(self.weight), self.bias)
 
     @staticmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
+        # [FUNCTION DOC] HELPER: declared as a static method whose first argument is the
+        # target QAT class (subclasses call it passing cls explicitly). Builds a QAT
+        # conv from a float module of exactly type _FLOAT_MODULE that has a valid
+        # qconfig, unwrapping fused modules to their first element, and shares weight
+        # and bias with the float module. Raises AssertionError on wrong type or
+        # missing/falsy qconfig. use_precomputed_fake_quant is unused.
         r"""Create a qat module from a float module
 
         Args:
@@ -92,6 +109,11 @@ class _ConvNd(nn.modules.conv._ConvNd):
         return qat_conv
 
     def to_float(self):
+        # [FUNCTION DOC] Converts to a float conv (_FLOAT_CONV_MODULE) with detached
+        # copies of weight and bias. For fused subclasses also builds the float relu
+        # from _FLOAT_RELU_MODULE and returns the fused float module with the same
+        # training flag. Raises AssertionError if a fused class lacks
+        # _FLOAT_RELU_MODULE.
         """This works for both single qat conv, and the qat conv - relu modules
         to convert the qat module to a floating point module
         """
@@ -129,6 +151,9 @@ class _ConvNd(nn.modules.conv._ConvNd):
 
 
 class Conv1d(_ConvNd, nn.Conv1d):
+    # [CLASS DOC] QAT Conv1d: nn.Conv1d with a weight FakeQuantize. _FLOAT_MODULE and
+    # _FLOAT_CONV_MODULE are nn.Conv1d. Attribute weight_fake_quant fake-quantizes the
+    # weight in forward.
     r"""
     A Conv1d module attached with FakeQuantize modules for weight,
     used for quantization aware training.
@@ -160,6 +185,10 @@ class Conv1d(_ConvNd, nn.Conv1d):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] Normalizes kernel_size, stride, dilation (and padding unless it
+        # is a string) to 1d tuples with _single, then initializes the base with
+        # transposed=False and zero output padding. qconfig is required by the base
+        # (AssertionError if falsy).
         kernel_size_ = _single(kernel_size)
         stride_ = _single(stride)
         padding_ = padding if isinstance(padding, str) else _single(padding)
@@ -183,12 +212,17 @@ class Conv1d(_ConvNd, nn.Conv1d):
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):  # type: ignore[override]
+        # [FUNCTION DOC] Classmethod: builds this QAT conv from a float conv by calling
+        # the shared base builder with this class.
         return super().from_float(
             cls, mod, use_precomputed_fake_quant=use_precomputed_fake_quant
         )
 
 
 class Conv2d(_ConvNd, nn.Conv2d):
+    # [CLASS DOC] QAT Conv2d: nn.Conv2d with a weight FakeQuantize. _FLOAT_MODULE and
+    # _FLOAT_CONV_MODULE are nn.Conv2d. Attribute weight_fake_quant fake-quantizes the
+    # weight in forward.
     r"""
     A Conv2d module attached with FakeQuantize modules for weight,
     used for quantization aware training.
@@ -222,6 +256,10 @@ class Conv2d(_ConvNd, nn.Conv2d):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] Normalizes kernel_size, stride, dilation (and padding unless it
+        # is a string) to 2d tuples with _pair, then initializes the base with
+        # transposed=False and zero output padding. qconfig is required by the base
+        # (AssertionError if falsy).
         kernel_size_ = _pair(kernel_size)
         stride_ = _pair(stride)
         padding_ = padding if isinstance(padding, str) else _pair(padding)
@@ -244,16 +282,23 @@ class Conv2d(_ConvNd, nn.Conv2d):
         )
 
     def forward(self, input):
+        # [FUNCTION DOC] Convolves with the fake-quantized weight and float bias (same
+        # as the base).
         return self._conv_forward(input, self.weight_fake_quant(self.weight), self.bias)
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):  # type: ignore[override]
+        # [FUNCTION DOC] Classmethod: builds this QAT conv from a float conv by calling
+        # the shared base builder with this class.
         return super().from_float(
             cls, mod, use_precomputed_fake_quant=use_precomputed_fake_quant
         )
 
 
 class Conv3d(_ConvNd, nn.Conv3d):
+    # [CLASS DOC] QAT Conv3d: nn.Conv3d with a weight FakeQuantize. _FLOAT_MODULE and
+    # _FLOAT_CONV_MODULE are nn.Conv3d. Attribute weight_fake_quant fake-quantizes the
+    # weight in forward.
     r"""
     A Conv3d module attached with FakeQuantize modules for weight,
     used for quantization aware training.
@@ -287,6 +332,10 @@ class Conv3d(_ConvNd, nn.Conv3d):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] Normalizes kernel_size, stride, dilation (and padding unless it
+        # is a string) to 3d tuples with _triple, then initializes the base with
+        # transposed=False and zero output padding. qconfig is required by the base
+        # (AssertionError if falsy).
         kernel_size_ = _triple(kernel_size)
         stride_ = _triple(stride)
         padding_ = padding if isinstance(padding, str) else _triple(padding)
@@ -309,10 +358,14 @@ class Conv3d(_ConvNd, nn.Conv3d):
         )
 
     def forward(self, input):
+        # [FUNCTION DOC] Convolves with the fake-quantized weight and float bias (same
+        # as the base).
         return self._conv_forward(input, self.weight_fake_quant(self.weight), self.bias)
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):  # type: ignore[override]
+        # [FUNCTION DOC] Classmethod: builds this QAT conv from a float conv by calling
+        # the shared base builder with this class.
         return super().from_float(
             cls, mod, use_precomputed_fake_quant=use_precomputed_fake_quant
         )

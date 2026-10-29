@@ -1,4 +1,5 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] QAT Linear module (fake-quantized weight). No import-time side effects.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,6 +15,9 @@ __all__ = ["Linear"]
 
 
 class Linear(nn.Linear):
+    # [CLASS DOC] Linear module with a weight FakeQuantize for quantization aware
+    # training. State: qconfig and weight_fake_quant (built from qconfig.weight);
+    # _FLOAT_MODULE is nn.Linear. Methods: forward, from_float, to_float.
     r"""
     A linear module attached with FakeQuantize modules for weight,
     used for quantization aware training.
@@ -40,6 +44,8 @@ class Linear(nn.Linear):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] Initializes the Linear with optional device/dtype and creates
+        # the weight fake-quant from qconfig. Raises AssertionError if qconfig is falsy.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(in_features, out_features, bias, **factory_kwargs)
         if not qconfig:
@@ -48,10 +54,19 @@ class Linear(nn.Linear):
         self.weight_fake_quant = qconfig.weight(factory_kwargs=factory_kwargs)
 
     def forward(self, input):
+        # [FUNCTION DOC] Applies a linear op using the fake-quantized weight and the
+        # float bias.
         return F.linear(input, self.weight_fake_quant(self.weight), self.bias)
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
+        # [FUNCTION DOC] Classmethod: builds a QAT module from a float module of type
+        # _FLOAT_MODULE with a valid qconfig, sharing (or transferring parametrizations
+        # of) weight and bias. Raises AssertionError on wrong type or missing/falsy
+        # qconfig. use_precomputed_fake_quant is unused. KNOWN ISSUE: the LinearReLU
+        # unwrapping branch is unreachable here because the earlier type check requires
+        # exactly _FLOAT_MODULE; it only matters for subclasses overriding
+        # _FLOAT_MODULE.
         r"""Create a qat module from a float module or qparams_dict
         Args: `mod` a float module, either produced by torch.ao.quantization utilities
         or directly from user
@@ -89,6 +104,8 @@ class Linear(nn.Linear):
         return qat_linear
 
     def to_float(self):
+        # [FUNCTION DOC] Converts to a float Linear with detached copies of weight and
+        # bias, preserving the training flag. Returns it.
         linear = torch.nn.Linear(
             self.in_features, self.out_features, self.bias is not None
         )

@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] QAT Embedding and EmbeddingBag modules with fake-quantized weights. No
+# import-time side effects.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,6 +11,9 @@ __all__ = ["Embedding", "EmbeddingBag"]
 
 
 class Embedding(nn.Embedding):
+    # [CLASS DOC] QAT Embedding: nn.Embedding with a weight FakeQuantize. Requires the
+    # weight qscheme to be per-channel affine with float qparams. State: qconfig,
+    # weight_fake_quant; _FLOAT_MODULE is nn.Embedding.
     r"""
     An embedding bag module attached with FakeQuantize modules for weight,
     used for quantization aware training.
@@ -40,6 +45,9 @@ class Embedding(nn.Embedding):
         dtype=None,
         qconfig=None,
     ) -> None:
+        # [FUNCTION DOC] Initializes the float base, then validates qconfig and stores
+        # it with the built weight_fake_quant. Raises AssertionError if qconfig is falsy
+        # or the weight qscheme is not per_channel_affine_float_qparams.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(
             num_embeddings,
@@ -64,6 +72,8 @@ class Embedding(nn.Embedding):
         self.weight_fake_quant = qconfig.weight(factory_kwargs=factory_kwargs)
 
     def forward(self, input) -> Tensor:
+        # [FUNCTION DOC] Runs the functional embedding lookup using the fake-quantized
+        # weight and the module settings. Returns a tensor.
         return F.embedding(
             input,
             self.weight_fake_quant(self.weight),
@@ -76,6 +86,10 @@ class Embedding(nn.Embedding):
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
+        # [FUNCTION DOC] Classmethod: builds the QAT module from a float nn.Embedding of
+        # exactly that type with a valid qconfig, reusing its weight. Raises
+        # AssertionError on wrong type, missing/falsy qconfig or wrong weight qscheme.
+        # use_precomputed_fake_quant is unused.
         r"""Create a qat module from a float module
 
         Args: `mod` a float module, either produced by torch.ao.quantization utilities
@@ -115,6 +129,8 @@ class Embedding(nn.Embedding):
         return qat_embedding_bag
 
     def to_float(self):
+        # [FUNCTION DOC] Converts to a float nn.Embedding with a detached copy of the
+        # weight and the same training flag.
         embedding_bag = torch.nn.Embedding(
             self.num_embeddings,
             self.embedding_dim,
@@ -131,6 +147,9 @@ class Embedding(nn.Embedding):
 
 
 class EmbeddingBag(nn.EmbeddingBag):
+    # [CLASS DOC] QAT EmbeddingBag: nn.EmbeddingBag with a weight FakeQuantize. Requires
+    # the weight qscheme to be per-channel affine with float qparams. State: qconfig,
+    # weight_fake_quant; _FLOAT_MODULE is nn.EmbeddingBag.
     r"""
     An embedding bag module attached with FakeQuantize modules for weight,
     used for quantization aware training.
@@ -164,6 +183,9 @@ class EmbeddingBag(nn.EmbeddingBag):
         device=None,
         dtype=None,
     ) -> None:
+        # [FUNCTION DOC] Initializes the float base, then validates qconfig and stores
+        # it with the built weight_fake_quant. Raises AssertionError if qconfig is falsy
+        # or the weight qscheme is not per_channel_affine_float_qparams.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(
             num_embeddings,
@@ -190,6 +212,9 @@ class EmbeddingBag(nn.EmbeddingBag):
         self.weight_fake_quant = qconfig.weight(factory_kwargs=factory_kwargs)
 
     def forward(self, input, offsets=None, per_sample_weights=None) -> Tensor:
+        # [FUNCTION DOC] Runs the functional embedding_bag lookup using the fake-
+        # quantized weight and the module settings (offsets and per_sample_weights
+        # optional). Returns a tensor.
         return F.embedding_bag(
             input,
             self.weight_fake_quant(self.weight),
@@ -206,6 +231,10 @@ class EmbeddingBag(nn.EmbeddingBag):
 
     @classmethod
     def from_float(cls, mod, use_precomputed_fake_quant=False):
+        # [FUNCTION DOC] Classmethod: builds the QAT module from a float nn.EmbeddingBag
+        # of exactly that type with a valid qconfig, reusing its weight. Raises
+        # AssertionError on wrong type, missing/falsy qconfig or wrong weight qscheme.
+        # use_precomputed_fake_quant is unused.
         r"""Create a qat module from a float module
 
         Args: `mod` a float module, either produced by torch.ao.quantization utilities
@@ -247,6 +276,8 @@ class EmbeddingBag(nn.EmbeddingBag):
         return qat_embedding_bag
 
     def to_float(self):
+        # [FUNCTION DOC] Converts to a float nn.EmbeddingBag with a detached copy of the
+        # weight and the same training flag.
         embedding_bag = torch.nn.EmbeddingBag(
             self.num_embeddings,
             self.embedding_dim,
