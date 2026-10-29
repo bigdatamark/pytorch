@@ -1,4 +1,12 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Inductor tests for the asynchronous compile machinery (AsyncCompile) and the
+# CuteDSL / NV Universal GEMM subprocess compile paths. Covers worker pool start methods in
+# daemon and non-daemon processes, ready-future handling, wait timeouts, the autotune lookup
+# table, precompile metadata handed to pool workers, and the CuteDSL on-disk cache (key
+# derivation, corruption fallback, ELF section patching, atomic concurrent writes). Defines two
+# kernel template source strings used by the CuteDSL tests. Most tests need a GPU, triton or
+# CuteDSL and are skipped otherwise; importing runs a guarded probe for a datacenter Blackwell
+# GPU with CuTe available and records the result in a module flag.
 import multiprocessing
 import os
 import pickle
@@ -96,11 +104,17 @@ def {{kernel_name}}_precompile(precompile_shapes, precompile_strides=None,
 
 
 class TestNVGemmPickling(TestCase):
+# [CLASS DOC] Test case for pickling NV Universal GEMM operand constraint objects. Stateless;
+# holds a single test that is skipped when the cutlass_api library is unavailable.
     @unittest.skipIf(
         not ensure_nv_universal_gemm_available(),
         "NVIDIA Universal GEMM (cutlass_api) library not available",
     )
     def test_scaled_operand_constraints_pickle_round_trip(self):
+    # [FUNCTION DOC] Builds scaled operand constraints from two dense tensor constraints plus a
+    # scale mode and swizzle mode, pickles and unpickles them, and checks the quantized and
+    # scale constraints, the mode and the swizzle survive unchanged. Imports the
+    # nv_universal_gemm utils module so its pickling support is registered.
         import cutlass
         from cutlass.operators import ScaleMode, ScaleSwizzleMode
         from cutlass.operators.metadata import (
@@ -127,6 +141,13 @@ class TestNVGemmPickling(TestCase):
 
 
 def _daemon_compile_worker(q, worker_start_method):
+    # [FUNCTION DOC] HELPER: Child-process entry point run under the spawn context. Patches
+    # config to two compile threads and the given worker start method, shuts down existing
+    # compile workers, warms the pool, wakes it and waits until ready, then compiles and
+    # runs a small add-then-relu function with inductor and checks it against eager. Puts
+    # an ok tuple (whether the process pool is in use, the start method) on the queue, or
+    # an err tuple holding the formatted traceback on any exception. Always shuts the
+    # compile workers down at the end.
     try:
         with config.patch(
             {"compile_threads": 2, "worker_start_method": worker_start_method}
@@ -137,6 +158,8 @@ def _daemon_compile_worker(q, worker_start_method):
             AsyncCompile.wait_pool_ready()
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: Adds one to the input and applies relu; the function
+                # that gets compiled.
                 return (x + 1).relu()
 
             x = torch.randn(4)
@@ -150,6 +173,11 @@ def _daemon_compile_worker(q, worker_start_method):
 
 
 def _forked_daemon_compile_worker(q):
+    # [FUNCTION DOC] HELPER: Entry point of a forked child process. Under a config with two
+    # compile threads and the fork start method, waits for the pool ready future with a one
+    # second timeout, then reports on the queue whether the inherited ready future class
+    # attribute was cleared to none and whether the process pool is in use. Reports an err tuple
+    # with the traceback on any exception, and always shuts down compile workers.
     try:
         with config.patch({"compile_threads": 2, "worker_start_method": "fork"}):
             AsyncCompile.wait_pool_ready(timeout=1)
@@ -164,7 +192,16 @@ def _forked_daemon_compile_worker(q):
 
 @instantiate_parametrized_tests
 class TestAsyncCompile(TestCase):
+    # [CLASS DOC] Tests for AsyncCompile worker pool behavior, using parametrized start methods.
+    # Includes tests of daemon and forked child processes, pool usage on GPU, error propagation
+    # from bad kernels, the autotune lookup table and the wait timeout. No instance state; tests
+    # mutate global compile pool state and shut it down as they go.
     def _run_daemon_compile_worker(self, worker_start_method):
+        # [FUNCTION DOC] HELPER: Runs the daemon compile worker helper in a daemon spawn-context
+        # process with the given worker start method and waits up to 120 seconds. Fails the test
+        # if the process times out (terminating it) or exits without putting a result on the
+        # queue. Asserts the exit code is zero and that the reported kind is ok. Returns the
+        # payload, a tuple of process-pool-in-use flag and start method.
         ctx = multiprocessing.get_context("spawn")
         q = ctx.Queue()
         p = ctx.Process(target=_daemon_compile_worker, args=(q, worker_start_method))
@@ -192,6 +229,9 @@ class TestAsyncCompile(TestCase):
     )
     @parametrize("method", ("fork", "spawn"))
     def test_daemon_process_disables_direct_compile_process_pool(self, method):
+        # [FUNCTION DOC] Parametrized over the fork and spawn start methods (skipped if the
+        # method is unavailable). Runs a compile in a daemon child and checks the child saw the
+        # requested start method and that the direct compile process pool was disabled there.
         if method not in multiprocessing.get_all_start_methods():
             self.skipTest(f"requires {method} multiprocessing start method")
 
@@ -205,6 +245,9 @@ class TestAsyncCompile(TestCase):
     )
     @skipIfWindows(msg="SubprocPool uses pass_fds, which is not supported on Windows.")
     def test_daemon_process_allows_subprocess_compile_process_pool(self):
+        # [FUNCTION DOC] Runs a compile in a daemon child using the subprocess start method and
+        # checks that, unlike fork and spawn, the process pool is still enabled. Skipped on
+        # Windows (pass_fds unsupported) and when spawn is unavailable.
         use_process_pool, worker_start_method = self._run_daemon_compile_worker(
             "subprocess"
         )
@@ -216,6 +259,11 @@ class TestAsyncCompile(TestCase):
         "requires fork multiprocessing start method",
     )
     def test_forked_daemon_process_clears_inherited_ready_future(self):
+        # [FUNCTION DOC] Warms the pool with the fork start method, plants a fresh Future as the
+        # inherited ready future, then forks a daemon child (suppressing fork-in-multithreaded-
+        # process warnings) and waits up to 10 seconds. Fails on timeout or missing result;
+        # always shuts down workers. Asserts the child exited cleanly, saw the ready future
+        # cleared, and found the process pool disabled.
         with config.patch({"compile_threads": 2, "worker_start_method": "fork"}):
             shutdown_compile_workers()
             AsyncCompile.warm_pool()
@@ -268,7 +316,13 @@ class TestAsyncCompile(TestCase):
     @requires_triton()
     @parametrize("method", ("subprocess", "fork", "spawn"))
     def test_pool(self, method):
+        # [FUNCTION DOC] GPU and triton test, parametrized over subprocess, fork and
+        # spawn start methods. Shuts down workers, waits for the pool under the given
+        # method, and checks that the inductor-compiled add of two GPU tensors in a
+        # fresh cache equals the eager result.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Elementwise sum of two tensors; the function
+            # compiled and compared.
             return x + y
 
         x = torch.rand(10).to(GPU_TYPE)
@@ -285,6 +339,9 @@ class TestAsyncCompile(TestCase):
     @requires_gpu()
     @requires_triton()
     def test_bad_kernel(self):
+        # [FUNCTION DOC] GPU and triton test. With the subprocess start method and eight compile
+        # threads, asks the pool to compile a triton kernel from invalid source text and checks
+        # that waiting on the result raises SubprocException.
         shutdown_compile_workers()
 
         with config.patch(worker_start_method="subprocess", compile_threads=8):
@@ -298,6 +355,9 @@ class TestAsyncCompile(TestCase):
     @requires_gpu()
     @requires_triton()
     def test_wait_pool_ready(self):
+        # [FUNCTION DOC] GPU and triton test. After shutting down workers, with the subprocess
+        # start method, waiting for pool readiness must leave the ready future completed and the
+        # process pool in use.
         shutdown_compile_workers()
 
         with config.patch(worker_start_method="subprocess", compile_threads=8):
@@ -306,11 +366,20 @@ class TestAsyncCompile(TestCase):
             self.assertTrue(AsyncCompile.use_process_pool())
 
     def test_subprocess_pool_registers_multiprocessing_finalizer(self):
+        # [FUNCTION DOC] Replaces the subprocess pool class with a fake and patches the
+        # multiprocessing Finalize hook. Creating the process pool must register exactly one
+        # finalizer with no object, the bound shutdown method of the created pool, and an exit
+        # priority of the maximum integer. Workers are shut down before and after.
         class FakeSubprocPool:
+            # [CLASS DOC] HELPER: Stand-in for the subprocess pool that accepts any constructor
+            # arguments and does nothing; exists so the registered finalizer can be inspected.
             def __init__(self, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: Accepts and ignores any arguments.
                 pass
 
             def shutdown(self):
+                # [FUNCTION DOC] HELPER: No-op shutdown; the finalizer is expected to be bound
+                # to this method.
                 pass
 
         shutdown_compile_workers()
@@ -338,7 +407,15 @@ class TestAsyncCompile(TestCase):
     @patch("torch._inductor.runtime.coordinate_descent_tuner.CoordescTuner.autotune")
     @parametrize("method", ("subprocess", "fork", "spawn"))
     def test_autotune_lookup_table(self, mock_autotune, method):
+        # [FUNCTION DOC] GPU and triton test, parametrized over start methods, with the
+        # coordinate descent tuner autotune method mocked. Builds a hash for a hand-written
+        # reduction kernel source and a size mapping, registers a config in the autotune lookup
+        # table under that hash, compiles a matmul-sum function on GPU with coordinate descent
+        # tuning, and asserts the tuner was called once with a config whose kwargs, warp count
+        # and stage count equal the table entry.
         def f(a, b):
+            # [FUNCTION DOC] HELPER: Matrix product of the inputs cast to float32 and summed
+            # over dimension one; the function compiled in the test.
             return (a @ b).to(torch.float32).sum(dim=1)
 
         # Fake name to make sure the lookup table is name agnostic
@@ -422,6 +499,10 @@ def triton_fused_fake_name(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK : tl.cons
         self.assertEqual(args[1].num_stages, autotune_config.num_stages)
 
     def test_wait_futures_timeout(self):
+        # [FUNCTION DOC] Submits a blocking wait to a one-thread executor to create a future
+        # that does not finish, sets the compile worker wait timeout to one second and checks
+        # that waiting on a scope holding that future raises RuntimeError naming the kernel. An
+        # event releases the worker thread and the executor is shut down afterwards.
         """A compile future that doesn't finish within
         compile_worker_wait_timeout causes _wait_futures to raise
         RuntimeError naming the kernel.
@@ -452,7 +533,15 @@ def triton_fused_fake_name(in_ptr0, out_ptr0, xnumel, r0_numel, XBLOCK : tl.cons
 
 @skipIfNoCuteDSL
 class TestCuteDSLSubprocessCompile(TestCase):
+    # [CLASS DOC] Tests for CuteDSL kernel compilation through AsyncCompile, requiring CuteDSL
+    # support. Covers end-to-end add kernels in subprocess and synchronous mode, error cases,
+    # precompile metadata and hooks, and the on-disk compiled-artifact cache. Stateless; tests
+    # clean up temporary files and cache directories.
     def _compile_and_run_add(self, template_name):
+        # [FUNCTION DOC] HELPER: Registers a CuteDSL template of the given name from the add
+        # kernel source, patches the add tensor lowering to use it (falling back to the default
+        # lowering when no choice is produced), compiles an add function with inductor on CUDA
+        # tensors, and asserts the generated code mentions cute and the result equals eager.
         """Compile a CuteDSL add kernel via torch.compile and verify correctness."""
         from torch._inductor.codegen.cutedsl.cutedsl_template import CuteDSLTemplate
         from torch._inductor.ir import TensorBox
@@ -465,6 +554,9 @@ class TestCuteDSLSubprocessCompile(TestCase):
         )
 
         def cutedsl_add_lowering(a: TensorBox, b: TensorBox) -> TensorBox:
+            # [FUNCTION DOC] HELPER: Replacement lowering for tensor addition. Asks the template
+            # to append a choice with 256 threads per block; if that errors or yields no choice
+            # it calls the default add lowering, else returns the first choice's output node.
             choices = []
             error = template.maybe_append_choice(
                 choices,
@@ -480,6 +572,7 @@ class TestCuteDSLSubprocessCompile(TestCase):
         with patch.dict(lowerings, {torch.ops.aten.add.Tensor: cutedsl_add_lowering}):
 
             def test_add(x, y):
+                # [FUNCTION DOC] HELPER: Adds two tensors; the function compiled by inductor.
                 return x + y
 
             x = torch.randn(128, 4, device="cuda", dtype=torch.float32)
@@ -493,6 +586,10 @@ class TestCuteDSLSubprocessCompile(TestCase):
             self.assertEqual(result, expected)
 
     def test_cutedsl_subprocess_e2e(self):
+        # [FUNCTION DOC] Starts the subprocess pool with four compile threads, requires the
+        # process pool, and runs the add kernel compile with the kernel-wrapper reload method
+        # spied on (still calling through). Asserts the reload was invoked, i.e. the parent
+        # reloaded the module produced by the worker.
         shutdown_compile_workers()
         with config.patch(worker_start_method="subprocess", compile_threads=4):
             AsyncCompile.wait_pool_ready()
@@ -510,6 +607,8 @@ class TestCuteDSLSubprocessCompile(TestCase):
                 mock_reload.assert_called()
 
     def test_cutedsl_synchronous_e2e(self):
+        # [FUNCTION DOC] With a single compile thread (no pool), runs the same add compile with
+        # the reload method spied on and asserts it was never called.
         with config.patch(compile_threads=1):
             with (
                 fresh_cache(),
@@ -524,6 +623,8 @@ class TestCuteDSLSubprocessCompile(TestCase):
                 mock_reload.assert_not_called()
 
     def test_cutedsl_bad_source_subprocess(self):
+        # [FUNCTION DOC] With the subprocess pool, asks for a CuteDSL compile of source that is
+        # not valid Python and checks waiting on the result raises SubprocException.
         shutdown_compile_workers()
         with config.patch(worker_start_method="subprocess", compile_threads=4):
             AsyncCompile.wait_pool_ready()
@@ -536,6 +637,8 @@ class TestCuteDSLSubprocessCompile(TestCase):
                 ).result()
 
     def test_cutedsl_missing_entry_point_subprocess(self):
+        # [FUNCTION DOC] With the subprocess pool, compiles source that lacks the expected
+        # kernel entry function and checks waiting on the result raises SubprocException.
         shutdown_compile_workers()
         with config.patch(worker_start_method="subprocess", compile_threads=4):
             AsyncCompile.wait_pool_ready()
@@ -548,6 +651,10 @@ class TestCuteDSLSubprocessCompile(TestCase):
                 ).result()
 
     def test_cutedsl_subprocess_precompile_invoked(self):
+        # [FUNCTION DOC] Uses an add template whose source also defines a precompile hook that
+        # writes a sentinel file with the shapes, strides and dtypes it receives. Compiles an
+        # add through the subprocess pool and asserts the sentinel file exists, proving the
+        # worker invoked the hook. The sentinel is removed in cleanup.
         """Verify that subprocess actually calls _precompile for a template that defines it."""
         import uuid
 
@@ -568,6 +675,9 @@ class TestCuteDSLSubprocessCompile(TestCase):
         )
 
         def cutedsl_add_lowering(a: TensorBox, b: TensorBox) -> TensorBox:
+            # [FUNCTION DOC] HELPER: Replacement add lowering that uses the
+            # template's first choice, falling back to the default lowering if the
+            # template errors or gives no choice.
             choices = []
             error = template.maybe_append_choice(
                 choices,
@@ -590,6 +700,8 @@ class TestCuteDSLSubprocessCompile(TestCase):
                 ):
 
                     def test_add(x, y):
+                        # [FUNCTION DOC] HELPER: Adds two tensors; the
+                        # function compiled by inductor.
                         return x + y
 
                     x = torch.randn(128, 4, device="cuda", dtype=torch.float32)
@@ -609,6 +721,8 @@ class TestCuteDSLSubprocessCompile(TestCase):
                 os.unlink(sentinel_path)
 
     def test_cutedsl_precompile_metadata_in_generated_code(self):
+        # [FUNCTION DOC] Compiles an add through the CuteDSL template and asserts the generated
+        # wrapper code contains the precompile metadata, shapes and dtypes entries.
         """Verify codegen includes precompile_metadata in the generated wrapper."""
         from torch._inductor.codegen.cutedsl.cutedsl_template import CuteDSLTemplate
         from torch._inductor.ir import TensorBox
@@ -621,6 +735,8 @@ class TestCuteDSLSubprocessCompile(TestCase):
         )
 
         def cutedsl_add_lowering(a: TensorBox, b: TensorBox) -> TensorBox:
+            # [FUNCTION DOC] HELPER: Replacement add lowering using the template's first choice,
+            # else the default lowering.
             choices = []
             error = template.maybe_append_choice(
                 choices,
@@ -636,6 +752,7 @@ class TestCuteDSLSubprocessCompile(TestCase):
         with patch.dict(lowerings, {torch.ops.aten.add.Tensor: cutedsl_add_lowering}):
 
             def test_add(x, y):
+                # [FUNCTION DOC] HELPER: Adds two tensors; the function compiled by inductor.
                 return x + y
 
             x = torch.randn(128, 4, device="cuda", dtype=torch.float32)
@@ -650,6 +767,11 @@ class TestCuteDSLSubprocessCompile(TestCase):
             self.assertIn("precompile_dtypes", code)
 
     def test_cutedsl_worker_precompile_cache_roundtrip(self):
+        # [FUNCTION DOC] Calls the worker compile function directly with a source whose
+        # precompile hook writes a json artifact into a temporary cache directory, passing shape
+        # and dtype metadata. Checks the artifact file exists, then loads the module from the
+        # code cache and checks its main function reads the artifact back with the expected
+        # shape and dtype. Removes the cache directory before and after.
         """Test that _precompile writes a cache artifact that _main can load.
 
         Simulates the subprocess/parent round-trip: _precompile writes a file
@@ -720,6 +842,9 @@ class TestCuteDSLSubprocessCompile(TestCase):
                 shutil.rmtree(cache_dir)
 
     def test_cutedsl_worker_skips_precompile_without_metadata(self):
+        # [FUNCTION DOC] Calls the worker compile function with no metadata for a module that
+        # has a precompile hook that records being called, then loads the module and asserts the
+        # hook did not run.
         """Test _worker_compile_pycodecache_kernel skips _precompile when metadata is None."""
         from torch._inductor.runtime.compile_tasks import (
             _worker_compile_pycodecache_kernel,
@@ -745,6 +870,9 @@ class TestCuteDSLSubprocessCompile(TestCase):
             self.assertFalse(mod.precompile_was_called)
 
     def test_cutedsl_worker_warns_missing_precompile_with_metadata(self):
+        # [FUNCTION DOC] Calls the worker compile function with metadata for a module that has a
+        # main function but no precompile hook, and asserts a warning from the compile tasks
+        # logger contains the text saying precompile metadata was provided.
         """Worker should warn when metadata is provided but _precompile hook is absent."""
         import logging
 
@@ -771,6 +899,8 @@ class TestCuteDSLSubprocessCompile(TestCase):
             )
 
     def test_disk_cache_key_includes_arch_and_version(self):
+        # [FUNCTION DOC] Asserts the disk cache key differs for different module paths and is
+        # identical for repeated calls with the same inputs.
         """Verify disk cache keys incorporate GPU arch and CUDA version."""
         from torch._inductor.runtime.cutedsl_cache import _make_disk_key
 
@@ -785,6 +915,9 @@ class TestCuteDSLSubprocessCompile(TestCase):
         self.assertEqual(key_same_1, key_same_2, "Same inputs should produce same key")
 
     def test_disk_cache_key_varies_by_device_arch(self):
+        # [FUNCTION DOC] Skips unless at least two GPUs with different compute capabilities
+        # exist. Then asserts keys built for device index zero and one with identical other
+        # inputs differ, since the key includes GPU architecture.
         """Verify different GPU architectures produce different cache keys.
 
         The disk key includes the device capability (arch), so devices with
@@ -815,6 +948,10 @@ class TestCuteDSLSubprocessCompile(TestCase):
         )
 
     def test_mem_cache_keys_include_device_index(self):
+        # [FUNCTION DOC] Stores different sentinel objects for device zero and device
+        # one in a shared in-memory cache using the disk cache set function with a
+        # fixed fake capability, then asserts the get function returns the matching
+        # object per device and that the two differ.
         """Verify in-memory cache in disk_cache_get/set is keyed by (runtime_key, device_index)."""
         from torch._inductor.runtime.cutedsl_cache import disk_cache_get, disk_cache_set
 
@@ -871,6 +1008,12 @@ class TestCuteDSLSubprocessCompile(TestCase):
         )
 
     def test_cutedsl_disk_cache_hot_load(self):
+        # [FUNCTION DOC] Needs CUTLASS and a CUDA GPU. Calls the worker compile function
+        # directly on a generated add kernel module with precompile metadata (compiling and
+        # writing an object file to the disk cache), checks the cache directory and at least one
+        # object file exist, then reloads the module as a fresh parent would and runs the
+        # kernel. Asserts the parent never compiled (compile counter stays zero) and the output
+        # equals the sum. Cache directory is cleared before and after.
         """End-to-end test: subprocess compiles via TVM FFI, writes .o to disk,
         parent loads .o without recompiling, produces correct results.
 
@@ -1035,6 +1178,12 @@ class TestCuteDSLSubprocessCompile(TestCase):
                     shutil.rmtree(cache_dir)
 
     def test_nv_universal_gemm_disk_cache_hot_load(self):
+        # [FUNCTION DOC] Same flow as the CuteDSL hot-load test but for the NV Universal GEMM
+        # pattern, where the compiled function is wrapped in an artifact class and kept in an
+        # in-memory artifact cache. The worker compiles and writes the object file; the reloaded
+        # parent module must load from disk without compiling, hold exactly one artifact
+        # instance of the wrapper class, and produce the correct sum. Cache directory is cleared
+        # before and after.
         """End-to-end test for the NV Universal GEMM subprocess hot-load path.
 
         NV Universal GEMM differs from CuteDSL in that it wraps compiled
@@ -1219,6 +1368,11 @@ class TestCuteDSLSubprocessCompile(TestCase):
                     shutil.rmtree(cache_dir)
 
     def test_cutedsl_subprocess_pool_handoff(self):
+        # [FUNCTION DOC] Exercises the real subprocess pool path without precompile metadata
+        # (pool workers are forked and cannot reinitialize CUDA). Compiles a pure-Python add
+        # kernel through the pool, gets the kernel wrapper from the future, runs it on GPU
+        # tensors and asserts the output equals the sum, covering serialization, worker start
+        # and result handoff.
         """Test the real subprocess pool path: serialization, result handoff, parent reload.
 
         Goes through AsyncCompile.cutedsl() -> SubprocPool -> parent reload
@@ -1258,6 +1412,12 @@ class TestCuteDSLSubprocessCompile(TestCase):
                 self.assertEqual(out, x + y)
 
     def test_cutedsl_subprocess_precompile_no_cuda_init(self):
+        # [FUNCTION DOC] Regression test for precompile in pool workers not touching CUDA. The
+        # module's precompile hook writes a json sentinel with device index, capability, whether
+        # the process is in a bad fork, and the shapes, strides and dtypes. Compiles through the
+        # subprocess pool with metadata that includes device capability, runs the kernel, then
+        # asserts the sentinel exists, device index and capability match the metadata, and the
+        # worker was in a bad fork. Sentinel is removed in cleanup.
         """Regression: precompile in subprocess workers must not call torch.cuda.*.
 
         SubprocPool workers are forked from a sidecar that has already initialized
@@ -1375,6 +1535,12 @@ class TestCuteDSLSubprocessCompile(TestCase):
         "NVIDIA Universal GEMM (cutlass_api) library not available",
     )
     def test_nv_universal_gemm_subprocess_precompile_skips_bad_fork(self):
+        # [FUNCTION DOC] Requires the NV Universal GEMM library. The module under test replaces
+        # the kernel lookup with a fake whose compile method records a sentinel file and raises.
+        # Compiles via the subprocess pool with metadata including capability and active cluster
+        # count. Asserts the precompile hook ran (first sentinel exists, worker in a bad fork)
+        # and that the compile sentinel does not exist, i.e. the GEMM precompile skipped
+        # compiling in a forked worker. Cleans up both sentinels.
         """NV Universal GEMM precompile skips compile in bad-fork workers."""
         import json
         import uuid
@@ -1511,6 +1677,11 @@ class TestCuteDSLSubprocessCompile(TestCase):
                 os.unlink(compile_sentinel_path)
 
     def test_concurrent_disk_cache_set_atomic(self):
+        # [FUNCTION DOC] Compiles a copy kernel with the CuTe compiler, then calls the disk
+        # cache set function for the same key from eight threads, collecting any exception per
+        # thread. Asserts no thread failed, that the cache get function then loads a non-null
+        # artifact, and that running the loaded function copies the input to the output. Cache
+        # directory is cleared before and after.
         """Verify concurrent disk_cache_set calls to the same key don't corrupt the .o file.
 
         Simulates multiple workers compiling the same kernel by calling
@@ -1591,6 +1762,9 @@ class TestCuteDSLSubprocessCompile(TestCase):
                 errors = []
 
                 def write_to_cache(thread_id):
+                    # [FUNCTION DOC] HELPER: Thread body. With a fresh in-memory cache, writes
+                    # the compiled function to the disk cache under the shared keys; appends the
+                    # thread id and exception to the shared error list if anything is raised.
                     try:
                         mem = {}
                         disk_cache_set(
@@ -1630,6 +1804,9 @@ class TestCuteDSLSubprocessCompile(TestCase):
                     shutil.rmtree(cache_dir)
 
     def test_corrupt_cache_falls_back_cleanly(self):
+        # [FUNCTION DOC] Writes invalid bytes at the path the disk key maps to, then calls the
+        # disk cache get function and asserts it returns none and leaves the in-memory cache
+        # empty, so a caller can recompile. Cache directory is removed afterwards.
         """A corrupt .o on disk should not crash -- disk_cache_get returns None
         so the caller falls back to recompile."""
         import shutil
@@ -1674,6 +1851,11 @@ class TestCuteDSLSubprocessCompile(TestCase):
                     shutil.rmtree(cache_dir)
 
     def test_corrupt_cache_recompile_end_to_end(self):
+        # [FUNCTION DOC] Writes the module to the code cache, plants corrupt bytes at the object
+        # path for its cache key, loads a fresh module and runs the add kernel. Asserts exactly
+        # one compile happened (fallback) and the result is correct. If the corrupt file was
+        # replaced, also reloads through the get function and checks the artifact is non-null
+        # and gives the right result. Cache directory is cleaned before and after.
         """Full round-trip: corrupt .o on disk, kernel falls back to recompile,
         produces correct results, and writes a valid .o replacing the corrupt one."""
         import shutil
@@ -1819,6 +2001,10 @@ class TestCuteDSLSubprocessCompile(TestCase):
                     shutil.rmtree(cache_dir)
 
     def test_fix_elf_dup_text_patches_duplicate_sections(self):
+        # [FUNCTION DOC] Builds a minimal 64-bit little-endian ELF image in memory with a string
+        # table section and two sections named text, the second with write and alloc flags.
+        # Asserts the fix function returns different bytes, that the second text section flags
+        # become the alloc plus exec value, and that the first is unchanged.
         """_fix_elf_dup_text_flags rewrites flags on duplicate .text sections."""
         import struct
 
@@ -1845,6 +2031,8 @@ class TestCuteDSLSubprocessCompile(TestCase):
         struct.pack_into("<H", ehdr, 62, e_shstrndx)
 
         def make_shdr(sh_name, sh_type, sh_flags, sh_offset, sh_size):
+            # [FUNCTION DOC] HELPER: Packs a 64-byte section header (name offset, type, flags,
+            # file offset, size at the ELF64 field positions) into a byte array and returns it.
             s = bytearray(e_shentsize)
             struct.pack_into("<I", s, 0, sh_name)  # sh_name
             struct.pack_into("<I", s, 4, sh_type)  # sh_type
@@ -1876,6 +2064,8 @@ class TestCuteDSLSubprocessCompile(TestCase):
         self.assertEqual(orig_flags, 0x6, "First .text section should remain unchanged")
 
     def test_fix_elf_dup_text_noop_single_text(self):
+        # [FUNCTION DOC] Builds an ELF image with only one text section and asserts the fix
+        # function returns identical bytes.
         """_fix_elf_dup_text_flags is a no-op when there's only one .text section."""
         import struct
 
@@ -1896,6 +2086,8 @@ class TestCuteDSLSubprocessCompile(TestCase):
         struct.pack_into("<H", ehdr, 62, 0)
 
         def make_shdr(sh_name, sh_type, sh_flags, sh_offset, sh_size):
+            # [FUNCTION DOC] HELPER: Packs a 64-byte ELF64 section header from name offset,
+            # type, flags, file offset and size, and returns the byte array.
             s = bytearray(e_shentsize)
             struct.pack_into("<I", s, 0, sh_name)
             struct.pack_into("<I", s, 4, sh_type)
@@ -1913,6 +2105,8 @@ class TestCuteDSLSubprocessCompile(TestCase):
         self.assertEqual(elf, result, "Single .text section should not be modified")
 
     def test_fix_elf_dup_text_noop_non_elf(self):
+        # [FUNCTION DOC] Asserts the fix function returns its input unchanged for empty bytes,
+        # for non-ELF bytes and for an ELF magic prefix with a too-short body.
         """_fix_elf_dup_text_flags is a no-op for non-ELF data."""
         from torch._inductor.runtime.cutedsl_cache import _fix_elf_dup_text_flags
 
@@ -1924,6 +2118,10 @@ class TestCuteDSLSubprocessCompile(TestCase):
         )
 
     def test_fix_elf_dup_text_old_artifacts_patched_on_load(self):
+        # [FUNCTION DOC] Builds an ELF image with a duplicate text section with wrong flags,
+        # writes it at the cache path for a key, and calls the disk cache get function (which
+        # cannot load the fake object). Asserts the file on disk was patched so the second text
+        # section has the alloc plus exec flags. Cache directory is cleaned afterwards.
         """disk_cache_get patches old unpatched .o files in-place on load."""
         import shutil
         import struct
@@ -1949,6 +2147,8 @@ class TestCuteDSLSubprocessCompile(TestCase):
         struct.pack_into("<H", ehdr, 62, 0)
 
         def make_shdr(sh_name, sh_type, sh_flags, sh_offset, sh_size):
+            # [FUNCTION DOC] HELPER: Packs a 64-byte ELF64 section header from name offset,
+            # type, flags, file offset and size, and returns the byte array.
             s = bytearray(e_shentsize)
             struct.pack_into("<I", s, 0, sh_name)
             struct.pack_into("<I", s, 4, sh_type)
@@ -1996,6 +2196,9 @@ class TestCuteDSLSubprocessCompile(TestCase):
                     shutil.rmtree(cache_dir)
 
     def test_symbolic_shapes_skip_precompile_metadata(self):
+        # [FUNCTION DOC] Uses mock kernel and template-buffer objects whose sizes are objects
+        # that raise TypeError when converted to int, mimicking symbolic sizes. Asserts the
+        # scheduling class method that builds precompile metadata returns none for them.
         """_build_precompile_metadata returns None for symbolic (dynamic) sizes,
         causing the async path to skip _precompile and compile lazily."""
         from unittest.mock import MagicMock
@@ -2003,9 +2206,13 @@ class TestCuteDSLSubprocessCompile(TestCase):
         from torch._inductor.codegen.cutedsl.cutedsl_scheduling import CuteDSLScheduling
 
         class _SymbolicSize:
+            # [CLASS DOC] HELPER: Fake symbolic size whose integer conversion
+            # always raises TypeError.
             """Mimics torch.SymInt -- int() raises TypeError."""
 
             def __int__(self):
+                # [FUNCTION DOC] HELPER: Always raises TypeError, simulating a symbolic integer
+                # that cannot be made concrete.
                 raise TypeError("Cannot convert symbolic size to int")
 
         kernel = MagicMock()
@@ -2032,6 +2239,10 @@ class TestCuteDSLSubprocessCompile(TestCase):
         )
 
     def test_symbolic_shapes_worker_skips_precompile(self):
+        # [FUNCTION DOC] Calls the worker compile function with no metadata for a
+        # module whose precompile hook would write a sentinel file. Asserts the
+        # sentinel was not created and that the module loaded from the code cache has
+        # the main function. Sentinel is removed in cleanup.
         """When precompile_metadata is None (symbolic shapes), the worker writes
         source but skips _precompile. The kernel still works via lazy compilation."""
         from torch._inductor.runtime.compile_tasks import (
@@ -2073,6 +2284,9 @@ class TestCuteDSLSubprocessCompile(TestCase):
                 os.unlink(compile_sentinel)
 
     def test_cache_key_changes_with_source_content(self):
+        # [FUNCTION DOC] Asserts disk keys differ for two different module paths with the same
+        # config and runtime key, and are equal when the same path is used again. Documents that
+        # the key does not include the cutlass version.
         """Different template/codegen output produces different disk cache keys.
 
         The disk key includes module_path which is content-addressed via PyCodeCache,
@@ -2111,6 +2325,8 @@ class TestCuteDSLSubprocessCompile(TestCase):
         self.assertEqual(key_v1, key_again)
 
     def test_cache_key_changes_with_config(self):
+        # [FUNCTION DOC] Asserts two keys built from the same module path and runtime key but
+        # different config keys are not equal.
         """Different config keys (e.g., kernel name, tile sizes) produce different
         disk cache keys even for the same module path."""
         from torch._inductor.runtime.cutedsl_cache import _make_disk_key
@@ -2143,6 +2359,9 @@ import unittest
     "CuTeDSL library or Blackwell device not available",
 )
 class TestCuteDSLSubprocessGroupedGemm(TestCase):
+    # [CLASS DOC] End-to-end test of a grouped GEMM through inductor with the CuteDSL
+    # backend and subprocess compilation. Only runs when a datacenter Blackwell GPU and
+    # CuTe are available. Stateless.
     """End-to-end test: grouped GEMM through torch.compile with subprocess compilation.
 
     Exercises the full path: CuTe DSL template selection -> codegen ->
@@ -2150,6 +2369,11 @@ class TestCuteDSLSubprocessGroupedGemm(TestCase):
     """
 
     def test_grouped_gemm_subprocess_e2e(self):
+        # [FUNCTION DOC] Builds bfloat16 grouped inputs (random group sizes in
+        # multiples of 16, packed A, batched B, cumulative offsets), computes the eager
+        # grouped matmul, then compiles it with max autotune restricted to the CuteDSL
+        # backend, subprocess workers, four compile threads and no aten fallback.
+        # Asserts the compiled result is close to eager.
         shutdown_compile_workers()
 
         device = "cuda"
@@ -2164,6 +2388,8 @@ class TestCuteDSLSubprocessGroupedGemm(TestCase):
         offsets = torch.cumsum(M_sizes, dim=0).to(dtype=torch.int32, device=device)
 
         def grouped_gemm_fn(A_packed, B_batched, offs):
+            # [FUNCTION DOC] HELPER: Calls the grouped matrix multiply with the packed input,
+            # batched weights and group offsets; the function compiled in the test.
             return torch.nn.functional.grouped_mm(A_packed, B_batched, offs=offs)
 
         c_eager = grouped_gemm_fn(A, B, offsets)

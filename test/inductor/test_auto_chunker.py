@@ -1,4 +1,11 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for the inductor auto chunker, which splits large intermediate computations
+# (such as the logits of a linear layer followed by softmax or cross entropy) into chunks to cut
+# peak GPU memory. Defines a small linear-plus-cross-entropy module and a test class run with
+# the chunker enabled. Tests compare compiled and eager results, assert the count of auto-
+# chunking applications recorded in inductor metrics, and check peak memory against a bound.
+# Environment variables select large inputs (on by default), optional perf timing and optional
+# profiling. The test runner is only invoked when CUDA and triton are available.
 import os
 
 import torch
@@ -20,25 +27,47 @@ DO_PROFILING = os.environ.get("DO_PROFILING") == "1"
 
 
 class LinearAndCEL(nn.Module):
+    # [CLASS DOC] HELPER: Small model holding a linear layer mapping C features to V outputs and
+    # a cross entropy loss. Used to reproduce a language-model head. Stores the output size V so
+    # the logits can be flattened.
     def __init__(self, C, V):
+        # [FUNCTION DOC] HELPER: Creates the linear layer with C inputs and V outputs, the cross
+        # entropy loss module and remembers V.
         super().__init__()
         self.linear = nn.Linear(C, V)
         self.ce = nn.CrossEntropyLoss()
         self.V = V
 
     def forward(self, x, y):
+        # [FUNCTION DOC] HELPER: Applies the linear layer to the input, flattens the logits to
+        # two dimensions with V columns, flattens the targets to one dimension and returns the
+        # cross entropy loss tensor.
         return self.ce(self.linear(x).view(-1, self.V), y.view(-1))
 
 
 @config.patch("auto_chunker.enable", True)
 @instantiate_parametrized_tests
 class AutoChunkerTest(TestCase):
+    # [CLASS DOC] Test case for the auto chunker, patched with the chunker enabled for every
+    # test and with parametrized tests instantiated. Tests need a GPU. A shared helper runs a
+    # matmul workload and checks results, metrics and memory. Metrics are reset in setup so the
+    # chunking counter starts at zero.
     def setUp(self):
+        # [FUNCTION DOC] Calls the base setup and resets the inductor metrics so the auto-
+        # chunking count starts at zero.
         super().setUp()
         metrics.reset()
 
     @largeTensorTest("8GB", device=GPU_TYPE, inductor=True)
     def common_matmul_test(self, has_softmax, use_bias=False, dynamic_shape=None):
+        # [FUNCTION DOC] HELPER: Shared workload (requires a GPU with at least 8GB free).
+        # Creates input, weight and bias tensors requiring gradients (large sizes when the
+        # large-input flag is set), computes an eager reference of the sum of a scaled matmul
+        # with optional bias and optional softmax together with the gradients, then repeats
+        # under torch.compile with the optional dynamic shape setting while measuring peak GPU
+        # memory. Asserts results match within tolerance, that the chunking count equals whether
+        # softmax is present and shapes are static, and, for large input with chunking, that
+        # peak memory is below the full output size in bytes.
         M, K, N = 1024, 16, 1024
 
         if USE_LARGE_INPUT:
@@ -52,6 +81,9 @@ class AutoChunkerTest(TestCase):
         bias = torch.randn(N, dtype=dtype, requires_grad=True, device=GPU_TYPE)
 
         def f(_input, weight, bias):
+            # [FUNCTION DOC] HELPER: Scales the input by two, multiplies by the weight,
+            # optionally adds the bias and applies a softmax over the last dimension, sums the
+            # result, runs backward on the sum and returns it.
             out = (_input * 2) @ weight
             if use_bias:
                 out = out + bias
@@ -104,9 +136,13 @@ class AutoChunkerTest(TestCase):
             )
 
     def test_matmul_trivial(self):
+        # [FUNCTION DOC] Runs the shared matmul check without softmax and bias; chunking is
+        # expected not to occur.
         self.common_matmul_test(has_softmax=False)
 
     def test_linear_trivial(self):
+        # [FUNCTION DOC] Runs the shared matmul check without softmax but with a bias; chunking
+        # is expected not to occur.
         self.common_matmul_test(has_softmax=False, use_bias=True)
 
     # Due to not able to generate an inplace version of a softmax like
@@ -114,18 +150,31 @@ class AutoChunkerTest(TestCase):
     # Use at least 4 chunks here.
     @config.patch("auto_chunker.num_chunk", config.auto_chunker.num_chunk or 4)
     def test_matmul_softmax(self):
+        # [FUNCTION DOC] Runs the shared matmul check with softmax. The chunk count is the
+        # configured value or four if unset, since the softmax-like kernel cannot be done in
+        # place and two chunks save too little.
         self.common_matmul_test(has_softmax=True)
 
     def test_matmul_softmax_dynamic_shape(self):
+        # [FUNCTION DOC] Runs the shared matmul check with softmax and dynamic shapes; the
+        # helper then expects no auto chunking.
         self.common_matmul_test(has_softmax=True, dynamic_shape=True)
 
     @config.patch("auto_chunker.num_chunk", 4)
     def test_linear_softmax(self):
+        # [FUNCTION DOC] Runs the shared matmul check with softmax and a bias, using
+        # four chunks.
         self.common_matmul_test(has_softmax=True, use_bias=True)
 
     @config.patch("auto_chunker.num_chunk", config.auto_chunker.num_chunk or 16)
     @largeTensorTest("10GB", device=GPU_TYPE, inductor=True)
     def test_fused_linear_cel(self):
+        # [FUNCTION DOC] Needs a CUDA device and at least 10GB. Builds a bfloat16 linear plus
+        # cross entropy model with a vocabulary of 50257, compiles a function that clears
+        # gradients, scales the input, computes loss and runs backward, and compares loss and
+        # gradients with eager. Optionally times eager versus compiled and writes a profiler
+        # trace under the temp directory when the perf and profiling flags are set. Asserts
+        # exactly one chunking and peak memory below the full logits size.
         B = 32
         T = 1024
         C = 768
@@ -136,6 +185,9 @@ class AutoChunkerTest(TestCase):
         mod = LinearAndCEL(C, V).cuda().to(dtype)
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Clears the gradients of the input and of the module's
+            # linear weight and bias, scales the input by two, computes the model loss, runs
+            # backward and returns the loss.
             x.grad = None
             mod.linear.weight.grad = None
             mod.linear.bias.grad = None
@@ -188,6 +240,11 @@ class AutoChunkerTest(TestCase):
     @largeTensorTest("12GB", device=GPU_TYPE, inductor=True)
     @parametrize("gradient_accumulation_steps", [1, 2])
     def test_gradient_accumulation(self, gradient_accumulation_steps):
+        # [FUNCTION DOC] Parametrized over one or two gradient accumulation steps;
+        # needs at least 12GB. Builds the same bfloat16 model, then compares eager and
+        # compiled runs over a list of inputs and targets, summing loss values across
+        # steps, and compares losses and all gradients. Asserts exactly one chunking
+        # and that peak memory is below the full logits size.
         B = 32
         T = 1024
         C = 768
@@ -198,6 +255,9 @@ class AutoChunkerTest(TestCase):
         mod = LinearAndCEL(C, V).cuda().to(dtype)
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Clears the input gradient, scales the input by two,
+            # computes the model loss divided by the number of accumulation steps, runs backward
+            # and returns the loss.
             x.grad = None
 
             x = x * 2
@@ -206,6 +266,9 @@ class AutoChunkerTest(TestCase):
             return loss
 
         def step(func, xs, ys):
+            # [FUNCTION DOC] HELPER: Clears the weight and bias gradients, calls the given
+            # function on each input and target pair and returns the sum of the detached loss
+            # values as Python numbers.
             mod.linear.weight.grad = None
             mod.linear.bias.grad = None
 
@@ -256,11 +319,17 @@ class AutoChunkerTest(TestCase):
     @config.patch("auto_chunker.output_size_threshold", 1024)
     @config.patch("auto_chunker.num_chunk", 2)
     def test_propagate_tanh_neg(self):
+        # [FUNCTION DOC] With a low output size threshold and two chunks, compiles a function
+        # with a scaled matmul followed by tanh, negation, sum and backward, compares loss and
+        # gradients with eager, and asserts exactly one chunking, showing chunk metadata
+        # propagates through tanh and neg.
         M, K, N = 256, 4, 256
         x = torch.randn(M, K, device=GPU_TYPE, requires_grad=True)
         w = torch.randn(K, N, device=GPU_TYPE, requires_grad=True)
 
         def f(x, w):
+            # [FUNCTION DOC] HELPER: Computes the scaled matmul, applies tanh and negation,
+            # sums, runs backward and returns the loss.
             out = (x * 2) @ w
             out = torch.tanh(out)
             out = -out
@@ -280,11 +349,17 @@ class AutoChunkerTest(TestCase):
     @config.patch("auto_chunker.output_size_threshold", 1024)
     @config.patch("auto_chunker.num_chunk", 2)
     def test_propagate_amax_unsqueeze(self):
+        # [FUNCTION DOC] With a low threshold and two chunks, compiles a function that subtracts
+        # the row-wise maximum (with an added dimension) before exponentiation, sums and runs
+        # backward, checks agreement with eager and exactly one chunking.
         M, K, N = 256, 4, 256
         x = torch.randn(M, K, device=GPU_TYPE, requires_grad=True)
         w = torch.randn(K, N, device=GPU_TYPE, requires_grad=True)
 
         def f(x, w):
+            # [FUNCTION DOC] HELPER: Computes the scaled matmul, subtracts the
+            # maximum along the last dimension (unsqueezed), exponentiates, sums,
+            # runs backward and returns the loss.
             out = (x * 2) @ w
             max_val = out.amax(dim=-1)
             out = out - max_val.unsqueeze(-1)
@@ -305,12 +380,17 @@ class AutoChunkerTest(TestCase):
     @config.patch("auto_chunker.output_size_threshold", 1024)
     @config.patch("auto_chunker.num_chunk", 2)
     def test_propagate_gather(self):
+        # [FUNCTION DOC] With a low threshold and two chunks, compiles a softmax
+        # followed by a gather of target columns, sums and backward, checks results
+        # against eager and exactly one chunking.
         M, K, N = 256, 4, 256
         x = torch.randn(M, K, device=GPU_TYPE, requires_grad=True)
         w = torch.randn(K, N, device=GPU_TYPE, requires_grad=True)
         targets = torch.randint(0, N, (M,), device=GPU_TYPE)
 
         def f(x, w, targets):
+            # [FUNCTION DOC] HELPER: Computes the scaled matmul and softmax, gathers one column
+            # per row by the targets, sums, runs backward and returns the loss.
             out = (x * 2) @ w
             out = out.softmax(dim=-1)
             selected = out.gather(1, targets.unsqueeze(1))
@@ -330,12 +410,17 @@ class AutoChunkerTest(TestCase):
     @config.patch("auto_chunker.output_size_threshold", 1024)
     @config.patch("auto_chunker.num_chunk", 2)
     def test_propagate_scatter(self):
+        # [FUNCTION DOC] With a low threshold and two chunks, compiles a softmax followed by a
+        # scatter that zeroes target columns, sums and backward, checks results against eager
+        # and exactly one chunking.
         M, K, N = 256, 4, 256
         x = torch.randn(M, K, device=GPU_TYPE, requires_grad=True)
         w = torch.randn(K, N, device=GPU_TYPE, requires_grad=True)
         targets = torch.randint(0, N, (M,), device=GPU_TYPE)
 
         def f(x, w, targets):
+            # [FUNCTION DOC] HELPER: Computes the scaled matmul and softmax, scatters zero into
+            # the target columns, sums, runs backward and returns the loss.
             out = (x * 2) @ w
             out = out.softmax(dim=-1)
             out = out.scatter(1, targets.unsqueeze(1), 0.0)
@@ -355,12 +440,18 @@ class AutoChunkerTest(TestCase):
     @config.patch("auto_chunker.output_size_threshold", 1024)
     @config.patch("auto_chunker.num_chunk", 2)
     def test_propagate_manual_cross_entropy(self):
+        # [FUNCTION DOC] With a low threshold and two chunks, compiles a hand-written cross
+        # entropy (max shift, exponential, log of sum, gather of target log probabilities, mean
+        # negative), checks results against eager and exactly one chunking.
         M, K, N = 256, 4, 256
         x = torch.randn(M, K, device=GPU_TYPE, requires_grad=True)
         w = torch.randn(K, N, device=GPU_TYPE, requires_grad=True)
         targets = torch.randint(0, N, (M,), device=GPU_TYPE)
 
         def f(x, w, targets):
+            # [FUNCTION DOC] HELPER: Computes the scaled matmul logits, hand-
+            # written log softmax and the negative mean log probability of the
+            # targets, runs backward and returns the loss.
             logits = (x * 2) @ w
             max_logits = logits.amax(dim=-1)
             shifted = logits - max_logits.unsqueeze(-1)
@@ -382,6 +473,10 @@ class AutoChunkerTest(TestCase):
         self.assertEqual(metrics.num_auto_chunking, 1)
 
     def test_set_num_chunk_with_compile_options(self):
+        # [FUNCTION DOC] Compiles the bfloat16 linear plus cross entropy model passing
+        # chunker settings only through compile options (enable, sixteen chunks, an
+        # amplify ratio threshold of ten), runs forward and backward and asserts
+        # exactly one chunking was recorded.
         B = 32
         T = 1024
         C = 768

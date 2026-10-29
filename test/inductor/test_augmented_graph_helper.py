@@ -1,4 +1,10 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Unit tests for the inductor AugmentedGraphHelper, which tracks merge sets of fx
+# nodes plus extra dependency and use edges on top of an fx graph. Tests cover singleton
+# initial state, merging and unmerging nodes, collecting merged dependencies, path finding
+# (direct, transitive, through merges and extra edges), cycle detection, and transferring the
+# dependencies of erased nodes to replacement nodes. Runnable as a script through the inductor
+# test runner.
 import operator
 
 import torch
@@ -8,9 +14,18 @@ from torch.testing._internal.common_utils import TestCase
 
 
 class TestAugmentedGraphHelper(TestCase):
+    # [CLASS DOC] Test case for AugmentedGraphHelper. The setup builds a small fx graph of
+    # chained call nodes A through H over two placeholders and stores the graph, the nodes, a
+    # name-to-node mapping, ancestor information and a tracker helper on the instance for use by
+    # tests. Several tests build their own small graphs instead.
     """Test suite for AugmentedGraphHelper dependency and merge management."""
 
     def setUp(self):
+        # [FUNCTION DOC] Test setup. Builds an fx graph with placeholders x and y and eight
+        # function nodes named A to H (A adds x and y, B and C use A, D combines B and C, then
+        # E, F, G, H chain on D), with H as output. Stores the name-to-node mapping, the list of
+        # all nodes, ancestors computed by the ancestor helper, and a tracker constructed from
+        # the graph and those ancestors.
         """Create a simple graph structure for testing."""
         super().setUp()
         # Create a torch.fx.Graph with multiple nodes
@@ -72,18 +87,24 @@ class TestAugmentedGraphHelper(TestCase):
         )
 
     def _collect_node_ancestors(self, graph: fx.Graph):  # -> BitsetAncestors
+        # [FUNCTION DOC] HELPER: Returns a bitset-based ancestors structure built over the nodes
+        # of the given fx graph, imported lazily from the fx passes utils.
         """Collect all ancestors for each node as a BitsetAncestors."""
         from torch._inductor.fx_passes.utils import BitsetAncestors
 
         return BitsetAncestors(list(graph.nodes))
 
     def get_deps(self, node):
+        # [FUNCTION DOC] HELPER: Returns the node's positional args as a new list; defaults to
+        # empty if the node has no args. Not used by the tests in this file.
         """Helper to get dependencies for a node."""
         return list(getattr(node, "args", []))
 
     # ========== Basic Functionality Tests ==========
 
     def test_initial_state(self):
+        # [FUNCTION DOC] Asserts that, before any merge, every node's merge set
+        # contains only itself.
         """Test that nodes start as singletons."""
         for node in self.all_nodes:
             merge_set = self.tracker.merge_sets[node]
@@ -91,6 +112,8 @@ class TestAugmentedGraphHelper(TestCase):
             self.assertEqual(len(merge_set), 1)
 
     def test_simple_merge(self):
+        # [FUNCTION DOC] Merges node B into node A's set and asserts both nodes map to the same
+        # set containing exactly those two nodes.
         """Test merging two nodes."""
         node_a = self.nodes["A"]
         node_b = self.nodes["B"]
@@ -105,6 +128,8 @@ class TestAugmentedGraphHelper(TestCase):
         )
 
     def test_transitive_merge(self):
+        # [FUNCTION DOC] Merges B, C and D one after another into A's set and asserts all four
+        # nodes share the same merge set of four members.
         """Test merging already merged nodes."""
         node_a = self.nodes["A"]
         node_b = self.nodes["B"]
@@ -120,10 +145,15 @@ class TestAugmentedGraphHelper(TestCase):
             self.assertEqual(self.tracker.merge_sets[node], expected_set)
 
     def merge_nodes(self, tracker, nodes):
+    # [FUNCTION DOC] HELPER: Merges every node after the first into the first node's set by
+    # repeated merge calls on the given tracker. Propagates the helper's error if a later node
+    # is already in a bigger set.
         for n in nodes[1:]:
             tracker.merge_to_set(nodes[0], n)
 
     def test_unmerge_node(self):
+        # [FUNCTION DOC] Merges A, B and C, removes B, and asserts B is a singleton while A and
+        # C still share a set of two.
         """Test removing a node from its merge set."""
         node_a = self.nodes["A"]
         node_b = self.nodes["B"]
@@ -144,6 +174,8 @@ class TestAugmentedGraphHelper(TestCase):
         self.assertEqual(self.tracker.merge_sets[node_c], {node_a, node_c})
 
     def test_unmerge_from_singleton(self):
+        # [FUNCTION DOC] Asserts that removing a node that is already a singleton
+        # leaves it unchanged.
         """Test unmerging a node that's already singleton."""
         node_a = self.nodes["A"]
 
@@ -154,6 +186,9 @@ class TestAugmentedGraphHelper(TestCase):
     # ========== Dependency Propagation Tests ==========
 
     def test_merged_deps_collection(self):
+        # [FUNCTION DOC] Merges B and C and asserts the merged dependencies of B
+        # include A (common input), x (from B) and y (from C), i.e. dependencies of all
+        # set members are collected.
         """Test that dependencies are collected from all merged nodes."""
         node_a = self.nodes["A"]
         node_b = self.nodes["B"]
@@ -174,6 +209,8 @@ class TestAugmentedGraphHelper(TestCase):
         self.assertIn(self.y, deps)  # From C
 
     def test_extra_deps_with_merge(self):
+        # [FUNCTION DOC] Adds an extra dependency of A on C, merges A with B, adds an extra
+        # dependency of D on B, and asserts D's merged dependencies include B and A's include C.
         """Test extra dependencies work correctly with merged nodes."""
         node_a = self.nodes["A"]
         node_b = self.nodes["B"]
@@ -200,6 +237,8 @@ class TestAugmentedGraphHelper(TestCase):
     # ========== Path Finding Tests ==========
 
     def test_has_path_direct(self):
+        # [FUNCTION DOC] Asserts a path is reported from A to B (B uses A) and not in
+        # the reverse direction.
         """Test path finding for direct dependencies."""
         # In our graph: B depends on A
         node_a = self.nodes["A"]
@@ -209,6 +248,8 @@ class TestAugmentedGraphHelper(TestCase):
         self.assertFalse(self.tracker.has_path(node_b, node_a))
 
     def test_has_path_transitive(self):
+        # [FUNCTION DOC] Asserts a path exists from A to E through several intermediate nodes
+        # and none from E to A.
         """Test path finding through multiple nodes."""
         # In our graph: A -> B -> D and A -> C -> D -> E
         node_a = self.nodes["A"]
@@ -218,6 +259,9 @@ class TestAugmentedGraphHelper(TestCase):
         self.assertFalse(self.tracker.has_path(node_e, node_a))
 
     def test_has_path_through_merge(self):
+        # [FUNCTION DOC] Builds a separate graph with two independent branches and a tracker
+        # without ancestors. Asserts no path from B2 to D2, merges B2 with C2 (D2's input), then
+        # asserts a path from B2 to D2 exists.
         """Test path finding when nodes are merged."""
         # Create a new graph for this specific test
         graph2 = fx.Graph()
@@ -240,6 +284,8 @@ class TestAugmentedGraphHelper(TestCase):
         self.assertTrue(tracker2.has_path(b2, d2))
 
     def test_has_path_with_extra_deps(self):
+        # [FUNCTION DOC] Builds the same two-branch graph, asserts no path from B2 to D2, adds
+        # an extra dependency of C2 on B2, then asserts a path from B2 to D2 exists.
         """Test path finding with extra dependencies."""
 
         graph2 = fx.Graph()
@@ -263,11 +309,15 @@ class TestAugmentedGraphHelper(TestCase):
     # ========== Cycle Detection Tests ==========
 
     def test_no_cycle_in_dag(self):
+        # [FUNCTION DOC] Asserts the unmodified graph reports no cycle.
         """Test that DAG has no cycles."""
         # Our original graph is a DAG, should have no cycles
         self.assertFalse(self.tracker.has_cycle())
 
     def test_simple_cycle_detection(self):
+        # [FUNCTION DOC] Builds a three-node chain graph, asserts no cycle, adds an extra
+        # dependency of the first node on the last (since fx cannot hold a real cycle), and
+        # asserts a cycle is now reported.
         """Test detection of simple cycle."""
         # Create a graph with a cycle
         graph3 = fx.Graph()
@@ -289,6 +339,10 @@ class TestAugmentedGraphHelper(TestCase):
         self.assertTrue(tracker3.has_cycle())
 
     def test_cycle_through_merge(self):
+        # [FUNCTION DOC] Builds a graph with two branches, adds an extra dependency
+        # making the first branch's start depend on the second branch's end, merges the
+        # two middle nodes, and asserts the cycle check still reports no cycle because
+        # it does not take merge sets into account.
         """Test that merging can create cycles."""
         # Create specific graph for this test
         graph4 = fx.Graph()
@@ -312,6 +366,8 @@ class TestAugmentedGraphHelper(TestCase):
         self.assertFalse(tracker4.has_cycle())
 
     def test_cycle_with_extra_deps(self):
+        # [FUNCTION DOC] Adds an extra dependency of A on B, which already depends on A, and
+        # asserts a cycle is reported.
         """Test cycle detection with extra dependencies."""
         node_a = self.nodes["A"]
         node_b = self.nodes["B"]
@@ -323,6 +379,10 @@ class TestAugmentedGraphHelper(TestCase):
         self.assertTrue(self.tracker.has_cycle())
 
     def test_multiple_merge_unmerge(self):
+        # [FUNCTION DOC] Merges A, B and C then D and E (checking set sizes), then attempts to
+        # merge across the two groups and asserts an AssertionError is raised because a non-
+        # singleton set cannot be merged. Then unmerges C and A, checking remaining set sizes
+        # and singleton results.
         """Test sequence of merge and unmerge operations."""
         nodes = [self.nodes[c] for c in ["A", "B", "C", "D", "E"]]
 
@@ -355,6 +415,11 @@ class TestAugmentedGraphHelper(TestCase):
     # ========== Dependency Transfer Tests ==========
 
     def test_transfer_with_cross_deps(self):
+        # [FUNCTION DOC] Builds a graph with a start node, a wait node and a compute
+        # node, with extra dependencies wait on start and compute on wait. Creates
+        # replacement nodes and transfers both erased nodes at once. Asserts the new
+        # wait depends on the new start, compute depends on the new wait, and the old
+        # nodes' extra dependency and use sets are empty.
         """Test transfer when erased nodes depend on each other."""
         # old_start -> old_wait, both get replaced
         # Should become: new_start -> new_wait
@@ -392,6 +457,10 @@ class TestAugmentedGraphHelper(TestCase):
         self.assertEqual(len(tracker.extra_uses[old_wait]), 0)
 
     def test_transfer_preserves_external_deps(self):
+        # [FUNCTION DOC] Adds extra dependencies of one old node on an external node and of
+        # another external node on a second old node, transfers both to new nodes, and asserts
+        # the new node inherits the external dependency while the external node now depends on
+        # the new node and no longer on the old one.
         """Test that external dependencies are preserved correctly."""
         # external1 -> old1, old2 -> external2
         # Should become: external1 -> new1, new2 -> external2
@@ -422,6 +491,10 @@ class TestAugmentedGraphHelper(TestCase):
         self.assertNotIn(old2, tracker.extra_deps[external2])
 
     def test_transfer_with_merge_sets(self):
+        # [FUNCTION DOC] Merges two old nodes, gives the first an extra dependency and makes a
+        # user depend on it, then transfers only the first old node to a new node. Asserts the
+        # new node depends on the dependency, the user depends on the new node, and the extra
+        # dependencies of both old nodes are cleared.
         """Test transfer when nodes have merge sets."""
         graph = fx.Graph()
         x = graph.placeholder("x")
@@ -457,6 +530,11 @@ class TestAugmentedGraphHelper(TestCase):
         self.assertEqual(len(tracker.extra_deps[old_b]), 0)
 
     def test_transfer_multiple_merge_sets_with_chain(self):
+        # [FUNCTION DOC] Two merge sets with a chain of dependencies between them and a
+        # singleton in the middle are transferred in one call to two new nodes, specifying one
+        # member of each set. Asserts the new nodes carry the redirected dependencies on the
+        # singletons and each other node, old members' dependencies are empty, and the reverse
+        # use edges are consistent.
         """Test transferring multiple merge sets that depend on each other.
 
         Setup:
