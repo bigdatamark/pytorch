@@ -1,4 +1,10 @@
 # Owner(s): ["module: functorch"]
+# [MODULE DOC]
+# Tests the codegen'd output-alias handling of the runtime wrapper (alias regeneration of
+# outputs that view inputs or intermediates) and parts of the output transform wrapper.
+# Compiles small functions with aot_eager (or aot_function with nop for metadata mutation),
+# checks values, aliasing via data pointers and grads, and inspects the captured source of
+# the "output_alias_wrapper" or "compiled_fn_wrapper" trace artifacts.
 
 """
 Tests for codegen'ing the output alias regeneration in
@@ -29,17 +35,29 @@ trace_log = logging.getLogger("torch.__trace")
 
 
 class TestCodegenOutputAlias(TestCase):
+    # [CLASS DOC]
+    # Test case for output-alias codegen. setUp resets dynamo; a helper context manager
+    # records trace artifacts by name; each test compiles a function and checks results.
     def setUp(self):
+        # [FUNCTION DOC] Runs the base class setup and then resets dynamo state so each test
+        # compiles from scratch.
         super().setUp()
         torch._dynamo.reset()
 
     @contextmanager
     def _capture_codegen_source(self, artifact_name):
+        # [FUNCTION DOC] HELPER: Context manager yielding a list of payloads of trace
+        # artifacts with the given name. Attaches a handler to the trace logger at debug
+        # level and restores the logger level and handler list on exit.
         """Capture codegen artifacts from the structured trace log."""
         captured: list[str] = []
 
         class _ArtifactHandler(logging.Handler):
+        # [CLASS DOC] HELPER: Logging handler appending the payload of records whose artifact
+        # metadata name matches the wanted name to the enclosing captured list.
             def emit(self, record):
+            # [FUNCTION DOC] HELPER: Appends the record payload to the captured list if the
+            # record metadata carries a matching artifact name and a non-missing payload.
                 metadata = getattr(record, "metadata", {})
                 if (
                     "artifact" in metadata
@@ -61,6 +79,9 @@ class TestCodegenOutputAlias(TestCase):
             trace_log.setLevel(old_level)
 
     def test_output_is_view_of_input(self):
+        # [FUNCTION DOC] Returns a flattened view of the input under aot_eager. Checks values,
+        # that the output shares storage with the input, and that one output_alias_wrapper
+        # artifact was emitted.
         """
         Output that is a view of an input (alias_of_input). Codegen should
         emit gen_alias_from_base(orig_inputs[i], ...) inline.
@@ -69,6 +90,7 @@ class TestCodegenOutputAlias(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function returning a flattened view of its arg.
                 return x.view(-1)
 
             x = torch.randn(2, 3)
@@ -84,6 +106,9 @@ class TestCodegenOutputAlias(TestCase):
         )
 
     def test_output_is_input(self):
+        # [FUNCTION DOC] Mutates the input in place and returns it. Checks the input was
+        # doubled, the output is the very same object, and one output_alias_wrapper artifact
+        # was emitted.
         """
         Output that IS the input (is_input). Codegen should emit a direct
         reference to orig_inputs[i].
@@ -92,6 +117,8 @@ class TestCodegenOutputAlias(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function doubling its
+                # arg in place and returning the same arg.
                 x.mul_(2)
                 return x
 
@@ -109,6 +136,8 @@ class TestCodegenOutputAlias(TestCase):
         )
 
     def test_mixed_alias_and_non_alias_outputs(self):
+        # [FUNCTION DOC] Returns one fresh tensor and one view of the input. Checks both values,
+        # that only the view shares storage with the input, and one artifact was emitted.
         """
         Multiple outputs: one aliased, one not. Codegen should emit
         gen_alias_from_base for the alias and a noop for the non-alias.
@@ -117,6 +146,8 @@ class TestCodegenOutputAlias(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function returning a doubled
+                # copy and a flattened view of its arg.
                 return x * 2, x.view(-1)
 
             x = torch.randn(2, 3)
@@ -133,6 +164,8 @@ class TestCodegenOutputAlias(TestCase):
         )
 
     def test_output_alias_with_mutation(self):
+        # [FUNCTION DOC] Adds one to the input in place and returns a flattened view. Checks the
+        # mutation reached the input, the view output values, and one artifact was emitted.
         """
         Input is mutated AND output is a view of the input. Codegen should
         handle both mutation epilogue and alias regeneration.
@@ -141,6 +174,8 @@ class TestCodegenOutputAlias(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function adding one to
+                # its arg in place and returning a flattened view.
                 x.add_(1)
                 return x.view(-1)
 
@@ -158,6 +193,8 @@ class TestCodegenOutputAlias(TestCase):
         )
 
     def test_output_aliases_intermediate(self):
+        # [FUNCTION DOC] Returns an intermediate and a view of it, with a grad-requiring input.
+        # Checks both values and that one output_alias_wrapper artifact was emitted.
         """
         Output is a view of another output (intermediate), not of an input.
         Triggers AliasOfIntermediateHandler in the codegen.
@@ -166,6 +203,8 @@ class TestCodegenOutputAlias(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function returning an
+                # intermediate (arg plus one) and its flattened view.
                 y = x + 1
                 return y, y.view(-1)
 
@@ -182,6 +221,8 @@ class TestCodegenOutputAlias(TestCase):
         )
 
     def test_multiple_views_of_same_input(self):
+        # [FUNCTION DOC] Returns two different views of the same input. Checks values, that both
+        # outputs share storage with the input, and that one artifact was emitted.
         """
         Two outputs both alias the same input. Codegen should emit two
         separate gen_alias_from_base calls referencing the same base.
@@ -190,6 +231,8 @@ class TestCodegenOutputAlias(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function returning a
+                # flattened view and a reshape of its arg.
                 return x.view(-1), x.reshape(6)
 
             x = torch.randn(2, 3)
@@ -207,6 +250,8 @@ class TestCodegenOutputAlias(TestCase):
         )
 
     def test_training_path_view_of_input(self):
+        # [FUNCTION DOC] Returns a view of a grad-requiring input (training path). Checks values
+        # and aliasing, runs backward and expects a gradient of ones, and one artifact emitted.
         """
         Training path (trace_joint=True): output is a view of input with
         requires_grad=True. Codegen should use _unwrap_tensoralias in the
@@ -216,6 +261,7 @@ class TestCodegenOutputAlias(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function returning a flattened view of its arg.
                 return x.view(-1)
 
             x = torch.randn(2, 3, requires_grad=True)
@@ -234,6 +280,9 @@ class TestCodegenOutputAlias(TestCase):
         )
 
     def test_training_path_mixed_requires_grad(self):
+        # [FUNCTION DOC] Returns one differentiable output and one view of a non-grad input.
+        # Checks values and requires_grad flags, backward grads of two, and that exactly one
+        # compiled_fn_wrapper artifact was captured (the alias artifact is captured but unchecked).
         """
         Training path with mixed differentiable and non-differentiable
         outputs. Exercises non-differentiable output collection in
@@ -246,6 +295,8 @@ class TestCodegenOutputAlias(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x, y):
+                # [FUNCTION DOC] HELPER: Compiled function returning a doubled
+                # first arg and a flattened view of the second.
                 return x * 2, y.view(-1)
 
             x = torch.randn(2, 3, requires_grad=True)
@@ -267,6 +318,8 @@ class TestCodegenOutputAlias(TestCase):
         )
 
     def test_training_path_mutation_and_alias(self):
+        # [FUNCTION DOC] Mutates a non-leaf clone in place and returns a flattened view of it
+        # (training path). Checks the mutation and the view values and one artifact emitted.
         """
         Training path: input is mutated AND returned as a view. Exercises
         both the mutation epilogue and alias codegen with trace_joint=True.
@@ -276,6 +329,8 @@ class TestCodegenOutputAlias(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function adding one to
+                # its arg in place and returning a flattened view.
                 x.add_(1)
                 return x.view(-1)
 
@@ -294,6 +349,8 @@ class TestCodegenOutputAlias(TestCase):
         )
 
     def test_training_path_is_input(self):
+        # [FUNCTION DOC] Doubles a non-leaf clone in place and returns the same tensor (training
+        # path). Checks the mutation, that the output is the input object, one artifact emitted.
         """
         Training path: output IS the input (mutation + return identity).
         Exercises IsInputHandler with trace_joint=True. Uses a non-leaf
@@ -303,6 +360,8 @@ class TestCodegenOutputAlias(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function doubling its
+                # arg in place and returning the same arg.
                 x.mul_(2)
                 return x
 
@@ -321,6 +380,9 @@ class TestCodegenOutputAlias(TestCase):
         )
 
     def test_training_path_alias_of_intermediate_detach(self):
+        # [FUNCTION DOC] Returns a detached view and a differentiable view of one intermediate.
+        # Checks values, requires_grad flags, shared storage, backward grads of ones, and one
+        # output_alias_wrapper artifact.
         """
         Training path: one output is a detached view of an intermediate,
         the other is a differentiable view. Exercises
@@ -331,6 +393,8 @@ class TestCodegenOutputAlias(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function returning a detached
+                # copy and a flattened view of arg plus one.
                 y = x + 1
                 return y.detach(), y.view(-1)
 
@@ -353,6 +417,9 @@ class TestCodegenOutputAlias(TestCase):
         )
 
     def test_view_replay_config_false(self):
+        # [FUNCTION DOC] With the view replay config patched to false, compiles a view-returning
+        # function. Checks values and aliasing, one artifact, and that its source records view
+        # replay as disabled.
         """
         Test that view_replay_for_aliased_outputs=False is correctly
         baked into the codegen'd alias function.
@@ -365,6 +432,8 @@ class TestCodegenOutputAlias(TestCase):
 
                 @torch.compile(backend="aot_eager")
                 def f(x):
+                    # [FUNCTION DOC] HELPER: Compiled function returning
+                    # a flattened view of its arg.
                     return x.view(-1)
 
                 x = torch.randn(2, 3)
@@ -377,6 +446,9 @@ class TestCodegenOutputAlias(TestCase):
             self.assertIn("replay_views=False", captured[0])
 
     def test_view_replay_config_true(self):
+        # [FUNCTION DOC] With the view replay config patched to true, compiles a view-returning
+        # function. Checks values and aliasing, one artifact, and that its source records view
+        # replay as enabled.
         """
         Test that view_replay_for_aliased_outputs=True (default) is
         correctly baked into the codegen'd alias function.
@@ -389,6 +461,8 @@ class TestCodegenOutputAlias(TestCase):
 
                 @torch.compile(backend="aot_eager")
                 def f(x):
+                    # [FUNCTION DOC] HELPER: Compiled function returning
+                    # a flattened view of its arg.
                     return x.view(-1)
 
                 x = torch.randn(2, 3)
@@ -401,6 +475,8 @@ class TestCodegenOutputAlias(TestCase):
             self.assertIn("replay_views=True", captured[0])
 
     def test_codegen_source_contains_gen_alias(self):
+        # [FUNCTION DOC] Mutates the input and returns it plus a view. Checks the single artifact
+        # source mentions the alias generation helper and indexes the original inputs.
         """
         Verify the codegen'd source contains gen_alias_from_base for
         alias-of-input outputs and orig_inputs for is_input outputs.
@@ -409,6 +485,8 @@ class TestCodegenOutputAlias(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function doubling its arg
+                # in place and returning it plus a flattened view.
                 x.mul_(2)
                 return x, x.view(-1)
 
@@ -421,6 +499,8 @@ class TestCodegenOutputAlias(TestCase):
         self.assertIn("orig_inputs[", source)
 
     def test_codegen_source_noop_handler(self):
+        # [FUNCTION DOC] Returns a fresh product and a view of the input. Checks the single
+        # artifact source indexes the forward outputs and uses the alias generation helper.
         """
         Verify the codegen'd source contains fw_outs[i] for non-aliased
         (NoopAliasHandler) outputs in a mixed scenario.
@@ -429,6 +509,8 @@ class TestCodegenOutputAlias(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function returning a doubled
+                # copy and a flattened view of its arg.
                 return x * 2, x.view(-1)
 
             x = torch.randn(2, 3)
@@ -440,6 +522,9 @@ class TestCodegenOutputAlias(TestCase):
         self.assertIn("gen_alias_from_base", source)
 
     def test_alias_of_intermediate_save_as_output(self):
+        # [FUNCTION DOC] Returns two views of the same intermediate with a grad-requiring input.
+        # Checks values, shared storage, backward grads of ones, one artifact whose source uses
+        # the alias generation helper.
         """
         Two outputs aliasing the same intermediate (not an input). When
         multiple outputs share the same intermediate base, the first triggers
@@ -450,6 +535,8 @@ class TestCodegenOutputAlias(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function returning two
+                # differently shaped views of arg plus one.
                 y = x + 1
                 return y.view(-1), y.view(3, 3)
 
@@ -469,6 +556,9 @@ class TestCodegenOutputAlias(TestCase):
         self.assertIn("gen_alias_from_base", source)
 
     def test_xform_unsafe_view_output(self):
+        # [FUNCTION DOC] Returns a single view of an intermediate in the training path and
+        # inspects the compiled_fn_wrapper artifact. Checks values, requires_grad, backward
+        # grads, one artifact, and that its source contains an unsafe view call.
         """
         _transform_raw_returns codegen: when an output is a view of an
         intermediate and is the only output aliasing that intermediate
@@ -478,6 +568,8 @@ class TestCodegenOutputAlias(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function returning
+                # a flattened view of arg plus one.
                 return (x + 1).view(-1)
 
             x = torch.randn(2, 3, requires_grad=True)
@@ -494,6 +586,9 @@ class TestCodegenOutputAlias(TestCase):
 
     @skipIfTorchDynamo("dynamo handles metadata mutations in-graph")
     def test_xform_metadata_only_mutation(self):
+        # [FUNCTION DOC] Uses aot_function with the nop compiler on a function that transposes
+        # its input in place. Checks the transposed shapes, one compiled_fn_wrapper artifact, and
+        # that its source wraps the result in the tensor alias class. Skipped under dynamo.
         """
         _transform_raw_returns codegen: when an input has a metadata-only
         mutation (mutates_metadata=True, mutates_data=False), the codegen
@@ -505,6 +600,8 @@ class TestCodegenOutputAlias(TestCase):
         with self._capture_codegen_source("compiled_fn_wrapper") as captured:
 
             def f(a, b):
+                # [FUNCTION DOC] HELPER: Traced function transposing its first arg in place and
+                # returning the sum with the second arg.
                 a.transpose_(1, 0)
                 return a + b
 
@@ -520,6 +617,8 @@ class TestCodegenOutputAlias(TestCase):
         self.assertIn("TensorAlias", captured[0])
 
     def test_cross_dtype_view_alias(self):
+        # [FUNCTION DOC] Returns the real-view of a complex tensor (a cross-dtype view). Checks
+        # values, shape, float dtype, and one artifact whose source uses the alias helper.
         """
         Output is a cross-dtype view of the input (view_as_real on a
         complex tensor). Exercises gen_alias_from_base's cross-dtype
@@ -529,6 +628,8 @@ class TestCodegenOutputAlias(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function returning
+                # the real view of a complex arg.
                 return torch.view_as_real(x)
 
             x = torch.randn(4, dtype=torch.complex64)
@@ -542,6 +643,9 @@ class TestCodegenOutputAlias(TestCase):
         self.assertIn("gen_alias_from_base", captured[0])
 
     def test_xform_aliased_output_tensoralias_wrapping(self):
+        # [FUNCTION DOC] Returns a product and a view of the input with grad enabled. Checks
+        # values, shared storage for the view, backward grads of two, and one compiled_fn_wrapper
+        # artifact whose source contains the tensor alias wrapper.
         """
         _transform_raw_returns codegen: aliased outputs get wrapped in
         TensorAlias so autograd.Function doesn't treat them as regular
@@ -554,6 +658,8 @@ class TestCodegenOutputAlias(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function returning a doubled
+                # copy and a flattened view of its arg.
                 return x * 2, x.view(-1)
 
             x = torch.randn(2, 3, requires_grad=True)

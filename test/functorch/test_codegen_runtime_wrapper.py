@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: pt2"]
+# [MODULE DOC]
+# Tests the codegen'd orchestration function of the runtime wrapper. Each test compiles a
+# small function (mostly aot_eager via torch.compile, sometimes aot_function with nop),
+# captures the generated source through the shared capture_codegen_source helper, and
+# checks both numeric behavior and which constructs (grad mode switches, view replay
+# tracking, version increments, alias replay, autocast disabling) appear in that source.
 
 """
 Tests for codegen'ing the RuntimeWrapper orchestration in aot_autograd.
@@ -24,11 +30,18 @@ from torch.testing._internal.common_utils import run_tests, skipIfTorchDynamo, T
 
 
 class TestCodegenRuntimeWrapper(TestCase):
+    # [CLASS DOC]
+    # Test case for runtime wrapper orchestration codegen; setUp resets dynamo so every test
+    # compiles afresh and captures its own artifact.
     def setUp(self):
+        # [FUNCTION DOC] Runs base setup then resets dynamo state.
         super().setUp()
         torch._dynamo.reset()
 
     def test_inference_simple(self):
+        # [FUNCTION DOC] Simple inference compile of a doubling function. Checks output and
+        # that the source starts with empty original inputs, disables grad mode, and has no
+        # view-replay or view-tracking helpers.
         """
         Simple inference: no mutations, no aliases. Generated code should
         use the inference path (grad disabled) with empty orig_inputs.
@@ -37,6 +50,7 @@ class TestCodegenRuntimeWrapper(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function doubling its arg.
                 return x * 2
 
             x = torch.randn(4)
@@ -52,6 +66,9 @@ class TestCodegenRuntimeWrapper(TestCase):
         self.assertNotIn("_set_view_replay_enabled", source)
 
     def test_training_simple(self):
+        # [FUNCTION DOC] Training compile of a doubling function on a grad-requiring input.
+        # Checks output and grad (two), and that the source enables view replay, restores it
+        # only when it was previously off, and enters enable_grad.
         """
         Simple training path: no mutations. Generated code should use
         the training path (enable_grad + view replay tracking).
@@ -60,6 +77,7 @@ class TestCodegenRuntimeWrapper(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function doubling its arg.
                 return x * 2
 
             x = torch.randn(4, requires_grad=True)
@@ -76,6 +94,9 @@ class TestCodegenRuntimeWrapper(TestCase):
         self.assertIn("torch.enable_grad()", source)
 
     def test_training_with_detach_indices(self):
+        # [FUNCTION DOC] Compiles a function using a detached non-leaf second input in training
+        # mode. Checks output, that the first input gets a grad, and that the source contains
+        # detach calls and view replay enabling.
         """
         Training path with a non-leaf input whose gradient is None in
         the backward graph. The input must be detached before calling
@@ -88,6 +109,8 @@ class TestCodegenRuntimeWrapper(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x, y):
+                # [FUNCTION DOC] HELPER: Compiled function multiplying its
+                # first arg by the detached second arg.
                 return x * y.detach()
 
             x = torch.randn(4, requires_grad=True)
@@ -102,6 +125,8 @@ class TestCodegenRuntimeWrapper(TestCase):
         self.assertIn("torch._C._set_view_replay_enabled(True)", source)
 
     def test_inference_with_mutation(self):
+        # [FUNCTION DOC] Inference compile of a function mutating its input in place. Checks the
+        # input and output values and that the source contains version increment helper usage.
         """
         Inference with input mutation. With keep_inference_input_mutations,
         mutations are kept in-graph so the runtime wrapper just increments
@@ -111,6 +136,8 @@ class TestCodegenRuntimeWrapper(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function adding one to
+                # its arg in place and returning a clone.
                 x.add_(1)
                 return x.clone()
 
@@ -126,6 +153,9 @@ class TestCodegenRuntimeWrapper(TestCase):
         self.assertIn("_increment_version_", source)
 
     def test_inference_with_output_alias(self):
+        # [FUNCTION DOC] Inference compile returning a view of the input. Checks values and
+        # shared storage, and that the source replays aliases and captures the first arg as the
+        # original inputs mapping.
         """
         Inference with output aliased to input. Generated code should
         capture orig_inputs and call _replay_aliases_.
@@ -134,6 +164,8 @@ class TestCodegenRuntimeWrapper(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function returning
+                # a flattened view of its arg.
                 return x.view(-1)
 
             x = torch.randn(2, 3)
@@ -148,6 +180,8 @@ class TestCodegenRuntimeWrapper(TestCase):
         self.assertIn("orig_inputs = {0: args[0]}", source)
 
     def test_inference_with_mutation_and_alias(self):
+        # [FUNCTION DOC] Inference compile mutating the input in place and returning a view.
+        # Checks both effects and that the source replays aliases.
         """
         Inference: input mutation + output alias. With
         keep_inference_input_mutations, mutations are in-graph. The
@@ -157,6 +191,8 @@ class TestCodegenRuntimeWrapper(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function adding one
+                # in place and returning a flattened view.
                 x.add_(1)
                 return x.view(-1)
 
@@ -172,6 +208,8 @@ class TestCodegenRuntimeWrapper(TestCase):
         self.assertIn("_replay_aliases_", source)
 
     def test_training_with_alias(self):
+        # [FUNCTION DOC] Training compile returning a product and a view of a grad-requiring
+        # input. Checks values, backward grad of two, and that one artifact was captured.
         """
         Training path with output alias and backward correctness.
         """
@@ -179,6 +217,8 @@ class TestCodegenRuntimeWrapper(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function returning
+                # a doubled copy and a flattened view.
                 return x * 2, x.view(-1)
 
             x = torch.randn(2, 3, requires_grad=True)
@@ -193,6 +233,8 @@ class TestCodegenRuntimeWrapper(TestCase):
         self.assertEqual(len(captured), 1)
 
     def test_multiple_inputs_mutation_version_increment(self):
+        # [FUNCTION DOC] Compiles a function mutating two inputs in place. Checks both mutations
+        # and the output, and that the source contains version increment helper usage.
         """
         Multiple inputs with mutations. Generated code should increment
         versions for all mutated inputs.
@@ -201,6 +243,8 @@ class TestCodegenRuntimeWrapper(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x, y):
+                # [FUNCTION DOC] HELPER: Compiled function mutating both
+                # args in place and returning their sum.
                 x.add_(1)
                 y.mul_(2)
                 return x + y
@@ -219,6 +263,8 @@ class TestCodegenRuntimeWrapper(TestCase):
         self.assertIn("_increment_version_", source)
 
     def test_output_arity_validation_baked(self):
+        # [FUNCTION DOC] Compiles a function returning three outputs and checks that the source
+        # compares the number of outputs against the constant three.
         """
         The expected output arity should be baked into the generated code
         as a constant, not computed at runtime.
@@ -227,6 +273,8 @@ class TestCodegenRuntimeWrapper(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function returning
+                # three derived tensors from its arg.
                 return x + 1, x * 2, x - 1
 
             f(torch.randn(4))
@@ -237,6 +285,10 @@ class TestCodegenRuntimeWrapper(TestCase):
 
     @skipIfTorchDynamo("dynamo handles mutations in-graph")
     def test_split_index_baked(self):
+        # [FUNCTION DOC] Uses aot_function with nop and in-graph input mutations disabled on a
+        # function mutating one input and returning a value. Checks the source slices the outputs
+        # at constant index one into updated inputs and forward outputs and applies mutations.
+        # Skipped under dynamo. The helper imports are done inside the function.
         """
         When there are mutated inputs that produce runtime mutation
         indices, the split index between updated_inputs and fw_outs
@@ -249,6 +301,8 @@ class TestCodegenRuntimeWrapper(TestCase):
         with capture_codegen_source("runtime_wrapper_orchestration") as captured:
 
             def f(x, y):
+                # [FUNCTION DOC] HELPER: Traced function adding one to its first arg in place
+                # and returning the second doubled.
                 x.add_(1)
                 return y * 2
 
@@ -263,6 +317,9 @@ class TestCodegenRuntimeWrapper(TestCase):
 
     @skipIfTorchDynamo("dynamo handles metadata mutations in-graph")
     def test_metadata_mutation(self):
+        # [FUNCTION DOC] Uses aot_function with nop on a function transposing its input in
+        # place. Checks the transposed shapes and that the source applies mutations. Skipped
+        # under dynamo. The helper imports are done inside the function.
         """
         Metadata-only mutation (transpose_). Verify the generated wrapper
         correctly applies metadata mutations via _apply_mutations_.
@@ -273,6 +330,8 @@ class TestCodegenRuntimeWrapper(TestCase):
         with capture_codegen_source("runtime_wrapper_orchestration") as captured:
 
             def f(x):
+                # [FUNCTION DOC] HELPER: Traced function transposing its arg in place and
+                # returning it plus one.
                 x.transpose_(1, 0)
                 return x + 1
 
@@ -287,6 +346,8 @@ class TestCodegenRuntimeWrapper(TestCase):
         self.assertIn("_apply_mutations_", source)
 
     def test_inference_disable_amp(self):
+        # [FUNCTION DOC] Runs a compiled doubling function under CPU autocast in inference mode.
+        # Checks the source disables autocast and grad mode.
         """
         Inference path with autocast active at compile time. Generated code
         should wrap the compiled fn call in _DisableAutocast_.
@@ -295,6 +356,7 @@ class TestCodegenRuntimeWrapper(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function doubling its arg.
                 return x * 2
 
             with torch.autocast("cpu"):
@@ -306,6 +368,9 @@ class TestCodegenRuntimeWrapper(TestCase):
         self.assertIn("torch._C._set_grad_enabled(False)", source)
 
     def test_training_disable_amp(self):
+        # [FUNCTION DOC] Runs a grad-requiring compiled doubling function under CPU autocast
+        # and backpropagates. Checks the grad (two) and that the source disables autocast and
+        # enables view replay.
         """
         Training path with autocast active at compile time. Generated code
         should use _DisableAutocast_ alongside view replay tracking and
@@ -315,6 +380,7 @@ class TestCodegenRuntimeWrapper(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function doubling its arg.
                 return x * 2
 
             with torch.autocast("cpu"):
@@ -329,6 +395,8 @@ class TestCodegenRuntimeWrapper(TestCase):
         self.assertIn("torch._C._set_view_replay_enabled(True)", source)
 
     def test_dynamic_dims(self):
+        # [FUNCTION DOC] Compiles with dynamic shapes enabled and runs once. Checks that the
+        # source contains the dynamic-dimension marking helper.
         """
         With dynamic=True, output dimensions are symbolic. Generated code
         should call _maybe_mark_dynamic_helper_ for dynamic outputs.
@@ -337,6 +405,7 @@ class TestCodegenRuntimeWrapper(TestCase):
 
             @torch.compile(backend="aot_eager", dynamic=True)
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function doubling its arg.
                 return x * 2
 
             f(torch.randn(4))
@@ -347,6 +416,9 @@ class TestCodegenRuntimeWrapper(TestCase):
 
     @skipIfTorchDynamo("dynamo handles grad mode changes in-graph")
     def test_grad_enabled_mutation(self):
+        # [FUNCTION DOC] Uses aot_function with nop on a function that turns grad mode off
+        # internally. Checks grad mode is off after the call (and restores it afterwards), and
+        # that the source sets grad mode to false. Skipped under dynamo.
         """
         Function that mutates grad_enabled state. Generated code should
         replay the mutation via torch._C._set_grad_enabled at the end.
@@ -357,6 +429,8 @@ class TestCodegenRuntimeWrapper(TestCase):
         with capture_codegen_source("runtime_wrapper_orchestration") as captured:
 
             def f(x):
+                # [FUNCTION DOC] HELPER: Traced function that turns
+                # grad mode off and returns its arg doubled.
                 torch._C._set_grad_enabled(False)
                 return x * 2
 
@@ -373,6 +447,9 @@ class TestCodegenRuntimeWrapper(TestCase):
         self.assertIn("torch._C._set_grad_enabled(False)", source)
 
     def test_many_mutations(self):
+        # [FUNCTION DOC] Compiles a function mutating five inputs in place by distinct amounts.
+        # Checks each input was updated and that the source has version increments and refers to
+        # all five argument positions.
         """
         Five inputs all mutated. Generated code should increment versions
         for all of them.
@@ -381,6 +458,8 @@ class TestCodegenRuntimeWrapper(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(a, b, c, d, e):
+                # [FUNCTION DOC] HELPER: Compiled function adding distinct constants in place
+                # to five args and summing them.
                 a.add_(1)
                 b.add_(2)
                 c.add_(3)
@@ -402,6 +481,9 @@ class TestCodegenRuntimeWrapper(TestCase):
             self.assertIn(f"args[{i}]", source)
 
     def test_multiple_output_aliases_different_inputs(self):
+        # [FUNCTION DOC] Compiles a function returning views of two different inputs. Checks
+        # values, shared storage with each input, and that the source replays aliases with both
+        # inputs recorded in the original inputs mapping.
         """
         Two outputs aliasing two different inputs. Generated code should
         capture both inputs in orig_inputs and call _replay_aliases_.
@@ -410,6 +492,8 @@ class TestCodegenRuntimeWrapper(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x, y):
+                # [FUNCTION DOC] HELPER: Compiled function
+                # returning flattened views of both args.
                 return x.view(-1), y.view(-1)
 
             x = torch.randn(2, 3)
@@ -428,6 +512,11 @@ class TestCodegenRuntimeWrapper(TestCase):
         self.assertIn("1: args[1]", source)
 
     def test_first_invocation_ctx_threaded_through_codegen(self):
+        # [FUNCTION DOC] Registers a custom op that returns a view of its input in a scoped
+        # test library (CPU/meta kernels), compiles a caller, and enables the custom op aliasing
+        # check with errors downgraded to warnings. Calls the function twice and counts warnings
+        # about aliasing: exactly one is expected on the first call and none on the second,
+        # showing the first-invocation context is threaded through the generated wrapper.
         """
         The codegen'd wrapper receives _first_ctx_ (a _FirstInvocationContext)
         as a parameter and wraps compiled fn execution in it. On first call,
@@ -441,6 +530,8 @@ class TestCodegenRuntimeWrapper(TestCase):
 
             @torch.compile(backend="aot_eager")
             def f(x):
+                # [FUNCTION DOC] HELPER: Compiled function calling the
+                # custom op on its arg and adding one.
                 return torch.ops.test_rw.alias_op(x) + 1
 
             x = torch.randn(4)
@@ -465,6 +556,10 @@ class TestCodegenRuntimeWrapper(TestCase):
                     self.assertEqual(len(aliasing_warnings), 0)
 
     @skipIfTorchDynamo("dynamo handles mutations in-graph")
+        # [FUNCTION DOC] Uses aot_function with nop and in-graph mutations disabled on a leaf
+        # without grad that is mutated through a detached alias. Checks values and that the
+        # mutation_epilogue source checks requires_grad and uses a plain copy. Skipped under
+        # dynamo. Helper imports are done inside the function.
     def test_leaf_no_grad_mutation_uses_copy(self):
         """
         Leaf input without requires_grad that is mutated via detach().
@@ -477,6 +572,8 @@ class TestCodegenRuntimeWrapper(TestCase):
         with capture_codegen_source("mutation_epilogue") as captured:
 
             def f(x):
+                # [FUNCTION DOC] HELPER: Traced function doubling a detached alias of its arg
+                # in place and returning arg plus one.
                 x.detach().mul_(2)
                 return x + 1
 

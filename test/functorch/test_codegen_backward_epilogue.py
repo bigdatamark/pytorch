@@ -1,4 +1,9 @@
 # Owner(s): ["module: functorch"]
+# [MODULE DOC]
+# Tests that the codegen'd backward epilogue wraps gradient outputs back into TwoTensor
+# subclasses for compiled (aot_eager) graphs: plain, multi-input and nested subclasses.
+# Each test compares grads against eager and checks that a "backward_subclass_wrapper"
+# structured-trace artifact was emitted. Import time only configures a trace logger name.
 
 """
 Tests for codegen'd backward epilogue subclass wrapping.
@@ -27,13 +32,23 @@ trace_log = logging.getLogger("torch.__trace")
 
 
 class TestCodegenBackwardEpilogue(TestCase):
+    # [CLASS DOC]
+    # Test case holding the backward-epilogue codegen tests plus one helper context manager
+    # that records structured-trace artifacts by name.
     @contextmanager
     def _capture_codegen_source(self, artifact_name):
+        # [FUNCTION DOC] HELPER: Context manager that yields a list collecting payloads of
+        # trace artifacts whose name equals artifact_name. Temporarily attaches a handler to
+        # the torch trace logger and lowers its level to DEBUG; both are restored on exit.
         """Capture codegen artifacts from the structured trace log."""
         captured: list[str] = []
 
         class _ArtifactHandler(logging.Handler):
+        # [CLASS DOC] HELPER: Logging handler that appends the payload of any record whose
+        # metadata holds an artifact entry with the wanted name to the enclosing list.
             def emit(self, record):
+            # [FUNCTION DOC] HELPER: Inspects the record metadata (default empty) and, when
+            # the artifact name matches and a payload exists, appends the payload to captured.
                 metadata = getattr(record, "metadata", {})
                 if (
                     "artifact" in metadata
@@ -55,6 +70,9 @@ class TestCodegenBackwardEpilogue(TestCase):
             trace_log.setLevel(old_level)
 
     def test_simple_backward_wraps_grad_inputs(self):
+        # [FUNCTION DOC] Compiles a function doubling a TwoTensor with aot_eager, runs
+        # backward, and checks the input grad is a TwoTensor whose components match eager
+        # results and that at least one backward_subclass_wrapper artifact was captured.
         """
         f(TwoTensor) -> TwoTensor, backward should wrap grad inputs back
         into TwoTensor via codegen'd epilogue.
@@ -92,6 +110,9 @@ class TestCodegenBackwardEpilogue(TestCase):
         )
 
     def test_multi_input_backward_wraps_grad_inputs(self):
+        # [FUNCTION DOC] Same as the single-input test but with a product of two TwoTensor
+        # inputs: both grads must be TwoTensor with components equal to eager, and a
+        # backward_subclass_wrapper artifact must have been emitted.
         """
         f(TwoTensor, TwoTensor) -> TwoTensor, backward should wrap grad
         inputs for each subclass input.
@@ -138,6 +159,9 @@ class TestCodegenBackwardEpilogue(TestCase):
         )
 
     def test_nested_subclass_backward_wraps_grad_inputs(self):
+        # [FUNCTION DOC] Uses a TwoTensor whose components are themselves TwoTensors and a
+        # sine op; checks outputs and the grad are wrapped recursively, grad leaves equal the
+        # eager grads, and a backward_subclass_wrapper artifact was emitted.
         """
         Nested TwoTensor backward should recursively wrap grad inputs.
         """

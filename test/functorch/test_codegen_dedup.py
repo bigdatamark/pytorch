@@ -1,4 +1,9 @@
 # Owner(s): ["module: functorch"]
+# [MODULE DOC]
+# Tests the codegen'd duplicate-argument removal of the dedup wrapper (strategy 2, used when
+# duplicated args are mutated). Functions are compiled with aot_function and a pass-through
+# compiler, and the captured "dedup_wrapper" artifact source is inspected for which argument
+# indices it selects.
 
 """
 Tests for codegen'ing AOTDedupeWrapper.
@@ -27,17 +32,29 @@ trace_log = logging.getLogger("torch.__trace")
 
 
 def _nop_compiler(gm, example_inputs):  # type: ignore[no-untyped-def]
+    # [FUNCTION DOC] HELPER: Trivial compiler backend that returns the traced graph module's
+    # forward method unchanged.
     return gm.forward
 
 
 class TestCodegenDedup(TestCase):
+    # [CLASS DOC]
+    # Test case for dedup codegen: a helper context manager records trace artifacts by name
+    # and three tests mutate duplicated inputs and check results and generated source.
     @contextmanager
     def _capture_codegen_source(self, artifact_name):
+        # [FUNCTION DOC] HELPER: Context manager yielding a list of payloads of trace
+        # artifacts with the given name. Attaches a handler to the trace logger at debug
+        # level and restores the logger level and handler list on exit.
         """Capture codegen artifacts from the structured trace log."""
         captured: list[str] = []
 
         class _ArtifactHandler(logging.Handler):
+        # [CLASS DOC] HELPER: Logging handler appending the payload of records whose artifact
+        # metadata name matches the wanted name to the enclosing captured list.
             def emit(self, record):
+            # [FUNCTION DOC] HELPER: Appends the record payload to the captured list if the
+            # record metadata carries a matching artifact name and a non-missing payload.
                 metadata = getattr(record, "metadata", {})
                 if (
                     "artifact" in metadata
@@ -59,6 +76,9 @@ class TestCodegenDedup(TestCase):
             trace_log.setLevel(old_level)
 
     def test_duplicate_args_with_mutation(self):
+        # [FUNCTION DOC] Passes one tensor as both args while the second is mutated in place
+        # (multiplied by two). Checks the input is doubled, the output matches, and the
+        # generated source mentions the first arg index but not the second.
         """
         When the same tensor is passed as two args and one position mutates,
         strategy 2 dedup kicks in. The codegen should emit straight-line
@@ -67,6 +87,8 @@ class TestCodegenDedup(TestCase):
         with self._capture_codegen_source("dedup_wrapper") as captured:
 
             def f(a, b):
+                # [FUNCTION DOC] HELPER: Traced function that mutates its second arg in
+                # place (multiply by two) and returns the sum of both args.
                 b.mul_(2)
                 return a + b
 
@@ -88,12 +110,17 @@ class TestCodegenDedup(TestCase):
         self.assertNotIn("args[1]", source)
 
     def test_three_way_duplicate_with_mutation(self):
+        # [FUNCTION DOC] Passes one tensor as all three args with the last mutated in place
+        # (add one). Checks input and output values and that the generated source selects
+        # only the first arg index.
         """
         Three-way duplication where the last position mutates.
         """
         with self._capture_codegen_source("dedup_wrapper") as captured:
 
             def f(a, b, c):
+                # [FUNCTION DOC] HELPER: Traced function that adds one to its third arg
+                # in place and returns the sum of all three args.
                 c.add_(1)
                 return a + b + c
 
@@ -116,6 +143,9 @@ class TestCodegenDedup(TestCase):
         self.assertNotIn("args[2]", source)
 
     def test_partial_duplicate_with_mutation(self):
+        # [FUNCTION DOC] Passes one tensor as the first two args and a distinct tensor as
+        # the third, mutating the duplicate second arg (multiply by three). Checks values and
+        # that the source selects the first and third arg indices but not the second.
         """
         Two args are duplicates (with mutation), third is distinct.
         Codegen should select [args[0], args[2]] dropping the duplicate.
@@ -123,6 +153,8 @@ class TestCodegenDedup(TestCase):
         with self._capture_codegen_source("dedup_wrapper") as captured:
 
             def f(a, b, c):
+                # [FUNCTION DOC] HELPER: Traced function that multiplies its second arg
+                # by three in place and returns the sum of all three args.
                 b.mul_(3)
                 return a + b + c
 

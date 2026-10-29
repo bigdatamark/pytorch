@@ -1,4 +1,8 @@
 # Owner(s): ["module: functorch"]
+# [MODULE DOC]
+# Tests that the backward prologue codegen unwraps saved TwoTensor subclass tensors for the
+# compiled backward and emits a "backward_subclass_unwrap" trace artifact. Uses the shared
+# capture_codegen_source helper from the sibling common_utils module.
 
 """
 Tests for codegen'ing backward non-tangent subclass unwrapping.
@@ -23,7 +27,13 @@ from torch.testing._internal.two_tensor import TwoTensor
 
 
 class TestCodegenBackwardPrologue(TestCase):
+    # [CLASS DOC]
+    # Test case with two aot_eager backward tests comparing grads against eager and checking
+    # that a backward_subclass_unwrap artifact was captured.
     def test_saved_subclass_tensors_unwrapped(self):
+        # [FUNCTION DOC] Multiplies two TwoTensor inputs under aot_eager and runs backward;
+        # asserts the component grads equal eager results and at least one unwrap artifact
+        # was emitted while compiling.
         """
         When subclass tensors are saved for backward, the prologue should
         codegen their unwrapping (non-tangent path).
@@ -67,6 +77,9 @@ class TestCodegenBackwardPrologue(TestCase):
         )
 
     def test_mixed_subclass_and_plain_saved_tensors(self):
+        # [FUNCTION DOC] Multiplies a TwoTensor by a plain tensor under aot_eager; asserts
+        # the TwoTensor component grads and the plain grad equal eager results and that an
+        # unwrap artifact was emitted. Only the subclass input is meant to be unwrapped.
         """
         When both subclass and plain tensors are saved, the prologue should
         codegen unwrapping only for the subclass ones.
