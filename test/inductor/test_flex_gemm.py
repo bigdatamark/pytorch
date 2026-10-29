@@ -1,4 +1,13 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for the flex_gemm higher-order op and its Inductor/CuTe DSL (Quack)
+#   backend: GEMM epilogue analysis, local-reduce planning, config selection, generated-code
+#   checks, and CUDA runtime comparisons against eager references.
+# Contents: scale-encoding helpers for MX/NVFP4 epilogues, optional cute.jit epilogue fixtures,
+#   CPU-only helper/plan tests, a shared FlexGemmTestCase base, SM100+ runtime tests, and
+#   HOP-level tests.
+# Import-time side effects: tries to import cutlass and cutlass.cute; when missing, the name
+#   cute is None and the jit fixtures are not defined. CUDA tests are skipped without CUDA/CuTe
+#   DSL/SM100.
 
 import contextlib
 import dataclasses
@@ -40,6 +49,17 @@ def mx_e8m0_scale(
     rounding: str | None = None,
     pack: int = 1,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Test helper that encodes per-block absolute maxima into E8M0 (power-of-two
+    #   exponent byte) scales. Arguments: amax tensor, max_value (positive finite float, default
+    #   448), rounding (None, floor, or rceil; None means rceil), pack (1 or 2, number of values
+    #   per inline-asm lane).
+    # Raises ValueError for a non-float, non-finite or non-positive max_value, an unknown
+    #   rounding mode, or a pack value other than 1 or 2. Returns a float8_e8m0fnu tensor shaped
+    #   like amax.
+    # When compiling or on fake tensors it emits inline PTX through inline_asm_elementwise
+    #   (round-up conversion for rceil, round-to-zero conversion for floor with infinity clamped
+    #   to a finite sentinel); in eager mode it computes the same exponent byte with integer bit
+    #   manipulation on the float32 representation, mapping NaN to byte 255.
     """Encode E8M0 scales using only public tensor ops and inline assembly."""
     if (
         not isinstance(max_value, float)
@@ -145,6 +165,9 @@ def mx_e8m0_scale(
 
 
 def nvfp4_e4m3_scale(amax: torch.Tensor, max_value: float = 6.0) -> torch.Tensor:
+    # [FUNCTION DOC] Test helper computing the ordinary E4M3 scale for NVFP4 epilogues: divides
+    #   amax (as float32) by max_value (default 6.0), clamps to the smallest normal and largest
+    #   finite float8_e4m3fn values, and returns a float8_e4m3fn tensor. No side effects.
     """Compute the ordinary E4M3 scale used by NVFP4 test epilogues."""
     return torch.clamp(
         amax.float() / max_value,
@@ -163,10 +186,16 @@ if cute is not None:
 
     @cute.jit
     def relu_epilogue(acc):
+        # [FUNCTION DOC] HELPER: cute.jit epilogue fixture applying ReLU elementwise to the
+        #   accumulator fragment (keeps positive values, zeros the rest). Returns the new
+        #   fragment.
         return cute.where(acc > cute.full_like(acc, 0), acc, cute.full_like(acc, 0))
 
     @cute.jit
     def captured_affine_epilogue(acc, col_bias, row_scale, tile_bias):
+        # [FUNCTION DOC] HELPER: cute.jit epilogue fixture with three captured arguments: adds a
+        #   per-column bias to the accumulator, multiplies by a per-row scale, adds a per-tile
+        #   bias, then applies ReLU. Returns the fragment.
         value = (acc + col_bias) * row_scale + tile_bias
         return cute.where(
             value > cute.full_like(value, 0), value, cute.full_like(value, 0)
@@ -174,14 +203,21 @@ if cute is not None:
 
     @cute.jit
     def row_scale_epilogue(acc, row_scale):
+        # [FUNCTION DOC] HELPER: cute.jit epilogue fixture that multiplies the accumulator by a
+        #   captured per-row scale and returns the product.
         return acc * row_scale
 
     @cute.jit
     def scalar_scale_epilogue(acc, scale):
+        # [FUNCTION DOC] HELPER: cute.jit epilogue fixture that multiplies the accumulator by a
+        #   captured scalar scale and returns the product.
         return acc * scale
 
     @cute.jit
     def captured_affine_scalar_epilogue(acc, col_bias, row_scale, tile_bias, scale):
+        # [FUNCTION DOC] HELPER: cute.jit epilogue fixture combining the captured-affine
+        #   computation (column bias, row scale, tile bias) with an extra scalar multiplication,
+        #   followed by ReLU. Returns the fragment.
         value = ((acc + col_bias) * row_scale + tile_bias) * scale
         return cute.where(
             value > cute.full_like(value, 0), value, cute.full_like(value, 0)
@@ -189,12 +225,19 @@ if cute is not None:
 
     @cute.jit
     def tuple_aux_epilogue(acc):
+        # [FUNCTION DOC] HELPER: cute.jit epilogue fixture returning a pair for the main output
+        #   and an auxiliary output: main is half of the accumulator plus one, aux is the
+        #   accumulator squared plus two.
         main = (acc + cute.full_like(acc, 1.0)) * cute.full_like(acc, 0.5)
         aux = acc * acc + cute.full_like(acc, 2.0)
         return main, aux
 
     @cute.jit
     def captured_tuple_aux_epilogue(acc, col_bias, row_scale, tile_bias):
+        # [FUNCTION DOC] HELPER: cute.jit epilogue fixture returning a main/aux pair with
+        #   captured arguments. Main is the ReLU of the affine value (column bias added, row scale
+        #   applied, tile bias added); aux is the accumulator times the row scale plus the tile
+        #   bias.
         biased = (acc + col_bias) * row_scale + tile_bias
         main = cute.where(
             biased > cute.full_like(biased, 0), biased, cute.full_like(biased, 0)
@@ -204,6 +247,11 @@ if cute is not None:
 
     @cute.jit
     def fragment_group32_sum_feed_epilogue(acc):
+        # [FUNCTION DOC] HELPER: cute.jit fixture mirroring the generated axis-1 group-of-32 sum
+        #   feed epilogue. It converts the accumulator to float32, reshapes the fragment so groups
+        #   of up to 32 elements are contiguous, sums each group, broadcasts the sums back and
+        #   returns the fragment times the reciprocal of its group sum (a normalization by group
+        #   sum).
         """Mirror the generated axis-1 group-32 TensorSSA feed epilogue.
 
         Uses the same symbolic min()/repeat fragment expressions as generated
@@ -249,19 +297,31 @@ if cute is not None:
 
     @cute.jit
     def physical_group_sum_feed_epilogue(acc, local_reduce0):
+        # [FUNCTION DOC] HELPER: cute.jit fixture for a physical group-sum feed: divides the
+        #   accumulator by the captured local_reduce0 value (the precomputed group sum).
         return acc / local_reduce0
 
     @cute.jit
     def physical_group_sum_combine(lhs, rhs):
+        # [FUNCTION DOC] HELPER: cute.jit combine callback for a physical group sum; returns the
+        #   elementwise sum of its two partial values.
         return lhs + rhs
 
     @cute.jit
     def physical_group_sum_finalize(value):
+        # [FUNCTION DOC] HELPER: cute.jit finalize callback for a physical group sum; returns
+        #   the reduced value unchanged.
         return value
 
 
 class TestFlexGemmRuntimeImport(TestCase):
+    # [CLASS DOC] Checks that the flex_gemm runtime module can be imported without pulling in an
+    #   external quack package. Stateless; one test method.
     def test_import_does_not_load_external_quack(self):
+        # [FUNCTION DOC] Removes quack and all quack submodules from the module table and the
+        #   cached flex_gemm runtime module, re-imports the runtime module, and asserts that no
+        #   quack entry is present afterwards (the vendored copy must be used). Side effect:
+        #   mutates the module table.
         for name in list(sys.modules):
             if name == "quack" or name.startswith("quack."):
                 del sys.modules[name]
@@ -272,12 +332,21 @@ class TestFlexGemmRuntimeImport(TestCase):
 
 @instantiate_parametrized_tests
 class TestFlexGemmRuntimeHelpers(TestCase):
+    # [CLASS DOC] CPU-friendly tests of helper layers behind flex_gemm: reduction table,
+    #   fast-math decompositions, post-grad pass guards, epilogue graph normalization,
+    #   local-reduce analysis, and dense config selection. Parametrized tests are expanded by the
+    #   class decorator.
     @parametrize(
         "reduction_type",
         get_args(ReductionType),
         name_fn=lambda reduction_type: reduction_type,
     )
     def test_tensorssa_reduction_table_covers_inductor_vocabulary(self, reduction_type):
+        # [FUNCTION DOC] For each Inductor reduction type, checks the TensorSSA reduction table:
+        #   its key set must equal sum, prod, max, min with the expected CuTe reduction op, init
+        #   value and combine expression. Unsupported reduction types must raise
+        #   NotImplementedError saying they do not map to a CuTe TensorSSA reduction; supported
+        #   ones must return the exact table entry.
         from torch._inductor.codegen.cutedsl.cutedsl_op_overrides import (
             tensorssa_reduction,
             TENSORSSA_REDUCTIONS,
@@ -362,6 +431,11 @@ class TestFlexGemmRuntimeHelpers(TestCase):
         name_fn=lambda case: case[0],
     )
     def test_fast_math_decompositions_preserve_type_promotion(self, case):
+        # [FUNCTION DOC] Parametrized by case (name, aten op, input dtype, expected convert
+        #   dtypes, result dtype) for sigmoid and silu. Traces the op with the fast-math Quack
+        #   body decomposition table and verifies the dtype-conversion nodes inserted match the
+        #   expected sequence, that the output dtype matches the input promotion rule, and that a
+        #   tanh node is present.
         from torch._higher_order_ops.flex_gemm import flex_gemm_body_decomposition_table
         from torch._inductor.decomposition import decompositions
         from torch.fx.experimental.proxy_tensor import make_fx
@@ -393,6 +467,9 @@ class TestFlexGemmRuntimeHelpers(TestCase):
         )
 
     def test_post_grad_addmm_fusion_preserves_flex_gemm_body_mm(self):
+        # [FUNCTION DOC] Builds a graph for a matmul plus bias and checks the post-grad addmm
+        #   fusion validity predicate accepts it; after the matmul node is marked as a flex_gemm
+        #   body gemm, the predicate must reject the fusion.
         from torch._higher_order_ops.flex_gemm import mark_flex_gemm_body_gemm_node
         from torch._inductor.fx_passes.post_grad import is_valid_addmm_fusion
         from torch.fx.experimental.proxy_tensor import make_fx
@@ -430,6 +507,10 @@ class TestFlexGemmRuntimeHelpers(TestCase):
         name_fn=lambda case: case[0],
     )
     def test_post_grad_unfuse_preserves_flex_gemm_body_gemm(self, case):
+        # [FUNCTION DOC] Parametrized over addmm and baddbmm. Traces the gemm followed by relu
+        #   under fake tensors, checks the should-prefer-unfused predicate for that gemm is true,
+        #   then marks the gemm node as a flex_gemm body gemm and checks the predicate becomes
+        #   false. Uses fake CUDA-device tensors only.
         from torch._higher_order_ops.flex_gemm import mark_flex_gemm_body_gemm_node
         from torch._inductor.fx_passes.post_grad import (
             should_prefer_unfused_addmm,
@@ -462,6 +543,9 @@ class TestFlexGemmRuntimeHelpers(TestCase):
         self.assertFalse(check(match))
 
     def test_epilogue_analysis_matches_prepare_softmax(self):
+        # [FUNCTION DOC] Traces a body that views its input as grouped and applies the
+        #   online-softmax preparation primitive, runs the local-reduce analysis, and checks the
+        #   prepare-softmax node is matched with no reduction type.
         from torch._inductor import inductor_prims
         from torch._inductor.kernel.gemm_epilogue_analysis import (
             GemmLocalReduceAnalysis,
@@ -469,6 +553,9 @@ class TestFlexGemmRuntimeHelpers(TestCase):
         from torch.fx.experimental.proxy_tensor import make_fx
 
         def body(x):
+            # [FUNCTION DOC] HELPER: traced body that views the input as a 3-D grouped tensor
+            #   and returns the first result of the online softmax preparation primitive over the
+            #   last dim.
             grouped = x.view(4, 4, 2)
             return inductor_prims.prepare_softmax_online(grouped, -1)[0]
 
@@ -483,6 +570,10 @@ class TestFlexGemmRuntimeHelpers(TestCase):
         self.assertIsNone(analysis.matches[prepare_softmax].reduction_type)
 
     def test_epilogue_graph_normalizes_selected_fx_nodes(self):
+        # [FUNCTION DOC] Traces a body with a keepdim sum, squeeze, max with indices, variance
+        #   and a dtype view, builds the epilogue graph, and asserts the normalized node records:
+        #   view, reduction (dims, keepdim, reduction name), squeeze, getitem, dtype view, and an
+        #   unsupported-reduction record for variance.
         import operator
 
         from torch._inductor.kernel.gemm_epilogue import (
@@ -497,6 +588,9 @@ class TestFlexGemmRuntimeHelpers(TestCase):
         from torch.fx.experimental.proxy_tensor import make_fx
 
         def body(x):
+            # [FUNCTION DOC] HELPER: traced body returning a squeezed grouped sum, the grouped
+            #   max values, the grouped variance and an int32 reinterpretation of the input, to
+            #   exercise node normalization.
             grouped = x.view(4, 2, 4)
             reduced = grouped.sum(dim=-1, keepdim=True)
             maximum = torch.max(grouped, dim=-1).values
@@ -549,12 +643,17 @@ class TestFlexGemmRuntimeHelpers(TestCase):
         )
 
     def test_local_reduce_propagates_before_grouped_view_matching(self):
+        # [FUNCTION DOC] Checks the FlexGemm local-reduce analysis propagates a match through a
+        #   squeeze and a later reshape: the final output node must be a match whose value node is
+        #   the grouped sum.
         from torch._inductor.kernel.flex_gemm.fx_cutedsl_codegen import (
             FlexGemmLocalReduceAnalysis,
         )
         from torch.fx.experimental.proxy_tensor import make_fx
 
         def body(x):
+            # [FUNCTION DOC] HELPER: traced body that sums a grouped view over the last dim with
+            #   keepdim, squeezes it, then reshapes the result to a different rank-3 layout.
             grouped = x.view(4, 6, 2)
             reduced = grouped.sum(dim=-1, keepdim=True).squeeze(-1)
             return reduced.view(-1, 4, 3)
@@ -572,12 +671,25 @@ class TestFlexGemmRuntimeHelpers(TestCase):
         )
 
     def test_dense_config_selection_is_explicit_and_sm110_reuses_sm100(self):
+        # [FUNCTION DOC] Tests dense GEMM config selection in the flex_gemm template heuristics
+        #   with patched device capability and patched Quack config enumeration. On capability 11
+        #   the candidates (SM100 configs reused) are filtered and ordered with the default first,
+        #   TMA-gather configs dropped; the default key depends on M and N (skinny, large, large
+        #   rectangular picks), keys round-trip back to a GemmConfig, and a fake graph handler
+        #   provides the size-var guard.
+        # On capability 12 only the SM120 pingpong config is a candidate; on capability 9 with
+        #   no matching configs a RuntimeError mentioning no QuACK configs is raised. Mocks
+        #   restore global state on exit.
         from torch._inductor.heuristics.template import (
             flex_gemm as flex_gemm_heuristics,
         )
         from torch._vendor.quack.gemm_config import GemmConfig
 
         def config(tile_m, tile_n, cluster_m, cluster_n, dynamic, **kwargs):
+            # [FUNCTION DOC] HELPER: builds a GemmConfig from tile and cluster sizes and the
+            #   dynamic-persistent flag, filling remaining fields with fixed defaults (cluster_k
+            #   one, no swap, device capacity ten, swizzle size eight) and allowing keyword
+            #   overrides.
             values = {
                 "tile_m": tile_m,
                 "tile_n": tile_n,
@@ -702,6 +814,10 @@ class TestFlexGemmRuntimeHelpers(TestCase):
                 )
 
     def test_output_contraction_device_validation(self):
+        # [FUNCTION DOC] Checks FlexGemmOutputContraction.validate_quack by device capability:
+        #   group 2 passes on capabilities 10 and 11, group 4 passes on 10; a chunked group 4
+        #   raises NotImplementedError (interleaved group 4 only); group 4 on 11, any group on 12,
+        #   and any group on 9 raise NotImplementedError with the matching message.
         from torch._inductor.kernel.flex_gemm.constraints import (
             FlexGemmOutputContraction,
         )
@@ -724,6 +840,10 @@ class TestFlexGemmRuntimeHelpers(TestCase):
 
     @skipIfNoCuteDSL
     def test_quack_grouped_n_contract_device_validation(self):
+        # [FUNCTION DOC] Same device rules as the contraction validation test, but against the
+        #   vendored Quack grouped-N contract validator taking a group size and a capability
+        #   tuple: groups 2 and 4 accepted on SM100, group 2 on SM110, group 4 on SM110 rejected,
+        #   SM120 and SM90 rejected, all via NotImplementedError. Requires the CuTe DSL.
         from torch._vendor.quack.gemm_act import validate_grouped_n_contract_device
 
         validate_grouped_n_contract_device(2, (10, 0))
@@ -739,6 +859,11 @@ class TestFlexGemmRuntimeHelpers(TestCase):
     @skipIfNoCuteDSL
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     def test_runtime_output_contraction_rejects_unsafe_explicit_config(self):
+        # [FUNCTION DOC] Runs gemm_epilogue with an output-contraction plan and an explicit
+        #   config key selecting a swap_ab config (patched candidate list and key decoder), with a
+        #   device capacity override of SM100. Expects NotImplementedError saying the config is
+        #   incompatible with output contraction. Needs CUDA (tensors on the GPU) but does not
+        #   launch a kernel.
         from torch._inductor.kernel.flex_gemm.constraints import (
             FlexGemmOutputContraction,
         )
@@ -783,6 +908,11 @@ class TestFlexGemmRuntimeHelpers(TestCase):
     @skipIfNoCuteDSL
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     def test_runtime_output_contraction_selects_safe_default_config(self):
+        # [FUNCTION DOC] With two patched candidate configs (an unsafe swap_ab one first, a safe
+        #   non-swap one second) and the dispatch function mocked, runs gemm_epilogue with an
+        #   output-contraction plan and no explicit config; asserts the config passed to the
+        #   dispatch call is the safe candidate, i.e. default selection skips configs that are
+        #   unsafe for contraction.
         from torch._inductor.kernel.flex_gemm.constraints import (
             FlexGemmOutputContraction,
         )
@@ -827,6 +957,14 @@ class TestFlexGemmRuntimeHelpers(TestCase):
         self.assertIs(dispatch.call_args.kwargs["config"], safe)
 
     def test_explicit_dense_config_supports_partial_constraints(self):
+        # [FUNCTION DOC] Checks explicit config handling in the heuristics and lowering config
+        #   key helpers under patched capability 10. A fully specified key yields exactly that
+        #   config; a partial constraint (tile_m only) yields every matching config, used as-is
+        #   when not tuned and as the whole tuning set when tuned. Rejections
+        #   (NotImplementedError): unknown field (stages), unsupported field values (boolean
+        #   cluster_m, TMA gather), and a device capacity mismatch. A swap_ab explicit config
+        #   combined with a local-reduce geometry must raise NotImplementedError about
+        #   incompatibility with local reduction.
         from torch._inductor.heuristics.template import (
             flex_gemm as flex_gemm_heuristics,
         )
@@ -939,6 +1077,11 @@ class TestFlexGemmRuntimeHelpers(TestCase):
             )
 
     def test_multi_cta_local_reduce_full_tile_follows_n_warp_topology(self):
+        # [FUNCTION DOC] Checks local-reduce config validation for multi-CTA configs: a group
+        #   spanning the full tile N is allowed only when a single epilogue N-warp partition owns
+        #   N (the 256-wide-N config rejects full-N, the 512-wide one accepts it), groups along
+        #   axis 0 sized by tile M are rejected for the single-N-warp case, and the maximum
+        #   allowed group over both configs on axis 1 is 512.
         """Allow full-N groups only when one epilogue warp partition owns N."""
         from torch._inductor.kernel.flex_gemm.constraints import (
             max_flex_gemm_local_reduce_group_for_configs,
@@ -981,6 +1124,11 @@ class TestFlexGemmRuntimeHelpers(TestCase):
         self.assertEqual(max_flex_gemm_local_reduce_group_for_configs(configs, 1), 512)
 
     def test_precompile_metadata_counts_symbolic_skip(self):
+        # [FUNCTION DOC] Builds a FlexGemmEpilogueCaller without running its constructor and
+        #   gives it fake benchmark request metadata containing a symbolic input size. Asserts
+        #   precompile_metadata returns None (precompilation is skipped for dynamic shapes) and
+        #   that the Inductor counter for skipped dynamic precompiles is incremented to one.
+        #   Clears the global dynamo counters first.
         import sympy
 
         from torch._dynamo.utils import counters
@@ -1012,12 +1160,21 @@ class TestFlexGemmRuntimeHelpers(TestCase):
 
 
 class FlexGemmTestCase(TestCase):
+    # [CLASS DOC] Shared base class for flex_gemm tests: provides tensor factories,
+    #   generated-code checks (via FileCheck), config-key helpers, and numerical comparison
+    #   helpers that bound error relative to a low-precision eager reference. Stateless.
     def makeTensor(self, *shape, device="cuda", dtype=torch.bfloat16):
+        # [FUNCTION DOC] HELPER: builds a random tensor of the given shape on device (default
+        #   CUDA) and dtype (default bfloat16) with values drawn uniformly from minus 0.1 to 0.1.
         return torch.testing.make_tensor(
             *shape, device=device, dtype=dtype, low=-0.1, high=0.1
         )
 
     def assertFlexGemmGeneratedCode(self, code, *checks):
+        # [FUNCTION DOC] HELPER: asserts generated Inductor code calls the flex_gemm runtime:
+        #   the import of the runtime plan and gemm_epilogue, the epilogue call, each extra
+        #   pattern in checks in order, then the stream and config_key arguments. The code must
+        #   not contain a tuned argument, an epilogue_source argument, or any quack import.
         file_check = (
             FileCheck()
             .check("from torch._inductor.kernel.flex_gemm.runtime import (")
@@ -1034,6 +1191,9 @@ class FlexGemmTestCase(TestCase):
         file_check.check_not("from quack").check_not("import quack").run(code)
 
     def swapAndNonSwapConfigKeys(self, device):
+        # [FUNCTION DOC] HELPER: builds config keys for all candidate GEMM configs on the device
+        #   and returns the first swap_ab key and first non-swap key. Asserts that both kinds
+        #   exist.
         """Return one swap_ab and one non-swap candidate config key for ``device``."""
         from torch._inductor.heuristics.template.flex_gemm import (
             candidate_gemm_configs_for_device,
@@ -1056,6 +1216,11 @@ class FlexGemmTestCase(TestCase):
         high_precision_expected,
         reduction_size,
     ):
+        # [FUNCTION DOC] HELPER: asserts the mean absolute error of actual (against a float64
+        #   reference) does not exceed the mean error of the low-precision eager result plus an
+        #   allowance. The allowance is the sum of a float32 accumulation epsilon scaled by the
+        #   square root of the reduction size and the output dtype epsilon, times the mean
+        #   magnitude of the reference. Failure message reports the error terms.
         actual_error = (actual.double() - high_precision_expected).abs().mean()
         eager_error = (
             (low_precision_expected.double() - high_precision_expected).abs().mean()
@@ -1080,6 +1245,10 @@ class FlexGemmTestCase(TestCase):
         )
 
     def assertTupleAuxMatchesReference(self, actual, aux, a, b, epilogue_fn):
+        # [FUNCTION DOC] HELPER: checks a main/aux pair from a tuple-aux epilogue against eager
+        #   references. The main output is compared with half of the float64 product plus one
+        #   half, the aux output with the squared float64 product plus two, using the K dimension
+        #   as reduction size.
         """Validate tuple-aux epilogues against low/high precision references."""
         expected, expected_aux = epilogue_fn(a @ b)
         high_precision_acc = a.double() @ b.double()
@@ -1099,6 +1268,10 @@ class FlexGemmTestCase(TestCase):
     def assertCapturedTupleAuxMatchesReference(
         self, actual, aux, a, b, col_bias, row_scale, tile_bias
     ):
+        # [FUNCTION DOC] HELPER: checks main and aux outputs of the captured-argument tuple
+        #   epilogue. The main output is the ReLU of the biased and scaled float32 accumulator,
+        #   the aux is the row-scaled accumulator plus tile bias; each compared with a float64
+        #   reference via the low-precision comparison helper.
         """Validate composed captured-load and tuple-aux epilogues."""
         acc = a @ b
         acc_float = acc.float()
@@ -1120,10 +1293,16 @@ class FlexGemmTestCase(TestCase):
         )
 
     def localReduceGeometryPattern(self, group, axis):
+        # [FUNCTION DOC] HELPER: returns the textual form of a local-reduce geometry
+        #   construction with the given group and axis, as it should appear in generated code.
         """Return the generated structural local-reduce geometry pattern."""
         return f"FlexGemmLocalReduceGeometry(group={group}, axis={axis})"
 
     def assertLocalReduceAuxCode(self, code, group, axis=1, callbacks=False):
+        # [FUNCTION DOC] HELPER: asserts generated code builds a runtime local-reduce plan with
+        #   the expected geometry text and an out argument, includes the callbacks class only when
+        #   callbacks is true (and excludes it otherwise), and does not contain the legacy
+        #   local_reduce_out, local_reduce_group, local_reduce_axis or local_reduce_op arguments.
         """Check generated code passes a structural compressed-aux plan."""
         file_check = (
             FileCheck()
@@ -1146,6 +1325,10 @@ class FlexGemmTestCase(TestCase):
         axis=0,
         feeds_main=False,
     ):
+        # [FUNCTION DOC] HELPER: builds a FlexGemmRuntimeLocalReducePlan from group, axis, out
+        #   and feeds_main. Callbacks (identity-like combine and finalize functions) are attached
+        #   when the plan feeds main, the axis is 0, or the group exceeds the fragment width
+        #   constant; otherwise callbacks are None.
         """Build the structural local-reduce runtime plan used by generated code."""
         from torch._inductor.kernel.flex_gemm.constraints import (
             FlexGemmLocalReduceCallbacks,
@@ -1172,6 +1355,10 @@ class FlexGemmTestCase(TestCase):
     def assertMatchesEpilogue(
         self, actual, expected, high_precision_expected, reduction_size
     ):
+        # [FUNCTION DOC] HELPER: compares actual outputs with eager and high-precision
+        #   references. For a tuple of expected outputs, checks lengths match and compares
+        #   elementwise with the low-precision comparison helper; for a single tensor compares
+        #   directly.
         """Compare one or multiple epilogue outputs against eager references."""
         if isinstance(expected, tuple):
             self.assertEqual(len(actual), len(expected))
@@ -1191,6 +1378,10 @@ class FlexGemmTestCase(TestCase):
         )
 
     def assertLocalReduceAuxMatches(self, actual, aux, a, b, epilogue_fn):
+        # [FUNCTION DOC] HELPER: computes eager and float64 versions of the epilogue on the GEMM
+        #   result. The main output is compared with the low-precision helper (K from the second
+        #   dimension of a); the compressed aux output is compared with the float64 aux using
+        #   absolute and relative tolerance of one thousandth.
         """Validate compressed local-reduce aux output against high precision GEMM."""
         expected, _ = epilogue_fn(a @ b)
         high_precision_expected, high_precision_aux = epilogue_fn(
@@ -1210,6 +1401,10 @@ class FlexGemmTestCase(TestCase):
         )
 
     def assertPhysicalFeedMainCode(self, code, group=None):
+        # [FUNCTION DOC] HELPER: asserts generated code passes a runtime local-reduce plan with
+        #   a feeds-main style ABI: axis 0 geometry (with the given group when specified), a
+        #   callbacks object, and none of the legacy local_reduce_out, local_reduce_feeds_main or
+        #   local_reduce_op arguments.
         """Check generated code uses the current physical feed-main ABI."""
         file_check = FileCheck().check("local_reduce=FlexGemmRuntimeLocalReducePlan")
         if group is None:
@@ -1229,8 +1424,15 @@ class FlexGemmTestCase(TestCase):
 @unittest.skipIf(not TEST_CUDA, "CUDA required")
 @instantiate_parametrized_tests
 class TestFlexGemmRuntime(FlexGemmTestCase):
+    # [CLASS DOC] CUDA runtime tests of gemm_epilogue and the generated epilogue paths. Skipped
+    #   without the CuTe DSL or CUDA; many tests additionally require SM100 or later. Class
+    #   attributes hold the module-level cute.jit epilogue fixtures as static methods.
     @classmethod
     def setUpClass(cls):
+        # [FUNCTION DOC] Class setup: after the base setup, stores the module-level cute.jit
+        #   epilogue fixtures (relu, captured affine, row scale, scalar scale, affine with scalar,
+        #   tuple aux, captured tuple aux) as static attributes so tests can pass them as
+        #   epilogues. Mutates class attributes only.
         super().setUpClass()
         cls.relu_epilogue = staticmethod(relu_epilogue)
         cls.captured_affine_epilogue = staticmethod(captured_affine_epilogue)
@@ -1244,6 +1446,11 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
 
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_epilogue_with_c_alpha_beta_matches_reference(self):
+        # [FUNCTION DOC] SM100+ CUDA test: runs gemm_epilogue with a ReLU epilogue, a
+        #   column-major C input, alpha 0.5, beta 1.25 and a preallocated column-major output
+        #   buffer. Asserts the returned tensor is that same buffer and that it matches an eager
+        #   float32 reference (within the low-precision comparison tolerance) of the ReLU of alpha
+        #   times the product plus beta times C. Seeds the RNG.
         from torch._inductor.kernel.flex_gemm.runtime import gemm_epilogue
 
         torch.manual_seed(0)
@@ -1276,6 +1483,9 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
 
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_batched_epilogue_beta_zero_ignores_nan_c(self):
+        # [FUNCTION DOC] SM100+ CUDA test: batched gemm_epilogue with beta zero and a C filled
+        #   with NaN. Output must contain no NaN (beta zero must not read C), and must match the
+        #   eager baddbmm with beta zero, alpha 1.5 followed by ReLU.
         from torch._inductor.kernel.flex_gemm.runtime import gemm_epilogue
 
         torch.manual_seed(7)
@@ -1304,6 +1514,9 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
 
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_explicit_arg_kind_disambiguates_row_arg(self):
+        # [FUNCTION DOC] SM100+ CUDA test: with an M of 1, passes a row-shaped float32 captured
+        #   argument together with the explicit kind row so the ambiguous shape is resolved;
+        #   checks the float32 output equals the product times the row scale.
         from torch._inductor.kernel.flex_gemm.runtime import gemm_epilogue
 
         torch.manual_seed(2)
@@ -1329,6 +1542,9 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
         )
 
     def test_explicit_arg_kind_disambiguates_col_arg_shape(self):
+        # [FUNCTION DOC] CPU test: with a 128 by 64 A, a 64 by 1 B and a 128 by 1 captured
+        #   argument, an explicit kind col is accepted by resolve_epilogue_arg_kinds and returned
+        #   unchanged.
         from torch._inductor.kernel.flex_gemm.runtime import resolve_epilogue_arg_kinds
 
         a = torch.empty(128, 64)
@@ -1342,6 +1558,9 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
 
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_epilogue_infers_captured_arg_kinds(self):
+        # [FUNCTION DOC] SM100+ CUDA test: captured arguments of shapes column vector, row
+        #   vector and full tile are passed without explicit kinds; the runtime must infer their
+        #   kinds and the float32 output must match the affine-plus-ReLU reference.
         from torch._inductor.kernel.flex_gemm.runtime import gemm_epilogue
 
         torch.manual_seed(4)
@@ -1373,6 +1592,10 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
 
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_epilogue_infers_scalar_captured_arg_kind(self):
+        # [FUNCTION DOC] SM100+ CUDA test: asserts a one by one captured argument resolves to
+        #   kind scalar even when M or N equals 1 (which would also fit row or col), then runs
+        #   gemm_epilogue with the scalar scale epilogue and compares with the product times the
+        #   scalar.
         from torch._inductor.kernel.flex_gemm.runtime import (
             gemm_epilogue,
             resolve_epilogue_arg_kinds,
@@ -1410,6 +1633,11 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
 
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_validation_rejects_unsupported_epilogue_arg_combinations(self):
+        # [FUNCTION DOC] SM100+ test of argument validation in gemm_epilogue. Each case must
+        #   raise: captured args together with C (NotImplementedError), non-default alpha with
+        #   captured args (NotImplementedError), an unknown arg kind (NotImplementedError), a row
+        #   arg with a transposed shape (RuntimeError), and a strided A or output that is neither
+        #   row- nor column-major (NotImplementedError).
         from torch._inductor.kernel.flex_gemm.runtime import gemm_epilogue
 
         a = self.makeTensor(128, 64)
@@ -1475,6 +1703,9 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
 
     @parametrize("group", (33, 64))
     def test_runtime_plan_rejects_cross_warp_feed_main_group(self, group):
+        # [FUNCTION DOC] Parametrized by group size (33 or 64). Building a runtime local-reduce
+        #   plan with axis 0 and feeds_main true must raise NotImplementedError because feed-main
+        #   supports only same-warp axis-0 groups of at most 32.
         with self.assertRaisesRegex(
             NotImplementedError, "same-warp axis-0 groups <= 32"
         ):
@@ -1485,6 +1716,8 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
             )
 
     def test_runtime_plan_rejects_axis_one_feed_main(self):
+        # [FUNCTION DOC] Building a runtime local-reduce plan with axis 1 and feeds_main true
+        #   must raise NotImplementedError (feed-main supports only axis 0).
         with self.assertRaisesRegex(NotImplementedError, "supports only axis 0"):
             self.runtimeLocalReducePlan(
                 group=8,
@@ -1493,6 +1726,9 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
             )
 
     def test_runtime_validation_rejects_non_divisible_local_reduce_group(self):
+        # [FUNCTION DOC] validate_runtime_local_reduce with a feed-main axis-0 group of 8 on a
+        #   tensor with 130 rows must raise RuntimeError since the group must divide the row
+        #   count.
         from torch._inductor.kernel.flex_gemm.runtime import (
             validate_runtime_local_reduce,
         )
@@ -1513,6 +1749,11 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
             )
 
     def test_runtime_validation_rejects_local_reduce_rank_and_output_shape(self):
+        # [FUNCTION DOC] Checks validate_runtime_local_reduce and the output-shape validator
+        #   reject: a 3-D (batched) input for a compressed plan (NotImplementedError, only 2-D
+        #   mm), a compressed output whose shape differs from the expected group-compressed shape
+        #   (RuntimeError), and a column-major local-reduce output tensor (NotImplementedError,
+        #   must be row-major).
         from torch._inductor.kernel.flex_gemm.constraints import (
             validate_local_reduce_out_shape,
         )
@@ -1550,6 +1791,9 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
             )
 
     def test_runtime_validation_rejects_local_reduce_with_c_alpha_beta(self):
+        # [FUNCTION DOC] For both a compressed-output plan and a feed-main plan,
+        #   validate_runtime_local_reduce must raise NotImplementedError when a C tensor is
+        #   supplied or alpha or beta differs from one.
         from torch._inductor.kernel.flex_gemm.runtime import (
             validate_runtime_local_reduce,
         )
@@ -1580,6 +1824,12 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
 
     @skipIfNoCuteDSL
     def test_quack_feed_main_host_guards_match_runtime_contract(self):
+        # [FUNCTION DOC] Calls the vendored Quack gemm_act on small CPU bf16 tensors with a
+        #   feed-main local-reduce setup and a patched device capacity of SM100, checking host
+        #   guards raise before any kernel work: C, alpha or beta given (NotImplementedError); a
+        #   group that does not divide the TensorSSA fragment width (RuntimeError); a group that
+        #   does not divide the output extent (RuntimeError); and missing tensor epilogue function
+        #   and key (RuntimeError). Requires CuTe DSL.
         from torch._vendor.quack.gemm_act import gemm_act
 
         a = torch.empty(1, 4, 8, dtype=torch.bfloat16)
@@ -1588,6 +1838,8 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
         c = torch.empty(1, 4, 8, dtype=torch.bfloat16)
 
         def tensor_epilogue(acc, local_reduce0):
+            # [FUNCTION DOC] HELPER: epilogue stub taking the accumulator and local_reduce0 and
+            #   returning the accumulator unchanged.
             return acc
 
         def call_gemm(
@@ -1597,6 +1849,10 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
             local_reduce_group=8,
             **kwargs,
         ):
+            # [FUNCTION DOC] HELPER: invokes gemm_act with the shared tensors, a feed-main
+            #   axis-0 local reduce setup and tile sizes; C, mat1, output, local_reduce_group and
+            #   extra keyword arguments (alpha, beta) are overridable. Returns whatever gemm_act
+            #   returns.
             return gemm_act(
                 mat1,
                 b,
@@ -1656,6 +1912,8 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
             )
 
     def test_local_reduce_callbacks_reject_missing_functions(self):
+        # [FUNCTION DOC] Constructing FlexGemmLocalReduceCallbacks with a missing combine or
+        #   finalize function must raise RuntimeError about generated local-reduce callbacks.
         from torch._inductor.kernel.flex_gemm.constraints import (
             FlexGemmLocalReduceCallbacks,
         )
@@ -1666,9 +1924,13 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
             FlexGemmLocalReduceCallbacks(lambda lhs, rhs: lhs, None)
 
     def test_local_reduce_callbacks_use_generated_cache_keys(self):
+        # [FUNCTION DOC] Checks local_reduce_callback_key: a function carrying a cache-key hook
+        #   returns that hook's value; a plain lambda without the hook returns the fallback key.
         from torch._inductor.kernel.flex_gemm.runtime import local_reduce_callback_key
 
         def combine(lhs, rhs):
+            # [FUNCTION DOC] HELPER: dummy combine callback returning its left operand; the test
+            #   attaches a cache-key attribute to it.
             return lhs
 
         combine.__cache_key__ = lambda: "combine-cache-key"
@@ -1680,6 +1942,8 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
         )
 
     def test_local_reduce_plan_rejects_invalid_group_axis(self):
+        # [FUNCTION DOC] FlexGemmLocalReduceGeometry must raise RuntimeError for a non-positive
+        #   group and for an axis other than 0 or 1.
         from torch._inductor.kernel.flex_gemm.constraints import (
             FlexGemmLocalReduceGeometry,
         )
@@ -1692,6 +1956,9 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
             FlexGemmLocalReduceGeometry(8, 2)
 
     def test_runtime_local_reduce_plan_rejects_missing_callbacks(self):
+        # [FUNCTION DOC] FlexGemmRuntimeLocalReducePlan must raise RuntimeError when it has
+        #   neither an output nor feeds_main, when an output is given without callbacks, and when
+        #   feeds_main is set without callbacks, each with the stated messages.
         from torch._inductor.kernel.flex_gemm.constraints import (
             FlexGemmLocalReduceGeometry,
         )
@@ -1711,6 +1978,11 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
             )
 
     def test_local_reduce_plan_uses_explicit_consumers(self):
+        # [FUNCTION DOC] Builds runtime plans for feed-only, shared (output plus feed) and
+        #   store-only cases and checks the feeds_main flag on each; checks the template-level
+        #   local-reduce config feeds_main flag with and without output index; and checks
+        #   local_reduce_gemm_act_kwargs sets the feed-main flag and a returns-local-reduce flag
+        #   that is true only when the plan has an output as well as feeding main.
         from torch._inductor.kernel.flex_gemm.constraints import (
             FlexGemmLocalReduceCallbacks,
             FlexGemmLocalReduceGeometry,
@@ -1767,6 +2039,12 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
         self.assertTrue(shared_kwargs["tensor_epilogue_returns_local_reduce"])
 
     def test_output_plan_rejects_invalid_state(self):
+        # [FUNCTION DOC] Checks validation in output plan classes using FX placeholder nodes:
+        #   output plans reject non-node outputs, local-reduce matches reject non-node sources,
+        #   output local-reduce plans require a match and store with a valid node and non-negative
+        #   index (RuntimeError), and tuple_output_plan rejects non-node outputs
+        #   (NotImplementedError). Then confirms valid plans with a store or with feeds_main
+        #   construct without error.
         from torch._inductor.kernel.flex_gemm.constraints import (
             FlexGemmLocalReduceGeometry,
         )
@@ -1820,6 +2098,10 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
         )
 
     def test_output_plan_uses_shared_reduction_plan(self):
+        # [FUNCTION DOC] Builds an output plan whose local reduce has a max reduction, a store
+        #   at index zero and feeds_main, and asserts its reduction_plan equals the shared
+        #   GemmReductionPlan with the node names, group 8, axis 0, max, identity, the output name
+        #   and feed output set.
         from torch._inductor.kernel.flex_gemm.constraints import (
             FlexGemmLocalReduceGeometry,
         )
@@ -1863,6 +2145,8 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
         )
 
     def test_ordered_outputs_restore_local_reduce_position(self):
+        # [FUNCTION DOC] Checks flex_gemm_ordered_outputs places the local-reduce output at the
+        #   requested index among main and two aux outputs (positions one, two, three of four).
         from torch._inductor.kernel.flex_gemm.lowering import flex_gemm_ordered_outputs
 
         expected_outputs = (
@@ -1877,6 +2161,9 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
             )
 
     def test_local_reduce_aux_result_requires_grouped_source(self):
+        # [FUNCTION DOC] Checks the emitter aux_result helper: an aux node without a grouped
+        #   source mapping raises NotImplementedError, with a mapping it returns the mapped
+        #   temporary name, and a None node returns None.
         from torch._inductor.kernel.flex_gemm.fx_cutedsl_codegen import (
             FlexGemmEpilogueEmitter,
         )
@@ -1890,6 +2177,9 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
 
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_swap_ab_rejects_local_reduce_aux(self):
+        # [FUNCTION DOC] SM100+ CUDA test: gemm_epilogue with a compressed local-reduce output
+        #   plan and a swap_ab config key must raise NotImplementedError saying swap_ab is not
+        #   supported.
         from torch._inductor.kernel.flex_gemm.constraints import (
             FlexGemmLocalReduceGeometry,
         )
@@ -1926,6 +2216,9 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
 
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_epilogue_explicit_config_key_matches_reference(self):
+        # [FUNCTION DOC] SM100+ CUDA test: takes the first two candidate config keys for the
+        #   device and runs gemm_epilogue with the row-scale epilogue and an explicit row argument
+        #   under each key; each float32 result must match the eager product times row scale.
         from torch._inductor.heuristics.template.flex_gemm import (
             candidate_gemm_configs_for_device,
             gemm_config_key,
@@ -1960,6 +2253,12 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
 
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_fragment_group32_forced_config_extremes_match_reference(self):
+        # [FUNCTION DOC] SM100+ CUDA regression test for the axis-1 group-of-32 fragment
+        #   contract. Picks, among candidate configs passing the local-reduce validation for group
+        #   32 on axis 1, the ones with the smallest and largest tile N, and runs the group32 sum
+        #   feed fixture with each forced config. Results must match the float64 per-group
+        #   normalization reference within 1e-4 and must differ by over 1e-2 from the half-group
+        #   reference (to catch partial-fragment reductions).
         """Pin the empirically verified g32 axis-1 fragment contract per config.
 
         Every config passing the axis-1 group-32 gate was verified to expose a
@@ -2010,6 +2309,11 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
 
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_physical_feed_main_forced_config_extremes_match_reference(self):
+        # [FUNCTION DOC] SM100+ CUDA test of a physical feed-main local reduce (group 32 along
+        #   axis 0, callbacks for sum combine and finalize). Selects configs passing local-reduce
+        #   validation with extreme tile M and tile N values (deduplicated by key), runs
+        #   gemm_epilogue with the divide-by-group-sum fixture and asserts each result matches the
+        #   float64 column-group normalization within 1e-4.
         from torch._inductor.heuristics.template.flex_gemm import (
             candidate_gemm_configs_for_device,
             gemm_config_key,
@@ -2070,6 +2374,10 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     @parametrize("shape", ((128, 512, 256), (512, 128, 256), (256, 256, 256)))
     def test_swap_ab_matches_non_swap_and_eager(self, shape):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by three (M, N, K) shapes: runs the ReLU
+        #   epilogue with a swap_ab config key and with a non-swap key; the two float32 results
+        #   must be exactly equal (swap_ab only changes tile orientation) and must match the eager
+        #   ReLU of the product within tolerance.
         from torch._inductor.kernel.flex_gemm.runtime import gemm_epilogue
 
         m, n, k = shape
@@ -2101,6 +2409,9 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
 
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_swap_ab_with_c_alpha_beta_matches_non_swap(self):
+        # [FUNCTION DOC] SM100+ CUDA test: runs a ReLU epilogue with C, alpha 1.5 and beta 0.5
+        #   under a swap_ab and a non-swap config key; results must be equal and match the eager
+        #   reference.
         from torch._inductor.kernel.flex_gemm.runtime import gemm_epilogue
 
         m, n, k = 256, 384, 192
@@ -2110,6 +2421,9 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
         swap_key, non_swap_key = self.swapAndNonSwapConfigKeys(a.device)
 
         def run(name, config_key):
+            # [FUNCTION DOC] HELPER: runs gemm_epilogue on the enclosing test tensors with C,
+            #   alpha and beta and the given kernel name and config key; returns the float32
+            #   output.
             return gemm_epilogue(
                 a,
                 b,
@@ -2135,6 +2449,9 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
 
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_swap_ab_captured_args_matches_non_swap(self):
+        # [FUNCTION DOC] SM100+ CUDA test: captured column, row and tile arguments with explicit
+        #   kinds must give identical results under swap_ab and non-swap configs (row and column
+        #   roles swap internally) and match the affine-ReLU eager reference.
         from torch._inductor.kernel.flex_gemm.runtime import gemm_epilogue
 
         m, n, k = 128, 384, 256
@@ -2146,6 +2463,9 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
         swap_key, non_swap_key = self.swapAndNonSwapConfigKeys(a.device)
 
         def run(name, config_key):
+            # [FUNCTION DOC] HELPER: runs gemm_epilogue with the captured affine epilogue,
+            #   explicit kinds col, row, tile, the given name and config key; returns the float32
+            #   output.
             return gemm_epilogue(
                 a,
                 b,
@@ -2174,6 +2494,9 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
 
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_swap_ab_scalar_captured_arg_matches_non_swap(self):
+        # [FUNCTION DOC] SM100+ CUDA test: like the swap_ab captured-args test but with an extra
+        #   scalar captured argument; swapped and non-swapped outputs must be exactly equal
+        #   (scalars do not depend on orientation) and match the eager reference. Seeds the RNG.
         from torch._inductor.kernel.flex_gemm.runtime import gemm_epilogue
 
         torch.manual_seed(11)
@@ -2187,6 +2510,9 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
         swap_key, non_swap_key = self.swapAndNonSwapConfigKeys(a.device)
 
         def run(name, config_key):
+            # [FUNCTION DOC] HELPER: runs gemm_epilogue with the affine-with-scalar epilogue,
+            #   explicit kinds col, row, tile, scalar, given name and config key; returns the
+            #   float32 output.
             return gemm_epilogue(
                 a,
                 b,
@@ -2218,6 +2544,10 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
 
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_swap_ab_captured_args_tuple_aux_matches_non_swap(self):
+        # [FUNCTION DOC] SM100+ CUDA test: captured arguments combined with a tuple-aux epilogue
+        #   and a runtime output plan with one aux output. Outputs and aux from the swap_ab and
+        #   non-swap configs must be equal and must match the captured tuple aux reference. Seeds
+        #   the RNG.
         from torch._inductor.kernel.flex_gemm.runtime import (
             FlexGemmRuntimeOutputPlan,
             gemm_epilogue,
@@ -2233,6 +2563,9 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
         swap_key, non_swap_key = self.swapAndNonSwapConfigKeys(a.device)
 
         def run(name, config_key):
+            # [FUNCTION DOC] HELPER: allocates fresh bf16 main and float32 aux outputs, runs
+            #   gemm_epilogue with the captured tuple aux epilogue (aux provided via the output
+            #   plan), explicit kinds and the config key; returns the main and aux tensors.
             out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
             aux = torch.empty(m, n, device="cuda", dtype=torch.float32)
             gemm_epilogue(
@@ -2263,6 +2596,9 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
 
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_epilogue_reads_captured_aux_tensors(self):
+        # [FUNCTION DOC] SM100+ CUDA test: default config run of the captured affine epilogue
+        #   with column, row and tile arguments given explicit kinds; float32 output must match
+        #   the eager and float64 references. Seeds the RNG.
         from torch._inductor.kernel.flex_gemm.runtime import gemm_epilogue
 
         torch.manual_seed(1)
@@ -2295,6 +2631,9 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
 
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_epilogue_writes_tuple_aux_out(self):
+        # [FUNCTION DOC] SM100+ CUDA test: runs the tuple-aux epilogue with a preallocated main
+        #   output and an aux output in the runtime output plan. Asserts the returned tensor is
+        #   the main output buffer and both main and aux match the references. Seeds the RNG.
         from torch._inductor.kernel.flex_gemm.runtime import (
             FlexGemmRuntimeOutputPlan,
             gemm_epilogue,
@@ -2308,6 +2647,9 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
         aux = torch.empty(m, n, device="cuda", dtype=torch.float32)
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: eager reference epilogue returning a main value (half of
+            #   accumulator plus one) and an aux value (accumulator squared plus two), both in
+            #   float32.
             main = (acc.float() + 1.0) * 0.5
             aux = acc.float().square() + 2.0
             return main, aux
@@ -2328,7 +2670,15 @@ class TestFlexGemmRuntime(FlexGemmTestCase):
 
 @instantiate_parametrized_tests
 class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
+    # [CLASS DOC] Tests flex_gemm at the higher-order-op level: eager and fake-tensor behavior
+    #   of the HOP, rejection of unsupported scopes at codegen, compiled runs on SM100,
+    #   local-reduce and output-contraction rejections, debug report output, and grouped-layout
+    #   planning. Redefines the shared generated-code check (identical logic).
     def assertFlexGemmGeneratedCode(self, code, *checks):
+        # [FUNCTION DOC] HELPER: redefinition of the base class generated-code check with
+        #   identical logic: runtime import, plan class, aliased gemm_epilogue and its call,
+        #   caller patterns, then stream and config_key present and tuned, epilogue_source and
+        #   quack imports absent.
         file_check = (
             FileCheck()
             .check("from torch._inductor.kernel.flex_gemm.runtime import (")
@@ -2345,6 +2695,10 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         file_check.check_not("from quack").check_not("import quack").run(code)
 
     def assertOutputContractionRejected(self, a, b, epilogue, error):
+        # [FUNCTION DOC] HELPER: resets dynamo, then compiles (inductor, full graph) a call of
+        #   flex_gemm on torch.mm with the given epilogue and the QUACK backend, and asserts
+        #   compilation raises InductorError whose message matches the error pattern. Arguments:
+        #   a, b, epilogue, error pattern.
         """Assert that an output contraction is rejected during compilation."""
         torch._dynamo.reset()
         with self.assertRaisesRegex(InductorError, error):
@@ -2360,6 +2714,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             )(a, b)
 
     def test_supported_op_names_match_dense_scope(self):
+        # [FUNCTION DOC] Asserts the exported supported-op-names string equals the slash-joined
+        #   list mm, addmm, bmm, baddbmm.
         self.assertEqual(_SUPPORTED_FLEX_GEMM_OP_NAMES, "mm/addmm/bmm/baddbmm")
 
     @parametrize(
@@ -2371,6 +2727,9 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda case: case[0],
     )
     def test_default_backend_eager_matches_reference(self, case):
+        # [FUNCTION DOC] Parametrized over mm and bmm: with the default (non-Quack) backend,
+        #   flex_gemm run eagerly on CPU tensors must return the ReLU of the matmul result. For
+        #   mm, the batch dimension is dropped from inputs.
         _, op, args_fn, ref_fn = case
         a = torch.randn(2, 8, 16)
         b = torch.randn(2, 16, 12)
@@ -2379,6 +2738,7 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             b = b[0]
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue applying ReLU to the accumulator.
             return acc.relu()
 
         actual = flex_gemm(op, args_fn(a, b), epilogue_fn)
@@ -2386,10 +2746,15 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         torch.testing.assert_close(actual, epilogue_fn(ref_fn(a, b)))
 
     def test_default_backend_eager_tuple_aux_matches_reference(self):
+        # [FUNCTION DOC] Eager default backend with a two-output epilogue (ReLU, accumulator
+        #   plus one): flex_gemm returns a pair equal to applying the epilogue to the plain
+        #   matmul.
         a = torch.randn(8, 16)
         b = torch.randn(16, 12)
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU of the accumulator and the
+            #   accumulator plus one.
             return acc.relu(), acc + 1
 
         actual, aux = flex_gemm(torch.mm, (a, b), epilogue_fn)
@@ -2399,6 +2764,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         torch.testing.assert_close(aux, expected_aux)
 
     def test_fake_tensor_mode_tuple_aux_returns_fake_tensors(self):
+        # [FUNCTION DOC] Under a FakeTensorMode, flex_gemm with a tuple epilogue returns two
+        #   fake tensors of shape 8 by 12, float32, both belonging to that fake mode.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         with FakeTensorMode() as mode:
@@ -2406,6 +2773,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             b = mode.from_tensor(torch.randn(16, 12))
 
             def epilogue_fn(acc):
+                # [FUNCTION DOC] HELPER: epilogue returning ReLU of the accumulator and the
+                #   accumulator plus one.
                 return acc.relu(), acc + 1
 
             actual, aux = flex_gemm(torch.mm, (a, b), epilogue_fn)
@@ -2418,10 +2787,14 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         self.assertIs(aux.fake_mode, mode)
 
     def test_autograd_is_not_implemented(self):
+        # [FUNCTION DOC] Calling backward on the sum of a flex_gemm eager result with
+        #   grad-requiring inputs must raise RuntimeError mentioning flex_gemm (autograd is not
+        #   implemented).
         a = torch.randn(8, 16, requires_grad=True)
         b = torch.randn(16, 12, requires_grad=True)
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue applying ReLU to the accumulator.
             return acc.relu()
 
         actual = flex_gemm(torch.mm, (a, b), epilogue_fn)
@@ -2431,7 +2804,12 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
 
     @skipIfNoCuteDSL
     def test_generated_captured_arg_rejects_unsupported_shape(self):
+        # [FUNCTION DOC] Compiling flex_gemm (QUACK) whose epilogue captures a 1-D scale of
+        #   length N must fail with an error saying captured tensor epilogue args must currently
+        #   match supported shapes.
         def fn(a, b, scale):
+            # [FUNCTION DOC] HELPER: compiled function calling flex_gemm on mm with an epilogue
+            #   multiplying the accumulator by the captured scale.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -2451,7 +2829,12 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
 
     @skipIfNoCuteDSL
     def test_generated_captured_arg_rejects_addmm_scope(self):
+        # [FUNCTION DOC] Compiling flex_gemm on addmm with a captured tensor read in the
+        #   epilogue must fail with a message that captured tensor reads currently support only
+        #   aten.mm.
         def fn(bias, a, b, scale):
+            # [FUNCTION DOC] HELPER: compiled function calling flex_gemm on addmm with an
+            #   epilogue multiplying the accumulator by the captured scale.
             return flex_gemm(
                 torch.addmm,
                 (bias, a, b),
@@ -2472,7 +2855,11 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
 
     @skipIfNoCuteDSL
     def test_generated_tuple_aux_rejects_unsupported_scope(self):
+        # [FUNCTION DOC] Compiling flex_gemm on addmm with a tuple-output epilogue must fail
+        #   with a message that support is currently only for aten.mm.
         def addmm_fn(bias, a, b):
+            # [FUNCTION DOC] HELPER: compiled function calling flex_gemm on addmm with an
+            #   epilogue returning ReLU and the accumulator plus one.
             return flex_gemm(
                 torch.addmm,
                 (bias, a, b),
@@ -2491,10 +2878,14 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_compiled_matches_reference(self):
+        # [FUNCTION DOC] SM100+ CUDA test: compiles flex_gemm (QUACK backend) with a
+        #   plus-one-then-ReLU epilogue on bf16 128 by 64 and 64 by 128 inputs and checks it
+        #   against low-precision eager and float64 references.
         a = torch.randn(128, 64, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue adding one to the accumulator and applying ReLU.
             return (acc + 1).relu()
 
         actual = torch.compile(flex_gemm, backend="inductor", fullgraph=True)(
@@ -2515,10 +2906,15 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_epilogue_alpha_clamp_compiled_matches_reference(self):
+        # [FUNCTION DOC] SM100+ CUDA test: compiled QUACK flex_gemm with an epilogue using an
+        #   add with alpha followed by clamp at zero; checked against eager and float64
+        #   references.
         a = torch.randn(128, 64, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue adding two scaled by alpha 0.25 to the accumulator
+            #   and clamping the minimum to zero.
             return torch.add(acc, 2.0, alpha=0.25).clamp(min=0.0)
 
         actual = torch.compile(flex_gemm, backend="inductor", fullgraph=True)(
@@ -2539,10 +2935,16 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_dynamic_shapes_compiled_matches_reference(self):
+        # [FUNCTION DOC] SM100+ CUDA test: compiles with dynamic shapes enabled and runs the
+        #   plus-one ReLU epilogue with M equal to 128 then 256, checking each result against
+        #   references.
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue adding one to the accumulator and applying ReLU.
             return (acc + 1).relu()
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the QUACK backend and the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -2566,10 +2968,17 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_swap_ab_dynamic_shapes_tuned_matches_reference(self):
+        # [FUNCTION DOC] SM100+ CUDA test: with tuning on and candidate configs patched to a
+        #   single swap_ab config, compiles with dynamic shapes and runs two (M, N) sizes,
+        #   checking results against references. Asserts that at least one swap_ab candidate
+        #   exists.
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue adding one to the accumulator and applying ReLU.
             return (acc + 1).relu()
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the QUACK backend, tuned on.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -2624,13 +3033,22 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda tuned: "tuned" if tuned else "untuned",
     )
     def test_mm_dynamic_shapes_reads_captured_tensor_epilogue_arg(self, case, tuned):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by captured arg layout (tile, row, col)
+        #   and tuned or untuned: compiles with dynamic shapes a flex_gemm whose epilogue
+        #   multiplies the float32 accumulator by a captured float32 tensor and applies ReLU,
+        #   running two shapes. When tuned, candidate configs are patched to the first two. Resets
+        #   dynamo; checks against references.
         torch._dynamo.reset()
         _, shape_fn = case
 
         def epilogue_fn(acc, scale):
+            # [FUNCTION DOC] HELPER: epilogue multiplying the float32 accumulator by the scale
+            #   and applying ReLU.
             return (acc.float() * scale).relu()
 
         def fn(a, b, scale):
+            # [FUNCTION DOC] HELPER: function under compilation, wrapping the epilogue with the
+            #   captured scale in a flex_gemm call on mm (QUACK, tuned per parameter).
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -2680,13 +3098,20 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda case: case[0],
     )
     def test_mm_reads_bool_mask_captured_tensor_epilogue_arg(self, case):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by mask layout (tile, row, col, scalar):
+        #   a captured boolean mask selects between the accumulator and its negation; the compiled
+        #   result must match eager and float64 references.
         _, shape_fn = case
 
         def epilogue_fn(acc, mask):
+            # [FUNCTION DOC] HELPER: epilogue returning the float32 accumulator where the mask
+            #   is true and its negation elsewhere.
             acc_float = acc.float()
             return torch.where(mask, acc_float, -acc_float)
 
         def fn(a, b, mask):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the mask-capturing epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -2712,11 +3137,19 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_preserves_integer_scalar_captured_tensor_epilogue_arg(self):
+        # [FUNCTION DOC] SM100+ CUDA test: a captured int64 scalar (value above the float32
+        #   integer precision limit, odd) must keep integer semantics: the epilogue tests its low
+        #   bit to choose the sign. Result matches references and generated code must show a
+        #   scalar argument kind.
         def epilogue_fn(acc, selector):
+            # [FUNCTION DOC] HELPER: epilogue choosing the accumulator or its negation by the
+            #   low bit of an integer selector.
             acc_float = acc.float()
             return torch.where(selector.bitwise_and(1).bool(), acc_float, -acc_float)
 
         def fn(a, b, selector):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the selector-capturing epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -2755,12 +3188,19 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda case: case[0],
     )
     def test_mm_promotes_low_precision_captured_tensor_epilogue_arg(self, case):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by scale layout (tile, row, col, scalar):
+        #   a captured bfloat16 scale is promoted against the float32 accumulator inside the
+        #   epilogue; the compiled result is compared with eager and float64 references.
         _, shape_fn = case
 
         def epilogue_fn(acc, scale):
+            # [FUNCTION DOC] HELPER: epilogue multiplying the captured scale by the float32
+            #   accumulator.
             return scale * acc.float()
 
         def fn(a, b, scale):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the scale-capturing epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -2791,13 +3231,22 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda tuned: "tuned" if tuned else "untuned",
     )
     def test_mm_scalar_captured_arg_fp8_quant_matches_reference(self, tuned):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by tuned or untuned: epilogue multiplies
+        #   by the absolute value of a captured 1 by 1 float32 scale and casts to float8 e4m3.
+        #   Output dtype must be that fp8 type, results match references, and generated code must
+        #   record a scalar epilogue argument kind. For the tuned case the first two candidate
+        #   configs are patched. Resets dynamo.
         torch._dynamo.reset()
         m, k, n = 128, 64, 128
 
         def epilogue_fn(acc, scale):
+            # [FUNCTION DOC] HELPER: epilogue multiplying the accumulator by the absolute value
+            #   of scale.
             return acc * scale.abs()
 
         def fn(a, b, scale):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the fp8-casting epilogue capturing the scale.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -2840,12 +3289,19 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_scalar_and_row_captured_args_matches_reference(self):
+        # [FUNCTION DOC] SM100+ CUDA test: captured scalar (1 by 1) and row (1 by N) float32
+        #   arguments in one epilogue, which multiplies and applies ReLU. Result matches
+        #   references and generated code must record the scalar-then-row argument kinds.
         m, k, n = 128, 64, 128
 
         def epilogue_fn(acc, scale, row_scale):
+            # [FUNCTION DOC] HELPER: epilogue multiplying the float32 accumulator by scale and
+            #   row scale and applying ReLU.
             return (acc.float() * scale * row_scale).relu()
 
         def fn(a, b, scale, row_scale):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the scale- and row-scale-capturing epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -2877,14 +3333,23 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_scalar_captured_arg_composes_with_compressed_local_reduce(self):
+        # [FUNCTION DOC] SM100+ CUDA test: epilogue scales the accumulator by a captured scalar
+        #   and also returns per-group (size 32) absolute maxima as a compressed local-reduce aux
+        #   output. Checks the main output against the low-precision reference, aux against
+        #   float64 within 1e-3, and that generated code has a scalar argument kind and a
+        #   compressed local-reduce plan for group 32.
         m, k, n = 128, 64, 128
         group = 32
 
         def epilogue_fn(acc, scale):
+            # [FUNCTION DOC] HELPER: epilogue returning the scaled float32 accumulator and the
+            #   absolute maximum over groups of 32 along the last dimension.
             x = acc.float().view(m, -1, group)
             return acc.float() * scale, x.abs().amax(-1)
 
         def fn(a, b, scale):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue capturing the scalar scale.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -2927,9 +3392,15 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda case: case[0],
     )
     def test_generated_tuple_aux_rejects_partial_reduction_without_contract(self, case):
+        # [FUNCTION DOC] Parametrized over partial reductions of the accumulator used as a
+        #   second output (sum or mean along either dim, full sum, logsumexp). Compiling flex_gemm
+        #   with QUACK must fail with an error mentioning the partial-output contract, since these
+        #   reductions are not local-reduce shapes.
         _, aux_fn = case
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with an
+            #   epilogue returning ReLU and the parametrized reduction of the accumulator.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -2945,7 +3416,11 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
 
     @skipIfNoCuteDSL
     def test_generated_tuple_aux_rejects_dbias_reduction_without_contract(self):
+        # [FUNCTION DOC] Compiling flex_gemm whose second output is a column sum (a
+        #   bias-gradient style reduction) must fail with a partial-output contract error.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with an
+            #   epilogue returning ReLU and a sum over dim 0.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -2961,8 +3436,14 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
 
     @skipIfNoCuteDSL
     def test_generated_local_reduce_aux_rejects_addmm_scope(self):
+        # [FUNCTION DOC] Compiling flex_gemm on addmm with a grouped-sum aux output must fail
+        #   with a message that such support is limited to aten.mm.
         def fn(bias, a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on addmm with
+            #   the grouped epilogue.
             def epilogue(acc):
+                # [FUNCTION DOC] HELPER: epilogue returning ReLU and the sum over groups of four
+                #   along the last dimension.
                 x = acc.float().view(4, -1, 4)
                 return acc.relu(), x.sum(-1)
 
@@ -2982,8 +3463,14 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
 
     @skipIfNoCuteDSL
     def test_generated_local_reduce_rejects_empty_dim_list(self):
+        # [FUNCTION DOC] An aten sum with an empty dimension list used as an aux output must be
+        #   rejected at compile time with an error about the innermost grouped dimension.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with an
+            #   epilogue built on a sum with an empty dim list.
             def epilogue(acc):
+                # [FUNCTION DOC] HELPER: epilogue returning ReLU and a sum with an empty
+                #   dimension list over a grouped view.
                 x = acc.float().view(4, -1, 4)
                 return acc.relu(), torch.ops.aten.sum.dim_IntList(x, [], False)
 
@@ -3002,8 +3489,14 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
 
     @skipIfNoCuteDSL
     def test_generated_local_reduce_feed_main_rejects_addmm_scope(self):
+        # [FUNCTION DOC] Compiling flex_gemm on addmm with a feed-main normalization by the sum
+        #   over axis-0 groups must fail with an aten.mm-only error.
         def fn(bias, a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on addmm with
+            #   the feed-main epilogue.
             def epilogue(acc):
+                # [FUNCTION DOC] HELPER: epilogue grouping the accumulator rows, dividing by the
+                #   group sum (via reciprocal), and reshaping back.
                 x = acc.float().view(-1, 4, 5)
                 scale = x.sum(1, keepdim=True)
                 return (x * scale.reciprocal()).view(4, 5)
@@ -3024,8 +3517,14 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
 
     @skipIfNoCuteDSL
     def test_generated_local_reduce_fragment_feed_main_rejects_addmm_scope(self):
+        # [FUNCTION DOC] Compiling flex_gemm on addmm with a fragment-level (axis-1) feed-main
+        #   normalization must fail with an aten.mm-only error.
         def fn(bias, a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on addmm with
+            #   the fragment feed-main epilogue.
             def epilogue(acc):
+                # [FUNCTION DOC] HELPER: epilogue grouping the last dimension in fours, scaling
+                #   by the reciprocal of the group sum, and reshaping back.
                 x = acc.float().view(4, -1, 4)
                 scale = x.sum(-1, keepdim=True)
                 return (x * scale.reciprocal()).view(4, 8)
@@ -3046,8 +3545,14 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
 
     @skipIfNoCuteDSL
     def test_generated_local_reduce_rejects_bmm_scope(self):
+        # [FUNCTION DOC] Compiling flex_gemm on bmm with a grouped-sum aux output must fail with
+        #   an aten.mm-only error.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on bmm with
+            #   the grouped epilogue.
             def epilogue(acc):
+                # [FUNCTION DOC] HELPER: epilogue returning ReLU and a grouped sum over a rank-4
+                #   view.
                 x = acc.float().view(2, 4, -1, 4)
                 return acc.relu(), x.sum(-1)
 
@@ -3102,9 +3607,16 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda case: case[0],
     )
     def test_generated_local_reduce_rejects_invalid_group(self, case):
+        # [FUNCTION DOC] Parametrized by case (name, epilogue, N, error pattern) with invalid
+        #   group shapes for a compressed local-reduce aux: non-innermost grouping, group sizes
+        #   not supported by the fragment width of 32 (7, 24 not dividing, 48 too large) and a
+        #   degenerate group of one. Compiling flex_gemm (QUACK) on CPU inputs must fail with an
+        #   error matching the case's pattern.
         _, epilogue, n, error = case
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the parametrized epilogue and the QUACK backend.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -3133,10 +3645,17 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda case: case[0],
     )
     def test_generated_local_reduce_rejects_explicit_reduction_dtype(self, case):
+        # [FUNCTION DOC] Parametrized over sum with a dtype keyword on the tensor method and on
+        #   the aten overload: a grouped sum aux with an explicit float64 reduction dtype must be
+        #   rejected at compile time with an error about explicit reduction dtype.
         _, reduce_fn = case
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with an
+            #   epilogue returning ReLU and the parametrized reduction of the grouped accumulator.
             def epilogue(acc):
+                # [FUNCTION DOC] HELPER: epilogue returning ReLU and the parametrized reduction
+                #   over groups of four.
                 x = acc.float().view(4, -1, 4)
                 return acc.relu(), reduce_fn(x)
 
@@ -3165,10 +3684,17 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda case: case[0],
     )
     def test_generated_local_reduce_rejects_non_value_reductions(self, case):
+        # [FUNCTION DOC] Parametrized over any, all, argmax, argmin as grouped aux outputs:
+        #   compiling must fail with an error stating the reduction does not map to a CuTe
+        #   TensorSSA reduction.
         _, reduce_fn = case
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with an
+            #   epilogue returning ReLU and the parametrized non-value reduction.
             def epilogue(acc):
+                # [FUNCTION DOC] HELPER: epilogue returning ReLU and the parametrized reduction
+                #   over groups of four.
                 x = acc.float().view(4, -1, 4)
                 return acc.relu(), reduce_fn(x)
 
@@ -3237,9 +3763,16 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     def test_generated_local_reduce_rejects_physical_result_feeding_pointwise(
         self, case
     ):
+        # [FUNCTION DOC] Parametrized by cases (name, epilogue, input shape, error pattern)
+        #   where a physical group reduction result (over rows, or over a wide group of 64 along
+        #   N) feeds further pointwise math in the main output or in a same-shape aux output.
+        #   Compiling must fail with the case's message, either about one generated physical
+        #   reduction or about post-reduction pointwise transforms.
         _, epilogue_fn, shape, error = case
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the parametrized epilogue and the QUACK backend.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -3289,9 +3822,14 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda case: case[0],
     )
     def test_generated_local_reduce_rejects_block_reductions(self, case):
+        # [FUNCTION DOC] Parametrized over block reductions (row-group sum then column-group
+        #   sum, the reverse order, and a direct two-dimension block sum) used as aux output.
+        #   Compiling must fail with an error mentioning the local-reduce output contract.
         _, epilogue_fn, shape, error = case
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the parametrized epilogue and the QUACK backend.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -3308,13 +3846,22 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
 
     @skipIfNoCuteDSL
     def test_generated_local_reduce_rejects_mixed_row_column_grouping(self):
+        # [FUNCTION DOC] Compiling an epilogue that normalizes by a group sum where the
+        #   accumulator is viewed with a row group of 4 and an inner width of 32 that does not
+        #   split N of 64 exactly must fail with an error saying the grouped reshape must split
+        #   exactly.
         m = 8
         n = 64
         group = 4
         bad_inner_n = 32
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             def epilogue(acc):
+                # [FUNCTION DOC] HELPER: epilogue grouping rows in fours with an inner width of
+                #   32, dividing by the group sum via reciprocal, and reshaping to the original
+                #   shape.
                 x = acc.float().view(-1, group, bad_inner_n)
                 scale = x.sum(1, keepdim=True)
                 return (x * scale.reciprocal()).view(m, n)
@@ -3333,6 +3880,15 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             torch.compile(fn, backend="inductor", fullgraph=True)(a, b)
 
     def test_flex_gemm_debug_report(self):
+        # [FUNCTION DOC] Builds an analysis of a traced body (ReLU main output plus a grouped
+        #   sum over groups of 32) and checks the debug formatters: the analysis report must
+        #   contain main output, no auxiliary, no output contraction, the grouped sum value,
+        #   dataflow, geometry (N axis, group 32), consumers, layout and config constraints
+        #   sections but not the verbose sections; the details report adds normalized nodes,
+        #   grouped layouts and local-reduce matches; the config-key formatter prints tile and
+        #   cluster values with auto for a missing tile_k. Also checks log_flex_gemm_artifact: at
+        #   INFO only the non-verbose artifact is emitted (one record with the lowering banner),
+        #   and at DEBUG the verbose details are emitted.
         from torch._inductor.kernel.flex_gemm.debug import (
             flex_gemm_log,
             format_flex_gemm_analysis,
@@ -3347,6 +3903,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         from torch.fx.experimental.proxy_tensor import make_fx
 
         def body(a, b):
+            # [FUNCTION DOC] HELPER: traced body running the matmul and returning ReLU of it
+            #   plus the sum over groups of 32 of its squares.
             acc = torch.mm(a, b)
             return torch.relu(acc), (acc * acc).view(4, -1, 32).sum(-1)
 
@@ -3404,6 +3962,10 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         self.assertIn(" ===== ANALYSIS DETAILS =====", records.output[0])
 
     def test_output_contraction_debug_report(self):
+        # [FUNCTION DOC] Analyzes a traced body that selects the two interleaved elements of
+        #   each N pair and subtracts them; the analysis report must show an N-axis, group 2,
+        #   interleaved output contraction, and the details report must list normalized select
+        #   nodes and non-empty output-contraction select indices.
         from torch._inductor.kernel.flex_gemm.debug import (
             format_flex_gemm_analysis,
             format_flex_gemm_analysis_details,
@@ -3415,6 +3977,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         from torch.fx.experimental.proxy_tensor import make_fx
 
         def body(a, b):
+            # [FUNCTION DOC] HELPER: traced body viewing the matmul result as pairs along N and
+            #   returning the difference of the two selected pair elements.
             grouped = torch.mm(a, b).view(4, 8, 2)
             return grouped.select(-1, 0) - grouped.select(-1, 1)
 
@@ -3436,9 +4000,18 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_emits_flex_gemm_debug_report(self):
+        # [FUNCTION DOC] SM100+ CUDA test: compiles a QUACK flex_gemm with ReLU while capturing
+        #   the flex_gemm logger at DEBUG. The result must equal eager ReLU; INFO records must
+        #   contain the problem, analysis, lowering plan and selection phases in that order, fixed
+        #   mode, one approved candidate, the template name and the log hint, with no ANSI
+        #   escapes, normalized nodes, generated epilogue or candidates; DEBUG records must
+        #   contain analysis details, generated epilogue (with cute.jit) and config candidates in
+        #   order.
         from torch._inductor.kernel.flex_gemm.debug import flex_gemm_log
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   ReLU as the epilogue and the QUACK backend.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -3496,6 +4069,9 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         self.assertIn("candidate 0:", verbose_report)
 
     def test_grouped_layout_rejects_inexact_inferred_preserved_dimension(self):
+        # [FUNCTION DOC] grouped_tensor_layout called with an inferred leading dimension and
+        #   group shape that cannot split the 4 by 5 tensor exactly must raise NotImplementedError
+        #   saying the grouped reshape must split exactly.
         from torch._inductor.kernel.gemm_epilogue_analysis import grouped_tensor_layout
 
         with self.assertRaisesRegex(
@@ -3505,6 +4081,9 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
 
     @parametrize("unbacked_dim", (1, 2))
     def test_grouped_layout_rejects_unbacked_structural_dimensions(self, unbacked_dim):
+        # [FUNCTION DOC] Parametrized by which of the two trailing dims is an unbacked symbolic
+        #   int: grouped_tensor_layout must return None (not a layout) when a structural dimension
+        #   is unbacked.
         from torch._inductor.kernel.gemm_epilogue_analysis import grouped_tensor_layout
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
@@ -3513,6 +4092,9 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         self.assertIsNone(grouped_tensor_layout(tuple(shape), (4, 8)))
 
     def test_grouped_layout_guards_backed_group_before_rejection(self):
+        # [FUNCTION DOC] With a backed symbolic group size of 3 that does not split the 4 by 8
+        #   tensor, grouped_tensor_layout returns None and exactly one guard is recorded on the
+        #   shape environment (the group is guarded before rejection).
         from torch._dynamo.source import ConstantSource
         from torch._inductor.kernel.gemm_epilogue_analysis import grouped_tensor_layout
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
@@ -3525,6 +4107,11 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         self.assertEqual(len(shape_env.guards), 1)
 
     def test_output_contraction_plan_only_mutates_analysis_on_match(self):
+        # [FUNCTION DOC] For two traced bodies with chunk-based halves (one swapping halves, one
+        #   a SiLU gate times up) and a symbolic split size, runs the epilogue analysis in
+        #   subtests. The swapped body must have no output contraction and register no split node
+        #   in the grouped tensors; the SiLU-gate body must detect a chunked group-2 contraction
+        #   and register all split nodes. Exactly one shape guard must be installed in each case.
         """Rejected recognitions must not leak grouped layouts."""
         from torch._dynamo.source import ConstantSource
         from torch._inductor.kernel.flex_gemm.constraints import (
@@ -3538,11 +4125,15 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
         def swap_halves_plus_acc(a, b):
+            # [FUNCTION DOC] HELPER: traced body splitting the matmul result into halves along
+            #   N, concatenating them swapped, and adding the original result.
             acc = torch.mm(a, b)
             halves = acc.chunk(2, dim=-1)
             return torch.cat((halves[1], halves[0]), dim=-1) + acc
 
         def silu_mul_halves(a, b):
+            # [FUNCTION DOC] HELPER: traced body splitting the matmul result into halves and
+            #   returning SiLU of the first multiplied by the second.
             acc = torch.mm(a, b)
             halves = acc.chunk(2, dim=-1)
             return torch.nn.functional.silu(halves[0]) * halves[1]
@@ -3585,6 +4176,9 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
                 self.assertEqual(len(shape_env.guards), 1)
 
     def test_incomplete_grouped_selects_are_rejected(self):
+        # [FUNCTION DOC] An epilogue concatenating four selects of a group of four where one
+        #   index is repeated must make analyze_flex_gemm_epilogue raise NotImplementedError
+        #   mentioning a complete output contraction.
         from torch._inductor.kernel.flex_gemm.fx_cutedsl_codegen import (
             analyze_flex_gemm_epilogue,
             gemm_node,
@@ -3592,6 +4186,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         from torch.fx.experimental.proxy_tensor import make_fx
 
         def duplicate_group_value(a, b):
+            # [FUNCTION DOC] HELPER: traced body concatenating selects of indices 0, 1, 2, 2 of
+            #   a 4-wide group of the matmul result (duplicate index, so incomplete).
             grouped = torch.mm(a, b).view(4, 4, 4)
             return torch.cat(
                 (
@@ -3613,6 +4209,10 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
 
     @parametrize("pointwise", (False, True))
     def test_accepted_grouped_reduction_installs_group_guard(self, pointwise):
+        # [FUNCTION DOC] Parametrized by whether a pointwise add precedes the reduction: traces
+        #   a normalization by a grouped sum, replaces the group size in the view with a backed
+        #   symbolic int, runs the analysis and asserts exactly one shape guard is installed on
+        #   the shape environment.
         from torch._dynamo.source import ConstantSource
         from torch._inductor.kernel.flex_gemm.fx_cutedsl_codegen import (
             analyze_flex_gemm_epilogue,
@@ -3622,6 +4222,9 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
         def grouped_reduction(a, b):
+            # [FUNCTION DOC] HELPER: traced body viewing the matmul result in groups of two,
+            #   optionally adding one, summing the last dim, dividing the grouped values by the
+            #   sum, and reshaping back.
             grouped = torch.mm(a, b).view(4, 8, 2)
             source = grouped + 1 if pointwise else grouped
             reduced = source.sum(-1, keepdim=True)
@@ -3646,6 +4249,9 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         self.assertEqual(len(shape_env.guards), 1)
 
     def test_output_contraction_does_not_contract_other_axes(self):
+        # [FUNCTION DOC] Two traced bodies that pair rows (via a row-axis view and selects) or
+        #   split along a middle axis must be analyzed without detecting an output contraction
+        #   (output_contraction is None), checked in subtests.
         from torch._inductor.kernel.flex_gemm.fx_cutedsl_codegen import (
             analyze_flex_gemm_epilogue,
             gemm_node,
@@ -3653,11 +4259,15 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         from torch.fx.experimental.proxy_tensor import make_fx
 
         def reassemble_row_pairs(a, b):
+            # [FUNCTION DOC] HELPER: traced body that views the result as row pairs and
+            #   concatenates the two selected rows along the first dimension.
             acc = torch.mm(a, b)
             rows = acc.view(2, 2, 16)
             return torch.cat((rows.select(1, 0), rows.select(1, 1)), dim=0)
 
         def split_grouped_view(a, b):
+            # [FUNCTION DOC] HELPER: traced body that splits a grouped view into chunks along
+            #   the middle axis, subtracts the first two, and repeats the result.
             acc = torch.mm(a, b)
             chunks = acc.view(4, 8, 2).split(1, dim=1)
             pair = (chunks[0] - chunks[1]).reshape(4, 2)
@@ -3673,9 +4283,17 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
 
     @skipIfNoCuteDSL
     def test_output_contraction_validates_output_layout_and_shape(self):
+        # [FUNCTION DOC] Calls the vendored Quack gemm_act on small CPU tensors with a
+        #   main-output transform group and checks host validation: a non-N-major post-activation
+        #   output raises NotImplementedError; a post-activation with the wrong width (for groups
+        #   2 and 4) raises RuntimeError about the required shape; and a physical N of 10 that is
+        #   not divisible by group 4 raises RuntimeError. Requires CuTe DSL.
         from torch._vendor.quack.gemm_act import gemm_act
 
         def run(b, out, group):
+            # [FUNCTION DOC] HELPER: calls gemm_act with a fixed 4 by 8 A, given B, given output
+            #   and given transform group, identity tensor epilogue, and tile and cluster sizes of
+            #   128, 128, 1, 1.
             gemm_act(
                 torch.empty(4, 8),
                 b,
@@ -3705,12 +4323,19 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_tuple_aux_dynamic_shapes_compiled_matches_reference(self):
+        # [FUNCTION DOC] SM100+ CUDA test: compiles with dynamic shapes a tuple epilogue (scaled
+        #   accumulator plus one, squared accumulator plus two) for two sets of (M, K, N), and
+        #   compares main and aux with the tuple-aux reference helper.
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning half of the accumulator plus one and the
+            #   accumulator squared plus two in float32.
             main = (acc.float() + 1.0) * 0.5
             aux = acc.float().square() + 2.0
             return main, aux
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the tuple epilogue and QUACK backend.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -3729,13 +4354,20 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_temporary_grouped_reshape_without_reduction(self):
+        # [FUNCTION DOC] SM100+ CUDA test: an epilogue that views N in groups of three, adds one
+        #   and views back (a temporary grouped reshape with no reduction) compiles and matches
+        #   the references for M 128, N 96, K 64.
         m, n, k, group = 128, 96, 64, 3
 
         def epilogue(acc):
+            # [FUNCTION DOC] HELPER: epilogue viewing the float32 accumulator as groups of
+            #   three, adding one, and reshaping to the original shape.
             grouped = acc.float().view(m, n // group, group)
             return (grouped + 1.0).view(m, n)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the grouped-reshape epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -3768,9 +4400,18 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         ),
     )
     def test_mm_output_contraction_compiled_matches_reference(self, operation, tuned):
+        # [FUNCTION DOC] SM100+ (not SM120) CUDA test parametrized by operation (SiLU-mul,
+        #   subtraction, uint8 subtraction, and a tuned SiLU-mul): pair-contracting epilogue
+        #   halves N (group 2) from float16 inputs. Compares the compiled output with the eager
+        #   flex_gemm result (exactly for uint8, loose tolerance otherwise), checks the output
+        #   shape is M by N and that generated code uses a group-2 output contraction with no
+        #   activation argument and no extern mm.
         m, k, n, group = 64, 64, 64, 2
 
         def epilogue(acc):
+            # [FUNCTION DOC] HELPER: epilogue viewing the accumulator as pairs along N, picking
+            #   gate and up elements (via select or indexing), and returning SiLU(gate) times up,
+            #   the difference, or the difference cast to uint8, depending on operation.
             grouped_values = acc.float().view(m, n, group)
             if operation == "sub":
                 gate, up = grouped_values.select(-1, 0), grouped_values.select(-1, 1)
@@ -3785,6 +4426,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
                     return (gate - up).to(torch.uint8)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the pair epilogue, QUACK backend, and the tuned option.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -3820,13 +4463,21 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     @unittest.skipIf(SM120OrLater, "output contractions are not supported on SM120")
     def test_mm_output_contraction_non_aligned_logical_n(self):
+        # [FUNCTION DOC] SM100+ (not SM120) CUDA test: output contraction where the logical N is
+        #   68 (not aligned to the tile); compiled result matches the eager pair difference with
+        #   loose tolerance, has shape M by N, and generated code has a group-2 contraction and no
+        #   extern mm.
         m, k, n = 64, 64, 68
 
         def epilogue(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning the difference of the two interleaved
+            #   halves of each pair, cast to the input dtype.
             grouped_values = acc.float().view(m, n, 2)
             return (grouped_values[..., 0] - grouped_values[..., 1]).to(acc.dtype)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the pair-difference epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -3860,10 +4511,19 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda case: case[0],
     )
     def test_mm_output_contraction_with_n_invariant_capture(self, case):
+        # [FUNCTION DOC] SM100+ (not SM120) CUDA test parametrized by capture case (scalar used
+        #   in an expression, column used before contraction, column used in an expression on the
+        #   chunked layout): output contraction combined with an N-invariant captured tensor.
+        #   Compares with eager and checks generated code records the expected arg kind and no
+        #   extern mm.
         _, capture_kind, capture_use, chunked = case
         m = k = n = 64
 
         def epilogue(acc, capture):
+            # [FUNCTION DOC] HELPER: epilogue optionally pre-multiplying the accumulator by the
+            #   capture, splitting into pair halves (chunked or interleaved), and returning the
+            #   difference optionally scaled by a capture expression, cast to the accumulator
+            #   dtype.
             value = acc.float()
             if capture_use == "pre":
                 value = value * capture
@@ -3880,6 +4540,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             return (lhs - rhs).to(acc.dtype)
 
         def fn(a, b, capture):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue capturing the tensor.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -3913,9 +4575,16 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         "interleaved group 4 is currently validated only on SM100",
     )
     def test_mm_output_contraction_group4(self):
+        # [FUNCTION DOC] SM100-only CUDA test (skipped otherwise): interleaved group-4 output
+        #   contraction combining a scalar scale and a column captured argument. Result matches
+        #   eager, has shape M by N, and generated code records the scalar and col arg kinds and
+        #   an interleaved group-4 contraction without extern mm.
         m, k, n, group = 64, 64, 64, 4
 
         def epilogue(acc, scale, col):
+            # [FUNCTION DOC] HELPER: epilogue combining the four elements of each group of four
+            #   with a scalar scale on the first difference, a column multiplier on the third and
+            #   subtracting the fourth, cast to the accumulator dtype.
             grouped_values = acc.float().view(m, n, group)
             return (
                 (grouped_values[..., 0] - grouped_values[..., 1]) * scale
@@ -3924,6 +4593,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             ).to(acc.dtype)
 
         def fn(a, b, scale, col):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the group-4 epilogue capturing scale and col.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -3953,9 +4624,16 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(SM120OrLater, "output contractions are not supported on SM120")
     @parametrize("chunked", (False, True))
     def test_mm_output_contraction_dynamic_m(self, chunked):
+        # [FUNCTION DOC] SM100+ (not SM120) CUDA test parametrized by chunked or interleaved
+        #   layout: pair contraction with SiLU gating and a column multiplier, run with M 64 (the
+        #   A and column inputs marked dynamic along M) and then M 128 on the same compiled
+        #   function; both outputs are compared with eager.
         k = n = 64
 
         def epilogue(acc, col):
+            # [FUNCTION DOC] HELPER: epilogue splitting into gate and up halves (chunked or
+            #   interleaved), returning SiLU(gate) times up times the column capture, cast to the
+            #   accumulator dtype.
             value = acc.float()
             if chunked:
                 gate, up = value.chunk(2, dim=-1)
@@ -3965,6 +4643,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             return (torch.nn.functional.silu(gate) * up * col).to(acc.dtype)
 
         def fn(a, b, col):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue capturing col.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -3991,10 +4671,16 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(SM120OrLater, "output contractions are not supported on SM120")
     @parametrize("chunked", (False, True))
     def test_mm_output_contraction_partial_n_tile(self, chunked):
+        # [FUNCTION DOC] SM100+ (not SM120) CUDA test parametrized by chunked or interleaved
+        #   layout: logical N of 80 with an explicit config of tile N 128 (a partial N tile),
+        #   contraction of pairs. Result matches eager with loose tolerance; generated code has a
+        #   group-2 contraction with the tile N key and no extern mm.
         m = k = 64
         n = 80
 
         def epilogue(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning the difference of the two halves of each
+            #   pair (chunked or interleaved), cast to the accumulator dtype.
             value = acc.float()
             if chunked:
                 lhs, rhs = value.chunk(2, dim=-1)
@@ -4004,6 +4690,9 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             return (lhs - rhs).to(acc.dtype)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the pair-difference epilogue and an explicit config with tile N 128, cluster N 1
+            #   and no swap.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -4033,14 +4722,24 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     @unittest.skipIf(SM120OrLater, "output contractions are not supported on SM120")
     def test_mm_output_contraction_concat_layout(self):
+        # [FUNCTION DOC] SM100+ (not SM120) CUDA test: concat-layout output contraction where
+        #   the accumulator is viewed as two halves along N and the last two slices are selected
+        #   (SiLU of one times the other) with a transposed B. Compiled result matches eager with
+        #   loose tolerance; generated code has a group-2 chunked contraction, no activation
+        #   argument and no extern mm.
         m, k, n = 64, 64, 64
 
         def epilogue(acc):
+            # [FUNCTION DOC] HELPER: epilogue viewing the accumulator as a pair of N-wide
+            #   halves, selecting them, and returning SiLU of one times the other, cast to the
+            #   accumulator dtype.
             grouped_values = acc.float().view(m, 2, n)
             gate, up = grouped_values.select(-2, -1), grouped_values.select(-2, -2)
             return (torch.nn.functional.silu(gate) * up).to(acc.dtype)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the concat-layout epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -4064,13 +4763,21 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     @unittest.skipIf(SM120OrLater, "output contractions are not supported on SM120")
     def test_mm_output_contraction_specializes_split_size(self):
+        # [FUNCTION DOC] SM100+ (not SM120) CUDA test: an epilogue splitting N by a static size
+        #   of 64 and subtracting the two pieces, with B's N dimension marked static. Compiled
+        #   output matches eager; generated code has a chunked group-2 contraction and no extern
+        #   mm.
         m = k = split_size = 64
 
         def epilogue(acc):
+            # [FUNCTION DOC] HELPER: epilogue splitting the accumulator along N into two halves
+            #   and returning their difference cast to the accumulator dtype.
             grouped_values = acc.float().split(split_size, dim=-1)
             return (grouped_values[0] - grouped_values[1]).to(acc.dtype)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the split-difference epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -4094,12 +4801,18 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     @unittest.skipIf(SM120OrLater, "output contractions are not supported on SM120")
     def test_mm_output_contraction_supports_clustered_m_configs(self):
+        # [FUNCTION DOC] SM100+ (not SM120) CUDA test: group-2 contraction with an explicit bf16
+        #   config using cluster M of 2 and tile M of 256 (tile N 256, SM100). Output matches
+        #   low-precision and float64 references; generated code records the col arg kind, the
+        #   contraction, and the tile M and cluster M keys.
         from torch._vendor.quack.gemm_config import GemmConfig
 
         m, k, n, group = 256, 64, 128, 2
         tile_m = 256
 
         def epilogue(acc, col):
+            # [FUNCTION DOC] HELPER: epilogue returning SiLU of the first pair element times the
+            #   second times the column capture, cast to the accumulator dtype.
             grouped_values = acc.float().view(m, n, group)
             return (
                 torch.nn.functional.silu(grouped_values[..., 0])
@@ -4119,6 +4832,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         )
 
         def fn(a, b, col):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the explicit config and the column-capturing epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -4148,6 +4863,11 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     @unittest.skipIf(SM120OrLater, "output contractions are not supported on SM120")
     def test_output_contraction_filters_unsafe_configs(self):
+        # [FUNCTION DOC] SM100+ (not SM120) CUDA test of config filtering for group-2 output
+        #   contraction: tuned config keys from flex_gemm_config_keys are non-empty and all
+        #   satisfy output_contraction_config_supported for N 128; and an explicit key for a
+        #   non-swap candidate that fails that check must raise NotImplementedError about
+        #   incompatibility with output contraction.
         from torch._inductor.heuristics.template.flex_gemm import (
             candidate_gemm_configs_for_device,
             gemm_config_from_key,
@@ -4197,10 +4917,17 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     @unittest.skipIf(SM120OrLater, "output contractions are not supported on SM120")
     def test_mm_output_contraction_rejects_unsupported_composition(self):
+        # [FUNCTION DOC] SM100+ (not SM120) CUDA test that unsupported output contraction
+        #   compositions are rejected at compile time (via the class helper) with matching
+        #   messages: a group of eight; an N-varying captured tensor; a boolean captured tensor;
+        #   chunked halves in a non-contiguous layout; dynamic physical N; and an auxiliary output
+        #   next to the contraction.
         m = k = n = 64
         a = torch.randn(m, k, device="cuda", dtype=torch.float16)
 
         def group_eight(acc):
+            # [FUNCTION DOC] HELPER: epilogue summing eight consecutive elements of each group
+            #   of eight along N.
             grouped_values = acc.view(m, n, 8)
             return sum(grouped_values[..., index] for index in range(8))
 
@@ -4214,6 +4941,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         scale = torch.randn(1, 2 * n, device="cuda", dtype=torch.float16)
 
         def n_varying_capture(acc):
+            # [FUNCTION DOC] HELPER: epilogue multiplying the accumulator by a captured row of
+            #   per-N scales, then taking the difference of the pair elements.
             grouped_values = (acc * scale).view(m, n, 2)
             return grouped_values[..., 0] - grouped_values[..., 1]
 
@@ -4225,6 +4954,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         boolean_scale = torch.ones(1, 1, device="cuda", dtype=torch.bool)
 
         def boolean_capture(acc):
+            # [FUNCTION DOC] HELPER: epilogue multiplying the accumulator by a captured boolean
+            #   scalar, then taking the difference of the pair elements.
             grouped_values = (acc * boolean_scale).view(m, n, 2)
             return grouped_values[..., 0] - grouped_values[..., 1]
 
@@ -4233,12 +4964,16 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         )
 
         def chunked(acc):
+            # [FUNCTION DOC] HELPER: epilogue splitting the accumulator into two halves along N
+            #   and returning their difference.
             gate, up = acc.chunk(2, dim=-1)
             return gate - up
 
         self.assertOutputContractionRejected(a, b, chunked, "non-contiguous")
 
         def dynamic_n(acc):
+            # [FUNCTION DOC] HELPER: epilogue viewing N with an inferred pair size and returning
+            #   the difference of the two pair elements.
             grouped_values = acc.view(m, -1, 2)
             return grouped_values[..., 0] - grouped_values[..., 1]
 
@@ -4249,6 +4984,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         )
 
         def auxiliary(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning the difference of pair elements together
+            #   with the raw accumulator as an extra output.
             grouped_values = acc.view(m, n, 2)
             return grouped_values[..., 0] - grouped_values[..., 1], acc
 
@@ -4259,9 +4996,16 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     @unittest.skipIf(SM120OrLater, "output contractions are not supported on SM120")
     def test_mm_chunked_output_contraction_rejects_grouped_reduction(self):
+        # [FUNCTION DOC] SM100+ (not SM120) CUDA test: an epilogue that normalizes by per-group
+        #   (32) absolute maxima and then contracts the chunked halves must fail to compile with
+        #   InductorError saying concat-layout output contractions do not compose with grouped
+        #   reductions.
         m, k, physical_n, group = 128, 64, 256, 32
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue normalizing the float32 accumulator by group-of-32
+            #   absolute maxima, splitting into halves and returning their difference cast to the
+            #   accumulator dtype.
             value = acc.float()
             grouped = value.view(m, -1, group)
             scale = grouped.abs().amax(-1, keepdim=True)
@@ -4270,6 +5014,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             return (gate - up).to(acc.dtype)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the normalization-then-chunk epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -4309,6 +5055,11 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda case: case[0],
     )
     def test_mm_tuple_aux_local_n_reduce_compiled_matches_reference(self, case):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by reduction (sum, mean, prod, amax, amin
+        #   as method or function): for N equal to 128 and then 96, compiles an epilogue returning
+        #   ReLU plus the reduction over groups of 16 along N as a compressed aux output. Checks
+        #   main and aux against references, that generated code contains the expected CuTe
+        #   reduction op, and the compressed local-reduce plan for group 16.
         _, reduce_fn, cute_op = case
         m = 128
         group = 16
@@ -4316,10 +5067,15 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         for n in (128, 96):
 
             def epilogue_fn(acc):
+                # [FUNCTION DOC] HELPER: epilogue returning ReLU of the accumulator and the
+                #   parametrized reduction over groups of 16 on the last axis of a grouped float32
+                #   view (closes over the loop variables and the reduction).
                 x = acc.float().view(m, -1, group)
                 return acc.relu(), reduce_fn(x)
 
             def fn(a, b):
+                # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm
+                #   with the reduction epilogue and QUACK backend.
                 return flex_gemm(
                     torch.mm,
                     (a, b),
@@ -4342,11 +5098,17 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     @parametrize("axis", (0, 1))
     def test_mm_tuple_aux_local_reduce_supports_explicit_group_count(self, axis):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by axis (0 or 1): epilogue returns ReLU
+        #   and a group sum with an explicit group count along rows (axis 0) or along N (axis 1),
+        #   group 16. Output matches references; generated code has a local-reduce plan with the
+        #   geometry and callbacks only for axis 0.
         m = 128
         n = 128
         group = 16
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the sum over groups of 16,
+            #   along N for axis 1 or along rows for axis 0, using the static shapes.
             match axis:
                 case 1:
                     x = acc.float().view(m, n // group, group)
@@ -4356,6 +5118,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
                     return acc.relu(), x.sum(1)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the grouped-sum epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -4377,7 +5141,14 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     @parametrize("axis", (0, 1))
     def test_mm_tuple_aux_local_reduce_dynamic_explicit_group_count(self, axis):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by axis: same grouped-sum aux as the
+        #   explicit group count test but with dynamic shapes, where group counts come from the
+        #   symbolic shape. Runs two shape sets (varying N for axis 0, varying M for axis 1) on
+        #   one compiled function and checks main and aux against references.
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue reading the accumulator shape at trace time and
+            #   returning ReLU plus the sum over groups of 16 along N (axis 1) or along rows (axis
+            #   0).
             m, n = acc.shape
             match axis:
                 case 1:
@@ -4388,6 +5159,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
                     return acc.relu(), x.sum(1)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the shape-reading epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -4424,16 +5197,25 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda case: case[0],
     )
     def test_mm_tuple_aux_local_m_reduce_compiled_matches_reference(self, case, group):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by group size (2, 16, 32) and reduction
+        #   (sum, mean, prod, amax, amin): axis-0 grouped reduction as aux output. Checks
+        #   references, that generated code contains a reduction-specific marker (combine
+        #   callback, divide by group, product, or max/min), and a local-reduce plan with axis 0
+        #   and callbacks.
         _, reduce_fn, code_check = case
         m = 128
         n = 128
         code_check = code_check.format(group=group)
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the parametrized reduction over
+            #   row groups of the float32 accumulator.
             x = acc.float().view(-1, group, n)
             return acc.relu(), reduce_fn(x)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the row-group reduction epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -4455,14 +5237,21 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_tuple_aux_supports_multiple_same_shape_outputs(self):
+        # [FUNCTION DOC] SM100+ CUDA test: epilogue returns three same-shape outputs (ReLU,
+        #   accumulator plus one, accumulator times two). Compiled results match eager and float64
+        #   references and generated code passes an aux output tuple.
         m = 128
         n = 128
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU of the accumulator and two float32
+            #   pointwise variants (plus one, times two).
             acc_f = acc.float()
             return acc.relu(), acc_f + 1, acc_f * 2
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the multi-output epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -4488,15 +5277,24 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_tuple_aux_combines_same_shape_and_compressed_local_reduce(self):
+        # [FUNCTION DOC] SM100+ CUDA test: outputs are the main ReLU, a compressed axis-0
+        #   group-sum aux (group 16) and a same-shape scaled aux. Checks each against references
+        #   (compressed aux with 1e-3 tolerance) and that generated code has aux outputs and the
+        #   axis-0 local-reduce plan with callbacks.
         m = 128
         n = 128
         group = 16
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU, the group sum over rows of the
+            #   grouped float32 view and the half-scaled grouped view reshaped to the original
+            #   shape.
             x = acc.float().view(-1, group, n)
             return acc.relu(), x.sum(1), (x * 0.5).view(m, n)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the three-output epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -4535,15 +5333,23 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_tuple_aux_physical_local_reduce_supports_finalize_expression(self):
+        # [FUNCTION DOC] SM100+ CUDA test: a physical (cross-warp) group-64 axis-0 maximum
+        #   followed by an add of one and a square root as the aux output. Verifies results and
+        #   that generated code reduces with a max, takes a square root, and routes through the
+        #   finalize callback.
         m = 128
         n = 128
         group = 64
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the square root of one plus the
+            #   absolute maximum over row groups of 64.
             x = acc.float().view(-1, group, n)
             return acc.relu(), (x.abs().amax(1) + 1.0).sqrt()
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the finalize-expression epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -4570,11 +5376,17 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     def test_mm_tuple_aux_physical_local_reduce_supports_wrapped_finalize(
         self, wrapper
     ):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by wrapper (squeeze or view): a group-64
+        #   sum over N, reshaped via the wrapper to the compressed shape and incremented by one,
+        #   is accepted as a physical local reduction with finalize. Checks references and that
+        #   combine and finalize callbacks appear in the generated code.
         m = 128
         n = 128
         group = 64
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the keepdim group sum over N
+            #   (groups of 64) squeezed or viewed to the compressed shape, plus one.
             x = acc.float().view(m, -1, group)
             reduced = x.sum(-1, keepdim=True)
             reduced = (
@@ -4585,6 +5397,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             return acc.relu(), reduced + 1.0
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the wrapped-finalize epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -4608,15 +5422,22 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_tuple_aux_rejects_composite_physical_local_reductions(self):
+        # [FUNCTION DOC] SM100+ CUDA test: an aux output built by adding a sum and an amax over
+        #   the same row groups of 64 (two reductions combined) must fail to compile with an error
+        #   saying only a single physical local reduction is supported.
         m = 128
         n = 128
         group = 64
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the sum plus the maximum over
+            #   row groups of 64.
             x = acc.float().view(-1, group, n)
             return acc.relu(), x.sum(1) + x.amax(1)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the composite-reduction epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -4630,6 +5451,13 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             torch.compile(fn, backend="inductor", fullgraph=True)(a, b)
 
     def test_nvfp4_pack_matches_reference(self):
+        # [FUNCTION DOC] CPU test of nvfp4_pack: builds float32 inputs at and around every FP4
+        #   E2M1 rounding boundary (just below, at, just above, both signs), special values
+        #   (extremes, tiny, signed zeros, infinities) and 4096 seeded random values, shaped as
+        #   pairs along the last dim, plus a non-contiguous permuted view. For each, the packed
+        #   result must be a contiguous float4 e2m1 pair dtype whose bytes equal the reference
+        #   conversion via the test quantization helpers; under a fake tensor mode, the result
+        #   must have the same dtype, shape and strides.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         boundaries = torch.tensor(
@@ -4674,6 +5502,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
                 self.assertEqual(fake.stride(), actual.stride())
 
     def test_quant_scale_fake_strides_match_eager(self):
+        # [FUNCTION DOC] Checks mx_e8m0_scale on a fake tensor created from an expanded (stride
+        #   zero) amax tensor yields the same output strides as the eager call on the real tensor.
         from torch._subclasses.fake_tensor import FakeTensorMode
 
         amax = torch.rand(2, 1).expand(2, 4)
@@ -4684,6 +5514,12 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
 
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     def test_quant_scale_rounding_args(self):
+        # [FUNCTION DOC] CUDA test of mx_e8m0_scale eager results on a fixed amax vector (zero,
+        #   448 and neighbours, 512, infinity, NaN): floor and rceil rounding give the listed byte
+        #   codes, and the default equals rceil. Also checks rceil on special float bit patterns
+        #   scaled by 448 (denormals, powers of two, max finite, infinity, NaN), floor and rceil
+        #   for maximum values of 6 and 57344 (exact boundary versus next float), and that an
+        #   unknown rounding mode or a pack value of 4 raises ValueError.
         amax = torch.tensor(
             [0.0, 448.0, 449.0, 500.0, 511.0, 512.0, float("inf"), float("nan")],
             device="cuda",
@@ -4784,6 +5620,12 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda c: f"{c[0]}_max{c[1]:g}_code{c[3]}".replace(".", "_"),
     )
     def test_mm_tuple_aux_mx_scale_rounding(self, case):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by (rounding, max_value, injected value,
+        #   expected byte code): the epilogue adds a constant to a zero accumulator, takes
+        #   group-of-32 absolute maxima and encodes them with mx_e8m0_scale as a compressed aux
+        #   output. All aux bytes must equal the expected code; generated code must contain the
+        #   matching PTX conversion instruction (round-to-zero for floor, round-up saturating for
+        #   rceil) with no finalize callback and the group-32 local-reduce plan.
         rounding, max_value, value, expected_code = case
         code_check = (
             "cvt.rz.ue8m0x2.f32"
@@ -4796,12 +5638,16 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         group = 32
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning the accumulator and the E8M0 scale of
+            #   the per-group (32) absolute maxima of the accumulator plus the injected constant.
             x = (acc.float() + value).view(m, -1, group)
             return acc, mx_e8m0_scale(
                 x.abs().amax(-1), max_value=max_value, rounding=rounding
             )
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the scale epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -4826,9 +5672,16 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_inline_asm_uses_compact_reduction(self):
+        # [FUNCTION DOC] SM100+ CUDA test: an inline asm elementwise op (float to unsigned
+        #   conversion) applied to a group-of-32 maximum must be lowered as an inline-asm
+        #   intrinsic on the compact reduced value rather than via a finalize callback. Inputs are
+        #   all ones; the aux must equal the group maximum cast to uint8 and then float; the main
+        #   output equals the matmul.
         m, n, k, group = 64, 96, 64, 32
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning the accumulator and the float version of
+            #   an inline-asm conversion of the per-group maximum.
             reduced = acc.float().view(m, -1, group).amax(-1)
             code = inline_asm_elementwise(
                 reduced,
@@ -4839,6 +5692,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             return acc, code.float()
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the inline-asm epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -4867,10 +5722,18 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_inline_asm_pack2_broadcasts_and_repeats_scalar(self):
+        # [FUNCTION DOC] SM100+ CUDA test: a pack-2 inline asm op takes row, column and scalar
+        #   captured tensors plus the accumulator and sums them per lane; with zero A and B, the
+        #   output must equal row plus col plus scalar (broadcasts and scalar repeated across the
+        #   packed pair). Generated code must show pack equal to 2.
         m = k = n = 64
 
         def fn(a, b, row, col, scalar):
+            # [FUNCTION DOC] HELPER: function under compilation, defining a pack-2 inline-asm
+            #   epilogue over row, col, scalar and accumulator and calling flex_gemm on mm.
             def epilogue_fn(acc):
+                # [FUNCTION DOC] HELPER: epilogue applying a pack-2 inline asm that adds the
+                #   three captured values to the accumulator for each of the two packed lanes.
                 return inline_asm_elementwise(
                     row,
                     col,
@@ -4919,11 +5782,19 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda case: str(case[0]).removeprefix("torch."),
     )
     def test_mm_inline_asm_pack2_restores_16bit_inputs(self, case):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by 16-bit dtype (float16 or bfloat16):
+        #   pack-2 inline asm moves 16-bit captured inputs (a row and a constant scalar) through
+        #   unchanged; output must equal the row broadcast over M, and generated code must convert
+        #   to the matching CuTe 16-bit type and use pack 2.
         dtype, cute_type = case
         m = k = n = 64
 
         def fn(a, b, row):
+            # [FUNCTION DOC] HELPER: function under compilation, defining the 16-bit pack-2
+            #   inline-asm epilogue and calling flex_gemm on mm.
             def epilogue_fn(acc):
+                # [FUNCTION DOC] HELPER: epilogue creating a constant 16-bit scalar and applying
+                #   a pack-2 inline asm that copies the row values to the output lanes.
                 scalar = torch.full((), 0.5, device="cuda", dtype=dtype)
                 return inline_asm_elementwise(
                     row,
@@ -4965,10 +5836,18 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda case: case[0],
     )
     def test_mm_inline_asm_rejects_invalid_pack_contract(self, case):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by invalid inline-asm pack contracts
+        #   (pack zero, wrong output constraint count, wrong input constraint count): compiling
+        #   must raise ValueError or InductorError whose message matches the case (pack must be at
+        #   least one, or the required number of output or input constraints).
         _, pack, constraints, error = case
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, defining an inline-asm epilogue
+            #   with the parametrized pack and constraints and calling flex_gemm on mm.
             def epilogue_fn(acc):
+                # [FUNCTION DOC] HELPER: epilogue applying a simple inline-asm move with the
+                #   parametrized pack and constraint string.
                 return inline_asm_elementwise(
                     acc.float(),
                     asm_str="mov.f32 $0, $1;",
@@ -5001,6 +5880,11 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda case: case[0],
     )
     def test_mm_tuple_aux_large_n_local_reduce_supports_scale_finalizer(self, case):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by scale function (MX E8M0 or NVFP4
+        #   E4M3): a physical group-64 absolute maximum along N is converted to a scale and
+        #   returned as compressed aux. With all-ones inputs main and aux equal the eager
+        #   epilogue; generated code must contain the expected conversion marker, a finalize
+        #   callback, and the callback local-reduce plan for group 64.
         _, scale_fn, code_check = case
         m = 64
         n = 128
@@ -5008,10 +5892,14 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         group = 64
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the parametrized scale function
+            #   applied to the group-of-64 absolute maxima along N.
             x = acc.float().view(m, -1, group)
             return acc.relu(), scale_fn(x.abs().amax(-1))
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the scale epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -5040,14 +5928,23 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda case: f"group{case[0]}_n{case[1]}",
     )
     def test_mm_tuple_aux_mx_scale_pack2(self, case):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by (group, N) of (16, 128) and (32, 96):
+        #   MX scale with pack 2 over group maxima, where B contains infinity and NaN column
+        #   blocks. Non-NaN main values and all scale bytes must match eager; scale bytes 0, 254
+        #   and 255 must each occur; generated code must show pack 2 and a broadcast, no finalize
+        #   callback, and the group local-reduce plan.
         group, n = case
         m = k = 16
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the pack-2 MX scale of group
+            #   absolute maxima.
             x = acc.float().view(m, -1, group)
             return acc.relu(), mx_e8m0_scale(x.abs().amax(-1), pack=2)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the pack-2 scale epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -5078,15 +5975,22 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_tuple_aux_physical_mx_scale_preserves_nan(self):
+        # [FUNCTION DOC] SM100+ CUDA test: physical group-64 MX scale where one B element is
+        #   NaN; scale bytes must equal the eager ones, include both the zero code and the NaN
+        #   code 255, and generated code uses a finalize callback with the callback plan.
         m = k = 16
         n = 128
         group = 64
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the MX scale of group-of-64
+            #   absolute maxima.
             x = acc.float().view(m, -1, group)
             return acc.relu(), mx_e8m0_scale(x.abs().amax(-1))
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the MX scale epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -5112,16 +6016,24 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_tuple_aux_physical_mx_scale_zero_preserves_min_value(self):
+        # [FUNCTION DOC] SM100+ CUDA test: with zero B, the physical MX scale of a zero maximum
+        #   is converted to float, doubled, and returned; every aux element must equal the doubled
+        #   smallest scale value (a power of two at minus 126 exponent) and match eager exactly.
+        #   Generated code uses a finalize callback.
         m = 16
         n = 128
         k = 16
         group = 64
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning the accumulator and twice the float
+            #   version of the MX scale of group maxima.
             x = acc.float().view(m, -1, group)
             return acc, mx_e8m0_scale(x.abs().amax(-1)).float() * 2
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the doubled-scale epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -5145,16 +6057,23 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_tuple_aux_physical_nvfp4_scale_rounds_before_pointwise(self):
+        # [FUNCTION DOC] SM100+ CUDA test: the NVFP4 E4M3 scale of group maxima is rounded to
+        #   float8 before being doubled in float; the aux must equal the eager value exactly and
+        #   generated code must show the float8 e4m3 conversion followed by the finalize callback.
         m = 16
         n = 128
         k = 64
         group = 64
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning the accumulator and twice the float
+            #   version of the E4M3 scale of group-of-64 maxima.
             x = acc.float().view(m, -1, group)
             return acc, nvfp4_e4m3_scale(x.abs().amax(-1)).float() * 2
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the E4M3 scale epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -5180,16 +6099,24 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     @parametrize("reduction", ("amax", "amin"))
     def test_mm_tuple_aux_physical_extrema_preserve_nan(self, reduction):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by amax or amin: a group-of-64 extremum
+        #   with a NaN input must propagate NaN to the first group only (second group stays zero).
+        #   Compares with eager allowing NaN equality, checks the generated code uses the matching
+        #   CuTe extremum helper and a finalize callback.
         m = 16
         n = 128
         k = 16
         group = 64
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning the accumulator and the parametrized
+            #   extremum over group-of-64 views.
             x = acc.float().view(m, -1, group)
             return acc, getattr(x, reduction)(-1)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the extremum epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -5218,9 +6145,15 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     @parametrize("case", ("clamp", "clamp_min", "clamp_max"))
     def test_mm_epilogue_clamp_preserves_nan(self, case):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by clamp, clamp_min and clamp_max: the
+        #   epilogue adds NaN to the accumulator and clamps; all results must be NaN (clamp must
+        #   propagate NaN). Generated code must use the matching math max and min helpers and must
+        #   not contain an inequality comparison.
         m = n = k = 16
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue adding NaN to the float32 accumulator and applying
+            #   the parametrized clamp.
             x = acc.float() + float("nan")
             match case:
                 case "clamp":
@@ -5231,6 +6164,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
                     return x.clamp_max(1.0)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the clamp epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -5259,12 +6194,20 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_fragment_group_mx_quant_feed_uses_tensorSSA(self):
+        # [FUNCTION DOC] SM100+ CUDA test: MX quantization feed where the per-group (32 along N)
+        #   scale is computed from the keepdim maximum and the grouped values are multiplied by
+        #   the scale reciprocal, cast to float8 e4m3, with the squeezed scale as aux. With one
+        #   NaN in B the float8 output (NaN equal) and scale bytes must match eager; scale bytes
+        #   include 0 and 255; generated code uses the PTX conversion and no finalize callback and
+        #   the group-32 plan.
         m = 64
         n = 128
         k = 64
         group = 32
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue computing MX scale of group maxima, returning the
+            #   float8 e4m3 scaled grouped values reshaped to M by N, and the squeezed scale.
             x = acc.float().view(m, -1, group)
             scale = mx_e8m0_scale(x.abs().amax(-1, keepdim=True))
             return (
@@ -5273,6 +6216,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             )
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the quantization epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -5317,16 +6262,24 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda case: case[0],
     )
     def test_mm_tuple_aux_local_m_reduce_supports_cta_group(self, case, group):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by group (64 or 128) and reduction (sum,
+        #   mean, amax): axis-0 grouped reduction across CTA tiles as aux output. Checks
+        #   references and that generated code has the reduction marker and the axis-0 plan with
+        #   callbacks.
         _, reduce_fn, code_check = case
         m = 128
         n = 128
         code_check = code_check.format(group=group)
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the parametrized reduction over
+            #   row groups.
             x = acc.float().view(-1, group, n)
             return acc.relu(), reduce_fn(x)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the row-group reduction epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -5348,15 +6301,21 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_tuple_aux_local_m_reduce_tuned_matches_reference(self):
+        # [FUNCTION DOC] SM100+ CUDA test: row-group (16) sum aux output with the tuned option
+        #   on, so the candidate configs are auto-selected; main and aux are compared with
+        #   references.
         m = 128
         n = 128
         group = 16
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the sum over row groups of 16.
             x = acc.float().view(-1, group, n)
             return acc.relu(), x.sum(1)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue and tuned on.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -5374,16 +6333,23 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_tuple_aux_local_m_reduce_tuned_internal_transpose(self):
+        # [FUNCTION DOC] SM100+ CUDA test: tuned flex_gemm with B passed as a transposed view
+        #   and a row-group (16) sum aux. Picks the first two candidate configs valid for axis-0
+        #   group 16 local reduce, patches the candidate list to them (asserts two exist),
+        #   compiles, and compares with references computed on the transposed B.
         m = 128
         n = 192
         k = 64
         group = 16
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the sum over row groups of 16.
             x = acc.float().view(-1, group, n)
             return acc.relu(), x.sum(1)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the transposed B argument and tuned on.
             return flex_gemm(
                 torch.mm,
                 (a, b.mT),
@@ -5421,15 +6387,20 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_tuple_aux_local_m_reduce_supports_tail_m(self):
+        # [FUNCTION DOC] SM100+ CUDA test: row-group (16) sum aux with M equal to 96, which
+        #   leaves a partial last tile along M; output and aux match references.
         m = 96
         n = 128
         group = 16
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the sum over row groups of 16.
             x = acc.float().view(-1, group, n)
             return acc.relu(), x.sum(1)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -5449,15 +6420,22 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_tuple_aux_local_m_reduce_rejects_var_reduction(self):
+        # [FUNCTION DOC] SM100+ CUDA test: a row-group variance aux output (correction zero)
+        #   must fail to compile with an error stating it does not map to a CuTe TensorSSA
+        #   reduction.
         m = 128
         n = 128
         group = 16
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the variance over row groups of
+            #   16.
             x = acc.float().view(-1, group, n)
             return acc.relu(), x.var(1, correction=0)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the variance epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -5475,14 +6453,21 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     @parametrize("group", (2, 32))
     def test_mm_tuple_aux_local_reduce_supports_group_extremes(self, group):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by group size 2 or 32: sum over N groups
+        #   as aux. Checks references, that generated code contains the CuTe add reduction, and
+        #   the compressed local-reduce plan.
         m = 128
         n = 128
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the sum over N groups of the
+            #   parametrized size.
             x = acc.float().view(m, -1, group)
             return acc.relu(), x.sum(-1)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the grouped-sum epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -5504,15 +6489,22 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_tuple_aux_local_reduce_supports_tuple_shape_reshape(self):
+        # [FUNCTION DOC] SM100+ CUDA test: the grouped view is requested with a reshape taking a
+        #   tuple shape instead of positional dimensions; analysis must still recognize the
+        #   group-16 sum. Checks references and the compressed plan.
         m = 128
         n = 128
         group = 16
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue reshaping to a tuple shape of groups of 16 and
+            #   returning ReLU plus the sum over the last axis.
             x = acc.float().reshape((m, -1, group))
             return acc.relu(), x.sum(-1)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -5543,14 +6535,22 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda case: case[0],
     )
     def test_mm_tuple_aux_local_n_reduce_supports_cta_subtile_group(self, case):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by (name, N, group, reduction, marker)
+        #   for groups of 64 or 128 along N that span CTA subtiles (sum, mean, amax). Checks
+        #   references, that the generated code contains the marker, includes callbacks in the
+        #   plan, and does not mention a local_reduce_strategy.
         _, n, group, reduce_fn, code_check = case
         m = 128
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the parametrized reduction over
+            #   N groups.
             x = acc.float().view(m, -1, group)
             return acc.relu(), reduce_fn(x)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the reduction epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -5573,15 +6573,21 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_tuple_aux_local_n_reduce_cta_subtile_group_tuned(self):
+        # [FUNCTION DOC] SM100+ CUDA test: group-128 sum along N with tuned on, N equal to 256.
+        #   Main output and aux match references, generated code has the callback plan, and a
+        #   tuned cluster N of one appears in the config keys.
         m = 128
         n = 256
         group = 128
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the sum over N groups of 128.
             x = acc.float().view(m, -1, group)
             return acc.relu(), x.sum(-1)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue and tuned on.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -5646,16 +6652,25 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda case: case[0],
     )
     def test_mm_tuple_aux_local_reduce_supports_chained_grouped_expressions(self, case):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by chained grouped expressions with group
+        #   4: variance-like (mean of squared deviations), a keepdim sum then squeeze, a
+        #   numerically stable logsumexp built from exp, sum, log and max, and the logsumexp
+        #   method. Checks references and that generated code contains the add reduction (and max
+        #   reduction for logsumexp) plus the expected marker, and the compressed plan.
         _, aux_fn, generated_check, checks_max = case
         m = 128
         n = 96
         group = 4
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the parametrized chained
+            #   expression over groups of four along N.
             x = acc.float().view(m, -1, group)
             return acc.relu(), aux_fn(x)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the chained-expression epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -5681,6 +6696,10 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_local_n_reduce_group32_filters_half_fragment_configs(self):
+        # [FUNCTION DOC] SM100+ CUDA test of config validation: among candidate configs with
+        #   tile M 128, tile N in 128, 160 or 224 and cluster M above one that accept group 16
+        #   along N, none may accept group 32 (their per-thread fragment covers only half a
+        #   group). Asserts such configs exist.
         from torch._inductor.heuristics.template.flex_gemm import (
             candidate_gemm_configs_for_device,
         )
@@ -5709,16 +6728,25 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_local_reduce_result_feeds_main_output(self):
+        # [FUNCTION DOC] SM100+ CUDA test: epilogue multiplies grouped values by the group sum
+        #   plus one along N (group 16) so the reduction feeds the main output as a fragment-local
+        #   TensorSSA computation. Result matches references; generated code has no feeds-main
+        #   plan flag, no combine callback and no separate reduction output, but uses the add
+        #   reduction.
         m = 128
         n = 128
         group = 16
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning the grouped float32 values multiplied by
+            #   the group sum plus one, reshaped to M by N.
             x = acc.float().view(m, -1, group)
             scale = x.sum(-1, keepdim=True) + 1.0
             return (x * scale).view(m, n)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the feed-main epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -5750,15 +6778,24 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     @parametrize("group", (2, 4, 8, 16, 32))
     def test_mm_local_m_reduce_result_feeds_main_output(self, group):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by row group size 2, 4, 8, 16, 32:
+        #   epilogue scales grouped values by the reciprocal of the row-group sum, so the
+        #   reduction result feeds the main output. Inputs are uniform random bf16. Output must
+        #   match references, and generated code must use the physical feed-main plan for that
+        #   group.
         m = 128
         n = 64
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue grouping rows, multiplying values by the
+            #   reciprocal of the row-group sum, and reshaping back to M by N.
             x = acc.float().view(-1, group, n)
             scale = x.sum(1, keepdim=True)
             return (x * scale.reciprocal()).view(m, n)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the feed-main epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -5786,16 +6823,25 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_local_m_reduce_feeds_main_and_returns_scale(self):
+        # [FUNCTION DOC] SM100+ CUDA test: row-group (8) sum scales the main output by its
+        #   reciprocal and is also returned as a squeezed scale aux. Checks both against
+        #   references (aux within 1e-3) and that generated code has a runtime local-reduce plan
+        #   with axis 0 geometry, an output, the feeds-main flag and callbacks, without legacy
+        #   arguments.
         m = 128
         n = 64
         group = 8
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning the grouped values times the reciprocal
+            #   of the row-group sum, reshaped to M by N, and the squeezed row-group sum.
             x = acc.float().view(-1, group, n)
             scale = x.sum(1, keepdim=True)
             return (x * scale.reciprocal()).view(m, n), scale.squeeze(1)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -5835,16 +6881,23 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_local_m_reduce_result_divides_main_output(self):
+        # [FUNCTION DOC] SM100+ CUDA test: main output is the grouped values divided by the
+        #   row-group (8) sum plus one. Matches references and generated code passes the physical
+        #   feed-main check.
         m = 128
         n = 64
         group = 8
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue dividing grouped values by the row-group sum plus
+            #   one and reshaping to M by N.
             x = acc.float().view(-1, group, n)
             scale = x.sum(1, keepdim=True) + 1.0
             return (x / scale).view(m, n)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -5873,11 +6926,17 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     @parametrize("consumer", ("main", "aux"))
     def test_mm_local_m_reduce_feed_main_supports_reversed_division(self, consumer):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by consumer (main or aux): the reduction
+        #   sum plus one divided by the grouped values (reversed division) feeds either the main
+        #   output or an aux next to ReLU. Matches references and the physical feed-main code
+        #   check passes.
         m = 128
         n = 64
         group = 8
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue computing the row-group sum plus one divided by
+            #   the grouped values; returns it alone or paired with ReLU depending on consumer.
             x = acc.float().view(-1, group, n)
             scale = x.sum(1, keepdim=True) + 1.0
             transformed = (scale / x).view(m, n)
@@ -5886,6 +6945,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             return acc.relu(), transformed
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -5912,11 +6973,16 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     @parametrize("consumer", ("main", "aux"))
     def test_mm_local_m_reduce_feed_main_supports_post_scale_pointwise(self, consumer):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by consumer (main or aux): the feed-main
+        #   value is divided by the row-group sum plus one and then shifted by 0.5 (pointwise work
+        #   after the scaling). Matches references and the physical feed-main code check passes.
         m = 128
         n = 64
         group = 8
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue dividing grouped values by the row-group sum plus
+            #   one, adding 0.5, and returning it alone or paired with ReLU depending on consumer.
             x = acc.float().view(-1, group, n)
             scale = x.sum(1, keepdim=True) + 1.0
             normalized = (x / scale + 0.5).view(m, n)
@@ -5925,6 +6991,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             return acc.relu(), normalized
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -5951,11 +7019,17 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     @parametrize("consumer", ("main", "aux"))
     def test_mm_local_m_reduce_feed_main_supports_centered_mean(self, consumer):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by consumer (main or aux): grouped values
+        #   minus the row-group mean plus 0.5 (centering) as the feed-main value. Matches
+        #   references and the physical feed-main code check passes.
         m = 128
         n = 64
         group = 8
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue subtracting the row-group mean from grouped
+            #   values, adding 0.5, and returning it alone or paired with ReLU depending on
+            #   consumer.
             x = acc.float().view(-1, group, n)
             mean = x.mean(1, keepdim=True)
             centered = (x - mean + 0.5).view(m, n)
@@ -5964,6 +7038,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             return acc.relu(), centered
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6003,11 +7079,19 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     )
     @parametrize("consumer", ("main", "aux"))
     def test_mm_local_m_reduce_feed_main_supports_reversed_add_sub(self, op, consumer):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by eight add/sub spellings (operator,
+        #   tensor method with and without alpha, torch function with alpha) and consumer (main or
+        #   aux): the row-group mean on the left side of an add or subtract with the grouped
+        #   values, plus 0.5, feeds the output. Matches references; physical feed-main code check
+        #   passes.
         m = 128
         n = 64
         group = 8
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue combining the row-group mean with grouped values
+            #   by the parametrized add or subtract form (including alpha variants), adding 0.5,
+            #   reshaping, and returning it alone or paired with ReLU depending on consumer.
             x = acc.float().view(-1, group, n)
             mean = x.mean(1, keepdim=True)
             if op == "add":
@@ -6031,6 +7115,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             return acc.relu(), transformed
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6056,17 +7142,25 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_local_m_reduce_feed_main_pointwise_wrapper_rejects_two_values(self):
+        # [FUNCTION DOC] SM100+ CUDA test: an epilogue dividing the grouped values by two
+        #   different row-group reductions (sum plus one and amax plus one) and adding the results
+        #   must fail to compile with an error that only one generated physical reduction is
+        #   supported.
         m = 128
         n = 64
         group = 8
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue adding the grouped values divided by the row-group
+            #   sum plus one and by the row-group max plus one.
             x = acc.float().view(-1, group, n)
             sum_scale = x.sum(1, keepdim=True) + 1.0
             max_scale = x.amax(1, keepdim=True) + 1.0
             return (x / sum_scale + x / max_scale).view(m, n)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6091,6 +7185,11 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda case: case[0],
     )
     def test_mm_local_m_reduce_feed_main_rejects_unsupported_group(self, case):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by (name, M, group, error): row-group
+        #   feed-main reductions with a cross-warp group of 64 (error says only same-warp axis-0
+        #   groups up to 32 are supported) and an unaligned boundary group of 17 with M of 136
+        #   (error mentions fragment width 32) must fail at compile time. Resets dynamo first to
+        #   avoid carrying shape state between cases.
         # Preserve each case's static geometry instead of inheriting PGO state
         # from the other parameterization.
         torch._dynamo.reset()
@@ -6098,11 +7197,16 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         n = 64
 
         def epilogue_fn(acc, group=group, m=m, n=n):
+            # [FUNCTION DOC] HELPER: epilogue dividing grouped values by the row-group sum
+            #   (reciprocal multiply) with group, M and N bound as default arguments from the
+            #   enclosing test.
             x = acc.float().view(-1, group, n)
             scale = x.sum(1, keepdim=True)
             return (x * scale.reciprocal()).view(m, n)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6119,17 +7223,26 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_local_m_reduce_feed_main_specializes_explicit_group(self):
+        # [FUNCTION DOC] SM100+ CUDA test: an explicit Python integer group size passed as an
+        #   argument to the compiled function is specialized, so calling it with 8, 16 and 32
+        #   triggers three compiles (frame count three) while each result matches references.
         torch._dynamo.reset()
         m = 128
         n = 64
 
         def epilogue_fn(acc, group):
+            # [FUNCTION DOC] HELPER: epilogue grouping rows by the given group size and scaling
+            #   grouped values by the reciprocal of the group sum plus one.
             x = acc.float().view(-1, group, n)
             scale = x.sum(1, keepdim=True) + 1.0
             return (x * scale.reciprocal()).view(m, n)
 
         def fn(a, b, group):
+            # [FUNCTION DOC] HELPER: function under compilation, taking the group as an extra
+            #   argument and calling flex_gemm on mm with an epilogue that closes over it.
             def epilogue(acc):
+                # [FUNCTION DOC] HELPER: epilogue forwarding the accumulator and the enclosing
+                #   group to the helper epilogue.
                 return epilogue_fn(acc, group)
 
             return flex_gemm(
@@ -6157,16 +7270,24 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_tuple_aux_same_shape_uses_broadcast_local_reduce(self):
+        # [FUNCTION DOC] SM100+ CUDA test: a same-shape aux output that multiplies grouped
+        #   values by the N-group mean plus one (group 16) must compute the mean fragment-locally.
+        #   Checks references; generated code has the add reduction, a divide by 16 and no
+        #   separate local reduce output.
         m = 128
         n = 128
         group = 16
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the grouped values times the
+            #   N-group mean plus one, reshaped to M by N.
             x = acc.float().view(m, -1, group)
             aux = (x * (x.mean(-1, keepdim=True) + 1.0)).view(m, n)
             return acc.relu(), aux
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6194,16 +7315,23 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_tuple_aux_uses_physical_m_broadcast_local_reduce(self):
+        # [FUNCTION DOC] SM100+ CUDA test: an aux output multiplying grouped values by the
+        #   reciprocal of the row-group (8) sum plus one. Checks references and the physical
+        #   feed-main code check (no group specified).
         m = 128
         n = 64
         group = 8
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the grouped values times the
+            #   reciprocal of the row-group sum plus one.
             x = acc.float().view(-1, group, n)
             aux = (x * (x.sum(1, keepdim=True) + 1.0).reciprocal()).view(m, n)
             return acc.relu(), aux
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6229,16 +7357,22 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_tuple_aux_divides_by_physical_m_broadcast_local_reduce(self):
+        # [FUNCTION DOC] SM100+ CUDA test: an aux output dividing grouped values by the
+        #   row-group (8) sum plus one. Checks references and the physical feed-main code check.
         m = 128
         n = 64
         group = 8
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the grouped values divided by
+            #   the row-group sum plus one.
             x = acc.float().view(-1, group, n)
             aux = (x / (x.sum(1, keepdim=True) + 1.0)).view(m, n)
             return acc.relu(), aux
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6264,11 +7398,17 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_tuple_outputs_share_physical_m_feed_main_reduce(self):
+        # [FUNCTION DOC] SM100+ CUDA test: both the main output and an aux output use the same
+        #   row-group (8) sum (the main by reciprocal scaling, the aux by multiplying with the sum
+        #   plus one), so the physical reduction is shared. Checks both outputs against references
+        #   and the physical feed-main code check.
         m = 128
         n = 64
         group = 8
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning the grouped values times the reciprocal
+            #   of the row-group sum and the grouped values times the sum plus one.
             x = acc.float().view(-1, group, n)
             scale = x.sum(1, keepdim=True)
             actual = (x * scale.reciprocal()).view(m, n)
@@ -6276,6 +7416,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             return actual, aux
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the two-output epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6301,11 +7443,17 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_local_m_reduce_feed_main_rejects_repeated_equivalent_reductions(self):
+        # [FUNCTION DOC] SM100+ CUDA test: the epilogue builds two separate grouped views of the
+        #   same accumulator and takes an equivalent row-group sum from each (one per output);
+        #   compiling must fail with an error that only one generated physical reduction is
+        #   supported.
         m = 128
         n = 64
         group = 8
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue producing two outputs, each from its own grouped
+            #   view and its own row-group sum.
             x0 = acc.float().view(-1, group, n)
             out = (x0 * x0.sum(1, keepdim=True).reciprocal()).view(m, n)
             x1 = acc.float().view(-1, group, n)
@@ -6313,6 +7461,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             return out, aux
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6329,11 +7479,16 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_local_m_reduce_feed_main_supports_regrouped_reduction_reuse(self):
+        # [FUNCTION DOC] SM100+ CUDA test: the aux output reuses the row-group sum through a
+        #   regrouped (reshaped twice) view of the grouped values. Compiles and both outputs match
+        #   references; physical feed-main code check passes.
         m = 128
         n = 64
         group = 8
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning grouped values times the reciprocal sum,
+            #   and the same computation from a flattened and regrouped view reusing the sum.
             x0 = acc.float().view(-1, group, n)
             scale = x0.sum(1, keepdim=True)
             out = (x0 * scale.reciprocal()).view(m, n)
@@ -6342,6 +7497,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             return out, aux
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6377,10 +7534,14 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_local_m_reduce_feed_main_rejects_mixed_grouped_layouts(self):
+        # [FUNCTION DOC] SM100+ CUDA test: two outputs use different row-group sizes (8 and 4);
+        #   compiling must fail with an error saying the outputs must share one grouped layout.
         m = 128
         n = 64
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning two reciprocal-sum normalizations, one
+            #   over groups of 8 and one over groups of 4 rows.
             x8 = acc.float().view(-1, 8, n)
             out = (x8 * x8.sum(1, keepdim=True).reciprocal()).view(m, n)
             x4 = acc.float().view(-1, 4, n)
@@ -6388,6 +7549,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             return out, aux
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6404,16 +7567,23 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_local_m_reduce_feed_main_rejects_composite_physical_reductions(self):
+        # [FUNCTION DOC] SM100+ CUDA test: the scale combines a row-group sum and a row-group
+        #   maximum before the reciprocal; compiling must fail saying only one generated physical
+        #   reduction is supported.
         m = 128
         n = 64
         group = 8
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue scaling grouped values by the reciprocal of the
+            #   sum plus the maximum over row groups.
             x = acc.float().view(-1, group, n)
             scale = x.sum(1, keepdim=True) + x.amax(1, keepdim=True)
             return (x * scale.reciprocal()).view(m, n)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6430,16 +7600,23 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_local_m_reduce_feed_main_rejects_unselected_physical_reduction(self):
+        # [FUNCTION DOC] SM100+ CUDA test: the scale combines the row-group sum and the
+        #   row-group sum of squares; compiling must fail with an error about the two-phase
+        #   local-reduce source.
         m = 128
         n = 64
         group = 8
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue scaling grouped values by the reciprocal of the
+            #   sum plus the sum of squares over row groups.
             x = acc.float().view(-1, group, n)
             scale = x.sum(1, keepdim=True) + x.square().sum(1, keepdim=True)
             return (x * scale.reciprocal()).view(m, n)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6456,17 +7633,25 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_local_m_reduce_feed_main_rejects_hidden_physical_reduction(self):
+        # [FUNCTION DOC] SM100+ CUDA test: one reduction acts on the accumulator and another on
+        #   the ReLU of the accumulator (a second, hidden physical reduction), and both feed the
+        #   main output; compiling must fail saying only one generated physical reduction is
+        #   supported.
         m = 128
         n = 64
         group = 8
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue adding grouped values divided by one row-group sum
+            #   to a row-group sum taken from ReLU of the accumulator.
             x = acc.float().view(-1, group, n)
             y = acc.float().relu().view(-1, group, n)
             scaled = x / (x.sum(1, keepdim=True) + 1.0)
             return (scaled + y.sum(1, keepdim=True)).view(m, n)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6487,11 +7672,18 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         ("rms_main", "rms_aux", "centered"),
     )
     def test_mm_local_m_reduce_feed_main_rejects_source_expression(self, case):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by case (RMS normalization as main, RMS
+        #   as aux next to ReLU, or mean-centered RMS normalization): the reduction source is
+        #   itself an expression (squared values) feeding main, which is not supported; compiling
+        #   must fail with an error about the two-phase local-reduce source.
         m = 128
         n = 64
         group = 8
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue normalizing grouped values by the reverse square
+            #   root of the mean of squares (optionally mean-centered), returned as main or as aux
+            #   next to ReLU depending on case.
             x = acc.float().view(-1, group, n)
             if case == "centered":
                 mean = x.mean(1, keepdim=True)
@@ -6504,6 +7696,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             return acc.relu(), normalized
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6520,20 +7714,30 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_local_m_reduce_feed_main_supports_trailing_fp8_quant(self):
+        # [FUNCTION DOC] SM100+ CUDA test: reciprocal-sum normalization over row groups of 32
+        #   followed by a cast to float8 e4m3 as the final pointwise step. Output dtype must be
+        #   fp8; matches the low-precision reference and a float64 reference; generated code has
+        #   the physical feed-main plan, the float8 conversion and the feeds-main flag.
         m = 128
         n = 64
         group = 32
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue normalizing grouped values by the reciprocal
+            #   row-group sum and casting to float8 e4m3.
             x = acc.float().view(-1, group, n)
             scale = x.sum(1, keepdim=True)
             return (x * scale.reciprocal()).view(m, n).to(torch.float8_e4m3fn)
 
         def high_precision_fn(acc):
+            # [FUNCTION DOC] HELPER: float64 reference of the normalization without the final
+            #   cast.
             x = acc.view(-1, group, n)
             return (x * x.sum(1, keepdim=True).reciprocal()).view(m, n)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6561,21 +7765,31 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_local_m_reduce_feed_main_supports_mx_scale(self):
+        # [FUNCTION DOC] SM100+ CUDA test: the row-group (32) scale is the MX E8M0 scale of the
+        #   group maximum; grouped values are scaled by its reciprocal and cast to float8 e4m3.
+        #   Output dtype is fp8; matches references; generated code has the PTX conversion and the
+        #   feeds-main flag with the physical plan.
         m = 128
         n = 64
         group = 32
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue computing the MX scale of row-group maxima,
+            #   scaling by its reciprocal and casting to float8 e4m3.
             x = acc.float().view(-1, group, n)
             scale = mx_e8m0_scale(x.amax(1, keepdim=True)).float()
             return (x * scale.reciprocal()).view(m, n).to(torch.float8_e4m3fn)
 
         def high_precision_fn(acc):
+            # [FUNCTION DOC] HELPER: float64 reference computing the same scaled values without
+            #   the final cast.
             x = acc.view(-1, group, n)
             scale = mx_e8m0_scale(x.amax(1, keepdim=True)).float()
             return (x * scale.reciprocal()).view(m, n)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6605,16 +7819,23 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_local_m_reduce_feed_main_supports_trailing_pointwise_chain(self):
+        # [FUNCTION DOC] SM100+ CUDA test: reciprocal-sum normalization followed by a chain of
+        #   trailing pointwise ops (times 0.5, plus one). Matches references; physical feed-main
+        #   code check passes and generated code has the feeds-main flag.
         m = 128
         n = 64
         group = 8
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue normalizing grouped values by the reciprocal of
+            #   the row-group sum, reshaping, then multiplying by 0.5 and adding one.
             x = acc.float().view(-1, group, n)
             scale = x.sum(1, keepdim=True)
             return (x * scale.reciprocal()).view(m, n) * 0.5 + 1.0
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6641,17 +7862,25 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_local_m_reduce_feed_main_trailing_quant_with_scale_store(self):
+        # [FUNCTION DOC] SM100+ CUDA test: fp8 quantized main output normalized by the row-group
+        #   (32) sum, with the squeezed sum also returned as aux. Checks fp8 dtype, main against
+        #   low-precision and float64 references, aux against the float64 group sum, and that
+        #   generated code has the plan with output, feeds-main and callbacks.
         m = 128
         n = 64
         group = 32
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning the float8 e4m3 normalized values and
+            #   the squeezed row-group sum.
             x = acc.float().view(-1, group, n)
             scale = x.sum(1, keepdim=True)
             quant = (x * scale.reciprocal()).view(m, n).to(torch.float8_e4m3fn)
             return quant, scale.squeeze(1)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6693,15 +7922,22 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     @parametrize("group", (4, 8, 16, 32))
     def test_mm_local_n_reduce_feed_main_fragment_group_sum(self, group):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by group size 4, 8, 16, 32: N-group sum
+        #   normalization (values times reciprocal group sum) handled fragment-locally. Matches
+        #   references; generated code has the add reduction and no runtime local-reduce plan.
         m = 128
         n = 128
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue scaling grouped values along N by the reciprocal
+            #   of their group sum and reshaping to M by N.
             x = acc.float().view(m, -1, group)
             scale = x.sum(-1, keepdim=True)
             return (x * scale.reciprocal()).view(m, n)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6730,20 +7966,29 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     @parametrize("group", (4, 8, 16, 32))
     def test_mm_local_n_reduce_feed_main_fragment_group_fp8_quant(self, group):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by group size: fragment-local per-group
+        #   quantization (scale from the clamped absolute maximum divided by 448, values divided
+        #   by the scale, cast to float8 e4m3). Output dtype fp8; matches references; generated
+        #   code has the float8 conversion and no runtime local-reduce plan.
         m = 128
         n = 128
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue scaling grouped values by the reciprocal of the
+            #   group scale (clamped maximum over 448), reshaping and casting to float8 e4m3.
             x = acc.float().view(m, -1, group)
             scale = x.abs().amax(-1, keepdim=True).clamp(min=1e-12) / 448.0
             return (x * scale.reciprocal()).view(m, n).to(torch.float8_e4m3fn)
 
         def high_precision_fn(acc):
+            # [FUNCTION DOC] HELPER: float64 reference of the same scaling without the cast.
             x = acc.view(m, -1, group)
             scale = x.abs().amax(-1, keepdim=True).clamp(min=1e-12) / 448.0
             return (x * scale.reciprocal()).view(m, n)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6773,15 +8018,23 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     @parametrize("group", (4, 8, 16, 32))
     def test_mm_local_n_reduce_feed_main_fragment_group_scale_store(self, group):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by group size: like fragment-local
+        #   quantization but also returns the squeezed scale as a compressed aux output. Checks
+        #   the main and aux against references and that generated code has a compressed plan
+        #   without the feeds-main flag.
         m = 128
         n = 128
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning the scaled grouped values and the
+            #   squeezed group scale (clamped maximum over 448).
             x = acc.float().view(m, -1, group)
             scale = x.abs().amax(-1, keepdim=True).clamp(min=1e-12) / 448.0
             return (x * scale.reciprocal()).view(m, n), scale.squeeze(-1)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6819,20 +8072,29 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     @parametrize("group", (16, 32))
     def test_mm_local_n_reduce_feed_main_fragment_group_tuned(self, group):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by group 16 or 32: fragment-local fp8
+        #   quantization with the tuned option. Matches references; generated code has the float8
+        #   conversion, no runtime plan, and only non-swap_ab candidate keys (swap_ab configs
+        #   would regroup the wrong elements).
         m = 128
         n = 128
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue scaling grouped values by the reciprocal group
+            #   scale and casting to float8 e4m3.
             x = acc.float().view(m, -1, group)
             scale = x.abs().amax(-1, keepdim=True).clamp(min=1e-12) / 448.0
             return (x * scale.reciprocal()).view(m, n).to(torch.float8_e4m3fn)
 
         def high_precision_fn(acc):
+            # [FUNCTION DOC] HELPER: float64 reference of the same scaling without the cast.
             x = acc.view(m, -1, group)
             scale = x.abs().amax(-1, keepdim=True).clamp(min=1e-12) / 448.0
             return (x * scale.reciprocal()).view(m, n)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue and tuned on.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6865,16 +8127,24 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_local_n_reduce_feed_main_fragment_group_skinny_default_config(self):
+        # [FUNCTION DOC] SM100+ CUDA test: N of 4096 (a skinny M, wide N shape) with
+        #   fragment-local group-16 scaling and no tuning. The default config must still satisfy
+        #   the grouped-fragment gate: matches references, no runtime plan in generated code, and
+        #   only non-swap_ab keys appear.
         m = 128
         n = 4096
         group = 16
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue scaling grouped values by the reciprocal group
+            #   scale (clamped maximum over 448) and reshaping.
             x = acc.float().view(m, -1, group)
             scale = x.abs().amax(-1, keepdim=True).clamp(min=1e-12) / 448.0
             return (x * scale.reciprocal()).view(m, n)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6905,16 +8175,24 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     @parametrize("group", (64, 128))
     def test_mm_local_n_reduce_feed_main_rejects_multi_fragment_group(self, group):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by group 64 or 128 along N: a
+        #   reciprocal-sum normalization whose axis-1 group exceeds one TensorSSA fragment must
+        #   fail to compile with an error about axis-1 groups larger than one fragment. Resets
+        #   dynamo first.
         torch._dynamo.reset()
         m = 128
         n = 256
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue scaling grouped values along N by the reciprocal
+            #   group sum.
             x = acc.float().view(m, -1, group)
             scale = x.sum(-1, keepdim=True)
             return (x * scale.reciprocal()).view(m, n)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -6943,12 +8221,25 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda case: case[0],
     )
     def test_mm_coda_rmsnorm_rewrite_e2e(self, case):
+        # [FUNCTION DOC] SM100+ CUDA end-to-end test parametrized by (name, N, group, tuned):
+        #   two chained flex_gemm calls implementing an RMS norm rewrite. The first returns a
+        #   gamma-scaled bf16 result plus per-group mean of squares as compressed aux; the second
+        #   multiplies its accumulator by the reciprocal root of the mean computed outside. Result
+        #   compared with eager within 1e-2; generated code must contain two epilogue calls, the
+        #   group geometry plan (with combine callback if the group exceeds 32), row and col arg
+        #   kinds, and no legacy arguments.
         _, n, group, tuned = case
         m, k, p = 64, 32, 48
         eps = 1e-5
 
         def fn(a, b1, gamma, b2):
+            # [FUNCTION DOC] HELPER: function under compilation: first flex_gemm computes the
+            #   gamma-scaled bf16 output and the per-group mean of squares, then the reciprocal
+            #   root of the mean is formed, then a second flex_gemm multiplies its accumulator by
+            #   it.
             def first_epilogue(acc):
+                # [FUNCTION DOC] HELPER: first epilogue returning the gamma-scaled accumulator
+                #   cast to bf16 and the per-group mean of squares along N.
                 x = acc.float().view(m, -1, group)
                 h2 = (acc.float() * gamma).to(torch.bfloat16)
                 partial_mean_square = x.square().mean(-1)
@@ -6963,6 +8254,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             rstd = (partial_mean_square.mean(-1, keepdim=True) + eps).rsqrt()
 
             def second_epilogue(acc):
+                # [FUNCTION DOC] HELPER: second epilogue multiplying the float32 accumulator by
+                #   the computed reciprocal-root scale.
                 return acc.float() * rstd
 
             return flex_gemm(
@@ -7005,12 +8298,19 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_coda_rmsnorm_rewrite_rejects_group_above_config_limit(self):
+        # [FUNCTION DOC] SM100+ CUDA test: the RMS norm rewrite with a group of 1024 along N
+        #   exceeds the maximum supported group of 512, so compile must fail with an error stating
+        #   requested group 1024 versus max supported group 512 for axis 1.
         m, k, n, p = 64, 32, 1024, 48
         group = 1024
         eps = 1e-5
 
         def fn(a, b1, gamma, b2):
+            # [FUNCTION DOC] HELPER: function under compilation chaining two flex_gemm calls as
+            #   in the RMS norm rewrite test.
             def first_epilogue(acc):
+                # [FUNCTION DOC] HELPER: first epilogue returning the gamma-scaled bf16
+                #   accumulator and the per-group mean of squares.
                 x = acc.float().view(m, -1, group)
                 h2 = (acc.float() * gamma).to(torch.bfloat16)
                 return h2, x.square().mean(-1)
@@ -7024,6 +8324,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             rstd = (partial_mean_square.mean(-1, keepdim=True) + eps).rsqrt()
 
             def second_epilogue(acc):
+                # [FUNCTION DOC] HELPER: second epilogue multiplying the float32 accumulator by
+                #   the computed reciprocal-root scale.
                 return acc.float() * rstd
 
             return flex_gemm(
@@ -7048,10 +8350,17 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_tuple_aux_supports_distinct_output_dtypes(self):
+        # [FUNCTION DOC] SM100+ CUDA test: a tuple epilogue with different output dtypes (bf16
+        #   ReLU and float32 squared plus two). The outputs keep distinct dtypes and each matches
+        #   its reference.
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU of the accumulator and its float32
+            #   square plus two.
             return acc.relu(), acc.float().square() + 2.0
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -7085,10 +8394,18 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_tuple_aux_supports_bool_mask_output(self):
+        # [FUNCTION DOC] SM100+ CUDA test: a tuple epilogue returning ReLU and a boolean mask of
+        #   positive accumulator values, compiled. The aux must be a bool tensor equal to the
+        #   eager mask, the main output matches references, and generated code passes aux outputs
+        #   (shared generated-code check).
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU of the accumulator and its
+            #   positivity mask.
             return acc.relu(), acc > 0
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -7118,10 +8435,15 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_epilogue_imports_generated_dependencies(self):
+        # [FUNCTION DOC] SM100+ CUDA test: compiles flex_gemm with an epilogue that uses
+        #   absolute value and a conditional select (so generated code needs extra imports for
+        #   those ops); result must match low-precision and float64 references.
         a = torch.randn(128, 64, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning the accumulator where its absolute value
+            #   exceeds 0.1 and its negation elsewhere.
             abs_acc = torch.abs(acc)
             return torch.where(abs_acc > 0.1, acc, -acc)
 
@@ -7143,11 +8465,15 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_addmm_compiled_matches_reference(self):
+        # [FUNCTION DOC] SM100+ CUDA test: compiles flex_gemm over addmm with beta 0.5, alpha
+        #   1.5 passed through the gemm keyword arguments and a ReLU epilogue; compares with eager
+        #   and float64 addmm followed by ReLU.
         bias = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
         a = torch.randn(128, 64, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue applying ReLU to the accumulator.
             return acc.relu()
 
         actual = torch.compile(flex_gemm, backend="inductor", fullgraph=True)(
@@ -7171,10 +8497,16 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_generated_code_calls_flex_gemm_adapter(self):
+        # [FUNCTION DOC] SM100+ CUDA test: with tuning off, the compiled plus-one ReLU epilogue
+        #   matches references, generated code passes the shared generated-code check and contains
+        #   no output plan argument.
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue adding one to the accumulator and applying ReLU.
             return (acc + 1).relu()
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue and tuned off.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -7211,12 +8543,20 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda case: case[0],
     )
     def test_mm_generated_code_reads_captured_tensor_epilogue_arg(self, case):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by captured scale layout (tile, row,
+        #   col): the compiled epilogue multiplies by the captured float32 tensor and applies
+        #   ReLU. Matches references; generated code passes the shared check with epilogue args
+        #   and the expected single arg kind.
         kind, shape_fn = case
 
         def epilogue_fn(acc, scale):
+            # [FUNCTION DOC] HELPER: epilogue multiplying the float32 accumulator by the scale
+            #   and applying ReLU.
             return (acc.float() * scale).relu()
 
         def fn(a, b, scale):
+            # [FUNCTION DOC] HELPER: function under compilation, wrapping the epilogue with the
+            #   captured scale in a flex_gemm call on mm.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -7247,7 +8587,13 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_generated_code_reads_multiple_captured_tensor_epilogue_args(self):
+        # [FUNCTION DOC] SM100+ CUDA test: three captured tensors (column bias, row scale, tile
+        #   bias) in one affine plus ReLU epilogue. Matches references; generated code records
+        #   epilogue args with kinds col, row, tile in that order.
         def fn(a, b, col_bias, row_scale, tile_bias):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with an
+            #   inline epilogue applying column bias, row scale and tile bias, then ReLU; also
+            #   used as the low-precision eager reference.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -7289,8 +8635,15 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_generated_code_reads_captured_args_and_writes_tuple_aux(self):
+        # [FUNCTION DOC] SM100+ CUDA test: three captured tensors combined with a tuple epilogue
+        #   (main and aux). Checks both against references with the captured-tuple helper;
+        #   generated code records epilogue args, kinds col, row, tile, and aux outputs.
         def fn(a, b, col_bias, row_scale, tile_bias):
+            # [FUNCTION DOC] HELPER: function under compilation, defining the tuple epilogue
+            #   over captured column bias, row scale and tile bias and calling flex_gemm on mm.
             def epilogue_fn(acc):
+                # [FUNCTION DOC] HELPER: epilogue returning the ReLU of the biased and scaled
+                #   accumulator and a row-scaled accumulator plus tile bias.
                 biased = (acc.float() + col_bias) * row_scale + tile_bias
                 return biased.relu(), acc.float() * row_scale + tile_bias
 
@@ -7331,10 +8684,16 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_generated_code_tuned_matches_reference(self):
+        # [FUNCTION DOC] SM100+ CUDA test: tuned flex_gemm with candidate configs patched to the
+        #   first two candidates; the plus-one ReLU result matches references and generated code
+        #   passes the shared check.
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue adding one to the accumulator and applying ReLU.
             return (acc + 1).relu()
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the epilogue and tuned on.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -7370,12 +8729,19 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_mm_tuple_aux_generated_code_tuned_matches_reference(self):
+        # [FUNCTION DOC] SM100+ CUDA test: tuned flex_gemm with a tuple epilogue and candidate
+        #   configs patched to the first two; both outputs match the tuple-aux reference and
+        #   generated code passes aux outputs in the shared check.
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning half of the accumulator plus one and the
+            #   accumulator squared plus two in float32.
             main = (acc.float() + 1.0) * 0.5
             aux = acc.float().square() + 2.0
             return main, aux
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the tuple epilogue and tuned on.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -7406,10 +8772,13 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_bmm_compiled_matches_reference(self):
+        # [FUNCTION DOC] SM100+ CUDA test: compiles flex_gemm over bmm (batch 2) with a ReLU
+        #   epilogue; the result is compared with eager and float64 bmm followed by ReLU.
         a = torch.randn(2, 128, 64, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(2, 64, 128, device="cuda", dtype=torch.bfloat16)
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue applying ReLU to the accumulator.
             return acc.relu()
 
         actual = torch.compile(flex_gemm, backend="inductor", fullgraph=True)(
@@ -7430,11 +8799,15 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_baddbmm_compiled_matches_reference(self):
+        # [FUNCTION DOC] SM100+ CUDA test: compiles flex_gemm over baddbmm with a full-shape
+        #   batch bias, beta 0.5 and alpha 1.5, plus a ReLU epilogue; compared with eager and
+        #   float64 baddbmm.
         bias = torch.randn(2, 128, 128, device="cuda", dtype=torch.bfloat16)
         a = torch.randn(2, 128, 64, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(2, 64, 128, device="cuda", dtype=torch.bfloat16)
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue applying ReLU to the accumulator.
             return acc.relu()
 
         actual = torch.compile(flex_gemm, backend="inductor", fullgraph=True)(
@@ -7460,11 +8833,15 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_baddbmm_broadcast_bias_compiled_matches_reference(self):
+        # [FUNCTION DOC] SM100+ CUDA test: baddbmm with a two-dimensional bias broadcast over
+        #   the batch (beta 0.5, alpha 1.5) and ReLU epilogue; compared with eager and float64
+        #   references.
         bias = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
         a = torch.randn(2, 128, 64, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(2, 64, 128, device="cuda", dtype=torch.bfloat16)
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue applying ReLU to the accumulator.
             return acc.relu()
 
         actual = torch.compile(flex_gemm, backend="inductor", fullgraph=True)(
@@ -7490,6 +8867,10 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_baddbmm_matrix_dim_broadcast_bias_compiled_matches_reference(self):
+        # [FUNCTION DOC] SM100+ CUDA test: baddbmm where the bias broadcasts along a matrix
+        #   dimension (a 1-D row of length N, a 1 by N row, or an M by 1 column), run in subtests
+        #   with beta 0.5 and alpha 1.5 and a ReLU epilogue; each compared with eager and float64
+        #   references.
         batch, m, n, k = 2, 128, 192, 64
         a = torch.randn(batch, m, k, device="cuda", dtype=torch.bfloat16)
         b = torch.randn(batch, k, n, device="cuda", dtype=torch.bfloat16)
@@ -7500,6 +8881,7 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         )
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue applying ReLU to the accumulator.
             return acc.relu()
 
         for name, bias in bias_cases:
@@ -7531,10 +8913,16 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_bmm_generated_code_calls_flex_gemm_adapter(self):
+        # [FUNCTION DOC] SM100+ CUDA test: compiled bmm with batch 2 and ReLU; matches
+        #   references and generated code passes the shared check including an expected rank of
+        #   three.
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue applying ReLU to the accumulator.
             return acc.relu()
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on bmm with
+            #   the epilogue.
             return flex_gemm(
                 torch.bmm,
                 (a, b),
@@ -7561,10 +8949,15 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_bmm_batch_one_generated_code_calls_flex_gemm_adapter(self):
+        # [FUNCTION DOC] SM100+ CUDA test: same as the bmm adapter test but with batch size one;
+        #   generated code must still show an expected rank of three.
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue applying ReLU to the accumulator.
             return acc.relu()
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on bmm with
+            #   the epilogue.
             return flex_gemm(
                 torch.bmm,
                 (a, b),
@@ -7591,10 +8984,15 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_bmm_generated_code_tuned_matches_reference(self):
+        # [FUNCTION DOC] SM100+ CUDA test: tuned bmm with candidate configs patched to the first
+        #   two; matches references and generated code shows an expected rank of three.
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue applying ReLU to the accumulator.
             return acc.relu()
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on bmm with
+            #   the epilogue and tuned on.
             return flex_gemm(
                 torch.bmm,
                 (a, b),
@@ -7630,10 +9028,16 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_baddbmm_generated_code_calls_flex_gemm_adapter(self):
+        # [FUNCTION DOC] SM100+ CUDA test: compiled baddbmm with beta 0.5 and alpha 1.5; matches
+        #   references and generated code passes C and an expected rank of three in the shared
+        #   check.
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue applying ReLU to the accumulator.
             return acc.relu()
 
         def fn(bias, a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on baddbmm
+            #   with beta and alpha keyword arguments.
             return flex_gemm(
                 torch.baddbmm,
                 (bias, a, b),
@@ -7666,10 +9070,15 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_addmm_generated_code_calls_flex_gemm_adapter(self):
+        # [FUNCTION DOC] SM100+ CUDA test: compiled addmm with beta 0.5 and alpha 1.5 and ReLU;
+        #   matches references and generated code passes a C argument.
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue applying ReLU to the accumulator.
             return acc.relu()
 
         def fn(bias, a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on addmm with
+            #   beta and alpha keyword arguments.
             return flex_gemm(
                 torch.addmm,
                 (bias, a, b),
@@ -7700,10 +9109,15 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA required")
     @unittest.skipIf(not SM100OrLater, "SM100+ required")
     def test_addmm_generated_code_tuned_matches_reference(self):
+        # [FUNCTION DOC] SM100+ CUDA test: tuned addmm with candidate configs patched to the
+        #   first two; matches references and generated code passes a C argument.
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue applying ReLU to the accumulator.
             return acc.relu()
 
         def fn(bias, a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on addmm with
+            #   beta and alpha and tuned on.
             return flex_gemm(
                 torch.addmm,
                 (bias, a, b),
@@ -7779,9 +9193,15 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
         name_fn=lambda case: case[0],
     )
     def test_generated_code_rejects_unsupported_cases(self, case):
+        # [FUNCTION DOC] SM100+ CUDA test parametrized by (name, epilogue, kernel options, error
+        #   pattern): compile-time rejection of an unsupported epilogue (a keepdim row sum),
+        #   unknown kernel option, non-bool fast_math, non-dict config, and an unknown config
+        #   field. Each must raise an exception matching the case message.
         _, epilogue_fn, kernel_options, error = case
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the parametrized epilogue and kernel options.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -7796,6 +9216,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             torch.compile(fn, backend="inductor", fullgraph=True)(a, b)
 
     def test_rejects_unsupported_quack_op(self):
+        # [FUNCTION DOC] flex_gemm on CPU tensors with a non-GEMM op (matmul) and the QUACK
+        #   backend must raise RuntimeError about an unsupported GEMM op.
         a = torch.randn(8, 16)
         b = torch.randn(16, 12)
 
@@ -7808,6 +9230,8 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
             )
 
     def test_rejects_unknown_backend(self):
+        # [FUNCTION DOC] flex_gemm on CPU tensors with a backend named CUTLASS must raise
+        #   RuntimeError about an unsupported FlexGEMM backend.
         a = torch.randn(8, 16)
         b = torch.randn(16, 12)
 
@@ -7823,9 +9247,17 @@ class TestFlexGemmEpilogueHOP(FlexGemmTestCase):
 @skipIfNoCuteDSL
 @unittest.skipIf(not SM100OrLater, "SM100+ required")
 class TestFlexGemmNVFP4Device(FlexGemmTestCase):
+    # [CLASS DOC] Device-generic tests (CUDA only, via device-type instantiation at module
+    #   level) of NVFP4 packing in compiled flex_gemm. Skipped without the CuTe DSL or SM100.
     @unittest.skipIf(SM120OrLater, "output contractions are not supported on SM120")
     @parametrize("tuned", (False, True))
     def test_mm_nvfp4_pack_matches_reference(self, device, tuned):
+        # [FUNCTION DOC] Parametrized by tuned: A selects column zero so the accumulator equals
+        #   a crafted B row of bf16 values at and around every FP4 rounding boundary (both signs,
+        #   infinities and signed zeros). The epilogue packs the float32 accumulator pairs with
+        #   nvfp4_pack; result dtype must be the float4 e2m1 pair type and its bytes equal the
+        #   eager pack; generated code must show an inline-asm intrinsic and a dtype-view to the
+        #   float4 type. Not run on SM120 or later.
         m = n = 128
         k = 64
         boundaries = torch.tensor(
@@ -7856,6 +9288,8 @@ class TestFlexGemmNVFP4Device(FlexGemmTestCase):
         b[0] = values
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with an
+            #   epilogue that packs accumulator pairs to NVFP4, with the tuned option.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -7880,8 +9314,18 @@ instantiate_device_type_tests(TestFlexGemmNVFP4Device, globals(), only_for="cuda
 @skipIfNoCuteDSL
 @unittest.skipIf(not SM100OrLater, "SM100+ required")
 class TestFlexGemmFastMathDevice(FlexGemmTestCase):
+    # [CLASS DOC] Device-generic tests (CUDA only) of the fast_math kernel option and its effect
+    #   on generated CuTe math calls for the epilogue. Skipped without the CuTe DSL or SM100.
     def test_mm_fast_math_kernel_option_controls_cutedsl_math(self, device):
+        # [FUNCTION DOC] Compiles a transcendental-heavy epilogue (tanh, sigmoid, exponential,
+        #   log1p, square root, reverse square root) with fast_math on and off, resetting dynamo
+        #   each time. Fast results must be within 0.2 absolute of a float64 reference, precise
+        #   results within 0.02. Fast code must use the CuTe math helpers for the listed ops and
+        #   the fastmath flag; precise code must not carry the flag.
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue summing tanh, sigmoid, exp of negative absolute
+            #   value, log1p of absolute value, square root and reverse square root of the
+            #   absolute value plus one.
             magnitude = acc.abs() + 1.0
             return (
                 torch.tanh(acc)
@@ -7893,7 +9337,11 @@ class TestFlexGemmFastMathDevice(FlexGemmTestCase):
             )
 
         def compile_with_fast_math(a, b, fast_math):
+            # [FUNCTION DOC] HELPER: resets dynamo and compiles a flex_gemm on mm with the
+            #   epilogue and the given fast_math option; returns the output and generated code.
             def fn(a, b):
+                # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm
+                #   with the fast_math kernel option.
                 return flex_gemm(
                     torch.mm,
                     (a, b),
@@ -7922,11 +9370,20 @@ class TestFlexGemmFastMathDevice(FlexGemmTestCase):
         self.assertNotIn("fastmath=True", precise_code)
 
     def test_mm_fast_math_sigmoid_uses_tanh_decomposition(self, device):
+        # [FUNCTION DOC] Compiles a sigmoid epilogue with fast_math on and off (resetting dynamo
+        #   each time). Fast result within 0.2 absolute and precise within 0.02 of float64; fast
+        #   code must use the CuTe tanh helper and fastmath flag with no exp2, while precise code
+        #   uses exp2 and no tanh (sigmoid is decomposed through tanh in fast mode).
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue applying sigmoid to the accumulator.
             return torch.sigmoid(acc)
 
         def compile_with_fast_math(a, b, fast_math):
+            # [FUNCTION DOC] HELPER: resets dynamo and compiles a flex_gemm on mm with the
+            #   epilogue and the given fast_math option; returns the output and generated code.
             def fn(a, b):
+                # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm
+                #   with the fast_math kernel option.
                 return flex_gemm(
                     torch.mm,
                     (a, b),
@@ -7956,11 +9413,20 @@ class TestFlexGemmFastMathDevice(FlexGemmTestCase):
         self.assertNotIn("cute.math.tanh", precise_code)
 
     def test_mm_fast_math_silu_uses_tanh_decomposition(self, device):
+        # [FUNCTION DOC] Same structure as the sigmoid fast-math test but for SiLU: fast and
+        #   precise compiled results are compared with float64 and the generated code is checked
+        #   for the tanh-based decomposition under fast math versus the exponential-based one
+        #   otherwise.
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue applying SiLU to the accumulator.
             return torch.nn.functional.silu(acc)
 
         def compile_with_fast_math(a, b, fast_math):
+            # [FUNCTION DOC] HELPER: resets dynamo and compiles a flex_gemm on mm with the
+            #   epilogue and the given fast_math option; returns the output and generated code.
             def fn(a, b):
+                # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm
+                #   with the fast_math kernel option.
                 return flex_gemm(
                     torch.mm,
                     (a, b),
@@ -7990,11 +9456,20 @@ class TestFlexGemmFastMathDevice(FlexGemmTestCase):
         self.assertNotIn("cute.math.tanh", precise_code)
 
     def test_mm_fast_math_gelu_none_uses_tanh_decomposition(self, device):
+        # [FUNCTION DOC] Exact GELU epilogue compiled with fast_math on and off; both results
+        #   within 0.02 absolute of float64. Fast code uses the CuTe tanh helper and fastmath flag
+        #   without erf; precise code uses erf and no tanh.
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue applying exact (non-approximate) GELU to the
+            #   accumulator.
             return torch.nn.functional.gelu(acc, approximate="none")
 
         def compile_with_fast_math(a, b, fast_math):
+            # [FUNCTION DOC] HELPER: resets dynamo and compiles a flex_gemm on mm with the
+            #   epilogue and the given fast_math option; returns the output and generated code.
             def fn(a, b):
+                # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm
+                #   with the fast_math kernel option.
                 return flex_gemm(
                     torch.mm,
                     (a, b),
@@ -8026,10 +9501,16 @@ class TestFlexGemmFastMathDevice(FlexGemmTestCase):
         self.assertNotIn("cute.math.tanh", precise_code)
 
     def test_mm_fast_math_gelu_tanh_preserves_requested_approximation(self, device):
+        # [FUNCTION DOC] Tanh-approximate GELU epilogue compiled with fast_math on: result
+        #   within 0.02 of the float64 exact reference; code uses the CuTe tanh helper and
+        #   fastmath flag and no erf (the requested approximation is preserved).
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue applying tanh-approximate GELU to the accumulator.
             return torch.nn.functional.gelu(acc, approximate="tanh")
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the fast_math kernel option on.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -8056,13 +9537,19 @@ instantiate_device_type_tests(TestFlexGemmFastMathDevice, globals(), only_for="c
 @skipIfNoCuteDSL
 @unittest.skipIf(not SM100OrLater, "SM100+ required")
 class TestFlexGemmExplicitConfigDevice(FlexGemmTestCase):
+    # [CLASS DOC] Device-generic tests (CUDA only) of explicit and partial config kernel options
+    #   and expanded local-reduce config coverage. Skipped without the CuTe DSL or SM100.
     def test_mm_explicit_config_matches_reference(self, device):
+        # [FUNCTION DOC] Takes the first candidate config with swap_ab for the device and passes
+        #   its full key as the explicit config kernel option; compiled plus-one ReLU matches
+        #   references, generated code passes the shared check and embeds the exact config key.
         from torch._inductor.heuristics.template.flex_gemm import (
             candidate_gemm_configs_for_device,
             gemm_config_key,
         )
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue adding one to the accumulator and applying ReLU.
             return (acc + 1).relu()
 
         config = next(
@@ -8073,6 +9560,8 @@ class TestFlexGemmExplicitConfigDevice(FlexGemmTestCase):
         config_key = gemm_config_key(config)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the explicit config kernel option.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -8096,11 +9585,16 @@ class TestFlexGemmExplicitConfigDevice(FlexGemmTestCase):
 
     @parametrize("tuned", (False, True))
     def test_mm_partial_config_matches_reference(self, device, tuned):
+        # [FUNCTION DOC] Parametrized by tuned: passes only tile M, tile N, cluster M, cluster N
+        #   and swap_ab from a swap_ab candidate as a partial config. Result matches references,
+        #   generated code passes the shared check, and every pinned item appears in the generated
+        #   code.
         from torch._inductor.heuristics.template.flex_gemm import (
             candidate_gemm_configs_for_device,
         )
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue adding one to the accumulator and applying ReLU.
             return (acc + 1).relu()
 
         config = next(
@@ -8114,6 +9608,8 @@ class TestFlexGemmExplicitConfigDevice(FlexGemmTestCase):
         }
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the pinned partial config and tuned option.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -8145,12 +9641,18 @@ class TestFlexGemmExplicitConfigDevice(FlexGemmTestCase):
     def test_mm_tuple_aux_local_n_reduce_supports_clustered_tile_m256(
         self, device, group
     ):
+        # [FUNCTION DOC] Parametrized by group 64 or 128 (skipped on SM120 or later): explicit
+        #   config with tile 256 by 256 and cluster M 2 on a 256 by 256 problem; N-group sum aux.
+        #   Main and aux match references, generated code has the callback plan and the exact
+        #   config key.
         from torch._inductor.heuristics.template.flex_gemm import gemm_config_key
         from torch._vendor.quack.gemm_config import GemmConfig
 
         m = n = 256
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the sum over N groups of the
+            #   parametrized size.
             x = acc.float().view(m, -1, group)
             return acc.relu(), x.sum(-1)
 
@@ -8166,6 +9668,8 @@ class TestFlexGemmExplicitConfigDevice(FlexGemmTestCase):
         config = dict(config_key)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the explicit config option.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -8185,16 +9689,23 @@ class TestFlexGemmExplicitConfigDevice(FlexGemmTestCase):
 
     @unittest.skipIf(SM120OrLater, "SM100 config required")
     def test_mm_tuned_local_reduce_supports_max_autotune(self, device):
+        # [FUNCTION DOC] With max_autotune enabled, tuned flex_gemm with a group-512 sum aux
+        #   output (reduced afterwards in the outer function) must keep mutable local-reduce
+        #   outputs out of deferred template selection: main and reduced results match references
+        #   and generated code carries tile M 256 and tile N 512 keys.
         """Keep mutable local-reduce outputs out of deferred template selection."""
         from torch._inductor import config as inductor_config
 
         m, n, group = 256, 512, 512
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the sum over N groups of 512.
             partials = acc.float().view(m, -1, group).sum(-1)
             return acc.relu(), partials
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   tuned on and then summing the partials over the last dim.
             actual, partials = flex_gemm(
                 torch.mm,
                 (a, b),
@@ -8232,12 +9743,18 @@ class TestFlexGemmExplicitConfigDevice(FlexGemmTestCase):
 
     @unittest.skipIf(SM120OrLater, "SM100 config required")
     def test_mm_full_tile_local_reduce_checks_actual_n_warp_layout(self, device):
+        # [FUNCTION DOC] Forces the host-side local-reduce config check to approve (mock) a
+        #   full-N group of 256 with a config whose layout splits N across warps; compile must
+        #   fail with an error saying a full-N grouped local reduce requires one epilogue N-warp
+        #   partition (the layout is checked again).
         """Reject a host-approved full-N group when the kernel layout splits N."""
         from torch._vendor.quack.gemm_config import GemmConfig
 
         m = n = group = 256
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the full-row sum over N groups
+            #   of 256.
             partials = acc.float().view(m, -1, group).sum(-1)
             return acc.relu(), partials
 
@@ -8254,6 +9771,8 @@ class TestFlexGemmExplicitConfigDevice(FlexGemmTestCase):
         )
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the explicit config option.
             return flex_gemm(
                 torch.mm,
                 (a, b),
@@ -8296,6 +9815,12 @@ class TestFlexGemmExplicitConfigDevice(FlexGemmTestCase):
         name_fn=lambda case: case[0],
     )
     def test_mm_tuple_aux_local_reduce_supports_expanded_configs(self, device, case):
+        # [FUNCTION DOC] Parametrized by cases (name, axis, group, tile M, tile N, cluster M,
+        #   cluster N) covering expanded local-reduce configs on axis 1 and axis 0 including
+        #   full-tile groups up to 512. Builds the explicit config, sizes the problem to fit,
+        #   compiles an epilogue returning ReLU and a group sum, checks references, and checks
+        #   generated code (callbacks when group exceeds 32 on axis 1; geometry and callbacks for
+        #   axis 0) plus the exact config key.
         from torch._inductor.heuristics.template.flex_gemm import gemm_config_key
         from torch._vendor.quack.gemm_config import GemmConfig
 
@@ -8304,6 +9829,8 @@ class TestFlexGemmExplicitConfigDevice(FlexGemmTestCase):
         n = max(tile_n, group if axis == 1 else 256)
 
         def epilogue_fn(acc):
+            # [FUNCTION DOC] HELPER: epilogue returning ReLU and the group sum along N (axis 1)
+            #   or along rows (axis 0).
             if axis == 1:
                 partial = acc.float().view(m, -1, group).sum(-1)
             else:
@@ -8322,6 +9849,8 @@ class TestFlexGemmExplicitConfigDevice(FlexGemmTestCase):
         config = dict(config_key)
 
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: function under compilation, calling flex_gemm on mm with
+            #   the explicit config option.
             return flex_gemm(
                 torch.mm,
                 (a, b),
