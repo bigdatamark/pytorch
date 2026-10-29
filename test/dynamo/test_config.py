@@ -1,4 +1,8 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for torch._dynamo.config: automatic-dynamic and static-by-default
+# recompilation behavior, the compile-ignored key list, config hashing under patch,
+# and custom config modules installed with install_config_module. Defines the
+# ConfigTests class only; import has no side effects, a __main__ guard runs the suite.
 
 import importlib.util
 import sys
@@ -14,7 +18,17 @@ from torch._dynamo.utils import disable_cache_limit
 
 
 class ConfigTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Tests for torch._dynamo.config behavior: shape-specialization flags
+    # (automatic_dynamic_shapes, assume_static_by_default), the compile-ignored key
+    # list, config hashing under patch, and custom config modules built with
+    # install_config_module. Stateless apart from per-test temp modules registered
+    # for cleanup. Must not be included in test_dynamic_shapes.py.
     def _make_config_module(self, name: str):
+        # [FUNCTION DOC] HELPER: Create a throwaway config module for a test. Writes a file
+        # in a temporary directory (removed at cleanup) that defines a boolean flag
+        # (False) and calls install_config_module on itself, loads it under the given
+        # name, registers it in sys.modules (removed at cleanup) and returns it. Raises
+        # AssertionError if the import spec cannot be built.
         tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(tmpdir.cleanup)
         module_path = f"{tmpdir.name}/config_module.py"
@@ -37,7 +51,11 @@ class ConfigTests(torch._dynamo.test_case.TestCase):
 
     @disable_cache_limit()
     def test_no_automatic_dynamic(self):
+        # [FUNCTION DOC] With automatic dynamic shapes off and static-by-default on,
+        # calling with ten different sizes (2 to 11) recompiles each time: frame count
+        # is 10. Resets dynamo first; cache limit disabled by decorator.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Compiled body: a minus b times 10.
             return a - b * 10
 
         torch._dynamo.reset()
@@ -52,7 +70,10 @@ class ConfigTests(torch._dynamo.test_case.TestCase):
 
     @disable_cache_limit()
     def test_automatic_dynamic(self):
+        # [FUNCTION DOC] With automatic dynamic shapes on and static-by-default, ten sizes
+        # (2 to 11) compile only twice (first static, then dynamic): frame count is 2.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Compiled body: a minus b times 10.
             return a - b * 10
 
         torch._dynamo.reset()
@@ -69,7 +90,10 @@ class ConfigTests(torch._dynamo.test_case.TestCase):
 
     @disable_cache_limit()
     def test_no_assume_static_by_default(self):
+        # [FUNCTION DOC] With automatic dynamic on and static-by-default off, shapes are
+        # dynamic from the start, so ten sizes compile once: frame count is 1.
         def fn(a, b):
+            # [FUNCTION DOC] HELPER: Compiled body: a minus b times 10.
             return a - b * 10
 
         torch._dynamo.reset()
@@ -85,6 +109,10 @@ class ConfigTests(torch._dynamo.test_case.TestCase):
         self.assertEqual(cnt_dynamic.frame_count, 1)
 
     def test_config_compile_ignored(self):
+        # [FUNCTION DOC] Asserts every key in a fixed list of logging, debugging and
+        # error-only dynamo config names (such as verbose, recompile_limit,
+        # error_on_recompile, debug_dir_root) is present in the config's
+        # _compile_ignored_keys set; raises AssertionError naming the missing key.
         # Remove from this list if no longer relevant
         dynamo_guarded_config_ignorelist = {
             "log_file_name",
@@ -111,6 +139,11 @@ class ConfigTests(torch._dynamo.test_case.TestCase):
                 raise AssertionError(f"Expected {k} to be in _compile_ignored_keys")
 
     def test_config_hash(self):
+        # [FUNCTION DOC] Checks get_hash semantics: patching a compile-ignored key (verbose)
+        # leaves the hash unchanged, patching a non-ignored key (suppress_errors)
+        # changes it, a nested patch of an ignored key inside the second patch keeps the
+        # changed hash, and the hash returns to the start value after exiting. Raises
+        # AssertionError on any mismatch.
         config = torch._dynamo.config
         starting_hash = config.get_hash()
 
@@ -163,11 +196,16 @@ class ConfigTests(torch._dynamo.test_case.TestCase):
             )
 
     def test_custom_config_module_patch_recompiles(self):
+        # [FUNCTION DOC] A compiled function reading a custom config module's flag gets
+        # recompiled when the flag is patched: x+2 with flag false (1 frame), x+1
+        # inside patch(flag=True) (2 frames), x+2 again after the patch (frame count
+        # stays at least 2).
         config = self._make_config_module(f"{__name__}.test_patch_config")
         cnt = torch._dynamo.testing.CompileCounter()
 
         @torch.compile(backend=cnt)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled body: returns x plus 1 if config.flag, else x plus 2.
             if config.flag:
                 return x + 1
             return x + 2
@@ -184,11 +222,16 @@ class ConfigTests(torch._dynamo.test_case.TestCase):
         self.assertGreaterEqual(cnt.frame_count, 2)
 
     def test_custom_config_module_setattr_updates_value(self):
+        # [FUNCTION DOC] A compiled function sets the custom module's flag with setattr in
+        # the middle of tracing; the later read must see True. Result is x plus 2,
+        # one frame, and the flag is True afterwards (side effect on the module).
         config = self._make_config_module(f"{__name__}.test_setattr_config")
         cnt = torch._dynamo.testing.CompileCounter()
 
         @torch.compile(backend=cnt)
         def fn(x):
+            # [FUNCTION DOC] HELPER: Compiled body: adds 1 if flag, sets flag True via setattr,
+            # adds 2 if flag; returns x.
             if config.flag:
                 x = x + 1
             setattr(config, "flag", True)  # noqa: B010
