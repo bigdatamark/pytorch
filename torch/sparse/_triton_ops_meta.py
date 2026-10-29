@@ -1,4 +1,16 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Database of pre-tuned Triton kernel meta parameters for the sparse (BSR) matmul
+# kernels in torch/sparse/_triton_ops.py, plus the tooling to look up, tune, and regenerate it.
+# - get_meta looks up parameters for an op (scatter_mm, bsr_dense_addmm, _int_bsr_dense_addmm)
+#   by device name, version tuple (format version, dtype, sparsity), and shape key.
+# - tune_bsr_dense_addmm, tune__int_bsr_dense_addmm and optimize_* run a local search
+#   (minimize) over parameters, optionally storing results in the in-memory database; dump
+#   rewrites the generated-data section at the end of this very file.
+# - The big mapping at the end of the file (operation, device, version -> shape key -> tuple of
+#   parameter values) is generated data and must keep its begin/end marker comments intact.
+# Import-time side effects: none beyond importing torch and tqdm; running the file as a script
+# tunes all configured shapes on the available GPU and may modify this file.
+# Public exports: get_meta, tune_bsr_dense_addmm, tune__int_bsr_dense_addmm.
 """Provides optimal triton kernel parameters.
 
 Aim
@@ -112,6 +124,9 @@ from torch.testing import make_tensor
 
 
 def _get_device_name() -> str:
+    # [FUNCTION DOC] HELPER: Returns the name of the current CUDA device if CUDA is available,
+    # else the current XPU device name if XPU is available, else an empty string. Used as the
+    # device part of the database key. No side effects.
     """Return the current accelerator device name for use as a Triton tuning cache key."""
     if torch.cuda.is_available():
         return torch.cuda.get_device_name()
@@ -121,6 +136,14 @@ def _get_device_name() -> str:
 
 
 def get_meta(op, key, device_name=None, version=(0, torch.float16, 0.5), exact=False):
+    # [FUNCTION DOC] Looks up stored kernel meta parameters for an operation and shape key.
+    # Device defaults to the current accelerator. When no data exists for the exact device and
+    # version and exact is false, an NVIDIA A100 device name is mapped to the A100-SXM4-80GB
+    # data set; any other device yields None. A key containing the wildcard "*" returns a
+    # mapping of every matching stored key to its named parameters; otherwise returns one
+    # mapping of parameter names to values, or None if absent. Raises NotImplementedError for
+    # an unknown op, and ValueError if a wildcard key length differs from stored key length.
+    # Read-only with respect to the database.
     """Return triton kernel meta parameters of the specified op and its inputs key.
 
     Parameters
@@ -210,6 +233,10 @@ def get_meta(op, key, device_name=None, version=(0, torch.float16, 0.5), exact=F
 
 
 def update(op, device_name, version, key, value):
+    # [FUNCTION DOC] Stores a tuple of parameter values for (op, device_name, version) and the
+    # shape key in the module-level in-memory database, creating the sub-mapping if needed.
+    # An empty value (failed tuning) is skipped with a warning; an identical existing value is
+    # left unchanged. Mutates global state; returns None.
     """Update the db of op parameters."""
     # skip storing possible optimization failures:
     if not value:
@@ -227,6 +254,11 @@ def update(op, device_name, version, key, value):
 
 
 def dump():
+    # [FUNCTION DOC] Writes the in-memory database back into this module's source file, between
+    # the begin-data marker line and the indented end-data marker line. Entries are sorted by
+    # operation, device name and version (dtypes compared as strings), and inner keys sorted.
+    # If either marker is missing, warns and writes nothing. The file is rewritten only when
+    # the generated content differs. Side effect: reads and may overwrite the source file.
     """Store the current runtime db state to the module file."""
     current_file = inspect.getfile(dump)
     with open(current_file) as f:
@@ -243,6 +275,8 @@ def dump():
         return
 
     def sort_key(key):
+        # [FUNCTION DOC] HELPER: Sort key for an (op, device_name, version) database key;
+        # converts dtype entries in the version to strings so mixed types compare safely.
         op, device_name, version = key
         version = tuple(
             (str(item) if isinstance(item, torch.dtype) else item) for item in version
@@ -272,6 +306,16 @@ def minimize(
     verbose=False,
     all_values=None,
 ):
+    # [FUNCTION DOC] Local search for the parameter set minimizing target_func (a timing).
+    # First times the reference and initial parameters (falling back to one of them if the
+    # other raises), then repeatedly tries neighbors reachable by step_func within max_step
+    # total steps (nearest first), moving to any strictly better one and restarting, until no
+    # neighbor improves. Results (timings, or error strings for failures) are cached in
+    # all_values, which is mutated and may be shared. Picks a stable minimizer among values
+    # within 0.1 percent of the best. If the speedup versus reference is negative, reruns
+    # with the reference as the start. Returns (parameters, speedup percent, best timing,
+    # sensitivity message); if both starts fail returns ({}, -1, -1, error text).
+    # Prints diagnostics and a progress bar when verbose.
     """Find a dict of parameters that minimizes the target function using
     the initial dict of parameters and a step function that progresses
     a specified parameter in a dict of parameters.
@@ -302,9 +346,13 @@ def minimize(
     """
 
     def to_key(parameters):
+        # [FUNCTION DOC] HELPER: Converts a parameter mapping to a tuple of values ordered by
+        # sorted parameter name, usable as a cache key.
         return tuple(parameters[k] for k in sorted(parameters))
 
     def from_key(key, parameters):
+        # [FUNCTION DOC] HELPER: Inverse of to_key; rebuilds a parameter mapping from a tuple
+        # of values using the sorted parameter names of the given mapping.
         return dict(zip(sorted(parameters), key, strict=True))
 
     if all_values is None:
@@ -454,6 +502,12 @@ def minimize(
 
 
 def create_blocked_tensor(B, M, N, blocksize, sparsity, dtype, device):
+    # [FUNCTION DOC] Builds a dense tensor of shape (B, M, N) (no batch dimension when B is 0)
+    # whose nonzero pattern is made of full blocks of the given blocksize, with a fraction
+    # equal to sparsity of the blocks zeroed. Block mask is random Bernoulli, then randomly
+    # adjusted to hit the expected block count exactly; blocks are expanded by repeating.
+    # Raises AssertionError if sparsity is outside 0..1 or M, N are not divisible by the
+    # blocksize. Uses the global random generator.
     if sparsity < 0.0 or sparsity > 1.0:
         raise AssertionError(f"sparsity should be between 0 and 1, got {sparsity}")
     if M % blocksize[0] != 0:
@@ -488,6 +542,12 @@ def create_blocked_tensor(B, M, N, blocksize, sparsity, dtype, device):
 def optimize_scatter_mm(
     m, k, n, bm, bk, dtype=torch.float16, device="cuda", sparsity=0.5, force=False
 ):
+    # [FUNCTION DOC] Tunes the scatter_mm kernel parameters for a BSR (m x k, block bm x bk)
+    # times dense (k x n) product at the given sparsity and stores the result in the in-memory
+    # database. Skips work if exact stored data exists and force is false. Starts from stored
+    # scatter_mm, else stored bsr_dense_addmm, else reference parameters. Stores nothing if
+    # the tuned result equals the stored start (unless force) or the speedup is negative.
+    # Requires triton and a GPU; seeds the global RNG; prints the result.
     import triton
 
     from torch.sparse._triton_ops import bsr_scatter_mm, bsr_scatter_mm_indices_data
@@ -529,11 +589,14 @@ def optimize_scatter_mm(
     dense = make_tensor(k, n, dtype=dtype, device=device)
 
     def bench(meta, bsr=bsr, dense=dense):
+        # [FUNCTION DOC] HELPER: Target function; precomputes scatter indices for the given
+        # meta parameters and returns the benchmarked time in milliseconds of the product.
         indices_data = bsr_scatter_mm_indices_data(
             bsr, dense, indices_format="bsr_strided_mm_compressed", **meta
         )
 
         def test_func():
+            # [FUNCTION DOC] HELPER: Runs the scatter matmul once with the prepared indices.
             return bsr_scatter_mm(bsr, dense, indices_data=indices_data)
 
         ms_min = triton.testing.do_bench(test_func, warmup=500, rep=100)
@@ -541,6 +604,11 @@ def optimize_scatter_mm(
         return ms_min
 
     def step_meta_parameter(name, value, direction, meta, m=m, n=n, k=k, bm=bm, bk=bk):
+        # [FUNCTION DOC] HELPER: Step function for minimize. Moves the named parameter by
+        # direction steps (multiplicative or divisive by 2 for SPLIT_N, TILE_M, TILE_N,
+        # num_warps; additive by 1 otherwise), clamped to per-parameter bounds. Returns the
+        # unchanged value if SPLIT_N would not divide n, or for combinations known to break
+        # CUDA state on A100 for float32 num_warps.
         # return next value in positive or negative direction, or
         # input value if the step will result an invalid
         # value. The input value is assumed to be valid.
@@ -607,6 +675,9 @@ def tune__int_bsr_dense_addmm(
     verbose=False,
     force=False,
 ):
+    # [FUNCTION DOC] Convenience wrapper: tunes the integer variant of the BSR-dense addmm
+    # kernel by calling tune_bsr_dense_addmm with the operation name _int_bsr_dense_addmm.
+    # Same arguments and return value (the tuned parameter mapping); no left/right alpha.
     return tune_bsr_dense_addmm(
         input,
         bsr,
@@ -636,6 +707,15 @@ def tune_bsr_dense_addmm(
     force=False,
     opname=None,
 ):
+    # [FUNCTION DOC] Tunes kernel parameters (GROUP_SIZE_ROW, SPLIT_N, num_stages, num_warps)
+    # of the BSR-dense addmm kernel for the given input, BSR matrix and dense matrix. The
+    # database key is built from shape, block size, whether beta is 0 or 1, and alpha being 1;
+    # the version from dtype (or dtype pair if out dtype differs) and rounded sparsity.
+    # If exact stored parameters exist and force is false, returns them without tuning.
+    # Otherwise searches via minimize starting from stored (sparsity 0.5) or reference
+    # parameters, and returns the best mapping. With store true, saves it via update unless
+    # it equals the forced-rerun start. Requires triton; runs GPU benchmarks.
+    # KNOWN ISSUE: left_alpha and right_alpha are not part of the database key.
     """Tune bsr_dense_addmm kernel parameters against the given inputs.
 
     When store is True, the tuning results will be stored in the
@@ -695,7 +775,10 @@ def tune_bsr_dense_addmm(
 
     # The target function that is minimized in the tuning process:
     def bench(meta, input=input, bsr=bsr, dense=dense, alpha=alpha, out=out):
+        # [FUNCTION DOC] HELPER: Target function; returns the benchmarked time in milliseconds
+        # of one addmm call using the given meta parameters.
         def test_func():
+            # [FUNCTION DOC] HELPER: Runs the addmm kernel once with the captured arguments.
             return bsr_dense_addmm(
                 input,
                 bsr,
@@ -712,6 +795,10 @@ def tune_bsr_dense_addmm(
 
     # The step function that increments a specified meta parameter:
     def step_meta_parameter(name, value, direction, meta, M=M, N=N, K=K, BM=BM, BK=BK):
+        # [FUNCTION DOC] HELPER: Step function for minimize. Moves the named parameter by
+        # direction steps (factor of 2 for SPLIT_N and num_warps, additive 1 for others),
+        # clamped to a minimum of 1 and, for SPLIT_N, a maximum of N divided by BM. Returns
+        # the unchanged value if SPLIT_N would not divide N.
         # return next value in positive or negative direction, or
         # input value if the step will result an invalid
         # value. The input value is assumed to be valid.
@@ -780,6 +867,10 @@ def optimize_bsr_dense_addmm(
     verbose=False,
     opname=None,
 ):
+    # [FUNCTION DOC] Creates random test inputs (BSR matrix of shape m x k with block bm x bk
+    # at the given sparsity, dense k x n, input m x n, optional left/right alpha vectors, and
+    # optional output buffer of out_dtype) and tunes the addmm kernel on them with storing
+    # enabled. Seeds the global RNG; returns None. Allocates on the given device.
     torch.manual_seed(0)
     bsr = create_blocked_tensor(
         0, m, k, (bm, bk), sparsity, dtype, device
@@ -811,6 +902,14 @@ def optimize_bsr_dense_addmm(
 
 
 def main(op="scatter_mm", force=False, dtype=torch.float16, verbose=True):
+    # [FUNCTION DOC] Driver that tunes op over a fixed grid of shapes, square sizes, and block
+    # sizes (32 and up for int8) at sparsity 0.5, skipping blocks that do not divide the
+    # shape. Dispatches to optimize_scatter_mm or optimize_bsr_dense_addmm (for alpha/beta
+    # pairs (1,1) and (1,0)); raises NotImplementedError for other ops. Ctrl-C stops early;
+    # any other error dumps the database then re-raises. Always dumps at the end, which
+    # rewrites this file. The trailing disabled block is dead code (never executed).
+    # KNOWN ISSUE: the verbose flag is ignored for scatter_mm, and the local import of
+    # itertools is redundant with the module-level import.
     import itertools
 
     sizes_lst = [
@@ -904,6 +1003,9 @@ def main(op="scatter_mm", force=False, dtype=torch.float16, verbose=True):
                         continue
 
                     def bench(meta, bsr=bsr, dense=dense):
+                        # [FUNCTION DOC] HELPER: Dead code. Benchmarks scatter_mm with
+                        # the given meta and returns milliseconds; other ops raise
+                        # NotImplementedError.
                         import triton
 
                         if op == "scatter_mm":
@@ -920,6 +1022,8 @@ def main(op="scatter_mm", force=False, dtype=torch.float16, verbose=True):
                             )
 
                             def test_func():
+                                # [FUNCTION DOC] HELPER: Dead code. Runs one
+                                # scatter matmul with the prepared indices.
                                 return bsr_scatter_mm(
                                     bsr, dense, indices_data=indices_data
                                 )
