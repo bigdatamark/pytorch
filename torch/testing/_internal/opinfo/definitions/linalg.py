@@ -1,5 +1,15 @@
 # mypy: ignore-errors
 
+# [MODULE DOC]
+# OpInfo database entries for the torch.linalg namespace and related legacy linear algebra
+# ops (svd, cross, det, solve, lu, qr, eig, norms, lstsq, ldl, cholesky, vander, etc.).
+# Contains many sample_inputs_* / error_inputs_* generator functions that yield SampleInput
+# or ErrorInput objects, an np_vander_batched numpy reference helper, and the module-level
+# list op_db of OpInfo / ReductionOpInfo entries (plus python_ref_db of reference infos)
+# that describe dtypes, sample generators, decorators and skips for each op.
+# Import-time side effects: builds the op_db list and constructs all OpInfo objects; it
+# does not mutate global state beyond that.
+
 import itertools
 import random
 import unittest
@@ -62,8 +72,14 @@ from torch.testing._internal.opinfo.refs import PythonRefInfo, ReductionPythonRe
 
 
 def sample_kwargs_vector_norm(t, **kwargs):
+    # [FUNCTION DOC] Sample-kwargs generator for vector_norm: given tensor t, returns a
+    # generator of (empty args, mapping with the key ord) pairs, one per norm order. The
+    # orders without an identity element (inf, negative) are dropped when t is empty or
+    # when any reduced dimension (from the dim kwarg, or all dims if none) has size 0.
     # orders with / without identity
     def ords():
+        # [FUNCTION DOC] HELPER: Returns the tuple of norm orders valid for t, excluding
+        # those lacking an identity when t is empty / reduces over a zero-sized dim.
         has_id = (6, 4, 2, 1, 0, 0.9)
         no_id = (inf, -2.1, -inf)
         if t.numel() == 0:
@@ -81,6 +97,11 @@ def sample_kwargs_vector_norm(t, **kwargs):
 
 
 def sample_inputs_svd(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Yields SampleInputs for svd / linalg.svd: full-rank matrices over a
+    # product of batch shapes, sizes (including 0), full_matrices (or some) flag and four
+    # output_process_fn_grad functions. Those functions make the outputs sign/phase
+    # invariant (abs of U or Vh) and truncate U and Vh to the singular value count so
+    # gradchecks are well defined. Keyword name depends on whether op_info is linalg.svd.
     make_fullrank = make_fullrank_matrices_with_distinct_singular_values
     make_arg = partial(
         make_fullrank, dtype=dtype, device=device, requires_grad=requires_grad
@@ -91,6 +112,9 @@ def sample_inputs_svd(op_info, device, dtype, requires_grad=False, **kwargs):
     ns = [0, 3, 5]
 
     def uniformize(usv):
+        # [FUNCTION DOC] HELPER: Converts an svd result triple into (U, S, Vh) with U and
+        # Vh cut to k = number of singular values; legacy svd returns V so it is conjugate
+        # transposed to Vh first.
         S = usv[1]
         k = S.shape[-1]
         U = usv[0][..., :k]
@@ -99,18 +123,23 @@ def sample_inputs_svd(op_info, device, dtype, requires_grad=False, **kwargs):
         return U, S, Vh
 
     def fn_U(usv):
+        # [FUNCTION DOC] HELPER: Returns the elementwise absolute value of the truncated U.
         U, _, _ = uniformize(usv)
         return U.abs()
 
     def fn_S(usv):
+        # [FUNCTION DOC] HELPER: Returns only the singular values.
         return uniformize(usv)[1]
 
     def fn_Vh(usv):
+        # [FUNCTION DOC] HELPER: Returns the pair (S, absolute value of truncated Vh).
         # We also return S to test
         _, S, Vh = uniformize(usv)
         return S, Vh.abs()
 
     def fn_UVh(usv):
+        # [FUNCTION DOC] HELPER: Returns the pair (U times Vh, S), which is invariant to
+        # the phase ambiguity of the singular vectors.
         U, S, Vh = uniformize(usv)
         return U @ Vh, S
 
@@ -126,6 +155,9 @@ def sample_inputs_svd(op_info, device, dtype, requires_grad=False, **kwargs):
 
 
 def sample_inputs_cross(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Yields three SampleInputs for cross: two with size-3 last dim
+    # (default dim), one with an explicit dim=1 on 3-d inputs, and one broadcasting a
+    # (1, 3) input against (S, 3) with dim=-1.
     make_arg = partial(
         make_tensor, dtype=dtype, device=device, requires_grad=requires_grad
     )
@@ -137,6 +169,9 @@ def sample_inputs_cross(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def error_inputs_cross(op_info, device, **kwargs):
+    # [FUNCTION DOC] Yields ErrorInputs for cross: mismatched size of the cross dim,
+    # differing number of dimensions, size-2 vectors (RuntimeError), and an out of range
+    # dim (IndexError), each with the expected error regex.
     make_arg = partial(make_tensor, device=device, dtype=torch.float32)
 
     sample = SampleInput(input=make_arg((S, 3)), args=(make_arg((S, 1)),))
@@ -159,6 +194,11 @@ def error_inputs_cross(op_info, device, **kwargs):
 
 
 def sample_inputs_householder_product(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Yields (matrix, tau vector) SampleInputs for householder_product:
+    # square, tall, batched, empty, empty tau, and tau shorter than the column count.
+    # Values are drawn from [-2, 2] to keep gradcheck accurate.
+    # KNOWN ISSUE: the docstring says the first argument is square, but tall matrices
+    # are also generated.
     """
     This function generates input for torch.linalg.householder_product (torch.orgqr).
     The first argument should be a square matrix or batch of square matrices, the second argument is a vector or batch of vectors.
@@ -191,6 +231,9 @@ def sample_inputs_householder_product(op_info, device, dtype, requires_grad, **k
 
 
 def sample_inputs_linalg_matrix_power(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Yields SampleInputs for matrix_power: for several (matrix size, batch)
+    # combinations, non-negative exponents 0, 3, 5 on random matrices and negative
+    # exponents -4, -2, -1 on full-rank (invertible) matrices, passing the exponent as arg.
     make_fullrank = make_fullrank_matrices_with_distinct_singular_values
     make_arg = partial(
         make_tensor, dtype=dtype, device=device, requires_grad=requires_grad
@@ -216,6 +259,10 @@ def sample_inputs_linalg_matrix_power(op_info, device, dtype, requires_grad, **k
 def sample_inputs_linalg_det_logdet_slogdet(
     op_info, device, dtype, requires_grad, **kwargs
 ):
+    # [FUNCTION DOC] Yields one full-rank square matrix SampleInput per combination of
+    # batch shape ((), (0,), (3,)) and size (0, 1, 5). For logdet on non-empty real
+    # inputs the matrix is multiplied by the sign of its determinant so the determinant
+    # is positive, then requires_grad is re-enabled on the product.
     make_fullrank = make_fullrank_matrices_with_distinct_singular_values
     make_arg = partial(
         make_fullrank, dtype=dtype, device=device, requires_grad=requires_grad
@@ -241,12 +288,19 @@ def sample_inputs_linalg_det_logdet_slogdet(
 
 
 def sample_inputs_lu_solve(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Yields SampleInputs for lu_solve / linalg.lu_solve. For each size,
+    # batch and rhs count it factors a full-rank matrix (on CPU for mps devices), builds
+    # right-hand sides, and tries every requires_grad combination of LU and B (at least
+    # one must require grad when requires_grad is set). linalg.lu_solve also varies the
+    # adjoint and left flags (B is transposed for right solves); legacy lu_solve passes B
+    # as input with LU and pivots as args.
     """Samples the inputs for both linalg.lu_solve and lu_solve"""
     make_fn = make_fullrank_matrices_with_distinct_singular_values
     make_a = partial(make_fn, dtype=dtype, device=device)
     make_b = partial(make_tensor, dtype=dtype, device=device)
 
     def clone(X, requires_grad):
+        # [FUNCTION DOC] HELPER: Returns a clone of X with requires_grad set as given.
         Y = X.clone()
         Y.requires_grad_(requires_grad)
         return Y
@@ -288,6 +342,8 @@ def sample_inputs_lu_solve(op_info, device, dtype, requires_grad=False, **kwargs
 
 
 def sample_inputs_linalg_multi_dot(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Yields SampleInputs whose input is a list of 2-d tensors forming a
+    # valid chain of matrix products, one list per size chain (including zero sizes).
     # Each test case consists of the sizes in the chain of multiplications
     # e.g. [2, 3, 4, 5] generates matrices (2, 3) @ (3, 4) @ (4, 5)
     test_cases = [
@@ -311,6 +367,10 @@ def sample_inputs_linalg_multi_dot(op_info, device, dtype, requires_grad, **kwar
 
 
 def sample_inputs_linalg_matrix_norm(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Yields SampleInputs for matrix_norm over sizes (2, 2) and (2, 3, 2),
+    # orders (fro, nuc, +-inf, +-1, +-2), two dim pairs and keepdim flags, passed as
+    # positional args (ord, dim, keepdim). For half precision and complex32 dtypes the
+    # orders needing svdvals (nuc, +-2) are omitted.
     low_precision_dtypes = (torch.float16, torch.bfloat16, torch.complex32)
     make_arg = partial(
         make_tensor, device=device, dtype=dtype, requires_grad=requires_grad
@@ -331,6 +391,12 @@ def sample_inputs_linalg_matrix_norm(op_info, device, dtype, requires_grad, **kw
 def sample_inputs_linalg_norm(
     op_info, device, dtype, requires_grad, *, variant=None, **kwargs
 ):
+    # [FUNCTION DOC] Yields SampleInputs for linalg.norm over many shapes including empty
+    # ones: default-ord samples, plus vector orders (1-d inputs) or matrix orders (2-d
+    # inputs) with keepdim True/False, and dim=(0, 1) for fro/nuc. Combinations that
+    # would error or lack gradients (zero-sized reduced dims, orders without identity)
+    # are skipped. With variant "subgradient_at_zero" only all-zeros inputs are yielded.
+    # Raises ValueError for any other non-None variant.
     if variant is not None and variant != "subgradient_at_zero":
         raise ValueError(
             f"Unsupported variant, expected variant to be 'subgradient_at_zero' but got: {variant}"
@@ -434,6 +500,9 @@ def sample_inputs_linalg_norm(
 
 
 def sample_inputs_linalg_vecdot(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Yields SampleInputs for vecdot: pairs of equal-shaped tensors over
+    # batch shapes and vector lengths (including 0), once with default dim and once for
+    # each possible dim index.
     make_arg = partial(
         make_tensor, device=device, dtype=dtype, requires_grad=requires_grad
     )
@@ -451,6 +520,9 @@ def sample_inputs_linalg_vecdot(op_info, device, dtype, requires_grad, **kwargs)
 def sample_inputs_linalg_invertible(
     op_info, device, dtype, requires_grad=False, **kwargs
 ):
+    # [FUNCTION DOC] Yields 8 SampleInputs, each a single full-rank square matrix (with
+    # distinct singular values) for every combination of batch shape ((), (0,), (2,),
+    # (1, 1)) and size (5, 0). Widely reused by other generators in this module.
     """
     This function generates invertible inputs for linear algebra ops
     The input is generated as the itertools.product of 'batches' and 'ns'.
@@ -474,12 +546,20 @@ def sample_inputs_linalg_invertible(
 
 
 def sample_inputs_matrix_rank(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Yields invertible-matrix samples with atol/rtol keyword combinations
+    # of none, float or tensor type (all tolerances of one kind per pass), then the
+    # samples with default kwargs. Raises an error if a base sample already has kwargs.
+    # KNOWN ISSUE: the "skip default behavior" check tests non-empty strings, which are
+    # always truthy, so it never skips; the (none, none) combination is yielded as well.
     """
     This function produces inputs for matrix rank that test
     all possible combinations for atol and rtol
     """
 
     def make_tol_arg(kwarg_type, inp):
+        # [FUNCTION DOC] HELPER: Builds a tolerance argument: None for "none", 1.0 for
+        # "float", or a tensor of ones shaped like the batch dims of inp for "tensor";
+        # raises an error for any other kind.
         if kwarg_type == "none":
             return None
         if kwarg_type == "float":
@@ -514,6 +594,10 @@ def sample_inputs_matrix_rank(op_info, device, dtype, requires_grad=False, **kwa
 def sample_inputs_linalg_pinv_singular(
     op_info, device, dtype, requires_grad=False, **kwargs
 ):
+    # [FUNCTION DOC] Yields (a, b) SampleInputs where a and b are random tensors with
+    # orthonormal columns (via QR) of rank k < 3, over batch shapes and sizes m, n in
+    # (0, 3, 50), so the product a b^T is rank deficient with condition number 1. Used to
+    # test pinv backward on singular inputs; requires_grad is applied to a and b.
     """
     This function produces factors `a` and `b` to generate inputs of the form `a @ b.t()` to
     test the backward method of `linalg_pinv`. That way we always preserve the rank of the
@@ -539,6 +623,8 @@ def sample_inputs_linalg_pinv_singular(
 
 
 def sample_inputs_linalg_cond(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Yields one SampleInput per square shape (S, S), (2, S, S) and
+    # (2, 1, S, S); empty inputs are omitted because autograd does not support them.
     make_arg = partial(
         make_tensor, dtype=dtype, device=device, requires_grad=requires_grad
     )
@@ -555,6 +641,9 @@ def sample_inputs_linalg_cond(op_info, device, dtype, requires_grad=False, **kwa
 
 
 def sample_inputs_linalg_vander(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Yields SampleInputs for vander: for scalar, 1-d and batched shapes,
+    # the default call (when the last dim exceeds 1) and calls with the N keyword set to
+    # last-dim size minus 1, equal, and plus 1, skipping N below 2.
     make_arg = partial(
         make_tensor, dtype=dtype, device=device, requires_grad=requires_grad
     )
@@ -579,6 +668,10 @@ def sample_inputs_linalg_vander(op_info, device, dtype, requires_grad=False, **k
 
 
 def np_vander_batched(x, N=None):
+    # [FUNCTION DOC] Numpy reference for linalg.vander: takes a numpy array x (0-d, 1-d
+    # or batched) and optional column count N (default last dim size) and returns the
+    # increasing-power Vandermonde matrix with a trailing N dim; 0-d input is treated as
+    # length 1. Batches are handled by flattening, applying numpy vander, and reshaping.
     # Wrapper around np.vander that supports batches of 1 dimension (enough for the tests)
     if x.ndim == 0:
         x = x[np.newaxis]
@@ -595,6 +688,10 @@ def np_vander_batched(x, N=None):
 def sample_inputs_linalg_cholesky_inverse(
     op_info, device, dtype, requires_grad=False, **kwargs
 ):
+    # [FUNCTION DOC] Yields SampleInputs for cholesky_inverse: Cholesky factors of an
+    # empty matrix, an empty batch, a single and a batched positive-definite matrix. For
+    # each lower factor it yields the default call, upper=False, and the transposed upper
+    # factor with upper=True. Needs random_well_conditioned_matrix (imported locally).
     from torch.testing._internal.common_utils import random_well_conditioned_matrix
 
     # Cholesky factorization is for positive-definite matrices
@@ -630,6 +727,10 @@ def sample_inputs_linalg_cholesky_inverse(
 def sample_inputs_linalg_ldl_factor(
     op_info, device, dtype, requires_grad=False, **kwargs
 ):
+    # [FUNCTION DOC] Yields SampleInputs for ldl_factor: symmetric positive-definite
+    # single, batched and empty matrices with hermitian=False, plus, for complex dtypes
+    # on CPU or CUDA with MAGMA 2.5.4+, Hermitian positive-definite matrices with
+    # hermitian=True. requires_grad is not applied to the inputs.
     from torch.testing._internal.common_utils import (
         random_hermitian_pd_matrix,
         random_symmetric_pd_matrix,
@@ -670,6 +771,11 @@ def sample_inputs_linalg_ldl_factor(
 def sample_inputs_linalg_ldl_solve(
     op_info, device, dtype, requires_grad=False, **kwargs
 ):
+    # [FUNCTION DOC] Yields SampleInputs for ldl_solve: computes ldl_factor_ex results for
+    # symmetric matrices (and Hermitian ones for complex dtypes on CPU only), then for each
+    # factor yields the factors with pivots and a right-hand side B (unbatched and
+    # matching batch), both with the original factors and a detached clone, with the
+    # hermitian keyword set accordingly. requires_grad is applied to factors and B.
     # Generate LDL factors of symmetric (and Hermitian on CPU) matrices
     from torch.testing._internal.common_utils import (
         random_hermitian_pd_matrix,
@@ -729,6 +835,9 @@ def sample_inputs_linalg_ldl_solve(
 
 
 def sample_inputs_linalg_lstsq(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Yields (a, b) SampleInputs for lstsq with well-conditioned a of shape
+    # (3 + delta, 3) over batch shapes, drivers (only gels on CUDA, four on other devices)
+    # and deltas -1, 0, 1 (only 0 when neither on CPU nor cusolver available).
     from torch.testing._internal.common_utils import random_well_conditioned_matrix
 
     device = torch.device(device)
@@ -764,6 +873,8 @@ def sample_inputs_linalg_lstsq(op_info, device, dtype, requires_grad=False, **kw
 
 
 def error_inputs_lstsq(op_info, device, **kwargs):
+    # [FUNCTION DOC] Yields one ErrorInput: 0-d tensors as both arguments, expecting a
+    # RuntimeError mentioning "at least 2 dimensions".
     zero_d = torch.randn((), device=device)
     yield ErrorInput(
         SampleInput(zero_d, args=(zero_d,)),
@@ -773,6 +884,9 @@ def error_inputs_lstsq(op_info, device, **kwargs):
 
 
 def error_inputs_lstsq_grad_oriented(op_info, device, **kwargs):
+    # [FUNCTION DOC] Like error_inputs_lstsq but for the grad-oriented signature: yields
+    # one ErrorInput with 0-d tensors and None as the third argument, expecting a
+    # RuntimeError mentioning "at least 2 dimensions".
     zero_d = torch.randn((), device=device)
     yield ErrorInput(
         SampleInput(zero_d, args=(zero_d, None)),
@@ -782,6 +896,8 @@ def error_inputs_lstsq_grad_oriented(op_info, device, **kwargs):
 
 
 def sample_inputs_diagonal_diag_embed(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Yields SampleInputs for diagonal / diag_embed: 2-d shapes with
+    # default or offset kwargs and a 3-d shape with offset, dim1 and dim2 kwargs.
     make_arg = partial(
         make_tensor, dtype=dtype, device=device, requires_grad=requires_grad
     )
@@ -806,6 +922,13 @@ def sample_inputs_diagonal_diag_embed(op_info, device, dtype, requires_grad, **k
 
 
 def error_inputs_diagonal_diag_embed(op_info, device, **kwargs):
+    # [FUNCTION DOC] Yields ErrorInputs for diagonal / diag_embed: identical dim1 and dim2
+    # (RuntimeError) and out-of-range dims (IndexError with range message computed from
+    # the effective number of dims, one more for diag_embed). Raises RuntimeError if
+    # op_info.name is neither a diagonal nor a diag_embed op, or if a case matches no
+    # expected error.
+    # KNOWN ISSUE: kwargs1d is an empty mapping, so the 1-d shape samples are never
+    # generated; also dim values of 0 are treated as unset by the truthiness checks.
     make_arg = partial(make_tensor, device=device, dtype=torch.float32)
 
     shapes1d = (0, 1, (0,), (1,))
@@ -868,6 +991,10 @@ def error_inputs_diagonal_diag_embed(op_info, device, **kwargs):
 def sample_inputs_linalg_cholesky(
     op_info, device, dtype, requires_grad=False, **kwargs
 ):
+    # [FUNCTION DOC] Yields SampleInputs for cholesky: Hermitian positive-definite
+    # matrices for batch shapes ((), (0,), (2,), (1, 1)) and sizes (5, 0), each with
+    # upper True and False.
+    # KNOWN ISSUE: the docstring says 8 SampleInputs, but the upper flag doubles it to 16.
     """
     This function generates always positive-definite input for torch.linalg.cholesky using
     random_hermitian_pd_matrix.
@@ -894,6 +1021,8 @@ def sample_inputs_linalg_cholesky(
 def sample_inputs_linalg_matrix_sqrth(
     op_info, device, dtype, requires_grad=False, **kwargs
 ):
+    # [FUNCTION DOC] Yields 8 SampleInputs of Hermitian positive-definite matrices over
+    # batch shapes ((), (0,), (2,), (1, 1)) and sizes (5, 0), with requires_grad set.
     """Generates symmetric/Hermitian positive-definite inputs for torch.linalg.matrix_sqrth."""
     from torch.testing._internal.common_utils import random_hermitian_pd_matrix
 
@@ -904,11 +1033,16 @@ def sample_inputs_linalg_matrix_sqrth(
 
 
 def sample_inputs_linalg_eig(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Yields the invertible-matrix samples with output_process_fn_grad set
+    # so gradchecks see eigenvalues and absolute eigenvectors (phase invariant). Mutates
+    # each sample from sample_inputs_linalg_invertible.
     """
     This function generates input for torch.linalg.eig
     """
 
     def out_fn(output):
+        # [FUNCTION DOC] HELPER: Returns (eigenvalues, abs of eigenvectors) from the
+        # eig output pair.
         return output[0], abs(output[1])
 
     samples = sample_inputs_linalg_invertible(op_info, device, dtype, requires_grad)
@@ -918,11 +1052,17 @@ def sample_inputs_linalg_eig(op_info, device, dtype, requires_grad=False, **kwar
 
 
 def sample_inputs_linalg_eigh(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Yields the invertible-matrix samples with a randomly chosen UPLO
+    # keyword ("L" or "U", via the python random module) and an output_process_fn_grad
+    # that makes eigenvectors phase invariant. Inputs need not be Hermitian since the
+    # OpInfo uses a Hermitian-input gradcheck wrapper.
     """
     This function generates input for torch.linalg.eigh/eigvalsh with UPLO="U" or "L" keyword argument.
     """
 
     def out_fn(output):
+        # [FUNCTION DOC] HELPER: For eigh (tuple output) returns (eigenvalues, abs of
+        # eigenvectors); for eigvalsh returns the output unchanged.
         if isinstance(output, tuple):
             # eigh function
             return output[0], abs(output[1])
@@ -941,6 +1081,8 @@ def sample_inputs_linalg_eigh(op_info, device, dtype, requires_grad=False, **kwa
 
 
 def sample_inputs_linalg_pinv(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] For each invertible-matrix sample yields clones with the rtol kwarg
+    # set to None, 1.0, and a 0-d tensor of the matching real dtype.
     """
     This function generates input for torch.linalg.pinv with hermitian=False keyword argument.
     """
@@ -958,6 +1100,8 @@ def sample_inputs_linalg_pinv(op_info, device, dtype, requires_grad=False, **kwa
 def sample_inputs_linalg_pinv_hermitian(
     op_info, device, dtype, requires_grad=False, **kwargs
 ):
+    # [FUNCTION DOC] Yields the invertible-matrix samples with the kwarg hermitian set to
+    # true. The inputs are not made Hermitian; the OpInfo is expected to wrap them.
     """
     This function generates input for torch.linalg.pinv with hermitian=True keyword argument.
     """
@@ -971,6 +1115,11 @@ def sample_inputs_linalg_pinv_hermitian(
 def sample_inputs_linalg_solve(
     op_info, device, dtype, requires_grad=False, vector_rhs_allowed=True, **kwargs
 ):
+    # [FUNCTION DOC] Yields (A, B) SampleInputs for solve with full-rank square A over
+    # sizes (5, 0), batch shapes ((), (0,), (2,), (2, 2)) and rhs trailing shapes (none,
+    # 1, 3); the vector rhs case is omitted when vector_rhs_allowed is false.
+    # KNOWN ISSUE: the docstring lists 3 batch shapes and 18 samples, but there are 4
+    # batch shapes, giving 24 (or 16 without vector rhs).
     """
     This function generates always solvable input for torch.linalg.solve
     We sample a fullrank square matrix (i.e. invertible) A
@@ -1015,6 +1164,11 @@ def sample_inputs_linalg_solve(
 def sample_inputs_linalg_solve_triangular(
     op_info, device, dtype, requires_grad=False, **kwargs
 ):
+    # [FUNCTION DOC] Yields (A, B) SampleInputs for solve_triangular over batch sizes
+    # (1 meaning unbatched, 2, 0), sizes and rhs widths, and all combinations of the
+    # left, upper and unitriangular flags. A is made triangular with a safe diagonal (ones
+    # if unitriangular, small entries replaced by 1). With requires_grad, yields clones
+    # for every grad combination of A and B with at least one set.
     make_arg = partial(make_tensor, dtype=dtype, device=device)
     bs = (1, 2, 0)
     ns = (3, 0)
@@ -1055,6 +1209,10 @@ def sample_inputs_linalg_solve_triangular(
 
 
 def sample_inputs_legacy_solve(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Reuses sample_inputs_linalg_solve without vector right-hand sides and
+    # swaps the roles so B becomes the input and A the only arg (legacy argument order);
+    # for the op named solve it also takes the first output for gradients. Mutates the
+    # samples from the underlying generator.
     """
     This function generates always solvable input for legacy solve functions
     (the ones that are not in torch.linalg module).
@@ -1067,6 +1225,7 @@ def sample_inputs_legacy_solve(op_info, device, dtype, requires_grad=False, **kw
     )
 
     def out_fn(output):
+        # [FUNCTION DOC] HELPER: Returns the first element of the op output.
         return output[0]
 
     # Reverses tensor order
@@ -1078,6 +1237,10 @@ def sample_inputs_legacy_solve(op_info, device, dtype, requires_grad=False, **kw
 
 
 def sample_inputs_linalg_lu(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Yields SampleInputs for linalg.lu / lu_factor: matrices of shape
+    # (S + delta, S) for delta in -2..2 over several batch shapes, with the pivot kwarg
+    # (False only tested on CUDA). lu_factor uses full-rank matrices; others random ones.
+    # output_process_fn_grad keeps only L and U for linalg.lu, otherwise the full output.
     full_rank = op_info.name == "linalg.lu_factor"
     make_fn = (
         make_tensor
@@ -1087,6 +1250,8 @@ def sample_inputs_linalg_lu(op_info, device, dtype, requires_grad=False, **kwarg
     make_arg = partial(make_fn, dtype=dtype, device=device, requires_grad=requires_grad)
 
     def out_fn(output):
+        # [FUNCTION DOC] HELPER: For linalg.lu returns the (L, U) part of the output
+        # (dropping the permutation); for other ops returns the output unchanged.
         if op_info.name == "linalg.lu":
             return output[1], output[2]
         else:
@@ -1104,6 +1269,8 @@ def sample_inputs_linalg_lu(op_info, device, dtype, requires_grad=False, **kwarg
 
 
 def sample_inputs_linalg_svdvals(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Yields random matrix SampleInputs for svdvals over batch shapes and
+    # all pairs of row/column sizes in (5, 2, 0).
     make_arg = partial(
         make_tensor, dtype=dtype, device=device, requires_grad=requires_grad
     )
@@ -1118,6 +1285,8 @@ def sample_inputs_linalg_svdvals(op_info, device, dtype, requires_grad=False, **
 def sample_inputs_linalg_qr_geqrf(
     op_info, device, dtype, requires_grad=False, **kwargs
 ):
+    # [FUNCTION DOC] Yields full-rank matrix SampleInputs for qr / geqrf over batch shapes
+    # and all pairs of row/column sizes in (5, 2, 0).
     # QR is just well defined when the matrix is full rank
     make_fullrank = make_fullrank_matrices_with_distinct_singular_values
     make_arg = partial(
@@ -1133,6 +1302,9 @@ def sample_inputs_linalg_qr_geqrf(
 
 
 def sample_inputs_linalg_polar(op_info, device, dtype, requires_grad=False, **kwargs):
+    # [FUNCTION DOC] Yields tall or square matrix SampleInputs (no zero-sized dims) over
+    # batch shapes for the polar decomposition; with requires_grad the matrices are
+    # full-rank and well conditioned, otherwise random values in [-2, 2].
     # The polar decomposition A = U @ H is defined for m >= n (tall or square).
     # No zero-size dims here: they trip generic coverage suites (e.g. vmap can't
     # batch over a size-0 dim). Empty/degenerate shapes are covered separately by
@@ -1157,6 +1329,9 @@ def sample_inputs_linalg_polar(op_info, device, dtype, requires_grad=False, **kw
 
 
 def sample_inputs_tensorsolve(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Yields (a, b) SampleInputs for tensorsolve for two multi-dim shapes
+    # of a, with b shaped like the leading two dims of a, and dims None or (0, 2).
+    # Zero-sized shapes are excluded because numpy does not support them.
     a_shapes = [(2, 3, 6), (3, 4, 4, 3)]
     # Zero-dim tensors are not supported in NumPy, so we skip them for now.
     # NumPy is used in reference check tests.
@@ -1174,9 +1349,14 @@ def sample_inputs_tensorsolve(op_info, device, dtype, requires_grad, **kwargs):
 
 
 def sample_inputs_tensorinv(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Yields SampleInputs for tensorinv: a full-rank 12x12 matrix reshaped
+    # to (lhs shape + rhs shape) whose dim products are 12, detached and re-enabled for
+    # grad, with the ind kwarg equal to the number of lhs dims.
     make_arg = make_fullrank_matrices_with_distinct_singular_values
 
     def make_input():
+        # [FUNCTION DOC] HELPER: Returns a new full-rank 12x12 matrix on the sample
+        # device and dtype with requires_grad as requested.
         return make_arg(12, 12, device=device, dtype=dtype, requires_grad=requires_grad)
 
     # lhs / rhs shape can have any number of dimensions as long as their product equals 12
