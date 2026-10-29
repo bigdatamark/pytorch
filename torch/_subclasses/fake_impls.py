@@ -1,3 +1,9 @@
+# [MODULE DOC] Fake-tensor implementations for ATen operators that cannot simply run their meta kernel under FakeTensorMode.
+# Holds a registry (op_implementations_dict for exact OpOverloads, op_implementations_checks for predicate-based rules) populated by the
+# register_op_impl decorator, plus the rule functions: constructors and device handling, sparse/mkldnn conversions, unique/nonzero/masked
+# data-dependent ops, view/reshape with symbolic or unbacked sizes, convolution/attention/foreach helpers, and similar special cases.
+# Exports (all): op_implementations_checks, get_fast_op_impls, stride_incorrect_op, has_meta.
+# Import-time side effects: builds module-level op sets and registers every rule, including notifying the C++ fake dispatch layer.
 from __future__ import annotations
 
 import functools
@@ -107,16 +113,19 @@ _PYTHON_TLS_SNAPSHOT_KEYSET = torch._C.DispatchKeySet(
 
 
 def ordered_set(*items: _T) -> dict[_T, bool]:
+    # [FUNCTION DOC] HELPER: Build an insertion-ordered mapping from each given item to True, used as an ordered set.
     return dict.fromkeys(items, True)
 
 
 # This function indicates if the backend device
 # supports non-contiguous tensors
 def is_noncontiguous_supported(device: torch.device) -> bool:
+    # [FUNCTION DOC] Return whether the device type supports non-contiguous tensors (everything except hpu).
     return device.type != "hpu"
 
 
 def _same_device_or_unspecified_index(a: torch.device, b: torch.device) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if two devices share a type and indices are equal or at least one index is unspecified.
     if a.type != b.type:
         return False
     return a.index is None or b.index is None or a.index == b.index
@@ -183,6 +192,7 @@ _non_kwarg_device_constructors = (aten._list_to_tensor,)
 
 
 def contains_tensor_types(type_: Any) -> bool:
+    # [FUNCTION DOC] HELPER: Recursively check whether a JIT schema type is a Tensor subtype or contains one (lists, optionals, tuples).
     tensor_type = torch._C.TensorType.get()
     return type_.isSubtypeOf(tensor_type) or any(
         contains_tensor_types(e) for e in type_.containedTypes()
@@ -191,6 +201,8 @@ def contains_tensor_types(type_: Any) -> bool:
 
 @functools.cache
 def _is_tensor_constructor(func: OpOverload) -> bool:
+    # [FUNCTION DOC] HELPER: Cached check that an OpOverload looks like a tensor factory: no tensor-typed arguments and exactly one Tensor return.
+    # Raises an error if the argument is not an OpOverload.
     if not isinstance(func, OpOverload):
         raise AssertionError(f"func must be an OpOverload, got {type(func)}")
     schema = func._schema
@@ -204,6 +216,7 @@ def _is_tensor_constructor(func: OpOverload) -> bool:
 
 @functools.cache
 def _has_device_arg(func: OpOverload) -> bool:
+    # [FUNCTION DOC] HELPER: Cached check whether the op schema has an argument named device of device or optional-device type.
     device_type = torch._C.DeviceObjType.get()
     optional_device_type = torch._C.OptionalType(device_type)
     return any(
@@ -217,12 +230,16 @@ def _has_device_arg(func: OpOverload) -> bool:
 
 
 def register_op_impl(
+    # [FUNCTION DOC] Decorator factory that registers a fake implementation. The argument may be one OpOverload (stored in the exact-op
+    # mapping, duplicates raise an error, and the C++ fake dispatch is notified), a list or tuple of OpOverloads (each registered), or a
+    # callable predicate over OpOverload (appended with the implementation to the checks list). Returns a decorator that returns the function unchanged.
     run_impl_check: Callable[[OpOverload], bool]
     | OpOverload
     | list[OpOverload]
     | tuple[OpOverload, ...],
 ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
     def impl_decorator(op_impl: Callable[_P, _R]) -> Callable[_P, _R]:
+        # [FUNCTION DOC] HELPER: Perform the registration for the captured check and return the implementation unchanged.
         if isinstance(run_impl_check, OpOverload):
             if run_impl_check in op_implementations_dict:
                 raise AssertionError(f"duplicate registration: {run_impl_check}")
@@ -245,10 +262,12 @@ def register_op_impl(
 
 
 def _is_op_registered_to_fake_rule(op: OpOverload) -> bool:
+    # [FUNCTION DOC] HELPER: Return whether the op has an exact-match fake rule registered.
     return op in op_implementations_dict
 
 
 def _deregister_op_impl(op: OpOverload) -> None:
+    # [FUNCTION DOC] HELPER: Remove an op's exact rule (and its C++ registration) and any predicate rule whose check is that op. Used to undo registrations.
     if op in op_implementations_dict:
         op_implementations_dict.pop(op, None)
         torch._C._fake_dispatch_deregister_op_impl(
@@ -264,6 +283,7 @@ def _deregister_op_impl(op: OpOverload) -> None:
 def dispatch_to_op_implementations_dict(
     fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any
 ) -> Any:
+    # [FUNCTION DOC] Predicate-based rule that forwards to the exact-op registry entry for the function, passing the fake mode, op, args and kwargs.
     return op_implementations_dict[func](fake_mode, func, *args, **kwargs)
 
 
@@ -272,6 +292,9 @@ def dispatch_to_op_implementations_dict(
 def constructors(
     fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any
 ) -> FakeTensor:
+    # [FUNCTION DOC] Fake rule for tensor factories (tensor-less-argument ops and the like/new_* family). Normalizes arguments to keyword form,
+    # picks the output device (explicit device, else the input's device for like-ops, else cpu), runs the op on the meta device inside the
+    # kernel-invocation context, and wraps the meta result as a FakeTensor reporting the chosen device. Raises if the op is a known non-kwarg-device constructor.
     if func in _non_kwarg_device_constructors:
         raise AssertionError(
             f"func must not be in _non_kwarg_device_constructors, got {func}"
@@ -308,6 +331,7 @@ def constructors(
 def non_kwarg_is_pinned(
     fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any
 ) -> bool:
+    # [FUNCTION DOC] Fake rule for is_pinned: normalizes arguments, ignores the deprecated device argument, and runs the op on the input inside kernel-invocation mode. Returns a bool.
     _, new_kwargs = _normalize_function_or_error(
         func, args, kwargs, normalize_to_only_use_kwargs=True
     )
@@ -325,6 +349,8 @@ def non_kwarg_is_pinned(
 def _record_function_enter(
     fake_mode: FakeTensorMode, func: OpOverload, name: str, args: object | None = None
 ) -> FakeTensor:
+    # [FUNCTION DOC] Fake rule for the legacy profiler record-function-enter op: calls the real op for a handle tensor, then returns a FakeTensor
+    # built from a meta tensor of the same properties on the cpu device.
     # Call the real implementation to get a real handle tensor
     with in_kernel_invocation_manager(fake_mode):
         real_handle = func(name, args)
@@ -339,6 +365,7 @@ def _record_function_exit(
     fake_mode: FakeTensorMode, func: OpOverload, handle: Any
 ) -> None:
     # Exit doesn't return anything and doesn't need to do anything for fake tensors
+    # [FUNCTION DOC] Fake rule for the legacy profiler record-function-exit op: does nothing and returns None.
     # Just return None (the actual return type is void)
     pass
 
@@ -347,6 +374,7 @@ def _record_function_exit(
 def _record_function_enter_new(
     fake_mode: FakeTensorMode, func: OpOverload, name: str, args: object | None = None
 ) -> Any:
+    # [FUNCTION DOC] Fake rule for the new-style profiler record-function-enter op: calls the real op in kernel-invocation mode and returns its custom-object result unwrapped.
     # Call the real implementation - returns a custom class, not a tensor
     # Just pass through without wrapping
     with in_kernel_invocation_manager(fake_mode):
@@ -358,6 +386,9 @@ def _record_function_enter_new(
 def non_kwarg_to(
     fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any
 ) -> FakeTensor:
+    # [FUNCTION DOC] Fake rule for the to(device) overloads whose device is not a keyword. Normalizes args, runs the op with the meta device,
+    # then returns a FakeTensor reporting the requested device (or the input's device if none given).
+    # KNOWN ISSUE: per the in-code TODO, wrong when the result is the same object as the input.
     _, new_kwargs = _normalize_function_or_error(
         func, args, kwargs, normalize_to_only_use_kwargs=True
     )
@@ -374,6 +405,7 @@ def non_kwarg_to(
 
 
 def stride_incorrect_op(op: OpOverload) -> bool:
+    # [FUNCTION DOC] Predicate for ops with meta implementations that produce incorrect strides; always returns False, so by default no op uses the workaround rule.
     return False
 
 
@@ -382,9 +414,12 @@ def stride_incorrect_op(op: OpOverload) -> bool:
 def workaround_stride_incorrect_op(
     fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any
 ) -> FakeTensor:
+    # [FUNCTION DOC] Fake rule workaround for ops whose meta kernel gives wrong strides. If fallback kernels are allowed and no argument is symbolic,
+    # runs the real kernel via the fallback path to get true strides; otherwise raises UnsupportedOperatorException.
     # This is a workaround for meta implementations with incorrect strides
 
     def is_symbolic(x: object) -> bool:
+        # [FUNCTION DOC] HELPER: Return True if the object is a fake tensor with symbolic sizes/strides or a symbolic int, float or bool.
         if is_fake_tensor(x):
             return x._has_symbolic_sizes_strides
         if isinstance(x, (torch.SymInt, torch.SymFloat, torch.SymBool)):
@@ -417,6 +452,7 @@ def workaround_stride_incorrect_op(
 def resize_as_(
     fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any
 ) -> FakeTensor:
+    # [FUNCTION DOC] Fake rule for resize_as_: runs the op directly in kernel-invocation mode, avoiding default device handling because the template tensor's device is ignored.
     with in_kernel_invocation_manager(fake_mode):
         return func(*args, **kwargs)
 
@@ -425,10 +461,13 @@ def resize_as_(
 def _sparse_coo_tensor_with_dims_and_tensors(
     fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any
 ) -> FakeTensor:
+    # [FUNCTION DOC] HELPER: Fake rule for sparse COO construction from dims and tensors; delegates to the generic constructors rule.
     return constructors(fake_mode, func, *args, **kwargs)
 
 
 def _spdiags_static_offsets(offsets: FakeTensorLike) -> list[int] | None:
+    # [FUNCTION DOC] HELPER: Try to get concrete offsets of a spdiags call as a list of ints from a constant or real tensor on cpu.
+    # Returns None if unavailable, fake, or not on cpu.
     constant = getattr(offsets, "constant", None)
     if constant is None:
         constant = getattr(offsets, "real_tensor", None)
@@ -440,6 +479,8 @@ def _spdiags_static_offsets(offsets: FakeTensorLike) -> list[int] | None:
 
 
 def _spdiags_nnz(offsets: list[int], rows: int, cols: int, diag_cols: int) -> int:
+    # [FUNCTION DOC] HELPER: Compute the total number of stored entries for spdiags given static offsets, row/column counts and diagonal length.
+    # Raises an error (via check) if any diagonal would have a negative length.
     nnz = 0
     pos_offset_limit = min(cols, diag_cols)
     for offset in offsets:
@@ -456,6 +497,7 @@ def _spdiags_nnz(offsets: list[int], rows: int, cols: int, diag_cols: int) -> in
 
 
 def _spdiags_max_nnz_per_diag(rows: int, cols: int, diag_cols: int) -> int:
+    # [FUNCTION DOC] HELPER: Upper bound on entries one diagonal can contribute for the given rows, columns and diagonal length (never negative).
     non_positive_offset_max = min(rows, diag_cols)
     positive_offset_max = max(min(cols, diag_cols) - 1, 0)
     return max(non_positive_offset_max, positive_offset_max, 0)
@@ -467,6 +509,8 @@ def _spdiags_dynamic_size(
     *,
     max_size: int | None,
 ) -> torch.SymInt:
+    # [FUNCTION DOC] HELPER: Create an unbacked symbolic int for the data-dependent nnz of spdiags, constrained to the range zero to max_size.
+    # Raises DynamicOutputShapeException if there is no shape env or dynamic output shape ops are disallowed.
     if (
         fake_mode.shape_env is None
         or not fake_mode.shape_env.allow_dynamic_output_shape_ops
@@ -482,6 +526,7 @@ def _spdiags_dynamic_size(
 
 
 def _spdiags_is_static_int(value: object) -> bool:
+    # [FUNCTION DOC] HELPER: Return True for plain ints that are not bools.
     return isinstance(value, int) and not isinstance(value, bool)
 
 
@@ -494,6 +539,9 @@ def _spdiags(
     shape: Sequence[int],
     layout: torch.layout | None = None,
 ) -> FakeTensor:
+    # [FUNCTION DOC] Fake rule for _spdiags. Validates diagonals (1-d or 2-d), shape (2 entries), offsets (scalar or vector, long dtype, cpu),
+    # count agreement, layout (coo, csr or csc) and offset uniqueness. Computes nnz statically when possible, else as a bounded unbacked symint.
+    # Builds meta sparse values and indices in the chosen layout (coo default) with invariant checks off, and returns a FakeTensor on the diagonals' device.
     diagonals_dim = diagonals.dim()
     torch._check(diagonals_dim in (1, 2), lambda: "Diagonals must be vector or matrix")
     torch._check(len(shape) == 2, lambda: "Output shape must be 2d")
@@ -599,6 +647,8 @@ def _to_dense(
     dtype: torch.dtype | None = None,
     masked_grad: bool | None = None,
 ) -> FakeTensor:
+    # [FUNCTION DOC] Fake rule for _to_dense. Tries the mkldnn path first; for sparse COO builds a meta dense tensor of the same shape and dtype
+    # (error if a dtype is given); otherwise runs the op on meta. Returns a FakeTensor with the input's fake device.
     maybe_mkldnn_out = maybe_to_dense_mkldnn(fake_mode, self, dtype, masked_grad)
     if maybe_mkldnn_out is not NotImplemented:
         return typing_cast(FakeTensor, maybe_mkldnn_out)
@@ -630,6 +680,7 @@ def _to_dense(
 def dyn_shape(
     fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any
 ) -> None:
+    # [FUNCTION DOC] Fake rule for ops tagged dynamic-output-shape (except index.Tensor, nonzero and repeat_interleave.Tensor): always raises DynamicOutputShapeException.
     raise DynamicOutputShapeException(func)
 
 
@@ -644,6 +695,9 @@ def _unique(
     *,
     unique_consecutive: bool = False,
 ) -> tuple[FakeTensor, FakeTensor, FakeTensor]:
+    # [FUNCTION DOC] HELPER: Shared fake rule for the unique family. Requires a shape env permitting dynamic output shapes, else raises DynamicOutputShapeException.
+    # The number of unique entries is a memoized (per tensor, separate for consecutive) unbacked symint bounded by numel or the dim size (zero if numel is statically zero).
+    # Returns a 3-tuple of values (new empty tensor), inverse and counts; inverse/counts are real-sized only if requested (or when dim is given on cpu), else empty.
     if (
         fake_mode.shape_env is None
         or not fake_mode.shape_env.allow_dynamic_output_shape_ops
@@ -724,6 +778,7 @@ def unique2(
     return_inverse: bool = False,
     return_counts: bool = False,
 ) -> tuple[FakeTensor, FakeTensor, FakeTensor]:
+    # [FUNCTION DOC] Fake rule for _unique2: delegates to the shared unique helper with no dim. Returns (values, inverse, counts).
     return _unique(fake_mode, func, arg, None, sorted, return_inverse, return_counts)
 
 
@@ -735,6 +790,7 @@ def unique(
     sorted: bool = True,
     return_inverse: bool = False,
 ) -> tuple[FakeTensor, FakeTensor]:
+    # [FUNCTION DOC] Fake rule for _unique: calls the shared unique helper with no dim and no counts, returns (values, inverse).
     uniques, inverse, _counts = _unique(
         fake_mode, func, arg, None, sorted, return_inverse, False
     )
@@ -749,6 +805,9 @@ def meta_select(
     dim: int,
     index: IntLikeType,
 ) -> FakeTensor:
+    # [FUNCTION DOC] Fake rule for select.int that supports data-dependent index. Returns NotImplemented for sparse input; raises on 0-dim input
+    # or a statically out-of-range index. Computes the storage offset for nonnegative or negative index when decidable; otherwise creates an
+    # unbacked symint offset (raising DataDependentOutputException if scalar outputs are not allowed). Returns a strided view with the dim removed.
     from torch.fx.experimental.symbolic_shapes import guard_or_false
 
     if self.is_sparse:
@@ -808,6 +867,7 @@ def unique_dim(
     return_inverse: bool = False,
     return_counts: bool = False,
 ) -> tuple[FakeTensor, FakeTensor, FakeTensor]:
+    # [FUNCTION DOC] Fake rule for unique_dim: normalizes a negative dim and delegates to the shared unique helper.
     return _unique(
         fake_mode,
         func,
@@ -829,6 +889,7 @@ def unique_consecutive(
     return_counts: bool = False,
     dim: int | None = None,
 ) -> tuple[FakeTensor, FakeTensor, FakeTensor]:
+    # [FUNCTION DOC] Fake rule for unique_consecutive: delegates to the shared unique helper with the consecutive flag set and sorting off.
     return _unique(
         fake_mode,
         func,
@@ -848,6 +909,9 @@ def _compute_stride(
     new_shape: Sequence[IntLikeType],
     size_oblivious: bool = False,
 ) -> list[IntLikeType] | None:
+    # [FUNCTION DOC] HELPER: Python port of the C++ stride computation for viewing a tensor with old shape/strides as a new shape.
+    # Returns the new strides, or None if the view is impossible without a copy. Handles zero-numel and zero-dim inputs. When size_oblivious
+    # is set, symbolic comparisons use guard_or_false/guard_or_true instead of specializing.
     from torch.fx.experimental.symbolic_shapes import (
         guard_or_false,
         guard_or_true,
@@ -855,12 +919,14 @@ def _compute_stride(
     )
 
     def maybe_guard_or_false(x: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Apply guard-or-false to the value when size-oblivious mode is on, else return it unchanged.
         if size_oblivious:
             return guard_or_false(x)
 
         return x
 
     def maybe_guard_or_true(x: Any) -> Any:
+        # [FUNCTION DOC] HELPER: Apply guard-or-true to the value when size-oblivious mode is on, else return it unchanged.
         if size_oblivious:
             return guard_or_true(x)
 
@@ -922,6 +988,7 @@ def _compute_stride(
 
 
 def _optimization_hint_or_none(value: Any) -> int | None:
+    # [FUNCTION DOC] HELPER: Return an int hint for an int or SymInt (via optimization hint, no fallback), else None.
     if type(value) is int:
         return value
     if isinstance(value, torch.SymInt):
@@ -932,6 +999,7 @@ def _optimization_hint_or_none(value: Any) -> int | None:
 
 
 def _hinted_eq(lhs: Any, rhs: Any) -> bool:
+    # [FUNCTION DOC] HELPER: Equality that first tries to prove equal; otherwise if hints agree, records a symbolic equality check and returns True. Returns False on missing or differing hints.
     from torch.fx.experimental.symbolic_shapes import guard_or_false
 
     if guard_or_false(lhs == rhs):
@@ -950,6 +1018,7 @@ def _hinted_eq(lhs: Any, rhs: Any) -> bool:
 
 
 def _is_contiguous_with_hinted_checks(a: torch.Tensor) -> bool:
+    # [FUNCTION DOC] HELPER: Contiguity test using hints for unbacked/symbolic dims. Records checks (numel below 2, sizes equal to 1, hinted stride equalities) that the answer relies on. Returns False when hints are missing or strides do not match.
     from torch.fx.experimental.symbolic_shapes import guard_or_false, is_nested_int
 
     if guard_or_false(a.numel() < 2):
@@ -987,6 +1056,7 @@ def _is_contiguous_with_hinted_checks(a: torch.Tensor) -> bool:
 def _view_has_unbacked_input(
     a: torch.Tensor, shape: ShapeType | tuple[ShapeType]
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if any size or stride of the tensor, or any entry of the requested shape, lacks a guarding hint (is unbacked).
     from torch.fx.experimental.symbolic_shapes import has_guarding_hint
 
     shape = utils.extract_shape_from_varargs(shape, validate=False)
@@ -999,6 +1069,7 @@ def _view_has_unbacked_input(
 
 
 def try_duck_specialization_first(a: torch.Tensor, shape) -> bool:
+    # [FUNCTION DOC] HELPER: Duck-specialization probe for views: pairs symbols with equal hints from the input and target dims, and commits equality checks only if substituting them makes the input and target numel symbolically equal. Returns True if equalities were committed.
     """
     Collect candidate (x, y) pairs whose runtime hints match (so they
     *could* be equal), then test whether substituting them into the
@@ -1021,6 +1092,7 @@ def try_duck_specialization_first(a: torch.Tensor, shape) -> bool:
     from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 
     def _atomic_syms(dims) -> list[torch.SymInt]:
+        # [FUNCTION DOC] HELPER: Keep only SymInts whose expression is one bare backed symbol.
         """Keep only SymInts whose expr is a single bare *backed* symbol."""
         out: list[torch.SymInt] = []
         for s in dims:
@@ -1071,6 +1143,7 @@ def try_duck_specialization_first(a: torch.Tensor, shape) -> bool:
 
     # 2) Symbolic test: does the substitution make the view's numel match?
     def _expr_of(s):
+        # [FUNCTION DOC] HELPER: Return the sympy expression of a SymInt, or the value itself otherwise.
         return s.node.expr if isinstance(s, torch.SymInt) else s
 
     try:
@@ -1095,6 +1168,9 @@ def _view_unbacked_meta(
     allow_copy: bool = False,
     tried_duck_specialize: bool = False,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: View/reshape meta logic for tensors with symbolic or unbacked sizes. Infers -1 dims, handles zero-dim cases, checks numel equality,
+    # and returns an alias via same-shape, contiguous or computed strides. On failure with size-oblivious mode it retries with duck-specialization, hinted
+    # contiguity checks, then non-oblivious mode (to raise data-dependent errors). With allow_copy it clones to contiguous then reshapes; otherwise raises ValueError if no view is possible.
     from torch._prims import view_of
     from torch.fx.experimental.symbolic_shapes import guard_or_false, sym_eq
 
@@ -1200,6 +1276,7 @@ def _view_unbacked_meta(
 def _reshape_copy(
     fake_mode: FakeTensorMode, func: OpOverload, a: FakeTensor, *shape: Any
 ) -> FakeTensor | Exception:
+    # [FUNCTION DOC] Fake rule for _reshape_copy. Returns NotImplemented for sparse or mkldnn input. Infers shape; if contiguous, views then clones contiguous, else clones contiguous first and views.
     if a.is_sparse or a.is_mkldnn:
         return NotImplemented
 
@@ -1228,6 +1305,7 @@ def _view_meta(
     *shape: Any,
     allow_copy: bool = False,
 ) -> FakeTensor:
+    # [FUNCTION DOC] Fake rule for view and _unsafe_view: uses the unbacked-aware view logic when backed-size-oblivious is configured or any size is unbacked, else the standard reshape-view helper.
     if torch.fx.experimental._config.backed_size_oblivious or _view_has_unbacked_input(
         a, shape
     ):
@@ -1249,6 +1327,7 @@ def _view_meta_copy(
     *shape: IntLikeType,
     out: FakeTensor | None = None,
 ) -> FakeTensor:
+    # [FUNCTION DOC] Fake rule for view_copy. Runs the view logic with copying allowed (so cases impossible as pure views, like expand then flatten, still succeed), then, unless an out tensor was given, clones the result to contiguous format via a tree map. Returns the FakeTensor.
     # view_copy is the non-aliasing counterpart of view. Eager may succeed on
     # cases where a pure view is impossible (e.g. expand -> flatten) by
     # materializing the result. Match eager by allowing copy-if-needed in meta.
@@ -1270,6 +1349,7 @@ def repeat_interleave_tensor(
     repeats: FakeTensor,
     output_size: IntLikeType | None = None,
 ) -> FakeTensor:
+    # [FUNCTION DOC] Fake rule for repeat_interleave with a tensor of repeats. If output_size is given it is used directly; otherwise requires a shape env allowing dynamic output shapes (else raises DynamicOutputShapeException) and creates an unbacked symint size constrained as a size. Returns a new empty tensor of that length like repeats. No memoization (TODO in code).
     if output_size is None:
         if (
             fake_mode.shape_env is None
@@ -1292,6 +1372,7 @@ def repeat_interleave_tensor(
 def local_scalar_dense(
     fake_mode: FakeTensorMode, func: OpOverload, arg: FakeTensor
 ) -> int | float | bool | torch.SymInt | torch.SymFloat | torch.SymBool:
+    # [FUNCTION DOC] Fake rule for item and _local_scalar_dense. Returns the memoized scalar if present; else needs a shape env (or scalar outputs allowed) or raises DataDependentOutputException. Creates an unbacked symfloat, symint or symbool by dtype, memoizes it on the tensor, and returns it. Raises NotImplementedError for other dtypes.
     if (r := arg.item_memo) is not None:
         return r
     if fake_mode.shape_env is None or (
@@ -1316,11 +1397,13 @@ def local_scalar_dense(
 def nonzero_numpy(
     fake_mode: FakeTensorMode, func: OpOverload, arg: FakeTensor
 ) -> list[FakeTensor]:
+    # [FUNCTION DOC] Fake rule for nonzero_numpy: calls nonzero and unbinds the result along dim 1 into a list of per-dimension index tensors.
     return torch.ops.aten.nonzero.default(arg).unbind(1)
 
 
 @register_op_impl(torch.ops.aten.nonzero.default)
 def nonzero(fake_mode: FakeTensorMode, func: OpOverload, arg: FakeTensor) -> FakeTensor:
+    # [FUNCTION DOC] Fake rule for nonzero. Requires a shape env allowing dynamic output shapes (else raises DynamicOutputShapeException). The count of nonzero entries is memoized on the tensor as an unbacked symint (zero if numel is statically zero), bounded by numel or the upper range of the symbolic size product. Returns an int64 empty tensor of shape (count, ndim) with column-major strides.
     if (
         fake_mode.shape_env is None
         or not fake_mode.shape_env.allow_dynamic_output_shape_ops
@@ -1378,6 +1461,7 @@ def _padded_dense_to_jagged_forward(
     offsets: list[FakeTensor],
     total_L: IntLikeType | None = None,
 ) -> FakeTensor:
+    # [FUNCTION DOC] Fake rule for padded-dense-to-jagged forward. Asserts exactly one offsets tensor. If total_L is missing, requires dynamic output shapes (else raises DynamicOutputShapeException) and makes an unbacked symint bounded by the padded numel. Returns an empty tensor of shape (total_L, trailing dims of padded after the first two).
     # only one jagged dim is supported for now
     if len(offsets) != 1:
         raise AssertionError(
@@ -1412,6 +1496,7 @@ def _padded_dense_to_jagged_forward(
 
 
 def _compute_slice_index(size: IntLikeType, index: IntLikeType) -> IntLikeType | None:
+    # [FUNCTION DOC] HELPER: Normalize a slice start or end index to the range zero to size, using guard-or-false decisions and symbolic min/max for undecidable cases. Returns None if no case can be proven.
     from torch.fx.experimental.symbolic_shapes import guard_or_false, sym_and
 
     if guard_or_false(sym_and(index >= 0, index <= size)):
@@ -1440,6 +1525,7 @@ def slice_forward(
     end: int | None = None,
     step: int = 1,
 ) -> FakeTensor:
+    # [FUNCTION DOC] Fake rule for slice.Tensor. Raises RuntimeError for 0-dim input or non-positive step. Computes start and end indices, then the new size (with a non-negative max form when ordering is unknown; an unbacked symint, bounded by the dim size, if indices are unresolved) and the new storage offset (unbacked and nonnegative if start unknown). Raises NotImplementedError for quantized tensors. Returns a strided view.
     from torch.fx.experimental.symbolic_shapes import (
         guard_or_false,
         statically_known_true,
@@ -1512,6 +1598,7 @@ def slice_forward(
 def masked_select(
     fake_mode: FakeTensorMode, func: OpOverload, self: FakeTensor, mask: FakeTensor
 ) -> FakeTensor:
+    # [FUNCTION DOC] Fake rule for masked_select. Requires a shape env allowing dynamic output shapes (else raises DynamicOutputShapeException). Creates an unbacked symint count, bounded by numel (or the symbolic upper bound) when that exceeds 2, and returns a 1-d empty tensor of that size.
     if (
         fake_mode.shape_env is None
         or not fake_mode.shape_env.allow_dynamic_output_shape_ops
@@ -1564,6 +1651,7 @@ def assert_tensor_metadata(
     device: torch.device | None = None,
     layout: torch.layout | None = None,
 ) -> None:
+    # [FUNCTION DOC] Fake rule for _assert_tensor_metadata: compares the fake tensor's size, stride, dtype, layout and device against the provided expectations and raises AssertionError describing the first mismatch. Returns None.
     if size is not None:
         if t.size() != tuple(size):
             raise AssertionError(
@@ -1596,6 +1684,7 @@ def assert_tensor_metadata(
 def data_dep(
     fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any
 ) -> None:
+    # [FUNCTION DOC] Fake rule for ops tagged data-dependent-output: always raises DataDependentOutputException. Must be registered after local_scalar_dense.
     raise DataDependentOutputException(func)
 
 
@@ -1604,6 +1693,7 @@ def data_dep(
 def check_no_bool_index_tensors(
     func: OpOverload, self: FakeTensor, indices: list[FakeTensor | None]
 ) -> None:
+    # [FUNCTION DOC] HELPER: Raise DynamicOutputShapeException if any index tensor is bool or uint8 (these expand into masks, giving data-dependent shapes).
     for index in indices:
         if index is not None and index.dtype in (torch.bool, torch.uint8):
             raise DynamicOutputShapeException(func)
@@ -1615,6 +1705,7 @@ def run_and_return_new_tensor_of_input_device(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> FakeTensor:
+    # [FUNCTION DOC] HELPER: Run the op on the fake inputs inside kernel-invocation mode and wrap the result as a new FakeTensor on the input tensor's device (new empty tensor if the device lacks non-contiguous support). If the result is the input itself (in-place ops like copy_) return it directly.
     # TODO: ref
     _, new_kwargs = _normalize_function_or_error(
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
@@ -1634,10 +1725,12 @@ _is_builtin_namespaces = ordered_set("aten", "prims", "prim")
 
 
 def is_builtin(op: OpOverload) -> bool:
+    # [FUNCTION DOC] HELPER: Return True if the op belongs to the aten, prims or prim namespace.
     return op.namespace in _is_builtin_namespaces
 
 
 def has_meta(func: OpOverload) -> bool:
+    # [FUNCTION DOC] Return whether the op has a computed Meta-key kernel registered in the dispatcher.
     return torch._C._dispatch_has_computed_kernel_for_dispatch_key(func.name(), "Meta")
 
 
@@ -1647,6 +1740,7 @@ def maybe_to_dense_mkldnn(
     dtype: torch.dtype | None = None,
     masked_grad: bool | None = None,
 ) -> object:
+    # [FUNCTION DOC] HELPER: Fake handling of mkldnn-to-dense. Returns NotImplemented if the input is not a mkldnn FakeTensor. Validates input and output dtypes (supported set, no dtype change for int8, uint8 and float8) raising RuntimeError otherwise, then returns a FakeTensor with a meta contiguous-stride tensor of the same shape on the input's fake device.
     # this function invokes in_kernel_invocation_manager and creates python
     # FakeTensor, revisit later for C++ behaviour
     if (
@@ -1683,12 +1777,14 @@ def maybe_to_dense_mkldnn(
 
 
 class _ToDenseMkldnn(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Autograd function wrapping to_dense for mkldnn inputs. Forward calls the _to_dense op; backward converts the gradient back to mkldnn if the input was mkldnn, else casts it to the input dtype. Returns None for the dtype and masked_grad gradients.
     @staticmethod
     def forward(
         self: torch.Tensor,
         dtype: torch.dtype | None,
         masked_grad: bool | None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Forward of the autograd function: calls the _to_dense op with the given dtype and masked_grad flag.
         return aten._to_dense.default(self, dtype, masked_grad)
 
     @staticmethod
@@ -1697,6 +1793,7 @@ class _ToDenseMkldnn(torch.autograd.Function):
         inputs: tuple[torch.Tensor, torch.dtype | None, bool | None],
         output: torch.Tensor,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Save on the context that grads are not materialized, whether the input was mkldnn, and its dtype.
         ctx.set_materialize_grads(False)
         ctx.input_is_mkldnn = inputs[0].is_mkldnn
         ctx.input_dtype = inputs[0].dtype
@@ -1706,6 +1803,7 @@ class _ToDenseMkldnn(torch.autograd.Function):
     def backward(
         ctx: Any, grad: torch.Tensor | None
     ) -> tuple[torch.Tensor | None, None, None]:
+        # [FUNCTION DOC] HELPER: Backward: returns all-None for a missing gradient; converts back to mkldnn for mkldnn input; otherwise casts the gradient to the input dtype (matching strided wrappers made by torch.func transforms).
         if grad is None:
             return None, None, None
         if ctx.input_is_mkldnn:
@@ -1724,6 +1822,7 @@ def to_dense_composite_impl(
     *,
     masked_grad: bool | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Python composite implementation of to_dense that dispatches on layout: strided returns self (cast if dtype is given), mkldnn goes through the mkldnn autograd function, sparse layouts call the _to_dense op. Any other layout raises an error via check. Needed because fake mkldnn tensors carry their layout in a side channel.
     layout = self.layout
     # This composite is installed globally so direct aten.to_dense can see fake
     # MKLDNN tensors. Keep the common strided path minimal.
@@ -1743,6 +1842,7 @@ def to_dense_functorch_frontmode_impl(
     *,
     masked_grad: bool | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Functorch front-mode implementation of to_dense. Outside a grad transform (or for unwrapped tensors) it lowers the interpreter and calls to_dense with grad enabled. Under grad it defines a single-level autograd function that unwraps, converts (mkldnn path or regular), and rewraps at the current level; its backward uses dtype cast for mkldnn or the to_dense backward op otherwise.
     interpreter = retrieve_current_functorch_interpreter()
     if interpreter.key() != TransformType.Grad or not is_functorch_wrapped_tensor(self):
         with torch.enable_grad(), interpreter.lower():
@@ -1751,6 +1851,7 @@ def to_dense_functorch_frontmode_impl(
     level = interpreter.level()
 
     class _ToDenseGrad(torch.autograd.function._SingleLevelFunction):
+        # [CLASS DOC] HELPER: Single-level autograd function used under functorch grad: forward unwraps the tensor, saves metadata, converts to dense with the interpreter lowered and rewraps; backward returns the dense gradient mapping. Defined per call to capture the interpreter level.
         @staticmethod
         def forward(
             ctx: Any,
@@ -1758,6 +1859,7 @@ def to_dense_functorch_frontmode_impl(
             dtype: torch.dtype | None,
             masked_grad: bool | None,
         ) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Forward: unwrap at the captured level, store input dtype, mkldnn flag and masked_grad on the context, convert to dense (mkldnn function if mkldnn), and wrap the result for grad.
             ctx.set_materialize_grads(False)
             unwrapped_self = _unwrap_for_grad(self, level)
             ctx.save_for_backward(unwrapped_self)
@@ -1775,6 +1877,7 @@ def to_dense_functorch_frontmode_impl(
 
         @staticmethod
         def backward(ctx: Any, *grads: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Backward: a None gradient gives all-None; mkldnn inputs return the gradient cast to input dtype; otherwise uses the to_dense backward op with the saved input. Other returns are None.
             (grad,) = grads
             if grad is None:
                 return None, None, None
@@ -1806,6 +1909,7 @@ def to_dense_python_tls_impl(
     *,
     masked_grad: bool | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: PythonTLSSnapshot-key implementation of to_dense. For FakeTensor or FunctionalTensor uses the composite implementation; for ordinary tensors excludes the python TLS snapshot key and calls to_dense on the normal C++ path.
     from torch._subclasses.functional_tensor import FunctionalTensor
 
     if isinstance(self, (FakeTensor, FunctionalTensor)):  # noqa: ISINSTANCE_FAKE_TENSOR
@@ -1836,6 +1940,7 @@ def to_mkldnn(
     a: FakeTensor,
     dtype: torch.dtype | None = None,
 ) -> object:
+    # [FUNCTION DOC] Fake rule for to_mkldnn. Returns NotImplemented for non-fake input. Raises RuntimeError unless the input is a strided cpu tensor with supported dtype, at most 5 dims, and no dtype change for int8/uint8. Returns a FakeTensor over a meta tensor with opaque mkldnn-style strides, tagged with the mkldnn dispatch keys.
     if not isinstance(a, FakeTensor):  # noqa: ISINSTANCE_FAKE_TENSOR
         return NotImplemented
 
@@ -1883,6 +1988,9 @@ def to_mkldnn(
 def foreach_run_and_map_input_device(
     fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any
 ) -> list[FakeTensor] | None:
+    # [FUNCTION DOC] Fake rule for builtin aten _foreach_ ops that have a meta kernel. Gathers the tensor-list arguments, runs the op on meta inside
+    # kernel-invocation mode (returns NotImplemented if the meta kernel raises NotImplementedError), and returns the output unchanged if empty.
+    # Otherwise wraps each meta output as a FakeTensor on the common device of the corresponding elements across the input lists. Returns the list of FakeTensors.
     tensor_lists = [
         arg
         for arg in itertools.chain(args, kwargs.values())
@@ -1922,6 +2030,7 @@ def foreach_run_and_map_input_device(
 def index_tensor(
     fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any
 ) -> FakeTensor:
+    # [FUNCTION DOC] Fake rule for index.Tensor, bypassing default device handling since cpu index tensors may be used with cuda input. Runs the meta index registration under the fake mode (so nonzero calls stay fake) and moves the result to the input's device.
     from torch._meta_registrations import meta_index_Tensor
 
     _, new_kwargs = _normalize_function_or_error(
@@ -1941,6 +2050,7 @@ def index_tensor(
 def embedding_bag(
     fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any
 ) -> tuple[FakeTensor, FakeTensor, FakeTensor, FakeTensor]:
+    # [FUNCTION DOC] Fake rule for _embedding_bag: runs the meta registration under the fake mode (mixed meta and real devices are tolerated). Returns the four output tensors.
     from torch._meta_registrations import meta_embedding_bag
 
     with fake_mode:
@@ -1951,6 +2061,7 @@ def embedding_bag(
 def embedding(
     fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any
 ) -> Any:
+    # [FUNCTION DOC] Fake rule for embedding. Returns NotImplemented if weight and indices are on different non-meta devices; otherwise runs the meta registration under the fake mode and returns the FakeTensor.
     from torch._meta_registrations import embedding as meta_embedding
 
     _, new_kwargs = _normalize_function_or_error(
@@ -1978,6 +2089,7 @@ def embedding(
 def multi_device_op_default(
     fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any
 ) -> FakeTensor:
+    # [FUNCTION DOC] Fake rule for multi-device ops (_unsafe_index_put, copy, copy_, slice_scatter, diagonal_scatter): runs the op and returns a result on the first input's device, skipping default device checks.
     return run_and_return_new_tensor_of_input_device(fake_mode, func, args, kwargs)
 
 
@@ -1985,6 +2097,7 @@ def multi_device_op_default(
 def _(
     fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any
 ) -> FakeTensor:
+    # [FUNCTION DOC] Fake rule for shallow_copy_data_: runs the op in kernel-invocation mode, then sets the input's fake device to the source tensor's device (mutation) and returns the input.
     _, new_kwargs = _normalize_function_or_error(
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2001,6 +2114,7 @@ def _(
 def multi_device_op_out(
     fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any
 ) -> FakeTensor:
+    # [FUNCTION DOC] Fake rule for the out variants of copy and slice_scatter: runs the op in kernel-invocation mode and returns the input tensor (the mutated destination).
     with in_kernel_invocation_manager(fake_mode):
         func(*args, **kwargs)
 
@@ -2016,6 +2130,7 @@ def multi_device_op_out(
 def index_put_impl(
     fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any
 ) -> FakeTensor:
+    # [FUNCTION DOC] Fake rule for index_put and index_put_. Checks that values is on the same fake device as self (or is a single-element scalar tensor), raising an error otherwise. Runs the op; the in-place variant returns the input, the functional variant returns the new tensor.
     _, new_kwargs = _normalize_function_or_error(
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
@@ -2040,6 +2155,7 @@ def index_put_impl(
 def nested_tensors_unsupported(
     fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any
 ) -> None:
+    # [FUNCTION DOC] Fake rule for nested-tensor construction ops: always raises UnsupportedOperatorException.
     raise UnsupportedOperatorException(func)
 
 
@@ -2059,6 +2175,7 @@ def nested_tensors_unsupported(
     ]
 )
 def nyi(fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any) -> None:
+    # [FUNCTION DOC] Fake rule registered for device-not-keyword ops not registered elsewhere; raises an AssertionError saying the op is not yet implemented.
     if func in _device_not_kwarg_ops:
         raise AssertionError(f"NYI: {func}")
 
@@ -2074,11 +2191,15 @@ def nyi(fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any) 
 def conv(
     fake_mode: FakeTensorMode, func: OpOverload, *args: Any, **kwargs: Any
 ) -> FakeTensor | tuple[FakeTensor | None, FakeTensor | None, FakeTensor | None]:
+    # [FUNCTION DOC] Fake rule for convolution, _convolution and convolution_backward. Requires FakeTensor inputs (AssertionError otherwise), checks dtype equality of input and weight for forward conv (RuntimeError, unless mkldnn or non-fake inputs allowed) and same-device across tensors.
+    # Determines the output memory format by selecting the conv backend and its memory format when sizes are hinted and input is batched, else none.
+    # Runs the op in kernel-invocation mode and wraps outputs as FakeTensors on the input device with that memory format (the third backward output, bias gradient, uses none).
     _, new_kwargs = _normalize_function_or_error(
         func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True
     )
 
     def expect_fake_tensor(name: str, value: object) -> FakeTensor:
+        # [FUNCTION DOC] HELPER: Return value if it is a FakeTensor; otherwise raise AssertionError naming the argument.
         if not isinstance(value, FakeTensor):  # noqa: ISINSTANCE_FAKE_TENSOR
             raise AssertionError(
                 "Expected fake convolution tensor arguments to be FakeTensors, "
@@ -2170,6 +2291,7 @@ def conv(
     def convert(
         t: torch.Tensor | None, mem_fmt: torch.memory_format | None
     ) -> FakeTensor | None:
+        # [FUNCTION DOC] HELPER: Wrap a tensor as a FakeTensor on the conv device after converting it to the given memory format (3-d channels-last handled by temporary unsqueeze). None passes through.
         if t is None:
             return t
         if mem_fmt is not None:
@@ -2205,6 +2327,7 @@ def bincount(
     weights: FakeTensor | None = None,
     minlength: IntLikeType = 0,
 ) -> FakeTensor:
+    # [FUNCTION DOC] Fake rule for bincount. Requires dynamic output shapes (else raises DynamicOutputShapeException). Zero-element input gives an int64 tensor of length minlength. Otherwise creates a size-like unbacked symint with a check that it is at least minlength; output dtype is int64 without weights, else a weights-dependent dtype (mps and other devices differ: float32 kept, otherwise float64 or int32).
     if (
         fake_mode.shape_env is None
         or not fake_mode.shape_env.allow_dynamic_output_shape_ops
@@ -2246,6 +2369,7 @@ def _pack_padded_sequence(
     lengths: FakeTensor,
     batch_first: bool,
 ) -> tuple[FakeTensor, FakeTensor]:
+    # [FUNCTION DOC] Fake rule for _pack_padded_sequence. Requires dynamic output shapes (else raises DynamicOutputShapeException). Transposes input if not batch-first, returns (packed data with the input shape minus its leading dim, batch-size tensor of unbacked symint length).
     if (
         fake_mode.shape_env is None
         or not fake_mode.shape_env.allow_dynamic_output_shape_ops
@@ -2270,6 +2394,7 @@ def _pack_padded_sequence(
 
 
 def _fake_alias(fake_mode: FakeTensorMode, x: FakeTensor) -> FakeTensor:
+    # [FUNCTION DOC] HELPER: Create an alias of a FakeTensor with the python dispatcher disabled, preserving the input's dispatch keys (keeps mkldnn layout state).
     with no_python_dispatcher(), in_kernel_invocation_manager(fake_mode):
         out = aten.alias.default(x)
     # Real MKLDNN alias is not public API, but compiler-generated alias nodes
@@ -2281,6 +2406,7 @@ def _fake_alias(fake_mode: FakeTensorMode, x: FakeTensor) -> FakeTensor:
 def fake_alias(
     fake_mode: FakeTensorMode, func: OpOverload, x: FakeTensor
 ) -> FakeTensor | object:
+    # [FUNCTION DOC] Fake rule for alias: returns NotImplemented for non-fake input, otherwise the fake alias.
     if not isinstance(x, FakeTensor):  # noqa: ISINSTANCE_FAKE_TENSOR
         return NotImplemented
     return _fake_alias(fake_mode, x)
@@ -2295,7 +2421,9 @@ FAST_OP_IMPLEMENTATIONS = {}
 def register_fast_op_impl(
     func: OpOverload,
 ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    # [FUNCTION DOC] Decorator factory registering a fast fake implementation for one op in the fast-impl table (no predicate iteration; runs before decompositions). Returns a decorator that returns the function unchanged.
     def impl_decorator(op_impl: Callable[_P, _R]) -> Callable[_P, _R]:
+        # [FUNCTION DOC] HELPER: Store the implementation in the fast-impl table under the captured op and return it.
         FAST_OP_IMPLEMENTATIONS[func] = op_impl
         return op_impl
 
@@ -2306,6 +2434,7 @@ def register_fast_op_impl(
 def infer_size(
     a: Sequence[IntLikeType], b: Sequence[IntLikeType]
 ) -> tuple[IntLikeType, ...]:
+    # [FUNCTION DOC] Compute the broadcast shape of two sizes (port of C++ infer_size), aligned from the right. Uses a check that sizes match unless one is 1 (broadcast tested first so unbacked sizes defer the equality); raises an error on mismatch. Returns a tuple.
     from torch.fx.experimental.symbolic_shapes import guard_or_false
 
     dimsA = len(a)
@@ -2344,8 +2473,11 @@ def make_fast_binary_impl(
     slow_ref: Callable[..., Any],
     type_promotion_kind: ELEMENTWISE_TYPE_PROMOTION_KIND = ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT,
 ) -> Callable[..., FakeTensor]:
+    # [FUNCTION DOC] Build a fast fake implementation for a binary elementwise op from a slow reference function and a type promotion kind. The returned function computes the output FakeTensor directly when shapes, devices and contiguity are obvious, falling back to running the slow reference under the fake mode.
     def fast_binary_impl(mode: FakeTensorMode, *args: Any, **kwargs: Any) -> FakeTensor:
+        # [FUNCTION DOC] HELPER: Fast path for a binary op. Computes the broadcast shape; requires some operand to have the full output shape (else slow path). Determines common device and dtype (using elementwise dtype promotion when mixed, scalars, or a non-default promotion kind). Allows at most one cpu scalar tensor with a non-cpu device; other device mismatches go slow. If all tensors are definitely contiguous (or channels-last) returns a meta-backed FakeTensor of that format on the common device; otherwise takes the slow path. Counts statistics labels.
         def slow(msg: str) -> FakeTensor:
+            # [FUNCTION DOC] HELPER: Record a slow-path statistic and run the slow reference implementation under the fake mode.
             count_label(f"slow {msg}")
             with mode:
                 return slow_ref(*args, **kwargs)
@@ -2495,6 +2627,7 @@ def fast_detach(
     x: FakeTensor | torch.Tensor,
     include_real: bool = False,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Fast fake rule for detach. Raises AssertionError if the input is not a FakeTensor or no mode is given. Runs detach with the python dispatcher disabled and returns a new FakeTensor keeping the dispatch keys, optionally carrying the real tensor when include_real is set.
     if (
         not isinstance(x, FakeTensor)  # noqa: ISINSTANCE_FAKE_TENSOR
         or fake_mode is None
@@ -2517,11 +2650,13 @@ def fast_detach(
 
 
 def fast_alias(fake_mode: FakeTensorMode, x: FakeTensor) -> FakeTensor:
+    # [FUNCTION DOC] Fast fake rule for alias: delegates to the fake alias helper.
     return _fake_alias(fake_mode, x)
 
 
 @functools.cache
 def get_fast_op_impls() -> dict[OpOverload, Callable[..., Any]]:
+    # [FUNCTION DOC] Cached accessor that registers the fast implementations (add, sub, mul, div with int-to-float promotion, detach, alias) on first call and returns the mapping from OpOverload to fast function. Side effect: mutates the module-level fast-impl table.
     import torch._refs
 
     register_fast_op_impl(torch.ops.aten.add.Tensor)(
