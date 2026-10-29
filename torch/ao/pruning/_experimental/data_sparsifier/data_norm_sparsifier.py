@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines DataNormSparsifier, a data sparsifier that zeroes out the blocks of a 2-D tensor with
+# the smallest L1 or L2 magnitude, optionally keeping only some elements zeroed inside the removed blocks.
+# No import-time side effects.
 import operator
 from functools import reduce
 from typing import Any
@@ -13,6 +16,10 @@ __all__ = ["DataNormSparsifier"]
 
 
 class DataNormSparsifier(BaseDataSparsifier):
+    # [CLASS DOC] Block-wise magnitude sparsifier for raw tensors. State: norm ("L1" or "L2") plus per-data
+    # config defaults sparsity_level (fraction of blocks removed), sparse_block_shape (block height, width,
+    # anchored at the origin, padded at the edges) and zeros_per_block (default: whole block). Masks are
+    # integer tensors produced by update_mask; only 1-D and 2-D data are supported.
     r"""L1-Norm Sparsifier
     This sparsifier computes the *L1-norm* of every sparse block and "zeroes-out" the
     ones with the lowest norm. The level of sparsity defines how many of the
@@ -44,6 +51,8 @@ class DataNormSparsifier(BaseDataSparsifier):
         zeros_per_block: int | None = None,
         norm: str = "L1",
     ):
+        # [FUNCTION DOC] Store the norm and register the defaults. zeros_per_block defaults to the block area.
+        # Raises an error if norm is not L1 or L2. Then initializes the base class, adding data_list if given.
         if zeros_per_block is None:
             zeros_per_block = reduce(operator.mul, sparse_block_shape)
 
@@ -61,6 +70,9 @@ class DataNormSparsifier(BaseDataSparsifier):
     def __get_scatter_folded_mask(
         self, data, dim, indices, output_size, sparse_block_shape
     ):
+        # [FUNCTION DOC] HELPER: Build a mask from unfolded blocks: starts from ones shaped like data, writes zeros
+        # at the given indices along dim, folds blocks back into a tensor of output_size using the block shape as
+        # kernel and stride, and returns it as 8-bit integers.
         mask = torch.ones_like(data)
         mask.scatter_(dim=dim, index=indices, value=0)  # zeroing out
         mask = F.fold(
@@ -73,6 +85,10 @@ class DataNormSparsifier(BaseDataSparsifier):
         return mask
 
     def __get_block_level_mask(self, data, sparse_block_shape, zeros_per_block):
+        # [FUNCTION DOC] HELPER: Mask zeroing the zeros_per_block smallest entries of every block of a 2-D tensor.
+        # If zeros_per_block equals the block area it returns an all-zero mask directly. Otherwise pads the data
+        # with NaN to a multiple of the block shape, unfolds blocks, sorts within each block, zeroes the lowest
+        # entries, folds back, removes padding and returns a contiguous 8-bit mask.
         # Assume data is a squeezed tensor
         height, width = data.shape[-2], data.shape[-1]
         block_height, block_width = sparse_block_shape
@@ -119,6 +135,10 @@ class DataNormSparsifier(BaseDataSparsifier):
         return mask
 
     def __get_data_level_mask(self, data, sparsity_level, sparse_block_shape):
+        # [FUNCTION DOC] HELPER: Mask removing whole low-norm blocks. Average-pools the (already magnitude) data
+        # over blocks (partial edge blocks included), ranks blocks, zeroes the lowest round(sparsity_level times
+        # number of blocks) of them, folds the result back to the padded size, and crops to the original
+        # height and width. Returns an 8-bit mask where 1 marks kept blocks.
         height, width = data.shape[-2], data.shape[-1]
         block_height, block_width = sparse_block_shape
         dh = (block_height - height % block_height) % block_height
@@ -160,6 +180,13 @@ class DataNormSparsifier(BaseDataSparsifier):
     def update_mask(  # type: ignore[override]
         self, name, data, sparsity_level, sparse_block_shape, zeros_per_block, **kwargs
     ):
+        # [FUNCTION DOC] Recompute the mask of the named data. Validates zeros_per_block (raises ValueError if above
+        # the block area or negative), takes absolute values (L1) or squares (L2) of the squeezed data, raises
+        # ValueError if more than 2-D, lifts 1-D data to a row. Combines the block-removal mask with the per-block
+        # mask: kept blocks stay 1, removed blocks use the in-block mask. Assigns into the stored mask in place.
+        # Extra kwargs are ignored.
+        # KNOWN ISSUE: the early assignments for sparsity_level <= 0 (all ones) or full sparsity (all zeros) are
+        # always overwritten by the final assignment since there is no early return, so those shortcuts have no effect.
         values_per_block = reduce(operator.mul, sparse_block_shape)
         if zeros_per_block > values_per_block:
             raise ValueError(

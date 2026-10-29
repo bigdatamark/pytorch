@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines QConfigMultiMapping, a container holding several QConfigMapping
+# objects so each qconfig matching style/key can carry a list of qconfigs (used by the
+# n-shadows model preparation API). Also holds the style-name to setter-method-name table.
+# No import-time side effects beyond the constant definitions.
 from __future__ import annotations
 
 import copy
@@ -26,6 +30,10 @@ _QCONFIG_STYLE_TO_METHOD: dict[str, str] = {
 
 
 def _remove_duplicates_and_none(qconfig_list: list[QConfigAny]) -> None:
+    # [FUNCTION DOC] HELPER: Mutates qconfig_list in place, removing None and duplicate qconfigs.
+    # Duplicates are detected with qconfig_equals against earlier entries. Returns nothing.
+    # KNOWN ISSUE: the scan stops (break) at the first None, so entries after it are never
+    # checked for duplicates, and only that first None is removed.
     to_remove = []
     for index, cur_qconfig in enumerate(qconfig_list):
         if cur_qconfig is None:
@@ -40,6 +48,12 @@ def _remove_duplicates_and_none(qconfig_list: list[QConfigAny]) -> None:
 
 
 class QConfigMultiMapping:
+    # [CLASS DOC] Holds a list of QConfigMapping objects (attribute qconfig_mappings_list,
+    # starts with one empty mapping) so multiple qconfigs can be given per style and key.
+    # Invariant: if any mapping has a qconfig for a style+key, every mapping has an entry
+    # (a qconfig or None) for it, so shorter lists never leak global-style matches.
+    # Setter methods mirror QConfigMapping but take lists and return self for chaining;
+    # from_list_qconfig_mapping builds an instance from existing mappings.
     """
     This class, used with the prepare_n_shadows_model API, stores a list of :class:`torch.ao.quantization.QConfigMapping`s
     so that multiple QConfigs can be specified for each QConfig matching style.
@@ -75,12 +89,18 @@ class QConfigMultiMapping:
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Creates the instance with a single default QConfigMapping in the list.
         # initialize this with 1 QConfigMapping to avoid corner cases
         self.qconfig_mappings_list: list[QConfigMapping] = [QConfigMapping()]
 
     def _handle_list_size_mismatch(
         self, qconfig_list: list[QConfigAny], style: str
     ) -> None:
+        # [FUNCTION DOC] HELPER: Reconciles qconfig_list length with the number of stored mappings.
+        # If the list is longer, appends deep copies of a new mapping whose non-global style
+        # keys (taken from the first existing mapping) are set to None, until sizes match.
+        # If shorter, pads qconfig_list in place with None. Mutates self and qconfig_list.
+        # The style argument is unused.
         # this method handles cases where the size of qconfig_list does not match
         # the size of qconfig_mappings_list.
         # Issue: Consider a user inserting global_qconfig A and B first, then inserting
@@ -129,6 +149,10 @@ class QConfigMultiMapping:
         args: list[str | int | Callable],
         qconfig_list: list[QConfigAny],
     ) -> None:
+        # [FUNCTION DOC] HELPER: Inserts a list of qconfigs for one style across all mappings.
+        # Strips None/duplicates from qconfig_list, balances sizes, then calls the matching
+        # QConfigMapping setter (looked up from the style) on each mapping with args plus
+        # the corresponding qconfig. Mutates qconfig_list and self; raises KeyError for unknown style.
         # we remove duplicates and None to make the ordering of qconfigs
         # deterministic upon insertion.
         _remove_duplicates_and_none(qconfig_list)
@@ -141,6 +165,7 @@ class QConfigMultiMapping:
             set_method(*args, qconfig)
 
     def set_global(self, global_qconfig_list: list[QConfigAny]) -> QConfigMultiMapping:
+        # [FUNCTION DOC] Sets the global qconfigs from a list; returns self for chaining.
         """
         Set global QConfigs
         see :func:`~torch.ao.quantization.QConfigMapping.set_global()` for more info
@@ -151,6 +176,7 @@ class QConfigMultiMapping:
     def set_object_type(
         self, object_type: Callable | str, qconfig_list: list[QConfigAny]
     ) -> QConfigMultiMapping:
+        # [FUNCTION DOC] Sets the qconfigs for an object type (module class, function or method name); returns self.
         """
         Set object type QConfigs
         see :func:`~torch.ao.quantization.QConfigMapping.set_object_type()` for more info
@@ -161,6 +187,7 @@ class QConfigMultiMapping:
     def set_module_name_regex(
         self, module_name_regex: str, qconfig_list: list[QConfigAny]
     ) -> QConfigMultiMapping:
+        # [FUNCTION DOC] Sets the qconfigs for modules whose names match a regex string; returns self.
         """
         Set module_name_regex QConfigs
         see :func:`~torch.ao.quantization.QConfigMapping.set_module_name_regex()` for more info
@@ -173,6 +200,7 @@ class QConfigMultiMapping:
     def set_module_name(
         self, module_name: str, qconfig_list: list[QConfigAny]
     ) -> QConfigMultiMapping:
+        # [FUNCTION DOC] Sets the qconfigs for the module with the given name; returns self.
         """
         Set module_name QConfigs
         see :func:`~torch.ao.quantization.QConfigMapping.set_module_name()` for more info
@@ -187,6 +215,7 @@ class QConfigMultiMapping:
         index: int,
         qconfig_list: list[QConfigAny],
     ) -> QConfigMultiMapping:
+        # [FUNCTION DOC] Sets qconfigs for a module name, object type and occurrence index combination; returns self.
         """
         Set module_name QConfigs
         see :func:`~torch.ao.quantization.QConfigMapping.set_module_name_object_type_order()` for more info
@@ -199,6 +228,7 @@ class QConfigMultiMapping:
         return self
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns a string: the class name followed by the repr of each stored mapping, one per line, in brackets.
         return (
             self.__class__.__name__
             + " ["
@@ -213,6 +243,11 @@ class QConfigMultiMapping:
     def from_list_qconfig_mapping(
         cls, qconfig_mapping_list: list[QConfigMapping]
     ) -> QConfigMultiMapping:
+        # [FUNCTION DOC] Alternate constructor: builds a QConfigMultiMapping from a list of QConfigMapping.
+        # Deep-copies the list into the new instance, then, for every non-global style, gathers
+        # the qconfigs per key across the mappings and re-inserts them through the setters so
+        # the size-balancing invariant holds. Tuple keys are unpacked as positional arguments.
+        # Does not modify the input list; returns the new instance.
         """
         Creates a QConfigMultiMapping from a list of QConfigMappings
         """

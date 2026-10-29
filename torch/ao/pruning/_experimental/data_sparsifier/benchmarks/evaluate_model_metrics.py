@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Benchmark script: evaluates quality metrics (precision, recall, f1, roc auc, accuracy,
+# log loss) of sparsified DLRM checkpoints listed in a metadata csv on the Criteo test set and writes
+# them to sparse_model_metrics.csv. Needs pandas, numpy, sklearn and external DLRM modules at import
+# time. Run as a script with --raw-data-file, --processed-data-file and --sparse-model-metadata.
 import argparse
 
 import numpy as np  # type: ignore[import]
@@ -15,6 +19,10 @@ import torch
 
 
 def inference_and_evaluation(dlrm, test_dataloader, device):
+    # [FUNCTION DOC] Run the model over every batch of the test loader (no early exit in practice), collect
+    # scores and targets, concatenate them and compute recall, precision, f1, average precision, roc auc,
+    # accuracy and log loss (rounded predictions for the thresholded ones). Returns a mapping metric name ->
+    # value rounded to 3 decimals.
     """Perform inference and evaluation on the test dataset.
     The function returns the dictionary that contains evaluation metrics such as accuracy, f1, auc,
     precision, recall.
@@ -79,6 +87,11 @@ def inference_and_evaluation(dlrm, test_dataloader, device):
 
 
 def evaluate_metrics(test_dataloader, sparse_model_metadata):
+    # [FUNCTION DOC] For each row of the metadata csv load the checkpoint, compute metrics with
+    # inference_and_evaluation and collect them with norm, block shape and sparsity level. Prints the table and
+    # writes sparse_model_metrics.csv in the current directory. Returns nothing.
+    # KNOWN ISSUE: the loop reuses the variable key for the display string and the metric names; the ap
+    # metric is computed but never stored since the table has no column for it.
     """Evaluates the metrics the sparsified metrics for the dlrm model on various sparsity levels,
     block shapes and norms. This function evaluates the model on the test dataset and dumps
     evaluation metrics in a csv file [model_performance.csv]

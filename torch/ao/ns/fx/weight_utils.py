@@ -1,3 +1,9 @@
+# [MODULE DOC] Weight extraction helpers for the FX numeric suite. Contains small functions that
+# pull a weight tensor out of a module (float, QAT, quantized, dynamic, LSTM) or out of a
+# function-call graph node (float or quantized conv/linear), a factory building the table of
+# node op -> module/function type -> extraction function, and extract_weight_from_node which
+# packages the result in the numeric suite single-result record format.
+# Import-time side effect: binds toq to the quantized ops namespace.
 from collections.abc import Callable
 
 import torch
@@ -20,18 +26,23 @@ toq = torch.ops.quantized
 
 
 def mod_weight_detach(mod: nn.Module) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Return the detached weight attribute of a module.
     return mod.weight.detach()  # type: ignore[operator]
 
 
 def mod_0_weight_detach(mod: nn.Module) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Return the detached weight of the first submodule (index 0) of a fused module.
     return mod[0].weight.detach()  # type: ignore[index]
 
 
 def mod_weight_bias_0(mod: nn.Module) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Return the first element (the weight) of a quantized module's weight-and-bias pair.
     return mod._weight_bias()[0]  # type: ignore[operator]
 
 
 def get_lstm_weight(mod: nn.Module) -> list[torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Return a list of detached input-hidden and hidden-hidden weight tensors of a
+    # float LSTM, selected by parameter name from its flat weights, in storage order.
     res = []
     for idx, param_name in enumerate(mod._flat_weights_names):  # type: ignore[arg-type]
         if "weight_ih_l" in param_name or "weight_hh_l" in param_name:
@@ -41,6 +52,8 @@ def get_lstm_weight(mod: nn.Module) -> list[torch.Tensor]:
 
 
 def get_qlstm_weight(mod: nn.Module) -> list[torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Return the weights of a dynamic quantized LSTM as a list: for each layer the
+    # two unpacked weight tensors, obtained by digging into the packed parameter state.
     res = []
     for weight_value in mod._all_weight_values:  # type: ignore[union-attr]
         res.append(weight_value.param.__getstate__()[0][4][0].__getstate__()[0][0])
@@ -49,6 +62,8 @@ def get_qlstm_weight(mod: nn.Module) -> list[torch.Tensor]:
 
 
 def get_conv_mod_weight(mod: nn.Module) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Weight of a conv module: detached weight for float convs, detached weight of
+    # the first child for conv-relu fused modules, otherwise the first item of the quantized weight-and-bias pair.
     if isinstance(mod, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
         return mod.weight.detach()
     elif isinstance(mod, (nni.ConvReLU1d, nni.ConvReLU2d, nni.ConvReLU3d)):
@@ -58,6 +73,8 @@ def get_conv_mod_weight(mod: nn.Module) -> torch.Tensor:
 
 
 def get_linear_mod_weight(mod: nn.Module) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Weight of a linear module: detached weight for a float linear, of the first
+    # child for a linear-relu fused module, otherwise the first item of the quantized weight-and-bias pair.
     if isinstance(mod, nn.Linear):
         return mod.weight.detach()
     elif isinstance(mod, nni.LinearReLU):
@@ -67,6 +84,8 @@ def get_linear_mod_weight(mod: nn.Module) -> torch.Tensor:
 
 
 def get_lstm_mod_weights(mod: nn.Module) -> list[torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Return list of LSTM weights for a float LSTM (detached ih/hh weights) or a
+    # dynamic quantized LSTM (unpacked weights). Raises an error for any other module type.
     # TODO(future PR): make more generic, handle everything
     if isinstance(mod, nn.LSTM):
         res = []
@@ -90,6 +109,9 @@ def get_lstm_mod_weights(mod: nn.Module) -> list[torch.Tensor]:
 
 
 def get_conv_fun_weight(node: Node, gm: GraphModule) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Weight of a functional conv node: follows the second arg back through
+    # observers to a get_attr node, looks the attribute up on gm and returns it detached.
+    # Raises an error if the structure is not as expected.
     # traverse backwards from the weight arg, accounting for any observers
     weight_arg_node = node.args[1]
     if not isinstance(weight_arg_node, Node):
@@ -104,6 +126,8 @@ def get_conv_fun_weight(node: Node, gm: GraphModule) -> torch.Tensor:
 
 
 def get_qconv_fun_weight(node: Node, gm: GraphModule) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Weight of a quantized functional conv node: the second arg must be a get_attr
+    # node holding a packed conv state object; returns the result of calling its weight method.
     # qconv state is arg 1
     qconv_state_node = node.args[1]
     if not isinstance(qconv_state_node, Node):
@@ -115,6 +139,9 @@ def get_qconv_fun_weight(node: Node, gm: GraphModule) -> torch.Tensor:
 
 
 def get_linear_fun_weight(node: Node, gm: GraphModule) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Weight of a functional linear node. Supported weight patterns: via an
+    # observer module call (reads the observer's input attribute), via cast to a dtype then dequantize
+    # (returns the attribute detached and cast to that dtype), or a direct get_attr. Raises an error otherwise.
     # traverse backwards from the weight arg, accounting for any observers
     # supported patterns:
     # weight -> obs -> linear
@@ -163,6 +190,8 @@ def get_linear_fun_weight(node: Node, gm: GraphModule) -> torch.Tensor:
 
 
 def get_qlinear_fun_weight(node: Node, gm: GraphModule) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Weight of a quantized functional linear node: the second arg must be a
+    # get_attr node holding the packed params; the weight is read from its serialized state.
     # packed weight is arg 1
     packed_weight_node = node.args[1]
     if not isinstance(packed_weight_node, Node):
@@ -176,6 +205,9 @@ def get_qlinear_fun_weight(node: Node, gm: GraphModule) -> torch.Tensor:
 
 
 def get_op_to_type_to_weight_extraction_fn() -> dict[str, dict[Callable, Callable]]:
+    # [FUNCTION DOC] Build and return a fresh nested mapping: node op ("call_module" or "call_function")
+    # to a mapping from module class / function to the weight extraction function for it. Covers
+    # conv 1d/2d/3d and linear in float, fused, QAT, quantized and dynamic variants, plus LSTM.
     op_to_type_to_weight_extraction_fn: dict[str, dict[Callable, Callable]] = {
         "call_module": {
             # Conv1d
@@ -246,6 +278,12 @@ def extract_weight_from_node(
     op_to_type_to_weight_extraction_fn: dict[str, dict[Callable, Callable]]
     | None = None,
 ) -> NSSingleResultType | None:
+    # [FUNCTION DOC] Extract the weight of a call_function or call_module node as a single-result record.
+    # Uses the given extraction table or builds the default one. Function targets are matched by
+    # equality, module types by exact type. Returns a mapping with the weight type tag, values list
+    # holding the weight, prev/ref node name and target type string (same node), arg indices of 0,
+    # and fqn (from gm's node scope table if present, else None). Returns None if no rule matches.
+    # Raises an error if a module target is not a string.
     res_type = NSSingleResultValuesType.WEIGHT.value
 
     # Not all graphmodules have _node_name_to_scope, so only fill it

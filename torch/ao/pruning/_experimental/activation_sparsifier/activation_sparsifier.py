@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Experimental activation sparsifier. Defines ActivationSparsifier, which attaches
+# forward pre-hooks to layers of a model to aggregate their input activations over time, then
+# derive and apply a sparsity mask from the aggregate via user supplied aggregate, reduce and
+# mask functions. Supports per-feature masks and state save/restore. No import-time side effects.
 import copy
 import warnings
 from collections import defaultdict
@@ -13,6 +17,12 @@ __all__ = ["ActivationSparsifier"]
 
 
 class ActivationSparsifier:
+    # [CLASS DOC] Manages activation sparsification for chosen layers of a model.
+    # State: model; defaults (default functions, features, feature_dim and sparse_config);
+    # data_groups (layer fqn -> per-layer config incl. layer, hook, hook_state, accumulated data);
+    # state (layer fqn -> mask, a tensor, or a list of tensors when features are used, None until
+    # the first forward). Workflow: register_layer, run forward passes, step to compute masks,
+    # then squash_mask to swap the aggregate hook for a hook that multiplies inputs by the mask.
     r"""
     The Activation sparsifier class aims to sparsify/prune activations in a neural
     network. The idea is to attach the sparsifier to a layer (or layers) and it
@@ -102,6 +112,9 @@ class ActivationSparsifier:
         feature_dim=None,
         **sparse_config,
     ):
+        # [FUNCTION DOC] Stores the model and default settings (aggregate_fn, reduce_fn, mask_fn, features,
+        # feature_dim, and extra keyword args kept as the default sparse_config) and creates empty
+        # per-layer data_groups and state mappings. Nothing is registered or hooked yet.
         self.model = model
         self.defaults: dict[str, Any] = defaultdict()
         self.defaults["sparse_config"] = sparse_config
@@ -123,6 +136,9 @@ class ActivationSparsifier:
 
     @staticmethod
     def _safe_rail_checks(args):
+        # [FUNCTION DOC] HELPER: Validates a layer config mapping. Raises an error if features is given
+        # without feature_dim, or if aggregate_fn, reduce_fn or mask_fn is not callable (so each must be
+        # supplied either as default or at registration).
         """Makes sure that some of the functions and attributes are not passed incorrectly"""
 
         # if features are not None, then feature_dim must not be None
@@ -139,6 +155,12 @@ class ActivationSparsifier:
                 raise AssertionError(f"{fn} must be callable")
 
     def _aggregate_hook(self, name):
+        # [FUNCTION DOC] HELPER: Build the forward pre-hook that aggregates inputs of the named layer.
+        # Reads feature settings and aggregate_fn from the layer config at build time. The hook takes the
+        # first input; without features it combines the stored data (zeros on first call) with the input
+        # via aggregate_fn; with features it does so per selected feature slice taken along feature_dim.
+        # On the first call it initializes the mask entries to ones in matching shape. Result is stored
+        # in the layer config under data. The hook returns nothing and does not modify the input.
         """Returns hook that computes aggregate of activations passing through."""
 
         # gather some data
@@ -147,6 +169,7 @@ class ActivationSparsifier:
         agg_fn = self.data_groups[name]["aggregate_fn"]
 
         def hook(module, input) -> None:
+            # [FUNCTION DOC] HELPER: Hook body described on the enclosing method; updates data_groups and state for this layer.
             input_data = input[0]
 
             data = self.data_groups[name].get("data")  # aggregated data
@@ -199,6 +222,11 @@ class ActivationSparsifier:
         feature_dim=None,
         **sparse_config,
     ):
+        # [FUNCTION DOC] Registers a layer (must be inside self.model) for sparsification. The name is its
+        # fully qualified name in the model; raises an error if not found. If already registered, warns and
+        # unregisters first. Builds the layer config from defaults overridden by non-None arguments
+        # (sparse_config is merged), validates it, stores it, attaches the aggregate forward pre-hook, sets
+        # the mask to None and marks hook_state as aggregate.
         r"""
         Registers a layer for sparsification. The layer should be part of self.model.
         Specifically, registers a pre-forward hook to the layer. The hook will apply the aggregate_fn
@@ -252,6 +280,9 @@ class ActivationSparsifier:
         self.data_groups[name]["hook_state"] = "aggregate"  # aggregate hook is attached
 
     def get_mask(self, name: str | None = None, layer: nn.Module | None = None):
+        # [FUNCTION DOC] Return the mask for a layer given by name or by module object (name derived from
+        # the model). Raises an error if neither given or module not in the model; raises ValueError if the
+        # layer is unknown or its mask is still None (no forward pass yet).
         """
         Returns mask associated to the layer.
 
@@ -286,6 +317,8 @@ class ActivationSparsifier:
         return mask
 
     def unregister_layer(self, name):
+        # [FUNCTION DOC] Remove the layer's hook and delete its state and data_groups entries.
+        # Raises KeyError if the name is not registered.
         """Detaches the sparsifier from the layer"""
 
         # detach any hooks attached
@@ -298,6 +331,9 @@ class ActivationSparsifier:
         self.data_groups.pop(name)
 
     def step(self):
+        # [FUNCTION DOC] Without gradients, for each registered layer calls update_mask with its accumulated
+        # data, then discards that accumulated data. Raises KeyError if a layer has seen no forward pass
+        # (no data entry).
         """Internally calls the update_mask() function for each layer"""
         with torch.no_grad():
             for name, configs in self.data_groups.items():
@@ -307,6 +343,9 @@ class ActivationSparsifier:
                 self.data_groups[name].pop("data")  # reset the accumulated data
 
     def update_mask(self, name, data, configs):
+        # [FUNCTION DOC] Update the stored mask of layer name from aggregated data. Applies reduce_fn then
+        # mask_fn (with the layer's sparse_config) to the data, per feature when features are set, and
+        # assigns the result into the existing mask tensor(s) in place. Returns nothing.
         """
         Called for each registered layer and does the following-
             1. apply reduce_fn on the aggregated activations
@@ -329,12 +368,17 @@ class ActivationSparsifier:
                 mask[feature_idx].data = mask_fn(data_feature, **sparse_config)
 
     def _sparsify_hook(self, name):
+        # [FUNCTION DOC] HELPER: Build the forward pre-hook that applies the layer's mask. Fetches the mask now
+        # (so raises if it is not yet known). The hook multiplies the input by the mask, or with features,
+        # overwrites each selected feature slice of the input in place with its masked values; returns the
+        # modified input, which replaces the layer input.
         """Returns hook that applies sparsification mask to input entering the attached layer"""
         mask = self.get_mask(name)
         features = self.data_groups[name]["features"]
         feature_dim = self.data_groups[name]["feature_dim"]
 
         def hook(module, input):
+            # [FUNCTION DOC] HELPER: Hook body described on the enclosing method.
             input_data = input[0]
             if features is None:
                 # apply to all the features
@@ -357,6 +401,10 @@ class ActivationSparsifier:
         return hook
 
     def squash_mask(self, attach_sparsify_hook=True, **kwargs):
+        # [FUNCTION DOC] Finalize masks: for every registered layer remove the aggregate hook and, if
+        # attach_sparsify_hook is true, attach the sparsify pre-hook. kwargs are ignored.
+        # KNOWN ISSUE: hook_state is set to sparsify even when no sparsify hook is attached, and the hook
+        # entry is then missing, so a later unregister_layer fails with KeyError.
         """
         Unregisters aggregate hook that was applied earlier and registers sparsification hooks if
         attach_sparsify_hook = True.
@@ -375,6 +423,8 @@ class ActivationSparsifier:
             )
 
     def _get_serializable_data_groups(self):
+        # [FUNCTION DOC] HELPER: Return a copy of data_groups with the hook and layer entries removed
+        # (those cannot be serialized). Functions are kept as is.
         """Exclude hook and layer from the config keys before serializing
 
         TODO: Might have to treat functions (reduce_fn, mask_fn etc) in a different manner while serializing.
@@ -391,6 +441,8 @@ class ActivationSparsifier:
         return data_groups
 
     def _convert_mask(self, states_dict, sparse_coo=True):
+        # [FUNCTION DOC] HELPER: Return a deep copy of the state mapping with each mask (or list of masks)
+        # converted to sparse COO format when sparse_coo is true, otherwise to dense. None masks are left.
         r"""Converts the mask to sparse coo or dense depending on the `sparse_coo` argument.
         If `sparse_coo=True`, then the mask is stored as sparse coo else dense tensor
         """
@@ -411,6 +463,8 @@ class ActivationSparsifier:
         return states
 
     def state_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Return a mapping with keys state (masks converted to sparse), data_groups
+        # (serializable configs) and defaults.
         r"""Returns the state of the sparsifier as a :class:`dict`.
 
         It contains:
@@ -424,6 +478,8 @@ class ActivationSparsifier:
         return {"state": state, "data_groups": data_groups, "defaults": self.defaults}
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        # [FUNCTION DOC] Restore the sparsifier from a mapping with state, data_groups and defaults by
+        # delegating to the set-state routine. Returns nothing.
         r"""The load_state_dict() restores the state of the sparsifier based on the state_dict
 
         Args:
@@ -437,6 +493,9 @@ class ActivationSparsifier:
         )
 
     def __get_state__(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Return a mapping with defaults, state (sparse masks) and serializable data_groups.
+        # KNOWN ISSUE: the name uses the pattern get-state with underscores around it, not the standard
+        # pickle protocol name, so pickling does not use it.
         data_groups = self._get_serializable_data_groups()
         state = self._convert_mask(self.state)
         return {
@@ -446,6 +505,11 @@ class ActivationSparsifier:
         }
 
     def __set_state__(self, state: dict[str, Any]) -> None:
+        # [FUNCTION DOC] Replace instance attributes from a state mapping, converting masks back to dense,
+        # then for each data group look up the layer in the model by name (raises an error if missing),
+        # re-attach the hook matching hook_state (aggregate or sparsify) and store layer and hook in the config.
+        # KNOWN ISSUE: if hook_state is neither value, no hook is created and the hook variable is unbound
+        # (or reuses the previous iteration's hook). Not the standard pickle protocol name either.
         state["state"] = self._convert_mask(
             state["state"], sparse_coo=False
         )  # convert mask to dense tensor
@@ -469,6 +533,8 @@ class ActivationSparsifier:
             config["hook"] = hook  # type: ignore[possibly-undefined]
 
     def __repr__(self):
+        # [FUNCTION DOC] Return a readable multi-line string listing each data group (name and config
+        # entries) excluding data, hook and the three function entries.
         format_string = self.__class__.__name__ + " ("
         for name, config in self.data_groups.items():
             format_string += "\n"

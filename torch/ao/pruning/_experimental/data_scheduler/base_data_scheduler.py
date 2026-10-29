@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines BaseDataScheduler, a learning-rate-scheduler-like base class that varies one
+# hyperparameter of a BaseDataSparsifier over time. Subclasses implement get_schedule_param. No
+# import-time side effects.
 import abc
 import warnings
 import weakref
@@ -11,6 +14,11 @@ __all__ = ["BaseDataScheduler"]
 
 
 class BaseDataScheduler:
+    # [CLASS DOC] Base scheduler for a BaseDataSparsifier. State: data_sparsifier, schedule_param (name of
+    # the config key being scheduled), base_param (initial value per data group), last_epoch, step counter,
+    # verbose flag, and the last applied values. On construction it wraps the sparsifier step method with
+    # a call counter (to warn if scheduler step is called first) and performs one initial step.
+    # Subclasses must override get_schedule_param (not enforced, the class does not derive from ABC).
     r"""
     The BaseDataScheduler is the abstract scheduler class specifically for the
     BaseDataSparsifier class. This class controls a specific hyperparameter of
@@ -33,6 +41,11 @@ class BaseDataScheduler:
     def __init__(
         self, data_sparsifier, schedule_param: str, last_epoch=-1, verbose=False
     ):
+        # [FUNCTION DOC] Attach to a data sparsifier and schedule the config key schedule_param.
+        # Raises TypeError if data_sparsifier is not a BaseDataSparsifier. Records base values per group,
+        # replaces the sparsifier step method with a counting wrapper (once), sets its step count to 0,
+        # then calls step once, which applies the initial schedule (and increments last_epoch from its
+        # starting value, default -1).
         # Attach sparsifier
         if not isinstance(data_sparsifier, BaseDataSparsifier):
             raise TypeError(
@@ -53,6 +66,8 @@ class BaseDataScheduler:
         # We would like to ensure that `scheduler.step()` is called after
         # `sparsifier.step()`
         def with_counter(method):
+        # [FUNCTION DOC] HELPER: Wrap a bound sparsifier step method so each call increments the instance step
+        # count. Returns it unchanged if already wrapped. Keeps only a weak reference to the instance.
             if getattr(method, "_with_counter", False):
                 # `sparsifier.step()` has already been replaced, return.
                 return method
@@ -67,6 +82,7 @@ class BaseDataScheduler:
 
             @wraps(func)
             def wrapper(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Increment the sparsifier step count then call the original step method.
                 instance = instance_ref()
                 instance._step_count += 1  # type: ignore[union-attr]
                 wrapped = func.__get__(instance, cls)
@@ -88,6 +104,8 @@ class BaseDataScheduler:
 
     @abc.abstractmethod
     def get_schedule_param(self):
+        # [FUNCTION DOC] Abstract: return a mapping from data group name to the new value of the scheduled
+        # parameter. Called by step; the base implementation raises NotImplementedError.
         r"""
         Abstract method that needs to be implemented by the child class.
         The expected return type should be a dictionary of name to schedule_param value
@@ -109,6 +127,7 @@ class BaseDataScheduler:
         raise NotImplementedError
 
     def __repr__(self):
+        # [FUNCTION DOC] Return a string with the class name, the sparsifier and the base parameter values.
         format_string = self.__class__.__name__ + " ("
         format_string += "\n"
         format_string += f"Data Sparsifier {self.data_sparsifier}\n"
@@ -117,6 +136,7 @@ class BaseDataScheduler:
         return format_string
 
     def state_dict(self):
+        # [FUNCTION DOC] Return a mapping of all instance attributes except the sparsifier (which is not saved).
         """Returns the state of the scheduler as a :class:`dict`.
 
         It contains an entry for every variable in self.__dict__ which
@@ -134,6 +154,7 @@ class BaseDataScheduler:
         }
 
     def load_state_dict(self, state_dict):
+        # [FUNCTION DOC] Restore scheduler attributes by updating the instance attribute table from the given mapping.
         """Loads the schedulers state.
 
         Note:
@@ -146,9 +167,16 @@ class BaseDataScheduler:
         self.__dict__.update(state_dict)
 
     def get_last_param(self):
+        # [FUNCTION DOC] Return the parameter values applied in the last step (mapping group name -> value).
+        # Raises AttributeError if step has never completed.
         return self._last_param
 
     def step(self):
+        # [FUNCTION DOC] Advance the schedule one step. On the first call after construction, warns (UserWarning)
+        # if the sparsifier step was overridden or has not been called yet. Increments counters and last_epoch,
+        # calls get_schedule_param (with an internal flag set), writes each returned value into the sparsifier
+        # data group config (printing a message if verbose), records the applied values, and sets the
+        # sparsifier enable_mask_update flag to True.
         # Raise warning if trying to call scheduler step before the sparsifier.
         # https://github.com/pytorch/pytorch/issues/20124
         if self._step_count == 1:
@@ -173,14 +201,19 @@ class BaseDataScheduler:
         self._step_count += 1
 
         class _enable_get_sp_call:
+        # [CLASS DOC] HELPER: Context manager that sets the scheduler flag marking that the schedule parameter is
+        # being computed inside step, and clears it on exit.
             def __init__(self, o):
+            # [FUNCTION DOC] HELPER: Remember the scheduler object.
                 self.o = o
 
             def __enter__(self):
+            # [FUNCTION DOC] HELPER: Set the flag on the scheduler and return the manager.
                 self.o._get_sp_called_within_step = True
                 return self
 
             def __exit__(self, type, value, traceback):
+            # [FUNCTION DOC] HELPER: Clear the flag on the scheduler; exceptions are not suppressed.
                 self.o._get_sp_called_within_step = False
 
         with _enable_get_sp_call(self):

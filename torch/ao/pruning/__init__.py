@@ -1,3 +1,4 @@
+# [PACKAGE DOC] Public API of the pruning package: sparse quantized mappings, schedulers (BaseScheduler, CubicSL, LambdaSL), sparsifiers (BaseSparsifier, NearlyDiagonalSparsifier, WeightNormSparsifier) and sparsity parametrization helpers (FakeSparsity, fqn_to_module, module_to_fqn, get_arg_info_from_tensor_fqn).
 # Variables
 from ._mappings import (
     get_dynamic_sparse_quantized_mapping,

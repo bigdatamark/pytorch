@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Benchmark helpers for DLRM (recommendation model) experiments with data sparsifiers:
+# a sparse-feature DLRM subclass, the Criteo Kaggle model configuration, input device moving, test
+# data loader creation and checkpoint loading. Requires the external dlrm_data_pytorch and
+# dlrm_s_pytorch modules at import time (import fails if they are not on the path).
 import os
 import zipfile
 
@@ -13,6 +17,9 @@ import torch
 
 
 class SparseDLRM(DLRM_Net):
+    # [CLASS DOC] DLRM_Net variant whose forward converts the interacted features to a sparse COO tensor
+    # and multiplies by the first top-layer linear weight (matrix multiply plus bias) before applying the
+    # remaining top layers.
     """The SparseDLRM model is a wrapper around the DLRM_Net model that tries
     to use torch.sparse tensors for the features obtained after the ```interact_features()```
     call. The idea is to do a simple torch.mm() with the weight matrix of the first linear
@@ -20,6 +27,9 @@ class SparseDLRM(DLRM_Net):
     """
 
     def forward(self, dense_x, lS_o, lS_i):
+        # [FUNCTION DOC] Forward pass: bottom MLP on dense input, embedding lookups from offsets/indices,
+        # feature interaction, sparse conversion, sparse matmul with the first top layer, then the rest of the
+        # top layers. Returns the model output tensor.
         x = self.apply_mlp(dense_x, self.bot_l)  # dense features
         ly = self.apply_emb(lS_o, lS_i, self.emb_l, self.v_W_l)  # apply embedding bag
         z = self.interact_features(x, ly)
@@ -33,11 +43,15 @@ class SparseDLRM(DLRM_Net):
 
 
 def get_valid_name(name):
+    # [FUNCTION DOC] HELPER: Return name with every dot replaced by an underscore (dots are invalid in data names).
     """Replaces '.' with '_' as names with '.' are invalid in data sparsifier"""
     return name.replace(".", "_")
 
 
 def get_dlrm_model(sparse_dlrm=False):
+    # [FUNCTION DOC] Build a DLRM model using the fixed Criteo Kaggle configuration (embedding sizes, bottom
+    # and top layer sizes, dot interaction, bce loss, single device). Returns SparseDLRM if sparse_dlrm
+    # else the standard DLRM_Net. The model is freshly initialized.
     """Obtain dlrm model. The configs specified are based on the script in
     bench/dlrm_s_criteo_kaggle.sh. The same config is used to train the model
     for benchmarking on data sparsifier.
@@ -101,6 +115,9 @@ def get_dlrm_model(sparse_dlrm=False):
 
 
 def dlrm_wrap(X, lS_o, lS_i, device, ndevices=1):
+    # [FUNCTION DOC] HELPER: Move the offsets and indices (single tensor or list of tensors) and the dense
+    # input to device when ndevices is 1 (otherwise offsets and indices are returned unmoved). Returns the
+    # tuple (X moved, offsets, indices); no forward pass.
     """Rewritten simpler version of ```dlrm_wrap()``` found in dlrm_s_pytorch.py.
     This function simply moves the input tensors into the device and without the forward pass
     """
@@ -119,6 +136,8 @@ def dlrm_wrap(X, lS_o, lS_i, device, ndevices=1):
 
 
 def make_test_data_loader(raw_data_file_path, processed_data_file):
+    # [FUNCTION DOC] Create the Criteo Kaggle test dataset and return a non-shuffled data loader (batch
+    # size 16384, 7 workers, offset collate function) over it, from the raw and processed data file paths.
     """Function to create dataset and dataloaders for the test dataset.
     Rewritten simpler version of ```make_criteo_and_loaders()``` from the dlrm_data_pytorch.py
     that makes the test dataset and dataloaders only for the ***kaggle criteo dataset***
@@ -147,6 +166,10 @@ def make_test_data_loader(raw_data_file_path, processed_data_file):
 
 
 def fetch_model(model_path, device, sparse_dlrm=False):
+    # [FUNCTION DOC] Load a DLRM model from a checkpoint path. If the path is a zip archive, extracts it
+    # into the same directory (checkpoint name assumed to be the zip name with a different extension),
+    # loads the state onto device, puts the model in eval mode and removes the extracted file. Returns the model.
+    # Side effects: file extraction and deletion.
     """This function unzips the zipped model checkpoint (if zipped) and returns a
     model object
 

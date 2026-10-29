@@ -1,5 +1,10 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
+# [MODULE DOC] Utilities for the FX numeric suite: inferring the input/output dtype class of
+# graph nodes, reading qparams from quantized producers, skipping observers, choosing which
+# args to log, rekeying/filling results dictionaries, comparison metrics (SQNR, normalized
+# L2 error, cosine similarity), and normalized access to a node's nth input.
+# Import-time side effect: binds toq to the quantized ops namespace.
 import enum
 import operator
 from collections.abc import Callable
@@ -23,6 +28,8 @@ toq = torch.ops.quantized
 # TODO(future PR): consider deleting this enum and using the torch types
 # directly.  This might be tricky because it is not a one to one mapping.
 class NodeInputOrOutputType(enum.Enum):
+    # [CLASS DOC] Enumeration of coarse dtype categories of a node input or output: FP32, INT8,
+    # FP16, UNKNOWN (cannot be determined) and FP32_OR_INT8 (either, depending on context).
     FP32 = enum.auto()  # torch.float
     INT8 = enum.auto()  # torch.qint8 or torch.quint8
     FP16 = enum.auto()  # torch.float16
@@ -41,6 +48,13 @@ def get_node_first_input_and_output_type(
     logger_cls: Callable,
     node_type_to_io_type_map: dict[str, set[NSNodeTargetType]],
 ) -> tuple[NodeInputOrOutputType, NodeInputOrOutputType]:
+    # [FUNCTION DOC] Determine the (input type, output type) of the first input of a graph node.
+    # node_type_to_io_type_map maps category names (functions, modules, methods by fp32/fp16/int8/
+    # fp32_or_int8) to sets of targets. Known targets map directly; pass-through ops, loggers,
+    # observers, fake quants and dequantize/to look up the producer's output type recursively
+    # (dequantize outputs FP32, to outputs FP16). Unrecognized nodes give (UNKNOWN, UNKNOWN).
+    # Raises an error if the first input is not a Node, a module target is not a string, or a
+    # to call uses a dtype other than float16.
     # TODO(future PR): clean this up
     FUNS_IO_TYPE_FP32 = node_type_to_io_type_map["funs_io_type_fp32"]
     FUNS_IO_TYPE_FP16 = node_type_to_io_type_map["funs_io_type_fp16"]
@@ -175,6 +189,11 @@ def get_node_input_qparams(
     gm: GraphModule,
     node_type_to_io_type_map: dict[str, set[NSNodeTargetType]],
 ) -> tuple[torch.Tensor | float, torch.Tensor | int] | None:
+    # [FUNCTION DOC] Return (scale, zero_point) of the first input of node if inferable, else None.
+    # Handles a quantize-per-tensor call and quantized add/mul ops (reading scale and zero point
+    # from get_attr nodes on gm), and known quantized modules (their scale and zero_point
+    # attributes). For pass-through modules it recurses to the producer. Returns None if the
+    # producer is not a Node or no rule applies. Raises an error on malformed arg nodes.
     """
     Returns the qparams (scale, zero_point) of the first input to `node`,
     if they can be inferred from the graph.
@@ -187,6 +206,8 @@ def get_node_input_qparams(
     MODS_IO_TYPE_FP32_OR_INT8 = node_type_to_io_type_map["mods_io_type_fp32_or_int8"]
 
     def _get_scale_zp_from_function_args(node, gm, scale_arg_idx, zp_arg_idx):
+        # [FUNCTION DOC] HELPER: Fetch scale and zero point objects from gm for the arguments at the given
+        # indices of node; both must be nodes with string targets (else raises an error). Returns a pair.
         scale_node = get_normalized_nth_input(node, gm, scale_arg_idx)
         zp_node = get_normalized_nth_input(node, gm, zp_arg_idx)
         if not isinstance(scale_node, Node):
@@ -262,6 +283,10 @@ def return_first_non_observer_node(
     node: Node,
     gm: GraphModule,
 ) -> Node:
+    # [FUNCTION DOC] Return node itself, or, if it is an observer/fake-quant module call, its nearest
+    # non-observer ancestor. Looks through at most two stacked observers (the second check is
+    # duplicated by design); each observer must have exactly one arg that is a Node, else raises
+    # an error. Does not mutate the graph.
     """
     If node is not an observer, returns it.  If node is an observer,
     navigates up the graph and returns the first parent which is not an
@@ -300,6 +325,8 @@ def get_number_of_non_param_args(
     node: Node,
     gm: GraphModule,
 ) -> int:
+    # [FUNCTION DOC] Return how many leading args of node are non-parameter inputs: 2 for an LSTM
+    # module call, 1 otherwise.
     """
     Assumes that all non-param args occur first. Returns the number of
     non-param args expected for a node.  For example, for
@@ -323,6 +350,8 @@ def get_number_of_non_param_args(
 
 
 def get_arg_indices_of_inputs_to_log(node: Node) -> list[int]:
+    # [FUNCTION DOC] Return indices of args of node to attach input loggers to. Empty list if no args;
+    # for add/mul style calls, the indices (0 and/or 1) whose arg is a Node; otherwise [0].
     """
     Returns the indices of args of the node which we should attach
     loggers to, if input logging is enabled.
@@ -347,6 +376,9 @@ def get_arg_indices_of_inputs_to_log(node: Node) -> list[int]:
 
 
 def get_target_type_str(node: Node, gm: GraphModule) -> str:
+    # [FUNCTION DOC] Return the type name string of the called function/method (call_function,
+    # call_method) or module (call_module, looked up on gm); empty string for other node ops.
+    # Raises an error if a module target is not a string.
     """
     Returns a string representation of the type of the function or module
     pointed to by this node, or '' for other node types.
@@ -366,6 +398,10 @@ def rekey_logger_info_on_node_name_of_model(
     results: NSResultsType,
     model_name: str,
 ) -> NSResultsType:
+    # [FUNCTION DOC] Return a new results mapping whose top-level keys are replaced by the
+    # ref_node_name of the first result recorded for model_name (the last match wins if several).
+    # Layers without a result for model_name keep their old key. Input is not mutated; raises an
+    # error if a matching model has an empty result list.
     """
     Rekeys the layer name of a results dictionary to use node names
     from `model_name`.
@@ -403,6 +439,9 @@ def rekey_logger_info_on_node_name_of_model(
 
 
 def maybe_add_missing_fqns(results: NSResultsType) -> None:
+    # [FUNCTION DOC] Mutates results in place: finds a model whose first result has a non-None fqn
+    # (only the first layer and first result type are examined), then copies fqn values by position
+    # into every other model's results in all layers and result types. No return value.
     """
     If `fqn` entries are filled in for one of the models in `results`, copies
     them over to any models which do not have them filled out.
@@ -438,7 +477,13 @@ def maybe_add_missing_fqns(results: NSResultsType) -> None:
 
 
 def maybe_dequantize_first_two_tensor_args_and_handle_tuples(f):
+    # [FUNCTION DOC] HELPER: Decorator for metric functions taking two tensors. The wrapper
+    # dequantizes quantized tensors, recurses element-wise over pairs of tuples or lists (returning
+    # a list of results), returns None when either input is not float32, and otherwise calls the
+    # wrapped function with the two (possibly converted) tensors plus any extra arguments.
     def inner(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapper implementing the behavior described on the decorator; requires
+        # at least two positional arguments.
         a0, a1, *a_other = args
 
         if (isinstance(a0, tuple) and isinstance(a1, tuple)) or (
@@ -468,6 +513,8 @@ def maybe_dequantize_first_two_tensor_args_and_handle_tuples(f):
 
 @maybe_dequantize_first_two_tensor_args_and_handle_tuples
 def compute_sqnr(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Signal-to-quantization-noise ratio in dB: 20 times log10 of norm(x) over norm(x - y).
+    # Wrapped to accept tuples/lists and quantized tensors; returns None for non-float32 inputs.
     """
     Computes the SQNR between `x` and `y`.
 
@@ -485,6 +532,8 @@ def compute_sqnr(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 @maybe_dequantize_first_two_tensor_args_and_handle_tuples
 def compute_normalized_l2_error(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Normalized L2 error: square root of sum of squared differences over sum of squared x.
+    # Wrapped to accept tuples/lists and quantized tensors; returns None for non-float32 inputs.
     """
     Computes the normalized L2 error between `x` and `y`.
 
@@ -501,6 +550,8 @@ def compute_normalized_l2_error(x: torch.Tensor, y: torch.Tensor) -> torch.Tenso
 
 @maybe_dequantize_first_two_tensor_args_and_handle_tuples
 def compute_cosine_similarity(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC] Cosine similarity of x and y after flattening each to one row (handles a
+    # quantized conv weight having an extra dimension). Wrapped like the other metrics.
     """
     Computes the cosine similarity between `x` and `y`.
 
@@ -520,6 +571,8 @@ def compute_cosine_similarity(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 def op_type_supports_shadowing(node: Node) -> bool:
+    # [FUNCTION DOC] Return False for call_function nodes with multiple tensor inputs (add, mul, cat,
+    # stack variants), where shadowing is not implemented; True otherwise.
     if node.op == "call_function":
         if node.target in (
             torch.add,
@@ -535,6 +588,12 @@ def op_type_supports_shadowing(node: Node) -> bool:
 
 
 def get_normalized_nth_input(node: Node, gm: GraphModule, idx: int) -> Node:
+    # [FUNCTION DOC] Return the idx-th input of node, using normalized args/kwargs (all as kwargs
+    # order) when possible, else raw args followed by kwargs values (also used when normalization
+    # raises a runtime error). Raises an error if idx is out of range.
+    # KNOWN ISSUE: in the fallback paths the kwargs index is computed as idx plus the number of
+    # args instead of idx minus it, which indexes the wrong kwarg or goes out of range; also the
+    # return annotation says Node though kwargs values may be anything.
     """
     Given a node, gets the n'th input to that node, normalizing
     args and kwargs to the best of its ability.

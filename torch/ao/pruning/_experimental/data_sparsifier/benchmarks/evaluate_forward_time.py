@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Benchmark script: measures forward-pass time of sparsified DLRM checkpoints listed in a
+# metadata csv, for both the sparse-tensor DLRM variant and the standard one, and writes the combined
+# timings to dlrm_forward_time_info.csv. Needs pandas, numpy and the external DLRM modules at import
+# time. Run as a script with --raw-data-file, --processed-data-file and --sparse-model-metadata.
 import argparse
 import time
 
@@ -15,6 +19,9 @@ import torch
 
 
 def run_forward(model, **batch):
+    # [FUNCTION DOC] Time 100 forward passes (no gradients) of model on the given X, lS_o, lS_i batch entries
+    # and return the mean over all but the first (warm-up) pass, in seconds.
+    # KNOWN ISSUE: the docstring says the average is over 100 runs, but the first run is excluded (99 runs).
     """The purpose of this function is to time the forward run of the model.
     The model forward happens a 100 times and each pass is timed. The average
     of this 100 runs is returned as avg_time.
@@ -34,6 +41,8 @@ def run_forward(model, **batch):
 
 
 def make_sample_test_batch(raw_data_path, processed_data_path, device):
+    # [FUNCTION DOC] Build the test data loader, take its first batch, unpack and move it to device, and
+    # return a mapping with keys X, lS_o and lS_i.
     """Create the test_data_loader and sample a batch from it. This batch will be used
     to measure the forward pass of the model throughout this experiment.
     """
@@ -52,6 +61,10 @@ def make_sample_test_batch(raw_data_path, processed_data_path, device):
 
 
 def measure_forward_pass(sparse_model_metadata, device, sparse_dlrm, **batch):
+    # [FUNCTION DOC] For each row of the metadata csv (norm, block shape, sparsity level, model path), load the
+    # model (sparse DLRM variant if sparse_dlrm), time its forward pass on the batch, print the result, and
+    # return a data frame of norm, block shape, sparsity level and time with a dlrm_type column
+    # (with_torch_sparse or without_torch_sparse).
     """Measures and tracks the forward pass of the model for all the sparsity levels, block shapes and norms
     available in sparse_model_metadata file.
     If sparse_dlrm=True, then the SparseDLRM model is loaded, otherwise the standard one is.

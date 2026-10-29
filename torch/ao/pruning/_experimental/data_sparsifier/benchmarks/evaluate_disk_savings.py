@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Benchmark script: sparsifies the embedding tables of a trained Criteo DLRM checkpoint with
+# DataNormSparsifier across sparsity levels, norms (L1, L2; L2 skipped for 1x1 blocks) and block shapes,
+# times each sparsifier step, saves each (zip-compressed) checkpoint and writes a metadata csv.
+# Needs pandas and the external DLRM modules at import time. Run as a script with --model-path and
+# --sparsified-model-dump-path.
 import argparse
 import copy
 import os
@@ -14,6 +19,8 @@ from torch.ao.pruning._experimental.data_sparsifier import DataNormSparsifier
 
 
 def create_attach_sparsifier(model, **sparse_config):
+    # [FUNCTION DOC] Create a DataNormSparsifier from the keyword config and add every model parameter
+    # whose name contains the embedding list marker, under a dot-free name. Returns the sparsifier.
     """Create a DataNormSparsifier and the attach it to the model embedding layers
 
     Args:
@@ -41,6 +48,10 @@ def save_model_states(
     norm,
     zip=True,
 ):
+    # [FUNCTION DOC] Save the model part ("state_dict" entry) of a checkpoint mapping under the dump path in a
+    # subfolder named by norm and block shape, creating directories. If zip is true, compresses it into a zip
+    # file and deletes the raw file. Returns (absolute path of the saved file, its size in whole megabytes).
+    # Side effects: file writes and deletion.
     """Dumps the state_dict() of the model.
 
     Args:
@@ -81,6 +92,11 @@ def save_model_states(
 
 
 def sparsify_model(path_to_model, sparsified_model_dump_path):
+    # [FUNCTION DOC] Run the full sparsification sweep (hardcoded sparsity levels, norms, block shapes; the
+    # docstring-listed arguments are not parameters). Loads the DLRM checkpoint, and for each configuration
+    # deep copies the model, attaches a sparsifier, times one step, squashes the mask, saves the checkpoint
+    # and records norm, block shape, level, step time, size and path. Writes sparse_model_metadata.csv in the
+    # current directory and prints progress. Returns nothing.
     """Sparsifies the embedding layers of the dlrm model for different sparsity levels, norms and block shapes
     using the DataNormSparsifier.
     The function tracks the step time of the sparsifier and the size of the compressed checkpoint and collates

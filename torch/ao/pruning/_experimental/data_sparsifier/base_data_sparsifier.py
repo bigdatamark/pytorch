@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines BaseDataSparsifier, a sparsifier for raw tensors, parameters and embeddings
+# (rather than module weights), plus the internal container module that owns the data and its mask
+# parametrizations. Also defines EMBEDDING_TYPES and SUPPORTED_TYPES. Import-time side effect:
+# if no Python warning options are set, sets the warnings filter to show each warning once.
 import abc
 import copy
 import sys
@@ -31,10 +35,16 @@ SUPPORTED_TYPES = {
 
 
 class _Container(nn.Module):
+    # [CLASS DOC] HELPER: Empty module used as the holder of buffers and parametrizations for sparsified data.
     pass
 
 
 class BaseDataSparsifier(base_sparsifier.BaseSparsifier):
+    # [CLASS DOC] Abstract base for data sparsifiers. State: _container (a holder module with one buffer per
+    # named data item, parametrized with a sparsity mask), data_groups (name -> config), state (name ->
+    # mask), plus defaults inherited from the base sparsifier. The class owns masks and parametrizations,
+    # not the user. Subclasses implement update_mask. Key methods: add_data, get_data, get_mask, step,
+    # squash_mask, state_dict / load_state_dict and pickle hooks.
     r"""
     Base Data Sparsifier class for all Data sparsifiers.
     The abstract class accepts raw torch tensors / embedding / embedding bags (refer to SUPPORTED_TYPES above)
@@ -62,6 +72,8 @@ class BaseDataSparsifier(base_sparsifier.BaseSparsifier):
     """
 
     def __init__(self, data_list: list[tuple[str, Any]] | None = None, **defaults):
+        # [FUNCTION DOC] Create the sparsifier with default configuration kwargs and an empty container, then
+        # add each (name, data) pair of data_list (if given) using the defaults.
         super().__init__(defaults=defaults)
 
         self._container = _Container()
@@ -72,9 +84,12 @@ class BaseDataSparsifier(base_sparsifier.BaseSparsifier):
             [self.add_data(name, data, **self.defaults) for name, data in data_list]
 
     def prepare(self, model, config):
+        # [FUNCTION DOC] Not supported: always raises NotImplementedError.
         raise NotImplementedError("this function is undefined for this class")
 
     def _extract_weight(self, data):
+        # [FUNCTION DOC] HELPER: Return the tensor itself for a tensor or parameter, or the weight of an
+        # embedding / embedding bag. Returns None for any other type.
         # extract the weight parameter instead of underlying data
         if type(data) in [torch.Tensor, nn.Parameter]:
             return data
@@ -82,6 +97,12 @@ class BaseDataSparsifier(base_sparsifier.BaseSparsifier):
             return data.weight
 
     def add_data(self, name: str, data, reuse_mask=True, **config):
+        # [FUNCTION DOC] Add (or replace) a named data item to sparsify. Data must be exactly one of the supported
+        # types, else raises an error. Config is the defaults overridden by the given keyword config; the mask
+        # defaults to all ones (config may supply mask or parametrization class). If the name exists, warns,
+        # starts from the old config updated with the new one and, if reuse_mask, keeps the old mask (raises an
+        # error if shapes differ), then deletes the old item. Registers the weight as a container buffer,
+        # parametrizes it with the mask, records state and config, and returns the parametrized container attribute.
         r"""Configures and parametrizes the internal container model with name and data.
 
         **Note**:
@@ -135,6 +156,9 @@ class BaseDataSparsifier(base_sparsifier.BaseSparsifier):
         return getattr(self._container, name)
 
     def get_data(self, name: str, return_original: bool = True):
+        # [FUNCTION DOC] Return the data registered under name: the original unparametrized tensor if
+        # return_original (raises ValueError if parametrization was removed by squashing), otherwise the
+        # sparsified (parametrized) view. Raises ValueError for an unknown name.
         r"""Returns weight tensor (or data)
         Args:
             - name: name of the data to be returned
@@ -153,6 +177,8 @@ class BaseDataSparsifier(base_sparsifier.BaseSparsifier):
             return getattr(self._container, name)
 
     def _convert_mask(self, states, sparse_coo=True):
+        # [FUNCTION DOC] HELPER: Deep copy the state mapping and convert every mask to sparse COO (or dense when
+        # sparse_coo is false). Returns the copy.
         r"""Converts the mask to sparse coo or dense tensors depending on the `sparse_coo` argument."""
         states = copy.deepcopy(states)
         for state in states.values():
@@ -164,6 +190,8 @@ class BaseDataSparsifier(base_sparsifier.BaseSparsifier):
         return states
 
     def state_dict(self):
+        # [FUNCTION DOC] Return a mapping with state (masks as sparse COO), data_groups (the live mapping, not a
+        # copy) and _container (the container module state dictionary).
         r"""Returns the state of the optimizer as a :class:`dict`.
 
         It contains:
@@ -181,6 +209,12 @@ class BaseDataSparsifier(base_sparsifier.BaseSparsifier):
         }
 
     def _load_container_from_state(self, states, data_groups, container_state_dict):
+        # [FUNCTION DOC] HELPER: Rebuild container contents from saved pieces. For each name in states, requires
+        # a config in data_groups and a matching entry in the container state (plain or parametrized original),
+        # else raises RuntimeError. Registers it as a buffer and, if it was parametrized, re-registers the
+        # parametrization with the saved mask (default all ones).
+        # KNOWN ISSUE: the parametrization class is looked up as a top-level key of data_groups (keyed by data
+        # name), so it practically always falls back to the default FakeSparsity.
         r"""This restores the state of the container specifically based on the data present in state and data_groups
         If the data was parametrized, then the data would be added to the container and then parametrized,
         else it would just add the attribute to the container.
@@ -220,6 +254,11 @@ class BaseDataSparsifier(base_sparsifier.BaseSparsifier):
                 )
 
     def load_state_dict(self, state_dict, strict=True):
+        # [FUNCTION DOC] Restore from a state mapping (state, data_groups, _container). Works on deep copies;
+        # converts masks to dense. If strict, replaces the container with a fresh one first; rebuilds the
+        # container, then (if not strict) merges the current state and groups over the loaded ones, and
+        # finally applies the result via the set-state routine.
+        # KNOWN ISSUE: in non-strict mode the current entries override loaded entries of the same name.
         r"""The load_state_dict() restores the state of the sparsifier based on the state_dict
 
         Args:
@@ -248,6 +287,9 @@ class BaseDataSparsifier(base_sparsifier.BaseSparsifier):
         self.__setstate__({"state": states, "data_groups": data_groups})
 
     def __setstate__(self, state):
+        # [FUNCTION DOC] Pickle support: if state has a container entry, rebuilds a fresh container from it
+        # (masks converted to dense) and consumes that entry; then updates the instance attributes from state.
+        # Without a container entry masks are not converted.
         if "_container" in state:  # If container object is in state then load model
             container_dict = state.pop("_container")
             self._container = _Container()
@@ -261,6 +303,8 @@ class BaseDataSparsifier(base_sparsifier.BaseSparsifier):
         self.__dict__.update(state)
 
     def __getstate__(self):
+        # [FUNCTION DOC] Pickle support: return a mapping with defaults, state (sparse masks), data_groups and
+        # the container state dictionary.
         state = self._convert_mask(self.state)
         return {
             "defaults": self.defaults,
@@ -270,6 +314,7 @@ class BaseDataSparsifier(base_sparsifier.BaseSparsifier):
         }
 
     def __repr__(self):  # type:ignore[override]
+        # [FUNCTION DOC] Return a readable multi-line string listing each data group name and its config, skipping the data entry.
         format_string = self.__class__.__name__ + " ("
         for name, sparse_args in self.data_groups.items():
             format_string += "\n"
@@ -283,11 +328,16 @@ class BaseDataSparsifier(base_sparsifier.BaseSparsifier):
         return format_string
 
     def get_mask(self, name: str):
+        # [FUNCTION DOC] Return the mask for the named data; raises ValueError if the name is unknown.
         if name not in self.state:
             raise ValueError("data with specified name does not exist")
         return self.state[name]["mask"]
 
     def squash_mask(self, *args, leave_parametrized=True, names=None, **kwargs):
+        # [FUNCTION DOC] Remove mask parametrizations from the container for names (default all data groups),
+        # keeping the parametrized (masked) values if leave_parametrized else restoring the originals.
+        # Extra args are ignored.
+        # KNOWN ISSUE: the docstring mentions a sparsified option that does not exist.
         r"""Squashes the sparse masks into the appropriate tensors. Also, accepts list of strings
         to squash mask for. If none, squashes mask for all the keys
         kwargs:
@@ -303,6 +353,8 @@ class BaseDataSparsifier(base_sparsifier.BaseSparsifier):
             )
 
     def step(self):  # type:ignore[override]
+        # [FUNCTION DOC] If mask updates are enabled, for each data group fetch the original data and call
+        # update_mask with the name, data and the group config, without gradients. No-op otherwise.
         if not self.enable_mask_update:
             return
         with torch.no_grad():
@@ -314,9 +366,13 @@ class BaseDataSparsifier(base_sparsifier.BaseSparsifier):
 
     @abc.abstractmethod
     def update_mask(self, name, data, **kwargs):  # type: ignore[override]
+        # [FUNCTION DOC] Abstract hook for subclasses to compute and store the mask for the named data from
+        # the given data and config kwargs. The base body does nothing.
         pass
 
     def _delete_data(self, name):
+        # [FUNCTION DOC] HELPER: Remove named data: squashes its parametrization without applying the mask,
+        # deletes the container attribute, and drops its state and data_groups entries.
         """Detaches some data from the sparsifier.
 
         Args:

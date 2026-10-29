@@ -1,3 +1,9 @@
+# [MODULE DOC] Pattern helpers for the FX numeric suite (ns) node matcher.
+# Provides the symmetric "related types" relation between ops/modules, the list of
+# fusion patterns (stored in reverse order) used to group multi-node sequences, and
+# a matcher checking whether a graph node ends such a fusion pattern.
+# Defines the type aliases NSFusionElType and NSFusionType. Import-time side effect:
+# binds toq to the quantized ops namespace.
 from collections.abc import Callable
 from typing import Any
 
@@ -20,6 +26,10 @@ toq = torch.ops.quantized
 def get_type_a_related_to_b(
     base_name_to_sets_of_related_ops: dict[str, set[NSNodeTargetType]],
 ) -> set[tuple[NSNodeTargetType, NSNodeTargetType]]:
+    # [FUNCTION DOC] Build the set of ordered pairs of node target types considered related.
+    # Input: mapping from a base name to a set of related ops/modules/functions.
+    # Output: set of pairs; every two members of the same set (including a member with
+    # itself) appear in both orders. Pure function, no side effects.
     # TODO(future PR): allow customizations
     # TODO(future PR): reuse existing quantization mappings
     # TODO(future PR): add the rest of modules and ops here
@@ -50,6 +60,13 @@ NSFusionType = (
 
 
 def get_reversed_fusions() -> list[tuple[NSFusionType, int]]:
+    # [FUNCTION DOC] Return the list of fusion patterns, each paired with a base op index.
+    # Patterns come from the native backend config quantization handlers (nested
+    # reverse-order patterns are flattened to a flat tuple), multi-op ones are kept, and
+    # each is also added with an observer or fake-quant class prepended. Extra hand-written
+    # patterns are appended (fp16 emulation linear-relu with base index 1, conv-bn and
+    # conv-bn-relu for 1d/2d/3d), each also with observer / fake-quant prefixed variants.
+    # The base index is given in non-reversed order. No arguments; builds the result each call.
     """
     Set of potential fusions, in reverse order.  The order is reversed
     to match how fusion patterns are defined in quantization code.
@@ -139,6 +156,14 @@ def end_node_matches_reversed_fusion(
     gm: GraphModule,
     seen_nodes: set[Node],
 ) -> bool:
+    # [FUNCTION DOC] Check whether the pattern ending at end_node matches reversed_fusion.
+    # Walks backwards from end_node through first arguments, one fusion element per step.
+    # Function elements must equal a call_function target, module elements must be a type
+    # the called module is an instance of (module looked up on gm by qualified name),
+    # method elements are a name or a (name, second argument) pair compared against the
+    # call_method target and args. Returns False on any mismatch, if a node is already in
+    # seen_nodes, or if the first argument is not a Node; True if all elements match.
+    # Raises an error if a call_module target is not a string. Does not mutate seen_nodes.
     """
     Returns true if a pattern ending with `end_node` matches
     the fusion pattern.
