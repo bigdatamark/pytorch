@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] The writing side of torch.package. Defines PackageExporter, which builds a
+# zip archive holding source code of modules, pickled objects, and text/binary resources,
+# using a dependency graph and user-declared intern/extern/mock/deny patterns to decide how
+# each referenced module is handled. Also defines the error reasons, the error types
+# (PackagingError, EmptyMatchError), the hook type alias and the set of stdlib modules that
+# may not be implicitly externed. Import-time side effects: none beyond definitions.
 import collections
 import importlib.machinery
 import io
@@ -43,6 +49,10 @@ ActionHook = Callable[["PackageExporter", str], None]
 
 
 class _ModuleProviderAction(Enum):
+    # [CLASS DOC] HELPER: Enumeration of what the exporter does with a module: intern (copy
+    # source into the archive), extern (record as an external dependency), mock (replace with
+    # stubs), deny (error if required), plus two special cases: an already repackaged mock
+    # module and the skip action for the package importer's special module.
     """Represents one of the actions that :class:`PackageExporter` can take on a module.
 
     See :meth:`PackageExporter.extern` and friends for a description of what the actions do.
@@ -64,6 +74,9 @@ class _ModuleProviderAction(Enum):
 
 
 class PackagingErrorReason(Enum):
+    # [CLASS DOC] Enumeration of reasons a module can fail to package. Each member's value is
+    # the human readable explanation text used in PackagingError messages. Members mark graph
+    # nodes in the dependency graph via an error attribute.
     """Listing of different reasons a dependency may fail to package.
 
     This enum is used to provide good error messages when
@@ -71,6 +84,7 @@ class PackagingErrorReason(Enum):
     """
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns a compact string of the form class name dot member name.
         return f"<{self.__class__.__name__}.{self.name}>"
 
     IS_EXTENSION_MODULE = (
@@ -94,6 +108,9 @@ class PackagingErrorReason(Enum):
 
 @dataclass
 class _PatternInfo:
+    # [CLASS DOC] HELPER: Record kept per registered glob pattern: the action to apply to
+    # matching modules, whether the user allows the pattern to match nothing, and a flag set
+    # when the pattern matched some module during packaging (checked at close time).
     """Holds :class:`PackageExporter`-specific info about how to execute matches against"""
 
     # What action to take on a module that matches this pattern.
@@ -104,24 +121,36 @@ class _PatternInfo:
     was_matched: bool
 
     def __init__(self, action, allow_empty):
+        # [FUNCTION DOC] HELPER: Stores the action and the allow-empty flag and starts with the
+        # matched flag cleared.
         self.action = action
         self.allow_empty = allow_empty
         self.was_matched = False
 
 
 class EmptyMatchError(Exception):
+    # [CLASS DOC] Error raised at close when an extern or mock pattern declared with
+    # allow_empty false never matched any module.
     """This is an exception that is thrown when a mock or extern is marked as
     ``allow_empty=False``, and is not matched with any module during packaging.
     """
 
 
 class PackagingError(Exception):
+    # [CLASS DOC] Aggregate error listing every module in the dependency graph that is marked
+    # broken, grouped by reason, with optional context and (in debug mode) a dependency path.
+    # Keeps the graph in the public dependency_graph attribute for tooling.
     """This exception is raised when there is an issue with exporting a package.
     ``PackageExporter`` will attempt to gather up all the errors and present
     them to you at once.
     """
 
     def __init__(self, dependency_graph: DiGraph, debug=False):
+        # [FUNCTION DOC] Builds the error message from the graph: groups nodes carrying an
+        # error attribute by reason, then lists each module with optional context, a security
+        # note for disallowed stdlib modules, and (if debug) the first path to it; otherwise
+        # appends a hint to enable debug. Stores the graph and initializes the base exception
+        # with the message. Raises AssertionError if a no-action node also has an action.
         # Group errors by reason.
         broken: dict[PackagingErrorReason, list[str]] = defaultdict(list)
         for module_name, attrs in dependency_graph.nodes.items():
@@ -173,6 +202,13 @@ class PackagingError(Exception):
 
 
 class PackageExporter:
+    # [CLASS DOC] Writer of torch.package archives, usable as a context manager (close on
+    # exit). State: the zip file writer and optional output buffer, the dependency graph
+    # (nodes are module names or pickle names, edges mean depends-on, node attributes hold
+    # action, source, errors), the importer used to find modules, registered glob patterns
+    # with actions, extern/mock/intern hook tables, set of written files, a unique id
+    # counter, and a table of already serialized reduce results. Key methods: save_* to add
+    # content, intern/extern/mock/deny to declare policies, close to validate and write all.
     """Exporters allow you to write packages of code, pickled Python data, and
     arbitrary binary and text resources into a self-contained package.
 
@@ -209,6 +245,11 @@ class PackageExporter:
         importer: Importer | Sequence[Importer] = sys_importer,
         debug: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Creates the exporter: logs API usage, opens the zip writer on the
+        # path or on the given binary buffer, sets the minimum archive version, and initializes
+        # empty graph, patterns, hook tables and counters. A single Importer is used as is; a
+        # sequence is wrapped in an OrderedImporter. Raises TypeError if importer is neither.
+        # Side effects: creates or truncates the output file.
         """
         Create an exporter.
 
@@ -265,6 +306,12 @@ class PackageExporter:
     def save_source_file(
         self, module_name: str, file_or_directory: str, dependencies=True
     ):
+        # [FUNCTION DOC] Adds code from a local file or directory as the source of the named
+        # module. For a directory, walks all Python files recursively, derives submodule names
+        # from relative paths (init files mark packages), and only after collecting all of
+        # them saves each through save_source_string, so overwritten modules are not pulled
+        # in as dependencies. For a file, saves its content, treating an init file as a
+        # package. Reads files; mutates the dependency graph.
         """Adds the local file system ``file_or_directory`` to the source package to provide the code
         for ``module_name``.
 
@@ -317,6 +364,8 @@ class PackageExporter:
             )
 
     def get_unique_id(self) -> str:
+        # [FUNCTION DOC] Returns the next value of an internal counter as a string and
+        # increments it, so each call on this exporter yields a distinct id.
         """Get an id. This id is guaranteed to only be handed out once for this package."""
         ret = str(self._unique_id)
         self._unique_id += 1
@@ -325,6 +374,12 @@ class PackageExporter:
     def _get_dependencies(
         self, src: str, module_name: str, is_package: bool
     ) -> list[str]:
+        # [FUNCTION DOC] HELPER: Scans the source for import references (relative to the module
+        # itself if it is a package, else its parent) and returns an ordered, unique list of
+        # module names that can actually be imported through this exporter's importer. A
+        # from-import of a name that is a real submodule yields the submodule only. If scanning
+        # fails, records a resolution-failed error on the module's graph node and returns an
+        # empty list.
         """Return all modules that this source code depends on.
 
         Dependencies are found by scanning the source code for import-like statements.
@@ -378,6 +433,11 @@ class PackageExporter:
         is_package: bool = False,
         dependencies: bool = True,
     ):
+        # [FUNCTION DOC] Registers the given text as the source of the module, as an interned
+        # and provided node in the dependency graph (flagged as a package if requested). If
+        # dependencies is true, finds its imports, adds graph edges from the module to each, and
+        # runs add_dependency on each so patterns decide their handling. Replaces any previous
+        # attributes of the node.
         """Adds ``src`` as the source code for ``module_name`` in the exported package.
 
         Args:
@@ -408,6 +468,10 @@ class PackageExporter:
         src: str,
         is_package: bool = False,
     ):
+        # [FUNCTION DOC] HELPER: Writes the source into the archive at the path derived from the
+        # module name (slashes for dots; init file inside a directory for packages, else a
+        # py suffix). Delegates to the internal write, which raises if the path was already
+        # written.
         """Write ``src`` as the source code for ``module_name`` in the zip archive.
 
         Arguments are otherwise the same as for :meth:`save_source_string`.
@@ -418,6 +482,10 @@ class PackageExporter:
         self._write(filename, src)
 
     def _import_module(self, module_name: str):
+        # [FUNCTION DOC] HELPER: Imports the module through the exporter's importer. For a
+        # mangled name that is not found, re-raises ModuleNotFoundError with a message saying
+        # the originating PackageImporter must be in the importer list; unmangled misses
+        # propagate unchanged.
         try:
             return self.importer.import_module(module_name)
         except ModuleNotFoundError:
@@ -430,6 +498,8 @@ class PackageExporter:
             raise ModuleNotFoundError(msg) from None
 
     def _module_exists(self, module_name: str) -> bool:
+        # [FUNCTION DOC] HELPER: Returns True if importing the module through the exporter
+        # succeeds, False on any exception. Importing may run module code (side effects).
         try:
             self._import_module(module_name)
             return True
@@ -437,6 +507,10 @@ class PackageExporter:
             return False
 
     def _get_source_of_module(self, module: types.ModuleType) -> str | None:
+        # [FUNCTION DOC] HELPER: Returns the module's source text, or None if unavailable.
+        # Finds the file name via a source file loader on the module spec when possible, else
+        # via the file attribute; only names ending in a py suffix are read, through the line
+        # cache (which may use module globals to find the source).
         filename = None
         spec = getattr(module, "__spec__", None)
         if spec is not None:
@@ -453,6 +527,12 @@ class PackageExporter:
         return None
 
     def add_dependency(self, module_name: str, dependencies=True):
+        # [FUNCTION DOC] Decides how the named module is handled and records it in the graph.
+        # Does nothing if already provided. Special names (the package importer module and the
+        # mock module) get skip or repackaged-mock actions; implicitly externable modules get
+        # extern. Otherwise the first matching registered pattern sets the action (marking the
+        # pattern matched; deny also records an error; intern also loads the module source and
+        # its dependencies). With no match, records a no-action error on the node.
         """Given a module, add it to the dependency graph according to patterns
         specified by the user.
         """
@@ -512,6 +592,9 @@ class PackageExporter:
         )
 
     def save_module(self, module_name: str, dependencies=True):
+        # [FUNCTION DOC] Public entry to add a module's code to the package: validates that the
+        # name is a string (raises TypeError otherwise), then interns the module, finding its
+        # source through the importer and optionally its dependencies.
         """Save the code for ``module`` into the package. Code for the module is resolved using the ``importers`` path to find the
         module object, and then using its ``__file__`` attribute to find the source code.
 
@@ -532,6 +615,11 @@ class PackageExporter:
         module_name: str,
         dependencies: bool,
     ):
+        # [FUNCTION DOC] HELPER: Imports the module via the importer, demangles its name, and
+        # adds an interned node holding its source and package flag. If no source exists,
+        # the node gets an error instead (no file, extension module, or file not found with
+        # context), and nothing else happens. If dependencies is true, finds imports, adds edges
+        # and calls add_dependency for each. Raises ModuleNotFoundError if import fails.
         """Adds the module to the dependency graph as an interned module,
         along with any metadata needed to write it out to the zipfile at serialization time.
         """
@@ -591,6 +679,17 @@ class PackageExporter:
         dependencies: bool = True,
         pickle_protocol: int = 3,
     ):
+        # [FUNCTION DOC] Pickles obj with a package-aware pickler (using the exporter importer
+        # and a persistent-id hook for storages and objects with a package reduce method) and
+        # writes the bytes under the package and resource path. Adds a pickle node to the
+        # dependency graph. If dependencies is true, scans the pickle opcodes for global
+        # references (protocol 4: string pairs before a stack-global opcode; protocol 3:
+        # global opcode), adds an edge per referenced module and calls add_dependency, except
+        # that modules matching a mock pattern become error nodes (mocked but still used).
+        # Raises AssertionError for protocols other than 3 or 4 and for repeated file paths.
+        # KNOWN ISSUE: the docstring does not document pickle_protocol, and the protocol 4
+        # opcode scan is a heuristic that infers module and name from the last two strings
+        # seen, so unrelated strings could be misread as globals.
         """Save a python object to the archive using pickle. Equivalent to :func:`torch.save` but saving into
         the archive rather than a stand-alone file. Standard pickle does not save the code, only the objects.
         If ``dependencies`` is true, this method will also scan the pickled objects for which modules are required
@@ -630,6 +729,10 @@ class PackageExporter:
         )
 
         def _check_mocked_error(module: str | None, field: str | None):
+            # [FUNCTION DOC] HELPER: Given a module and attribute name seen in the pickle,
+            # records the attribute in the enclosing mocked-modules mapping if the first
+            # matching user pattern for that module is a mock action. Implicitly externed
+            # modules are ignored. Raises AssertionError if either argument is not a string.
             """
             checks if an object (field) comes from a mocked module and then adds
             the pair to mocked_modules which contains mocked modules paired with their
@@ -734,6 +837,8 @@ class PackageExporter:
         self._write(filename, data_value)
 
     def save_text(self, package: str, resource: str, text: str):
+        # [FUNCTION DOC] Saves text into the archive at the path for package and resource,
+        # encoded as UTF-8, by delegating to save_binary.
         """Save text data to the package.
 
         Args:
@@ -744,6 +849,10 @@ class PackageExporter:
         return self.save_binary(package, resource, text.encode("utf-8"))
 
     def save_binary(self, package, resource, binary: bytes):
+        # [FUNCTION DOC] Writes raw bytes into the archive at the path built from package and
+        # resource (package dots become slashes, resource path normalized). Raises
+        # AssertionError if that path was already written.
+        # KNOWN ISSUE: the docstring types the data argument as str, but bytes are expected.
         """Save raw bytes to the package.
 
         Args:
@@ -755,6 +864,9 @@ class PackageExporter:
         self._write(filename, binary)
 
     def register_extern_hook(self, hook: ActionHook) -> RemovableHandle:
+        # [FUNCTION DOC] Adds the hook to the extern hook table (called with the exporter and
+        # module name for each externed module at close, in registration order) and returns a
+        # handle whose remove method unregisters it.
         """Registers an extern hook on the exporter.
 
         The hook will be called each time a module matches against an :meth:`extern` pattern.
@@ -774,6 +886,9 @@ class PackageExporter:
         return handle
 
     def register_mock_hook(self, hook: ActionHook) -> RemovableHandle:
+        # [FUNCTION DOC] Adds the hook to the mock hook table (called with the exporter and
+        # module name for each mocked module at close, in registration order) and returns a
+        # handle whose remove method unregisters it.
         """Registers a mock hook on the exporter.
 
         The hook will be called each time a module matches against a :meth:`mock` pattern.
@@ -793,6 +908,9 @@ class PackageExporter:
         return handle
 
     def register_intern_hook(self, hook: ActionHook) -> RemovableHandle:
+        # [FUNCTION DOC] Adds the hook to the intern hook table (called with the exporter and
+        # module name for each interned module at close, in registration order) and returns a
+        # handle whose remove method unregisters it.
         """Registers an intern hook on the exporter.
 
         The hook will be called each time a module matches against an :meth:`intern` pattern.
@@ -818,6 +936,10 @@ class PackageExporter:
         exclude: "GlobPattern" = (),
         allow_empty: bool = True,
     ):
+        # [FUNCTION DOC] Registers a glob group (include and exclude patterns) with the intern
+        # action in the pattern table, recording the allow-empty flag. Modules matching it are
+        # copied into the package and their dependencies processed. Later registrations of an
+        # equal-looking pattern are separate entries; earlier patterns win on matching.
         """Specify modules that should be packaged. A module must match some ``intern`` pattern in order to be
         included in the package and have its dependencies processed recursively.
 
@@ -844,6 +966,10 @@ class PackageExporter:
         exclude: "GlobPattern" = (),
         allow_empty: bool = True,
     ):
+        # [FUNCTION DOC] Registers a glob group with the mock action in the pattern table,
+        # recording the allow-empty flag. Matching modules are written as stub modules that
+        # return mocked objects for any attribute. If allow_empty is false and nothing
+        # matches, closing raises EmptyMatchError.
         """Replace some required modules with a mock implementation.  Mocked modules will return a fake
         object for any attribute accessed from it. Because we copy file-by-file, the dependency resolution will sometimes
         find files that are imported by model files but whose functionality is never used
@@ -885,6 +1011,10 @@ class PackageExporter:
         exclude: "GlobPattern" = (),
         allow_empty: bool = True,
     ):
+        # [FUNCTION DOC] Registers a glob group with the extern action in the pattern table,
+        # recording the allow-empty flag. Matching modules are not copied but listed in the
+        # archive as external dependencies. If allow_empty is false and nothing matches,
+        # closing raises EmptyMatchError.
         """Include ``module`` in the list of external modules the package can import.
         This will prevent dependency discovery from saving
         it in the package. The importer will load an external module directly from the standard import system.
@@ -910,6 +1040,9 @@ class PackageExporter:
         )
 
     def deny(self, include: "GlobPattern", *, exclude: "GlobPattern" = ()):
+        # [FUNCTION DOC] Registers a glob group with the deny action (always allowing empty
+        # matches). Any required module that matches is marked with a denied error, so closing
+        # raises PackagingError.
         """Blocklist modules whose names match the given glob patterns from the list of modules the package can import.
         If a dependency on any matching packages is found, a :class:`PackagingError` is raised.
 
@@ -924,6 +1057,14 @@ class PackageExporter:
         )
 
     def _persistent_id(self, obj):
+        # [FUNCTION DOC] HELPER: Pickler hook deciding how to save special objects. For tensor
+        # storages (typed or untyped), writes the storage bytes into the archive once (moving
+        # to CPU if needed) and returns a tuple of tag, storage type, storage id, location tag
+        # and element count. For objects with a package reduce method, returns (and caches by
+        # object identity) a tuple of tag, identity and the method's results; script modules
+        # are refused while the beta gate flag is on. Returns None for everything else.
+        # Raises RuntimeError for unrecognized storage kinds and a bare Exception for gated
+        # script modules. Side effects: writes archive records, updates the reduce cache.
         if torch.is_storage(obj) or isinstance(obj, torch.storage.TypedStorage):
             storage: Storage
             if isinstance(obj, torch.storage.TypedStorage):
@@ -978,9 +1119,13 @@ class PackageExporter:
         return None
 
     def __enter__(self):
+        # [FUNCTION DOC] Context manager entry; returns the exporter itself.
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # [FUNCTION DOC] Context manager exit. If the block raised, only finalizes the zip
+        # (so a buffer stays valid) and lets the exception propagate; otherwise calls close,
+        # which may itself raise PackagingError or EmptyMatchError. Never suppresses errors.
         # If __exit__ was called because an exception was raised, we do not
         # attempt to finalize the package. Instead, control is returned to the
         # caller to continue raising the exception.
@@ -992,6 +1137,10 @@ class PackageExporter:
         self.close()
 
     def _write(self, filename, str_or_bytes):
+        # [FUNCTION DOC] HELPER: Writes one record to the archive. Text is encoded as UTF-8.
+        # Raises AssertionError if the file name was already written in this archive or if it
+        # looks like a mangled module name. Side effects: updates the written-files set and
+        # writes to the zip.
         if filename in self._written_files:
             raise AssertionError(
                 f"Tried to write file '{filename}', but it already exists in this archive. "
@@ -1009,6 +1158,9 @@ class PackageExporter:
         self.zip_file.write_record(filename, str_or_bytes, len(str_or_bytes))
 
     def _validate_dependency_graph(self):
+        # [FUNCTION DOC] HELPER: Raises PackagingError if any graph node carries an error, and
+        # raises EmptyMatchError if a pattern registered with allow-empty false never matched.
+        # Does not mutate anything.
         # 1. Check the graph for any errors inserted during dependency analysis.
         for attrs in self.dependency_graph.nodes.values():
             if "error" in attrs:
@@ -1022,11 +1174,21 @@ class PackageExporter:
                 )
 
     def _write_mock_file(self):
+        # [FUNCTION DOC] HELPER: Writes the mock support module source (copied from the file
+        # next to this module) into the archive, only once per archive.
         if "_mock.py" not in self._written_files:
             mock_file = str(Path(__file__).parent / "_mock.py")
             self._write_source_string("_mock", _read_file(mock_file), is_package=False)
 
     def _execute_dependency_graph(self):
+        # [FUNCTION DOC] HELPER: Validates the graph, then walks every node and acts on its
+        # recorded action: extern nodes run extern hooks and are collected; mock nodes run
+        # hooks, ensure the mock support module is written, and write a stub module (package
+        # or plain, as the real module is); intern nodes run hooks and write their source
+        # (pickle nodes write nothing); repackaged-mock nodes write the mock support module;
+        # skip nodes are ignored. Finally writes the list of extern modules to a data file.
+        # Raises AssertionError for unprovided interned nodes or unknown actions, plus the
+        # validation errors. Side effects: writes archive records, calls user hooks.
         """Takes a finalized dependency graph describing how to package all
         modules and executes it, writing to the ZIP archive.
         """
@@ -1083,10 +1245,16 @@ class PackageExporter:
         self._write(".data/extern_modules", extern_file_contents)
 
     def _write_python_version(self):
+        # [FUNCTION DOC] HELPER: Records the running interpreter version string in the archive's
+        # version data file.
         """Writes the python version that the package was created with to .data/python_version"""
         self._write(".data/python_version", platform.python_version())
 
     def close(self):
+        # [FUNCTION DOC] Finishes the package: executes the dependency graph (validating and
+        # writing all modules), writes the python version, flushes script module files, and
+        # finalizes the zip. Raises PackagingError or EmptyMatchError on invalid state. The
+        # exporter must not be used afterwards (its zip writer is deleted).
         """Write the package to the filesystem. Any calls after :meth:`close` are now invalid.
         It is preferable to use resource guard syntax instead::
 
@@ -1100,17 +1268,24 @@ class PackageExporter:
         self._finalize_zip()
 
     def _finalize_zip(self):
+        # [FUNCTION DOC] HELPER: Deletes the zip writer attribute (which closes the archive) and
+        # flushes the user buffer if one was given.
         """Called at the very end of packaging to leave the zipfile in a closed but valid state."""
         del self.zip_file
         if self.buffer:
             self.buffer.flush()
 
     def _filename(self, package, resource):
+        # [FUNCTION DOC] HELPER: Builds the archive path for a resource: package name with dots
+        # turned into slashes, a slash, then the normalized resource path.
         package_path = package.replace(".", "/")
         resource = _normalize_path(resource)
         return f"{package_path}/{resource}"
 
     def _can_implicitly_extern(self, module_name: str):
+        # [FUNCTION DOC] HELPER: Returns True if the top-level package is torch, or is a
+        # standard library module that is not in the disallowed list; such modules are
+        # externed automatically without a user pattern.
         top_level_package_name = module_name.partition(".")[0]
         return top_level_package_name == "torch" or (
             top_level_package_name not in _DISALLOWED_MODULES
@@ -1118,6 +1293,7 @@ class PackageExporter:
         )
 
     def dependency_graph_string(self) -> str:
+        # [FUNCTION DOC] Returns the dependency graph rendered in dot (graphviz) text.
         """Returns digraph string representation of dependencies in package.
 
         Returns:
@@ -1128,6 +1304,8 @@ class PackageExporter:
     def _nodes_with_action_type(
         self, action: _ModuleProviderAction | None
     ) -> list[str]:
+        # [FUNCTION DOC] HELPER: Returns the sorted names of non-pickle graph nodes whose
+        # recorded action equals the given one (None selects nodes without an action).
         result = []
         for name, node_dict in self.dependency_graph.nodes.items():
             node_action = node_dict.get("action", None)
@@ -1137,6 +1315,7 @@ class PackageExporter:
         return result
 
     def externed_modules(self) -> list[str]:
+        # [FUNCTION DOC] Returns the sorted names of modules currently marked as extern.
         """Return all modules that are currently externed.
 
         Returns:
@@ -1146,6 +1325,7 @@ class PackageExporter:
         return self._nodes_with_action_type(_ModuleProviderAction.EXTERN)
 
     def interned_modules(self) -> list[str]:
+        # [FUNCTION DOC] Returns the sorted names of modules currently marked as intern.
         """Return all modules that are currently interned.
 
         Returns:
@@ -1155,6 +1335,7 @@ class PackageExporter:
         return self._nodes_with_action_type(_ModuleProviderAction.INTERN)
 
     def mocked_modules(self) -> list[str]:
+        # [FUNCTION DOC] Returns the sorted names of modules currently marked as mock.
         """Return all modules that are currently mocked.
 
         Returns:
@@ -1164,6 +1345,7 @@ class PackageExporter:
         return self._nodes_with_action_type(_ModuleProviderAction.MOCK)
 
     def denied_modules(self) -> list[str]:
+        # [FUNCTION DOC] Returns the sorted names of modules currently marked as deny.
         """Return all modules that are currently denied.
 
         Returns:
@@ -1173,6 +1355,8 @@ class PackageExporter:
         return self._nodes_with_action_type(_ModuleProviderAction.DENY)
 
     def get_rdeps(self, module_name: str) -> list[str]:
+        # [FUNCTION DOC] Returns the names of modules that have an edge to the given module in
+        # the dependency graph (its predecessors), or an empty list if it is not in the graph.
         """Return a list of all modules which depend on the module ``module_name``.
 
         Returns:
@@ -1184,6 +1368,8 @@ class PackageExporter:
             return []
 
     def all_paths(self, src: str, dst: str) -> str:
+        # [FUNCTION DOC] Returns dot text of the subgraph containing all paths from src to dst,
+        # computed by the dependency graph.
         """Return a dot representation of the subgraph
            that has all paths from src to dst.
 
@@ -1206,6 +1392,8 @@ def __getattr__(attr: str):
 
 
 def _read_file(filename: str) -> str:
+    # [FUNCTION DOC] HELPER: Reads the file in binary mode and returns its content decoded as
+    # UTF-8. Raises OSError or UnicodeDecodeError on failure.
     with open(filename, "rb") as f:
         b = f.read()
         return b.decode("utf-8")

@@ -1,3 +1,7 @@
+# [MODULE DOC] Importer abstractions for torch.package. Defines two error types, the abstract
+# Importer (import a module by name, and find the module-relative name of an object), the
+# default sys_importer instance and OrderedImporter, which tries several importers in turn.
+# Import-time side effect: creates a module logger and the sys_importer singleton.
 import importlib
 import logging
 import sys
@@ -18,14 +22,23 @@ log = logging.getLogger(__name__)
 
 
 class ObjNotFoundError(Exception):
+    # [CLASS DOC] Error raised when an importer cannot locate an object by its name.
     """Raised when an importer cannot find an object by searching for its name."""
 
 
 class ObjMismatchError(Exception):
+    # [CLASS DOC] Error raised when looking up an object's name in an importer yields a
+    # different object, typically because the same name exists in two environments.
     """Raised when an importer found a different object with the same name as the user-provided one."""
 
 
 class Importer(ABC):
+    # [CLASS DOC] Abstract environment from which modules can be imported. Subclasses supply
+    # import_module and may override whichmodule; they are expected to provide a mapping of
+    # module names to module objects as the modules attribute (used by the default
+    # whichmodule). The provided get_name performs the round trip check: find the module and
+    # qualified name of an object, re-import and confirm it is the same object, else raise
+    # ObjNotFoundError or ObjMismatchError.
     """Represents an environment to import modules from.
 
     By default, you can figure out what module an object belongs by checking
@@ -50,12 +63,23 @@ class Importer(ABC):
 
     @abstractmethod
     def import_module(self, module_name: str) -> ModuleType:
+        # [FUNCTION DOC] Abstract: imports and returns the named module from this
+        # environment, following the contract of the standard library import function
+        # (raising ModuleNotFoundError or ImportError on failure).
         """Import `module_name` from this environment.
 
         The contract is the same as for importlib.import_module.
         """
 
     def get_name(self, obj: Any, name: str | None = None) -> tuple[str, str]:
+        # [FUNCTION DOC] Returns a pair of (module name, attribute path) under which obj can be
+        # retrieved from this environment. The attribute path is the explicit name if given,
+        # else a string returned by calling the object's reduce method (only for types without
+        # a pickler dispatch entry; failures ignored), else its qualified name, else its
+        # name. The module comes from whichmodule and is demangled, imported through this
+        # importer and the attribute resolved. Raises ObjNotFoundError if import or lookup
+        # fails, and ObjMismatchError (with a message explaining importer ordering) if a
+        # different object is found.
         """Given an object, return a name that can be used to retrieve the
         object from this environment.
 
@@ -115,6 +139,10 @@ class Importer(ABC):
             return module_name, name
 
         def get_obj_info(obj):
+            # [FUNCTION DOC] HELPER: For the given object returns a tuple of its module name,
+            # a human readable origin (the package mangle prefix or the current environment)
+            # and the name of the importer that would provide it. Raises AssertionError if
+            # the enclosing name is None.
             if name is None:
                 raise AssertionError("name must not be None")
             module_name = self.whichmodule(obj, name)
@@ -143,6 +171,10 @@ class Importer(ABC):
         raise ObjMismatchError(msg)
 
     def whichmodule(self, obj: Any, name: str) -> str:
+        # [FUNCTION DOC] Returns the module name an object belongs to: its module attribute if
+        # present, else the first loaded module (from a copy of the modules mapping, skipping
+        # main modules and empty entries) that holds the same object at the given name, else
+        # the main module name. Pure apart from attribute access on modules.
         """Find the module name an object belongs to.
 
         This should be considered internal for end-users, but developers of
@@ -173,12 +205,19 @@ class Importer(ABC):
 
 
 class _SysImporter(Importer):
+    # [CLASS DOC] HELPER: Importer that behaves like normal Python: modules come from the
+    # standard import machinery. A single instance is exported as sys_importer.
     """An importer that implements the default behavior of Python."""
 
     def import_module(self, module_name: str):
+        # [FUNCTION DOC] HELPER: Imports and returns the module with the standard library
+        # import function (may populate the interpreter module cache; raises on failure).
         return importlib.import_module(module_name)
 
     def whichmodule(self, obj: Any, name: str) -> str:
+        # [FUNCTION DOC] HELPER: Returns the module attribute of obj when present (so mangled
+        # package names are not imported); otherwise falls back to the pickle library's module
+        # search for the given name.
         # In Python 3.14+, pickle.whichmodule tries to import the module,
         # which fails for mangled package names like '<torch_package_0>'.
         # Check __module__ first before calling pickle.whichmodule.
@@ -192,15 +231,22 @@ sys_importer = _SysImporter()
 
 
 class OrderedImporter(Importer):
+    # [CLASS DOC] Importer that wraps an ordered list of other importers (kept in a private
+    # list) and delegates each operation to them in order, first success wins. Used by the
+    # exporter and importer to combine a package with the system environment.
     """A compound importer that takes a list of importers and tries them one at a time.
 
     The first importer in the list that returns a result "wins".
     """
 
     def __init__(self, *args):
+        # [FUNCTION DOC] Stores the given importers, in order, as a list.
         self._importers: list[Importer] = list(args)
 
     def _is_torchpackage_dummy(self, module):
+        # [FUNCTION DOC] HELPER: Returns True if the module is a package-flagged namespace
+        # placeholder: marked as a torch package module, has a path attribute, and either
+        # lacks a file attribute or has it set to None. False otherwise.
         """Returns true iff this module is an empty PackageNode in a torch.package.
 
         If you intern `a.b` but never use `a` in your code, then `a` will be an
@@ -219,6 +265,9 @@ class OrderedImporter(Importer):
         return module.__file__ is None
 
     def get_name(self, obj: Any, name: str | None = None) -> tuple[str, str]:
+        # [FUNCTION DOC] Asks each importer in order for the name of obj and returns the first
+        # successful (module name, attribute path) pair. Failures from an importer are logged
+        # as warnings and skipped. Raises ObjNotFoundError if none of them succeeds.
         for importer in self._importers:
             try:
                 return importer.get_name(obj, name)
@@ -233,6 +282,10 @@ class OrderedImporter(Importer):
         )
 
     def import_module(self, module_name: str) -> ModuleType:
+        # [FUNCTION DOC] Tries each importer in order and returns the first module found that
+        # is not an empty package placeholder. Raises TypeError if an entry is not an
+        # Importer (checked lazily when reached), re-raises the last ModuleNotFoundError if
+        # every importer failed, or raises a new one if all results were placeholders.
         last_err = None
         for importer in self._importers:
             if not isinstance(importer, Importer):
@@ -254,6 +307,8 @@ class OrderedImporter(Importer):
             raise ModuleNotFoundError(module_name)
 
     def whichmodule(self, obj: Any, name: str) -> str:
+        # [FUNCTION DOC] Returns the first module name reported by the importers in order
+        # that is not the main module name; returns the main module name if none qualifies.
         for importer in self._importers:
             module_name = importer.whichmodule(obj, name)
             if module_name != "__main__":

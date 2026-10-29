@@ -1,3 +1,8 @@
+# [PACKAGE DOC] Public API of torch.profiler. Re-exports the profile context manager,
+# schedule helpers, trace handlers, activity and action enums, record_function and
+# ExecutionTraceObserver from the profiler submodule and C++ bindings. Import-time side
+# effect: if the Kineto daemon env var is set (or the fbcode optimizer-hook env var in
+# fbcode), registers a global optimizer step post hook that advances the Kineto step counter.
 r"""
 PyTorch Profiler is a tool that allows the collection of performance metrics during training and inference.
 Profiler's context manager API can be used to better understand what model operators are the most expensive,
@@ -51,6 +56,8 @@ _Ts = TypeVarTuple("_Ts")
 def _optimizer_post_hook(
     optimizer: Optimizer, args: tuple[Unpack[_Ts]], kwargs: dict[str, Any]
 ) -> None:
+    # [FUNCTION DOC] HELPER: Optimizer step post hook; increments the Kineto step counter for
+    # the "Optimizer" requester. Ignores the optimizer and arguments. Returns None.
     KinetoStepTracker.increment_step("Optimizer")
 
 

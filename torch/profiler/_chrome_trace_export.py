@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] HELPER: Streaming Chrome trace JSON writer for profiler results. Defines small
+# formatting helpers and export_chrome_trace, which writes activities one by one to a plain
+# or gzip file. Module constants hold the trimonth interval length, flow category names, the
+# record-param-comms call name and the activity types excluded from external id output.
 """Stream chrome trace JSON directly from ITraceActivity objects.
 
 Bypasses Kineto's C++ ChromeTraceLogger, writing events one-at-a-time
@@ -35,6 +39,8 @@ _EXCLUDED_EXTERNAL_ID_TYPES = {
 
 
 def _trimester_base_ns() -> int:
+    # [FUNCTION DOC] HELPER: Returns the current wall clock time floored to a multiple of the
+    # trimonth interval, in nanoseconds since the epoch. Reads the clock; no other effects.
     """Epoch nanoseconds at the start of the current trimonth interval.
 
     Matches libkineto's ChromeTraceBaseTime (floor to 7889238-second
@@ -44,22 +50,32 @@ def _trimester_base_ns() -> int:
 
 
 def _ns_to_us(time_ns: int) -> str:
+    # [FUNCTION DOC] HELPER: Formats nanoseconds as a decimal microsecond string with exactly
+    # three fractional digits (integer division and zero-padded remainder).
+    # KNOWN ISSUE: negative inputs give a malformed result; callers clamp to zero first.
     return f"{time_ns // 1000}.{time_ns % 1000:03d}"
 
 
 def _sanitize_tid(tid: int) -> int:
+    # [FUNCTION DOC] HELPER: Maps a thread or stream id to a non-negative value: the minimum
+    # signed 64-bit value becomes zero, anything else is replaced by its absolute value.
     if tid == -(2**63):
         return 0
     return abs(tid)
 
 
 def _json_escape(s: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the string encoded as a quoted JSON string literal.
     return json.dumps(s)
 
 
 def _write_metadata_event(
     f: IO[str], name: str, ts: str, pid, tid, arg_key: str, arg_value: str
 ):
+    # [FUNCTION DOC] HELPER: Writes one metadata ("M" phase) trace event line to the text
+    # stream, with the given event name, timestamp text, pid, tid and a single argument whose
+    # key is quoted but whose value is inserted verbatim (caller must pre-encode it). The
+    # line ends with a comma and newline. Name and key are not escaped.
     f.write(
         f'{{"ph":"M","name":"{name}","ts":{ts},'
         f'"pid":{pid},"tid":{tid},'
@@ -72,6 +88,19 @@ def export_chrome_trace(
     path: str,
     metadata: dict[str, str] | None = None,
 ):
+    # [FUNCTION DOC] Writes a complete Chrome trace JSON file at the path (gzip-compressed if
+    # the path ends with the gz suffix). Takes the activity list from the profiler result,
+    # does a first pass to find the first timestamp per device and per (device, resource)
+    # pair plus the overall time span, then streams: header with GPU device properties and
+    # optional extra metadata entries, process and thread metadata events, one complete event
+    # per activity (with external id, metadata and linked communication metadata in args)
+    # plus flow start/finish events, summary span and marker events, and the trace name.
+    # Timestamps are relative to a trimonth base, in microseconds. Side effects: creates or
+    # overwrites the file and queries CUDA device properties. Raises OSError on I/O failure.
+    # KNOWN ISSUE: the max threads per multiprocessor field is filled from the multiprocessor
+    # count, and the metadata values are written without any JSON encoding or escaping.
+    # KNOWN ISSUE: the stream thread name has a trailing space, and the device property query
+    # is made without checking that CUDA is available.
     """Export chrome trace from ITraceActivity objects, streaming to disk.
 
     ``kineto_results`` is a ``_ProfilerResult`` that exposes
@@ -102,6 +131,8 @@ def export_chrome_trace(
             seen_resources[key] = ts
 
     def _rel(ns: int) -> str:
+        # [FUNCTION DOC] HELPER: Converts an absolute nanosecond time to a microsecond string
+        # relative to the trimonth base, clamped at zero.
         return _ns_to_us(max(ns - base_ns, 0))
 
     with gzip.open(path, "wt") if path.endswith(".gz") else open(path, "w") as f:

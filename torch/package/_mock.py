@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] HELPER: Support for mocked modules in torch.package. Defines the list of magic
+# method names and the MockedObject placeholder class. At import time, every name in the list
+# is installed on MockedObject as a method that raises NotImplementedError when used, so a
+# mocked-out object fails loudly on any operation (mutates MockedObject at import).
 _magic_methods = [
     "__subclasscheck__",
     "__hex__",
@@ -83,9 +87,19 @@ _magic_methods = [
 
 
 class MockedObject:
+    # [CLASS DOC] HELPER: Placeholder handed out for attributes of mocked modules. Stores the
+    # fully qualified name of the mocked thing in the instance dict entry for the name
+    # attribute. Constructing it is only allowed internally (with the suppress flag); any
+    # other construction, e.g. during unpickling, raises NotImplementedError. All magic
+    # methods are replaced (see install_method) with ones that raise NotImplementedError.
     _name: str
 
     def __new__(cls, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Allocates an instance. Raises NotImplementedError unless the
+        # keyword argument _suppress_err is truthy; otherwise defers to the normal object
+        # allocation and returns the new instance.
+        # KNOWN ISSUE: the error message reads the name from the class, but the name is only
+        # set on instances, so a raise here would hit an AttributeError instead.
         # _suppress_err is set by us in the mocked module impl, so that we can
         # construct instances of MockedObject to hand out to people looking up
         # module attributes.
@@ -104,14 +118,21 @@ class MockedObject:
         return super().__new__(cls)
 
     def __init__(self, name: str, _suppress_err: bool):
+        # [FUNCTION DOC] HELPER: Records the mocked object's name directly in the instance
+        # dict (bypassing the overridden attribute setter). The suppress flag is unused here.
         self.__dict__["_name"] = name
 
     def __repr__(self):
+        # [FUNCTION DOC] HELPER: Returns a string showing the mocked object's name.
         return f"MockedObject({self._name})"
 
 
 def install_method(method_name):
+    # [FUNCTION DOC] HELPER: Installs on MockedObject a method with the given name that always
+    # raises NotImplementedError naming the mocked object. Mutates the MockedObject class.
     def _not_implemented(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Always raises NotImplementedError saying the mocked object
+        # was used in the enclosing method name.
         raise NotImplementedError(
             f"Object '{self._name}' was mocked out during packaging but it is being used in {method_name}"
         )

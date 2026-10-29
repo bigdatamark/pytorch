@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] File tree representation of a package's contents. Defines Directory (a node
+# in a tree of directories and files, printable as a tree) and a helper that builds a tree
+# from a list of file paths filtered by glob patterns. No import-time side effects.
 
 from .glob_group import GlobGroup, GlobPattern
 
@@ -7,16 +10,25 @@ __all__ = ["Directory"]
 
 
 class Directory:
+    # [CLASS DOC] Node of a file tree. Attributes: name (this node's own name), is_dir (True
+    # for directories, False for files) and children (mapping from child name to child node;
+    # empty for files). Paths use forward slashes. Key methods: has_file for lookup and
+    # string conversion, which renders an ASCII-art style tree with directories listed first.
     """A file structure representation. Organized as Directory nodes that have lists of
     their Directory children. Directories for a package are created by calling
     :meth:`PackageImporter.file_structure`."""
 
     def __init__(self, name: str, is_dir: bool):
+        # [FUNCTION DOC] Creates a node with the given name and directory flag and an empty
+        # children mapping.
         self.name = name
         self.is_dir = is_dir
         self.children: dict[str, Directory] = {}
 
     def _get_dir(self, dirs: list[str]) -> "Directory":
+        # [FUNCTION DOC] HELPER: Walks down the list of directory names recursively, creating
+        # missing directory children as it goes, and returns the node at the end (self if the
+        # list is empty). Mutates the tree.
         """Builds path of Directories if not yet built and returns last directory
         in list.
 
@@ -34,6 +46,9 @@ class Directory:
         return self.children[dir_name]._get_dir(dirs[1:])
 
     def _add_file(self, file_path: str):
+        # [FUNCTION DOC] HELPER: Splits the slash-separated path, creates the intermediate
+        # directories, and adds the last component as a file node (replacing any existing
+        # child with that name). Mutates the tree.
         """Adds a file to a Directory.
 
         Args:
@@ -45,6 +60,9 @@ class Directory:
         dir.children[file] = Directory(file, False)
 
     def has_file(self, filename: str) -> bool:
+        # [FUNCTION DOC] Returns True if the slash-separated path names an existing child
+        # (file or directory) below this node, looking up one component at a time
+        # recursively; False otherwise. Pure.
         """Checks if a file is present in a :class:`Directory`.
 
         Args:
@@ -63,6 +81,8 @@ class Directory:
         return False
 
     def __str__(self):
+        # [FUNCTION DOC] Returns the multi-line tree rendering of this node and its
+        # descendants, built by the recursive stringify helper.
         str_list: list[str] = []
         self._stringify_tree(str_list)
         return "".join(str_list)
@@ -73,6 +93,10 @@ class Directory:
         preamble: str = "",
         dir_ptr: str = "\u2500\u2500\u2500 ",
     ):
+        # [FUNCTION DOC] HELPER: Appends to str_list one line for this node (prefixed by the
+        # preamble and pointer glyph), then recursively appends its children: subdirectories
+        # sorted by name first, then files sorted by name, using branch glyphs that mark the
+        # last entry differently. Mutates str_list.
         """Recursive method to generate print-friendly version of a Directory."""
         space = "    "
         branch = "\u2502   "
@@ -112,6 +136,9 @@ def _create_directory_from_file_list(
     include: "GlobPattern" = "**",
     exclude: "GlobPattern" = (),
 ) -> Directory:
+    # [FUNCTION DOC] HELPER: Builds a Directory tree named filename from the list of file
+    # paths, keeping only those matching the include glob patterns and not the exclude
+    # ones (slash separator). Returns the root node. Pure apart from building new nodes.
     """Return a :class:`Directory` file structure representation created from a list of files.
 
     Args:

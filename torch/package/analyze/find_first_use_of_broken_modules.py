@@ -1,3 +1,5 @@
+# [MODULE DOC] Defines find_first_use_of_broken_modules, which inspects the dependency graph
+# of a PackagingError. Importing this module imports the package exporter.
 from torch.package.package_exporter import PackagingError
 
 
@@ -5,6 +7,10 @@ __all__ = ["find_first_use_of_broken_modules"]
 
 
 def find_first_use_of_broken_modules(exc: PackagingError) -> dict[str, list[str]]:
+    # [FUNCTION DOC] Given a PackagingError, collects the graph nodes flagged with an error and
+    # returns a mapping from each broken module name to the first dependency path (list of
+    # module names) that reached it. Raises AssertionError if the argument is not a
+    # PackagingError. Does not mutate the graph.
     """
     Find all broken modules in a PackagingError, and for each one, return the
     dependency path in which the module was first encountered.

@@ -1,4 +1,12 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] The loading side of torch.package. Defines PackageImporter, a hermetic importer
+# that loads module source, pickled objects and resources from a package archive (or an
+# unpacked directory) and keeps its modules apart from the global module table, plus the
+# internal tree node classes describing archive layout, a resource reader, a global registry
+# of package-loaded modules, an implicit import allowlist and an extern compatibility name
+# table. Import-time side effect: replaces the standard library function that finds the
+# defining file of an object with a patched version that also consults the registry of
+# package-imported modules (global monkey patch).
 import builtins
 import importlib
 import importlib.machinery
@@ -64,6 +72,14 @@ EXTERN_IMPORT_COMPAT_NAME_MAPPING: dict[str, dict[str, Any]] = {
 
 
 class PackageImporter(Importer):
+    # [CLASS DOC] Importer that loads from a package archive, isolated from the interpreter's
+    # module table. State: the archive reader (zip or directory), file name, a tree of
+    # path nodes describing archive layout, the local module table (modules attribute), list
+    # of extern modules, a mangler giving this importer unique module name prefixes, patched
+    # builtins whose import function routes back here, and temporary deserialization context
+    # (storage context and map location, set only during load_pickle). Key methods:
+    # import_module, load_pickle, load_text, load_binary, file_structure. Also acts as the
+    # loader of its modules (source access and resource reader support).
     """Importers allow you to load code written to packages by :class:`PackageExporter`.
     Code is loaded in a hermetic way, using files from the package
     rather than the normal python import system. This allows
@@ -88,6 +104,12 @@ class PackageImporter(Importer):
         file_or_buffer: FileLike | torch._C.PyTorchFileReader,
         module_allowed: Callable[[str], bool] = lambda module_name: True,
     ):
+        # [FUNCTION DOC] Opens the archive from a reader object, a path (file or unpacked
+        # directory) or a binary buffer. Logs usage, reads the list of extern modules, raises
+        # ImportError if any is rejected by the module_allowed callable, registers externs and
+        # every archive record in the layout tree (skipping the data directory), prepares
+        # patched builtins, registers itself as a special module for packaged code, and creates
+        # the mangler and the unpickler factory. Raises on unreadable archives.
         """Open ``file_or_buffer`` for importing. This checks that the imported package only requires modules
         allowed by ``module_allowed``
 
@@ -156,6 +178,11 @@ class PackageImporter(Importer):
 
     # pyrefly: ignore [bad-override]
     def import_module(self, name: str, package=None):
+        # [FUNCTION DOC] Returns the module with the given fully qualified name, loading it from
+        # the archive (or the real import system for extern/allowlisted modules) on first use
+        # and caching it in the local module table. Names mangled by this importer are first
+        # demangled. The package argument is ignored. Raises ModuleNotFoundError if the module
+        # is neither in the archive nor allowed externally. Executes module code.
         """Load a module from the package if it hasn't already been loaded, and then return
         the module. Modules are loaded locally
         to the importer and will appear in ``self.modules`` rather than ``sys.modules``.
@@ -179,6 +206,9 @@ class PackageImporter(Importer):
         return self._gcd_import(name)
 
     def load_binary(self, package: str, resource: str) -> bytes:
+        # [FUNCTION DOC] Returns the raw bytes of the named resource inside the named package,
+        # found by mapping the package to its archive directory. Raises if the package cannot
+        # be imported or is not a package, or if the record is missing.
         """Load raw bytes.
 
         Args:
@@ -199,6 +229,9 @@ class PackageImporter(Importer):
         encoding: str = "utf-8",
         errors: str = "strict",
     ) -> str:
+        # [FUNCTION DOC] Loads the resource bytes and returns them decoded with the given
+        # encoding and error handling mode. Raises UnicodeDecodeError on bad data, plus the
+        # errors of the binary loader.
         """Load a string.
 
         Args:
@@ -214,6 +247,15 @@ class PackageImporter(Importer):
         return data.decode(encoding, errors)
 
     def load_pickle(self, package: str, resource: str, map_location=None) -> Any:
+        # [FUNCTION DOC] Unpickles the named resource using a package-aware unpickler, so
+        # classes are resolved through this importer. Handles persistent ids: tensor storages
+        # are read from the data records (cached per call, moved with the map location) and
+        # wrapped as typed storages; package reduce entries call the stored function with this
+        # importer and cached arguments. While loading, exposes the storage context and map
+        # location on the importer, cleared afterwards. Finally validates sparse tensors loaded
+        # globally and returns the object. Raises on missing resources or bad pickles.
+        # KNOWN ISSUE: a global validation call is used that is not thread safe, per the
+        # original TODO.
         """Unpickles the resource from the package, loading any modules that are needed to construct the objects
         using :meth:`import_module`.
 
@@ -232,6 +274,10 @@ class PackageImporter(Importer):
         storage_context = torch._C.DeserializationStorageContext()
 
         def load_tensor(dtype, size, key, location, restore_location):
+            # [FUNCTION DOC] HELPER: Fetches the storage record for the key (reusing one from the
+            # storage context when already present, adding new ones when the reader is a
+            # file reader), places it on the target location with the restore function and
+            # stores the result in the enclosing loaded-storages mapping. Returns nothing.
             name = f"{key}.storage"
 
             if storage_context.has_storage(name):
@@ -246,6 +292,14 @@ class PackageImporter(Importer):
             loaded_storages[key] = restore_location(storage, location)
 
         def persistent_load(saved_id):
+            # [FUNCTION DOC] HELPER: Unpickler callback resolving a persistent id tuple. For
+            # storage ids, loads the storage once and returns a typed storage wrapper around it
+            # (byte dtype for untyped storage). For package reduce ids, calls the saved function
+            # with the importer and args; entries with an id are cached so the same object is
+            # reused, older two-element entries are re-created each time. Raises AssertionError
+            # if the id is not a tuple.
+            # KNOWN ISSUE: for an unknown type name the code only builds an error message string
+            # and discards it, so it silently returns None instead of raising.
             if not isinstance(saved_id, tuple):
                 raise AssertionError(
                     f"saved_id must be a tuple, got {type(saved_id).__name__}"
@@ -294,6 +348,9 @@ class PackageImporter(Importer):
 
         @contextmanager
         def set_deserialization_context():
+            # [FUNCTION DOC] HELPER: Context manager that publishes the current storage context
+            # and map location as importer attributes (so package reduce functions can use
+            # them) and resets both to None on exit, even on error.
             # to let reduce_package access deserialization context
             self.storage_context = storage_context
             self.last_map_location = map_location
@@ -315,6 +372,8 @@ class PackageImporter(Importer):
         return result
 
     def id(self):
+        # [FUNCTION DOC] Returns the mangle prefix string that uniquely identifies this
+        # importer instance among package importers.
         """
         Returns internal identifier that torch.package uses to distinguish :class:`PackageImporter` instances.
         Looks like::
@@ -326,6 +385,8 @@ class PackageImporter(Importer):
     def file_structure(
         self, *, include: "GlobPattern" = "**", exclude: "GlobPattern" = ()
     ) -> Directory:
+        # [FUNCTION DOC] Builds a Directory tree rooted at the archive file name from all
+        # archive record names, filtered by the include and exclude glob patterns (default all).
         """Returns a file structure representation of package's zipfile.
 
         Args:
@@ -343,6 +404,8 @@ class PackageImporter(Importer):
         )
 
     def python_version(self):
+        # [FUNCTION DOC] Returns the stripped python version text stored in the archive's
+        # version data record, or None if the record is absent.
         """Returns the version of python that was used to create this package.
 
         Note: this function is experimental and not Forward Compatible. The plan is to move this into a lock
@@ -359,6 +422,8 @@ class PackageImporter(Importer):
         )
 
     def _read_extern(self):
+        # [FUNCTION DOC] HELPER: Reads the extern modules data record and returns its lines as
+        # a list of module names. Raises if the record is missing.
         return (
             self.zip_reader.get_record(".data/extern_modules")
             .decode("utf-8")
@@ -368,6 +433,15 @@ class PackageImporter(Importer):
     def _make_module(
         self, name: str, filename: str | None, is_package: bool, parent: str
     ):
+        # [FUNCTION DOC] HELPER: Creates a module object for an archive module: builds a spec
+        # with this importer as loader, stores it in the local table under the plain name,
+        # renames it with the mangled name, fills in loader, file, cached, patched builtins and
+        # the torch package marker, registers it in the global registry, attaches it to its
+        # parent, and if there is source, registers lazy line cache source and compiles and
+        # executes the code in the module namespace. Returns the module. Raises AssertionError
+        # on duplicate registration.
+        # KNOWN ISSUE: the line cache duplicate check looks up the plain file name while the
+        # entry added is under the mangled file name, so the check cannot detect duplicates.
         mangled_filename = self._mangler.mangle(filename) if filename else None
         spec = importlib.machinery.ModuleSpec(
             name,
@@ -414,6 +488,11 @@ class PackageImporter(Importer):
         return module
 
     def _load_module(self, name: str, parent: str):
+        # [FUNCTION DOC] HELPER: Walks the layout tree along the dotted name. If the path leaves
+        # the tree, imports the module from the real import system when it is on the implicit
+        # allowlist, else raises ModuleNotFoundError. If an extern node is reached, imports the
+        # name from the real system, applies compatibility attribute defaults, caches and
+        # returns it. Otherwise builds the module from the archive via _make_module.
         cur: _PathNode = self.root
         for atom in name.split("."):
             if not isinstance(cur, _PackageNode) or atom not in cur.children:
@@ -442,6 +521,9 @@ class PackageImporter(Importer):
         )
 
     def _compile_source(self, fullpath: str, mangled_filename: str):
+        # [FUNCTION DOC] HELPER: Reads the source record, normalizes line endings and compiles
+        # it to a code object labelled with the mangled file name, without inheriting future
+        # flags. Raises SyntaxError for bad source.
         source = self.zip_reader.get_record(fullpath)
         source = _normalize_line_endings(source)
         return compile(source, mangled_filename, "exec", dont_inherit=True)
@@ -449,6 +531,8 @@ class PackageImporter(Importer):
     # note: named `get_source` so that linecache can find the source
     # when this is the __loader__ of a module.
     def get_source(self, module_name) -> str:
+        # [FUNCTION DOC] Loader protocol method used by the line cache: demangles the module
+        # name, imports the module and returns the decoded source of its file record.
         # linecache calls `get_source` with the `module.__name__` as the argument, so we must demangle it here.
         module = self.import_module(demangle(module_name))
         return self.zip_reader.get_record(demangle(module.__file__)).decode("utf-8")
@@ -456,6 +540,9 @@ class PackageImporter(Importer):
     # note: named `get_resource_reader` so that importlib.resources can find it.
     # This is otherwise considered an internal method.
     def get_resource_reader(self, fullname):
+        # [FUNCTION DOC] Loader protocol method for resource access: returns a resource reader
+        # for the named package, or None if the name is not a package or was not loaded by
+        # this importer.
         try:
             package = self._get_package(fullname)
         except ImportError:
@@ -465,6 +552,9 @@ class PackageImporter(Importer):
         return _PackageResourceReader(self, fullname)
 
     def _install_on_parent(self, parent: str, name: str, module: types.ModuleType):
+        # [FUNCTION DOC] HELPER: If a parent name is given and the parent module was loaded by
+        # this importer, sets the module as an attribute of the parent under its last name
+        # component. No effect otherwise.
         if not parent:
             return
         # Set the module as an attribute on its parent.
@@ -474,6 +564,14 @@ class PackageImporter(Importer):
 
     # note: copied from cpython's import code, with call to create module replaced with _make_module
     def _do_find_and_load(self, name):
+        # [FUNCTION DOC] HELPER: Loads a not yet cached module. First ensures the parent package
+        # is imported (the parent import may already have loaded the module, in which case that
+        # is returned). If the parent is not a package, raises ModuleNotFoundError with a
+        # message (special messages for non-externed or missing members of C extension parents).
+        # Then loads the module and attaches it to its parent.
+        # KNOWN ISSUE: the message for a non-externed C extension module contains a stray
+        # closing brace, which makes string formatting fail with a ValueError instead of
+        # producing the intended ModuleNotFoundError.
         parent = name.rpartition(".")[0]
         module_name_no_parent = name.rpartition(".")[-1]
         if parent:
@@ -520,6 +618,10 @@ class PackageImporter(Importer):
 
     # note: copied from cpython's import code
     def _find_and_load(self, name):
+        # [FUNCTION DOC] HELPER: Returns the cached module if present, else loads it. Raises
+        # ModuleNotFoundError if the cache holds None for the name. For the os and typing
+        # modules, also registers their fake submodules (os.path, and typing.io and typing.re
+        # on older Python versions) in the local table.
         module = self.modules.get(name, _NEEDS_LOADING)
         if module is _NEEDS_LOADING:
             return self._do_find_and_load(name)
@@ -541,6 +643,9 @@ class PackageImporter(Importer):
         return module
 
     def _gcd_import(self, name, package=None, level=0):
+        # [FUNCTION DOC] HELPER: Core import routine: validates arguments, resolves a relative
+        # name against the package when level is positive, and returns the module through the
+        # caching loader. Raises on invalid arguments or missing modules.
         """Import and return the module based on its name, the package the call is
         being made from, and the level adjustment.
 
@@ -557,6 +662,11 @@ class PackageImporter(Importer):
 
     # note: copied from cpython's import code
     def _handle_fromlist(self, module, fromlist, *, recursive=False):
+        # [FUNCTION DOC] HELPER: For a package module, makes sure each name in the from-list is
+        # available: star expands the module's export list (once), and missing names are tried
+        # as submodules; a failed import of exactly that submodule is ignored. Returns the
+        # module. Raises TypeError for non-string entries and re-raises other import errors.
+        # KNOWN ISSUE: the docstring mentions an import callable parameter that does not exist.
         """Figure out what __import__ should return.
 
         The import_ parameter is a callable which takes the name of module to
@@ -597,6 +707,10 @@ class PackageImporter(Importer):
         return module
 
     def __import__(self, name, globals=None, locals=None, fromlist=(), level=0):
+        # [FUNCTION DOC] Replacement for the builtin import statement function used by packaged
+        # code. Imports the module (resolving relative names using the caller globals). With an
+        # empty from-list returns the top-level package (or the leading part of a relative
+        # name); otherwise returns the module after handling the from-list. Locals is unused.
         if level == 0:
             module = self._gcd_import(name)
         else:
@@ -622,6 +736,8 @@ class PackageImporter(Importer):
             return self._handle_fromlist(module, fromlist)
 
     def _get_package(self, package):
+        # [FUNCTION DOC] HELPER: Accepts a package name or a module object and returns the
+        # module, importing by name if needed. Raises TypeError if it is not a package.
         """Take a package name or module object and return the module.
 
         If a name, the module is imported.  If the passed or imported module
@@ -640,6 +756,9 @@ class PackageImporter(Importer):
                 return module
 
     def _zipfile_path(self, package, resource=None):
+        # [FUNCTION DOC] HELPER: Returns the archive path of a package directory, or of a
+        # resource inside it (normalized) when given. Raises AssertionError if the package was
+        # not loaded by this importer.
         package = self._get_package(package)
         if package.__loader__ is not self:
             raise AssertionError(
@@ -653,6 +772,12 @@ class PackageImporter(Importer):
             return f"{name.replace('.', '/')}"
 
     def _get_or_create_package(self, atoms: list[str]) -> "_PackageNode | _ExternNode":
+        # [FUNCTION DOC] HELPER: Walks the layout tree along the name parts, creating package
+        # nodes for missing parts, and returns the final package node, or the first extern node
+        # met on the way. Raises ImportError if a plain module node is found where a package
+        # is needed.
+        # KNOWN ISSUE: the module name in that ImportError excludes the offending part itself
+        # (it joins only the preceding parts), so the message names the parent.
         cur = self.root
         for i, atom in enumerate(atoms):
             node = cur.children.get(atom, None)
@@ -673,6 +798,10 @@ class PackageImporter(Importer):
         return cur
 
     def _add_file(self, filename: str):
+        # [FUNCTION DOC] HELPER: Registers an archive record in the layout tree. Records under
+        # the data directory (with a deeper path) are skipped. An init file sets the source of
+        # its package node; other py files become module nodes; non-Python files are ignored.
+        # Raises ImportError if the file lies below an extern module.
         """Assembles a Python module out of the given file. Will ignore files in the .data directory.
 
         Args:
@@ -694,6 +823,8 @@ class PackageImporter(Importer):
             package.children[package_name] = _ModuleNode(filename)
 
     def _add_extern(self, extern_name: str):
+        # [FUNCTION DOC] HELPER: Registers a dotted module name as an extern leaf in the layout
+        # tree (creating parent package nodes), unless a shorter extern already covers it.
         *prefix, last = extern_name.split(".")
         package = self._get_or_create_package(prefix)
         if isinstance(package, _ExternNode):
@@ -707,23 +838,31 @@ _ERR_MSG = _ERR_MSG_PREFIX + "{!r}"
 
 
 class _PathNode:
+    # [CLASS DOC] HELPER: Base class of nodes in the archive layout tree (no state).
     __slots__ = []
 
 
 class _PackageNode(_PathNode):
+    # [CLASS DOC] HELPER: Layout tree node for a package (directory): optional source file of
+    # its init file and a mapping from child name to child node.
     def __init__(self, source_file: str | None):
+        # [FUNCTION DOC] HELPER: Stores the optional init source path and an empty children map.
         self.source_file = source_file
         self.children: dict[str, _PathNode] = {}
 
 
 class _ModuleNode(_PathNode):
+    # [CLASS DOC] HELPER: Layout tree leaf for a plain module, holding its source file path.
     __slots__ = ["source_file"]
 
     def __init__(self, source_file: str):
+        # [FUNCTION DOC] HELPER: Stores the archive path of the module source.
         self.source_file = source_file
 
 
 class _ExternNode(_PathNode):
+    # [CLASS DOC] HELPER: Layout tree leaf marking a module (and everything below it) as
+    # provided by the real import system rather than the archive. No state.
     pass
 
 
@@ -736,6 +875,9 @@ _orig_getfile = inspect.getfile
 
 
 def _patched_getfile(object):
+    # [FUNCTION DOC] HELPER: Replacement for the standard file lookup of objects. For classes
+    # whose module is in the registry of package-imported modules, returns that module's file
+    # path; everything else goes to the original function.
     if inspect.isclass(object):
         if object.__module__ in _package_imported_modules:
             return _package_imported_modules[object.__module__].__file__
@@ -746,6 +888,9 @@ inspect.getfile = _patched_getfile
 
 
 class _PackageResourceReader:
+    # [CLASS DOC] HELPER: Resource reader for one package loaded by a PackageImporter, holding
+    # the importer and the package name. Implements opening, path lookup, existence checks
+    # and listing of the package's resources.
     """Private class used to support PackageImporter.get_resource_reader().
 
     Conforms to the importlib.abc.ResourceReader interface. Allowed to access
@@ -753,15 +898,23 @@ class _PackageResourceReader:
     """
 
     def __init__(self, importer, fullname):
+        # [FUNCTION DOC] HELPER: Stores the importer and the package name.
         self.importer = importer
         self.fullname = fullname
 
     def open_resource(self, resource):
+        # [FUNCTION DOC] HELPER: Returns an in-memory binary stream over the resource bytes
+        # loaded from the archive.
         from io import BytesIO
 
         return BytesIO(self.importer.load_binary(self.fullname, resource))
 
     def resource_path(self, resource):
+        # [FUNCTION DOC] HELPER: Returns a real file system path for the resource, only
+        # possible when the importer reads from an unpacked directory and the record exists;
+        # otherwise raises FileNotFoundError.
+        # KNOWN ISSUE: the lookup joins the dotted package name directly instead of converting
+        # it to a directory path, so nested packages are likely not found.
         # The contract for resource_path is that it either returns a concrete
         # file system path or raises FileNotFoundError.
         if isinstance(
@@ -775,10 +928,18 @@ class _PackageResourceReader:
         raise FileNotFoundError
 
     def is_resource(self, name):
+        # [FUNCTION DOC] HELPER: Returns True if the archive has a record for the named resource
+        # in this package.
         path = self.importer._zipfile_path(self.fullname, name)
         return self.importer.zip_reader.has_record(path)
 
     def contents(self):
+        # [FUNCTION DOC] HELPER: Generator yielding the names directly inside the package:
+        # file names for records at the top level of the package directory, and each immediate
+        # subdirectory name once. Records outside the package are skipped.
+        # KNOWN ISSUE: only the last component of the parent path is checked, so entries two or
+        # more levels deep yield their direct parent directory name, which may repeat or be
+        # wrong for deeper trees.
         from pathlib import Path
 
         filename = self.fullname.replace(".", "/")
