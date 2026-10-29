@@ -1,4 +1,9 @@
 # Owner(s): ["module: sparse"]
+# [MODULE DOC] Tests that structured sparsity (WeightNormSparsifier) composes with eager-mode
+# and FX-graph quantization (prepare, QAT prepare, fusion, convert), regardless of the order of
+# operations. Contains shared model/sparsifier builders, TestComposability (eager) and
+# TestFxComposability (FX). Requires FBGEMM for the eager tests. Direct execution is rejected in
+# favor of test/test_ao_sparsity.py.
 
 
 import torch
@@ -28,6 +33,11 @@ sparse_defaults = {
 
 
 def _get_model_and_sparsifier_and_sparse_config(qconfig=None):
+    # [FUNCTION DOC] HELPER: Builds a Sequential of linear/relu layers with a quant stub and
+    # dequant stub, a WeightNormSparsifier from the shared defaults, and a sparse config list
+    # targeting the weights of layers 5 and 0 (layer 5 with a custom level). If a qconfig is
+    # given it is assigned to the quant stub and layer 5. Returns the tuple of model,
+    # sparsifier, sparse_config.
     model = nn.Sequential(
         nn.Linear(4, 4),  # 0
         nn.ReLU(),
@@ -57,6 +67,9 @@ def _get_model_and_sparsifier_and_sparse_config(qconfig=None):
 
 
 def _squash_mask_calibrate_and_convert(model, sparsifier, input):
+    # [FUNCTION DOC] HELPER: Runs sparsifier step, squashes the masks into the weights, calls
+    # the model once on the input for calibration, then converts the model to quantized form in
+    # place. Returns nothing.
     sparsifier.step()
     sparsifier.squash_mask()
     model(input)
@@ -64,6 +77,8 @@ def _squash_mask_calibrate_and_convert(model, sparsifier, input):
 
 
 def _calculate_sparsity(tensor):
+    # [FUNCTION DOC] HELPER: Returns the fraction of exactly-zero entries of the tensor as a
+    # Python float.
     return ((tensor == 0).sum() / tensor.numel()).item()
 
 
@@ -72,11 +87,18 @@ def _calculate_sparsity(tensor):
 # does not cause problems
 @skipIfNoFBGEMM
 class TestComposability(TestCase):
+    # [CLASS DOC] Eager-mode composability tests, skipped without FBGEMM. Each test combines
+    # sparse prepare, quantization prepare (or QAT prepare), fusion and convert in a different
+    # order and checks parametrizations, observers, the final quantized module type and that
+    # sparsity survives.
     # This test checks whether performing quantization prepare before sparse prepare
     # causes any issues and verifies that the correct observers are inserted and that
     # the quantized model works as expected
     @xfailIfS390X
     def test_q_prep_before_s_prep(self):
+        # [FUNCTION DOC] Quantization prepare followed by sparse prepare: checks
+        # parametrizations and observers exist, then squash, calibrate and convert, and checks
+        # the result is a quantized Linear that runs with the expected output shape.
         (
             mod,
             sparsifier,
@@ -107,6 +129,9 @@ class TestComposability(TestCase):
     # the fix for this was successful.
     @xfailIfS390X
     def test_s_prep_before_q_prep(self):
+        # [FUNCTION DOC] Sparse prepare followed by quantization prepare: checks parametrized
+        # modules are still matched, observers inserted, then squash, convert and that the
+        # quantized Linear runs with the expected output shape.
         (
             mod,
             sparsifier,
@@ -139,6 +164,9 @@ class TestComposability(TestCase):
     # module uses the sparse version of the weight value.
     @xfailIfS390X
     def test_convert_without_squash_mask(self):
+        # [FUNCTION DOC] Sparse prepare then quantization prepare, step, calibrate and convert
+        # without squashing the mask: checks the quantized Linear runs and that its weight keeps
+        # at least the sparsity of the sparsified float weight and the configured level.
         (
             mod,
             sparsifier,
@@ -180,6 +208,9 @@ class TestComposability(TestCase):
     # be sparsified would be broken.
     @xfailIfS390X
     def test_s_prep_before_fusion(self):
+        # [FUNCTION DOC] Sparse prepare, then fuse layers 5 and 6, then quantization prepare:
+        # checks parametrizations survive fusion, observers exist, and after squash and convert
+        # the module is a quantized LinearReLU that runs.
         (
             mod,
             sparsifier,
@@ -210,6 +241,9 @@ class TestComposability(TestCase):
     # main worry was that the links to the modules in the sparse config would be broken by fusion.
     @xfailIfS390X
     def test_fusion_before_s_prep(self):
+        # [FUNCTION DOC] Fuse first, then sparse prepare using the post-fusion tensor name, then
+        # quantization prepare, step and convert without squash. Checks the result is a
+        # quantized LinearReLU that runs and stays at least as sparse as configured.
         (
             mod,
             sparsifier,
@@ -265,6 +299,9 @@ class TestComposability(TestCase):
     # from the modules.
     @xfailIfS390X
     def test_s_prep_before_qat_prep(self):
+        # [FUNCTION DOC] Sparse prepare followed by QAT prepare: checks parametrizations,
+        # observers and the QAT Linear type, then squash and convert to a quantized Linear that
+        # runs and meets the configured sparsity.
         (
             mod,
             sparsifier,
@@ -293,6 +330,9 @@ class TestComposability(TestCase):
     # This tests whether performing qat prepare before sparse prepare causes issues.
     @xfailIfS390X
     def test_qat_prep_before_s_prep(self):
+        # [FUNCTION DOC] QAT prepare followed by sparse prepare with a config rebuilt for the
+        # new modules: checks parametrizations, observers and QAT Linear type, then squash and
+        # convert, verifying the quantized Linear runs and meets the configured sparsity.
         mod, sparsifier, _ = _get_model_and_sparsifier_and_sparse_config(
             tq.get_default_qat_qconfig("fbgemm")
         )
@@ -332,6 +372,9 @@ class TestComposability(TestCase):
 
 
 def _module_has_activation_post_process(model, fqn_of_module):
+    # [FUNCTION DOC] HELPER: Returns True if some node in the FX graph of the model has a name
+    # containing the observer marker and its first argument targets the given module name, else
+    # False.
     for node in model.graph.nodes:
         # look for an observer whose arg is the target module
         if "activation_post_process" in node.name:
@@ -341,12 +384,17 @@ def _module_has_activation_post_process(model, fqn_of_module):
 
 
 class TestFxComposability(TestCase):
+    # [CLASS DOC] FX-graph composability tests combining sparse prepare with prepare_fx,
+    # prepare_qat_fx, convert_fx and convert_to_reference_fx in different orders.
     r"""This series of tests checks that various steps of the quantization and sparsity flow
     compose cleanly despite variation in sequencing.
     """
 
     @xfailIfS390X
     def test_q_prep_fx_before_s_prep(self):
+        # [FUNCTION DOC] prepare_fx, then sparse prepare (using post-fusion names), step,
+        # calibrate and convert_fx without squashing. Checks automatic fusion, observers, a
+        # quantized LinearReLU result that runs, and sparsity at least the configured level.
         r"""
         This test checks that the ordering of prepare_fx -> sparse prepare -> convert_fx
         compose cleanly without issue and that the final result is sparsified without
@@ -412,6 +460,9 @@ class TestFxComposability(TestCase):
         self.assertGreaterAlmostEqual(cur_sparsity, sparse_config[0]["sparsity_level"])
 
     def test_q_prep_fx_s_prep_ref_conv(self):
+        # [FUNCTION DOC] prepare_fx, then sparse prepare, step, calibrate and
+        # convert_to_reference_fx without squashing. Checks the fused reference LinearReLU
+        # contains a reference Linear that runs and is at least as sparse as configured.
         r"""
         This checks that the ordering: prepare_fx -> sparse prepare -> convert_to_reference_fx
         compose cleanly without issue and that the final result is sparsified without
@@ -480,6 +531,9 @@ class TestFxComposability(TestCase):
 
     @xfailIfS390X
     def test_s_prep_before_q_prep_fx(self):
+        # [FUNCTION DOC] Sparse prepare, then prepare_fx, step, calibrate and convert_fx without
+        # squashing. Checks parametrizations and observers survive, the result is a quantized
+        # LinearReLU that runs, and the weight meets the configured sparsity.
         r"""
         This test checks that the ordering of sparse prepare -> prepare_fx -> convert_fx
         compose cleanly without issue and that the final result is sparsified without
@@ -532,6 +586,9 @@ class TestFxComposability(TestCase):
 
     @xfailIfS390X
     def test_s_prep_before_qat_prep_fx(self):
+        # [FUNCTION DOC] Sparse prepare, then prepare_qat_fx, step, calibrate and convert_fx
+        # without squashing. Checks parametrizations survive on the QAT fused LinearReLU, the
+        # quantized result runs and meets the configured sparsity.
         r"""
         This test checks that the ordering of sparse prepare -> prepare_qat_fx -> convert_fx
         compose cleanly without issue and that the final result is sparsified without
@@ -586,6 +643,9 @@ class TestFxComposability(TestCase):
         self.assertGreaterAlmostEqual(cur_sparsity, sparse_config[0]["sparsity_level"])
 
     def test_s_prep_q_prep_fx_ref(self):
+        # [FUNCTION DOC] Sparse prepare, then prepare_fx, step, calibrate and
+        # convert_to_reference_fx without squashing. Checks the fused reference LinearReLU with
+        # a reference Linear runs and meets the configured sparsity.
         r"""
         This checks that the ordering: sparse prepare -> prepare_fx -> convert_to_reference_fx
         compose cleanly without issue and that the final result is sparsified without

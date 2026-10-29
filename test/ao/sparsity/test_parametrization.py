@@ -1,4 +1,8 @@
 # Owner(s): ["module: sparse"]
+# [MODULE DOC] Tests for FakeSparsity parametrization (torch.ao.pruning.sparsifier.utils)
+# applied to linear weights: masking behavior, registration, state_dict handling and JIT
+# tracing. Defines a small ModelUnderTest and TestFakeSparsity. Direct execution is rejected in
+# favor of test/test_ao_sparsity.py.
 
 
 import torch
@@ -9,7 +13,14 @@ from torch.testing._internal.common_utils import raise_on_run_directly, TestCase
 
 
 class ModelUnderTest(nn.Module):
+    # [CLASS DOC] HELPER: Model with one linear and a sequential of two linears, with constant
+    # weights (1, 2, 3) so results are deterministic.
     def __init__(self, bias=True):
+        # [FUNCTION DOC] HELPER: Builds the layers with the optional bias flag and overwrites
+        # weights with constants.
+        # KNOWN ISSUE: when bias is true, the code assigns Parameters to the linear attribute
+        #   and twice to the first sequential slot instead of to bias, replacing modules; every
+        #   test passes bias false so this is never exercised.
         super().__init__()
         self.linear = nn.Linear(16, 16, bias=bias)
         self.seq = nn.Sequential(
@@ -26,13 +37,18 @@ class ModelUnderTest(nn.Module):
             self.seq[0] = nn.Parameter(torch.zeros_like(self.seq[0].bias) + 30.0)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies the linear layer then the sequential and returns the
+        # result.
         x = self.linear(x)
         x = self.seq(x)
         return x
 
 
 class TestFakeSparsity(TestCase):
+    # [CLASS DOC] Tests of the FakeSparsity mask parametrization on linear layers.
     def test_masking_logic(self):
+        # [FUNCTION DOC] Checks a linear with identity weights matches plain matmul, then with
+        # an all-zero mask parametrization its output is all zeros.
         model = nn.Linear(16, 16, bias=False)
         model.weight = nn.Parameter(torch.eye(16))
         x = torch.randn(3, 16)
@@ -46,6 +62,10 @@ class TestFakeSparsity(TestCase):
         self.assertEqual(torch.zeros(3, 16), model(x))
 
     def test_weights_parametrized(self):
+        # [FUNCTION DOC] Checks no layer has parametrizations at first, then after registering
+        # FakeSparsity on all three linears each reports parametrizations.
+        # KNOWN ISSUE: the is_parametrized assertions always inspect the first linear instead of
+        #   the sequential layers.
         model = ModelUnderTest(bias=False)
 
         if hasattr(model.linear, "parametrizations"):
@@ -81,6 +101,12 @@ class TestFakeSparsity(TestCase):
             raise AssertionError("model.linear.weight should be parametrized")
 
     def test_state_dict_preserved(self):
+        # [FUNCTION DOC] Parametrizes three layers in a saved model, loads its state_dict non-
+        # strictly into a similarly parametrized model, and checks parametrizations stay,
+        # original weights are copied and masks are not.
+        # KNOWN ISSUE: a comment says to keep loading strict, but strict is false (masks are
+        #   absent from the state); the is_parametrized checks again only inspect the first
+        #   linear.
         model_save = ModelUnderTest(bias=False)
 
         mask = torch.eye(16)
@@ -158,6 +184,9 @@ class TestFakeSparsity(TestCase):
         )
 
     def test_jit_trace(self):
+        # [FUNCTION DOC] Parametrizes three layers with identity masks, traces the model with
+        # torch.jit.trace_module and checks the traced output equals the eager output on random
+        # input.
         model = ModelUnderTest(bias=False)
 
         mask = torch.eye(16)

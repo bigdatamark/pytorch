@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 # Owner(s): ["oncall: mobile"]
+# [MODULE DOC] Tests serialization of packed parameters of the sparse dynamic quantized Linear
+# for the fbgemm and qnnpack engines: serialized state fields, unpacking, save/load round trips
+# and cross-engine compatibility. Contains one TestQlinearPackedParams class. Has no main entry
+# block.
 
 import tempfile
 
@@ -15,7 +19,14 @@ from torch.testing._internal.common_utils import TestCase
 
 
 class TestQlinearPackedParams(TestCase):
+    # [CLASS DOC] Tests packed-parameter state and round trips of the sparse quantized Linear.
     def qlinear_packed_params_test(self, allow_non_zero_zero_points=False):
+        # [FUNCTION DOC] HELPER: Shared check, not collected as a test. Builds per-tensor and
+        # per-channel quantized small weights and a wide per-tensor weight (crossing the 4000
+        # fbgemm tile width), sets them in a sparse Linear with 1x4 blocks and checks serialized
+        # state (bias, block sizes, scales, zero points, scheme, block indices, weights stored
+        # with +128 offset), unpacked weight and bias, a torch save/load round trip, and under
+        # qnnpack output equality. allow_non_zero_zero_points shifts expected weights.
         # copied from https://pytorch.org/docs/stable/sparse.html#csr-tensor-operations,
         # so row/col block indices match that example, but with blocks and
         # scaled rows
@@ -175,18 +186,25 @@ class TestQlinearPackedParams(TestCase):
 
     @skipIfNoFBGEMM
     def test_qlinear_packed_params_fbgemm(self):
+        # [FUNCTION DOC] Seeds the RNG and runs the shared check under the fbgemm engine with
+        # zero zero-points. Skipped without FBGEMM.
         torch.manual_seed(0)
         with override_quantized_engine("fbgemm"):
             self.qlinear_packed_params_test(allow_non_zero_zero_points=False)
 
     @skipIfNoQNNPACK
     def test_qlinear_packed_params_qnnpack(self):
+        # [FUNCTION DOC] Seeds the RNG and runs the shared check under qnnpack with the CPU
+        # allocator override and non-zero zero-points. Skipped without QNNPACK.
         torch.manual_seed(0)
         with override_quantized_engine("qnnpack"):
             with override_cpu_allocator_for_qnnpack(qengine_is_qnnpack()):
                 self.qlinear_packed_params_test(allow_non_zero_zero_points=True)
 
     def test_qlinear_packed_params_fbgemm_qnnpack_cross_compatibility(self):
+        # [FUNCTION DOC] Saves a sparse Linear under one engine and loads it under the other, in
+        # both directions (fbgemm to qnnpack, then qnnpack to fbgemm), asserting the serialized
+        # state and unpacked weights match once the block indices are cast to 32-bit integers.
         torch.manual_seed(0)
 
         weight_fp32 = torch.Tensor(
@@ -206,6 +224,9 @@ class TestQlinearPackedParams(TestCase):
         dtype = torch.qint8
 
         def make_lin_get_state_weight_bias_and_save():
+            # [FUNCTION DOC] HELPER: Builds a quantized sparse Linear from the outer weight,
+            # returns its serialized state and weight/bias plus the open temporary file holding
+            # the saved module, rewound.
             weight = torch.quantize_per_tensor(
                 weight_fp32,
                 scales[0],
@@ -233,6 +254,8 @@ class TestQlinearPackedParams(TestCase):
             return ((state, weight_bias), file_buff)
 
         def load_get_state_weight_bias(f_b):
+            # [FUNCTION DOC] HELPER: Loads a Linear from the given file, closes the file and
+            # returns its serialized state and weight/bias.
             lin2 = torch.load(f_b)
             state = lin2._packed_params._packed_params.__getstate__()
             weight_bias = lin2._weight_bias()
@@ -240,6 +263,9 @@ class TestQlinearPackedParams(TestCase):
             return (state, weight_bias)
 
         def packed_params_data_with_int32_indices(data_as_state_and_weight_bias):
+            # [FUNCTION DOC] HELPER: Takes a (state, weight_bias) pair and returns it with the
+            # row and column block index entries of the first state element converted to 32-bit
+            # integers.
             (st, weight_bias) = data_as_state_and_weight_bias
             (s0, s1) = st
             s0_updated = tuple(

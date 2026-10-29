@@ -1,4 +1,9 @@
 # Owner(s): ["module: sparse"]
+# [MODULE DOC] Tests for quantized sparse kernels and layers: raw sparse qlinear ops compared to
+# dense quantized ops, and module-level conversion of a linear model with sparse quantization
+# mappings (including TorchScript save/load). Defines a module logger, a shared helper,
+# SparseQuantizedModel and two test classes. Direct execution is rejected in favor of
+# test/test_ao_sparsity.py.
 
 import copy
 import io
@@ -32,9 +37,16 @@ logger = logging.getLogger(__name__)
 
 
 class TestQuantizedSparseKernels(TestCase):
+    # [CLASS DOC] Tests the sparse quantized linear operators (prepack, static and dynamic
+    # linear) against their dense counterparts.
     @skipIfTorchDynamo("TorchDynamo fails here for unknown reasons")
     @override_qengines
     def test_sparse_qlinear(self):
+        # [FUNCTION DOC] Builds a random input and weight (per-channel and per-tensor), prepacks
+        # them densely and sparsely with a 1x4 block, runs both static and dynamic variants
+        # allowed by the active engine, and asserts outputs agree to four decimals. Returns
+        # early (passes) for unsupported engines such as onednn and x86, and skips fbgemm
+        # dynamic and qnnpack static modes. Skipped under TorchDynamo.
         batch_size = 12
         input_channels = 16
         output_channels = 4
@@ -135,6 +147,12 @@ def _sparse_layer_test_helper(
     test_class,
     test_scripting,
 ):
+    # [FUNCTION DOC] HELPER: Shared check for sparse quantized layers. Builds a model with a half-
+    # zero quantized weight, makes a plain copy and a sparse copy, prepares and calibrates both,
+    # checks identical weight qparams, converts the sparse copy with the sparse mapping and the
+    # plain copy with the reference mapping, and checks module types and a 1x4 block size.
+    # Optionally scripts, saves and reloads the sparse model, then compares outputs (dynamic mode
+    # takes float input, static takes quantized). Raises AssertionError on failures.
     # SET UP TEST PARAMETERS, INPUTS AND WEIGHTS
     # ------------------------------------------
     batch_size = 12
@@ -253,17 +271,26 @@ def _sparse_layer_test_helper(
 
 
 class SparseQuantizedModel(nn.Module):
+    # [CLASS DOC] HELPER: Model holding a single linear layer, used as the sparse quantization
+    # test target.
     def __init__(self, in_channels, out_channels):
+        # [FUNCTION DOC] HELPER: Creates the linear layer with the given input and output
+        # channels.
         super().__init__()
         self.linear = nn.Linear(in_channels, out_channels)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies the linear layer to the input and returns the result.
         return self.linear(x)
 
 
 class TestQuantizedSparseLayers(TestCase):
+    # [CLASS DOC] Tests converting SparseQuantizedModel with sparse quantization module
+    # mappings.
     @override_qengines
     def test_sparse_qlinear(self):
+        # [FUNCTION DOC] Runs the layer helper without scripting: static flow with fbgemm,
+        # dynamic flow with qnnpack, and returns without testing for other engines.
         # Note: At the moment, for sparse kernels
         # fbgemm supports only static quantized sparse linear
         # qnnpack supports only dynamically quantized sparse linear
@@ -296,6 +323,8 @@ class TestQuantizedSparseLayers(TestCase):
 
     @override_qengines
     def test_sparse_qlinear_serdes(self):
+        # [FUNCTION DOC] Same as the plain layer test but with scripting, saving and reloading
+        # the sparse model enabled, so serialization round trips are checked.
         # Note: At the moment, for sparse kernels
         # fbgemm supports only static quantized sparse linear
         # qnnpack supports only dynamically quantized sparse linear

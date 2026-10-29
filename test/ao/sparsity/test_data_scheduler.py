@@ -1,4 +1,9 @@
 # Owner(s): ["module: sparse"]
+# [MODULE DOC] Tests for BaseDataScheduler (torch.ao.pruning._experimental) driving a
+# DataNormSparsifier: constructor state, warning on wrong step order, scheduled parameter
+# updates and state_dict round trip. Defines ImplementedDataScheduler (halves the sparsity level
+# after the first epoch) and TestBaseDataScheduler. Direct execution is rejected in favor of
+# test/test_ao_sparsity.py.
 
 import copy
 import warnings
@@ -11,10 +16,16 @@ from torch.testing._internal.common_utils import raise_on_run_directly, TestCase
 
 
 class ImplementedDataScheduler(BaseDataScheduler):
+    # [CLASS DOC] HELPER: Concrete data scheduler for tests. After the first epoch it returns
+    # half of each data group's sparsity_level; before that it returns the base parameters.
     def __init__(self, sparsifier, sparsifier_hyperparam, last_epoch=-1, verbose=False):
+        # [FUNCTION DOC] HELPER: Forwards sparsifier, hyperparameter name, last_epoch and
+        # verbose to the base class unchanged.
         super().__init__(sparsifier, sparsifier_hyperparam, last_epoch, verbose)
 
     def get_schedule_param(self):
+        # [FUNCTION DOC] HELPER: Returns a mapping of data group name to half its current
+        # sparsity_level when last_epoch is positive, otherwise the stored base_param mapping.
         if self.last_epoch > 0:
             return {
                 name: config["sparsity_level"] * 0.5
@@ -25,7 +36,12 @@ class ImplementedDataScheduler(BaseDataScheduler):
 
 
 class TestBaseDataScheduler(TestCase):
+    # [CLASS DOC] Tests of BaseDataScheduler behavior through ImplementedDataScheduler; the
+    # _get_* methods build the data, sparsifier and scheduler fixtures.
     def _get_data(self):
+        # [FUNCTION DOC] HELPER: Returns a tuple of a list of named data (a tensor, a parameter
+        # and an embedding), a list with one dict holding name, data and per-data config, and a
+        # defaults dict of sparsity settings.
         tensor1, param1, emb1 = (
             torch.randn(5, 5),
             nn.Parameter(torch.randn(10, 10)),
@@ -47,6 +63,8 @@ class TestBaseDataScheduler(TestCase):
         return data_list, data_with_config, defaults
 
     def _get_sparsifier(self, data_list, data_with_config, defaults):
+        # [FUNCTION DOC] HELPER: Builds a DataNormSparsifier from the data list and defaults,
+        # then adds each extra data entry with its own config. Returns the sparsifier.
         sparsifier = DataNormSparsifier(data_list, **defaults)
         for data_config_dict in data_with_config:
             name, data, config = (
@@ -58,13 +76,19 @@ class TestBaseDataScheduler(TestCase):
         return sparsifier
 
     def _get_scheduler(self, sparsifier, schedule_param):
+        # [FUNCTION DOC] HELPER: Returns an ImplementedDataScheduler for the sparsifier and
+        # hyperparameter name.
         scheduler = ImplementedDataScheduler(sparsifier, schedule_param)
         return scheduler
 
     def _get_schedule_param(self):
+        # [FUNCTION DOC] HELPER: Returns the scheduled hyperparameter name, sparsity_level.
         return "sparsity_level"
 
     def _get_name_data_config(self, some_data, defaults):
+        # [FUNCTION DOC] HELPER: For a data entry (tuple or config dict) returns its name, data
+        # and the effective config, i.e. a copy of the defaults updated with the entry's own
+        # config if present.
         config = copy.deepcopy(defaults)
         if isinstance(some_data, tuple):
             # dealing with data_list
@@ -80,6 +104,11 @@ class TestBaseDataScheduler(TestCase):
         return name, data, config
 
     def test_constructor(self):
+        # [FUNCTION DOC] Checks the scheduler stores the sparsifier, starts with step count one
+        # and base_param equal to each group's scheduled parameter. Raises AssertionError on
+        # mismatch.
+        # KNOWN ISSUE: the docstring says it checks a warning for wrong step order, but the test
+        #   does not check any warning.
         """Checks if the warning is thrown if the scheduler step is called
         before the sparsifier step"""
         data_list, data_with_config, defaults = self._get_data()
@@ -99,6 +128,11 @@ class TestBaseDataScheduler(TestCase):
                 )
 
     def test_order_of_steps(self):
+        # [FUNCTION DOC] Checks that stepping the scheduler before the sparsifier emits a
+        # UserWarning, and that the correct order emits no warning from the base data scheduler
+        # file.
+        # KNOWN ISSUE: the filename compared in the warning check is an old torch/ao/sparsity
+        #   path that does not exist for this module, so the loop can never fail.
         data_list, data_with_config, defaults = self._get_data()
         sparsifier = self._get_sparsifier(data_list, data_with_config, defaults)
         schedule_param = self._get_schedule_param()
@@ -124,6 +158,9 @@ class TestBaseDataScheduler(TestCase):
                     raise AssertionError("Unexpected warning from base_data_scheduler")
 
     def test_step(self):
+        # [FUNCTION DOC] Checks that each data group starts at its configured sparsity level,
+        # that one sparsifier step plus scheduler step halves it, and that the step count grows
+        # to the expected total after five more steps.
         data_list, data_with_config, defaults = self._get_data()
         sparsifier = self._get_sparsifier(data_list, data_with_config, defaults)
         schedule_param = self._get_schedule_param()
@@ -166,6 +203,9 @@ class TestBaseDataScheduler(TestCase):
             )
 
     def test_state_dict(self):
+        # [FUNCTION DOC] Checks that a second scheduler differs from the first after a step,
+        # then that load_state_dict of the first scheduler's state makes base_param and last
+        # param match.
         data_list, data_with_config, defaults = self._get_data()
         sparsifier = self._get_sparsifier(data_list, data_with_config, defaults)
         schedule_param = self._get_schedule_param()

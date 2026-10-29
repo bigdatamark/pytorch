@@ -1,4 +1,8 @@
 # Owner(s): ["module: sparse"]
+# [MODULE DOC] Tests for the experimental ActivationSparsifier (torch.ao.pruning). Defines a
+# small conv/linear Model and one TestActivationSparsifier case that walks the whole workflow:
+# construction, layer registration, pre-forward hook aggregation, step, squash_mask and
+# state_dict round trips. Direct execution is rejected in favor of test/test_ao_sparsity.py.
 
 import copy
 
@@ -17,7 +21,10 @@ from torch.testing._internal.common_utils import (
 
 
 class Model(nn.Module):
+    # [CLASS DOC] HELPER: Small test network (two convs, identity layers, max pool, two linear
+    # layers) for 1x28x28 inputs; the identity layers are used as sparsification targets.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Builds the layers; takes no arguments and returns nothing.
         super().__init__()
         self.conv1 = nn.Conv2d(1, 32, kernel_size=3)
         self.conv2 = nn.Conv2d(32, 32, kernel_size=3)
@@ -29,6 +36,8 @@ class Model(nn.Module):
         self.linear2 = nn.Linear(128, 10)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Runs convs, identity, pool, flattens per batch, then linear1
+        # with identity2 and relu, then linear2. Returns the logits tensor of shape batch by 10.
         out = self.conv1(x)
         out = self.conv2(out)
         out = self.identity1(out)
@@ -43,7 +52,12 @@ class Model(nn.Module):
 
 
 class TestActivationSparsifier(TestCase):
+    # [CLASS DOC] Test case driving ActivationSparsifier through its workflow; the _check_*
+    # methods are assertion helpers invoked from the single test method.
     def _check_constructor(self, activation_sparsifier, model, defaults, sparse_config):
+        # [FUNCTION DOC] HELPER: Verifies the sparsifier defaults equal the passed defaults
+        # merged with the sparse_config entry (extra keys in the sparsifier are allowed). Raises
+        # AssertionError on mismatch.
         """Helper function to check if the model, defaults and sparse_config are loaded correctly
         in the activation sparsifier
         """
@@ -68,6 +82,10 @@ class TestActivationSparsifier(TestCase):
     def _check_register_layer(
         self, activation_sparsifier, defaults, sparse_config, layer_args_list
     ):
+        # [FUNCTION DOC] HELPER: Verifies each registered layer's data group has the expected
+        # merged sparse_config and other settings (defaults overridden by per-layer args, minus
+        # the layer itself), that the number of groups matches, and that get_mask raises
+        # ValueError before any step. Raises AssertionError on mismatch.
         """Checks if layers in the model are correctly mapped to it's arguments.
 
         Args:
@@ -126,6 +144,9 @@ class TestActivationSparsifier(TestCase):
                 activation_sparsifier.get_mask(name=name)
 
     def _check_pre_forward_hook(self, activation_sparsifier, data_list):
+        # [FUNCTION DOC] HELPER: Checks the pre-forward hook of conv1: folds the given input
+        # tensors with the layer's aggregate function and asserts the stored data equals the
+        # result. Returns the expected aggregated tensor for later steps.
         """Registering a layer attaches a pre-forward hook to that layer. This function
         checks if the pre-forward hook works as expected. Specifically, checks if the
         input is aggregated correctly.
@@ -160,6 +181,9 @@ class TestActivationSparsifier(TestCase):
         return data_agg_actual
 
     def _check_step(self, activation_sparsifier, data_agg_actual):
+        # [FUNCTION DOC] HELPER: After step, recomputes the conv1 mask from the aggregated data
+        # using the layer's reduce and mask functions and sparse_config, asserts it equals the
+        # sparsifier mask, and asserts the data entry was removed from every data group.
         """Checks if .step() works as expected. Specifically, checks if the mask is computed correctly.
 
         Args:
@@ -194,6 +218,9 @@ class TestActivationSparsifier(TestCase):
                 )
 
     def _check_squash_mask(self, activation_sparsifier, data):
+        # [FUNCTION DOC] HELPER: After squash_mask, registers forward hooks on the identity
+        # layers that assert output equals input times mask (per selected feature along
+        # feature_dim when features are set), then runs the model on the data to trigger them.
         """Makes sure that squash_mask() works as usual. Specifically, checks
         if the sparsifier hook is attached correctly.
         This is achieved by only looking at the identity layers and making sure that
@@ -209,11 +236,16 @@ class TestActivationSparsifier(TestCase):
 
         # create a forward hook for checking output == layer(input * mask)
         def check_output(name):
+            # [FUNCTION DOC] HELPER: Builds and returns a forward hook for the named layer,
+            # capturing its mask, features and feature_dim from the sparsifier.
             mask = activation_sparsifier.get_mask(name)
             features = activation_sparsifier.data_groups[name].get("features")
             feature_dim = activation_sparsifier.data_groups[name].get("feature_dim")
 
             def hook(module, input, output):
+                # [FUNCTION DOC] HELPER: Forward hook asserting output matches mask times input,
+                # either overall or per selected feature slice. Raises AssertionError on
+                # mismatch.
                 input_data = input[0]
                 if features is None:
                     if not torch.all(mask * input_data == output):
@@ -246,6 +278,10 @@ class TestActivationSparsifier(TestCase):
         activation_sparsifier.model(data)
 
     def _check_state_dict(self, sparsifier1):
+        # [FUNCTION DOC] HELPER: Dumps state_dict of the given sparsifier, loads it into a fresh
+        # sparsifier on a new model, and asserts defaults, masks (stored as sparse tensors in
+        # the dump) and per-layer data groups (ignoring hook and layer) match. Raises
+        # AssertionError.
         """Checks if loading and restoring of state_dict() works as expected.
         Basically, dumps the state of the sparsifier and loads it in the other sparsifier
         and checks if all the configuration are in line.
@@ -335,6 +371,10 @@ class TestActivationSparsifier(TestCase):
 
     @skipIfTorchDynamo("TorchDynamo fails with unknown reason")
     def test_activation_sparsifier(self):
+        # [FUNCTION DOC] End-to-end test: builds the sparsifier with custom aggregate and reduce
+        # functions, registers four layers with per-layer sparsity, feeds random data, then runs
+        # the checks for registration, hooks, step, squash_mask, with state_dict checks between
+        # stages.
         """Simulates the workflow of the activation sparsifier, starting from object creation
         till squash_mask().
         The idea is to check that everything works as expected while in the workflow.
@@ -342,12 +382,16 @@ class TestActivationSparsifier(TestCase):
 
         # defining aggregate, reduce and mask functions
         def agg_fn(x, y):
+            # [FUNCTION DOC] HELPER: Aggregation function: elementwise sum of the two tensors.
             return x + y
 
         def reduce_fn(x):
+            # [FUNCTION DOC] HELPER: Reduction function: mean over the batch dimension (dim 0).
             return torch.mean(x, dim=0)
 
         def _vanilla_norm_sparsifier(data, sparsity_level):
+            # [FUNCTION DOC] HELPER: Mask function: flattens abs of data, zeroes the smallest
+            # fraction (sparsity_level) of entries, keeps the rest, returns mask in data shape.
             r"""Similar to data norm sparsifier but block_shape = (1,1).
             Simply, flatten the data, sort it and mask out the values less than threshold
             """

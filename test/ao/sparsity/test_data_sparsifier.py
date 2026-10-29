@@ -1,4 +1,10 @@
 # Owner(s): ["module: sparse"]
+# [MODULE DOC] Tests for the experimental data sparsifiers (BaseDataSparsifier,
+# DataNormSparsifier) and post_training_sparse_quantize. Provides reusable check runners
+# (constructor, squash_mask, add_data, step, state_dict, memory reference, norm-specific
+# sparsity bounds), test cases over tensors, parameters and embeddings, and quantization utility
+# tests on a small embedding model. Direct execution is rejected in favor of
+# test/test_ao_sparsity.py.
 
 import copy
 import itertools
@@ -18,10 +24,15 @@ from torch.testing._internal.common_utils import raise_on_run_directly, TestCase
 
 
 class ImplementedSparsifier(BaseDataSparsifier):
+    # [CLASS DOC] HELPER: Minimal BaseDataSparsifier subclass for tests; its update_mask zeroes
+    # the first mask row and counts steps in the per-data state.
     def __init__(self, **kwargs):
+        # [FUNCTION DOC] HELPER: Forwards all keyword arguments to the base class.
         super().__init__(**kwargs)
 
     def update_mask(self, name, data, **kwargs):
+        # [FUNCTION DOC] HELPER: Sets the first entry of the named data's mask to zero in place
+        # and increments step_count in that data's state (starting from zero). Returns nothing.
         mask = self.get_mask(name)
         mask[0] = 0
         linear_state = self.state[name]
@@ -29,6 +40,9 @@ class ImplementedSparsifier(BaseDataSparsifier):
 
 
 class _BaseDataSparsiferTestCase(TestCase):
+    # [CLASS DOC] HELPER: Base test case offering check_* routines that validate a data
+    # sparsifier for a given data_list (name, data pairs), data_with_config (dicts with name,
+    # data, config) and defaults. Concrete test classes call run_all_checks.
     r"""This helper test class takes in any supported type of and runs some tests.
     The user is required to pass in the data that needs to sparsified and the
     runner will run some tests that needs to be passed in order for the data
@@ -38,6 +52,8 @@ class _BaseDataSparsiferTestCase(TestCase):
     """
 
     def run_all_checks(self, data_list, data_with_config, defaults):
+        # [FUNCTION DOC] HELPER: Runs the constructor, squash_mask, add_data, step, state_dict
+        # and memory reference checks in order.
         self.check_constructor(data_list, data_with_config, defaults)
         self.check_squash_mask(data_list, data_with_config, defaults)
         self.check_add_data(data_list, data_with_config, defaults)
@@ -47,6 +63,8 @@ class _BaseDataSparsiferTestCase(TestCase):
 
     @staticmethod
     def _get_name_data_config(some_data, defaults=None):
+        # [FUNCTION DOC] HELPER: Static. Returns name, data and config of an entry: for a tuple
+        # the config is the given defaults, for a dict the config comes from its config key.
         if isinstance(some_data, tuple):
             # dealing with data_list
             name, data = some_data
@@ -68,6 +86,10 @@ class _BaseDataSparsiferTestCase(TestCase):
         sparsifier_type=None,
         sparsifier_kwargs=None,
     ):
+        # [FUNCTION DOC] HELPER: Static. Builds a sparsifier (ImplementedSparsifier by default,
+        # or sparsifier_type with defaults updated by sparsifier_kwargs) from data_list, asserts
+        # one data group per entry, then adds each data_with_config entry with its config.
+        # Returns the sparsifier.
         if sparsifier_type is None:
             sparsifier = ImplementedSparsifier(data_list=data_list, **defaults)
         else:
@@ -89,6 +111,8 @@ class _BaseDataSparsiferTestCase(TestCase):
         return sparsifier
 
     def check_constructor(self, data_list, data_with_config, defaults, **kwargs):
+        # [FUNCTION DOC] HELPER: Checks the sparsifier has one data group per input and each
+        # group's config equals the expected config (defaults or per-entry).
         sparsifier = self._make_sparsifier(
             data_list, data_with_config, defaults=defaults, **kwargs
         )
@@ -108,6 +132,9 @@ class _BaseDataSparsiferTestCase(TestCase):
             self.assertEqual(sparsifier.data_groups[name], config)
 
     def check_step(self, data_list, data_with_config, defaults, **kwargs):
+        # [FUNCTION DOC] HELPER: Checks data is unchanged and mask starts as ones, then after
+        # three steps the sparsified data and mask first entries are zero, the original data is
+        # intact and step_count is three.
         sparsifier = self._make_sparsifier(
             data_list, data_with_config, defaults=defaults, **kwargs
         )
@@ -147,6 +174,9 @@ class _BaseDataSparsiferTestCase(TestCase):
                 )
 
     def check_squash_mask(self, data_list, data_with_config, defaults, **kwargs):
+        # [FUNCTION DOC] HELPER: Checks every datum is a parametrized attribute of the container
+        # before squash_mask, and after step plus squash_mask is no longer parametrized, so
+        # getting the original data raises ValueError.
         sparsifier = self._make_sparsifier(
             data_list, data_with_config, defaults=defaults, **kwargs
         )
@@ -170,6 +200,9 @@ class _BaseDataSparsiferTestCase(TestCase):
                 sparsifier.get_data(name, return_original=True)
 
     def check_add_data(self, data_list, data_with_config, defaults, **kwargs):
+        # [FUNCTION DOC] HELPER: For each datum, steps, then re-adds new random data of the same
+        # shape under the same name and checks the stored data is replaced, the mask and config
+        # are unchanged and the old data was not modified.
         sparsifier = self._make_sparsifier(
             data_list, data_with_config, defaults=defaults, **kwargs
         )
@@ -204,6 +237,9 @@ class _BaseDataSparsiferTestCase(TestCase):
                 )
 
     def check_state_dict(self, data_list, data_with_config, defaults, **kwargs):
+        # [FUNCTION DOC] HELPER: Steps a full sparsifier, loads its state_dict into a smaller
+        # one and checks states, data groups, sparse-vs-dense masks, container data and
+        # parametrization attributes match.
         sparsifier1 = self._make_sparsifier(
             data_list, data_with_config, defaults=defaults, **kwargs
         )
@@ -269,6 +305,9 @@ class _BaseDataSparsiferTestCase(TestCase):
                 self.assertEqual(param1.__dict__, param2.__dict__)
 
     def check_memory_reference(self, data_list, data_with_config, defaults, **kwargs):
+        # [FUNCTION DOC] HELPER: Checks the sparsifier holds references, not copies: modifies
+        # each input weight in place and asserts the sparsifier data shares storage and equals
+        # the new values.
         """Checks if the data is truly "attached" to the sparsifier. Meaning, when the
         data is changed outside of the sparsifier, the changes must be reflected on the data
         inside the data sparsifier as well.
@@ -296,6 +335,9 @@ class _BaseDataSparsiferTestCase(TestCase):
 
 
 class _NormDataSparsifierTestCase(_BaseDataSparsiferTestCase):
+    # [CLASS DOC] HELPER: Test case base specialized for DataNormSparsifier; overrides
+    # run_all_checks, check_step and adds norm-specific checks for sparsity bounds, 2-of-4
+    # patterns and sparsity levels.
     r"""This helper test class takes in any supported type of and runs some tests.
     This inherits the TestBaseDataSparsifierRuner wherein some functions are
     over-ridden to take accommodate the specific sparsifier.
@@ -304,6 +346,10 @@ class _NormDataSparsifierTestCase(_BaseDataSparsiferTestCase):
     """
 
     def run_all_checks(self, data_list, defaults, data_with_config, norm_type="L1"):
+        # [FUNCTION DOC] HELPER: Validates norm_type is L1 or L2 (AssertionError otherwise) and
+        # runs all checks with a DataNormSparsifier configured with that norm.
+        # KNOWN ISSUE: parameter order (data_list, defaults, data_with_config) differs from the
+        #   base class order.
         if norm_type not in ["L1", "L2"]:
             raise AssertionError(f"norm_type must be 'L1' or 'L2', got '{norm_type}'")
         kwargs = {
@@ -323,6 +369,10 @@ class _NormDataSparsifierTestCase(_BaseDataSparsiferTestCase):
 
     @staticmethod
     def _get_bounds_on_actual_sparsity(config, tensor_shape):
+        # [FUNCTION DOC] HELPER: Static. From a config's sparsity_level, zeros_per_block and
+        # sparse_block_shape and the tensor shape, computes (lower, upper) bounds, rounded to
+        # three places, on the achievable zero fraction. Returns (1.0, 1.0) when zeros_per_block
+        # is zero.
         r"""This function gets the bounds on actual sparsity.
         Note::
             Although we specify the sparsity_level parameter, this does not mean that
@@ -356,6 +406,9 @@ class _NormDataSparsifierTestCase(_BaseDataSparsiferTestCase):
             return lower_bound, upper_bound
 
     def check_step(self, data_list, data_with_config, defaults, norm_type="L1"):
+        # [FUNCTION DOC] HELPER: Checks masks are fully dense before step, after step the actual
+        # sparsity lies within the computed bounds and is positive, and that repeated add_data
+        # plus step on random data always yields some sparsity.
         sparsifier = self._make_sparsifier(
             data_list,
             data_with_config,
@@ -407,6 +460,9 @@ class _NormDataSparsifierTestCase(_BaseDataSparsiferTestCase):
                 raise AssertionError("Expected some sparsity to be achieved")
 
     def check_step_2_of_4(self, norm_type):
+        # [FUNCTION DOC] HELPER: With full sparsity level, 2 zeros per block of 4, checks one
+        # step zeroes exactly half the mask and each block of four has two zeros and two non-
+        # zeros.
         # overriding default config for test purposes
         default_config = {
             "sparsity_level": 1.0,
@@ -441,6 +497,14 @@ class _NormDataSparsifierTestCase(_BaseDataSparsiferTestCase):
     def check_sparsity_level(
         self, data_list, data_with_config, defaults, norm_type="L1"
     ):
+        # [FUNCTION DOC] HELPER: Adds the first data_with_config tensor under many (sparsity
+        # level, block shape, zeros per block) combinations, skipping impossible ones, steps and
+        # squashes, then checks the zero fraction of each sparsified datum matches the clamped
+        # level scaled by zeros per block over block size.
+        # KNOWN ISSUE: the second loop does not skip combinations skipped in the first, so it
+        #   looks up names that were never added.
+        # KNOWN ISSUE: get_data is called with an original keyword while other checks use
+        #   return_original.
         sparsity_levels = [-1.0, 0.0, 0.5, 1.0, 2.0]
         sparse_block_shapes = [(1, 1), (1, 4), (2, 2), (4, 1)]
         zeros_per_blocks = [0, 1, 2, 3, 4]
@@ -496,6 +560,8 @@ class _NormDataSparsifierTestCase(_BaseDataSparsiferTestCase):
 
 
 class TestBaseDataSparsifier(_BaseDataSparsiferTestCase):
+    # [CLASS DOC] Tests BaseDataSparsifier on tensors, parameters and embeddings using the
+    # generic checks.
     """To add unit tests to support new data types for the BaseDataSparsifier, create the following
         data_list: List of tuples of name, data to be added to the constructor
         defaults: default config for the above data in data_list
@@ -505,6 +571,8 @@ class TestBaseDataSparsifier(_BaseDataSparsiferTestCase):
     """
 
     def test_tensors(self):
+        # [FUNCTION DOC] Runs all generic checks on plain tensors given in the constructor list
+        # and via per-data configs.
         tensor1, tensor2, tensor3 = (
             torch.randn(3, 3),
             torch.randn(4, 4),
@@ -523,6 +591,8 @@ class TestBaseDataSparsifier(_BaseDataSparsiferTestCase):
         )
 
     def test_nn_parameters(self):
+        # [FUNCTION DOC] Runs all generic checks on nn.Parameter data, from the constructor list
+        # and per-data configs.
         param1, param2, param3 = (
             nn.Parameter(torch.randn(3, 3)),
             nn.Parameter(torch.randn(4, 4)),
@@ -544,6 +614,8 @@ class TestBaseDataSparsifier(_BaseDataSparsiferTestCase):
         )
 
     def test_nn_embeddings(self):
+        # [FUNCTION DOC] Runs all generic checks on Embedding and EmbeddingBag modules, from the
+        # constructor list and per-data configs.
         (
             emb1,
             emb2,
@@ -569,6 +641,8 @@ class TestBaseDataSparsifier(_BaseDataSparsiferTestCase):
 
 
 class TestNormDataSparsifiers(_NormDataSparsifierTestCase):
+    # [CLASS DOC] Tests DataNormSparsifier on tensors, parameters and embeddings, each with L1
+    # and L2 norms.
     """To add unit tests to support new data types for the NormDataSparsifier, create the following
     data_list: List of tuples of name, data to be added to the constructor
     defaults: default config for the above data in data_list
@@ -578,6 +652,8 @@ class TestNormDataSparsifiers(_NormDataSparsifierTestCase):
     """
 
     def test_tensors(self):
+        # [FUNCTION DOC] Runs all norm checks on tensors with block-sparsity configs, for both
+        # L1 and L2 norms.
         tensor1, tensor2, tensor3 = (
             torch.randn(1, 10),
             torch.randn(4, 4),
@@ -625,6 +701,8 @@ class TestNormDataSparsifiers(_NormDataSparsifierTestCase):
         )
 
     def test_nn_parameters(self):
+        # [FUNCTION DOC] Runs all norm checks on nn.Parameter data with block-sparsity configs,
+        # for L1 and L2.
         param1, param2, param3 = (
             nn.Parameter(torch.randn(1, 8)),
             nn.Parameter(torch.randn(4, 4)),
@@ -675,6 +753,8 @@ class TestNormDataSparsifiers(_NormDataSparsifierTestCase):
         )
 
     def test_nn_embeddings(self):
+        # [FUNCTION DOC] Runs all norm checks on Embedding and EmbeddingBag modules with block-
+        # sparsity configs, for L1 and L2.
         (
             emb1,
             emb2,
@@ -730,7 +810,11 @@ class TestNormDataSparsifiers(_NormDataSparsifierTestCase):
 
 
 class Model(nn.Module):
+    # [CLASS DOC] HELPER: Model with embeddings, an embedding bag, a sequential of both and two
+    # linear layers, used for quantization utility tests.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the embedding, embedding bag, sequential and linear
+        # submodules.
         super().__init__()
         self.emb1 = nn.Embedding(100, 3)
         self.embbag1 = nn.EmbeddingBag(200, 32)
@@ -740,7 +824,11 @@ class Model(nn.Module):
 
 
 class TestQuantizationUtils(TestCase):
+    # [CLASS DOC] Tests post_training_sparse_quantize on the Model fixture.
     def test_ptq_sparsify_first(self):
+        # [FUNCTION DOC] Sparsify-first flow on selected embeddings: checks only those become
+        # quantized embedding modules, linear and unselected ones stay float, and sparsity is
+        # about 0.8 within tolerance.
         """The expectation is post_training_sparse_quantize function
         1. Takes in a model
         2. Sparsifies the embeddings
@@ -802,6 +890,9 @@ class TestQuantizationUtils(TestCase):
             raise AssertionError(f"Expected sl_embbag1 ~0.80, got {sl_embbag1}")
 
     def test_ptq_quantize_first(self):
+        # [FUNCTION DOC] Quantize-first flow on all embeddings: checks all embedding modules are
+        # quantized, linears stay float, and sparsity is about 0.8 using a looser zero
+        # threshold.
         """The expectation is post_training_sparse_quantize function
         1. Takes in a model
         2. Quantize the embeddings
