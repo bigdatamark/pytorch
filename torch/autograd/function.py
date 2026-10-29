@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Custom autograd Function machinery. Defines FunctionCtx (the ctx object API: saving tensors,
+# marking dirty/non-differentiable, grad dtype and materialization settings), BackwardCFunction (the
+# generated backward node class), the FunctionMeta metaclass, the _SingleLevelFunction / Function base
+# classes users subclass, the once_differentiable decorator, InplaceFunction and the legacy
+# NestedIOFunction plus its nesting helpers. Import-time side effects: creates the global function id
+# counter and module-level iterator/mapper helpers; each Function subclass creation later registers a
+# backward class and increments the counter.
 import functools
 import inspect
 import itertools
@@ -36,9 +43,16 @@ _P = ParamSpec("_P")
 
 # Formerly known as: _ContextMethodMixin
 class FunctionCtx:
+    # [CLASS DOC] Mixin providing the ctx-side API for autograd Functions. Methods only record state on the
+    # instance (to_save, saved_for_forward, dirty_tensors, non_differentiable, output_grad_dtypes,
+    # materialize_grads), which the autograd engine reads after forward. Formerly named _ContextMethodMixin
+    # (still aliased for loading old serialized models).
     output_grad_dtypes: "tuple[torch.dtype | None, ...] | None"
 
     def save_for_backward(self, *tensors: torch.Tensor):
+        # [FUNCTION DOC] Record the tensors (or None entries) to be saved for backward by storing them on
+        # the context; intended to be called at most once from forward or setup_context. Performs no
+        # validation here; the engine handles saving and version checks.
         r"""Save given tensors for a future call to :func:`~Function.backward`.
 
         ``save_for_backward`` should be called at most once, in either the
@@ -100,6 +114,8 @@ class FunctionCtx:
         self.to_save = tensors
 
     def save_for_forward(self, *tensors: torch.Tensor):
+        # [FUNCTION DOC] Record tensors to be saved for the forward-mode jvp method. Raises AssertionError
+        # if any argument is neither a tensor nor None. Stores the tuple on the context.
         r"""Save given tensors for a future call to :func:`~Function.jvp`.
 
         ``save_for_forward`` should be called at most once, in either the
@@ -156,6 +172,8 @@ class FunctionCtx:
         self.saved_for_forward = tensors
 
     def mark_dirty(self, *args: torch.Tensor):
+        # [FUNCTION DOC] Record which input tensors were modified in place so the engine can account for
+        # them. Stores the arguments on the context; no validation done here.
         r"""Mark given tensors as modified in an in-place operation.
 
         This should be called at most once, in either the :func:`setup_context`
@@ -199,9 +217,13 @@ class FunctionCtx:
         category=FutureWarning,
     )
     def mark_shared_storage(self, *pairs):
+        # [FUNCTION DOC] Deprecated no-op; emits a FutureWarning when called since shared storages are
+        # tracked automatically.
         pass
 
     def mark_non_differentiable(self, *args: torch.Tensor):
+        # [FUNCTION DOC] Record output tensors that are non-differentiable (so they will not require
+        # grad). Stores the arguments on the context.
         r"""Mark outputs as non-differentiable.
 
         This should be called at most once, in either the :func:`setup_context`
@@ -234,6 +256,9 @@ class FunctionCtx:
         self.non_differentiable = args
 
     def set_output_grad_dtype(self, *dtypes: "torch.dtype | None") -> None:
+        # [FUNCTION DOC] Declare the dtype in which each output's gradient should be delivered to backward
+        # (None means leave as-is). Stores the tuple on the context. Raises RuntimeError if already set.
+        # Count/validity checks against the outputs are done later by the engine.
         r"""Declare the gradient dtype for each of this Function's outputs.
 
         This should be called at most once, from either the
@@ -274,6 +299,8 @@ class FunctionCtx:
         self.output_grad_dtypes = dtypes
 
     def set_materialize_grads(self, value: bool):
+        # [FUNCTION DOC] Set whether undefined output gradients are expanded into zero tensors before
+        # backward and jvp are called (default True). Stores the flag on the context.
         r"""Set whether to materialize grad tensors. Default is ``True``.
 
         This should be called only from either the :func:`setup_context` or
@@ -326,8 +353,11 @@ _ContextMethodMixin = FunctionCtx
 
 
 class _HookMixin:
+    # [CLASS DOC] HELPER: Mixin with a static helper for registering backward hooks.
     @staticmethod
     def _register_hook(backward_hooks, hook):
+        # [FUNCTION DOC] HELPER: Register a hook in an ordered mapping of backward hooks (creating the mapping
+        # if None), keyed by a new removable handle id. Returns the (mapping, handle) pair.
         if backward_hooks is None:
             backward_hooks = OrderedDict()
         handle = hooks.RemovableHandle(backward_hooks)
@@ -336,11 +366,16 @@ class _HookMixin:
 
 
 class BackwardCFunction(_C._FunctionBase, FunctionCtx, _HookMixin):
+    # [CLASS DOC] HELPER: Internal node class generated per Function subclass that executes the user's
+    # backward / jvp during autograd. Combines the native function base, FunctionCtx and hook mixin.
+    # Relies on the _forward_cls attribute set by FunctionMeta.
     r"""
     This class is used for internal autograd work. Do not use.
     """
 
     def _get_user_fn(self):
+        # [FUNCTION DOC] HELPER: Return the user-defined backward callable of the forward class, preferring
+        # a vjp override over backward. Raises RuntimeError if both were overridden.
         backward_fn = self._forward_cls.backward  # type: ignore[attr-defined]
         vjp_fn = self._forward_cls.vjp  # type: ignore[attr-defined]
         if backward_fn is not Function.backward and vjp_fn is not Function.vjp:
@@ -352,6 +387,9 @@ class BackwardCFunction(_C._FunctionBase, FunctionCtx, _HookMixin):
         return vjp_fn if vjp_fn is not Function.vjp else backward_fn
 
     def apply(self, *args):
+        # [FUNCTION DOC] Called by the engine (and direct grad_fn calls) to run the user's backward with
+        # the gradients; if the forward class sets the boxed-grads flag, passes all grads as one mutable
+        # list. Returns the user function's result.
         r"""
         Apply method used when executing this Node during the backward.
 
@@ -366,6 +404,8 @@ class BackwardCFunction(_C._FunctionBase, FunctionCtx, _HookMixin):
         return user_fn(self, *args)
 
     def apply_boxed(self, *args):
+        # [FUNCTION DOC] Engine entry for the boxed-grads case: calls the user's backward with the single
+        # list argument as given. Returns its result.
         r"""
         Apply method called by the autograd engine when boxed_grads_call
         is True. Grads arrive as a single mutable list argument, allowing
@@ -374,6 +414,8 @@ class BackwardCFunction(_C._FunctionBase, FunctionCtx, _HookMixin):
         return self._get_user_fn()(self, *args)
 
     def apply_jvp(self, *args):
+        # [FUNCTION DOC] Run the user's jvp for forward-mode AD with the given tangent arguments; returns
+        # its result.
         r"""
         Apply method used when executing forward mode AD during the forward
         """
@@ -381,10 +423,14 @@ class BackwardCFunction(_C._FunctionBase, FunctionCtx, _HookMixin):
         return self._forward_cls.jvp(self, *args)  # type: ignore[attr-defined]
 
     def _compiled_autograd_key(self):
+        # [FUNCTION DOC] HELPER: Return the compiled-autograd cache key by delegating to the forward class.
         return self._forward_cls._compiled_autograd_key(self)  # type: ignore[attr-defined]
 
 
 class FunctionMeta(type):
+    # [CLASS DOC] Metaclass for Function classes. On creating each class it generates a companion backward
+    # node class (name plus "Backward", deriving from BackwardCFunction), assigns it a unique id from the
+    # global counter, and stores it on the class as the backward-class attribute.
     """Function metaclass.
 
     This metaclass sets up the following properties:
@@ -394,6 +440,9 @@ class FunctionMeta(type):
     """
 
     def __init__(cls, name, bases, attrs):
+        # [FUNCTION DOC] Class-initialization hook: create the dynamic backward class bound to cls, assign
+        # it the next global function id, attach it to cls, then run the normal type initialization.
+        # Side effect: increments the global counter.
         backward_fn = type(
             name + "Backward", (BackwardCFunction,), {"_forward_cls": cls}
         )
@@ -406,8 +455,13 @@ class FunctionMeta(type):
 class _SingleLevelFunction(
     _C._FunctionBase, FunctionCtx, _HookMixin, metaclass=FunctionMeta
 ):
+    # [CLASS DOC] Base class holding the overridable static methods (forward, setup_context, backward/vjp,
+    # jvp) and class flags (clear_saved_tensors_on_access, boxed_grads_call) of an autograd Function
+    # without the functorch levels. Uses FunctionMeta. Default methods raise NotImplementedError.
     @staticmethod
     def forward(*args: Any, **kwargs: Any) -> Any:
+        # [FUNCTION DOC] Abstract forward of the custom Function; must be overridden. Either takes ctx first
+        # or, with setup_context, takes only the inputs. Default raises NotImplementedError.
         r"""Define the forward of the custom autograd Function.
 
         This function is to be overridden by all subclasses.
@@ -455,6 +509,8 @@ class _SingleLevelFunction(
 
     @staticmethod
     def setup_context(ctx: Any, inputs: tuple[Any, ...], output: Any) -> Any:
+        # [FUNCTION DOC] Hook for configuring ctx when forward is defined without ctx; receives ctx, the
+        # input tuple and the output. Default raises NotImplementedError.
         r"""There are two ways to define the forward pass of an autograd.Function.
 
         Either:
@@ -472,6 +528,9 @@ class _SingleLevelFunction(
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Any) -> Any:
+        # [FUNCTION DOC] Abstract reverse-mode derivative (aliased as vjp); must be overridden. Takes ctx and
+        # one gradient per forward output, returns one gradient per forward input (None for non-differentiable
+        # inputs). Default raises NotImplementedError.
         r"""Define a formula for differentiating the operation with backward mode automatic differentiation.
 
         This function is to be overridden by all subclasses.
@@ -530,6 +589,8 @@ class _SingleLevelFunction(
 
     @staticmethod
     def jvp(ctx: Any, *grad_inputs: Any) -> Any:
+        # [FUNCTION DOC] Abstract forward-mode derivative; must be overridden to use forward-mode AD. Takes
+        # ctx and one tangent per input, returns one tangent per output. Default raises NotImplementedError.
         r"""Define a formula for differentiating the operation with forward mode automatic differentiation.
 
         This function is to be overridden by all subclasses.
@@ -553,6 +614,10 @@ class _SingleLevelFunction(
 
 
 class Function(_SingleLevelFunction):
+    # [CLASS DOC] Public base class for user-defined autograd Functions. Subclasses implement static
+    # forward and backward (or setup_context, vjp, jvp, vmap) and are invoked through the apply class
+    # method, which is taken from the native base. Class flag generate_vmap_rule requests auto vmap support.
+    # Instantiation is deprecated and calling an instance is an error.
     r"""Base class to create custom `autograd.Function`.
 
     To create a custom `autograd.Function`, subclass this class and implement
@@ -587,6 +652,8 @@ class Function(_SingleLevelFunction):
     """
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] Deprecated constructor: only emits a DeprecationWarning that Functions should not
+        # be instantiated (methods are static); arguments are ignored.
         warnings.warn(
             f"{self.__class__} should not be instantiated. Methods on autograd functions "
             "are all static, so you should invoke them on the class itself. "
@@ -597,6 +664,8 @@ class Function(_SingleLevelFunction):
         )
 
     def __call__(self, *args, **kwargs):
+        # [FUNCTION DOC] Always raises RuntimeError: legacy non-static autograd Function calls are not
+        # supported; use the static forward with apply.
         raise RuntimeError(
             "Legacy autograd function with non-static forward method is deprecated. "
             "Please use new-style autograd function with static forward method. "
@@ -616,6 +685,8 @@ class Function(_SingleLevelFunction):
 
     @staticmethod
     def vmap(info, in_dims, *args):
+        # [FUNCTION DOC] Define vmap behavior for the Function; takes info (batch size, randomness), per-arg
+        # in_dims and the forward args; should return (output, out_dims). Default raises NotImplementedError.
         r"""Define the behavior for this autograd.Function underneath :func:`torch.vmap`.
 
         For a :func:`torch.autograd.Function` to support
@@ -651,6 +722,8 @@ class Function(_SingleLevelFunction):
 
     @staticmethod
     def _compiled_autograd_key(ctx):
+        # [FUNCTION DOC] HELPER: Return the compiled-autograd key, a one-element tuple holding the ctx's
+        # autograd function id.
         return (ctx._autograd_function_id,)
 
 
@@ -659,6 +732,8 @@ def _bind_default_args(
     args: _P.args,  # type: ignore[valid-type]
     kwargs: _P.kwargs,  # type: ignore[valid-type]
 ) -> tuple[_P.args, _P.kwargs]:  # type: ignore[valid-type]
+    # [FUNCTION DOC] HELPER: Bind args and kwargs (kwargs may be None) to the signature of func, fill in
+    # default values, and return the resulting (args, kwargs) pair. Raises TypeError if binding fails.
     signature = inspect.signature(func)
     bound_args = signature.bind(*args, **({} if kwargs is None else kwargs))
     bound_args.apply_defaults()
@@ -666,20 +741,32 @@ def _bind_default_args(
 
 
 def _call_custom_function_call(cls, args, kwargs):
+    # [FUNCTION DOC] HELPER: Invoke the functorch custom_function_call for cls with positional args and
+    # the keyword args if present (kwargs may be None). Returns its result.
     if kwargs is None:
         return custom_function_call(cls, *args)
     return custom_function_call(cls, *args, **kwargs)
 
 
 def _is_setup_context_defined(fn):
+    # [FUNCTION DOC] HELPER: True if the given setup_context differs from the base class default (i.e.
+    # the user overrode it).
     return fn != _SingleLevelFunction.setup_context
 
 
 def once_differentiable(
     fn: Callable[Concatenate[_T, _P], _R],
 ) -> Callable[Concatenate[_T, _P], _R]:
+    # [FUNCTION DOC] Decorator for backward methods that supports only a single differentiation. The wrapper
+    # runs the function with grad disabled; if grad mode is on and any tensor argument requires grad, the
+    # outputs are replaced by detached aliases routed through a delayed-error node, so a second
+    # differentiation raises an error. Otherwise returns outputs directly. Preserves the wrapped metadata.
     @functools.wraps(fn)
     def wrapper(ctx: _T, *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        # [FUNCTION DOC] HELPER: Run the wrapped function under no_grad, then (when grad mode is enabled and
+        # some tensor arg requires grad) wrap its outputs, tuple or single, with the double-backward error
+        # node and return that; otherwise return outputs unchanged.
+        # KNOWN ISSUE: requires-grad is only approximated from the explicit args, as noted in the source.
         with torch.no_grad():
             outputs = fn(ctx, *args, **kwargs)
 
@@ -716,6 +803,8 @@ def once_differentiable(
         # at least one of the inputs to err_fn to require grad so that the
         # output will have a grad_fn.
         def fake_requires_grad(var):
+            # [FUNCTION DOC] HELPER: Detach the value and mark it requiring grad so the error node attaches
+            # a grad_fn; None passes through. Returns the aliased value.
             if var is not None:
                 var = var.detach()
                 var.requires_grad = True
@@ -727,18 +816,25 @@ def once_differentiable(
 
 
 class InplaceFunction(Function):
+    # [CLASS DOC] Backward-compatibility subclass of Function that stores an inplace flag. Use Function
+    # in new code.
     r"""
     This class is here only for backward compatibility reasons.
     Use :class:`Function` instead of this for any new use case.
     """
 
     def __init__(self, inplace=False):
+        # [FUNCTION DOC] Initialize via the Function constructor (which warns) and store the inplace flag.
         super().__init__()
         self.inplace = inplace
 
 
 def _nested_map(condition, fn, condition_msg=None):
+    # [FUNCTION DOC] HELPER: Build a recursive mapper. The returned function applies fn to objects that
+    # satisfy condition, passes None through, rebuilds lists, tuples (including namedtuples) and dicts with
+    # mapped contents, and raises ValueError for any other type (message lists accepted types).
     def _map(obj):
+        # [FUNCTION DOC] HELPER: Recursive mapping step for the structure described by the enclosing call.
         if condition(obj):
             return fn(obj)
         elif obj is None:
@@ -767,13 +863,19 @@ def _nested_map(condition, fn, condition_msg=None):
 
 
 def _jit_unwrap_structured(obj):
+    # [FUNCTION DOC] HELPER: Return the object's unwrapped value if it has the jit unwrap method, else the
+    # object itself.
     if hasattr(obj, "_jit_unwrap"):
         return obj._jit_unwrap()
     return obj
 
 
 def _iter_filter(condition, allow_unknown=False, condition_msg=None, conversion=None):
+    # [FUNCTION DOC] HELPER: Build a generator-based flattener. The returned function optionally converts the
+    # object, yields it if it satisfies condition, skips None, recurses into lists, tuples and dict values,
+    # yields unknown objects when allow_unknown is set, and otherwise raises ValueError.
     def _iter(obj):
+        # [FUNCTION DOC] HELPER: Recursive generator step that yields matching leaves of a nested structure.
         if conversion is not None:
             obj = conversion(obj)
         if condition(obj):
@@ -805,9 +907,15 @@ def _iter_filter(condition, allow_unknown=False, condition_msg=None, conversion=
 
 
 def _unflatten(input, proto):
+    # [FUNCTION DOC] HELPER: Rebuild a nested list/tuple structure matching proto from a flat sequence of
+    # tensors, consuming elements in order (None entries in proto stay None). Returns the nested structure.
     # unflatten a list or tuple input into a nested list/tuple structure
     # specified by proto
     def unflatten_helper(input, proto):
+        # [FUNCTION DOC] HELPER: Recursive step returning (rebuilt structure, remaining flat input). Objects
+        # with a jit wrap method are rebuilt by it; non-sequence protos consume one element.
+        # KNOWN ISSUE: the jit-wrap branch returns a single value rather than a (value, remainder) pair
+        # like the other branches, which would break the tuple unpacking in the recursive caller.
         res: list[torch.Tensor | None] = []
         if hasattr(proto, "_jit_wrap"):
             return proto._jit_wrap(input)
@@ -847,6 +955,10 @@ _map_tensor_data = _nested_map(
 
 
 class NestedIOFunction(Function):
+    # [CLASS DOC] Backward-compatibility Function variant whose forward and backward accept and return
+    # nested structures of tensors. Flattens inputs/outputs for the core machinery and rebuilds nesting
+    # using stored state (_nested_input, _nested_output, _to_save_nested). Subclasses override
+    # forward_extended and backward_extended. Use Function in new code.
     r"""
     This class is here only for backward compatibility reasons.
     Use :class:`Function` instead of this for any new use case.
@@ -856,6 +968,9 @@ class NestedIOFunction(Function):
     # superclass (Function) but are instance methods here, which mypy reports as incompatible.
 
     def _do_forward(self, *input):
+        # [FUNCTION DOC] HELPER: Flatten the nested inputs to tensors (remembering the nested input), run
+        # the base class forward machinery, and rebuild the output in the nested layout. Also used as the
+        # call operator. Returns the nested output.
         self._nested_input = input
         flat_input = tuple(_iter_tensors(input))
         flat_output = super()._do_forward(*flat_input)  # type: ignore[misc]
@@ -863,6 +978,8 @@ class NestedIOFunction(Function):
         return nested_tensors
 
     def _do_backward(self, gradients, retain_variables):
+        # [FUNCTION DOC] HELPER: Store the retain flag, run the base backward machinery, and, unless
+        # variables are retained, delete the saved nested output and saved-tensor structure. Returns the result.
         self.retain_variables = retain_variables
         result = super()._do_backward(gradients, retain_variables)  # type: ignore[misc]
         if not retain_variables:
@@ -871,6 +988,8 @@ class NestedIOFunction(Function):
         return result
 
     def backward(self, *gradients: Any) -> Any:  # type: ignore[override]
+        # [FUNCTION DOC] Unflatten the incoming gradients to the nested output layout, call the user's
+        # backward_extended, and return its result flattened to a tuple of tensors/None.
         r"""
         Shared backward utility.
         """
@@ -881,6 +1000,8 @@ class NestedIOFunction(Function):
     __call__ = _do_forward
 
     def forward(self, *args: Any) -> Any:  # type: ignore[override]
+        # [FUNCTION DOC] Run the user's forward_extended on the tensor data of the stored nested input,
+        # delete the stored input, remember the nested output, and return its flattened tensors as a tuple.
         r"""
         Shared forward utility.
         """
@@ -891,6 +1012,8 @@ class NestedIOFunction(Function):
         return tuple(_iter_tensors(result))
 
     def save_for_backward(self, *args: Any) -> None:
+        # [FUNCTION DOC] Save the flattened tensors for backward and remember the nested structure of the
+        # arguments so saved_tensors can rebuild it.
         r"""
         See :meth:`Function.save_for_backward`.
         """
@@ -899,6 +1022,8 @@ class NestedIOFunction(Function):
 
     @property
     def saved_tensors(self):  # type: ignore[override]
+        # [FUNCTION DOC] Property returning the saved tensors rebuilt into the nested structure given to
+        # save_for_backward.
         r"""
         See :meth:`Function.saved_tensors`.
         """
@@ -906,24 +1031,30 @@ class NestedIOFunction(Function):
         return _unflatten(flat_tensors, self._to_save_nested)
 
     def mark_dirty(self, *args: Any, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Record the flattened tensors from the arguments (positional and keyword values)
+        # as dirty.
         r"""
         See :meth:`Function.mark_dirty`.
         """
         self.dirty_tensors = tuple(_iter_tensors((args, kwargs)))
 
     def mark_non_differentiable(self, *args: Any, **kwargs: Any) -> None:
+        # [FUNCTION DOC] Record the flattened tensors from the arguments (positional and keyword values)
+        # as non-differentiable.
         r"""
         See :meth:`Function.mark_non_differentiable`.
         """
         self.non_differentiable = tuple(_iter_tensors((args, kwargs)))
 
     def forward_extended(self, *input: Any) -> None:
+        # [FUNCTION DOC] User-overridable nested forward; default raises NotImplementedError.
         r"""
         User defined forward.
         """
         raise NotImplementedError
 
     def backward_extended(self, *grad_output: Any) -> None:
+        # [FUNCTION DOC] User-overridable nested backward; default raises NotImplementedError.
         r"""
         User defined backward.
         """

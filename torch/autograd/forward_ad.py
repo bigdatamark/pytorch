@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Python API for forward-mode automatic differentiation (dual tensors).
+# Provides enter_dual_level / exit_dual_level, make_dual, unpack_dual, the dual_level context manager,
+# and the UnpackedDualTensor namedtuple. Keeps a module-global current level (starts at -1, meaning none)
+# used by default by the functions. Private helpers: _is_fwd_grad_enabled and _set_fwd_grad_enabled.
 import os
 from typing import Any, NamedTuple
 
@@ -21,6 +25,9 @@ _current_level = -1
 
 
 def enter_dual_level():
+    # [FUNCTION DOC] Enter a new forward-AD level via the predispatch implementation and make it the
+    # module's current level. Returns the new level. Raises RuntimeError if the level returned is not
+    # exactly one above the tracked current level (the global was modified externally).
     r"""Enter a new forward grad level.
 
     This level can be used to make and unpack dual Tensors to compute
@@ -45,6 +52,9 @@ def enter_dual_level():
 
 
 def exit_dual_level(*, level=None):
+    # [FUNCTION DOC] Exit a forward-AD level (default: the current level), deleting its gradients, and
+    # set the current level to one lower. Only the most recently entered level may be exited; otherwise
+    # raises RuntimeError. Mutates the module-global current level.
     r"""Exit a forward grad level.
 
     This function deletes all the gradients associated with this
@@ -70,11 +80,17 @@ def exit_dual_level(*, level=None):
 
 
 def _maybe_load_decompositions():
+    # [FUNCTION DOC] HELPER: Import the decompositions-for-jvp module (registering jvp decompositions) only
+    # when the PYTORCH_JIT environment variable is "1" (default) and Python is not running in optimized mode.
     if os.environ.get("PYTORCH_JIT", "1") == "1" and __debug__:
         from torch._decomp import decompositions_for_jvp  # noqa: F401
 
 
 def make_dual(tensor, tangent, *, level=None):
+    # [FUNCTION DOC] Create a dual tensor aliasing the primal tensor with the tangent attached, at the given
+    # level (default: current level). Loads jvp decompositions first. Raises RuntimeError if no level
+    # exists (level below zero) and ValueError if tensor or tangent is not floating point or complex.
+    # Returns the dual tensor from the predispatch make-dual implementation.
     r"""Associate a tensor value with its tangent to create a "dual tensor" for forward AD gradient computation.
 
     The result is a new tensor aliased to :attr:`tensor` with :attr:`tangent` embedded
@@ -139,6 +155,7 @@ def make_dual(tensor, tangent, *, level=None):
 
 
 class UnpackedDualTensor(NamedTuple):
+    # [CLASS DOC] Named tuple (primal, tangent) returned by unpack_dual; tangent is None when absent.
     r"""Namedtuple returned by :func:`unpack_dual` containing the primal and tangent components of the dual tensor.
 
     See :func:`unpack_dual` for more details.
@@ -149,6 +166,9 @@ class UnpackedDualTensor(NamedTuple):
 
 
 def unpack_dual(tensor, *, level=None):
+    # [FUNCTION DOC] Split a dual tensor into a named tuple of its primal and tangent at the given level
+    # (default: current level). If no level exists (below zero), returns the tensor itself with None
+    # as tangent. Otherwise delegates to the predispatch unpack implementation.
     r"""Unpack a "dual tensor" to get both its Tensor value and its forward AD gradient.
 
     The result is a namedtuple ``(primal, tangent)`` where ``primal`` is a view of
@@ -183,6 +203,8 @@ def unpack_dual(tensor, *, level=None):
 
 
 class dual_level(_DecoratorContextManager):
+    # [CLASS DOC] Context manager and decorator that wraps forward-AD computation: enters a dual level on
+    # entry and exits it (deleting tangents) on exit. Nesting is not supported (single level only).
     r"""Context-manager for forward AD, where all forward AD computation must occur within the ``dual_level`` context.
 
     .. Note::
@@ -217,9 +239,11 @@ class dual_level(_DecoratorContextManager):
     """
 
     def __enter__(self):
+        # [FUNCTION DOC] Enter a new dual level and return its level number.
         return enter_dual_level()
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        # [FUNCTION DOC] Exit the current dual level; exception arguments are ignored.
         exit_dual_level()
 
 
@@ -230,12 +254,17 @@ _is_fwd_grad_enabled = torch._C._is_fwd_grad_enabled
 # Private helper function to enable or disable fwd grad.
 # If you're a user and want to use this, please file an issue to discuss the use case.
 class _set_fwd_grad_enabled(_DecoratorContextManager):
+    # [CLASS DOC] HELPER: Private context manager/decorator that sets forward-grad enabled mode globally
+    # on construction and restores the previous value on exit. State: prev (earlier flag).
     def __init__(self, mode: bool) -> None:
+        # [FUNCTION DOC] HELPER: Record the current forward-grad flag and set it to mode immediately.
         self.prev = _is_fwd_grad_enabled()
         torch._C._set_fwd_grad_enabled(mode)
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] HELPER: No-op; the mode is applied in the constructor.
         pass
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        # [FUNCTION DOC] HELPER: Restore the previously recorded forward-grad flag.
         torch._C._set_fwd_grad_enabled(self.prev)

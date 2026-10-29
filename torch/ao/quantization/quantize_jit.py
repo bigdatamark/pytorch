@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Post-training quantization entry points for TorchScript (JIT) models.
+# Offers fuse_conv_bn_jit, prepare_jit / prepare_dynamic_jit (insert observers), convert_jit /
+# convert_dynamic_jit (replace observers with quant/dequant), the one-call quantize_jit and
+# quantize_dynamic_jit, plus script_qconfig helpers and private on-device PTQ variants.
+# All heavy work is delegated to torch._C JIT passes. No import-time side effects.
 
 import torch
 from torch.ao.quantization.qconfig import QConfig
@@ -20,16 +25,20 @@ __all__ = [
 
 
 def _check_is_script_module(model):
+    # [FUNCTION DOC] HELPER: Raise ValueError unless the model is a TorchScript ScriptModule.
     if not isinstance(model, torch.jit.ScriptModule):
         raise ValueError("input must be a script module, got: " + str(type(model)))
 
 
 def _check_forward_method(model):
+    # [FUNCTION DOC] HELPER: Raise ValueError if the script module has no forward method.
     if not model._c._has_method("forward"):
         raise ValueError("input script module does not have forward method")
 
 
 def script_qconfig(qconfig):
+    # [FUNCTION DOC] Instantiate the activation and weight observer factories of a qconfig, script each
+    # one, and return a new QConfig holding the underlying C++ modules (deep-copied later in prepare).
     r"""Instantiate the activation and weight observer modules and script
     them, these observer module instances will be deepcopied during
     prepare_jit step.
@@ -41,6 +50,8 @@ def script_qconfig(qconfig):
 
 
 def script_qconfig_dict(qconfig_dict):
+    # [FUNCTION DOC] HELPER: Map every entry of the qconfig dict to its scripted qconfig, keeping None for
+    # falsy values. Returns a new dict.
     r"""Helper function used by `prepare_jit`.
     Apply `script_qconfig` for all entries in `qconfig_dict` that is
     not None.
@@ -49,6 +60,9 @@ def script_qconfig_dict(qconfig_dict):
 
 
 def fuse_conv_bn_jit(model, inplace=False):
+    # [FUNCTION DOC] Fold batch norm into preceding conv using the JIT pass; intended for eval-mode models.
+    # Logs API usage. If inplace, reconstructs the given model from the result and returns it; otherwise
+    # returns a new wrapped module.
     r"""Fuse conv - bn module
     Works for eval model only.
 
@@ -66,6 +80,9 @@ def fuse_conv_bn_jit(model, inplace=False):
 
 
 def _prepare_jit(model, qconfig_dict, inplace=False, quant_type=QuantType.STATIC):
+    # [FUNCTION DOC] HELPER: Shared prepare step for static/dynamic quantization. Validates script module,
+    # forward method and that qconfig_dict keys are strings (ValueError otherwise), scripts the qconfigs,
+    # fuses conv-bn, then inserts observers on forward via the JIT pass. Returns the model (in place or new).
     _check_is_script_module(model)
     _check_forward_method(model)
     if not all(isinstance(x, str) for x in qconfig_dict):
@@ -89,6 +106,9 @@ def _prepare_ondevice_jit(
     inplace=False,
     quant_type=QuantType.STATIC,
 ):
+    # [FUNCTION DOC] HELPER: On-device PTQ prepare step. Validates script module and string keys (ValueError),
+    # scripts qconfigs, inlines the named method's graph (mutating it), fuses conv-bn and inserts observer
+    # methods for on-device PTQ. Returns the model (in place or a new wrapped module).
     _check_is_script_module(model)
     if not all(isinstance(x, str) for x in qconfig_dict):
         raise ValueError("qconfig_dict should only contain names(str) as keys.")
@@ -107,11 +127,13 @@ def _prepare_ondevice_jit(
 
 
 def prepare_jit(model, qconfig_dict, inplace=False):
+    # [FUNCTION DOC] Public static-quantization prepare: log usage and insert observers into a script model.
     torch._C._log_api_usage_once("quantization_api.quantize_jit.prepare_jit")
     return _prepare_jit(model, qconfig_dict, inplace, quant_type=QuantType.STATIC)
 
 
 def prepare_dynamic_jit(model, qconfig_dict, inplace=False):
+    # [FUNCTION DOC] Public dynamic-quantization prepare: log usage and insert observers for dynamic quant.
     torch._C._log_api_usage_once("quantization_api.quantize_jit.prepare_dynamic_jit")
     return _prepare_jit(model, qconfig_dict, inplace, quant_type=QuantType.DYNAMIC)
 
@@ -119,6 +141,7 @@ def prepare_dynamic_jit(model, qconfig_dict, inplace=False):
 def _prepare_ondevice_dynamic_jit(
     model, qconfig_dict, method_name="forward", inplace=False
 ):
+    # [FUNCTION DOC] HELPER: On-device dynamic prepare; forwards to the on-device prepare with dynamic quant type.
     return _prepare_ondevice_jit(
         model, qconfig_dict, method_name, inplace, quant_type=QuantType.DYNAMIC
     )
@@ -127,6 +150,10 @@ def _prepare_ondevice_dynamic_jit(
 def _convert_jit(
     model, inplace=False, debug=False, quant_type=QuantType.STATIC, preserved_attrs=None
 ):
+    # [FUNCTION DOC] HELPER: Shared convert step. Validates script module, puts it in eval mode (mutating it),
+    # inserts quant/dequant, and unless debug is set moves parameters to CPU (skipped when all are on XPU)
+    # and finalizes with preserved_attrs (default empty). Reconstructs in place or wraps a new module, then
+    # runs constant propagation and dead-code elimination on its graph. Returns the model.
     _check_is_script_module(model)
     model.eval()
     model_c = model._c
@@ -156,6 +183,9 @@ def _convert_jit(
 def _convert_ondevice_jit(
     model, method_name, inplace=False, debug=False, quant_type=QuantType.STATIC
 ):
+    # [FUNCTION DOC] HELPER: On-device convert step. Requires a script module, dynamic quant type and a method
+    # name not starting with observe_ (AssertionError otherwise). Inserts quant/dequant for the observe_ method
+    # and finalizes into a quantize_ method. Returns the model (in place or new).
     _check_is_script_module(model)
     if quant_type != QuantType.DYNAMIC:
         raise AssertionError(
@@ -180,6 +210,7 @@ def _convert_ondevice_jit(
 
 
 def convert_jit(model, inplace=False, debug=False, preserved_attrs=None):
+    # [FUNCTION DOC] Public static convert: log usage and convert an observed script model to quantized.
     torch._C._log_api_usage_once("quantization_api.quantize_jit.convert_jit")
     return _convert_jit(
         model,
@@ -191,6 +222,7 @@ def convert_jit(model, inplace=False, debug=False, preserved_attrs=None):
 
 
 def convert_dynamic_jit(model, inplace=False, debug=False, preserved_attrs=None):
+    # [FUNCTION DOC] Public dynamic convert: log usage and convert with dynamic quant type.
     torch._C._log_api_usage_once("quantization_api.quantize_jit.convert_dynamic_jit")
     return _convert_jit(
         model,
@@ -202,6 +234,7 @@ def convert_dynamic_jit(model, inplace=False, debug=False, preserved_attrs=None)
 
 
 def _convert_ondevice_dynamic_jit(model, method_name, inplace=False, debug=False):
+    # [FUNCTION DOC] HELPER: On-device dynamic convert; forwards with dynamic quant type.
     return _convert_ondevice_jit(
         model, method_name, inplace, debug, quant_type=QuantType.DYNAMIC
     )
@@ -210,6 +243,7 @@ def _convert_ondevice_dynamic_jit(model, method_name, inplace=False, debug=False
 def _quantize_ondevice_dynamic_jit_impl(
     model, qconfig_dict, method_name, inplace=False
 ):
+    # [FUNCTION DOC] HELPER: Prepare then convert for on-device dynamic PTQ; returns the resulting model.
     model = _prepare_ondevice_dynamic_jit(model, qconfig_dict, method_name, inplace)
     model = _convert_ondevice_dynamic_jit(model, method_name, inplace)
     return model
@@ -224,6 +258,9 @@ def _quantize_jit(
     debug=False,
     quant_type=QuantType.STATIC,
 ):
+    # [FUNCTION DOC] HELPER: Shared prepare+convert pipeline. Dynamic: prepare then convert in place. Static:
+    # requires run_fn and run_args (AssertionError otherwise), prepares, runs calibration run_fn(model, *run_args),
+    # converts in place. Finally runs constant propagation and dead-code elimination. Returns the model.
     # Always do inplace convert because the Tensor is already
     # copied in prepare_jit when inplace is False
     if quant_type == QuantType.DYNAMIC:
@@ -248,6 +285,8 @@ def _quantize_jit(
 
 
 def quantize_jit(model, qconfig_dict, run_fn, run_args, inplace=False, debug=False):
+    # [FUNCTION DOC] Post-training static quantization of a float script model: prepare, calibrate with
+    # run_fn and run_args, convert. Returns the quantized script model; inplace and debug are passed through.
     r"""Quantize the input float TorchScript model with
     post training static quantization.
 
@@ -313,6 +352,9 @@ def quantize_jit(model, qconfig_dict, run_fn, run_args, inplace=False, debug=Fal
 
 
 def quantize_dynamic_jit(model, qconfig_dict, inplace=False, debug=False):
+    # [FUNCTION DOC] Post-training dynamic quantization of a float script model (no calibration needed).
+    # Returns the quantized script model.
+    # KNOWN ISSUE: the docstring example calls it with calibration arguments this function does not accept.
     r"""Quantize the input float TorchScript model with
     post training dynamic quantization.
     Currently only qint8 quantization of torch.nn.Linear is supported.
@@ -362,6 +404,9 @@ def quantize_dynamic_jit(model, qconfig_dict, inplace=False, debug=False):
 def _quantize_ondevice_dynamic_jit(
     model, qconfig_dict, method_name="forward", inplace=False
 ):
+    # [FUNCTION DOC] HELPER: Prepare a script model for on-device dynamic PTQ of the named method; returns the
+    # model with observe_/quantize_ methods added. Delegates to the private implementation.
+    # KNOWN ISSUE: docstring Args ordering mixes the method_name and qconfig_dict descriptions.
     r"""Prepares the input float TorchScript model with
     *on-device* post training dynamic quantization.
     Currently only qint8 quantization of torch.nn.Linear is supported.

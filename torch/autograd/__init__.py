@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Top-level torch.autograd package: automatic differentiation for tensors.
+# Defines the public backward and grad entry points (plus helpers that build default gradient seeds and
+# validate shapes), a deprecated variable stub, and re-exports Function, NestedIOFunction, grad-mode context
+# managers, gradcheck, anomaly detection, Variable, and submodules (forward_ad, functional, graph, profiler).
+# Import-time side effects: runs the native autograd initialization (raises RuntimeError on failure),
+# imports native profiler/autograd symbols, patches Variable onto the variable stub, and attaches
+# docstrings to the multithreading and view-replay query functions.
 """
 ``torch.autograd`` provides classes and functions implementing automatic differentiation of arbitrary scalar valued functions.
 
@@ -64,6 +71,10 @@ def _calculate_shape(
     grad: torch.Tensor,
     is_grads_batched: bool,
 ) -> tuple[_ShapeorNestedShape, _ShapeorNestedShape]:
+    # [FUNCTION DOC] HELPER: Compute the (output shape, grad shape) pair used for mismatch error messages.
+    # For a GradientEdge, uses the recorded input metadata shape (raises RuntimeError if grads are batched).
+    # For a C++ nested tensor uses nested sizes (RuntimeError if batched). Otherwise uses ordinary shapes,
+    # dropping the leading batch dimension of the grad when batched.
     # is_same_size ensures that both tensors are either nested or non nested
     # circular import
     from torch.nested._internal.nested_tensor import NestedTensor
@@ -93,6 +104,15 @@ def _make_grads(
     grads: Sequence[_OptionalTensor],
     is_grads_batched: bool,
 ) -> tuple[_OptionalTensor, ...]:
+    # [FUNCTION DOC] HELPER: Validate user-provided grad outputs and fill in defaults, returning a tuple
+    # aligned with the outputs. Each output may be a tensor or GradientEdge (edge metadata supplies size,
+    # dtype, device; C++ nested edges raise RuntimeError). Given tensor grads are checked for matching shape
+    # (with the batch dim skipped if batched) and matching complex-ness of dtype, raising RuntimeError on
+    # mismatch. Missing grads (None) become ones for single-element real floating outputs that require
+    # grad (RuntimeError for non-scalar or non-floating outputs), stay None for outputs not requiring grad.
+    # Any other grad type raises TypeError.
+    # KNOWN ISSUE: error messages locate the offending grad/output by list index lookup, which compares by
+    # equality and may find the wrong position for duplicate or equal tensors.
     new_grads: list[_OptionalTensor] = []
 
     for out, grad in zip(outputs, grads):
@@ -245,6 +265,8 @@ def _make_grads(
 def _tensor_or_tensors_to_tuple(
     tensors: _TensorOrOptionalTensors | None, length: int
 ) -> tuple[_OptionalTensor, ...]:
+    # [FUNCTION DOC] HELPER: Normalize optional tensors into a tuple: None becomes a tuple of Nones of the
+    # given length, a single tensor becomes a one-element tuple, any other sequence is converted to a tuple.
     if tensors is None:
         return (None,) * length
     if isinstance(tensors, torch.Tensor):
@@ -260,6 +282,13 @@ def backward(
     grad_variables: _TensorOrOptionalTensors | None = None,
     inputs: _TensorOrTensorsOrGradEdge | dict[str, torch.Tensor] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Compute gradients of tensors with respect to graph leaves and accumulate them into
+    # the .grad of leaves (or of the given inputs only). Args: tensors (tensor, edge or sequence),
+    # grad_tensors (seed gradients; deprecated alias grad_variables), retain_graph (defaults to
+    # create_graph), create_graph, inputs (tensor, edge, sequence or dict whose values are used).
+    # Raises RuntimeError inside functorch transforms, when both grad_tensors and grad_variables are given,
+    # or when inputs is empty; TypeError for non-dict mappings as inputs. Dispatches to __torch_function__
+    # overrides when present. Runs the autograd engine with accumulation; returns None.
     r"""Compute the sum of gradients of given tensors with respect to graph leaves.
 
     The graph is differentiated using the chain rule. If any of ``tensors``
@@ -442,6 +471,14 @@ def grad(
     is_grads_batched: bool = False,
     materialize_grads: bool = False,
 ) -> tuple[torch.Tensor, ...] | dict[str, torch.Tensor]:
+    # [FUNCTION DOC] Compute and return gradients of outputs with respect to inputs without accumulating
+    # into .grad. Inputs may be a tensor, edge, sequence, or a dict (result is then a dict with same keys).
+    # Supports grad_outputs, retain_graph (defaults to create_graph), allow_unused (defaults to
+    # materialize_grads), batched grads via vmap, and materialize_grads (unused inputs become zeros).
+    # Raises ValueError if materialize_grads is set while allow_unused is False; RuntimeError for empty
+    # inputs or materializing with GradientEdge inputs; TypeError for non-dict mappings. Warns (FutureWarning)
+    # if only_inputs is False (ignored). Honors __torch_function__ overrides. Returns a tuple of tensors
+    # (entries may be None) or a dict.
     r"""Compute and return the sum of gradients of outputs with respect to the inputs.
 
     ``grad_outputs`` should be a sequence of length matching ``output``
@@ -577,6 +614,8 @@ def grad(
     if is_grads_batched:
 
         def vjp(gO):
+        # [FUNCTION DOC] HELPER: Run the engine for one batch element of grad outputs without accumulating;
+        # used as the function mapped by vmap when is_grads_batched is set.
             return _engine_run_backward(
                 outputs,
                 gO,
@@ -635,10 +674,14 @@ def grad(
 # checks for whether reentrant backwards is imperative or not.
 # See https://github.com/pytorch/pytorch/pull/4594 for more discussion/context
 def _is_checkpoint_valid():
+    # [FUNCTION DOC] HELPER: Return whether gradient checkpointing is valid in the current engine call,
+    # i.e. whether the engine was invoked through backward without an inputs argument rather than grad.
     return Variable._execution_engine.is_checkpoint_valid()
 
 
 def variable(*args, **kwargs):
+    # [FUNCTION DOC] Deprecated stub; always raises RuntimeError telling the user to use the tensor
+    # factory instead. Also serves as the carrier of the Variable attribute patched on below.
     raise RuntimeError(
         "torch.autograd.variable(...) is deprecated, use torch.tensor(...) instead"
     )
@@ -686,6 +729,8 @@ from . import profiler
 
 
 def _register_py_tensor_class_for_device(device, cls):
+    # [FUNCTION DOC] HELPER: Register a Python tensor class for a device with the native layer. Raises
+    # RuntimeError if cls is not a class object; otherwise calls the native registration (global side effect).
     if not isinstance(cls, type):
         raise RuntimeError("cls isn't a typeinfo object")
     torch._C._register_py_class_for_device(device, cls)

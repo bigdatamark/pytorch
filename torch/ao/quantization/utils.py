@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Utilities shared by eager and FX graph mode quantization.
+# Contains type aliases (NodePattern, Pattern), the MatchAllNode marker, module/function/method
+# allow-sets used by check_node, qconfig dtype inspection helpers (activation/weight dtype, quant type),
+# qparam computation (calculate_qmin_qmax, determine_qparams, validation), example-input capture for
+# submodules, device checks, and the DEPRECATION_WARNING text. Exports the public names via __all__.
+# Import-time side effects: builds the module-level sets and aliases only.
 """
 Utils shared by different modes of quantization (eager/graph)
 """
@@ -45,6 +51,8 @@ Pattern = TypeAliasType(
 
 # TODO: maybe rename this to MatchInputNode
 class MatchAllNode:
+    # [CLASS DOC] Marker pattern node that matches any node when defining fusion patterns in FX graph mode
+    # quantization. Has no state or methods.
     """A node pattern that matches all nodes, used in defining
     fusion patterns in FX Graph Mode Quantization
     """
@@ -128,6 +136,9 @@ method_list = {
 
 # TODO: not used now, remove
 def check_node(node, modules):
+    # [FUNCTION DOC] Classify an FX node as a call to a known function, method, or module type from the
+    # module-level allow-sets. Returns a tuple of three booleans (is_call_function, is_call_method,
+    # is_call_module); modules maps target names to module instances. Marked unused in the source.
     # TODO: reuse is_fixed_qparam_node after we move this function to _lower_to_native_backend.py
     is_call_function = node.op == "call_function" and node.target in func_list
     is_call_method = node.op == "call_method" and node.target in method_list
@@ -138,6 +149,8 @@ def check_node(node, modules):
 
 
 def get_combined_dict(default_dict, additional_dict):
+    # [FUNCTION DOC] Return a new dict with the default dict's entries updated by the additional dict
+    # (additional values win). Inputs are not mutated.
     """
     Combines two dictionaries.
 
@@ -163,10 +176,12 @@ def get_combined_dict(default_dict, additional_dict):
 
 
 def is_per_tensor(qscheme):
+    # [FUNCTION DOC] Return True if the qscheme is per-tensor affine or per-tensor symmetric.
     return qscheme == torch.per_tensor_affine or qscheme == torch.per_tensor_symmetric
 
 
 def is_per_channel(qscheme):
+    # [FUNCTION DOC] Return True if the qscheme is per-channel affine, affine with float qparams, or symmetric.
     return qscheme in [
         torch.per_channel_affine,
         torch.per_channel_affine_float_qparams,
@@ -175,6 +190,8 @@ def is_per_channel(qscheme):
 
 
 def getattr_from_fqn(obj: Any, fqn: str) -> Any:
+    # [FUNCTION DOC] Resolve a dotted fully qualified name by repeated attribute lookup starting at obj.
+    # Raises AttributeError if a part is missing.
     """
     Given an obj and a fqn such as "foo.bar.baz", returns gm.foo.bar.baz.
     """
@@ -182,6 +199,8 @@ def getattr_from_fqn(obj: Any, fqn: str) -> Any:
 
 
 def to_underlying_dtype(qdtype):
+    # [FUNCTION DOC] Map a quantized or integer dtype to its underlying plain integer/float8 dtype via a fixed
+    # table (e.g. quint8 to uint8). Raises AssertionError for unsupported dtypes.
     DTYPE_MAPPING = {
         torch.quint8: torch.uint8,
         torch.qint8: torch.int8,
@@ -202,6 +221,11 @@ def to_underlying_dtype(qdtype):
 
 
 def get_qparam_dict(observer_or_fake_quant):
+    # [FUNCTION DOC] Build a dict of quantization parameters from an observer or fake-quant module.
+    # Always has qscheme and dtype; for placeholder observers or a missing qscheme, qscheme is None and
+    # nothing else is added. Otherwise symmetric schemes become affine, per-channel adds axis, and scale,
+    # zero_point (from calculate_qparams) plus quant_min/quant_max (if present) are included.
+    # Raises RuntimeError for an unrecognized qscheme.
     from torch.ao.quantization.observer import PlaceholderObserver
 
     qscheme = getattr(observer_or_fake_quant, "qscheme", None)
@@ -240,6 +264,9 @@ def get_qparam_dict(observer_or_fake_quant):
 def get_swapped_custom_module_class(
     custom_module, custom_module_class_mapping, qconfig
 ):
+    # [FUNCTION DOC] Look up the observed/quantized class to swap a custom module to. The quant type is
+    # derived from the qconfig and used to select a class mapping; returns the class mapped to the
+    # module's exact type. Raises AssertionError if the type is not in the mapping.
     """Get the observed/quantized custom module class that we need
     to swap ``custom_module`` to.
 
@@ -264,6 +291,8 @@ def get_swapped_custom_module_class(
 
 
 def activation_dtype(qconfig):
+    # [FUNCTION DOC] Instantiate the qconfig's activation factory and return its dtype. Raises AssertionError
+    # if qconfig is None.
     if qconfig is None:
         raise AssertionError("qconfig must be provided to determine activation dtype")
     activation = qconfig.activation()
@@ -271,6 +300,8 @@ def activation_dtype(qconfig):
 
 
 def weight_dtype(qconfig):
+    # [FUNCTION DOC] Instantiate the qconfig's weight factory and return its dtype. Raises AssertionError
+    # if qconfig is None.
     if qconfig is None:
         raise AssertionError("qconfig must be provided to determine weight dtype")
     weight = qconfig.weight()
@@ -278,6 +309,8 @@ def weight_dtype(qconfig):
 
 
 def activation_is_statically_quantized(qconfig):
+    # [FUNCTION DOC] True if the activation dtype is one of the listed quantized dtypes (quint8, qint8,
+    # qint32, float16, and integer types) and the activation is not dynamically quantized.
     """Given a qconfig, decide if the activation needs to be
     quantized or not, this includes quantizing to quint8, qint8 and qint32 and float16
     """
@@ -296,6 +329,7 @@ def activation_is_statically_quantized(qconfig):
 
 
 def activation_is_dynamically_quantized(qconfig):
+    # [FUNCTION DOC] True if the qconfig's activation observer is flagged dynamic (from get_qconfig_dtypes).
     """Given a qconfig, decide if the activation needs to be
     dynamically quantized or not, this includes dynamically quantizing to
     quint8, qint8 and float16
@@ -305,6 +339,7 @@ def activation_is_dynamically_quantized(qconfig):
 
 
 def activation_is_int8_quantized(qconfig):
+    # [FUNCTION DOC] True if the activation dtype is an 8-bit quantized type (quint8, qint8, uint8, int8).
     """Given a qconfig, decide if the activation needs to be
     quantized to int8 or not, this includes quantizing to quint8, qint8
     """
@@ -317,6 +352,7 @@ def activation_is_int8_quantized(qconfig):
 
 
 def activation_is_int32_quantized(qconfig):
+    # [FUNCTION DOC] True if the activation dtype is qint32 or int32.
     """Given a qconfig, decide if the activation needs to be
     quantized to int32 or not
     """
@@ -324,6 +360,8 @@ def activation_is_int32_quantized(qconfig):
 
 
 def weight_is_quantized(qconfig):
+    # [FUNCTION DOC] True if the weight dtype is one of the listed quantized types (8/16/32-bit ints,
+    # quint4x2, float16, float8 variants).
     """Given a qconfig, decide if the weight needs to be
     quantized or not
     """
@@ -342,6 +380,7 @@ def weight_is_quantized(qconfig):
 
 
 def weight_is_statically_quantized(qconfig):
+    # [FUNCTION DOC] True if the weight dtype is an 8-bit quantized type (quint8, qint8, uint8, int8).
     """Given a qconfig, decide if the weight needs to be statically
     quantized or not
     """
@@ -349,6 +388,8 @@ def weight_is_statically_quantized(qconfig):
 
 
 def op_is_int8_dynamically_quantized(qconfig) -> bool:
+    # [FUNCTION DOC] True if the op uses int8 dynamic quantization: activation dtype is quint8 or uint8,
+    # weight dtype is qint8 or int8, and the activation is dynamic.
     """Given a qconfig, returns True if this op is using int8 dynamic
     quantization
     """
@@ -363,6 +404,9 @@ def op_is_int8_dynamically_quantized(qconfig) -> bool:
 
 
 def get_qconfig_dtypes(qconfig):
+    # [FUNCTION DOC] Instantiate the activation and weight factories and return the tuple
+    # (activation dtype, weight dtype, activation-is-dynamic flag; the flag defaults to False if the
+    # observer lacks it). Raises AssertionError if qconfig is None.
     r"""returns the qconfig tuple for qconfig:
     (activation_dtype, weight_dtype, activation_is_dynamic)
     """
@@ -375,6 +419,11 @@ def get_qconfig_dtypes(qconfig):
 
 
 def get_quant_type(qconfig):
+    # [FUNCTION DOC] Determine the QuantType (DYNAMIC, STATIC or WEIGHT_ONLY) of a qconfig from its
+    # instantiated activation and weight dtypes. Static-capable weights give DYNAMIC if the activation is
+    # dynamic, STATIC if the activation dtype is also static, else WEIGHT_ONLY; float16 weights give DYNAMIC
+    # or STATIC (float16 activation). Raises AssertionError for None qconfig, and a bare Exception for
+    # unrecognized dtype combinations.
     if qconfig is None:
         raise AssertionError("qconfig must be provided to determine quant type")
     activation = qconfig.activation()
@@ -412,6 +461,9 @@ def get_quant_type(qconfig):
 
 
 def check_min_max_valid(min_val: torch.Tensor, max_val: torch.Tensor) -> bool:
+    # [FUNCTION DOC] Check whether observed min/max tensors are usable. Returns False (with a warning)
+    # if either is empty or if scalar values are still at their initial infinities. Raises AssertionError
+    # if any min exceeds its max. Returns True otherwise.
     """Checks if the given minimum and maximum values are valid, meaning that
     they exist and the min value is less than the max value.
     """
@@ -449,6 +501,12 @@ def calculate_qmin_qmax(
     dtype: torch.dtype,
     reduce_range: bool,
 ) -> tuple[int, int]:
+    # [FUNCTION DOC] Compute the effective (quant_min, quant_max) integer range. With a customized range,
+    # validates the length for 8-bit and 32-bit signed dtypes (AssertionError if invalid) and halves the
+    # given bounds when reduce_range is set. Otherwise uses dtype defaults (int8, uint8, int32, uint16,
+    # int16; 4-bit range 0..15 for anything else), narrowed when reduce_range applies to 8-bit types.
+    # KNOWN ISSUE: with a customized range the returned bounds are the caller's values, not the validated
+    # initial ones, and halving fails if the bounds are None.
     r"""Calculates actual qmin and qmax based on the quantization range,
     observer datatype and if range is reduced.
     """
@@ -507,6 +565,8 @@ def calculate_qmin_qmax(
 
 
 def _parent_name(target):
+    # [FUNCTION DOC] HELPER: Split a dotted target at its last dot into (parent path, name); parent is
+    # an empty string when there is no dot.
     """
     Turn 'foo.bar' into ['foo', 'bar']
     """
@@ -518,6 +578,8 @@ def _parent_name(target):
 
 
 def has_no_children_ignoring_parametrizations(module):
+    # [FUNCTION DOC] True if the module has no child modules, or, for a parametrized module, only the
+    # parametrizations child.
     """
     Checks if module._modules is empty or
     if module is a parametrization, checks that module._modules only has
@@ -534,6 +596,8 @@ def has_no_children_ignoring_parametrizations(module):
 def _get_path_of_module(
     root: torch.nn.Module, submodule: torch.nn.Module
 ) -> str | None:
+    # [FUNCTION DOC] HELPER: Return the name of the submodule in root's named modules that is identical
+    # (by identity) to the given submodule, or None if not found.
     """Get the path (fully qualified name) of a submodule
 
     Example::
@@ -556,6 +620,7 @@ def _get_path_of_module(
 
 
 def _get_signature_locals(f: Callable, loc: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC] HELPER: Filter the dict of local variables to entries whose names are parameters of f.
     """Get local keyword arguments
 
     Example::
@@ -570,6 +635,9 @@ def _get_signature_locals(f: Callable, loc: dict[str, Any]) -> dict[str, Any]:
 
 
 def _get_default_kwargs(f: Callable) -> "OrderedDict[str, Any]":
+    # [FUNCTION DOC] HELPER: Collect default values of f's signature into an ordered mapping; variadic
+    # positional parameters default to an empty tuple and variadic keyword parameters to an empty dict.
+    # Parameters without defaults are omitted.
     """Get all default keyword arguments from function signature
 
     Example::
@@ -591,6 +659,8 @@ def _get_default_kwargs(f: Callable) -> "OrderedDict[str, Any]":
 
 
 def _normalize_kwargs(func: Callable, loc: dict[str, Any]) -> "OrderedDict[str, Any]":
+    # [FUNCTION DOC] HELPER: Return an ordered mapping of f's defaults overridden by matching entries of the
+    # given locals; only names that already have a default are overridden.
     """Given a function and local function arguments, normalize the keyword
     arguments by filling in default arguments from function signature
 
@@ -613,6 +683,9 @@ def _normalize_kwargs(func: Callable, loc: dict[str, Any]) -> "OrderedDict[str, 
 
 
 def validate_qmin_qmax(quant_min: int, quant_max: int) -> None:
+    # [FUNCTION DOC] Validate a user-specified quantization range: it must include zero and quant_min must
+    # be strictly less than quant_max. Raises AssertionError otherwise.
+    # KNOWN ISSUE: error message typo "Used-specified".
     r"""Validates that the user-specified quantization range is properly initialized
     and within the given bound supported by the observer dtype.
 
@@ -650,6 +723,13 @@ def determine_qparams(
     has_customized_qrange: bool,
     qscheme: torch.qscheme = torch.per_tensor_affine,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Compute (scale, zero_point) tensors from observed min/max. If the min/max are not valid,
+    # returns default scale 1.0 and zero point 0. Handles symmetric schemes (scale from max magnitude, zero
+    # point 128 or range midpoint for unsigned dtypes, else 0), per-channel affine with float qparams, and
+    # affine (scale from range, zero point rounded and clamped). Scalars become size-one tensors. Returns
+    # scale as double and zero point as int64. Duplicates observer logic for TorchScript reasons.
+    # KNOWN ISSUE: docstring omits several parameters; for the float-qparams scalar case the zero point is
+    # converted to int first and then to float.
     r"""Calculates the quantization parameters, given min and max
     value tensors. Works for both per tensor and per channel cases
 
@@ -719,6 +799,7 @@ def determine_qparams(
 
 
 def _get_num_pos_args(f: Callable) -> int:
+    # [FUNCTION DOC] HELPER: Return the count of named positional args of f (includes self for methods).
     """Get number of positional args for a function
 
     Example::
@@ -734,6 +815,10 @@ def _get_num_pos_args(f: Callable) -> int:
 def get_fqn_to_example_inputs(
     model: torch.nn.Module, example_inputs: tuple[Any, ...]
 ) -> dict[str, tuple[Any, ...]]:
+    # [FUNCTION DOC] Run the model once on example_inputs while temporarily patching the Module call
+    # operator to record each submodule's example inputs, keyed by fully qualified name. Keyword arguments
+    # are flattened into positional ones using forward defaults. Returns the mapping. Side effect: the class
+    # level call attribute is replaced during the run and always restored, even on error.
     """Given a model and its example inputs, return a dictionary from
     fully qualified name of submodules to example_inputs for that submodule,
     e.g. ``{"linear1": (tensor1,), "linear2": (tensor2,), "sub": (tensor3,),
@@ -763,6 +848,9 @@ def get_fqn_to_example_inputs(
     fqn_to_example_inputs = {}
 
     def _patched_module_call(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Patched module call. Builds the positional example inputs from the call args
+        # plus the normalized keyword values (dropping defaults overridden positionally), records them under
+        # the module's name if it is found under root, then calls the original module call.
         submodule_example_inputs = list(args).copy()
         normalized_kwargs = _normalize_kwargs(self.forward, kwargs)
         # minus 1 to skipping counting `self`
@@ -789,6 +877,10 @@ def get_fqn_to_example_inputs(
 
 
 def _assert_and_get_unique_device(module: torch.nn.Module) -> Any:
+    # [FUNCTION DOC] HELPER: Return the single device used by the module's parameters and buffers, or None
+    # if it has none. If exactly cpu and meta are present, warns and picks cpu. Raises AssertionError when
+    # multiple devices remain.
+    # KNOWN ISSUE: contains stray bare string statements in the body (a workaround note and an empty string).
     """
     Returns the unique device for a module, or None if no device is found.
     Throws an error if multiple devices are detected.

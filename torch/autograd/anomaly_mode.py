@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Autograd anomaly detection context managers: detect_anomaly and set_detect_anomaly.
+# Both toggle the global anomaly-mode flags (enabled, check_nan) through torch functions and restore
+# the previous values on exit. Exports both names via __all__. No import-time side effects.
 r"""Autograd anomaly mode."""
 
 import warnings
@@ -10,6 +13,9 @@ __all__ = ["detect_anomaly", "set_detect_anomaly"]
 
 
 class detect_anomaly:
+    # [CLASS DOC] Context manager enabling autograd anomaly detection (forward traceback recording and
+    # optional NaN checks in backward). State: prev and prev_check_nan (flags captured at construction)
+    # and check_nan. Slows execution; for debugging only.
     r"""Context-manager that enables anomaly detection for the autograd engine.
 
     This does two things:
@@ -77,6 +83,9 @@ class detect_anomaly:
     """
 
     def __init__(self, check_nan=True) -> None:
+        # [FUNCTION DOC] Capture the current anomaly-enabled and check-nan flags for later restoration,
+        # store check_nan, and emit a warning that anomaly detection is on and slows runtime.
+        # Does not enable anything itself; enabling happens in __enter__.
         self.prev = torch.is_anomaly_enabled()
         self.check_nan = check_nan
         self.prev_check_nan = torch.is_anomaly_check_nan_enabled()
@@ -88,13 +97,17 @@ class detect_anomaly:
         )
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] Turn anomaly detection on globally, with NaN checking per check_nan.
         torch.set_anomaly_enabled(True, self.check_nan)
 
     def __exit__(self, *args: object) -> None:
+        # [FUNCTION DOC] Restore the anomaly flags captured at construction; ignores exception info.
         torch.set_anomaly_enabled(self.prev, self.prev_check_nan)
 
 
 class set_detect_anomaly:
+    # [CLASS DOC] Context manager and function that sets anomaly detection on or off.
+    # State: prev and prev_check_nan hold the flags before construction, restored on exit.
     r"""Context-manager that sets the anomaly detection for the autograd engine on or off.
 
     ``set_detect_anomaly`` will enable or disable the autograd anomaly detection
@@ -112,12 +125,16 @@ class set_detect_anomaly:
     """
 
     def __init__(self, mode: bool, check_nan: bool = True) -> None:
+        # [FUNCTION DOC] Record the current anomaly flags, then immediately apply the given mode and
+        # check_nan globally (so it also works as a plain function call, with effect before entering).
         self.prev = torch.is_anomaly_enabled()
         self.prev_check_nan = torch.is_anomaly_check_nan_enabled()
         torch.set_anomaly_enabled(mode, check_nan)
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] No-op; the new mode was already applied in the constructor.
         pass
 
     def __exit__(self, *args: object) -> None:
+        # [FUNCTION DOC] Restore the anomaly flags recorded at construction; ignores exception info.
         torch.set_anomaly_enabled(self.prev, self.prev_check_nan)
