@@ -1,3 +1,9 @@
+# [MODULE DOC] Utilities for variable-length sequence batches fed to recurrent networks.
+# Defines PackedSequence (a named tuple holding packed data, per-step batch sizes and the
+# optional sort/unsort permutations) and the functions that pack, unpack, pad and unpad
+# lists of tensors: pack_padded_sequence, pad_packed_sequence, pad_sequence, unpad_sequence,
+# pack_sequence, unpack_sequence, plus invert_permutation. Heavy lifting is delegated to
+# native ops (_VF and torch._C._nn). No import-time side effects beyond defining names.
 import warnings
 from collections.abc import Callable, Iterable
 from typing import Any, NamedTuple, TypeVar
@@ -24,6 +30,9 @@ _R = TypeVar("_R")
 
 
 class PackedSequence_(NamedTuple):
+    # [CLASS DOC] HELPER: Plain named tuple base class of PackedSequence. Declares the four
+    # fields (data, batch_sizes, sorted_indices, unsorted_indices); the last two may be None.
+    # Exists so the real class can customize construction while staying a tuple.
     data: torch.Tensor
     batch_sizes: torch.Tensor
     sorted_indices: torch.Tensor | None
@@ -31,12 +40,22 @@ class PackedSequence_(NamedTuple):
 
 
 def bind(optional: _T | None, fn: Callable[[_T], _R]) -> _R | None:
+    # [FUNCTION DOC] HELPER: Apply fn to optional if it is not None, otherwise return None.
+    # Used to map a conversion over the optional index tensors of a PackedSequence.
     if optional is None:
         return None
     return fn(optional)
 
 
 class PackedSequence(PackedSequence_):
+    # [CLASS DOC] Immutable tuple-like container for a packed batch of variable-length sequences.
+    # Fields: data (time-major concatenation of the valid elements), batch_sizes (CPU int64
+    # tensor with the number of active batch entries per time step), sorted_indices and
+    # unsorted_indices (optional int64 permutations mapping between original and
+    # length-sorted batch order). Invariant: batch_sizes lives on the CPU; indices live on the
+    # same device as data. Methods return new instances (device/dtype conversion only touches
+    # data and indices, never batch_sizes) or report data placement.
+    # KNOWN ISSUE: the docstring text for unsorted_indices is garbled ("how this to recover").
     r"""Holds the data and list of :attr:`batch_sizes` of a packed sequence.
 
     All RNN modules accept packed sequences as inputs.
@@ -79,6 +98,10 @@ class PackedSequence(PackedSequence_):
         sorted_indices: Tensor | None = None,
         unsorted_indices: Tensor | None = None,
     ) -> Self:
+        # [FUNCTION DOC] Construct a PackedSequence from data, batch_sizes and optional indices.
+        # Normalizes the arguments via _packed_sequence_init_args (which may unpack a
+        # (data, batch_sizes) pair and derive unsorted_indices) and builds the tuple.
+        # Raises ValueError if batch_sizes is not on the CPU.
         return super().__new__(
             cls,
             *_packed_sequence_init_args(
@@ -91,6 +114,8 @@ class PackedSequence(PackedSequence_):
     # See the note above in doc string (starting with ":attr:`data` can be on
     # arbitrary device...").
     def pin_memory(self) -> Self:
+        # [FUNCTION DOC] Return a copy whose data and index tensors are in pinned memory.
+        # batch_sizes is shared unchanged (it must stay on the CPU). Absent indices stay None.
         # Why not convert `batch_sizes`?
         # See NOTE [ device and dtype of a PackedSequence ]
         return type(self)(
@@ -102,6 +127,10 @@ class PackedSequence(PackedSequence_):
 
     @copy_method_params(torch.Tensor.to)
     def to(self, *args: Any, **kwargs: Any) -> Self:
+        # [FUNCTION DOC] Convert data via the tensor to method and return the converted copy.
+        # If conversion is a no-op (same object back), returns self. Otherwise the index tensors
+        # are moved to the new data device (honoring non_blocking and memory format only, not
+        # dtype) and a new PackedSequence is built sharing batch_sizes.
         r"""Perform dtype and/or device conversion on `self.data`.
 
         It has similar signature as :meth:`torch.Tensor.to`
@@ -125,6 +154,8 @@ class PackedSequence(PackedSequence_):
 
             # Does not forward device or dtype arg/kwargs, device is set from data.device
             def call_to(t: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Move a tensor to the new data device, forwarding only the
+            # non_blocking and memory_format settings parsed from the outer arguments.
                 return t.to(
                     data.device,
                     non_blocking=non_blocking,
@@ -137,6 +168,9 @@ class PackedSequence(PackedSequence_):
 
     @copy_method_params(torch.Tensor.cuda)
     def cuda(self, *args: Any, **kwargs: Any) -> Self:
+        # [FUNCTION DOC] Move to a CUDA device. Probes with an empty tensor whether the given
+        # arguments already name a CUDA target; if not, forces the device keyword to "cuda".
+        # Mutates the passed kwargs mapping in that case. Returns the converted PackedSequence.
         # Tests to see if 'cuda' should be added to kwargs
         ex = torch.tensor((), dtype=self.data.dtype, device=self.data.device).to(
             *args, **kwargs
@@ -148,6 +182,9 @@ class PackedSequence(PackedSequence_):
 
     @copy_method_params(torch.Tensor.cpu)
     def cpu(self, *args: Any, **kwargs: Any) -> Self:
+        # [FUNCTION DOC] Move to the CPU. Probes with an empty tensor whether the given arguments
+        # already resolve to a CPU device; if not, forces the device keyword to "cpu" (mutating
+        # the passed kwargs mapping). Returns the converted PackedSequence.
         ex = torch.tensor((), dtype=self.data.dtype, device=self.data.device).to(
             *args, **kwargs
         )
@@ -157,35 +194,45 @@ class PackedSequence(PackedSequence_):
         return self.to(*args, **kwargs)
 
     def double(self) -> Self:
+        # [FUNCTION DOC] Return a copy with data cast to double precision.
         return self.to(dtype=torch.double)
 
     def float(self) -> Self:
+        # [FUNCTION DOC] Return a copy with data cast to single-precision float.
         return self.to(dtype=torch.float)
 
     def half(self) -> Self:
+        # [FUNCTION DOC] Return a copy with data cast to half precision.
         return self.to(dtype=torch.half)
 
     def long(self) -> Self:
+        # [FUNCTION DOC] Return a copy with data cast to 64-bit integer.
         return self.to(dtype=torch.long)
 
     def int(self) -> Self:
+        # [FUNCTION DOC] Return a copy with data cast to 32-bit integer.
         return self.to(dtype=torch.int)
 
     def short(self) -> Self:
+        # [FUNCTION DOC] Return a copy with data cast to 16-bit integer.
         return self.to(dtype=torch.short)
 
     def char(self) -> Self:
+        # [FUNCTION DOC] Return a copy with data cast to signed 8-bit integer.
         return self.to(dtype=torch.int8)
 
     def byte(self) -> Self:
+        # [FUNCTION DOC] Return a copy with data cast to unsigned 8-bit integer.
         return self.to(dtype=torch.uint8)
 
     @property
     def is_cuda(self) -> bool:
+        # [FUNCTION DOC] Property: True if the data tensor is on a CUDA device.
         r"""Return true if `self.data` stored on a gpu."""
         return self.data.is_cuda
 
     def is_pinned(self) -> bool:
+        # [FUNCTION DOC] Return True if the data tensor is in pinned (page-locked) memory.
         r"""Return true if `self.data` stored on in pinned memory."""
         return self.data.is_pinned()
 
@@ -198,6 +245,12 @@ def _packed_sequence_init_args(
     sorted_indices: Tensor | None = None,
     unsorted_indices: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
+    # [FUNCTION DOC] HELPER: Normalize PackedSequence constructor arguments into a 4-tuple.
+    # If unsorted_indices is None it is computed by inverting sorted_indices (None stays None).
+    # When batch_sizes is given, returns the fields as-is, raising ValueError if batch_sizes
+    # is not on the CPU. When it is None, data must be a list or tuple of length 2 holding
+    # (data, batch_sizes); otherwise an AssertionError is raised. Exists because TorchScript
+    # cannot construct named tuples directly.
     # NB: if unsorted_indices is provided, it should be the inverse permutation
     # to sorted_indices. Don't assert it here because the PackedSequence ctor
     # should only be used internally.
@@ -231,6 +284,8 @@ def _packed_sequence_init(
     sorted_indices: Tensor | None = None,
     unsorted_indices: Tensor | None = None,
 ) -> PackedSequence:
+    # [FUNCTION DOC] HELPER: Build a PackedSequence after normalizing the arguments with
+    # _packed_sequence_init_args. Same inputs and errors as that helper.
     data, batch_sizes, sorted_indices, unsorted_indices = _packed_sequence_init_args(
         data, batch_sizes, sorted_indices, unsorted_indices
     )
@@ -238,6 +293,9 @@ def _packed_sequence_init(
 
 
 def invert_permutation(permutation: Tensor | None) -> Tensor | None:
+    # [FUNCTION DOC] Return the inverse permutation of a 1-D index tensor, or None for None.
+    # Allocates a new tensor and scatters positions into it so that applying the inverse
+    # restores the original order. Does not validate that the input is a real permutation.
     """Returns the inverse of ``permutation``.
 
     This is useful for converting between sorted and unsorted indices in
@@ -261,6 +319,12 @@ def pack_padded_sequence(
     batch_first: bool = False,
     enforce_sorted: bool = True,
 ) -> PackedSequence:
+    # [FUNCTION DOC] Pack a padded batch of sequences into a PackedSequence.
+    # lengths may be a tensor (cast to int64) or a list (converted to a CPU int64 tensor, with
+    # a tracing warning). If enforce_sorted is False the lengths are sorted descending and the
+    # batch dimension of input is reordered, recording sorted_indices; otherwise no reordering
+    # is done and the native op validates the order. Delegates packing to the native op.
+    # Returns a PackedSequence (unsorted_indices derived from sorted_indices).
     r"""Packs a Tensor containing padded sequences of variable length.
 
     :attr:`input` can be of size ``T x B x *`` (if :attr:`batch_first` is ``False``)
@@ -330,6 +394,11 @@ def pad_packed_sequence(
     padding_value: float = 0.0,
     total_length: int | None = None,
 ) -> tuple[Tensor, Tensor]:
+    # [FUNCTION DOC] Inverse of pack_padded_sequence: pad a PackedSequence back to a dense tensor.
+    # Pads to the longest sequence, or to total_length if given. Raises ValueError when
+    # total_length is smaller than the longest sequence. If the sequence carries
+    # unsorted_indices, both the padded output and the lengths are reordered back to the
+    # original batch order. Returns a tuple of (padded tensor, lengths tensor).
     r"""Pad a packed batch of variable length sequences.
 
     It is an inverse operation to :func:`pack_padded_sequence`.
@@ -408,6 +477,11 @@ def pad_sequence(
     padding_value: float = 0.0,
     padding_side: str = "right",
 ) -> Tensor:
+    # [FUNCTION DOC] Stack a list of variable-length tensors into one padded tensor.
+    # Accepts an iterable of tensors (converted to a tuple) or, when tracing/scripting, a
+    # single tensor which is split along dimension 0. Raises RuntimeError if not iterable
+    # outside tracing/scripting. padding_value fills the padding, padding_side selects which
+    # end is padded, batch_first selects batch-major output. Delegates to the native op.
     r"""Pad a list of variable length Tensors with :attr:`padding_value`.
 
     ``pad_sequence`` stacks a list of Tensors along a new dimension, and pads them
@@ -475,6 +549,10 @@ def unpad_sequence(
     lengths: Tensor,
     batch_first: bool = False,
 ) -> list[Tensor]:
+    # [FUNCTION DOC] Split a padded tensor into a list of tensors trimmed to their true lengths.
+    # Walks each batch row with its length and keeps the leading valid entries via a mask.
+    # KNOWN ISSUE: when batch_first is False it transposes the caller's padded_sequences in
+    # place (transpose_), mutating the argument's shape/strides as a side effect.
     r"""Unpad padded Tensor into a list of variable length Tensors.
 
     ``unpad_sequence`` unstacks padded Tensor into a list of variable length Tensors.
@@ -523,6 +601,10 @@ def pack_sequence(
     sequences: list[Tensor],
     enforce_sorted: bool = True,
 ) -> PackedSequence:
+    # [FUNCTION DOC] Pack a list of variable-length tensors into a PackedSequence.
+    # Computes the lengths, pads the list with pad_sequence, then calls pack_padded_sequence
+    # forwarding enforce_sorted. With enforce_sorted True the sequences must already be in
+    # decreasing length order (checked by the native op); otherwise they are sorted internally.
     r"""Packs a list of variable length Tensors.
 
     Consecutive call of the next functions: ``pad_sequence``, ``pack_padded_sequence``.
@@ -559,6 +641,9 @@ def pack_sequence(
 
 
 def unpack_sequence(packed_sequences: PackedSequence) -> list[Tensor]:
+    # [FUNCTION DOC] Convert a PackedSequence back into a list of variable-length tensors.
+    # Pads it to a batch-first tensor with pad_packed_sequence, then trims each row with
+    # unpad_sequence. Returns the list in the original batch order.
     r"""Unpack PackedSequence into a list of variable length Tensors.
 
     ``packed_sequences`` should be a PackedSequence object.

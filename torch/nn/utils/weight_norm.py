@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Legacy hook-based weight normalization (arxiv 1602.07868).
+# Defines WeightNorm, a forward pre-hook that rebuilds a weight from magnitude (name_g) and
+# direction (name_v) parameters, plus the public weight_norm and remove_weight_norm
+# functions. Deprecated in favor of torch.nn.utils.parametrizations.weight_norm.
+# No import-time side effects.
 r"""Weight Normalization from https://arxiv.org/abs/1602.07868."""
 
 from typing import Any, TypeVar
@@ -13,10 +18,15 @@ __all__ = ["WeightNorm", "weight_norm", "remove_weight_norm"]
 
 
 class WeightNorm:
+    # [CLASS DOC] Forward pre-hook implementing weight normalization of one named parameter.
+    # Attributes: name (parameter name) and dim (dimension kept when computing norms; -1 means
+    # the whole tensor). Applying it replaces the parameter by name_g and name_v parameters
+    # and recomputes the plain weight attribute before every forward call.
     name: str
     dim: int
 
     def __init__(self, name: str, dim: int) -> None:
+        # [FUNCTION DOC] Store name and dim; a dim of None is converted to -1 (whole-tensor norm).
         if dim is None:
             dim = -1
         self.name = name
@@ -24,6 +34,8 @@ class WeightNorm:
 
     # TODO Make return type more specific
     def compute_weight(self, module: Module) -> Any:
+        # [FUNCTION DOC] Compute the weight from the module's name_g and name_v parameters.
+        # Returns the normalized-direction times magnitude tensor via the native weight norm op.
         g = getattr(module, self.name + "_g")
         v = getattr(module, self.name + "_v")
         return _weight_norm(v, g, self.dim)
@@ -35,6 +47,12 @@ class WeightNorm:
         category=FutureWarning,
     )
     def apply(module, name: str, dim: int) -> "WeightNorm":
+        # [FUNCTION DOC] Install weight normalization on a module parameter and return the hook.
+        # Deprecated (emits FutureWarning). Raises RuntimeError if a WeightNorm hook already exists
+        # for the name, ValueError for an uninitialized lazy parameter. Side effects: deletes the
+        # original parameter, registers name_g (norm over all dims except dim) and name_v,
+        # sets the computed weight as a plain attribute, and registers the forward pre-hook.
+        # A dim of None is treated as -1.
         for hook in module._forward_pre_hooks.values():
             if isinstance(hook, WeightNorm) and hook.name == name:
                 raise RuntimeError(
@@ -68,6 +86,9 @@ class WeightNorm:
         return fn
 
     def remove(self, module: Module) -> None:
+        # [FUNCTION DOC] Undo weight normalization on a module.
+        # Computes the current weight, deletes the attribute and the g and v parameters, and
+        # registers a new Parameter holding the detached weight data under the original name.
         weight = self.compute_weight(module)
         delattr(module, self.name)
         del module._parameters[self.name + "_g"]
@@ -75,6 +96,7 @@ class WeightNorm:
         setattr(module, self.name, Parameter(weight.data))
 
     def __call__(self, module: Module, inputs: Any) -> None:
+        # [FUNCTION DOC] Forward pre-hook entry point: recompute and assign the weight.
         setattr(module, self.name, self.compute_weight(module))
 
 
@@ -82,6 +104,9 @@ T_module = TypeVar("T_module", bound=Module)
 
 
 def weight_norm(module: T_module, name: str = "weight", dim: int = 0) -> T_module:
+    # [FUNCTION DOC] Apply weight normalization to a parameter of the module and return the module.
+    # Mutates the module in place via WeightNorm.apply (so warns about deprecation and may
+    # raise the errors described there).
     r"""Apply weight normalization to a parameter in the given module.
 
     .. math::
@@ -147,6 +172,9 @@ def weight_norm(module: T_module, name: str = "weight", dim: int = 0) -> T_modul
 
 
 def remove_weight_norm(module: T_module, name: str = "weight") -> T_module:
+    # [FUNCTION DOC] Remove weight normalization from the named parameter and return the module.
+    # Finds the matching forward pre-hook, restores a plain parameter and deletes the hook.
+    # Raises ValueError if no weight norm hook exists for the given name.
     r"""Remove the weight normalization reparameterization from a module.
 
     Args:

@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Public entry point of the torch.onnx package.
+# Exports the export function (default path uses torch.export based dynamo exporter,
+# legacy TorchScript exporter when dynamo is disabled), is_in_onnx_export, the errors and
+# ops submodules, ONNXProgram, ExportableModule, InputObserver and OnnxExporterError, plus
+# deprecated re-exports kept for compatibility (enums, symbolic helpers, custom op
+# symbolic registration). Import-time side effects: sets the reported module name of the
+# exported classes to torch.onnx and defines producer_name and producer_version.
 from __future__ import annotations
 
 
@@ -100,6 +107,14 @@ def export(
     export_modules_as_functions: bool | Collection[type[torch.nn.Module]] = False,
     autograd_inlining: bool = True,
 ) -> ONNXProgram | None:
+    # [FUNCTION DOC] Export a model to ONNX and return an ONNXProgram or None.
+    # Uses the dynamo exporter (via the compat entry point) when dynamo is true or the model is
+    # an ExportedProgram or ExportableModule; a single tensor for args is wrapped in a tuple.
+    # Otherwise uses the legacy TorchScript exporter: emits a DeprecationWarning, raises
+    # ValueError if dynamic_shapes is given, writes the model through the legacy export
+    # and returns None. Writes a file when f is given. Other errors propagate.
+    # KNOWN ISSUE: dynamo is compared by identity with True, so other truthy values select the
+    # legacy exporter, and several dynamo-only options are silently ignored on that path.
     r"""Exports a model into ONNX format.
 
     Setting ``dynamo=True`` enables the new ONNX export logic
@@ -357,6 +372,8 @@ def export(
 
 
 def is_in_onnx_export() -> bool:
+    # [FUNCTION DOC] Return True while an ONNX export is in progress.
+    # True if either the legacy exporter global state or the new exporter flag says so.
     """Returns whether it is in the middle of ONNX export."""
     from torch.onnx._internal.exporter import _flags
     from torch.onnx._internal.torchscript_exporter._globals import GLOBALS

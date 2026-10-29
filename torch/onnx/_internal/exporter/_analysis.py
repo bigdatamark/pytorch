@@ -1,6 +1,11 @@
 """Compatibility analyzer for PyTorch models."""
 
 # mypy: allow-untyped-defs
+# [MODULE DOC] Compatibility analysis report for exporting a torch.export program to ONNX.
+# Counts parameters/buffers by dtype and FX nodes by op and call target, records input and
+# output metadata, tries to dispatch every call_function node to a registered ONNX
+# implementation, and prints a markdown report of operators that fail. Also offers compare_ops
+# to diff the operator sets of two programs. No import-time side effects.
 
 from __future__ import annotations
 
@@ -23,6 +28,13 @@ if TYPE_CHECKING:
 
 @dataclasses.dataclass
 class ModelInfo:
+    # [CLASS DOC] Dataclass collecting the analysis results for one exported program.
+    # Fields: parameter_count and buffer_count (element counts per dtype), fx_node_count,
+    # fx_node_op_count (node counts by op kind), fx_node_target_count (call target counts),
+    # dispatch_failures (pairs of FX node and failure message), inputs and outputs (mappings
+    # from name to tensor metadata or a symbolic type name).
+    # KNOWN ISSUE: inputs and outputs are annotated as tensor metadata only, but may also hold
+    # strings such as the symbolic integer type names.
     """Information about the model."""
 
     parameter_count: defaultdict[torch.dtype, int] = dataclasses.field(
@@ -52,6 +64,8 @@ class ModelInfo:
 def _count_weights(
     exported_program: torch.export.ExportedProgram,
 ) -> tuple[defaultdict[torch.dtype, int], defaultdict[torch.dtype, int]]:
+    # [FUNCTION DOC] HELPER: Total element counts of parameters and buffers, grouped by dtype.
+    # Returns a pair of mappings (parameters first, buffers second).
     """Count the size of the parameters in the exported program."""
 
     parameter_count: defaultdict[torch.dtype, int] = defaultdict(int)
@@ -68,6 +82,10 @@ def _count_weights(
 
 
 def _format_model_info(model_info: ModelInfo) -> str:
+    # [FUNCTION DOC] HELPER: Render a ModelInfo as a markdown report string.
+    # Includes weight counts per dtype, inputs and outputs, FX node counts per op, call target
+    # counts sorted by count, and either a statement that all operators are registered or a list
+    # of dispatch failures grouped by operator with the first message and example node.
     """Format the information about the model."""
     lines = [
         textwrap.dedent(
@@ -144,6 +162,8 @@ def _format_model_info(model_info: ModelInfo) -> str:
 
 
 def _get_io_specs(exported_program: torch.export.ExportedProgram) -> tuple[dict, dict]:
+    # [FUNCTION DOC] HELPER: Collect user-visible input and output specs of an exported program.
+    # Returns two mappings from argument name to tensor metadata (or a symbolic type name).
     """Get the input and output specs of the exported program."""
 
     nodes: dict[str, torch.fx.Node] = {
@@ -173,6 +193,10 @@ def _log_spec_into_io_specs(
     nodes: dict[str, torch.fx.Node],
     inputs_or_outputs: dict[str, torch._export.serde.schema.TensorMeta | str],
 ) -> dict[str, torch._export.serde.schema.TensorMeta | str]:
+    # [FUNCTION DOC] HELPER: Add one input/output spec to a mapping and return that mapping.
+    # Constant arguments are skipped; symbolic int, float and bool arguments are recorded as
+    # type-name strings; others use the graph node's tensor metadata (mutating the mapping).
+    # Raises KeyError if the node or its tensor_meta entry is missing.
     # If dynamic is set to a constant input, it becomes a
     # symbolic argument, which is not a tensor.
     if isinstance(spec.arg, graph_signature.ConstantArgument):
@@ -204,6 +228,7 @@ def _log_spec_into_io_specs(
 def _count_fx_targets(
     exported_program: torch.export.ExportedProgram,
 ) -> defaultdict[str, int]:
+    # [FUNCTION DOC] HELPER: Count call_function nodes by string form of their target.
     """Count the number of targets for each node in the exported program."""
     fx_node_target_count: defaultdict[str, int] = defaultdict(int)
     for node in exported_program.graph.nodes:
@@ -217,6 +242,11 @@ def analyze(
     registry: _registration.ONNXRegistry | None = None,
     file=None,
 ) -> None:
+    # [FUNCTION DOC] Analyze ONNX export compatibility of an exported program and print a report.
+    # Builds a ModelInfo (using the torchlib registry if none given), tries to dispatch each
+    # call_function node and records failures (including unexpected dispatcher exceptions
+    # as formatted tracebacks), then prints the markdown report to the given file or standard
+    # output and flushes. Returns None.
     """Analyze the compatibility of the exported program."""
     # Get basic information about the model
     model_info = ModelInfo()
@@ -256,6 +286,8 @@ def analyze(
 def compare_ops(
     program_a: torch.export.ExportedProgram, program_b: torch.export.ExportedProgram
 ) -> tuple[set[str], set[str]]:
+    # [FUNCTION DOC] Return the operator targets unique to each of two exported programs.
+    # Result is a pair of sets: ops only in the first program, ops only in the second.
     """Compare and get unique ops in two exported programs.
 
     Args:

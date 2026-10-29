@@ -1,3 +1,6 @@
+# [MODULE DOC] Numeric constants for the ONNX exporters: archive proto name, base/min/max/
+# default opset versions (the TorchScript exporter has its own max), the constant folding
+# minimum opset, the issue tracker URL, and integer min/max bounds. Pure data.
 """Constant values used in ONNX."""
 
 ONNX_ARCHIVE_MODEL_PROTO_NAME = "__MODEL_PROTO"

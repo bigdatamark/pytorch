@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Deprecated stateless functional_call API for running a module with swapped
+# parameters and buffers. Contains a helper that expands tied-weight overrides, a
+# context manager that temporarily swaps tensors into a module and restores them (writing
+# back in-place changes), the deprecated public functional_call, and its implementation.
+# Superseded by torch.func.functional_call. No import-time side effects.
 import contextlib
 from typing import Any
 from typing_extensions import deprecated
@@ -15,6 +20,14 @@ def _untie_named_tensors_map(
     module: "torch.nn.Module",
     parameters_and_buffers: dict[str, Tensor],
 ) -> dict[str, Tensor]:
+    # [FUNCTION DOC] HELPER: Expand overrides so every name tied to a given tensor gets its value.
+    # Builds the groups of module names sharing one tensor (including duplicates), then
+    # returns a new dict (the input is not mutated) where each tied name receives the value
+    # supplied for any member of its group. Raises ValueError if different values were
+    # supplied for names in the same tied group.
+    # KNOWN ISSUE: the conflict check builds a set from every tied name of the group in the
+    #     given mapping, so a tied name missing from it would raise a lookup error
+    #     instead of the documented ValueError or being skipped.
     """
     Unties all tied tensors in the module to parameters_and_buffers.
 
@@ -103,6 +116,11 @@ def _reparametrize_module(
     strict: bool = False,
     stack_weights: bool = False,
 ):
+    # [FUNCTION DOC] HELPER: Context manager swapping module parameters/buffers for given tensors.
+    # Optionally untied first (tie_weights). If strict, raises RuntimeError listing missing
+    # and unexpected keys. Swaps tensors in (missing keys allowed), yields, and on exit
+    # swaps the originals back (reversed order when stack_weights). Any in-place replacement
+    # the module made to its tensors is written back into the caller's mapping (mutated).
     if tie_weights:
         untied_parameters_and_buffers = _untie_named_tensors_map(
             module, parameters_and_buffers
@@ -171,6 +189,10 @@ def functional_call(
     tie_weights: bool = True,
     strict: bool = False,
 ):
+    # [FUNCTION DOC] Deprecated wrapper (emits FutureWarning) that calls a module functionally.
+    # Forwards all arguments to _functional_call and returns the module output. See
+    # torch.func.functional_call for the replacement.
+    # KNOWN ISSUE: the docstring example calls with an empty tensor-constructor and no args.
     r"""Perform a functional call on the module by replacing the module parameters and buffers with the provided ones.
 
     .. warning::
@@ -249,6 +271,11 @@ def _functional_call(
     tie_weights: bool = True,
     strict: bool = False,
 ):
+    # [FUNCTION DOC] HELPER: Run a module with parameters and buffers temporarily replaced.
+    # Raises RuntimeError for TorchScript/traced modules or when tracing/scripting, and for
+    # DataParallel modules. A None args becomes an empty tuple and a non-tuple becomes a
+    # one-element tuple; None kwargs becomes an empty mapping. Calls the module inside the
+    # reparametrization context and returns its result.
     # TODO allow kwargs such as unsafe and others for parametrization
     if (
         torch.jit.is_tracing()

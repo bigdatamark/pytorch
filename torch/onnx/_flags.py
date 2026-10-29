@@ -1,3 +1,7 @@
+# [MODULE DOC] Experimental environment-variable feature flags for the ONNX exporter.
+# Import-time side effects: reads the process environment and, for each flag set to the
+# value 1, logs a warning (or error if deprecated). Defines ENABLE_DRAFT_EXPORT (default
+# False) and PREFER_DEFERRED_RUNTIME_ASSERTS_OVER_GUARDS (default True) as module booleans.
 """Internal feature flags for torch.onnx.
 
 NOTE: These flags are experimental only. Any flag here can be removed at any
@@ -18,6 +22,10 @@ def _load_boolean_flag(
     deprecated: bool = False,
     default: bool = False,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Read a boolean flag from an environment variable.
+    # The flag is on only when the variable equals the string 1; an unset variable yields
+    # default instead. A variable set to anything else is off, even if default is True.
+    # Logs an error for deprecated flags or a warning describing this_will when enabled.
     """Load a boolean flag from environment variable.
 
     Args:

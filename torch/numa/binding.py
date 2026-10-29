@@ -1,3 +1,10 @@
+# [MODULE DOC] NUMA binding support for worker processes (torchrun --numa-binding).
+# Public API: AffinityMode (node, socket, exclusive, core-complex) and the NumaOptions
+# dataclass. Internals pick the set of logical CPUs near the accelerator device used by a
+# worker by reading Linux sysfs topology files and the process CPU affinity, then either
+# prefix a command with the numactl tool or set the affinity of all threads of the current
+# process. Failures are reported through signpost events and logging, and are optionally
+# swallowed. Linux only. Import time only creates a logger and type variables.
 """
 In NUMA (Non-Uniform Memory Access) systems, accessing memory on remote NUMA
 nodes incurs additional latency. PyTorch provides NUMA binding utilities to
@@ -42,6 +49,10 @@ logger = getLogger(__name__)
 
 
 class AffinityMode(str, Enum):
+    # [CLASS DOC] String-valued enum of strategies for choosing CPUs near a worker's device.
+    # Members: NODE (all CPUs of the device's NUMA node), SOCKET (all CPUs of every NUMA node on
+    # that node's socket), EXCLUSIVE (an even share of the node's physical cores per device),
+    # CORE_COMPLEX (one group of cores sharing the last-level cache per device).
     NODE = "node"
     """
     Each worker process and its threads will be bound to all the CPUs
@@ -90,6 +101,9 @@ class AffinityMode(str, Enum):
 
 @dataclass(frozen=True)
 class NumaOptions:
+    # [CLASS DOC] Frozen dataclass of NUMA binding settings.
+    # Fields: affinity_mode (an AffinityMode) and should_fall_back_if_binding_fails (bool,
+    # default False) which, when True, makes binding errors get logged instead of raised.
     affinity_mode: AffinityMode
 
     should_fall_back_if_binding_fails: bool = False
@@ -108,6 +122,11 @@ def _maybe_wrap_command_args_with_numa_binding(
     device_index: int,
     numa_options: NumaOptions | None,
 ) -> tuple[str, ...]:
+    # [FUNCTION DOC] HELPER: Prefix a command with numactl pinning to the device's CPUs.
+    # Returns the command unchanged when numa_options is None. Otherwise computes the validated
+    # CPU set for device_index, builds the numactl-prefixed tuple, and emits a success
+    # signpost event. On any exception it goes through _handle_exception (which re-raises
+    # unless fallback is enabled) and then returns the original command.
     """
     Wraps command arguments with numactl to apply NUMA CPU binding.
 
@@ -170,6 +189,10 @@ def _maybe_wrap_with_numa_binding(
     device_index: int,
     numa_options: NumaOptions | None,
 ) -> Callable[_TParams, _TReturn]:
+    # [FUNCTION DOC] HELPER: Wrap a callable so NUMA binding is applied before each call.
+    # Returns func itself when numa_options is None. Otherwise returns a wrapper (preserving
+    # metadata) that first binds the current process threads for device_index and then
+    # calls func with the original arguments.
     """
     Wraps a function to apply NUMA CPU binding before execution.
 
@@ -192,6 +215,8 @@ def _maybe_wrap_with_numa_binding(
 
     @wraps(func)
     def wrapped(*args: _TParams.args, **kwargs: _TParams.kwargs) -> _TReturn:
+        # [FUNCTION DOC] HELPER: Apply NUMA binding to the current process, then call the wrapped
+        # function and return its result.
         _maybe_apply_numa_binding_to_current_process(
             device_index=device_index,
             # pyrefly: ignore [bad-argument-type]
@@ -205,6 +230,10 @@ def _maybe_wrap_with_numa_binding(
 def _maybe_apply_numa_binding_to_current_process(
     *, device_index: int, numa_options: NumaOptions
 ) -> None:
+    # [FUNCTION DOC] HELPER: Bind every thread of the current process to the device's CPUs.
+    # Computes and validates the CPU set, sets affinity for all threads, and emits a success
+    # signpost event. Exceptions are routed to _handle_exception (re-raised unless fallback
+    # is enabled). Returns None.
     kwargs = {
         "device_index": device_index,
         "numa_options": asdict(numa_options),
@@ -236,6 +265,9 @@ def _maybe_apply_numa_binding_to_current_process(
 def _assemble_numactl_command_args(
     *, original_command_args: tuple[str, ...], logical_cpu_indices: set[int]
 ) -> tuple[str, ...]:
+    # [FUNCTION DOC] HELPER: Build the argument tuple running a command under numactl.
+    # Result is numactl, a physcpubind option listing the CPUs as a compact range string,
+    # then the original arguments.
     return (
         "numactl",
         f"--physcpubind={_get_ranges_str_from_ints(logical_cpu_indices)}",
@@ -246,6 +278,9 @@ def _assemble_numactl_command_args(
 def _handle_exception(
     *, numa_options: NumaOptions, logger_kwargs: dict[str, object]
 ) -> None:
+    # [FUNCTION DOC] HELPER: Record and handle a failed NUMA binding; call only inside an except.
+    # Emits an exception signpost event with the traceback and logs the failure. If fallback is
+    # enabled it logs a warning and returns; otherwise it re-raises the active exception.
     signpost_event(
         category="numa_binding",
         name="apply_exception",
@@ -271,6 +306,9 @@ def _get_validated_logical_cpus_to_bind_to(
     device_index: int,
     numa_options: NumaOptions,
 ) -> set[int]:
+    # [FUNCTION DOC] HELPER: Compute the CPU set for a device and check it is usable.
+    # Returns the set of logical CPU indices; raises RuntimeError (from the validator) if
+    # numactl is missing or the set is empty.
     logical_cpu_indices = _get_logical_cpus_to_bind_to(
         device_index=device_index, numa_options=numa_options
     )
@@ -280,6 +318,8 @@ def _get_validated_logical_cpus_to_bind_to(
 
 
 def _raise_if_binding_invalid(*, logical_cpu_indices: set[int]) -> None:
+    # [FUNCTION DOC] HELPER: Raise RuntimeError if the numactl tool is not on PATH or the CPU set
+    # is empty.
     # NOTE: numactl CLI is only actually necessary for the str entrypoint path,
     # but for simplicity we will just check it no matter what.
     if shutil.which("numactl") is None:
@@ -292,6 +332,11 @@ def _raise_if_binding_invalid(*, logical_cpu_indices: set[int]) -> None:
 def _bind_all_threads_in_current_process_to_logical_cpus(
     *, logical_cpu_indices: set[int]
 ) -> None:
+    # [FUNCTION DOC] HELPER: Set CPU affinity of all threads in this process (Linux only).
+    # First binds the calling thread (errors propagate). Then walks the task entries of the
+    # process and sets affinity for each thread whose current affinity still equals the
+    # calling thread's original affinity (threads already customized are left alone).
+    # Per-thread errors, for example exited threads, are ignored.
     # Save the original affinity of the main thread before changing it
     # pyrefly: ignore [missing-attribute]
     original_main_thread_affinity = os.sched_getaffinity(0)  # type: ignore[attr-defined]
@@ -322,6 +367,9 @@ def _get_logical_cpus_to_bind_to(
     device_index: int,
     numa_options: NumaOptions,
 ) -> set[int]:
+    # [FUNCTION DOC] HELPER: Dispatch on the affinity mode to choose CPUs for a device.
+    # Returns the set of logical CPU indices from the strategy function matching the mode.
+    # Raises ValueError for an unsupported mode.
     """
     Args:
         device_index: The index of the accelerator device that will be used by the subprocess.
@@ -348,6 +396,7 @@ def _get_logical_cpus_to_bind_to(
 
 
 def _node_get_logical_cpus_to_bind_to(*, device_index: int) -> set[int]:
+    # [FUNCTION DOC] HELPER: Node strategy: all allowed CPUs of the device's NUMA node.
     """
     Core logic of 'node' numa strategy.
     """
@@ -359,6 +408,8 @@ def _node_get_logical_cpus_to_bind_to(*, device_index: int) -> set[int]:
 
 
 def _socket_get_logical_cpus_to_bind_to(*, device_index: int) -> set[int]:
+    # [FUNCTION DOC] HELPER: Socket strategy: union of allowed CPUs over all NUMA nodes that share
+    # a socket with the NUMA node of the device.
     """
     Core logic of 'socket' numa strategy.
     """
@@ -384,6 +435,11 @@ def _socket_get_logical_cpus_to_bind_to(*, device_index: int) -> set[int]:
 
 
 def _exclusive_get_logical_cpus_to_bind_to(*, device_index: int) -> set[int]:
+    # [FUNCTION DOC] HELPER: Exclusive strategy: give each device on the node its own cores.
+    # Groups the node's allowed logical CPUs by physical core, orders cores, and splits them
+    # into contiguous slices across the node's sorted device indices (leftover cores go one
+    # each to the first devices). Returns the logical CPUs of this device's slice. Raises
+    # RuntimeError if there are fewer physical cores than devices on the node.
     """
     Core logic of 'exclusive' numa strategy.
     """
@@ -452,6 +508,13 @@ def _exclusive_get_logical_cpus_to_bind_to(*, device_index: int) -> set[int]:
 
 
 def _core_complex_get_logical_cpus_to_bind_to(*, device_index: int) -> set[int]:
+    # [FUNCTION DOC] HELPER: Core-complex strategy: give each device one last-level-cache group.
+    # Groups the node's allowed CPUs by the CPUs sharing their highest-level data or unified
+    # cache, orders groups by size (largest first, then lowest index), and picks the group by
+    # the device's rank among the node's devices, wrapping around if there are more devices
+    # than groups. Returns that group's CPU set.
+    # KNOWN ISSUE: a CPU with no readable cache data yields an empty sharing set, which makes
+    # the group-key computation fail with an error from taking the minimum of an empty set.
     """
     Core logic of 'core-complex' numa strategy.
 
@@ -503,6 +566,7 @@ V = TypeVar("V")
 
 
 def _group_by(values: Iterable[V], get_key: Callable[[V], K]) -> dict[K, set[V]]:
+    # [FUNCTION DOC] HELPER: Group values by a key function into a mapping from key to set.
     """
     Groups elements with same key into sets.
     """
@@ -516,6 +580,8 @@ def _group_by(values: Iterable[V], get_key: Callable[[V], K]) -> dict[K, set[V]]
 def _get_logical_cpu_indices_sharing_same_physical_core_as(
     *, logical_cpu_index: int
 ) -> set[int]:
+    # [FUNCTION DOC] HELPER: Read from sysfs the hyperthread sibling CPUs of a CPU.
+    # Returns a set of CPU indices (including the CPU). Raises a file error if sysfs is missing.
     thread_siblings_list_absolute_path = (
         f"/sys/devices/system/cpu/cpu{logical_cpu_index}/topology/thread_siblings_list"
     )
@@ -526,6 +592,9 @@ def _get_logical_cpu_indices_sharing_same_physical_core_as(
 def _get_logical_cpus_sharing_same_max_level_cache_as(
     *, logical_cpu_index: int
 ) -> set[int]:
+    # [FUNCTION DOC] HELPER: Find the CPUs sharing the highest-level data/unified cache with a CPU.
+    # Scans the cache entries under sysfs for the CPU, skipping instruction caches, keeps the
+    # entry with the highest level, and returns its shared CPU set (empty if none found).
     cpu_cache_dir_absolute_path = (
         f"/sys/devices/system/cpu/cpu{logical_cpu_index}/cache"
     )
@@ -562,6 +631,7 @@ def _get_logical_cpus_sharing_same_max_level_cache_as(
 
 
 def _get_allowed_logical_cpu_indices_for_numa_node(*, numa_node_index: int) -> set[int]:
+    # [FUNCTION DOC] HELPER: CPUs of a NUMA node intersected with the current thread's allowed set.
     all_cpu_indices = _get_cpu_indices_for_numa_node_MAYBE_NOT_ALLOWED(
         numa_node_index=numa_node_index
     )
@@ -572,6 +642,8 @@ def _get_allowed_logical_cpu_indices_for_numa_node(*, numa_node_index: int) -> s
 def _get_cpu_indices_for_numa_node_MAYBE_NOT_ALLOWED(
     *, numa_node_index: int
 ) -> set[int]:
+    # [FUNCTION DOC] HELPER: Read all CPU indices of a NUMA node from sysfs, ignoring affinity.
+    # Raises RuntimeError if the node's cpulist file does not exist.
     """
     Returns:
         Indices of all CPUs associated with numa_node_index. However, the list
@@ -589,10 +661,15 @@ def _get_cpu_indices_for_numa_node_MAYBE_NOT_ALLOWED(
 
 
 def _get_device_count() -> int:
+    # [FUNCTION DOC] HELPER: Return the number of accelerator devices.
     return torch.accelerator.device_count()
 
 
 def _get_numa_node_index_for_device_index(*, device_index: int) -> int:
+    # [FUNCTION DOC] HELPER: Map an accelerator device index to its NUMA node via PCI sysfs info.
+    # Raises RuntimeError if no accelerator is available. Builds the PCI address from the
+    # device properties and reads the numa_node file; negative values (single-node systems)
+    # become 0. File errors propagate.
     if not torch.accelerator.is_available():
         raise RuntimeError("No accelerator available for NUMA binding")
     acc = torch.accelerator.current_accelerator()
@@ -615,6 +692,7 @@ def _get_numa_node_index_for_device_index(*, device_index: int) -> int:
 
 
 def _get_device_indices_for_numa_node(*, numa_node_index: int) -> set[int]:
+    # [FUNCTION DOC] HELPER: Device indices whose PCI-reported NUMA node equals the given one.
     return {
         device_index
         for device_index in range(_get_device_count())
@@ -624,6 +702,9 @@ def _get_device_indices_for_numa_node(*, numa_node_index: int) -> set[int]:
 
 
 def _get_socket_index_for_numa_node(*, numa_node_index: int) -> int:
+    # [FUNCTION DOC] HELPER: Socket index of a NUMA node, taken from its lowest allowed CPU.
+    # KNOWN ISSUE: raises an error from taking the minimum of an empty set if the node has no
+    # CPUs allowed for this process.
     arbitrary_cpu_index = _get_arbitrary_allowed_cpu_index_for_numa_node(
         numa_node_index=numa_node_index
     )
@@ -632,6 +713,8 @@ def _get_socket_index_for_numa_node(*, numa_node_index: int) -> int:
 
 
 def _get_socket_index_for_cpu(*, cpu_index: int) -> int:
+    # [FUNCTION DOC] HELPER: Read a CPU's physical package (socket) id from sysfs.
+    # Raises RuntimeError if the topology file does not exist.
     package_id_absolute_path = (
         f"/sys/devices/system/cpu/cpu{cpu_index}/topology/physical_package_id"
     )
@@ -643,12 +726,16 @@ def _get_socket_index_for_cpu(*, cpu_index: int) -> int:
 
 
 def _get_arbitrary_allowed_cpu_index_for_numa_node(*, numa_node_index: int) -> int:
+    # [FUNCTION DOC] HELPER: Lowest allowed CPU index in a NUMA node (raises if none are allowed).
     return min(
         _get_allowed_logical_cpu_indices_for_numa_node(numa_node_index=numa_node_index)
     )
 
 
 def _get_set_of_int_from_ranges_str(ranges_str: str) -> set[int]:
+    # [FUNCTION DOC] HELPER: Parse a sysfs range list such as zero-to-two, four, six-to-seven.
+    # Splits on commas, ignores empty items, expands inclusive ranges, and returns a set of
+    # ints. Raises ValueError on malformed numbers.
     """
     Util for parsing a string of int ranges, as in a sysfs file.
 
@@ -673,6 +760,9 @@ def _get_set_of_int_from_ranges_str(ranges_str: str) -> set[int]:
 
 
 def _get_ranges_str_from_ints(ints: Iterable[int]) -> str:
+    # [FUNCTION DOC] HELPER: Format integers as a compact comma-separated range string.
+    # Sorts the values and collapses consecutive runs into start-end items; empty input gives
+    # an empty string. Inverse of the range-string parser.
     """
     Convert a set of integers to a compact string with ranges.
 
@@ -709,6 +799,7 @@ def _get_ranges_str_from_ints(ints: Iterable[int]) -> str:
 
 
 def _get_systemwide_numa_node_indices() -> set[int]:
+    # [FUNCTION DOC] HELPER: Read the set of possible NUMA node indices on this system from sysfs.
     with open("/sys/devices/system/node/possible") as f:
         possible_nodes_str = f.read()
 
@@ -716,6 +807,8 @@ def _get_systemwide_numa_node_indices() -> set[int]:
 
 
 def _get_numa_node_indices_for_socket_index(*, socket_index: int) -> set[int]:
+    # [FUNCTION DOC] HELPER: NUMA nodes on the system whose socket equals the given socket index.
+    # Determines each node's socket from its lowest allowed CPU.
     systemwide_numa_node_indices = _get_systemwide_numa_node_indices()
 
     matching_numa_node_indices = set()
@@ -730,6 +823,7 @@ def _get_numa_node_indices_for_socket_index(*, socket_index: int) -> set[int]:
 
 
 def _get_allowed_cpu_indices_for_current_thread() -> set[int]:
+    # [FUNCTION DOC] HELPER: Return the CPU affinity set of the current thread (Linux only).
     # 0 denotes current thread
     # pyrefly: ignore [missing-attribute]
     return os.sched_getaffinity(0)  # type:ignore[attr-defined]
