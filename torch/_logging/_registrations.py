@@ -1,3 +1,11 @@
+# [MODULE DOC] Declarative registry of PyTorch log components and artifacts. Purely import-time
+# side effects: calls register_log to map short log names (dynamo, aot, inductor, dynamic,
+# distributed, ddp, fsdp, export, onnx, ...) to lists of logger module names, and
+# register_artifact to declare named artifact logs (graphs, guards, bytecode, recompiles,
+# graph_breaks, output_code, autotuning, ...) with a help string and optional flags: visible
+# (shown in help), off_by_default, and log_format. Defines the shared lists DYNAMIC and
+# DISTRIBUTED of module names reused by several registrations.
+# KNOWN ISSUE: the loop_tiling artifact help string says "loop ordering" (copy of loop_ordering).
 from ._internal import register_artifact, register_log
 
 

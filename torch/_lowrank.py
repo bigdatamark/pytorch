@@ -1,3 +1,7 @@
+# [MODULE DOC] Randomized low-rank linear algebra (Halko et al. 2009): approximate range basis,
+# low-rank SVD (svd_lowrank) and low-rank PCA (pca_lowrank), supporting dense, batched and
+# sparse inputs and torch function overrides. Public exports: svd_lowrank, pca_lowrank.
+# No import-time side effects.
 """Implement various linear algebra algorithms for low rank matrices."""
 
 __all__ = ["svd_lowrank", "pca_lowrank"]
@@ -14,6 +18,11 @@ def get_approximate_basis(
     niter: int | None = 2,
     M: Tensor | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Computes a tensor Q with q orthonormal columns approximating the range of A
+    # (or of A minus M) via randomized subspace iteration. Draws a random Gaussian matrix
+    # (consumes RNG state), multiplies by A, orthonormalizes with QR, then runs niter rounds
+    # alternating between A-conjugate-transpose and A with QR each time. niter of None means 2;
+    # M, if given, is subtracted implicitly without forming A - M. Returns Q.
     """Return tensor :math:`Q` with :math:`q` orthonormal columns such
     that :math:`Q Q^H A` approximates :math:`A`. If :math:`M` is
     specified, then :math:`Q` is such that :math:`Q Q^H (A - M)`
@@ -88,6 +97,9 @@ def svd_lowrank(
     niter: int | None = 2,
     M: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
+    # [FUNCTION DOC] Public entry point for randomized low-rank SVD of A (optionally of A - M).
+    # Dispatches to a torch function override when A or M is a non-Tensor type with an override
+    # (skipped under scripting); otherwise calls _svd_lowrank. Returns (U, S, V).
     r"""Return the singular value decomposition ``(U, S, V)`` of a matrix,
     batches of matrices, or a sparse matrix :math:`A` such that
     :math:`A \approx U \operatorname{diag}(S) V^{\text{H}}`. In case :math:`M` is given, then
@@ -152,6 +164,11 @@ def _svd_lowrank(
     niter: int | None = 2,
     M: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
+    # [FUNCTION DOC] HELPER: Implementation of randomized SVD (Algorithm 5.1, Halko et al.).
+    # q defaults to 6 if None. M is broadcast to A's shape. If A is wide (rows < columns) both
+    # are conjugate-transposed so A is tall, and U and V are swapped back at the end. Builds an
+    # approximate basis Q, projects A (minus M) to a small matrix B, takes its full-matrices-off
+    # SVD, and lifts U by Q. Returns (U, S, V). Consumes RNG state.
     # Algorithm 5.1 in Halko et al., 2009
 
     q = 6 if q is None else q
@@ -186,6 +203,12 @@ def pca_lowrank(
     center: bool = True,
     niter: int = 2,
 ) -> tuple[Tensor, Tensor, Tensor]:
+    # [FUNCTION DOC] Randomized low-rank PCA of A (dense, batched or sparse). Dispatches to a
+    # torch function override when applicable. q defaults to min(6, rows, columns). Raises
+    # ValueError if q is outside 0..min(rows, columns), if niter is negative, or if a sparse
+    # input with centering is not 2-dimensional. With center false, runs the low-rank SVD
+    # directly. With center true, dense inputs have column means subtracted; sparse inputs build a
+    # sparse mean matrix passed as M. Returns (U, S, V).
     r"""Performs linear Principal Component Analysis (PCA) on a low-rank
     matrix, batches of such matrices, or sparse matrix.
 

@@ -1,3 +1,10 @@
+# [MODULE DOC] Defines the open-source "signpost" scribe logger used to record CI/workflow events.
+# Tries to import make_scribe_logger from the optional fbscribelogger package; if unavailable,
+# defines type aliases (TAtom, TField, TLazyField) and a no-op make_scribe_logger fallback whose
+# returned logger accepts keyword fields and discards them.
+# Import-time side effect: creates the module-level open_source_signpost logger from an embedded
+# thrift schema (TorchOpenSourceSignpostLogEntry: commit/GitHub run metadata, name, parameters,
+# subsystem, time, weight).
 from collections.abc import Callable
 from typing import TypeAlias
 
@@ -12,7 +19,11 @@ except ImportError:
     TLazyField: TypeAlias = TField | Callable[[], TField]
 
     def make_scribe_logger(name: str, thrift_src: str) -> Callable[..., None]:
+        # [FUNCTION DOC] Fallback used when fbscribelogger is missing. Ignores the logger name and
+        # thrift schema text and returns a logger callable that accepts any keyword fields and
+        # does nothing. No I/O or state.
         def inner(**kwargs: TLazyField) -> None:
+            # [FUNCTION DOC] HELPER: No-op logger; discards all keyword fields and returns None.
             pass
 
         return inner

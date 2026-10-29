@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Core of PyTorch's logging subsystem. Holds the registry of log components and
+# artifacts (LogRegistry/log_registry), the user-requested state (LogState/log_state), parsing of
+# the TORCH_LOGS, TORCH_LOGS_OUT, TORCH_LOGS_FORMAT and TORCH_TRACE environment variables, the
+# public set_logs API, custom formatters/filters/handlers, artifact loggers, and structured
+# tracing (trace_structured and the lazily created trace file handler).
+# Import-time side effects: creates module loggers (including the synthetic torch.__trace logger),
+# the global registry and state objects, and defines environment variable name constants.
 import contextlib
 import errno
 import functools
@@ -63,6 +70,11 @@ LOG_PREFIX = "dedicated_log_torch_trace_"
 
 @dataclass
 class LogRegistry:
+    # [CLASS DOC] Global registry of what can be logged: aliases mapping to logger qualified
+    # names, artifact names with descriptions, visibility and off-by-default flags, per-artifact
+    # formatters, and lazily discovered artifact logger and child logger names.
+    # Populated by register_log / register_artifact and by artifact logger creation; read when
+    # applying log state. Single module-level instance: log_registry.
     # shorthand name to log qualified name
     # Note: this only contains loggers registered
     # from register_log
@@ -100,13 +112,17 @@ class LogRegistry:
     artifact_log_formatters: dict[str, logging.Formatter] = field(default_factory=dict)
 
     def is_artifact(self, name):
+        # [FUNCTION DOC] HELPER: True if name is a registered artifact name.
         return name in self.artifact_names
 
     def is_log(self, alias):
+        # [FUNCTION DOC] HELPER: True if alias is a registered log alias.
         return alias in self.log_alias_to_log_qnames
 
     # register a log with an alias
     def register_log(self, alias, log_qnames: str | list[str]) -> None:
+        # [FUNCTION DOC] Associates an alias with one logger name or a list of logger names
+        # (a single string is wrapped in a list). Overwrites any previous mapping for the alias.
         if isinstance(log_qnames, str):
             log_qnames = [log_qnames]
         self.log_alias_to_log_qnames[alias] = log_qnames
@@ -115,6 +131,9 @@ class LogRegistry:
     def register_artifact_name(
         self, name, description, visible, off_by_default, log_format
     ) -> None:
+        # [FUNCTION DOC] Records an artifact: adds its name, stores its description, marks it
+        # visible and/or off-by-default per the flags, and, if log_format is not None, creates and
+        # stores a logging formatter for it from that format string.
         self.artifact_names.add(name)
         if visible:
             self.visible_artifacts.add(name)
@@ -132,27 +151,38 @@ class LogRegistry:
     # this is needed to know which logs need to be reset
     # whenever the log_state is changed
     def register_artifact_log(self, artifact_log_qname) -> None:
+        # [FUNCTION DOC] HELPER: Remembers the qualified name of an artifact logger.
         self.artifact_log_qnames.add(artifact_log_qname)
 
     def register_child_log(self, log_qname) -> None:
+        # [FUNCTION DOC] HELPER: Remembers a user-specified child logger of a registered log.
         self.child_log_qnames.add(log_qname)
 
     # flattens all the qnames together (TODO: consider memoizing?)
     def get_log_qnames(self) -> set[str]:
+        # [FUNCTION DOC] Returns the set of all logger names across all registered aliases.
         return set(itertools.chain.from_iterable(self.log_alias_to_log_qnames.values()))
 
     def get_artifact_log_qnames(self):
+        # [FUNCTION DOC] HELPER: Returns a copy of the set of artifact logger names.
         return set(self.artifact_log_qnames)
 
     def get_child_log_qnames(self):
+        # [FUNCTION DOC] HELPER: Returns a copy of the set of child logger names.
         return set(self.child_log_qnames)
 
     def is_off_by_default(self, artifact_qname):
+        # [FUNCTION DOC] HELPER: True if the named artifact is registered as off by default.
+        # (Note: keyed by artifact name, not logger qualified name, despite the argument name.)
         return artifact_qname in self.off_by_default_artifact_names
 
 
 @dataclass
 class LogState:
+    # [CLASS DOC] Mutable record of the user's current logging request: mapping from logger
+    # qualified name to requested level, and the set of enabled artifact names. Updated by
+    # set_logs or TORCH_LOGS parsing and consumed when configuring loggers. Single module-level
+    # instance: log_state.
     # qualified log names -> currently set log level
     log_qname_to_level: dict[str, str] = field(default_factory=dict)
 
@@ -160,18 +190,23 @@ class LogState:
     artifact_names: set[str] = field(default_factory=set)
 
     def enable_artifact(self, artifact_name) -> None:
+        # [FUNCTION DOC] HELPER: Marks an artifact as enabled.
         self.artifact_names.add(artifact_name)
 
     def is_artifact_enabled(self, name):
+        # [FUNCTION DOC] HELPER: True if the artifact is currently enabled.
         return name in self.artifact_names
 
     def enable_log(self, log_qnames, log_level) -> None:
+        # [FUNCTION DOC] Sets the requested level for one logger name or each name in a list,
+        # overwriting any previous level for those names.
         if isinstance(log_qnames, str):
             log_qnames = [log_qnames]
         for log_qname in log_qnames:
             self.log_qname_to_level[log_qname] = log_level
 
     def get_log_level_pairs(self):
+        # [FUNCTION DOC] Returns a view of (logger name, level) pairs the user explicitly set.
         """Returns all qualified module names for which the user requested
         explicit logging settings.
 
@@ -186,6 +221,7 @@ class LogState:
         return self.log_qname_to_level.items()
 
     def clear(self) -> None:
+        # [FUNCTION DOC] HELPER: Resets the state, dropping all requested levels and artifacts.
         self.log_qname_to_level.clear()
         self.artifact_names.clear()
 
@@ -267,6 +303,15 @@ def set_logs(
     caching: bool = False,
     partitioned_scatter: bool = False,
 ) -> None:
+    # [FUNCTION DOC] Public API to set component log levels and toggle artifacts via keyword
+    # arguments (all maps to the torch root logger; modules supplies extra name-to-value pairs,
+    # including unregistered modules). If the TORCH_LOGS environment variable is set, only warns
+    # and returns. Otherwise clears log_state, validates each value (artifacts need a bool; logs
+    # need a valid logging level; unregistered valid module names are registered, with
+    # submodules, and given the level), updates log_state, then reinitializes loggers.
+    # Raises ValueError for wrong types, bad levels or unknown names.
+    # KNOWN ISSUE: the docstring omits several accepted arguments (e.g. compute_dependencies,
+    # partitioned_scatter).
     """
     Sets the log level for individual components and toggles individual log
     artifact types.
@@ -505,6 +550,9 @@ def set_logs(
     modules = modules or {}
 
     def _set_logs(**kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Applies each keyword (and each entry of modules) to log_state,
+        # skipping None values; validates as described in set_logs, raising ValueError on
+        # invalid input; finally calls _init_logs to apply the new state to loggers.
         for alias, val in itertools.chain(kwargs.items(), modules.items()):  # type: ignore[union-attr]
             if val is None:
                 continue
@@ -607,6 +655,8 @@ def set_logs(
 
 
 def get_loggers() -> list[logging.Logger]:
+    # [FUNCTION DOC] Returns logging.Logger objects for every logger name registered through any
+    # alias (order unspecified).
     """
     Returns: a list of all registered loggers
     """
@@ -614,6 +664,8 @@ def get_loggers() -> list[logging.Logger]:
 
 
 def register_log(setting_name, log_name) -> None:
+    # [FUNCTION DOC] Registers a log alias (setting_name) for one logger name or list of names in
+    # the global registry so it can be controlled by TORCH_LOGS and set_logs.
     """
     Enables a log to be controlled by the env var and user API with the setting_name
     Args:
@@ -626,6 +678,8 @@ def register_log(setting_name, log_name) -> None:
 def register_artifact(
     setting_name, description, visible=False, off_by_default=False, log_format=None
 ) -> None:
+    # [FUNCTION DOC] Registers an artifact name in the global registry with a description and the
+    # visible, off_by_default and optional log_format settings (see LogRegistry).
     """
     Enables an artifact to be controlled by the env var and user API with name
     Args:
@@ -641,6 +695,10 @@ def register_artifact(
 
 
 def getArtifactLogger(module_qname, artifact_name) -> logging.Logger:
+    # [FUNCTION DOC] Returns the logger for an artifact within a module. The logger name is the
+    # module name plus a double-underscore-prefixed artifact suffix. Raises ValueError if the
+    # artifact is not registered. Side effects: tags the logger with its artifact_name,
+    # records its name in the registry, and applies configure_artifact_log.
     if artifact_name not in log_registry.artifact_names:
         raise ValueError(
             f"Artifact name: {repr(artifact_name)} not registered,"
@@ -664,6 +722,9 @@ VERBOSITY_REGEX = (
 
 
 def configure_artifact_log(log) -> None:
+    # [FUNCTION DOC] Adjusts an artifact logger to current state: off-by-default artifacts stop
+    # propagating to ancestors; artifacts explicitly enabled in log_state get level DEBUG and
+    # propagation turned back on. Mutates the logger.
     # If the artifact is off by default, then it should only be logged when explicitly
     # enabled; set propagate to False so that this artifact is not propagated
     # to its ancestor logger
@@ -678,15 +739,24 @@ def configure_artifact_log(log) -> None:
 
 # match a comma separated list of loggable names (whitespace allowed after commas)
 def _gen_settings_regex():
+    # [FUNCTION DOC] HELPER: Builds the compiled regex for a comma separated list of names, each
+    # optionally prefixed by a plus or minus sign, with whitespace allowed after commas.
     return re.compile(r"((\+|-)?[\w\.]+,\s*)*(\+|-)?[\w\.]+?")
 
 
 def _validate_settings(settings):
+    # [FUNCTION DOC] HELPER: True if the whole settings string matches the settings regex.
     return re.fullmatch(_gen_settings_regex(), settings) is not None
 
 
 def help_message(verbose=False):
+    # [FUNCTION DOC] Builds the TORCH_LOGS help text: usage examples plus a heading and list of
+    # settings (the alias all, sorted log aliases, and artifacts with descriptions). With verbose
+    # true lists all artifacts, otherwise only visible ones. Returns the string.
+    # Raises AssertionError if an artifact name is longer than 30 characters.
     def pad_to(s, length=30):
+        # [FUNCTION DOC] HELPER: Right-pads a string with spaces to the given length; raises
+        # AssertionError if the string is longer.
         if len(s) > length:
             raise AssertionError(f"string length {len(s)} exceeds max {length}")
         return s + " " * (length - len(s))
@@ -749,6 +819,8 @@ TORCH_LOGS Info
 
 
 def _invalid_settings_err_msg(settings, verbose=False):
+    # [FUNCTION DOC] HELPER: Builds the error message for invalid log settings, listing the sorted
+    # valid settings (all, log aliases, artifact names). The verbose argument is unused.
     valid_settings = (
         ["all"]
         + list(log_registry.log_alias_to_log_qnames.keys())
@@ -766,6 +838,9 @@ Valid settings:
 
 
 def process_env_var_string_for_windows(env_var_str: str) -> str:
+    # [FUNCTION DOC] HELPER: On Windows only, strips one pair of matching outer single or double
+    # quotes from the string (the shell keeps them in the variable); other platforms return the
+    # string unchanged.
     """
     When we setup logging config as guide: https://docs.pytorch.org/docs/stable/logging.html
     Such as:
@@ -792,6 +867,7 @@ def process_env_var_string_for_windows(env_var_str: str) -> str:
     _IS_WINDOWS = sys.platform == "win32"
 
     def remove_outer_quotes(s: str) -> str:
+        # [FUNCTION DOC] HELPER: Removes one pair of matching outer quotes if present.
         if len(s) >= 2 and (
             (s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")
         ):
@@ -806,6 +882,15 @@ def process_env_var_string_for_windows(env_var_str: str) -> str:
 
 @functools.lru_cache
 def _parse_log_settings(settings):
+    # [FUNCTION DOC] HELPER: Parses a TORCH_LOGS string (cached per string) into a new LogState.
+    # Empty string yields an empty dict (not a LogState). The strings help and +help raise a
+    # ValueError carrying the help text. Invalid syntax or unknown names raise ValueError.
+    # Each comma separated name has an optional prefix: plus means DEBUG, minus means ERROR,
+    # none means INFO; all means the torch root logger. Names resolve to a log alias (level set),
+    # an artifact (enabled), or an importable module (it and submodules registered, as logs or
+    # child logs, as a side effect on the global registry).
+    # KNOWN ISSUE: returns a plain dict for empty settings but LogState otherwise; the level None
+    # assertion can never fire.
     settings = process_env_var_string_for_windows(settings)
 
     if settings == "":
@@ -822,6 +907,8 @@ def _parse_log_settings(settings):
     log_names = settings.split(",")
 
     def get_name_level_pair(name):
+        # [FUNCTION DOC] HELPER: Splits a setting into its bare name and level based on the
+        # leading plus (DEBUG), minus (ERROR) or neither (INFO) character.
         clean_name = name.replace(INCR_VERBOSITY_CHAR, "")
         clean_name = clean_name.replace(DECR_VERBOSITY_CHAR, "")
 
@@ -865,11 +952,15 @@ def _parse_log_settings(settings):
 
 
 def _is_valid_module(qname):
+    # [FUNCTION DOC] HELPER: True if the dotted name can be located as an importable module.
     spec = importlib.util.find_spec(qname)
     return spec is not None
 
 
 def _get_module_and_submodules(qname: str) -> Sequence[str] | None:
+    # [FUNCTION DOC] HELPER: Returns None if the module cannot be found. Otherwise returns a list
+    # starting with the module name; if it is a package, imports it and appends all its
+    # submodules found by walking the package path recursively.
     """
     Get a module and all its submodules (recursively).
 
@@ -902,6 +993,8 @@ def _get_module_and_submodules(qname: str) -> Sequence[str] | None:
 
 
 def _update_log_state_from_env() -> None:
+    # [FUNCTION DOC] HELPER: If TORCH_LOGS is set, replaces the global log_state with the result
+    # of parsing it (may raise ValueError on bad settings). Otherwise leaves state unchanged.
     global log_state
     log_setting = os.environ.get(LOG_ENV_VAR, None)
     if log_setting is not None:
@@ -909,6 +1002,8 @@ def _update_log_state_from_env() -> None:
 
 
 def _has_registered_parent(log_qname) -> bool:
+    # [FUNCTION DOC] HELPER: True if the logger itself or any ancestor in the logger hierarchy has
+    # a name registered in the registry.
     cur_log = logging.getLogger(log_qname)
 
     registered_log_qnames = log_registry.get_log_qnames()
@@ -923,6 +1018,8 @@ def _has_registered_parent(log_qname) -> bool:
 
 @functools.lru_cache
 def _make_module_path_relative(abs_path: str, sys_path: tuple[str, ...]) -> str:
+    # [FUNCTION DOC] HELPER: Cached. Resolves the path and returns it relative to the first entry
+    # of sys_path that contains it, or the resolved absolute path if none does.
     """
     The string manipulation here is fairly expensive and we expect very high
     cache hit rates. Because `sys.path` changes very infrequently it's most
@@ -946,6 +1043,8 @@ def _make_module_path_relative(abs_path: str, sys_path: tuple[str, ...]) -> str:
 
 
 def make_module_path_relative(abs_path: str) -> str:
+    # [FUNCTION DOC] Converts an absolute module file path to one relative to a Python search
+    # path, using the current sys.path (as a tuple, for cache keying).
     """
     Given an absolute filepath corresponding to a Python module which was
     loaded via normal import mechanisms using sys.path, convert it into
@@ -956,14 +1055,28 @@ def make_module_path_relative(abs_path: str) -> str:
 
 # apply custom formats to artifacts when necessary
 class TorchLogsFormatter(logging.Formatter):
+    # [CLASS DOC] Formatter producing glog-style lines: rank prefix, level letter, timestamp,
+    # process id, relative file path and line, trace id and artifact tag. Delegates to a custom
+    # per-artifact formatter if one is registered. In trace mode, emits the record's metadata as
+    # JSON followed by its indented payload. State: whether trace mode is on and an optional
+    # set of trace ids; lines whose trace id is not in the set render as empty strings.
     def __init__(
         self, *, trace: bool = False, trace_id_filter: set[str] | None = None
     ) -> None:
+        # [FUNCTION DOC] Stores trace mode flag and optional trace id filter set.
         super().__init__()
         self._is_trace = trace
         self._trace_id_filter = trace_id_filter
 
     def format(self, record):
+        # [FUNCTION DOC] Formats a log record. Uses the artifact-specific formatter when the
+        # record's logger has an artifact with one. Otherwise builds message text (plus exception
+        # text and stack info; graph_breaks exceptions only when dynamo verbose is set), then the
+        # prefix. Returns an empty string if a trace id filter is set and the record's trace id
+        # is not in it. Trace mode requires an empty message and returns the prefix, JSON
+        # metadata and indented payload lines; normal mode prefixes every message line.
+        # Sets extra attributes on the record (rankprefix, traceid, artifactprefix, asctime).
+        # Raises AssertionError if a trace record has a non-empty message.
         artifact_name = getattr(logging.getLogger(record.name), "artifact_name", None)
         if artifact_name is not None:
             artifact_formatter = log_registry.artifact_log_formatters.get(
@@ -1047,6 +1160,10 @@ class TorchLogsFormatter(logging.Formatter):
 
 
 def _default_formatter():
+    # [FUNCTION DOC] HELPER: Builds the default formatter from environment variables. With no
+    # TORCH_LOGS_FORMAT, returns a TorchLogsFormatter using the comma separated trace id filter
+    # from TORCH_LOGS_TRACE_ID_FILTER. Otherwise a plain logging formatter (short or basic maps
+    # to the standard basic format).
     fmt = os.environ.get(LOG_FORMAT_ENV_VAR, None)
     trace_id_filter = {
         item.strip()
@@ -1065,6 +1182,8 @@ DEFAULT_FORMATTER = _default_formatter()
 
 
 class _StderrHandler(logging.Handler):
+    # [CLASS DOC] HELPER: Console handler that always writes to the current sys.stderr (looked up
+    # on each use) rather than a stream captured at creation; emits one line per record.
     """
     A logging handler that follows the current sys.stderr.
 
@@ -1077,9 +1196,12 @@ class _StderrHandler(logging.Handler):
 
     @property
     def stream(self) -> Any:
+        # [FUNCTION DOC] HELPER: Property returning the current sys.stderr.
         return sys.stderr
 
     def flush(self) -> None:
+        # [FUNCTION DOC] HELPER: Under the handler lock, flushes the current stderr if it has a
+        # flush method.
         self.acquire()
         try:
             stream = self.stream
@@ -1089,6 +1211,8 @@ class _StderrHandler(logging.Handler):
             self.release()
 
     def emit(self, record: logging.LogRecord) -> None:
+        # [FUNCTION DOC] HELPER: Formats the record, writes it plus newline to stderr and
+        # flushes. RecursionError is re-raised; other errors go to the standard handleError.
         try:
             msg = self.format(record)
             stream = self.stream
@@ -1101,6 +1225,8 @@ class _StderrHandler(logging.Handler):
 
 
 def _setup_handlers(create_handler_fn, log) -> None:
+    # [FUNCTION DOC] HELPER: Creates a handler via the factory, tracks it as a torch-owned
+    # handler, sets the default formatter and DEBUG level, and attaches it to the logger.
     debug_handler = _track_handler(create_handler_fn())
     debug_handler.setFormatter(DEFAULT_FORMATTER)
     debug_handler.setLevel(logging.DEBUG)
@@ -1114,17 +1240,22 @@ _TORCH_HANDLER_MARKER = "_torch_logging_internal_handler"
 # mark handlers that we've created
 # so we don't modify user handlers
 def _track_handler(handler):
+    # [FUNCTION DOC] HELPER: Marks a handler as created by this module (attribute marker and
+    # weak set membership) and returns it, so user handlers are never removed.
     setattr(handler, _TORCH_HANDLER_MARKER, True)
     handlers.add(handler)
     return handler
 
 
 def _is_torch_handler(handler):
+    # [FUNCTION DOC] HELPER: True if the handler was tracked by this module.
     return handler in handlers or getattr(handler, _TORCH_HANDLER_MARKER, False)
 
 
 # clears all torch handlers on specified loggers
 def _clear_handlers(log, *, close: bool = True) -> None:
+    # [FUNCTION DOC] HELPER: Removes torch-owned handlers from the logger, closing them unless
+    # close is false.
     to_remove = [handler for handler in log.handlers if _is_torch_handler(handler)]
     for handler in to_remove:
         log.removeHandler(handler)
@@ -1133,6 +1264,10 @@ def _clear_handlers(log, *, close: bool = True) -> None:
 
 
 def _reset_logs() -> None:
+    # [FUNCTION DOC] HELPER: Resets all registered loggers to WARNING with no propagation and no
+    # torch handlers; artifact and child loggers to NOTSET with propagation; and the trace logger
+    # to no propagation with its torch handlers removed but not closed (the lazy trace handler
+    # singleton is reused).
     # reset all registered logs
     for log_qname in log_registry.get_log_qnames():
         log = logging.getLogger(log_qname)
@@ -1155,15 +1290,22 @@ def _reset_logs() -> None:
 
 
 def _get_log_state():
+    # [FUNCTION DOC] HELPER: Returns the current global log_state.
     return log_state
 
 
 def _set_log_state(state) -> None:
+    # [FUNCTION DOC] HELPER: Replaces the global log_state with the given state.
     global log_state
     log_state = state
 
 
 def _init_logs(log_file_name=None) -> None:
+    # [FUNCTION DOC] Applies current logging configuration to all loggers: resets logs, reloads
+    # state from TORCH_LOGS, lets TORCH_LOGS_OUT override the log file name, sets registered
+    # loggers (except torch) to NOTSET and then applies user-requested levels. The remainder
+    # (below) attaches stderr/file handlers, configures artifact loggers and sets up tracing
+    # via TORCH_TRACE / TORCH_DTRACE. Mutates global logger and handler state.
     global GET_DTRACE_STRUCTURED
 
     _reset_logs()
@@ -1246,9 +1388,16 @@ def _init_logs(log_file_name=None) -> None:
 
 
 class LazyTraceHandler(logging.StreamHandler):
+    # [CLASS DOC] Stream handler for structured trace output that creates its log file lazily on
+    # the first record, in a directory root_dir (or a default logs directory in supported
+    # internal environments; otherwise it removes itself from the trace logger and does nothing).
+    # State: root_dir, open stream, owning process id (to detect forks), file path, and a flag
+    # that the torch version artifact still needs to be written after the first record.
     """Like FileHandler, but the file is allocated lazily only upon the first log message"""
 
     def __init__(self, root_dir: str | None) -> None:
+        # [FUNCTION DOC] Initializes the handler without opening any file; stores root_dir and
+        # resets stream, pid, path and pending-version state.
         # This is implemented in the same way that delay is implemented on
         # FileHandler
         self.root_dir = root_dir
@@ -1260,6 +1409,10 @@ class LazyTraceHandler(logging.StreamHandler):
         self._pending_log_version = False
 
     def _close_stream(self, *, flush: bool = True) -> None:
+        # [FUNCTION DOC] HELPER: Closes the current stream if any and clears stream, pid, path and
+        # pending-version state. With flush true, flushes then closes normally. With flush false
+        # (post-fork child), closes only the inherited file descriptor so buffered parent data is
+        # not written, ignoring a bad-descriptor error when closing the stream object.
         if self.stream:
             stream = self.stream
             try:
@@ -1285,6 +1438,8 @@ class LazyTraceHandler(logging.StreamHandler):
 
     # cloned from FileHandler in cpython
     def close(self) -> None:
+        # [FUNCTION DOC] Under the handler lock, closes the stream (flushing only if opened by
+        # this process), then always runs the base stream handler close.
         self.acquire()
         try:
             try:
@@ -1299,6 +1454,14 @@ class LazyTraceHandler(logging.StreamHandler):
             self.release()
 
     def emit(self, record) -> None:
+        # [FUNCTION DOC] Writes a record, opening the file on first use. If the process id changed
+        # since opening (fork), drops the inherited stream without flushing. With no root_dir,
+        # tries the default logs directory only in allowed internal setups (checks version
+        # attributes, MAST job name, a justknobs flag, directory existence and write access),
+        # logging why it is disabled; if unusable, removes itself from the trace logger and
+        # returns. When opening: creates the directory and a uniquely named file (with a rank
+        # suffix when distributed is initialized), logs its path to the module and inductor
+        # loggers, and schedules a torch version artifact to be emitted after the first record.
         current_pid = os.getpid()
         if self.stream is not None and self._pid != current_pid:
             self._close_stream(flush=False)
@@ -1364,6 +1527,9 @@ class LazyTraceHandler(logging.StreamHandler):
 
 
 def _log_torch_version() -> None:
+    # [FUNCTION DOC] HELPER: Emits a structured "artifact" trace named torch_version with JSON
+    # payload of the torch version, source commit and whether this is an open-source build; no
+    # compile context or trace id is attached.
     import torch
     from torch._environment import is_fbcode
     from torch._utils_internal import get_torch_source_version
@@ -1385,6 +1551,8 @@ def _log_torch_version() -> None:
 
 @functools.cache
 def warning_once(logger_obj, *args, **kwargs) -> None:
+    # [FUNCTION DOC] Logs a warning on the given logger, but only once per distinct argument
+    # combination (memoized on all arguments, which must be hashable). Returns None.
     """
     This function is similar to `logger.warning()`, but will emit the warning with the same message only once
     Note: The cache is for the function arguments, so 2 different callers using the same arguments will hit the cache.
@@ -1395,17 +1563,24 @@ def warning_once(logger_obj, *args, **kwargs) -> None:
 
 
 def safe_grad_filter(message, category, filename, lineno, file=None, line=None) -> bool:
+    # [FUNCTION DOC] HELPER: Warning filter for hide_warnings; returns False (hide) for warnings
+    # whose message mentions the tensor grad attribute notice, True otherwise.
     return "The .grad attribute of a Tensor" not in str(message)
 
 
 def user_warning_filter(
     message, category, filename, lineno, file=None, line=None
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Warning filter for hide_warnings; returns False (hide) for
+    # UserWarning exactly, True for all other categories.
     return category is not UserWarning
 
 
 @contextlib.contextmanager
 def hide_warnings(filter_fn=lambda *args, **kwargs: True):
+    # [FUNCTION DOC] Context manager that temporarily replaces the warnings display hook with one
+    # that forwards a warning to the previous hook only when filter_fn returns true for its
+    # arguments. Restores the previous hook on exit, even on error. Default filter shows all.
     """
     A context manager that temporarily suppresses warnings,
     using public API: https://docs.python.org/3/library/warnings.html#warnings.showwarning.
@@ -1423,6 +1598,7 @@ def hide_warnings(filter_fn=lambda *args, **kwargs: True):
     prior = warnings.showwarning
 
     def _showwarning(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Forwards to the prior warning hook if filter_fn accepts.
         if filter_fn(*args, **kwargs):
             prior(*args, **kwargs)
 
@@ -1434,14 +1610,18 @@ def hide_warnings(filter_fn=lambda *args, **kwargs: True):
 
 
 class LazyString(Generic[_P]):
+    # [CLASS DOC] Wraps a string-producing function and its arguments so the string is computed
+    # only when converted with str (useful for log arguments that are expensive to build).
     def __init__(
         self, func: Callable[_P, str], *args: _P.args, **kwargs: _P.kwargs
     ) -> None:
+        # [FUNCTION DOC] Stores the function and its positional and keyword arguments.
         self.func = func
         self.args = args
         self.kwargs = kwargs
 
     def __str__(self) -> str:
+        # [FUNCTION DOC] Calls the stored function with stored arguments and returns the string.
         return self.func(*self.args, **self.kwargs)
 
 
@@ -1451,6 +1631,9 @@ structured_logging_overhead: dict[str, float] = defaultdict(float)
 
 
 def add_structured_logging_overhead(time_spent: float) -> None:
+    # [FUNCTION DOC] Adds seconds spent on structured logging to the global overhead table under
+    # the key of the current compile (frame id and frame compile id, aggregated over attempts).
+    # Does nothing when there is no current trace id.
     global structured_logging_overhead
     key = None
     if (trace_id := torch._guards.CompileContext.current_trace_id()) is not None:
@@ -1469,6 +1652,8 @@ def add_structured_logging_overhead(time_spent: float) -> None:
 
 
 def get_structured_logging_overhead() -> float | None:
+    # [FUNCTION DOC] Returns accumulated structured logging seconds for the current compile
+    # (keyed by frame id and frame compile id), or None if no trace id or no entry exists.
     key = None
     if (trace_id := torch._guards.CompileContext.current_trace_id()) is not None:
         frame_id = trace_id.compile_id.frame_id
@@ -1486,6 +1671,8 @@ def trace_structured_artifact(
     payload_fn: Callable[[], str | object | None] = lambda: None,
     compile_id: CompileId | None = None,
 ) -> None:
+    # [FUNCTION DOC] Convenience wrapper that emits a structured "artifact" trace with metadata
+    # of the given name and encoding, the payload from payload_fn, and an optional compile id.
     trace_structured(
         "artifact",
         metadata_fn=lambda: {
@@ -1509,6 +1696,16 @@ def trace_structured(
     record_logging_overhead: bool = True,  # Whether or not to record the time spent on structured logging
     compile_id: CompileId | None = None,  # Optional if unavailable in the trace
 ) -> None:
+    # [FUNCTION DOC] Emits one structured trace event named name, only if the trace logger has
+    # handlers. Raises AssertionError for reserved names or non-callable metadata_fn/payload_fn.
+    # The record holds metadata_fn output under the name; unless suppress_context, it adds
+    # distributed rank, compile ids (compiled autograd id, frame id, frame compile id, attempt)
+    # from the current trace id or the compile_id argument, a captured stack when a trace id was
+    # expected but missing, and the regional inductor subgraph name. The payload (lazily
+    # computed) is serialized: strings as is, lists one JSON item per line, other objects as
+    # JSON (sets become lists; other unserializable types raise TypeError); a hash of the payload
+    # is added to the record. Writes via the trace logger, notifies the internal event logger,
+    # and optionally accumulates elapsed time into the structured logging overhead table.
     """
     metadata is an arbitrary JSON compatible struct, but it's expected to not be
     too long (e.g., less than 1MB)
@@ -1585,6 +1782,8 @@ def trace_structured(
                 else:
 
                     def json_default(obj):
+                        # [FUNCTION DOC] HELPER: JSON fallback serializer: converts sets to
+                        # lists; raises TypeError for any other unserializable type.
                         # Sets aren't json serializable
                         if isinstance(obj, set):
                             return list(obj)
@@ -1619,6 +1818,9 @@ def dtrace_structured(
     expect_trace_id: bool = False,  # Whether or not we expect to have a current trace id
     record_logging_overhead: bool = True,  # Whether or not to record the time spent on structured logging
 ) -> None:
+    # [FUNCTION DOC] Like trace_structured, but only emits when detailed tracing was enabled
+    # (global flag set from the TORCH_DTRACE environment variable during log init); otherwise
+    # does nothing. expect_trace_id defaults to false. compile_id is not forwarded.
     """
     For logging more detailed information used for debugging. This may result in
     the program becoming slow.
