@@ -1,5 +1,11 @@
 # mypy: ignore-errors
 
+# [MODULE DOC] Shared helpers for TorchScript (JIT) tests: the JitTestCase base class with
+# script/trace/module equivalence checks and graph assertions, context managers and decorators
+# toggling JIT global flags (inlining, fusion, CPU fuser), and utilities for sample-variant
+# collection and input cloning. Import-time side effects: computes the module constants
+# RUN_CUDA, RUN_CUDA_MULTI_GPU, RUN_CUDA_HALF (and CUDA_VERSION when CUDA is on a non-HIP build).
+
 # Torch
 from torch.autograd import Variable
 from torch.autograd.function import _nested_map
@@ -53,17 +59,25 @@ if torch.cuda.is_available() and not torch.version.hip:
             RUN_CUDA_HALF = False
 
 def execWrapper(code, glob, loc):
+    # [FUNCTION DOC] HELPER: executes the source string code with the given global and local
+    # namespaces; definitions land in loc. Kept as a function so exec syntax stays isolated.
     exec(code, glob, loc)
 
 def do_input_map(fn, input):
+    # [FUNCTION DOC] HELPER: applies fn to every tensor found in the nested input structure and
+    # returns the same structure with the results; non-tensor leaves are kept as they are.
     return _nested_map(lambda t: isinstance(t, torch.Tensor), fn)(input)
 
 def clear_class_registry():
+    # [FUNCTION DOC] HELPER: resets global TorchScript class state: the C++ class registry, the
+    # recursive-scripting concrete type store and the Python-side class state. Mutates globals.
     torch._C._jit_clear_class_registry()
     torch.jit._recursive.concrete_type_store = torch.jit._recursive.ConcreteTypeStore()
     torch.jit._state._clear_class_state()
 
 def get_execution_plan(graph_executor_state):
+    # [FUNCTION DOC] Returns the single execution plan of a graph executor debug state. Raises a
+    # runtime error if the state holds any number of plans other than one.
     execution_plans = list(graph_executor_state.execution_plans.values())
     num_plans = len(execution_plans)
     if num_plans != 1:
@@ -72,21 +86,32 @@ def get_execution_plan(graph_executor_state):
     return execution_plans[0]
 
 class _AssertRaisesRegexWithHighlightContext:
+    # [CLASS DOC] HELPER: context manager used by assertRaisesRegexWithHighlight. Stores the test
+    # case, expected exception type, message regex and expected highlighted source text. On exit
+    # it swallows the body's exception after checking its type and message, and optionally that
+    # the message highlights the given source snippet.
     """
     A context manager that is useful for checking that error messages highlight
     the correct part of the source code.
     """
 
     def __init__(self, test_case, exception, regex, highlight):
+        # [FUNCTION DOC] HELPER: stores the test case, exception type, regex and highlight text.
         self.test_case = test_case
         self.exception_type = exception
         self.regex = regex
         self.highlight = highlight
 
     def __enter__(self):
+        # [FUNCTION DOC] HELPER: returns the context object itself.
         return self
 
     def __exit__(self, type, value, traceback):
+        # [FUNCTION DOC] HELPER: re-raises the body's exception inside an assert-raises-regex
+        # check (failing the test if the type or message does not match), then, if a highlight
+        # was given, checks the message highlights it. Always returns true to suppress the error.
+        # KNOWN ISSUE: if the body raised nothing, value is unset and the check fails by the
+        # assert-raises machinery only; the later highlight check would use a missing value.
         with self.test_case.assertRaisesRegex(self.exception_type, self.regex):
             if type:
                 raise value
@@ -99,46 +124,64 @@ class _AssertRaisesRegexWithHighlightContext:
 FUSION_GROUP = "prim::TensorExprGroup"
 
 class JitTestCase(JitCommonTestCase):
+    # [CLASS DOC] Base test case for TorchScript tests. Installs JIT emit hooks in setUp that
+    # check every compiled function or module survives a save/load round trip with identical
+    # code, and clears hooks and the class registry in tearDown. Offers helpers to compare
+    # script, trace and eager results and to assert on graph contents. The class flag
+    # _restored_warnings makes the tracer warning filter install happen once per process.
     _do_cuda_memory_leak_check = True
     _restored_warnings = False
 
     class capture_stdout(list):
+        # [CLASS DOC] Context manager (a list subclass) that redirects standard output to an
+        # in-memory buffer; on exit the captured text is appended as the single list element.
         """
         Replace sys.stdout with a temporary StringIO
         """
         def __enter__(self):
+            # [FUNCTION DOC] Saves the real stdout, installs a fresh buffer and returns self.
             self.sys_stdout = sys.stdout
             self.stringio = StringIO()
             sys.stdout = self.stringio
             return self
 
         def __exit__(self, *args):
+            # [FUNCTION DOC] Appends the captured text to this list, drops the buffer and
+            # restores the saved stdout. Never suppresses exceptions.
             self.append(str(self.stringio.getvalue()))
             del self.stringio
             sys.stdout = self.sys_stdout
 
     class capture_stderr(list):
+        # [CLASS DOC] Same as capture_stdout but for standard error.
         """
         Replace sys.stderr with a temporary StringIO
         """
         def __enter__(self):
+            # [FUNCTION DOC] Saves the real stderr, installs a fresh buffer and returns self.
             self.sys_stderr = sys.stderr
             self.stringio = StringIO()
             sys.stderr = self.stringio
             return self
 
         def __exit__(self, *args):
+            # [FUNCTION DOC] Appends the captured text to this list, drops the buffer and
+            # restores the saved stderr. Never suppresses exceptions.
             self.append(str(self.stringio.getvalue()))
             del self.stringio
             sys.stderr = self.sys_stderr
 
     def setHooks(self):
+        # [FUNCTION DOC] Registers this test's module and function emit hooks with the JIT.
         torch._C._jit_set_emit_hooks(self.emitModuleHook, self.emitFunctionHook)
 
     def clearHooks(self):
+        # [FUNCTION DOC] Removes both JIT emit hooks.
         torch._C._jit_set_emit_hooks(None, None)
 
     def setUp(self):
+        # [FUNCTION DOC] Runs base setup; the first time in the process re-applies the tracer
+        # warning ignore filter (recorded in a class flag); then installs the emit hooks.
         super().setUp()
         # unittest overrides all warning filters and forces all of them to show up
         # after we install our own to silence those coming from inside PyTorch.
@@ -149,6 +192,7 @@ class JitTestCase(JitCommonTestCase):
         self.setHooks()
 
     def tearDown(self):
+        # [FUNCTION DOC] Runs base teardown, removes the emit hooks and clears the class registry.
         super().tearDown()
         # needs to be cleared because python might be unloaded before
         # the callback gets destructed
@@ -156,10 +200,17 @@ class JitTestCase(JitCommonTestCase):
         clear_class_registry()
 
     def assertAllFused(self, graph, except_for=()):
+        # [FUNCTION DOC] Asserts that the fast-path part of graph has exactly one block holding
+        # exactly one fusion group node, and that every node in that block is an allowed kind
+        # (constants, fusion group, bailout template, tuple construct, if, type and grad checks,
+        # plus any kinds in except_for). Fails the test otherwise.
 
         # note this helper collects nodes on 'fast path' only
         # i.e. the true blocks of specialized checks
         def get_nodes_and_parents_recursively(block, kind, acc):
+            # [FUNCTION DOC] HELPER: walks the block, recording nodes of the given kind into the
+            # mapping from containing block to node list; descends into differentiable graph
+            # subgraphs, the guarded branch of guard-style if nodes, and other nodes' blocks.
             for node in block.nodes():
                 if node.kind() == kind:
                     acc[block].append(node)
@@ -186,6 +237,9 @@ class JitTestCase(JitCommonTestCase):
                         f'got {graph}')
 
     def _isHookExceptionOk(self, e):
+        # [FUNCTION DOC] HELPER: returns true if the exception message contains one of the known
+        # export-failure phrases (unexportable Python function, closures), meaning the round
+        # trip check should be skipped rather than failed.
         se = str(e)
         allowed = ("Could not export Python function",
                    "closures are not exportable")
@@ -195,7 +249,15 @@ class JitTestCase(JitCommonTestCase):
         return False
 
     def _compared_saved_loaded(self, m):
+        # [FUNCTION DOC] HELPER: round trip check for a scripted function or module m, with emit
+        # hooks disabled meanwhile. Skips empty code or modules without methods and tolerates
+        # known export errors. Otherwise saves m, loads it, saves the loaded copy, and asserts
+        # the code files of both saves match line for line (and, for script modules, that value
+        # tags match). Other runtime errors from saving are re-raised.
         def extract_files(buffer):
+            # [FUNCTION DOC] HELPER: opens the zip archive in buffer, asserts entry names are
+            # unique, and returns the source text of archived code files and the unpickled
+            # debug files, as two lists.
             # crack open the zip format to get at the main module code
             with zipfile.ZipFile(buffer) as archive:
                 # check that we have no duplicate names
@@ -261,16 +323,24 @@ class JitTestCase(JitCommonTestCase):
 
 
     def emitFunctionHook(self, func):
+        # [FUNCTION DOC] JIT hook called for each compiled function: skips lambdas and builtin
+        # operator names (invalid for export), else runs the save/load comparison.
         # func has invalid names for export, skip the jitter check
         if func.name == "<lambda>" or "aten::" in func.name:
             return
         self._compared_saved_loaded(func)
 
     def emitModuleHook(self, module):
+        # [FUNCTION DOC] JIT hook called for each compiled module: runs the save/load comparison.
         self._compared_saved_loaded(module)
 
 
     def getExportImportCopyWithPacking(self, m, also_test_file=True, map_location=None):
+        # [FUNCTION DOC] Returns a copy of module m made by saving and loading it, calling the
+        # pack method on submodules that have one before saving and unpack afterwards (on m and
+        # the loaded copy). Uses an in-memory buffer; when also_test_file is true it additionally
+        # saves and loads through a temporary file (removed afterwards, closed first for Windows)
+        # and returns that result. map_location is passed to the loader.
         buffer = io.BytesIO()
         m.apply(lambda s: s._pack() if s._c._has_method('_pack') else None)
         torch.jit.save(m, buffer)
@@ -297,6 +367,9 @@ class JitTestCase(JitCommonTestCase):
         return result
 
     def assertGraphContains(self, graph, kind, consider_subgraphs=False):
+        # [FUNCTION DOC] Asserts the graph has at least one node of the given kind. With
+        # consider_subgraphs the check counts textual occurrences in the printed graph (excluding
+        # subgraph header mentions); otherwise it walks nodes and nested blocks.
 
         if consider_subgraphs:
             strgraph = str(graph)
@@ -305,6 +378,8 @@ class JitTestCase(JitCommonTestCase):
             return
 
         def nodes(block):
+            # [FUNCTION DOC] HELPER: returns the list of nodes of the wanted kind in the block
+            # and, recursively, in all nested blocks.
             out = []
             for node in block.nodes():
                 if node.kind() == kind:
@@ -317,7 +392,12 @@ class JitTestCase(JitCommonTestCase):
         self.assertTrue(len(out_nodes) > 0)
 
     def assertGraphContainsExactly(self, graph, kind, num_kind_nodes, consider_subgraphs=False):
+        # [FUNCTION DOC] Asserts the graph has exactly num_kind_nodes nodes of the given kind,
+        # counted like assertGraphContains (text based when consider_subgraphs, else a walk of
+        # nodes and nested blocks). Raises an assertion error showing the graph on mismatch.
         def perform_assert(graph, kind, actual, expected, consider_subgraphs):
+            # [FUNCTION DOC] HELPER: returns if actual equals expected, else raises an assertion
+            # error with the graph and counts.
             if actual == expected:
                 return
             subgraph = 'including' if consider_subgraphs else 'excluding'
@@ -332,6 +412,8 @@ class JitTestCase(JitCommonTestCase):
             return
 
         def nodes(block):
+            # [FUNCTION DOC] HELPER: returns the list of nodes of the wanted kind in the block
+            # and, recursively, in all nested blocks.
             out = []
             for node in block.nodes():
                 if node.kind() == kind:
@@ -345,10 +427,15 @@ class JitTestCase(JitCommonTestCase):
                        consider_subgraphs)
 
     def assertExpectedONNXGraph(self, g, *args, **kwargs):
+        # [FUNCTION DOC] Optimizes the traced graph g for ONNX export and compares it against the
+        # stored expected output via assertExpectedGraph; extra arguments are forwarded.
         g = torch.onnx._optimize_trace(g, operator_export_type=OperatorExportTypes.ONNX)
         self.assertExpectedGraph(g, *args, **kwargs)
 
     def assertExpectedGraph(self, trace, *args, **kwargs):
+        # [FUNCTION DOC] Takes a graph (or an object with a graph), lints it, removes dead code,
+        # canonicalizes it, lints again, and compares its string form with the stored expected
+        # text via assertExpected; extra arguments are forwarded.
         if isinstance(trace, torch._C.Graph):
             graph = trace
         else:
@@ -362,6 +449,9 @@ class JitTestCase(JitCommonTestCase):
         self.assertExpected(str(graph), *args, **kwargs)
 
     def run_pass(self, name, trace):
+        # [FUNCTION DOC] Runs the named JIT graph pass on a graph or traced object (linting before
+        # and after). If the pass returns a new graph, that replaces the working graph; for a
+        # traced object the final graph is set back on it. Returns the resulting graph.
         if isinstance(trace, torch._C.Graph):
             graph = trace
             set_graph = False
@@ -380,6 +470,9 @@ class JitTestCase(JitCommonTestCase):
         return graph
 
     def get_frame_vars(self, frames_up):
+        # [FUNCTION DOC] Returns a mapping merging the locals and globals (globals win on clash)
+        # of the frame frames_up levels above the caller. Raises a runtime error if frame
+        # inspection is unavailable or the stack is too shallow.
         frame = inspect.currentframe()
         if not frame:
             raise RuntimeError("failed to inspect frame")
@@ -395,11 +488,17 @@ class JitTestCase(JitCommonTestCase):
         return defined_vars
 
     def assertRaisesRegexWithHighlight(self, exception, regex, highlight):
+        # [FUNCTION DOC] Returns a context manager asserting the body raises the exception type
+        # with a message matching regex and highlighting the given source snippet.
         return _AssertRaisesRegexWithHighlightContext(self, exception, regex, highlight)
 
     def checkScriptRaisesRegex(self, script, inputs, exception, regex,
                                name=None, outputs=None, capture_output=False,
                                frames_up=1, profiling=ProfilingMode.PROFILING):
+        # [FUNCTION DOC] Asserts that running the script (source string or Python function) with
+        # inputs raises the exception matching regex in plain Python, in the string frontend, and
+        # (for function inputs) in the AST frontend. For string sources, name selects the function.
+        # KNOWN ISSUE: outputs, capture_output and profiling are accepted but unused.
         """
         Checks that a given function will throw the correct exception,
         when executed with normal python, the string frontend, and the
@@ -440,6 +539,8 @@ class JitTestCase(JitCommonTestCase):
                     ge(*inputs)
 
     def checkBailouts(self, model, inputs, expected):
+        # [FUNCTION DOC] For each bailout point in the model's single execution plan, requests that
+        # bailout, runs the model on inputs and asserts the output equals expected.
         state = model.get_debug_state()
         plan = get_execution_plan(state)
         num_bailouts = plan.code.num_bailouts()
@@ -459,6 +560,13 @@ class JitTestCase(JitCommonTestCase):
                     profiling=ProfilingMode.PROFILING,
                     atol=None,
                     rtol=None):
+        # [FUNCTION DOC] Compiles script (source string or Python function) with TorchScript and
+        # asserts it matches the Python version on inputs, within atol/rtol. For functions it
+        # first recursively checks the string-frontend form. Runs a profiling pass, an extra one
+        # if grads are involved, and an optimized pass; with capture_output also checks printed
+        # stdout against the stored expectation (skipped on Windows); with bailout testing on,
+        # checks bailouts. Returns the scripted function.
+        # KNOWN ISSUE: with capture_output, the profiling run output is not compared to Python.
         """
         Checks that a given script generates the same output as the Python
         version using the given inputs.
@@ -531,9 +639,16 @@ class JitTestCase(JitCommonTestCase):
                    drop=None, allow_unused=False, verbose=False,
                    inputs_require_grads=True, check_tolerance=1e-5, export_import=True,
                    _force_outplace=False, grad_atol=None, grad_rtol=None):
+        # [FUNCTION DOC] Traces func with input_tensors (default reference_tensors), optionally
+        # round-trips it through export/import, then asserts outputs match eager execution without
+        # grad, with first-order gradients, and with second-order (grad of grad) gradients, using
+        # the given tolerances. drop removes trailing outputs from the loss; allow_unused permits
+        # unused inputs. Returns the traced function.
 
         # TODO: check gradients for parameters, not just inputs
         def allSum(vs):
+            # [FUNCTION DOC] HELPER: returns a weighted sum of the entries (after dropping the last
+            # drop ones), weighting entry i by the log of i plus two; skips none entries.
             # drop allows us to remove some values from ever being used
             # to test unused outputs
             if drop is not None:
@@ -545,7 +660,11 @@ class JitTestCase(JitCommonTestCase):
             input_tensors = reference_tensors
 
         def flatten_inputs(inputs):
+            # [FUNCTION DOC] HELPER: returns a tuple of all tensors in the nested recording inputs.
+            # KNOWN ISSUE: ignores its parameter and always reads the enclosing recording_inputs.
             def input_reduce(input, fn, acc):
+                # [FUNCTION DOC] HELPER: recursively visits tensors in nested containers (mappings
+                # by key), applying fn to each tensor and the accumulator; returns the accumulator.
                 if isinstance(input, torch.Tensor):
                     fn(input, acc)
                 elif isinstance(input, dict):
@@ -628,6 +747,9 @@ class JitTestCase(JitCommonTestCase):
         return ge
 
     def checkModule(self, nn_module, args):
+        # [FUNCTION DOC] Scripts nn_module, runs eager and scripted versions on args with the
+        # random state frozen for each, asserts equal outputs and that export/import of the
+        # scripted module works. Returns the scripted module.
         """
         Check that a nn.Module's results in Script mode match eager and that it
         can be exported
@@ -646,15 +768,21 @@ class JitTestCase(JitCommonTestCase):
         return sm
 
 class NoTracerWarnContextManager:
+    # [CLASS DOC] Context manager that turns off the tracer state warning for its body and
+    # restores the previous setting (kept in prev) on exit.
     def __enter__(self):
+        # [FUNCTION DOC] Saves the current tracer warning flag and disables the warning.
         self.prev = torch._C._jit_get_tracer_state_warn()
         torch._C._jit_set_tracer_state_warn(False)
 
     def __exit__(self, *args):
+        # [FUNCTION DOC] Restores the saved tracer warning flag.
         torch._C._jit_set_tracer_state_warn(self.prev)
 
 @contextmanager
 def inline_everything_mode(should_inline):
+    # [FUNCTION DOC] Context manager setting the global JIT inline-everything mode to
+    # should_inline for the body, restoring the previous value afterwards (even on error).
     old = torch._C._jit_get_inline_everything_mode()
     torch._C._jit_set_inline_everything_mode(should_inline)
     try:
@@ -664,6 +792,8 @@ def inline_everything_mode(should_inline):
 
 @contextmanager
 def set_fusion_group_inlining(inlining):
+    # [FUNCTION DOC] Context manager setting the debug fusion-group inlining flag for the body and
+    # restoring the old value afterwards (even on error).
     old = torch._C._debug_get_fusion_group_inlining()
     torch._C._debug_set_fusion_group_inlining(inlining)
     try:
@@ -674,6 +804,9 @@ def set_fusion_group_inlining(inlining):
 # note: not re-entrant, use unnested only
 @contextmanager
 def disable_autodiff_subgraph_inlining(enabled=True):
+    # [FUNCTION DOC] Context manager that, when enabled is true, turns off autodiff subgraph
+    # inlining for the body (the flag is set to the negation of enabled). On exit inlining is
+    # always reset to on, not to the prior value, hence not re-entrant.
     torch._C._debug_set_autodiff_subgraph_inlining(not enabled)
     try:
         yield
@@ -681,8 +814,11 @@ def disable_autodiff_subgraph_inlining(enabled=True):
         torch._C._debug_set_autodiff_subgraph_inlining(True)
 
 def _inline_everything(fn):
+    # [FUNCTION DOC] HELPER: decorator running fn with inline-everything mode on.
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: calls fn inside the mode.
+        # KNOWN ISSUE: the return value of fn is discarded.
         with inline_everything_mode(True):
             fn(*args, **kwargs)
     return wrapper
@@ -690,21 +826,31 @@ def _inline_everything(fn):
 # this exists for forward compatibility reasons temporarily.
 # TODO(suo) remove
 def _tmp_donotuse_dont_inline_everything(fn):
+    # [FUNCTION DOC] HELPER: temporary decorator running fn with inline-everything mode off.
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: calls fn inside the mode.
+        # KNOWN ISSUE: the return value of fn is discarded.
         with inline_everything_mode(False):
             fn(*args, **kwargs)
     return wrapper
 
 # make it easy to quickly define/trace a function for these tests
 def _trace(*args, **kwargs):
+    # [FUNCTION DOC] HELPER: decorator factory; the positional arguments become the example
+    # inputs and keyword arguments are tracer options. The decorator returns the traced function.
     def wrapper(func):
+        # [FUNCTION DOC] HELPER: traces func with the captured example inputs.
         return torch.jit.trace(func, args, **kwargs)
     return wrapper
 
 
 def enable_cpu_fuser(fn):
+    # [FUNCTION DOC] Decorator running fn with CPU fusion overrides on (both legacy and current,
+    # LLVM requirement off) and, afterwards, resetting them to off and LLVM-required.
     def wrapper(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: sets the overrides, calls fn, and always resets them.
+        # KNOWN ISSUE: the return value of fn is discarded; resets to fixed values, not prior ones.
         torch._C._jit_override_can_fuse_on_cpu_legacy(True)
         torch._C._jit_override_can_fuse_on_cpu(True)
         torch._C._jit_set_te_must_use_llvm_cpu(False)
@@ -718,29 +864,43 @@ def enable_cpu_fuser(fn):
 
 
 def enable_cpu_fuser_if(cond):
+    # [FUNCTION DOC] Returns the enable_cpu_fuser decorator when cond is true, otherwise a
+    # decorator that leaves behavior unchanged.
     if cond:
         return enable_cpu_fuser
     else:
         def noop_fuser(fn):
+            # [FUNCTION DOC] HELPER: pass-through decorator.
             def wrapper(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: calls fn and returns its result.
                 return fn(*args, **kwargs)
             return wrapper
         return noop_fuser
 
 def get_forward(c):
+    # [FUNCTION DOC] HELPER: returns the forward method object of a compiled module.
     return c._get_method('forward')
 
 def get_forward_graph(c):
+    # [FUNCTION DOC] HELPER: returns the graph of the forward method of a compiled module.
     return c._get_method('forward').graph
 
 def get_module_method(m, module, method):
+    # [FUNCTION DOC] HELPER: returns the named method of the submodule called module on
+    # script module m.
     return m._c.getattr(module)._get_method(method)
 
 def attrs_with_prefix(module, prefix):
+    # [FUNCTION DOC] HELPER: returns the names of the module's registered submodules that
+    # start with prefix.
     return [x for x, _ in module._modules._c.items()
             if x.startswith(prefix)]
 
 def warmup_backward(f, *args):
+    # [FUNCTION DOC] Runs a backward computation three times to warm up the profiling executor.
+    # With extra args they are the inputs for a gradient computation whose results are collected;
+    # without, it calls backward on f retaining the graph. Returns the list of gradient results
+    # (empty when no args). Side effect: accumulates gradients in the no-args case.
     profiling_count = 3
     results = []
     for _ in range(profiling_count):
@@ -754,12 +914,17 @@ def warmup_backward(f, *args):
 
 # TODO: Remove me once https://bugs.python.org/issue42666 is resolved
 def make_global(*args):
+    # [FUNCTION DOC] HELPER: sets each given class or function as an attribute, under its own name,
+    # on its defining module so that TorchScript can resolve it as a global. Mutates modules.
     for arg in args:
         setattr(sys.modules[arg.__module__], arg.__name__, arg)
 
 # Helper function to eval Python3 code without causing a syntax error for
 # this file under py2
 def _get_py3_code(code, fn_name):
+    # [FUNCTION DOC] HELPER: writes the source text code to a script file in a temporary
+    # directory, loads it as a module, and returns the attribute named fn_name. Raises an
+    # assertion error if the module spec has no usable loader. The directory is deleted on return.
     with tempfile.TemporaryDirectory() as tmp_dir:
         script_path = os.path.join(tmp_dir, 'script.py')
         with open(script_path, 'w') as f:
@@ -774,7 +939,12 @@ def _get_py3_code(code, fn_name):
         return fn
 
 class TensorExprTestOptions:
+    # [CLASS DOC] Saves global JIT fuser settings and switches to a configuration suited for
+    # TensorExpr fuser tests (profiling executor on, CPU and GPU fusion on, TensorExpr fuser on,
+    # fusion-group inlining off, LLVM not required). restore puts the saved values back.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Records the current values of each setting in attributes and applies the
+        # test configuration. Mutates global JIT state.
         self.old_profiling_executor = torch._C._jit_set_profiling_executor(True)
         self.old_profiling_mode = torch._C._get_graph_executor_optimize(True)
 
@@ -790,6 +960,9 @@ class TensorExprTestOptions:
         torch._C._jit_set_te_must_use_llvm_cpu(False)
 
     def restore(self):
+        # [FUNCTION DOC] Restores every global JIT setting recorded at construction.
+        # KNOWN ISSUE: the graph executor optimize call is a getter-style call with the saved
+        # value as argument, so it may not actually restore the previous optimize flag.
         torch._C._jit_set_profiling_executor(self.old_profiling_executor)
         torch._C._get_graph_executor_optimize(self.old_profiling_mode)
 
@@ -800,6 +973,8 @@ class TensorExprTestOptions:
         torch._C._jit_set_te_must_use_llvm_cpu(self.old_te_must_use_llvm_cpu)
 
 def clone_inputs(args):
+    # [FUNCTION DOC] Returns a new list where each tensor argument is a detached clone, each
+    # iterable-of-tensors argument becomes a list of detached clones, and other values are kept.
     inputs: list[torch.Tensor | list[torch.Tensor]] = []
 
     for arg in args:
@@ -813,6 +988,11 @@ def clone_inputs(args):
     return inputs
 
 def get_traced_sample_variant_pairs(device, dtype, op):
+    # [FUNCTION DOC] Builds (variant, sample) pairs for tracing tests of an operator info object:
+    # variants are its function and method forms (skipping missing ones and lambdas); samples come
+    # from its sample inputs for the device and dtype. For a few listed ops, boolean sample
+    # arguments at given positions are converted to integers (mutating the sample), since JIT
+    # scalars exclude bool. Returns an empty list for resize-style ops, which cannot be traced.
     # tuples of (variant, sample)
     outputs: list[tuple[Any, Any]] = []
 
@@ -893,5 +1073,6 @@ def get_traced_sample_variant_pairs(device, dtype, op):
 
 # types.LambdaType gave false positives
 def is_lambda(lamb):
+    # [FUNCTION DOC] HELPER: returns true if the object is a plain function named like a lambda.
     LAMBDA = lambda: 0  # noqa: E731
     return isinstance(lamb, type(LAMBDA)) and lamb.__name__ == LAMBDA.__name__

@@ -1,5 +1,11 @@
 # mypy: ignore-errors
 
+# [MODULE DOC] Test utilities that log every operator seen at the dispatcher level.
+# Provides a wrapper tensor subclass (LoggingTensor), a dispatch mode (LoggingTensorMode),
+# a logging handler that formats calls with short tensor ids, and capture_logs helpers
+# that collect the formatted lines (optionally with tracebacks) into a list.
+# Import-time side effect: creates the logger named LoggingTensor.
+
 import torch
 from torch.utils._pytree import tree_map
 from collections.abc import Iterator
@@ -30,6 +36,11 @@ logger = logging.getLogger("LoggingTensor")
 
 # TODO: TensorBase should work
 class LoggingTensor(torch.Tensor):
+    # [CLASS DOC] Wrapper tensor subclass holding a real tensor in the elem slot; it owns no
+    # memory itself but mirrors size, strides, dtype, layout and device of the wrapped tensor.
+    # Every operator reaching dispatch is run on the unwrapped tensors, results are rewrapped,
+    # and the call is logged. The class attribute context is a context-manager factory entered
+    # around the call (subclasses may override it).
     elem: torch.Tensor
 
     __slots__ = ['elem']
@@ -38,6 +49,10 @@ class LoggingTensor(torch.Tensor):
 
     @staticmethod
     def __new__(cls, elem, *args, **kwargs):
+        # [FUNCTION DOC] Builds a wrapper subclass instance mirroring the metadata of elem.
+        # The requires_grad keyword (default false) is read from kwargs; extra args are ignored.
+        # When the wrapper requires grad, the stored element is a detached alias of elem,
+        # otherwise elem itself is stored. Returns the new wrapper tensor.
         # The wrapping tensor (LoggingTensor) shouldn't hold any
         # memory for the class in question, but it should still
         # advertise the same device as before
@@ -53,14 +68,25 @@ class LoggingTensor(torch.Tensor):
         return r
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns the standard tensor repr but showing the wrapped element's
+        # contents.
         return super().__repr__(tensor_contents=f"{self.elem}")
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Dispatch hook: unwraps instances of this class in args and kwargs, runs
+        # func inside the class context, wraps every tensor in the result back into this class,
+        # then emits one info record on the LoggingTensor logger carrying the original args,
+        # kwargs and result. Returns the wrapped result. Side effect: logging.
+        # KNOWN ISSUE: kwargs defaults to None but is passed to tree_map and then double-star
+        # unpacked, which would fail if it were really None (callers normally pass a mapping).
         def unwrap(e):
+            # [FUNCTION DOC] HELPER: returns the wrapped element for an instance of this class,
+            # else the input unchanged.
             return e.elem if isinstance(e, cls) else e
 
         def wrap(e):
+            # [FUNCTION DOC] HELPER: wraps a plain tensor in this class; other values pass through.
             return cls(e) if isinstance(e, torch.Tensor) else e
 
         with cls.context():
@@ -72,7 +98,11 @@ class LoggingTensor(torch.Tensor):
         return rs
 
 class LoggingTensorMode(TorchDispatchMode):
+    # [CLASS DOC] Dispatch mode that runs each operator unchanged and logs the call (args,
+    # kwargs, result) on the LoggingTensor logger. Holds no state of its own.
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Runs func with args and kwargs (empty mapping if none), logs one info
+        # record with the call details and result, and returns the result unchanged.
         if kwargs is None:
             kwargs = {}
         rs = func(*args, **kwargs)
@@ -83,13 +113,22 @@ class LoggingTensorMode(TorchDispatchMode):
         return rs
 
 class LoggingTensorReentrant(LoggingTensor):
+    # [CLASS DOC] LoggingTensor variant whose dispatch context enables reentrant dispatch, so
+    # operators run inside dispatch can themselves hit the Python dispatch key.
     context = torch.overrides.enable_reentrant_dispatch
 
 # https://stackoverflow.com/questions/36408496/python-logging-handler-to-append-to-list
 class LoggingTensorHandler(logging.Handler):
+    # [CLASS DOC] Logging handler that formats LoggingTensor records as text lines and appends
+    # them to a caller-provided list. Tensors are shown as numbered short ids assigned on first
+    # sight (memo keyed weakly by tensor, counter next_id); optional dtype/shape suffix on
+    # results; optionally collects each record's traceback into a second list.
     def __init__(
             self, log_list: list[str], use_shortid_for_all_tensors: bool,
             with_type: bool, tracebacks_list: list | None) -> None:
+        # [FUNCTION DOC] Stores the output list, the flag choosing whether all tensors or only
+        # LoggingTensor instances get short ids, the type-suffix flag and the optional
+        # traceback list (none disables traceback collection); starts id numbering at zero.
         logging.Handler.__init__(self)
         self.log_list = log_list
         self.use_shortid_for_all_tensors = use_shortid_for_all_tensors
@@ -99,12 +138,18 @@ class LoggingTensorHandler(logging.Handler):
         self.with_type = with_type
 
     def _shortid(self, t: torch.Tensor) -> int:
+        # [FUNCTION DOC] HELPER: returns the stable small integer id for t, assigning the next
+        # unused id the first time the tensor is seen.
         if t not in self.memo:
             self.memo[t] = self.next_id
             self.next_id += 1
         return self.memo[t]
 
     def _fmt(self, a: object, with_type: bool = False) -> str:
+        # [FUNCTION DOC] HELPER: formats one value. Tensors (all tensors, or only LoggingTensor
+        # instances depending on the handler flag) become a dollar sign plus short id, with an
+        # abbreviated dtype and shape appended when both with_type and the handler flag are set.
+        # Any other value is formatted with its repr.
         cond_cls = torch.Tensor if self.use_shortid_for_all_tensors else LoggingTensor
         if isinstance(a, cond_cls):
             maybe_type = ""
@@ -116,6 +161,10 @@ class LoggingTensorHandler(logging.Handler):
             return repr(a)
 
     def emit(self, record):
+        # [FUNCTION DOC] Formats a record's stored args, kwargs and result into one line of the
+        # form results equals op name applied to args, and appends it to the output list. If
+        # traceback collection is on, also appends the traceback attached to the record (which
+        # requires the GatherTraceback filter to have run, else an attribute error is raised).
         fmt_args = ", ".join(
             itertools.chain(
                 (str(tree_map(self._fmt, a)) for a in record.lt_args),
@@ -128,20 +177,35 @@ class LoggingTensorHandler(logging.Handler):
             self.tracebacks_list.append(record.traceback)
 
 def log_input(name: str, var: object) -> None:
+    # [FUNCTION DOC] Emits an info record named input on the LoggingTensor logger that marks
+    # var as a named input, so captured logs show where an input tensor was introduced.
     logger.info("input", extra={"lt_args": (name,), "lt_kwargs": {}, "lt_rs": var})
 
 class GatherTraceback(logging.Filter):
+    # [CLASS DOC] Logging filter that attaches a freshly gathered traceback (python, script
+    # and/or C++ frames per its flags) to every record and always lets the record through.
     def __init__(self, python=True, script=True, cpp=False):
+        # [FUNCTION DOC] Records which frame kinds to gather. Does not call the base initializer.
         self.python = python
         self.script = script
         self.cpp = cpp
 
     def filter(self, record):
+        # [FUNCTION DOC] Sets the traceback attribute on the record from a fresh gather and
+        # returns true so the record is never dropped.
         record.traceback = gather_traceback(python=self.python, script=self.script, cpp=self.cpp)
         return True
 
 @contextlib.contextmanager
 def capture_logs(is_mode=False, python_tb=False, script_tb=False, cpp_tb=False) -> Iterator[list[str]]:
+    # [FUNCTION DOC] Context manager that captures LoggingTensor log lines. Yields a list of
+    # strings, or a pair of that list and a traceback list when any traceback flag is set.
+    # is_mode makes all tensors, not only LoggingTensor, print as short ids. On exit the
+    # tracebacks are symbolized in place and the handler is removed.
+    # Side effects: sets the logger level to info and disables propagation, and adds a
+    # traceback filter when requested.
+    # KNOWN ISSUE: propagate is never restored and the GatherTraceback filter is never removed,
+    # so both leak past the context; symbolization also runs even without tracebacks.
     collect_traceback = python_tb or script_tb or cpp_tb
     log_list: list[str] = []
     tracebacks_list: list[str] = []
@@ -169,5 +233,7 @@ def capture_logs(is_mode=False, python_tb=False, script_tb=False, cpp_tb=False) 
 
 @contextlib.contextmanager
 def capture_logs_with_logging_tensor_mode(python_tb=False, script_tb=False, cpp_tb=False):
+    # [FUNCTION DOC] Context manager combining LoggingTensorMode with capture_logs in mode
+    # style (all tensors shown as short ids); yields what capture_logs yields.
     with LoggingTensorMode(), capture_logs(True, python_tb, script_tb, cpp_tb) as logs:
         yield logs
