@@ -7,6 +7,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [MODULE DOC] Tails multiple log files concurrently, copying each line with a header prefix to a
+# destination stream. Exports tail_logfile (single-file worker loop) and TailLog (thread-pool
+# manager). Import-time side effect: creates a module logger.
+
 import logging
 import os
 import time
@@ -32,6 +36,12 @@ def tail_logfile(
     interval_sec: float,
     log_line_filter: Callable[[str], bool] | None = None,
 ):
+    # [FUNCTION DOC] Blocking loop that follows a file: waits (polling every interval_sec) for the
+    # file to exist, returning early if the finished event is set first. Then reads lines
+    # (undecodable bytes replaced), writing each to dst with the header prepended, and at end of
+    # file sleeps and retries until finished is set. Returns nothing.
+    # KNOWN ISSUE: a line is written only if log_line_filter is given and accepts it; with the
+    # default of no filter, nothing is ever written.
     while not os.path.exists(file):
         if finished.is_set():
             return
@@ -55,6 +65,10 @@ def tail_logfile(
 
 
 class TailLog:
+    # [CLASS DOC] Manages one tailing task per log file on a thread pool (none if there are no
+    # files). State: name, destination stream, file mapping keyed by local rank, optional
+    # prefix overrides, line filter, per-rank finished events, submitted futures, poll interval
+    # and a stopped flag. Lifecycle: construct, start(), stop(); stopped() reports completion.
     """
     Tail the given log files.
 
@@ -102,6 +116,9 @@ class TailLog:
         interval_sec: float = 0.1,
         log_line_filter: Callable[[str], bool] = (lambda _: True),
     ):
+        # [FUNCTION DOC] Stores the configuration, creates a finished event per rank, and creates
+        # a thread pool with one worker per log file (no pool when log_files is empty). Does not
+        # start tailing. The default filter accepts every line.
         n = len(log_files)
         self._threadpool = None
         if n > 0:
@@ -123,6 +140,9 @@ class TailLog:
         self._stopped = False
 
     def start(self) -> "TailLog":
+        # [FUNCTION DOC] Submits one tailing task per log file to the pool, using a header of the
+        # form name+rank in brackets unless a prefix override exists for that rank. Does nothing
+        # if there is no pool or no destination. Returns self for chaining.
         if not self._threadpool or not self._dst:
             return self
 
@@ -144,6 +164,11 @@ class TailLog:
         return self
 
     def stop(self) -> None:
+        # [FUNCTION DOC] Signals all tasks to finish, waits for each future (logging any task
+        # exception rather than raising), shuts the pool down waiting for threads, and marks
+        # the tailer stopped. Blocks until tasks drain remaining lines.
+        # KNOWN ISSUE: the rank in error messages is the position in the futures list, which
+        # may differ from the real local rank.
         for finished in self._finished_events.values():
             finished.set()
 
@@ -164,4 +189,5 @@ class TailLog:
         self._stopped = True
 
     def stopped(self) -> bool:
+        # [FUNCTION DOC] Returns whether stop() has completed.
         return self._stopped

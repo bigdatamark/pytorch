@@ -7,6 +7,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [MODULE DOC] Context managers redirecting the process-level stdout or stderr (Python stream and
+# underlying C-level descriptors) to a file; exports redirect, redirect_stdout, redirect_stderr.
+# Import-time side effects: loads the C runtime library into the module-level libc (None on
+# macOS, with a logged warning; raises a runtime error on Windows if no C runtime can be loaded),
+# and on Windows also loads kernel32 and configures dup/dup2 bindings.
+
 # Taken and modified from original source:
 # https://eli.thegreenplace.net/2015/redirecting-all-kinds-of-stdout-in-python/
 import ctypes
@@ -31,6 +37,9 @@ _WIN32_STD_HANDLE = {
 
 
 def get_libc():
+    # [FUNCTION DOC] Loads and returns the C runtime library handle: None on macOS (warns that
+    # redirects are unsupported), the first loadable CRT DLL on Windows (raises a runtime error
+    # if none loads), or the system libc shared object on other platforms.
     if IS_MACOS:
         logger.warning("NOTE: Redirects are currently not supported in MacOs.")
         return None
@@ -54,6 +63,9 @@ libc = get_libc()
 
 
 def _c_std(stream: str):
+    # [FUNCTION DOC] HELPER: Returns the C-level FILE pointer object for stdout or stderr. On
+    # Windows tries the modern CRT accessor function, then the legacy table, raising a runtime
+    # error if neither exists; elsewhere reads the libc global variable of that name.
     if IS_WINDOWS:
         stream_index = 2 if stream == "stderr" else 1
         try:
@@ -76,6 +88,8 @@ def _c_std(stream: str):
 
 
 def _python_std(stream: str):
+    # [FUNCTION DOC] HELPER: Returns the current Python sys.stdout or sys.stderr object by name;
+    # raises a key error for other names.
     return {"stdout": sys.stdout, "stderr": sys.stderr}[stream]
 
 
@@ -97,6 +111,10 @@ if IS_WINDOWS:  # libc is None on macOS; all of the below is Windows-only
 
     @contextmanager
     def redirect(std: str, to_file: str):
+        # [FUNCTION DOC] Windows context manager: for the duration of the block, sends the named
+        # stream to to_file (created or truncated) at the Python, CRT descriptor and Win32 handle
+        # levels, flushing before switching. On exit flushes and restores all three. Raises a
+        # value error for an unknown stream name and OS errors if duplicating descriptors fails.
         """
         Redirect ``std`` (one of ``"stdout"`` or ``"stderr"``) to a file at ``to_file``.
 
@@ -178,6 +196,11 @@ else:
 
     @contextmanager
     def redirect(std: str, to_file: str):
+        # [FUNCTION DOC] POSIX context manager: flushes C and Python buffers, then points the
+        # stream's file descriptor at to_file (created or truncated) for the duration of the
+        # block; on exit flushes and restores the saved original descriptor. Raises a value error
+        # for an unknown stream name. Side effects: changes process-wide descriptor state.
+        # KNOWN ISSUE: fails with an attribute error on macOS where libc is None.
         """
         Redirect ``std`` (one of ``"stdout"`` or ``"stderr"``) to a file in the path specified by ``to_file``.
 
@@ -213,6 +236,8 @@ else:
         std_fd = python_std.fileno()
 
         def _redirect(dst):
+            # [FUNCTION DOC] HELPER: Flushes C and Python output, then duplicates dst's
+            # descriptor onto the standard stream's descriptor.
             libc.fflush(c_std)
             python_std.flush()
             os.dup2(dst.fileno(), std_fd)

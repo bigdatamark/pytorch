@@ -7,6 +7,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [MODULE DOC] Process-launching abstractions for the elastic agent: Std redirect flags, log
+# destination specs (LogsSpecs, DefaultLogsSpecs, LogsDest), RunProcsResult, the PContext base
+# class and its concrete MultiprocessContext (function entrypoints) and SubprocessContext
+# (binary entrypoints), plus start_processes-related helpers. Import-time side effects: creates a
+# module logger and platform flags IS_WINDOWS / IS_MACOS.
+
 import abc
 import logging
 import os
@@ -63,17 +69,22 @@ __all__ = [
 
 
 class SignalException(Exception):
+    # [CLASS DOC] Raised in the agent process by the termination handler when a death signal is
+    # received; carries the signal value in attribute sigval. Must not be silently swallowed.
     """
     Exception is raised inside the torchelastic agent process by the termination handler
     if the death signal got received by the process.
     """
 
     def __init__(self, msg: str, sigval: signal.Signals) -> None:
+        # [FUNCTION DOC] Initializes the exception with msg and records the signal in sigval.
         super().__init__(msg)
         self.sigval = sigval
 
 
 def _terminate_process_handler(signum: int, frame: FrameType | None) -> None:
+    # [FUNCTION DOC] HELPER: Signal handler that converts the received signal number to a signal
+    # enum and always raises SignalException with a message naming this process id. The frame is unused.
     """Termination handler that raises exceptions on the main process.
 
     When the process receives death signal(SIGTERM, SIGINT), this termination handler will
@@ -87,6 +98,7 @@ def _terminate_process_handler(signum: int, frame: FrameType | None) -> None:
 
 
 def _get_kill_signal() -> signal.Signals:
+    # [FUNCTION DOC] HELPER: Returns the forceful kill signal: SIGKILL on unix, the Ctrl-C event on Windows.
     """Get the kill signal. SIGKILL for unix, CTRL_C_EVENT for windows."""
     if IS_WINDOWS:
         return signal.CTRL_C_EVENT  # type: ignore[attr-defined]
@@ -95,6 +107,7 @@ def _get_kill_signal() -> signal.Signals:
 
 
 def _get_default_signal() -> signal.Signals:
+    # [FUNCTION DOC] HELPER: Returns the default termination signal: SIGTERM on unix, the Ctrl-C event on Windows.
     """Get the default termination signal. SIGTERM for unix, CTRL_C_EVENT for windows."""
     if IS_WINDOWS:
         return signal.CTRL_C_EVENT  # type: ignore[attr-defined]
@@ -103,6 +116,9 @@ def _get_default_signal() -> signal.Signals:
 
 
 def _validate_full_rank(d: dict[int, Any], nprocs: int, what: str):
+    # [FUNCTION DOC] HELPER: Checks that the mapping keys are exactly the local ranks zero through
+    # nprocs minus one; otherwise raises a runtime error naming what was validated and the
+    # expected and actual key sets.
     actual_keys = set(d.keys())
     expected_keys = set(range(nprocs))
 
@@ -118,6 +134,8 @@ _VALUE_REGEX = r"^[0123]$"
 
 
 class Std(IntFlag):
+    # [CLASS DOC] Bit flags selecting standard streams: NONE (0), OUT (1), ERR (2), ALL (both).
+    # Flags can be combined with bitwise or; from_str parses the CLI string form.
     NONE = 0
     OUT = 1
     ERR = 2
@@ -125,6 +143,9 @@ class Std(IntFlag):
 
     @classmethod
     def from_str(cls, vm: str) -> Union["Std", dict[int, "Std"]]:
+        # [FUNCTION DOC] Parses either a single digit 0-3 into one flag value, or a comma-separated
+        # list of rank:digit pairs into a mapping from local rank to flag value. Raises a value
+        # error for any other text.
         """
         Example:
         ::
@@ -137,6 +158,7 @@ class Std(IntFlag):
         """
 
         def to_std(v: str) -> Std:  # type: ignore[return]
+            # [FUNCTION DOC] HELPER: Converts a digit string to a Std flag, returning it if valid.
             s = Std(int(v))
             if s in Std:
                 return s
@@ -157,6 +179,9 @@ class Std(IntFlag):
 
 
 def to_map(val_or_map: Std | dict[int, Std], local_world_size: int) -> dict[int, Std]:
+    # [FUNCTION DOC] Expands a single Std value to a mapping giving it to every local rank from
+    # zero to local_world_size minus one, or completes a partial mapping by filling missing
+    # ranks with NONE (extra keys beyond the world size are dropped). Returns a new mapping.
     """
     Certain APIs take redirect settings either as a single value (e.g. apply to all
     local ranks) or as an explicit user-provided mapping. This method is a convenience
@@ -182,6 +207,10 @@ def to_map(val_or_map: Std | dict[int, Std], local_world_size: int) -> dict[int,
 
 @dataclass
 class LogsDest:
+    # [CLASS DOC] Dataclass of log destinations, each a mapping from local rank to file path:
+    # stdouts, stderrs, tee_stdouts (streams to tail to console), tee_stderrs, error_files; plus
+    # single paths for the filtered stdout and stderr aggregate files. An empty string in
+    # stdouts/stderrs means console output.
     """
     For each log type, holds mapping of local rank ids to file paths.
     """
@@ -196,6 +225,9 @@ class LogsDest:
 
 
 class LogsSpecs(ABC):
+    # [CLASS DOC] Abstract policy for where each worker's logs go. Stores the root log directory,
+    # the redirect and tee stream selections (single value or per-rank mapping) and an optional
+    # set of local ranks whose console output is kept. Subclasses implement reify and root_log_dir.
     """
     Defines logs processing and redirection for each worker process.
 
@@ -219,6 +251,7 @@ class LogsSpecs(ABC):
         tee: Std | dict[int, Std] = Std.NONE,
         local_ranks_filter: set[int] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Stores log_dir, redirects, tee and local_ranks_filter without validation.
         self._root_log_dir = log_dir
         self._redirects = redirects
         self._tee = tee
@@ -229,6 +262,8 @@ class LogsSpecs(ABC):
         self,
         envs: dict[int, dict[str, str]],
     ) -> LogsDest:
+        # [FUNCTION DOC] Abstract: given the per-local-rank environment mappings, computes the log
+        # destinations for each rank and may set per-rank environment entries (such as the error file).
         """
         Given the environment variables, builds destination of log files for each of the local ranks.
 
@@ -239,10 +274,15 @@ class LogsSpecs(ABC):
     @property
     @abstractmethod
     def root_log_dir(self) -> str:
+        # [FUNCTION DOC] Abstract property: returns the root log directory as text.
         pass
 
 
 class DefaultLogsSpecs(LogsSpecs):
+    # [CLASS DOC] Standard LogsSpecs: lays out one directory per run and attempt, with one
+    # subdirectory per local rank holding stdout, stderr and error files, and aggregate filtered
+    # logs per attempt. State: the run directory is created once on first reify and reused.
+    # The null device as log_dir disables all log files.
     """
     Default LogsSpecs implementation:
 
@@ -257,6 +297,10 @@ class DefaultLogsSpecs(LogsSpecs):
         tee: Std | dict[int, Std] = Std.NONE,
         local_ranks_filter: set[int] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Prepares the root log directory unless it is the null device: creates a
+        # temporary directory if none is given, creates the directory if missing, and raises
+        # NotADirectoryError if the path is an existing file. Then delegates to the base
+        # constructor and clears the lazily created run directory.
         if log_dir != os.devnull:
             if not log_dir:
                 log_dir = tempfile.mkdtemp(prefix="torchelastic_")
@@ -271,9 +315,13 @@ class DefaultLogsSpecs(LogsSpecs):
 
     @property
     def root_log_dir(self) -> str:
+        # [FUNCTION DOC] Returns the root log directory as text.
+        # KNOWN ISSUE: if the root is None this returns the text None rather than a path.
         return str(self._root_log_dir)
 
     def _make_log_dir(self, log_dir: str | None, rdzv_run_id: str):
+        # [FUNCTION DOC] HELPER: Ensures the base directory exists (temporary one if none given) and
+        # creates a uniquely named subdirectory prefixed with the run id. Logs and returns its path.
         base_log_dir = log_dir or tempfile.mkdtemp(prefix="torchelastic_")
         os.makedirs(base_log_dir, exist_ok=True)
         dir = tempfile.mkdtemp(prefix=f"{rdzv_run_id}_", dir=base_log_dir)
@@ -284,6 +332,14 @@ class DefaultLogsSpecs(LogsSpecs):
         self,
         envs: dict[int, dict[str, str]],
     ) -> LogsDest:
+        # [FUNCTION DOC] Builds LogsDest for len(envs) local ranks. Reads run id and restart count
+        # from rank zero's environment (defaults for tests). Unless the root is the null device,
+        # creates the run directory once, then (re)creates a fresh attempt directory and a
+        # subdirectory per rank. Per rank decides stdout/stderr file paths from redirect flags
+        # (tee implies redirect), tee paths, and error file path, and writes the error file path
+        # into that rank's environment mapping (empty for null device). Ranks outside the filter
+        # have tee dropped and unredirected streams sent to the null device. Returns LogsDest
+        # including the filtered output file paths. Side effects: file system and env mutation.
         """
         Uses following scheme to build log destination paths:
 
@@ -401,12 +457,15 @@ class DefaultLogsSpecs(LogsSpecs):
         )
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns text showing root log dir, redirects, tee and rank filter.
         return (
             f"DefaultLogsSpecs(root_log_dir={self._root_log_dir}, redirects={self._redirects}, "
             f"tee={self._tee}, local_ranks_filter={self._local_ranks_filter})"
         )
 
     def __eq__(self, other: object) -> bool:
+        # [FUNCTION DOC] Equal when other is a DefaultLogsSpecs with the same root directory,
+        # redirects, tee and rank filter; false for other types.
         if not isinstance(other, DefaultLogsSpecs):
             return False
 
@@ -420,6 +479,8 @@ class DefaultLogsSpecs(LogsSpecs):
 
 @dataclass
 class RunProcsResult:
+    # [CLASS DOC] Dataclass result of a finished process run, all mappings keyed by local rank:
+    # return_values (functions only), failures (ProcessFailure), stdouts and stderrs file paths.
     """
     Results of a completed run of processes started with ``start_processes()``. Returned by ``PContext``.
 
@@ -438,10 +499,15 @@ class RunProcsResult:
     stderrs: dict[int, str] = field(default_factory=dict)
 
     def is_failed(self) -> bool:
+        # [FUNCTION DOC] Returns true if any worker failed (failures mapping is non-empty).
         return len(self.failures) > 0
 
 
 class PContext(abc.ABC):
+    # [CLASS DOC] Abstract context managing a set of worker processes launched by some mechanism.
+    # State: name, entrypoint, per-rank args and envs, per-rank stdout/stderr/error-file paths,
+    # process count, optional filtered output files, and a list of TailLog tailers (console tee
+    # plus filtered copies). Subclasses implement process start, polling, pid listing and close.
     """
     The base class that standardizes operations over a set of processes that are launched via different mechanisms.
 
@@ -473,6 +539,11 @@ class PContext(abc.ABC):
         duplicate_stdout_filters: list[str] | None = None,
         duplicate_stderr_filters: list[str] | None = None,
     ):
+        # [FUNCTION DOC] Resolves log destinations via logs_specs (which may modify envs), validates
+        # that stdout and stderr mappings cover exactly the ranks of args (runtime error otherwise),
+        # stores the configuration, and builds tailers for tee'd stdout and stderr. For each
+        # non-empty duplicate filter list also opens a line-buffered filtered output file (side
+        # effect) and adds a tailer writing only lines containing any filter substring.
         self.name = name
         # validate that all mappings have the same number of keys and
         # all local ranks are accounted for
@@ -532,6 +603,12 @@ class PContext(abc.ABC):
             )
 
     def start(self) -> None:
+        # [FUNCTION DOC] On the main thread, registers the termination handler (which raises
+        # SignalException) for each signal named in the comma-separated environment variable
+        # for signals to handle (default terminate, interrupt, hangup, quit); unknown or
+        # unregistrable signals are logged as warnings, and unsupported ones on Windows as info.
+        # On other threads only logs a warning. Then calls the subclass start hook and starts
+        # all tailers. Side effects: process-wide signal handlers, worker processes, threads.
         """Start processes using parameters defined in the constructor."""
         if threading.current_thread() is threading.main_thread():
             # Register signal handlers for the signals specified in the environment variable
@@ -578,11 +655,14 @@ class PContext(abc.ABC):
 
     @abc.abstractmethod
     def _start(self) -> None:
+        # [FUNCTION DOC] Abstract: launches the worker processes using the subclass mechanism.
         """Start processes using strategy defined in a particular context."""
         raise NotImplementedError
 
     @abc.abstractmethod
     def _poll(self) -> RunProcsResult | None:
+        # [FUNCTION DOC] Abstract: non-blocking status check, all-or-nothing. Returns a result when
+        # all processes succeeded or any failed, or None while all are still running.
         """
         Poll the run status of the processes running under this context.
         This method follows an "all-or-nothing" policy and returns
@@ -593,6 +673,9 @@ class PContext(abc.ABC):
         raise NotImplementedError
 
     def wait(self, timeout: float = -1, period: float = 1) -> RunProcsResult | None:
+        # [FUNCTION DOC] Polls every period seconds until a result is available or timeout seconds
+        # pass. Zero timeout does a single poll; negative waits effectively forever. Returns the
+        # result, or None on timeout. Propagates SignalException raised by the signal handler.
         """
         Wait for the specified ``timeout`` seconds, polling every ``period`` seconds
         for the processes to be done. Returns ``None`` if the processes are still running
@@ -635,11 +718,14 @@ class PContext(abc.ABC):
 
     @abc.abstractmethod
     def pids(self) -> dict[int, int]:
+        # [FUNCTION DOC] Abstract: returns a mapping from local rank to process id.
         """Return pids of processes mapped by their respective local_ranks."""
         raise NotImplementedError
 
     @abc.abstractmethod
     def _close(self, death_sig: signal.Signals, timeout: int = 30) -> None:
+        # [FUNCTION DOC] Abstract: sends death_sig to all workers, waits up to timeout, escalates
+        # to a kill, and cleans up subclass resources.
         r"""
         Terminates all processes managed by this context and cleans up any
         meta resources (e.g. redirect, error_file files).
@@ -647,6 +733,9 @@ class PContext(abc.ABC):
         raise NotImplementedError
 
     def close(self, death_sig: signal.Signals | None = None, timeout: int = 30) -> None:
+        # [FUNCTION DOC] Terminates workers via the subclass close hook (default signal if none
+        # given), then stops all tailers and closes the filtered output files if open.
+        # Side effects: signals processes, joins tail threads, closes files.
         r"""
         Terminates all processes managed by this context and cleans up any
         meta resources (e.g. redirect, error_file files).
@@ -668,6 +757,8 @@ class PContext(abc.ABC):
 
 
 def get_std_cm(std_rd: str, redirect_fn):
+    # [FUNCTION DOC] Returns a context manager for redirecting a stream: a no-op one on Windows,
+    # macOS or when std_rd is empty; otherwise the result of calling redirect_fn with std_rd.
     if IS_WINDOWS or IS_MACOS or not std_rd:
         return nullcontext()
     else:
@@ -685,6 +776,11 @@ def _wrap(
     queue_finished_reading_event: synchronize.Event,
     numa_options: NumaOptions | None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Worker-process entry point. Looks up this rank's args, env, return
+    # queue and redirect paths (key error if missing), applies the env to the process environment,
+    # runs the function (with optional NUMA binding and error recording) inside the stdout/stderr
+    # redirects, puts the return value on the queue, then blocks until the parent signals that
+    # it finished reading. Side effects: mutates os.environ, redirects streams.
     # get the per-rank params up front so we fail fast if no mapping is found
     args_ = args[local_rank]
     env_ = envs[local_rank]
@@ -709,6 +805,10 @@ def _wrap(
 
 
 class MultiprocessContext(PContext):
+    # [CLASS DOC] PContext that runs a Python function in worker processes started through
+    # torch multiprocessing with the given start method. State: per-rank return value queues,
+    # collected return values, the process context handle (None until started), an event telling
+    # workers the parent finished reading results, and NUMA options. Fails fast if any worker fails.
     """``PContext`` holding worker processes invoked as a function."""
 
     def __init__(
@@ -724,6 +824,9 @@ class MultiprocessContext(PContext):
         duplicate_stdout_filters: list[str] | None = None,
         duplicate_stderr_filters: list[str] | None = None,
     ):
+        # [FUNCTION DOC] Initializes the base context, then creates one single-item return queue
+        # per rank and the worker-finished event from the chosen start method context, and
+        # stores NUMA options. Does not start any process.
         super().__init__(
             name,
             entrypoint,
@@ -752,6 +855,9 @@ class MultiprocessContext(PContext):
         self._numa_options: NumaOptions | None = numa_options
 
     def _start(self):
+        # [FUNCTION DOC] Starts the worker processes non-blocking and non-daemonic via torch
+        # multiprocessing, running the wrapper function with the shared configuration. Raises a
+        # value error if already started.
         if self._pc:
             raise ValueError(
                 "The process context already initialized."
@@ -776,9 +882,16 @@ class MultiprocessContext(PContext):
         )
 
     def _is_done(self) -> bool:
+        # [FUNCTION DOC] HELPER: True when a return value has been collected from every rank.
         return len(self._return_values) == self.nprocs
 
     def _poll(self) -> RunProcsResult | None:
+        # [FUNCTION DOC] Non-blocking status check. Joins the process context (raising if a worker
+        # raised or exited abnormally), drains any ready return queues, and when all return values
+        # are in: releases workers, waits for all to exit, validates the return values cover all
+        # ranks, closes the context and returns a successful result. Returns None while work
+        # remains. On a worker failure logs it, closes the context and returns a result holding
+        # a single ProcessFailure for the failing rank.
         if self._pc is None:
             raise AssertionError  # assertion for mypy type checker
 
@@ -859,11 +972,15 @@ class MultiprocessContext(PContext):
             )
 
     def pids(self) -> dict[int, int]:
+        # [FUNCTION DOC] Returns rank to pid mapping from the process context; assertion error if not started.
         if self._pc is None:
             raise AssertionError  # assertion for mypy type checking
         return dict(enumerate(self._pc.pids()))
 
     def _close(self, death_sig: signal.Signals, timeout: int = 30) -> None:
+        # [FUNCTION DOC] No-op if not started. Sends death_sig to each live worker, waits for
+        # all up to a shared timeout budget, then force-kills survivors and joins each with a
+        # bounded timeout, logging an error for any that cannot be reaped. Missing processes ignored.
         if not self._pc:
             return
         for proc in self._pc.processes:
@@ -915,6 +1032,9 @@ class MultiprocessContext(PContext):
 
 
 class SubprocessContext(PContext):
+    # [CLASS DOC] PContext that runs a binary entrypoint as one subprocess per rank through
+    # SubprocessHandler objects. State: set of still-running ranks, mapping of failures, the
+    # handlers by rank, and NUMA options. Return values are placeholders (None) on success.
     """``PContext`` holding worker processes invoked as a binary."""
 
     def __init__(
@@ -929,6 +1049,8 @@ class SubprocessContext(PContext):
         duplicate_stdout_filters: list[str] | None = None,
         duplicate_stderr_filters: list[str] | None = None,
     ):
+        # [FUNCTION DOC] Initializes the base context, marks all ranks as running, and prepares
+        # empty failure and handler mappings. Does not start any process.
         super().__init__(
             name,
             entrypoint,
@@ -947,6 +1069,9 @@ class SubprocessContext(PContext):
         self._numa_options: NumaOptions | None = numa_options
 
     def _start(self):
+        # [FUNCTION DOC] Launches one subprocess per rank via the handler factory using that
+        # rank's args, env, output paths and NUMA options. Raises a value error if handlers
+        # already exist (start called twice).
         if self.subprocess_handlers:
             raise ValueError(
                 "The subprocess handlers already initialized. Most likely the start method got called twice."
@@ -965,6 +1090,9 @@ class SubprocessContext(PContext):
         }
 
     def _capture_process_failures(self, done_local_ranks: set[int]):
+        # [FUNCTION DOC] HELPER: For each still-running rank, polls its process; if exited, adds
+        # the rank to done_local_ranks (mutated) and, for a nonzero exit code, records a
+        # ProcessFailure in the failures mapping.
         for local_rank in self._running_local_ranks:
             handler = self.subprocess_handlers[local_rank]
             exitcode = handler.proc.poll()
@@ -980,6 +1108,10 @@ class SubprocessContext(PContext):
                 # else: --> succeeded; nothing to do
 
     def _poll(self) -> RunProcsResult | None:
+        # [FUNCTION DOC] Updates which ranks finished. If all finished or any failed, closes all
+        # processes, re-captures failures caused by termination, and returns a result with
+        # failures (logging the earliest one) or, on success, placeholder None return values for
+        # every rank. Otherwise returns None.
         done_local_ranks: set[int] = set()
         self._capture_process_failures(done_local_ranks)
 
@@ -1015,12 +1147,16 @@ class SubprocessContext(PContext):
             return None
 
     def pids(self) -> dict[int, int]:
+        # [FUNCTION DOC] Returns rank to process id mapping from the subprocess handlers.
         return {
             local_rank: sh.proc.pid
             for local_rank, sh in self.subprocess_handlers.items()
         }
 
     def _close(self, death_sig: signal.Signals, timeout: int = 30) -> None:
+        # [FUNCTION DOC] No-op without handlers. Signals each live process with death_sig, waits
+        # for all within a shared timeout budget (ignoring expiry), force-kills survivors and waits
+        # a bounded time for each, logging an error for any that will not exit.
         if not self.subprocess_handlers:
             return
         for handler in self.subprocess_handlers.values():

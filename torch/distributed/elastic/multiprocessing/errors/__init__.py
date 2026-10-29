@@ -6,6 +6,11 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+# [PACKAGE DOC] File-based error propagation from worker processes to the elastic agent.
+# Exports ProcessFailure (parsed failure of one worker), ChildFailedError (exception carrying
+# all worker failures and formatting a report), record (decorator writing uncaught exceptions to
+# the file in TORCHELASTIC_ERROR_FILE), ErrorHandler and get_error_handler. Import-time side
+# effect: creates a module logger.
 
 """
 Each host in a distributed PyTorch job runs with a single TorchElastic agent,
@@ -90,6 +95,10 @@ _P = ParamSpec("_P")
 
 @dataclass
 class ProcessFailure:
+    # [CLASS DOC] Dataclass describing one failed worker: local_rank, pid, exitcode and
+    # error_file are inputs; error_file_data (parsed JSON), message and timestamp are derived at
+    # construction. If the error file is missing, a placeholder message state and the current
+    # time are used; a negative exit code means death by signal.
     """
     Represent the failed process result. When the worker process fails, it may record failure root cause into the file.
 
@@ -116,6 +125,13 @@ class ProcessFailure:
     timestamp: int = field(init=False)
 
     def __post_init__(self):
+        # [FUNCTION DOC] Populates derived fields. If the error file exists it is parsed as JSON
+        # and message/timestamp are extracted (parse failures are logged and re-raised);
+        # otherwise the no-reply defaults are used. If the message is empty, builds one: a
+        # signal description for negative exit codes, else a pointer to the docs, and in that
+        # case also adds error traits marking a non-retryable system-terminated error.
+        # KNOWN ISSUE: the traits are added to the shared module-level empty-data dict when the
+        # file is missing, so that mutation leaks across instances.
         self.error_file_data = _EMPTY_ERROR_DATA
         if os.path.isfile(self.error_file):
             try:
@@ -150,6 +166,10 @@ class ProcessFailure:
                 self.message = "To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html"
 
     def _get_error_data(self, error_file_data: dict[str, Any]) -> tuple[str, int]:
+        # [FUNCTION DOC] HELPER: Extracts (message, timestamp) from parsed error data. A string
+        # message uses the top-level timestamp (default 0); a mapping message uses the nested
+        # extra-info timestamp. Raises a key error if required fields are missing. The returned
+        # message may be a mapping despite the string annotation.
         message = error_file_data["message"]
         if isinstance(message, str):
             timestamp = int(error_file_data.get("timestamp", 0))
@@ -158,12 +178,17 @@ class ProcessFailure:
         return (message, timestamp)
 
     def _set_no_reply_file(self):
+        # [FUNCTION DOC] HELPER: Marks the error file as unavailable, resets data to the empty
+        # placeholder, clears the message and sets timestamp to the current time.
         self.error_file = _NOT_AVAILABLE
         self.error_file_data = _EMPTY_ERROR_DATA
         self.message = ""
         self.timestamp = int(time.time())
 
     def signal_name(self) -> str:
+        # [FUNCTION DOC] Returns the symbolic name of the signal that killed the process when
+        # the exit code is negative and maps to a known signal; otherwise returns the
+        # not-available marker. Never raises.
         if self.exitcode < 0:
             # We don't want to kill the parent process trying to find the signal name.
             # if the signal doesn't map to a known name, use not available.
@@ -175,6 +200,8 @@ class ProcessFailure:
             return _NOT_AVAILABLE
 
     def timestamp_isoformat(self):
+        # [FUNCTION DOC] Returns the failure timestamp as a local-time ISO string with an
+        # underscore between date and time.
         """Return timestamp in ISO format (YYYY-MM-DD_HH:MM:SS)."""
         return datetime.fromtimestamp(self.timestamp).isoformat(sep="_")
 
@@ -203,6 +230,9 @@ ${boarder}"""
 
 
 class ChildFailedError(Exception):
+    # [CLASS DOC] Exception holding a name and a non-empty mapping of global rank to
+    # ProcessFailure. Its message is a formatted multi-failure report highlighting the root
+    # cause (failure with the smallest timestamp). Constructing with no failures is an error.
     """
     Special exception type that can be raised from a function annotated with the
     ``@record`` decorator to have the child process' (root exception) propagate
@@ -238,6 +268,8 @@ class ChildFailedError(Exception):
     """
 
     def __init__(self, name: str, failures: dict[GlobalRank, ProcessFailure]):
+        # [FUNCTION DOC] Stores name and failures, raises an assertion error if failures is
+        # empty, then initializes the base exception with the formatted report.
         self.name = name
         self.failures = failures
         # does not make sense to create a ChildFailedError with no failures
@@ -246,10 +278,15 @@ class ChildFailedError(Exception):
         super().__init__(self.format_msg())
 
     def get_first_failure(self) -> tuple[GlobalRank, ProcessFailure]:
+        # [FUNCTION DOC] Returns the (rank, failure) pair with the smallest timestamp.
         rank = min(self.failures.keys(), key=lambda r: self.failures[r].timestamp)
         return rank, self.failures[rank]
 
     def format_msg(self, boarder_delim="=", section_delim="-"):
+        # [FUNCTION DOC] Builds the report text: a title, the other failures (or a placeholder
+        # line if none) and the root-cause failure, framed by border and section lines whose
+        # width is the widest formatted entry capped at 60 characters. Args set the border and
+        # section delimiter characters. Returns the string.
         title = f"{self.name} FAILED"
         root_rank, _root_failure = self.get_first_failure()
 
@@ -278,6 +315,11 @@ class ChildFailedError(Exception):
     def _format_failure(
         self, idx: int, rank: int, failure: ProcessFailure
     ) -> tuple[str, int]:
+        # [FUNCTION DOC] HELPER: Formats one failure as a block with index, time, host, rank,
+        # exit code, pid, signal name, error file and message/traceback. For mapping messages
+        # prefers the stored traceback, then the message text, then a placeholder. For signal
+        # failures lets the error handler enrich the text (exceptions swallowed with a warning).
+        # Returns (text, width of longest line).
         # failure.message is either a str (when the failure does not generate a traceback - e.g. signals)
         # or a dict (json) of the form
         # {"message": $ERROR_MSG, "extraInfo": {"py_callstack": $TRACEBACK, timestamp: $TS}}
@@ -331,6 +373,13 @@ class ChildFailedError(Exception):
 def record(
     fn: Callable[_P, _R], error_handler: ErrorHandler | None = None
 ) -> Callable[_P, _R | None]:
+    # [FUNCTION DOC] Decorator that wraps fn so that, on each call, the error handler is
+    # initialized and uncaught errors are recorded before being re-raised. A child-failure error
+    # copies the first failure's error file to this process's file (or logs if none exists);
+    # other exceptions are written via the handler; an exit request with code zero returns None
+    # instead of exiting. Uses the default handler when none is given. Returns the wrapped function.
+    # KNOWN ISSUE: the no-error-file log call passes a single tuple as the message, so the
+    # format string and rank are not interpolated.
     """
     Syntactic sugar to record errors/exceptions that happened in the decorated
     function using the provided ``error_handler``.
@@ -371,8 +420,11 @@ def record(
         error_handler = get_error_handler()
 
     def wrap(f: Callable[_P, _R]) -> Callable[_P, _R | None]:
+        # [FUNCTION DOC] HELPER: Builds and returns the recording wrapper around f.
         @wraps(f)
         def wrapper(*args: _P.args, **kwargs: _P.kwargs):
+            # [FUNCTION DOC] HELPER: Initializes the handler, calls f and returns its result;
+            # handles errors as described for record, always re-raising except zero-code exit.
             if error_handler is None:
                 raise AssertionError  # assertion for mypy type checker
             error_handler.initialize()

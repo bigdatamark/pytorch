@@ -4,6 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [PACKAGE DOC] Rendezvous (distributed synchronization plus peer discovery) for elastic jobs.
+# Re-exports the rendezvous handler interface, parameters, info types, registry and the error
+# hierarchy from the api module. Import-time side effects: registers the default rendezvous
+# handlers and any out-of-tree handlers into the global registry.
+
 """
 In the context of Torch Distributed Elastic we use the term *rendezvous* to
 refer to a particular functionality that combines a **distributed

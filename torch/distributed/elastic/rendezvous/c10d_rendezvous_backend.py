@@ -5,6 +5,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [MODULE DOC] Rendezvous backend that keeps the shared rendezvous state in a C10d store (TCPStore
+# or FileStore). Contains C10dRendezvousBackend, store construction helpers and create_backend.
+# Import-time side effects: creates a module logger; defines DEFAULT_PORT (29400) for the TCP store.
+
 import binascii
 import logging
 import os
@@ -33,6 +37,10 @@ DEFAULT_PORT = 29400
 
 
 class C10dRendezvousBackend(RendezvousBackend):
+    # [CLASS DOC] Implements the backend state interface on top of a C10d store. The state is
+    # stored base64-encoded under a key derived from the run id; the encoded text itself serves as
+    # the version token for compare-and-set updates. A sentinel value stands in for "no state"
+    # because store reads block on missing keys.
     """Represents a C10d-backed rendezvous backend.
 
     Args:
@@ -50,6 +58,9 @@ class C10dRendezvousBackend(RendezvousBackend):
     _key: str
 
     def __init__(self, store: Store, run_id: str) -> None:
+        # [FUNCTION DOC] Stores the store, derives the state key from run_id, and initializes the
+        # key to the null sentinel via compare-and-set (leaving existing state untouched).
+        # Raises a value error for an empty run_id and a rendezvous connection error on store failure.
         if not run_id:
             raise ValueError("The run id must be a non-empty string.")
 
@@ -67,10 +78,13 @@ class C10dRendezvousBackend(RendezvousBackend):
 
     @property
     def name(self) -> str:
+        # [FUNCTION DOC] Returns the backend name, the constant string c10d.
         """See base class."""
         return "c10d"
 
     def get_state(self) -> tuple[bytes, Token] | None:
+        # [FUNCTION DOC] Reads the stored value and decodes it. Returns (state bytes, token) or None
+        # if only the sentinel is stored. Raises connection or state errors.
         """See base class."""
         base64_state: bytes = self._call_store("get", self._key)
 
@@ -79,6 +93,12 @@ class C10dRendezvousBackend(RendezvousBackend):
     def set_state(
         self, state: bytes, token: Token | None = None
     ) -> tuple[bytes, Token, bool] | None:
+        # [FUNCTION DOC] Attempts a compare-and-set of the state. With no token, expects the null
+        # sentinel; with a token, expects it to equal the stored encoding. A non-bytes token is
+        # treated as stale: returns the current state with a false flag (or None if empty).
+        # Otherwise returns (state now stored, its token, whether it equals the proposed state);
+        # the flag is determined by comparing contents since the store gives no success signal.
+        # Returns None if the stored value is the sentinel. Raises connection or state errors.
         """See base class."""
         base64_state_str: str = b64encode(state).decode()
 
@@ -110,6 +130,8 @@ class C10dRendezvousBackend(RendezvousBackend):
         return new_state, new_token, new_state == state
 
     def _call_store(self, store_op: str, *args, **kwargs) -> Any:
+        # [FUNCTION DOC] HELPER: Invokes the named store method with the given arguments and returns
+        # its result, translating value, runtime and timeout errors into a rendezvous connection error.
         try:
             return getattr(self._store, store_op)(*args, **kwargs)
         except (ValueError, RuntimeError, TimeoutError) as exc:
@@ -118,6 +140,9 @@ class C10dRendezvousBackend(RendezvousBackend):
             ) from exc
 
     def _decode_state(self, base64_state: bytes) -> tuple[bytes, Token] | None:
+        # [FUNCTION DOC] HELPER: Maps the sentinel to None; otherwise base64-decodes the value and
+        # returns (decoded state, original encoded value as token). Raises a rendezvous state error
+        # if decoding fails.
         if base64_state == self._NULL_SENTINEL.encode():
             return None
 
@@ -132,6 +157,11 @@ class C10dRendezvousBackend(RendezvousBackend):
 
 
 def _create_tcp_store(params: RendezvousParameters) -> TCPStore:
+    # [FUNCTION DOC] HELPER: Builds a multi-tenant TCPStore from the endpoint (default port 29400).
+    # Whether this process hosts the server comes from the is_host option, else a hostname match.
+    # The read timeout option (default 60 seconds) must be positive, else a value error is raised.
+    # If hosting was only inferred and creation fails, retries once as a non-host client; other
+    # failures raise a rendezvous connection error. Logs and records an event when hosting.
     host, port = parse_rendezvous_endpoint(params.endpoint, default_port=DEFAULT_PORT)
 
     cfg_is_host = params.get_as_bool("is_host")
@@ -185,6 +215,10 @@ def _create_tcp_store(params: RendezvousParameters) -> TCPStore:
 
 
 def _create_file_store(params: RendezvousParameters) -> FileStore:
+    # [FUNCTION DOC] HELPER: Builds a FileStore at the endpoint path, or at a newly created
+    # temporary file if no endpoint is given. Raises a rendezvous error if the temp file cannot
+    # be created and a connection error if the store cannot be opened.
+    # KNOWN ISSUE: the file descriptor returned by the temp file creation is never closed.
     # If a user specifies an endpoint, we treat it as a path to a file.
     if params.endpoint:
         path = params.endpoint
@@ -209,6 +243,10 @@ def _create_file_store(params: RendezvousParameters) -> FileStore:
 
 
 def create_backend(params: RendezvousParameters) -> tuple[C10dRendezvousBackend, Store]:
+    # [FUNCTION DOC] Creates the store selected by the store_type option (tcp by default, or file;
+    # case and whitespace ignored) and wraps it in a C10dRendezvousBackend. Returns (backend, store).
+    # Raises a value error for an unknown store type; any failure is recorded as a failed
+    # rendezvous event before being re-raised.
     """Create a new :py:class:`C10dRendezvousBackend` from the specified parameters.
 
     +--------------+-----------------------------------------------------------+

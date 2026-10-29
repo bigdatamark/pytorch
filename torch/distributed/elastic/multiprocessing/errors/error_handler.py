@@ -6,6 +6,9 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+# [MODULE DOC] Defines ErrorHandler, which records worker exceptions as JSON into the file named
+# by the TORCHELASTIC_ERROR_FILE environment variable and propagates child error files to a
+# parent. Creates a module logger at import time; no other side effects.
 import faulthandler
 import json
 import logging
@@ -22,6 +25,10 @@ logger = logging.getLogger(__name__)
 
 
 class ErrorHandler:
+    # [CLASS DOC] Stateless handler for capturing and persisting errors. Key methods: initialize
+    # (enable fault handler), record_exception (write JSON error file), dump_error_file (copy a
+    # child's error file into this process's error file with optional error code override), and
+    # hooks maybe_enrich_signal_failure_message / _get_error_file_path for subclass customization.
     """
     Write the provided exception object along with some other metadata about
     the error in a structured way in JSON format to an error file specified by the
@@ -34,6 +41,8 @@ class ErrorHandler:
     """
 
     def _get_error_file_path(self) -> str | None:
+        # [FUNCTION DOC] HELPER: Returns the value of the TORCHELASTIC_ERROR_FILE environment
+        # variable, or None if unset (meaning errors are only logged).
         """
         Return the error file path.
 
@@ -42,6 +51,9 @@ class ErrorHandler:
         return os.environ.get("TORCHELASTIC_ERROR_FILE", None)
 
     def initialize(self) -> None:
+        # [FUNCTION DOC] Enables the fault handler for all threads so fatal signals dump a
+        # traceback. Any failure to enable is downgraded to a warning (never raises).
+        # Side effect: changes process-global faulthandler state.
         """
         Call prior to running code that we wish to capture errors/exceptions.
 
@@ -57,6 +69,8 @@ class ErrorHandler:
             )
 
     def _write_error_file(self, file_path: str, error_msg: str) -> None:
+        # [FUNCTION DOC] HELPER: Writes error_msg to file_path, truncating it. Any exception
+        # is converted to a warning rather than raised.
         """Write error message to the file."""
         try:
             with open(file_path, "w") as fp:
@@ -67,6 +81,12 @@ class ErrorHandler:
             )
 
     def record_exception(self, e: BaseException) -> None:
+        # [FUNCTION DOC] If an error file path is configured, writes a JSON document with the
+        # exception type and text, the formatted current traceback, and a timestamp in whole
+        # seconds. If no path is configured, does nothing.
+        # KNOWN ISSUE: the docstring says contents are logged when there is no file, but the code
+        # logs nothing. Also the traceback is the one for the exception currently being handled,
+        # so it is only meaningful when called inside an except block. File write errors propagate.
         """
         Write structured information about the exception into an error file in JSON format.
 
@@ -88,6 +108,8 @@ class ErrorHandler:
                 json.dump(data, fp)
 
     def maybe_enrich_signal_failure_message(self, message: str, error_file: str) -> str:
+        # [FUNCTION DOC] Extension hook for signal failures; the base implementation returns the
+        # message unchanged and ignores error_file.
         """Hook to enrich a signal (no-traceback) failure message.
 
         Called from ``ProcessFailure`` when a worker fails by signal (negative
@@ -105,6 +127,9 @@ class ErrorHandler:
         rootcause_error: dict[str, Any],
         error_code: int = 0,
     ):
+        # [FUNCTION DOC] Mutates the parsed root-cause error mapping in place by setting the
+        # error code inside its message entry. If there is no message entry, or the message is a
+        # plain string (new format), logs a warning and leaves it unchanged. Returns nothing.
         """Modify the rootcause_error read from the file, to correctly set the exit code."""
         if "message" not in rootcause_error:
             logger.warning(
@@ -123,6 +148,10 @@ class ErrorHandler:
             rootcause_error["message"]["errorCode"] = error_code
 
     def dump_error_file(self, rootcause_error_file: str, error_code: int = 0):
+        # [FUNCTION DOC] Reads the child's JSON error file (errors if missing or invalid), applies
+        # the nonzero error_code override, and writes the result to this process's own error file
+        # (replacing any existing one, with a warning). If no own error file is configured, only
+        # logs an error. Side effects: file I/O and logging.
         """Dump parent error file from child process's root cause error and error code."""
         with open(rootcause_error_file) as fp:
             rootcause_error = json.load(fp)
@@ -160,6 +189,8 @@ class ErrorHandler:
             )
 
     def _rm(self, my_error_file):
+        # [FUNCTION DOC] HELPER: If the file exists, logs a warning with its parsed contents (or a
+        # note if it is not valid JSON) and then deletes it. Does nothing if absent.
         if os.path.isfile(my_error_file):
             # Log the contents of the original file.
             with open(my_error_file) as fp:
