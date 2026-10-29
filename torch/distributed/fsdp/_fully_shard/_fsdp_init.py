@@ -1,3 +1,7 @@
+# [MODULE DOC] Initialization helpers shared by fully_shard and replicate: module/mesh validation,
+# mesh-info construction (FSDP, DDP, HSDP, including named dp_mesh_dims), post-forward mesh derivation,
+# default mesh creation, managed module/parameter/buffer discovery, device movement, wrapper-class
+# application, and FSDPParamGroup construction. Defines a module logger; no other import-time side effects.
 import itertools
 import logging
 from typing import TYPE_CHECKING
@@ -33,6 +37,8 @@ logger = logging.getLogger("torch.distributed.fsdp.fully_shard")
 
 
 def _validate_module(module: nn.Module, func_name: str) -> None:
+    # [FUNCTION DOC] HELPER: Raises ValueError if the module is a ModuleList or ModuleDict that does not
+    # override forward; func_name is used in the message. Returns None otherwise.
     """
     Validate that the module can be used with fully_shard or replicate.
 
@@ -51,6 +57,9 @@ def _validate_mesh(
     mesh: "DeviceMesh",
     dp_mesh_dims: "DataParallelMeshDims | None" = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Validates a mesh for fully_shard. With dp_mesh_dims: requires shard or replicate to be
+    # set, the mesh to have dim names, and every named dim to exist (ValueError otherwise). Without: requires a 1D or
+    # 2D mesh (ValueError), and a 2D mesh must have dim names (AssertionError).
     """
     Validate that the mesh can be used with fully_shard.
 
@@ -88,6 +97,8 @@ def _get_mesh_info(
     mesh: "DeviceMesh",
     dp_mesh_dims: "DataParallelMeshDims | None" = None,
 ) -> "DataParallelMeshInfo":
+    # [FUNCTION DOC] HELPER: Returns the mesh info for the mesh: with dp_mesh_dims delegates to the named-dims
+    # builder; otherwise FSDPMeshInfo for a 1D mesh (shard dim 0) or HSDPMeshInfo for 2D (replicate dim 0, shard dim 1).
     """
     Get the appropriate mesh info for the given mesh.
 
@@ -109,10 +120,15 @@ def _get_mesh_info_from_named_dims(
     mesh: "DeviceMesh",
     dp_mesh_dims: "DataParallelMeshDims",
 ) -> "DataParallelMeshInfo":
+    # [FUNCTION DOC] HELPER: Builds mesh info from named dims of the full SPMD mesh: extracts a 1D submesh for
+    # shard names and/or replicate names (multiple names are flattened into one new dim, creating a new mesh and
+    # process group). Returns DDPMeshInfo (no shard names), FSDPMeshInfo (no replicate names), or HSDPMeshInfo
+    # (replicate mesh concatenated before shard mesh); each records dp_mesh_dims and the full spmd_mesh.
     shard_names = dp_mesh_dims.shard_names
     replicate_names = dp_mesh_dims.replicate_names
 
     def _get_submesh(names: tuple[str, ...]) -> "DeviceMesh":
+        # [FUNCTION DOC] HELPER: Returns the single named submesh, or a flattened 1D mesh over several names.
         if len(names) == 1:
             return mesh[names[0]]
         # Flatten multi-dim submesh into a single dim so FSDP's internal
@@ -152,6 +168,10 @@ def _get_mesh_info_from_named_dims(
 def _get_post_forward_mesh_info(
     reshard_after_forward: bool | int, mesh_info: FSDPMeshInfo
 ) -> FSDPMeshInfo | None:
+    # [FUNCTION DOC] HELPER: Maps reshard_after_forward to the mesh info used after forward. True (or an int equal to
+    # the shard size) gives the same mesh info; False (or int 1, with a one-time warning) gives None; other int factors
+    # of the shard size give a new HSDPMeshInfo over a reshaped mesh (replicate x factor). Raises ValueError for
+    # non-bool/int values or ints that are not a factor of the shard size.
     shard_mesh_size = mesh_info.shard_mesh_size
     if not isinstance(reshard_after_forward, (bool, int)):
         raise ValueError(
@@ -198,6 +218,8 @@ def _get_post_forward_mesh_info(
 def _init_default_mesh(
     mesh_dim_names: tuple[str, ...] | None = None,
 ) -> DeviceMesh:
+    # [FUNCTION DOC] HELPER: Returns a 1D device mesh over the whole default process group on the current
+    # accelerator type, with optional dim names. Side effect: initializes the default process group if needed.
     """Default to global CUDA mesh if possible else global CPU mesh."""
     if not dist.distributed_c10d.is_initialized():
         dist.distributed_c10d.init_process_group()
@@ -212,11 +234,14 @@ def _init_default_mesh(
 
 
 def _init_default_fully_shard_mesh() -> DeviceMesh:
+    # [FUNCTION DOC] HELPER: Returns the default 1D mesh for fully_shard (delegates to the default mesh helper).
     """Default to global CUDA mesh if possible else global CPU mesh."""
     return _init_default_mesh()
 
 
 def _get_device_from_mesh(mesh: DeviceMesh) -> torch.device:
+    # [FUNCTION DOC] HELPER: Returns the torch device for the mesh: cpu for a cpu mesh, otherwise the mesh
+    # device type at the current device index.
     if mesh.device_type == "cpu":
         return torch.device("cpu")
     device_handle = _get_device_handle(mesh.device_type)
@@ -228,6 +253,8 @@ def _ignore_module(
     ignored_params: set[nn.Parameter],
     ignore_decision: dict[nn.Module, bool],
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Recursive decision whether a module can be ignored: it must have no direct buffers, all
+    # direct parameters ignored, and all children ignorable. Memoizes results in ignore_decision (mutated) and returns bool.
     """
     Decide if it is safe to ignore a module for applying fully_shard.
     """
@@ -261,6 +288,8 @@ def _ignore_module(
 def _adjust_managed_modules(
     modules: list[nn.Module], ignored_params: set[nn.Parameter]
 ) -> list[nn.Module]:
+    # [FUNCTION DOC] HELPER: Returns the subset of modules (order kept) that should not be ignored, using a shared
+    # memo for the ignore decision.
     """
     Adjust the given list of managed modules by removing those with all parameters ignored.
     """
@@ -279,6 +308,9 @@ def _get_managed_modules(
     is_composable_fn: "Callable[[nn.Module], bool] | None" = None,
     get_state_fn: "Callable[[nn.Module], Any] | None" = None,
 ) -> list[nn.Module]:
+    # [FUNCTION DOC] HELPER: Collects managed modules by post-order DFS from the root modules, skipping modules that are not
+    # composable and non-root modules that already have FSDP state. Defaults the composability and state getters to the
+    # FSDP versions. If ignored_params is given, drops modules whose params are all ignored. Returns the module list.
     """
     Get the list of managed modules for FSDP/replicate.
 
@@ -301,6 +333,8 @@ def _get_managed_modules(
     visited_modules: set[nn.Module] = set()
 
     def dfs(module: nn.Module) -> None:
+        # [FUNCTION DOC] HELPER: Post-order DFS visiting each unvisited child, appending to the modules list; stops at
+        # non-composable modules and nested already-sharded non-root modules.
         """
         Runs a DFS to collect managed modules, not recursing into modules with
         a non-composable API or ``fully_shard`` already applied.
@@ -326,6 +360,7 @@ def _get_managed_modules(
 
 
 def _verify_managed_param(name: str, param: nn.Parameter) -> None:
+    # [FUNCTION DOC] HELPER: Raises ValueError if the parameter is a scalar (zero dims), since a dim is needed to shard.
     """
     Verify if the parameter is accepted by fully_shard. The only restriction now
     is that the parameter cannot be a scalar tensor (param.numel == 0) since we
@@ -341,6 +376,8 @@ def _verify_managed_param(name: str, param: nn.Parameter) -> None:
 def _get_managed_states(
     modules: list[nn.Module], ignored_params: set[nn.Parameter] | None = None
 ) -> tuple[list[nn.Parameter], list[torch.Tensor]]:
+    # [FUNCTION DOC] HELPER: Returns (params, buffers) from the modules' direct (non-recursive) parameters and buffers,
+    # deduplicated by identity, skipping ignored params and validating each param with the scalar check.
     params: list[nn.Parameter] = []
     buffers: list[torch.Tensor] = []
     # Track visited parameters/buffers to avoid visiting shared parameters and
@@ -371,6 +408,9 @@ def _move_states_to_device(
     buffers: list[torch.Tensor],
     device: torch.device,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Moves params and buffers to device in place (by replacing data, or swapping tensors for traceable
+    # wrapper subclasses), skipping tensors already there or on meta. Raises ValueError if a DTensor has a mesh of a different
+    # device type, and AssertionError for any other DTensor needing a move.
     """
     We have FSDP move states to device for simpler and faster initialization
     since FSDP almost always uses CUDA for training. We move parameters/buffers
@@ -408,6 +448,9 @@ def _apply_to_module(
     wrapper_cls_prefix: str,
     unimplemented_deepcopy: "Callable",
 ) -> None:
+    # [FUNCTION DOC] HELPER: For each module, swaps its class for a dynamically created subclass of
+    # (wrapper_module_cls, original class) named with the prefix, with __deepcopy__ set to the given function. New classes
+    # are cached in cls_to_wrapper_cls (mutated). No return value.
     """
     Modify module classes to include the wrapper class in their MRO.
 
@@ -442,6 +485,11 @@ def _init_param_group(
     offload_policy: "OffloadPolicy",
     reshard_after_forward: bool | int = True,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Creates FSDPParamGroup objects and appends them to state._fsdp_param_groups (mutated). Does
+    # nothing for empty params. Without shard_placement_fn creates one group; otherwise groups params by (shard process
+    # group, replicate process group) of each param's resolved mesh info and builds one group each, computing a post-forward
+    # mesh info for groups whose mesh differs from the default. Raises ValueError if mesh_info is not FSDPMeshInfo in
+    # the per-param case, or if one process group key maps to different mesh info objects.
     """
     Initialize FSDP param groups for the given state.
 
@@ -546,6 +594,8 @@ def _get_modules_and_states(
     list[nn.Parameter],
     list[torch.Tensor],
 ]:
+    # [FUNCTION DOC] HELPER: Resolves root modules (the module itself or a collection via root-module lookup), gets managed
+    # modules, then params and buffers, and moves them to device. Returns (arg_module, modules, managed_modules, params, buffers).
     """
     Get modules tuple, managed modules, params, and buffers for FSDP/replicate initialization.
 

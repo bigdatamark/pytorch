@@ -1,3 +1,8 @@
+# [MODULE DOC] Collective-communication layer for FSDP: all-gather of sharded parameters (with copy-in and
+# copy-out into unsharded params), reduce-scatter of gradients (with optional all-reduce for HSDP), allocator
+# mixins and default / process-group-allocated / symmetric-memory implementations of the AllGather and ReduceScatter
+# comm interfaces. Import-time side effect: creates the "fsdp" library fragment and registers the ops
+# all_gather_copy_in, split_with_sizes_copy and chunk_cat with their device implementations.
 import math
 from collections.abc import Callable, Sequence
 from itertools import chain
@@ -21,6 +26,9 @@ from ._fsdp_param import FSDPParam, ShardedState
 
 
 class AllGatherResult(NamedTuple):
+    # [CLASS DOC] Result of launching a parameter all-gather: the flat output tensor, the completion event (or None),
+    # the async work handle (or None), per-parameter input dtypes and numels (nested lists), and the flattened list
+    # of per-input split sizes (cached to avoid recomputation).
     all_gather_output: torch.Tensor
     all_gather_event: torch.Event | None
     all_gather_work: dist.distributed_c10d.Work | None
@@ -49,6 +57,7 @@ lib.define(
 
 
 class DefaultAllocMixin:
+    # [CLASS DOC] Allocator mixin that allocates all-gather / reduce-scatter buffers with a plain empty tensor.
     def allocate(
         self,
         size: Sequence[int | torch.SymInt],
@@ -56,11 +65,15 @@ class DefaultAllocMixin:
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Returns an uninitialized tensor of the given size, dtype and device.
         return torch.empty(*size, dtype=dtype, device=device)
 
 
 class ProcessGroupAllocMixin:
+    # [CLASS DOC] Allocator mixin bound to a process group: allocates through the group's backend when it supports
+    # tensor allocation on the device, else falls back to an ordinary empty tensor.
     def __init__(self, group: dist.ProcessGroup, *args: Any, **kwargs: Any):
+        # [FUNCTION DOC] Stores the process group and forwards remaining arguments to the next class in the method order.
         self._group = group
         super().__init__(*args, **kwargs)
 
@@ -71,6 +84,9 @@ class ProcessGroupAllocMixin:
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Returns a tensor of the given size: via the backend's allocator (as a flat 1D buffer of the total
+        # element count) if supported for the device, otherwise an uninitialized tensor. KNOWN ISSUE: the backend path
+        # returns a 1D tensor regardless of the requested shape; callers appear to pass 1D sizes only.
         backend = self._group._get_backend(device)
         if backend.supports_tensor_alloc(device):
             size_1d = math.prod(int(s) for s in size)
@@ -79,6 +95,8 @@ class ProcessGroupAllocMixin:
 
 
 class SymmMemAllocMixin:
+    # [CLASS DOC] Allocator mixin using NCCL symmetric memory: sets the symmetric-memory backend and barriers on the
+    # group at init, then allocates from the device's symmetric memory pool so buffers can be reused across calls.
     def __init__(
         self,
         group: dist.ProcessGroup,
@@ -86,6 +104,9 @@ class SymmMemAllocMixin:
         *args: Any,
         **kwargs: Any,
     ):
+        # [FUNCTION DOC] Stores the group, selects the symmetric-memory backend, and runs a barrier on the group to force
+        # communicator initialization (one-time cost). KNOWN ISSUE: extra args are accepted but not forwarded to the
+        # parent initializer.
         self._group = group
         symm_mem.set_backend(backend)
         # Force initialization of communicator; otherwise, the rendezvous may
@@ -101,6 +122,7 @@ class SymmMemAllocMixin:
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Allocates an uninitialized tensor inside the symmetric-memory pool context for the device.
         # Leverage MemPool to reuse the symmetric buffer, avoiding allocation
         # and rendezvous overhead
         mempool = symm_mem.get_mem_pool(device)
@@ -109,6 +131,7 @@ class SymmMemAllocMixin:
 
 
 class DefaultAllGather(DefaultAllocMixin, AllGather):
+    # [CLASS DOC] Default AllGather implementation: ordinary allocation plus a single-tensor all-gather.
     def __call__(
         self,
         output_tensor: torch.Tensor,
@@ -116,6 +139,8 @@ class DefaultAllGather(DefaultAllocMixin, AllGather):
         group: dist.ProcessGroup,
         async_op: bool = False,
     ) -> dist.Work | None:
+        # [FUNCTION DOC] Runs an all-gather of input_tensor into output_tensor over the group; returns the work handle
+        # when async_op is true, else None.
         return dist.all_gather_single(
             output_tensor,
             input_tensor,
@@ -125,7 +150,9 @@ class DefaultAllGather(DefaultAllocMixin, AllGather):
 
 
 class ProcessGroupAllocAllGather(ProcessGroupAllocMixin, AllGather):
+    # [CLASS DOC] AllGather implementation whose buffers are allocated by the process group's backend allocator.
     def __init__(self, group: dist.ProcessGroup) -> None:
+        # [FUNCTION DOC] Initializes the allocator mixin with the process group.
         super().__init__(group)
 
     def __call__(
@@ -135,6 +162,8 @@ class ProcessGroupAllocAllGather(ProcessGroupAllocMixin, AllGather):
         group: dist.ProcessGroup,
         async_op: bool = False,
     ) -> dist.Work | None:
+        # [FUNCTION DOC] Runs a single-tensor all-gather of input_tensor into output_tensor over the group; returns the
+        # work handle when async_op is true, else None.
         return dist.all_gather_single(
             output_tensor,
             input_tensor,
@@ -144,11 +173,13 @@ class ProcessGroupAllocAllGather(ProcessGroupAllocMixin, AllGather):
 
 
 class SymmMemAllGather(SymmMemAllocMixin, AllGather):
+    # [CLASS DOC] AllGather implementation using symmetric-memory buffers; rendezvous on the output before gathering.
     def __init__(
         self,
         group: dist.ProcessGroup,
         backend: Literal["NCCL"] = "NCCL",
     ) -> None:
+        # [FUNCTION DOC] Initializes the symmetric-memory allocator mixin with the group and backend name.
         super().__init__(group, backend)
 
     def __call__(
@@ -158,6 +189,8 @@ class SymmMemAllGather(SymmMemAllocMixin, AllGather):
         group: dist.ProcessGroup,
         async_op: bool = False,
     ) -> dist.Work | None:
+        # [FUNCTION DOC] Rendezvouses the output tensor on the group in symmetric memory, then runs a single-tensor
+        # all-gather (the backend picks its symmetric-memory algorithm). Returns the work handle if async, else None.
         # We are doing inplace all-gather, so we need to rendezvous the output tensor only
         symm_mem.rendezvous(output_tensor, group=group.group_name)
         # Calling regular all-gather would already cause libraries like NCCL to
@@ -173,6 +206,7 @@ class SymmMemAllGather(SymmMemAllocMixin, AllGather):
 
 
 class DefaultReduceScatter(DefaultAllocMixin, ReduceScatter):
+    # [CLASS DOC] Default ReduceScatter implementation: ordinary allocation plus a single-tensor reduce-scatter.
     def __call__(
         self,
         output_tensor: torch.Tensor,
@@ -181,6 +215,8 @@ class DefaultReduceScatter(DefaultAllocMixin, ReduceScatter):
         op: _ReduceOp,
         async_op: bool = False,
     ) -> dist.Work | None:
+        # [FUNCTION DOC] Reduce-scatters input_tensor into output_tensor over the group with reduce op op; returns the
+        # work handle when async_op is true, else None.
         return dist.reduce_scatter_single(
             output=output_tensor,
             input=input_tensor,
@@ -191,7 +227,9 @@ class DefaultReduceScatter(DefaultAllocMixin, ReduceScatter):
 
 
 class ProcessGroupAllocReduceScatter(ProcessGroupAllocMixin, ReduceScatter):
+    # [CLASS DOC] ReduceScatter implementation whose buffers are allocated by the process group's backend allocator.
     def __init__(self, group: dist.ProcessGroup) -> None:
+        # [FUNCTION DOC] Initializes the allocator mixin with the process group.
         super().__init__(group)
 
     def __call__(
@@ -202,6 +240,8 @@ class ProcessGroupAllocReduceScatter(ProcessGroupAllocMixin, ReduceScatter):
         op: _ReduceOp,
         async_op: bool = False,
     ) -> dist.Work | None:
+        # [FUNCTION DOC] Reduce-scatters input_tensor into output_tensor over the group with reduce op op; returns the
+        # work handle when async_op is true, else None.
         return dist.reduce_scatter_single(
             output=output_tensor,
             input=input_tensor,
@@ -212,11 +252,13 @@ class ProcessGroupAllocReduceScatter(ProcessGroupAllocMixin, ReduceScatter):
 
 
 class SymmMemReduceScatter(SymmMemAllocMixin, ReduceScatter):
+    # [CLASS DOC] ReduceScatter implementation using symmetric-memory buffers; rendezvous on input and output first.
     def __init__(
         self,
         group: dist.ProcessGroup,
         backend: Literal["NCCL"] = "NCCL",
     ) -> None:
+        # [FUNCTION DOC] Initializes the symmetric-memory allocator mixin with the group and backend name.
         super().__init__(group, backend)
 
     def __call__(
@@ -227,6 +269,8 @@ class SymmMemReduceScatter(SymmMemAllocMixin, ReduceScatter):
         op: _ReduceOp,
         async_op: bool = False,
     ) -> dist.Work | None:
+        # [FUNCTION DOC] Rendezvouses both input and output tensors in symmetric memory, then reduce-scatters over the
+        # group with op. Returns the work handle if async, else None.
         symm_mem.rendezvous(input_tensor, group=group.group_name)
         symm_mem.rendezvous(output_tensor, group=group.group_name)
         # Calling regular reduce-scatter would already cause libraries like NCCL to
@@ -248,6 +292,8 @@ def all_gather_copy_in_meta(
     all_gather_input_numel: int,
     rank: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Meta implementation of the all_gather_copy_in op: returns the narrow slice of the output
+    # belonging to this rank (offset numel times rank) and the output; performs no copy.
     all_gather_input = all_gather_output.narrow(
         0, all_gather_input_numel * rank, all_gather_input_numel
     )
@@ -267,6 +313,9 @@ def all_gather_copy_in_cuda(
     all_gather_input_numel: int,
     rank: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Real implementation (CUDA, XPU, HPU, CPU, MTIA, PrivateUse1) of the all_gather_copy_in op: takes this
+    # rank's slice of the all-gather output, splits it by inp_split_sizes and copies the input tensors in with a
+    # no-grad foreach copy. Returns (this rank's input slice, full output).
     all_gather_input = all_gather_output.narrow(
         0, all_gather_input_numel * rank, all_gather_input_numel
     )
@@ -295,6 +344,8 @@ def split_with_sizes_copy(
     *,
     out: list[torch.Tensor],
 ) -> None:
+    # [FUNCTION DOC] Implementation of the split_with_sizes_copy op for all device types: splits the all-gather output
+    # along dim by the given sizes, copying into the preallocated out tensors (mutated). Returns None.
     torch.split_with_sizes_copy(
         all_gather_output, all_gather_input_split_sizes, dim=dim, out=out
     )
@@ -318,6 +369,8 @@ def chunk_cat(
     num_chunks: int,
     out: torch.Tensor,
 ) -> None:
+    # [FUNCTION DOC] Implementation of the chunk_cat op for all device types: chunks each tensor along dim into
+    # num_chunks pieces and concatenates them chunk-wise into out (mutated). Returns None.
     torch._chunk_cat(tensors, dim, num_chunks, out=out)
 
 
@@ -331,6 +384,11 @@ def foreach_all_gather(
     device: torch.device,
     all_gather_comm: AllGather,
 ) -> AllGatherResult | None:
+    # [FUNCTION DOC] Launches an all-gather of the sharded params of fsdp_params over group, without autograd. In the copy-in
+    # stream it gathers each param's all-gather inputs, flattens them into one buffer (viewed as bytes when the common
+    # dtype is uint8), allocates the world-size output via all_gather_comm and runs the copy-in op; then the all-gather
+    # stream waits on that stream and issues the collective (async per async_op) and records an event. Returns an
+    # AllGatherResult containing the output, event, work handle, metadata and split sizes.
     world_size, rank = group.size(), group.rank()
     device_handle = _get_device_handle(device.type)
     with device_handle.stream(all_gather_copy_in_stream):
@@ -382,10 +440,15 @@ def foreach_all_gather(
 def _get_param_all_gather_inputs(
     fsdp_params: list[FSDPParam],
 ) -> list[list[torch.Tensor]]:
+    # [FUNCTION DOC] HELPER: Returns, for each FSDP param, its list of all-gather input tensors. Params using mixed precision
+    # without CPU offload and without a custom pre-all-gather hook are cast and copied together with a single foreach
+    # copy into one flat buffer (each getting a split of it); the rest use their own all_gather_inputs property.
     # Intentionally try to run a fast-path that bypasses abstractions for the
     # common FSDP case of bf16/fp32 mixed precision in order to use foreach
     # copy for lower CPU overhead and more efficient copying in eager
     def use_foreach_copy(fsdp_param: FSDPParam) -> bool:
+        # [FUNCTION DOC] HELPER: True if the param has a param dtype, is not CPU-offloaded, and its sharded local tensor has no
+        # pre-all-gather hook, so the fast foreach-copy path applies.
         return (
             fsdp_param.param_dtype is not None
             and not fsdp_param.offload_to_cpu
@@ -433,6 +496,10 @@ def foreach_all_gather_copy_out(
     fsdp_params: list[FSDPParam],
     group: dist.ProcessGroup,
 ) -> None:
+    # [FUNCTION DOC] Waits for the all-gather to complete (event on the current stream, and work handle if present) and
+    # then copies the gathered output into the unsharded params of fsdp_params. Allocates each param's all-gather outputs, split-copies the gathered
+    # buffer into them (preserving version counters), and for non-dim-0 shard placements chunk-cats through a temporary
+    # along the shard dim. Returns None.
     (
         all_gather_output,
         all_gather_event,
@@ -544,6 +611,21 @@ def foreach_reduce(
     torch.Event | None,
     torch.Tensor | None,
 ]:
+    # [FUNCTION DOC] Reduce-scatters (and for HSDP/replicate also all-reduces) the unsharded gradients of fsdp_params and
+    # writes the results into each param's sharded gradient, without autograd. Steps: require a uniform gradient dtype
+    # (prints and raises AssertionError otherwise); compute pre/post divide factors and reduce ops; for non-dim-0 shard
+    # placements re-layout grads by chunking along the shard dim and concatenating on dim 0 (AssertionError if uneven);
+    # pad dim 0 to a multiple of world size, copy grads into one flat reduce-scatter input and clear unsharded_grads
+    # (frees them); in the reduce-scatter stream pre-divide and reduce-scatter (or copy, with optional division, when
+    # world size is 1). With an all-reduce group: if all_reduce_grads is false, accumulate into partial_reduce_output and
+    # return early; otherwise add the partial output, all-reduce in the all-reduce stream and keep the reduce-dtype
+    # buffer and event alive. Then run the optional all_reduce_hook, post-divide, cast to orig_dtype, view out each
+    # param's shard, optionally copy to CPU (non-blocking only if pinned, not accumulating, no post-accumulate hooks;
+    # records grad_offload_event), accumulate into or set the sharded DTensor grad, and call post-accumulate-grad hooks.
+    # Returns (reduce_scatter_input, reduce_scatter_event, post_reduce_stream, post_reduce_event, all_reduce_input,
+    # all_reduce_event, partial_reduce_output or None).
+    # KNOWN ISSUE: the world_size >= 1 check before the all-reduce stream sync is always true, so the else branch
+    # (waiting on the current stream) is dead code.
     """
     ``unsharded_grads`` owns the references to the gradients computed by
     autograd, so clearing the list frees the gradients.
@@ -780,6 +862,8 @@ def foreach_reduce_scatter_copy_in(
     reduce_scatter_input: torch.Tensor,
     world_size: int,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Copies the unsharded grads into the flat reduce-scatter input, viewed as (world_size, -1),
+    # using the chunk_cat op so each grad is chunked on dim 0 per rank. Mutates reduce_scatter_input.
     reduce_scatter_input = reduce_scatter_input.view(world_size, -1)
     torch.ops.fsdp.chunk_cat(
         unsharded_grads, dim=0, num_chunks=world_size, out=reduce_scatter_input
@@ -789,6 +873,8 @@ def foreach_reduce_scatter_copy_in(
 def _get_all_gather_input_metadatas(
     param_all_gather_inputs: list[list[torch.Tensor]],
 ) -> tuple[list[list[torch.dtype]], list[list[int]], torch.dtype]:
+    # [FUNCTION DOC] HELPER: Collects per-param, per-input dtypes and numels from the all-gather inputs. Returns the two nested
+    # lists and the common all-gather dtype: the first input's dtype, or uint8 if any input dtype differs.
     param_all_gather_input_dtypes: list[list[torch.dtype]] = []
     param_all_gather_input_numels: list[list[int]] = []
     all_gather_dtype = param_all_gather_inputs[0][0].dtype
@@ -822,6 +908,13 @@ def _get_gradient_divide_factors(
     dist.ReduceOp | dist.ReduceOp.RedOpType,
     dist.ReduceOp | dist.ReduceOp.RedOpType,
 ]:
+    # [FUNCTION DOC] HELPER: Computes (predivide factor, postdivide factor, reduce-scatter op, all-reduce op). Total data
+    # parallel size is the reduce-scatter group size times the all-reduce group size (missing groups count as 1). For
+    # fp32/bf16 (unless sum is forced, always on mtia) division is delegated to the collective: average (sum when size is
+    # 1) if no factor given, else average or premul-sum for the reduce-scatter and sum for all-reduce, with no manual
+    # factors. Otherwise factor defaults to the data parallel size; for fp16-like dtypes it is split into a power-of-two
+    # pre factor near its square root and the remaining post factor, else pre is None and post is the whole factor; ops
+    # are sum.
     # MTIA appears to only support SUM reduction, hence we force it implicitly
     if device_type == "mtia":
         force_sum_reduction_for_comms = True
@@ -870,5 +963,6 @@ def _get_gradient_divide_factors(
 
 
 def _div_if_needed(tensor: torch.Tensor, div_factor: float | None) -> None:
+    # [FUNCTION DOC] HELPER: Divides the tensor in place by div_factor unless it is None or 1.
     if div_factor is not None and div_factor != 1:
         tensor.div_(div_factor)
