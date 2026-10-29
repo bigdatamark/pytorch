@@ -1,4 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
+# [MODULE DOC] Defines the public parallelize_module entry point, which applies a ParallelStyle
+# (or a mapping from submodule name patterns to styles) to an nn.Module over a 1-D DeviceMesh.
+# No import-time side effects.
 import warnings
 from fnmatch import fnmatch
 
@@ -18,6 +21,15 @@ def parallelize_module(  # type: ignore[return]
     *,
     src_data_rank: int | None = 0,
 ) -> nn.Module:
+    # [FUNCTION DOC] Applies the plan to module. Logs API usage; the mesh defaults to the current
+    # mesh context. With no plan, warns and returns module unchanged. With a single ParallelStyle,
+    # records src_data_rank on it and returns the result of its apply method. With a mapping,
+    # for each key: an empty key applies the style to module itself; otherwise the first dotted
+    # component is glob-matched (fnmatch) against direct children, warning and skipping if
+    # nothing matches, then recursing into each match with the remaining path (or the style
+    # when the path is exhausted). Returns the module. Raises TypeError for other plan types.
+    # KNOWN ISSUE: the empty-key shortcut call does not forward src_data_rank, so it silently
+    # uses the default of 0. Mutates module in place.
     """
     Apply Tensor Parallelism in PyTorch by parallelizing modules or sub-modules based on a user-specified plan.
 

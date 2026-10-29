@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Experimental graph transformation that turns a single-device ExportedProgram into
+# a tensor-parallel one. Public entry: tensor_parallel_transformation. Contains a pass class that
+# marks a sharding spec on every graph node (parameters from the parallel strategies, ops via the
+# DTensor sharding propagator, default replicate for unknown ops), rewrites node values to local
+# shards, inserts redistribution subgraphs where specs mismatch and shards the state dict. Only
+# a single mesh dimension (one placement per tensor) is handled. No import-time side effects
+# beyond defining the aten alias.
 import copy
 import operator
 from collections.abc import Sequence
@@ -39,6 +46,12 @@ def tensor_parallel_transformation(
     device_type: str,
     parallel_strategies: dict[str, ParallelStyle],
 ) -> ExportedProgram:
+    # [FUNCTION DOC] Transforms exported_program into a tensor-parallel program for the given
+    # rank, world_size and device_type using parallel_strategies (mapping from linear-layer FQN
+    # to parallel style). Copies the graph signature and state dict, runs the transform pass
+    # under a replace hook that keeps the signature in sync, and returns a new ExportedProgram
+    # with the transformed graph, signature and locally sharded state dict. The input program
+    # is not mutated. Raises AssertionError if the pass returns nothing.
     """
     The entry point function to perform graph transformations on an exported program
     to transform a single-device graph into a tensor parallel graph.
@@ -68,6 +81,9 @@ def tensor_parallel_transformation(
 
 
 class _TensorParallelTransformPass(PassBase):
+    # [CLASS DOC] HELPER: FX pass performing the tensor-parallel transformation. State: rank,
+    # a 1-D DeviceMesh over all ranks, the state dict (sharded in place by the pass), the graph
+    # signature and the parallel strategies mapping. Its call method returns a PassResult.
     """
     This pass is responsible for transforming a single-device graph into a tensor parallel
     graph. It will mark the OpSpec of each node in the graph, partition the graph into
@@ -83,6 +99,9 @@ class _TensorParallelTransformPass(PassBase):
         graph_signature: ExportGraphSignature,
         parallel_strategies: dict[str, ParallelStyle],
     ) -> None:
+        # [FUNCTION DOC] HELPER: Stores the rank, builds a DeviceMesh of device_type over world
+        # size devices, and keeps references (not copies) to the state dict, graph signature and
+        # parallel strategies.
         super().__init__()
         self.rank = rank
         self.mesh = DeviceMesh(device_type, torch.arange(world_size))
@@ -91,6 +110,10 @@ class _TensorParallelTransformPass(PassBase):
         self.parallel_strategies = parallel_strategies
 
     def call(self, graph_module) -> PassResult:
+        # [FUNCTION DOC] HELPER: Deep-copies the graph module, computes parameter placements from
+        # the strategies, marks sharding on all nodes, partitions the graph to local shards and
+        # shards the state dict in place (side effect). Returns a PassResult with the new graph
+        # module marked as modified.
         gm = copy.deepcopy(graph_module)
 
         parameter_placements = _generate_parameter_and_buffer_placements(
@@ -110,6 +133,12 @@ def _generate_parameter_and_buffer_placements(
     params_and_buffers: list[str],
     parallel_strategies: dict[str, ParallelStyle],
 ) -> dict[str, Placement]:
+    # [FUNCTION DOC] HELPER: For each linear-layer FQN in parallel_strategies, assigns weight and
+    # (if present in the given names) bias placements: column-wise gives shard on dim 0 for both;
+    # otherwise weight shard on dim 1 and replicated bias. Returns mapping from parameter FQN to
+    # placement. Raises AssertionError if a weight name is missing.
+    # KNOWN ISSUE: the style is compared to the ColwiseParallel class itself, so style instances
+    # never match and are always treated as row-wise.
     """
     Build parameter placements based on the give parallel style of linear layers.
     """
@@ -135,6 +164,10 @@ def _mark_tensor_parallel_shardings(
     mesh: DeviceMesh,
     parameter_placements: dict[str, Placement],
 ) -> dict[Node, OpSpec]:
+    # [FUNCTION DOC] HELPER: Walks graph placeholders. The first placeholders (as many as
+    # parameter and buffer inputs) get the placement from parameter_placements by FQN, default
+    # replicate; remaining (user input) placeholders get replicate. Returns mapping from node to
+    # OpSpec. Raises ValueError from FQN lookup for unknown inputs.
     """
     Mark the placement strategies of the parameter and buffer placeholder nodes.
     """
@@ -168,6 +201,8 @@ def _mark_tensor_parallel_shardings(
 
 
 def _get_input_node_fqn(input_name: str, graph_signature: ExportGraphSignature) -> str:
+    # [FUNCTION DOC] HELPER: Looks up an input name in the signature's parameter then buffer
+    # mappings and returns its FQN; raises ValueError if in neither.
     """
     Return the FQN of an input node.
     """
@@ -187,6 +222,14 @@ def _mark_sharding(
     mesh: DeviceMesh,
     parameter_placements: dict[str, Placement],
 ) -> dict[Node, OpSpec]:
+    # [FUNCTION DOC] HELPER: Assigns an OpSpec to every node and stores it in the node metadata
+    # under the sharding key. Placeholders use the parameter/buffer marking (default replicate).
+    # Item-extraction (getitem) nodes copy their single input's output placements. Other calls
+    # build an op schema from input specs and use the DTensor sharding propagator if the op is
+    # known, otherwise a default all-replicate sharding; the input specs come from the suggested
+    # redistribution schema if any. Output nodes get no sharding. Returns mapping node to OpSpec.
+    # Raises AssertionError for getitem with other than one input node and RuntimeError for
+    # unsupported node kinds.
     """
     Mark the sharding strategy for each node in the graph module.
     """
@@ -261,6 +304,10 @@ def _mark_sharding(
 def _get_output_spec_from_output_sharding(
     output_sharding: OutputSharding,
 ) -> DTensorSpec:
+    # [FUNCTION DOC] HELPER: Returns the output spec of an OutputSharding: the spec itself if
+    # single, else (multi-output) the first spec with its tensor meta cleared, assuming all
+    # outputs share it. Raises AssertionError if the output spec is not a sequence or its first
+    # element is None. Mutates that spec.
     """
     Util function to extract output spec from output sharding.
     """
@@ -282,6 +329,9 @@ def _create_placement_strategy(
     placements: tuple[Placement, ...],
     input_specs: Sequence[DTensorSpec] | None = None,
 ) -> OpSpec:
+    # [FUNCTION DOC] HELPER: Builds an OpSpec with a DTensorSpec output (mesh and placements) and
+    # optional input specs, and fills in its tensor meta from the node's recorded value.
+    # Returns the OpSpec.
     """
     Util function to construct an OpSpec for a given node.
     """
@@ -297,6 +347,10 @@ def _create_placement_strategy(
 
 
 def _populate_tensor_meta(node: Node, output_spec: OutputSpecType) -> None:
+    # [FUNCTION DOC] HELPER: Sets tensor_meta (shape, stride, dtype) on the output spec(s) from
+    # the node's recorded value; for a sequence value, pairs each spec with each fake tensor.
+    # Mutates the specs. Raises AssertionError on a type mismatch between value and spec or a
+    # None spec.
     """
     Util function to populate tensor meta of output_spec based on node metadata.
     """
@@ -326,11 +380,16 @@ def _generate_default_output_sharding(
     mesh: DeviceMesh,
     op_schema: OpSchema,
 ) -> OutputSharding:
+    # [FUNCTION DOC] HELPER: Builds an OutputSharding that requests redistribution: a new op
+    # schema where every input spec is replicated, and output specs that are replicated with
+    # tensor meta taken from the node's fake tensor value(s). Marks needs_redistribute true.
     """
     Util function to create a default output sharding that suggests Replicate placement for both args and outputs.
     """
 
     def update_arg_spec(arg_spec: DTensorSpec) -> DTensorSpec:
+        # [FUNCTION DOC] HELPER: Returns a copy of the spec with a single replicate placement,
+        # keeping mesh and tensor meta.
         return DTensorSpec(
             mesh=arg_spec.mesh,
             placements=(Replicate(),),
@@ -346,6 +405,8 @@ def _generate_default_output_sharding(
     )
 
     def create_output_spec(tensor: FakeTensor) -> DTensorSpec:
+        # [FUNCTION DOC] HELPER: Builds a replicated spec on the mesh with tensor meta (shape,
+        # stride, dtype) of the given fake tensor.
         return DTensorSpec(
             mesh=mesh,
             placements=(Replicate(),),
@@ -366,6 +427,15 @@ def _generate_default_output_sharding(
 
 
 def _partitioner(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+    # [FUNCTION DOC] HELPER: Converts the marked graph in place to a per-rank distributed graph.
+    # Placeholders get their recorded value replaced by the local shard. Call nodes get reshard
+    # subgraphs inserted for inputs whose spec differs from the expected input spec (or the
+    # node output spec when none given), and their value is replaced by the local shard. Output
+    # nodes get resharding to replicate for any non-replicated input. Finally removes sharding
+    # metadata, lints and recompiles. Returns the same module. Raises RuntimeError for
+    # unsupported node kinds.
+    # KNOWN ISSUE: the output-node loop tests whether an input is a sequence, but iterating
+    # input nodes never yields sequences, so the list wrapping is effectively always used.
     """
     Graph partitioner that partitions the single device graph
     to distributed graph
@@ -419,6 +489,11 @@ def _partitioner(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
 
 
 def _partition_val(val: Any, spec: DTensorSpec) -> Any:
+    # [FUNCTION DOC] HELPER: Converts a full-value tensor to this rank's local shard. Scalars
+    # are returned unchanged. For each shard placement, selects this rank's chunk along the
+    # mesh dim (no padding, contiguous, no clone). Lists and tuples are processed element-wise
+    # keeping their type. Raises AssertionError if this rank is not in the mesh and RuntimeError
+    # for other value types.
     """
     util function to convert a full tensor val to its local component
     """
@@ -460,6 +535,11 @@ def _insert_reshard_gm(
     input_arg_spec: DTensorSpec,
     desired_spec: DTensorSpec,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Inserts, before node, the operations that redistribute input_arg
+    # from input_arg_spec to desired_spec, and rewires node to consume the result. Sets both
+    # specs' tensor meta from the argument's metadata, traces a local redistribution function
+    # into a graph, copies the module-stack metadata onto its nodes, and splices it in.
+    # Mutates the graph and the specs.
     """
     Transform the graph for tensor redistribution.
     """
@@ -469,6 +549,8 @@ def _insert_reshard_gm(
 
     # insert reshard operation
     def reshard_fn(local_tensor: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Traced function; redistributes a local tensor from the source
+        # spec to the desired spec (collectives as needed) and returns the result.
         return redistribute_local_tensor(
             local_tensor,
             input_arg_spec,
@@ -497,6 +579,8 @@ def _insert_reshard_gm(
 
 
 def _clean_up_graph_metadata(gm: torch.fx.GraphModule) -> None:
+    # [FUNCTION DOC] HELPER: Deletes the sharding metadata from every node and refreshes the
+    # tensor_meta metadata from each node's (now local) tensor value. Mutates the graph.
     """
     Clean up the graph by removing sharding and partitioning related metadata
     """
@@ -511,6 +595,9 @@ def _clean_up_graph_metadata(gm: torch.fx.GraphModule) -> None:
 def _get_input_node_specs(
     node: Node, placement_strategies: dict[Node, OpSpec]
 ) -> tuple[DTensorSpec, ...]:
+    # [FUNCTION DOC] HELPER: Returns a tuple with the output spec of each input node of node,
+    # taken from placement_strategies. Raises ValueError if an input has no entry and
+    # AssertionError if its output spec is not a single DTensorSpec.
     """
     Get the input specs of a node.
     """
@@ -527,6 +614,9 @@ def _get_input_node_specs(
 
 
 def _get_op_schema(node: Node, placement_strategies: dict[Node, OpSpec]) -> OpSchema:
+    # [FUNCTION DOC] HELPER: Builds an OpSchema for the node's target op, replacing node
+    # arguments (recursively) with their recorded output specs and passing keyword arguments
+    # through. Raises KeyError if an argument node has no recorded strategy.
     """
     Util function to construct the operator schema of a node.
     """
@@ -547,6 +637,11 @@ def _shard_state_dict(
     graph_signature: ExportGraphSignature,
     mesh: DeviceMesh,
 ) -> None:
+    # [FUNCTION DOC] HELPER: For each placeholder node that is a parameter or buffer input,
+    # distributes the full tensor from the state dict with the node's output placements on the
+    # mesh and replaces the entry in place with this rank's local tensor (wrapped as a Parameter
+    # if the original was one). Other nodes are skipped. Raises AssertionError if the FQN is
+    # missing from the state dict. Mutates the state dict; may communicate.
     """
     Inplace partition the weights based on the OpSpec
     """

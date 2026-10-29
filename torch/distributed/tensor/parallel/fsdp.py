@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] FSDP extension for 2-D FSDP + Tensor Parallel. Provides DTensorExtensions, an
+# FSDPExtensions implementation that flattens/unflattens DTensor parameters, chunks tensors
+# into ShardedTensor or DTensor form, and all-gathers along the FSDP mesh dimension, plus
+# private helpers that derive ShardedTensor metadata from a DTensor. Only 1-D device meshes
+# are handled by the sharded-tensor helpers. No import-time side effects.
 import copy
 from typing import Any, cast
 
@@ -29,6 +34,11 @@ __all__ = ["DTensorExtensions"]
 
 
 def _get_box(tensor: DTensor) -> tuple[torch.Size, torch.Size]:
+    # [FUNCTION DOC] HELPER: Returns (per-chunk offset step, local tensor size) for a DTensor on
+    # a 1-D mesh. The offset step is zero everywhere except the shard dim, where it is the
+    # global size divided (integer division) by the number of chunks. Raises AssertionError for
+    # non-1-D meshes.
+    # KNOWN ISSUE: integer division assumes even sharding; uneven last chunks get wrong offsets.
     device_mesh = tensor.device_mesh
     if device_mesh.ndim != 1:
         raise AssertionError("Only 1D DeviceMeshes currently handled")
@@ -47,11 +57,15 @@ def _get_box(tensor: DTensor) -> tuple[torch.Size, torch.Size]:
 
 
 def _get_box_for(tensor: DTensor, idx: int) -> tuple[torch.Size, torch.Size]:
+    # [FUNCTION DOC] HELPER: Returns (offsets, size) of chunk number idx, i.e. the per-chunk
+    # offset step from the box helper multiplied by idx, with the local size unchanged.
     offsets, size = _get_box(tensor)
     return (torch.Size([val * idx for val in offsets]), size)
 
 
 def _get_local_box(tensor: DTensor) -> tuple[torch.Size, torch.Size]:
+    # [FUNCTION DOC] HELPER: Returns (offsets, size) of the calling rank's chunk, using its mesh
+    # coordinate along dimension zero. Raises AssertionError if this rank is not in the mesh.
     device_mesh = tensor.device_mesh
     coord = device_mesh.get_coordinate()
     if coord is None:
@@ -60,6 +74,9 @@ def _get_local_box(tensor: DTensor) -> tuple[torch.Size, torch.Size]:
 
 
 def _create_shard_md_from_dt(dt: DTensor, current_rank: int) -> ShardMetadata:
+    # [FUNCTION DOC] HELPER: Builds ShardMetadata for the local shard of a DTensor: offsets and
+    # sizes of the local box and a placement string naming current_rank and the local tensor's
+    # device. Raises AssertionError for non-1-D meshes.
     mesh = dt.device_mesh
     if mesh.ndim != 1:
         raise AssertionError("Only 1D DeviceMeshes currently handled")
@@ -75,6 +92,11 @@ def _create_shard_md_from_dt(dt: DTensor, current_rank: int) -> ShardMetadata:
 def _create_sharded_tensor_md_from_dt(
     dt: DTensor, dt_pg: c10d.ProcessGroup
 ) -> ShardedTensorMetadata:
+    # [FUNCTION DOC] HELPER: Builds global ShardedTensorMetadata for a DTensor with full
+    # coverage but only one real shard. Shard count is the group size if dim zero placement is
+    # a shard, else one. Chunk zero is assigned to the current rank; all other chunks are
+    # assigned to a "scapegoat" rank (rank 0, or rank 1 when the current rank is 0). Size and
+    # tensor properties (dtype, layout, requires_grad) come from the DTensor.
     # This is where it gets tricky, we have to produce a ShardedTensor that has full coverage
     # and yet has only one valid shard for the current rank.
 
@@ -113,6 +135,8 @@ def _create_sharded_tensor_md_from_dt(
 
 
 def _get_dt_pg(dt: DTensor) -> c10d.ProcessGroup:
+    # [FUNCTION DOC] HELPER: Returns the process group of the DTensor's 1-D device mesh.
+    # Raises AssertionError for non-1-D meshes.
     mesh = dt.device_mesh
     if mesh.ndim != 1:
         raise AssertionError("Only 1D DeviceMeshes currently handled")
@@ -122,6 +146,9 @@ def _get_dt_pg(dt: DTensor) -> c10d.ProcessGroup:
 def _rewrite_spec_if_needed(
     spec: shard_spec.ShardingSpec, tensor: torch.Tensor, rank: int
 ) -> shard_spec.ShardingSpec:
+    # [FUNCTION DOC] HELPER: Returns spec unchanged unless it is a ChunkShardingSpec having a
+    # placement for the given rank whose device differs from the tensor's device; in that case
+    # returns a deep copy with those placements replaced by the rank on the tensor's device.
     """
     Rewrite ``spec`` to match the device of ``tensor``.
 
@@ -157,6 +184,14 @@ def _chunk_tensor(
     num_devices_per_node: int,
     pg: dist.ProcessGroup,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Chunks a tensor for FSDP and returns a ShardedTensor. For a
+    # ShardedTensor input (must have exactly one local shard, else AssertionError) it chunks
+    # the local tensor into an inner ShardedTensor and wraps it as the single shard of an outer
+    # ShardedTensor with requires_grad off. For a DTensor on a 1-D mesh it does the same using
+    # metadata derived from the DTensor and the accelerator device count, on the DTensor's group.
+    # Any other tensor is chunked directly by the shared FSDP shard utility.
+    # KNOWN ISSUE: the DTensor branch ignores the num_devices_per_node argument and uses the
+    # accelerator device count instead.
     if type(tensor) is ShardedTensor:
         if len(tensor.local_shards()) != 1:
             raise AssertionError
@@ -231,6 +266,12 @@ def _chunk_dtensor(
     rank: int,
     device_mesh: DeviceMesh,
 ) -> DTensor:
+    # [FUNCTION DOC] HELPER: Shards a (possibly TP-sharded) tensor over the FSDP mesh dimension.
+    # Uses the root mesh of device_mesh; raises RuntimeError if there is none or it has fewer
+    # than two dims. Detaches and clones the tensor. A plain tensor becomes a DTensor with
+    # first-dim shard on mesh dim zero and replication elsewhere. A DTensor keeps its TP
+    # placement on the last mesh dim and gets a first-dim shard on the second-to-last dim
+    # (other dims replicated). Returns the redistributed DTensor. The rank argument is unused.
     """
     Shard a tensor to chunks along the first dimension.
 
@@ -294,6 +335,9 @@ def _chunk_dtensor(
 def _pre_load_state_dict(
     tensor: torch.Tensor,
 ) -> tuple[torch.Tensor, list[Shard]]:
+    # [FUNCTION DOC] HELPER: Given a ShardedTensor, returns (tensor, local shards). If it has
+    # exactly one local shard that is itself a ShardedTensor (nested FSDP+TP form), unwraps to
+    # that inner tensor and its local shards. Returns an empty list when there are no shards.
     shards = cast(ShardedTensor, tensor).local_shards()
     if len(shards) == 1 and type(shards[0].tensor) is ShardedTensor:
         inner_tensor = shards[0].tensor
@@ -307,6 +351,9 @@ def _all_gather_dtensor(
     tensor: DTensor,
     parent_mesh: DeviceMesh | None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Redistributes the DTensor so every mesh dim except the last (the TP
+    # dim) is replicated, then returns the local tensor. Raises AssertionError if parent_mesh
+    # differs from the tensor's mesh. Performs collective communication.
     """All gather a DTensor in its FSDP dimension and return the local tensor."""
     if parent_mesh != tensor.device_mesh:
         raise AssertionError
@@ -325,6 +372,10 @@ def _all_gather_dtensor(
 
 
 class DTensorExtensions(FSDPExtensions):
+    # [CLASS DOC] FSDPExtensions implementation that lets FSDP handle DTensor (TP) parameters.
+    # State: device_handle (device module used for streams) and compute_stream (optional, None
+    # by default). Methods delegate to module-level helpers: flatten/unflatten DTensors,
+    # chunk to ShardedTensor or DTensor, prepare state-dict loading, and all-gather over FSDP dims.
     """
     DTensorExtension is the TensorFlattener extension needed for 2D FSDP + TP.
 
@@ -333,6 +384,8 @@ class DTensorExtensions(FSDPExtensions):
     """
 
     def __init__(self, device_handle) -> None:
+        # [FUNCTION DOC] Stores device_handle, sets compute_stream to None, and replaces the
+        # instance's post-unflatten method with a version wrapped to disable Dynamo tracing.
         super().__init__()
         self.compute_stream = None
         self.device_handle = device_handle
@@ -346,11 +399,16 @@ class DTensorExtensions(FSDPExtensions):
         self,
         tensor: torch.Tensor,
     ) -> tuple[torch.Tensor, Any | None]:
+        # [FUNCTION DOC] Flattens a parameter: a DTensor becomes (local tensor, spec) with the
+        # local tensor marked as requiring grad; a plain tensor becomes (tensor, None).
         return _flatten_tensor(tensor)
 
     def post_unflatten_transform(
         self, tensor: torch.Tensor, param_extension: Any
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Rebuilds a DTensor from the unflattened local tensor and the spec saved
+        # at flatten time, under the compute stream (or current stream if unset). Registers a
+        # grad hook via the unflatten helper, marks the result as FSDP-flattened, and returns it.
         stream = self.compute_stream or self.device_handle.current_stream()
         with self.device_handle.stream(stream):
             # runtime we put the unflattened tensor call on the compute stream since
@@ -376,6 +434,7 @@ class DTensorExtensions(FSDPExtensions):
         pg: dist.ProcessGroup,
         device: torch.device | None = None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Delegates to the tensor-chunking helper; the device argument is unused.
         return _chunk_tensor(tensor, rank, world_size, num_devices_per_node, pg)
 
     def chunk_dtensor(
@@ -384,12 +443,16 @@ class DTensorExtensions(FSDPExtensions):
         rank: int,
         device_mesh: DeviceMesh,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Delegates to the DTensor-chunking helper; returns a DTensor sharded
+        # over the FSDP mesh dimension.
         return _chunk_dtensor(tensor, rank, device_mesh)
 
     def pre_load_state_dict_transform(
         self,
         tensor: torch.Tensor,
     ) -> tuple[torch.Tensor, list[Shard]]:
+        # [FUNCTION DOC] Delegates to the helper returning (tensor, local shards), unwrapping
+        # nested ShardedTensors.
         return _pre_load_state_dict(tensor)
 
     def all_gather_dtensor(
@@ -397,4 +460,6 @@ class DTensorExtensions(FSDPExtensions):
         tensor: DTensor,
         parent_mesh: DeviceMesh | None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Delegates to the helper that replicates all but the last mesh dim and
+        # returns the local tensor; raises AssertionError if parent_mesh mismatches.
         return _all_gather_dtensor(tensor, parent_mesh)

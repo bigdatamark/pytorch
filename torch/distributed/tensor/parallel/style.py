@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines the ParallelStyle abstraction and the concrete Tensor Parallel styles:
+# ColwiseParallel, RowwiseParallel, SequenceParallel (parameter and activation sharding via
+# distribute_module with input/output hooks) and PrepareModuleInput, PrepareModuleOutput,
+# PrepareModuleInputOutput (hook-only styles that annotate and redistribute module inputs or
+# outputs as DTensors). Each style implements a private apply method taking a module and a
+# device mesh and returning the parallelized module. No import-time side effects.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 from abc import ABC, abstractmethod
 from functools import partial
@@ -29,6 +35,9 @@ __all__ = [
 
 
 class ParallelStyle(ABC):
+    # [CLASS DOC] Abstract base of all parallel styles. Declares the class attribute
+    # src_data_rank (default 0; set by parallelize_module before applying) and the abstract
+    # private apply method (module, device mesh) -> module that subclasses implement.
     """
     The parallel style contract defines how the module or submodule should be parallelized.
 
@@ -43,6 +52,11 @@ class ParallelStyle(ABC):
 
 
 class ColwiseParallel(ParallelStyle):
+    # [CLASS DOC] Column-wise sharding style for nn.Linear and nn.Embedding. State: input_layouts
+    # (tuple, default replicate), output_layouts (tuple, default shard on last dim),
+    # desired_input_layouts (always replicate) and use_local_output. Shards weights (and bias)
+    # via distribute_module and installs input and output hooks that convert and redistribute
+    # layouts. Other module types raise NotImplementedError.
     """
     Partition a compatible nn.Module in a column-wise fashion. Currently supports nn.Linear and nn.Embedding.
     Users can compose it together with RowwiseParallel to achieve the sharding of more complicated modules.
@@ -86,6 +100,9 @@ class ColwiseParallel(ParallelStyle):
         output_layouts: Placement | None = None,
         use_local_output: bool = True,
     ):
+        # [FUNCTION DOC] Stores layouts as one-element tuples: input defaults to replicate,
+        # output to shard on the last dim; desired input layout is fixed to replicate.
+        # Records use_local_output. No validation.
         super().__init__()
         self.input_layouts = (input_layouts or Replicate(),)
         self.output_layouts = (output_layouts or Shard(-1),)
@@ -99,6 +116,10 @@ class ColwiseParallel(ParallelStyle):
     def _prepare_input_fn(
         input_layouts, desired_input_layouts, mod, inputs, device_mesh
     ):
+        # [FUNCTION DOC] HELPER: Forward pre-hook body (static). Takes the first module input;
+        # if not a DTensor wraps it as one on the mesh with input_layouts (no check). If layouts
+        # differ from the desired ones, redistributes asynchronously. Returns the DTensor
+        # (only the first input; other inputs are dropped).
         # TODO: figure out dynamo support for instance method and switch this to instance method
 
         # annotate module input placements/sharding with input_layouts
@@ -119,6 +140,10 @@ class ColwiseParallel(ParallelStyle):
         return input_tensor
 
     def _partition_linear_fn(self, name, module, device_mesh):
+        # [FUNCTION DOC] HELPER: Partition function for distribute_module. Replaces every
+        # parameter (weight and bias) of the linear module with a parameter holding a DTensor
+        # sharded on dim 0 across the mesh, preserving requires_grad, using src_data_rank.
+        # Mutates the module.
         # colwise shard weight/bias to Shard(0), weight be Shard(0)
         # means Colwise as Linear is input * weight^T + bias, where
         # weight would become Shard(1)
@@ -132,6 +157,9 @@ class ColwiseParallel(ParallelStyle):
             module.register_parameter(name, dist_param)
 
     def _partition_embedding_fn(self, name, module, device_mesh):
+        # [FUNCTION DOC] HELPER: Partition function for distribute_module. Replaces each
+        # embedding parameter with a DTensor sharded on dim 1 (preserving requires_grad).
+        # Mutates the module.
         # colwise shard embedding.weight is straight forward as Shard(1)
         for name, param in module.named_parameters():
             dist_param = nn.Parameter(
@@ -144,6 +172,9 @@ class ColwiseParallel(ParallelStyle):
 
     @staticmethod
     def _prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh):
+        # [FUNCTION DOC] HELPER: Forward hook body (static). Redistributes the output DTensor
+        # (asynchronously) if its placements differ from output_layouts, then returns the local
+        # tensor if use_local_output else the DTensor.
         # outputs is a shard on last dimension DTensor, i.e. Shard(-1)
         if outputs.placements != output_layouts:
             outputs = outputs.redistribute(placements=output_layouts, async_op=True)
@@ -151,6 +182,9 @@ class ColwiseParallel(ParallelStyle):
         return outputs.to_local() if use_local_output else outputs
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        # [FUNCTION DOC] Picks the linear or embedding partition function by module type
+        # (otherwise raises NotImplementedError) and calls distribute_module with it plus the
+        # bound input and output hook functions. Returns the parallelized module (mutated).
         if isinstance(module, nn.Linear):
             partition_fn = self._partition_linear_fn
         elif isinstance(module, nn.Embedding):
@@ -175,6 +209,8 @@ class ColwiseParallel(ParallelStyle):
         )
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns a string with class name, input layouts, output layouts
+        # and use_local_output.
         tmpstr = self.__class__.__name__ + "("
         tmpstr += f"input_layouts={self.input_layouts}, "
         tmpstr += f"output_layouts={self.output_layouts}, "
@@ -184,6 +220,11 @@ class ColwiseParallel(ParallelStyle):
 
 
 class RowwiseParallel(ParallelStyle):
+    # [CLASS DOC] Row-wise sharding style for nn.Linear and nn.Embedding. State: input_layouts
+    # (default shard on last dim), output_layouts (default replicate), use_local_output, and
+    # desired_input_layouts which is only set when the apply method runs (shard on last dim for
+    # linear, replicate for embedding). Linear weight is sharded on dim 1 with replicated bias;
+    # embedding weight is sharded on dim 0. Other module types raise NotImplementedError.
     """
     Partition a compatible nn.Module in a row-wise fashion. Currently supports nn.Linear and nn.Embedding.
     Users can compose it with ColwiseParallel to achieve the sharding of more complicated modules.
@@ -223,6 +264,9 @@ class RowwiseParallel(ParallelStyle):
         output_layouts: Placement | None = None,
         use_local_output: bool = True,
     ):
+        # [FUNCTION DOC] Stores layouts as one-element tuples: input defaults to shard on the
+        # last dim, output to replicate. Records use_local_output. desired_input_layouts is not
+        # set here (see the apply method).
         super().__init__()
         self.input_layouts = (input_layouts or Shard(-1),)
         self.output_layouts = (output_layouts or Replicate(),)
@@ -232,6 +276,9 @@ class RowwiseParallel(ParallelStyle):
     def _prepare_input_fn(
         input_layouts, desired_input_layouts, mod, inputs, device_mesh
     ):
+        # [FUNCTION DOC] HELPER: Forward pre-hook body (static). Wraps the first input as a
+        # DTensor with input_layouts if it is not one, redistributes asynchronously to the
+        # desired layouts if different, and returns it (other inputs are dropped).
         input_tensor = inputs[0]
         if not isinstance(input_tensor, DTensor):
             input_tensor = DTensor.from_local(
@@ -248,6 +295,9 @@ class RowwiseParallel(ParallelStyle):
         return input_tensor
 
     def _partition_linear_fn(self, name, module, device_mesh):
+        # [FUNCTION DOC] HELPER: Partition function for distribute_module. Replaces the weight
+        # with a DTensor sharded on dim 1 and, if a bias exists, with a replicated DTensor
+        # (both keep requires_grad; use src_data_rank). Mutates the module.
         # Rowwise shard weight to Shard(1), bias to Replicate(), weight be Shard(1)
         # means Rowwise as nn.Linear is input * weight^T + bias, where
         # weight would become Shard(0)
@@ -279,6 +329,8 @@ class RowwiseParallel(ParallelStyle):
             )
 
     def _partition_embedding_fn(self, name, module, device_mesh):
+        # [FUNCTION DOC] HELPER: Partition function for distribute_module. Replaces each
+        # embedding parameter with a DTensor sharded on dim 0 (preserving requires_grad).
         # rowwise shard embedding.weight is Shard(0)
         for name, param in module.named_parameters():
             dist_param = nn.Parameter(
@@ -291,6 +343,9 @@ class RowwiseParallel(ParallelStyle):
 
     @staticmethod
     def _prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh):
+        # [FUNCTION DOC] HELPER: Forward hook body (static). The output is partial; if placements
+        # differ from output_layouts, redistributes asynchronously (all-reduce for replicate,
+        # reduce-scatter for shard). Returns the local tensor if use_local_output, else the DTensor.
         # Rowwise sharding produces partial output, depending on output layouts:
         # 1. to replicate -> allreduce
         # 2. to shard -> reduce_scatter
@@ -300,6 +355,12 @@ class RowwiseParallel(ParallelStyle):
         return outputs.to_local() if use_local_output else outputs
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        # [FUNCTION DOC] Chooses partition function and sets desired_input_layouts on the style
+        # by module type (linear: shard on last dim; embedding: replicate); other types raise
+        # NotImplementedError. Calls distribute_module with bound input and output hooks and
+        # returns the parallelized module.
+        # KNOWN ISSUE: desired_input_layouts is created as an attribute here, so a style object
+        # reused on different module types is mutated and has no such attribute before apply.
         if isinstance(module, nn.Linear):
             partition_fn = self._partition_linear_fn
             # rowwise linear runtime sharding requires input tensor shard on last dim
@@ -328,6 +389,8 @@ class RowwiseParallel(ParallelStyle):
         )
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns a string with class name, input layouts, output layouts
+        # and use_local_output.
         tmpstr = self.__class__.__name__ + "("
         tmpstr += f"input_layouts={self.input_layouts}, "
         tmpstr += f"output_layouts={self.output_layouts}, "
@@ -337,6 +400,10 @@ class RowwiseParallel(ParallelStyle):
 
 
 class SequenceParallel(ParallelStyle):
+    # [CLASS DOC] Sequence-parallel style for norm-like modules (any module type; parameters
+    # are replicated). State: sequence_sharding (one-element tuple shard on sequence_dim) and
+    # use_local_output. Inputs are annotated or redistributed to be sharded on the sequence dim;
+    # outputs stay sharded and are optionally converted to local tensors.
     """
     SequenceParallel replicates a compatible ``nn.Module`` parameters and runs the sharded computation with
     input sharded on the sequence dimension. This currently supports ``nn.LayerNorm``, ``nn.Dropout``, and the
@@ -382,6 +449,8 @@ class SequenceParallel(ParallelStyle):
     """
 
     def __init__(self, *, sequence_dim: int = 1, use_local_output: bool = False):
+        # [FUNCTION DOC] Stores a one-element tuple holding a shard placement on sequence_dim
+        # and the use_local_output flag.
         super().__init__()
         self.sequence_sharding = (Shard(sequence_dim),)
         self.use_local_output = use_local_output
@@ -389,6 +458,10 @@ class SequenceParallel(ParallelStyle):
     def _replicate_module_fn(
         self, name: str, module: nn.Module, device_mesh: DeviceMesh
     ):
+        # [FUNCTION DOC] HELPER: Partition function for distribute_module. Replaces each
+        # parameter with a new parameter wrapping its local data as a replicated DTensor (no
+        # communication or check; assumes identical values on all ranks). Mutates the module.
+        # KNOWN ISSUE: the new parameter always requires grad, ignoring the original flag.
         for p_name, param in module.named_parameters():
             # simple replication with fixed ones_ init from LayerNorm/RMSNorm, which allow
             # us to simply just use from_local
@@ -399,6 +472,10 @@ class SequenceParallel(ParallelStyle):
 
     @staticmethod
     def _prepare_input_fn(sequence_sharding, mod, inputs, device_mesh):
+        # [FUNCTION DOC] HELPER: Forward pre-hook body (static). Uses the first input. A DTensor
+        # not matching sequence_sharding is redistributed asynchronously; a plain tensor is
+        # assumed already sharded and wrapped as a DTensor without a check. Returns the DTensor.
+        # Raises ValueError for any other input type.
         input_tensor = inputs[0]
         if isinstance(input_tensor, DTensor):
             # if the passed in input DTensor is not sharded on the sequence dim, we need to redistribute it
@@ -419,9 +496,13 @@ class SequenceParallel(ParallelStyle):
 
     @staticmethod
     def _prepare_output_fn(use_local_output, mod, outputs, device_mesh):
+        # [FUNCTION DOC] HELPER: Forward hook body (static). Returns the local tensor of the
+        # output if use_local_output, else the output unchanged.
         return outputs.to_local() if use_local_output else outputs
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        # [FUNCTION DOC] Calls distribute_module with the parameter replication function and
+        # bound input and output hooks; returns the parallelized module (mutated).
         return distribute_module(
             module,
             device_mesh,
@@ -431,6 +512,8 @@ class SequenceParallel(ParallelStyle):
         )
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns a string with class name, the sequence dim and
+        # use_local_output.
         tmpstr = self.__class__.__name__ + "("
         if len(self.sequence_sharding) == 1:
             tmpstr += f"sequence_dim={self.sequence_sharding[0].dim}, "
@@ -440,6 +523,12 @@ class SequenceParallel(ParallelStyle):
 
 
 class PrepareModuleInput(ParallelStyle):
+    # [CLASS DOC] Hook-only style: registers a forward pre-hook that converts module inputs
+    # (positional and optionally keyword) to DTensors per input_layouts and redistributes them
+    # to desired layouts. State: input_layouts and desired_input_layouts (tuples or None),
+    # input_kwarg_layouts and desired_input_kwarg_layouts (mappings), with_kwargs flag,
+    # use_local_output. Invariants: equal lengths of layouts and desired layouts. Does not
+    # shard parameters.
     """
     Configure the nn.Module's inputs to convert the input tensors of the nn.Module to DTensors at runtime according to
     ``input_layouts``, and perform layout redistribution according to the ``desired_input_layouts``.
@@ -494,6 +583,11 @@ class PrepareModuleInput(ParallelStyle):
         desired_input_kwarg_layouts: dict[str, Placement] | None = None,
         use_local_output: bool = False,
     ):
+        # [FUNCTION DOC] Normalizes single placements into one-element tuples and stores layouts,
+        # kwarg layouts (empty mapping if None) and use_local_output; with_kwargs is true iff
+        # input_kwarg_layouts was given. Raises AssertionError if input layouts are given
+        # without desired ones, or if lengths of input and desired layouts (or of kwarg layouts)
+        # differ.
         self.input_layouts = (
             (input_layouts,) if isinstance(input_layouts, Placement) else input_layouts
         )
@@ -526,6 +620,11 @@ class PrepareModuleInput(ParallelStyle):
         input_layout: Placement | None,
         desired_layout: Placement | None,
     ):
+        # [FUNCTION DOC] HELPER: Prepares one argument. If input_layout is None, returns the
+        # argument untouched. Otherwise uses a DTensor as is, or wraps a plain tensor as a
+        # DTensor with that layout (AssertionError if it is not a tensor); redistributes to
+        # desired_layout when given and different; returns the local tensor if use_local_output
+        # else the DTensor.
         if input_layout is not None:
             if isinstance(input, DTensor):
                 # TODO: re-enable the check once we fix the compile path
@@ -546,6 +645,10 @@ class PrepareModuleInput(ParallelStyle):
             return input
 
     def _prepare_input_fn(self, inputs, device_mesh):
+        # [FUNCTION DOC] HELPER: Prepares positional inputs. Returns inputs unchanged if no input
+        # layouts are set. Otherwise wraps a non-tuple into a tuple, requires its length to equal
+        # the number of layouts (ValueError otherwise; AssertionError if desired layouts are
+        # missing) and returns a tuple of per-argument prepared values.
         if self.input_layouts is None:
             return inputs
         prepared_inputs = []
@@ -566,6 +669,9 @@ class PrepareModuleInput(ParallelStyle):
         return tuple(prepared_inputs)
 
     def _prepare_input_kwarg_fn(self, inputs, kwarg_inputs, device_mesh):
+        # [FUNCTION DOC] HELPER: Prepares positional inputs as above and each keyword input using
+        # the kwarg layout mappings (keys missing from the mappings are passed through
+        # untouched). Returns the pair (prepared args, prepared kwargs mapping).
         prepared_arg_inputs = self._prepare_input_fn(inputs, device_mesh)
         prepared_kwarg_inputs = {}
         for kwarg_key in kwarg_inputs:
@@ -580,6 +686,8 @@ class PrepareModuleInput(ParallelStyle):
         return (prepared_arg_inputs, prepared_kwarg_inputs)
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        # [FUNCTION DOC] Registers a forward pre-hook on the module (with-kwargs variant when
+        # kwarg layouts were given) that prepares inputs for the mesh. Returns the same module.
         if self.with_kwargs:
             module.register_forward_pre_hook(
                 lambda _, inputs, kwargs: self._prepare_input_kwarg_fn(
@@ -594,6 +702,8 @@ class PrepareModuleInput(ParallelStyle):
         return module
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns a string with class name and all layout settings and
+        # use_local_output.
         tmpstr = self.__class__.__name__ + "("
         tmpstr += f"input_layouts={self.input_layouts}, "
         tmpstr += f"desired_input_layouts={self.desired_input_layouts}, "
@@ -605,6 +715,10 @@ class PrepareModuleInput(ParallelStyle):
 
 
 class PrepareModuleOutput(ParallelStyle):
+    # [CLASS DOC] Hook-only style: registers a forward hook that converts module outputs to
+    # DTensors per output_layouts and redistributes to desired_output_layouts. State:
+    # output_layouts and desired_output_layouts (tuples, equal length enforced), use_local_output.
+    # Does not shard parameters.
     """
     Configure the nn.Module's outputs to convert the output tensors of the nn.Module to DTensors at runtime according to
     ``output_layouts``, and perform layout redistribution according to the ``desired_output_layouts``.
@@ -649,6 +763,8 @@ class PrepareModuleOutput(ParallelStyle):
         desired_output_layouts: Placement | tuple[Placement, ...],
         use_local_output: bool = True,
     ):
+        # [FUNCTION DOC] Normalizes single placements to one-element tuples and stores layouts
+        # and use_local_output. Raises AssertionError if the two layout tuples differ in length.
         self.output_layouts = (
             (output_layouts,)
             if isinstance(output_layouts, Placement)
@@ -666,6 +782,13 @@ class PrepareModuleOutput(ParallelStyle):
             )
 
     def _prepare_out_fn(self, outputs, device_mesh):
+        # [FUNCTION DOC] HELPER: Forward hook body. Wraps a non-tuple output into a tuple whose
+        # length must equal the number of layouts (ValueError otherwise). For each output with a
+        # layout: use a DTensor as is or wrap a plain tensor as DTensor, redistribute to the
+        # desired layout if different, optionally convert to local. Outputs with no layout pass
+        # through. Returns the single item if there is only one, else a tuple.
+        # KNOWN ISSUE: outputs whose type is neither a tensor nor DTensor but have a layout are
+        # passed to the DTensor wrapper without a type check.
         prepared_outputs = []
         if not isinstance(outputs, tuple):
             outputs = (outputs,)
@@ -700,12 +823,16 @@ class PrepareModuleOutput(ParallelStyle):
             return tuple(prepared_outputs)
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        # [FUNCTION DOC] Registers a forward hook that prepares the module outputs for the mesh
+        # and replaces them. Returns the same module.
         module.register_forward_hook(
             lambda _, inputs, outputs: self._prepare_out_fn(outputs, device_mesh)
         )  # type: ignore[misc, call-arg]
         return module
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns a string with class name, output layouts, desired output
+        # layouts and use_local_output.
         tmpstr = self.__class__.__name__ + "("
         tmpstr += f"output_layouts={self.output_layouts}, "
         tmpstr += f"desired_output_layouts={self.desired_output_layouts}, "
@@ -715,6 +842,9 @@ class PrepareModuleOutput(ParallelStyle):
 
 
 class PrepareModuleInputOutput(ParallelStyle):
+    # [CLASS DOC] Composite hook-only style combining PrepareModuleInput and PrepareModuleOutput.
+    # State: prepare_module_input and prepare_module_output sub-styles; the apply method applies
+    # both to the module. No other behavior.
     """
     Configure the nn.Module's inputs (and outputs) to convert the input tensors (and output tensors, respectively) of the nn.Module
     to DTensors at runtime according to ``input_layouts`` (and output_layouts, respectively), and perform layout redistribution
@@ -786,6 +916,8 @@ class PrepareModuleInputOutput(ParallelStyle):
         desired_output_layouts: Placement | tuple[Placement, ...],
         use_local_output: bool = True,
     ):
+        # [FUNCTION DOC] Builds the input sub-style (use_local_input becomes its local-output
+        # flag) and output sub-style from the given layouts; validation errors come from them.
         self.prepare_module_input = PrepareModuleInput(
             input_layouts=input_layouts,
             desired_input_layouts=desired_input_layouts,
@@ -800,12 +932,16 @@ class PrepareModuleInputOutput(ParallelStyle):
         )
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        # [FUNCTION DOC] Applies the input sub-style then the output sub-style to the module,
+        # registering both hooks. Returns the same module.
         self.prepare_module_input._apply(module, device_mesh)
         self.prepare_module_output._apply(module, device_mesh)
 
         return module
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns a string with class name and the settings of both
+        # sub-styles.
         tmpstr = self.__class__.__name__ + "("
         tmpstr += f"input_layouts={self.prepare_module_input.input_layouts}, "
         tmpstr += (

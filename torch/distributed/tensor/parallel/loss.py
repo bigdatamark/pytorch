@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Implements loss parallelism for cross-entropy on DTensors whose class dimension
+# is sharded over exactly one mesh dim. Exposes the loss_parallel context manager, which
+# registers custom DTensor op handlers for log_softmax, nll_loss (1-D and 2-D forward and
+# backward) containing hand-placed collectives. Holds the module-level mapping from aten ops to
+# handlers. Import-time side effect: defines the aten alias and the handler mapping only; the
+# global dispatcher is not modified until the context manager is entered.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 import contextlib
 from typing import cast
@@ -29,6 +35,11 @@ __all__ = ["loss_parallel"]
 
 @contextlib.contextmanager
 def loss_parallel():
+    # [FUNCTION DOC] Context manager. On entry registers the custom loss op handlers in the
+    # DTensor op dispatcher (global state); on exit removes them. Yields nothing.
+    # KNOWN ISSUE: cleanup is not in a finally block, so an exception raised inside the with
+    # body leaves the custom handlers registered; also re-entering nested contexts would raise
+    # on the second removal.
     """
     A context manager that enables loss parallelism, where efficient parallelized loss computation
     can be performed when the input is sharded on the class dimension. Currently only the cross-entropy
@@ -124,6 +135,9 @@ def loss_parallel():
 # reduction="none" cannot silently accept garbage (replicate_reduction_dims
 # would otherwise rewrite Partial -> Replicate in target_placements).
 def _find_all_reduce_mesh_dim(placements: tuple[Placement, ...], dim: int) -> int:
+    # [FUNCTION DOC] HELPER: Returns the index of the single mesh dim whose placement shards
+    # tensor dim dim. Raises ValueError if zero or several mesh dims shard it, or if any other
+    # mesh dim is neither shard nor replicate (for example partial).
     shard_mesh_dims = [i for i, p in enumerate(placements) if p.is_shard(dim)]
     if len(shard_mesh_dims) != 1:
         raise ValueError(
@@ -146,6 +160,10 @@ def _find_all_reduce_mesh_dim(placements: tuple[Placement, ...], dim: int) -> in
 def _cast_to_dtensor(
     tensor, placements: tuple[Placement, ...], mesh: DeviceMesh
 ) -> DTensor:
+    # [FUNCTION DOC] HELPER: Ensures tensor is a DTensor with the expected placements. A DTensor
+    # is returned as is if placements match, else RuntimeError. A plain tensor is wrapped as a
+    # DTensor on mesh with those placements (no check), but raises ValueError if any placement
+    # is a shard. Other types raise TypeError.
     if isinstance(tensor, DTensor):
         if tensor.placements == placements:
             return tensor
@@ -175,6 +193,9 @@ def _propagate_tensor_meta(
     args: tuple[object, ...],
     kwargs: dict[str, object],
 ) -> TensorMeta:
+    # [FUNCTION DOC] HELPER: Asks the DTensor sharding propagator for the output tensor meta of
+    # an op call given DTensor arguments; if several outputs, returns the first. Raises
+    # AssertionError if no schema is produced and RuntimeError on unexpected result types.
     op_info = DTensor._op_dispatcher.unwrap_to_op_info(op_call, args, kwargs)
     if op_info.schema is None:
         raise AssertionError(
@@ -195,6 +216,11 @@ def _propagate_tensor_meta(
 # NOTE: The implementation follows torch._decomp.decomposition._log_softmax,
 # with all_reduce manually inserted to perform distributed computation.
 def _log_softmax(x, dim, half_to_float, mesh, mesh_dim):
+    # [FUNCTION DOC] HELPER: Local log-softmax over dim for a tensor sharded on that dim across
+    # mesh_dim. Promotes to the computation dtype, all-reduces the maximum and the sum of
+    # exponentials over the mesh dimension, and returns the result in the computation dtype if
+    # half_to_float, otherwise cast back to the original result dtype. Raises AssertionError if
+    # half_to_float is set but input is not half precision. Runs collectives.
     if half_to_float:
         if x.dtype != torch.half:
             raise AssertionError
@@ -226,6 +252,10 @@ def _log_softmax_handler(
     args: tuple[object, ...],
     kwargs: dict[str, object],
 ) -> object:
+    # [FUNCTION DOC] HELPER: Custom handler for the log_softmax op. Reads input, dim and
+    # half_to_float from args, finds the sharded mesh dim, computes the local result with
+    # collectives, and returns a DTensor with the input's mesh and placements and propagated
+    # tensor meta. Raises ValueError if the placements are unsupported.
     x = cast(DTensor, args[0])
     dim = cast(int, args[1])
     half_to_float = cast(bool, args[2])
@@ -261,6 +291,9 @@ def _log_softmax_backward_handler(
     args: tuple[object, ...],
     kwargs: dict[str, object],
 ) -> object:
+    # [FUNCTION DOC] HELPER: Custom handler for the log_softmax backward op. Does no real
+    # computation: it only casts the incoming gradient DTensor to the input dtype, because the
+    # nll_loss backward handler already produced the fused gradient.
     grad_output = cast(DTensor, args[0])
     input_dtype = cast(torch.dtype, args[3])
     return grad_output.to(input_dtype)
@@ -280,12 +313,22 @@ def _nll_loss_forward(
     mesh: DeviceMesh,
     mesh_dim: int,
 ) -> tuple[Tensor, Tensor]:
+    # [FUNCTION DOC] HELPER: Local part of distributed nll_loss forward on a local shard x of the
+    # class dimension. Optionally multiplies by the sharded local weight, gathers the target
+    # class log-probability using a masked partial placement (all-reduce over mesh_dim),
+    # negates it, zeroes ignored targets, then applies the reduction (none, sum or mean via total
+    # weight). Returns (result, total_weight); for no reduction on multi-dim input, total weight
+    # is a zero scalar. Raises AssertionError if weight is given without local_weight.
+    # KNOWN ISSUE: the channel_dim argument is overwritten at the start (1, or 0 if fewer than
+    # 2 dims), so the passed value is ignored.
     n_dims = x.dim()
     channel_dim = 1
     if n_dims < 2:
         channel_dim = 0
 
     def _weight_view(weight: Tensor) -> Tensor:
+        # [FUNCTION DOC] HELPER: Reshapes a 1-D class weight so it broadcasts along the channel
+        # dim of x (size one on all other dims); returns it unchanged for inputs with one dim.
         if n_dims > 1:
             shape = [
                 1,
@@ -351,6 +394,13 @@ def _nll_loss_forward_handler(
     args: tuple[object, ...],
     kwargs: dict[str, object],
 ) -> object:
+    # [FUNCTION DOC] HELPER: Custom handler for nll_loss forward (1-D and 2-D variants). Finds
+    # the class-sharded mesh dim, converts target (derived placements) and weight (replicated) to
+    # DTensors, builds the sharded local weight, and picks output placements: target placements
+    # for no reduction, otherwise replicate on the class mesh dim and partial on other sharded
+    # dims. Runs the local forward and returns (output DTensor, total_weight tensor).
+    # Raises NotImplementedError for mean reduction on a multi-dim mesh, plus errors from
+    # placement checks; AssertionError if local weight size mismatches the local class size.
     x = cast(DTensor, args[0])
     target = args[1]
     weight = args[2]
@@ -461,6 +511,14 @@ def _nll_loss_and_log_softmax_backward(
     mesh: DeviceMesh,
     mesh_dim: int,
 ) -> Tensor:
+    # [FUNCTION DOC] HELPER: Fused local backward of nll_loss and log_softmax for a class-sharded
+    # input. Builds a gradient that is minus one at the (locally owned) target class using the
+    # masked partial placement, scales by the grad output (divided by total weight for mean,
+    # multiplied by target class weight if weight is given, zero for ignored targets), and
+    # returns the local input gradient from adding the exponential of the log-probabilities.
+    # Handles 1-D, 2-D and higher-dimensional inputs. Raises AssertionError if the mask buffer
+    # is missing.
+    # KNOWN ISSUE: the channel_dim argument is overwritten at the start, so it is ignored.
     channel_dim = 0 if x.dim() < 2 else 1
     if reduction == Reduction.MEAN.value:
         grad_output = grad_output / total_weight
@@ -523,6 +581,11 @@ def _nll_loss_backward_handler(
     args: tuple[object, ...],
     kwargs: dict[str, object],
 ) -> object:
+    # [FUNCTION DOC] HELPER: Custom handler for nll_loss backward (1-D and 2-D variants). Converts
+    # target and weight to DTensors, redistributes grad_output to the target placements for no
+    # reduction, converts total weight to a replicated DTensor, then runs the fused local
+    # backward. Returns a DTensor with the same mesh and placements as the input x.
+    # Raises errors from placement checks.
     grad_output = cast(DTensor, args[0])
     x = cast(DTensor, args[1])
     target = args[2]
@@ -606,9 +669,13 @@ customized_loss_ops = {
 
 
 def _enable_custom_loss_ops():
+    # [FUNCTION DOC] HELPER: Registers all custom loss op handlers in the global DTensor op
+    # dispatcher mapping (mutates global state).
     DTensor._op_dispatcher._custom_op_handlers.update(customized_loss_ops)
 
 
 def _disable_custom_loss_ops():
+    # [FUNCTION DOC] HELPER: Removes each custom loss op handler from the global DTensor op
+    # dispatcher mapping. Raises KeyError if a handler is not registered.
     for custom_op in customized_loss_ops:
         DTensor._op_dispatcher._custom_op_handlers.pop(custom_op)
