@@ -1,5 +1,11 @@
 # mypy: allow-untyped-defs
 
+# [MODULE DOC]
+# Multi-process tests of the distributed optimizer combined with distributed autograd. Defines a
+# small module returning a fixed-seed weight, optimizers that fail on step or on construction,
+# helpers to call methods on remote objects, and a test case comparing distributed optimizer
+# updates with local ones. No import-time side effects beyond imports.
+
 
 import threading
 
@@ -15,9 +21,14 @@ from torch.testing._internal.distributed.rpc.rpc_agent_test_fixture import (
 
 
 class MyModule:
+    # [CLASS DOC] HELPER: Toy module holding one 3x3 weight tensor initialized deterministically
+    # from a dedicated seeded generator (so every instance has identical weights). Has a class
+    # level lock that is not used by its methods.
     lock = threading.Lock()
 
     def __init__(self, requires_grad=True):
+        # [FUNCTION DOC] HELPER: Creates the weight from a private generator seeded with zero,
+        # with the given requires_grad flag, avoiding the shared default generator.
         # cannot directly use torch.manual_seed(0) as all threads share the same
         # default generator. The race from multiple RPC threads could mess up
         # the draw order from the default RNG instance, leading to
@@ -27,34 +38,50 @@ class MyModule:
         self.w = torch.rand((3, 3), requires_grad=requires_grad, generator=g_cpu)
 
     def forward(self, t1):
+        # [FUNCTION DOC] HELPER: Returns the matrix product of the weight and the input tensor.
         return torch.mm(self.w, t1)
 
     def get_w(self):
+        # [FUNCTION DOC] HELPER: Returns the weight tensor itself (not a copy).
         return self.w
 
 
 class FailingOptimizer(optim.Optimizer):
+    # [CLASS DOC] HELPER: Optimizer with no hyperparameters whose step always raises an error.
     def __init__(self, params):
+        # [FUNCTION DOC] HELPER: Initializes the base optimizer with the params and empty defaults.
         super().__init__(params, {})
 
     def step(self, closure=None):
+        # [FUNCTION DOC] HELPER: Always raises a value error with the message "Error running
+        # optimizer." The closure argument is ignored.
         raise ValueError("Error running optimizer.")
 
 
 class OptimizerFailingOnConstructor(optim.Optimizer):
+    # [CLASS DOC] HELPER: Optimizer whose constructor always raises, used to test error
+    # propagation when the remote optimizer cannot be created.
     def __init__(self, params):
+        # [FUNCTION DOC] HELPER: Initializes the base optimizer, then always raises a value error
+        # with the message "Error creating optimizer."
         super().__init__(params, {})
         raise ValueError("Error creating optimizer.")
 
     def step(self, closure=None):
+        # [FUNCTION DOC] HELPER: Raises a not-implemented error; never reached because
+        # construction fails first.
         raise NotImplementedError
 
 
 def _call_method(method, obj_rref, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Runs on the owner: calls the method with the referenced local object
+    # first, followed by the extra arguments, and returns the result.
     return method(obj_rref.local_value(), *args, **kwargs)
 
 
 def remote_method(method, obj_rref, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Issues a remote call on the owner of the reference that applies the
+    # method to the referenced object; returns immediately with a reference to the result.
     """
     Call rpc.remote on a method in a remote object.
 
@@ -75,6 +102,8 @@ def remote_method(method, obj_rref, *args, **kwargs):
 
 
 def rpc_async_method(method, obj_rref, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Like the remote variant but uses an asynchronous call and returns a
+    # future for the result.
     """
     Call rpc.rpc_async on a method in a remote object.
 
@@ -95,8 +124,13 @@ def rpc_async_method(method, obj_rref, *args, **kwargs):
 
 
 class DistOptimizerTest(RpcAgentTestFixture):
+    # [CLASS DOC] Multi-process test case for the distributed optimizer: error propagation and
+    # equivalence with local optimizers for several optimizer types.
     @dist_init()
     def test_dist_optim_exception(self):
+        # [FUNCTION DOC] Builds two remote modules on neighbor workers, runs a distributed
+        # forward and backward pass, and checks that stepping a distributed optimizer built from a
+        # failing optimizer class raises an error mentioning "Error running optimizer".
         # distributed version
         owner1 = f"worker{(self.rank + 1) % self.world_size:d}"
         owner2 = f"worker{(self.rank + 2) % self.world_size:d}"
@@ -125,6 +159,8 @@ class DistOptimizerTest(RpcAgentTestFixture):
 
     @dist_init()
     def test_dist_optim_exception_on_constructor(self):
+        # [FUNCTION DOC] Checks that constructing a distributed optimizer from a class whose
+        # constructor raises fails with an error mentioning "Error creating optimizer."
         # distributed version
         owner1 = f"worker{(self.rank + 1) % self.world_size:d}"
         owner2 = f"worker{(self.rank + 2) % self.world_size:d}"
@@ -140,6 +176,11 @@ class DistOptimizerTest(RpcAgentTestFixture):
             )
 
     def _test_dist_optim_base(self, optim_cls, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Given an optimizer class and its hyperparameters, runs one local
+        # forward, backward and step on two local modules, then repeats the same computation on
+        # two remote modules with a distributed optimizer inside a distributed autograd context.
+        # Asserts the initial weights match, the weights change, and the final remote weights
+        # equal the local ones.
         # local version
         module1 = MyModule()
         module2 = MyModule()
@@ -200,6 +241,9 @@ class DistOptimizerTest(RpcAgentTestFixture):
 
     @dist_init()
     def test_dist_optim(self):
+        # [FUNCTION DOC] Runs the local versus distributed comparison for Adagrad, Adam, AdamW,
+        # SGD (plain and with momentum, weight decay and Nesterov), Adadelta, RMSprop, Adamax and
+        # Rprop.
         self._test_dist_optim_base(optim.Adagrad, lr=0.05)
         self._test_dist_optim_base(optim.Adam, lr=1e-2, amsgrad=True)
         self._test_dist_optim_base(optim.AdamW, lr=0.05, amsgrad=True)
@@ -213,6 +257,10 @@ class DistOptimizerTest(RpcAgentTestFixture):
         self._test_dist_optim_base(optim.Rprop, lr=0.05)
 
     def _test_dist_optim_none_grads(self, optim_cls, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Like the base comparison, but the second module's weight does not
+        # require gradients, so it has no gradient. Uses the remote-object proxy call style.
+        # Asserts the first weight changes, the second stays unchanged, and both match the local
+        # results.
         # local version
         module1 = MyModule()
         module2 = MyModule(requires_grad=False)
@@ -275,6 +323,7 @@ class DistOptimizerTest(RpcAgentTestFixture):
 
     @dist_init()
     def test_dist_optim_none_grads(self):
+        # [FUNCTION DOC] Runs the missing-gradient comparison for SGD, RMSprop, Rprop and Adadelta.
         self._test_dist_optim_none_grads(optim.SGD, lr=0.05)
         self._test_dist_optim_none_grads(optim.RMSprop, lr=0.05)
         self._test_dist_optim_none_grads(optim.Rprop, lr=0.05)
