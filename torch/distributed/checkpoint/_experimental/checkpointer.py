@@ -1,3 +1,6 @@
+# [MODULE DOC] Experimental checkpointer API: the abstract Checkpointer plus SyncCheckpointer
+# (blocking write via CheckpointWriter) and AsyncCheckpointer (stage then write in a separate
+# process). Defines module constants LOG_INTERVAL and a TypeVar T; no other import-time side effects.
 import abc
 import logging
 from concurrent.futures import Future
@@ -18,6 +21,7 @@ T = TypeVar("T")
 
 
 class Checkpointer(abc.ABC):
+    # [CLASS DOC] Abstract interface with save, load and close; experimental and subject to change.
     """
     WARNING: This class is experimental, and is created to validate certain ideas,
     and is subjected to change or deprecation and we strong discourage any usages at
@@ -39,6 +43,8 @@ class Checkpointer(abc.ABC):
         state_dict: STATE_DICT,
         **kwargs: dict[str, Any],
     ) -> tuple[Future, Future] | None:
+        # [FUNCTION DOC] Abstract: saves state_dict under path. Returns None for synchronous implementations
+        # or a tuple of (stage future, write future) for asynchronous ones.
         """
         Save a state dictionary to storage.
 
@@ -63,6 +69,8 @@ class Checkpointer(abc.ABC):
         strict: bool = False,
         **kwargs: dict[str, Any],
     ) -> STATE_DICT:
+        # [FUNCTION DOC] Abstract: loads and returns a state dict from path, optionally restricted to keys of a
+        # provided state_dict, with a default map location; strict makes missing keys an error.
         """
         Load a state dictionary from storage.
 
@@ -80,6 +88,7 @@ class Checkpointer(abc.ABC):
 
     @abc.abstractmethod
     def close(self) -> None:
+        # [FUNCTION DOC] Abstract: releases resources held by the checkpointer.
         """
         Close the checkpointer and release any resources.
 
@@ -89,6 +98,8 @@ class Checkpointer(abc.ABC):
 
 
 class SyncCheckpointer(Checkpointer):
+    # [CLASS DOC] Blocking checkpointer. State: a CheckpointWriter (_writer) and CheckpointReader (_reader).
+    # Save writes immediately; load reads synchronously.
     """
     Synchronous implementation of Checkpointer.
 
@@ -111,6 +122,7 @@ class SyncCheckpointer(Checkpointer):
         writer: CheckpointWriter,
         reader: CheckpointReader,
     ):
+        # [FUNCTION DOC] Stores the writer and reader; no other side effects.
         """
         Initialize a synchronous checkpointer.
 
@@ -127,6 +139,9 @@ class SyncCheckpointer(Checkpointer):
         state_dict: STATE_DICT,
         **kwargs: dict[str, Any],
     ) -> tuple[Future, Future] | None:
+        # [FUNCTION DOC] Writes state_dict to path via the writer (extra kwargs forwarded) and blocks until done.
+        # Always returns None.
+        # KNOWN ISSUE: docstring examples pass arguments as state dict first, path second; the real order is path first.
         """
         Save a state dictionary to storage synchronously.
 
@@ -154,6 +169,10 @@ class SyncCheckpointer(Checkpointer):
         strict: bool = False,
         **kwargs: dict[str, Any],
     ) -> STATE_DICT:
+        # [FUNCTION DOC] Reads the checkpoint at path through the reader, mapping tensors with default_map_location.
+        # If state_dict is given only its keys are filled. Returns the loaded state dict.
+        # Raises RuntimeError when strict is true and the reader reported missing keys; FileNotFoundError
+        # propagates from the reader.
         """
         Load a state dictionary from storage.
 
@@ -185,6 +204,7 @@ class SyncCheckpointer(Checkpointer):
         return loaded_state_dict
 
     def close(self) -> None:
+        # [FUNCTION DOC] Closes the underlying writer (the reader holds no resources) and logs.
         """
         Close the checkpointer and release any resources.
 
@@ -196,6 +216,11 @@ class SyncCheckpointer(Checkpointer):
 
 
 class AsyncCheckpointer(Checkpointer):
+    # [CLASS DOC] Asynchronous checkpointer. State: reader, a CheckpointStager, a CheckpointProcess and
+    # _write_future (the in-flight write, or None). Save stages the state dict then hands it to the
+    # process for background writing; at most one outstanding write is allowed at a time.
+    # Load is always synchronous.
+    # KNOWN ISSUE: docstring example passes arguments as state dict first, path second; the real order is path first.
     """
     Asynchronous implementation of Checkpointer.
 
@@ -226,6 +251,7 @@ class AsyncCheckpointer(Checkpointer):
         checkpoint_process: CheckpointProcess,
         reader: CheckpointReader,
     ):
+        # [FUNCTION DOC] Stores the stager, process and reader and initializes the pending write future to None.
         """
         Initialize an asynchronous checkpointer.
 
@@ -245,6 +271,10 @@ class AsyncCheckpointer(Checkpointer):
         state_dict: STATE_DICT,
         **kwargs: Any,
     ) -> tuple[Future, Future] | None:
+        # [FUNCTION DOC] Waits for (and re-raises errors from) the previous write future, stages state_dict via the
+        # stager, then submits the staged result and path to the checkpoint process, remembering the new
+        # write future. Returns a tuple of (staging future wrapped to yield None, write future).
+        # Raises RuntimeError if the write future is unexpectedly None, or any error from the previous write.
         """
         Save a state dictionary to storage asynchronously.
 
@@ -297,6 +327,8 @@ class AsyncCheckpointer(Checkpointer):
         strict: bool = False,
         **kwargs: Any,
     ) -> STATE_DICT:
+        # [FUNCTION DOC] Synchronous load, identical in behavior to SyncCheckpointer.load: reads through the reader
+        # and returns the state dict; raises RuntimeError on missing keys when strict, FileNotFoundError if absent.
         """
         Load a state dictionary from storage.
 
@@ -330,6 +362,7 @@ class AsyncCheckpointer(Checkpointer):
         return loaded_state_dict
 
     def close(self) -> None:
+        # [FUNCTION DOC] Closes the stager and then the checkpoint process, and logs.
         """
         Close the checkpointer and release any resources.
 

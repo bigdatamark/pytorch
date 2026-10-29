@@ -1,3 +1,4 @@
+# [MODULE DOC] Utility helpers for the experimental checkpoint package; currently only wrap_future.
 """
 Utility functions for the experimental checkpoint module.
 
@@ -10,6 +11,9 @@ from typing import Any
 
 
 def wrap_future(original_result: Any) -> Future[None]:
+    # [FUNCTION DOC] Converts any result into a Future whose value is None. If the input is a Future, returns
+    # a new Future that completes with None when it succeeds and carries its exception when it fails
+    # (via a done callback). Otherwise returns an already-completed Future with None.
     """
     Wraps a result (Future or not) to return a Future with None result.
 
@@ -28,6 +32,7 @@ def wrap_future(original_result: Any) -> Future[None]:
     if isinstance(original_result, Future):
 
         def on_complete(_: Future[Any]) -> None:
+        # [FUNCTION DOC] HELPER: Done callback that copies success (as None) or the exception of the original future to the masked future.
             try:
                 original_result.result()
                 masked_future.set_result(None)

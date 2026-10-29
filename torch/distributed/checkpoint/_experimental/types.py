@@ -1,3 +1,5 @@
+# [MODULE DOC] Shared types for experimental checkpointing: the STATE_DICT alias (mapping of string keys
+# to arbitrary values) and the RankInfo dataclass. No import-time side effects.
 """
 Type definitions for distributed training and checkpointing.
 
@@ -16,6 +18,7 @@ STATE_DICT: TypeAlias = dict[str, Any]
 
 @dataclass
 class RankInfo:
+    # [CLASS DOC] Dataclass holding global_rank (this process's rank id) and global_world_size (total process count).
     """
     Information about the current rank in a distributed training environment.
 

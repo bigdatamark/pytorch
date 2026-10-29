@@ -1,4 +1,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
+# [MODULE DOC] Flatten and unflatten of nested state dicts. flatten_state_dict turns nested dicts/lists into a
+# single-level dict with dot-joined keys plus a mapping from new keys to original object paths;
+# unflatten_state_dict restores the nesting from that mapping. Defines the FLATTEN_MAPPING alias.
+# No import-time side effects.
 
 from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE
 
@@ -27,6 +31,10 @@ FLATTEN_MAPPING = dict[str, OBJ_PATH]
 def flatten_state_dict(
     state_dict: STATE_DICT_TYPE,
 ) -> tuple[STATE_DICT_TYPE, FLATTEN_MAPPING]:
+    # [FUNCTION DOC] Flattens state_dict via a traversal that calls a collector for each leaf. Returns the flat dict
+    # (keys are the path elements joined by dots) and a mapping from flat key to original path.
+    # Uses the legacy 2.3 traversal when the derived version in the _version module is "2_3",
+    # otherwise the current traversal. Raises ValueError on duplicate flattened keys.
     """
     Flatten ``state_dict`` made of nested dicts and lists into a top level dictionary.
 
@@ -40,6 +48,7 @@ def flatten_state_dict(
     mappings: FLATTEN_MAPPING = {}
 
     def flat_copy(path: OBJ_PATH, value: STATE_DICT_ITEM) -> None:
+        # [FUNCTION DOC] HELPER: Leaf callback: records the value under the dotted key and the path in the mapping; raises ValueError if the key already exists.
         new_fqn = ".".join(map(str, path))
         if new_fqn in flattened:
             raise ValueError(f"duplicated flatten key {new_fqn}")
@@ -62,6 +71,7 @@ def flatten_state_dict(
 def unflatten_state_dict(
     state_dict: STATE_DICT_TYPE, mapping: FLATTEN_MAPPING
 ) -> STATE_DICT_TYPE:
+    # [FUNCTION DOC] Rebuilds a nested dict from the flat state_dict by placing each value at the path given by mapping for its key. Raises KeyError if a key is not in the mapping.
     """Restore the original nested state_dict according to ``mapping`` and the flattened ``state_dict``."""
     nested: STATE_DICT_TYPE = {}
     for key, value in state_dict.items():

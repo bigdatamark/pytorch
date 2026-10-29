@@ -1,3 +1,8 @@
+# [MODULE DOC] Experimental staging of state dicts for async checkpointing: CheckpointStager (abstract
+# interface), CheckpointStagerConfig (pinned/shared memory, async, non-blocking flags) and DefaultStager
+# (wraps StateDictStager, optionally on a single-thread executor with an accelerator stream).
+# Defines TypeVar T; no other import-time side effects.
+# KNOWN ISSUE: module docstring mentions StagingOptions, which does not exist (the class is CheckpointStagerConfig).
 """
 Experimental staging module for PyTorch Distributed Checkpointing.
 
@@ -30,6 +35,7 @@ T = TypeVar("T")
 
 
 class CheckpointStager(abc.ABC):
+    # [CLASS DOC] Abstract interface for stagers: stage (returns staged state dict or a Future of it) and close.
     """
     Abstract base class for checkpoint staging implementations.
 
@@ -44,6 +50,7 @@ class CheckpointStager(abc.ABC):
         state_dict: STATE_DICT,
         **kwargs: Any,
     ) -> STATE_DICT | Future[STATE_DICT]:
+        # [FUNCTION DOC] Abstract: stages a state dict, returning either the staged dict (sync) or a Future resolving to it (async).
         """
         Stage a state dictionary for checkpointing.
 
@@ -58,6 +65,7 @@ class CheckpointStager(abc.ABC):
 
     @abc.abstractmethod
     def close(self) -> None:
+        # [FUNCTION DOC] Abstract: releases all resources held by the stager.
         """
         Clean up all resources used by the stager.
         """
@@ -65,6 +73,8 @@ class CheckpointStager(abc.ABC):
 
 @dataclass
 class CheckpointStagerConfig:
+    # [CLASS DOC] Dataclass of staging flags, all defaulting to true: use_pinned_memory, use_shared_memory,
+    # use_async_staging (background thread), use_non_blocking_copy (needs an available accelerator).
     """
     Configuration options for checkpoint staging behavior.
 
@@ -92,6 +102,10 @@ class CheckpointStagerConfig:
 
 
 class DefaultStager(CheckpointStager):
+    # [CLASS DOC] Full stager. State: config, a StateDictStager doing the tensor copies, an optional
+    # single-worker ThreadPoolExecutor (when async staging) and an optional accelerator stream.
+    # Not thread-safe; close must be called to shut down the executor and cached storages.
+    # KNOWN ISSUE: class docstring advertises a context manager pattern, but no enter/exit methods are defined.
     """
     DefaultStager provides a full-featured staging implementation that combines
     multiple optimization techniques for efficient checkpoint preparation.
@@ -139,6 +153,10 @@ class DefaultStager(CheckpointStager):
         self,
         config: CheckpointStagerConfig = CheckpointStagerConfig(),
     ):
+        # [FUNCTION DOC] Builds the StateDictStager from the pinned/shared memory flags. If async staging is on,
+        # creates the executor and, when an accelerator is available, a dedicated stream (created on the main
+        # thread to avoid reusing the compute stream). Raises AssertionError if non-blocking copy is requested
+        # but no accelerator is available.
         self._config = config
         self._state_dict_stager = StateDictStager(
             pin_memory=config.use_pinned_memory, share_memory=config.use_shared_memory
@@ -166,6 +184,9 @@ class DefaultStager(CheckpointStager):
         state_dict: STATE_DICT,
         **kwargs: Any,
     ) -> STATE_DICT | Future[STATE_DICT]:
+        # [FUNCTION DOC] Stages state_dict. In async mode submits the private _stage to the executor and returns its
+        # Future; otherwise runs it inline and returns the staged dict. Extra kwargs go to the underlying stager.
+        # Raises AssertionError if async mode has no executor.
         if self._config.use_async_staging:
             if self._staging_executor is None:
                 raise AssertionError(
@@ -180,6 +201,9 @@ class DefaultStager(CheckpointStager):
             return self._stage(state_dict, **kwargs)
 
     def _stage(self, state_dict: STATE_DICT, **kwargs: Any) -> STATE_DICT:
+        # [FUNCTION DOC] HELPER: Copies state_dict through the StateDictStager (passing the non-blocking flag), then, if
+        # non-blocking copies are enabled, synchronizes the staging stream (or the whole accelerator) so the data is ready.
+        # Returns the staged dict. Raises AssertionError if async non-blocking staging lacks a stream.
         state_dict = self._state_dict_stager.stage(
             state_dict, non_blocking=self._config.use_non_blocking_copy, **kwargs
         )
@@ -196,6 +220,8 @@ class DefaultStager(CheckpointStager):
         return state_dict
 
     def close(self) -> None:
+        # [FUNCTION DOC] Shuts down the executor (waiting for pending work) if present and closes the StateDictStager,
+        # freeing cached storages. The stager must not be used afterwards.
         """
         Clean up all resources used by the DefaultStager. Shuts down the ThreadPoolExecutor
         used for async staging operations and cleans up the underlying StateDictStager's

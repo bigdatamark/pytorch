@@ -1,3 +1,7 @@
+# [MODULE DOC] Checkpoint transport over a process group for fast worker recovery: PGTransport sends a state dict
+# from one rank to several destination ranks (pickled metadata, then raw bytes of each tensor) and receives it on
+# another rank. Also defines picklable metadata dataclasses for tensors, DTensors, ShardedTensors and whole state
+# dicts, and helpers to timeit, flatten a state dict and view tensors as bytes. Creates a module logger and TypeVar T at import time.
 import logging
 import pickle
 import time
@@ -31,6 +35,7 @@ T = TypeVar("T")
 
 @dataclass
 class _TensorMeta:
+    # [CLASS DOC] HELPER: Picklable metadata of one tensor: shape, dtype, storage offset, stride and storage size in bytes.
     """
     This is the metadata for a tensor that is used to transfer checkpoints.
     It contains the shape, the dtype, the storage offset and the stride of the
@@ -48,6 +53,7 @@ class _TensorMeta:
 
 @dataclass
 class _DTensorMeta:
+    # [CLASS DOC] HELPER: Picklable metadata of a DTensor: metadata of its local tensor plus its DTensor spec.
     """
     This is the metadata for a DTensor that is used to transfer checkpoints.
     It contains the metadata for the local tensor and the spec of the DTensor.
@@ -61,6 +67,8 @@ class _DTensorMeta:
 
 @dataclass
 class _ShardedTensorMeta:
+    # [CLASS DOC] HELPER: Picklable metadata of a ShardedTensor: per-local-shard tensor metadata, the original shard
+    # metadata of each local shard, and the global ShardedTensor metadata.
     """
     This is the metadata for a ShardedTensor that is used to transfer checkpoints.
     It contains the metadata for all local shards and the global tensor metadata.
@@ -77,6 +85,9 @@ class _ShardedTensorMeta:
 
 @dataclass
 class _StateDictMeta:
+    # [CLASS DOC] HELPER: Picklable metadata of a whole state dict: the pytree spec, the key path of every leaf, and for each
+    # leaf either the tensor-like metadata or the non-tensor value itself.
+    # KNOWN ISSUE: the docstring documents a step argument that does not exist as a field.
     """
     This is the metadata for a state dict that is used to transfer checkpoints.
     It contains the step, the pytree spec of the state dict and the metadata for
@@ -99,6 +110,8 @@ class _StateDictMeta:
 
 @contextmanager
 def _timeit(name: str) -> Generator[None, None, None]:
+    # [FUNCTION DOC] HELPER: Context manager that times the enclosed block with a perf counter and logs the elapsed
+    # seconds at info level under the given name. The log is skipped if the block raises.
     start = time.perf_counter()
     yield
     dur = time.perf_counter() - start
@@ -106,6 +119,8 @@ def _timeit(name: str) -> Generator[None, None, None]:
 
 
 def _prepare_tensor(tensor: torch.Tensor) -> tuple[torch.Tensor, _TensorMeta]:
+    # [FUNCTION DOC] HELPER: Returns a tensor's storage viewed as a flat byte tensor together with its _TensorMeta (shape, dtype,
+    # storage offset, stride, whole-storage byte size).
     return (
         _cast_tensor(tensor, torch.uint8),
         _TensorMeta(
@@ -122,6 +137,10 @@ def _prepare_state_dict(
     state_dict: object,
     device: torch.device,
 ) -> tuple[_StateDictMeta, list[torch.Tensor]]:
+    # [FUNCTION DOC] HELPER: Flattens state_dict with its key paths. Every leaf that is a DTensor (its local tensor), ShardedTensor
+    # (each local shard) or plain tensor is turned into byte tensors, collected in order, and replaced in the leaf list by its
+    # metadata; other leaves are kept as they are. Returns the _StateDictMeta and the list of byte tensors.
+    # The device argument is unused.
     leaves: list[tuple[KeyPath, object]]
     leaves, treespec = tree_flatten_with_path(state_dict)
 
@@ -182,6 +201,9 @@ def _prepare_state_dict(
 
 
 def _cast_tensor(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Reinterprets the entire underlying storage of a standard tensor as a tensor of the given dtype (sharing
+    # the storage), so the result may be larger than the original for strided or offset tensors.
+    # Raises AssertionError for tensor subclasses or if the storage was not shared.
     """
     Casts the underlying storage to a tensor of the given dtype.
 
@@ -201,6 +223,9 @@ def _cast_tensor(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
 
 
 class PGTransport:
+    # [CLASS DOC] Checkpoint transport using a process group. State: the process group, timeout, device, an optional
+    # callable returning a state dict for in-place receive, and a list of pending work (unused beyond init).
+    # Key methods: send_checkpoint and recv_checkpoint, which must be called in matched pairs with agreeing tag order.
     """
     This is a checkpoint transport that uses the process group to transfer checkpoints.
     This allows for fast recovery of workers by fetching the current weights
@@ -222,6 +247,8 @@ class PGTransport:
         device: torch.device,
         state_dict: Callable[[], object] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Stores the process group, timeout, device and optional state dict provider; initializes the pending work list.
+        # The timeout is stored but not used by the transfer methods.
         self._work: list[Work] = []
         self._pg = pg
         self._timeout = timeout
@@ -229,6 +256,10 @@ class PGTransport:
         self._state_dict = state_dict
 
     def send_checkpoint(self, dst_ranks: list[int], state_dict: object) -> None:
+        # [FUNCTION DOC] Sends state_dict to every rank in dst_ranks. Prepares the state dict, sends the pickled metadata size (tag 1)
+        # and bytes (tag 2) to each destination, then sends each tensor (tag 3 plus tensor index) to each destination, moving it
+        # to the transport device first. Pending sends are waited on after each CPU tensor (to free copies) and at the end.
+        # Side effects: logs timings; blocks until all sends complete. Returns None.
         """
         Send a checkpoint to multiple destination ranks.
 
@@ -272,6 +303,11 @@ class PGTransport:
                 w.wait()
 
     def recv_checkpoint(self, src_rank: int) -> object:
+        # [FUNCTION DOC] Receives a checkpoint from src_rank and returns the rebuilt state dict. Receives the metadata length and
+        # pickled metadata, then, for each leaf in order, receives tensor bytes (reusing matching tensors from the provider's state
+        # dict in place when the device type matches, else allocating, and copying to CPU if not in place), rebuilds DTensors and
+        # ShardedTensors (with placement updated to this rank), and unflattens by the saved tree spec. Waits for all in-place receives before returning.
+        # Raises AssertionError if an in-place tensor has a different storage size.
         """
         Receive a checkpoint from a source rank.
 
@@ -304,6 +340,9 @@ class PGTransport:
         works: list[Work] = []
 
         def recv(path: KeyPath, v: _TensorMeta) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Receives one tensor's bytes with the next tag number (advancing a counter): into the matching existing tensor
+        # for the path if available, otherwise into a new byte buffer (waited on and moved to CPU). Returns a strided view with the
+        # saved dtype, shape, stride and storage offset. Raises AssertionError on in-place size mismatch.
             nonlocal i
 
             inplace = dst_tensors.get(path)

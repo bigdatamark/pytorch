@@ -1,3 +1,6 @@
+# [MODULE DOC] Experimental checkpoint writer: WriterHook (abstract pre/post commit callbacks),
+# CheckpointWriterConfig (barrier timeout) and CheckpointWriter, which saves a state dict to a
+# per-rank file, runs hooks and optionally synchronizes ranks with a Barrier. No import-time side effects.
 """
 Checkpoint writer functionality for machine learning models.
 
@@ -24,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 
 class WriterHook(abc.ABC):
+    # [CLASS DOC] Abstract base class for commit hooks with two abstract callbacks, pre_commit and
+    # post_commit, invoked around the cross-rank barrier when a checkpoint is written.
     """
     Abstract base class for checkpoint commit hooks.
 
@@ -35,12 +40,14 @@ class WriterHook(abc.ABC):
 
     @abc.abstractmethod
     def pre_commit(self, path: str, **kwargs: dict[str, Any]) -> None:
+        # [FUNCTION DOC] Abstract callback run after the local file is saved and before the barrier; receives the checkpoint path and extra kwargs.
         """
         Performs actions before committing the checkpoint.
         """
 
     @abc.abstractmethod
     def post_commit(self, path: str, **kwargs: dict[str, Any]) -> None:
+        # [FUNCTION DOC] Abstract callback run after the barrier completes; receives the checkpoint path and extra kwargs.
         """
         Performs actions after committing the checkpoint.
         """
@@ -48,6 +55,9 @@ class WriterHook(abc.ABC):
 
 @dataclass
 class CheckpointWriterConfig:
+    # [CLASS DOC] Dataclass config for CheckpointWriter. Field write_barrier_timeout_secs (default 600)
+    # is the max wait for all ranks at the barrier.
+    # KNOWN ISSUE: the writer only logs this value; the timeout is actually enforced by the Barrier object.
     """
     Configuration options for the CheckpointWriter.
 
@@ -60,6 +70,8 @@ class CheckpointWriterConfig:
 
 
 class CheckpointWriter:
+    # [CLASS DOC] Writes a state dict to <path>/checkpoint_<global_rank>.pt using torch.save.
+    # State: config, rank info, optional Barrier and optional WriterHook. Key methods: write, close.
     """
     Handles writing state dictionaries to storage.
 
@@ -75,6 +87,7 @@ class CheckpointWriter:
         barrier: Barrier | None = None,
         commit_hook: WriterHook | None = None,
     ):
+        # [FUNCTION DOC] Stores config, rank info, optional barrier and optional commit hook; no other side effects.
         """
         Initialize a CheckpointWriter.
 
@@ -98,6 +111,10 @@ class CheckpointWriter:
         state_dict: STATE_DICT,
         **kwargs: dict[str, Any],
     ) -> Future[None] | None:
+        # [FUNCTION DOC] Saves state_dict to this rank's file under path (creating the directory if needed),
+        # then calls the hook's pre_commit, waits on the barrier if configured, then calls post_commit.
+        # Extra kwargs are forwarded to the hooks. Always returns None (the write is synchronous).
+        # Side effects: filesystem writes, logging, barrier synchronization.
         """
         Writes the state_dict to storage.
 
@@ -154,6 +171,7 @@ class CheckpointWriter:
         return None
 
     def close(self) -> None:
+        # [FUNCTION DOC] No-op cleanup hook (only logs); subclasses may override to release resources.
         """
         Close the writer and release any resources.
 

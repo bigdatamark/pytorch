@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Staging of state dicts to CPU for async checkpointing. StateDictStager performs a custom deep copy that
+# offloads tensors into cached CPU storages, optionally in shared memory (multi-process) and pinned memory (faster
+# transfers), reusing cached storages across calls and preserving storage sharing between tensors.
+# No import-time side effects.
 import types
 import warnings
 import weakref
@@ -12,6 +16,10 @@ from torch.utils.weak import WeakIdKeyDictionary
 
 
 class StateDictStager:
+    # [CLASS DOC] Deep-copies state dicts to CPU. Attributes: pin_memory (forced off with a warning when CUDA is unavailable),
+    # share_memory, pin_memory_min_bytes (skip pinning for smaller storages), a weak-keyed cache from original storage to staged
+    # CPU storage, and a dispatch table of per-type copy functions built in the constructor. Call close to clear caches and break
+    # the reference cycle created by closures capturing self.
     """
     A class for optimizing storage objects during staging for async checkpointing.
 
@@ -33,6 +41,9 @@ class StateDictStager:
         share_memory: bool = False,
         pin_memory_min_bytes: int = 5,
     ):
+        # [FUNCTION DOC] Sets the flags (disabling pinning with a warning if CUDA is not available), creates the storage cache, and
+        # builds the type-to-copier dispatch table with atomic, list, tuple, dict and bound method copiers defined as closures.
+        # KNOWN ISSUE: the warning message string lacks a space between the concatenated sentences.
         if pin_memory and not torch.cuda.is_available():
             warnings.warn(
                 "Ignoring pin_memory flag for checkpoint staging as pinning memory"
@@ -48,9 +59,11 @@ class StateDictStager:
         self.pin_memory_min_bytes = pin_memory_min_bytes
 
         def _deepcopy_atomic(x, _):
+        # [FUNCTION DOC] HELPER: Copier for immutable types; returns the object itself.
             return x
 
         def _deepcopy_list(x, memo, non_blocking=False):
+        # [FUNCTION DOC] HELPER: Copier for lists; registers the new list in the memo and fills it with offloaded deep copies of the elements.
             y: list = []
             memo[id(x)] = y
             append = y.append
@@ -63,6 +76,8 @@ class StateDictStager:
             return y
 
         def _deepcopy_tuple(x, memo, non_blocking=False):
+        # [FUNCTION DOC] HELPER: Copier for tuples; copies the elements, returns a memoized result if one exists, returns the original
+        # tuple if no element changed, otherwise a new tuple.
             y = [
                 self.deepcopy_with_tensor_offload(a, memo, non_blocking=non_blocking)
                 for a in x
@@ -84,6 +99,7 @@ class StateDictStager:
             return x
 
         def _deepcopy_dict(x, memo, non_blocking=False):
+        # [FUNCTION DOC] HELPER: Copier for dicts; registers the new dict in the memo and fills it with deep copies of keys and values.
             y: dict = {}
             memo[id(x)] = y
             for key, value in x.items():
@@ -97,6 +113,7 @@ class StateDictStager:
             return y
 
         def _deepcopy_method(x, memo, non_blocking=False):  # Copy instance methods
+        # [FUNCTION DOC] HELPER: Copier for bound methods; rebuilds the method around a deep copy of its instance.
             return type(x)(
                 x.__func__,
                 self.deepcopy_with_tensor_offload(
@@ -130,6 +147,11 @@ class StateDictStager:
         storage: UntypedStorage,
         non_blocking: bool = False,
     ):
+        # [FUNCTION DOC] HELPER: Returns a CPU storage holding the data of the given storage. If the original was staged before, copies
+        # new data into the cached CPU storage (optionally non-blocking) and returns it. Otherwise allocates a CPU storage (shared
+        # if share_memory), pins it when pinning is on and it is at least pin_memory_min_bytes (unpinned by a finalizer that does not
+        # run at exit), copies the data, caches it and returns it. Raises AssertionError if the cached storage size differs.
+        # KNOWN ISSUE: docstring refers to a StagingStateDict class that does not exist.
         """
         Called from the hooked storage_deepcopy function in torch.Tensor.__deepcopy__.
 
@@ -188,9 +210,15 @@ class StateDictStager:
         state_dict: Any,
         non_blocking: bool = False,
     ) -> Any:
+        # [FUNCTION DOC] Stages state_dict under no-grad: deep copies it with tensors offloaded to CPU storages (see
+        # deepcopy_with_tensor_offload) and returns the copy. non_blocking requests asynchronous device-to-host copies, so the
+        # caller must synchronize before using the result.
         return self.deepcopy_with_tensor_offload(state_dict, None, [], non_blocking)
 
     def _offload_tensor(self, x, memo, non_blocking=False):
+        # [FUNCTION DOC] HELPER: Copies one tensor (or subclass) to CPU. Creates an empty CPU tensor, registers it in the memo, stages
+        # its untyped storage once per call (a memo keyed by storage id keeps tensors sharing a storage sharing the copy), sets the
+        # copy's storage, offset, size and stride, and deep copies instance dict attributes and slots. Returns the new tensor.
         """
         Deep copy a PyTorch tensor with optimized storage handling.
 
@@ -260,6 +288,8 @@ class StateDictStager:
         return y
 
     def close(self):
+        # [FUNCTION DOC] Clears the storage cache (pinned memory is released by finalizers when storages are collected) and the dispatch
+        # table to break reference cycles. The stager cannot copy standard types after closing.
         """
         Clean up all cached storages and release associated resources.
 
@@ -276,6 +306,12 @@ class StateDictStager:
 
     @torch.no_grad()
     def deepcopy_with_tensor_offload(self, x, memo=None, _nil=[], non_blocking=False):  # noqa: B006
+        # [FUNCTION DOC] Deep copy variant of the standard library algorithm that sends tensors to the offload path. Returns a memoized
+        # copy when available; tensors go to the tensor offloader; types in the dispatch table use their copier; type objects are atomic;
+        # objects defining a deep copy method use it; others are rebuilt from their pickle reduction (reduce_ex with protocol 4, or reduce),
+        # via the reconstruct helper. Raises RuntimeError for uncopyable objects or an unexpected reduction tuple length.
+        # Memoizes results that differ from the input and keeps inputs alive. Runs under no-grad.
+        # KNOWN ISSUE: the mutable default for the sentinel argument is intentional but stage passes a distinct list; callers need not provide it.
         """Deep copy operation on arbitrary Python objects with special handling for PyTorch tensors.
 
         This implementation extends the standard deepcopy functionality to handle PyTorch tensors
@@ -393,6 +429,7 @@ class StateDictStager:
         return y
 
     def _keep_alive(self, x, memo):
+        # [FUNCTION DOC] HELPER: Keeps x alive by appending it to a list stored in the memo under the memo's own id, so object ids stay unique.
         """Keeps a reference to the object x in the memo.
 
         Because we remember objects by their id, we have
@@ -419,6 +456,9 @@ class StateDictStager:
         dictiter=None,
         non_blocking=False,
     ):
+        # [FUNCTION DOC] HELPER: Rebuilds an object from a pickle reduction tuple (callable, args, optional state, list iterator, dict iterator),
+        # deep copying args, state and items via the offload copier when a memo is provided. Applies state through the set-state method or by
+        # updating the instance dict and slots, appends list items and sets dict items. Returns the new object.
         deep = memo is not None
         if deep and args:
             args = tuple(

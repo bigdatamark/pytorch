@@ -1,3 +1,7 @@
+# [MODULE DOC] Experimental checkpoint reader: loads a per-rank state dict from a torch-serialized file.
+# Main content is CheckpointReader, supporting full loads and partial loads that only read
+# tensors whose keys exist in a caller-provided state dict. No import-time side effects
+# other than creating a module logger.
 """
 Checkpoint reader functionality for machine learning models.
 
@@ -21,6 +25,9 @@ logger = logging.getLogger(__name__)
 
 
 class CheckpointReader:
+    # [CLASS DOC] Reads one rank's checkpoint file (named checkpoint_<global_rank>.pt) from a directory.
+    # State: the RankInfo of the current process. Key methods: read (full or partial load) and
+    # the private _partial_read (selective, in-place tensor loading using FakeTensorMode metadata).
     """
     Handles reading state dictionaries from storage.
 
@@ -33,6 +40,7 @@ class CheckpointReader:
         self,
         rank_info: RankInfo,
     ):
+        # [FUNCTION DOC] Stores the RankInfo identifying this process; no other side effects.
         """
         Initialize a CheckpointReader.
 
@@ -50,6 +58,12 @@ class CheckpointReader:
         map_location: Any = None,
         **kwargs: dict[str, Any],
     ) -> tuple[STATE_DICT, list[str]]:
+        # [FUNCTION DOC] Reads the checkpoint file for this rank under directory path.
+        # Args: path (directory), optional state_dict (target to fill in), map_location for torch.load,
+        # extra kwargs forwarded to the partial reader. Returns a tuple of (state dict, missing keys).
+        # If state_dict is None, loads the whole file and returns an empty missing list; otherwise
+        # delegates to _partial_read. Raises FileNotFoundError if the rank file does not exist.
+        # KNOWN ISSUE: the docstring omits the state_dict argument.
         """
         Reads a state dictionary from storage.
 
@@ -96,6 +110,14 @@ class CheckpointReader:
         map_location: Any = None,
         **kwargs: dict[str, Any],
     ) -> tuple[STATE_DICT, list[str]]:
+        # [FUNCTION DOC] HELPER: Loads only the entries of the file that correspond to keys in state_dict.
+        # First loads the file under FakeTensorMode to get structure and tensor metadata without data,
+        # then walks target and source recursively (dicts, lists, tensors), reading each tensor's bytes
+        # directly from the file at its recorded storage offset and copying into the target tensor
+        # (allocating one if the target is None). Keys absent from the source are collected as
+        # missing (dotted/indexed paths) and logged as a warning (first 10 shown if more than 10).
+        # Raises RuntimeError on size/dtype/type mismatch, AssertionError if the file lacks
+        # checkpoint offsets (saved by an older PyTorch). Returns (updated state dict, missing keys).
         """
         Reads only the keys present in state_dict from the checkpoint file.
 
@@ -124,6 +146,10 @@ class CheckpointReader:
             def load_tensor(
                 target: torch.Tensor | None, source: torch.Tensor, full_key: str
             ) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Reads the raw bytes of one source tensor from the open file and copies them
+                # into target (allocating a new tensor from source metadata when target is None).
+                # Raises RuntimeError if target size or dtype differs from source, AssertionError if the
+                # storage has no checkpoint offset. Returns the filled target tensor.
                 if target is not None and (
                     target.size() != source.size() or target.dtype != source.dtype
                 ):
@@ -160,6 +186,10 @@ class CheckpointReader:
             def process_value(
                 target_value: Any, source_value: Any, key_path: str
             ) -> Any:
+                # [FUNCTION DOC] HELPER: Recursively merges source_value structure into target_value. Tensors are loaded
+                # via load_tensor; dicts are walked over the target's keys (keys missing in source are appended
+                # to missing_keys); lists are walked pairwise with padding; other values are returned from the
+                # source as is. Raises RuntimeError if target type is incompatible with the source type.
                 source_type = type(source_value)
                 if source_type is torch._subclasses.fake_tensor.FakeTensor:
                     source_type = torch.Tensor

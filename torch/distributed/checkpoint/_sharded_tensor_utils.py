@@ -1,4 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
+# [MODULE DOC] HELPER: Flattening of nested ShardedTensor entries (as produced by FSDP sharded state dicts) for checkpointing.
+# Contains _flatten_sharded_tensors. No import-time side effects.
 
 import copy
 from typing import TYPE_CHECKING
@@ -18,6 +20,12 @@ if TYPE_CHECKING:
 
 # TODO: We need to refactor this code.
 def _flatten_sharded_tensors(state_dict: STATE_DICT_TYPE) -> STATE_DICT_TYPE:
+    # [FUNCTION DOC] HELPER: Returns a new state dict in which any ShardedTensor whose single local shard is itself a ShardedTensor
+    # is replaced by a flat ShardedTensor. Offsets of the inner shard are added to the outer shard offsets, global metadata
+    # is copied with the outer shard removed and the other shards attributed to another rank, and the result is built from
+    # the local shard plus that metadata. The resulting tensors are only valid for checkpointing. Other values are copied by
+    # reference; tensors with no local shards are dropped; multi-shard tensors pass through. Raises ValueError if the inner tensor has more than one local shard.
+    # Requires an initialized process group (uses the rank).
     r"""
     Transform ``state_dict`` by flattening all nested ShardedTensor instances found.
 
@@ -30,6 +38,7 @@ def _flatten_sharded_tensors(state_dict: STATE_DICT_TYPE) -> STATE_DICT_TYPE:
     new_state_dict: STATE_DICT_TYPE = {}
 
     def rewrite_dict(path: OBJ_PATH, value: STATE_DICT_ITEM) -> None:
+        # [FUNCTION DOC] HELPER: Traversal visitor that writes either the original value or the flattened ShardedTensor into the new state dict at the given path.
         if not isinstance(value, ShardedTensor):
             set_element(new_state_dict, path, value)
             return

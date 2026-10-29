@@ -1,3 +1,5 @@
+# [MODULE DOC] Defines CheckpointerConfig, a dataclass bundling the writer, barrier, staging and
+# process configs used to construct a checkpointer. No import-time side effects.
 """
 Configuration classes for checkpointer construction.
 
@@ -15,6 +17,8 @@ from .staging import CheckpointStagerConfig
 
 @dataclass
 class CheckpointerConfig:
+    # [CLASS DOC] Aggregates per-component configs: writer_config, barrier_config, and (for async
+    # checkpointing) staging_config and process_config. Each field defaults to a freshly built default config.
     """
     Configuration class for checkpointer construction.
 

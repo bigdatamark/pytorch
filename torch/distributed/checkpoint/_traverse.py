@@ -1,6 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # ruff: noqa: F821
 # flake8: noqa: F821
+# [MODULE DOC] Utilities for walking and editing nested state dicts addressed by object paths (tuples of string keys and
+# integer indices): traverse_state_dict (current) and traverse_state_dict_v_2_3 (legacy), set_element, get_element and
+# print_tensor. Defines the type aliases PATH_ITEM, OBJ_PATH, STATE_DICT_ITEM, CONTAINER_TYPE and TypeVar T.
+# Exports: traverse_state_dict, set_element, get_element, print_tensor. No import-time side effects.
 from collections.abc import Callable, Collection, Mapping, MutableMapping
 from typing import cast, TypeVar
 from typing_extensions import TypeIs
@@ -22,6 +26,7 @@ __all__ = ["traverse_state_dict", "set_element", "get_element", "print_tensor"]
 
 
 def _keep_visiting_tensors(value: STATE_DICT_ITEM) -> TypeIs[torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Default traversal predicate: true when the value is a tensor.
     return isinstance(value, torch.Tensor)
 
 
@@ -31,6 +36,11 @@ def traverse_state_dict(
     visitor: Callable[[OBJ_PATH, STATE_DICT_ITEM], None],
     keep_traversing: Callable[[STATE_DICT_ITEM], bool] = _keep_visiting_tensors,
 ) -> None:
+    # [FUNCTION DOC] Walks state_dict and calls visitor with (path, value) for each leaf. Mappings are always descended
+    # into (keys converted to strings); lists are descended into only if they contain tensors, mappings or lists
+    # that keep_traversing/terminal checks say need visiting, otherwise the whole list is passed to the visitor as a leaf.
+    # Other values are leaves. Deletes the inner helper closures at the end to break reference cycles (avoids leaks in async save).
+    # KNOWN ISSUE: the docstring says lists or tuples are treated as containers, but the terminal check only recognizes lists, so tuples are always visited as leaves.
     """
     Invoke ``visitor`` for each value recursively in ``state_dict``.
     Mapping will be traversed and ``visitor`` will be applied to the leaf elements.
@@ -39,6 +49,7 @@ def traverse_state_dict(
     """
 
     def _is_terminal(value: STATE_DICT_ITEM) -> bool:
+        # [FUNCTION DOC] HELPER: True if the value is not a mapping and is either a non-list or a list that holds no mappings, no non-terminal lists and no entries accepted by keep_traversing.
         values: Collection[STATE_DICT_ITEM]
         if isinstance(value, Mapping):
             return False
@@ -55,6 +66,7 @@ def traverse_state_dict(
         return True
 
     def _traverse_obj(path: OBJ_PATH, value: STATE_DICT_ITEM) -> None:
+        # [FUNCTION DOC] HELPER: Recursive step: mappings descend by key, terminal values go to the visitor with their path, lists/tuples descend by index.
         if isinstance(value, Mapping):
             for k, v in value.items():
                 _traverse_obj(path + (str(k),), v)
@@ -76,6 +88,10 @@ def traverse_state_dict_v_2_3(
     visitor: Callable[[OBJ_PATH, STATE_DICT_ITEM], None],
     keep_traversing: Callable[[STATE_DICT_ITEM], bool] = _keep_visiting_tensors,
 ) -> None:
+    # [FUNCTION DOC] Legacy (pre-2.4) traversal kept to reconstruct old checkpoints. Calls visitor for every value
+    # that is terminal, where a mapping or list is terminal when none of its entries are containers needing
+    # traversal or accepted by keep_traversing; so a dict of non-tensors is visited as one leaf. Otherwise descends
+    # into mappings and lists. Deletes helper closures at the end to avoid reference cycles.
     """
     Traversal is short-circuited when it finds a collection for which ``keep_visiting_tensors`` evaluates
     to false for all elements.
@@ -85,6 +101,7 @@ def traverse_state_dict_v_2_3(
 
     # a value is terminal if it has no other containers values inside it
     def _is_terminal(value: STATE_DICT_ITEM) -> bool:
+        # [FUNCTION DOC] HELPER: True if the value is a non-container, or a mapping/list whose entries are all terminal and rejected by keep_traversing.
         values: Collection[STATE_DICT_ITEM]
         if isinstance(value, Mapping):
             values = value.values()
@@ -101,6 +118,7 @@ def traverse_state_dict_v_2_3(
         return True
 
     def _traverse_obj(path: OBJ_PATH, value: STATE_DICT_ITEM) -> None:
+        # [FUNCTION DOC] HELPER: Recursive step: calls the visitor on terminal values, otherwise descends into mappings by key and lists by index.
         if _is_terminal(value):
             visitor(path, value)
         elif isinstance(value, Mapping):
@@ -120,10 +138,13 @@ def traverse_state_dict_v_2_3(
 def set_element(
     root_dict: STATE_DICT_TYPE, path: OBJ_PATH, value: STATE_DICT_ITEM
 ) -> None:
+    # [FUNCTION DOC] Sets value in root_dict at the given path, creating intermediate containers: a mapping if the
+    # next path element is a string, a list if it is an integer. Lists are padded with None as needed. Mutates root_dict in place; returns None.
     """Set ``value`` in ``root_dict`` along the ``path`` object path."""
     cur_container = cast(CONTAINER_TYPE, root_dict)
 
     def extend_list(lst: list[STATE_DICT_ITEM], idx: int) -> None:
+        # [FUNCTION DOC] HELPER: Pads the list with None until index idx is valid.
         while len(lst) <= idx:
             lst.append(None)
 
@@ -155,6 +176,9 @@ def get_element(
     path: OBJ_PATH,
     default_value: T | None = None,
 ) -> T | None:
+    # [FUNCTION DOC] Returns the value at path inside root_dict, or default_value if any step is missing
+    # (wrong container type, missing key, or index out of range).
+    # KNOWN ISSUE: the list bound check rejects only indices greater than the length, so an index equal to the length passes and raises IndexError instead of returning the default.
     """Retrieve the value at ``path``from ``root_dict``, returning ``default_value`` if not found."""
     cur_value = cast(CONTAINER_TYPE, root_dict)
     for part in path:
@@ -173,6 +197,8 @@ def _print_nested(
     prefix: str = "",
     print_fun: Callable[[str], None] = print,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Prints a one-line description via print_fun of a value: size for ShardedTensor (recursing into
+    # local shards), DTensor (recursing into the local tensor) and plain tensors, or the type for anything else.
     if type(value) is ShardedTensor:
         print_fun(f"{prefix} ShardedTensor size: {value.size()}")
         for shard in value.local_shards():
@@ -199,6 +225,8 @@ def print_tensor(
     value: STATE_DICT_ITEM,
     print_fun: Callable[[str], None] = print,
 ) -> None:
+    # [FUNCTION DOC] Visitor callback for traverse_state_dict that prints the path and a description of the value
+    # (see _print_nested) using print_fun, which defaults to the builtin print.
     """
     Use this callback with traverse_state_dict to print its content.
 

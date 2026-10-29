@@ -1,3 +1,7 @@
+# [MODULE DOC] HELPER: Constants and helpers for the HuggingFace safetensors checkpoint format used by DCP:
+# file name templates, metadata keys, a dtype-string to torch dtype map, DCP version markers, and functions
+# to generate file names, parse a safetensors header, map dtype strings and extract DCP custom metadata.
+# No import-time side effects beyond defining constants.
 import io
 import json
 import struct
@@ -48,6 +52,7 @@ SHARDED_DIR_NAME = "sharded"
 
 @dataclass
 class _HFStorageInfo:
+    # [CLASS DOC] HELPER: Per-tensor storage info: relative file path, tensor shape and dtype.
     """This is the per entry storage info."""
 
     relative_path: str
@@ -58,6 +63,8 @@ class _HFStorageInfo:
 def _gen_file_name(
     index: int, largest_index: int, shard_index: int | None = None
 ) -> str:
+    # [FUNCTION DOC] HELPER: Builds a safetensors file name from a 1-based index and total file count (both zero-padded
+    # to five digits), using the sharded name template when shard_index is given, and appends the suffix.
     if shard_index is not None:
         return (
             SHARDED_FILE_NAME.format(
@@ -77,6 +84,9 @@ def _gen_file_name(
 
 
 def _get_safetensors_file_metadata(file_bytes: io.IOBase) -> tuple[Any, int]:
+    # [FUNCTION DOC] HELPER: Reads a safetensors header from an open binary stream positioned at the start: an 8-byte
+    # little-endian length followed by that many bytes of JSON. Returns a tuple of the parsed metadata and the
+    # total header size (JSON length plus 8), i.e. the data start offset.
     # this uses the same logic that's done in HF code base
     # https://github.com/2404589803/huggingface_hub/blob/main/src/huggingface_hub/hf_api.py#L5308
     # and follows their documentation on how their files are serialized
@@ -90,6 +100,7 @@ def _get_safetensors_file_metadata(file_bytes: io.IOBase) -> tuple[Any, int]:
 
 
 def _get_dtype(dtype_str: str) -> torch.dtype:
+    # [FUNCTION DOC] HELPER: Maps a safetensors dtype string to a torch dtype. Unknown strings silently fall back to the current default dtype.
     try:
         dtype = DTYPE_MAP[dtype_str]
     except KeyError:
@@ -99,6 +110,8 @@ def _get_dtype(dtype_str: str) -> torch.dtype:
 
 
 def _get_dcp_custom_metadata(metadata: Any) -> Any | None:
+    # [FUNCTION DOC] HELPER: Returns the decoded DCP sharding info found inside the extra-metadata entry of a
+    # safetensors header, or None if the entry or the DCP key is missing.
     if DEFAULT_EXTRA_METADATA_KEY in metadata:
         custom_metadata = metadata[DEFAULT_EXTRA_METADATA_KEY]
         if CUSTOM_METADATA_KEY in custom_metadata:
