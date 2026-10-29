@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command line tool that builds PyTorch wheels, once per Python interpreter
+# (given explicitly or discovered in manylinux locations). For each interpreter it makes a
+# temporary virtual environment, installs the requirements, cleans the source tree, builds
+# a wheel into the destination directory, and finally logs per-version build times.
+# Import-time side effects: configures root logging, sets the logger level, and inserts
+# the repository root at the front of the module search path to import the clean helper.
 
 import argparse
 import contextlib
@@ -31,6 +37,9 @@ from tools.clean import clean as clean_source_tree
 def run_cmd(
     cmd: list[str], capture_output: bool = False
 ) -> subprocess.CompletedProcess[bytes]:
+    # [FUNCTION DOC] HELPER: Runs the command with the current environment, raising
+    # CalledProcessError on a non-zero exit, optionally capturing output. Returns the
+    # completed process.
     logger.debug("Running command: %s", " ".join(cmd))
     return subprocess.run(
         cmd,
@@ -42,6 +51,8 @@ def run_cmd(
 
 
 def interpreter_version(interpreter: str) -> str:
+    # [FUNCTION DOC] Runs the interpreter with the version flag and returns the version
+    # number part of its output (the second word).
     version_string = (
         run_cmd([interpreter, "--version"], capture_output=True)
         .stdout.decode("utf-8")
@@ -51,6 +62,8 @@ def interpreter_version(interpreter: str) -> str:
 
 
 def get_supported_python_versions() -> list[str]:
+    # [FUNCTION DOC] Reads the project metadata file and returns the sorted (numerically)
+    # list of major.minor versions found in its Python programming language classifiers.
     """Extract supported Python versions from pyproject.toml classifiers."""
     with open(PYPROJECT_TOML_PATH) as f:
         content = f.read()
@@ -64,6 +77,8 @@ def get_supported_python_versions() -> list[str]:
 
 
 def find_python_interpreters(mode: str) -> list[str]:
+    # [FUNCTION DOC] Returns interpreter paths found for the mode; only manylinux is
+    # supported, any other mode raises ValueError.
     """Find Python interpreters based on the specified mode."""
     if mode == "manylinux":
         return _find_manylinux_interpreters()
@@ -72,6 +87,10 @@ def find_python_interpreters(mode: str) -> list[str]:
 
 
 def _find_manylinux_interpreters() -> list[str]:
+    # [FUNCTION DOC] HELPER: Scans the python3 binaries under the manylinux interpreter
+    # root, skipping PyPy and unparsable or unsupported versions (only versions in the
+    # project classifiers are kept), and returns the matching paths. Returns an empty
+    # list with a warning if the root does not exist. Runs each binary to get its version.
     """Find Python interpreters in manylinux format (/opt/python/)."""
     supported_versions = get_supported_python_versions()
     interpreters = []
@@ -125,6 +144,9 @@ def _find_manylinux_interpreters() -> list[str]:
 
 @contextlib.contextmanager
 def venv(interpreter: str) -> Iterator[str]:
+    # [FUNCTION DOC] Context manager that creates a virtual environment in a temporary
+    # directory using the interpreter and yields the path of its python3 executable. The
+    # directory is deleted on exit. Raises CalledProcessError if creation fails.
     # Should this use EnvBuilder? Probably, maybe a good todo in the future
     python_version = interpreter_version(interpreter)
     with tempfile.TemporaryDirectory(
@@ -140,13 +162,19 @@ def venv(interpreter: str) -> Iterator[str]:
 
 
 class Builder:
+    # [CLASS DOC] Runs the build steps (install requirements, clean, build wheel) with one
+    # Python interpreter, stored in the interpreter attribute and used for all commands.
     # The python interpreter that we should be using
     interpreter: str
 
     def __init__(self, interpreter: str) -> None:
+        # [FUNCTION DOC] Stores the interpreter path to use for later commands.
         self.interpreter = interpreter
 
     def build_wheel(self, destination: str) -> bool:
+        # [FUNCTION DOC] Builds a wheel of the repository without build isolation into the
+        # destination directory using the build module. Returns true on success; failure
+        # raises CalledProcessError since the command checks its exit code.
         logger.info("Running bdist_wheel -d %s", destination)
         return (
             run_cmd(
@@ -165,6 +193,8 @@ class Builder:
         )
 
     def clean(self) -> bool:
+        # [FUNCTION DOC] Cleans the source tree via the imported clean helper, which acts
+        # on the current working directory (expected to be the repo root). Always returns true.
         logger.info("Running clean")
         # Like the old `setup.py clean`, this operates on the current working
         # directory, which is expected to be the repository root.
@@ -172,6 +202,8 @@ class Builder:
         return True
 
     def install_requirements(self) -> None:
+        # [FUNCTION DOC] Installs the repository requirements file with pip using the
+        # interpreter. Raises CalledProcessError on failure.
         logger.info("Installing requirements")
         run_cmd(
             [self.interpreter, "-m", "pip", "install", "-r", str(REQUIREMENTS_PATH)]
@@ -179,6 +211,9 @@ class Builder:
 
 
 def parse_args() -> argparse.Namespace:
+    # [FUNCTION DOC] Parses the command line: repeatable python interpreter option,
+    # find-python mode (manylinux), and destination directory (default dist/). Returns the
+    # namespace.
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "-p",
@@ -211,6 +246,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Chooses interpreters (discovered ones take precedence over explicit
+    # ones, with a warning; exits with status 1 if discovery finds none; default is the
+    # running interpreter), warns if several are built into the default destination, then
+    # for each builds a wheel in a fresh temporary venv and logs per-version build times.
     args = parse_args()
 
     if args.find_python:

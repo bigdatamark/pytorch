@@ -1,3 +1,7 @@
+# [MODULE DOC] Wrapper script around nvcc that runs the given nvcc command and then
+# rewrites the dependency file (the -MF target) so that every listed path is absolute,
+# resolving relative entries against the include directories seen on the command line.
+# Exits with nvcc's return code. When run as a script it executes at import time.
 """Tool to fix the nvcc's dependency file output
 
 Usage: python nvcc_fix_deps.py nvcc [nvcc args]...
@@ -22,6 +26,8 @@ from typing import TextIO
 
 
 def resolve_include(path: Path, include_dirs: list[Path]) -> Path:
+    # [FUNCTION DOC] Returns the first include directory joined with the relative path
+    # that exists on disk. Raises RuntimeError listing all tried paths if none exists.
     for include_path in include_dirs:
         abs_path = include_path / path
         if abs_path.exists():
@@ -39,6 +45,11 @@ Tried the following paths, but none existed:
 
 
 def repair_depfile(depfile: TextIO, include_dirs: list[Path]) -> None:
+    # [FUNCTION DOC] Reads the dependency file (opened for reading and writing) line by
+    # line, keeping the text up to the last colon on a line, and makes each listed path
+    # absolute via resolve_include (raising RuntimeError if unresolved). If any path
+    # changed, rewrites the whole file in place, normalizing indentation; otherwise the
+    # file is left untouched.
     changes_made = False
     out = ""
     for line in depfile:
@@ -73,7 +84,15 @@ POST_INCLUDE_ARGS = ["-I", "--include-path", "-isystem", "--system-include"]
 
 
 def extract_include_arg(include_dirs: list[Path], i: int, args: list[str]) -> None:
+    # [FUNCTION DOC] Checks whether the argument at the index is an include option. Pre-include
+    # style options put their resolved directory at the front of the list, post-include
+    # style options (include path, system include) append it. Mutates the list; returns nothing.
     def extract_one(name: str, i: int, args: list[str]) -> str | None:
+        # [FUNCTION DOC] HELPER: If the argument equals the option name, returns the next
+        # argument; if it starts with the name, returns the remainder with a leading equals
+        # sign removed; otherwise returns none.
+        # KNOWN ISSUE: a bare prefix match may also hit unrelated options that merely start
+        # with the name, and an empty remainder would fail on indexing.
         arg = args[i]
         if arg == name:
             return args[i + 1]

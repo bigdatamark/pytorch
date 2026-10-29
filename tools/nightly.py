@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 # Much of the logging code here was forked from https://github.com/ezyang/ghstack
 # Copyright (c) Edward Z. Yang <ezyang@mit.edu>
+# [MODULE DOC] Command line tool that sets up a PyTorch development environment from the
+# pre-built nightly binaries. Subcommands: checkout (check out the commit matching the
+# nightly wheel, optionally on a new branch) and pull (merge that commit into the current
+# branch). It creates or reuses a virtual environment, downloads the nightly torch wheel,
+# installs its dependencies plus dev tools, and moves/links the compiled artifacts from
+# the wheel into the repo's torch directory, then writes a .pth file pointing to the repo.
+# Import-time side effects: runs the binary build matrix generator script as a subprocess
+# (which writes nightly_source_matrix.json), then loads that file into PIP_SOURCES.
+# Also defines platform flags and global LOGGER/VERBOSE state set by main.
 r"""Checks out the nightly development version of PyTorch and installs pre-built
 binaries into the repo.
 
@@ -123,6 +132,9 @@ POSIX = LINUX or MACOS
 
 
 class PipSource(NamedTuple):
+    # [CLASS DOC] Immutable description of one pip index to install nightly wheels from:
+    # name (for example cpu or cuda-<version>), index_url, the set of platform names that
+    # support it, and the accelerator kind. Built from entries of the nightly source matrix.
     name: str
     index_url: str
     supported_platforms: set[str]
@@ -145,20 +157,29 @@ PIP_SOURCES = {name: PipSource(**data) for name, data in NIGHTLY_SOURCE_MATRIX.i
 
 
 class Formatter(logging.Formatter):
+    # [CLASS DOC] Logging formatter that scrubs secrets from every formatted record.
+    # State: redactions, a mapping from sensitive substring to its replacement text.
+    # INFO and DEBUG records are emitted as the bare message; other levels use the format.
     redactions: dict[str, str]
 
     def __init__(self, fmt: str | None = None, datefmt: str | None = None) -> None:
+        # [FUNCTION DOC] Initializes the base formatter with the given format strings and
+        # starts with an empty redaction mapping.
         super().__init__(fmt, datefmt)
         self.redactions = {}
 
     # Remove sensitive information from URLs
     def _filter(self, s: str) -> str:
+        # [FUNCTION DOC] HELPER: Returns the text with URL credentials replaced by
+        # placeholders and every registered redaction needle replaced by its replacement.
         s = USERNAME_PASSWORD_RE.sub(r"://<USERNAME>:<PASSWORD>@", s)
         for needle, replace in self.redactions.items():
             s = s.replace(needle, replace)
         return s
 
     def formatMessage(self, record: logging.LogRecord) -> str:
+        # [FUNCTION DOC] Returns the raw message for INFO and DEBUG records without any
+        # level prefix; for other levels defers to the base class formatting.
         if record.levelno == logging.INFO or record.levelno == logging.DEBUG:
             # Log INFO/DEBUG without any adornment
             return record.getMessage()
@@ -168,9 +189,12 @@ class Formatter(logging.Formatter):
             return super().formatMessage(record)
 
     def format(self, record: logging.LogRecord) -> str:
+        # [FUNCTION DOC] Formats the record with the base class, then applies redaction.
         return self._filter(super().format(record))
 
     def redact(self, needle: str, replace: str = "<REDACTED>") -> None:
+        # [FUNCTION DOC] Registers a substring to be replaced in all later output. Empty
+        # needles are ignored. Mutates the redactions mapping; returns nothing.
         """Redact specific strings; e.g., authorization tokens.  This won't
         retroactively redact stuff you've already leaked, so make sure
         you redact things as soon as possible.
@@ -184,6 +208,10 @@ class Formatter(logging.Formatter):
 
 @contextlib.contextmanager
 def timer(logger: logging.Logger, prefix: str) -> Iterator[None]:
+    # [FUNCTION DOC] Context manager that measures the wall time of its body and logs an
+    # info line with the prefix and elapsed seconds.
+    # KNOWN ISSUE: the log line is not in a finally block, so nothing is logged if the
+    # body raises.
     """Timed context manager"""
     start_time = time.perf_counter()
     yield
@@ -194,11 +222,17 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 
 def timed(prefix: str) -> Callable[[F], F]:
+    # [FUNCTION DOC] Decorator factory. The decorated function logs the prefix on entry
+    # and its elapsed time on exit using the global LOGGER, which must already be set.
     """Decorator for timing functions"""
 
     def decorator(f: F) -> F:
+        # [FUNCTION DOC] HELPER: Wraps the given function with the timing behavior,
+        # preserving its metadata.
         @functools.wraps(f)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Logs the prefix, runs the wrapped function inside
+            # the timer and returns its result unchanged.
             logger = cast(logging.Logger, LOGGER)
             logger.info(prefix)
             with timer(logger, prefix):
@@ -210,6 +244,11 @@ def timed(prefix: str) -> Callable[[F], F]:
 
 
 class Venv:
+    # [CLASS DOC] Manages a Python virtual environment at a prefix path: creation,
+    # validation, running python/pip/uv/wheel commands inside it, and installing or
+    # downloading packages from a given PipSource. State: prefix, pip_source,
+    # base_executable (interpreter used to create it), cached executable and bindir,
+    # and an environment mapping merged into every subprocess (pip/uv index, colors).
     """Virtual environment manager"""
 
     AGGRESSIVE_UPDATE_PACKAGES = (
@@ -228,6 +267,9 @@ class Venv:
         *,
         base_executable: Path | str | None = None,
     ) -> None:
+        # [FUNCTION DOC] Resolves the base interpreter (default: the running one; a
+        # non-absolute name is looked up on PATH) and records the absolute prefix, source
+        # and subprocess environment. Raises RuntimeError if the interpreter is not found.
         base_executable = Path(base_executable or sys.executable)
         if not base_executable.is_absolute():
             base_exec = shutil.which(str(base_executable))
@@ -251,11 +293,14 @@ class Venv:
         }
 
     def is_venv(self) -> bool:
+        # [FUNCTION DOC] Returns true if the prefix is a directory containing pyvenv.cfg.
         """Check if the prefix is a virtual environment."""
         return self.prefix.is_dir() and (self.prefix / "pyvenv.cfg").is_file()
 
     @property
     def bindir(self) -> Path:
+        # [FUNCTION DOC] Property: the Scripts directory on Windows, otherwise bin, under
+        # the prefix; cached. Raises AssertionError if the prefix is not a virtual env.
         """Get the bin directory for the virtual environment."""
         if not self.is_venv():
             raise AssertionError("Not a virtual environment")
@@ -268,6 +313,9 @@ class Venv:
 
     @property
     def executable(self) -> Path:
+        # [FUNCTION DOC] Property: the venv's python executable path (python.exe on
+        # Windows), cached. Raises AssertionError if the prefix is not a venv or the file
+        # is missing or not executable.
         """Get the Python executable for the virtual environment."""
         if not self.is_venv():
             raise AssertionError("Not a virtual environment")
@@ -281,6 +329,9 @@ class Venv:
         return self._executable
 
     def site_packages(self, python: Path | str | None = None) -> Path:
+        # [FUNCTION DOC] Asks the interpreter (default: the venv python) for its site
+        # directories and returns the first existing one named site-packages. Raises
+        # RuntimeError if none exists. Runs a subprocess.
         """Get the site-packages directory for the virtual environment."""
         output = self.python(
             "-c",
@@ -299,6 +350,8 @@ class Venv:
 
     @property
     def activate_script(self) -> Path:
+        # [FUNCTION DOC] Property: path of the shell activation script (Scripts/activate
+        # on Windows, bin/activate elsewhere). Does not check that it exists.
         """Get the activation script for the virtual environment."""
         if WINDOWS:
             # Assume PowerShell
@@ -308,6 +361,8 @@ class Venv:
 
     @property
     def activate_command(self) -> str:
+        # [FUNCTION DOC] Property: shell command text that activates the venv (dot-source
+        # on Windows, source with a quoted path elsewhere).
         """Get the command to activate the virtual environment."""
         if WINDOWS:
             # Assume PowerShell
@@ -323,6 +378,13 @@ class Venv:
         remove_if_exists: bool = False,
         assume_yes: bool = False,
     ) -> Path:
+        # [FUNCTION DOC] Creates the venv at the prefix with the base interpreter. If the
+        # prefix exists: raises RuntimeError unless remove_if_exists; when set, refuses
+        # (RuntimeError) if it is not a venv or is one of the interpreters' prefixes,
+        # asks for confirmation unless assume_yes (exits with status 1 on refusal), then
+        # deletes it. Adds a gitignore, and on Linux appends a snippet to the activate
+        # script that extends the library path with NVIDIA package libraries. Returns the
+        # result of ensure (the prefix path). Side effects: filesystem, subprocesses, stdout.
         """Create a virtual environment."""
         if self.prefix.exists():
             if remove_if_exists:
@@ -431,6 +493,10 @@ class Venv:
         return self.ensure()
 
     def ensure(self) -> Path:
+        # [FUNCTION DOC] Creates the venv (replacing any existing path) if it is not one;
+        # otherwise checks that its major.minor Python version matches the base
+        # interpreter (RuntimeError on mismatch) and upgrades the core packaging tools.
+        # Returns the prefix.
         """Ensure the virtual environment exists."""
         if not self.is_venv():
             return self.create(remove_if_exists=True)
@@ -453,6 +519,10 @@ class Venv:
         python: Path | str | None = None,
         **popen_kwargs: Any,
     ) -> subprocess.CompletedProcess[str]:
+        # [FUNCTION DOC] Runs the given interpreter (default venv python) with the args
+        # as a text-mode subprocess. Environment is the process environment plus the
+        # venv mapping plus an optional env override; check defaults to true (raises
+        # CalledProcessError on failure). Other keyword args go to subprocess run.
         """Run a Python command in the virtual environment."""
         if python is None:
             python = self.executable
@@ -474,10 +544,13 @@ class Venv:
         *args: str,
         **popen_kwargs: Any,
     ) -> subprocess.CompletedProcess[str]:
+        # [FUNCTION DOC] Same as python but always uses the base interpreter.
         """Run a Python command in the base environment."""
         return self.python(*args, python=self.base_executable, **popen_kwargs)
 
     def python_version(self, *, python: Path | str | None = None) -> str:
+        # [FUNCTION DOC] Runs the interpreter to print its version as major.minor.micro
+        # followed by ABI flags; returns the stripped string.
         """Get the Python version for the virtual environment.
 
         Return a string like "3.13.7", "3.13.7t", "3.13.7d", "3.13.7td", etc.
@@ -493,6 +566,7 @@ class Venv:
         ).stdout.strip()
 
     def base_python_version(self) -> str:
+        # [FUNCTION DOC] Version string of the base interpreter (see python_version).
         """Get the Python version for the base environment.
 
         Return a string like "3.13.7", "3.13.7t", "3.13.7d", "3.13.7td", etc.
@@ -505,6 +579,9 @@ class Venv:
         python: Path | str | None = None,
         **popen_kwargs: Any,
     ) -> subprocess.CompletedProcess[str]:
+        # [FUNCTION DOC] Runs the uv program from the venv bin directory with the args,
+        # targeting the given interpreter (default venv python) through the UV_PYTHON
+        # variable. Environment and check handling are the same as in python.
         """Run a uv command in the virtual environment."""
         if python is None:
             python = self.executable
@@ -530,6 +607,11 @@ class Venv:
         no_deps: bool = False,
         **popen_kwargs: Any,
     ) -> subprocess.CompletedProcess[str]:
+        # [FUNCTION DOC] Prints the packages and runs uv pip install with optional
+        # verbose, prerelease, upgrade and no-deps flags. Returns the completed process.
+        # KNOWN ISSUE: the prerelease flag is passed to uv without a value, but uv's
+        # prerelease option expects a strategy argument, so the next argument would be
+        # consumed as its value.
         """Run a pip install command in the virtual environment."""
         uv_pip_args = []
         if VERBOSE:
@@ -549,6 +631,7 @@ class Venv:
         return self.uv("pip", "install", *uv_pip_args, *packages, **popen_kwargs)
 
     def pip(self, *args: str, **popen_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        # [FUNCTION DOC] Runs the pip module of the venv python with the given args.
         """Run a pip command in the virtual environment."""
         return self.python("-m", "pip", *args, **popen_kwargs)
 
@@ -561,6 +644,8 @@ class Venv:
         no_deps: bool = False,
         **popen_kwargs: Any,
     ) -> subprocess.CompletedProcess[str]:
+        # [FUNCTION DOC] Prints the packages and runs pip install with optional verbose,
+        # pre-release, upgrade and no-deps flags. Returns the completed process.
         """Run a pip install command in the virtual environment."""
         pip_args = []
         if VERBOSE:
@@ -587,6 +672,9 @@ class Venv:
         no_deps: bool = False,
         **popen_kwargs: Any,
     ) -> list[Path]:
+        # [FUNCTION DOC] Downloads the packages with pip into a new temporary directory
+        # that is deleted at interpreter exit, prints what was downloaded, and returns
+        # the list of downloaded file paths. Raises CalledProcessError if pip fails.
         """Download a package in the virtual environment."""
         tmpdir = tempfile.TemporaryDirectory(prefix="pip-download-")
         atexit.register(tmpdir.cleanup)
@@ -614,6 +702,7 @@ class Venv:
         *args: str,
         **popen_kwargs: Any,
     ) -> subprocess.CompletedProcess[str]:
+        # [FUNCTION DOC] Runs the wheel module of the venv python with the given args.
         """Run a wheel command in the virtual environment."""
         return self.python("-m", "wheel", *args, **popen_kwargs)
 
@@ -624,6 +713,8 @@ class Venv:
         dest: Path | str,
         **popen_kwargs: Any,
     ) -> subprocess.CompletedProcess[str]:
+        # [FUNCTION DOC] Unpacks a .whl file into the destination directory using the
+        # wheel tool. Raises AssertionError if the path is not a wheel file.
         """Unpack a wheel into a directory."""
         wheel = Path(wheel).absolute()
         dest = Path(dest).absolute()
@@ -633,6 +724,10 @@ class Venv:
 
     @contextlib.contextmanager
     def extracted_wheel(self, wheel: Path | str) -> Generator[Path]:
+        # [FUNCTION DOC] Context manager: unpacks the given local wheel into a temporary
+        # directory and yields the single unpacked subdirectory (the site directory
+        # contents). Raises RuntimeError if there is not exactly one subdirectory. The
+        # temporary directory is removed on exit.
         """Download and extract a wheel into a temporary directory."""
         with tempfile.TemporaryDirectory(prefix="wheel-") as tempdir:
             self.wheel_unpack(wheel, tempdir)
@@ -646,11 +741,15 @@ class Venv:
 
 
 def git(*args: str) -> list[str]:
+    # [FUNCTION DOC] HELPER: Builds a git command line (as a list) that runs in the repo
+    # root with the given arguments. Does not execute anything.
     return ["git", "-C", str(REPO_ROOT), *args]
 
 
 @functools.lru_cache
 def logging_base_dir() -> Path:
+    # [FUNCTION DOC] HELPER: Returns (creating if needed, cached) the nightly/log
+    # directory under the repo root.
     base_dir = REPO_ROOT / "nightly" / "log"
     base_dir.mkdir(parents=True, exist_ok=True)
     return base_dir
@@ -658,6 +757,8 @@ def logging_base_dir() -> Path:
 
 @functools.lru_cache
 def logging_run_dir() -> Path:
+    # [FUNCTION DOC] HELPER: Creates (once, cached) a per-run log directory named by
+    # timestamp and a uuid inside the base log directory, and returns it.
     base_dir = logging_base_dir()
     cur_dir = base_dir / f"{datetime.now().strftime(DATETIME_FORMAT)}_{uuid.uuid1()}"
     cur_dir.mkdir(parents=True, exist_ok=True)
@@ -666,11 +767,15 @@ def logging_run_dir() -> Path:
 
 @functools.lru_cache
 def logging_record_argv() -> None:
+    # [FUNCTION DOC] HELPER: Writes the command line of this run into an argv file in
+    # the run log directory (only once because of caching).
     s = subprocess.list2cmdline(sys.argv)
     (logging_run_dir() / "argv").write_text(s, encoding="utf-8")
 
 
 def logging_record_exception(e: BaseException) -> None:
+    # [FUNCTION DOC] HELPER: Writes the exception type and message to an exception file
+    # in the run log directory, adding captured stdout and stderr for a failed subprocess.
     text = f"{type(e).__name__}: {e}"
     if isinstance(e, subprocess.CalledProcessError):
         text += f"\n\nstdout: {e.stdout}\n\nstderr: {e.stderr}"
@@ -678,6 +783,8 @@ def logging_record_exception(e: BaseException) -> None:
 
 
 def logging_rotate() -> None:
+    # [FUNCTION DOC] HELPER: Deletes all but the newest 1000 entries (sorted by name,
+    # newest first) of the log base directory, skipping names that do not look like run logs.
     log_base = logging_base_dir()
     old_logs = sorted(log_base.iterdir(), reverse=True)
     for stale_log in old_logs[1000:]:
@@ -688,6 +795,12 @@ def logging_rotate() -> None:
 
 @contextlib.contextmanager
 def logging_manager(*, debug: bool = False) -> Generator[logging.Logger, None, None]:
+    # [FUNCTION DOC] Context manager that configures the pytorch-nightly logger with a
+    # console handler (info, or debug when requested) and a file handler in the run log
+    # directory, records argv, rotates old logs, and yields the logger. On any exception
+    # it logs it, saves it to the run directory, prints the log path and exits with
+    # status 1.
+    # KNOWN ISSUE: the handlers are never removed, so repeated use would duplicate output.
     """Setup logging. If a failure starts here we won't
     be able to save the user in a reasonable way.
 
@@ -734,6 +847,9 @@ def logging_manager(*, debug: bool = False) -> Generator[logging.Logger, None, N
 
 
 def check_branch(subcommand: str, branch: str | None) -> str | None:
+    # [FUNCTION DOC] For the checkout subcommand, returns an error message if the working
+    # tree (ignoring untracked files) is dirty or if the named branch already exists;
+    # returns None when all is fine or for other subcommands. Runs git subprocesses.
     """Checks that the branch name can be checked out."""
     if subcommand != "checkout":
         return None
@@ -753,6 +869,8 @@ def check_branch(subcommand: str, branch: str | None) -> str | None:
 
 @timed("Installing dependencies")
 def install_packages(venv: Venv, packages: Iterable[str]) -> None:
+    # [FUNCTION DOC] Removes duplicate package specs (keeping order) and installs the
+    # rest into the venv with uv; does nothing for an empty list.
     """Install dependencies to deps environment"""
     # install packages
     packages = list(dict.fromkeys(packages))
@@ -761,6 +879,8 @@ def install_packages(venv: Venv, packages: Iterable[str]) -> None:
 
 
 def _ensure_commit(git_sha1: str) -> None:
+    # [FUNCTION DOC] HELPER: Checks whether the commit exists in the local repo and, if
+    # not, fetches it from the GitHub remote. Raises CalledProcessError if fetch fails.
     """Make sure that we actually have the commit locally"""
     cmd = git("cat-file", "-e", git_sha1 + r"^{commit}")
     p = subprocess.run(cmd, capture_output=True, check=False)
@@ -773,6 +893,10 @@ def _ensure_commit(git_sha1: str) -> None:
 
 
 def _nightly_version(site_dir: Path) -> str:
+    # [FUNCTION DOC] HELPER: Reads the git version recorded in the unpacked wheel's
+    # torch version file, fetches that commit if needed, extracts the nightly commit
+    # hash from its subject line, ensures that commit is available, and returns it.
+    # Raises RuntimeError if the git version line or the hash cannot be found.
     # first get the git version from the installed module
     version_file = site_dir / "torch" / "version.py"
     with version_file.open(encoding="utf-8") as f:
@@ -803,6 +927,8 @@ def _nightly_version(site_dir: Path) -> str:
 
 @timed("Checking out nightly PyTorch")
 def checkout_nightly_version(branch: str | None, site_dir: Path) -> None:
+    # [FUNCTION DOC] Resolves the nightly commit from the wheel and checks it out,
+    # detached when branch is None, else on a new branch with that name.
     """Gets the nightly version and then checks it out."""
     nightly_version = _nightly_version(site_dir)
     if branch is None:
@@ -816,6 +942,8 @@ def checkout_nightly_version(branch: str | None, site_dir: Path) -> None:
 
 @timed("Pulling nightly PyTorch")
 def pull_nightly_version(site_dir: Path) -> None:
+    # [FUNCTION DOC] Resolves the nightly commit from the wheel and merges it into the
+    # current branch.
     """Fetches the nightly version and then merges it ."""
     nightly_version = _nightly_version(site_dir)
     cmd = git("merge", nightly_version)
@@ -823,6 +951,8 @@ def pull_nightly_version(site_dir: Path) -> None:
 
 
 def _get_listing_linux(source_dir: Path) -> list[Path]:
+    # [FUNCTION DOC] HELPER: Lists shared objects in the source dir and in its lib
+    # subdirectory (including versioned names).
     return list(
         itertools.chain(
             source_dir.glob("*.so"),
@@ -833,6 +963,8 @@ def _get_listing_linux(source_dir: Path) -> list[Path]:
 
 
 def _get_listing_macos(source_dir: Path) -> list[Path]:
+    # [FUNCTION DOC] HELPER: Lists shared objects in the source dir plus dylibs in its
+    # lib subdirectory.
     # oddly, these are .so files even on Mac
     return list(
         itertools.chain(
@@ -843,6 +975,10 @@ def _get_listing_macos(source_dir: Path) -> list[Path]:
 
 
 def _get_listing_windows(source_dir: Path) -> list[Path]:
+    # [FUNCTION DOC] HELPER: Lists pyd files in the source dir plus lib and dll files in
+    # its lib subdirectory.
+    # KNOWN ISSUE: the dll pattern lacks a wildcard (it matches only a file literally
+    # named .dll), so real dll files are not listed.
     return list(
         itertools.chain(
             source_dir.glob("*.pyd"),
@@ -853,10 +989,14 @@ def _get_listing_windows(source_dir: Path) -> list[Path]:
 
 
 def _glob_pyis(d: Path) -> set[str]:
+    # [FUNCTION DOC] HELPER: Returns the set of posix-style relative paths of all stub
+    # files found recursively under the directory.
     return {p.relative_to(d).as_posix() for p in d.rglob("*.pyi")}
 
 
 def _find_missing_pyi(source_dir: Path, target_dir: Path) -> list[Path]:
+    # [FUNCTION DOC] HELPER: Returns, sorted, the stub files present in the source dir
+    # but absent from the target dir (as paths under the source dir).
     source_pyis = _glob_pyis(source_dir)
     target_pyis = _glob_pyis(target_dir)
     missing_pyis = sorted(source_dir / p for p in (source_pyis - target_pyis))
@@ -864,6 +1004,9 @@ def _find_missing_pyi(source_dir: Path, target_dir: Path) -> list[Path]:
 
 
 def _get_listing(source_dir: Path, target_dir: Path) -> list[Path]:
+    # [FUNCTION DOC] HELPER: Builds the list of items to move from the wheel's torch
+    # directory: platform binaries, missing stubs, the version file, the generated test
+    # directory, bin and include. Raises RuntimeError on an unknown platform.
     if LINUX:
         listing = _get_listing_linux(source_dir)
     elif MACOS:
@@ -881,6 +1024,7 @@ def _get_listing(source_dir: Path, target_dir: Path) -> list[Path]:
 
 
 def _remove_existing(path: Path) -> None:
+    # [FUNCTION DOC] HELPER: Deletes the path if it exists, recursively for directories.
     if path.exists():
         if path.is_dir():
             shutil.rmtree(path)
@@ -895,6 +1039,9 @@ def _move_single(
     mover: Callable[[Path, Path], None],
     verb: str,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Moves one file or directory tree from the source dir to the
+    # same relative place in the target dir, first deleting any existing target. The
+    # mover callable (copy or link) is applied per file; the verb is used for verbose output.
     relpath = src.relative_to(source_dir)
     trg = target_dir / relpath
     _remove_existing(trg)
@@ -919,18 +1066,23 @@ def _move_single(
 
 
 def _copy_files(listing: list[Path], source_dir: Path, target_dir: Path) -> None:
+    # [FUNCTION DOC] HELPER: Copies each listed item into the target dir, with metadata.
     for src in listing:
         # pyrefly: ignore [bad-argument-type]
         _move_single(src, source_dir, target_dir, shutil.copy2, "Copying")
 
 
 def _link_files(listing: list[Path], source_dir: Path, target_dir: Path) -> None:
+    # [FUNCTION DOC] HELPER: Hard-links each listed item into the target dir.
     for src in listing:
         _move_single(src, source_dir, target_dir, os.link, "Linking")
 
 
 @timed("Moving nightly files into repo")
 def move_nightly_files(site_dir: Path) -> None:
+    # [FUNCTION DOC] Moves the nightly binaries and related files from the unpacked wheel
+    # into the repo's torch directory: copies on Windows, hard links elsewhere with a
+    # fall back to copying if linking fails. Mutates the repo tree.
     """Moves PyTorch files from temporary installed location to repo."""
     # get file listing
     source_dir = site_dir / "torch"
@@ -948,6 +1100,8 @@ def move_nightly_files(site_dir: Path) -> None:
 
 @timed("Writing pytorch-nightly.pth")
 def write_pth(venv: Venv) -> None:
+    # [FUNCTION DOC] Writes a pytorch-nightly path file into the venv's site-packages so
+    # that the repo root is importable, with a header explaining how to remove it.
     """Writes Python path file for this dir."""
     (venv.site_packages() / "pytorch-nightly.pth").write_text(
         "# This file was autogenerated by PyTorch's tools/nightly.py\n"
@@ -962,6 +1116,10 @@ def parse_dependencies(
     venv: Venv,
     wheel_site_dir: Path,
 ) -> list[str]:
+    # [FUNCTION DOC] Reads the wheel's metadata file (from its single dist-info
+    # directory) with the venv interpreter and returns requirement strings whose
+    # environment markers evaluate true. Raises RuntimeError if the dist-info directory
+    # or metadata file is missing or ambiguous.
     """Parse dependencies from the torch wheel's metadata."""
     dist_info_dirs = list(wheel_site_dir.glob("*.dist-info"))
     if len(dist_info_dirs) != 1:
@@ -1009,6 +1167,11 @@ def install(
     fresh_venv: bool = False,
     assume_yes: bool = False,
 ) -> None:
+    # [FUNCTION DOC] Full workflow: ensure or recreate the venv, download the nightly
+    # torch wheel without dependencies (RuntimeError unless exactly one wheel), install
+    # its dependencies and the extra packages, then check out or merge the matching
+    # commit (ValueError for an unknown subcommand), move the binaries into the repo,
+    # write the path file and log activation instructions.
     """Development install of PyTorch"""
     if not fresh_venv:
         print(f"Using existing venv: {venv.prefix}")
@@ -1050,7 +1213,12 @@ def install(
 
 
 def make_parser() -> argparse.ArgumentParser:
+    # [FUNCTION DOC] Builds the argument parser with checkout and pull subcommands; each
+    # accepts python interpreter, prefix, fresh, yes, verbose and optional cuda/rocm
+    # version options. Returns the parser.
     def find_executable(name: str) -> Path:
+        # [FUNCTION DOC] HELPER: Argument type converter that resolves an executable name
+        # on PATH to an absolute path or raises an argument type error if not found.
         executable = shutil.which(name)
         if executable is None:
             raise argparse.ArgumentTypeError(
@@ -1149,6 +1317,8 @@ def make_parser() -> argparse.ArgumentParser:
 
 
 def parse_arguments() -> argparse.Namespace:
+    # [FUNCTION DOC] Parses the command line, defaulting branch to none, and reports a
+    # parser error if both cuda and rocm are requested. Returns the namespace.
     parser = make_parser()
     args = parser.parse_args()
     args.branch = getattr(args, "branch", None)
@@ -1158,6 +1328,12 @@ def parse_arguments() -> argparse.Namespace:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point: parses arguments, sets global verbosity, validates the
+    # branch (exits with the message on problems), selects the pip source (cpu by default,
+    # or the requested/latest CUDA or ROCm one for this platform, exiting if unavailable),
+    # then runs the install workflow under the logging manager. Sets global LOGGER.
+    # KNOWN ISSUE: sorting versions uses the packaging Version class, which is None if the
+    # optional import failed, so the cuda/rocm paths would then fail.
     """Main entry point"""
     global LOGGER, VERBOSE
     args = parse_arguments()

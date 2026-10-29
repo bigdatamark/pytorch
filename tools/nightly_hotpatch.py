@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command line tool that downloads the diff of a PyTorch GitHub pull request
+# and applies it with the system patch utility to the installed PyTorch package (or a
+# user-given directory). Intended for hot-patching disposable environments. No import-time
+# side effects; the work happens in main when run as a script.
 
 import argparse
 import os
@@ -11,6 +15,9 @@ from typing import cast, NoReturn
 
 
 def parse_arguments() -> argparse.Namespace:
+    # [FUNCTION DOC] Parses the command line: a required integer PR number, optional
+    # target directory and strip count (default 1). Returns the namespace; argparse exits
+    # on invalid input.
     """
     Parses command-line arguments using argparse.
 
@@ -62,6 +69,9 @@ def parse_arguments() -> argparse.Namespace:
 
 
 def get_pytorch_path() -> str:
+    # [FUNCTION DOC] Imports torch and returns the parent directory of the installed torch
+    # package (where patch paths are relative to), printing both paths. If torch cannot be
+    # imported, exits the program with status 1 through the import error handler.
     """
     Retrieves the installation path of PyTorch in the current environment.
 
@@ -85,6 +95,8 @@ def get_pytorch_path() -> str:
 
 
 def handle_import_error() -> NoReturn:
+    # [FUNCTION DOC] HELPER: Prints a message that PyTorch is not installed and exits the
+    # process with status 1.
     """
     Handle the case where PyTorch is not installed and exit the program.
 
@@ -96,6 +108,11 @@ def handle_import_error() -> NoReturn:
 
 
 def download_patch(pr_number: int, repo_url: str, download_dir: str) -> str:
+    # [FUNCTION DOC] Downloads the diff of the pull request from the repository URL into
+    # a file in the download directory and returns that file path. Network and file I/O.
+    # Exits with status 1 on an HTTP error or any other failure.
+    # KNOWN ISSUE: the error module is referenced through urllib without being imported
+    # explicitly; it works only because the request module imports it.
     """
     Downloads the patch file for a given PR from the specified GitHub repository.
 
@@ -133,6 +150,12 @@ def download_patch(pr_number: int, repo_url: str, download_dir: str) -> str:
 
 
 def apply_patch(patch_file: str, target_dir: str | None, strip_count: int) -> None:
+    # [FUNCTION DOC] Runs the patch utility with the given strip count on the patch file,
+    # inside the target directory, printing progress and any output on failure. Exits
+    # with status 1 if patch fails, is missing, or any error occurs.
+    # KNOWN ISSUE: when no target directory is given, the else branch still adds a
+    # directory option containing the text None, so patch would target a directory named
+    # None; the branches are otherwise identical.
     """
     Applies the downloaded patch to the specified directory using the given strip count.
 
@@ -183,6 +206,10 @@ def apply_patch(patch_file: str, target_dir: str | None, strip_count: int) -> No
 
 
 def main() -> None:
+    # [FUNCTION DOC] Orchestrates the tool: parses arguments, picks the target directory
+    # (the custom one, which must exist or the program exits with status 1, else the
+    # installed torch parent), downloads the PR patch into a temporary directory and
+    # applies it. The temporary directory is removed afterwards.
     """
     Main function to orchestrate the patch download and application process.
 
