@@ -1,3 +1,9 @@
+# [MODULE DOC] Tests combining FSDP with activation checkpointing and activation offload: parity of
+# losses, outputs and gradients across checkpoint-and-FSDP nesting orders, offload detection
+# through a patched save_on_cpu, and checkpointed submodules wrapped by FSDP. Defines helper models
+# and a patchable global flag. Import-time side effects: exits the interpreter with status 0 when
+# distributed is unavailable or under dev-debug ASAN; computes device_type; instantiates device-
+# specific test classes for cuda, hpu and xpu.
 # Owner(s): ["oncall: distributed"]
 import contextlib
 import sys
@@ -48,11 +54,15 @@ _save_on_cpu_called = False
 
 
 def get_patched_save_on_cpu():
+    # [FUNCTION DOC] HELPER: Returns a replacement for the checkpoint wrapper's save_on_cpu that
+    # sets the module-level flag recording that it was called and then delegates to the original.
     orig_save_on_cpu = (
         torch.distributed.algorithms._checkpoint.checkpoint_wrapper.save_on_cpu
     )
 
     def patched_save_on_cpu(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Sets the global called flag to true and returns the original
+        # save_on_cpu result for the same arguments.
         global _save_on_cpu_called
         _save_on_cpu_called = True
         return orig_save_on_cpu(*args, **kwargs)
@@ -62,6 +72,8 @@ def get_patched_save_on_cpu():
 
 @contextlib.contextmanager
 def patch_save_on_cpu(new_save_on_cpu):
+    # [FUNCTION DOC] HELPER: Context manager that swaps the checkpoint wrapper module's save_on_cpu
+    # for the given replacement and restores the original on exit, even on error.
     orig_save_on_cpu = (
         torch.distributed.algorithms._checkpoint.checkpoint_wrapper.save_on_cpu
     )
@@ -77,7 +89,12 @@ def patch_save_on_cpu(new_save_on_cpu):
 
 
 class TestFSDPCheckpoint(FSDPTest):
+    # [CLASS DOC] Multi-process tests (FSDPTest) of FSDP together with checkpoint and offload
+    # wrappers, parametrized over CPU offload, activation offload and use_orig_params. Instantiated
+    # with the parametrized test helper.
     class SequentialModule(nn.Module):
+        # [CLASS DOC] HELPER: Three small linear layers in a sequential, each optionally wrapped by
+        # a checkpoint or offload wrapper and optionally by FSDP.
         def __init__(
             self,
             checkpoint_layer=False,
@@ -86,6 +103,10 @@ class TestFSDPCheckpoint(FSDPTest):
             *fsdp_args,
             **fsdp_kwargs,
         ):
+            # [FUNCTION DOC] HELPER: Seeds the generator with 0, builds three 3 by 3 linear layers
+            # on the test device, wraps each with an offload or checkpoint wrapper when requested,
+            # then wraps each with FSDP when wrap_fsdp is set (extra arguments are passed to FSDP)
+            # and stores them in a sequential named ffn.
             torch.manual_seed(0)
             super().__init__()
             l1 = nn.Linear(3, 3).to(device_type.type)
@@ -109,9 +130,13 @@ class TestFSDPCheckpoint(FSDPTest):
             )
 
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Runs the input through the sequential.
             return self.ffn(x)
 
     def _verify_parity(self, losses, outputs, models):
+        # [FUNCTION DOC] HELPER: Raises AssertionError if any of the lists is empty. Checks every
+        # later loss and output equals the first, and that parameter gradients of every later model
+        # equal those of the first model.
         if not losses:
             raise AssertionError("Expected losses to be non-empty")
         if not outputs:
@@ -144,6 +169,13 @@ class TestFSDPCheckpoint(FSDPTest):
         offload_activations: bool,
         use_orig_params: bool,
     ):
+        # [FUNCTION DOC] Builds three models: checkpoint around FSDP layers, FSDP around
+        # checkpointed layers, and a plain FSDP baseline. Runs two iterations with patched
+        # save_on_cpu; on the first iteration for offload mode checks the offload function was
+        # called by non-baseline models. Checks parity of losses, outputs and gradients, then a
+        # barrier. Requires at least 2 GPUs.
+        # KNOWN ISSUE: the TODO notes it relies on global state and should move to the continuous
+        # test base.
         # Test checkpoint(FSDP(layer1), FSDP(layer2), ....)
         if offload_activations:
             wrapper_to_use = offload_wrapper
@@ -204,6 +236,11 @@ class TestFSDPCheckpoint(FSDPTest):
         offload_activations: bool,
         use_orig_params: bool,
     ):
+        # [FUNCTION DOC] Compares four models on six iterations: plain FSDP, checkpoint-wrapped
+        # FSDP, FSDP over a checkpoint-wrapped module, and FSDP with a manual functional checkpoint
+        # call (with a patched offload context when offloading). Checks the offload hook is only
+        # called when expected, resets the flag after each model, and verifies parity. Requires at
+        # least 2 GPUs.
         fsdp_kwargs = {"cpu_offload": cpu_offload, "use_orig_params": use_orig_params}
         global _save_on_cpu_called
         with patch_save_on_cpu(get_patched_save_on_cpu()):
@@ -272,13 +309,19 @@ instantiate_parametrized_tests(TestFSDPCheckpoint)
 
 
 class CheckpointModule(nn.Module):
+    # [CLASS DOC] HELPER: Sequential of four 100 by 100 linear layers that is run through
+    # functional checkpoint when its checkpoint flag is set.
     def __init__(self, checkpoint: bool = False, use_reentrant: bool = True):
+        # [FUNCTION DOC] HELPER: Builds the sequential and stores the checkpoint and
+        # reentrant flags.
         super().__init__()
         self.seq = nn.Sequential(*[nn.Linear(100, 100) for _ in range(4)])
         self.checkpoint = checkpoint
         self.use_reentrant = use_reentrant
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Runs the sequential through functional checkpoint with the
+        # configured reentrant mode if checkpointing is enabled, otherwise runs it directly.
         return (
             checkpoint(self.seq, x, use_reentrant=self.use_reentrant)
             if self.checkpoint
@@ -287,7 +330,10 @@ class CheckpointModule(nn.Module):
 
 
 class ModelWithCheckpointSubmodule(nn.Module):
+    # [CLASS DOC] HELPER: Linear, two CheckpointModule submodules, ReLU and a final linear.
     def __init__(self, checkpoint: bool = False, use_reentrant: bool = True):
+        # [FUNCTION DOC] HELPER: Builds the layers; both submodules receive the checkpoint and
+        # reentrant flags.
         super().__init__()
         self.l1 = nn.Linear(100, 100)
         self.s1 = CheckpointModule(checkpoint, use_reentrant)
@@ -296,11 +342,18 @@ class ModelWithCheckpointSubmodule(nn.Module):
         self.l2 = nn.Linear(100, 100)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies the first linear, the two submodules in order, ReLU and
+        # the last linear.
         return self.l2(self.relu(self.s2(self.s1(self.l1(x)))))
 
 
 class TestModel(nn.Module):
+    # [CLASS DOC] HELPER: Model with two linear layers around two ModelWithCheckpointSubmodule
+    # blocks, used to compare checkpointed and non-checkpointed gradients. Not a test class despite
+    # its name.
     def __init__(self, checkpoint: bool = False, use_reentrant: bool = True):
+        # [FUNCTION DOC] HELPER: Builds the layers and two blocks, passing along the checkpoint and
+        # reentrant flags.
         super().__init__()
         self.l1 = nn.Linear(100, 100)
         self.relu = nn.ReLU()
@@ -309,14 +362,24 @@ class TestModel(nn.Module):
         self.l2 = nn.Linear(100, 100)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies the first linear, ReLU, both blocks in order, and the
+        # last linear.
         return self.l2(self.relu(self.checkpoint2(self.checkpoint1(self.l1(x)))))
 
 
 class TestFSDPCheckpointSubmodule(FSDPTestContinuous):
+    # [CLASS DOC] Multi-process test class (FSDPTestContinuous) for FSDP wrapping of checkpointed
+    # submodules, instantiated per device type.
     # TODO: grad value checks occasionally fails when use_reentrant = True
     @skip_if_lt_x_gpu(2)
     @parametrize("use_reentrant", [False])
     def test_checkpoint_submodule(self, device, use_reentrant: bool):
+        # [FUNCTION DOC] Makes a model and a deep copy in which every CheckpointModule has
+        # checkpointing turned on. Wraps the two blocks of each with FSDP using NO_SHARD, runs
+        # forward and backward on the same input for both, and checks parameter names match and
+        # gradients are close. Only non-reentrant mode is parametrized. Requires at least 2 GPUs.
+        # KNOWN ISSUE: reentrant mode is excluded because gradient checks occasionally fail (per
+        # the TODO).
         model = TestModel(use_reentrant=use_reentrant).to(device_type.type)
         model_ac = deepcopy(model)
         for _, m in model_ac.named_modules():

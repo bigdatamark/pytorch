@@ -1,3 +1,8 @@
+# [MODULE DOC] Test that an FSDP-wrapped model can be saved with torch.distributed.checkpoint and
+# loaded into a differently initialized model, for local and sharded state dict types. Import-time
+# side effects: exits the interpreter with status 0 (printing to stderr) if distributed is
+# unavailable or under dev-debug ASAN; instantiates device-specific test classes for cuda, hpu and
+# xpu into the module namespace.
 # Owner(s): ["oncall: distributed"]
 
 import sys
@@ -43,8 +48,12 @@ _DISTRIBUTED_STATE_DICT_IMPLS = (
 
 
 class TestDistributedCheckpoint(FSDPTestContinuous):
+    # [CLASS DOC] Multi-process FSDP checkpoint round-trip test class (FSDPTestContinuous),
+    # instantiated per device type.
     @property
     def world_size(self):
+        # [FUNCTION DOC] Property giving the number of ranks: 2, unless an accelerator is present
+        # with fewer than 2 devices, in which case it returns that device count.
         if torch.accelerator.is_available():
             gpu_cnt = torch.accelerator.device_count()
             if gpu_cnt < 2:
@@ -67,6 +76,14 @@ class TestDistributedCheckpoint(FSDPTestContinuous):
     @with_temp_dir
     @parametrize("state_dict_type", _DISTRIBUTED_STATE_DICT_IMPLS)
     def test_distributed_checkpoint(self, state_dict_type) -> None:
+        # [FUNCTION DOC] Builds two FSDP-wrapped SkipModel instances with different seeds and
+        # checks their full parameters differ. Saves the first model's state dict (of the
+        # parametrized type) to a temporary directory with a file system writer, loads it into the
+        # second model's state dict via a reader, loads that into the second model, and checks all
+        # full parameters now equal.
+        # KNOWN ISSUE: every skipIf decorator uses a condition that is true on Linux or ROCm, so
+        # the test is skipped on all Linux machines despite the issue links. A resharding case
+        # remains a TODO.
         with enable_wrap(wrapper_cls=FSDP):
             torch.manual_seed(100)
             model = wrap(SkipModel(double_nest=True))

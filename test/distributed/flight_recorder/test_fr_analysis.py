@@ -1,3 +1,8 @@
+# [MODULE DOC] Tests for the flight recorder analysis components: match_one_event comparison of
+# two collective trace events, the Op class accepting supported backend prefixes, MatchInfo
+# string formatting, and build_db end to end on synthetic dumps of two ranks. Defines the event
+# and entry factory helpers and a template of loaded dump data at module level; no other import-
+# time side effects.
 # Owner(s): ["oncall: distributed"]
 
 import copy
@@ -26,6 +31,10 @@ def create_one_event(
     p2p_seq_id=0,
     output_dtypes="float32",
 ):
+    # [FUNCTION DOC] HELPER: Builds a trace event dictionary for a collective: profiling name
+    # prefixed with nccl, the given state, process group info, input and output sizes, float32
+    # input dtypes, the given output dtypes, sequence ids converted to strings, creation time 0 and
+    # no frames. Returns the dictionary.
     return {
         "profiling_name": f"nccl:{collective_name}",
         "state": state,
@@ -42,7 +51,15 @@ def create_one_event(
 
 
 class FlightRecorderEventTest(TestCase):
+    # [CLASS DOC] Tests match_one_event on pairs of synthetic events for different mismatch kinds
+    # and for every collective in the COLLECTIVES list.
     def test_match_one_event(self):
+        # [FUNCTION DOC] Compares pairs of events and checks the resulting MatchState: identical
+        # events fully match, different collective names give a type mismatch, all_to_all is
+        # undecided, differing input or output sizes give a size mismatch (including an event
+        # compared against itself with inconsistent sizes), scheduled versus completed gives a
+        # state mismatch, differing output dtypes give a dtype mismatch, and gather events with
+        # empty outputs or dtypes still match fully.
         e1 = create_one_event(
             "all_reduce", ("0", "default"), [[4, 4]], [[4, 4]], "scheduled", 1
         )
@@ -152,6 +169,10 @@ class FlightRecorderEventTest(TestCase):
         )
 
     def test_all_events(self):
+        # [FUNCTION DOC] For each collective name in sorted order, builds an event with sizes
+        # adjusted for reduce-scatter and all-gather variants (output sizes scaled for the two-rank
+        # group), matches it against itself and checks the state is fully matched, except
+        # all_to_all which must be undecided.
         for collective in sorted(COLLECTIVES):
             input_sizes = [[4, 4]]
             output_sizes = [[4, 4]]
@@ -180,9 +201,14 @@ class FlightRecorderEventTest(TestCase):
 
 
 class FlightRecorderOpBackendTest(TestCase):
+    # [CLASS DOC] Tests that the Op class parses the backend prefix of the profiling name and
+    # accepts the supported backends (nccl, ncclx, gloo, xccl) while rejecting unknown ones.
     """Tests that the Op class accepts all supported backend prefixes."""
 
     def _make_event(self, backend: str, collective: str = "all_reduce"):
+        # [FUNCTION DOC] HELPER: Builds a completed collective event dictionary whose profiling
+        # name is the backend and collective joined by a colon, on the default group with 4 by 4
+        # float32 sizes.
         return {
             "profiling_name": f"{backend}:{collective}",
             "state": "completed",
@@ -198,28 +224,36 @@ class FlightRecorderOpBackendTest(TestCase):
         }
 
     def test_nccl_backend(self):
+        # [FUNCTION DOC] Checks Op built from an nccl event reports collective type all_reduce.
         op = Op(self._make_event("nccl"), {"0": {0, 1}}, "0")
         self.assertEqual(op.type, "all_reduce")
 
     def test_ncclx_backend(self):
+        # [FUNCTION DOC] Checks Op built from an ncclx event reports collective type all_reduce.
         op = Op(self._make_event("ncclx"), {"0": {0, 1}}, "0")
         self.assertEqual(op.type, "all_reduce")
 
     def test_gloo_backend(self):
+        # [FUNCTION DOC] Checks Op built from a gloo event reports collective type all_reduce.
         op = Op(self._make_event("gloo"), {"0": {0, 1}}, "0")
         self.assertEqual(op.type, "all_reduce")
 
     def test_xccl_backend(self):
+        # [FUNCTION DOC] Checks Op built from an xccl event reports collective type all_reduce.
         op = Op(self._make_event("xccl"), {"0": {0, 1}}, "0")
         self.assertEqual(op.type, "all_reduce")
 
     def test_unsupported_backend_raises(self):
+        # [FUNCTION DOC] Checks Op built from an unknown backend prefix raises AssertionError.
         with self.assertRaises(AssertionError):
             Op(self._make_event("unknown_backend"), {"0": {0, 1}}, "0")
 
 
 class FlightMatchInfoTest(TestCase):
+    # [CLASS DOC] Tests the MatchInfo value object that pairs a match state with a message.
     def test_match_info(self):
+        # [FUNCTION DOC] Checks the state attribute is preserved and that the string form is the
+        # error type name followed by a comma and the message.
         m1 = MatchInfo(MatchState.FULLY_MATCHED, "rank 0")
         m2 = MatchInfo(MatchState.FULLY_MATCHED, "rank 1")
         self.assertEqual(m1.state, MatchState.FULLY_MATCHED)
@@ -259,6 +293,9 @@ def create_one_entry(
     output_dtypes="float32",
     pg_info=("0", "default"),
 ):
+    # [FUNCTION DOC] HELPER: Builds a dump entry by creating an event with the given arguments
+    # (default state completed, default group) and adding a record id and a non-p2p flag. Returns
+    # the dictionary.
     event = create_one_event(
         collective_name,
         pg_info,
@@ -275,7 +312,15 @@ def create_one_entry(
 
 
 class FlightRecorderE2ETest(TestCase):
+    # [CLASS DOC] End-to-end test of build_db over synthetic two-rank dumps.
     def testBuildDB(self):
+        # [FUNCTION DOC] Parses default job arguments and tags the shared dump template with
+        # version 2.8 (mutating module-level data). Builds databases from six scenarios, each from
+        # a deep copy of the template, and checks the number of collectives, record ids, names and
+        # pass_check flags: matched all_reduce on the default and a sub group; matched
+        # allreduce_coalesced; two broadcasts folded into one coalesced collective; mismatched
+        # sizes in an uneven all-gather failing the check; matched uneven reduce scatter; and an
+        # empty coalesced call on rank 0 where rank 1 has extra entries.
         config = JobConfig()
         args = config.parse_args([])
         version = "2.8"  # Same as the version in FlightRecorder.hpp

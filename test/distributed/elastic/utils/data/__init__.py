@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# [PACKAGE DOC] Test package for torchelastic data utilities such as the cycling iterator. Empty
+# marker; no import-time side effects.
 
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.

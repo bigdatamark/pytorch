@@ -1,3 +1,9 @@
+# [MODULE DOC] Tests for FullyShardedDataParallel.clip_grad_norm_: root-only restriction, parity
+# against DDP with torch.nn.utils.clip_grad_norm_ over norms, sharding strategies, original-
+# parameter and offload settings, low precision gradients, the no-gradient case and mixed gradient
+# dtypes. Import-time side effects: exits the interpreter with status 0 when distributed is
+# unavailable or under dev-debug ASAN; computes device_type; instantiates device-specific test
+# classes for cuda, hpu and xpu.
 # Owner(s): ["oncall: distributed"]
 import itertools
 import sys
@@ -41,10 +47,15 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 
 class TestClipGradNorm(FSDPTestContinuous):
+    # [CLASS DOC] Multi-process tests (FSDPTestContinuous) of FSDP gradient norm clipping on small
+    # models and a transformer.
     """Tests :meth:`FullyShardedDataParallel.clip_grad_norm_`."""
 
     @skip_if_lt_x_gpu(2)
     def test_non_root(self, device):
+        # [FUNCTION DOC] Builds a model with an FSDP-wrapped inner layer and an FSDP root, runs
+        # forward and backward, and checks clip_grad_norm_ on the inner instance raises
+        # RuntimeError saying it should only be called on the root. Requires at least 2 GPUs.
         """
         Tests that calling ``clip_grad_norm_()`` on a non-root FSDP instance
         raises an error.
@@ -52,11 +63,13 @@ class TestClipGradNorm(FSDPTestContinuous):
 
         class Model(nn.Module):
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates two 5 by 5 linear layers.
                 super().__init__()
                 self.lin1 = nn.Linear(5, 5)
                 self.lin2 = nn.Linear(5, 5)
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Applies the first then the second linear layer.
                 return self.lin2(self.lin1(x))
 
         model = Model().to(device_type.type)
@@ -70,6 +83,9 @@ class TestClipGradNorm(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_ddp_parity(self, device):
+        # [FUNCTION DOC] Runs the DDP parity check as subtests over max norm values, norm types (1,
+        # 2, infinity), sharding strategies (including a mixed strategy), original parameter use
+        # and parameter offload. Requires at least 2 GPUs.
         """
         Tests FSDP with ``FullyShardedDataParallel.clip_grad_norm_()` against
         DDP with ``torch.nn.utils.clip_grad_norm_()` when using full precision.
@@ -99,6 +115,14 @@ class TestClipGradNorm(FSDPTestContinuous):
         use_orig_params: bool,
         offload_params: bool,
     ):
+        # [FUNCTION DOC] HELPER: Builds a DDP model and an FSDP model from the same deterministic
+        # transformer (for the mixed strategy: no-shard encoder, full-shard decoder and an FSDP
+        # root). Runs backward, multiplies gradients by 100 so clipping applies, clips both, and
+        # checks equal total norms, that gradients actually changed, and equal parameters after an
+        # Adam step. Unless parameters are offloaded, runs three more iterations with alternating
+        # zero-grad modes checking matching norms.
+        # KNOWN ISSUE: the device argument is overwritten by a locally created device; offload runs
+        # return early because of known CPU/GPU drift.
         local_model = TransformerWithSharedParams.init(
             self.process_group,
             FSDPInitMode.NO_FSDP,
@@ -244,6 +268,9 @@ class TestClipGradNorm(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_low_precision_grads(self, device):
+        # [FUNCTION DOC] Runs the low precision gradient check as subtests over max norm, norm
+        # types, sharding strategies (full shard and no shard) and original parameter use. Requires
+        # at least 2 GPUs.
         """Tests ``clip_grad_norm_()`` when using low precision gradients."""
         self.run_subtests(
             {
@@ -267,6 +294,10 @@ class TestClipGradNorm(FSDPTestContinuous):
         sharding_strategy: ShardingStrategy,
         use_orig_params: bool,
     ):
+        # [FUNCTION DOC] HELPER: Wraps a nested module in FSDP with float16 parameters and
+        # reduction and low precision gradients kept. After backward checks gradients are float16,
+        # the returned total norm is float16, and each gradient norm does not exceed the max norm
+        # (best effort, since DDP cannot be compared).
         fsdp_kwargs = {
             "sharding_strategy": sharding_strategy,
             "use_orig_params": use_orig_params,
@@ -307,6 +338,8 @@ class TestClipGradNorm(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_no_gradients(self, device):
+        # [FUNCTION DOC] Runs the no-gradient check as subtests over original parameter use.
+        # Requires at least 2 GPUs.
         """
         Tests that calling ``clip_grad_norm_()`` when the FDSP module has no
         gradients simply returns a scalar zero tensor in FP32 without erroring.
@@ -317,6 +350,9 @@ class TestClipGradNorm(FSDPTestContinuous):
         )
 
     def _test_no_gradients(self, device, use_orig_params: bool):
+        # [FUNCTION DOC] HELPER: Wraps a linear in FSDP with shard-grad-op and mixed precision,
+        # runs forward only, then checks clip_grad_norm_ emits a UserWarning about having no
+        # gradients on this rank and returns a float32 scalar equal to zero.
         lin_module = nn.Linear(24, 24)
         mixed_precision_config = MixedPrecision(
             param_dtype=torch.float16,
@@ -344,6 +380,10 @@ class TestClipGradNorm(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_non_uniform_grad_dtype(self, device):
+        # [FUNCTION DOC] Builds two FSDP-wrapped linears with different mixed precision (bfloat16
+        # with low precision gradients kept, and float32) under an FSDP root, runs backward, checks
+        # gradients really have more than one dtype, and checks clip_grad_norm_ returns a float32
+        # total norm. Requires at least 2 GPUs.
         """Tests clip_grad_norm_ with non-uniform gradient dtypes via MixedPrecision."""
         device_type = torch.device(device).type
         model = nn.Sequential(nn.Linear(5, 5), nn.Linear(5, 5))

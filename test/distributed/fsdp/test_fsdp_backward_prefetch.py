@@ -1,3 +1,9 @@
+# [MODULE DOC] Test of FSDP backward prefetch ordering on a 12 layer transformer: by wrapping the
+# runtime function that selects the next handle to prefetch, it records the parameter names of
+# each prefetched handle and checks the order and count for BACKWARD_PRE, BACKWARD_POST and no
+# prefetch. Defines parameter-name templates and expected-count constants. Import-time side
+# effects: exits the interpreter with status 0 when distributed is unavailable or under dev-debug
+# ASAN; computes device_type.
 # Owner(s): ["oncall: distributed"]
 
 import sys
@@ -75,11 +81,22 @@ if TEST_WITH_DEV_DBG_ASAN:
 
 
 class TestBackwardPrefetch(FSDPTestContinuous):
+    # [CLASS DOC] Two-rank FSDP test (FSDPTestContinuous) checking which handles are prefetched
+    # during backward for each backward prefetch setting.
     @property
     def world_size(self):
+        # [FUNCTION DOC] Property returning the fixed rank count of 2.
         return 2
 
     def _dist_train(self, backward_prefetch=BackwardPrefetch.BACKWARD_PRE):
+        # [FUNCTION DOC] HELPER: Builds a transformer (d_model 1024, 8 heads) wrapped by FSDP per
+        # encoder or decoder layer with the given backward prefetch mode, and an SGD optimizer.
+        # Patches the prefetch selection function in the runtime module to record, in the matching
+        # training state, the parameter names of each returned handle. For two iterations it trains
+        # and then checks: no records for no prefetch; otherwise the expected total (counts plus
+        # trailing none results), decoder layers in descending index, then encoder layers in
+        # descending index, then none values. Resets the record list each iteration. Asserts the
+        # patched function is called with exactly two positional arguments.
         rank = self.rank
         orig_get_handle_to_prefetch = _get_handle_to_prefetch
         torch.manual_seed(0)
@@ -104,6 +121,10 @@ class TestBackwardPrefetch(FSDPTestContinuous):
         all_handle_fqns: list[list[str]] = []
 
         def patched_get_handle_to_prefetch(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Wrapper around the original prefetch selection function: calls
+            # it, then when the current handle's training state matches the configured backward
+            # prefetch mode, appends the handle's names (relative to the root) to the enclosing
+            # record list. Returns the original result.
             handle = orig_get_handle_to_prefetch(*args, **kwargs)
 
             self.assertEqual(
@@ -200,6 +221,8 @@ class TestBackwardPrefetch(FSDPTestContinuous):
 
     @skip_if_lt_x_gpu(2)
     def test_backward_prefetch(self):
+        # [FUNCTION DOC] Runs the training check as subtests for backward prefetch values none,
+        # BACKWARD_PRE and BACKWARD_POST, reusing the process group. Requires at least 2 GPUs.
         # subtest reuse process group to shorten test time
         self.run_subtests(
             {
@@ -213,6 +236,8 @@ class TestBackwardPrefetch(FSDPTestContinuous):
         )
 
     def _test_backward_prefetch(self, backward_prefetch: BackwardPrefetch):
+        # [FUNCTION DOC] HELPER: Subtest body that calls the training check with the given backward
+        # prefetch value.
         self._dist_train(backward_prefetch)
 
 
