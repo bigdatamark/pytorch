@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] FX-graph analysis for grouped GEMM epilogues: recognizes grouped reshapes of the
+# 2-D GEMM output (group along M or N), propagates grouped layouts and local-reduction matches
+# through pointwise ops, detects "feed-main" patterns where a reduction is broadcast back into the
+# main output, and builds output plans (GemmOutputPlan and related records) that finalize into a
+# GemmReductionPlan. Many unsupported patterns raise NotImplementedError with shared messages.
+# No import-time side effects beyond constant tables.
 """Shared FX analysis and output planning for grouped GEMM epilogues."""
 
 import dataclasses
@@ -51,11 +57,14 @@ from torch.utils._ordered_set import OrderedSet
 
 
 def _is_inferred_reshape_dim(value: Any) -> bool:
+    # [FUNCTION DOC] HELPER: True only for a plain integer equal to -1 (the inferred-size marker).
     """Return whether a reshape dimension is the literal inferred-size marker."""
     return isinstance(value, int) and value == -1
 
 
 def _kept_dim_matches_source(kept_size: Any, source_size: Any) -> bool:
+    # [FUNCTION DOC] HELPER: True if the untouched reshape dimension is -1 or statically known equal to
+    # the source dimension.
     return _is_inferred_reshape_dim(kept_size) or statically_known_equal(
         kept_size, source_size
     )
@@ -64,6 +73,11 @@ def _kept_dim_matches_source(kept_size: Any, source_size: Any) -> bool:
 def _guard_grouped_reshape_group(
     shape: tuple[Any, ...], source_shape: tuple[Any, ...]
 ) -> tuple[Any, ...]:
+    # [FUNCTION DOC] HELPER: For a 3-entry reshape shape, find a candidate group position (last entry
+    # paired with the first as kept dim, or second-to-last paired with the last) whose kept dim
+    # matches the source and whose group entry is symbolic (SymInt); replace that entry by its
+    # guarded concrete int (side effect: may add a shape guard) and return the new tuple. Otherwise
+    # return the shape unchanged.
     """Specialize a backed group dimension used to recognize a grouped reshape."""
     if len(shape) != 3:
         return shape
@@ -89,6 +103,9 @@ def _guard_grouped_reshape_group(
 def _syntactic_grouped_tensor_layout(
     shape: tuple[Any, ...],
 ) -> GemmReductionGeometry | None:
+    # [FUNCTION DOC] HELPER: Recognize grouped reshape syntax from the shape alone: rank 3 or 4 with a
+    # positive int last entry preceded by -1 (axis 1, group is last), or a -1 three from the end
+    # followed by a positive int (axis 0, group is second-to-last). Else None.
     """Match grouped-reshape syntax before validating source geometry."""
     if len(shape) not in (3, 4):
         return None
@@ -113,6 +130,9 @@ def _group_count_matches_selected_dim(
     group: int,
     kept_size: Any,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: True if group_count is -1, or group_count times group equals the selected
+    # source dimension, or (when kept_size is not -1) group_count equals the selected dimension
+    # divided by group; comparisons are static (no guards).
     """Match a group count, allowing -1 to infer the selected source dimension."""
     if _is_inferred_reshape_dim(group_count):
         return True
@@ -127,6 +147,10 @@ def _grouped_layout_matches_source_shape(
     source_shape: tuple[Any, ...],
     layout: GemmReductionGeometry,
 ) -> bool:
+    # [FUNCTION DOC] HELPER: Check that a 3-D reshape shape splits exactly one axis of the 2-D source
+    # (M, N). Axis 1 expects (kept M, group count, group); axis 0 expects (group count, group, kept
+    # N); the group must equal the layout's group and the other dims must match the source.
+    # Returns False for non-3-D shapes or any mismatch.
     """Require a 2-D GEMM output reshape to split exactly M or N."""
     if len(shape) != 3:
         return False
@@ -148,6 +172,12 @@ def _grouped_layout_matches_source_shape(
 def grouped_tensor_layout(
     shape: Any, source_shape: Any | None = None
 ) -> GemmReductionGeometry | None:
+    # [FUNCTION DOC] Recognize grouped M/N geometry of a reshape target shape. Normalizes the shape
+    # (unwrapping a single nested sequence); non-tuples give None. With a 2-D source shape, may
+    # specialize a symbolic group (guard side effect), tries axis 1 (group last) and axis 0 (group
+    # second to last) candidates against the source, and returns the first that fits. If none fit
+    # but the shape looks grouped syntactically, raises NotImplementedError (grouped reshape
+    # error); otherwise None. Without a source shape, only syntactic recognition is used.
     """Recognize grouped M/N geometry, specializing backed group dimensions."""
     shape = normalize_shape(shape)
     if not isinstance(shape, tuple):
@@ -189,6 +219,9 @@ FEED_MAIN_BINARY_FUNCTIONS = frozenset(
 
 @dataclasses.dataclass(frozen=True)
 class GemmLocalReduceMatch:
+    # [CLASS DOC] Immutable record of a supported grouped local reduction: value_node (node producing
+    # the value), geometry, reduction_node (defaults to value_node) and reduction_type. Offers
+    # conversion to an output plan and helpers that merge several matches.
     """Describe a supported grouped local-reduction value found in the FX graph.
 
     Attributes:
@@ -202,6 +235,8 @@ class GemmLocalReduceMatch:
     reduction_type: str | None = None
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Raises RuntimeError if value_node is not an FX node; defaults reduction_node
+        # to value_node (mutating the frozen record via object setattr).
         if not isinstance(self.value_node, torch.fx.Node):
             raise RuntimeError(LOCAL_REDUCE_MATCH_NODE_ERROR)
         if self.reduction_node is None:
@@ -213,6 +248,7 @@ class GemmLocalReduceMatch:
         store: "GemmLocalReduceStore | None",
         feeds_main: bool,
     ) -> "GemmOutputLocalReducePlan":
+        # [FUNCTION DOC] Bind this match to an optional compressed store and a feeds_main flag.
         """Bind this matched value to its output consumers."""
         return GemmOutputLocalReducePlan(self, store=store, feeds_main=feeds_main)
 
@@ -222,6 +258,8 @@ class GemmLocalReduceMatch:
         matches: list["GemmLocalReduceMatch"],
         mixed_match_error: str,
     ) -> "GemmLocalReduceMatch | None":
+        # [FUNCTION DOC] Return the first match if all matches share one geometry; None for an empty
+        # list; raises NotImplementedError(mixed_match_error) if geometries differ.
         """Return the common match when all values use one reduction geometry."""
         if not matches:
             return None
@@ -236,6 +274,8 @@ class GemmLocalReduceMatch:
         matches: list["GemmLocalReduceMatch"],
         mixed_match_error: str,
     ) -> "GemmLocalReduceMatch | None":
+        # [FUNCTION DOC] Like common, and additionally requires every match to have the identical
+        # value_node; otherwise raises NotImplementedError (one-physical-value error).
         """Return the common match when all consumers use one physical value."""
         match = cls.common(matches, mixed_match_error)
         if match is None:
@@ -247,6 +287,8 @@ class GemmLocalReduceMatch:
 
 @dataclasses.dataclass(frozen=True)
 class GemmLocalReduceStore:
+    # [CLASS DOC] Immutable record of where a compressed local reduction is returned: the output node
+    # and its index among auxiliary outputs.
     """Describe where a compressed local reduction appears in graph outputs.
 
     Attributes:
@@ -258,12 +300,15 @@ class GemmLocalReduceStore:
     aux_index: int
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Raises RuntimeError if node is not an FX node or aux_index is negative.
         if not isinstance(self.node, torch.fx.Node) or self.aux_index < 0:
             raise RuntimeError(LOCAL_REDUCE_OUTPUT_PLAN_NODE_ERROR)
 
 
 @dataclasses.dataclass(frozen=True)
 class GemmOutputLocalReducePlan:
+    # [CLASS DOC] Immutable binding of a local-reduction match to its consumers: an optional
+    # compressed store and/or a flag that the reduced value feeds the main output.
     """Bind a matched local reduction to store and/or main-output consumers.
 
     Attributes:
@@ -277,6 +322,8 @@ class GemmOutputLocalReducePlan:
     feeds_main: bool = False
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Raises RuntimeError if match is not a GemmLocalReduceMatch or the plan has
+        # neither a store nor feeds_main.
         if not isinstance(self.match, GemmLocalReduceMatch) or (
             self.store is None and not self.feeds_main
         ):
@@ -284,11 +331,14 @@ class GemmOutputLocalReducePlan:
 
     @property
     def needs_physical_callbacks(self) -> bool:
+        # [FUNCTION DOC] Delegates to the matched geometry's needs_physical_callbacks.
         return self.match.geometry.needs_physical_callbacks
 
 
 @dataclasses.dataclass(frozen=True)
 class GemmOutputPlan:
+    # [CLASS DOC] Immutable classification of the values returned by a FlexGEMM body: main output
+    # node, same-shape auxiliary output nodes, and an optional local-reduce plan.
     """Classify the values returned by a FlexGEMM body.
 
     Attributes:
@@ -302,6 +352,7 @@ class GemmOutputPlan:
     local_reduce: GemmOutputLocalReducePlan | None = None
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC] Raises RuntimeError unless output and all aux outputs are FX nodes.
         if not isinstance(self.output, torch.fx.Node) or not all(
             isinstance(aux_output, torch.fx.Node) for aux_output in self.aux_outputs
         ):
@@ -309,6 +360,10 @@ class GemmOutputPlan:
 
     @property
     def reduction_plan(self) -> GemmReductionPlan | None:
+        # [FUNCTION DOC] Convert the local-reduce plan into a GemmReductionPlan, or None if there is no
+        # local reduce or no reduction type. The reduction output is the store node name (if any),
+        # source type is identity, the primary output is the main output name, and feed_output is
+        # the main output name only when the reduction feeds main.
         """Finalize FX ownership metadata into the shared reduction contract."""
         local_reduce = self.local_reduce
         if local_reduce is None:
@@ -334,6 +389,10 @@ class GemmOutputPlan:
 
 @dataclasses.dataclass
 class GemmLocalReduceAnalysis:
+    # [CLASS DOC] Mutable analysis state for one FX graph: graph (dependency and normalization
+    # index), grouped_tensors (node to grouped geometry) and matches (node to local-reduce
+    # match). Built by from_graph_module via a topological visit; planning methods then derive
+    # compressed-aux and feed-main output plans. Raises NotImplementedError on unsupported shapes.
     """Collect grouped TensorSSA layouts and supported local-reduction matches.
 
     ``from_graph_module`` visits the FX graph in topological order. See
@@ -359,6 +418,8 @@ class GemmLocalReduceAnalysis:
     def from_graph_module(
         cls, graph_module: torch.fx.GraphModule
     ) -> "GemmLocalReduceAnalysis":
+        # [FUNCTION DOC] Index the graph and visit nodes in order up to (excluding) the output node,
+        # recording grouped layouts and matches. Returns the populated analysis.
         """Build shared dependency and reduction state in one topological pass."""
         nodes = tuple(graph_module.graph.nodes)
         analysis = cls(GemmEpilogueGraph.from_nodes(nodes))
@@ -369,6 +430,11 @@ class GemmLocalReduceAnalysis:
         return analysis
 
     def visit_node(self, node: torch.fx.Node) -> None:
+        # [FUNCTION DOC] Process one call_function node: views propagate an existing match or bind a
+        # new grouped layout; reductions and softmax prep bind grouped reductions; unsupported
+        # reductions on grouped tensors raise NotImplementedError; squeeze and getitem propagate
+        # matches; shape-preserving pointwise nodes propagate layouts and matches (mixed-match
+        # error on conflicts). Mutates grouped_tensors and matches. Other node kinds are ignored.
         """Record grouped layouts and local-reduction matches for one FX node."""
         if node.op != "call_function":
             return
@@ -405,6 +471,9 @@ class GemmLocalReduceAnalysis:
             self.propagate_pointwise_match(node, LOCAL_REDUCE_MIXED_MATCH_ERROR)
 
     def bind_grouped_layout(self, node: torch.fx.Node, shape: Any, source: Any) -> bool:
+        # [FUNCTION DOC] If a reshape of source to shape forms a grouped layout (using the source tensor
+        # shape when known), record it for node and return True; otherwise False. May raise
+        # NotImplementedError from layout recognition.
         """Attach a grouped TensorSSA layout introduced by a reshape."""
         source_shape = (
             tensor_meta_shape(source) if isinstance(source, torch.fx.Node) else None
@@ -416,6 +485,8 @@ class GemmLocalReduceAnalysis:
         return True
 
     def propagate_local_reduce_match(self, node: torch.fx.Node, source: Any) -> bool:
+        # [FUNCTION DOC] If source is a node with a recorded match, record the same match for node and
+        # return True; else False.
         """Copy a matched local-reduction value through an FX wrapper."""
         if not isinstance(source, torch.fx.Node):
             return False
@@ -435,6 +506,11 @@ class GemmLocalReduceAnalysis:
         reduction_type: str | None = None,
         raise_invalid_dims: bool = True,
     ) -> bool:
+        # [FUNCTION DOC] If input_node has a grouped layout, record a match for node when the reduced dim
+        # is the grouped one. Returns False when the input is not a grouped node. Raises
+        # NotImplementedError for an explicit dtype, for an unsupported group size (validator),
+        # and for a non-grouped reduce dim unless raise_invalid_dims is false (then returns False).
+        # Side effect: stores the match with reduction_type.
         """Match and record a reduction over a grouped TensorSSA layout."""
         if not isinstance(input_node, torch.fx.Node):
             return False
@@ -457,6 +533,8 @@ class GemmLocalReduceAnalysis:
         return True
 
     def has_physical_grouped_input(self, value: Any) -> bool:
+        # [FUNCTION DOC] True if any node in value, or any of its dependencies, is a grouped tensor whose
+        # layout requires physical callbacks and whose geometry is used by some active match.
         """Return whether a value depends on a grouped layout needing callbacks."""
         active_geometries = OrderedSet(
             match.geometry for match in self.matches.values()
@@ -478,6 +556,10 @@ class GemmLocalReduceAnalysis:
     def propagate_pointwise_match(
         self, node: torch.fx.Node, mixed_match_error: str
     ) -> bool:
+        # [FUNCTION DOC] Propagate grouped layouts from a pointwise node's inputs to the node (raises
+        # NotImplementedError if inputs carry different layouts), then propagate input matches
+        # (common match, else raises mixed_match_error) with value_node set to this node. Returns
+        # True when a match was recorded.
         """Propagate grouped layouts and local-reduction matches through pointwise ops."""
         grouped_layouts = [
             self.grouped_tensors[arg]
@@ -508,6 +590,12 @@ class GemmLocalReduceAnalysis:
         grouped_source: torch.fx.Node,
         layout: GemmReductionGeometry,
     ) -> GemmLocalReduceMatch | None:
+        # [FUNCTION DOC] Recursively find the single grouped reduction (of grouped_source, keepdim,
+        # no dtype, matching reduce dim) that produces a broadcast value, looking through
+        # shape-preserving pointwise nodes. Returns None if value is not a node or not such a
+        # pattern. Raises NotImplementedError when a reduction uses another source (source
+        # expression error if derived from grouped_source) or violates the constraints, or when
+        # different reduction values are mixed.
         """Find the grouped reduction that produces a broadcast value."""
         if not isinstance(value, torch.fx.Node):
             return None
@@ -545,6 +633,8 @@ class GemmLocalReduceAnalysis:
         input_node: Any,
         grouped_source: torch.fx.Node,
     ) -> None:
+        # [FUNCTION DOC] Raise NotImplementedError if input_node is grouped_source itself, depends on it,
+        # or has a physical grouped input; non-node inputs are accepted.
         """Reject reduction inputs that would need another physical feed-main value."""
         if input_node is grouped_source:
             raise NotImplementedError(LOCAL_REDUCE_ONE_PHYSICAL_VALUE_ERROR)
@@ -562,6 +652,9 @@ class GemmLocalReduceAnalysis:
         selected_reduction: torch.fx.Node,
         seen: OrderedSet[torch.fx.Node] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Walk value's input graph (each node once via seen), skipping the selected
+        # reduction, and validate the source of every other reduction found with
+        # validate_hidden_feed_main_reduction_input. Raises NotImplementedError on violations.
         """Reject hidden physical reductions outside the selected feed-main value."""
         if not isinstance(value, torch.fx.Node):
             for arg in iter_fx_node_inputs(value):
@@ -591,6 +684,8 @@ class GemmLocalReduceAnalysis:
         source: torch.fx.Node,
         match: GemmLocalReduceMatch | None,
     ) -> GemmLocalReduceMatch | None:
+        # [FUNCTION DOC] Pass through a None match; if the match value is a reduction, validate the
+        # source expression for hidden reductions (may raise NotImplementedError) and return the match.
         """Preserve the one-physical-value ABI across recursive source matching."""
         if match is None:
             return None
@@ -605,6 +700,8 @@ class GemmLocalReduceAnalysis:
     def feed_main_binary_candidates(
         source: torch.fx.Node,
     ) -> tuple[tuple[Any, Any], ...]:
+        # [FUNCTION DOC] For a binary add/sub/mul/div call, return both operand orderings as pairs
+        # (lhs, rhs) and (rhs, lhs); otherwise an empty tuple.
         """Return operand orderings for supported binary feed-main expressions."""
         if (
             len(source.args) < 2
@@ -621,6 +718,8 @@ class GemmLocalReduceAnalysis:
         grouped_source: torch.fx.Node,
         layout: GemmReductionGeometry,
     ) -> bool:
+        # [FUNCTION DOC] True if value is, or via shape-preserving pointwise nodes contains, a keepdim
+        # reduction without dtype over a matching dim whose source is or depends on grouped_source.
         """Return whether a candidate contains a grouped feed-main reduction."""
         if not isinstance(value, torch.fx.Node):
             return False
@@ -648,6 +747,12 @@ class GemmLocalReduceAnalysis:
         value: Any,
         output_meta: Any,
     ) -> GemmLocalReduceMatch | None:
+        # [FUNCTION DOC] Try one operand ordering. grouped_source must be a view node with a grouped
+        # layout. For axis 1, return None (axis-1 groups within one fragment lower as plain
+        # TensorSSA) when a grouped reduction exists and the group fits the fragment width, or
+        # when none exists; a larger group raises NotImplementedError. For axis 0, validates
+        # feed-main capability, returns None if output and source shapes differ, else delegates
+        # to match_feed_value.
         """Match one grouped-source and reduced-value operand ordering."""
         if not isinstance(grouped_source, torch.fx.Node) or not isinstance(
             value, torch.fx.Node
@@ -683,6 +788,10 @@ class GemmLocalReduceAnalysis:
         source: torch.fx.Node,
         output_meta: Any,
     ) -> GemmLocalReduceMatch | None:
+        # [FUNCTION DOC] Search a pointwise expression for the single physical feed-main value: try binary
+        # operand orderings first, else recurse into inputs of shape-preserving pointwise nodes.
+        # Matches must share one value node (else NotImplementedError). The result is validated
+        # for hidden physical reductions; None when nothing matches.
         """Find one physical feed-main value inside a pointwise expression."""
         matches = [
             match
@@ -720,6 +829,9 @@ class GemmLocalReduceAnalysis:
         self,
         output: torch.fx.Node,
     ) -> GemmLocalReduceMatch | None:
+        # [FUNCTION DOC] Find the feed-main match for an output: a view node searches its source; other
+        # shape-preserving pointwise nodes recurse into node inputs and merge matches into one
+        # physical value (validated). Returns None if not applicable.
         """Match feed-main reductions through trailing pointwise nodes."""
         normalized = self.graph.normalized_nodes.get(output)
         if isinstance(normalized, NormalizedView):
@@ -745,6 +857,8 @@ class GemmLocalReduceAnalysis:
         self,
         candidates: tuple[Any, ...],
     ) -> GemmLocalReduceMatch | None:
+        # [FUNCTION DOC] Compute the feed-main plan of each node candidate and require all matches to
+        # share one physical value; raises NotImplementedError (mixed feed-main error) otherwise.
         """Find the physical reduction value shared by feed-main consumers."""
         matches = [
             match
@@ -759,6 +873,9 @@ class GemmLocalReduceAnalysis:
     def common_reduction_dependency_match(
         self, outputs: Sequence[torch.fx.Node]
     ) -> GemmLocalReduceMatch | None:
+        # [FUNCTION DOC] Collect outputs and their transitive dependencies; if every recorded match among
+        # them refers to the same reduction node return the first, else None (also None if there
+        # are no matches).
         """Return one physical reduction transitively consumed by the outputs."""
         reachable = OrderedSet(outputs)
         for output in outputs:
@@ -779,6 +896,9 @@ class GemmLocalReduceAnalysis:
         aux: torch.fx.Node,
         aux_index: int,
     ) -> GemmOutputLocalReducePlan | None:
+        # [FUNCTION DOC] If aux has a match and its shape is statically known equal to the compressed
+        # shape of the main output for that geometry, return a store-only plan at aux_index;
+        # None when metadata is missing or the shape differs.
         """Plan a matched local reduction returned in compressed output shape."""
         match = self.matches.get(aux)
         output_meta = (
@@ -803,6 +923,9 @@ class GemmLocalReduceAnalysis:
         *,
         allow_dependency_match: bool = False,
     ) -> GemmOutputPlan | None:
+        # [FUNCTION DOC] Build an output plan where one physical reduction value feeds the main output:
+        # use the common feed-main match over output and aux outputs, optionally falling back to
+        # the dependency match. Returns None if nothing matches. May raise NotImplementedError.
         """Plan one physical reduction value consumed by the main output."""
         match = self.common_feed_main_match((output, *aux_outputs))
         if match is None and allow_dependency_match:

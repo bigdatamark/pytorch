@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Converts the loop-body IR of fused GEMM epilogue buffers into the source text of a
+# CuTeDSL function that takes the accumulator fragment and extra input fragments and returns the
+# output fragments. Main content: LoopIRCuteDSLCodegen. No import-time side effects.
 """Lower Inductor GEMM epilogue loop IR to CuTeDSL source."""
 
 from collections.abc import Sequence
@@ -19,9 +22,15 @@ from .loop_ir_epilogue_lowering import GemmEpilogueIRAnalysis, GemmEpilogueIRExp
 
 
 class LoopIRCuteDSLCodegen:
+    # [CLASS DOC] One-shot lowering driver. State: accumulator buffer name, removed_buffers set,
+    # a fake CuTeDSL kernel collecting body lines, reads (ordered set of external input names),
+    # input_values (cache of CSE variables per input) and the accum variable (float32). Use
+    # from_buffers for the full flow; render emits the function source.
     """Lower scheduler loop-body expressions to a CuTeDSL fragment function."""
 
     def __init__(self, accumulator: str, removed_buffers: OrderedSet[str]) -> None:
+        # [FUNCTION DOC] Store the accumulator buffer name and removed buffers, and create the fake
+        # kernel, empty read set, input cache and the float32 accumulator variable named accum.
         self.accumulator = accumulator
         self.removed_buffers = removed_buffers
         self.kernel = GemmEpilogueCuteDSLKernel()
@@ -32,6 +41,10 @@ class LoopIRCuteDSLCodegen:
         )
 
     def load(self, name: str, stored: Any) -> Any:
+        # [FUNCTION DOC] Resolve a buffer read. If the buffer was produced inside the epilogue
+        # (stored is not None) lower its stored expression; if it is the accumulator return the
+        # accum variable; otherwise record it as an external read and return a cached CSE variable
+        # typed from the graph dtype. Side effect: updates reads and input_values.
         if stored is not None:
             return self.lower(stored)
         if name == self.accumulator:
@@ -45,6 +58,11 @@ class LoopIRCuteDSLCodegen:
         return self.input_values[name]
 
     def lower(self, value: Any) -> Any:
+        # [FUNCTION DOC] Recursively lower an IR expression into CuTeDSL values. Non-expression
+        # values pass through (tuples are lowered element-wise). Load nodes go to load, identity
+        # nodes lower their argument, reduction and bitcast ops raise NotImplementedError, as does
+        # any op missing from GemmEpilogueCuteDSLOpOverrides. Other ops call the matching override
+        # with lowered args and kwargs, which may emit lines into the kernel body.
         if not isinstance(value, GemmEpilogueIRExpression):
             if isinstance(value, tuple):
                 return tuple(self.lower(item) for item in value)
@@ -70,6 +88,11 @@ class LoopIRCuteDSLCodegen:
     def render(
         self, buffers: Sequence[ComputedBuffer], fn_name: str
     ) -> tuple[list[str], list[str], dict[str, str], str]:
+        # [FUNCTION DOC] Analyze buffers, lower every store whose buffer is not removed (plus the
+        # accumulator itself if not removed), and write one result assignment per output; the last
+        # is named D, others output0, output1, and so on. Returns (read names, output buffer
+        # names, rename map from function-local names to buffer names, function source text with
+        # parameters accum plus reads). Raises NotImplementedError if there are no outputs.
         analysis = GemmEpilogueIRAnalysis.from_buffers(buffers)
         outputs: list[tuple[str, Any]] = []
         if self.accumulator not in self.removed_buffers:
@@ -103,6 +126,8 @@ class LoopIRCuteDSLCodegen:
         removed_buffers: OrderedSet[str],
         fn_name: str,
     ) -> tuple[list[str], list[str], dict[str, str], str]:
+        # [FUNCTION DOC] Convenience entry point: build a codegen, install its kernel and the GEMM
+        # epilogue op overrides as the active virtualized handlers, and return render's result.
         codegen = cls(accumulator, removed_buffers)
         with (
             V.set_kernel_handler(codegen.kernel),

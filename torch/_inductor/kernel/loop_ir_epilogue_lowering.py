@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Captures lowered GEMM epilogue loop bodies as a symbolic expression IR by replaying
+# them under a recording ops handler, then classifies that IR: grouped reductions (sum, mean,
+# prod, max, min over groups of adjacent elements, either unrolled or primitive), reduction
+# regions (generic, welford, online softmax), finalizers (identity, mean, absmax scale), affine
+# structure, and normalized consumers such as centered mean. Provides frozen dataclasses for the
+# IR plus many module-level classifier helpers. No import-time side effects.
 """Lower GEMM epilogue loop IR to shared epilogue contracts."""
 
 import dataclasses
@@ -18,6 +24,9 @@ from torch._inductor.virtualized import V
 
 @dataclasses.dataclass(frozen=True)
 class GemmEpilogueIRExpression:
+    # [CLASS DOC] Immutable node of the captured IR: op name, positional args (which may contain nested
+    # expressions), sorted keyword pairs, the set of buffer names loaded (transitively), and the
+    # unique reductions contained in the node.
     """Operation captured from a lowered GEMM epilogue loop body.
 
     Attributes:
@@ -35,6 +44,9 @@ class GemmEpilogueIRExpression:
 
 @dataclasses.dataclass(frozen=True)
 class GemmEpilogueIRReduction:
+    # [CLASS DOC] Immutable record of one reduction found in the IR: reduction type, the source
+    # expression being reduced, an optional result index (for multi-output reductions such as
+    # welford or online softmax) and an optional source transform name for synthetic reductions.
     reduction_type: str
     source: GemmEpilogueIRExpression
     result: int | None = None
@@ -43,12 +55,16 @@ class GemmEpilogueIRReduction:
 
 @dataclasses.dataclass(frozen=True)
 class GemmEpilogueIRRegion:
+    # [CLASS DOC] Immutable description of a reduction region for one output: its name, the reductions
+    # involved and the full stored expression. The algorithm property names the strategy.
     output_name: str
     reductions: tuple[GemmEpilogueIRReduction, ...]
     expression: GemmEpilogueIRExpression
 
     @property
     def algorithm(self) -> str:
+        # [FUNCTION DOC] Pick the algorithm label: online_softmax if any reduction is an online softmax
+        # reduce, else welford if any is a welford reduce, else generic.
         reduction_types = OrderedSet(
             reduction.reduction_type for reduction in self.reductions
         )
@@ -61,6 +77,7 @@ class GemmEpilogueIRRegion:
 
 @dataclasses.dataclass(frozen=True)
 class GemmEpilogueIRStore:
+    # [CLASS DOC] Immutable record of a captured store: destination symbolic index and stored expression.
     """Symbolic store produced by replaying a lowered epilogue loop body.
 
     Attributes:
@@ -74,6 +91,8 @@ class GemmEpilogueIRStore:
 
 @dataclasses.dataclass(frozen=True)
 class GemmEpilogueIROutputRole:
+    # [CLASS DOC] Immutable summary of which buffers an output depends on: all transitive inputs and
+    # the subset whose stored values contain reductions.
     """Transitive inputs that determine one captured epilogue output.
 
     Attributes:
@@ -87,6 +106,8 @@ class GemmEpilogueIROutputRole:
 
 @dataclasses.dataclass(frozen=True)
 class GemmEpilogueIRFinalizer:
+    # [CLASS DOC] Immutable record naming a post-reduction operation: output buffer, source (reduction)
+    # buffer and a kind label such as identity, mean, absmax_scale or generic.
     """Normalized operation applied to a completed grouped reduction."""
 
     output_name: str
@@ -95,6 +116,8 @@ class GemmEpilogueIRFinalizer:
 
 
 def _expression_values(value: Any):
+    # [FUNCTION DOC] HELPER: Generator yielding every IR expression inside a value, descending into
+    # tuples and lists; non-expression leaves are skipped.
     if isinstance(value, GemmEpilogueIRExpression):
         yield value
     elif isinstance(value, (tuple, list)):
@@ -105,6 +128,8 @@ def _expression_values(value: Any):
 def _unique_reductions(
     values: Sequence[GemmEpilogueIRExpression],
 ) -> tuple[GemmEpilogueIRReduction, ...]:
+    # [FUNCTION DOC] HELPER: Collect the reductions of all given expressions, de-duplicated by object
+    # identity and in first-seen order.
     reductions = []
     seen: OrderedSet[int] = OrderedSet()
     for value in values:
@@ -116,12 +141,19 @@ def _unique_reductions(
 
 
 class _GemmEpilogueIRHandler(DefaultHandler):
+    # [CLASS DOC] HELPER: Ops handler that records instead of computing. Every op becomes an IR
+    # expression; stores are remembered in the stores mapping keyed by buffer name, so later loads
+    # of that buffer can inline the stored expression. Install via the virtualized ops handler.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Start with an empty mapping of buffer name to captured store.
         self.stores: dict[str, GemmEpilogueIRStore] = {}
 
     def _default(
         self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> GemmEpilogueIRExpression:
+        # [FUNCTION DOC] HELPER: Fallback for any op: build an expression holding the op name, args,
+        # keyword args sorted by key, and the union of loads and unique reductions of nested
+        # expression arguments.
         values = tuple(_expression_values((*args, *tuple(kwargs.values()))))
         return GemmEpilogueIRExpression(
             name,
@@ -132,9 +164,14 @@ class _GemmEpilogueIRHandler(DefaultHandler):
         )
 
     def indirect_indexing(self, x, size, check=True, wrap_neg=True):
+        # [FUNCTION DOC] HELPER: Return a fresh integer symbol named by the count of stores so far; the
+        # index value, size and flags are ignored.
         return sympy.Symbol(f"indirect_{len(self.stores)}", integer=True)
 
     def load(self, name: str, index: sympy.Expr) -> GemmEpilogueIRExpression:
+        # [FUNCTION DOC] HELPER: Record a load expression with args (name, index, stored value). The stored
+        # value is the previously captured store for that buffer, or None; when present its loads
+        # and reductions are inherited.
         stored = self.stores.get(name)
         if stored is None:
             return GemmEpilogueIRExpression(
@@ -148,6 +185,10 @@ class _GemmEpilogueIRHandler(DefaultHandler):
         )
 
     def reduction(self, dtype, src_dtype, reduction_type, value):
+        # [FUNCTION DOC] HELPER: Record a reduction. For online softmax (2 outputs) and welford (3
+        # outputs) return a tuple of expressions, one per output index, each registering a
+        # reduction with that result index; otherwise return a single reduction expression. The
+        # new reduction is appended to those already inside value.
         args = (dtype, src_dtype, reduction_type, value)
         if reduction_type in ("online_softmax_reduce", "welford_reduce"):
             count = 2 if reduction_type == "online_softmax_reduce" else 3
@@ -180,15 +221,20 @@ class _GemmEpilogueIRHandler(DefaultHandler):
         value: GemmEpilogueIRExpression,
         mode=None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Remember the store of value at index under name (mode is ignored),
+        # replacing any earlier store to that buffer.
         self.stores[name] = GemmEpilogueIRStore(index, value)
 
     def store_reduction(
         self, name: str, index: sympy.Expr, value: GemmEpilogueIRExpression
     ) -> None:
+        # [FUNCTION DOC] HELPER: Same as store: remember the reduction result store under name.
         self.stores[name] = GemmEpilogueIRStore(index, value)
 
 
 def _loaded_names(expr: Any) -> frozenset[str]:
+    # [FUNCTION DOC] HELPER: Names of all buffers loaded by an expression, following stored values of
+    # loads and nested arguments; empty for non-expressions.
     if not isinstance(expr, GemmEpilogueIRExpression):
         return frozenset()
     if expr.op == "load":
@@ -199,6 +245,9 @@ def _loaded_names(expr: Any) -> frozenset[str]:
 
 @dataclasses.dataclass(frozen=True)
 class GemmEpilogueIRAnalysis:
+    # [CLASS DOC] Immutable analysis result holding stores (buffer name to captured store) for a set of
+    # lowered buffers. Provides lookups and classification queries: output roles, grouped
+    # reductions, reduction regions, finalizers and the set of reduction-containing stores.
     """Candidate-wide semantic view of existing lowered loop bodies."""
 
     stores: dict[str, GemmEpilogueIRStore]
@@ -207,6 +256,9 @@ class GemmEpilogueIRAnalysis:
     def from_buffers(
         cls, buffers: Sequence[ComputedBuffer]
     ) -> "GemmEpilogueIRAnalysis":
+        # [FUNCTION DOC] Replay each buffer's store function over its inner-function arguments in order
+        # under the recording handler (side effect: temporarily installs the ops handler), and
+        # wrap the captured stores.
         handler = _GemmEpilogueIRHandler()
         with V.set_ops_handler(handler):
             for buffer in buffers:
@@ -215,12 +267,16 @@ class GemmEpilogueIRAnalysis:
 
     @classmethod
     def store_from_buffer(cls, buffer: ComputedBuffer) -> GemmEpilogueIRStore | None:
+        # [FUNCTION DOC] Analyze one buffer and return its own captured store, or None if absent.
         return cls.from_buffers((buffer,)).store(buffer.get_name())
 
     def store(self, name: str) -> GemmEpilogueIRStore | None:
+        # [FUNCTION DOC] Look up the captured store for a buffer name; None if there is none.
         return self.stores.get(name)
 
     def output_role(self, name: str) -> GemmEpilogueIROutputRole | None:
+        # [FUNCTION DOC] For an output, return its transitive inputs and the subset that are reduction
+        # stores; None if the output has no store.
         store = self.store(name)
         if store is None:
             return None
@@ -238,6 +294,9 @@ class GemmEpilogueIRAnalysis:
         axis: int,
         source_dtype: torch.dtype,
     ) -> GemmReductionConfig | None:
+        # [FUNCTION DOC] Classify the output's store as a grouped reduction of source_name over groups of
+        # size group; on success return a GemmReductionConfig with the given axis and the
+        # detected reduction and source types, else None (also None if no store).
         store = self.store(output_name)
         classified = (
             grouped_reduction_ir(store, source_name, group, source_dtype)
@@ -258,6 +317,9 @@ class GemmEpilogueIRAnalysis:
         group: int,
         source_dtype: torch.dtype,
     ) -> GemmEpilogueIRRegion | None:
+        # [FUNCTION DOC] Build a reduction region for the output: use reductions already in the store, or
+        # synthesize them from unrolled grouped patterns. Returns None if no store, no
+        # reductions, or any reduction source does not load exactly source_name.
         store = self.store(output_name)
         if store is None:
             return None
@@ -280,6 +342,10 @@ class GemmEpilogueIRAnalysis:
         source_name: str,
         group: int | None = None,
     ) -> GemmEpilogueIRFinalizer | None:
+        # [FUNCTION DOC] Classify what the output applies to the reduced source: identity (only loads and
+        # dtype conversions), mean (affine scale of one over group, when group is given), absmax
+        # scale, or generic (loads only the source, no reductions). Returns None for no store or
+        # anything else.
         store = self.store(output_name)
         if store is None:
             return None
@@ -305,6 +371,7 @@ class GemmEpilogueIRAnalysis:
 
     @property
     def reduction_stores(self) -> frozenset[str]:
+        # [FUNCTION DOC] Names of stores whose value contains a reduction, directly or nested.
         return frozenset(
             name
             for name, store in self.stores.items()
@@ -313,6 +380,8 @@ class GemmEpilogueIRAnalysis:
 
 
 def _constant_value(expr: Any) -> Any | None:
+    # [FUNCTION DOC] HELPER: Constant payload of a constant or index_expr node, looking through dtype
+    # conversions; None for anything else.
     if not isinstance(expr, GemmEpilogueIRExpression):
         return None
     if expr.op in ("constant", "index_expr") and expr.args:
@@ -323,6 +392,8 @@ def _constant_value(expr: Any) -> Any | None:
 
 
 def _strip_conversions(expr: Any) -> Any:
+    # [FUNCTION DOC] HELPER: Peel off leading to_dtype, bitcast and identity wrappers and return the
+    # innermost value.
     while (
         isinstance(expr, GemmEpilogueIRExpression)
         and expr.op in ("to_dtype", "to_dtype_bitcast", "identity")
@@ -333,6 +404,7 @@ def _strip_conversions(expr: Any) -> Any:
 
 
 def _walk(expr: Any):
+    # [FUNCTION DOC] HELPER: Pre-order generator over an expression and all nested expression arguments.
     if not isinstance(expr, GemmEpilogueIRExpression):
         return
     yield expr
@@ -343,6 +415,9 @@ def _walk(expr: Any):
 def grouped_reduction_axis_ir(
     reduction: GemmEpilogueIRReduction, group: int, n: int
 ) -> int | None:
+    # [FUNCTION DOC] Infer the grouped axis from the load indices in the reduction source. Needs exactly
+    # group distinct indices; axis 1 if they form an arithmetic progression of step 1, axis 0 if
+    # step n (row stride). Returns None when neither or both patterns fit.
     """Infer grouped M/N geometry from the reduction source load strides."""
     indices = [
         expr.args[1]
@@ -357,6 +432,8 @@ def grouped_reduction_axis_ir(
         return None
 
     def is_progression(step: int) -> bool:
+        # [FUNCTION DOC] HELPER: True if some base index plus multiples of step covers all group
+        # indices (by symbolic simplification).
         return any(
             all(
                 any(
@@ -373,6 +450,7 @@ def grouped_reduction_axis_ir(
 
 
 def operation_names_ir(store: GemmEpilogueIRStore) -> frozenset[str]:
+    # [FUNCTION DOC] Set of op names appearing anywhere in the store's expression.
     return frozenset(expr.op for expr in _walk(store.value))
 
 
@@ -381,6 +459,10 @@ def _source_transform(
     source_name: str,
     allowed_conversion_dtypes: frozenset[torch.dtype] | None = None,
 ) -> str | None:
+    # [FUNCTION DOC] HELPER: Describe how expr transforms the source buffer: identity (plain load of
+    # source_name), abs, or square (self-multiplication or power of two) of an identity; else
+    # None. Conversions are stripped freely when no dtype filter is given; with a filter, only
+    # to_dtype to an allowed dtype is skipped and bitcasts reject.
     if allowed_conversion_dtypes is None:
         expr = _strip_conversions(expr)
     else:
@@ -426,6 +508,8 @@ def _source_transform(
 
 
 def _flatten_associative(expr: Any, op: str) -> list[Any]:
+    # [FUNCTION DOC] HELPER: Flatten a tree of a binary op (ignoring conversion wrappers) into the list
+    # of its leaf terms, left to right; a non-matching expression is a single term.
     stripped = _strip_conversions(expr)
     if isinstance(stripped, GemmEpilogueIRExpression) and stripped.op == op:
         return _flatten_associative(stripped.args[0], op) + _flatten_associative(
@@ -440,6 +524,11 @@ def grouped_reduction_ir(
     group: int,
     source_dtype: torch.dtype,
 ) -> tuple[str, str] | None:
+    # [FUNCTION DOC] Classify a store as a grouped reduction of source_name; returns (reduction type,
+    # source transform) or None. If primitive reduction nodes exist, exactly one must match.
+    # Otherwise detect unrolled forms: division by group of a sum of group terms (mean), sums or
+    # products of group terms, or max/min chains of group terms, where all terms share the same
+    # source transform.
     """Classify a primitive or unrolled grouped reduction loop body."""
     allowed_conversion_dtypes = frozenset((source_dtype, torch.float32))
     candidates = [expr for expr in _walk(store.value) if expr.op == "reduction"]
@@ -498,6 +587,9 @@ def _synthetic_reductions_ir(
     group: int,
     source_dtype: torch.dtype,
 ) -> tuple[GemmEpilogueIRReduction, ...]:
+    # [FUNCTION DOC] HELPER: Find reductions implied by unrolled grouped patterns: if the whole
+    # expression classifies, return one synthetic reduction; otherwise recurse into nested
+    # arguments and return the de-duplicated results (by source identity).
     if not isinstance(expr, GemmEpilogueIRExpression):
         return ()
     classified = grouped_reduction_ir(
@@ -520,6 +612,8 @@ def _synthetic_reductions_ir(
 
 
 def is_direct_bool_gt_zero_ir(store: GemmEpilogueIRStore, source_name: str) -> bool:
+    # [FUNCTION DOC] True if the store is a greater-than or greater-equal comparison whose left side is
+    # a direct load of source_name and whose right side is the constant zero.
     """Match a direct comparison of one lowered buffer load against zero."""
     expr = _strip_conversions(store.value)
     if not isinstance(expr, GemmEpilogueIRExpression) or expr.op not in ("gt", "ge"):
@@ -534,6 +628,9 @@ def is_direct_bool_gt_zero_ir(store: GemmEpilogueIRStore, source_name: str) -> b
 
 
 def is_absmax_scale_finalizer_ir(store: GemmEpilogueIRStore, source_name: str) -> bool:
+    # [FUNCTION DOC] True if the store computes the source clamped below by 1e-12 and divided by 448
+    # (or multiplied by its reciprocal), with the clamp expressed as maximum, clamp_min or clamp
+    # with no upper bound.
     """Match clamp(source, 1e-12) / 448 used by FP8 absmax scaling."""
     expr = _strip_conversions(store.value)
     if not isinstance(expr, GemmEpilogueIRExpression):
@@ -573,6 +670,7 @@ def is_absmax_scale_finalizer_ir(store: GemmEpilogueIRStore, source_name: str) -
 
 
 def _contains_reduction(expr: Any) -> bool:
+    # [FUNCTION DOC] HELPER: True if the expression or any nested argument is a reduction node.
     if not isinstance(expr, GemmEpilogueIRExpression):
         return False
     return expr.op == "reduction" or any(_contains_reduction(arg) for arg in expr.args)
@@ -581,18 +679,26 @@ def _contains_reduction(expr: Any) -> bool:
 def _affine_scale(
     value: tuple[float, float, float], scale: float
 ) -> tuple[float, float, float]:
+    # [FUNCTION DOC] HELPER: Multiply each coefficient of an affine triple by scale.
     return value[0] * scale, value[1] * scale, value[2] * scale
 
 
 def _affine_add(
     lhs: tuple[float, float, float], rhs: tuple[float, float, float]
 ) -> tuple[float, float, float]:
+    # [FUNCTION DOC] HELPER: Component-wise sum of two affine triples.
     return lhs[0] + rhs[0], lhs[1] + rhs[1], lhs[2] + rhs[2]
 
 
 def _affine_coefficients(
     expr: Any, source_name: str, reduction_names: frozenset[str]
 ) -> tuple[float, float, float] | None:
+    # [FUNCTION DOC] HELPER: Express expr as an affine form (source coefficient, reduction coefficient,
+    # constant), where the source is the buffer source_name and the "reduction" variable is
+    # any reduction node or a load of a name in reduction_names or whose stored value contains
+    # one. Supports numbers, constants, neg, add, sub, mul/truediv by constants and fma with a
+    # constant factor. Returns None when the expression is not affine or divides by a
+    # non-constant or zero.
     expr = _strip_conversions(expr)
     if isinstance(expr, (int, float, sympy.Number)) and not isinstance(expr, bool):
         return 0.0, 0.0, float(expr)
@@ -657,6 +763,10 @@ def centered_mean_consumer_type_ir(
     reduction_names: frozenset[str],
     reduction_scale: float = 1.0,
 ) -> str | None:
+    # [FUNCTION DOC] Express the store as source coefficient, reduction coefficient (times
+    # reduction_scale) and constant. Returns a descriptor string for a mean_linear consumer
+    # with those three numbers (17 significant digits, colon separated), or None when not affine,
+    # when the source or reduction coefficient is zero, or when any value is not finite.
     """Classify an affine combination of a lowered value and grouped reduction."""
     coefficients = _affine_coefficients(store.value, source_name, reduction_names)
     if coefficients is not None:
@@ -678,6 +788,8 @@ def centered_mean_consumer_type_ir(
 def single_source_affine_ir(
     store: GemmEpilogueIRStore, source_name: str
 ) -> tuple[float, float] | None:
+    # [FUNCTION DOC] Return (scale, bias) if the store is affine in the single buffer source_name with no
+    # reduction dependence; otherwise None.
     """Return scale and bias for an affine expression of one lowered buffer."""
     coefficients = _affine_coefficients(store.value, source_name, frozenset())
     if coefficients is None or coefficients[1] != 0.0:
@@ -686,6 +798,9 @@ def single_source_affine_ir(
 
 
 def _affine_around(expr: Any, basis) -> tuple[float, float] | None:
+    # [FUNCTION DOC] HELPER: Express expr as scale times a "basis" value plus a constant, returning
+    # (scale, constant). The predicate basis marks sub-expressions that count as the basis value.
+    # Handles constants, neg, add, sub and mul where one side is constant. None if not affine.
     expr = _strip_conversions(expr)
     if basis(expr):
         return 1.0, 0.0
@@ -719,20 +834,26 @@ def _affine_around(expr: Any, basis) -> tuple[float, float] | None:
 
 
 def _is_source(expr: Any, source_name: str) -> bool:
+    # [FUNCTION DOC] HELPER: True if expr is a plain (conversion-wrapped) load of source_name.
     return _source_transform(expr, source_name) == "identity"
 
 
 def _sum_terms(expr: Any, source_name: str, group: int) -> bool:
+    # [FUNCTION DOC] HELPER: True if expr is a sum of exactly group terms, each a plain source load.
     terms = _flatten_associative(expr, "add")
     return len(terms) == group and all(_is_source(term, source_name) for term in terms)
 
 
 def _group_max(expr: Any, source_name: str, group: int) -> bool:
+    # [FUNCTION DOC] HELPER: True if expr is a chain of maximum over exactly group plain source loads.
     terms = _flatten_associative(expr, "maximum")
     return len(terms) == group and all(_is_source(term, source_name) for term in terms)
 
 
 def _stable_group_max(expr: Any, source_name: str, group: int) -> bool:
+    # [FUNCTION DOC] HELPER: Match the group maximum, either directly or in the guarded form that
+    # replaces an infinite maximum by zero (select with an equality test of abs(max) against
+    # infinity, zero in the true branch, the max in the false branch).
     """Match max(xs), including logsumexp's where(isinf(max), 0, max)."""
     expr = _strip_conversions(expr)
     if _group_max(expr, source_name, group):
@@ -765,6 +886,8 @@ def _stable_group_max(expr: Any, source_name: str, group: int) -> bool:
 
 
 def _shifted_exp(expr: Any, source_name: str) -> Any | None:
+    # [FUNCTION DOC] HELPER: If expr is exp of (source minus something), return the stripped subtrahend;
+    # otherwise None.
     expr = _strip_conversions(expr)
     if not (
         isinstance(expr, GemmEpilogueIRExpression) and expr.op == "exp" and expr.args
@@ -786,6 +909,10 @@ def is_softmax_ir(
     group: int,
     reduction_names: frozenset[str] = frozenset(),
 ) -> bool:
+    # [FUNCTION DOC] Match a numerically stable grouped softmax: division of exp(source - max) by a
+    # denominator. With reduction_names, max and denominator must be loads of two different
+    # reduction buffers. Without, the max must be an unrolled group max and the denominator a
+    # sum of group terms each exp(source - same max).
     """Match stable grouped softmax, either unrolled or reduction-backed."""
     expr = _strip_conversions(store.value)
     if not isinstance(expr, GemmEpilogueIRExpression) or expr.op != "truediv":
@@ -818,6 +945,8 @@ def is_absmax_normalize_ir(
     source_name: str,
     scale_names: str | frozenset[str],
 ) -> bool:
+    # [FUNCTION DOC] True if the store multiplies a plain source load by the reciprocal of an absmax scale
+    # finalizer computed from one of scale_names (a single name or a set), in either operand order.
     """Match source * reciprocal(clamp(absmax, 1e-12) / 448)."""
     if isinstance(scale_names, str):
         scale_names = frozenset((scale_names,))
@@ -847,7 +976,10 @@ def _sum_affine_ir(
     reduction_names: frozenset[str],
     group: int,
 ) -> tuple[float, float] | None:
+    # [FUNCTION DOC] HELPER: Express expr as scale times the grouped sum plus constant. The sum is either
+    # a load of a reduction buffer or an unrolled sum of group source loads.
     def is_sum(candidate: Any) -> bool:
+        # [FUNCTION DOC] HELPER: Predicate identifying the grouped-sum value.
         candidate = _strip_conversions(candidate)
         return (
             isinstance(candidate, GemmEpilogueIRExpression)
@@ -864,10 +996,17 @@ def sum_normalize_consumer_type_ir(
     reduction_names: frozenset[str],
     group: int,
 ) -> str | None:
+    # [FUNCTION DOC] Detect normalization of the source by an affine function of the grouped sum:
+    # source divided by it, it divided by source (reverse), or source times its reciprocal.
+    # Returns a descriptor string (normalize_sum_affine or normalize_sum_reverse_affine followed by
+    # outer scale, outer bias and the inner affine parameters), or None if the shape does not
+    # match, the outer scale is zero, or any number is not finite.
     """Classify normalization by a primitive or unrolled grouped sum."""
     parameters: tuple[str, float, float] | None = None
 
     def is_normalization(expr: Any) -> bool:
+        # [FUNCTION DOC] HELPER: Predicate that recognizes the normalization pattern and, as a side
+        # effect, records its direction and inner affine parameters in the enclosing variable.
         nonlocal parameters
         expr = _strip_conversions(expr)
         if not isinstance(expr, GemmEpilogueIRExpression):
@@ -923,6 +1062,9 @@ def sum_multiply_consumer_type_ir(
     reduction_names: frozenset[str],
     group: int,
 ) -> str | None:
+    # [FUNCTION DOC] Detect the source multiplied by an affine function of the grouped sum (either operand
+    # order). Returns a descriptor string for sum_mul_affine with the two affine numbers, or
+    # None if no match or a non-finite value.
     expr = _strip_conversions(store.value)
     if not isinstance(expr, GemmEpilogueIRExpression) or expr.op != "mul":
         return None
@@ -940,9 +1082,13 @@ def sum_multiply_consumer_type_ir(
 def variance_parameters_ir(
     store: GemmEpilogueIRStore, source_name: str, group: int
 ) -> tuple[float, float] | None:
+    # [FUNCTION DOC] Match an unrolled population variance (sum over group of squared deviations from the
+    # unrolled mean, divided by group) under an affine transform. Returns (scale, constant) or
+    # None when no match or when the scale is zero.
     """Match an unrolled grouped variance followed by an affine transform."""
 
     def is_variance(expr: Any) -> bool:
+        # [FUNCTION DOC] HELPER: Predicate for the unrolled variance expression.
         expr = _strip_conversions(expr)
         if not isinstance(expr, GemmEpilogueIRExpression) or expr.op != "truediv":
             return False
@@ -983,9 +1129,15 @@ def variance_parameters_ir(
 def centered_mean_consumer_type_unrolled_ir(
     store: GemmEpilogueIRStore, source_name: str, group: int
 ) -> str | None:
+    # [FUNCTION DOC] Classify an expression that is affine in the source and the unrolled group mean (sum
+    # of group source loads divided by group). Returns a mean_linear descriptor with source
+    # coefficient, mean coefficient and constant, or None if not affine, either coefficient is
+    # zero, or any is not finite.
     """Classify an affine source/mean expression after a small reduction unroll."""
 
     def coefficients(expr: Any) -> tuple[float, float, float] | None:
+        # [FUNCTION DOC] HELPER: Affine coefficients (source, mean, constant) of expr, supporting add, sub
+        # and mul by a constant; None when unsupported.
         expr = _strip_conversions(expr)
         if isinstance(expr, GemmEpilogueIRExpression) and expr.op == "truediv":
             if _constant_value(expr.args[1]) == group and _sum_terms(
@@ -1030,6 +1182,8 @@ def centered_mean_consumer_type_unrolled_ir(
 
 
 def is_logsumexp_ir(store: GemmEpilogueIRStore, source_name: str, group: int) -> bool:
+    # [FUNCTION DOC] True if the store is the group max plus the log of a sum of group terms
+    # exp(source - the same max), in either operand order; the max may be the guarded stable form.
     """Match max(xs) + log(sum(exp(xs - max(xs))))."""
     expr = _strip_conversions(store.value)
     if not isinstance(expr, GemmEpilogueIRExpression) or expr.op != "add":
