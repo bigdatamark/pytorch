@@ -1,3 +1,9 @@
+# [MODULE DOC] HELPER: Implements the tensorify_python_scalars graph pass used on the joint AOT Autograd
+# graph: backed SymFloat scalar arithmetic and comparisons are rewritten as tensor operations on 0-d
+# tensors (with on-the-fly hash consing of sympy expressions), leftover float symbols are specialized,
+# and Dynamo analysis is restarted when specialization is needed. Defines the supported operator maps
+# SUPPORTED_OPS and SUPPORTED_METHOD_OPS, a module logger and a graph code artifact logger. Exports nothing
+# via __all__. Import-time side effects: creates the loggers; imports sympy and Dynamo internals.
 from __future__ import annotations
 
 import logging
@@ -116,6 +122,11 @@ SUPPORTED_METHOD_OPS = {
 def tensorify_python_scalars(
     gm: GraphModule, shape_env: ShapeEnv, fake_mode: fake_tensor.FakeTensorMode
 ) -> None:
+    # [FUNCTION DOC] Public entry point of the pass. Returns immediately when tensorify is disabled by
+    # configuration; otherwise re-enables torch function dispatch (needed by the proxy objects) and runs
+    # the implementation on the graph module. Mutates the graph in place; returns nothing. May raise
+    # TensorifyScalarRestartAnalysis to ask Dynamo to restart with extra specializations.
+    # KNOWN ISSUE: the docstring omits the fake_mode argument and the restart exception.
     """
     Converts Python scalar operations into Tensor operations within the graph. This pass looks for
     Tensor operations that involve SymFloat arguments and transforms them into equivalent operations
@@ -145,6 +156,18 @@ def _tensorify_impl(
     shape_env: ShapeEnv,
     fake_mode: fake_tensor.FakeTensorMode,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Core of the pass. Phase one walks nodes (except the last): records the
+    # symbolic proxy for each item call (and a float64 0-d tensor proxy for floating point sources) and for
+    # other nodes carrying symbolic values; marks float symbols appearing in tensor shapes for
+    # specialization; and for supported ops (functions or in-place methods) that take SymFloat arguments,
+    # rebuilds them as tensor ops with converted dtypes, keeping keyword arguments, replaces uses and erases
+    # the old node, recording a success metric. Unsupported ops with SymFloat args are logged and recorded
+    # as failures. Phase two erases unused pure nodes in reverse order and replaces nodes whose symbols are
+    # all float by guarded concrete values. Phase three specializes float symbols that were already
+    # specialized in the shape env but not tensorified. If any specialization was requested it records
+    # metrics and raises TensorifyScalarRestartAnalysis; otherwise it logs the final graph code.
+    # KNOWN ISSUE: the failure set is updated with a string, which adds individual characters rather
+    # than the whole op name.
     """Helper fn in tensorify_python_scalars so the caller can wrap
     with _EnableTorchFunction (#180906).
     """
@@ -169,6 +192,11 @@ def _tensorify_impl(
     Analysis = TensorReferenceAnalysis
 
     def _sympy_interp(expr: sympy.Expr) -> MetaProxy:
+        # [FUNCTION DOC] HELPER: Converts a sympy expression to a tensor proxy with caching. Symbols get a
+        # scalar tensor built from their symbolic proxy (which must exist); numbers and booleans become
+        # constant scalar tensor nodes (bool, int64 or float64) created in the graph with a fake value;
+        # cached results are returned; other expressions are evaluated recursively over their arguments
+        # via the tensor reference handlers and cached. Mutates the graph and the caches.
         # sympy_interp() with hash consing, and special handling for
         # generating constants correctly
 

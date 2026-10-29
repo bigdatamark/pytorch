@@ -1,3 +1,8 @@
+# [MODULE DOC] Utilities for normalizing the arguments of calls to torch operators, functions and modules
+# against their signatures: converts TorchScript schemas to Python signatures (with caching), checks that
+# traced operations are not mutating, matches argument types to signature types, and rewrites args/kwargs
+# into a canonical positional or all-keyword form. Import-time side effects: registers manual signature
+# overrides for the nonzero function and fills the type evaluation namespace with the typing names.
 import enum
 import inspect
 import numbers
@@ -31,6 +36,7 @@ __all__ = [
 
 @compatibility(is_backward_compatible=False)
 class ArgsKwargsPair(NamedTuple):
+    # [CLASS DOC] Immutable pair of a tuple of positional arguments and a mapping of keyword arguments.
     """
     Simple named tuple for wrapping args/kwargs pairs.
     """
@@ -43,14 +49,18 @@ _manual_overrides: dict[Callable[..., Any], list[inspect.Signature]] = {}
 
 
 def _nonzero_schemas() -> list[inspect.Signature]:
+    # [FUNCTION DOC] HELPER: Builds the two hand-written signatures for the nonzero function: one taking
+    # only the tensor, and one also taking a keyword-only as_tuple flag. Returns them as a list.
     signatures = []
 
     def nonzero(self: torch.Tensor) -> None:
+        # [FUNCTION DOC] HELPER: Dummy function whose signature is captured; never meant to be called.
         pass
 
     signatures.append(inspect.signature(nonzero))
 
     def nonzero(self: torch.Tensor, *, as_tuple: bool) -> None:  # type: ignore[no-redef]
+        # [FUNCTION DOC] HELPER: Dummy function whose signature is captured; never meant to be called.
         pass
 
     signatures.append(inspect.signature(nonzero))
@@ -62,7 +72,11 @@ _manual_overrides[torch.nonzero] = _nonzero_schemas()
 
 
 class _FakeGlobalNamespace:
+    # [CLASS DOC] HELPER: Stand-in for the TorchScript top-level namespace object used while evaluating
+    # type strings; only the torch attribute is available.
     def __getattr__(self, name: str) -> types.ModuleType:
+        # [FUNCTION DOC] HELPER: Returns the torch module for the torch attribute; any other lookup
+        # raises a runtime error.
         if name == "torch":
             return torch
         raise RuntimeError("Expected a torch namespace lookup")
@@ -87,6 +101,8 @@ for k in dir(typing):
 
 
 def _torchscript_type_to_python_type(ts_type: "torch._C.JitType") -> Any:
+    # [FUNCTION DOC] HELPER: Evaluates the annotation string of a TorchScript type in the prepared
+    # namespace and returns the resulting Python type object. Errors from evaluation propagate.
     """
     Convert a TorchScript type to a Python type (including subtypes) via
     eval'ing the annotation_str. _type_eval_globals sets up expressions
@@ -98,6 +114,11 @@ def _torchscript_type_to_python_type(ts_type: "torch._C.JitType") -> Any:
 def _torchscript_schema_to_signature_impl(
     ts_schema: torch._C.FunctionSchema,
 ) -> inspect.Signature:
+    # [FUNCTION DOC] HELPER: Converts a TorchScript function schema into a Python signature. Each
+    # argument becomes a parameter (keyword-only or positional-or-keyword, with its default if any, and
+    # the evaluated type as annotation); the name self is renamed to input; an argument named from forces
+    # it and all earlier parameters to be positional-only. The return annotation is none, the single
+    # return type, or a tuple of types. Raises AssertionError on unexpected parameter kinds.
     from inspect import Parameter
 
     parameters: list[Parameter] = []
@@ -158,6 +179,8 @@ _SCHEMA_TO_SIGNATURE_CACHE: dict[tuple[str, str], inspect.Signature] = {}
 def _torchscript_schema_to_signature(
     ts_schema: torch._C.FunctionSchema,
 ) -> inspect.Signature:
+    # [FUNCTION DOC] HELPER: Cached wrapper over the schema conversion, keyed by operator name and
+    # overload name. Side effect: fills the module-level cache.
     # Cached as it's called in the hot path of FakeTensor dispatch
     cache_key = ts_schema.name, ts_schema.overload_name
     cache_val = _SCHEMA_TO_SIGNATURE_CACHE.get(cache_key)
@@ -175,6 +198,10 @@ def check_for_mutable_operation(
     args: tuple["Argument", ...],
     kwargs: dict[str, "Argument"],
 ) -> None:
+    # [FUNCTION DOC] Looks up the signatures and schemas of the target and finds which candidate
+    # signatures accept the given args and kwargs. Only when exactly one schema matches and it is mutable
+    # does it raise a runtime error (FX supports only functional code); no match or an ambiguous match is
+    # silently accepted. Targets without known schemas are ignored. Returns nothing.
     signatures, schemas = get_signature_for_torch_op(target, return_schemas=True)
 
     if signatures and schemas:
@@ -191,6 +218,7 @@ def check_for_mutable_operation(
                 continue
 
         def throw_if_mutable(schema: torch._C.FunctionSchema) -> None:
+            # [FUNCTION DOC] HELPER: Raises a runtime error mentioning the schema if it is mutable.
             if schema.is_mutable:
                 raise RuntimeError(
                     f"Tried to trace mutable operation {schema}. FX only supports functional "
@@ -231,6 +259,13 @@ def get_signature_for_torch_op(
     | tuple[list[inspect.Signature] | None, list[torch._C.FunctionSchema] | None]
     | None
 ):
+    # [FUNCTION DOC] Returns the Python signatures for an operator: one per schema for an op overload,
+    # one per overload for an overload packet, and for other callables the manual override or the
+    # builtin schemas found via the TorchScript builtin table. Returns none (or a pair of none values
+    # when schemas are requested) if nothing is found. With schemas requested, returns the pair of
+    # signatures and schemas (the schemas element is none for manual overrides).
+    # KNOWN ISSUE: for a manual override and no schemas requested, the function returns none instead of
+    # the override signatures (the conditional only returns the override when schemas are requested).
     """
     Given an operator on the `torch` namespace, return a list of `inspect.Signature`
     objects corresponding to the overloads of that op. May return `None` if a signature
@@ -266,6 +301,10 @@ def get_signature_for_torch_op(
 
 @compatibility(is_backward_compatible=False)
 def create_type_hint(x: object) -> object:
+    # [FUNCTION DOC] For a list or tuple of types, returns a list or variadic tuple type hint whose element
+    # type is the most general element (a common superclass among the elements), or Any if the elements
+    # are unrelated or the container is empty. Any other input is returned unchanged. If building the hint
+    # fails, emits a warning and returns the input unchanged.
     """
     Produces a type hint for the given argument.
 
@@ -283,11 +322,13 @@ def create_type_hint(x: object) -> object:
             if isinstance(x, list):
 
                 def ret_type(x: Any) -> Any:
+                    # [FUNCTION DOC] HELPER: Wraps an element type into a list type.
                     return list[x]  # type: ignore[valid-type]
 
             else:
 
                 def ret_type(x: Any) -> Any:
+                    # [FUNCTION DOC] HELPER: Wraps an element type into a variadic tuple type.
                     return tuple[x, ...]  # type: ignore[valid-type]
 
             if len(x) == 0:
@@ -311,6 +352,12 @@ def create_type_hint(x: object) -> object:
 
 @compatibility(is_backward_compatible=False)
 def type_matches(signature_type: Any, argument_type: Any) -> bool:
+    # [FUNCTION DOC] Decides whether an argument type is acceptable for a signature type. True when they
+    # are identical; for a union signature when any member matches; for a list signature when the
+    # argument is an int and the element type is int, a list of a subclass, or a homogeneous tuple of
+    # subclasses (nested parametric element types warn and give false); when the signature is int and
+    # the argument a dtype; when the signature is the number type and the argument int or float; and
+    # otherwise when both are classes and the argument is a subclass. Else false. Pure except warnings.
     sig_origin_type = getattr(signature_type, "__origin__", signature_type)
 
     if signature_type is argument_type:
@@ -338,6 +385,8 @@ def type_matches(signature_type: Any, argument_type: Any) -> bool:
             return issubclass(typing.get_args(argument_type)[0], sig_el_type)
 
         def is_homogeneous_tuple(t: object) -> bool:
+            # [FUNCTION DOC] HELPER: True if the type is a tuple type that is empty or whose members are
+            # all ellipsis or subclasses of the enclosing list element type.
             if typing.get_origin(t) is not tuple:
                 return False
             contained = typing.get_args(t)
@@ -369,6 +418,8 @@ def _normalize_function_or_error(
     kwarg_types: dict[str, Any] | None = None,
     normalize_to_only_use_kwargs: bool = False,
 ) -> ArgsKwargsPair:
+    # [FUNCTION DOC] HELPER: Calls normalize_function with the same arguments and returns its result,
+    # raising a runtime error describing the target and arguments if normalization returned none.
     """
     Wrapper around normalize_function that never returns None, but
     loudly errors instead
@@ -393,6 +444,14 @@ def normalize_function(
     kwarg_types: dict[str, Any] | None = None,
     normalize_to_only_use_kwargs: bool = False,
 ) -> ArgsKwargsPair | None:
+    # [FUNCTION DOC] Normalizes a call to a function or operator against its signature. Wrapper objects
+    # exposing an inner op are unwrapped first. For ordinary Python callables (boolean-dispatched
+    # functions are analyzed through their true branch if both branches share a signature, else none is
+    # returned) the inspected signature is used. For builtins and torch ops, all known overload
+    # signatures are tried: exactly one binding match is used; several matches are disambiguated by the
+    # provided argument types (first matching signature wins; none if nothing matches), and raise a
+    # runtime error if no types were given. Returns the normalized pair or none when unsupported.
+    # Raises AssertionError if the target is not callable.
     """
     Returns normalized arguments to PyTorch functions. This means that
     `args/kwargs` will be matched up to the functional's
@@ -532,6 +591,11 @@ def normalize_module(
     kwargs: dict[str, Any] | None = None,
     normalize_to_only_use_kwargs: bool = False,
 ) -> ArgsKwargsPair | None:
+    # [FUNCTION DOC] Resolves the dotted submodule path on the root module (raising a runtime error if it
+    # does not exist) and, only if the submodule's class is the same class as the one of that name in the
+    # torch.nn namespace, normalizes the call against the signature of its forward method. Returns the
+    # normalized pair, or none for non-standard modules or unsupported signatures.
+    # KNOWN ISSUE: the docstring calls the target a callable, but it is a string path.
     """
     Returns normalized arguments to PyTorch modules. This means that
     `args/kwargs` will be matched up to the functional's
@@ -577,6 +641,11 @@ def _args_kwargs_to_normalized_args_kwargs(
     kwargs: dict[str, Any],
     normalize_to_only_use_kwargs: bool,
 ) -> ArgsKwargsPair | None:
+    # [FUNCTION DOC] HELPER: Binds the args and kwargs to the signature, fills in defaults, and returns
+    # the arguments as positional values (for parameters covered by the original positional count) plus
+    # keywords for the rest, or all as keywords when requested. Returns none if the signature has
+    # positional-only or variadic parameters, except for the special random-uniform style signature.
+    # Raises a type error if binding fails.
     """
     Given a call target, args, and kwargs, return the arguments normalized into
     an ArgsKwargsPair, or None if the type signature is not supported by

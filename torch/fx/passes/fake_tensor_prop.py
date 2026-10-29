@@ -1,3 +1,5 @@
+# [MODULE DOC] Defines FakeTensorProp, an FX interpreter that runs a graph on fake tensors and records
+# the resulting fake values (and unbacked symbol bindings) in node metadata. No import-time side effects.
 from typing import Any
 
 import torch.fx
@@ -14,6 +16,11 @@ __all__ = ["FakeTensorProp"]
 
 @compatibility(is_backward_compatible=False)
 class FakeTensorProp(torch.fx.Interpreter):
+    # [CLASS DOC] Interpreter that executes each node under a fake tensor mode and stores snapshots of
+    # the outputs in the val metadata entry of the node. State: _mode (the fake mode, created if not
+    # supplied) and seen_subgraphs (names of invoke_subgraph bodies already propagated, to avoid redundant
+    # work). Key methods: propagate (converts real tensor inputs to fakes), propagate_dont_convert_inputs,
+    # run_node.
     """
     Execute an FX graph Node-by-Node and record a fake tensor representing
     the metadata for the node.  Unlike ShapeProp, (1) this propagation
@@ -30,6 +37,9 @@ class FakeTensorProp(torch.fx.Interpreter):
     def __init__(
         self, module: torch.fx.GraphModule, mode: FakeTensorMode | None = None
     ) -> None:
+        # [FUNCTION DOC] Initializes the interpreter for the module, creating a new fake mode when none
+        # is given. Side effects: increments the epoch of the mode and resets its nested tensor id counter
+        # (even for a mode shared with the caller). Starts with an empty set of seen subgraphs.
         super().__init__(module)
         if mode is None:
             mode = FakeTensorMode()
@@ -39,6 +49,15 @@ class FakeTensorProp(torch.fx.Interpreter):
         self.seen_subgraphs: OrderedSet[str] = OrderedSet()
 
     def run_node(self, n: Node) -> Any:
+        # [FUNCTION DOC] Executes one node and records its result. For the first occurrence of an
+        # invoke_subgraph call on a given subgraph name, it instead recursively propagates a fresh
+        # FakeTensorProp (sharing the same mode) over the referenced submodule using the val metadata of
+        # the operands, and returns that result without recording metadata on this node. Otherwise it
+        # runs the node via the base class, rebinds unbacked symbols, converts the result tree to
+        # snapshots of fake tensors (real tensors are first converted with static shapes; ints, floats,
+        # bools and symbolic scalars are kept; other leaves become None) and, if not entirely None,
+        # stores it as val, plus unbacked_bindings when the shape env yields any. Returns the raw result.
+        # Raises AssertionError for malformed invoke_subgraph arguments or operands lacking val.
         from torch.fx.experimental.symbolic_shapes import (
             compute_unbacked_bindings,
             rebind_unbacked,
@@ -80,6 +99,9 @@ class FakeTensorProp(torch.fx.Interpreter):
         rebind_unbacked(self._mode.shape_env, n, result)
 
         def extract_val(obj: Any) -> Any:
+            # [FUNCTION DOC] HELPER: Maps one result leaf to its metadata form: fake tensors are
+            # snapshotted, real tensors are converted to static-shape fakes then snapshotted, symbolic
+            # and plain numeric/bool values pass through, anything else yields none.
             if is_fake_tensor(obj):
                 return snapshot_fake(obj)
             elif isinstance(obj, torch.Tensor):
@@ -102,6 +124,9 @@ class FakeTensorProp(torch.fx.Interpreter):
         return result
 
     def propagate(self, *args: object) -> Any:
+        # [FUNCTION DOC] Converts every real tensor argument to a fake tensor using the mode (other
+        # arguments are passed unchanged) and runs the graph via propagate_dont_convert_inputs.
+        # Returns the output of the graph; annotates node metadata as a side effect.
         fake_args = [
             self._mode.from_tensor(a) if isinstance(a, torch.Tensor) else a
             for a in args
@@ -109,6 +134,9 @@ class FakeTensorProp(torch.fx.Interpreter):
         return self.propagate_dont_convert_inputs(*fake_args)
 
     def propagate_dont_convert_inputs(self, *args: object) -> Any:
+        # [FUNCTION DOC] Runs the interpreter with the given inputs (assumed already fake) inside the
+        # fake mode context and returns the graph output. Saves the fake device of each fake tensor input
+        # beforehand and restores it afterwards (even on error) because in-place ops may change it.
         # In-place ops like shallow_copy_data_ can mutate fake_device on
         # input FakeTensors during propagation. Save and restore so the
         # caller's inputs are not permanently corrupted.

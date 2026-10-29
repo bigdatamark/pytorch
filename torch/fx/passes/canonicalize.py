@@ -1,3 +1,7 @@
+# [MODULE DOC] Graph canonicalization passes: a deterministic topological reordering of nodes with
+# barrier handling for impure nodes, post-processing steps (sinking get_attr nodes, grouping getitems),
+# and renaming of nodes to canonical names. Defines default key and safety helpers. No import-time
+# side effects.
 """Canonicalize an FX graph's node order and names.
 
 Provides two passes:
@@ -45,12 +49,18 @@ _IN_PLACE_OPERATORS = frozenset(
 def _computation_node_key(
     node: fx.Node, canonical_idx: dict[fx.Node, int]
 ) -> tuple[int, str, tuple[int, ...]]:
+    # [FUNCTION DOC] HELPER: Builds the sort key for a computation node: a rank of two, the string form
+    # of its target, and the tuple of canonical positions of its input nodes (which must all be present
+    # in the mapping, else a lookup error is raised).
     """Canonical heap key for a computation node (call_function / call_method / call_module)."""
     input_indices = tuple(canonical_idx[n] for n in node.all_input_nodes)
     return (2, node.graph._target_to_str(node.target), input_indices)
 
 
 def _canonical_node_key(node: fx.Node, canonical_idx: dict[fx.Node, int]) -> object:
+    # [FUNCTION DOC] HELPER: Returns a heap key by node kind: rank one with the target string for
+    # get_attr, rank three for output, and the computation key otherwise. Raises AssertionError for
+    # placeholder nodes, which callers must order themselves.
     """Canonical heap key for get_attr, output, and computation nodes.
 
     Callers must handle placeholder nodes themselves (the ordering strategy
@@ -67,6 +77,11 @@ def _canonical_node_key(node: fx.Node, canonical_idx: dict[fx.Node, int]) -> obj
 
 
 def _is_safe_to_reorder(node: fx.Node) -> bool:
+    # [FUNCTION DOC] HELPER: Decides whether a node may be moved freely. Method calls ending in an
+    # underscore (in-place) are unsafe; module calls follow the impurity check; non-call nodes are safe;
+    # function calls are unsafe if impure, or if the target is not an op overload and looks stateful
+    # (trailing underscore name, in-place operator module function, an out keyword holding a node, the
+    # triton mutation wrapper, no node inputs at all, or batch dim helpers). Otherwise safe. Pure query.
     """Check if a node is safe to reorder during graph canonicalization.
 
     Builds on Node.is_impure() (used by DCE) with two additional checks for
@@ -114,6 +129,10 @@ def rename_nodes_to_canonical(
     graph: fx.Graph,
     skip_ops: frozenset[str] = frozenset(),
 ) -> dict[str, str]:
+    # [FUNCTION DOC] Walks the nodes in order and assigns each a fresh unique name derived from its
+    # target using a new namespace; nodes whose op is in the skip set keep their name but reserve it.
+    # Replaces the graph namespace with the new one afterwards. Returns a mapping from old to new names
+    # for nodes whose name changed. Mutates node names and the graph in place.
     """Rename all nodes in the graph to canonical names based on their target.
 
     Uses the same naming scheme as FX ``Graph.create_node`` (auto-generated
@@ -146,6 +165,9 @@ def rename_nodes_to_canonical(
 
 
 def _sink_get_attr_nodes(order: list[fx.Node]) -> None:
+    # [FUNCTION DOC] HELPER: Rewrites the given node list in place so each get_attr node sits right before
+    # its earliest consumer in the list; unused ones go just before a trailing output node, or at the end.
+    # Returns nothing; unchanged when there are no get_attr nodes.
     """Move each get_attr node to right before its earliest consumer.
 
     By default, Kahn's algorithm places get_attr nodes (which have no data
@@ -178,6 +200,9 @@ def _sink_get_attr_nodes(order: list[fx.Node]) -> None:
 
 
 def _group_getitem_nodes(order: list[fx.Node]) -> None:
+    # [FUNCTION DOC] HELPER: Rewrites the node list in place so every getitem node follows its producer,
+    # sorted by integer index (non-integer indices after them, by string), with nested getitems emitted
+    # depth first. Raises AssertionError if nodes would be lost (a producer missing from the list).
     """Move each getitem node to immediately after its producer, in index order.
 
     Serialization does not store getitem nodes as free-standing nodes; the
@@ -205,6 +230,8 @@ def _group_getitem_nodes(order: list[fx.Node]) -> None:
         return
 
     def _index(node: fx.Node) -> tuple[int, int, str]:
+        # [FUNCTION DOC] HELPER: Sort key for a getitem: integer indices first by value, others after
+        # by string form.
         idx = node.args[1]
         return (0, idx, "") if isinstance(idx, int) else (1, 0, str(idx))
 
@@ -214,6 +241,7 @@ def _group_getitem_nodes(order: list[fx.Node]) -> None:
     new_order: list[fx.Node] = []
 
     def _emit(node: fx.Node) -> None:
+        # [FUNCTION DOC] HELPER: Appends the node to the new order, then recursively its getitem children.
         new_order.append(node)
         for child in children.get(node, ()):
             _emit(child)
@@ -237,6 +265,13 @@ def canonicalize_graph(
     skip_rename_ops: frozenset[str] = frozenset(),
     group_getitems: bool = False,
 ) -> dict[str, str]:
+    # [FUNCTION DOC] Reorders the graph nodes in place into a deterministic topological order and then
+    # renames them. Steps: compute in-degrees; treat unsafe nodes as barriers by adding synthetic
+    # dependencies so reorderable nodes stay within their segment; run a heap based Kahn traversal keyed
+    # by the caller key function with an insertion counter as tiebreaker; sink get_attr nodes; optionally
+    # group getitems; purge erased nodes still linked in the node list; relink nodes in the new order
+    # keeping node identity; finally rename. Returns the old-to-new name mapping.
+    # Raises RuntimeError if not all nodes could be ordered (a cycle).
     """Reorder graph nodes into a canonical topological order and rename them.
 
     This ensures that structurally equivalent graphs produce identical node

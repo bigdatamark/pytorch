@@ -1,3 +1,6 @@
+# [MODULE DOC] Defines a single FX pass helper that propagates element type annotations from
+# sequence-typed nodes (tuple, list, NamedTuple) onto the getitem nodes that index them.
+# No import-time side effects.
 import operator
 import typing
 
@@ -5,6 +8,14 @@ import torch
 
 
 def annotate_getitem_nodes(graph: torch.fx.Graph) -> None:
+    # [FUNCTION DOC] Walks every node of the graph and, for each getitem call, sets the node's type
+    # from the type of its sequence argument. Handles typing aliases with a name (Tuple/List), generic
+    # aliases (tuple/list origin) and NamedTuple-like classes. Variadic tuples give their first element type;
+    # fixed tuples use the type at the (integer) index; lists must have exactly one parameter type.
+    # Sequence nodes without a type are skipped. Mutates node.type in place; returns nothing.
+    # Raises AssertionError on an out-of-range tuple index or a list with other than one parameter.
+    # KNOWN ISSUE: the tuple/list branches assume the index is an integer; a non-integer index node
+    # (such as a Node or slice) would fail in the comparison or lookup.
     """
     Annotate the type of getitem nodes, inferred from the type of sequence node.
     If sequence node is not annotated with a type, do nothing.

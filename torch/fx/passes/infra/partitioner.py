@@ -1,3 +1,7 @@
+# [MODULE DOC] Capability-based graph partitioning: groups nodes that an operator-support policy accepts
+# into partitions without creating dependency cycles, and fuses partitions into submodules. Defines
+# Partition, a private dependency viewer and CapabilityBasedPartitioner. Import-time side effect: creates
+# the module logger and sets its level to warning.
 import collections
 import itertools
 import logging
@@ -15,12 +19,16 @@ logger.setLevel(logging.WARNING)
 
 
 class Partition:
+    # [CLASS DOC] A group of graph nodes proposed for fusion. State: id, and nodes, an insertion ordered
+    # mapping from node to an optional integer order (reverse topological position) used for sorting.
     def __init__(
         self,
         id: int | None = None,
         nodes: Iterable[Node] | None = None,
         node_orders: Iterable[int] | None = None,
     ) -> None:
+        # [FUNCTION DOC] Creates a partition with an optional id and initial nodes; orders default to none
+        # for each node. Raises AssertionError if node orders are given with a different length.
         self.id = id
         self.nodes: dict[Node, int | None] = {}
         if nodes is not None:
@@ -36,20 +44,28 @@ class Partition:
                 self.nodes = dict(zip(nodes_list, node_orders_list))
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns the string form of the node to order mapping.
         return str(self.nodes)
 
     def add_node(self, node: Node, node_order: int | None = None) -> None:
+        # [FUNCTION DOC] Adds the node, or updates its order if already present.
         self.nodes.update({node: node_order})
 
     def remove_node(self, node: Node) -> None:
+        # [FUNCTION DOC] Removes the node; raises a missing key error if it is not in the partition.
         del self.nodes[node]
 
     def size(self) -> int:
+        # [FUNCTION DOC] Returns the number of nodes in the partition.
         return len(self.nodes)
 
 
 class _DependencyViewer:
+    # [CLASS DOC] HELPER: Precomputed transitive downstream (user) sets for every node of a graph; the
+    # state is a mapping from node to the set of all nodes reachable through users.
     def __init__(self, graph_module: GraphModule) -> None:
+        # [FUNCTION DOC] HELPER: Walks the nodes in reverse order and accumulates, for each node, its
+        # users and their already computed downstream sets.
         self.downstreams = collections.defaultdict(set)
 
         for node in reversed(graph_module.graph.nodes):
@@ -59,10 +75,16 @@ class _DependencyViewer:
                 self.downstreams[node].update(self.downstreams[output_node])
 
     def downstreams_of(self, node: Node) -> set[Node]:
+        # [FUNCTION DOC] HELPER: Returns the set of all nodes transitively using the node (the stored
+        # set itself, empty for unknown nodes; callers must not mutate it).
         return self.downstreams[node]
 
 
 class CapabilityBasedPartitioner:
+    # [CLASS DOC] Proposes and fuses partitions of supported nodes. State: the graph module, the operator
+    # support policy, whether single node partitions are kept, extra non-compute op names, op names
+    # allowed to form single node partitions, a flag to skip horizontal fusion, and the dependency viewer.
+    # Key methods: propose_partitions, fuse_partitions, remove_bookend_non_compute_ops, partition_and_fuse.
     def __init__(
         self,
         graph_module: GraphModule,
@@ -72,6 +94,8 @@ class CapabilityBasedPartitioner:
         allowed_single_node_partition_ops: Sequence[str] | None = None,
         skip_horizontal_fusion: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Stores the configuration (missing lists become empty) and precomputes the
+        # downstream dependency sets of the graph. The graph must not change between construction and use.
         self.graph_module = graph_module
         self.operator_support = operator_support
         self.allows_single_node_partition = allows_single_node_partition
@@ -85,11 +109,22 @@ class CapabilityBasedPartitioner:
         self.dependency_viewer = _DependencyViewer(graph_module)
 
     def _is_node_supported(self, node: Node) -> bool:
+        # [FUNCTION DOC] HELPER: Asks the operator support policy about the node, passing a mapping of
+        # the module's submodule names to modules (rebuilt on each call).
         return self.operator_support.is_node_supported(
             dict(self.graph_module.named_modules()), node
         )
 
     def propose_partitions(self) -> list[Partition]:
+        # [FUNCTION DOC] Computes partitions without modifying the graph. Visits nodes in reverse
+        # topological order; each supported unassigned node starts a new partition, which is then merged
+        # with other candidate partitions (all existing ones, or only direct users' partitions when
+        # horizontal fusion is skipped) in a deterministic order, but only when the merge creates no cycle
+        # (checked via downstream reachability between partitions). Afterwards sorts each partition's
+        # nodes by descending order, repeatedly reassigns getitem users of tuple-producing nodes to the
+        # producer's partition, and, unless single node partitions are allowed, drops partitions with at
+        # most one compute node (view and getitem count as non-compute; allowed single-node ops add
+        # extra weight). Returns the non-empty partitions. Only logging side effects.
         # partition_map is a mapping from partition id to a set of partition id's.
         # The value set contains all the partition ids that can be reached by doing a
         # DFS starting from the partition id in the key.
@@ -114,6 +149,9 @@ class CapabilityBasedPartitioner:
         def downstream_partitions(
             user_nodes: Iterable[Node], source_ids: Iterable[int]
         ) -> set[int]:
+            # [FUNCTION DOC] HELPER: Returns ids of all partitions reachable downstream from the given
+            # user nodes (the nodes and their transitive users that are assigned, plus partitions
+            # reachable from those partitions), excluding the source partition ids.
             source_ids_set = set(source_ids)
             downstream_partition_ids: set[int] = set()
             for user_node in user_nodes:
@@ -133,11 +171,18 @@ class CapabilityBasedPartitioner:
         # merge only happens if the end graph doesn't contain cyclic dependency
         # returns `True` when merge happens, `False` otherwise.
         def maybe_merge_partition(self_id: int, other_id: int) -> tuple[int, bool]:
+            # [FUNCTION DOC] HELPER: Tries to merge two partitions. Returns the surviving id and whether
+            # a merge happened. If merging would create a cycle (a user path leading back into either
+            # partition) it changes nothing and returns the first id with false. Otherwise the smaller
+            # partition is folded into the larger one and the assignment, order, reachability and user
+            # bookkeeping are updated and the removed partition's entries deleted.
             # merged_nodes is the union of nodes in two partition to-be-merged
             self_nodes = partitions_by_id[self_id].nodes
             other_nodes = partitions_by_id[other_id].nodes
 
             def dfs_iter_find_cycle(all_user_nodes: set[Node]) -> bool:
+                # [FUNCTION DOC] HELPER: True if any downstream path from the given user nodes re-enters
+                # either partition being merged, directly or through a partition that can reach them.
                 for user_node in all_user_nodes:
                     visited_partition_ids = set()
 
@@ -215,7 +260,14 @@ class CapabilityBasedPartitioner:
         def merge_single_node(
             node: Node, node_order: int | None, id: int | None
         ) -> None:
+            # [FUNCTION DOC] HELPER: Moves a node into the partition with the given id, first removing it
+            # from its current partition. A none id unassigns the node. A new id creates the partition
+            # (requires a node order, else AssertionError) and initializes its users and reachability;
+            # an existing id just adds the node. Mutates the enclosing bookkeeping.
+            # KNOWN ISSUE: unassigning a node that is not currently assigned raises a missing key error.
             def _update_partition_map(node: Node, id: int) -> None:
+                # [FUNCTION DOC] HELPER: Adds to the partition's reachability set every partition
+                # downstream of the node's users.
                 # Update reachability through both assigned and unsupported users.
                 partition_map[id].update(downstream_partitions(node.users, (id,)))
 
@@ -356,6 +408,8 @@ class CapabilityBasedPartitioner:
     def fuse_partitions(
         self, partitions: list[Partition], prefix: str = "fused_"
     ) -> GraphModule:
+        # [FUNCTION DOC] Fuses each partition into a call to a submodule of the graph module, named with
+        # the prefix, via the fuser utility, and returns the resulting module.
         logger.debug("Fusing partitions...")
         # fuse_by_partitions expects partitions in List[Dict[Node, None]]: [ {node0 : None}, {node1 : None} ]
         return fuse_by_partitions(
@@ -366,9 +420,16 @@ class CapabilityBasedPartitioner:
 
     # remove non-compute-ops that sits at the boundary of a partition.
     def remove_bookend_non_compute_ops(self, partitions: list[Partition]) -> None:
+        # [FUNCTION DOC] For each partition, removes (in place) non-compute nodes, by configured op names,
+        # located at its boundary: those whose inputs are all outside, removed, placeholders or
+        # themselves transparent non-compute nodes, or whose users all are. Returns nothing.
+        # KNOWN ISSUE: the transparency caches are shared across partitions although the answer depends
+        # on the partition and removed set, so later partitions can see stale results.
         non_compute_ops = set(self.non_compute_ops)
 
         def is_non_compute_node(node: Node) -> bool:
+            # [FUNCTION DOC] HELPER: True for function calls whose qualified name is a configured
+            # non-compute op.
             return (
                 node.op == "call_function"
                 and _get_qualified_name(node.target) in non_compute_ops  # type: ignore[arg-type]
@@ -381,6 +442,8 @@ class CapabilityBasedPartitioner:
         def is_transparent_input_node(
             node: Node, partition: set[Node], removed_nodes: set[Node]
         ) -> bool:
+            # [FUNCTION DOC] HELPER: True if the node is a placeholder, outside the partition or already
+            # removed, or is a non-compute node all of whose inputs are transparent (recursive, cached).
             if (
                 node.op == "placeholder"
                 or (node not in partition)
@@ -402,6 +465,8 @@ class CapabilityBasedPartitioner:
         def is_transparent_output_node(
             node: Node, partition: set[Node], removed_nodes: set[Node]
         ) -> bool:
+            # [FUNCTION DOC] HELPER: Mirror of the input check along users: true for placeholders,
+            # nodes outside the partition or removed, or non-compute nodes whose users are all transparent.
             if (
                 node.op == "placeholder"
                 or (node not in partition)
@@ -441,6 +506,8 @@ class CapabilityBasedPartitioner:
                     partition.nodes.pop(node, None)
 
     def partition_and_fuse(self, prefix: str = "fused_") -> GraphModule:
+        # [FUNCTION DOC] Convenience: proposes partitions and fuses them with the given prefix, returning
+        # the fused module.
         partitions = self.propose_partitions()
         fused_gm = self.fuse_partitions(partitions, prefix=prefix)
         return fused_gm

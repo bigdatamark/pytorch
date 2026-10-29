@@ -1,3 +1,7 @@
+# [MODULE DOC] Defines GraphTransformObserver, a context manager that observes node creation, erasure and
+# replacement on a graph module during a pass, annotates node provenance metadata, optionally writes
+# before/after dot graphs to a log directory, and can run a pass function with timing and disabling
+# support. Imports the graph drawer at import time; no other import-time side effects.
 import os
 from collections.abc import Callable
 from types import TracebackType
@@ -20,6 +24,11 @@ __all__ = ["GraphTransformObserver"]
 
 @compatibility(is_backward_compatible=False)
 class GraphTransformObserver:
+    # [CLASS DOC] Context manager wrapping one graph pass. State: the module, pass name, optional
+    # subsystem, log directory, an active flag (true when a log directory is set or provenance tracking
+    # level is one) and, when active, sets of created and erased node names, a name to node mapping, the
+    # list of deep-copied modules and the registered hooks. A class-level counter numbers logged passes.
+    # Use via the with statement or the apply helpers; when inactive it does nothing.
     __pass_count = 0
 
     def __init__(
@@ -29,6 +38,11 @@ class GraphTransformObserver:
         subsystem: str | None = None,
         log_url: str | None = None,
     ) -> None:
+        # [FUNCTION DOC] Stores the arguments, takes the log directory from inductor configuration when
+        # none is given, and decides whether the observer is active. When active, creates the bookkeeping
+        # containers and the four hook callbacks. If a log directory is set, increments the global pass
+        # counter and renders the input graph to a dot graph (ignoring get_attr, parameters and buffers).
+        # Requires the pydot package in that case (the drawer raises otherwise).
         """
         log_url is inferred to be torch._inductor.config.trace.log_url_for_graph_xform unless otherwise specified
         """
@@ -74,9 +88,13 @@ class GraphTransformObserver:
 
     @classmethod
     def get_current_pass_count(cls) -> int:
+        # [FUNCTION DOC] Returns how many logged passes have been constructed so far (class-wide counter).
         return cls.__pass_count
 
     def apply_gm_pass(self, pass_fn: Callable[[GraphModule], T]) -> T | None:
+        # [FUNCTION DOC] Inside the observer context, returns none if the pass is disabled (by name or
+        # by the compiler bisector); otherwise calls the function on the graph module under a timing
+        # scope named after the subsystem and pass, and returns its result.
         from torch._dynamo.utils import dynamo_timed
 
         with self:
@@ -90,6 +108,7 @@ class GraphTransformObserver:
                 return pass_fn(self.gm)
 
     def apply_graph_pass(self, pass_fn: Callable[[Graph], T]) -> T | None:
+        # [FUNCTION DOC] Same as apply_gm_pass but passes the graph of the module to the function.
         from torch._dynamo.utils import dynamo_timed
 
         with self:
@@ -103,6 +122,9 @@ class GraphTransformObserver:
                 return pass_fn(self.gm.graph)
 
     def _check_disable_pass(self) -> bool:
+        # [FUNCTION DOC] HELPER: True if the pass name appears (case-insensitively, as a substring) in
+        # the inductor disabled passes setting, or if the compiler bisector disables the subsystem for
+        # this pass. Without a subsystem, only the setting is consulted.
         from torch._inductor import config as inductor_config
 
         if self.passname.upper() in inductor_config.disabled_passes.upper():
@@ -118,6 +140,8 @@ class GraphTransformObserver:
         )
 
     def __enter__(self) -> "GraphTransformObserver":
+        # [FUNCTION DOC] When active, registers the create, erase, replace and deepcopy hooks on the
+        # module, clears all bookkeeping and indexes the current nodes by name. Returns self.
         if not self.active:
             return self
         self.gm._register_create_node_hook(self._node_creation_hook)
@@ -141,6 +165,11 @@ class GraphTransformObserver:
         value: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
+        # [FUNCTION DOC] When active, unregisters the hooks from the module and its deep copies. If a
+        # log directory is set and nodes were created or erased, colors the saved input graph (erased
+        # nodes yellow, others grey), writes it to a dot file named with the pass counter and pass name,
+        # draws the output graph, colors created nodes yellow, and writes that file too. Exception
+        # arguments are ignored and exceptions are not suppressed.
         if not self.active:
             return
         for gm in self.copied_gms + [self.gm]:
@@ -186,9 +215,13 @@ class GraphTransformObserver:
             )
 
     def get_node_creation_hook(self) -> Callable[[Node], None]:
+        # [FUNCTION DOC] Returns a callback that records a new node name as created, indexes it, and
+        # appends a creation source entry for this pass to the from_node metadata (creating the list
+        # when absent). Only valid when active (the sets exist).
         # We have to return a function instead of using a class method directly
         # to avoid max recursion issue when deepcopy a graph module within the context manager.
         def on_node_creation(node: Node) -> None:
+            # [FUNCTION DOC] HELPER: Hook body for node creation; see get_node_creation_hook.
             self.created_nodes.add(node.name)
             self.name_to_node[node.name] = node
             source = NodeSource(None, self.passname, NodeSourceAction.CREATE)
@@ -200,14 +233,21 @@ class GraphTransformObserver:
         return on_node_creation
 
     def get_node_erase_hook(self) -> Callable[[Node], None]:
+        # [FUNCTION DOC] Returns a callback that records an erased node name and drops it from the index.
         def on_node_erase(node: Node) -> None:
+            # [FUNCTION DOC] HELPER: Hook body for node erasure; see get_node_erase_hook.
             self.erased_nodes.add(node.name)
             self.name_to_node.pop(node.name, None)
 
         return on_node_erase
 
     def get_node_replace_hook(self) -> Callable[[Node, str, Node], None]:
+        # [FUNCTION DOC] Returns a callback that updates provenance metadata when one node replaces another.
         def on_node_replace(old: Node, new: str, user: Node) -> None:
+            # [FUNCTION DOC] HELPER: Hook body. Looks up the replacement node by name (ignoring unknown
+            # names), skips it if the old node is already listed in its provenance, otherwise drops
+            # creation entries made by this pass and appends a replace entry (plus create if the node
+            # was created in this pass) naming the old node. The user argument is unused.
             # Update node meta when replacing old node with new node
             new_node = self.name_to_node.get(new, None)
 
@@ -228,6 +268,8 @@ class GraphTransformObserver:
                 action.append(NodeSourceAction.CREATE)
 
             def created_this_pass(source: NodeSource) -> bool:
+                # [FUNCTION DOC] HELPER: True for a provenance entry from this pass whose action is
+                # exactly a single creation.
                 return source.pass_name == self.passname and source.action == [
                     NodeSourceAction.CREATE
                 ]
@@ -246,7 +288,9 @@ class GraphTransformObserver:
         return on_node_replace
 
     def get_deepcopy_hook(self) -> Callable[[GraphModule], None]:
+        # [FUNCTION DOC] Returns a callback that remembers deep-copied modules so hooks can be removed later.
         def on_deepcopy(gm: GraphModule) -> None:
+            # [FUNCTION DOC] HELPER: Hook body; appends the copied module to the tracked list.
             self.copied_gms.append(gm)
 
         return on_deepcopy

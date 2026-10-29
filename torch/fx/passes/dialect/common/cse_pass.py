@@ -1,3 +1,6 @@
+# [MODULE DOC] Common subexpression elimination (CSE) pass for FX graphs that is dialect agnostic and
+# based purely on node connectivity. Defines the sets of banned (random and in-place) aten ops, a helper
+# returning their union, and the CSEPass class. Import-time side effect: resolves the aten op namespace.
 from typing import Any
 
 import torch
@@ -44,14 +47,22 @@ inplace_ops = {
 
 @torch.fx._compatibility.compatibility(is_backward_compatible=False)
 def get_CSE_banned_ops() -> set[torch._ops.OpOverloadPacket]:
+    # [FUNCTION DOC] Returns a new set holding every op that CSE must not merge: the union of the
+    # random (stateful) ops and the in-place ops defined in this module. No arguments, no side effects.
     return rand_ops.union(inplace_ops)
 
 
 @torch.fx._compatibility.compatibility(is_backward_compatible=False)
 class CSEPass(PassBase):
+    # [CLASS DOC] Pass that removes duplicate call_function nodes (same target and same substituted
+    # arguments) from a graph module, producing a new module. State: banned_ops, the set of op
+    # packets that are never deduplicated. Only safe for functional graphs.
     def __init__(
         self, banned_ops: set[torch._ops.OpOverloadPacket] | None = None
     ) -> None:
+        # [FUNCTION DOC] Stores the banned op set (an empty set when None is given) and runs the base
+        # initializer. Note the default does not include the module-level random or in-place op sets;
+        # callers wanting those must pass get_CSE_banned_ops explicitly.
         """
         This version of CSE Pass aims to be dialect agnostic, and it's implemented purely based on the connectivity between fx.Node.
 
@@ -67,6 +78,14 @@ class CSEPass(PassBase):
         super().__init__()
 
     def call(self, graph_module: GraphModule) -> PassResult:
+        # [FUNCTION DOC] Builds a new graph by copying nodes in order. Placeholder, output, get_attr and
+        # banned-op nodes are copied unchanged. Other nodes have their arguments remapped to the new
+        # graph; a node whose target and remapped args/kwargs match an earlier node (compared via a hash
+        # then full equality of a token) is dropped and uses are redirected to the earlier node.
+        # Returns a PassResult with the original module and False if nothing was removed, else a new
+        # GraphModule and True. The input module is not mutated.
+        # KNOWN ISSUE: the docstring says the result is always a new copy, but the unmodified case returns
+        # the input module itself. Hash collisions with a differing token are copied but not recorded.
         """
         Return a new copy of torch.fx.GraphModule with CSE applied to the input graph
 
@@ -86,6 +105,8 @@ class CSEPass(PassBase):
         """
 
         def get_aten_target(node: Node) -> Target:
+            # [FUNCTION DOC] HELPER: Returns the overload packet of the node's target if it has one,
+            # otherwise the target itself; used to match against the banned op set.
             if hasattr(node.target, "overloadpacket"):
                 return node.target.overloadpacket
             return node.target
@@ -116,6 +137,9 @@ class CSEPass(PassBase):
                 # substitute args and kwargs members to their mapping in env if exists
                 # specs can be used to reconstruct nested list/dictionaries
                 def substitute(arg_list: Any) -> tuple[tuple[Any, ...], Any]:
+                    # [FUNCTION DOC] HELPER: Flattens a nested args/kwargs structure, replaces every
+                    # Node leaf found in the old-to-new mapping by its new node, and returns the flat
+                    # tuple together with the structure spec needed to rebuild it.
                     arg_list, spec = tree_flatten(arg_list)
                     for i in range(len(arg_list)):
                         v = arg_list[i]

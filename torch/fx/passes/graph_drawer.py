@@ -1,3 +1,7 @@
+# [MODULE DOC] Visualization of FX graphs as graphviz dot graphs through the optional pydot package.
+# Defines color tables and the FxGraphDrawer class. Import-time side effect: tries to import pydot and
+# defines the real drawer when it is available, otherwise defines a stub class whose constructor raises
+# a runtime error asking to install pydot. Exports FxGraphDrawer.
 import hashlib
 from itertools import chain
 from types import ModuleType
@@ -66,6 +70,11 @@ if HAS_PYDOT:
 
     @compatibility(is_backward_compatible=False)
     class FxGraphDrawer:
+        # [CLASS DOC] Builds and stores dot graphs for a graph module and for each of its call_module
+        # children that is itself a GraphModule. State: _name (main graph name), dot_graph_shape (node
+        # shape, default record), normalize_args, and _dot_graphs (mapping of graph name to dot graph,
+        # where child graphs are keyed by main name, underscore and the call target). Query methods return
+        # the stored dot graphs. Note that construction mutates the module-level weight template shape.
         """
         Visualize a torch.fx.Graph with graphviz
         Basic usage:
@@ -84,6 +93,12 @@ if HAS_PYDOT:
             dot_graph_shape: str | None = None,
             normalize_args: bool = False,
         ) -> None:
+            # [FUNCTION DOC] Builds the dot graph of the module under the given name and one more for
+            # every call_module node whose target is a GraphModule (named by name plus target). Options
+            # control skipping get_attr nodes, parameter and buffer nodes, argument name stripping,
+            # stack trace display and argument normalization. Side effect: sets the shape entry of the
+            # shared module-level weight node template, affecting all drawers. Raises RuntimeError if a
+            # call_module target cannot be resolved.
             self._name = name
             self.dot_graph_shape = (
                 dot_graph_shape if dot_graph_shape is not None else "record"
@@ -121,6 +136,8 @@ if HAS_PYDOT:
                 )
 
         def get_dot_graph(self, submod_name: str | None = None) -> pydot.Dot:
+            # [FUNCTION DOC] Returns the main dot graph when no submodule name is given, otherwise the
+            # dot graph of the named submodule. Raises a missing key error for unknown names.
             """
             Visualize a torch.fx.Graph with graphviz
             Example:
@@ -150,15 +167,22 @@ if HAS_PYDOT:
                 return self.get_submod_dot_graph(submod_name)
 
         def get_main_dot_graph(self) -> pydot.Dot:
+            # [FUNCTION DOC] Returns the dot graph built for the top-level module.
             return self._dot_graphs[self._name]
 
         def get_submod_dot_graph(self, submod_name: str) -> pydot.Dot:
+            # [FUNCTION DOC] Returns the dot graph of the submodule with the given call target; raises a
+            # missing key error if there is none.
             return self._dot_graphs[f"{self._name}_{submod_name}"]
 
         def get_all_dot_graphs(self) -> dict[str, pydot.Dot]:
+            # [FUNCTION DOC] Returns the internal mapping of graph name to dot graph (not a copy).
             return self._dot_graphs
 
         def _get_node_style(self, node: torch.fx.Node) -> dict[str, str]:
+            # [FUNCTION DOC] HELPER: Returns the dot style attributes for a node (shape, fill color,
+            # style, font color). The fill color comes from the op table when the op is listed, otherwise
+            # from a stable hash of the printed target name indexing the color palette.
             template = {
                 "shape": self.dot_graph_shape,
                 "fillcolor": "#CAFFE3",
@@ -184,6 +208,9 @@ if HAS_PYDOT:
         def _get_leaf_node(
             self, module: torch.nn.Module, node: torch.fx.Node
         ) -> torch.nn.Module:
+            # [FUNCTION DOC] HELPER: Resolves a call_module node's dotted string target by following
+            # attributes from the given module and returns the resulting object. Raises AssertionError
+            # if the target is not a string and RuntimeError if an attribute is missing.
             py_obj = module
             if not isinstance(node.target, str):
                 raise AssertionError(f"Expected str target, got {type(node.target)}")
@@ -197,6 +224,8 @@ if HAS_PYDOT:
             return py_obj
 
         def _typename(self, target: torch.fx.node.Target | torch.nn.Module) -> str:
+            # [FUNCTION DOC] HELPER: Returns a display name: the type name for modules, the string itself
+            # for strings, else the qualified function name. Curly braces are escaped for dot labels.
             if isinstance(target, torch.nn.Module):
                 ret = torch.typename(target)
             elif isinstance(target, str):
@@ -217,6 +246,8 @@ if HAS_PYDOT:
             full_file_name: str,
             truncate_to_last_n: int = 2,
         ) -> str:
+            # [FUNCTION DOC] HELPER: Keeps only the last N slash-separated components of a path (default
+            # two); shorter paths are returned unchanged.
             splits = full_file_name.split("/")
             if len(splits) >= truncate_to_last_n:
                 return "/".join(splits[-truncate_to_last_n:])
@@ -229,7 +260,17 @@ if HAS_PYDOT:
             skip_node_names_in_args: bool,
             parse_stack_trace: bool,
         ) -> str:
+            # [FUNCTION DOC] HELPER: Builds the record style label of a node: name and op code; for
+            # module calls the module type and its constants; for other nodes the target, formatted args
+            # and kwargs (optionally normalized, falling back on failure) and user count. Then appends
+            # tensor metadata, buffer metadata (name and origin count) and, if requested and available,
+            # the shortened file, line and code from the stack trace. Raises RuntimeError for unsupported
+            # tensor metadata types or an unresolvable module target.
             def _get_str_for_args_kwargs(arg: tuple[Any, ...] | dict[str, Any]) -> str:
+                # [FUNCTION DOC] HELPER: Formats a tuple of args or a mapping of kwargs as a multi-line
+                # label fragment (truncating long lists), optionally dropping entries that mention node
+                # names, escaping braces; single entries are put on one line. Returns an empty string
+                # for other types or when nothing remains.
                 if isinstance(arg, tuple):
                     prefix, suffix = r"|args=(\l", r",\n)\l"
                     arg_strs_list = [_format_arg(a, max_list_len=8) for a in arg]
@@ -311,6 +352,9 @@ if HAS_PYDOT:
             return label + "}"
 
         def _tensor_meta_to_label(self, tm: object) -> str:
+            # [FUNCTION DOC] HELPER: Converts tensor metadata to label text: empty for none, formatted
+            # fields for a single metadata record, and the concatenation over elements for lists,
+            # tuples and mapping values (recursively). Raises RuntimeError for any other type.
             if tm is None:
                 return ""
             elif isinstance(tm, TensorMetadata):
@@ -334,6 +378,12 @@ if HAS_PYDOT:
                 raise RuntimeError(f"Unsupported tensor meta type {type(tm)}")
 
         def _stringify_tensor_meta(self, tm: TensorMetadata) -> str:
+            # [FUNCTION DOC] HELPER: Renders dtype, shape, requires_grad and stride as label lines, plus
+            # quantization parameters (per-tensor scale and zero point, or per-channel scale, zero point
+            # and axis) and the scheme when the tensor is quantized. Raises AssertionError if quantization
+            # parameters or the scheme are missing and RuntimeError for an unsupported scheme.
+            # Side effect: prints the record to standard output when it lacks a dtype attribute.
+            # KNOWN ISSUE: the debug print is left in; a record without dtype then fails on the next line.
             result = ""
             if not hasattr(tm, "dtype"):
                 print("tm", tm)
@@ -391,6 +441,8 @@ if HAS_PYDOT:
             return result
 
         def _get_tensor_label(self, t: torch.Tensor) -> str:
+            # [FUNCTION DOC] HELPER: Returns dtype followed by the list of dimensions of the tensor,
+            # ending with a literal line break escape for dot labels.
             return str(t.dtype) + str(list(t.shape)) + r"\n"
 
         # when parse_stack_trace=True
@@ -404,6 +456,13 @@ if HAS_PYDOT:
             skip_node_names_in_args: bool,
             parse_stack_trace: bool,
         ) -> pydot.Dot:
+            # [FUNCTION DOC] HELPER: Creates a top-to-bottom dot graph with one node per FX node (skipping
+            # get_attr nodes if requested), styled and labeled; nodes whose buffer metadata has several
+            # origins are grouped into colored clusters per buffer. For module calls to non-GraphModule
+            # modules, adds weight nodes and edges for each parameter and buffer unless disabled. Finally
+            # adds clusters and an edge from each node to each of its users. Returns the dot graph.
+            # KNOWN ISSUE: in the weight node label, operator precedence makes buffers lose their name
+            # prefix (only the buffer text is used), while parameters get the full prefix.
             """
             Actual interface to visualize a fx.Graph. Note that it takes in the GraphModule instead of the Graph.
             If ignore_parameters_and_buffers is True, the parameters and buffers
@@ -443,6 +502,9 @@ if HAS_PYDOT:
                 current_graph.add_node(dot_node)
 
                 def get_module_params_or_buffers() -> None:
+                    # [FUNCTION DOC] HELPER: For the current leaf module, adds a weight node for every
+                    # parameter and buffer to the dot graph, each with an edge to the module node.
+                    # Reads the enclosing loop variables for the node and module at call time.
                     for pname, ptensor in chain(
                         leaf_module.named_parameters(),
                         # pyrefly: ignore [bad-argument-type]
@@ -489,6 +551,8 @@ else:
 
         @compatibility(is_backward_compatible=False)
         class FxGraphDrawer:
+            # [CLASS DOC] Fallback stub used when pydot is not installed; it has no state and cannot be
+            # instantiated successfully.
             def __init__(
                 self,
                 graph_module: torch.fx.GraphModule,
@@ -500,6 +564,8 @@ else:
                 dot_graph_shape: str | None = None,
                 normalize_args: bool = False,
             ):
+                # [FUNCTION DOC] Always raises a runtime error telling the user to install pydot;
+                # all arguments are ignored.
                 raise RuntimeError(
                     "FXGraphDrawer requires the pydot package to be installed. Please install "
                     "pydot through your favorite Python package manager."
