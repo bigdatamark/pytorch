@@ -1,4 +1,12 @@
 # mypy: allow-untyped-defs
+# [PACKAGE DOC] The torch.xpu package: Intel GPU (XPU) backend support. Lazily initializes
+# the XPU runtime, and provides device queries and selection (count, properties, names,
+# capability, current/set device, device context managers), stream and event utilities,
+# synchronization, Level Zero Sysman based telemetry (utilization, temperature, clocks,
+# power, memory), and re-exports of the memory, random, streams and graphs submodules.
+# Import time creates module-level state (init lock, queued lazy calls, device
+# caches) but does not initialize XPU; device property types fall back to dummies when
+# PyTorch is built without XPU.
 r"""
 This package introduces support for the XPU backend, specifically tailored for
 Intel GPU optimization.
@@ -53,6 +61,9 @@ _cached_device_count: int | None = None
 
 @dataclasses.dataclass
 class _ZesDeviceInfo:
+    # [CLASS DOC] HELPER: Record of Level Zero Sysman handles for one logical device: the
+    # device handle, sub-device id (None unless a tiled sub-device), integrated-GPU flag and
+    # lazily filled optional handles for temperature, frequency, power, engine and memory.
     device_handle: c_void_p
     subdevice_id: int | None = None
     is_integrated: bool = False
@@ -69,6 +80,7 @@ _zes_sample_interval_ms = 150
 
 
 def _is_compiled() -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if this PyTorch build includes XPU support.
     r"""Return true if compile with XPU support."""
     return torch._C._has_xpu
 
@@ -82,13 +94,19 @@ else:
     _XpuDeviceProperties = _dummy_type("_XpuDeviceProperties")  # type: ignore[assignment, misc]
 
     def _exchange_device(device: int) -> int:
+        # [FUNCTION DOC] HELPER: Stub for builds without XPU; always raises NotImplementedError.
         raise NotImplementedError("PyTorch was compiled without XPU support")
 
     def _maybe_exchange_device(device: int) -> int:
+        # [FUNCTION DOC] HELPER: Stub for builds without XPU; always raises NotImplementedError.
         raise NotImplementedError("PyTorch was compiled without XPU support")
 
 
 def _parse_visible_devices(strict=False) -> list[int]:
+    # [FUNCTION DOC] HELPER: Reads the ZE_AFFINITY_MASK environment variable and returns the
+    # list of distinct non-negative visible device ordinals. Unset gives 0 through 127.
+    # A non-integer entry (composite style) gives an empty list, or raises ValueError if
+    # strict is True. Negative entries are skipped.
     r"""Parse ``ZE_AFFINITY_MASK`` and return visible device ordinals.
 
     Returns a list of non-negative device ordinals specified by the mask.
@@ -126,6 +144,12 @@ def _parse_visible_devices(strict=False) -> list[int]:
 
 
 def _enum_zes_device_infos(visible_mask: list[int]) -> int:
+    # [FUNCTION DOC] HELPER: Enumerates devices of the first Level Zero Sysman driver, and
+    # rebuilds the global cached device info list with entries whose logical index is in
+    # visible_mask (tiled discrete GPUs expand into sub-devices unless the hierarchy mode is
+    # composite). Discrete GPUs take priority over integrated ones. Returns the visible
+    # count, 0 if no driver, or -1 if pyzes is missing or any Sysman call fails (warning
+    # issued for failures). Side effects: mutates the cache and may warn.
     r"""Enumerate visible XPU devices via Level Zero Sysman and cache their info.
 
     Enumerates devices from the first Level Zero Sysman driver and counts those
@@ -156,6 +180,8 @@ def _enum_zes_device_infos(visible_mask: list[int]) -> int:
     global _cached_zes_device_infos
 
     def _zes_check_warn(rc: int, msg: str) -> bool:
+        # [FUNCTION DOC] HELPER: Warns with msg when result code rc is not success; returns
+        # True on failure, False on success.
         """Return True if the call failed (rc != ZE_RESULT_SUCCESS) after issuing a warning."""
         if rc != pyzes.ZE_RESULT_SUCCESS:
             warnings.warn(msg, stacklevel=3)
@@ -247,11 +273,15 @@ def _enum_zes_device_infos(visible_mask: list[int]) -> int:
 
 
 def _raw_device_count_zes(visible_mask: list[int]) -> int:
+    # [FUNCTION DOC] HELPER: Returns the visible device count for visible_mask via Sysman
+    # enumeration (negative on failure).
     r"""Return the visible XPU device count via Level Zero Sysman, or negative on failure."""
     return _enum_zes_device_infos(visible_mask)
 
 
 def _device_count_zes() -> int:
+    # [FUNCTION DOC] HELPER: Returns the visible device count from the environment mask via
+    # Sysman, or -1 if the mask is unsupported or enumeration fails.
     r"""Return the number of visible XPU devices, or -1 on failure."""
     visible_devices = _parse_visible_devices()
     if not visible_devices:
@@ -260,6 +290,9 @@ def _device_count_zes() -> int:
 
 
 def device_count() -> int:
+    # [FUNCTION DOC] Returns the number of XPU devices (0 if not compiled with XPU). Uses a
+    # cached count once initialized; before initialization it prefers Sysman discovery
+    # (which does not poison fork) and falls back to the runtime query, without caching.
     r"""
     Return the number of XPU device available.
 
@@ -285,12 +318,15 @@ def device_count() -> int:
 
 
 def is_available() -> bool:
+    # [FUNCTION DOC] Returns True if at least one XPU device is present. Never raises.
     r"""Return a bool indicating if XPU is currently available."""
     # This function never throws.
     return device_count() > 0
 
 
 def is_bf16_supported(including_emulation: bool = True) -> bool:
+    # [FUNCTION DOC] Returns False if XPU is unavailable; True if emulation counts as
+    # support; otherwise whether the current device has native bfloat16 conversions.
     r"""Return a bool indicating if the current XPU device supports dtype bfloat16."""
     if not is_available():
         return False
@@ -301,6 +337,8 @@ def is_bf16_supported(including_emulation: bool = True) -> bool:
 
 
 def is_tf32_supported() -> bool:
+    # [FUNCTION DOC] Returns whether the current device supports tf32, judged by subgroup
+    # matrix multiply-accumulate support; False if XPU is unavailable.
     r"""Return a bool indicating if the current XPU device supports dtype tf32."""
     if not is_available():
         return False
@@ -312,11 +350,17 @@ def is_tf32_supported() -> bool:
 
 
 def is_initialized():
+    # [FUNCTION DOC] Returns True if XPU state is initialized and the process is not in a
+    # bad (forked) state.
     r"""Return whether PyTorch's XPU state has been initialized."""
     return _initialized and not _is_in_bad_fork()
 
 
 def _lazy_call(callable, **kwargs) -> None:
+    # [FUNCTION DOC] HELPER: Runs callable now if XPU is initialized; otherwise queues it
+    # (with the captured call stack text) to run at initialization. Keyword flags seed_all
+    # or seed route it to the lazy seed tracker so only the latest seed call is kept. Holds
+    # the initialization lock while deciding.
     with _initialization_lock:
         if is_initialized():
             callable()
@@ -332,6 +376,7 @@ def _lazy_call(callable, **kwargs) -> None:
 
 
 def init() -> None:
+    # [FUNCTION DOC] Public entry to initialize XPU state lazily; no-op if already done.
     r"""Initialize PyTorch's XPU state.
     This is a Python API about lazy initialization that avoids initializing
     XPU until the first time it is accessed. Does nothing if the XPU state is
@@ -341,6 +386,14 @@ def init() -> None:
 
 
 def _lazy_init() -> None:
+    # [FUNCTION DOC] HELPER: Initializes the XPU runtime once, thread-safely. Returns early if
+    # initialized or re-entered from a queued call. Raises RuntimeError in a forked child
+    # process and AssertionError if built without XPU. Runs the native init, then every
+    # queued lazy call (including pending seed calls); a failing call raises a generic
+    # Exception wrapping the message and the original call stack. Sets the initialized
+    # flag only on success.
+    # KNOWN ISSUE: the queued call list is not cleared after running, unlike the declared
+    # global suggests, so the same calls stay stored.
     global _initialized, _queued_calls
     if is_initialized() or hasattr(_tls, "is_initializing"):
         return
@@ -381,19 +434,27 @@ def _lazy_init() -> None:
 
 
 class _DeviceGuard:
+    # [CLASS DOC] HELPER: Context manager that switches the current device to a given index
+    # on entry and restores the previous one on exit. State: idx and prev_idx.
     def __init__(self, index: int) -> None:
+        # [FUNCTION DOC] HELPER: Stores the target index; previous index starts as -1.
         self.idx = index
         self.prev_idx = -1
 
     def __enter__(self):
+        # [FUNCTION DOC] HELPER: Switches to idx, remembering the previous device index.
         self.prev_idx = torch.xpu._exchange_device(self.idx)
 
     def __exit__(self, type: Any, value: Any, traceback: Any):
+        # [FUNCTION DOC] HELPER: Restores the previous device; never suppresses exceptions.
         self.idx = torch.xpu._maybe_exchange_device(self.prev_idx)
         return False
 
 
 class device:
+    # [CLASS DOC] Context manager selecting an XPU device for the with block and restoring
+    # the previous device on exit. State: idx (target index; negative means no-op) and
+    # prev_idx. The index is resolved from an int, string, device object or None (current).
     r"""Context-manager that changes the selected device.
 
     Args:
@@ -402,18 +463,24 @@ class device:
     """
 
     def __init__(self, device: Any) -> None:
+        # [FUNCTION DOC] Resolves device to an index (None means current) and stores it.
+        # Raises ValueError for non-XPU devices.
         self.idx = _get_device_index(device, optional=True)
         self.prev_idx = -1
 
     def __enter__(self):
+        # [FUNCTION DOC] Switches to the selected device, remembering the previous index.
         self.prev_idx = torch.xpu._exchange_device(self.idx)
 
     def __exit__(self, type: Any, value: Any, traceback: Any):
+        # [FUNCTION DOC] Switches back to the previous device; never suppresses exceptions.
         self.idx = torch.xpu._maybe_exchange_device(self.prev_idx)
         return False
 
 
 class device_of(device):
+    # [CLASS DOC] Device context manager that selects the device of a tensor or storage
+    # (no-op if the object is not on an XPU). Extends device.
     r"""Context-manager that changes the current device to that of given object.
 
     You can use both tensors and storages as arguments. If a given object is
@@ -424,11 +491,14 @@ class device_of(device):
     """
 
     def __init__(self, obj) -> None:
+        # [FUNCTION DOC] Uses the object's device index if it lives on XPU, else -1 (no-op).
         idx = obj.get_device() if obj.is_xpu else -1
         super().__init__(idx)
 
 
 def set_device(device: Device) -> None:
+    # [FUNCTION DOC] Makes device the current XPU device; negative index is a no-op.
+    # Initializes XPU. Raises ValueError for non-XPU devices.
     r"""Set the current device.
 
     Args:
@@ -442,6 +512,7 @@ def set_device(device: Device) -> None:
 
 
 def get_device_name(device: Device = None) -> str:
+    # [FUNCTION DOC] Returns the name string from the properties of device (default current).
     r"""Get the name of a device.
 
     Args:
@@ -458,6 +529,11 @@ def get_device_name(device: Device = None) -> str:
 
 @lru_cache(None)
 def get_device_capability(device: Device = None) -> dict[str, Any]:
+    # [FUNCTION DOC] Returns a mapping of the device property attribute names to values,
+    # keeping only plain serializable types (numbers, strings, bool, None, containers).
+    # Results are cached per argument.
+    # KNOWN ISSUE: the cache is keyed by the argument, so with None it can return stale data
+    # after the current device changes.
     r"""Get the xpu capability of a device.
 
     Args:
@@ -484,6 +560,9 @@ def get_device_capability(device: Device = None) -> dict[str, Any]:
 def get_device_properties(
     device: Device = None,
 ) -> _XpuDeviceProperties:
+    # [FUNCTION DOC] Returns the properties object of device (default current): name, memory,
+    # compute and feature flags. Initializes XPU; invalid indices are rejected by the
+    # native layer.
     r"""Get the properties of a device. Returns _XpuDeviceProperties containing the following device properties:
 
     - ``name`` (str): device name.
@@ -528,12 +607,15 @@ def get_device_properties(
 
 
 def current_device() -> int:
+    # [FUNCTION DOC] Returns the index of the current XPU device. Initializes XPU.
     r"""Return the index of a currently selected device."""
     _lazy_init()
     return torch._C._xpu_getDevice()
 
 
 def _get_device(device: int | str | torch.device) -> torch.device:
+    # [FUNCTION DOC] HELPER: Converts a string or int (as an xpu index) into a torch.device;
+    # a torch.device is returned unchanged.
     r"""Return the torch.device type object from the passed in device.
 
     Args:
@@ -547,6 +629,8 @@ def _get_device(device: int | str | torch.device) -> torch.device:
 
 
 def can_device_access_peer(device: Device, peer: Device) -> bool:
+    # [FUNCTION DOC] Returns True if device can access peer device's memory. Both resolve to
+    # indices (None means current). Initializes XPU.
     r"""Query whether a device can access a peer device's memory.
 
     Args:
@@ -563,6 +647,10 @@ def can_device_access_peer(device: Device, peer: Device) -> bool:
 
 
 class StreamContext:
+    # [CLASS DOC] Context manager that makes a given stream current for the with block and
+    # restores previous streams on exit (on both the source and, if different, the stream's
+    # device). A None stream makes it a no-op. State: stream, idx, and previous streams saved
+    # on entry.
     r"""Context-manager that selects a given stream.
 
     All XPU kernels queued within its context will be enqueued on a selected
@@ -577,12 +665,15 @@ class StreamContext:
     cur_stream: torch.xpu.Stream | None
 
     def __init__(self, stream: torch.xpu.Stream | None) -> None:
+        # [FUNCTION DOC] Stores the stream and the current device index (fallback -1).
         self.stream = stream
         self.idx = _get_device_index(None, True)
         if self.idx is None:
             self.idx = -1  # pyrefly: ignore [bad-assignment]
 
     def __enter__(self):
+        # [FUNCTION DOC] Saves the current stream (and the target device's current stream when
+        # on another device), then sets the managed stream current. No-op for None stream.
         cur_stream = self.stream
         if cur_stream is None or self.idx == -1:
             return
@@ -595,6 +686,7 @@ class StreamContext:
         torch.xpu.set_stream(cur_stream)
 
     def __exit__(self, type: Any, value: Any, traceback: Any):
+        # [FUNCTION DOC] Restores the streams saved on entry; no-op for None stream.
         cur_stream = self.stream
         if cur_stream is None or self.idx == -1:
             return
@@ -606,6 +698,7 @@ class StreamContext:
 
 
 def stream(stream: torch.xpu.Stream | None) -> StreamContext:
+    # [FUNCTION DOC] Returns a StreamContext for stream (no-op context if None).
     r"""Wrap around the Context-manager StreamContext that selects a given stream.
 
     Arguments:
@@ -615,6 +708,8 @@ def stream(stream: torch.xpu.Stream | None) -> StreamContext:
 
 
 def _set_stream_by_id(stream_id, device_index, device_type) -> None:
+    # [FUNCTION DOC] HELPER: Makes the stream identified by id, device index and device type
+    # the current one via the native layer.
     r"""set stream specified by the stream id, device index and device type
 
     Args: stream_id (int): not visible to the user, used to assigned to the specific stream.
@@ -629,6 +724,8 @@ def _set_stream_by_id(stream_id, device_index, device_type) -> None:
 
 
 def set_stream(stream: Stream) -> None:
+    # [FUNCTION DOC] Sets the current stream (of its device) to stream; returns immediately
+    # for None. Initializes XPU otherwise.
     r"""Set the current stream. This is a wrapper API to set the stream.
         Usage of this function is discouraged in favor of the ``stream``
         context manager.
@@ -648,6 +745,8 @@ def set_stream(stream: Stream) -> None:
 
 
 def current_stream(device: Device = None) -> Stream:
+    # [FUNCTION DOC] Returns a Stream object for the stream currently selected on device
+    # (default current device). Initializes XPU.
     r"""Return the currently selected :class:`Stream` for a given device.
 
     Args:
@@ -666,6 +765,8 @@ def current_stream(device: Device = None) -> Stream:
 
 
 def get_stream_from_external(data_ptr: int, device: Device = None) -> Stream:
+    # [FUNCTION DOC] Wraps an externally created SYCL queue (address data_ptr, created on
+    # device) as a Stream. The queue lifetime is not managed here. Initializes XPU.
     r"""Return a :class:`Stream` from an external SYCL queue.
 
     This function is used to wrap SYCL queue created in other libraries in order
@@ -691,6 +792,8 @@ def get_stream_from_external(data_ptr: int, device: Device = None) -> Stream:
 
 
 def synchronize(device: Device = None) -> None:
+    # [FUNCTION DOC] Blocks until all work in all streams of device (default current)
+    # completes. Initializes XPU.
     r"""Wait for all kernels in all streams on a XPU device to complete.
 
     Args:
@@ -704,6 +807,8 @@ def synchronize(device: Device = None) -> None:
 
 
 def _sleep(cycles: int) -> None:
+    # [FUNCTION DOC] HELPER: Enqueues an asynchronous device-side spin of cycles clock cycles
+    # on the current stream; returns immediately.
     r"""Spin the current XPU device for the given number of device clock cycles.
 
     The kernel is enqueued on the current stream and returns immediately on the
@@ -716,6 +821,8 @@ def _sleep(cycles: int) -> None:
 
 
 def get_arch_list() -> list[str]:
+    # [FUNCTION DOC] Returns the list of device architectures this build was compiled for;
+    # empty if built without XPU or no flags are available.
     r"""Return list XPU architectures this library was compiled for."""
     if not _is_compiled():
         return []
@@ -726,6 +833,8 @@ def get_arch_list() -> list[str]:
 
 
 def get_gencode_flags() -> str:
+    # [FUNCTION DOC] Returns the ahead-of-time build flag string listing the compiled
+    # architectures joined by commas, or an empty string if there are none.
     r"""Return XPU AOT(ahead-of-time) build flags this library was compiled with."""
     arch_list = get_arch_list()
     if len(arch_list) == 0:
@@ -734,6 +843,8 @@ def get_gencode_flags() -> str:
 
 
 def _get_generator(device: torch.device) -> torch._C.Generator:
+    # [FUNCTION DOC] HELPER: Returns the default generator of device (current index if the
+    # device has none).
     r"""Return the XPU Generator object for the given device.
 
     Args:
@@ -748,6 +859,8 @@ def _get_generator(device: torch.device) -> torch._C.Generator:
 def _set_rng_state_offset(
     offset: int, device: int | str | torch.device = "xpu"
 ) -> None:
+    # [FUNCTION DOC] HELPER: Schedules (via the lazy call queue) setting the default
+    # generator's offset on device to offset.
     r"""Set the random number generator state offset of the specified GPU.
 
     Args:
@@ -758,6 +871,7 @@ def _set_rng_state_offset(
     final_device = _get_device(device)
 
     def cb() -> None:
+        # [FUNCTION DOC] HELPER: Deferred action setting the generator offset.
         default_generator = _get_generator(final_device)
         default_generator.set_offset(offset)
 
@@ -765,6 +879,7 @@ def _set_rng_state_offset(
 
 
 def _get_rng_state_offset(device: int | str | torch.device = "xpu") -> int:
+    # [FUNCTION DOC] HELPER: Returns the default generator's offset for device. Initializes XPU.
     r"""Return the random number generator state offset of the specified GPU.
 
     Args:
@@ -781,6 +896,8 @@ def _get_rng_state_offset(device: int | str | torch.device = "xpu") -> int:
 
 
 def _import_pyzes():
+    # [FUNCTION DOC] HELPER: Imports and returns the pyzes module. Raises ImportError if it
+    # is not installed, RuntimeError if importing fails for another reason (driver issue).
     """Return the imported pyzes module; raise ImportError if missing, RuntimeError if the GPU driver is unavailable."""
     try:
         import pyzes  # type: ignore[import]
@@ -796,6 +913,8 @@ def _import_pyzes():
 
 
 def _get_pyzes_version() -> tuple[int, ...]:
+    # [FUNCTION DOC] HELPER: Returns the installed pyzes version as a tuple of ints. Raises
+    # on a package that is missing or has a non-numeric version component.
     """
     Return the version of the pyzes package as a tuple of integers (major, minor, patch).
     Always ensure that the pyzes package is installed before calling this function.
@@ -806,6 +925,7 @@ def _get_pyzes_version() -> tuple[int, ...]:
 
 
 def _zes_check(rc: int, msg: str) -> None:
+    # [FUNCTION DOC] HELPER: Raises RuntimeError with msg and the code if rc is not success.
     """Raise RuntimeError if the Level Zero Sysman call failed (rc != ZE_RESULT_SUCCESS)."""
     import pyzes  # type: ignore[import]
 
@@ -814,6 +934,8 @@ def _zes_check(rc: int, msg: str) -> None:
 
 
 def _zes_ensure_device_infos(device: int):
+    # [FUNCTION DOC] HELPER: Populates the device info cache if empty (strict mask parsing)
+    # and checks the index. Raises RuntimeError if enumeration fails or device is out of range.
     """Ensure the ZES device info cache is populated and validate the device index."""
     if not _cached_zes_device_infos:
         if _enum_zes_device_infos(_parse_visible_devices(strict=True)) < 0:
@@ -827,6 +949,9 @@ def _zes_ensure_device_infos(device: int):
 
 
 def _get_zes_temperature_handle(device: Device = None) -> c_void_p:
+    # [FUNCTION DOC] HELPER: Returns (and caches) the GPU temperature sensor handle for device:
+    # the sensor of GPU type matching the sub-device (or the root-level one for non-tiled).
+    # Raises RuntimeError if none is found or a Sysman call fails.
     r"""Return the Level Zero Sysman GPU temperature sensor handle for the specified device.
 
     The result is cached in ``_ZesDeviceInfo.temperature_handle`` so that
@@ -894,6 +1019,8 @@ def _get_zes_temperature_handle(device: Device = None) -> c_void_p:
 
 
 def temperature(device: Device = None) -> float:
+    # [FUNCTION DOC] Returns the GPU temperature in degrees Celsius via Sysman. Raises
+    # RuntimeError if unavailable (may need elevated privileges) or the query fails.
     r"""Return the GPU temperature in degrees Celsius.
 
     Args:
@@ -919,6 +1046,9 @@ def temperature(device: Device = None) -> float:
 
 
 def _get_zes_frequency_handle(device: Device = None) -> c_void_p:
+    # [FUNCTION DOC] HELPER: Returns (and caches) the GPU frequency domain handle for device.
+    # With pyzes older than 0.1.2 it takes the first domain; otherwise it picks the GPU-type
+    # domain matching the sub-device (or root-level). Raises RuntimeError if none is found.
     r"""Return the Level Zero Sysman GPU frequency domain handle for the specified device.
 
     The result is cached in ``_ZesDeviceInfo.frequency_handle`` so that
@@ -989,6 +1119,8 @@ def _get_zes_frequency_handle(device: Device = None) -> c_void_p:
 
 
 def clock_rate(device: Device = None) -> float:
+    # [FUNCTION DOC] Returns the current actual GPU clock rate in MHz via Sysman. Raises
+    # RuntimeError if the query fails.
     r"""Return the GPU clock rate in MHz.
 
     Args:
@@ -1008,6 +1140,10 @@ def clock_rate(device: Device = None) -> float:
 
 
 def _get_zes_power_handle(device: Device = None) -> c_void_p:
+    # [FUNCTION DOC] HELPER: Returns (and caches) the power domain handle for device. With
+    # pyzes older than 0.1.2 it takes the first domain; otherwise it prefers the card domain
+    # and falls back to the package domain, matching sub-device or root-level. Raises
+    # RuntimeError if none is found.
     r"""Return the Level Zero Sysman GPU power domain handle for the specified device.
 
     The result is cached in ``_ZesDeviceInfo.power_handle`` so that
@@ -1086,6 +1222,11 @@ def _get_zes_power_handle(device: Device = None) -> c_void_p:
 
 
 def power_draw(device: Device = None) -> float:
+    # [FUNCTION DOC] Returns card power draw in watts: energy delta over time delta between
+    # two counter reads separated by the sampling interval (blocks about 150 ms, set by the
+    # module interval variable). Raises RuntimeError if unavailable or a query fails.
+    # KNOWN ISSUE: the docstring says the sampling interval is 100 ms but the module value
+    # is 150 ms; the same mismatch exists in utilization and memory_usage.
     r"""Return the GPU card power draw in watts.
 
     The value is computed by dividing the energy delta by the time delta between
@@ -1133,6 +1274,9 @@ def power_draw(device: Device = None) -> float:
 
 
 def _get_zes_engine_handle(device: Device = None) -> c_void_p:
+    # [FUNCTION DOC] HELPER: Returns (and caches) the engine group handle of the all-engines
+    # type for device, matching sub-device or root-level. Raises RuntimeError if no groups
+    # (also the symptom of missing privileges) or no match is found.
     r"""Return the Level Zero Sysman GPU engine group handle for the specified device.
 
     The result is cached in ``_ZesDeviceInfo.engine_handle`` so that
@@ -1202,6 +1346,9 @@ def _get_zes_engine_handle(device: Device = None) -> c_void_p:
 
 
 def utilization(device: Device = None) -> float:
+    # [FUNCTION DOC] Returns GPU engine utilization as a percentage: active-time delta over
+    # time delta between two activity reads separated by the sampling interval (blocks).
+    # Raises RuntimeError if unavailable or a query fails.
     r"""Return the GPU engine utilization as a percentage.
 
     The value is computed by dividing the active-time delta by the time delta
@@ -1247,6 +1394,8 @@ def utilization(device: Device = None) -> float:
 
 
 def _zes_get_memory_handle(device: Device = None) -> c_void_p:
+    # [FUNCTION DOC] HELPER: Returns (and caches) the device-local memory module handle for
+    # device, matching sub-device or root-level. Raises RuntimeError if none is found.
     r"""Return the Level Zero Sysman GPU memory module handle for the specified device.
 
     The result is cached in ``_ZesDeviceInfo.memory_handle`` so that
@@ -1312,6 +1461,9 @@ def _zes_get_memory_handle(device: Device = None) -> c_void_p:
 
 
 def memory_usage(device: Device = None) -> float:
+    # [FUNCTION DOC] Returns memory bandwidth usage as a percentage of the hardware peak:
+    # bytes read plus written between two counter reads separated by the sampling interval
+    # (blocks), scaled by elapsed time. Raises RuntimeError if unavailable or a query fails.
     r"""Return the GPU memory bandwidth usage as a percentage.
 
     The value is computed by dividing the byte-transfer delta by the time delta
@@ -1361,6 +1513,8 @@ def memory_usage(device: Device = None) -> float:
 
 
 def device_memory_used(device: Device = None) -> int:
+    # [FUNCTION DOC] Returns used device memory in bytes: total (physical size, or allocatable
+    # size when the driver reports zero) minus free. Raises RuntimeError if unavailable.
     r"""Return the current GPU used global (device) memory in bytes.
 
     Args:

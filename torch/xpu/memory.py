@@ -1,3 +1,8 @@
+# [MODULE DOC] XPU caching allocator utilities: cache release, memory statistics and peak
+# resets, per-process memory fraction, allocator snapshots and history recording, a
+# pluggable allocator loaded from a shared library, MemPool and use_mem_pool, and a GPU
+# process listing via Level Zero. Import time: when torch is built without XPU, registers
+# dummy placeholders for the native allocator symbols in the torch._C namespace.
 import collections
 import contextlib
 import ctypes
@@ -24,6 +29,8 @@ if not _is_compiled():
 
 
 def empty_cache() -> None:
+    # [FUNCTION DOC] Releases all unoccupied cached memory held by the caching allocator.
+    # Does nothing if XPU is not initialized.
     r"""Release all unoccupied cached memory currently held by the caching
     allocator so that those can be used in other XPU application.
 
@@ -37,6 +44,8 @@ def empty_cache() -> None:
 
 
 def reset_peak_memory_stats(device: Device = None) -> None:
+    # [FUNCTION DOC] Resets the peak statistics of the allocator for device (None means the
+    # current device). Resolves the device index; side effect on allocator state.
     r"""Reset the "peak" stats tracked by the XPU memory allocator.
 
     See :func:`~torch.xpu.memory_stats` for details. Peak stats correspond to the
@@ -52,6 +61,8 @@ def reset_peak_memory_stats(device: Device = None) -> None:
 
 
 def reset_accumulated_memory_stats(device: Device = None) -> None:
+    # [FUNCTION DOC] Resets the accumulated (allocated and freed totals) statistics of the
+    # allocator for device (None means the current device).
     r"""Reset the "accumulated" (historical) stats tracked by the XPU memory allocator.
 
     See :func:`~torch.xpu.memory_stats` for details. Accumulated stats correspond to
@@ -67,6 +78,8 @@ def reset_accumulated_memory_stats(device: Device = None) -> None:
 
 
 def memory_stats_as_nested_dict(device: Device = None) -> dict[str, Any]:
+    # [FUNCTION DOC] Returns the allocator statistics of device as a nested mapping, or an
+    # empty mapping if XPU is not initialized.
     r"""Return the result of :func:`~torch.xpu.memory_stats` as a nested dictionary."""
     if not is_initialized():
         return {}
@@ -77,6 +90,8 @@ def memory_stats_as_nested_dict(device: Device = None) -> dict[str, Any]:
 def _recurse_add_to_result(
     result: list[tuple[str, Any]], prefix: str, obj: Any
 ) -> None:
+    # [FUNCTION DOC] HELPER: Flattens a nested mapping obj into dotted-key (name, value)
+    # pairs appended to the result list (mutated), using prefix as the key path so far.
     if isinstance(obj, dict):
         if prefix:
             prefix += "."
@@ -87,6 +102,9 @@ def _recurse_add_to_result(
 
 
 def memory_stats(device: Device = None) -> dict[str, Any]:
+    # [FUNCTION DOC] Returns an ordered mapping of flattened statistic names (dotted paths
+    # such as the pool and metric) to values for device, sorted by name. Empty if XPU is
+    # not initialized.
     r"""Return a dictionary of XPU memory allocator statistics for a given device.
 
     The return value of this function is a dictionary of statistics, each of
@@ -134,6 +152,7 @@ def memory_stats(device: Device = None) -> dict[str, Any]:
 
 
 def memory_allocated(device: Device = None) -> int:
+    # [FUNCTION DOC] Returns the current bytes occupied by tensors on device (0 if absent).
     r"""Return the current GPU memory occupied by tensors in bytes for a given device.
 
     Args:
@@ -150,6 +169,8 @@ def memory_allocated(device: Device = None) -> int:
 
 
 def max_memory_allocated(device: Device = None) -> int:
+    # [FUNCTION DOC] Returns the peak bytes occupied by tensors on device since start or the
+    # last peak reset (0 if absent).
     r"""Return the maximum GPU memory occupied by tensors in bytes for a given device.
 
     By default, this returns the peak allocated memory since the beginning of
@@ -167,6 +188,7 @@ def max_memory_allocated(device: Device = None) -> int:
 
 
 def memory_reserved(device: Device = None) -> int:
+    # [FUNCTION DOC] Returns the current bytes managed by the caching allocator on device.
     r"""Return the current GPU memory managed by the caching allocator in bytes for a given device.
 
     Args:
@@ -178,6 +200,8 @@ def memory_reserved(device: Device = None) -> int:
 
 
 def max_memory_reserved(device: Device = None) -> int:
+    # [FUNCTION DOC] Returns the peak bytes managed by the caching allocator on device since
+    # start or the last peak reset (0 if absent).
     r"""Return the maximum GPU memory managed by the caching allocator in bytes for a given device.
 
     By default, this returns the peak cached memory since the beginning of this
@@ -195,6 +219,8 @@ def max_memory_reserved(device: Device = None) -> int:
 
 
 def mem_get_info(device: Device = None) -> tuple[int, int]:
+    # [FUNCTION DOC] Returns (free bytes, total bytes) of device memory as reported by the
+    # runtime. Eagerly initializes XPU.
     r"""Return the global free and total GPU memory for a given device.
 
     Args:
@@ -213,6 +239,8 @@ def mem_get_info(device: Device = None) -> tuple[int, int]:
 
 
 def get_per_process_memory_fraction(device: Device = None) -> float:
+    # [FUNCTION DOC] Returns the fraction of total device memory the caching allocator may
+    # use for this process on device. Eagerly initializes XPU.
     r"""
     Retrieve the memory fraction currently set for a process on a given XPU device.
     This fraction represents the portion of the total device memory that
@@ -233,6 +261,9 @@ def get_per_process_memory_fraction(device: Device = None) -> float:
 
 
 def set_per_process_memory_fraction(fraction: float, device: Device = None) -> None:
+    # [FUNCTION DOC] Limits the allocator on device to the given fraction of total memory.
+    # Eagerly initializes XPU. Raises TypeError if fraction is not a float (an int fails).
+    # Exceeding the limit later causes an out-of-memory error from the allocator.
     r"""
     Set the memory fraction for a single process on XPU device.
     This function limits the amount of memory that the caching allocator can allocate
@@ -260,6 +291,9 @@ def set_per_process_memory_fraction(fraction: float, device: Device = None) -> N
 def memory_snapshot(
     mempool_id: tuple[int, int] | None = None,
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] Returns the list of memory segment descriptions from the allocator
+    # snapshot, for the pool mempool_id (None means the default pool). Empty list if XPU is
+    # not initialized.
     r"""
     Return a snapshot of the XPU memory allocator state across all devices.
     Provides detailed information for each memory segment managed by the allocator
@@ -277,6 +311,9 @@ def memory_snapshot(
 
 
 def _snapshot(device: Device = None, augment_with_fx_traces: bool = False):
+    # [FUNCTION DOC] HELPER: Returns the full allocator snapshot mapping (segments and device
+    # traces), optionally augmenting stack frames with FX debug info.
+    # KNOWN ISSUE: the device argument is ignored; the native snapshot covers all devices.
     """
     Capture a snapshot of the XPU memory state at the time this function is called.
 
@@ -368,6 +405,8 @@ def _snapshot(device: Device = None, augment_with_fx_traces: bool = False):
 def _dump_snapshot(
     filename: str = "dump_snapshot.pickle", augment_with_fx_traces: bool = False
 ) -> None:
+    # [FUNCTION DOC] HELPER: Takes a snapshot and writes it pickled to the file filename
+    # (overwritten). Raises I/O errors if the file cannot be opened.
     """
     Save a pickled version of the `torch.memory._snapshot()` dictionary to a file.
 
@@ -397,6 +436,10 @@ def _record_memory_history(
     clear_history: bool = False,
     skip_actions: list[str] | None = None,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Configures allocator history recording: enabled (what to keep),
+    # context (which tracebacks), stacks (python only or also C++), max_entries ring buffer
+    # size, clear_history, and skip_actions (event kinds to omit; None means none).
+    # Passes everything to the native layer; changes global allocator state.
     """
     Enable recording of stack traces associated with memory allocations, so you can
     tell what allocated any piece of memory in :func:`~torch.xpu.memory._snapshot()`.
@@ -478,16 +521,22 @@ def _record_memory_history(
 
 
 class _XPUAllocator:
+    # [CLASS DOC] HELPER: Thin holder of a native allocator object, exposed via allocator().
     r"""Wrapper over internal XPU memory allocators."""
 
     def __init__(self, allocator: torch._C._xpu_XPUAllocator):
+        # [FUNCTION DOC] HELPER: Stores the native allocator object.
         self._allocator = allocator
 
     def allocator(self):
+        # [FUNCTION DOC] HELPER: Returns the wrapped native allocator object.
         return self._allocator
 
 
 class XPUPluggableAllocator(_XPUAllocator):
+    # [CLASS DOC] Allocator built from allocation and free functions exported by a shared
+    # library. State: the native custom allocator object (inherited attribute). Intended to
+    # be passed to change_current_allocator.
     r"""
     XPU memory allocator loaded dynamically from a shared library.
 
@@ -513,6 +562,11 @@ class XPUPluggableAllocator(_XPUAllocator):
     """
 
     def __init__(self, path_to_lib_file: str, alloc_fn_name: str, free_fn_name: str):
+        # [FUNCTION DOC] Loads the shared library at path_to_lib_file, looks up the named
+        # allocation and free functions, and builds a native custom allocator from their
+        # addresses. Raises RuntimeError if an address cannot be resolved; a missing symbol
+        # raises AttributeError and a bad library path raises OSError. Does not call the
+        # base class initializer.
         allocator_lib = ctypes.CDLL(path_to_lib_file)
 
         alloc_fn_ptr = getattr(allocator_lib, alloc_fn_name)
@@ -530,6 +584,8 @@ class XPUPluggableAllocator(_XPUAllocator):
 
 
 def change_current_allocator(allocator: _XPUAllocator) -> None:
+    # [FUNCTION DOC] Makes the wrapped native allocator the active one. Errors from the
+    # native layer if the current allocator was already initialized/used.
     r"""Change the currently used memory allocator to be the one provided.
 
     .. note::
@@ -542,6 +598,7 @@ def change_current_allocator(allocator: _XPUAllocator) -> None:
 
 
 def _get_current_allocator() -> _XPUAllocator:
+    # [FUNCTION DOC] HELPER: Returns a wrapper around the currently active native allocator.
     r"""Return the allocator being currently used.
 
     Returns:
@@ -551,6 +608,9 @@ def _get_current_allocator() -> _XPUAllocator:
 
 
 class MemPool(torch._C._XPUMemPool):
+    # [CLASS DOC] A memory pool in the caching allocator, identified by a pair of ints. Can
+    # route allocations to an optional custom allocator and optionally serve as a last
+    # resort on out-of-memory. Key members: id, allocator, use_count, snapshot.
     r"""MemPool represents a pool of memory in a caching allocator. Currently,
     it's just the ID of the pool object maintained in the XPUCachingAllocator.
 
@@ -570,23 +630,30 @@ class MemPool(torch._C._XPUMemPool):
         allocator: torch._C._xpu_XPUAllocator | None = None,
         use_on_oom: bool = False,
     ):
+        # [FUNCTION DOC] Creates the pool with an optional custom native allocator and the
+        # use_on_oom flag; always passes True for the base class's third setting (a flag that
+        # is not exposed by this wrapper).
         super().__init__(allocator, True, use_on_oom)
 
     @property
     def id(self) -> tuple[int, int]:
+        # [FUNCTION DOC] Returns the pool id as a tuple of two ints.
         r"""Returns the ID of this pool as a tuple of two ints."""
         return super().id
 
     @property
     def allocator(self) -> torch._C._xpu_XPUAllocator | None:
+        # [FUNCTION DOC] Returns the custom allocator this pool uses, or None for the default.
         r"""Returns the allocator this MemPool routes allocations to."""
         return super().allocator
 
     def use_count(self) -> int:
+        # [FUNCTION DOC] Returns the reference count of this pool.
         r"""Returns the reference count of this pool."""
         return super().use_count()
 
     def snapshot(self):
+        # [FUNCTION DOC] Returns the list of memory segments of this pool (via memory_snapshot).
         r"""Return a snapshot of the XPU memory allocator pool state across all
         devices.
 
@@ -599,6 +666,9 @@ class MemPool(torch._C._XPUMemPool):
 
 @contextlib.contextmanager
 def use_mem_pool(pool: MemPool, device: "Device" = None):
+    # [FUNCTION DOC] Context manager: routes the current thread's allocations on device
+    # (default current device) to pool while active. On exit, ends the routing and releases
+    # the pool reference (even if the body raised). Other threads are unaffected.
     r"""A context manager that routes allocations to a given pool.
 
     Args:
@@ -626,6 +696,9 @@ def use_mem_pool(pool: MemPool, device: "Device" = None):
 
 
 def list_gpu_processes(device: "Device" = None) -> str:
+    # [FUNCTION DOC] Returns a multi-line text listing processes using device and their GPU
+    # memory in MB, queried via Level Zero Sysman (pyzes). Raises RuntimeError if pyzes is
+    # older than 0.1.2 or a query fails. Fills the cached device info as a side effect.
     r"""Return a printout of running processes and their GPU memory usage on a given device.
 
     Args:

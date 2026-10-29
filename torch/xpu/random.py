@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] XPU random number generator control: get/set RNG state and seeding for the
+# current device or all devices, using the per-device default generators in torch.xpu.
+# Seeding and state setting are deferred through the lazy call queue when XPU is not yet
+# initialized. Exports the names listed in __all__.
 from collections.abc import Iterable
 
 import torch
@@ -8,6 +12,8 @@ from . import _lazy_call, _lazy_init, current_device, device_count, is_initializ
 
 
 def get_rng_state(device: int | str | torch.device = "xpu") -> Tensor:
+    # [FUNCTION DOC] Returns the default generator state (byte tensor) of device (int, string
+    # or torch.device; no index means current device). Eagerly initializes XPU.
     r"""Return the random number generator state of the specified GPU as a ByteTensor.
 
     Args:
@@ -30,12 +36,16 @@ def get_rng_state(device: int | str | torch.device = "xpu") -> Tensor:
 
 
 def get_rng_state_all() -> list[Tensor]:
+    # [FUNCTION DOC] Returns a list with the RNG state of each device, indexed by device number.
     r"""Return a list of ByteTensor representing the random number states of all devices."""
     results = [get_rng_state(i) for i in range(device_count())]
     return results
 
 
 def set_rng_state(new_state: Tensor, device: int | str | torch.device = "xpu") -> None:
+    # [FUNCTION DOC] Sets the default generator state of device to new_state. If XPU is not
+    # yet initialized, the state is first cloned (outside functorch). The actual set is
+    # scheduled through the lazy call mechanism, resolving a missing index at run time.
     r"""Set the random number generator state of the specified GPU.
 
     Args:
@@ -53,6 +63,8 @@ def set_rng_state(new_state: Tensor, device: int | str | torch.device = "xpu") -
         device = torch.device("xpu", device)
 
     def cb() -> None:
+        # [FUNCTION DOC] HELPER: Deferred action applying new_state to the generator of the
+        # resolved device index (current device if none).
         idx = device.index
         if idx is None:
             idx = current_device()
@@ -63,6 +75,7 @@ def set_rng_state(new_state: Tensor, device: int | str | torch.device = "xpu") -
 
 
 def set_rng_state_all(new_states: Iterable[Tensor]) -> None:
+    # [FUNCTION DOC] Sets the RNG state of device i to the i-th item of new_states, in order.
     r"""Set the random number generator state of all devices.
 
     Args:
@@ -73,6 +86,8 @@ def set_rng_state_all(new_states: Iterable[Tensor]) -> None:
 
 
 def manual_seed(seed: int) -> None:
+    # [FUNCTION DOC] Seeds the current device's generator with the integer seed. Deferred
+    # via the lazy call queue (flagged as a seed call), so it is a no-op without XPU.
     r"""Set the seed for generating random numbers for the current GPU.
 
     It's safe to call this function if XPU is not available; in that case, it is silently ignored.
@@ -87,6 +102,7 @@ def manual_seed(seed: int) -> None:
     seed = int(seed)
 
     def cb() -> None:
+        # [FUNCTION DOC] HELPER: Deferred action seeding the current device's generator.
         idx = current_device()
         default_generator = torch.xpu.default_generators[idx]
         default_generator.manual_seed(seed)
@@ -95,6 +111,8 @@ def manual_seed(seed: int) -> None:
 
 
 def manual_seed_all(seed: int) -> None:
+    # [FUNCTION DOC] Seeds every device's generator with the integer seed, deferred via the
+    # lazy call queue (flagged as seed-all), so it is a no-op without XPU.
     r"""Set the seed for generating random numbers on all GPUs.
 
     It's safe to call this function if XPU is not available; in that case, it is silently ignored.
@@ -105,6 +123,7 @@ def manual_seed_all(seed: int) -> None:
     seed = int(seed)
 
     def cb() -> None:
+        # [FUNCTION DOC] HELPER: Deferred action seeding all device generators with seed.
         for i in range(device_count()):
             default_generator = torch.xpu.default_generators[i]
             default_generator.manual_seed(seed)
@@ -113,6 +132,8 @@ def manual_seed_all(seed: int) -> None:
 
 
 def seed() -> None:
+    # [FUNCTION DOC] Seeds the current device's generator with a nondeterministic random seed,
+    # deferred via the lazy call queue. Returns nothing.
     r"""Set the seed for generating random numbers to a random number for the current GPU.
 
     It's safe to call this function if XPU is not available; in that case, it is silently ignored.
@@ -123,6 +144,7 @@ def seed() -> None:
     """
 
     def cb() -> None:
+        # [FUNCTION DOC] HELPER: Deferred action randomly seeding the current device's generator.
         idx = current_device()
         default_generator = torch.xpu.default_generators[idx]
         default_generator.seed()
@@ -131,12 +153,17 @@ def seed() -> None:
 
 
 def seed_all() -> None:
+    # [FUNCTION DOC] Seeds all devices with one random seed: the first device is randomly
+    # seeded and the others are manually seeded with its resulting initial seed. Deferred
+    # via the lazy call queue.
     r"""Set the seed for generating random numbers to a random number on all GPUs.
 
     It's safe to call this function if XPU is not available; in that case, it is silently ignored.
     """
 
     def cb() -> None:
+        # [FUNCTION DOC] HELPER: Deferred action seeding the first device randomly and copying
+        # its initial seed to the remaining devices.
         random_seed = 0
         seeded = False
         for i in range(device_count()):
@@ -152,6 +179,8 @@ def seed_all() -> None:
 
 
 def initial_seed() -> int:
+    # [FUNCTION DOC] Returns the initial seed of the current device's generator. Eagerly
+    # initializes XPU.
     r"""Return the current random seed of the current GPU.
 
     .. warning::

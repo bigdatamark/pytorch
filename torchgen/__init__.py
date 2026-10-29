@@ -1,3 +1,6 @@
+# [PACKAGE DOC] Package of code generation utilities used to build PyTorch from source
+# (and by out-of-tree extensions). Defines no code itself, only a docstring; there are
+# no BC guarantees for its submodules.
 """torchgen
 
 This module contains codegeneration utilities for PyTorch. It is used to

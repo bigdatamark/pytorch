@@ -1,3 +1,9 @@
+# [MODULE DOC] XPU graph capture and replay API: XPUGraph wrapper, the graph capture context
+# manager, graph_pool_handle, is_current_stream_capturing and make_graphed_callables.
+# Import time: if the C extension lacks XPU stream support, registers dummy placeholders for
+# the native graph symbols in the torch._C namespace, then imports them from torch._C.
+# KNOWN ISSUE: the availability check tests for the stream base class symbol, not for the
+# graph symbols that are being stubbed.
 from __future__ import annotations
 
 import typing
@@ -38,6 +44,8 @@ from torch._C import _xpu_graph_pool_handle, _xpu_isCurrentStreamCapturing, _XPU
 
 
 def is_current_stream_capturing() -> bool:
+    # [FUNCTION DOC] Returns True if graph capture is underway on the current XPU stream;
+    # False otherwise (also when no XPU context exists, without creating one).
     r"""Return True if XPU graph capture is underway on the current XPU stream, False otherwise.
 
     If a XPU context does not exist on the current device, returns False without initializing the context.
@@ -46,11 +54,17 @@ def is_current_stream_capturing() -> bool:
 
 
 def graph_pool_handle() -> _POOL_HANDLE:
+    # [FUNCTION DOC] Allocates a new graph memory pool id from the runtime and returns it
+    # wrapped as an opaque pool handle token.
     r"""Return an opaque token representing the id of a graph memory pool."""
     return torch.xpu._POOL_HANDLE(_xpu_graph_pool_handle())
 
 
 class XPUGraph(_XPUGraph):
+    # [CLASS DOC] Python wrapper over the native XPU graph. Lifecycle: capture_begin, then
+    # capture_end, optional instantiate, then replay any number of times; reset discards the
+    # graph. keep_graph controls whether the executable graph is built at capture_end or
+    # lazily. Other methods expose the memory pool, debug dump and raw native handles.
     r"""Wrapper around a XPU graph.
 
     Arguments:
@@ -68,9 +82,13 @@ class XPUGraph(_XPUGraph):
     """
 
     def __new__(cls, keep_graph: bool = False) -> Self:
+        # [FUNCTION DOC] Creates a graph object; keep_graph selects whether the modifiable
+        # graph is kept (so instantiation is deferred) or consumed at capture end.
         return super().__new__(cls, keep_graph)
 
     def capture_begin(self, pool: _POOL_HANDLE | None = None) -> None:
+        # [FUNCTION DOC] Starts capturing work submitted to the current XPU stream. pool is an
+        # optional memory pool handle this graph may share allocations with.
         r"""Begin capturing XPU work on the current xpu stream.
 
         Typically, you shouldn't call ``capture_begin`` yourself.
@@ -84,6 +102,8 @@ class XPUGraph(_XPUGraph):
         super().capture_begin(pool=pool)
 
     def capture_end(self) -> None:
+        # [FUNCTION DOC] Ends capture on the current stream; replay becomes possible. Builds
+        # the executable graph now unless keep_graph was requested.
         r"""End XPU graph capture on the current stream.
 
         After ``capture_end``, ``replay`` may be called on this instance.
@@ -94,6 +114,8 @@ class XPUGraph(_XPUGraph):
         super().capture_end()
 
     def instantiate(self) -> None:
+        # [FUNCTION DOC] Builds the executable graph from the captured one, keeping the
+        # modifiable graph available.
         r"""Instantiate the XPU graph. Will be called by
         ``capture_end`` if ``keep_graph=False``, or by ``replay`` if
         ``keep_graph=True`` and ``instantiate`` has not already been
@@ -103,14 +125,18 @@ class XPUGraph(_XPUGraph):
         super().instantiate()
 
     def replay(self) -> None:
+        # [FUNCTION DOC] Launches the captured work again (instantiating first if needed).
         r"""Replay the XPU work captured by this graph."""
         super().replay()
 
     def reset(self) -> None:
+        # [FUNCTION DOC] Releases the graph held by this instance.
         r"""Delete the graph currently held by this instance."""
         super().reset()
 
     def pool(self) -> _POOL_HANDLE:
+        # [FUNCTION DOC] Returns the opaque id of this graph's memory pool, usable as the pool
+        # argument of another graph's capture.
         r"""Return an opaque token representing the id of this graph's memory pool.
 
         This id can optionally be passed to another graph's ``capture_begin``,
@@ -119,10 +145,12 @@ class XPUGraph(_XPUGraph):
         return super().pool()
 
     def enable_debug_mode(self) -> None:
+        # [FUNCTION DOC] Turns on debug mode so debug_dump can write the graph.
         r"""Enable debugging mode for XPUGraph.debug_dump."""
         return super().enable_debug_mode()
 
     def debug_dump(self, debug_path: str) -> None:
+        # [FUNCTION DOC] Writes the graph to the file path debug_path if debug mode is enabled.
         r"""
         Arguments:
             debug_path (required): Path to dump the graph to.
@@ -133,6 +161,8 @@ class XPUGraph(_XPUGraph):
         return super().debug_dump(debug_path)
 
     def raw_xpu_graph(self) -> int:
+        # [FUNCTION DOC] Returns the native modifiable graph handle as an integer; requires
+        # keep_graph to be set (the native layer enforces this).
         r"""Returns the underlying xpuGraph_t. ``keep_graph`` must be True.
 
         XPU doesn't provide APIs to manipulate this object.
@@ -140,6 +170,8 @@ class XPUGraph(_XPUGraph):
         return super().raw_xpu_graph()
 
     def raw_xpu_graph_exec(self) -> int:
+        # [FUNCTION DOC] Returns the native executable graph handle as an integer. A later
+        # instantiate call destroys the previously returned handle.
         r"""Returns the underlying xpuGraphExec_t. ``instantiate`` must have been called if ``keep_graph`` is True, or ``capture_end`` must have been called if ``keep_graph`` is False. If you call ``instantiate()`` after ``raw_xpu_graph_exec()``, the previously returned xpuGraphExec_t will be destroyed. It is your responsibility not to use this object after destruction.
 
         XPU doesn't provide APIs to manipulate this object.
@@ -148,6 +180,9 @@ class XPUGraph(_XPUGraph):
 
 
 class graph:
+    # [CLASS DOC] Context manager that captures XPU work into an XPUGraph. State: pool (an
+    # empty or one-element tuple of pool handle), capture_stream, stream_ctx and xpu_graph.
+    # The class attribute default_capture_stream is a lazily created shared side stream.
     r"""Context-manager that captures XPU work into a :class:`torch.xpu.XPUGraph` object for later replay.
 
     Arguments:
@@ -172,6 +207,9 @@ class graph:
         pool: _POOL_HANDLE | None = None,
         stream: torch.xpu.Stream | None = None,
     ):
+        # [FUNCTION DOC] Stores the graph and optional pool, picks the capture stream (given
+        # stream, else the shared default side stream, created lazily and not thread safe).
+        # Raises AssertionError if no capture stream results.
         # Lazy-init of default_capture_stream helps avoid circular-import errors.
         # Not thread safe, but graphs already have the general (explicitly documented)
         # restriction that only one capture may be underway at a time in the process.
@@ -188,6 +226,8 @@ class graph:
         self.xpu_graph = xpu_graph
 
     def __enter__(self) -> None:
+        # [FUNCTION DOC] Synchronizes the device and empties the allocator cache to free memory,
+        # enters the capture stream context, then begins capture (with the pool if any).
         # Free as much memory as we can for the graph
         torch.xpu.synchronize()
 
@@ -197,6 +237,8 @@ class graph:
         self.xpu_graph.capture_begin(*self.pool)
 
     def __exit__(self, *args: object) -> None:
+        # [FUNCTION DOC] Ends capture, then exits the stream context passing along the
+        # exception info arguments.
         self.xpu_graph.capture_end()
         self.stream_ctx.__exit__(*args)
 
@@ -231,6 +273,17 @@ def make_graphed_callables(
     allow_unused_input: bool = False,
     pool: _POOL_HANDLE | None = None,
 ) -> _ModuleOrCallable | tuple[_ModuleOrCallable, ...]:
+    # [FUNCTION DOC] Returns graphed versions of callables (a module/function or a tuple of
+    # them) using sample_args (one tuple of tensors, or one per callable). Steps: validate
+    # (RuntimeError for autocast caching, module hooks, or buffers requiring grad; TypeError
+    # for non-tensor sample args); warm up for num_warmup_iters iterations on a side stream;
+    # capture forward graphs in order and backward graphs in reverse order, all in one
+    # shared memory pool (pool or a new one); wrap each in an autograd function that copies
+    # inputs into static buffers and replays. Modules get their forward method replaced
+    # (mutation) and fall back to the original forward when the training flag differs from
+    # that at capture time. Synchronizes the device and allocates static buffers.
+    # KNOWN ISSUE: the loop deleting warmup results only deletes the loop variable, so the
+    # references remain until the function exits.
     r"""Accept callables (functions or :class:`nn.Module<torch.nn.Module>`\ s) and returns graphed versions.
 
     Each graphed callable's forward pass runs its source callable's
@@ -445,10 +498,17 @@ def make_graphed_callables(
         static_grad_outputs: tuple[Tensor | None, ...],
         static_grad_inputs: tuple[Tensor, ...],
     ) -> Callable[..., object]:
+        # [FUNCTION DOC] HELPER: Builds the callable replaying one captured fwd/bwd graph pair
+        # through a custom autograd function, then unflattening outputs with the saved spec.
         class Graphed(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd function whose forward replays the forward graph
+            # and whose backward replays the backward graph over static buffers.
             @staticmethod
             # pyrefly: ignore [bad-override]
             def forward(ctx: object, *inputs: Tensor) -> tuple[Tensor, ...]:
+                # [FUNCTION DOC] HELPER: Copies user inputs into the static input buffers when
+                # they are different memory, replays the forward graph and returns detached
+                # static outputs. Raises RuntimeError if static outputs are not a tuple.
                 # At this stage, only the user args may (potentially) be new tensors.
                 for i in range(len_user_args):
                     if static_input_surface[i].data_ptr() != inputs[i].data_ptr():
@@ -462,6 +522,9 @@ def make_graphed_callables(
             @torch.autograd.function.once_differentiable
             # pyrefly: ignore [bad-override]
             def backward(ctx: object, *grads: Tensor) -> tuple[Tensor, ...]:
+                # [FUNCTION DOC] HELPER: Copies incoming grads into the static grad-output
+                # buffers, replays the backward graph and returns detached static grad inputs.
+                # Raises RuntimeError on a wrong gradient count or non-tuple static grads.
                 if len(grads) != len(static_grad_outputs):
                     raise RuntimeError(
                         f"Expected {len(static_grad_outputs)} gradients but got {len(grads)}"
@@ -479,6 +542,8 @@ def make_graphed_callables(
                 )
 
         def functionalized(*user_args: object) -> object:
+            # [FUNCTION DOC] HELPER: Flattens user args, appends module parameters, applies the
+            # graphed autograd function and rebuilds the original output structure.
             # Runs the new autograd function which replays the XPU graphs
             flatten_user_args = torch.utils._pytree.arg_tree_leaves(*user_args)
             out = Graphed.apply(*(tuple(flatten_user_args) + module_params))
@@ -508,7 +573,11 @@ def make_graphed_callables(
                 graphed: Callable[_P, _R],
                 orig_fwd: Callable[_P, _R],
             ) -> Callable[_P, _R]:
+                # [FUNCTION DOC] HELPER: Returns a forward wrapper choosing the graphed callable
+                # when the module's training flag matches graph_training_state, else orig_fwd.
                 def new_fwd(*user_args: _P.args, **user_kwargs: _P.kwargs) -> _R:
+                    # [FUNCTION DOC] HELPER: Dispatches to graphed or original forward based on
+                    # the module's current training flag.
                     if func.training == graph_training_state:
                         return graphed(*user_args, **user_kwargs)
                     else:

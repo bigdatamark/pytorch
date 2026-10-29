@@ -1,3 +1,5 @@
+# [MODULE DOC] HELPER: XPU-specific wrapper around the shared device index resolver.
+# Exposes _get_device_index, which validates that a device is XPU (or CPU if allowed).
 from typing import Any
 
 import torch
@@ -9,6 +11,10 @@ from torch._utils import _get_device_index as _torch_get_device_index
 def _get_device_index(
     device: Any, optional: bool = False, allow_cpu: bool = False
 ) -> int:
+    # [FUNCTION DOC] HELPER: Resolves device (int, string, torch.device, xpu device object,
+    # or None) to an integer XPU index. Ints are returned unchanged; strings are parsed.
+    # Raises ValueError if a torch.device is not xpu (or cpu when allow_cpu is set).
+    # Otherwise delegates to the generic resolver, which handles None/optional/allow_cpu.
     r"""Get the device index from :attr:`device`, which can be a torch.device
     object, a Python integer, or ``None``.
 
