@@ -1,5 +1,14 @@
 # mypy: ignore-errors
 
+# [MODULE DOC]
+# Test infrastructure for torch.optim optimizers: metadata about each optimizer (OptimizerInfo),
+# generators of constructor configurations and of invalid configurations that must raise errors,
+# a device-generic test parametrizer (optims), a database (optim_db) listing one OptimizerInfo
+# per optimizer with per-test skips, tolerance overrides and decorators, and a TensorTracker
+# helper for step-by-step comparisons. Note that global-cliquey flags (foreach, fused,
+# differentiable) are deliberately not produced by the input generators; tests add them.
+# Import-time side effects: builds the optim_db list; no global state is modified.
+
 import functools
 import itertools
 import sys
@@ -52,6 +61,9 @@ CUDA_CONFIG_GPUS = ["cuda", "xpu"]
 
 
 class OptimizerInput:
+    # [CLASS DOC] Plain record of one optimizer construction config: params (list of tensors,
+    # param groups, named params, or None when the test supplies them), kwargs (constructor
+    # keyword mapping) and desc (human-readable label). Uses slots; no behavior beyond repr.
     """Contains args / kwargs to be passed to an optimizer constructor."""
 
     __slots__ = ["params", "kwargs", "desc"]
@@ -62,16 +74,22 @@ class OptimizerInput:
         kwargs: dict[str, Any],
         desc: str = "",
     ):
+        # [FUNCTION DOC] Stores params, kwargs and desc as attributes. Nothing is validated or
+        # copied (kwargs is kept by reference, so callers may mutate it later). Returns nothing.
         # params can be a list of Tensors OR param_groups OR None
         self.params = params
         self.kwargs = kwargs
         self.desc = desc
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns a string showing params, kwargs and desc, used in test names
+        # and failure messages.
         return f"params={self.params}, kwargs={self.kwargs}, desc={self.desc}"
 
 
 class OptimizerErrorEnum(Enum):
+    # [CLASS DOC] Enumeration of the phase in which an error input is expected to raise:
+    # CONSTRUCTION_ERROR (while building the optimizer) or STEP_ERROR (during step).
     """Enumerates when an error is raised when testing optimizers."""
 
     CONSTRUCTION_ERROR = 0
@@ -79,6 +97,11 @@ class OptimizerErrorEnum(Enum):
 
 
 class ErrorOptimizerInput:
+    # [CLASS DOC] Record pairing an OptimizerInput with the failure it must trigger: the phase
+    # (error_on, default construction), the expected exception or warning type (error_type,
+    # default RuntimeError) and a regular expression the message must match (error_regex).
+    # KNOWN ISSUE: the docstring says the error occurs on construction only, but error_on can
+    # also request that the error occur at step time.
     """
     An OptimizerInput that will cause the optimizer to throw an error when constructed.
     Includes the type and string of the resulting error.
@@ -94,6 +117,9 @@ class ErrorOptimizerInput:
         error_type=RuntimeError,
         error_regex="",
     ):
+        # [FUNCTION DOC] Stores the wrapped OptimizerInput and the keyword-only expectation
+        # fields (error_on, error_type, error_regex) as attributes. No validation. Returns
+        # nothing.
         self.optimizer_error_input = optimizer_error_input
         self.error_on = error_on
         self.error_type = error_type
@@ -101,6 +127,12 @@ class ErrorOptimizerInput:
 
 
 class OptimizerInfo:
+    # [CLASS DOC] Per-optimizer test metadata: the optimizer class, generators of valid and
+    # invalid constructor inputs, scheduler factories, which global-cliquey implementations
+    # (foreach, fused, differentiable) it supports, capability flags (sparse, complex,
+    # capturable, closure-requiring step, param groups, multiple devices) and a combined tuple
+    # of decorators/skips consulted when tests are instantiated. Attributes mirror the
+    # constructor arguments; skips and decorators are merged into one decorators tuple.
     """Optimizer information to be used in testing."""
 
     def __init__(
@@ -156,6 +188,12 @@ class OptimizerInfo:
         optim_error_inputs_func=None,  # Function to generate optim inputs that error
         supports_fused_on: tuple[str, ...] = (),
     ):
+        # [FUNCTION DOC] Records every argument as an attribute. The decorators and skips
+        # arguments are combined (decorators first) into a single tuple, with None treated as
+        # empty. No validation is done. Returns nothing.
+        # KNOWN ISSUE: optim_cls is annotated as an Optimizer instance but holds a class, and
+        # the default scheduler_inputs is a one-element tuple holding a list of factories,
+        # whereas the comment describes a flat tuple of factories.
         self.optim_cls = optim_cls
         self.optim_inputs_func = optim_inputs_func
         self.scheduler_inputs = scheduler_inputs
@@ -177,6 +215,10 @@ class OptimizerInfo:
         self.supports_fused_on = supports_fused_on
 
     def get_decorators(self, test_class, test_name, device, dtype, param_kwargs):
+        # [FUNCTION DOC] Returns the flat list of decorators that apply to one generated test.
+        # Each DecorateInfo entry is included (its decorators expanded) only if it is active
+        # for the given test class, test name, device, dtype and parametrization kwargs; plain
+        # decorators are always included. No side effects.
         result = []
         for decorator in self.decorators:
             if isinstance(decorator, DecorateInfo):
@@ -190,13 +232,20 @@ class OptimizerInfo:
 
     @property
     def name(self):
+        # [FUNCTION DOC] Property returning the optimizer class name, used in test names.
         return self.optim_cls.__name__
 
 
 class optims(_TestParametrizer):
+    # [CLASS DOC] Test parametrizer decorator that runs a device-generic test once per
+    # (OptimizerInfo, dtype) combination. State: optim_info_list (materialized list of infos)
+    # and dtypes (defaults to float32). Only valid with device-type test instantiation.
     """Decorator for specifying a list of optimizers over which to run a test."""
 
     def __init__(self, optim_info_iterable, dtypes=None):
+        # [FUNCTION DOC] Materializes the iterable of OptimizerInfo into a list and stores the
+        # dtypes to test (a single-element list of float32 when none are given). Returns
+        # nothing.
         self.optim_info_list = list(optim_info_iterable)
 
         # optimizers aren't limited to be one dtype as parameters can have different dtypes
@@ -205,6 +254,12 @@ class optims(_TestParametrizer):
         self.dtypes = dtypes if dtypes is not None else [torch.float32]
 
     def _parametrize_test(self, test, generic_cls, device_cls):
+        # [FUNCTION DOC] HELPER: Generator used by the test framework. For every combination of
+        # OptimizerInfo and dtype it yields a tuple of a wrapper around the test, a test name
+        # (the optimizer class name), the keyword mapping with optim_info and dtype to pass to
+        # the test, and a callable that lazily computes the applicable decorators.
+        # Raises RuntimeError if no device class is given (use with device-type instantiation).
+        # If yielding fails, prints a message naming the optimizer and re-raises the exception.
         if device_cls is None:
             raise RuntimeError(
                 "The @optims decorator is only intended to be used in a device-specific "
@@ -224,6 +279,9 @@ class optims(_TestParametrizer):
 
                 @functools.wraps(test)
                 def test_wrapper(*args, **kwargs):
+                    # [FUNCTION DOC] HELPER: Forwards all arguments to the wrapped test and
+                    # returns its result; exists so each parametrization gets its own function
+                    # object that keeps the original test's metadata.
                     return test(*args, **kwargs)
 
                 decorator_fn = functools.partial(
@@ -245,6 +303,11 @@ class optims(_TestParametrizer):
 
 # Helper function for generating error inputs for all optimizers, used below.
 def get_error_inputs_for_all_optims(device, dtype):
+    # [FUNCTION DOC] HELPER: Returns the list of ErrorOptimizerInput cases shared by every
+    # optimizer: invalid param type, duplicate parameters within and across groups, a
+    # multi-element tensor lr, and mixes of named and unnamed params or groups. Only the cpu
+    # device type yields cases (two small 2D parameters are created, so Muon is compatible);
+    # any other device type returns an empty list. Allocates tensors; no other side effects.
     if _get_device_type(device) == "cpu":
         # Creating 2D parameters for compatibility with Muon.
         sample_param = Parameter(torch.randn(1, 1, device=device, dtype=dtype))
@@ -340,6 +403,9 @@ def get_error_inputs_for_all_optims(device, dtype):
 
 
 def optim_inputs_func_adadelta(device, dtype=None):
+    # [FUNCTION DOC] Returns OptimizerInput configs for Adadelta (default, lr, weight_decay,
+    # maximize, rho). On cuda/xpu devices, extra capturable configs (with weight decay and with
+    # tensor lr) are appended. dtype is unused. No global-cliquey flags are set.
     cuda_supported_configs = [
         OptimizerInput(params=None, kwargs={"capturable": True}, desc="capturable"),
         OptimizerInput(
@@ -373,6 +439,8 @@ def optim_inputs_func_adadelta(device, dtype=None):
 
 
 def optim_error_inputs_func_adadelta(device, dtype):
+    # [FUNCTION DOC] Returns the shared error inputs plus, on cpu only, a case where rho is
+    # above 1 which must raise a ValueError about an invalid rho value.
     error_inputs = get_error_inputs_for_all_optims(device, dtype)
     if _get_device_type(device) == "cpu":
         error_inputs += [
@@ -390,6 +458,9 @@ def optim_error_inputs_func_adadelta(device, dtype):
 
 
 def optim_inputs_func_adafactor(device, dtype=None):
+    # [FUNCTION DOC] Returns OptimizerInput configs for Adafactor: default, weight decay with
+    # lr, weight decay with maximize, non-default beta2_decay and non-default clipping
+    # threshold d. Independent of device and dtype (both unused).
     return [
         OptimizerInput(params=None, kwargs={}, desc="default"),
         OptimizerInput(
@@ -416,6 +487,10 @@ def optim_inputs_func_adafactor(device, dtype=None):
 
 
 def optim_error_inputs_func_adafactor(device, dtype):
+    # [FUNCTION DOC] Returns the shared error inputs plus, on cpu only, cases that must raise
+    # ValueError (negative epsilon1, clipping threshold d below 1, positive beta2_decay) and a
+    # complex parameter with a gradient that must raise RuntimeError at step time. Allocates a
+    # complex tensor on the device.
     error_inputs = get_error_inputs_for_all_optims(device, dtype)
     if _get_device_type(device) == "cpu":
         complex_param = torch.rand(2, 3, device=device, dtype=torch.complex64)
@@ -463,6 +538,9 @@ def optim_error_inputs_func_adafactor(device, dtype):
 
 
 def optim_inputs_func_adagrad(device, dtype=None):
+    # [FUNCTION DOC] Returns OptimizerInput configs for Adagrad: default, weight decay,
+    # maximize, lr, initial_accumulator_value, lr_decay and tensor lr. Same for all devices;
+    # device and dtype are unused.
     return [
         OptimizerInput(params=None, kwargs={}, desc="default"),
         OptimizerInput(
@@ -493,6 +571,11 @@ def optim_inputs_func_adagrad(device, dtype=None):
 
 
 def optim_error_inputs_func_adagrad(device, dtype):
+    # [FUNCTION DOC] Returns the shared error inputs plus: on cpu, a negative lr_decay that must
+    # raise ValueError; on cuda, cases where fused and foreach are both enabled, and where
+    # fused is combined with differentiable, which must raise RuntimeError.
+    # KNOWN ISSUE: the fused checks run only for cuda, unlike Adam which uses all devices in
+    # the cuda-like device list (so xpu is skipped here).
     error_inputs = get_error_inputs_for_all_optims(device, dtype)
     if _get_device_type(device) == "cpu":
         error_inputs += [
@@ -534,6 +617,11 @@ def optim_error_inputs_func_adagrad(device, dtype):
 # TODO: consider tensor LR! See multi_tensor_optimizer_configs in test_optim.py --> tensor LR should work
 # with all implementation code paths...
 def optim_inputs_func_adam(device, dtype=None):
+    # [FUNCTION DOC] Returns OptimizerInput configs for Adam: default, lr, weight decay,
+    # maximize, amsgrad; on cuda/xpu adds capturable variants (including tensor lr and tensor
+    # betas); on mps adds a tensor lr config. For float16 dtype every config gets a large eps
+    # of 0.1 written into its kwargs so the denominator is not zero in low precision.
+    # Also reused for AdamW.
     cuda_supported_configs = [
         OptimizerInput(params=None, kwargs={"capturable": True}, desc="capturable"),
         OptimizerInput(
@@ -614,6 +702,11 @@ def optim_inputs_func_adam(device, dtype=None):
 
 
 def optim_error_inputs_func_adam(device, dtype):
+    # [FUNCTION DOC] Returns the shared error inputs plus: on cpu, invalid beta1, negative
+    # weight decay, tensor lr with foreach and no capturable, mixed float/tensor betas, and
+    # tensor betas with foreach (all ValueError); on cuda/xpu, fused combined with foreach or
+    # with differentiable (RuntimeError). Allocates a scalar tensor on accelerator devices.
+    # Also reused for AdamW.
     error_inputs = get_error_inputs_for_all_optims(device, dtype)
     if _get_device_type(device) == "cpu":
         error_inputs += [
@@ -702,6 +795,9 @@ def optim_error_inputs_func_adam(device, dtype):
 
 
 def optim_inputs_func_adamax(device, dtype=None):
+    # [FUNCTION DOC] Returns OptimizerInput configs for Adamax: default, lr, weight decay,
+    # maximize, and both; on cuda/xpu adds capturable variants (with weight decay, maximize
+    # and tensor lr). dtype is unused.
     cuda_supported_configs = [
         OptimizerInput(params=None, kwargs={"capturable": True}, desc="capturable"),
         OptimizerInput(
@@ -751,6 +847,8 @@ def optim_inputs_func_adamax(device, dtype=None):
 
 
 def optim_error_inputs_func_adamax(device, dtype):
+    # [FUNCTION DOC] Returns the shared error inputs plus, on cpu only, a beta2 of 1.0 that
+    # must raise a ValueError about an invalid beta at index 1.
     error_inputs = get_error_inputs_for_all_optims(device, dtype)
     if _get_device_type(device) == "cpu":
         error_inputs += [
@@ -768,14 +866,19 @@ def optim_error_inputs_func_adamax(device, dtype):
 
 
 def optim_inputs_func_adamw(device, dtype=None):
+    # [FUNCTION DOC] Returns the same configs as the Adam generator for AdamW.
     return optim_inputs_func_adam(device, dtype)
 
 
 def optim_error_inputs_func_adamw(device, dtype):
+    # [FUNCTION DOC] Returns the same error inputs as the Adam generator for AdamW.
     return optim_error_inputs_func_adam(device, dtype)
 
 
 def optim_inputs_func_asgd(device, dtype=None):
+    # [FUNCTION DOC] Returns OptimizerInput configs for ASGD: default, lambd, lr, t0, maximize,
+    # weight decay and both; on cuda/xpu adds capturable variants (including tensor lr).
+    # dtype is unused.
     cuda_supported_configs = [
         OptimizerInput(params=None, kwargs={"capturable": True}, desc="capturable"),
         OptimizerInput(
@@ -822,6 +925,8 @@ def optim_inputs_func_asgd(device, dtype=None):
 
 
 def optim_error_inputs_func_asgd(device, dtype):
+    # [FUNCTION DOC] Returns the shared error inputs plus, on cpu only, a negative weight decay
+    # that must raise ValueError.
     error_inputs = get_error_inputs_for_all_optims(device, dtype)
     if _get_device_type(device) == "cpu":
         error_inputs += [
@@ -839,6 +944,9 @@ def optim_error_inputs_func_asgd(device, dtype):
 
 
 def optim_inputs_func_lbfgs(device, dtype=None):
+    # [FUNCTION DOC] Returns OptimizerInput configs for LBFGS: default, lr, tensor lr,
+    # tolerance_grad, strong_wolfe line search, maximize, and maximize with line search.
+    # device and dtype are unused.
     return [
         OptimizerInput(params=None, kwargs={}, desc="default"),
         OptimizerInput(params=None, kwargs={"lr": 0.01}, desc="non-default lr"),
@@ -867,11 +975,15 @@ def optim_inputs_func_lbfgs(device, dtype=None):
 
 
 def optim_error_inputs_func_lbfgs(device, dtype):
+    # [FUNCTION DOC] Returns only the shared error inputs; LBFGS has no extra error cases.
     error_inputs = get_error_inputs_for_all_optims(device, dtype)
     return error_inputs
 
 
 def optim_inputs_func_muon(device, dtype=None):
+    # [FUNCTION DOC] Returns OptimizerInput configs for Muon: default, lr, tensor lr, weight
+    # decay, momentum, alternative ns_steps and ns_coefficients, and two lr adjustment
+    # functions. device and dtype are unused.
     return [
         OptimizerInput(params=None, kwargs={}, desc="default"),
         OptimizerInput(params=None, kwargs={"lr": 0.01}, desc="non-default lr"),
@@ -914,6 +1026,10 @@ def optim_inputs_func_muon(device, dtype=None):
 
 
 def optim_error_inputs_func_muon(device, dtype):
+    # [FUNCTION DOC] Returns the shared error inputs plus, for every device type: a non-2D
+    # parameter and an unknown adjust_lr_fn (ValueError at construction), and a complex
+    # parameter (RuntimeError at step). Allocates random tensors with gradients on the device.
+    # Unlike the other generators it does not restrict extra cases to cpu.
     error_inputs = get_error_inputs_for_all_optims(device, dtype)
     complex_param = torch.rand(2, 3, device=device, dtype=torch.complex64)
     complex_param.grad = torch.rand_like(complex_param)
@@ -957,6 +1073,9 @@ def optim_error_inputs_func_muon(device, dtype):
 
 
 def optim_inputs_func_nadam(device, dtype=None):
+    # [FUNCTION DOC] Returns OptimizerInput configs for NAdam: default, lr, momentum_decay,
+    # weight decay, decoupled weight decay and maximize; on cuda/xpu adds capturable variants
+    # (including tensor lr). dtype is unused.
     cuda_supported_configs = [
         OptimizerInput(params=None, kwargs={"capturable": True}, desc="capturable"),
         OptimizerInput(
@@ -1024,6 +1143,8 @@ def optim_inputs_func_nadam(device, dtype=None):
 
 
 def optim_error_inputs_func_nadam(device, dtype):
+    # [FUNCTION DOC] Returns the shared error inputs plus, on cpu only, an invalid beta1 and a
+    # negative momentum_decay, both expected to raise ValueError.
     error_inputs = get_error_inputs_for_all_optims(device, dtype)
     if _get_device_type(device) == "cpu":
         error_inputs += [
@@ -1051,6 +1172,11 @@ def optim_error_inputs_func_nadam(device, dtype):
 
 # Weird story bro, NAdam and RAdam do not have maximize.
 def optim_inputs_func_radam(device=None, dtype=None):
+    # [FUNCTION DOC] Returns OptimizerInput configs for RAdam: default, lr, eps, weight decay,
+    # decoupled weight decay and maximize; on cuda/xpu adds capturable variants (including
+    # tensor lr). dtype is unused.
+    # KNOWN ISSUE: device defaults to None but the device type helper rejects None, so calling
+    # without a device raises an error.
     cuda_supported_configs = [
         OptimizerInput(params=None, kwargs={"capturable": True}, desc="capturable"),
         OptimizerInput(
@@ -1102,6 +1228,8 @@ def optim_inputs_func_radam(device=None, dtype=None):
 
 
 def optim_error_inputs_func_radam(device, dtype):
+    # [FUNCTION DOC] Returns the shared error inputs plus, on cpu only, an invalid beta1 and a
+    # negative weight decay, both expected to raise ValueError.
     error_inputs = get_error_inputs_for_all_optims(device, dtype)
     if _get_device_type(device) == "cpu":
         error_inputs += [
@@ -1128,6 +1256,9 @@ def optim_error_inputs_func_radam(device, dtype):
 
 
 def optim_inputs_func_rmsprop(device, dtype=None):
+    # [FUNCTION DOC] Returns OptimizerInput configs for RMSprop: default, lr, weight decay,
+    # maximize, centered, and combinations with momentum; on cuda/xpu adds capturable variants
+    # (including tensor lr). dtype is unused.
     cuda_supported_configs = [
         OptimizerInput(params=None, kwargs={"capturable": True}, desc="capturable"),
         OptimizerInput(
@@ -1187,6 +1318,8 @@ def optim_inputs_func_rmsprop(device, dtype=None):
 
 
 def optim_error_inputs_func_rmsprop(device, dtype):
+    # [FUNCTION DOC] Returns the shared error inputs plus, on cpu only, a negative momentum
+    # that must raise ValueError.
     error_inputs = get_error_inputs_for_all_optims(device, dtype)
     if _get_device_type(device) == "cpu":
         error_inputs += [
@@ -1204,6 +1337,9 @@ def optim_error_inputs_func_rmsprop(device, dtype):
 
 
 def optim_inputs_func_rprop(device, dtype=None):
+    # [FUNCTION DOC] Returns OptimizerInput configs for Rprop: default, lr, etas, step_sizes
+    # and maximize; on cuda/xpu adds capturable variants (including tensor lr). dtype is
+    # unused.
     cuda_supported_configs = [
         OptimizerInput(params=None, kwargs={"capturable": True}, desc="capturable"),
         OptimizerInput(
@@ -1229,6 +1365,8 @@ def optim_inputs_func_rprop(device, dtype=None):
 
 
 def optim_error_inputs_func_rprop(device, dtype):
+    # [FUNCTION DOC] Returns the shared error inputs plus, on cpu only, invalid etas (first
+    # not below 1) that must raise ValueError.
     error_inputs = get_error_inputs_for_all_optims(device, dtype)
     if _get_device_type(device) == "cpu":
         error_inputs += [
@@ -1246,6 +1384,9 @@ def optim_error_inputs_func_rprop(device, dtype):
 
 
 def optim_inputs_func_sgd(device, dtype=None):
+    # [FUNCTION DOC] Returns OptimizerInput configs for SGD: default, lr, tensor lr, weight
+    # decay, momentum, maximize, dampening, weight decay with momentum, and nesterov.
+    # device and dtype are unused.
     return [
         OptimizerInput(params=None, kwargs={}, desc="default"),
         OptimizerInput(params=None, kwargs={"lr": 1e-2}, desc="non-default lr"),
@@ -1280,6 +1421,8 @@ def optim_inputs_func_sgd(device, dtype=None):
 
 
 def optim_error_inputs_func_sgd(device, dtype):
+    # [FUNCTION DOC] Returns the shared error inputs plus, on cpu only, a negative momentum
+    # that must raise ValueError.
     error_inputs = get_error_inputs_for_all_optims(device, dtype)
     if _get_device_type(device) == "cpu":
         error_inputs += [
@@ -1297,6 +1440,8 @@ def optim_error_inputs_func_sgd(device, dtype):
 
 
 def optim_inputs_func_sparseadam(device, dtype=None):
+    # [FUNCTION DOC] Returns OptimizerInput configs for SparseAdam: default, lr, tensor lr and
+    # maximize. device and dtype are unused.
     return [
         OptimizerInput(params=None, kwargs={}, desc="default"),
         OptimizerInput(
@@ -1310,6 +1455,9 @@ def optim_inputs_func_sparseadam(device, dtype=None):
 
 
 def optim_error_inputs_func_sparseadam(device, dtype):
+    # [FUNCTION DOC] Returns the shared error inputs plus, on cpu only: an invalid beta1,
+    # sparse parameters (directly and inside a param group) and complex parameters, all
+    # expected to raise ValueError. Allocates sparse and complex tensors on the device.
     error_inputs = get_error_inputs_for_all_optims(device, dtype)
 
     if _get_device_type(device) == "cpu":
@@ -1370,6 +1518,9 @@ def optim_error_inputs_func_sparseadam(device, dtype):
 
 
 def _get_device_type(device: str | torch.device) -> str:
+    # [FUNCTION DOC] HELPER: Returns the device type string (for example cpu or cuda) from a
+    # device string, which may carry an index after a colon, or a torch device object.
+    # Raises AssertionError if the input is neither a string nor a device.
     # Returns the device type as a string, e.g., "cpu" or "cuda"
     if isinstance(device, torch.device):
         device = str(device.type)
@@ -1381,6 +1532,13 @@ def _get_device_type(device: str | torch.device) -> str:
 def _get_optim_inputs_including_global_cliquey_kwargs(
     device, dtype, optim_info, skip=()
 ) -> list[OptimizerInput]:
+    # [FUNCTION DOC] HELPER: Expands the optimizer's base configs with the global-cliquey flags.
+    # For each base config it emits one copy with every supported flag set false (or the
+    # original config if none are supported), then one copy per supported flag with only that
+    # flag true, labelled by appending the flag name to the description. Supported flags are
+    # filtered by the skip argument, by fused support on the device type and by foreach kernel
+    # support on the device. Raises AssertionError if skip has names outside the three flags.
+    # Deep-copies kwargs, so the generator output is not mutated. dtype is unused.
     """
     Return a list of all configs for a given optimizer as a list of OptimizerInputs,
     including configs that have supported global cliquey kwargs (foreach, fused,
@@ -2217,6 +2375,10 @@ optim_db: list[OptimizerInfo] = [
 
 
 class TensorTracker:
+    # [CLASS DOC] FIFO list of cloned tensors recorded during one computation and replayed
+    # against a second computation. State: assert_eq_kwargs (keyword arguments for the test
+    # case's equality assertion) and tensors (queue of detached clones). Key methods: add,
+    # pop_check_set and all_popped.
     """
     A utility to track tensor clones in a list, with the expectation of popping them later (in
     order) to make fair comparisons between two multi-step computation. The intended use case is
@@ -2228,12 +2390,16 @@ class TensorTracker:
     """
 
     def __init__(self, assert_eq_kwargs=None):
+        # [FUNCTION DOC] Stores the equality-assertion keyword arguments (an empty mapping when
+        # none are given) and starts with an empty list of tensors. Returns nothing.
         if assert_eq_kwargs is None:
             assert_eq_kwargs = {}
         self.assert_eq_kwargs = assert_eq_kwargs
         self.tensors = []
 
     def add(self, tensor):
+        # [FUNCTION DOC] Appends a detached clone of the tensor to the end of the queue, so
+        # later changes to the original do not affect it. Returns nothing.
         """
         Add a detach().clone()'d version of the tensor
         """
@@ -2241,6 +2407,11 @@ class TensorTracker:
 
     # pops from beginning, like a queue and not a stack!
     def pop_check_set(self, tensor_to_set, testcase, override_assert_eq_kwargs=None):
+        # [FUNCTION DOC] Removes the oldest recorded tensor, asserts through the test case that
+        # it equals tensor_to_set (using the override kwargs when given, else the stored ones),
+        # then copies the recorded values into tensor_to_set under no-grad to realign the two
+        # computations. Fails the test if the queue is empty or the values differ. Mutates
+        # tensor_to_set and the queue. Returns nothing.
         """
         Pop the first element in the tensor tracker, assert equality between the popped tensor and
         the input tensor, and then set the input tensor to have the same values as the popped tensor
@@ -2261,4 +2432,5 @@ class TensorTracker:
             tensor_to_set.copy_(ref)
 
     def all_popped(self):
+        # [FUNCTION DOC] Returns True when no recorded tensors remain in the queue.
         return len(self.tensors) == 0

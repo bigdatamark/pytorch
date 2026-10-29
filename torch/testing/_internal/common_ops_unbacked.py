@@ -1,5 +1,13 @@
 # Owner(s): ["oncall: pt2"]
 
+# [MODULE DOC]
+# Shared expected-failure and skip lists for tests that run OpInfo ops on tensors with unbacked
+# symbolic dimensions. Defines two module-level sets of device-type test decorators built with
+# the xfail and skip helpers from common_device_type: one for ops that hit data-dependent
+# errors, one for ops skipped because no sample has dimensions that can be marked unbacked.
+# Consumed by test_ops_unbacked.py and test_dtensor_ops.py. Import-time side effects: none
+# beyond constructing the sets.
+
 """
 Shared xfail lists for unbacked symint tests.
 
