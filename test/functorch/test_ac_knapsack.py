@@ -1,4 +1,9 @@
 # Owner(s): ["module: functorch"]
+# [MODULE DOC] Tests for the activation checkpointing helpers: GraphInfoProvider (graph
+# bookkeeping for what can be recomputed), KnapsackEvaluator (peak memory and recompute runtime
+# of a knapsack decision), and the dp_knapsack and dp_knapsack_sliding_hirschberg solvers.
+# Defines three TestCase classes on small hand-made graphs and tables, plus a run_tests entry
+# point. No import-time side effects.
 from torch._functorch._activation_checkpointing.graph_info_provider import (
     GraphInfoProvider,
 )
@@ -14,12 +19,18 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 
 class TestGraphInfoProvider(TestCase):
+    # [CLASS DOC] Tests graph construction and derived graphs of GraphInfoProvider. setUp builds
+    # a six-node chain (node1 to output, plus an edge from node1 to output) where node1, node2
+    # and node5 are the recomputable banned nodes, each with unit memory and runtime.
     """
     Test class for GraphInfoProvider.
     The test class sets up a small graph example and tests the methods validating the graph building logic.
     """
 
     def setUp(self) -> None:
+        # [FUNCTION DOC] HELPER: Fixture. Stores the node order, the edge list, the three
+        # recomputable banned nodes, unit memory and runtime lists, and a GraphInfoProvider
+        # built from them.
         super().setUp()
         self.graph_nodes_in_order = [
             "node1",
@@ -49,6 +60,10 @@ class TestGraphInfoProvider(TestCase):
         )
 
     def test_inialize_from_graph(self):
+        # [FUNCTION DOC] Builds an fx graph by hand with the same shape as the fixture, then
+        # calls the provider factory (spelled with a typo in the source) and checks the node
+        # order, the edges (compared sorted) and the recomputable banned node names come out as
+        # the string names.
         joint_graph = Graph()
         node1 = joint_graph.placeholder("node1")
         node2 = joint_graph.call_function(lambda x: x, (node1,))
@@ -93,30 +108,37 @@ class TestGraphInfoProvider(TestCase):
         )
 
     def test_get_non_ac_peak_memory(self):
+        # [FUNCTION DOC] Checks the non-AC peak memory equals the sum of the recorded memories.
         self.assertEqual(
             self.graph_info_provider.get_non_ac_peak_memory(),
             sum(self.recorded_knapsack_input_memories),
         )
 
     def test_get_theoretical_max_runtime(self):
+        # [FUNCTION DOC] Checks the theoretical max runtime equals the sum of the
+        # recorded runtimes.
         self.assertEqual(
             self.graph_info_provider.get_theoretical_max_runtime(),
             sum(self.recorded_knapsack_input_runtimes),
         )
 
     def test_get_knapsack_memory_input(self):
+        # [FUNCTION DOC] Checks the knapsack memory input equals the recorded memory list.
         self.assertEqual(
             self.graph_info_provider.get_knapsack_memory_input(),
             self.recorded_knapsack_input_memories,
         )
 
     def test_get_knapsack_runtime_input(self):
+        # [FUNCTION DOC] Checks the knapsack runtime input equals the recorded runtime list.
         self.assertEqual(
             self.graph_info_provider.get_knapsack_runtime_input(),
             self.recorded_knapsack_input_runtimes,
         )
 
     def test_recomputable_node_only_graph(self):
+        # [FUNCTION DOC] Checks the graph restricted to recomputable nodes has exactly those
+        # nodes in order and only the direct edge from node1 to node2.
         recomputable_node_only_graph = (
             self.graph_info_provider.recomputable_node_only_graph
         )
@@ -128,6 +150,9 @@ class TestGraphInfoProvider(TestCase):
         )
 
     def test_recomputable_node_only_graph_with_larger_graph_context(self):
+        # [FUNCTION DOC] Checks the recomputable-node graph that keeps the larger graph context:
+        # same nodes, and edges node1 to node2 and node2 to node5 (indirect paths count, except
+        # those passing through another recomputable node, so no edge from node1 to node5).
         recomputable_node_only_graph_with_larger_graph_context = self.graph_info_provider.recomputable_node_only_graph_with_larger_graph_context
         expected_nodes = self.all_recomputable_banned_nodes
         # node1 does not have an indirect path to node5 because of node2
@@ -143,6 +168,8 @@ class TestGraphInfoProvider(TestCase):
         )
 
     def test_full_joint_nx_graph(self):
+        # [FUNCTION DOC] Builds a fresh provider and checks the full joint graph drops the
+        # output node and every edge touching it.
         graph_info_provider = GraphInfoProvider(
             graph_nodes_in_order=self.graph_nodes_in_order,
             graph_edges=self.graph_edges,
@@ -161,6 +188,8 @@ class TestGraphInfoProvider(TestCase):
         self.assertEqual(sorted(full_joint_nx_graph.edges), sorted(expected_edges))
 
     def test_simplified_fx_joint_graph(self):
+        # [FUNCTION DOC] Builds a fresh provider and checks the simplified fx joint graph has
+        # the nodes in the original order and, via user links, exactly the original edge set.
         graph_info_provider = GraphInfoProvider(
             graph_nodes_in_order=self.graph_nodes_in_order,
             graph_edges=self.graph_edges,
@@ -187,12 +216,19 @@ class TestGraphInfoProvider(TestCase):
 
 
 class TestKnapsackEvaluator(TestCase):
+    # [CLASS DOC] Tests KnapsackEvaluator on a six-node graph with recomputable memories 0.1,
+    # 0.2, 0.2 and runtimes 100, 50, 51. setUp also installs a fake knapsack algorithm: a lookup
+    # table from memory budget to runtime, saved indices and recomputable indices, defaulting to
+    # saving everything.
     """
     Test class for KnapsackEvaluator.
     The test class sets up a small graph example and tests the methods validating the knapsack evaluation logic.
     """
 
     def setUp(self) -> None:
+        # [FUNCTION DOC] HELPER: Fixture. Builds the graph data, a provider, an evaluator and a
+        # fake knapsack function mapping budgets 0.1 to 0.5 to canned results (unknown budgets
+        # save all).
         super().setUp()
         self.graph_nodes_in_order = [
             "node1",
@@ -232,6 +268,8 @@ class TestKnapsackEvaluator(TestCase):
         }.get(memory_budget, (0.0, [0, 1, 2], []))
 
     def test_evaluate_knapsack_output_not_accounting_for_backward_pass(self):
+        # [FUNCTION DOC] Evaluates saving node 0 and recomputing nodes 1 and 2 without backward
+        # accounting; expects peak memory 0.1 and recomputation runtime 101.
         saved_nodes_idxs = [0]
         recomputable_node_idxs = [1, 2]
         result = self.knapsack_evaluator.evaluate_knapsack_output(
@@ -242,6 +280,8 @@ class TestKnapsackEvaluator(TestCase):
         self.assertEqual(result["recomputation_runtime"], 101.0)
 
     def test_evaluate_knapsack_output_accounting_for_backward_pass(self):
+        # [FUNCTION DOC] Same choice with backward accounting on; expects peak memory 0.5 and
+        # the same recomputation runtime 101.
         saved_nodes_idxs = [0]
         recomputable_node_idxs = [1, 2]
         result = self.knapsack_evaluator.evaluate_knapsack_output(
@@ -253,6 +293,8 @@ class TestKnapsackEvaluator(TestCase):
         self.assertEqual(result["recomputation_runtime"], 101.0)
 
     def test_evaluate_knapsack_output_with_wrong_sized_values(self):
+        # [FUNCTION DOC] Passes index lists that do not cover all three recomputable nodes and
+        # expects an AssertionError.
         saved_nodes_idxs = [0]
         recomputable_node_idxs = [1]
         with self.assertRaises(AssertionError):
@@ -262,6 +304,9 @@ class TestKnapsackEvaluator(TestCase):
             )
 
     def test_evaluate_distribution_of_results_for_knapsack_algo(self):
+        # [FUNCTION DOC] Runs the distribution evaluation over budgets 0.1, 0.2, 0.3 using the
+        # fake algorithm; checks one result per budget and spot-checks the budget, peak memory,
+        # runtime, non-AC peak memory, theoretical max runtime and the two percentage fields.
         memory_budget_values = [0.1, 0.2, 0.3]
         results = (
             self.knapsack_evaluator.evaluate_distribution_of_results_for_knapsack_algo(
@@ -281,6 +326,9 @@ class TestKnapsackEvaluator(TestCase):
         )
 
     def test_get_knee_point_memory_budget(self):
+        # [FUNCTION DOC] Searches for the knee point of the memory/runtime trade-off for several
+        # upper budgets (lower bound 0.1, five iterations) and compares to expected values. Ties
+        # between budgets with the same result are resolved arbitrarily, per the inline note.
         """
         Checks if the method correctly estimates the knee point in the memory budget
         where the trade-off between memory usage and recomputation runtime is optimal.
@@ -310,6 +358,11 @@ class TestKnapsackEvaluator(TestCase):
             self.assertEqual(knee_point_memory_budget, expected_knee_point)
 
     def test_get_backward_memory_from_topologically_sorted_graph(self):
+        # [FUNCTION DOC] Calls a private evaluator method that walks the larger-context graph
+        # recomputing and dropping nodes with only node1 saved, starting from 0.1. Prints the
+        # result and the expected list, then compares memory values (approximately) and event
+        # labels pairwise. Pairs are compared with a zip, so a shorter result would not fail
+        # the test.
         result = self.knapsack_evaluator._get_backward_memory_from_topologically_sorted_graph(
             node_graph=self.graph_info_provider.recomputable_node_only_graph_with_larger_graph_context,
             node_memories=self.graph_info_provider.all_node_memories,
@@ -331,7 +384,12 @@ class TestKnapsackEvaluator(TestCase):
 
 
 class TestActivationCheckpointingKnapsack(TestCase):
+    # [CLASS DOC] Tests the two dynamic programming knapsack solvers on a shared table of cases
+    # (memory, runtime, budget, expected runtime, saved indices, recomputable indices),
+    # including empty input, zero budget and zero costs.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Fixture. Builds the list of thirteen test case tuples shared by
+        # both solver tests.
         super().setUp()
         # (memory, runtime, max_memory, expected_runtime, expected_saved, expected_recomputable)
         self.test_cases = [
@@ -360,6 +418,9 @@ class TestActivationCheckpointingKnapsack(TestCase):
         expected_saved,
         expected_recomputable,
     ):
+        # [FUNCTION DOC] HELPER: Calls the given solver with memory, runtime and budget, and
+        # checks the returned runtime exactly, and the saved and recomputable index lists
+        # after sorting.
         result_runtime, result_saved, result_recomputable = func(
             memory, runtime, max_memory
         )
@@ -368,6 +429,8 @@ class TestActivationCheckpointingKnapsack(TestCase):
         self.assertEqual(sorted(result_recomputable), sorted(expected_recomputable))
 
     def test_dp_knapsack(self):
+        # [FUNCTION DOC] Runs the plain knapsack solver on every shared case, one subtest
+        # per case.
         for i, (
             memory,
             runtime,
@@ -388,6 +451,8 @@ class TestActivationCheckpointingKnapsack(TestCase):
                 )
 
     def test_dp_knapsack_sliding_hirschberg(self):
+        # [FUNCTION DOC] Runs the sliding Hirschberg knapsack solver on every shared case, one
+        # subtest per case.
         for i, (
             memory,
             runtime,

@@ -1,3 +1,10 @@
+# [MODULE DOC] Extra OpInfo definitions used by the functorch tests that are not (yet) in
+# PyTorch core: conv2d variants, a functorch embedding and mse_loss, a getitem, two index_put
+# variants, masked_fill with scalar value, a feature-meta zeros op, and dtype conversion ops.
+# Each sample-input generator is paired with an OpInfo appended to the module-level list
+# additional_op_db, which is the public export. Import-time side effect: the list is built when
+# the module loads. KNOWN ISSUE: the conv2d variant named strided_padding_dilation_no_bias
+# builds its samples with bias enabled, so it does not match its name.
 import itertools
 import unittest
 from functools import partial
@@ -29,6 +36,14 @@ additional_op_db = []
 def sample_inputs_conv2d(
     has_bias, self, device, dtype, requires_grad, extra_args=(), groups=1
 ):
+    # [FUNCTION DOC] Sample generator for the conv2d OpInfos. Builds one input of shape batch
+    # 2, channels 6 times groups, height 7, width 5 and a weight with 4 times groups output
+    # channels, 6 input channels per group and a 3 by 2 kernel, all random in the range -1 to
+    # 1. A bias is made only when has_bias is true. Returns a one-element list whose
+    # positional arguments are weight, bias, then extra_args (stride, padding, dilation,
+    # groups as given by the caller). The groups parameter only scales the channel counts; it
+    # is not passed on to the op. The first parameter named self is the OpInfo supplied by the
+    # framework and is unused.
     in_ch, out_ch = 6, 4
     inp = make_tensor(
         (2, in_ch * groups, 7, 5),
@@ -192,18 +207,31 @@ additional_op_db.extend(
 # TODO: PyTorch core has a check for if requires_grad=True or not.
 # We actually want to test more things for backward here which is why we have our own
 def sample_inputs_embedding(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Sample generator for the functorch embedding OpInfo. Defines two tensor
+    # helpers and a nested generator of six samples (index tensors of rank 0 to 2, padding
+    # indices, inverse-frequency gradient scaling), then returns them as a list. Extra
+    # keyword arguments are ignored. Unlike core, it does not skip samples based on
+    # requires_grad (see the TODO above).
     def make_input(shape):
+        # [FUNCTION DOC] HELPER: Makes a random tensor of the given shape using the enclosing
+        # device, dtype and requires_grad setting.
         return make_tensor(
             shape, device=device, dtype=dtype, requires_grad=requires_grad
         )
 
     def make_long_input(shape, *, low, high):
+        # [FUNCTION DOC] HELPER: Makes a random integer (long) tensor of the given shape with
+        # values in the half-open range from low to high, on the enclosing device.
         return make_tensor(shape, device=device, dtype=torch.long, low=low, high=high)
 
     M = 20
     S = 5
 
     def generator():
+        # [FUNCTION DOC] HELPER: Generator yielding six embedding samples: a weight of 20 by 5
+        # with a scalar, a vector and a 5 by 5 index tensor; a 5 by 5 weight with padding index
+        # 2 and another with padding index minus 1 (indices forced to hit the padding row); and
+        # one with gradient scaling by inverse frequency enabled and repeated indices.
         # 0-D index tensor
         idx = make_long_input((), low=0, high=M)
         yield SampleInput(
@@ -277,7 +305,14 @@ additional_op_db.append(
 
 
 def sample_inputs_mse_loss(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Sample generator for mse_loss. For each shape of rank 2, 3, 4 (each side 5)
+    # and each reduction mode (none, mean, sum), yields one sample with an input and a target.
+    # The target requires grad according to an optional keyword rhs_requires_grad, defaulting to
+    # the requires_grad argument. This is a generator, not a list.
     def make_input(shape, requires_grad=requires_grad):
+        # [FUNCTION DOC] HELPER: Makes a random tensor of the given shape; requires_grad
+        # defaults to the outer requires_grad but can be overridden per call (used for
+        # the target).
         return make_tensor(
             shape, device=device, dtype=dtype, requires_grad=requires_grad
         )
@@ -315,6 +350,11 @@ additional_op_db.append(
 # TODO: upstream sample inputs to pytorch/pytorch.
 # We are more comprehensive.
 def sample_inputs_getitem(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Sample generator for getitem. Holds a table of 24 pairs of tensor rank (3
+    # to 6) and an index expression mixing lists, slices, ellipsis, None and 2-D index tensors
+    # (advanced indexing in several adjacent and separated positions). Returns a tuple of
+    # samples whose tensors have per-axis sizes 5, 6, 7 and so on, and the index expression as
+    # the single positional argument.
     # Short for "advanced index"
     adv_idx = torch.LongTensor([[0, 1], [2, 3]])
     S = 5
@@ -354,6 +394,8 @@ def sample_inputs_getitem(op_info, device, dtype, requires_grad, **kwargs):
     ]
 
     def get_shape(dim):
+        # [FUNCTION DOC] HELPER: Returns a tuple of axis sizes for the given rank, starting at 5
+        # and growing by one per axis.
         return tuple(S + i for i in range(dim))
 
     return tuple(
@@ -393,6 +435,11 @@ additional_op_db.append(
 # Turns out at::index_put is different from torch.index_put...
 # TODO: figure out how to upstream this
 def sample_inputs_aten_index_put(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Sample generator for the aten-level index_put. For eight (shape, indices)
+    # pairs of rank 4 to 6 where None marks a skipped axis, and for both full and broadcast
+    # values, builds an input and a values tensor. The values shape is taken from indexing the
+    # input with None replaced by full slices, minus its first three dims when broadcasting.
+    # Returns a list of samples whose arguments are the indices tuple and the values.
     make_arg = partial(
         make_tensor, dtype=dtype, device=device, requires_grad=requires_grad
     )
@@ -425,6 +472,12 @@ def sample_inputs_aten_index_put(op_info, device, dtype, requires_grad, **kwargs
 
 
 def sample_inputs_index_put(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Sample generator for index_put. For accumulate false and true, builds
+    # samples that put vectors, multi-dim tensors, a zero-size dim and a scalar at indexed
+    # positions, with indices drawn below 4 (or below 5 for the scalar). A broadcast-values
+    # sample is added only when not accumulating on CUDA, working around an accumulate issue
+    # on CUDA. Returns a list of samples with the indices tuple, the values, and an
+    # accumulate keyword.
     make_arg = partial(
         make_tensor, dtype=dtype, device=device, requires_grad=requires_grad
     )
@@ -508,6 +561,10 @@ additional_op_db.append(
 
 
 def sample_inputs_masked_fill(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Sample generator for masked_fill with a scalar fill value 10. Yields five
+    # samples on a 3 by 3 input: masks of full shape, row shape, scalar shape on a 0-D input,
+    # scalar mask on a matrix, and a vector input broadcast against a 3 by 3 mask (flagged as
+    # broadcasting the input). Masks are random normal values compared with zero.
     S = 3
     make_arg = partial(
         make_tensor, device=device, dtype=dtype, requires_grad=requires_grad
@@ -543,6 +600,10 @@ additional_op_db.append(
 def sample_inputs_new_zeros_with_same_feature_meta(
     op_info, device, dtype, requires_grad, **kwargs
 ):
+    # [FUNCTION DOC] Sample generator for the feature-meta zeros op. Goes through eight tuples
+    # of tangent shape, base shape and number of batch dims of the tangent (0 to 2), including
+    # empty and zero-size shapes, and returns a list of samples with the tangent as input, the
+    # base as the positional argument and the batch dim count as a keyword.
     make_arg = partial(
         make_tensor, dtype=dtype, device=device, requires_grad=requires_grad
     )
@@ -585,6 +646,9 @@ additional_op_db.append(
 
 
 def sample_inputs_conversion(op_info, device, dtype, requires_grad, **kwargs):
+    # [FUNCTION DOC] Sample generator for dtype conversion ops (bfloat16, bool, and so on).
+    # Yields samples for a scalar and a 2 by 3 tensor, each without arguments or with the
+    # contiguous memory format keyword. This is a generator.
     make_arg = partial(
         make_tensor, dtype=dtype, device=device, requires_grad=requires_grad
     )

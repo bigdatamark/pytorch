@@ -1,4 +1,8 @@
 # Owner(s): ["module: functorch"]
+# [MODULE DOC] Tests for splitting first-class dimension tensors (functorch.dim) with Dim
+# objects as the split sizes. Covers bound and unbound dims, size inference, error cases, result
+# types, devices, dtypes, autograd and the standalone split function. Defines one TestCase class
+# and a run_tests entry point; no import-time side effects.
 import unittest
 
 import torch
@@ -11,13 +15,21 @@ from torch.testing._internal.common_utils import (
 
 
 class TestSplit(TestCase):
+    # [CLASS DOC] Test case for tensor split where the sizes are Dim objects. Each test indexes
+    # a plain tensor with three dims, splits one dim, and inspects results via order. setUp
+    # stores three unused dims as batch, height and width attributes.
     """Comprehensive tests for first-class dimension split operations."""
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Fixture. Calls the base setUp and stores three fresh unbound
+        # dims as attributes batch, height and width.
         super().setUp()
         self.batch, self.height, self.width = dims(3)
 
     def test_dim_object_split_all_bound(self):
+        # [FUNCTION DOC] Splits the middle axis (size 12) with three bound dims of sizes 3, 4,
+        # 5. Expects three results whose ordered shapes use those chunk sizes and dims keeping
+        # their sizes.
         """Test split with all Dim objects bound to specific sizes."""
         tensor = torch.randn(3, 12, 5)
         x, y, z = dims(3)
@@ -42,6 +54,8 @@ class TestSplit(TestCase):
         self.assertEqual(d3.size, 5)
 
     def test_dim_object_split_unbound(self):
+        # [FUNCTION DOC] Splits a size 12 axis with three unbound dims. Expects an even split
+        # into chunks of 4 and each dim becoming bound to size 4.
         """Test split with unbound Dim objects."""
         tensor = torch.randn(3, 12, 5)
         x, y, z = dims(3)
@@ -71,6 +85,9 @@ class TestSplit(TestCase):
         self.assertEqual(d3.size, 4)
 
     def test_dim_object_split_mixed_bound_unbound(self):
+        # [FUNCTION DOC] Splits a size 12 axis with bound dims of sizes 3 and 2 and one unbound
+        # dim between them. Expects the unbound dim to take the remainder (7) and become bound
+        # to it.
         """Test split with mix of bound and unbound Dim objects."""
         tensor = torch.randn(3, 12, 5)
         x, y, z = dims(3)
@@ -91,6 +108,8 @@ class TestSplit(TestCase):
         self.assertEqual(d2.size, 7)
 
     def test_dim_object_split_multiple_unbound(self):
+        # [FUNCTION DOC] Splits a size 15 axis with one bound dim (3) and two unbound dims.
+        # Expects the remaining 12 to be shared evenly, giving both unbound dims size 6.
         """Test split with multiple unbound Dim objects."""
         tensor = torch.randn(3, 15, 5)
         x, y, z = dims(3)
@@ -113,6 +132,9 @@ class TestSplit(TestCase):
         self.assertEqual(d3.size, 6)
 
     def test_dim_object_split_uneven_remainder(self):
+        # [FUNCTION DOC] Splits a size 14 axis with one bound dim (3) and two unbound dims.
+        # Expects the first unbound dim to get 6 (rounded up share of the remaining 11) and the
+        # last unbound dim to get the leftover 5.
         """Test split with unbound dimensions that don't divide evenly."""
         tensor = torch.randn(3, 14, 5)  # 14 doesn't divide evenly by 3
         x, y, z = dims(3)
@@ -132,6 +154,9 @@ class TestSplit(TestCase):
         self.assertEqual(d3.size, 5)
 
     def test_split_with_dim_object_parameter(self):
+        # [FUNCTION DOC] Splits along a Dim used as the dim argument, with three fully bound
+        # dims, and only checks that three chunks are returned. Its name suggests a different
+        # case than the sibling test of bound dims, but the body is nearly identical to it.
         """Test split when dim parameter is a Dim object."""
         tensor = torch.randn(3, 12, 5)
         x, y, z = dims(3)
@@ -146,6 +171,8 @@ class TestSplit(TestCase):
         self.assertEqual(len(result), 3)
 
     def test_error_mixed_types(self):
+        # [FUNCTION DOC] Checks that a split-size list mixing Dim objects and integers raises
+        # TypeError, with the integer after the dim and with the integer between dims.
         """Test error when mixing integers and Dim objects in split sizes."""
         tensor = torch.randn(3, 12, 5)
         x, y, z = dims(3)
@@ -161,6 +188,9 @@ class TestSplit(TestCase):
             t.split([3, d1, 5], dim=y)
 
     def test_error_dim_parameter_with_int_sizes(self):
+        # [FUNCTION DOC] Checks that an integer split size, or a list of integers, raises
+        # TypeError when the split axis is given as a Dim. The message argument of the assertion
+        # context is only a failure message and does not check the error text.
         """Test error when dim parameter is Dim but sizes are integers."""
         tensor = torch.randn(3, 12, 5)
         x, y, z = dims(3)
@@ -180,6 +210,8 @@ class TestSplit(TestCase):
             t.split([3, 4, 5], dim=y)
 
     def test_error_size_mismatch(self):
+        # [FUNCTION DOC] Checks that bound dim sizes summing to 13 for a size 12 axis
+        # raise TypeError.
         """Test error when bound sizes don't match tensor dimension."""
         tensor = torch.randn(3, 12, 5)
         x, y, z = dims(3)
@@ -194,6 +226,8 @@ class TestSplit(TestCase):
             t.split([d1, d2, d3], dim=y)
 
     def test_error_bound_sizes_exceed_tensor(self):
+        # [FUNCTION DOC] Checks that bound dim sizes (8 and 6) exceeding the axis size 12 raise
+        # TypeError even when a third dim is left unbound.
         """Test error when bound sizes exceed tensor dimension."""
         tensor = torch.randn(3, 12, 5)
         x, y, z = dims(3)
@@ -208,6 +242,8 @@ class TestSplit(TestCase):
             t.split([d1, d2, d3], dim=y)
 
     def test_error_nonexistent_dimension(self):
+        # [FUNCTION DOC] Checks that splitting along a Dim that is not a dimension of the tensor
+        # raises TypeError.
         """Test error when splitting on non-existent dimension."""
         tensor = torch.randn(3, 12, 5)
         x, y, z = dims(3)
@@ -219,6 +255,8 @@ class TestSplit(TestCase):
             t.split([Dim("d1"), Dim("d2")], dim=w)
 
     def test_split_different_dims(self):
+        # [FUNCTION DOC] Splits along the first axis into two bound dims (2, 4) and along the
+        # last axis into two bound dims (3, 7), and verifies each ordered chunk shape.
         """Test splitting along different dimensions."""
         tensor = torch.randn(6, 8, 10)
         x, y, z = dims(3)
@@ -239,6 +277,8 @@ class TestSplit(TestCase):
         self.assertEqual(result2[1].order(x, y, d).shape, (6, 8, 7))
 
     def test_split_single_dim_object(self):
+        # [FUNCTION DOC] Splits an axis of size 12 with a single bound dim of size 12 and
+        # expects one chunk with the full original shape.
         """Test split with single Dim object that matches tensor dimension size."""
         tensor = torch.randn(3, 12, 5)
         x, y, z = dims(3)
@@ -257,6 +297,9 @@ class TestSplit(TestCase):
         "TorchDynamo doesn't preserve side effects during tracing",
     )
     def test_dimension_binding_consistency(self):
+        # [FUNCTION DOC] Skipped under TorchDynamo (side effects not preserved). After a split
+        # with three unbound dims, checks they are bound, then indexes a new tensor with the
+        # first dim and checks the dim keeps its size.
         """Test that split properly binds dimensions and they remain consistent."""
         tensor = torch.randn(3, 15, 5)
         x, y, z = dims(3)
@@ -284,6 +327,8 @@ class TestSplit(TestCase):
         self.assertEqual(t2.order(d1, a).shape, (original_sizes[0], 4))
 
     def test_split_result_tensor_types(self):
+        # [FUNCTION DOC] Splits into two bound dims and checks every chunk is a torch or
+        # functorch.dim Tensor; if it has a dims attribute, that attribute must be non-empty.
         """Test that split results are proper first-class dimension tensors."""
         tensor = torch.randn(3, 12, 5)
         x, y, z = dims(3)
@@ -305,6 +350,8 @@ class TestSplit(TestCase):
                 self.assertTrue(len(dims_in_result) > 0)
 
     def test_large_tensor_split(self):
+        # [FUNCTION DOC] Splits a size 100 axis into twenty bound dims of size 5 and checks the
+        # chunk count, each ordered shape and each dim size.
         """Test split on larger tensors to verify performance and correctness."""
         tensor = torch.randn(10, 100, 20)
         x, y, z = dims(3)
@@ -321,6 +368,8 @@ class TestSplit(TestCase):
             self.assertEqual(split_dims[i].size, 5)
 
     def test_device_handling(self):
+        # [FUNCTION DOC] Splits into two bound dims on CUDA (only if available) and on CPU,
+        # checking that ordered chunks keep the device and the untouched axis sizes.
         """Test split behavior with different devices."""
         if torch.cuda.is_available():
             # Test on CUDA
@@ -350,6 +399,8 @@ class TestSplit(TestCase):
             self.assertEqual(ordered.device, torch.device("cpu"))
 
     def test_split_preserves_dtype(self):
+        # [FUNCTION DOC] Loops over float32, float64, int32 and int64 tensors, splits into two
+        # bound dims, and checks every ordered chunk keeps the dtype.
         """Test that split preserves tensor dtype."""
         for dtype in [torch.float32, torch.float64, torch.int32, torch.int64]:
             if dtype in [torch.int32, torch.int64]:
@@ -367,6 +418,8 @@ class TestSplit(TestCase):
                 self.assertEqual(ordered.dtype, dtype)
 
     def test_split_with_requires_grad(self):
+        # [FUNCTION DOC] Splits a tensor that requires grad into two bound dims and checks each
+        # ordered chunk still reports requires_grad as true.
         """Test split with tensors that require gradients."""
         tensor = torch.randn(3, 12, 5, requires_grad=True)
         x, y, z = dims(3)
@@ -382,6 +435,8 @@ class TestSplit(TestCase):
             )
 
     def test_edge_case_single_element_splits(self):
+        # [FUNCTION DOC] Splits a size 5 axis into five bound dims of size 1 and checks the
+        # chunk count and each ordered shape.
         """Test splitting into single-element chunks."""
         tensor = torch.randn(3, 5, 4)
         x, y, z = dims(3)
@@ -400,6 +455,10 @@ class TestSplit(TestCase):
         TEST_WITH_TORCHDYNAMO, "TorchDynamo has issues with torch._tensor.split"
     )
     def test_split_function_directly(self):
+        # [FUNCTION DOC] Skipped under TorchDynamo. Imports the standalone split function from
+        # functorch.dim. On a plain tensor with an integer chunk size it returns three plain
+        # chunks; on an indexed tensor with two bound dims it returns two chunks with the
+        # expected shapes.
         """Test that the standalone split function works correctly."""
         from functorch.dim import split
 
@@ -426,6 +485,10 @@ class TestSplit(TestCase):
         "TorchDynamo can't parse dims() without arguments from bytecode",
     )
     def test_split_on_plain_tensor_with_fcd_args(self):
+        # [FUNCTION DOC] Skipped under TorchDynamo. Splits a plain size 8 tensor using two
+        # unbound dims as sizes. Expects two functorch.dim results having a dims attribute
+        # whose first dim is the given one, with both dims bound to 4. Then repeats with one
+        # dim used twice.
         """Test that split() works on plain tensors when FCD arguments are provided."""
         # Test the exact example from the user message
         x, y = dims()
@@ -452,6 +515,8 @@ class TestSplit(TestCase):
         self.assertEqual(x2.size, 4)  # Both chunks should be size 4
 
     def test_plain_tensor_regular_split_still_works(self):
+        # [FUNCTION DOC] Checks that a regular integer split of a plain tensor is unaffected:
+        # three plain torch Tensor chunks of the right shape that lack a dims attribute.
         """Test that regular split on plain tensors still works without FCD args."""
         tensor = torch.randn(3, 12, 5)
 
