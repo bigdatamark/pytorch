@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines the Fisher-Snedecor (F) distribution parameterized by two positive
+# degrees of freedom, sampled as a ratio of two Gamma variables. Imports Gamma.
+# No import-time side effects. Exports: FisherSnedecor.
 
 import torch
 from torch import nan, Tensor
@@ -13,6 +17,10 @@ __all__ = ["FisherSnedecor"]
 
 
 class FisherSnedecor(Distribution):
+    # [CLASS DOC]
+    # F distribution on positive reals. State: df1, df2 (broadcast positive
+    # tensors) and two private Gamma distributions used for reparameterized
+    # sampling. Moments are NaN where undefined.
     r"""
     Creates a Fisher-Snedecor distribution parameterized by :attr:`df1` and :attr:`df2`.
 
@@ -39,6 +47,7 @@ class FisherSnedecor(Distribution):
         df2: Tensor | float,
         validate_args: bool | None = None,
     ) -> None:
+        # [FUNCTION DOC] Broadcasts df1 and df2 into tensors and builds two Gamma helpers (shape df/2, rate df). Batch shape is empty if both inputs are Python numbers, else the broadcast shape. Gamma construction or base validation may raise ValueError for nonpositive values.
         self.df1, self.df2 = broadcast_all(df1, df2)
         self._gamma1 = Gamma(self.df1 * 0.5, self.df1)
         self._gamma2 = Gamma(self.df2 * 0.5, self.df2)
@@ -50,6 +59,7 @@ class FisherSnedecor(Distribution):
         super().__init__(batch_shape, validate_args=validate_args)
 
     def expand(self, batch_shape, _instance=None):
+        # [FUNCTION DOC] Returns a new FisherSnedecor with df1, df2 and both Gamma helpers expanded to batch_shape, preserving the validation setting; self is unchanged.
         new = self._get_checked_instance(FisherSnedecor, _instance)
         batch_shape = torch.Size(batch_shape)
         new.df1 = self.df1.expand(batch_shape)
@@ -62,18 +72,21 @@ class FisherSnedecor(Distribution):
 
     @property
     def mean(self) -> Tensor:
+        # [FUNCTION DOC] Mean: df2 divided by df2 minus two; NaN where df2 is at most 2 (undefined).
         df2 = self.df2.clone(memory_format=torch.contiguous_format)
         df2[df2 <= 2] = nan
         return df2 / (df2 - 2)
 
     @property
     def mode(self) -> Tensor:
+        # [FUNCTION DOC] Mode: (df1 minus 2) over df1 times df2 over (df2 plus 2); NaN where df1 is at most 2.
         mode = (self.df1 - 2) / self.df1 * self.df2 / (self.df2 + 2)
         mode[self.df1 <= 2] = nan
         return mode
 
     @property
     def variance(self) -> Tensor:
+        # [FUNCTION DOC] Variance by the standard F formula; NaN where df2 is at most 4 (undefined).
         df2 = self.df2.clone(memory_format=torch.contiguous_format)
         df2[df2 <= 4] = nan
         return (
@@ -84,6 +97,7 @@ class FisherSnedecor(Distribution):
         )
 
     def rsample(self, sample_shape: _size = torch.Size(())) -> Tensor:
+        # [FUNCTION DOC] Draws reparameterized samples as the ratio of two independent Gamma samples (consumes random state). The denominator and the result are clamped from below at the smallest normal float of the dtype to avoid zero or division blowups; results are reshaped to the extended shape.
         shape = self._extended_shape(sample_shape)
         #   X1 ~ Gamma(df1 / 2, 1 / df1), X2 ~ Gamma(df2 / 2, 1 / df2)
         #   Y = df2 * df1 * X1 / (df1 * df2 * X2) = X1 / X2 ~ F(df1, df2)
@@ -96,6 +110,7 @@ class FisherSnedecor(Distribution):
         return Y
 
     def log_prob(self, value):
+        # [FUNCTION DOC] Log density of the F distribution at value, via log-gamma terms of df1/2 and df2/2 and the ratio df1/df2. Validates value if validation is on (ValueError if not positive).
         if self._validate_args:
             self._validate_sample(value)
         ct1 = self.df1 * 0.5

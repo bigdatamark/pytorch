@@ -1,4 +1,12 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines Distribution, the abstract base class of all probability distributions:
+# shape bookkeeping (batch_shape, event_shape), constructor-time parameter
+# validation against arg_constraints, sample-value validation against support,
+# and the abstract interface (sample, rsample, log_prob, cdf, icdf, entropy, ...).
+# Import-time side effect: the class attribute _validate_args is initialized from
+# the interpreter's debug flag (validation off under optimized mode).
+# Exports: Distribution.
 import warnings
 from typing_extensions import deprecated
 
@@ -13,6 +21,13 @@ __all__ = ["Distribution"]
 
 
 class Distribution:
+    # [CLASS DOC]
+    # Abstract base class for distributions. Instance state: _batch_shape and
+    # _event_shape (set at construction, fixed afterwards) and a possibly
+    # per-instance _validate_args flag shadowing the class-level default.
+    # Class flags: has_rsample and has_enumerate_support (False by default).
+    # Subclasses define arg_constraints, support and the sampling/density methods;
+    # unimplemented members raise NotImplementedError.
     r"""
     Distribution is the abstract base class for probability distributions.
 
@@ -28,6 +43,11 @@ class Distribution:
 
     @staticmethod
     def set_default_validate_args(value: bool) -> None:
+        # [FUNCTION DOC]
+        # Sets the class-wide default for argument validation, affecting every
+        # distribution that does not pass validate_args explicitly (global state).
+        # Raises ValueError (with no message) if value is not equal to True or False.
+        # Note that the membership test also accepts 0 and 1.
         """
         Sets whether validation is enabled or disabled.
 
@@ -49,6 +69,13 @@ class Distribution:
         event_shape: torch.Size = torch.Size(),
         validate_args: bool | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Records batch_shape and event_shape. If validate_args is given, stores it on
+        # the instance. When validation is enabled, checks each parameter named in
+        # arg_constraints against its constraint: skips dependent constraints and
+        # lazily computed parameters not yet materialized; warns (not errors) if the
+        # subclass defines no arg_constraints. Raises ValueError listing the offending
+        # parameter if any value violates its constraint.
         self._batch_shape = batch_shape
         self._event_shape = event_shape
         if validate_args is not None:
@@ -84,6 +111,7 @@ class Distribution:
         super().__init__()
 
     def expand(self, batch_shape: _size, _instance=None):
+        # [FUNCTION DOC] Abstract: subclasses return a new instance with parameters expanded to batch_shape without validation. The base version raises NotImplementedError.
         """
         Returns a new distribution instance (or populates an existing instance
         provided by a derived class) with batch dimensions expanded to
@@ -106,6 +134,7 @@ class Distribution:
 
     @property
     def batch_shape(self) -> torch.Size:
+        # [FUNCTION DOC] Returns the shape over which parameters are batched.
         """
         Returns the shape over which parameters are batched.
         """
@@ -113,6 +142,7 @@ class Distribution:
 
     @property
     def event_shape(self) -> torch.Size:
+        # [FUNCTION DOC] Returns the shape of a single sample without batching.
         """
         Returns the shape of a single sample (without batching).
         """
@@ -120,6 +150,7 @@ class Distribution:
 
     @property
     def arg_constraints(self) -> dict[str, constraints.Constraint]:
+        # [FUNCTION DOC] Abstract: subclasses return a mapping from parameter name to its Constraint. The base version raises NotImplementedError.
         """
         Returns a dictionary from argument names to
         :class:`~torch.distributions.constraints.Constraint` objects that
@@ -130,6 +161,7 @@ class Distribution:
 
     @property
     def support(self) -> constraints.Constraint | None:
+        # [FUNCTION DOC] Abstract: subclasses return the Constraint describing the support. The base version raises NotImplementedError.
         """
         Returns a :class:`~torch.distributions.constraints.Constraint` object
         representing this distribution's support.
@@ -138,6 +170,7 @@ class Distribution:
 
     @property
     def mean(self) -> Tensor:
+        # [FUNCTION DOC] Abstract: subclasses return the mean. The base version raises NotImplementedError.
         """
         Returns the mean of the distribution.
         """
@@ -145,6 +178,7 @@ class Distribution:
 
     @property
     def mode(self) -> Tensor:
+        # [FUNCTION DOC] Abstract: subclasses return the mode. The base version raises NotImplementedError naming the class.
         """
         Returns the mode of the distribution.
         """
@@ -152,6 +186,7 @@ class Distribution:
 
     @property
     def variance(self) -> Tensor:
+        # [FUNCTION DOC] Abstract: subclasses return the variance. The base version raises NotImplementedError.
         """
         Returns the variance of the distribution.
         """
@@ -159,12 +194,14 @@ class Distribution:
 
     @property
     def stddev(self) -> Tensor:
+        # [FUNCTION DOC] Standard deviation, the square root of variance (so it raises if variance is unimplemented).
         """
         Returns the standard deviation of the distribution.
         """
         return self.variance.sqrt()
 
     def sample(self, sample_shape: _size = torch.Size()) -> Tensor:
+        # [FUNCTION DOC] Default sampler: calls rsample with gradient tracking disabled and returns the result. Subclasses without rsample must override it; otherwise rsample raises NotImplementedError.
         """
         Generates a sample_shape shaped sample or sample_shape shaped batch of
         samples if the distribution parameters are batched.
@@ -173,6 +210,7 @@ class Distribution:
             return self.rsample(sample_shape)
 
     def rsample(self, sample_shape: _size = torch.Size()) -> Tensor:
+        # [FUNCTION DOC] Abstract: subclasses return reparameterized samples of shape sample_shape plus batch and event shape. The base version raises NotImplementedError.
         """
         Generates a sample_shape shaped reparameterized sample or sample_shape
         shaped batch of reparameterized samples if the distribution parameters
@@ -185,6 +223,7 @@ class Distribution:
         category=FutureWarning,
     )
     def sample_n(self, n: int) -> Tensor:
+        # [FUNCTION DOC] Deprecated (emits a FutureWarning): draws n samples by calling sample with a one-element shape of n.
         """
         Generates n samples or n batches of samples if the distribution
         parameters are batched.
@@ -192,6 +231,7 @@ class Distribution:
         return self.sample(torch.Size((n,)))
 
     def log_prob(self, value: Tensor) -> Tensor:
+        # [FUNCTION DOC] Abstract: subclasses return the log density or mass at value. The base version raises NotImplementedError.
         """
         Returns the log of the probability density/mass function evaluated at
         `value`.
@@ -202,6 +242,7 @@ class Distribution:
         raise NotImplementedError
 
     def cdf(self, value: Tensor) -> Tensor:
+        # [FUNCTION DOC] Abstract: subclasses return the cumulative distribution at value. The base version raises NotImplementedError.
         """
         Returns the cumulative density/mass function evaluated at
         `value`.
@@ -212,6 +253,7 @@ class Distribution:
         raise NotImplementedError
 
     def icdf(self, value: Tensor) -> Tensor:
+        # [FUNCTION DOC] Abstract: subclasses return the inverse cumulative distribution at value. The base version raises NotImplementedError.
         """
         Returns the inverse cumulative density/mass function evaluated at
         `value`.
@@ -222,6 +264,7 @@ class Distribution:
         raise NotImplementedError
 
     def enumerate_support(self, expand: bool = True) -> Tensor:
+        # [FUNCTION DOC] Abstract: discrete subclasses return all support values enumerated along dimension 0, optionally expanded over batch dims. The base version raises NotImplementedError.
         """
         Returns tensor containing all values supported by a discrete
         distribution. The result will enumerate over dimension 0, so the shape
@@ -246,6 +289,7 @@ class Distribution:
         raise NotImplementedError
 
     def entropy(self) -> Tensor:
+        # [FUNCTION DOC] Abstract: subclasses return the entropy as a tensor of batch shape. The base version raises NotImplementedError.
         """
         Returns entropy of distribution, batched over batch_shape.
 
@@ -255,6 +299,7 @@ class Distribution:
         raise NotImplementedError
 
     def perplexity(self) -> Tensor:
+        # [FUNCTION DOC] Returns the exponential of the entropy, a tensor of batch shape (raises if entropy is unimplemented).
         """
         Returns perplexity of distribution, batched over batch_shape.
 
@@ -264,6 +309,11 @@ class Distribution:
         return torch.exp(self.entropy())
 
     def _extended_shape(self, sample_shape: _size = torch.Size()) -> torch.Size:
+        # [FUNCTION DOC]
+        # HELPER: Returns sample_shape (converted to a size object if needed) followed by
+        # batch shape and event shape.
+        # KNOWN ISSUE: the docstring says an empty result is upcast to (1,), but the code
+        # performs no such upcast.
         """
         Returns the size of the sample returned by the distribution, given
         a `sample_shape`. Note, that the batch and event shapes of a distribution
@@ -278,6 +328,14 @@ class Distribution:
         return torch.Size(sample_shape + self._batch_shape + self._event_shape)
 
     def _validate_sample(self, value: Tensor) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Validates a value passed to log_prob, cdf or icdf. Checks it is a
+        # tensor, that its trailing dims equal the event shape, that it broadcasts with
+        # batch plus event shape, and that every element lies in the support. If the
+        # subclass defines no support, only warns and returns. Raises ValueError on any
+        # violation. Returns nothing.
+        # KNOWN ISSUE: the tensor-type error message always mentions log_prob even when
+        # called from cdf or icdf.
         """
         Argument validation for distribution methods such as `log_prob`,
         `cdf` and `icdf`. The rightmost dimensions of a value to be
@@ -330,6 +388,7 @@ class Distribution:
             )
 
     def _get_checked_instance(self, cls, _instance=None):
+        # [FUNCTION DOC] HELPER: Used by expand overrides. If no instance is supplied, returns a fresh uninitialized object of this instance's type; raises NotImplementedError if this type defines its own initializer different from cls's (it must then override expand itself). If an instance is supplied, returns it unchanged.
         if _instance is None and type(self).__init__ != cls.__init__:
             raise NotImplementedError(
                 f"Subclass {self.__class__.__name__} of {cls.__name__} that defines a custom __init__ method "
@@ -338,6 +397,7 @@ class Distribution:
         return self.__new__(type(self)) if _instance is None else _instance
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC] Returns the class name followed by parameters listed in arg_constraints that are present in the instance attributes; each shown by value if single-element, else by size. Assumes those attributes are tensors; raises NotImplementedError if arg_constraints is undefined.
         param_names = [k for k in self.arg_constraints if k in self.__dict__]
         args_string = ", ".join(
             [

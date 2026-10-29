@@ -1,4 +1,12 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines the Constraint base class and its concrete subclasses describing the
+# valid region of a variable (distribution supports and parameter domains), each
+# with a check method returning a boolean tensor, plus event_dim / is_discrete
+# attributes. Also defines the dependent placeholder and decorator, and wrapper
+# constraints (independent, MixtureSameFamilyConstraint, cat, stack).
+# Import-time side effect: creates the public singleton instances and aliases
+# (real, positive, simplex, boolean, unit_interval, etc.) listed in __all__.
 
 from collections.abc import Callable
 from typing import Any
@@ -95,7 +103,15 @@ class Constraint:
     is_discrete = False  # Default to continuous.
     event_dim = 0  # Default to univariate.
 
+    # [CLASS DOC]
+    # Abstract base of all constraints. Class attributes: is_discrete (default
+    # False) and event_dim (default 0). Subclasses override check to return a
+    # boolean tensor with the rightmost event_dim dimensions reduced away.
+
     def check(self, value):
+        # [FUNCTION DOC]
+        # Abstract: returns a boolean tensor telling whether each event in value
+        # satisfies the constraint. The base version raises NotImplementedError.
         """
         Returns a byte tensor of ``sample_shape + batch_shape`` indicating
         whether each event in value satisfies this constraint.
@@ -103,10 +119,17 @@ class Constraint:
         raise NotImplementedError
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns the class name with its first character (the leading underscore) dropped, followed by empty parentheses.
         return self.__class__.__name__[1:] + "()"
 
 
 class _Dependent(Constraint):
+    # [CLASS DOC]
+    # HELPER: Placeholder constraint for variables whose support depends on other
+    # variables. Stores optional static is_discrete and event_dim values (the
+    # NotImplemented sentinel means unknown); reading an unknown one raises
+    # NotImplementedError. Calling the instance makes a customized copy; check
+    # always raises. Public alias: dependent.
     """
     Placeholder for variables whose support depends on other variables.
     These variables obey no simple coordinate-wise constraints.
@@ -121,23 +144,27 @@ class _Dependent(Constraint):
     """
 
     def __init__(self, *, is_discrete=NotImplemented, event_dim=NotImplemented):
+        # [FUNCTION DOC] HELPER: Stores the optional static is_discrete and event_dim values (keyword-only; NotImplemented means undetermined).
         self._is_discrete = is_discrete
         self._event_dim = event_dim
         super().__init__()
 
     @property
     def is_discrete(self) -> bool:  # type: ignore[override]
+        # [FUNCTION DOC] HELPER: Returns the stored is_discrete flag; raises NotImplementedError if it was not provided.
         if self._is_discrete is NotImplemented:
             raise NotImplementedError(".is_discrete cannot be determined statically")
         return self._is_discrete
 
     @property
     def event_dim(self) -> int:  # type: ignore[override]
+        # [FUNCTION DOC] HELPER: Returns the stored event_dim; raises NotImplementedError if it was not provided.
         if self._event_dim is NotImplemented:
             raise NotImplementedError(".event_dim cannot be determined statically")
         return self._event_dim
 
     def __call__(self, *, is_discrete=NotImplemented, event_dim=NotImplemented):
+        # [FUNCTION DOC] HELPER: Returns a new _Dependent whose is_discrete and event_dim are the given values, falling back to this instance's values for any left unspecified.
         """
         Support for syntax to customize static attributes::
 
@@ -150,10 +177,12 @@ class _Dependent(Constraint):
         return _Dependent(is_discrete=is_discrete, event_dim=event_dim)
 
     def check(self, x):
+        # [FUNCTION DOC] HELPER: Always raises ValueError because validity of a dependent constraint cannot be determined.
         raise ValueError("Cannot determine validity of dependent constraint")
 
 
 def is_dependent(constraint):
+    # [FUNCTION DOC] Returns True if the given constraint is a _Dependent instance (including dependent properties), else False. Pure; no errors.
     """
     Checks if ``constraint`` is a ``_Dependent`` object.
 
@@ -180,6 +209,11 @@ def is_dependent(constraint):
 
 
 class _DependentProperty(property, _Dependent):
+    # [CLASS DOC]
+    # HELPER: Descriptor that is both a property and a _Dependent constraint.
+    # Accessed on an instance it behaves as the decorated property; accessed on
+    # the class it is itself a dependent constraint carrying static is_discrete
+    # and event_dim. Public alias: dependent_property.
     """
     Decorator that extends @property to act like a `Dependent` constraint when
     called on a class and act like a property when called on an object.
@@ -212,11 +246,13 @@ class _DependentProperty(property, _Dependent):
         is_discrete: bool | None = NotImplemented,
         event_dim: int | None = NotImplemented,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Initializes the property with the optional getter fn and stores the static is_discrete and event_dim values (keyword-only).
         super().__init__(fn)
         self._is_discrete = is_discrete
         self._event_dim = event_dim
 
     def __call__(self, fn: Callable[..., Any]) -> "_DependentProperty":  # type: ignore[override]
+        # [FUNCTION DOC] HELPER: Decorator form; wraps fn in a new _DependentProperty that keeps this instance's is_discrete and event_dim.
         """
         Support for syntax to customize static attributes::
 
@@ -229,6 +265,11 @@ class _DependentProperty(property, _Dependent):
 
 
 class _IndependentConstraint(Constraint):
+    # [CLASS DOC]
+    # Wraps a base constraint and reinterprets the rightmost
+    # reinterpreted_batch_ndims batch dims as event dims: check reduces with
+    # logical-and over them. is_discrete is the base's; event_dim is the base's
+    # plus reinterpreted_batch_ndims. Public alias: independent.
     """
     Wraps a constraint by aggregating over ``reinterpreted_batch_ndims``-many
     dims in :meth:`check`, so that an event is valid only if all its
@@ -236,6 +277,7 @@ class _IndependentConstraint(Constraint):
     """
 
     def __init__(self, base_constraint, reinterpreted_batch_ndims):
+        # [FUNCTION DOC] Stores the base constraint and the number of reinterpreted batch dims. Raises AssertionError if base_constraint is not a Constraint, or the count is not an int or is negative.
         if not isinstance(base_constraint, Constraint):
             raise AssertionError(
                 f"base_constraint must be a Constraint, got {type(base_constraint).__name__}"
@@ -254,13 +296,20 @@ class _IndependentConstraint(Constraint):
 
     @property
     def is_discrete(self) -> bool:  # type: ignore[override]
+        # [FUNCTION DOC] Returns the base constraint's is_discrete.
         return self.base_constraint.is_discrete
 
     @property
     def event_dim(self) -> int:  # type: ignore[override]
+        # [FUNCTION DOC] Returns the base constraint's event_dim plus reinterpreted_batch_ndims.
         return self.base_constraint.event_dim + self.reinterpreted_batch_ndims
 
     def check(self, value):
+        # [FUNCTION DOC]
+        # Applies the base check, then flattens the rightmost reinterpreted dims
+        # of the result and reduces them with logical-and, so an event is valid
+        # only if all its entries are. Returns a boolean tensor with those dims removed.
+        # Raises ValueError if the base result has fewer dims than reinterpreted_batch_ndims.
         result = self.base_constraint.check(value)
         if result.dim() < self.reinterpreted_batch_ndims:
             expected = self.base_constraint.event_dim + self.reinterpreted_batch_ndims
@@ -274,10 +323,15 @@ class _IndependentConstraint(Constraint):
         return result
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns the class name without its leading underscore, then the base constraint repr and the reinterpreted dim count in parentheses.
         return f"{self.__class__.__name__[1:]}({repr(self.base_constraint)}, {self.reinterpreted_batch_ndims})"
 
 
 class MixtureSameFamilyConstraint(Constraint):
+    # [CLASS DOC]
+    # Constraint for MixtureSameFamily: validates a value against the component
+    # constraint after re-inserting the mixture batch dimension just left of the
+    # event dims. Holds base_constraint; is_discrete and event_dim are the base's.
     """
     Constraint for the :class:`~torch.distributions.MixtureSameFamily`
     distribution that adds back the rightmost batch dimension before
@@ -291,6 +345,7 @@ class MixtureSameFamilyConstraint(Constraint):
     """
 
     def __init__(self, base_constraint):
+        # [FUNCTION DOC] Stores the component constraint. Raises AssertionError if it is not a Constraint.
         if not isinstance(base_constraint, Constraint):
             raise AssertionError(
                 f"base_constraint must be a Constraint, got {type(base_constraint).__name__}"
@@ -300,13 +355,21 @@ class MixtureSameFamilyConstraint(Constraint):
 
     @property
     def is_discrete(self) -> bool:  # type: ignore[override]
+        # [FUNCTION DOC] Returns the base constraint's is_discrete.
         return self.base_constraint.is_discrete
 
     @property
     def event_dim(self) -> int:  # type: ignore[override]
+        # [FUNCTION DOC] Returns the base constraint's event_dim.
         return self.base_constraint.event_dim
 
     def check(self, value):
+        # [FUNCTION DOC]
+        # Adds a singleton dimension just left of the event dims, applies the
+        # base check, flattens the trailing dims of the result and reduces them
+        # with logical-and, keeping value.dim() minus event_dim leading dims.
+        # Raises ValueError if value has fewer dims than event_dim (note the
+        # base check runs before this validation).
         """
         Check validity of ``value`` as a possible outcome of sampling
         the :class:`~torch.distributions.MixtureSameFamily` distribution.
@@ -323,10 +386,12 @@ class MixtureSameFamilyConstraint(Constraint):
         return result
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns the class name followed by the base constraint repr in parentheses.
         return f"{self.__class__.__name__}({repr(self.base_constraint)})"
 
 
 class _Boolean(Constraint):
+    # [CLASS DOC] HELPER: Discrete scalar constraint allowing only 0 and 1. Public singleton: boolean.
     """
     Constrain to the two values `{0, 1}`.
     """
@@ -334,10 +399,12 @@ class _Boolean(Constraint):
     is_discrete = True
 
     def check(self, value):
+        # [FUNCTION DOC] HELPER: Returns an elementwise boolean tensor, true where value equals 0 or 1.
         return (value == 0) | (value == 1)
 
 
 class _OneHot(Constraint):
+    # [CLASS DOC] HELPER: Discrete constraint (event_dim 1) for one-hot vectors along the last dimension. Public singleton: one_hot.
     """
     Constrain to one-hot vectors.
     """
@@ -346,12 +413,14 @@ class _OneHot(Constraint):
     event_dim = 1
 
     def check(self, value):
+        # [FUNCTION DOC] HELPER: Returns a boolean tensor (last dim removed), true where every entry is 0 or 1 and the last-dim sum equals 1.
         is_boolean = (value == 0) | (value == 1)
         is_normalized = value.sum(-1).eq(1)
         return is_boolean.all(-1) & is_normalized
 
 
 class _IntegerInterval(Constraint):
+    # [CLASS DOC] HELPER: Discrete constraint for integer values in the closed interval between lower_bound and upper_bound (both stored). Public alias: integer_interval.
     """
     Constrain to an integer interval `[lower_bound, upper_bound]`.
     """
@@ -359,16 +428,19 @@ class _IntegerInterval(Constraint):
     is_discrete = True
 
     def __init__(self, lower_bound, upper_bound):
+        # [FUNCTION DOC] HELPER: Stores the inclusive lower and upper bounds.
         self.lower_bound = lower_bound
         self.upper_bound = upper_bound
         super().__init__()
 
     def check(self, value):
+        # [FUNCTION DOC] HELPER: Returns an elementwise boolean tensor, true where value is integral (zero remainder mod 1) and within both bounds inclusive.
         return (
             (value % 1 == 0) & (self.lower_bound <= value) & (value <= self.upper_bound)
         )
 
     def __repr__(self):
+        # [FUNCTION DOC] HELPER: Returns the class name without its leading underscore, with lower_bound and upper_bound shown in parentheses.
         fmt_string = self.__class__.__name__[1:]
         fmt_string += (
             f"(lower_bound={self.lower_bound}, upper_bound={self.upper_bound})"
@@ -377,6 +449,7 @@ class _IntegerInterval(Constraint):
 
 
 class _IntegerLessThan(Constraint):
+    # [CLASS DOC] HELPER: Discrete constraint for integers at most upper_bound (stored). Defined but not exported or instantiated in this module.
     """
     Constrain to an integer interval `(-inf, upper_bound]`.
     """
@@ -384,19 +457,23 @@ class _IntegerLessThan(Constraint):
     is_discrete = True
 
     def __init__(self, upper_bound):
+        # [FUNCTION DOC] HELPER: Stores the inclusive upper bound.
         self.upper_bound = upper_bound
         super().__init__()
 
     def check(self, value):
+        # [FUNCTION DOC] HELPER: Returns an elementwise boolean tensor, true where value is integral and not above upper_bound.
         return (value % 1 == 0) & (value <= self.upper_bound)
 
     def __repr__(self):
+        # [FUNCTION DOC] HELPER: Returns the class name without its leading underscore with upper_bound in parentheses.
         fmt_string = self.__class__.__name__[1:]
         fmt_string += f"(upper_bound={self.upper_bound})"
         return fmt_string
 
 
 class _IntegerGreaterThan(Constraint):
+    # [CLASS DOC] HELPER: Discrete constraint for integers at least lower_bound (stored). Used for nonnegative_integer (bound 0) and positive_integer (bound 1).
     """
     Constrain to an integer interval `[lower_bound, inf)`.
     """
@@ -404,95 +481,116 @@ class _IntegerGreaterThan(Constraint):
     is_discrete = True
 
     def __init__(self, lower_bound):
+        # [FUNCTION DOC] HELPER: Stores the inclusive lower bound.
         self.lower_bound = lower_bound
         super().__init__()
 
     def check(self, value):
+        # [FUNCTION DOC] HELPER: Returns an elementwise boolean tensor, true where value is integral and not below lower_bound.
         return (value % 1 == 0) & (value >= self.lower_bound)
 
     def __repr__(self):
+        # [FUNCTION DOC] HELPER: Returns the class name without its leading underscore with lower_bound in parentheses.
         fmt_string = self.__class__.__name__[1:]
         fmt_string += f"(lower_bound={self.lower_bound})"
         return fmt_string
 
 
 class _Real(Constraint):
+    # [CLASS DOC] HELPER: Continuous scalar constraint accepting every non-NaN value (infinities allowed). Public singleton: real.
     """
     Trivially constrain to the extended real line `[-inf, inf]`.
     """
 
     def check(self, value):
+        # [FUNCTION DOC] HELPER: Returns an elementwise boolean tensor that is false only for NaN entries.
         return value == value  # False for NANs.
 
 
 class _GreaterThan(Constraint):
+    # [CLASS DOC] HELPER: Real constraint for values strictly above lower_bound (stored; may be a number or tensor). Aliases: greater_than, and positive (bound 0.0).
     """
     Constrain to a real half line `(lower_bound, inf]`.
     """
 
     def __init__(self, lower_bound):
+        # [FUNCTION DOC] HELPER: Stores the exclusive lower bound.
         self.lower_bound = lower_bound
         super().__init__()
 
     def check(self, value):
+        # [FUNCTION DOC] HELPER: Returns an elementwise boolean tensor, true where value is strictly greater than lower_bound.
         return self.lower_bound < value
 
     def __repr__(self):
+        # [FUNCTION DOC] HELPER: Returns the class name without its leading underscore with lower_bound in parentheses.
         fmt_string = self.__class__.__name__[1:]
         fmt_string += f"(lower_bound={self.lower_bound})"
         return fmt_string
 
 
 class _GreaterThanEq(Constraint):
+    # [CLASS DOC] HELPER: Real constraint for values at least lower_bound (stored). Aliases: greater_than_eq, and nonnegative (bound 0.0).
     """
     Constrain to a real half line `[lower_bound, inf)`.
     """
 
     def __init__(self, lower_bound):
+        # [FUNCTION DOC] HELPER: Stores the inclusive lower bound.
         self.lower_bound = lower_bound
         super().__init__()
 
     def check(self, value):
+        # [FUNCTION DOC] HELPER: Returns an elementwise boolean tensor, true where value is greater than or equal to lower_bound.
         return self.lower_bound <= value
 
     def __repr__(self):
+        # [FUNCTION DOC] HELPER: Returns the class name without its leading underscore with lower_bound in parentheses.
         fmt_string = self.__class__.__name__[1:]
         fmt_string += f"(lower_bound={self.lower_bound})"
         return fmt_string
 
 
 class _LessThan(Constraint):
+    # [CLASS DOC] HELPER: Real constraint for values strictly below upper_bound (stored). Public alias: less_than.
     """
     Constrain to a real half line `[-inf, upper_bound)`.
     """
 
     def __init__(self, upper_bound):
+        # [FUNCTION DOC] HELPER: Stores the exclusive upper bound.
         self.upper_bound = upper_bound
         super().__init__()
 
     def check(self, value):
+        # [FUNCTION DOC] HELPER: Returns an elementwise boolean tensor, true where value is strictly less than upper_bound.
         return value < self.upper_bound
 
     def __repr__(self):
+        # [FUNCTION DOC] HELPER: Returns the class name without its leading underscore with upper_bound in parentheses.
         fmt_string = self.__class__.__name__[1:]
         fmt_string += f"(upper_bound={self.upper_bound})"
         return fmt_string
 
 
 class _Interval(Constraint):
+    # [CLASS DOC] HELPER: Real constraint for values in the closed interval from lower_bound to upper_bound (stored). Aliases: interval, and unit_interval (0.0 to 1.0).
     """
     Constrain to a real interval `[lower_bound, upper_bound]`.
     """
 
     def __init__(self, lower_bound, upper_bound):
+        # [FUNCTION DOC] HELPER: Stores the inclusive lower and upper bounds.
         self.lower_bound = lower_bound
         self.upper_bound = upper_bound
         super().__init__()
 
     def check(self, value):
+        # [FUNCTION DOC] HELPER: Returns an elementwise boolean tensor, true where lower_bound <= value <= upper_bound.
         return (self.lower_bound <= value) & (value <= self.upper_bound)
 
     def __repr__(self):
+        # [FUNCTION DOC] HELPER: Returns the class name without its leading underscore with both bounds in parentheses.
         fmt_string = self.__class__.__name__[1:]
         fmt_string += (
             f"(lower_bound={self.lower_bound}, upper_bound={self.upper_bound})"
@@ -501,19 +599,23 @@ class _Interval(Constraint):
 
 
 class _HalfOpenInterval(Constraint):
+    # [CLASS DOC] HELPER: Real constraint for values from lower_bound inclusive to upper_bound exclusive (both stored). Public alias: half_open_interval.
     """
     Constrain to a real interval `[lower_bound, upper_bound)`.
     """
 
     def __init__(self, lower_bound, upper_bound):
+        # [FUNCTION DOC] HELPER: Stores the lower bound (inclusive) and upper bound (exclusive).
         self.lower_bound = lower_bound
         self.upper_bound = upper_bound
         super().__init__()
 
     def check(self, value):
+        # [FUNCTION DOC] HELPER: Returns an elementwise boolean tensor, true where lower_bound <= value < upper_bound.
         return (self.lower_bound <= value) & (value < self.upper_bound)
 
     def __repr__(self):
+        # [FUNCTION DOC] HELPER: Returns the class name without its leading underscore with both bounds in parentheses.
         fmt_string = self.__class__.__name__[1:]
         fmt_string += (
             f"(lower_bound={self.lower_bound}, upper_bound={self.upper_bound})"
@@ -522,6 +624,7 @@ class _HalfOpenInterval(Constraint):
 
 
 class _Simplex(Constraint):
+    # [CLASS DOC] HELPER: Constraint (event_dim 1) for the unit simplex along the last dimension: nonnegative entries summing to 1 within an absolute tolerance of 1e-6. Public singleton: simplex.
     """
     Constrain to the unit simplex in the innermost (rightmost) dimension.
     Specifically: `x >= 0` and `x.sum(-1) == 1`.
@@ -530,10 +633,12 @@ class _Simplex(Constraint):
     event_dim = 1
 
     def check(self, value):
+        # [FUNCTION DOC] HELPER: Returns a boolean tensor (last dim removed), true where all entries are nonnegative and the last-dim sum is within 1e-6 of 1.
         return torch.all(value >= 0, dim=-1) & ((value.sum(-1) - 1).abs() < 1e-6)
 
 
 class _Multinomial(Constraint):
+    # [CLASS DOC] HELPER: Discrete constraint (event_dim 1) for nonnegative count vectors whose last-dim sum is at most upper_bound (stored). Public alias: multinomial.
     """
     Constrain to nonnegative integer values summing to at most an upper bound.
 
@@ -546,13 +651,20 @@ class _Multinomial(Constraint):
     event_dim = 1
 
     def __init__(self, upper_bound):
+        # [FUNCTION DOC]
+        # HELPER: Stores the upper bound on the last-dim sum.
+        # KNOWN ISSUE: does not call the base class initializer, unlike sibling constraints (harmless here since the base has no state).
         self.upper_bound = upper_bound
 
     def check(self, x):
+        # [FUNCTION DOC]
+        # HELPER: Returns a boolean tensor (last dim removed), true where all entries are nonnegative and the last-dim sum is at most upper_bound.
+        # KNOWN ISSUE: does not check integrality despite being a discrete count constraint.
         return (x >= 0).all(dim=-1) & (x.sum(dim=-1) <= self.upper_bound)
 
 
 class _LowerTriangular(Constraint):
+    # [CLASS DOC] HELPER: Constraint (event_dim 2) for matrices equal to their lower triangle. Public singleton: lower_triangular.
     """
     Constrain to lower-triangular square matrices.
     """
@@ -560,11 +672,13 @@ class _LowerTriangular(Constraint):
     event_dim = 2
 
     def check(self, value):
+        # [FUNCTION DOC] HELPER: Returns a boolean tensor (last two dims removed), true where every entry equals the corresponding entry of the lower-triangular part. Does not itself check squareness.
         value_tril = value.tril()
         return (value_tril == value).view(value.shape[:-2] + (-1,)).min(-1)[0]
 
 
 class _LowerCholesky(Constraint):
+    # [CLASS DOC] HELPER: Constraint (event_dim 2) for lower-triangular matrices with strictly positive diagonal. Public singleton: lower_cholesky.
     """
     Constrain to lower-triangular square matrices with positive diagonals.
     """
@@ -572,6 +686,7 @@ class _LowerCholesky(Constraint):
     event_dim = 2
 
     def check(self, value):
+        # [FUNCTION DOC] HELPER: Returns a boolean tensor (last two dims removed), true where the matrix is lower triangular and every diagonal entry is positive.
         value_tril = value.tril()
         lower_triangular = (
             (value_tril == value).view(value.shape[:-2] + (-1,)).min(-1)[0]
@@ -582,6 +697,7 @@ class _LowerCholesky(Constraint):
 
 
 class _CorrCholesky(Constraint):
+    # [CLASS DOC] HELPER: Constraint (event_dim 2) for Cholesky factors of correlation matrices: lower Cholesky with each row of unit Euclidean norm within a dtype-dependent tolerance. Public singleton: corr_cholesky.
     """
     Constrain to lower-triangular square matrices with positive diagonals and each
     row vector being of unit length.
@@ -590,6 +706,7 @@ class _CorrCholesky(Constraint):
     event_dim = 2
 
     def check(self, value):
+        # [FUNCTION DOC] HELPER: Returns a boolean tensor, true where the matrix satisfies the lower Cholesky constraint and every row norm (computed on a detached copy) is within a tolerance of 1; tolerance is machine epsilon times matrix size times 10.
         tol = (
             torch.finfo(value.dtype).eps * value.size(-1) * 10
         )  # 10 is an adjustable fudge factor
@@ -599,6 +716,7 @@ class _CorrCholesky(Constraint):
 
 
 class _Square(Constraint):
+    # [CLASS DOC] HELPER: Constraint (event_dim 2) for square matrices. Public singleton: square.
     """
     Constrain to square matrices.
     """
@@ -606,6 +724,7 @@ class _Square(Constraint):
     event_dim = 2
 
     def check(self, value):
+        # [FUNCTION DOC] HELPER: Returns a boolean tensor shaped like the leading batch dims of value on the same device, filled with whether the last two dims are equal.
         return torch.full(
             size=value.shape[:-2],
             fill_value=(value.shape[-2] == value.shape[-1]),
@@ -615,11 +734,13 @@ class _Square(Constraint):
 
 
 class _Symmetric(_Square):
+    # [CLASS DOC] HELPER: Square matrices equal to their transpose (absolute tolerance 1e-6). Public singleton: symmetric.
     """
     Constrain to Symmetric square matrices.
     """
 
     def check(self, value):
+        # [FUNCTION DOC] HELPER: If any matrix is not square, returns the squareness result unchanged; otherwise returns a boolean tensor, true where the matrix is close to its transpose.
         square_check = super().check(value)
         if not square_check.all():
             return square_check
@@ -627,11 +748,13 @@ class _Symmetric(_Square):
 
 
 class _PositiveSemidefinite(_Symmetric):
+    # [CLASS DOC] HELPER: Symmetric matrices with all eigenvalues nonnegative. Public singleton: positive_semidefinite.
     """
     Constrain to positive-semidefinite matrices.
     """
 
     def check(self, value):
+        # [FUNCTION DOC] HELPER: If the symmetry check fails for any matrix, returns that result unchanged; otherwise returns a boolean tensor, true where all eigenvalues (from a symmetric eigensolver) are nonnegative.
         sym_check = super().check(value)
         if not sym_check.all():
             return sym_check
@@ -639,11 +762,13 @@ class _PositiveSemidefinite(_Symmetric):
 
 
 class _PositiveDefinite(_Symmetric):
+    # [CLASS DOC] HELPER: Symmetric matrices that admit a Cholesky factorization. Public singleton: positive_definite.
     """
     Constrain to positive-definite matrices.
     """
 
     def check(self, value):
+        # [FUNCTION DOC] HELPER: If the symmetry check fails for any matrix, returns that result unchanged; otherwise returns a boolean tensor, true where the non-raising Cholesky factorization reports success (info code zero).
         sym_check = super().check(value)
         if not sym_check.all():
             return sym_check
@@ -651,6 +776,7 @@ class _PositiveDefinite(_Symmetric):
 
 
 class _Cat(Constraint):
+    # [CLASS DOC] HELPER: Applies a sequence of constraints cseq to consecutive slices along dimension dim, slice i having size lengths[i] (default 1 each), mirroring concatenation. is_discrete is any-of the parts; event_dim is the max. Public alias: cat.
     """
     Constraint functor that applies a sequence of constraints
     `cseq` at the submatrices at dimension `dim`,
@@ -658,6 +784,7 @@ class _Cat(Constraint):
     """
 
     def __init__(self, cseq, dim=0, lengths=None):
+        # [FUNCTION DOC] HELPER: Stores a list copy of cseq, the dim, and lengths (default all ones). Raises AssertionError if any element of cseq is not a Constraint or the lengths count differs from the constraint count.
         if not all(isinstance(c, Constraint) for c in cseq):
             raise AssertionError("All elements of cseq must be Constraint instances")
         self.cseq = list(cseq)
@@ -673,13 +800,16 @@ class _Cat(Constraint):
 
     @property
     def is_discrete(self) -> bool:  # type: ignore[override]
+        # [FUNCTION DOC] HELPER: True if any component constraint is discrete.
         return any(c.is_discrete for c in self.cseq)
 
     @property
     def event_dim(self) -> int:  # type: ignore[override]
+        # [FUNCTION DOC] HELPER: Maximum event_dim among the component constraints.
         return max(c.event_dim for c in self.cseq)
 
     def check(self, value):
+        # [FUNCTION DOC] HELPER: Splits value along dim into consecutive slices of the configured lengths, checks each with its constraint, and concatenates the boolean results along dim. Raises AssertionError if dim is out of range for value.
         if not (-value.dim() <= self.dim < value.dim()):
             raise AssertionError(
                 f"dim {self.dim} out of range for value with {value.dim()} dimensions"
@@ -694,6 +824,7 @@ class _Cat(Constraint):
 
 
 class _Stack(Constraint):
+    # [CLASS DOC] HELPER: Applies the i-th constraint of cseq to the i-th slice along dimension dim, mirroring stacking. is_discrete is any-of the parts; event_dim is the max, adjusted by one when dim is a negative index reaching into the event dims. Public alias: stack.
     """
     Constraint functor that applies a sequence of constraints
     `cseq` at the submatrices at dimension `dim`,
@@ -701,6 +832,7 @@ class _Stack(Constraint):
     """
 
     def __init__(self, cseq, dim=0):
+        # [FUNCTION DOC] HELPER: Stores a list copy of cseq and the stacking dim. Raises AssertionError if any element is not a Constraint.
         if not all(isinstance(c, Constraint) for c in cseq):
             raise AssertionError("All elements of cseq must be Constraint instances")
         self.cseq = list(cseq)
@@ -709,16 +841,19 @@ class _Stack(Constraint):
 
     @property
     def is_discrete(self) -> bool:  # type: ignore[override]
+        # [FUNCTION DOC] HELPER: True if any component constraint is discrete.
         return any(c.is_discrete for c in self.cseq)
 
     @property
     def event_dim(self) -> int:  # type: ignore[override]
+        # [FUNCTION DOC] HELPER: Maximum component event_dim, incremented by one if dim is negative enough to index into the event dims (the stacked dim adds an event dimension).
         dim = max(c.event_dim for c in self.cseq)
         if self.dim + dim < 0:
             dim += 1
         return dim
 
     def check(self, value):
+        # [FUNCTION DOC] HELPER: Selects each index along dim of value, checks it with the matching constraint, and stacks the boolean results along dim. Raises AssertionError if dim is out of range for value.
         if not (-value.dim() <= self.dim < value.dim()):
             raise AssertionError(
                 f"dim {self.dim} out of range for value with {value.dim()} dimensions"

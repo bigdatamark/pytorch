@@ -1,4 +1,8 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines the Geometric distribution over the number of failures before the
+# first success (support 0, 1, 2, ...), parameterized by probs or logits.
+# No import-time side effects. Exports: Geometric.
 
 import torch
 from torch import Tensor
@@ -18,6 +22,9 @@ __all__ = ["Geometric"]
 
 
 class Geometric(Distribution):
+    # [CLASS DOC]
+    # Geometric distribution over nonnegative integers. State: probs or logits
+    # (one given, the other lazily derived). Sampling is not reparameterized.
     r"""
     Creates a Geometric distribution parameterized by :attr:`probs`,
     where :attr:`probs` is the probability of success of Bernoulli trials.
@@ -53,6 +60,7 @@ class Geometric(Distribution):
         logits: Tensor | Number | None = None,
         validate_args: bool | None = None,
     ) -> None:
+        # [FUNCTION DOC] Builds the distribution from exactly one of probs or logits (numbers or tensors, broadcast); batch shape is empty for numbers, else the parameter size. When validation is on and probs is given, additionally requires probs strictly positive. Raises ValueError if both or neither parameter is given, or if validation fails.
         if (probs is None) == (logits is None):
             raise ValueError(
                 "Either `probs` or `logits` must be specified, but not both."
@@ -87,6 +95,7 @@ class Geometric(Distribution):
                 )
 
     def expand(self, batch_shape, _instance=None):
+        # [FUNCTION DOC] Returns a new Geometric with probs and/or logits (whichever are materialized) expanded to batch_shape, preserving the validation setting; self is unchanged.
         new = self._get_checked_instance(Geometric, _instance)
         batch_shape = torch.Size(batch_shape)
         if "probs" in self.__dict__:
@@ -99,25 +108,31 @@ class Geometric(Distribution):
 
     @property
     def mean(self) -> Tensor:
+        # [FUNCTION DOC] Mean: 1/probs minus 1.
         return 1.0 / self.probs - 1.0
 
     @property
     def mode(self) -> Tensor:
+        # [FUNCTION DOC] Mode: zeros shaped like probs.
         return torch.zeros_like(self.probs)
 
     @property
     def variance(self) -> Tensor:
+        # [FUNCTION DOC] Variance: (1/probs minus 1) divided by probs.
         return (1.0 / self.probs - 1.0) / self.probs
 
     @lazy_property
     def logits(self) -> Tensor:
+        # [FUNCTION DOC] Lazily computed logits derived from probs (binary log-odds); cached on first access.
         return probs_to_logits(self.probs, is_binary=True)
 
     @lazy_property
     def probs(self) -> Tensor:
+        # [FUNCTION DOC] Lazily computed probs derived from logits (sigmoid); cached on first access.
         return logits_to_probs(self.logits, is_binary=True)
 
     def sample(self, sample_shape=torch.Size()):
+        # [FUNCTION DOC] Draws samples of shape sample_shape plus batch shape via inverse transform: floor of log of a uniform value divided by log1p of minus probs, with the uniform bounded below by the smallest normal float. Runs without gradient tracking; consumes global random state. Uses a rand-based path while tracing for the JIT.
         shape = self._extended_shape(sample_shape)
         tiny = torch.finfo(self.probs.dtype).tiny
         with torch.no_grad():
@@ -130,6 +145,7 @@ class Geometric(Distribution):
             return (u.log() / (-self.probs).log1p()).floor()
 
     def log_prob(self, value):
+        # [FUNCTION DOC] Log mass at value: value times log1p of minus probs plus log probs. A cloned probs is set to zero where probs is 1 and value is 0 to avoid zero times infinity. Validates value if validation is on (ValueError).
         if self._validate_args:
             self._validate_sample(value)
         value, probs = broadcast_all(value, self.probs)
@@ -138,6 +154,7 @@ class Geometric(Distribution):
         return value * (-probs).log1p() + self.probs.log()
 
     def entropy(self):
+        # [FUNCTION DOC] Entropy: the binary cross entropy between probs and logits, divided by probs.
         return (
             binary_cross_entropy_with_logits(self.logits, self.probs, reduction="none")
             / self.probs

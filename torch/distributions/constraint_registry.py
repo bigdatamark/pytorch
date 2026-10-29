@@ -1,4 +1,13 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines ConstraintRegistry, a mapping from Constraint classes to factory
+# callables that build Transform objects (unconstrained real space -> constrained
+# space), and the two global registries biject_to (bijective transforms) and
+# transform_to (not necessarily bijective, cheaper transforms).
+# Import-time side effect: populates both registries with the standard
+# constraint/transform pairs (real, independent, positive, greater_than, less_than,
+# interval, simplex, lower_cholesky, positive_definite, corr_cholesky, cat, stack).
+# Exports: ConstraintRegistry, biject_to, transform_to.
 r"""
 PyTorch provides two global :class:`ConstraintRegistry` objects that link
 :class:`~torch.distributions.constraints.Constraint` objects to
@@ -78,15 +87,28 @@ __all__ = [
 
 
 class ConstraintRegistry:
+    # [CLASS DOC]
+    # Registry mapping Constraint subclasses to factory callables. State: the
+    # private mapping _registry from constraint class to factory. Calling the
+    # registry on a constraint instance dispatches on its exact type (no
+    # inheritance lookup) and returns the Transform built by the factory.
     """
     Registry to link constraints to transforms.
     """
 
     def __init__(self):
+        # [FUNCTION DOC]
+        # Creates an empty registry (initializes the private mapping to empty).
         self._registry = {}
         super().__init__()
 
     def register(self, constraint, factory=None):
+        # [FUNCTION DOC]
+        # Associates a Constraint subclass (or the class of a given Constraint
+        # instance) with a factory callable. If factory is omitted, returns a
+        # decorator that registers the decorated function. Returns the factory.
+        # Mutates the registry; a later registration overrides an earlier one.
+        # Raises TypeError if constraint is neither a Constraint subclass nor instance.
         """
         Registers a :class:`~torch.distributions.constraints.Constraint`
         subclass in this registry. Usage::
@@ -122,6 +144,10 @@ class ConstraintRegistry:
         return factory
 
     def __call__(self, constraint):
+        # [FUNCTION DOC]
+        # Looks up the factory registered for the exact type of the constraint
+        # object and returns the Transform it builds from that constraint.
+        # Raises NotImplementedError if no factory is registered for that type.
         """
         Looks up a transform to constrained space, given a constraint object.
         Usage::
@@ -162,11 +188,13 @@ transform_to = ConstraintRegistry()
 @biject_to.register(constraints.real)
 @transform_to.register(constraints.real)
 def _transform_to_real(constraint):
+    # [FUNCTION DOC] HELPER: Factory for the real constraint; returns the shared identity transform.
     return transforms.identity_transform
 
 
 @biject_to.register(constraints.independent)
 def _biject_to_independent(constraint):
+    # [FUNCTION DOC] HELPER: Factory for the independent constraint; wraps the bijection of the base constraint in an IndependentTransform with the same number of reinterpreted batch dims.
     base_transform = biject_to(constraint.base_constraint)
     return transforms.IndependentTransform(
         base_transform, constraint.reinterpreted_batch_ndims
@@ -175,6 +203,7 @@ def _biject_to_independent(constraint):
 
 @transform_to.register(constraints.independent)
 def _transform_to_independent(constraint):
+    # [FUNCTION DOC] HELPER: Same as the bijective independent factory but uses the transform_to registry for the base constraint.
     base_transform = transform_to(constraint.base_constraint)
     return transforms.IndependentTransform(
         base_transform, constraint.reinterpreted_batch_ndims
@@ -186,6 +215,7 @@ def _transform_to_independent(constraint):
 @transform_to.register(constraints.positive)
 @transform_to.register(constraints.nonnegative)
 def _transform_to_positive(constraint):
+    # [FUNCTION DOC] HELPER: Factory for positive and nonnegative constraints in both registries; returns an ExpTransform.
     return transforms.ExpTransform()
 
 
@@ -194,6 +224,7 @@ def _transform_to_positive(constraint):
 @transform_to.register(constraints.greater_than)
 @transform_to.register(constraints.greater_than_eq)
 def _transform_to_greater_than(constraint):
+    # [FUNCTION DOC] HELPER: Factory for greater_than(_eq) constraints; composes exp with an affine shift by the lower bound (scale 1).
     return transforms.ComposeTransform(
         [
             transforms.ExpTransform(),
@@ -205,6 +236,7 @@ def _transform_to_greater_than(constraint):
 @biject_to.register(constraints.less_than)
 @transform_to.register(constraints.less_than)
 def _transform_to_less_than(constraint):
+    # [FUNCTION DOC] HELPER: Factory for less_than constraints; composes exp with an affine map of loc upper bound and scale -1, so outputs lie below the upper bound.
     return transforms.ComposeTransform(
         [
             transforms.ExpTransform(),
@@ -218,6 +250,7 @@ def _transform_to_less_than(constraint):
 @transform_to.register(constraints.interval)
 @transform_to.register(constraints.half_open_interval)
 def _transform_to_interval(constraint):
+    # [FUNCTION DOC] HELPER: Factory for interval and half_open_interval constraints. If the bounds are plain numbers 0 and 1, returns a bare SigmoidTransform; otherwise composes sigmoid with an affine map (loc = lower bound, scale = upper minus lower).
     # Handle the special case of the unit interval.
     lower_is_0 = (
         isinstance(constraint.lower_bound, _Number) and constraint.lower_bound == 0
@@ -237,34 +270,40 @@ def _transform_to_interval(constraint):
 
 @biject_to.register(constraints.simplex)
 def _biject_to_simplex(constraint):
+    # [FUNCTION DOC] HELPER: Factory for simplex in biject_to; returns a StickBreakingTransform.
     return transforms.StickBreakingTransform()
 
 
 @transform_to.register(constraints.simplex)
 def _transform_to_simplex(constraint):
+    # [FUNCTION DOC] HELPER: Factory for simplex in transform_to; returns a SoftmaxTransform (not bijective).
     return transforms.SoftmaxTransform()
 
 
 # TODO define a bijection for LowerCholeskyTransform
 @transform_to.register(constraints.lower_cholesky)
 def _transform_to_lower_cholesky(constraint):
+    # [FUNCTION DOC] HELPER: Factory for lower_cholesky; returns a LowerCholeskyTransform (registered only in transform_to).
     return transforms.LowerCholeskyTransform()
 
 
 @transform_to.register(constraints.positive_definite)
 @transform_to.register(constraints.positive_semidefinite)
 def _transform_to_positive_definite(constraint):
+    # [FUNCTION DOC] HELPER: Factory for positive_definite and positive_semidefinite (transform_to only); returns a PositiveDefiniteTransform.
     return transforms.PositiveDefiniteTransform()
 
 
 @biject_to.register(constraints.corr_cholesky)
 @transform_to.register(constraints.corr_cholesky)
 def _transform_to_corr_cholesky(constraint):
+    # [FUNCTION DOC] HELPER: Factory for corr_cholesky in both registries; returns a CorrCholeskyTransform.
     return transforms.CorrCholeskyTransform()
 
 
 @biject_to.register(constraints.cat)
 def _biject_to_cat(constraint):
+    # [FUNCTION DOC] HELPER: Factory for cat constraints; builds a CatTransform from the bijections of each component constraint, reusing the constraint's dim and lengths.
     return transforms.CatTransform(
         [biject_to(c) for c in constraint.cseq], constraint.dim, constraint.lengths
     )
@@ -272,6 +311,7 @@ def _biject_to_cat(constraint):
 
 @transform_to.register(constraints.cat)
 def _transform_to_cat(constraint):
+    # [FUNCTION DOC] HELPER: Same as the bijective cat factory but uses transform_to for each component constraint.
     return transforms.CatTransform(
         [transform_to(c) for c in constraint.cseq], constraint.dim, constraint.lengths
     )
@@ -279,6 +319,7 @@ def _transform_to_cat(constraint):
 
 @biject_to.register(constraints.stack)
 def _biject_to_stack(constraint):
+    # [FUNCTION DOC] HELPER: Factory for stack constraints; builds a StackTransform from the bijections of each component constraint along the constraint's dim.
     return transforms.StackTransform(
         [biject_to(c) for c in constraint.cseq], constraint.dim
     )
@@ -286,6 +327,7 @@ def _biject_to_stack(constraint):
 
 @transform_to.register(constraints.stack)
 def _transform_to_stack(constraint):
+    # [FUNCTION DOC] HELPER: Same as the bijective stack factory but uses transform_to for each component constraint.
     return transforms.StackTransform(
         [transform_to(c) for c in constraint.cseq], constraint.dim
     )

@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines ExponentialFamily, an abstract Distribution subclass for exponential
+# family members. It declares the hooks natural parameters, log normalizer and
+# mean carrier measure, and provides a generic entropy computed with autograd via
+# a Bregman-divergence formula. No import-time side effects.
+# Exports: ExponentialFamily.
 
 import torch
 from torch import Tensor
@@ -9,6 +15,11 @@ __all__ = ["ExponentialFamily"]
 
 
 class ExponentialFamily(Distribution):
+    # [CLASS DOC]
+    # Abstract intermediate base for exponential-family distributions. Subclasses
+    # supply _natural_params (tuple of tensors), _log_normalizer (function of the
+    # natural parameters) and _mean_carrier_measure (a number or property); this
+    # class then offers a generic entropy and is used for analytic KL divergences.
     r"""
     ExponentialFamily is the abstract base class for probability distributions belonging to an
     exponential family, whose probability mass/density function is defined below
@@ -31,6 +42,7 @@ class ExponentialFamily(Distribution):
 
     @property
     def _natural_params(self) -> tuple[Tensor, ...]:
+        # [FUNCTION DOC] HELPER: Abstract: subclasses return the tuple of natural parameter tensors. The base version raises NotImplementedError.
         """
         Abstract method for natural parameters. Returns a tuple of Tensors based
         on the distribution
@@ -38,6 +50,7 @@ class ExponentialFamily(Distribution):
         raise NotImplementedError
 
     def _log_normalizer(self, *natural_params):
+        # [FUNCTION DOC] HELPER: Abstract: subclasses return the log normalizer evaluated at the given natural parameter tensors. The base version raises NotImplementedError.
         """
         Abstract method for log normalizer function. Returns a log normalizer based on
         the distribution and input
@@ -46,6 +59,7 @@ class ExponentialFamily(Distribution):
 
     @property
     def _mean_carrier_measure(self) -> float:
+        # [FUNCTION DOC] HELPER: Abstract: subclasses provide the expected carrier measure (often as a plain class attribute overriding this property). The base version raises NotImplementedError.
         """
         Abstract method for expected carrier measure, which is required for computing
         entropy.
@@ -53,6 +67,7 @@ class ExponentialFamily(Distribution):
         raise NotImplementedError
 
     def entropy(self):
+        # [FUNCTION DOC] Generic entropy: starts from the negative mean carrier measure, adds the log normalizer, and subtracts the inner product of each detached natural parameter with the gradient of the summed log normalizer (obtained by autograd with graph creation), summed over non-batch dims. Returns a tensor of batch shape; does not modify the stored parameters.
         """
         Method to compute the entropy using Bregman divergence of the log normalizer.
         """

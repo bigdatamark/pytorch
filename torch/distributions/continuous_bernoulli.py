@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC]
+# Defines the ContinuousBernoulli distribution on [0, 1] (an exponential family
+# member) parameterized by probs or logits, with closed-form mean, variance,
+# cdf, icdf, entropy, and a Taylor approximation near probs of one half where
+# the closed forms are numerically unstable. No import-time side effects.
+# Exports: ContinuousBernoulli.
 import math
 
 import torch
@@ -20,6 +26,12 @@ __all__ = ["ContinuousBernoulli"]
 
 
 class ContinuousBernoulli(ExponentialFamily):
+    # [CLASS DOC]
+    # Continuous Bernoulli distribution on the unit interval, with density
+    # proportional to p^x (1-p)^(1-x). State: probs (clamped away from 0 and 1)
+    # or logits (one is lazily derived from the other), the private _param
+    # (whichever was given), and _lims, the interval of probs around one half
+    # treated as numerically unstable. Supports reparameterized sampling.
     r"""
     Creates a continuous Bernoulli distribution parameterized by :attr:`probs`
     or :attr:`logits` (but not both).
@@ -59,6 +71,14 @@ class ContinuousBernoulli(ExponentialFamily):
         lims: tuple[float, float] = (0.499, 0.501),
         validate_args: bool | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Builds the distribution from exactly one of probs or logits (numbers or
+        # tensors, broadcast); batch shape is empty for scalars, else the parameter
+        # shape. Probs are clamped away from 0 and 1 after optional validation.
+        # lims is the unstable probs interval. Raises ValueError if both or neither
+        # parameter is given, or if probs has invalid values.
+        # KNOWN ISSUE: probs are validated whenever validate_args is not None, so
+        # an explicit validate_args of False still validates probs.
         if (probs is None) == (logits is None):
             raise ValueError(
                 "Either `probs` or `logits` must be specified, but not both."
@@ -89,6 +109,7 @@ class ContinuousBernoulli(ExponentialFamily):
         super().__init__(batch_shape, validate_args=validate_args)
 
     def expand(self, batch_shape, _instance=None):
+        # [FUNCTION DOC] Returns a new instance with probs and/or logits expanded to batch_shape (whichever are already materialized), same lims and validation setting; does not mutate self.
         new = self._get_checked_instance(ContinuousBernoulli, _instance)
         new._lims = self._lims
         batch_shape = torch.Size(batch_shape)
@@ -103,14 +124,17 @@ class ContinuousBernoulli(ExponentialFamily):
         return new
 
     def _new(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Creates a new tensor of the same type and device as the parameter, forwarding all arguments.
         return self._param.new(*args, **kwargs)
 
     def _outside_unstable_region(self):
+        # [FUNCTION DOC] HELPER: Boolean tensor, true where probs is at or below the lower lim or above the upper lim (closed forms are safe there).
         return torch.max(
             torch.le(self.probs, self._lims[0]), torch.gt(self.probs, self._lims[1])
         )
 
     def _cut_probs(self):
+        # [FUNCTION DOC] HELPER: Returns probs with entries inside the unstable region replaced by the lower lim, so closed-form expressions avoid division by zero; callers then override those entries with Taylor values.
         return torch.where(
             self._outside_unstable_region(),
             self.probs,
@@ -118,6 +142,7 @@ class ContinuousBernoulli(ExponentialFamily):
         )
 
     def _cont_bern_log_norm(self):
+        # [FUNCTION DOC] HELPER: Log of the normalizing constant as a function of probs: closed form outside the unstable region, a Taylor expansion around one half inside it. Returns a tensor of batch shape.
         """computes the log normalizing constant as a function of the 'probs' parameter"""
         cut_probs = self._cut_probs()
         cut_probs_below_half = torch.where(
@@ -139,6 +164,7 @@ class ContinuousBernoulli(ExponentialFamily):
 
     @property
     def mean(self) -> Tensor:
+        # [FUNCTION DOC] Mean of the distribution: closed form in probs outside the unstable region, Taylor approximation near one half.
         cut_probs = self._cut_probs()
         mus = cut_probs / (2.0 * cut_probs - 1.0) + 1.0 / (
             torch.log1p(-cut_probs) - torch.log(cut_probs)
@@ -149,10 +175,12 @@ class ContinuousBernoulli(ExponentialFamily):
 
     @property
     def stddev(self) -> Tensor:
+        # [FUNCTION DOC] Standard deviation, the square root of the variance.
         return torch.sqrt(self.variance)
 
     @property
     def variance(self) -> Tensor:
+        # [FUNCTION DOC] Variance: closed form in probs outside the unstable region, Taylor approximation near one half (tends to one twelfth at probs one half).
         cut_probs = self._cut_probs()
         vars = cut_probs * (cut_probs - 1.0) / torch.pow(
             1.0 - 2.0 * cut_probs, 2
@@ -163,28 +191,34 @@ class ContinuousBernoulli(ExponentialFamily):
 
     @lazy_property
     def logits(self) -> Tensor:
+        # [FUNCTION DOC] Lazily computed logits derived from probs via the binary log-odds transform; cached on first access.
         return probs_to_logits(self.probs, is_binary=True)
 
     @lazy_property
     def probs(self) -> Tensor:
+        # [FUNCTION DOC] Lazily computed probs derived from logits via the sigmoid and clamped away from 0 and 1; cached on first access.
         return clamp_probs(logits_to_probs(self.logits, is_binary=True))
 
     @property
     def param_shape(self) -> torch.Size:
+        # [FUNCTION DOC] Shape of the stored parameter tensor (probs or logits).
         return self._param.size()
 
     def sample(self, sample_shape=torch.Size()):
+        # [FUNCTION DOC] Draws samples of shape sample_shape plus batch shape by inverse-cdf transform of uniform noise, under no-grad so no gradient flows. Consumes global random state.
         shape = self._extended_shape(sample_shape)
         u = torch.rand(shape, dtype=self.probs.dtype, device=self.probs.device)
         with torch.no_grad():
             return self.icdf(u)
 
     def rsample(self, sample_shape: _size = torch.Size()) -> Tensor:
+        # [FUNCTION DOC] Reparameterized samples of shape sample_shape plus batch shape: uniform noise pushed through the differentiable inverse cdf. Consumes global random state.
         shape = self._extended_shape(sample_shape)
         u = torch.rand(shape, dtype=self.probs.dtype, device=self.probs.device)
         return self.icdf(u)
 
     def log_prob(self, value):
+        # [FUNCTION DOC] Log density at value: the negative binary cross entropy with logits plus the log normalizing constant. Validates value when argument validation is on (raises ValueError if outside support); broadcasts logits with value.
         if self._validate_args:
             self._validate_sample(value)
         logits, value = broadcast_all(self.logits, value)
@@ -194,6 +228,7 @@ class ContinuousBernoulli(ExponentialFamily):
         )
 
     def cdf(self, value):
+        # [FUNCTION DOC] Cumulative distribution at value: closed form outside the unstable region, identity (the uniform cdf) inside it; zero at or below 0 and one at or above 1. Validates value when validation is on.
         if self._validate_args:
             self._validate_sample(value)
         cut_probs = self._cut_probs()
@@ -210,6 +245,7 @@ class ContinuousBernoulli(ExponentialFamily):
         )
 
     def icdf(self, value):
+        # [FUNCTION DOC] Inverse cdf (quantile) of value in [0, 1]: closed form outside the unstable region, identity inside it. No input validation.
         cut_probs = self._cut_probs()
         return torch.where(
             self._outside_unstable_region(),
@@ -222,6 +258,7 @@ class ContinuousBernoulli(ExponentialFamily):
         )
 
     def entropy(self):
+        # [FUNCTION DOC] Differential entropy computed from the mean, log probabilities and log normalizing constant. Returns a tensor of batch shape.
         log_probs0 = torch.log1p(-self.probs)
         log_probs1 = torch.log(self.probs)
         return (
@@ -232,10 +269,17 @@ class ContinuousBernoulli(ExponentialFamily):
 
     @property
     def _natural_params(self) -> tuple[Tensor]:
+        # [FUNCTION DOC] HELPER: Natural parameters of the exponential family, a one-element tuple holding logits.
         return (self.logits,)
 
     # pyrefly: ignore [bad-override]
     def _log_normalizer(self, x):
+        # [FUNCTION DOC]
+        # HELPER: Log normalizer as a function of the natural parameter x: closed form
+        # using the exponential minus one outside the unstable region, Taylor series inside.
+        # KNOWN ISSUE: the unstable region is derived by shifting the probs-based lims
+        # by one half and applying them to the logit-scale x, which does not match the
+        # probs-space region used elsewhere (only coincides near x = 0).
         """computes the log normalizing constant as a function of the natural parameter"""
         out_unst_reg = torch.max(
             torch.le(x, self._lims[0] - 0.5), torch.gt(x, self._lims[1] - 0.5)
