@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-process NCCL tests for copy-engine (zero-CTA policy) collectives,
+# which need NCCL 2.28 or newer, CUDA peer-to-peer access and symmetric-memory buffers.
+# Tests run all-gather and all-to-all over symmetric tensors and compare to the regular
+# kernel-based result. At import time, if c10d or NCCL is unavailable, prints a message to
+# stderr and exits the process with status 0 (skipping everything).
 import sys
 
 import torch
@@ -24,12 +29,19 @@ if not dist.is_available() or not dist.is_nccl_available():
 @requires_nccl_version((2, 28), "Need NCCL 2.28+ for CE collectives")
 @requires_cuda_p2p_access()
 class NCCLCopyEngineCollectives(MultiProcContinuousTest):
+    # [CLASS DOC] Multi-process test case using the NCCL backend configured with the
+    # zero-CTA policy so collectives run on copy engines instead of SM kernels. Provides
+    # a device property, an init helper and two tests (all-gather, all-to-all). Skipped
+    # unless NCCL >= 2.28 and CUDA p2p access exist.
     @classmethod
     def backend_str(cls) -> str | None:
+        # [FUNCTION DOC] HELPER: Selects the nccl backend for the test process group.
         return "nccl"
 
     @classmethod
     def opts(cls) -> dist.ProcessGroupNCCL.Options | None:
+        # [FUNCTION DOC] HELPER: Builds NCCL process group options whose config CTA policy
+        # is set to zero, which enables copy-engine collectives. Returns the options.
         # Enable Zero-CTA policy for CE collectives
         opts = dist.ProcessGroupNCCL.Options()
         opts.config.cta_policy = dist.ProcessGroupNCCL.NCCL_CTA_POLICY_ZERO
@@ -37,9 +49,14 @@ class NCCLCopyEngineCollectives(MultiProcContinuousTest):
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Property giving the cuda device indexed by this rank.
         return torch.device("cuda", self.rank)
 
     def _init(self):
+        # [FUNCTION DOC] HELPER: Selects the NCCL symmetric-memory backend, binds the
+        # process to its device and runs a one-element all_reduce so the NCCL communicator
+        # exists (otherwise the tests hang). Creates, but does not start, a CPU+CUDA
+        # profiler. Returns the world group name and the profiler.
         symm_mem.set_backend("NCCL")
         torch.cuda.set_device(self.rank)
         # Need this all_reduce to initialize NCCL communicator. Otherwise, the
@@ -62,6 +79,11 @@ class NCCLCopyEngineCollectives(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     @skip_if_rocm_ver_atleast_multiprocess([7, 14])
     def test_ce_allgather(self):
+        # [FUNCTION DOC] Computes a reference all_gather_single on ordinary buffers, then
+        # repeats it with symmetric-memory (rendezvoused) buffers twice: asynchronously
+        # with an explicit wait, and on a side stream ordered after the current stream.
+        # Runs under the profiler and steps it. Asserts both copy-engine outputs equal the
+        # reference. Skipped with fewer than two GPUs or on ROCm 7.14 and later.
         group_name, prof = self._init()
         dtype = torch.float
         numel = 1024 * 1024 * 32
@@ -106,6 +128,11 @@ class NCCLCopyEngineCollectives(MultiProcContinuousTest):
     @skip_if_lt_x_gpu(2)
     @skip_if_rocm_ver_atleast_multiprocess([7, 14])
     def test_ce_alltoall(self):
+        # [FUNCTION DOC] Same structure as the all-gather test but for all_to_all_single:
+        # input and output both hold a multiple of world size elements; a reference result
+        # from ordinary buffers is compared with copy-engine results from symmetric buffers
+        # (async with wait, and on a side stream). Skipped with fewer than two GPUs or on
+        # ROCm 7.14 and later.
         group_name, prof = self._init()
         dtype = torch.float
         numel = 1024 * 1024 * self.world_size

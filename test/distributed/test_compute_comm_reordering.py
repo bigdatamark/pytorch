@@ -1,4 +1,10 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Two-rank tests for Inductor's compute/communication overlap scheduling passes
+# (sink_waits, raise_comms, reorder_compute_for_overlap, a custom runtime estimator, grouped
+# scheduler nodes, default comms ordering) and sanity checks of NCCL cost-model tables. Each
+# test compiles a function using functional all_reduce, inspects the generated Triton code
+# ordering with FileCheck, and compares results with eager. Defines a custom cost model, a
+# pre-fusion grouping pass, and one multi-process test class.
 import unittest
 from unittest.mock import patch
 
@@ -40,6 +46,9 @@ device_type = get_devtype().type
 
 
 def get_snode_runtime_for_reorder_compute_test(snode):
+    # [FUNCTION DOC] HELPER: Custom Inductor runtime estimator for a scheduler node:
+    # collective kernels cost 100, wait kernels 0, other extern kernels (e.g. matmuls) 5, and
+    # everything else 1. Returns the number; used to show the reordering responds to the model.
     # NOTE: custom cost model to show that the compute reordering algorithm is working
     # Collective kernels
     if isinstance(snode.node, ir._CollectiveKernel):
@@ -54,6 +63,11 @@ def get_snode_runtime_for_reorder_compute_test(snode):
 
 
 def create_grouped_node_for_allreduce_and_its_deps(snodes):
+    # [FUNCTION DOC] HELPER: Pre-fusion custom pass taking the list of scheduler nodes.
+    # Finds the single in-place all_reduce collective node and its single producer node
+    # (looked up by buffer name), merges both into one grouped scheduler node, and returns a
+    # new order with that group first followed by all remaining nodes in original order.
+    # Raises AssertionError unless there is exactly one all_reduce and exactly one input node.
     name_to_snode = {snode.node.name: snode for snode in snodes}
     all_reduce_snodes = [
         snode
@@ -94,11 +108,18 @@ def create_grouped_node_for_allreduce_and_its_deps(snodes):
 )
 @instantiate_parametrized_tests
 class TestComputeCommReorderingMultiProc(DynamoDistributedMultiProcTestCase):
+    # [CLASS DOC] Multi-process (two ranks, fake process group when fewer than two GPUs)
+    # Inductor test case requiring an accelerator distributed backend and non-native matmul.
+    # Tests patch Inductor config for each reordering pass, compile small functions and
+    # check kernel ordering in the generated code.
     """
     Run correctness checks in multi-proc runner, mark with minimum # GPUs to run under
     """
 
     def get_world_trs(self):
+        # [FUNCTION DOC] HELPER: Returns a mapping with an empty tag, the list of all ranks
+        # (0 to world size minus one) and the group size, used as keyword arguments that
+        # describe the process group to the functional collectives.
         return {
             "tag": "",
             "ranks": list(range(self.world_size)),
@@ -107,6 +128,8 @@ class TestComputeCommReorderingMultiProc(DynamoDistributedMultiProcTestCase):
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC] HELPER: Property fixing the world size at two regardless of the
+        # number of GPUs available.
         # hack: no matter whether we have 2 or 3 or 4 gpus, just run on 2
         # works around issue with skipif<2 and workers with unpredictable #s gpu
         return 2
@@ -125,7 +148,13 @@ class TestComputeCommReorderingMultiProc(DynamoDistributedMultiProcTestCase):
         ],
     )
     def test_sink_waits(self):
+        # [FUNCTION DOC] With only the sink_waits pass enabled, compiles a function doing an
+        # all_reduce followed by two matmuls and checks the generated code places the wait
+        # after the first matmul and before the second. Also checks the compiled output
+        # matches eager. Runs inside a per-rank dynamo distributed init.
         def func(a):
+            # [FUNCTION DOC] HELPER: Model function: all_reduce of a, matmul of a with itself,
+            # then matmul of the reduced tensor with that product.
             ar = _functional_collectives.all_reduce(a, "sum", "0")
             b = torch.matmul(a, a)
             return torch.matmul(ar, b)
@@ -167,7 +196,14 @@ class TestComputeCommReorderingMultiProc(DynamoDistributedMultiProcTestCase):
         ],
     )
     def test_raise_comms(self):
+        # [FUNCTION DOC] With only the raise_comms pass enabled, compiles a function whose
+        # all_reduce depends on the first matmul, and checks the collective is issued after
+        # the first relu (it writes into the first matmul's buffer) but before the second
+        # matmul, with the wait before the final matmul. Also compares against eager.
         def func(a):
+            # [FUNCTION DOC] HELPER: Model function: matmul, relu, matmul chain, plus an
+            # all_reduce of the first matmul result; returns the product of the chain end
+            # with the reduced tensor.
             b = torch.matmul(a, a)
             c = torch.relu(b)
             d = torch.matmul(c, c)
@@ -219,7 +255,14 @@ class TestComputeCommReorderingMultiProc(DynamoDistributedMultiProcTestCase):
         ],
     )
     def test_sink_waits_raise_comms(self):
+        # [FUNCTION DOC] Enables both sink_waits and raise_comms and checks that the
+        # all_reduce and its clone prologue (not fused with relus) are raised between the
+        # first and second matmuls while the wait is sunk past the third matmul and before
+        # the fourth. Also compares compiled and eager results.
         def func(a, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: Model function: matmul chain with relus, an all_reduce of
+            # the first matmul result, and a final matmul of the reduced tensor with the
+            # chain output. The keyword arguments are accepted but unused.
             b = torch.matmul(a, a)
             c = torch.relu(b)
             d = torch.matmul(c, c)
@@ -279,6 +322,11 @@ class TestComputeCommReorderingMultiProc(DynamoDistributedMultiProcTestCase):
         False,
     )
     def test_reorder_compute_for_overlap(self):
+        # [FUNCTION DOC] Enables only the reorder_compute_for_overlap pass (matmul runtime
+        # benchmarking off) on a function with two dependent all_reduces and checks the
+        # emitted order: first collective, compute needed by the second collective, compute
+        # independent of both, the wait, the fused mul, second collective and wait, then the
+        # final add and matmul. Also compares compiled and eager results.
         def func(a, *, tag, ranks, group_size):
             ar = _functional_collectives.all_reduce(a, "sum", ranks, tag)
             g = torch.matmul(a, a)
@@ -339,6 +387,9 @@ class TestComputeCommReorderingMultiProc(DynamoDistributedMultiProcTestCase):
         get_snode_runtime_for_reorder_compute_test,
     )
     def test_reorder_compute_for_overlap_custom_runtime_estimation(self):
+        # [FUNCTION DOC] Same function and expected kernel order as the previous test, but
+        # the pass uses the custom runtime estimator configured via estimate_op_runtime
+        # (collectives cost most). Compares compiled output with eager.
         def func(a, *, tag, ranks, group_size):
             ar = _functional_collectives.all_reduce(a, "sum", ranks, tag)
             g = torch.matmul(a, a)
@@ -395,7 +446,15 @@ class TestComputeCommReorderingMultiProc(DynamoDistributedMultiProcTestCase):
     )
     @parametrize("combo_kernels", (False, True))
     def test_grouped_scheduler_node(self, combo_kernels):
+        # [FUNCTION DOC] Parametrized on the combo_kernels flag. Installs the pre-fusion pass
+        # that groups the all_reduce with its producer, compiles a function and checks the
+        # producer ops (add, div) are still fused with each other, then the collective, and
+        # that the independent multiply is a separate kernel (grouped nodes cannot fuse with
+        # outside ops). Also compares compiled and eager results.
         def func(a, *, tag, ranks, group_size):
+            # [FUNCTION DOC] HELPER: Model function: elementwise add and divide feeding an
+            # all_reduce, an independent elementwise multiply, and a matmul of the multiply
+            # with the reduced tensor.
             add = a + a
             div = add / a
             ar = _functional_collectives.all_reduce(div, "sum", ranks, tag)
@@ -433,6 +492,13 @@ class TestComputeCommReorderingMultiProc(DynamoDistributedMultiProcTestCase):
     @unittest.skipIf(not HAS_GPU, "Inductor+gpu needs triton and recent GPU arch")
     @torch._inductor.config.patch(force_disable_caches=True)
     def test_inductor_default_comms_ordering(self):
+        # [FUNCTION DOC] Compiles a function that launches three all_reduces and waits on them
+        # in reverse order, with a post-grad pass that asserts the graph keeps all_reduces in
+        # launch order followed by waits in reverse order. Runs on a fake process group.
+        # Side effect: assigns the post_grad_custom_post_pass config globally and never
+        # restores it. Only the graph assertion runs; there is no numerical check.
+        # KNOWN ISSUE: the global config assignment is not undone, so it can leak into
+        # tests that run later in the same process.
         pg_info = self.get_world_trs()
         tag = pg_info["tag"]
         ranks = pg_info["ranks"]
@@ -443,6 +509,9 @@ class TestComputeCommReorderingMultiProc(DynamoDistributedMultiProcTestCase):
         g3 = torch.ones(12, 12, device=device_type)
 
         def assert_pass(graph):
+            # [FUNCTION DOC] HELPER: Post-grad pass callback; compares the printed graph with
+            # the expected text via the expect-test helper (all_reduces in order, then waits
+            # reversed). Raises on mismatch; returns nothing.
             # all_reduces need to remain in order!
             self.assertExpectedInline(
                 graph,
@@ -464,6 +533,9 @@ graph():
 
         @torch.compile
         def fn(g1, g2, g3):
+            # [FUNCTION DOC] HELPER: Launches an averaging all_reduce on each of three
+            # tensors, then waits on them in reverse order; returns the three results
+            # ordered third, second, first.
             handle1 = torch.ops.c10d_functional.all_reduce(
                 g1, "avg", tag, ranks, group_size
             )
@@ -486,6 +558,11 @@ graph():
             fn(g1, g2, g3)
 
     def test_nccl_heuristics(self):
+        # [FUNCTION DOC] Checks shape consistency of the NCCL cost-model tables: base latency
+        # has one row per algorithm with one entry per protocol; hardware latency has one
+        # entry per hardware type, each with per-algorithm rows of per-protocol entries; the
+        # low-latency max bandwidth table has one entry per GPU type. Raises AssertionError
+        # on any mismatch.
         if len(baseLat) != len(NCCL_ALGO):
             raise AssertionError(
                 f"Expected len(baseLat) == len(NCCL_ALGO), got {len(baseLat)} vs {len(NCCL_ALGO)}"

@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Four-GPU NCCL tests that compose pipeline parallelism with data parallelism
+# (DDP or FSDP2 fully_shard, optionally with bfloat16 mixed precision) on a 2D device mesh
+# named dp and pp, comparing gradients from pipelined runs to a single-model reference. Also
+# tests FSDP unshard/reshard actions via the pipeline schedule runtime. Defines two small MLP
+# modules, a scaled cross-entropy loss helper, and the ComposabilityTest case; parametrized
+# tests are instantiated at import time.
 import copy
 
 import torch
@@ -41,7 +47,11 @@ device_type = "cuda"
 
 # MLP Layer
 class MLPModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Two-layer MLP (linear, relu, linear) with hidden size d_hid for
+    # both input and output; submodules net1, relu, net2. Weights get Kaiming uniform init.
     def __init__(self, d_hid: int):
+        # [FUNCTION DOC] HELPER: Creates the two linear layers (d_hid to d_hid) and the relu,
+        # then initializes the weights.
         super().__init__()
         self.net1 = torch.nn.Linear(d_hid, d_hid)
         self.relu = torch.nn.ReLU()
@@ -49,6 +59,8 @@ class MLPModule(torch.nn.Module):
         self.init_weights()
 
     def init_weights(self):
+        # [FUNCTION DOC] HELPER: Re-initializes both linear weights in place with Kaiming
+        # uniform (fan in, relu gain); biases are untouched.
         # ensure a proper init otherwise gradient tests will be more likely to get zero grad values
         torch.nn.init.kaiming_uniform_(
             self.net1.weight, mode="fan_in", nonlinearity="relu"
@@ -58,6 +70,7 @@ class MLPModule(torch.nn.Module):
         )
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies net1, relu, then net2 and returns the result.
         x = self.net1(x)
         x = self.relu(x)
         x = self.net2(x)
@@ -65,7 +78,12 @@ class MLPModule(torch.nn.Module):
 
 
 class MLPModuleEven(torch.nn.Module):
+    # [CLASS DOC] HELPER: Three-layer MLP with relu after every layer; the last layer widens
+    # the output to twice d_hid. Weights get Kaiming uniform init. Not used by tests in
+    # this file.
     def __init__(self, d_hid: int):
+        # [FUNCTION DOC] HELPER: Creates three linear layers (d_hid, d_hid, then d_hid to
+        # twice d_hid) and initializes their weights.
         super().__init__()
         self.net1 = nn.Linear(d_hid, d_hid)
         self.net2 = nn.Linear(d_hid, d_hid)
@@ -73,6 +91,8 @@ class MLPModuleEven(torch.nn.Module):
         self.init_weights()
 
     def init_weights(self):
+        # [FUNCTION DOC] HELPER: Re-initializes all three linear weights with Kaiming
+        # uniform (fan in, relu gain); biases are untouched.
         torch.nn.init.kaiming_uniform_(
             self.net1.weight, mode="fan_in", nonlinearity="relu"
         )
@@ -84,6 +104,8 @@ class MLPModuleEven(torch.nn.Module):
         )
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies each of the three linear layers followed by relu
+        # and returns the result (last dimension twice d_hid).
         x = F.relu(self.net1(x))
         x = F.relu(self.net2(x))
         x = F.relu(self.net3(x))
@@ -91,21 +113,33 @@ class MLPModuleEven(torch.nn.Module):
 
 
 def loss_fn(y, target, scale=1e-4):
+    # [FUNCTION DOC] HELPER: Cross entropy between predictions y and target, multiplied by
+    # scale (default 1e-4) to mimic a small learning rate and keep gradients from blowing
+    # up. Returns the scaled scalar loss.
     # Scale the loss to simulate a small learning rate and avoid exploding grads
     return torch.nn.functional.cross_entropy(y, target) * scale
 
 
 class ComposabilityTest(MultiProcContinuousTest):
+    # [CLASS DOC] Multi-process NCCL test case (one process per GPU) for pipeline parallel
+    # combined with DDP or FSDP2. Helper methods build random microbatches, pipeline stages
+    # and schedules; tests compare pipeline gradients to a locally computed reference.
     @classmethod
     def backend_str(cls) -> str:
+        # [FUNCTION DOC] HELPER: Selects the nccl backend for the test process group.
         # Testing with NCCL backend
         return "nccl"
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] HELPER: Property giving the cuda device indexed by this rank.
         return torch.device(device_type, self.rank)
 
     def _rand_microbatches(self, dp_mesh, num_microbatches, dim, dtype=torch.float32):
+        # [FUNCTION DOC] HELPER: Draws one random tensor of shape (num_microbatches, dim) per
+        # data-parallel rank (dp mesh size) on this device. Returns the list of all of them,
+        # the one belonging to this rank's local dp rank, and a list of single-row
+        # microbatches, each wrapped in a one-element list, taken from the local tensor.
         full = [
             torch.rand((num_microbatches, dim), device=self.device, dtype=dtype)
             for _ in range(dp_mesh.size())
@@ -118,6 +152,11 @@ class ComposabilityTest(MultiProcContinuousTest):
     def _build_pp_stage(
         self, pp_group, full_model, total_layers, apply_dp, stage_idx, num_stages
     ):
+        # [FUNCTION DOC] HELPER: Builds one pipeline stage. Slices a contiguous equal share
+        # of total_layers from full_model for stage_idx out of num_stages, moves it to this
+        # device, wraps it with the apply_dp callable, and creates a PipelineStage on
+        # pp_group. Returns the stage and the layer offset of its first layer. Raises
+        # AssertionError if layers do not divide evenly by the stage count.
         # divide the model (e.g. 8 layers) by the number of stages
         layers_per_stage = total_layers // num_stages
         if layers_per_stage * num_stages != total_layers:
@@ -152,6 +191,14 @@ class ComposabilityTest(MultiProcContinuousTest):
         loss_fn,
         scale_grads=True,
     ):
+        # [FUNCTION DOC] HELPER: Creates a pipeline schedule of the given class. For
+        # single-stage-per-rank schedules builds one stage with index equal to the pp rank.
+        # Otherwise builds two virtual stages per rank (stage ids rank and rank plus two
+        # times the virtual index, over twice the pp size stages) and passes the list.
+        # Returns the schedule, the per-stage data-parallel-wrapped submodules and the
+        # layer offsets of each stage.
+        # KNOWN ISSUE: the virtual stage index uses the virtual count as the stride, which
+        # only matches the usual looped layout when the pp group size equals that count (2).
         if issubclass(ScheduleClass, PipelineScheduleSingle):
             pipeline_stage, offset = self._build_pp_stage(
                 pp_group,
@@ -207,6 +254,13 @@ class ComposabilityTest(MultiProcContinuousTest):
         ],
     )
     def test_pp_ddp(self, ScheduleClass):
+        # [FUNCTION DOC] Parametrized over GPipe, interleaved 1F1B and interleaved zero
+        # bubble; the zero-bubble case returns immediately (DDP unsupported there, see the
+        # linked issue). Builds a (world/2, 2) dp-by-pp mesh, an eight layer MLP model and
+        # DDP-wrapped stages, runs one pipeline step (first stage feeds input, others feed
+        # targets), computes reference gradients by running the full model on each simulated
+        # dp rank's input and averaging, and asserts each stage parameter gradient matches
+        # the matching reference one. Needs 4 GPUs and NCCL.
         if ScheduleClass == ScheduleInterleavedZeroBubble:
             # TODO: DDP + InterleavedZeroBubble is not currently supported due to issue with DDP reducer not triggering
             # https://github.com/pytorch/pytorch/issues/144530
@@ -236,6 +290,7 @@ class ComposabilityTest(MultiProcContinuousTest):
         )
 
         def apply_dp(partial_model):
+            # [FUNCTION DOC] HELPER: Wraps the stage module in DDP over the dp mesh group.
             return DDP(partial_model, process_group=dp_mesh.get_group())
 
         # Build pipeline stages, apply data parallelism and attach to a schedule
@@ -290,6 +345,13 @@ class ComposabilityTest(MultiProcContinuousTest):
         ],
     )
     def test_pp_fsdp(self, dp_type, ScheduleClass):
+        # [FUNCTION DOC] Parametrized over FSDP with and without bfloat16 mixed precision and
+        # four schedule classes; returns immediately on ROCm. Same flow as the DDP test but
+        # each stage is sharded with fully_shard (per-layer without reshard after forward,
+        # then the whole stage). After the pipeline step each gradient is divided then
+        # multiplied by two to expose races between pipelining and FSDP reduce-scatter.
+        # Asserts every gradient is a DTensor whose full tensor is close to the reference
+        # (absolute 5e-5, relative 2e-2). Raises AssertionError if a gradient is missing.
         if TEST_WITH_ROCM:
             return
 
@@ -325,6 +387,10 @@ class ComposabilityTest(MultiProcContinuousTest):
 
         # Apply FSDP to stage module
         def apply_dp(partial_model):
+            # [FUNCTION DOC] HELPER: Applies fully_shard to each child layer (no reshard
+            # after forward) and then to the whole module, using the dp mesh and a mixed
+            # precision policy (param dtype mp_dtype, reduce dtype float32). Returns the
+            # sharded module.
             mp_policy = MixedPrecisionPolicy(
                 param_dtype=mp_dtype,
                 reduce_dtype=torch.float32,
@@ -392,6 +458,12 @@ class ComposabilityTest(MultiProcContinuousTest):
     @skip_but_pass_in_sandcastle_if(not TEST_MULTIGPU, "Test requires 4+ GPUs")
     @parametrize("dp_type", ["FSDP", "FSDP_MP"])
     def test_pp_fsdp_unshard_reshard_runtime(self, dp_type):
+        # [FUNCTION DOC] On a (world, 1) mesh, builds one four-layer FSDP stage and drives it
+        # with hand-written schedules in the pipeline schedule runtime (one microbatch, no
+        # loss). Checks all FSDP parameters are sharded initially (skips if none exist), runs
+        # an unshard, forward, reshard schedule and asserts parameters are sharded again,
+        # then an unshard, forward, reduce-grad schedule and asserts they are sharded again.
+        # Returns immediately on ROCm.
         """Test FSDP UNSHARD/RESHARD functionality using _PipelineScheduleRuntime with custom schedules."""
         if TEST_WITH_ROCM:
             return
@@ -412,6 +484,10 @@ class ComposabilityTest(MultiProcContinuousTest):
         full_model = nn.ModuleList([MLPModule(dim) for _ in range(total_layers)])
 
         def apply_dp(partial_model):
+            # [FUNCTION DOC] HELPER: Same sharding as in the FSDP test: fully_shard on each
+            # child layer (no reshard after forward) and then on the whole module, with the
+            # dp mesh and mixed precision (param dtype mp_dtype, reduce dtype float32).
+            # Returns the sharded module.
             mp_policy = MixedPrecisionPolicy(
                 param_dtype=mp_dtype,
                 reduce_dtype=torch.float32,
@@ -449,6 +525,10 @@ class ComposabilityTest(MultiProcContinuousTest):
 
         # Helper function to check FSDP sharding state
         def check_fsdp_unsharded_state(module, expected_unsharded=False):
+            # [FUNCTION DOC] HELPER: Walks all FSDP states and parameter groups of the module,
+            # counting parameters whose sharded state is unsharded. Asserts that all are
+            # unsharded if expected_unsharded, else that none are. Returns whether any FSDP
+            # parameter was found.
             """Check if FSDP parameters are in expected sharding state."""
             distributed_state = fully_shard.state(module)
             unsharded_count = 0
@@ -485,6 +565,9 @@ class ComposabilityTest(MultiProcContinuousTest):
             self.skipTest("No FSDP parameters found in the model")
 
         def create_schedule(computation_types, microbatch_index=None):
+            # [FUNCTION DOC] HELPER: Builds a one-rank schedule mapping rank 0 to a list of
+            # actions on stage 0, one per computation type; only forward actions carry the
+            # given microbatch index, others get none. Returns the mapping.
             schedule = {
                 0: [
                     _Action(

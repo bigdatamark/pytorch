@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Tests for torch.distributed.collective_utils: broadcast and all_gather of a
+# function result (with and without a process group, exception propagation), the RNG
+# synchronization checker over gloo, and the rank-list summarizer (using a fake process group
+# with 4096 ranks). Defines TestCollectiveUtils (multi-process) and TestUtils; parametrized
+# tests are instantiated at import time.
 
 from unittest import mock
 
@@ -27,20 +32,30 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 
 
 class TestCollectiveUtils(MultiProcessTestCase):
+    # [CLASS DOC] Multi-process test case (processes spawned in setUp) exercising the
+    # broadcast, all_gather and RNG-sync helpers against real gloo process groups.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Runs parent setup, then spawns the worker processes.
         super().setUp()
         self._spawn_processes()
 
     def tearDown(self) -> None:
+        # [FUNCTION DOC] HELPER: Only runs the parent teardown.
         super().tearDown()
 
     def opts(self, threads=2):
+        # [FUNCTION DOC] HELPER: Builds gloo process group options with a timeout of 50
+        # seconds and the given number of threads (default 2); returns them.
         opts = c10d.ProcessGroupGloo._Options()
         opts._timeout = 50.0
         opts._threads = threads
         return opts
 
     def test_broadcast_result(self) -> None:
+        # [FUNCTION DOC] Creates a gloo group, then broadcasts the result of a mock function
+        # returning each rank's own rank, first from source rank 0 then from rank 1. Asserts
+        # all ranks receive the source's value and that only the source rank called the
+        # function. Raises AssertionError on mismatch.
         """
         Basic unit test for broadcast using a process group of default world size.
         """
@@ -74,6 +89,8 @@ class TestCollectiveUtils(MultiProcessTestCase):
             func.assert_not_called()
 
     def test_broadcast_result_no_pg(self) -> None:
+        # [FUNCTION DOC] Calls broadcast with no process group and checks the function is
+        # invoked exactly once locally.
         """
         Ensure broadcast has no dependency on torch.distributed when run in single process.
         """
@@ -84,6 +101,8 @@ class TestCollectiveUtils(MultiProcessTestCase):
     def test_broadcast_result_raises_exceptions_from_func(
         self,
     ) -> None:
+        # [FUNCTION DOC] With no process group, a function that raises an exception must
+        # have that exception propagate out of broadcast (matched by message).
         """
         Ensure broadcast exception is propagated properly.
         """
@@ -96,6 +115,9 @@ class TestCollectiveUtils(MultiProcessTestCase):
             broadcast(data_or_fn=func, rank=0)
 
     def test_all_gather_result(self) -> None:
+        # [FUNCTION DOC] Creates a gloo group and gathers a mock function's per-rank result
+        # (the rank). Asserts the function ran once per process and every rank gets the list
+        # of ranks in order. Raises AssertionError on mismatch.
         """
         Basic unit test for all_gather using a process group of default world size.
         """
@@ -116,6 +138,8 @@ class TestCollectiveUtils(MultiProcessTestCase):
             )
 
     def test_all_gather_result_no_pg(self) -> None:
+        # [FUNCTION DOC] Calls all_gather with no process group and checks the function is
+        # invoked exactly once locally.
         """
         Ensure all_gather has no dependency on torch.distributed when run in single process.
         """
@@ -126,6 +150,8 @@ class TestCollectiveUtils(MultiProcessTestCase):
     def test_all_gather_result_raises_exceptions_from_func(
         self,
     ) -> None:
+        # [FUNCTION DOC] With no process group, a function that raises an exception must
+        # have that exception propagate out of all_gather (matched by message).
         """
         Ensure all_gather exception is propagated properly.
         """
@@ -143,6 +169,12 @@ class TestCollectiveUtils(MultiProcessTestCase):
         self,
         device,
     ) -> None:
+        # [FUNCTION DOC] Parametrized over cpu and cuda (needs at least 4 GPUs, skips if cuda
+        # is missing). On a 4-rank gloo group, seeds a generator identically and checks the
+        # internal RNG sync check groups all ranks together; then advances the generator on
+        # rank 1 (two groups: {0,2,3} and {1}); then reseeds on rank 0 (three groups). Finally
+        # checks the textual report mentions a generator desync, ranks, and the summarized
+        # range 2:4.
         if device == "cuda" and not torch.cuda.is_available():
             self.skipTest("Cuda is not available")
         store = c10d.FileStore(self.file_name, self.world_size)
@@ -178,7 +210,11 @@ class TestCollectiveUtils(MultiProcessTestCase):
 
 
 class TestUtils(TestCase):
+    # [CLASS DOC] Single-process test case for the rank summarizer, running on a fake
+    # process group of world size 4096 initialized in setUp when none exists.
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Runs parent setup and, if no process group is initialized,
+        # sets rank 0 and world size 4096 and initializes the fake backend with a fake store.
         super().setUp()
 
         if not c10d.is_initialized():
@@ -194,9 +230,14 @@ class TestUtils(TestCase):
             )
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Destroys the default process group.
         c10d.destroy_process_group()
 
     def test_summarize_ranks(self):
+        # [FUNCTION DOC] Builds a CPU device mesh of shape 8 by 64 by 8 (pp, dp, tp) and
+        # checks the summarized rank strings of each named dimension's rank list against
+        # strided range notation (pp, dp, tp), plus a mixed list giving comma-joined ranges
+        # and a single rank giving just that number.
         mesh_dim_names = ("pp", "dp", "tp")
         mesh = init_device_mesh("cpu", (8, 64, 8), mesh_dim_names=mesh_dim_names)
         ranks_lists = {name: mesh[name].mesh.tolist() for name in mesh_dim_names}

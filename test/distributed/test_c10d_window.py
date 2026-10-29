@@ -5,6 +5,12 @@
 # map_remote_tensor). Modeled on torchcomms' WindowRmaTest; parameterized over
 # backends like test_c10d_fault_tolerance.py so additional backends can be
 # enabled by extending WINDOW_BACKENDS.
+# [MODULE DOC] Two-process tests of the one-sided window API (register, put, signal,
+# wait_signal, map_remote_tensor, get_attr) over memory allocated from the backend mempool.
+# An abstract mixin holds all tests; a factory builds one concrete multi-process test class
+# per (backend, device) entry in WINDOW_BACKENDS (currently nccl2 on cuda) and publishes it
+# as a module global named after the backend. Import side effects: exits the process with
+# status 0 if the distributed package is unavailable, and creates those module globals.
 
 import os
 import sys
@@ -32,19 +38,30 @@ WINDOW_BACKENDS = [
 
 
 class AbstractWindowTest:
+    # [CLASS DOC] Mixin with all window tests, meant to be combined with a multi-process test
+    # case. The concrete subclass must provide the class attributes backend_name and
+    # device_type. Each test spawns two processes, initializes a process group over a
+    # file store, skips if the backend lacks window support, and uses tensors allocated from
+    # the backend mempool so they can be registered in a window.
     @property
     def world_size(self):
+        # [FUNCTION DOC] HELPER: Property fixing the number of ranks at two.
         return 2
 
     @property
     def device(self):
+        # [FUNCTION DOC] HELPER: Property giving the device of the configured type indexed
+        # by this process's rank.
         return torch.device(f"{self.device_type}:{self.rank}")
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Runs parent setup, then spawns the worker processes.
         super().setUp()
         self._spawn_processes()
 
     def tearDown(self):
+        # [FUNCTION DOC] HELPER: Destroys the process group if one is initialized, runs the
+        # parent teardown, and removes the file-store file, ignoring OS errors.
         if dist.is_initialized():
             dist.destroy_process_group()
         super().tearDown()
@@ -54,6 +71,10 @@ class AbstractWindowTest:
             pass
 
     def _init_pg(self):
+        # [FUNCTION DOC] HELPER: Sets the cuda device for this rank (cuda only), creates the
+        # process group for the test backend using a file store and a 60 second timeout,
+        # and stores the backend implementation for this rank's device on self.backend. Skips
+        # the test if windows are unsupported by the distributed build or the backend.
         if self.device_type == "cuda":
             torch.cuda.set_device(self.rank)
         store = dist.FileStore(self.file_name, self.world_size)
@@ -69,9 +90,14 @@ class AbstractWindowTest:
             self.skipTest(f"{self.backend_name} does not support windows")
 
     def _make_pool(self):
+        # [FUNCTION DOC] HELPER: Returns a CUDA memory pool backed by the backend's memory
+        # allocator, used to allocate window-registrable tensors.
         return torch.cuda.MemPool(self.backend.mem_allocator)
 
     def _probe_window_support(self, pool):
+        # [FUNCTION DOC] HELPER: Allocates a one-element tensor from the pool, then tries to
+        # register and deregister it in a throwaway window. A runtime error from registration
+        # makes the test skip with the error text. Collective: all ranks must call it.
         # Symmetric-window registration needs a transport that can expose
         # VMM-backed memory across ranks (NVLink intra-node or IB inter-node).
         # The probe is collective, so every rank succeeds or skips together.
@@ -85,6 +111,13 @@ class AbstractWindowTest:
             self.skipTest(f"symmetric window registration unsupported: {e}")
 
     def _window_ring_put(self, count, dtype, async_op, use_tensor_in_new_window):
+        # [FUNCTION DOC] HELPER: Shared ring test body. Allocates a payload of count elements
+        # (filled with the rank) and a window buffer of count times world size elements from
+        # the pool, creates the window (passing the buffer at creation or registering it
+        # afterwards, per use_tensor_in_new_window). For four iterations each rank puts a
+        # payload into the next rank's slot, waits for the previous rank's signal (both
+        # awaited explicitly if async_op), maps its own window tensor and asserts its slot
+        # holds the previous rank's value for that iteration. Deregisters at the end.
         # Ring put: each rank puts its payload into the next rank's window and
         # signals it; each rank waits for the previous rank's signal and
         # verifies the received slice. Port of torchcomms' _window_put_test.
@@ -138,14 +171,20 @@ class AbstractWindowTest:
         torch.cuda.synchronize()
 
     def test_put_signal_wait_sync(self):
+        # [FUNCTION DOC] Ring put of 1024 floats with synchronous put and wait_signal.
         self._init_pg()
         self._window_ring_put(1024, torch.float, False, False)
 
     def test_put_signal_wait_async(self):
+        # [FUNCTION DOC] Ring put of 1024 floats with asynchronous put and wait_signal,
+        # waiting on the returned work objects.
         self._init_pg()
         self._window_ring_put(1024, torch.float, True, False)
 
     def test_signal_wait(self):
+        # [FUNCTION DOC] Creates a window over a one-element pooled tensor, signals the next
+        # rank and waits for a signal from the previous rank (both synchronous), then
+        # synchronizes and deregisters. Passes if nothing hangs or raises.
         self._init_pg()
         pool = self._make_pool()
         self._probe_window_support(pool)
@@ -158,6 +197,8 @@ class AbstractWindowTest:
         win.tensor_deregister()
 
     def test_put_dtypes_and_sizes(self):
+        # [FUNCTION DOC] Runs the synchronous ring put for three combinations of element
+        # count and dtype: 4 floats, 1024 int32 and 65536 int8.
         self._init_pg()
         for count, dtype in [
             (4, torch.float),
@@ -167,10 +208,15 @@ class AbstractWindowTest:
             self._window_ring_put(count, dtype, False, False)
 
     def test_new_window_with_tensor(self):
+        # [FUNCTION DOC] Ring put where the buffer is handed to the window constructor
+        # rather than registered afterwards.
         self._init_pg()
         self._window_ring_put(1024, torch.float, False, True)
 
     def test_map_remote_tensor_local(self):
+        # [FUNCTION DOC] Registers a pooled arange tensor, maps the window tensor for the
+        # caller's own rank, and asserts it has the same dtype, shape and values as the
+        # registered buffer. Deregisters afterwards.
         self._init_pg()
         pool = self._make_pool()
         self._probe_window_support(pool)
@@ -189,6 +235,9 @@ class AbstractWindowTest:
         win.tensor_deregister()
 
     def test_window_attr(self):
+        # [FUNCTION DOC] Creates a window over a pooled tensor and asserts that the
+        # attributes queried for the next rank report an access type that is an instance of
+        # the WindowAccessType enum.
         self._init_pg()
         pool = self._make_pool()
         self._probe_window_support(pool)
@@ -204,6 +253,10 @@ class AbstractWindowTest:
 
     @skip_if_rocm_ver_atleast_multiprocess([7, 14])
     def test_register_errors(self):
+        # [FUNCTION DOC] Checks runtime errors: registering a tensor not from the backend
+        # mempool (message mentions the mempool); put or signal before registration
+        # ("not registered"); registering the same pooled tensor twice (double registration).
+        # Skipped on ROCm 7.14 and later.
         self._init_pg()
         pool = self._make_pool()
         self._probe_window_support(pool)
@@ -229,6 +282,8 @@ class AbstractWindowTest:
         win.tensor_deregister()
 
     def test_put_out_of_bounds(self):
+        # [FUNCTION DOC] Puts a 16-element source at offset 8 into a 16-element window and
+        # expects a runtime error saying the write exceeds the window size.
         self._init_pg()
         pool = self._make_pool()
         self._probe_window_support(pool)
@@ -242,6 +297,11 @@ class AbstractWindowTest:
         win.tensor_deregister()
 
     def test_put_argument_validation_is_rank_local(self):
+        # [FUNCTION DOC] Checks that put validates its arguments locally, raising runtime
+        # errors for a negative offset ("nonnegative"), a huge offset (exceeds or overflows),
+        # a source dtype differing from the window ("does not match"), and, on rank 0 only,
+        # a source tensor outside any registered region ("not in a registered"), without
+        # needing the other rank to participate. A barrier precedes deregistration.
         self._init_pg()
         pool = self._make_pool()
         self._probe_window_support(pool)
@@ -269,6 +329,12 @@ class AbstractWindowTest:
         win.tensor_deregister()
 
     def test_put_uses_destination_window_metadata(self):
+        # [FUNCTION DOC] Each rank allocates a window buffer of 16 plus rank elements after
+        # rank-dependent padding, so offsets differ per rank. Each rank puts its first
+        # element (rank plus 10) into the last slot of the next rank's window, using the
+        # destination's size, then waits for the previous rank's signal and asserts its own
+        # last element equals the previous rank's value. Verifies the destination window's
+        # metadata, not the local one, determines placement.
         self._init_pg()
         pool = self._make_pool()
         self._probe_window_support(pool)
@@ -293,7 +359,13 @@ class AbstractWindowTest:
 
 
 def _make_window_test_class(backend_name, device_type):
+    # [FUNCTION DOC] HELPER: Builds a concrete test class combining the abstract mixin with
+    # the multi-process test case, sets its backend_name and device_type attributes and a
+    # class name derived from the capitalized backend name. Wraps it to skip when the backend
+    # is unavailable and, for cuda, when the machine has no CUDA or fewer than two GPUs.
     class WindowTest(AbstractWindowTest, MultiProcessTestCase):
+        # [CLASS DOC] HELPER: Concrete window test class; behavior comes entirely from the
+        # mixin and base class, attributes are assigned by the enclosing factory.
         pass
 
     WindowTest.backend_name = backend_name
