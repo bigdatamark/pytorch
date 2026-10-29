@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Derives DTensor sharding strategies for operators lacking a registered
+# strategy by tracing their decompositions on meta tensors. Contains a schema-info
+# inference helper, PlacementTrackingMode (a dispatch mode recording output placements)
+# and DecompShardingStrategy (candidate enumeration and expansion to the full mesh).
+# No import-time side effects beyond imports.
 """
 Decomposition-based sharding propagation for DTensor.
 
@@ -30,6 +35,9 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 
 def _infer_schema_info_from_op(op: OpOverload) -> RuntimeSchemaInfo:
+    # [FUNCTION DOC] HELPER: Builds a RuntimeSchemaInfo from an operator schema. The static
+    # argument index is the first positional non-tensor argument; static keyword keys are
+    # all keyword-only non-tensor arguments. Returns the RuntimeSchemaInfo; no side effects.
     """Infer RuntimeSchemaInfo from an operator's schema for decomposition ops"""
     schema = op._schema
 
@@ -70,10 +78,16 @@ if TYPE_CHECKING:
 
 
 def _extract_input_specs(op_schema: OpSchema) -> tuple[DTensorSpec | object, ...]:
+    # [FUNCTION DOC] HELPER: Returns positional args schema followed by keyword args schema
+    # values as one tuple (specs for tensors, raw values otherwise).
     return op_schema.args_schema + tuple(op_schema.kwargs_schema.values())
 
 
 class PlacementTrackingMode(TorchDispatchMode):
+    # [CLASS DOC] Dispatch mode used during decomposition tracing on meta tensors. Holds the
+    # sharding propagator and a mesh; each intercepted op gets its output placements
+    # propagated and stored on the result tensors as a spec attribute. Disallows
+    # redistribution (raises an error if inputs would need different placements).
     """
     TorchDispatchMode that tracks DTensor placements through op execution.
 
@@ -82,11 +96,17 @@ class PlacementTrackingMode(TorchDispatchMode):
     """
 
     def __init__(self, sharding_prop: ShardingPropagator, mesh: DeviceMesh):
+        # [FUNCTION DOC] HELPER: Stores the sharding propagator and mesh for later dispatch calls.
         super().__init__()
         self.sharding_prop = sharding_prop
         self.mesh = mesh
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] Intercepts one op: converts tensor args to their recorded specs, builds an
+        # OpSchema (attaching cached schema info), propagates sharding (uncached when tracing),
+        # runs the real op, and records output specs on the result. Returns the op output.
+        # Raises NotImplementedError if no spec is present in the inputs, and RuntimeError if
+        # any input placement would need to change (true redistribution).
         args_schema, kwargs_schema = tree_map(
             lambda x: getattr(x, "_spec", x) if isinstance(x, torch.Tensor) else x,
             (args, kwargs or {}),
@@ -142,6 +162,8 @@ class PlacementTrackingMode(TorchDispatchMode):
         return out
 
     def _record_output_specs(self, output: Any, output_spec: DTensorSpec | Any) -> None:
+        # [FUNCTION DOC] HELPER: Recursively attaches output specs to output tensors, pairing
+        # tuples/lists elementwise. Mutates the tensors; returns nothing.
         if isinstance(output, torch.Tensor) and output_spec is not None:
             output._spec = output_spec  # pyrefly: ignore [missing-attribute]
         elif isinstance(output, (tuple, list)) and isinstance(
@@ -152,6 +174,10 @@ class PlacementTrackingMode(TorchDispatchMode):
 
 
 class DecompShardingStrategy:
+    # [CLASS DOC] Builds an OpStrategy for an op by running its decomposition for each candidate
+    # per-mesh-dimension input placement combination. State: the sharding propagator and a
+    # cache of fake size-1 meshes keyed by device type. Key methods: has_decomp,
+    # ensure_schema_info, propagate_strategy.
     """
     Generates sharding strategies for ops by tracing through their decompositions.
 
@@ -161,6 +187,7 @@ class DecompShardingStrategy:
     """
 
     def __init__(self, sharding_prop: ShardingPropagator):
+        # [FUNCTION DOC] HELPER: Stores the sharding propagator and initializes an empty fake-mesh cache.
         self.sharding_prop = sharding_prop
         # Cache fake meshes per device type to avoid repeated allocation.
         # A fake size-1 mesh ensures identical strategy computation across all ranks
@@ -170,6 +197,8 @@ class DecompShardingStrategy:
         self._fake_meshes: dict[str, DeviceMesh] = {}
 
     def _get_fake_mesh(self, device_type: str) -> DeviceMesh:
+        # [FUNCTION DOC] HELPER: Returns a cached single-device mesh (no backend init, rank 0)
+        # for the device type, creating and caching it on first use.
         fake_mesh = self._fake_meshes.get(device_type)
         if fake_mesh is None:
             fake_mesh = DeviceMesh(device_type, [0], _init_backend=False, _rank=0)
@@ -178,10 +207,14 @@ class DecompShardingStrategy:
 
     @staticmethod
     def has_decomp(op: OpOverload) -> bool:
+        # [FUNCTION DOC] Returns True if the op has an entry in the decomposition table or can
+        # decompose implicitly (composite implicit autograd).
         # Check if op has a decomposition (explicit or CIA)
         return op in decomposition_table or op._can_decompose()
 
     def ensure_schema_info(self, op: OpOverload) -> None:
+        # [FUNCTION DOC] Registers inferred schema info for the op in the propagator's mapping if
+        # absent (mutates that mapping); needed so the propagation cache key is correct.
         """
         Register schema_info for decomposition op on first invocation.
         Needed for correct shard prop cache key.
@@ -195,6 +228,12 @@ class DecompShardingStrategy:
         op_schema: OpSchema,
         output_tensor_meta: TensorMeta | Sequence[TensorMeta | None] | None = None,
     ) -> OpStrategy | None:
+        # [FUNCTION DOC] Computes an OpStrategy for the op by enumerating candidate input placements,
+        # tracing the decomposition on a fake mesh for each, collecting (outputs + inputs)
+        # single-dim strategies, and expanding them to the real mesh. Returns None if no
+        # DTensorSpec inputs exist, the decomposition is missing, or it needs data-dependent
+        # guards. Candidates that fail with runtime/key/index errors are skipped. Raises
+        # AssertionError if no candidate succeeds.
         if not tree_any(
             lambda x: isinstance(x, DTensorSpec),
             (op_schema.args_schema, op_schema.kwargs_schema),
@@ -255,6 +294,11 @@ class DecompShardingStrategy:
         placement: tuple[Placement | None],
         mesh: DeviceMesh,
     ) -> Placement | tuple[Placement, ...]:
+        # [FUNCTION DOC] HELPER: Runs the op decomposition on meta tensors whose specs use the given
+        # per-input placement on the given mesh, under PlacementTrackingMode with local tensor
+        # mode disabled. Returns the output placement (a single one, or a tuple for multiple
+        # outputs). Raises NotImplementedError if no decomposition exists; RuntimeError
+        # propagates when redistribution is required.
         op = op_schema.op
         if op in decomposition_table:
             decomp_fn = decomposition_table[op]
@@ -266,6 +310,8 @@ class DecompShardingStrategy:
         placement_iter = iter(placement)
 
         def to_meta(x):
+            # [FUNCTION DOC] HELPER: Consumes the next placement; turns a DTensorSpec into a meta tensor
+            # carrying a spec with that placement, and returns other values unchanged.
             p = next(placement_iter)
             if isinstance(x, DTensorSpec):
                 # pyrefly: ignore [missing-attribute]
@@ -288,6 +334,7 @@ class DecompShardingStrategy:
                 output = decomp_fn(*args_meta, **kwargs_meta)
 
         def get_placement(t):
+            # [FUNCTION DOC] HELPER: Returns the first placement of a tensor's recorded spec, else None.
             if isinstance(t, torch.Tensor):
                 spec = getattr(t, "_spec", None)
                 return spec.placements[0] if spec else None
@@ -303,6 +350,10 @@ class DecompShardingStrategy:
     def _get_candidate_placements(
         op_schema: OpSchema,
     ) -> list[tuple[Placement | None]]:
+        # [FUNCTION DOC] HELPER: Enumerates candidate placement tuples, one entry per flattened input.
+        # Non-spec inputs get None; spec inputs choose from the set of all placements seen in
+        # the inputs plus Replicate, with Shard/StridedShard expanded to every tensor dim.
+        # Returns the cartesian product as a list.
         tensor_specs = _extract_input_specs(op_schema)
         flat_specs, _ = tree_flatten(list(tensor_specs))
 

@@ -1,5 +1,11 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
+# [MODULE DOC] Core public DTensor API: the DTensor tensor subclass (local tensor plus
+# DTensorSpec of mesh and placements), autograd functions bridging plain tensors and
+# DTensors (to_local / from_local), distribute_tensor, distribute_module, and the factory
+# functions (ones, empty, full, rand, randn, zeros, linspace, logspace).
+# Import-time side effects: creates the shared op dispatcher as a DTensor class attribute
+# and sets the DTensor constructor to the C++ implementation.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 import copy
 import hashlib
@@ -63,6 +69,8 @@ aten = torch.ops.aten
 def _normalize_placements_for_grad(
     placements: tuple[Placement, ...],
 ) -> tuple[Placement, ...]:
+    # [FUNCTION DOC] HELPER: Returns a tuple of placements where every Partial is replaced by Replicate and
+    # others are kept; used to choose default gradient placements.
     """
     Normalize gradient placements by converting Partial to Replicate.
 
@@ -100,12 +108,17 @@ def _normalize_placements_for_grad(
 # So from_local/to_local must be Autograd functions.
 #
 class _ToTorchTensor(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Autograd function implementing DTensor to_local. Forward returns a fresh view of
+    # the local tensor; backward wraps the incoming local gradient back into a DTensor using
+    # the saved spec (or requested gradient placements).
     @staticmethod
     def forward(  # type: ignore[override]
         ctx,
         input: "DTensor",
         grad_placements: Sequence[Placement] | None,
     ):
+        # [FUNCTION DOC] HELPER: Saves the input spec, grad placements and local stride on ctx (gradients are
+        # not materialized) and returns a view of the local tensor as a fresh tensor object.
         ctx.dtensor_spec = input._spec
         ctx.grad_placements = grad_placements
         ctx.set_materialize_grads(False)
@@ -119,6 +132,11 @@ class _ToTorchTensor(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor | None):  # type: ignore[override]
+        # [FUNCTION DOC] HELPER: Converts the local gradient into a DTensor gradient. Returns (None, None) for
+        # a missing gradient. Grad placements default to the forward placements with Partial
+        # mapped to Replicate. If those equal the forward placements and strides provably
+        # match (or are contiguous), the forward spec is copied; otherwise global shape/stride
+        # info is recomputed. Returns (DTensor gradient, None).
         if grad_output is None:
             return None, None
 
@@ -137,16 +155,19 @@ class _ToTorchTensor(torch.autograd.Function):
         from torch.fx.experimental.symbolic_shapes import guard_or_false
 
         def strides_provably_match(stride, other):
+            # [FUNCTION DOC] HELPER: True if both strides have equal length and every pair of entries is provably equal.
             return len(stride) == len(other) and all(
                 guard_or_false(a == b) for a, b in zip(stride, other)
             )
 
         def strides_provably_differ(stride, other):
+            # [FUNCTION DOC] HELPER: True if the strides differ in length or some pair of entries is provably different.
             return len(stride) != len(other) or any(
                 guard_or_false(a != b) for a, b in zip(stride, other)
             )
 
         def strides_are_contiguous_for_shape(shape, stride, other):
+            # [FUNCTION DOC] HELPER: True if shape and both strides have equal rank and both strides are contiguous for the shape.
             if not (len(shape) == len(stride) == len(other)):
                 return False
             return check_contiguous_sizes_strides(
@@ -154,6 +175,7 @@ class _ToTorchTensor(torch.autograd.Function):
             ) and check_contiguous_sizes_strides(shape, other, false_if_dde=True)
 
         def strides_may_match(shape, stride, other):
+            # [FUNCTION DOC] HELPER: True if the strides provably match, are both contiguous for the shape, or cannot be proven different.
             return (
                 strides_provably_match(stride, other)
                 or strides_are_contiguous_for_shape(shape, stride, other)
@@ -161,6 +183,8 @@ class _ToTorchTensor(torch.autograd.Function):
             )
 
         def check_stride_matches(shape, stride, other):
+            # [FUNCTION DOC] HELPER: Returns silently if strides provably match or are both contiguous; otherwise
+            # emits per-entry equality checks that raise an error (or add guards) on mismatch.
             if strides_provably_match(
                 stride, other
             ) or strides_are_contiguous_for_shape(shape, stride, other):
@@ -221,6 +245,9 @@ class _ToTorchTensor(torch.autograd.Function):
 
 
 class _FromTorchTensor(torch.autograd.Function):
+    # [CLASS DOC] HELPER: Autograd function implementing DTensor.from_local. Forward builds a DTensor
+    # sharing memory with the local tensor; backward redistributes the DTensor gradient to the
+    # expected gradient placements and returns its local tensor.
     @staticmethod
     def forward(  # type: ignore[override]
         ctx,  # pyre-ignore[2]: Parameter must be annotated.
@@ -232,6 +259,11 @@ class _FromTorchTensor(torch.autograd.Function):
         stride: tuple[int, ...] | None = None,
         grad_placements: tuple[Placement, ...] | None = None,
     ) -> "DTensor":
+        # [FUNCTION DOC] HELPER: Saves placements, mesh and grad placements on ctx. Global shape/stride are
+        # taken from the arguments (both must be given) or computed from the local tensor
+        # assuming even sharding; raises RuntimeError if only one is given. Ranks outside the
+        # mesh get an empty local tensor; with run_check, metadata is verified across ranks and
+        # replicated mesh dims are broadcast from the first rank. Returns the new DTensor.
         ctx.forward_input_placements = placements
         ctx.forward_input_device_mesh = device_mesh
         ctx.grad_placements = grad_placements
@@ -296,6 +328,11 @@ class _FromTorchTensor(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: "DTensor | None"):  # type: ignore[override]
+        # [FUNCTION DOC] HELPER: Returns the local gradient plus six None entries (None entries only for a
+        # missing gradient). Target placements are the user grad placements or the forward
+        # placements with Partial mapped to Replicate. If the gradient placements differ, it is
+        # redistributed (the implicit redistribution is reported to the explicit-redistribution
+        # context) and the local result returned; otherwise its local tensor is returned.
         forward_input_placements = ctx.forward_input_placements
         forward_input_device_mesh = ctx.forward_input_device_mesh
         grad_placements = ctx.grad_placements
@@ -354,6 +391,11 @@ class _FromTorchTensor(torch.autograd.Function):
 
 
 class DTensor(torch.Tensor):
+    # [CLASS DOC] Distributed tensor subclass. State (slots): _local_tensor, the local shard on this rank,
+    # and _spec, a DTensorSpec holding the mesh, placements and global tensor meta. Operators
+    # are dispatched through a class-level OpDispatcher that propagates sharding and
+    # redistributes as needed. Public constructors: from_local, distribute_tensor; conversions:
+    # to_local, full_tensor, redistribute. Direct construction is internal.
     """
     ``DTensor`` (Distributed Tensor) is a subclass of ``torch.Tensor`` that provides single-device like
     abstraction to program with multi-device ``torch.Tensor``. It describes the distributed tensor sharding
@@ -391,6 +433,8 @@ class DTensor(torch.Tensor):
         *,
         requires_grad: bool,
     ) -> "DTensor":
+        # [FUNCTION DOC] HELPER: Python reference constructor creating the wrapper subclass and storing spec and
+        # local tensor. Immediately replaced by the C++ implementation assigned below.
         r = torch.Tensor._dtensor__new__(
             cls, local_tensor, spec, requires_grad=requires_grad
         )
@@ -403,6 +447,7 @@ class DTensor(torch.Tensor):
     @torch._disable_dynamo
     @mark_subclass_constructor_exportable_experimental
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] Internal initializer; only calls the parent initializer (state is set in the constructor). Not public API.
         """
         Construct a DTensor from a local tensor, device mesh, and placement and
         other tensor properties (i.e. shape, requires_grad, strides, etc).
@@ -418,10 +463,14 @@ class DTensor(torch.Tensor):
     # pyre-fixme[14]: `__repr__` overrides method defined in `DTensor` inconsistently.
     # pyre-fixme[3]: Return type must be annotated.
     def __repr__(self):  # type: ignore[override]
+        # [FUNCTION DOC] Returns a string showing the local tensor, device mesh and placements (no communication).
         # TODO: consider all_gather the local tensors for better debugging
         return f"DTensor(local_tensor={self._local_tensor}, device_mesh={self._spec.mesh}, placements={self._spec.placements})"
 
     def __tensor_flatten__(self):
+        # [FUNCTION DOC] Subclass flatten protocol for PT2 tracing. Returns the inner attribute names (local
+        # tensor and device mesh) and a context tuple of placements, tensor meta, shard order
+        # and requires_grad.
         """
         protocol to inform how to flatten a DTensor to local tensor
         for PT2 tracing
@@ -435,6 +484,9 @@ class DTensor(torch.Tensor):
 
     @staticmethod
     def __tensor_unflatten__(inner_tensors, flatten_spec, outer_size, outer_stride):
+        # [FUNCTION DOC] Inverse of the flatten protocol: rebuilds a DTensor from the inner local tensor and mesh,
+        # the saved context and the outer size/stride (dtype taken from the old meta). Raises
+        # AssertionError if the context is None.
         if flatten_spec is None:
             raise AssertionError(
                 "Expecting spec to be not None from `__tensor_flatten__` return value!"
@@ -463,6 +515,8 @@ class DTensor(torch.Tensor):
         )
 
     def _stable_hash_for_caching(self) -> str:
+        # [FUNCTION DOC] HELPER: Returns a hex digest combining the spec's stable hash, requires_grad and the local
+        # tensor device string, used as an AOT autograd cache key (device keeps ranks distinct).
         """
         Return a stable hash for AOT autograd caching.
         [See note: Tensor subclass stable hashing for AOT autograd cache]
@@ -475,6 +529,8 @@ class DTensor(torch.Tensor):
         return hashlib.blake2b(cache_data.encode(), digest_size=16).hexdigest()
 
     def __coerce_tangent_metadata__(self):
+        # [FUNCTION DOC] Returns self if no placement is Partial; otherwise redistributes to the same mesh with
+        # every Partial replaced by Replicate (may communicate).
         if not any(isinstance(p, Partial) for p in self.placements):
             return self
         placements = [
@@ -483,6 +539,8 @@ class DTensor(torch.Tensor):
         return self.redistribute(device_mesh=self.device_mesh, placements=placements)
 
     def __coerce_same_metadata_as_tangent__(self, flatten_spec, expected_type=None):
+        # [FUNCTION DOC] Returns None if an expected_type is given; otherwise redistributes this DTensor to the
+        # placements stored in the flattened spec context (may communicate).
         if expected_type is not None:
             return None
 
@@ -494,12 +552,16 @@ class DTensor(torch.Tensor):
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):  # type: ignore[override]
+        # [FUNCTION DOC] Fallback dispatch used only by DTensor subclasses delegating to the base: converts
+        # subclass instances in args/kwargs to base DTensor and re-invokes the op (which then
+        # takes the C++ fast path). Returns the op result.
         # Base DTensor is normally dispatched via a C++ fast path (see #167051)
         # and never reaches here. This implementation exists so that DTensor
         # subclasses can delegate back via super().__torch_dispatch__().
         # It unwraps subclass instances to base DTensor and re-calls the op,
         # which re-enters dispatch and hits the C++ fast path.
         def unwrap(t):
+            # [FUNCTION DOC] HELPER: Converts a DTensor subclass instance to a plain DTensor sharing local tensor and spec; other values unchanged.
             if isinstance(t, DTensor) and type(t) is not DTensor:
                 # pyrefly: ignore [bad-argument-type]
                 return DTensor(
@@ -526,6 +588,11 @@ class DTensor(torch.Tensor):
         stride: tuple[int, ...] | None = None,
         grad_placements: Sequence[Placement] | None = None,
     ) -> "DTensor":
+        # [FUNCTION DOC] Builds a differentiable DTensor from each rank's local tensor. Raises RuntimeError if
+        # the input is already a DTensor and ValueError for mixed Partial reduce types. Uses the
+        # current mesh when none is given, moves the local tensor to the mesh device type,
+        # defaults placements to Replicate on every mesh dim, and normalizes negative shard dims.
+        # Delegates to the autograd function (optional cross-rank check and broadcast).
         """
         Create a :class:`DTensor` from a local torch.Tensor on each rank
         according to the ``device_mesh`` and ``placements`` specified.
@@ -645,6 +712,10 @@ class DTensor(torch.Tensor):
     def to_local(
         self, *, grad_placements: Sequence[Placement] | None = None
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Returns the local tensor on this rank. With grad disabled returns the stored local tensor
+        # directly; otherwise goes through a differentiable function honoring grad_placements.
+        # If this DTensor is flagged as a Parameter, the result is flagged too (using a fresh
+        # view to avoid mutating internal storage).
         """
         Get the local tensor of this DTensor on its current rank. For sharding it returns
         a local shard of the logical tensor view, for replication it returns the replica on
@@ -716,6 +787,11 @@ class DTensor(torch.Tensor):
         forward_dtype: torch.dtype | None = None,
         backward_dtype: torch.dtype | None = None,
     ) -> "DTensor":
+        # [FUNCTION DOC] Out-of-place redistribution to new placements on a mesh (default: own mesh). Raises
+        # RuntimeError if placements is missing or a conversion to Partial other than Shard to
+        # Partial(sum) is requested. Normalizes negative shard dims, then applies the
+        # differentiable redistribute function with forward/backward dtype options (backward
+        # defaults to the input dtype). Returns a new DTensor; communicates as needed.
         """
         ``redistribute`` performs necessary collective operations that redistribute the current
         DTensor from its current placements to a new placements, or from its current DeviceMesh
@@ -830,6 +906,8 @@ class DTensor(torch.Tensor):
     def full_tensor(
         self, *, grad_placements: Sequence[Placement] | None = None
     ) -> torch.Tensor:
+        # [FUNCTION DOC] Redistributes to Replicate on all mesh dims (synchronously, collective) and returns the
+        # local tensor as a plain differentiable tensor, honoring grad_placements.
         """
         Return the full tensor of this DTensor. It will perform necessary collectives
         to gather the local tensors from other ranks in its DeviceMesh and concatenate
@@ -860,6 +938,7 @@ class DTensor(torch.Tensor):
 
     @property
     def device_mesh(self) -> DeviceMesh:
+        # [FUNCTION DOC] Read-only property returning the DeviceMesh of this DTensor's spec.
         """
         The :class:`DeviceMesh` attribute that associates with this DTensor object.
 
@@ -869,6 +948,7 @@ class DTensor(torch.Tensor):
 
     @property
     def placements(self) -> tuple[Placement, ...]:
+        # [FUNCTION DOC] Read-only property returning the tuple of placements, one per mesh dimension.
         """
         The placements attribute of this DTensor that describes the layout of this
         DTensor on the its DeviceMesh.
@@ -878,6 +958,7 @@ class DTensor(torch.Tensor):
         return self._spec.placements
 
     def _raise_if_contains_partial_placements(self) -> None:
+        # [FUNCTION DOC] HELPER: Raises ValueError if any placement is Partial (checkpointing is unsupported then).
         """
         Raise an error if the DTensor contains partial placements.
         """
@@ -891,6 +972,10 @@ class DTensor(torch.Tensor):
             )
 
     def __create_write_items__(self, fqn: str, object: Any):
+        # [FUNCTION DOC] Checkpoint protocol: returns write items for this DTensor under the given name.
+        # Delegates to the local tensor if it supports the protocol, else builds a single item
+        # list for a plain tensor. Raises ValueError for Partial placements and RuntimeError
+        # for unsupported local tensor types.
         self._raise_if_contains_partial_placements()
         from torch.distributed.checkpoint.planner_helpers import (
             _create_write_items_for_dtensor,
@@ -904,6 +989,9 @@ class DTensor(torch.Tensor):
             raise RuntimeError("Unsupported tensor type!")
 
     def __create_chunk_list__(self):
+        # [FUNCTION DOC] Checkpoint protocol: returns the list of chunk metadata (size/offset) of the local shard.
+        # Delegates to the local tensor if supported, else a single chunk for a plain tensor.
+        # Raises ValueError for Partial placements and RuntimeError for unsupported types.
         """
         Return a list of ChunkStorageMetadata, which is a dataclass that describes the size/offset of the local shard/replica
         on current rank. For DTensor, each rank will have a single local shard/replica, so the returned list usually only
@@ -927,6 +1015,9 @@ class DTensor(torch.Tensor):
             raise RuntimeError("Unsupported tensor type!")
 
     def __get_tensor_shard__(self, index):
+        # [FUNCTION DOC] Checkpoint protocol: returns the local shard for the index. Delegates to the local tensor
+        # if supported, else returns the local tensor. Raises ValueError for Partial placements
+        # and RuntimeError for unsupported types.
         self._raise_if_contains_partial_placements()
         if hasattr(self._local_tensor, "__get_tensor_shard__"):
             return self._local_tensor.__get_tensor_shard__(index)  # type: ignore[attr-defined]
@@ -943,6 +1034,14 @@ def distribute_tensor(
     *,
     src_data_rank: int | None = 0,
 ) -> DTensor:
+    # [FUNCTION DOC] Shards/replicates a leaf global tensor over a mesh into a DTensor. Uses the current mesh
+    # if none is given and defaults placements to Replicate. For xla meshes delegates to the
+    # torch_xla integration (ImportError if missing). Raises RuntimeError for non-leaf tensors
+    # or unsupported placements, ValueError for wrong placements length, mixed Partial types, or
+    # a DTensor input with a different mesh/placements (identical DTensor is returned as is).
+    # Per placement: Shard/StridedShard scatter shards, Replicate broadcasts, Partial
+    # replicates then partitions the value, all from src_data_rank (None means use local data).
+    # Returns a DTensor preserving requires_grad. Communicates across ranks.
     """
     Distribute a leaf ``torch.Tensor`` (i.e. nn.Parameter/buffers) to the ``device_mesh`` according
     to the ``placements`` specified. The rank of ``device_mesh`` and ``placements`` must be the
@@ -1116,6 +1215,8 @@ def _shard_tensor(
     placements: Sequence[Shard],
     device_mesh: DeviceMesh | None = None,
 ) -> "DTensor":
+    # [FUNCTION DOC] HELPER: Deprecated private wrapper that shards a full tensor locally with no communication
+    # by calling distribute_tensor with no source rank. Assumes all ranks hold identical data.
     """
     Locally shards a full tensor based on indicated sharding arrangement, and
     returns a DTensor containing the local shard.
@@ -1155,6 +1256,12 @@ def distribute_module(
     input_fn: Callable[[nn.Module, Any, DeviceMesh], None] | None = None,
     output_fn: Callable[[nn.Module, Any, DeviceMesh], None] | None = None,
 ) -> nn.Module:
+    # [FUNCTION DOC] Converts a module's parameters and buffers to DTensors in place and installs optional
+    # input/output hooks. Raises RuntimeError if already applied to this module. For xla meshes
+    # delegates to torch_xla (ImportError if missing). Calls partition_fn for every submodule,
+    # replicates any remaining non-DTensor parameters/buffers, wraps legacy two-argument hooks
+    # with a deprecation warning, registers forward pre/post hooks on the top-level module, marks
+    # the module as applied and returns it.
     """
     Convert a module's parameters/buffers to :class:`DTensor` s, and optionally
     convert its inputs/outputs at runtime, using the three user-provided callbacks.
@@ -1305,6 +1412,8 @@ def distribute_module(
             raise ImportError(msg) from e
 
     def replicate_module_params_buffers(m: nn.Module, mesh: DeviceMesh) -> None:
+        # [FUNCTION DOC] HELPER: Replaces the immediate non-DTensor parameters and buffers of a module with fully
+        # replicated DTensors on the mesh (keeping requires_grad); mutates the module in place.
         # This function loop over the immediate module parameters and
         # buffers, replicate all non DTensor params/buffers to DTensor
         # parameters/buffers, if they have not been partitioned in the
@@ -1398,6 +1507,9 @@ def distribute_module(
 def _linspace_local_tensor(
     init_op, start, end, total_steps, local_steps, offset, **kwargs
 ):
+    # [FUNCTION DOC] HELPER: Builds the local piece of a sharded linspace: computes the step from the global
+    # step count, shifts the start by the global offset, and calls the init op for the local
+    # number of steps. Handles empty and single-step cases. Returns the local tensor.
     local_start = start
     local_end = end
     if local_steps > 0 and total_steps > 1:
@@ -1413,6 +1525,9 @@ def _linspace_local_tensor(
 def _logspace_local_tensor(
     init_op, start, end, base, total_steps, local_steps, offset, **kwargs
 ):
+    # [FUNCTION DOC] HELPER: Same as the local linspace helper but for logspace: local exponent range is
+    # derived from the global step count and offset, and the base is forwarded. Returns the
+    # local tensor.
     local_start = start
     local_end = end
     if local_steps > 0 and total_steps > 1:
@@ -1529,6 +1644,7 @@ def ones(  # type: ignore[no-untyped-def]
     device_mesh: DeviceMesh | None = None,
     placements: Sequence[Placement] | None = None,
 ) -> DTensor:
+    # [FUNCTION DOC] Creates a DTensor of ones with the given global size on the mesh/placements. Returns the DTensor.
     """
     Returns a :class:`DTensor` filled with the scalar value 1, with the shape defined
     by the variable argument ``size``.
@@ -1572,6 +1688,7 @@ def empty(  # type: ignore[no-untyped-def]
     device_mesh: DeviceMesh | None = None,
     placements: Sequence[Placement] | None = None,
 ) -> DTensor:
+    # [FUNCTION DOC] Creates a DTensor with uninitialized data of the given global size on the mesh/placements. Returns the DTensor.
     """
     Returns a :class:`DTensor` filled with uninitialized data. The shape of the :class:`DTensor`
     is defined by the variable argument ``size``.
@@ -1617,6 +1734,7 @@ def full(  # type: ignore[no-untyped-def]
     device_mesh: DeviceMesh | None = None,
     placements: Sequence[Placement] | None = None,
 ) -> DTensor:
+    # [FUNCTION DOC] Creates a DTensor of the given global size filled with fill_value on the mesh/placements. Returns the DTensor.
     """
     Returns a :class:`DTensor` filled with ``fill_value`` according to ``device_mesh`` and
     ``placements``, with the shape defined by the argument ``size``.
@@ -1665,6 +1783,9 @@ def linspace(
     device_mesh: DeviceMesh | None = None,
     placements: Sequence[Placement] | None = None,
 ) -> DTensor:
+    # [FUNCTION DOC] Creates a 1-D DTensor of evenly spaced values. Zero-dimensional tensor start/end are
+    # converted to Python numbers (raising an error otherwise). Raises AssertionError for
+    # _StridedShard placements. Returns the DTensor.
     """
     Returns a :class:`DTensor` of size ``steps`` whose values are evenly spaced from
     `start` to `end`.
@@ -1735,6 +1856,9 @@ def logspace(
     device_mesh: DeviceMesh | None = None,
     placements: Sequence[Placement] | None = None,
 ) -> DTensor:
+    # [FUNCTION DOC] Creates a 1-D DTensor of logarithmically spaced values with the given base. Zero-dimensional
+    # tensor start/end are converted to Python numbers (raising an error otherwise). Raises
+    # AssertionError for _StridedShard placements. Returns the DTensor.
     """
     Returns a :class:`DTensor` of size ``steps`` whose values are evenly spaced from
     ``base`` :sup:`start` to ``base`` :sup:`end`, inclusive, on a logarithmic scale
@@ -1804,6 +1928,8 @@ def rand(  # type: ignore[no-untyped-def]
     device_mesh: DeviceMesh | None = None,
     placements: Sequence[Placement] | None = None,
 ) -> DTensor:
+    # [FUNCTION DOC] Creates a DTensor of uniform random values in zero to one, using the distributed RNG so
+    # shards are consistent with the global tensor. Returns the DTensor.
     """
     Returns a :class:`DTensor` filled with random numbers from a uniform distribution
     on the interval ``[0, 1)``. The shape of the tensor is defined by the variable
@@ -1848,6 +1974,8 @@ def randn(  # type: ignore[no-untyped-def]
     device_mesh: DeviceMesh | None = None,
     placements: Sequence[Placement] | None = None,
 ) -> DTensor:
+    # [FUNCTION DOC] Creates a DTensor of standard normal random values, using the distributed RNG so shards
+    # are consistent with the global tensor. Returns the DTensor.
     """
     Returns a :class:`DTensor` filled with random numbers from a normal distribution
     with mean 0 and variance 1. The shape of the tensor is defined by the variable
@@ -1892,6 +2020,7 @@ def zeros(  # type: ignore[no-untyped-def]
     device_mesh: DeviceMesh | None = None,
     placements: Sequence[Placement] | None = None,
 ) -> DTensor:
+    # [FUNCTION DOC] Creates a DTensor of zeros with the given global size on the mesh/placements. Returns the DTensor.
     """
     Returns a :class:`DTensor` filled with the scalar value 0.
 

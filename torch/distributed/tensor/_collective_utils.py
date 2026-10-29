@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Collective-communication helpers for DTensor: a custom shard-dim alltoall op
+# (fake kernel and autograd registration), mesh scatter/broadcast wrappers, padding and
+# unpadding helpers, tensor metadata consistency check, and a ring-based cost model
+# (MeshTopoInfo, allgather/allreduce/reduce_scatter costs, redistribute_cost).
+# Import-time side effects: registers distributed opaque types, creates the "_dtensor"
+# library fragment, defines the mesh_get_process_group op, and registers fake and autograd
+# implementations for the _dtensor ops.
 import logging
 import math
 from dataclasses import dataclass
@@ -50,11 +57,13 @@ _dtensor_lib.define(
 
 @torch.library.impl("_dtensor::mesh_get_process_group", "CompositeExplicitAutograd")
 def _mesh_get_process_group_impl(mesh, dim):
+    # [FUNCTION DOC] HELPER: Real kernel of the mesh_get_process_group op; returns the process group of the mesh at the given dim.
     return mesh.get_group(dim)
 
 
 @torch.library.register_fake("_dtensor::mesh_get_process_group")
 def _mesh_get_process_group_fake(mesh, dim):
+    # [FUNCTION DOC] HELPER: Fake-mode kernel; unwraps a possibly fake script-object mesh and returns its process group for the dim.
     from torch._library.fake_class_registry import maybe_unwrap_fake_script_object
 
     real_mesh = maybe_unwrap_fake_script_object(mesh)
@@ -65,6 +74,9 @@ def _mesh_get_process_group_fake(mesh, dim):
 def _shard_dim_alltoall_meta(
     input, gather_dim, shard_dim, group_name: GroupName | ProcessGroup
 ):
+    # [FUNCTION DOC] HELPER: Fake (shape-inference) kernel for shard_dim_alltoall. Resolves the group
+    # from a name if needed, simulates gathering group-size copies along gather_dim, then
+    # narrows this rank's chunk along shard_dim. Returns a contiguous tensor of the result shape.
     if isinstance(group_name, str):
         # pyrefly: ignore[bad-argument-type]  # pyrefly bug
         group_name = _resolve_process_group(group_name)
@@ -80,6 +92,8 @@ def _shard_dim_alltoall_meta(
 
 
 def _shard_dim_alltoall_backward(ctx, grad_output):
+    # [FUNCTION DOC] HELPER: Autograd backward: applies the alltoall with gather and shard dims swapped
+    # to the gradient. Returns the input gradient followed by three None entries.
     return (
         torch.ops._dtensor.shard_dim_alltoall.default(
             grad_output.contiguous(), ctx.shard_dim, ctx.gather_dim, ctx.group_name
@@ -91,6 +105,7 @@ def _shard_dim_alltoall_backward(ctx, grad_output):
 
 
 def _shard_dim_alltoall_setup_context(ctx, inputs, output):
+    # [FUNCTION DOC] HELPER: Saves gather_dim, shard_dim and group_name from the forward inputs on ctx for backward.
     input, gather_dim, shard_dim, group_name = inputs
     ctx.gather_dim = gather_dim
     ctx.shard_dim = shard_dim
@@ -105,6 +120,10 @@ torch.library.register_autograd(
 
 
 def shard_dim_alltoall(input, gather_dim, shard_dim, mesh, mesh_dim):
+    # [FUNCTION DOC] Moves sharding of a tensor from gather_dim to shard_dim across one mesh dimension
+    # via the alltoall op. On CPU (outside local tensor mode) alltoall is unsupported, so it
+    # warns once and falls back to all-gather followed by taking the local chunk. Returns the
+    # contiguous resharded local tensor. Async alltoall is not supported yet.
     if mesh.device_type == "cpu" and local_tensor_mode() is None:
         # Gloo does not support alltoall, so falling back to allgather + chunk
         warning_once(
@@ -138,6 +157,12 @@ def mesh_scatter(
     *,
     group_src: int = 0,
 ) -> Work | None:
+    # [FUNCTION DOC] Scatters scatter_list from group_src of the mesh dimension's process group into
+    # output on every rank (non-source ranks pass no list). Returns the Work handle, or None
+    # for meta tensors (no communication). Raises AssertionError if the dim group is not a
+    # ProcessGroup. Performs collective communication.
+    # KNOWN ISSUE: docstring says passing None for group_src skips communication, but the
+    # code does not handle None specially.
     """
     scatter a list of tensors to a device mesh dimension. We by default
     use the first rank of the mesh dimension as the source of truth, i.e
@@ -200,6 +225,11 @@ def mesh_broadcast(
     *,
     group_src: int = 0,
 ) -> Work | None:
+    # [FUNCTION DOC] Broadcasts the tensor in place from group_src across the mesh dimension's process
+    # group. Returns the Work handle, or None for meta tensors. Raises AssertionError if the
+    # dim group is not a ProcessGroup. Performs collective communication.
+    # KNOWN ISSUE: docstring says passing None for group_src skips communication, but the
+    # code does not handle None specially.
     """
     broadcast the tensor to a device mesh dimension. We by default
     use the first rank of the mesh dimension as the source of truth, i.e
@@ -240,6 +270,10 @@ def mesh_broadcast(
 def pad_tensor(
     tensor: torch.Tensor, pad_dim: int, pad_size: IntLikeType
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Appends pad_size zeros at the end of dimension pad_dim and returns the padded tensor.
+    # Returns the input unchanged when pad_size is zero (except while tracing, where the op is
+    # always emitted for SPMD consistency). Uses a concatenation with zeros when the tensor has
+    # unbacked symbols during tracing. Runs per local tensor under local tensor mode.
     # During tracing, always emit the pad op even when pad_size=0 so all
     # ranks produce identical FX graph structure (SPMD).
     # In eager with concrete pad_size=0, guard_or_false returns True and we
@@ -270,6 +304,9 @@ def pad_tensor(
 def unpad_tensor(
     tensor: torch.Tensor, pad_dim: int, pad_size: IntLikeType
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Removes pad_size trailing elements along pad_dim by narrowing; inverse of pad_tensor.
+    # Returns the input unchanged when pad_size is zero (except while tracing). Runs per local
+    # tensor under local tensor mode.
     # During tracing, always emit the narrow op even when pad_size=0 so all
     # ranks produce identical FX graph structure (SPMD).
     # In eager with concrete pad_size=0, guard_or_false returns True and we
@@ -293,6 +330,8 @@ def unpad_tensor(
 def fill_empty_tensor_to_shards(
     shards: list[torch.Tensor], shard_dim: int, num_empty_tensors: int
 ) -> list[torch.Tensor]:
+    # [FUNCTION DOC] Appends num_empty_tensors zero-size tensors (size zero along shard_dim, shaped like the
+    # first shard otherwise) to the shards list in place and returns the same list.
     if num_empty_tensors == 0:
         return shards
     tensor_size = list(shards[0].size())
@@ -305,6 +344,9 @@ def fill_empty_tensor_to_shards(
 def check_tensor_meta(
     local_tensor, check_shape_stride=False
 ) -> Optional["dtensor_spec.TensorMeta"]:
+    # [FUNCTION DOC] Gathers each rank's tensor metadata (dtype, requires_grad, and optionally shape and
+    # stride) with an object all-gather and verifies all ranks agree. Raises ValueError on
+    # mismatch; otherwise returns None. Collective communication on the default group.
     local_metadata = {
         "dtype": local_tensor.dtype,
         "requires_grad": local_tensor.requires_grad,
@@ -327,6 +369,8 @@ def check_tensor_meta(
 
 
 def spec_to_bytes(spec: "dtensor_spec.DTensorSpec") -> int:
+    # [FUNCTION DOC] Returns the global byte size of the tensor described by the spec (element size times
+    # number of elements). Raises AssertionError if the spec has no tensor meta.
     if spec.tensor_meta is None:
         raise AssertionError("spec should have tensor meta defined!")
     return spec.tensor_meta.dtype.itemsize * math.prod(spec.shape)
@@ -334,6 +378,8 @@ def spec_to_bytes(spec: "dtensor_spec.DTensorSpec") -> int:
 
 @dataclass
 class MeshTopoInfo:
+    # [CLASS DOC] Dataclass holding per-mesh-dimension topology for the cost model: the mesh, device
+    # count, bandwidth (GB/s) and latency (us) for each mesh dimension. Built by build_from_mesh.
     """
     Mesh information for collective cost estimation
     """
@@ -346,6 +392,10 @@ class MeshTopoInfo:
     @staticmethod
     @lru_cache(None)
     def build_from_mesh(mesh: DeviceMesh) -> "MeshTopoInfo":
+        # [FUNCTION DOC] Builds (and caches per mesh) topology info assuming a homogeneous NVLink GPU host.
+        # Walking mesh dims from innermost out, once the cumulative device count exceeds the
+        # devices per host, that dim gets reduced bandwidth and ethernet-like latency. Returns a
+        # MeshTopoInfo. Assumes ring-based collectives and Ampere/Hopper hardware.
         # Generate mesh topology info for intra-host/inter-host communication pattern
         # Note that we made bunch of assumptions for simplicity:
         # 1. we assume the mesh is homogeneous, and it's gpu/nccl model
@@ -379,6 +429,8 @@ class MeshTopoInfo:
 
 
 def allgather_cost(bytes_gb: float, mesh_topo: MeshTopoInfo, mesh_dim: int) -> float:
+    # [FUNCTION DOC] Estimated all-gather time in microseconds on a mesh dim: base latency plus per-hop
+    # latency (devices minus one hops) plus bandwidth term for the given gigabytes.
     num_devices_on_mesh_dim = mesh_topo.mesh_dim_devices[mesh_dim]
     mesh_dim_bandwidth = mesh_topo.mesh_dim_bandwidth[mesh_dim]
     num_hops = num_devices_on_mesh_dim - 1
@@ -389,6 +441,8 @@ def allgather_cost(bytes_gb: float, mesh_topo: MeshTopoInfo, mesh_dim: int) -> f
 
 
 def allreduce_cost(bytes_gb: float, mesh_topo: MeshTopoInfo, mesh_dim: int) -> float:
+    # [FUNCTION DOC] Estimated all-reduce time in microseconds on a mesh dim; same model as all-gather
+    # but with twice as many hops.
     num_devices_on_mesh_dim = mesh_topo.mesh_dim_devices[mesh_dim]
     mesh_dim_bandwidth = mesh_topo.mesh_dim_bandwidth[mesh_dim]
     # allreduce have almost 2x comm bytes compare to allgather/reduce_scatter
@@ -404,6 +458,7 @@ def reduce_scatter_cost(
     mesh_topo: MeshTopoInfo,
     mesh_dim: int,
 ) -> float:
+    # [FUNCTION DOC] Estimated reduce-scatter time in microseconds on a mesh dim; same model as all-gather.
     num_devices_on_mesh_dim = mesh_topo.mesh_dim_devices[mesh_dim]
     mesh_dim_bandwidth = mesh_topo.mesh_dim_bandwidth[mesh_dim]
     num_hops = num_devices_on_mesh_dim - 1
@@ -420,6 +475,12 @@ def _compute_placement_transition_cost(
     mesh_dim: int,
     comm_bytes_gb: float,
 ) -> tuple[float, float]:
+    # [FUNCTION DOC] HELPER: Cost of changing one mesh dim from current to target placement. Returns a
+    # pair (cost, updated communication gigabytes). Same placement is free; shard to replicate
+    # is all-gather (bytes scale up); shard to shard is all-gather plus a penalty; partial to
+    # replicate is all-reduce; partial to shard is reduce-scatter (bytes scale down); shard to
+    # partial and partial to different partial are infinite (not implicitly selectable);
+    # replicate to shard is free with bytes scaled down; anything else is free.
     """
     Compute the cost of transitioning from one placement to another on a single mesh dimension.
 
@@ -481,6 +542,10 @@ def one_step_redistribute_cost(
     current_spec: "dtensor_spec.DTensorSpec",
     target_spec: "dtensor_spec.DTensorSpec",
 ) -> float:
+    # [FUNCTION DOC] Cost of a redistribution where specs differ in exactly one mesh dim placement.
+    # Returns infinity for different meshes, zero for identical placements, otherwise the
+    # transition cost using the local shard byte size. Raises ValueError if more than one
+    # mesh dim differs.
     """
     Calculate the cost of a single redistribution step between two DTensorSpecs.
 
@@ -539,6 +604,12 @@ def redistribute_cost(
     current_spec: "dtensor_spec.DTensorSpec",
     target_spec: "dtensor_spec.DTensorSpec",
 ) -> float:
+    # [FUNCTION DOC] Total communication cost (microseconds) to redistribute from current to target spec.
+    # Returns infinity for different meshes or when either spec lacks a shard order; zero for
+    # fully replicated source, identical specs, or ranks outside a sub-mesh. Otherwise sums
+    # per-step transition costs over the generated transform infos (uncached generation while
+    # tracing); any infinite step makes the total infinite. Raises AssertionError if tensor
+    # meta is missing.
     """
     This function returns the cost of redistribute from current to target DTensorSpec.
 
