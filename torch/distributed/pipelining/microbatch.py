@@ -1,4 +1,11 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Microbatch splitting and merging utilities for pipeline parallelism.
+# Provides TensorChunkSpec (per-argument chunk dimension), split_args_kwargs_into_chunks
+# (split nested args/kwargs into microbatches, replicating non-tensors by default) and
+# merge_chunks (inverse: concatenate, reduce or verify-equal per-microbatch outputs).
+# Supports plain tensors, DTensors and flex-attention BlockMasks. Module-level state: a
+# debug flag _debug_mask_minibatches (default off), DEFAULT_CHUNK_DIM = 0 and a
+# sum_reducer for losses. No import-time side effects besides creating a logger and tensor.
 # Copyright (c) Meta Platforms, Inc. and affiliates
 import logging
 import operator
@@ -29,6 +36,8 @@ _debug_mask_minibatches = False
 
 
 class _CustomReducer:
+    # [CLASS DOC] HELPER: Chunk spec for outputs reduced across microbatches. Attributes:
+    # init_value (starting accumulator) and reduce_fn (binary function folding each chunk in).
     """
     Custom reducer class that can be used to specify a custom operation that
     reduces losses of multiple microbatches into one value.
@@ -42,11 +51,13 @@ class _CustomReducer:
     """
 
     def __init__(self, init_value, reduce_fn):
+        # [FUNCTION DOC] HELPER: Stores the initial accumulator value and the binary reduce function.
         self.init_value = init_value
         self.reduce_fn = reduce_fn
 
 
 class _LossReducer(_CustomReducer):
+    # [CLASS DOC] HELPER: Reducer subclass used as a chunk spec for loss outputs; adds no behavior.
     pass
 
 
@@ -58,27 +69,34 @@ DEFAULT_CHUNK_DIM = 0
 
 
 class TensorChunkSpec:
+    # [CLASS DOC] Spec for one tensor argument: holds split_dim, the dimension to chunk along
+    # (and to concatenate along when merging). Build trees of these with from_tuple/from_dict.
     """
     Class used to specify chunking of inputs
     """
 
     def __init__(self, split_dim):
+        # [FUNCTION DOC] Stores the dimension along which a tensor is split into microbatches.
         self.split_dim = split_dim
 
     split_dim: int
 
     def __repr__(self):
+        # [FUNCTION DOC] Representation including module-qualified class name and split dimension.
         return (
             f"{self.__class__.__module__}.{self.__class__.__name__}({self.split_dim})"
         )
 
     def __str__(self):
+        # [FUNCTION DOC] Short string form, class name and split dimension only.
         return f"TensorChunkSpec({self.split_dim})"
 
     @staticmethod
     def from_tuple(
         chunk_dims: tuple[int, ...],
     ):
+        # [FUNCTION DOC] Static. Maps a tuple of chunk dimensions to a same-shaped tuple of
+        # TensorChunkSpec objects.
         """
         A helper for creating a tuple of `TensorChunkSpec` from a tuple of chunk
         dimensions (int's).
@@ -98,6 +116,8 @@ class TensorChunkSpec:
     def from_dict(
         chunk_dims: dict[str, int],
     ):
+        # [FUNCTION DOC] Static. Maps a dict of chunk dimensions to a same-shaped dict of
+        # TensorChunkSpec objects.
         """
         A helper for creating a dictionary of `TensorChunkSpec` from a
         dictionary of chunk dimensions (int's).
@@ -115,6 +135,7 @@ class TensorChunkSpec:
 
 # Class used to specify replication of inputs
 class _Replicate:
+    # [CLASS DOC] HELPER: Marker spec meaning the value is copied unchanged to every chunk.
     pass
 
 
@@ -122,6 +143,10 @@ def _split_block_mask(
     block_mask: BlockMask,
     num_chunks: int,
 ) -> list[BlockMask]:
+    # [FUNCTION DOC] HELPER: Splits a BlockMask along the batch dimension into num_chunks masks.
+    # A mask with batch size 1 is broadcast (same object repeated). Otherwise the block tensors
+    # (including optional full-block ones) are split and each chunk's mask_mod is wrapped to add
+    # the chunk's batch offset. Raises AssertionError if batch size is below num_chunks.
     """Given a block mask, split the block mask along the batch dimension (dim0).
 
     Args:
@@ -162,7 +187,11 @@ def _split_block_mask(
     for chunk_idx in range(num_chunks):
 
         def create_mask_mod(idx):
+            # [FUNCTION DOC] HELPER: Closure factory capturing the batch offset idx for one chunk;
+            # returns a mask function that shifts batch indices by idx.
             def batch_offset_mask_mod(b, h, q_idx, kv_idx):
+                # [FUNCTION DOC] HELPER: Calls the original mask_mod with the batch index shifted by
+                # the chunk's offset so a chunk sees its global batch positions.
                 b_offset = torch.full_like(b, idx)
                 return block_mask.mask_mod(b + b_offset, h, q_idx, kv_idx)
 
@@ -188,6 +217,12 @@ def _split_tensor(
     spec: TensorChunkSpec,
     num_chunks: int,
 ) -> Sequence[torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Splits one tensor into num_chunks pieces along spec.split_dim
+    # (uneven split via tensor_split). Raises AssertionError if the dimension is smaller than
+    # num_chunks. DTensors are split locally and each piece rewrapped with the correct global
+    # shape and the original placements. Leaf tensors requiring grad get retain_grad on each
+    # chunk so backward can read gradients. In debug-mask mode returns full-size zero-padded
+    # tensors instead of slices.
     """Given a tensor, and a chunking spec, split the tensor.
     Args:
 
@@ -251,6 +286,9 @@ def _split_tensor(
     def _expand_chunks(
         orig: torch.Tensor, *chunks: torch.Tensor
     ) -> tuple[torch.Tensor, ...]:
+        # [FUNCTION DOC] HELPER: Debug mode only. For each chunk, builds a zero tensor shaped like
+        # orig and copies the chunk into its contiguous slot along split_dim, giving full-size
+        # masked mini-batches. Returns a tuple of these tensors.
         expanded = []
         idx = 0
         for chunk in chunks:
@@ -292,6 +330,12 @@ def _shard_dict_of_args(
     args_chunk_spec,
     num_chunks,
 ):
+    # [FUNCTION DOC] HELPER: Shards a dict (or index-keyed dict) of args per a parallel spec
+    # structure. Flattens both (BlockMask treated as a leaf), computes the usable chunk count
+    # as the minimum of num_chunks and each split dimension size, then splits tensors, splits
+    # BlockMasks, or replicates values marked _Replicate, and unflattens one structure per
+    # chunk. Empty input gives num_chunks empty dicts. Raises AssertionError on size/spec
+    # mismatch or wrong spec type, ValueError for unsupported value/spec combinations.
     """
     Given a dictionary of args, and a dictionary of chunking specs, shard the
     args according to the chunking specs.
@@ -382,6 +426,12 @@ def split_args_kwargs_into_chunks(
     args_chunk_spec: tuple[TensorChunkSpec, ...] | None = None,
     kwargs_chunk_spec: dict[str, TensorChunkSpec] | None = None,
 ) -> tuple[list[tuple], list[dict]]:
+    # [FUNCTION DOC] Splits positional args and keyword args into microbatches. None kwargs
+    # become empty; missing specs default to splitting tensors/BlockMasks on dim 0 and
+    # replicating everything else. Args are sharded first, kwargs are sharded to that count,
+    # and if kwargs yield fewer chunks args are re-sharded to match. The actual chunk count
+    # may be smaller than requested when a tensor is too small. Returns (list of arg tuples,
+    # list of kwarg dicts), equal length. Raises RuntimeError if counts still differ.
     """
     Given a sequence of args and kwargs, split them into a number of chunks
     according to  their respective chunking specs.
@@ -437,6 +487,8 @@ def split_args_kwargs_into_chunks(
     # If user did not provide args_chunk_spec or kwargs_chunk_spec, we extend
     # their format and use default chunking along dim 0
     def default_spec(v):
+        # [FUNCTION DOC] HELPER: Default chunk spec for one leaf: TensorChunkSpec on the default
+        # dim for tensors and BlockMasks, otherwise a replicate marker.
         if isinstance(v, torch.Tensor | BlockMask):
             return TensorChunkSpec(DEFAULT_CHUNK_DIM)
         else:
@@ -494,6 +546,14 @@ def merge_chunks(
     chunks: list[Any],
     chunk_spec,
 ):
+    # [FUNCTION DOC] Inverse of split_args_kwargs_into_chunks. Takes a list of per-microbatch
+    # outputs and a chunk spec tree (or None, meaning concatenate every leaf along dim 0).
+    # Leaves with a TensorChunkSpec are concatenated along split_dim (DTensors are
+    # concatenated locally and rewrapped with the summed global shape; mixed or
+    # placement-mismatched DTensors raise AssertionError); _CustomReducer leaves are folded
+    # with reduce_fn from init_value; other leaves must be equal across chunks (else
+    # AssertionError). Raises ValueError if a chunk's leaf count differs from the spec.
+    # In debug-mask mode each chunk is first sliced back to its own region. Returns merged tree.
     """
     Given a list of chunks, merge them into a single value according to
     the chunk spec.
