@@ -1,4 +1,6 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Operator-level GPU memory tracking for nn.Module runs. Provides MemoryProfileDispatchMode (a dispatch mode recording memory after every operator) and MemoryTracker (module hooks, recording, summary printing, matplotlib plotting, pickle save/load).
+# Constant BYTES_PER_MB converts bytes to megabytes. No import-time side effects beyond imports.
 import operator
 import pickle
 from collections import defaultdict
@@ -19,12 +21,17 @@ BYTES_PER_MB = 1024 * 1024.0
 
 
 class MemoryProfileDispatchMode(TorchDispatchMode):
+    # [CLASS DOC] Dispatch mode that, after executing each operator, asks its owning MemoryTracker to record memory stats under a unique operator name.
+    # State: the memory_tracker reference. Detach operations are executed but not recorded.
     """Run in ``TorchDispatchMode`` to get memory stats at operator level."""
 
     def __init__(self, memory_tracker) -> None:
+        # [FUNCTION DOC] Stores the memory tracker that receives per-operator records.
         self.memory_tracker = memory_tracker
 
     def __torch_dispatch__(self, func, types, args=..., kwargs=None):
+        # [FUNCTION DOC] Runs the intercepted operator and returns its result unchanged. Except for detach, builds a name from the tracker's current module name, the operator name and a per-operator running count, increments that count, and calls the tracker to record memory stats under that name.
+        # Side effects: mutates the tracker's operator-name counters and stat tables.
         rs = func(*args, **kwargs)
         if func is torch.ops.aten.detach.default:
             return rs
@@ -44,6 +51,8 @@ class MemoryProfileDispatchMode(TorchDispatchMode):
 
 
 class MemoryTracker:
+    # [CLASS DOC] Collects allocated, active and reserved device memory (in MB) after each operator while a root module runs, with markers for forward start and the forward/backward boundary.
+    # State: forward-hook handles, per-operator-name counters, three tables mapping operator index to (name, MB), marker positions, current module name, operator index, allocation-retry count, and the device module. Use start_monitor, run the model, stop, then summary, show_traces, save_stats or load.
     """
     Collect and plot the memory stats at operator level.
 
@@ -72,6 +81,7 @@ class MemoryTracker:
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Logs API usage once and initializes empty hooks, counters, stat tables, markers, operator index, retry count and the current device module.
         torch._C._log_api_usage_once("torch.distributed.memory_tracker")
         self._hooks: list[RemovableHandle] = []
         self._operator_names: dict[str, int] = defaultdict(int)
@@ -86,6 +96,8 @@ class MemoryTracker:
 
     @no_type_check
     def start_monitor(self, root_module: nn.Module) -> None:
+        # [FUNCTION DOC] Resets state, tags the root module as root and every other submodule as non-root (via an attribute), and registers a forward pre-hook and forward hook on each module except those whose name contains the fused grouped embedding bag marker. Empties the device cache, then creates and enters a MemoryProfileDispatchMode.
+        # Raises AssertionError if a profile mode is already active. Side effects: mutates modules, installs hooks, enters the dispatch mode.
         """
         Register module hooks and entering ``MemoryProfileDispatchMode``.
 
@@ -115,6 +127,8 @@ class MemoryTracker:
 
     @no_type_check
     def stop(self) -> None:
+        # [FUNCTION DOC] Reads the allocation retry count from the device memory stats, removes all registered hooks, exits and clears the profile dispatch mode.
+        # Raises AssertionError if monitoring was not started.
         """
         Remove module hooks and exit ``MemoryProfileDispatchMode`` to stop tracking memory stats at operator level.
 
@@ -134,6 +148,8 @@ class MemoryTracker:
 
     @no_type_check
     def summary(self, top: int = 20) -> None:
+        # [FUNCTION DOC] Prints the number of allocation retries and the top operators by memory growth. For each operator index after the first, computes the allocated memory difference from the previous record, then prints the largest values in MB, up to the given count.
+        # Requires recorded data (raises a key error if none). Output goes to standard output.
         """
         Print out the top operators that generate the most memories.
 
@@ -157,9 +173,12 @@ class MemoryTracker:
 
     @no_type_check
     def show_traces(self, path: str = "") -> None:
+        # [FUNCTION DOC] Plots the recorded memory traces with matplotlib: one figure with allocated, active and reserved lines, plus one figure per series, with vertical marker lines (red for the forward/backward boundary, black otherwise). If a path is given, first loads stats from that file.
+        # Does not call show or save; figures are only created. Imports matplotlib lazily.
         import matplotlib.pyplot as plt
 
         def _plot_figure(x, y_values, labels):
+            # [FUNCTION DOC] HELPER: Creates a new figure, draws each series against the operator index with labels and axis titles, and draws a vertical line for every marker spanning slightly beyond the data range.
             min_val = min(chain.from_iterable(y_values)) * 0.999
             max_val = max(chain.from_iterable(y_values)) * 1.001
             plt.figure()
@@ -205,6 +224,7 @@ class MemoryTracker:
         _plot_figure(x, [list(y_3)], ["reserved_memory"])
 
     def save_stats(self, path: str) -> None:
+        # [FUNCTION DOC] Pickles the three memory tables, markers and retry count to the given file path (binary write, highest protocol). Raises on file errors.
         """Save the stats using pickle during runtime if users want to plot the traces in other places like notebook."""
         stats = {
             "memories_allocated": self.memories_allocated,
@@ -218,6 +238,7 @@ class MemoryTracker:
             pickle.dump(stats, f, pickle.HIGHEST_PROTOCOL)
 
     def load(self, path: str) -> None:
+        # [FUNCTION DOC] Reads a pickle file and replaces the memory tables, markers and retry count with its contents. Raises on file or key errors. KNOWN ISSUE: unpickling executes arbitrary code if the file is untrusted.
         """Load the pickled memory stats to plot the traces or print the summary."""
         with open(path, "rb") as f:
             stats = pickle.load(f)
@@ -229,9 +250,11 @@ class MemoryTracker:
         self._num_alloc_retries = stats["num_alloc_retries"]
 
     def _create_pre_forward_hook(self, name: str) -> Callable:
+        # [FUNCTION DOC] HELPER: Returns a forward pre-hook for the module with the given name. The hook sets the current module name to the name plus forward and, for the root module, adds the forward start marker.
         """Prefix operator name with current module and 'forward', and insert 'fw_start' marker at forward pass start."""
 
         def _pre_forward_hook(module: nn.Module, inputs: Any) -> None:
+            # [FUNCTION DOC] HELPER: Pre-forward hook body; sets the current module name and adds the forward start marker when the module is the root.
             self._cur_module_name = f"{name}.forward"
             if (
                 hasattr(module, "_memory_tracker_is_root")
@@ -242,6 +265,7 @@ class MemoryTracker:
         return _pre_forward_hook
 
     def _create_post_forward_hook(self, name: str) -> Callable:
+        # [FUNCTION DOC] HELPER: Returns a forward hook that adds the forward/backward boundary marker when the root module finishes forward. The name argument is unused.
         """Insert the marker 'fw_bw_boundary' at the boundary of forward and backward pass."""
 
         def _post_forward_hook(
@@ -249,6 +273,7 @@ class MemoryTracker:
             inputs: Sequence[torch.Tensor],
             outputs: Sequence[torch.Tensor],
         ) -> None:
+            # [FUNCTION DOC] HELPER: Post-forward hook body; adds the boundary marker for the root module only.
             if (
                 hasattr(module, "_memory_tracker_is_root")
                 and module._memory_tracker_is_root
@@ -258,17 +283,20 @@ class MemoryTracker:
         return _post_forward_hook
 
     def _create_backward_hook(self, name: str) -> Callable:
+        # [FUNCTION DOC] HELPER: Returns a backward hook that sets the current module name to the name plus backward. Currently not registered anywhere (its registration is commented out in start_monitor).
         """Insert the current module name with backward prefix for the operator name."""
 
         def _backward_hook(
             module: nn.Module, grad_input: torch.Tensor, grad_output: torch.Tensor
         ) -> None:
+            # [FUNCTION DOC] HELPER: Backward hook body; sets the current module name for subsequent operator naming.
             self._cur_module_name = f"{name}.backward"
 
         return _backward_hook
 
     @no_type_check
     def _record_memory_stats(self, fn_name: str) -> None:
+        # [FUNCTION DOC] HELPER: Records the device's allocated, reserved and active memory (converted to MB) as (name, value) pairs under the current operator index in the three tables, then increments the index.
         """
         Record current memory allocated, current memory active and current memory reserved.
 
@@ -286,11 +314,13 @@ class MemoryTracker:
         self._op_index += 1
 
     def _add_marker(self, marker_name: str) -> None:
+        # [FUNCTION DOC] HELPER: Records a marker at the position equal to the number of operators recorded so far.
         """Set the marker's x-axis value."""
         marker_val = len(self.memories_allocated.values())
         self._markers[marker_name] = marker_val
 
     def _clear_state(self) -> None:
+        # [FUNCTION DOC] HELPER: Clears operator counters, memory tables and markers, and resets module name, operator index and retry count.
         """Clear states when start_monitor() is called."""
         self._operator_names.clear()
         self.memories_allocated.clear()

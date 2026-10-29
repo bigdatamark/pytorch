@@ -1,3 +1,6 @@
+# [MODULE DOC] Defines MemTracker, a dispatch-mode context manager that tracks and categorizes tensor storage memory (parameters, buffers, gradients, activations, temporary backward memory, optimizer state, other) per device, with current and peak snapshots globally and per module at forward/backward states, plus printing helpers (plain and tabulate formats).
+# Supporting internals: reference-type and module-state enums, per-module stats class, a per-storage weak-reference info class, and unit-conversion and snapshot printing functions.
+# Import-time: computes the minimum CUDA allocation block (512 bytes, or 1 if the caching allocator is disabled by environment variable) and imports the fake collectives module (registering fake collective implementations). Exports MemTracker.
 import math
 import os
 import re
@@ -39,14 +42,17 @@ __all__ = ["MemTracker"]
 
 
 class _RefType(str, Enum):
+    # [CLASS DOC] HELPER: Marker base class (string-valued enum) for memory reference types; subclasses define the categories.
     """Base Class for defining memory reference types, categorizing tensors based on their usage within a model."""
 
 
 class _State(str, Enum):
+    # [CLASS DOC] HELPER: Marker base class (string-valued enum) for module states used to key snapshots.
     """Base Class for defining module state to capture snapshots ."""
 
 
 class _MemRefType(_RefType):
+    # [CLASS DOC] HELPER: Enum of memory reference categories with display strings: Parameter, Buffer, Gradient, Activation, Temp, Optstate, Other.
     """
     An enum to define memory reference types, categorizing tensors based on their usage within a model.
 
@@ -69,6 +75,7 @@ class _MemRefType(_RefType):
 
 
 class _ModState(_State):
+    # [CLASS DOC] HELPER: Enum of module states at which snapshots are taken: pre/post forward, peak forward, pre-backward, pre/post forward under activation checkpointing (recompute), post-backward and peak backward.
     """
     An enum to define the state of a module.
 
@@ -93,6 +100,7 @@ class _ModState(_State):
 
 
 class _ModMemStats:
+    # [CLASS DOC] HELPER: Per-module statistics record: module name, memory of parameters, buffers, inputs and outputs (set later by hooks), a per-device local peak, and a mapping from module state to a list of snapshots (each a per-device mapping from category to bytes).
     """
     A class to store the memory statistics of a module.
 
@@ -113,6 +121,7 @@ class _ModMemStats:
     """
 
     def __init__(self, mod_fqn: str):
+        # [FUNCTION DOC] HELPER: Stores the module name and creates the empty local peak and snapshots containers; the memory size fields are declared but left unset until hooks fill them.
         self.mod_fqn = mod_fqn
         self.parameter_mem: int
         self.buffer_mem: int
@@ -123,6 +132,7 @@ class _ModMemStats:
 
 
 class _WeakRefInfo:
+    # [CLASS DOC] HELPER: Tracks one tensor storage: its element count, element size, device, reference type, and the memory it consumes in bytes (rounded up to the allocator block size on cuda devices).
     """
     Manages memory statistics and device attributes for tensor storages.
     """
@@ -130,6 +140,7 @@ class _WeakRefInfo:
     def __init__(
         self, size: int, element_size: int, device: torch.device, reftype: _RefType
     ) -> None:
+        # [FUNCTION DOC] HELPER: Stores the storage properties and computes the consumed memory.
         """
         Initializes the ``_WeakRefInfo`` object with tensor storage properties.
 
@@ -146,6 +157,7 @@ class _WeakRefInfo:
         self.mem_consumed = self._calculate_mem_consumed()
 
     def _calculate_mem_consumed(self) -> int:
+        # [FUNCTION DOC] HELPER: Returns size times element size in bytes, rounded up to the minimum allocation block for cuda devices.
         """
         Calculates the memory consumed by the tensor storage, considering device-specific allocation rules.
 
@@ -158,6 +170,7 @@ class _WeakRefInfo:
         return mem
 
     def update_mem_consumed(self, st: torch.UntypedStorage) -> int:
+        # [FUNCTION DOC] HELPER: If the storage size differs from the recorded one, records the new size and recomputes consumed memory. Returns the (possibly updated) consumed bytes.
         """
         Updates and returns the memory consumed if the storage size has changed.
 
@@ -180,6 +193,7 @@ class _WeakRefInfo:
         reftype: _RefType,
         callback: Callable[[Self, weakref.ref], Any] | None = None,
     ) -> tuple[Self, weakref.ref]:
+        # [FUNCTION DOC] HELPER: Class method that builds a record for a storage and a weak reference to the storage, optionally with a finalization callback bound to the record. Returns (record, weak reference).
         """
         Creates a new ``_WeakRefInfo`` instance and a weak reference to a ``torch.UntypedStorage`` object,
         optionally attaching a callback to the weak reference.
@@ -202,6 +216,7 @@ class _WeakRefInfo:
 
 
 def _get_mem_divisor(units: str) -> int:
+    # [FUNCTION DOC] HELPER: Maps a unit name (B, KiB, MiB, GiB) to its byte divisor. Raises ValueError for any other unit, listing supported ones.
     unit_dict = {"B": 1, "KiB": 2**10, "MiB": 2**20, "GiB": 2**30}
     if units in unit_dict:
         return unit_dict[units]
@@ -212,10 +227,12 @@ def _get_mem_divisor(units: str) -> int:
 
 
 def _rounding_fn(value: int, divisor: int, precision: int) -> float | int:
+    # [FUNCTION DOC] HELPER: Divides by the divisor and rounds to the given precision, or returns the value unchanged when the divisor is 1.
     return value if divisor == 1 else round(value / divisor, precision)
 
 
 def _print_snapshot(snapshot: dict[torch.device, dict[str, int]], units: str) -> None:
+    # [FUNCTION DOC] HELPER: Prints a per-device memory breakdown in the given units, or a notice if the snapshot is empty. Devices whose rounded total is not positive are skipped; keys that are reference types print their display names.
     if len(snapshot) == 0:
         print("No memory tracked.")
         return
@@ -238,6 +255,7 @@ def _print_snapshot(snapshot: dict[torch.device, dict[str, int]], units: str) ->
 def _print_snapshot_tabular(
     snapshot: dict[torch.device, dict[str, int]], units: str
 ) -> None:
+    # [FUNCTION DOC] HELPER: Prints the snapshot as an rst table (one row per device, one column per category) using tabulate, skipping devices with non-positive rounded totals; prints a notice for an empty snapshot. Raises ImportError if tabulate is missing.
     if len(snapshot) == 0:
         print("No memory tracked.")
         return
@@ -266,6 +284,7 @@ def _print_snapshot_tabular(
 def _print_state_snapshots(
     snapshots: dict[_State, list[dict[torch.device, dict[str, int]]]], units: str
 ) -> None:
+    # [FUNCTION DOC] HELPER: For each state, prints its name and each numbered snapshot of that state using the plain snapshot printer, followed by a blank line.
     for state, snapshot_list in snapshots.items():
         print(f"{state.value}")
         for i, snapshot in enumerate(snapshot_list):
@@ -277,6 +296,7 @@ def _print_state_snapshots(
 def _print_state_snapshots_tabular(
     snapshots: dict[_State, list[dict[torch.device, dict[str, int]]]], units: str
 ) -> None:
+    # [FUNCTION DOC] HELPER: Prints all states and snapshots as a single rst table with state-and-call-number, device and category columns, blanking the repeated state label on consecutive rows and skipping devices with non-positive rounded totals. Raises ImportError if tabulate is missing.
     try:
         from tabulate import tabulate
     except ImportError as err:
@@ -309,6 +329,7 @@ def _print_state_snapshots_tabular(
 
 
 class _UpdateType(Enum):
+    # [CLASS DOC] HELPER: Enum of update kinds applied to the running memory snapshot: ADD (new storage tracked), DEL (storage finalized), REF (reference type changed) and SIZE (storage resized).
     # These are used for tracking updates to the continuously maintained memory snapshot.
     # ADD - When a new tensor storage is tracked
     # DEL - When a tensor storage is about to be finalized (garbage collected).
@@ -322,6 +343,9 @@ class _UpdateType(Enum):
 
 
 class MemTracker(TorchDispatchMode):
+    # [CLASS DOC] TorchDispatchMode that tracks, categorizes and attributes tensor storage memory created or touched inside its context, with nesting supported by a depth counter.
+    # State: memory_tracking (weak mapping from module to its _ModMemStats), the current and peak per-device snapshots, a weak mapping from storage to its info and weak reference, gradient-hook and optimizer-hook handles, a ModTracker, in-optimizer and in-activation-checkpoint flags, a weak reference to the outermost checkpointed module, and the original storage resize function.
+    # Usage: optionally register outside objects with track_external, enter the context, run, and use the snapshot and display methods. Limitations: ops under no-dispatch and non-traceable subclasses are not seen; during backward recompute, activation and temp memory can be misattributed but peak is right.
     """
     A TorchDispatchMode to track, categorize and attribute the tensor memory created or accessed within its context.
 
@@ -371,6 +395,8 @@ class MemTracker(TorchDispatchMode):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC] Initializes empty tracking tables and snapshots, hook handle containers, the module tracker, flags, the memory category enum, the original resize function, and a zero nesting depth.
+        # KNOWN ISSUE: the attribute holding the fake mode seen on entry is only created in the enter method, not here.
         self.memory_tracking = WeakIdKeyDictionary()
         self._curr_mem_snap: dict[torch.device, dict[str, int]] = {}
         self._peak_mem: dict[torch.device, int] = {}
@@ -399,6 +425,7 @@ class MemTracker(TorchDispatchMode):
         old_mem_consumed: int | None = None,
         old_reftype: _RefType | None = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Applies one change to the current per-device snapshot (created on demand with zero for each category and a total): ADD and DEL adjust the category and total by the storage's memory; REF moves memory between the old and new category (requires the old type); SIZE adjusts by the difference from the old consumed memory (requires it). Raises AssertionError on missing required arguments and ValueError for an unknown update kind. Removes the device entry if its total drops to zero after a deletion or resize.
         # Initialize a flag to track if the total memory might drop to zero after updates.
         maybe_zero = False
         # Ensure the device entry exists in the current memory snapshot, initializing if necessary.
@@ -445,6 +472,7 @@ class MemTracker(TorchDispatchMode):
         reftype: _RefType,
         update_existing: bool = False,
     ) -> set[_WeakRefInfo]:
+        # [FUNCTION DOC] HELPER: For each storage of the tensor, finds the existing info (updating its reference type and snapshot if the type differs) or, unless update_existing is set, creates and registers new info with a finalization callback and adds it to the snapshot when it consumes memory. Raises KeyError if update_existing is set and the storage is not tracked. Returns the set of infos.
         sts = get_untyped_storages(t)
         winfos = set()
         for st in sts:
@@ -475,16 +503,19 @@ class MemTracker(TorchDispatchMode):
         return winfos
 
     def _delete_callback(self, winfo: _WeakRefInfo, w_st: weakref.ref) -> None:
+        # [FUNCTION DOC] HELPER: Weak-reference callback run when a tracked storage is finalized; subtracts its memory from the current snapshot if it consumed any.
         # Callback to be called when the storage object corresponding to the  ``_WeakRefInfo``
         # instance is about to be finalized.
         if winfo.mem_consumed > 0:
             self._update_snap(_UpdateType.DEL, winfo)
 
     def _track_resize(self) -> None:
+        # [FUNCTION DOC] HELPER: Monkey-patches the untyped storage resize method globally (since resizes are not seen by dispatch) so resizing a tracked storage updates its info and the snapshot. Restored by the restore method.
         # Need to monkey-patch this because ``torch.UntypedStorage.resize_`` is not captured
         # by ``TorchDispatchMode``.
         @wraps(self._orig_resize)
         def resize_(st: torch.UntypedStorage, size: int) -> None:
+            # [FUNCTION DOC] HELPER: Replacement resize: calls the original, then, if the storage is tracked and its size changed, updates the consumed memory and snapshot.
             self._orig_resize(st, size)
             winfo, _ = self._WINFO.get(st, (None, None))
             if winfo is not None and winfo.size != st.size():
@@ -497,9 +528,11 @@ class MemTracker(TorchDispatchMode):
         torch.UntypedStorage.resize_ = resize_  # type: ignore[method-assign, assignment]
 
     def _restore_resize(self) -> None:
+        # [FUNCTION DOC] HELPER: Restores the original storage resize method.
         torch.UntypedStorage.resize_ = self._orig_resize  # type: ignore[method-assign]
 
     def _update_peak_stats(self, peak_state: _State) -> None:
+        # [FUNCTION DOC] HELPER: Updates peak statistics from the current snapshot. For each tracked module that is currently active and has the given peak state recorded, raises its per-device local peak and replaces the latest peak snapshot when the current total is larger. Also updates the global per-device peak and peak snapshot.
         # We first capture the current memory snapshot of the current tracker state then,
         # We step through each of the modules we have tracked so far in ``memory_tracking``
         #  and check if it is currently active by querying ``_mod_tracker.parents``
@@ -523,6 +556,8 @@ class MemTracker(TorchDispatchMode):
                 self._peak_mem_snap[dev] = deepcopy(dev_snap)
 
     def _track(self, reftype: _RefType, t: torch.Tensor) -> None:
+        # [FUNCTION DOC] HELPER: Tracks each storage of a tensor: for a known storage, updates its size in the snapshot if changed; for a new one, creates info with the given reference type and adds it to the snapshot.
+        # KNOWN ISSUE: the early return after handling a known storage ends the whole call, so remaining storages of the same tensor are skipped (probably meant to continue).
         # Get the storages of the tensor and check if we have already tracked them.
         # If yes, then check if the storage size has changed and update the current snapshot.
         # Else create a new ``_WeakRefInfo`` instance and add it to the dictionary.
@@ -549,6 +584,7 @@ class MemTracker(TorchDispatchMode):
     def get_tracker_snapshot(
         self, type: str = "current"
     ) -> dict[torch.device, dict[str, int]]:
+        # [FUNCTION DOC] Returns a deep copy of the current ("current") or peak ("peak") per-device snapshot mapping each device to category-to-bytes (plus a total). Raises ValueError for any other type.
         """
         Capture a snapshot of the memory usage breakdown per device, based on the specified type.
 
@@ -573,12 +609,14 @@ class MemTracker(TorchDispatchMode):
     def _track_module_params_and_buffers(
         self, module: nn.Module, install_grad_hooks: bool = True
     ) -> tuple[int, int]:
+        # [FUNCTION DOC] HELPER: Records the module's parameters (and existing gradients) and buffers with their reference types, optionally installing on each parameter a gradient hook and a post-accumulate-gradient hook (once per parameter) that record gradients. Returns (parameter bytes, buffer bytes).
         # Track the parameters and buffers of the module if not already tracked.
         # If the parameters have gradients, track the gradients as well.
         # If install_grad_hooks is True, install a gradient hook on the parameters
         #  to track the gradients, if it has not already been installed.
         # Return the total memory consumed by the parameters and buffers.
         def _grad_hook(grad: torch.Tensor) -> None:
+            # [FUNCTION DOC] HELPER: Gradient hook that records the gradient tensor as a gradient reference type.
             self._update_and_maybe_create_winfos(
                 grad,
                 _MemRefType.GRAD,
@@ -618,10 +656,12 @@ class MemTracker(TorchDispatchMode):
         return (param_memory, buffer_memory)
 
     def _track_inputs_or_outputs(self, args: Any) -> int:
+        # [FUNCTION DOC] HELPER: Returns the total memory of the tracked storages among all tensors found in the nested argument structure; untracked storages count zero.
         # Calculate the memory consumed by the inputs or outputs of the module.
         input_or_output_memory = 0
 
         def add_inps_or_outs(t: torch.Tensor) -> None:
+            # [FUNCTION DOC] HELPER: Adds the memory of each tracked storage of the tensor to the running total in the enclosing function.
             nonlocal input_or_output_memory
             sts = get_untyped_storages(t)
             for st in sts:
@@ -633,6 +673,8 @@ class MemTracker(TorchDispatchMode):
         return input_or_output_memory
 
     def _pre_fw_hook(self, module: nn.Module, inputs: Any) -> None:
+        # [FUNCTION DOC] HELPER: Pre-forward user hook from the module tracker. Raises AssertionError if the module name is unknown. First call for a module: records its parameters, buffers and input memory, creates its stats (state pre-forward). Call during backward: treated as activation checkpoint recompute (state pre-forward-AC), marking the outermost such module and the in-AC flag. Repeated forward call: raises NotImplementedError if the module is a root called again (multiple iterations); otherwise a reused submodule updates its input memory.
+        # For pre-forward states also resets the local peak from the current snapshot and starts a peak-forward snapshot list; always appends a snapshot for the state.
         # This is installed as a pre-fwd user hook with ``ModTracker.`` Based on the following cases we
         # set the state and capture the memory snapshot for the module.
         # Case 1: If the module is not in the ``memory_tracking`` dictionary, we track the parameters, buffers,
@@ -690,6 +732,7 @@ class MemTracker(TorchDispatchMode):
         mod_stats.snapshots.setdefault(state, []).append(deepcopy(mem_snapshot))
 
     def _post_fw_hook(self, module: nn.Module, inputs: Any, outputs: Any) -> None:
+        # [FUNCTION DOC] HELPER: Post-forward user hook. During backward (checkpoint recompute) it records a post-forward-AC snapshot and clears the in-AC state if this is the outermost checkpointed module. In forward it records the output memory and a post-forward snapshot.
         # This is installed as a post-fwd user hook with ``ModTracker``. Based on the following cases we
         # set the state and capture the memory snapshot for the module.
         # Case 1: This is called in backward, which means we are in the AC region. If this is the top most module
@@ -709,6 +752,7 @@ class MemTracker(TorchDispatchMode):
         mod_stats.snapshots.setdefault(state, []).append(self.get_tracker_snapshot())
 
     def _pre_bw_hook(self, module: nn.Module, args: Any) -> None:
+        # [FUNCTION DOC] HELPER: Pre-backward user hook. If the module is gone (None), warns and returns. Otherwise resets the module's local peak from the current snapshot, starts a peak-backward snapshot list and records a pre-backward snapshot.
         # This is installed as a pre-bwd user hook with ``ModTracker``. We set the state and capture the
         # snapshot for the module. We also initialize the ``local_peak`` and ``PEAK_BW`` snapshot for it.
         # If the module is None, we skip the hook.
@@ -728,6 +772,7 @@ class MemTracker(TorchDispatchMode):
         )
 
     def _post_bw_hook(self, module: nn.Module, args: Any) -> None:
+        # [FUNCTION DOC] HELPER: Post-backward user hook. If the module is gone (None), warns and returns; otherwise records a post-backward snapshot.
         # This is installed as a post-bwd user hook with ``ModTracker``. We set the state and capture the
         # snapshot for the module if it is not None.
         # This can happen since this installed inside a multi-grad hook on the module's input tensors
@@ -743,6 +788,7 @@ class MemTracker(TorchDispatchMode):
     def _track_optimizer_states(
         self, reftype: _RefType, optimizer: optim.Optimizer
     ) -> None:
+        # [FUNCTION DOC] HELPER: Records every tensor in the optimizer's state with the given reference type.
         for states in optimizer.state.values():
             for val in states.values():
                 if isinstance(val, torch.Tensor):
@@ -752,17 +798,20 @@ class MemTracker(TorchDispatchMode):
                     )
 
     def _register_global_optimizer_hook(self) -> None:
+        # [FUNCTION DOC] HELPER: Registers global optimizer step pre and post hooks and stores their handles. The pre hook sets the in-optimizer flag; the post hook records optimizer state tensors as optimizer state and clears the flag.
         # Register a hook on the optimizer step to track the optimizer states.
         # The pre-hook is to set the flag ``_in_opt`` to True. The post-hook unsets the flag,
         # and also tracks any optimizer states that are created during the optimizer step.
         def _opt_step_pre_hook(
             optimizer: optim.Optimizer, args: Any, kwargs: Any
         ) -> None:
+            # [FUNCTION DOC] HELPER: Optimizer step pre hook; sets the in-optimizer flag.
             self._in_opt = True
 
         def _opt_step_post_hook(
             optimizer: optim.Optimizer, args: Any, kwargs: Any
         ) -> None:
+            # [FUNCTION DOC] HELPER: Optimizer step post hook; records the optimizer's state tensors and clears the in-optimizer flag.
             self._track_optimizer_states(_MemRefType.OPT, optimizer)
             self._in_opt = False
 
@@ -772,6 +821,7 @@ class MemTracker(TorchDispatchMode):
         )
 
     def _deregister_param_and_optimizer_hooks(self) -> None:
+        # [FUNCTION DOC] HELPER: Removes all parameter gradient hooks and the optimizer step hooks and forgets their handles.
         for (
             grad_hook_handle,
             post_acc_grad_hook_handle,
@@ -788,6 +838,7 @@ class MemTracker(TorchDispatchMode):
     def track_external(
         self, *external: nn.Module | optim.Optimizer | torch.Tensor
     ) -> None:
+        # [FUNCTION DOC] Registers objects created outside the tracker so their memory is tracked: tensors as Other, modules' parameters/buffers (without gradient hooks), optimizers' state tensors as optimizer state; None entries are ignored and nested containers are flattened. Raises TypeError for any other object type. Call before using the tracker.
         """
         Track tensors and stateful objects like modules, optimizers etc. that are created outside the MemTracker.
 
@@ -822,6 +873,7 @@ class MemTracker(TorchDispatchMode):
     def display_snapshot(
         self, type: str = "current", units: str = "B", tabulate: bool = False
     ) -> None:
+        # [FUNCTION DOC] Prints the current or peak snapshot in the given units (B, KiB, MiB, GiB), as plain text or an rst table when tabulate is true. Raises ValueError for an invalid snapshot type or unit; ImportError if tabulate is needed but missing.
         """
         Display the memory usage breakdown snapshot of the tracker based on the specified type and units.
 
@@ -840,6 +892,7 @@ class MemTracker(TorchDispatchMode):
     def display_modulewise_snapshots(
         self, depth: int = 2, units: str = "B", tabulate: bool = False
     ) -> None:
+        # [FUNCTION DOC] Prints, for each tracked module in natural name order and with nesting depth (dots plus one) at most depth, its name and all state snapshots in the given units, plain or tabular.
         """
         Print per device memory breakdown snapshot for each module called within MemTracker.
 
@@ -853,6 +906,7 @@ class MemTracker(TorchDispatchMode):
         """
 
         def natural_sort_key(s: str) -> list[int | str]:
+            # [FUNCTION DOC] HELPER: Builds a sort key splitting a string into digit runs (as integers) and lowercase text for natural ordering.
             return [
                 int(text) if text.isdigit() else text.lower()
                 for text in re.split("([0-9]+)", s)
@@ -873,12 +927,14 @@ class MemTracker(TorchDispatchMode):
                 _print_state_snapshots(mod_stats.snapshots, units)
 
     def reset_mod_stats(self) -> None:
+        # [FUNCTION DOC] Clears the per-module memory statistics (the memory_tracking mapping), e.g. between iterations.
         """
         Reset all the module memory stats. Clears ``memory_tracking`` dictionary.
         """
         self.memory_tracking.clear()
 
     def __enter__(self) -> "MemTracker":
+        # [FUNCTION DOC] Context entry, reentrant via a depth counter. On the outermost entry: remembers the active fake mode, registers the optimizer hooks and module tracker user hooks, patches storage resize, initializes the global peak from the current snapshot, enters the module tracker and the dispatch mode. Returns self.
         if self._depth == 0:
             # None in eager, a FakeTensorMode instance in SAC.  Used in
             # __torch_dispatch__ to skip DTensor propagation ops.
@@ -903,6 +959,7 @@ class MemTracker(TorchDispatchMode):
 
     # pyrefly: ignore [bad-override]
     def __exit__(self, *args: Any) -> None:
+        # [FUNCTION DOC] Context exit. Decrements the depth; on the outermost exit removes parameter and optimizer hooks, clears the tracker's user hooks, restores storage resize, and exits the module tracker and dispatch mode.
         self._depth -= 1
         if self._depth == 0:
             self._deregister_param_and_optimizer_hooks()
@@ -912,6 +969,7 @@ class MemTracker(TorchDispatchMode):
         super().__exit__(*args)
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Dispatch hook. Returns NotImplemented if any DTensor is among the types so the DTensor logic runs first. Runs the op (a wait_tensor under a fake mode returns its input, to mimic eager aliasing). Only if the active fake mode is the one seen at entry (skipping DTensor sharding propagation under nested fake modes), classifies the outputs as optimizer state, temp (backward and not in checkpoint recompute) or activation, tracks all output tensors, and updates peak stats for the forward or backward state. Returns the op result.
         # When running this mode with DTensor, ordinarily all modes will
         # run **before** subclasses get a chance to run.
         # Returning NotImplemented here gives us a chance to let DTensor

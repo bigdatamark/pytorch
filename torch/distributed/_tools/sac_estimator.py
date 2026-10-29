@@ -1,3 +1,6 @@
+# [MODULE DOC] Selective activation checkpointing (SAC) estimation. Defines SACEstimator, a dispatch-mode context manager used under a fake tensor mode that records per-operator runtime and output memory for each module, derives per-module SACStats, a greedy recompute order (SACGreedyOrderMeta, ordered by memory saved per second), and a piecewise-linear trade-off curve of discarded memory vs recomputation time (SACTradeOffStats).
+# Also defines the data containers MSPS, SACStats, SACTradeOffStats, SACGreedyOrderMeta, internal metadata dataclasses, and a tabular display helper.
+# Import-time constants: OPS_TO_ALWAYS_SKIP (SAC-ignored ops plus a few extras) and the minimum allocator block size (512 bytes, or 1 when the CUDA caching allocator is disabled by environment variable). Optional dependencies (tabulate, numpy, pwlf, matplotlib) are imported lazily.
 import math
 import os
 import sys
@@ -40,6 +43,7 @@ _PYTORCH_MIN_ALLOCATE = (
 
 
 def _display_stats_tabular(headers: list[str], table_data: list[list[Any]]) -> None:
+    # [FUNCTION DOC] HELPER: Prints a table in reStructuredText format using the tabulate package. Raises ImportError if tabulate is not installed.
     try:
         from tabulate import tabulate
     except ImportError as err:
@@ -53,6 +57,7 @@ def _display_stats_tabular(headers: list[str], table_data: list[list[Any]]) -> N
 # https://github.com/facebookresearch/xformers/blob/main/xformers/checkpoint.py#L71
 @dataclass
 class _SACMetadata:
+    # [CLASS DOC] HELPER: Per-operator record for one dispatched call: the op, its time, output memory in bytes, global index, hashes of output storage ids, inplace info (the op index and its first parent index, or empty), and flags for view-like and random ops.
     """
     Stores metadata for a single operator for SAC.
 
@@ -79,6 +84,7 @@ class _SACMetadata:
 
 @dataclass
 class _SACModMetadata:
+    # [CLASS DOC] HELPER: Per-module collection state: the global operator index where the module started, whether random ops must be force-stored, and the list of operator records seen inside the module.
     """
     Stores metadata for a module for SAC.
 
@@ -95,6 +101,7 @@ class _SACModMetadata:
 
 @dataclass
 class SACStats:
+    # [CLASS DOC] Public per-module SAC statistics, with parallel lists indexed by operator (after skipped ops are removed): names, runtimes in ms, memory in bytes; plus indices of view-like ops, random ops, ops whose results autograd saves, a list of (inplace op, first parent) index pairs, and the force_store_random flag.
     """
     A class for storing Activation Checkpointing statistics corresponding to a module.
 
@@ -120,6 +127,7 @@ class SACStats:
 
 
 class MSPS(NamedTuple):
+    # [CLASS DOC] Immutable record of memory-per-second statistics for an operator or operator group: set of op names, the op (group head) index, total memory in bytes, total runtime in ms, and memory divided by runtime.
     """
     Represents Memory and Runtime Statistics for an operator/operator group.
 
@@ -140,6 +148,7 @@ class MSPS(NamedTuple):
 
 @dataclass
 class SACTradeOffStats:
+    # [CLASS DOC] Result of fitting the memory-discarded vs recomputation-time trade-off of a module: number of linear segments, their slopes, intercepts and breakpoints, the raw trade-off curve (ordered mapping), and total SAC memory and runtime of the module.
     """
     Stores statistics for activation-checkpointing trade-off.
 
@@ -164,6 +173,7 @@ class SACTradeOffStats:
 
 @dataclass
 class SACGreedyOrderMeta:
+    # [CLASS DOC] Greedy-order metadata for a module: ops always recomputed, ops always stored, inplace op groups keyed by group head, random op group keyed by its head, and the list of recompute candidates (MSPS records) sorted by descending memory per second.
     """
     Stores metadata for Greedy-order SAC.
 
@@ -183,6 +193,9 @@ class SACGreedyOrderMeta:
 
 
 class SACEstimator(TorchDispatchMode):
+    # [CLASS DOC] TorchDispatchMode (to be used under a FakeTensorMode) that estimates, per module, memory and recomputation trade-offs of selective activation checkpointing. Runtime comes from RuntimeEstimator (roofline by default, or benchmarking via the call method).
+    # State: public dicts keyed by module name (sac_mod_stats, sac_mod_tradeoff_stats, sac_mod_greedy_order_meta); private operator metadata for the top level, per-module metadata, set of leaf modules, a ModTracker, autograd saved-tensor hooks recording the storage ids of tensors saved for backward, and an optional gpu type.
+    # Lifecycle: set the mode (optional), enter the context, run forward, exit; then call the pwlf and display methods. Only compute time and memory are modeled, not communication.
     """
     Estimates the memory and recomputation time trade-offs for applying Selective Activation Checkpointing (SAC).
 
@@ -216,6 +229,7 @@ class SACEstimator(TorchDispatchMode):
     """
 
     def __init__(self, gpu_type: str | None = None) -> None:
+        # [FUNCTION DOC] Creates empty stat tables and metadata containers, a module tracker, saved-tensor hooks whose pack step records storage ids (unpack is identity), and defaults the runtime estimator to the roofline model. The optional gpu type pins the roofline device specs.
         """
         Args:
             gpu_type (str | None): Optional datasheet device name (e.g.
@@ -237,6 +251,7 @@ class SACEstimator(TorchDispatchMode):
         self._estimate_runtime = RuntimeEstimator._roofline_estimate
 
     def _pack_hook(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Saved-tensor pack hook: records hashes of the tensor's underlying untyped storages in the saved-ids set and returns the tensor unchanged.
         # Hook function to track underlying storage IDs of tensors
         # Updates the _saved_tensor_ids set with the IDs of the tensor's storages
         # Used in conjunction with torch.autograd.graph.saved_tensors_hooks
@@ -246,6 +261,7 @@ class SACEstimator(TorchDispatchMode):
         return x
 
     def _pre_fw_hook(self, mod: nn.Module, inputs: Any) -> None:
+        # [FUNCTION DOC] HELPER: Module pre-forward hook. Looks up the module's known name (raises AssertionError if unknown). For modules with children, creates module metadata starting at the current global operator count with the force-store-random flag computed from the inputs; leaf modules are only added to the leaf set.
         # Pre-forward hook function to prepare module metadata
         # Tracks module FQN, force store random flag, and ``SACModMetadata``
         # Initializes metadata for non-leaf modules, marks leaf modules
@@ -264,6 +280,7 @@ class SACEstimator(TorchDispatchMode):
             self._leaf_modules.add(mod_fqn)
 
     def _post_fw_hook(self, mod: nn.Module, inputs: Any, outputs: Any) -> None:
+        # [FUNCTION DOC] HELPER: Module post-forward hook. Does nothing for leaf modules. For other modules, computes and stores the SACStats from the collected operator metadata and the greedy order metadata from those stats. Raises AssertionError if the module name is unknown.
         # 1. Retrieves the module's FQN and checks if it's a leaf module
         # 2. If not a leaf module, computes:
         #    - ``SACStats`` using the module's metadata and force store random flag
@@ -283,12 +300,15 @@ class SACEstimator(TorchDispatchMode):
             )
 
     def _get_force_store_random(self, inputs: Any) -> bool:
+        # [FUNCTION DOC] HELPER: Returns true when none of the flattened inputs is a tensor (random ops must then be stored since the recompute cannot reproduce RNG state otherwise).
         flat_inputs, _ = tree_flatten(inputs)
         return all(not isinstance(x, torch.Tensor) for x in flat_inputs)
 
     def _get_sac_stats(
         self, data: list[_SACMetadata], force_store_random: bool
     ) -> SACStats:
+        # [FUNCTION DOC] HELPER: Converts a module's operator records into SACStats. Drops ops that SAC always skips, extracts names, runtimes, memory, view-like, random and autograd-saved indices, and remaps inplace (op, parent) indices to the filtered numbering (raises ValueError if a parent was filtered out). Finally sets the memory of the last op that is neither view-like nor inplace to zero, because the block output is always stored.
+        # KNOWN ISSUE: fails (unpacking an empty zip) if every operator is filtered out; the last-op heuristic may be wrong (noted by a FIXME).
         # 1. Ignore the operations that should be skipped by SAC such as aten.detach.default because autograd
         # inserts those during backward and it breaks the fwd-bwd alignment
         filtered_data = [x for x in data if x.func not in OPS_TO_ALWAYS_SKIP]
@@ -357,6 +377,8 @@ class SACEstimator(TorchDispatchMode):
     def _get_inplace_metadata(
         self, func: Any, out_storages: set[UntypedStorage]
     ) -> tuple[int, tuple[int, ...], dict[str, tuple[int, ...]]]:
+        # [FUNCTION DOC] HELPER: For an op about to be recorded, returns (global op index, tuple of output storage hashes, mapping from each active non-leaf module name to inplace info). For non-inplace ops the info is empty. For inplace ops, finds per module the first earlier record (at or after that module's start index; any record for Global) whose outputs contain this op's output storages and uses it as parent; if none is found the op is its own parent.
+        # Raises AssertionError if a module other than Global has no metadata.
         # 1. Get the current index of the metadata obtained so far
         curr_idx = len(self._sac_metadata)
         # 2. Get the set of active modules that are not leaf
@@ -400,6 +422,7 @@ class SACEstimator(TorchDispatchMode):
     def __torch_dispatch__(  # type: ignore[no-untyped-def]
         self, func, types, args=..., kwargs=None
     ):
+        # [FUNCTION DOC] Dispatch hook. Runs the runtime estimator to get the output and time, collects output storages split into cuda and cpu (raises AssertionError if outputs span more than one CUDA device), computes output bytes (CUDA sizes rounded up to the allocator block size; view-like ops count zero), determines inplace, view-like and random flags (flash attention counts as random only if dropout is nonzero), and appends an operator record to every active non-leaf module (or the global list for Global). Raises AssertionError if an active module has no metadata. Returns the op output.
         # 1. Get the runtime estimate
         out, op_time = self._estimate_runtime(func, args, kwargs)
         flat_outs, _ = tree_flatten(out)
@@ -466,6 +489,8 @@ class SACEstimator(TorchDispatchMode):
         return out
 
     def _get_greedy_order_meta(self, sac_stats: SACStats) -> SACGreedyOrderMeta:
+        # [FUNCTION DOC] HELPER: Builds the greedy order metadata from SACStats. Groups inplace ops by their top-most parent and groups all random ops under the first one. Always stored: random group head when force_store_random, inplace group heads that are themselves inplace ops, and groups containing random ops when force_store_random is set. Always recomputed: view-like ops. Remaining heads, groups and plain ops are recompute candidates; each gets total memory, runtime and memory-per-second (maximum float if runtime is zero), and candidates are sorted by descending memory per second.
+        # KNOWN ISSUE: the group-with-random-ops check combines a boolean and a count with a bitwise AND before comparing, so the result depends on the parity of the count rather than on whether any random op is present. A comment says increasing msps but the sort is descending.
         # An inplace-op group is a set of inplace-ops that operate on the same underlying tensor storage.
         # 1. inplace_op_groups: A dictionary from the top-most parent of inplace-ops to the inplace-ops in the group
         #   The top-most op can itself be an inplace-op or can be a non-inplace op.
@@ -558,6 +583,8 @@ class SACEstimator(TorchDispatchMode):
         save_tradeoff_graph: bool = False,
         filename: str = "ac_tradeoff",
     ) -> SACTradeOffStats:
+        # [FUNCTION DOC] HELPER: Fits a piecewise linear function to the trade-off curve for a module. Builds a curve of cumulative discarded memory fraction (plus a 0.01 offset) vs cumulative recompute time fraction, starting from the always-recomputed ops, adding candidates in greedy order, then the always-stored ops. Shifts y left and x right to upper bound the curve, fits with the requested number of segments (clamped between 1 and number of points minus 2), optionally saves a plot, and returns a SACTradeOffStats.
+        # Raises ImportError if pwlf or numpy is missing, AssertionError if fitted intercepts or breaks are not arrays. Divides by total memory and runtime, so zero totals would fail.
         try:
             import numpy as np  # type: ignore[import-not-found]
             import pwlf  # type: ignore[import-untyped, import-not-found]
@@ -629,6 +656,7 @@ class SACEstimator(TorchDispatchMode):
         def save_prediction_graph(
             pwlf_: pwlf.PiecewiseLinFit, x: list[float], y: list[float], filename: str
         ) -> None:
+            # [FUNCTION DOC] HELPER: Plots the shifted points, the fitted prediction and the original curve with labels and a title showing total memory and runtime, then saves a png named after the file name in a folder called tradeoff_graphs in the current directory (created if needed). Raises ImportError if matplotlib or numpy is missing.
             try:
                 import matplotlib.pyplot as plt  # type: ignore[import-not-found]
                 import numpy as np  # type: ignore[import-not-found]
@@ -683,6 +711,7 @@ class SACEstimator(TorchDispatchMode):
     def display_sac_stats(
         self, sac_stats: SACStats, print_tabular: bool = False
     ) -> None:
+        # [FUNCTION DOC] Prints a summary line (total memory, total runtime, store-random flag) and a per-operator table with index, name, runtime, memory, view-like, random, saved-by-autograd and inplace parent columns. Uses the tabulate rst format if print_tabular is true, otherwise tab-separated aligned columns.
         """
         Displays the SAC statistics.
 
@@ -758,6 +787,8 @@ class SACEstimator(TorchDispatchMode):
         sac_stats: SACStats,
         print_tabular: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Prints a table of the trade-off: one row per always-recomputed group, then one per candidate in greedy order, then one per always-stored group, each with op ids, names, cumulative discarded memory (fraction and bytes), cumulative recompute time (fraction and ms), memory per second, and stored/recomputed flags. Format is tabular or aligned plain text depending on print_tabular.
+        # KNOWN ISSUE: always-stored ops are also added to the cumulative discarded memory and recompute time, which is questionable for ops that are never discarded.
         """
         Displays the SAC trade-off statistics.
 
@@ -793,6 +824,7 @@ class SACEstimator(TorchDispatchMode):
             stored: bool | None = False,
             recomputed: bool | None = False,
         ) -> None:
+            # [FUNCTION DOC] HELPER: Appends a table row with the given op ids, names, current cumulative discarded memory and recompute time (taken from the enclosing scope), memory per second (or nan text) and the stored and recomputed flags.
             row = [
                 str(op_indices),
                 str(func_names),
@@ -877,6 +909,7 @@ class SACEstimator(TorchDispatchMode):
         n_segments: int = 2,
         save_tradeoff_graphs: bool = False,
     ) -> None:
+        # [FUNCTION DOC] For every module with SAC stats, fits the piecewise linear trade-off curve with the given number of segments and stores the result in the trade-off stats mapping. Optionally saves a graph per module named after the module. Requires greedy order metadata for each module.
         """
         Fits a piecewise linear function with the specified sumber of segments to the SAC trade-off curve of
         discarded memory vs recomputation time.
@@ -900,6 +933,7 @@ class SACEstimator(TorchDispatchMode):
     def display_modulewise_sac_stats(
         self, depth: int = 2, print_tabular: bool = False
     ) -> None:
+        # [FUNCTION DOC] Prints, for each module whose nesting depth (dots in the name plus one) is at most depth, the module name, its SAC stats table and its trade-off table.
         """
         Displays the SAC and trade-off statistics for each module.
 
@@ -927,6 +961,7 @@ class SACEstimator(TorchDispatchMode):
             )
 
     def __call__(self, estimate_mode_type: str) -> Self:
+        # [FUNCTION DOC] Selects the runtime estimation function (benchmark or roofline cost model) by mode name and returns self for use in a with statement. Raises NotImplementedError for unknown modes.
         """
         Sets the estimate mode type.
 
@@ -954,6 +989,7 @@ class SACEstimator(TorchDispatchMode):
         return self
 
     def __enter__(self) -> Self:  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Requires an active FakeTensorMode (raises AssertionError otherwise). Shares the fake mode and gpu type with RuntimeEstimator class attributes, registers pre/post forward hooks on the module tracker, enters the tracker and the saved-tensor hooks, then enters the dispatch mode and returns its result.
         fake_mode = active_fake_mode()
         if not isinstance(fake_mode, FakeTensorMode):
             raise AssertionError("SAC Estimator should be called in FakeTensorMode")
@@ -968,6 +1004,7 @@ class SACEstimator(TorchDispatchMode):
         return super().__enter__()
 
     def __exit__(self, *args: Any) -> None:  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Exits the saved-tensor hooks, the module tracker and the dispatch mode, in that order, passing through the exception info.
         self._saved_tensor_hook_ctx.__exit__()
         self._mod_tracker.__exit__(*args)
         super().__exit__(*args)

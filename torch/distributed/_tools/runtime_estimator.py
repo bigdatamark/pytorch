@@ -1,4 +1,6 @@
 # Owner(s): ["module: unknown"]
+# [MODULE DOC] Defines RuntimeEstimator, a dispatch-mode context manager (used under a fake tensor mode) that estimates GPU runtime in milliseconds per operator, either by benchmarking real kernels or with a roofline cost model, and aggregates forward and backward time per module using ModTracker.
+# Imports helper tables and cost functions from torch.utils._runtime_estimation. No import-time side effects. Exports RuntimeEstimator.
 from collections import defaultdict
 from typing import Any, TYPE_CHECKING
 from typing_extensions import Self
@@ -26,6 +28,9 @@ __all__ = ["RuntimeEstimator"]
 
 
 class RuntimeEstimator(TorchDispatchMode):
+    # [CLASS DOC] TorchDispatchMode that estimates operator runtimes under a FakeTensorMode. Select the method by calling the instance with a mode name (operator-level-benchmark or operator-level-cost-model) and then entering it.
+    # State: mod_runtimes (module name to forward/backward milliseconds), four lists of module names in pre/post forward/backward order, total_runtime, an optional pinned gpu_type, a ModTracker, and class-level fake_mode, gpu_type and the set of operators lacking a fallback kernel.
+    # Only compute time is estimated (no communication); tensor subclasses such as DTensor are not handled; benchmarking runs real kernels and assumes each op fits in memory.
     """
     Estimates the GPU runtime in milliseconds using various estimation methods under the ``FakeTensorMode``.
 
@@ -75,6 +80,7 @@ class RuntimeEstimator(TorchDispatchMode):
     gpu_type: str | None = None
 
     def __init__(self, gpu_type: str | None = None) -> None:
+        # [FUNCTION DOC] Creates the estimator with an optional datasheet GPU name used to pin roofline peak FLOPS and bandwidth (only affects the cost-model mode). Initializes the module tracker, empty runtime table, empty order lists and zero total runtime.
         """
         Args:
             gpu_type (str | None): Optional datasheet device name (e.g.
@@ -107,6 +113,9 @@ class RuntimeEstimator(TorchDispatchMode):
         kwargs,
         orig_not_implemented_exception,
     ):
+        # [FUNCTION DOC] HELPER: Class method that runs a function on real (randomly or ones filled) tensors made from the fake inputs and benchmarks it: one run for the result, 2 warmup runs, then 3 timed runs with device events, returning the mean time in milliseconds.
+        # Outputs are converted back to fake tensors. Raises the supplied exception if the op modifies metadata in place (inplace view tag) or if an output aliases an input storage without being an input itself.
+        # Side effects: executes kernels on the accelerator and synchronizes it.
         """
         Runs and benchmarks a fallback kernel for a given function.
 
@@ -134,6 +143,7 @@ class RuntimeEstimator(TorchDispatchMode):
         with no_dispatch():
 
             def to_real_tensor(e):  # type: ignore[no-untyped-def]
+                # [FUNCTION DOC] HELPER: Converts a fake tensor of this mode into a real tensor on its fake device (random floats for float dtypes, ones otherwise, preserving sparse coalesced state) and remembers the mapping to the fake original; other values pass through unchanged.
                 if cls.fake_mode.is_our_fake(e):
                     if e.dtype in _FLOAT_TYPES:
                         out = torch.rand_like(e, device=e.fake_device)
@@ -174,6 +184,7 @@ class RuntimeEstimator(TorchDispatchMode):
         # input impl
 
         def map_out(e):  # type: ignore[no-untyped-def]
+            # [FUNCTION DOC] HELPER: Maps a real output back to a fake tensor (reusing the original fake input if it is one). Raises the original exception if the output shares storage with an input but is not that input. Non-tensors pass through.
             if id(e) not in inp_impls and (
                 isinstance(e, torch.Tensor)
                 and not e.is_sparse
@@ -195,6 +206,8 @@ class RuntimeEstimator(TorchDispatchMode):
 
     @classmethod
     def _benchmark_estimate(cls, func, args, kwargs) -> tuple[Any, float]:  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] HELPER: Class method that estimates an op by benchmarking. Raises AssertionError if the fake mode is not set. For non-view ops it tries the benchmarked fallback kernel and returns (result, mean ms); if that is not implemented it records the op packet in the no-fallback set and runs the op normally with zero time. View ops are run with zero time.
+        # Note: the docstring mentions a res argument that does not exist.
         """
         Estimates the runtime of a function using benchmarking.
 
@@ -230,6 +243,9 @@ class RuntimeEstimator(TorchDispatchMode):
     # Adapted from: https://github.com/pytorch/pytorch/blob/9b902b3ee3bd608a19543362b66bf06c373dd374/torch/_inductor/scheduler.py#L589
     @classmethod
     def _roofline_estimate(cls, func, args, kwargs) -> tuple[Any, float]:  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] HELPER: Class method that runs the op and estimates its time with a roofline model: time is the larger of transfer time (bytes moved over bandwidth) and compute time (flops over peak flops), converted to milliseconds; ignored op packets cost zero.
+        # Raises AssertionError if no accelerator is available. Returns (output, ms).
+        # Note: the docstring mentions an out argument that is not a parameter.
         """
         Estimates the runtime of a function using a roofline cost model.
 
@@ -302,6 +318,7 @@ class RuntimeEstimator(TorchDispatchMode):
         return (out, op_time)
 
     def display_modulewise_stats(self, depth: int = 2) -> None:
+        # [FUNCTION DOC] Prints to standard output the pre-forward and pre-backward module orders and each module's forward and backward milliseconds, skipping modules nested deeper than the given depth (counted by dots in the name plus one).
         """
         Displays module-wise statistics collected by ``RuntimeEstimator``.
 
@@ -332,6 +349,8 @@ class RuntimeEstimator(TorchDispatchMode):
             )
 
     def __torch_dispatch__(self, func, types, args=..., kwargs=None):  # type: ignore[no-untyped-def]
+        # [FUNCTION DOC] Dispatch hook: obtains the result and time from the selected estimate function, adds that time to the forward or backward total of every currently active module (per ModTracker) and to total_runtime, then returns the result.
+        # Requires the estimate mode to have been set via call first, otherwise fails on a missing attribute.
         # TODO: @sanketpurandare: Flatten tensors by desugaring the tensor subclasses
         # TODO: @sanketpurandare: Add logic for incorporating communication time
         res, op_time = self._estimate(func, args, kwargs)
@@ -344,6 +363,8 @@ class RuntimeEstimator(TorchDispatchMode):
         return res
 
     def __call__(self, estimate_mode_type: str) -> Self:
+        # [FUNCTION DOC] Selects the estimation function by mode name and stores the mode; returns self so it can be used in a with statement.
+        # Raises NotImplementedError for an unsupported mode name.
         """
         Sets the estimate mode type.
 
@@ -372,6 +393,7 @@ class RuntimeEstimator(TorchDispatchMode):
         return self
 
     def __enter__(self) -> Self:
+        # [FUNCTION DOC] Requires an active FakeTensorMode (raises AssertionError otherwise), stores it and the gpu type on the class, resets runtime totals and order lists, registers module-tracker hooks that append module names to the four order lists, then enters the module tracker and the dispatch mode. Returns self.
         fake_mode = active_fake_mode()
         if not isinstance(fake_mode, FakeTensorMode):
             raise AssertionError(
@@ -405,6 +427,8 @@ class RuntimeEstimator(TorchDispatchMode):
 
     # pyrefly: ignore [bad-override]
     def __exit__(self, *args: Any) -> None:
+        # [FUNCTION DOC] Prints the mode and total estimated time (note the output lacks a space after the mode) and any ops without fallback kernels, exits the dispatch mode, clears tracker hooks and exits the tracker.
+        # KNOWN ISSUE: the printed message concatenates the mode and the word total_time without a separator.
         print(
             f"Estimated ({self._estimate_mode_type})"
             f"total_time: {self.total_runtime:.3f} ms"

@@ -1,3 +1,5 @@
+# [MODULE DOC] Mixed-integer linear programs (via the pulp package and the CBC solver) for selective activation checkpointing: sac_milp picks which modules to checkpoint and what fraction of activations to discard under a memory budget, and get_optimal_checkpointing_policy_per_module picks which operators of one module to save versus recompute.
+# Also defines SACDecision. Import-time side effects: raises ImportError if pulp is missing; creates a module logger set to INFO level.
 import logging
 import math
 from enum import IntEnum
@@ -38,6 +40,11 @@ def sac_milp(
     ac_units: list[str] | None = None,
     fsdp_units: list[str] | None = None,
 ) -> tuple[dict[str, float], float, int]:
+    # [FUNCTION DOC] Builds and solves a MILP over the module tree graph to minimize total recomputation time subject to peak memory (in GiB) not exceeding memory_budget.
+    # Per module variables: AC indicator, discard fraction, discarded memory, activation memory, total memory, recompute fraction and time, plus overall peak memory. Constraints: only user-given AC units (if any), AC units are not supermodules of FSDP units, no nested AC units, no AC on leaf modules, discarded memory consistent with the discard fraction, discard only if AC'ed and large enough to matter, activation memory including gradients minus discards of modules finished earlier in forward post-order, per-module memory including sharded parameters and gradients divided by world_size, piecewise-linear lower bounds on recompute fraction, and recompute time linked to the AC indicator via a big-M bound.
+    # Returns (mapping of AC'ed module name to discard fraction, recomputation time rounded to 2 places, peak memory in bytes); on solver failure logs an error and returns an empty mapping, 0 and -1. Solver limits: 5 percent relative gap, 180 seconds.
+    # Side effects: logs warnings and overrides a node's sac_memory with its act_fw_per_module when the former is smaller (mutates the graph).
+    # KNOWN ISSUE: the constraint on the discard fraction divides by sac_memory, which is zero-division prone for non-leaf modules with zero SAC memory. Status check equals 1 means optimal only.
     """
     MILP to decide which modules to AC and how much memory to discard.
     The objective is to minimize recomputation time.
@@ -220,6 +227,7 @@ def sac_milp(
 
 
 class SACDecision(IntEnum):
+    # [CLASS DOC] Integer enumeration of the per-operator decision: RECOMPUTE is 0 and SAVE is 1.
     RECOMPUTE = 0
     SAVE = 1
 
@@ -227,6 +235,9 @@ class SACDecision(IntEnum):
 def get_optimal_checkpointing_policy_per_module(
     sac_stats: SACStats, memory_budget: float
 ) -> list[int]:
+    # [FUNCTION DOC] Builds and solves a MILP choosing, for each operator in the SACStats, whether to save (1) or recompute (0) it, maximizing the runtime of saved ops (equivalent to minimizing recomputation) with saved memory at most the fraction memory_budget of total op memory.
+    # Constraints: random ops all saved if force_store_random else all share one decision; view-like ops always recomputed; an inplace op follows its parent, or is saved if it is its own parent.
+    # Raises ValueError if memory_budget is outside zero to one. Returns the list of decisions, or an empty list (after logging an error) if the solver fails. Solver limits: 5 percent gap, 10 seconds.
     """
     This is adapted from --
     https://github.com/facebookresearch/xformers/blob/c6c0ac31f1b08542a0bc27278c6ed10f825f6963/xformers/checkpoint.py#L375

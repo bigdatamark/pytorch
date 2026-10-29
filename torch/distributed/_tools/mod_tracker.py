@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Defines ModTracker, a context manager that tracks which nn.Module (by fully qualified name) is currently running forward or backward.
+# It works by registering global module forward pre/post hooks plus autograd multi-grad hooks and engine callbacks.
+# Import-time side effects: none; global hooks are only installed while a ModTracker is entered. Exports ModTracker.
 import warnings
 import weakref
 from collections.abc import Callable
@@ -16,6 +19,9 @@ __all__ = ["ModTracker"]
 
 
 class ModTracker:
+    # [CLASS DOC] Context manager exposing the set of currently executing module names (parents, always containing "Global") and whether execution is in backward (is_bw).
+    # State: parents set, per-name active counts, weak maps of known/seen modules (name assignment), a flag for a queued engine callback, pending post-backward callbacks, and four optional user hooks (pre/post forward/backward).
+    # Entering installs global forward hooks; exiting removes them. Hook handlers are skipped inside dynamo-optimized modules.
     """
     ``ModTracker`` is a context manager that tracks the nn.Module hierarchy during execution
     so that other system can query which Module is currently being executed (or its backward is being
@@ -55,6 +61,7 @@ class ModTracker:
     """
 
     def __init__(self):
+        # [FUNCTION DOC] Initializes tracking state: parents starts as the Global entry, empty counters, weak module-name maps, no engine callback, no pending callbacks, and no user hooks.
         self.parents = {"Global"}
         self._active_module_cnt = {}
         self._known_modules: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
@@ -67,6 +74,8 @@ class ModTracker:
         self._user_post_bw_hook = None
 
     def _maybe_set_engine_callback(self):
+        # [FUNCTION DOC] HELPER: Ensures a backward-end cleanup is queued on the autograd engine for the current backward pass (assumes no concurrent backward).
+        # If one is already queued, returns. Otherwise queues the pending post-backward callbacks in reverse order, clears that list, then queues a callback that resets parents to the Global entry and clears the flag, and sets the flag.
         # This assumes no concurrent calls to backward
         if self._has_callback:
             return
@@ -76,6 +85,7 @@ class ModTracker:
         self._post_bw_callbacks_to_enqueue.clear()
 
         def callback():
+            # [FUNCTION DOC] HELPER: Engine callback that resets parents to only Global and marks that no callback is pending.
             self.parents = {"Global"}
             self._has_callback = False
 
@@ -84,12 +94,14 @@ class ModTracker:
 
     @property
     def is_bw(self):
+        # [FUNCTION DOC] Property: true when a backward graph task is currently executing (the current graph task id is not -1).
         """
         A boolean marking if this is currently running during the backward pass or not
         """
         return torch._C._current_graph_task_id() != -1
 
     def get_known_fqn(self, mod):
+        # [FUNCTION DOC] Returns the recorded fully qualified name for a module, or None if the tracker has not seen it.
         """
         Return the fqn for the given module if it is known to the ``ModTracker``, otherwise ``None``.
         """
@@ -102,6 +114,9 @@ class ModTracker:
         pre_bw_hook: Callable | None = None,
         post_bw_hook: Callable | None = None,
     ):
+        # [FUNCTION DOC] Registers up to four user hooks (pre/post forward, pre/post backward) invoked around each tracked module; arguments may be None to leave a slot unchanged-empty.
+        # Raises AssertionError if a non-None hook is supplied for a slot that already holds a hook (clear first).
+        # Side effect: stores the hooks on the tracker. KNOWN ISSUE: passing None for a slot overwrites an existing hook in that slot with None, so registering only one hook clears the others.
         """
         Registers user-specified hooks to be called before/after the forward/backward pass for each
         module tracked by the ``ModTracker``. One or more can be ``None``.
@@ -128,6 +143,7 @@ class ModTracker:
         """
 
         def set_hook(hook, user_hook, hook_name):
+            # [FUNCTION DOC] HELPER: Returns the new hook, or raises AssertionError if both the new and existing hooks are set.
             if hook is not None and user_hook is not None:
                 raise AssertionError(
                     f"Only one {hook_name} can be registered at a time"
@@ -149,6 +165,7 @@ class ModTracker:
         )
 
     def clear_user_hooks(self):
+        # [FUNCTION DOC] Resets all four user hooks to None.
         """
         Clears the user specified hooks registered with ``register_user_hooks``
         """
@@ -158,6 +175,8 @@ class ModTracker:
         self._user_post_bw_hook = None
 
     def _get_mod_name(self, mod):
+        # [FUNCTION DOC] HELPER: Returns the name for a module, defaulting to its class name, and on first visit recursively assigns dotted names (parent name plus child attribute) to all children.
+        # Side effect: updates the known-module map and marks the module as seen.
         if mod not in self._known_modules:
             self._known_modules[mod] = type(mod).__name__
         mod_name = self._known_modules[mod]
@@ -169,12 +188,15 @@ class ModTracker:
         return mod_name
 
     def _get_append_fn(self, w_mod, name, is_bw):
+        # [FUNCTION DOC] HELPER: Builds a callback that marks a module as entered. In backward mode it also ensures the end-of-backward engine callback is queued.
         def fn(*args):
+            # [FUNCTION DOC] HELPER: Pushes the module name: warns (and replaces the global warning formatter) if the name is already active outside backward; adds the name to parents or increments its count; in backward, then calls the user pre-backward hook with the live module (or None) and the arguments.
             if is_bw:
                 self._maybe_set_engine_callback()
             if name in self.parents and not self.is_bw:
 
                 def custom_formatwarning(msg, category, filename, lineno, line=None):
+                    # [FUNCTION DOC] HELPER: Formats a warning as file, line, category name and message.
                     return f"{filename}:{lineno}: {category.__name__}: {msg} \n"
 
                 # pyrefly: ignore [bad-assignment]
@@ -196,7 +218,9 @@ class ModTracker:
         return fn
 
     def _get_pop_fn(self, w_mod, name, is_bw):
+        # [FUNCTION DOC] HELPER: Builds a callback that marks a module as exited (see inner function).
         def fn(*args):
+            # [FUNCTION DOC] HELPER: In backward, first calls the user post-backward hook. Then decrements the module's active count and removes it from parents at zero. If the name is not active and not in backward, raises RuntimeError about broken hierarchy tracking.
             if self._user_post_bw_hook is not None and is_bw:
                 self._user_post_bw_hook(w_mod(), args)
             if name in self.parents:
@@ -213,6 +237,7 @@ class ModTracker:
         return fn
 
     def _fw_pre_hook(self, mod, input):
+        # [FUNCTION DOC] HELPER: Global forward pre-hook. Skips if inside a dynamo-optimized module. Pushes the module name, calls the user pre-forward hook, and (outside backward) arranges the matching backward pop: a multi-grad hook on input tensors that require grad, or else a queued post-backward callback.
         if torch._dynamo.eval_frame._is_in_optimized_module():
             return
 
@@ -232,6 +257,7 @@ class ModTracker:
                 )
 
     def _fw_post_hook(self, mod, input, output):
+        # [FUNCTION DOC] HELPER: Global forward post-hook. Skips inside dynamo-optimized modules. Calls the user post-forward hook, pops the module name, and (outside backward) registers a multi-grad hook in any-mode on output tensors requiring grad that pushes the name when backward reaches the module.
         if torch._dynamo.eval_frame._is_in_optimized_module():
             return
 
@@ -248,6 +274,7 @@ class ModTracker:
             )
 
     def __enter__(self):
+        # [FUNCTION DOC] Installs the global forward pre-hook and forward hook (always_call) and returns the tracker.
         self._fw_pre_handle = register_module_forward_pre_hook(self._fw_pre_hook)
         self._fw_post_handle = register_module_forward_hook(
             self._fw_post_hook, always_call=True
@@ -255,5 +282,6 @@ class ModTracker:
         return self
 
     def __exit__(self, *args):
+        # [FUNCTION DOC] Removes the global forward hooks installed on enter. Exceptions are not suppressed.
         self._fw_pre_handle.remove()
         self._fw_post_handle.remove()
