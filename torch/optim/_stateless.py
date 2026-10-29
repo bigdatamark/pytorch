@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Stateless swap utility for optimizers: the context manager
+# swap_in_optimizer_params_and_state temporarily installs caller-supplied parameter tensors,
+# optimizer state and group hyperparameters (in optimizer.state_dict() format) into a live
+# optimizer, then restores the original contents on exit. Used e.g. to trace an optimizer step
+# with fake tensors. Also holds private validation helpers and a NamedTuple of per-group
+# bookkeeping. No import-time side effects.
 import contextlib
 from collections import defaultdict
 from typing import Any, NamedTuple
@@ -8,6 +14,9 @@ from torch import Tensor
 
 
 class _GroupSwapinInfo(NamedTuple):
+    # [CLASS DOC] HELPER: Immutable record per param group: the live group dict (mutated in
+    # place), the swap-in group dict (hyperparameters plus packed param ids), and the
+    # replacement parameter tensors in the same order as those ids.
     """Per-group bookkeeping for ``swap_in_optimizer_params_and_state``.
 
     Fields:
@@ -25,6 +34,9 @@ class _GroupSwapinInfo(NamedTuple):
 
 
 def _validate_state_field(state: Any) -> dict[Any, Any]:
+    # [FUNCTION DOC] HELPER: Validates the swap-in state field: must be a mapping, must not
+    # be keyed by tensors, and integer-keyed entries must be mappings. Returns it unchanged;
+    # raises RuntimeError otherwise.
     """Check ``state`` is a dict mapping packed parameter ids to per-param state dicts."""
     if not isinstance(state, dict):
         raise RuntimeError(
@@ -48,6 +60,9 @@ def _validate_state_field(state: Any) -> dict[Any, Any]:
 def _validate_param_groups_field(
     optimizer: "torch.optim.Optimizer", param_groups: Any
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] HELPER: Validates that the swap-in param groups field is a list with
+    # the same length as the live optimizer's param groups. Returns it; raises RuntimeError
+    # otherwise.
     """``param_groups`` must be a list whose length matches the live optimizer's param groups."""
     if not isinstance(param_groups, list):
         raise RuntimeError(
@@ -67,6 +82,11 @@ def _validate_group_against_live(
     group: dict[str, Any],
     swapin_group: Any,
 ) -> list[int]:
+    # [FUNCTION DOC] HELPER: Validates one swap-in group against its live group: it must be
+    # a mapping, its params must be a list of ints of the same length as the live group's
+    # params, and its key set must equal the live group's key set. Returns the list of
+    # packed param ids. Raises RuntimeError on any mismatch (the docstring says asserts, but
+    # errors are raised explicitly).
     """Validate a single swap-in param group against its live counterpart and
     return its packed parameter ids.
 
@@ -110,6 +130,14 @@ def _prepare_swap_in(
     swapin_parameters: dict[str, Tensor],
     swapin_optim_state: dict[str, Any],
 ) -> tuple[dict[Any, Any], list[_GroupSwapinInfo]]:
+    # [FUNCTION DOC] HELPER: Validates the whole swap-in request and aligns it with the
+    # optimizer. Requires initialized live optimizer state and well-formed state and param
+    # groups. Slices the flat swap-in parameters across groups in order by each group's
+    # param count, and builds one _GroupSwapinInfo per group. Returns the swap-in state
+    # mapping and the list of infos. Raises RuntimeError for uninitialized state, too few
+    # swap-in parameters, or state keys that are not packed ids in any group. Does not
+    # mutate the optimizer.
+    # KNOWN ISSUE: surplus swap-in parameters beyond the groups' total are not rejected.
     """
     Validate and normalize optimizer state for ``swap_in_optimizer_params_and_state``.
 
@@ -195,6 +223,13 @@ def swap_in_optimizer_params_and_state(
     swapin_parameters: dict[str, Tensor],
     swapin_optim_state: dict[str, Any],
 ):
+    # [FUNCTION DOC] Context manager that swaps the supplied parameters, per-parameter state
+    # and group hyperparameters into the optimizer: each live group gets the new params list
+    # and hyperparameter values, and optimizer.state becomes a mapping keyed by the
+    # swapped-in tensors, each holding a shallow copy of the matching per-param state
+    # (in-place tensor edits propagate back). On exit, even on error, group contents and the
+    # original state are restored. Raises RuntimeError from validation before any mutation.
+    # Yields nothing.
     """Temporarily replace an optimizer's parameters and state with the
     supplied params and optim states, then restore them on exit.
 

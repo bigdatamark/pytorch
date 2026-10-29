@@ -1,3 +1,7 @@
+# [PACKAGE DOC] HELPER: Legacy package exposing foreach-enabled variants of the optimizers
+# (Adam, AdamW, NAdam, SGD, RAdam, RMSprop, Rprop, ASGD, Adamax, Adadelta, Adagrad). Each name
+# is a subclass of the torch.optim optimizer whose constructor defaults to foreach set to true.
+# Built at import time.
 """
 :mod:`torch.optim._multi_tensor` is a package implementing various optimization algorithms.
 
@@ -12,7 +16,11 @@ from torch import optim
 
 
 def partialclass(cls, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Returns a subclass of cls whose constructor has the given positional
+    # and keyword arguments pre-bound (via a partial method). Does not modify cls itself.
     class NewCls(cls):
+        # [CLASS DOC] HELPER: Dynamically created subclass of cls; only overrides the constructor
+        # with a partially applied version of the parent constructor.
         __init__ = partialmethod(cls.__init__, *args, **kwargs)
 
     return NewCls

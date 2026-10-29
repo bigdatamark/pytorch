@@ -1,4 +1,7 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Adadelta optimizer: the Adadelta class (running averages of squared gradients and of
+# squared updates), single-tensor and foreach update implementations, and the functional entry
+# point adadelta. Exports Adadelta and adadelta. Import-time side effect: assigns Adadelta.__doc__.
 from typing import Any, cast
 
 import torch
@@ -26,6 +29,11 @@ __all__ = ["Adadelta", "adadelta"]
 
 
 class Adadelta(Optimizer):
+    # [CLASS DOC] Optimizer implementing Adadelta. Per-parameter state: step (scalar tensor,
+    # on the param device when capturable), square_avg and acc_delta (zeros like the param).
+    # Group hyperparameters: lr, rho, eps, weight_decay, maximize, capturable, foreach,
+    # differentiable. Key methods: step and the private group initializer. Sparse gradients
+    # are rejected.
     def __init__(
         self,
         params: ParamsT,
@@ -39,6 +47,9 @@ class Adadelta(Optimizer):
         maximize: bool = False,
         differentiable: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Validates hyperparameters and builds defaults for the base
+        # Optimizer. Raises ValueError for a non-scalar tensor lr, negative lr, rho
+        # outside [0, 1], negative eps or negative weight_decay.
         if isinstance(lr, Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be 1-element")
         if not 0.0 <= lr:
@@ -62,6 +73,10 @@ class Adadelta(Optimizer):
         }
         super().__init__(params, defaults)
 
+        # [FUNCTION DOC] HELPER: Restores state after unpickling: fills missing group
+        # flags (foreach, maximize, differentiable, capturable) with defaults and
+        # converts non-tensor step values to scalar tensors (on the param device if
+        # capturable).
     def __setstate__(self, state):
         super().__setstate__(state)
         for group in self.param_groups:
@@ -90,6 +105,10 @@ class Adadelta(Optimizer):
         acc_deltas: list[Tensor],
         state_steps: list[Tensor],
     ):
+        # [FUNCTION DOC] HELPER: Collects params with gradients, their grads, square
+        # averages, accumulated deltas and step tensors into the passed lists, lazily
+        # creating state. Returns whether any such param is complex. Raises RuntimeError
+        # for sparse gradients. Mutates the lists and self.state.
         has_complex = False
         p: Tensor
         for p in group["params"]:
@@ -126,6 +145,10 @@ class Adadelta(Optimizer):
 
     @_use_grad_for_differentiable
     def step(self, closure=None):
+        # [FUNCTION DOC] Performs one optimization step: optionally evaluates a closure
+        # with grad enabled, then for each group gathers tensors and calls the
+        # functional adadelta. Returns the loss or None. Updates params and state in
+        # place; wrapped so differentiable mode controls grad mode.
         """Perform a single optimization step.
 
         Args:
@@ -258,6 +281,12 @@ def _single_tensor_adadelta(
     capturable: bool,
     has_complex: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Per-tensor Adadelta update. If capturable, checks that params
+    # and steps are on supported devices (AssertionError otherwise). For each param:
+    # increments step, negates grad if maximize, adds weight decay, updates square_avg,
+    # computes the delta from the accumulated delta and the root of square_avg, updates
+    # acc_delta, and subtracts the delta scaled by lr. Complex tensors are handled through
+    # real views. Mutates params and state in place.
     # If compiling, the compiler will handle cudagraph checks, see note [torch.compile x capturable]
     if not torch.compiler.is_compiling() and capturable:
         capturable_supported_devices = _get_capturable_supported_devices(
@@ -318,6 +347,10 @@ def _multi_tensor_adadelta(
     capturable: bool,
     has_complex: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Foreach Adadelta update with the same math as the single-tensor
+    # version, grouped by device and dtype. Raises AssertionError if differentiable or if
+    # capturable is set with unsupported devices. Returns early for empty input. Uses a
+    # tensor lr multiply when capturable. Mutates params and state in place.
     if differentiable:
         raise AssertionError("_foreach ops don't support autograd")
 
@@ -428,6 +461,11 @@ def adadelta(
     weight_decay: float,
     maximize: bool,
 ) -> None:
+    # [FUNCTION DOC] Functional Adadelta entry point. Raises RuntimeError if state steps are
+    # not tensors (outside compilation) or if foreach is combined with scripting. Chooses
+    # the foreach implementation when foreach is true (or by default heuristics when None),
+    # else the single-tensor one, and calls it. Mutates params and state in place; returns
+    # None.
     r"""Functional API that performs Adadelta algorithm computation.
 
     See :class:`~torch.optim.Adadelta` for details.

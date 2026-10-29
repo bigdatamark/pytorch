@@ -1,3 +1,8 @@
+# [MODULE DOC] Symbolic placeholder ops (onnx_symbolic::_symbolic and _symbolic_multi_out) used to
+# represent arbitrary ONNX nodes in FX graphs, plus EncodedAttrs which flattens a mapping of ONNX
+# attributes into FX-friendly lists. The real kernels return zero tensors of the requested shape
+# and ONNX dtype; fake kernels do the same. Import-time side effect: registers the custom ops and
+# their fake kernels with torch.library.
 """Implementation of symbolic FX ops to represent arbitrary ONNX ops.
 
 This module provides a way to create symbolic FX operators that can represent
@@ -28,6 +33,12 @@ _STRING_SEQ_TYPE = "ss"
 
 @dataclasses.dataclass
 class EncodedAttrs:
+    # [CLASS DOC] Dataclass holding ONNX node attributes encoded as parallel lists, since FX
+    # cannot hold dictionaries. State: attr_keys and attr_types (one per attribute, type
+    # codes i, f, s, is, fs, ss), attr_pos (start/end slice into the typed value list for
+    # each attribute), and the value lists attr_ints, attr_floats, attr_strs. Invariant:
+    # keys, types and pos have equal length. Methods: from_dict (encode) and to_dict
+    # (decode).
     """Class to encode attributes from dictionary into lists of FX compatible attributes.
 
     Since FX does not support dictionaries, we need to encode the attributes into
@@ -66,6 +77,13 @@ class EncodedAttrs:
             | Sequence[bool],
         ],
     ) -> "EncodedAttrs":
+        # [FUNCTION DOC] Encodes a mapping from attribute name to int, float, str, or a
+        # non-empty sequence of those into an EncodedAttrs. Scalars append one value to
+        # the matching list; a sequence is classified as float if any element is a
+        # float, else by its first element (int or str). Returns the new instance.
+        # Raises ValueError for empty sequences, unsupported element or value types.
+        # KNOWN ISSUE: bool values count as ints; sequences are typed from the first
+        # element only.
         encoded = cls(
             attr_keys=[],
             attr_types=[],
@@ -129,6 +147,10 @@ class EncodedAttrs:
         str,
         int | float | str | list[int] | list[float] | list[str],
     ]:
+        # [FUNCTION DOC] Decodes the stored lists back into a mapping from attribute
+        # name to scalar or list value, using the type codes and position slices.
+        # Returns a new mapping; raises ValueError on an unknown type code. Does not
+        # mutate the instance.
         """Convert the encoded attributes back to a dictionary for creating an ONNX node."""
         attrs: dict[
             str,
@@ -181,6 +203,9 @@ def _symbolic(
     domain: str = "",
     version: int | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Real kernel of the symbolic single-output op. Ignores inputs
+    # and attributes and returns a zero tensor with the given shape and the torch dtype for
+    # onnx_dtype. Raises an error if onnx_dtype is not a known ONNX data type code.
     torch._check(
         onnx_dtype in _dtype_mappings.ONNX_DTYPE_TO_TORCH_DTYPE,
         lambda: f"{onnx_dtype} is invalid as an ONNX data type. Valid values are {list(_dtype_mappings.ONNX_DTYPE_TO_TORCH_DTYPE.keys())}",
@@ -208,6 +233,9 @@ def _(
     domain: str = "",
     version: int | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Fake kernel of the symbolic single-output op; same behavior as
+    # the real kernel (zeros of the given shape and mapped dtype; error on an invalid ONNX
+    # dtype).
     torch._check(
         onnx_dtype in _dtype_mappings.ONNX_DTYPE_TO_TORCH_DTYPE,
         lambda: f"{onnx_dtype} is invalid as an ONNX data type. Valid values are {list(_dtype_mappings.ONNX_DTYPE_TO_TORCH_DTYPE.keys())}",
@@ -247,6 +275,10 @@ def _symbolic_multi_out(
     domain: str = "",
     version: int | None = None,
 ) -> list[torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Real kernel of the symbolic multi-output op. Returns a list
+    # with one zero tensor per (shape, onnx dtype) pair. Raises an error if the number of
+    # shapes differs from the number of dtypes or any dtype code is invalid. Inputs and
+    # attributes are ignored.
     outputs = []
     torch._check(
         len(shapes) == len(onnx_dtypes),
@@ -283,6 +315,8 @@ def _(
     domain: str = "",
     version: int | None = None,
 ) -> list[torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Fake kernel of the symbolic multi-output op; same behavior as
+    # the real kernel.
     outputs = []
     torch._check(
         len(shapes) == len(onnx_dtypes),

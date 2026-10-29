@@ -1,5 +1,11 @@
 # mypy: allow-untyped-decorators
 # mypy: allow-untyped-defs
+# [MODULE DOC] Adafactor optimizer: a memory-efficient adaptive optimizer that stores factored
+# (row and column) second-moment statistics for matrix gradients and a full variance for
+# vectors. Contains the Adafactor class, single-tensor and foreach (multi-tensor) update
+# implementations, a grouping helper, and the functional entry point adafactor. Exports
+# Adafactor and adafactor. Import-time side effect: assigns the long documentation string to
+# Adafactor.__doc__.
 from typing import cast
 
 import torch
@@ -21,6 +27,12 @@ __all__ = ["Adafactor", "adafactor"]
 
 
 class Adafactor(Optimizer):
+    # [CLASS DOC] Optimizer implementing Adafactor. Per-parameter state: step (scalar tensor
+    # on CPU), and either row_var and col_var (for gradients with more than one dim, reduced
+    # to size 1 along the last / penultimate dim) or variance (for vectors). Param-group
+    # hyperparameters: lr, beta2_decay, eps (pair of epsilon1 or None, and epsilon2), d
+    # (update clipping threshold), weight_decay, foreach, maximize. Rejects complex params
+    # and sparse grads. Key methods: step and the private group initializer.
     def __init__(
         self,
         params: ParamsT,
@@ -33,6 +45,12 @@ class Adafactor(Optimizer):
         foreach: bool | None = None,
         maximize: bool = False,
     ) -> None:
+        # [FUNCTION DOC] Validates hyperparameters and builds the defaults mapping for
+        # the base Optimizer. Raises ValueError for a non-scalar tensor lr, negative lr,
+        # positive beta2_decay, negative epsilons, d below 1, or negative weight_decay.
+        # foreach=None selects the loop implementation.
+        # KNOWN ISSUE: the class docstring says the weight_decay default is 1e-2 but the
+        # code uses 0.0.
         if isinstance(lr, Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be 1-element")
         if not 0.0 <= lr:
@@ -59,6 +77,9 @@ class Adafactor(Optimizer):
         super().__init__(params, defaults)
 
     def __setstate__(self, state):
+        # [FUNCTION DOC] HELPER: Restores optimizer state after unpickling. Defaults the
+        # foreach entry of each group to None and converts any non-tensor step value in
+        # the state into a scalar tensor.
         super().__setstate__(state)
         for group in self.param_groups:
             group.setdefault("foreach", None)
@@ -78,6 +99,11 @@ class Adafactor(Optimizer):
         variances,
         state_steps,
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Collects parameters that have gradients into the output
+        # lists (params, grads, row_vars, col_vars, variances, state_steps), lazily
+        # creating state on first use. Returns False always (the has_complex flag),
+        # since complex params are rejected. Raises RuntimeError for complex params or
+        # sparse grads. Mutates the passed lists and self.state.
         for p in group["params"]:
             if p.grad is None:
                 continue
@@ -120,6 +146,10 @@ class Adafactor(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
+        # [FUNCTION DOC] Performs one optimization step over all parameter groups under
+        # no-grad. Optionally re-evaluates a closure (with grad enabled) for the loss.
+        # Returns the loss or None. Mutates parameters and state in place; does a
+        # graph-capture health check first.
         r"""Perform a single optimization step.
 
         Args:
@@ -350,6 +380,14 @@ def _single_tensor_adafactor(
     maximize: bool,
     has_complex: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Per-parameter (for-loop) Adafactor update. Increments the step,
+    # computes the decay factor and relative step size, applies decoupled weight decay,
+    # updates the factored row and column (or full) variance with a lerp, estimates the
+    # variance, clips the normalized update by its RMS relative to d, and subtracts it
+    # scaled by alpha. Raises if grad scaling args are set or required state is missing.
+    # Mutates params and state in place.
+    # KNOWN ISSUE: when eps1 is None it is set from the first parameter's dtype and then
+    # reused for later parameters of other dtypes. has_complex is unused.
     if grad_scale is not None or found_inf is not None:
         raise AssertionError("Grad scaling should occur outside of optimizer.step()")
 
@@ -426,6 +464,10 @@ def _group_tensors_by_device_dtype_and_is_multidim(
     tuple[torch.device | None, torch.dtype | None, bool],
     list[list[Tensor | None]],
 ]:
+    # [FUNCTION DOC] HELPER: Groups parallel tensor lists by (device, dtype, is_matrix),
+    # where is_matrix means the gradient (second list) has more than one dim. Returns a
+    # mapping from that key to the lists of grouped tensors. Raises an error if a gradient
+    # is None.
     """Groups tensors by device, dtype, AND multidimensionality -- whether the tensor
     has multiple dims or just one dim (is a vector). This allows the foreach impl of
     Adafactor to assume that every group of params will either be factored or not."""
@@ -478,6 +520,12 @@ def _multi_tensor_adafactor(
     maximize: bool,
     has_complex: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Foreach Adafactor update, equivalent to the single-tensor
+    # version but batched per (device, dtype, matrix-or-vector) group using foreach ops.
+    # Returns early for empty params. Raises if grad scaling args are set or required state
+    # is missing. Mutates params and state.
+    # KNOWN ISSUE: when eps1 is None it is fixed from the first group's dtype and reused for
+    # later groups. has_complex is unused.
     if len(params) == 0:
         return
 
@@ -625,6 +673,11 @@ def adafactor(
     eps2: float,
     maximize: bool,
 ) -> None:
+    # [FUNCTION DOC] Functional Adafactor entry point. Checks (outside compilation) that
+    # every state step is a tensor, otherwise raises RuntimeError, then dispatches to the
+    # foreach implementation if foreach is true, else to the single-tensor one. Mutates
+    # params and state in place; returns None.
+    # KNOWN ISSUE: eps1 is annotated float but None is accepted downstream.
     r"""Functional API that performs Adafactor algorithm computation.
 
     See :class:`~torch.optim.Adafactor` for details.

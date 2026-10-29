@@ -1,3 +1,9 @@
+# [MODULE DOC] Reference eager implementations of ONNX operators (RotaryEmbedding-23,
+# Attention-23) as torch custom ops in the onnx namespace, with fake (meta) kernels for
+# torch.compile/export. Defines ONNX_ATEN_DECOMP_TABLE (maps registered onnx op overloads to
+# their plain Python implementations) and a private registration decorator. Import-time side
+# effects: registers the custom ops and their fake kernels with torch.library, and fills the
+# decomposition table.
 """Implementations of ONNX operators as native Torch ops.
 
 NOTE: Fake implementations:
@@ -33,9 +39,16 @@ _ATTENTION_23_ALLOWED_INTERMEDIATE_PRECISIONS = frozenset(
 def _onnx_op(
     op_type: str, opset_version: int, fake_impl: Callable[_P, _R]
 ) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    # [FUNCTION DOC] HELPER: Builds a decorator that registers a function as the torch
+    # custom op named onnx::<op_type>.opset<version> (no mutated args), records the plain
+    # function in ONNX_ATEN_DECOMP_TABLE under that overload, registers fake_impl as its
+    # fake kernel, and returns the registered custom op in place of the function.
     """Decorator to register an ONNX operator with a custom implementation."""
 
     def decorator(func: Callable[_P, _R]) -> Callable[_P, _R]:
+        # [FUNCTION DOC] HELPER: Applies the registration described above to func;
+        # mutates global library state and the decomposition table; returns the custom
+        # op wrapper.
         overload = f"opset{opset_version}"
         torch_op = torch.library.custom_op(
             f"onnx::{op_type}.{overload}", mutates_args=()
@@ -59,6 +72,10 @@ def _rotary_embedding_23_fake_impl(
     num_heads: int = 0,
     rotary_embedding_dim: int = 0,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Fake kernel for RotaryEmbedding-23. Returns an uninitialized
+    # tensor with the shape, dtype and device of x. For 4D input the strides mimic a
+    # permuted layout (0,2,1,3) to match the real kernel's output; for 3D input the result
+    # is contiguous. Other args are ignored.
     """Fake implementation for RotaryEmbedding-23 for torch.compile purposes."""
     if x.dim() == 4:
         # Real impl permutes (0,2,1,3), computes via cat (allocates fresh
@@ -84,6 +101,14 @@ def rotary_embedding_23(
     num_heads: int = 0,
     rotary_embedding_dim: int = 0,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] ONNX RotaryEmbedding-23. Applies rotary position embedding to x, which
+    # is either 4D (batch, num_heads, seq, head_size) or 3D (batch, seq, hidden) where
+    # num_heads is required. cos_cache and sin_cache are 2D indexed by position_ids (batch,
+    # seq) when given, otherwise 3D with batch and seq already aligned. Rotates the first
+    # rotary_embedding_dim features (all if 0), either as split halves or interleaved pairs,
+    # leaving the remainder unchanged. Returns a tensor of the same shape as x. Raises
+    # errors (via torch._check) when ranks, shapes or num_heads are inconsistent. Pure
+    # function; does not mutate its inputs.
     """RotaryEmbedding-23 https://onnx.ai/onnx/operators/onnx__RotaryEmbedding.html#rotaryembedding-23"""
     # x has shape (batch_size, num_heads, sequence_length, head_size)
     # or (batch_size, sequence_length, hidden_size)
@@ -210,6 +235,7 @@ def rotary_embedding_23(
 
 
 def _get_scale_factor(scale: float | None, head_size: int) -> float:
+    # [FUNCTION DOC] HELPER: Returns scale if given, otherwise 1 / sqrt(head_size).
     """Get the scale factor for attention computation."""
     return scale if scale is not None else (1.0 / math.sqrt(head_size))
 
@@ -217,6 +243,8 @@ def _get_scale_factor(scale: float | None, head_size: int) -> float:
 def _reshape_3d_to_4d(
     tensor: torch.Tensor, batch_size: int, num_heads: int
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Reshapes a 3D (batch, seq, hidden) tensor into a contiguous 4D
+    # (batch, num_heads, seq, head_size) tensor, head_size being hidden // num_heads.
     """Reshape 3D tensor to 4D for multi-head attention."""
     sequence_length, hidden_size = tensor.shape[1], tensor.shape[2]
     head_size = hidden_size // num_heads
@@ -235,6 +263,10 @@ def _get_qk_output_for_aten_spda(
     scale: float | None,
     qk_matmul_output_mode: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Returns the QK matmul output for the SDPA code path. For output
+    # mode 0 it computes the scaled Q times K-transpose product; for any other mode it
+    # returns zeros of the matching shape. KNOWN ISSUE: the SDPA path is only taken when the
+    # mode is 0, so the zeros branch looks unreachable from the caller.
     """Get QK output tensor based on the specified mode."""
     if qk_matmul_output_mode == 0:
         return _compute_qk_output_for_mode_0(
@@ -248,6 +280,8 @@ def _get_qk_output_for_aten_spda(
 def _validate_gqa_configuration(
     current_q_num_heads: int, current_kv_num_heads: int
 ) -> None:
+    # [FUNCTION DOC] HELPER: Raises an error unless the query head count is divisible by the
+    # key/value head count (required for grouped-query attention).
     """Validate Group Query Attention configuration."""
     torch._check(
         current_q_num_heads % current_kv_num_heads == 0,
@@ -262,6 +296,10 @@ def _compute_qk_output_for_mode_0(
     current_kv_num_heads: int,
     scale: float | None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Computes the pre-softmax attention scores for output mode 0.
+    # Repeats K heads to match Q heads when they differ, scales both Q and K by the square
+    # root of the scale factor for numerical stability, and returns Q times K-transpose over
+    # the last two dims.
     """Helper function to compute QK output for qk_matmul_output_mode == 0."""
     # Handle GQA manually for QK output
     K_for_qk = K
@@ -293,6 +331,11 @@ def _attention_23_fake_impl(
     softcap: float = 0.0,
     softmax_precision: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] HELPER: Fake kernel for Attention-23. Computes only output shapes and
+    # returns four uninitialized tensors: output (same shape as Q), present_key,
+    # present_value (K shape with the past length added to the sequence dim; 4D layout even
+    # for 3D inputs) and qk_output (batch, q_heads, q_seq, kv_seq). Dtypes and devices
+    # follow Q, K and V.
     """Fake implementation for Attention-23 for torch.compile purposes."""
     batch_size = Q.shape[0]
 
@@ -378,6 +421,14 @@ def attention_23(
     softcap: float = 0.0,
     softmax_precision: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] ONNX Attention-23 with optional past key/value caches. Q, K, V are 3D (needs
+    # q_num_heads and kv_num_heads) or 4D. Concatenates past states, then either uses
+    # scaled_dot_product_attention (no softcap, mode 0, no softmax precision, bool or no mask) or a
+    # manual path with GQA head repetition, causal/bool/float masks, softcap and optional softmax
+    # precision. Returns (output, present_key, present_value, qk_output); qk_output depends on
+    # qk_matmul_output_mode (0 raw, 1 with mask, 2 after softcap, 3 after softmax). Output is
+    # reshaped to 3D for 3D inputs. Raises errors on bad ranks, GQA divisibility, or is_causal
+    # combined with attn_mask (manual path only). Pure; inputs are not mutated.
     """Attention-23 https://onnx.ai/onnx/operators/onnx__Attention.html#attention-23"""
 
     num_head_dim, sequence_dim, head_dim = 1, 2, 3

@@ -1,3 +1,9 @@
+# [PACKAGE DOC] torch.optim: optimization algorithms. Re-exports Optimizer and the concrete
+# optimizers (Adadelta, Adagrad, Adam, AdamW, Adamax, ASGD, LBFGS, Muon, NAdam, RAdam, RMSprop,
+# Rprop, SGD, SparseAdam, Adafactor), the lr_scheduler and swa_utils submodules, and the
+# swap_in_optimizer_params_and_state utility. Import-time side effects: sets __module__ of
+# Adafactor, Muon and the swap utility to torch.optim, and deletes the per-algorithm submodule
+# names (adam, sgd, ...) from the package namespace; __all__ lists the public names.
 """
 :mod:`torch.optim` is a package implementing various optimization algorithms.
 

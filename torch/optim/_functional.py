@@ -1,3 +1,7 @@
+# [MODULE DOC] HELPER: Legacy functional interface of torch.optim. Re-exports the per-algorithm
+# functional implementations (adadelta, adagrad, adam, adamax, adamw, asgd, nadam, radam,
+# rmsprop, rprop, sgd, plus the sparse helper) and defines a functional sparse_adam. No
+# import-time side effects.
 r"""Functional interface."""
 
 import math
@@ -33,6 +37,11 @@ def sparse_adam(
     lr: float,
     maximize: bool,
 ) -> None:
+    # [FUNCTION DOC] Functional Sparse Adam step. For each parameter, coalesces its sparse gradient
+    # (negated if maximize), skips empty gradients, updates the dense first/second moment tensors
+    # in place using only the gradient's nonzero entries, then applies a bias-corrected update to
+    # the parameter in place. Args are parallel lists plus eps, beta1, beta2, lr, maximize. Returns
+    # nothing; mutates params, exp_avgs and exp_avg_sqs. state_steps holds plain ints per param.
     r"""Functional API that performs Sparse Adam algorithm computation.
 
     See :class:`~torch.optim.SparseAdam` for details.
@@ -53,6 +62,9 @@ def sparse_adam(
         step = state_steps[i]
 
         def make_sparse(values: Tensor) -> Tensor:
+            # [FUNCTION DOC] HELPER: Builds a sparse tensor shaped like the gradient from the given
+            # values, reusing the gradient's indices; returns an empty resized tensor if indices or
+            # values are zero-dimensional.
             constructor = grad.new
             if grad_indices.dim() == 0 or values.dim() == 0:
                 return constructor().resize_as_(grad)

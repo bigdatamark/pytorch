@@ -1,5 +1,10 @@
 # mypy: allow-untyped-defs
 # mypy: disable-error-code=arg-type
+# [MODULE DOC] Muon optimizer for 2D (matrix) parameters: momentum followed by Newton-Schulz
+# orthogonalization of the update and a shape-dependent learning-rate adjustment. Contains the
+# Muon class, the orthogonalization and lr-adjust helpers, a single-tensor update and the
+# functional entry point muon. Defines module constants for epsilon and the default Newton-Schulz
+# coefficients and step count. Exports Muon. Import-time side effect: assigns Muon.__doc__.
 """Implementation of the Muon optimizer."""
 
 import math
@@ -31,6 +36,15 @@ DEFAULT_NS_STEPS = 5
 def _zeropower_via_newtonschulz(
     grad: Tensor, ns_coefficients: tuple[float, float, float], ns_steps: int, eps: float
 ) -> Tensor:
+    # [FUNCTION DOC] HELPER: Approximately orthogonalizes a 2D matrix with a quintic
+    # Newton-Schulz iteration run in bfloat16. Normalizes by the matrix norm (clamped below
+    # by eps), transposes tall matrices so the Gram matrix is small, applies ns_steps
+    # iterations using the three coefficients, then restores orientation. Returns a bfloat16
+    # tensor. Raises ValueError if ns_steps is 100 or more, the input is not 2D, or there
+    # are not exactly 3 coefficients.
+    # KNOWN ISSUE: if the input is already bfloat16 the conversion makes no copy, so the
+    # in-place division mutates the caller's tensor (possibly the momentum buffer). A
+    # comment says spectral norm but the code divides by the Frobenius norm.
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
     quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
@@ -71,6 +85,9 @@ def _zeropower_via_newtonschulz(
 
 
 def _adjust_lr(lr: float, adjust_lr_fn: str | None, param_shape: torch.Size) -> float:
+    # [FUNCTION DOC] HELPER: Returns lr scaled by a factor from the first two param dims A
+    # and B. original (or None): sqrt(max(1, A/B)); match_rms_adamw: 0.2 * sqrt(max(A, B));
+    # spectral_unclamped: sqrt(A/B); any other value: factor 1.
     """Default learning rate adjustment used by Muon."""
     A, B = param_shape[:2]
 
@@ -87,6 +104,10 @@ def _adjust_lr(lr: float, adjust_lr_fn: str | None, param_shape: torch.Size) -> 
 
 
 class Muon(Optimizer):
+# [CLASS DOC] Muon optimizer for 2D parameters only. Per-parameter state: momentum_buffer (zeros
+# like the grad initially). Group hyperparameters: lr, weight_decay, momentum, nesterov,
+# ns_coefficients, eps, ns_steps, adjust_lr_fn. Key methods: step (momentum, orthogonalized
+# update, decoupled weight decay) and the private group initializer.
     def __init__(
         self,
         params: ParamsT,
@@ -99,6 +120,9 @@ class Muon(Optimizer):
         ns_steps: int = DEFAULT_NS_STEPS,
         adjust_lr_fn: str | None = None,
     ) -> None:
+        # [FUNCTION DOC] Validates hyperparameters and builds defaults. Raises
+        # ValueError for a non-scalar tensor lr, negative lr, momentum or weight_decay,
+        # an unsupported adjust_lr_fn, or any parameter that is not 2D.
         if isinstance(lr, Tensor) and lr.numel() != 1:
             raise ValueError("Tensor lr must be 1-element")
         if not 0.0 <= lr:
@@ -142,6 +166,10 @@ class Muon(Optimizer):
         grads: list[Tensor],
         muon_momentum_bufs: list[Tensor],
     ) -> bool:
+        # [FUNCTION DOC] HELPER: Gathers parameters with gradients and their momentum
+        # buffers (created as zeros on first use) into the passed lists. Returns False
+        # (the has_complex flag). Raises RuntimeError for complex params or sparse
+        # grads. Mutates the lists and self.state.
         for p in group["params"]:
             if p.grad is None:
                 continue
@@ -166,6 +194,9 @@ class Muon(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
+        # [FUNCTION DOC] Performs one optimization step across all groups under no-grad,
+        # optionally re-evaluating a closure with grad enabled for the loss. Returns the
+        # loss or None. Updates params and momentum buffers in place.
         """Performs a single optimization step."""
         loss = None
         if closure is not None:
@@ -330,6 +361,13 @@ def _single_tensor_muon(
     adjust_lr_fn: str | None,
     has_complex: bool,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Per-parameter Muon update. Updates the momentum buffer with an
+    # exponential average, forms the (optionally Nesterov) update, orthogonalizes it,
+    # applies decoupled weight decay to the param, then subtracts the update scaled by the
+    # adjusted lr. Raises ValueError for complex params or non-2D grads. Mutates params and
+    # buffers in place.
+    # KNOWN ISSUE: the buffer update is an average weighted by 1 - momentum, which differs
+    # from the documented formula (momentum times buffer plus grad).
     lr = _to_scalar(lr)
     if has_complex:
         raise ValueError("Complex parameters are not supported")
@@ -368,6 +406,9 @@ def muon(
     adjust_lr_fn: str | None,
     has_complex: bool,
 ) -> None:
+    # [FUNCTION DOC] Functional Muon entry point; delegates to the single-tensor
+    # implementation. Raises RuntimeError if foreach is requested (unsupported). Mutates
+    # params and buffers in place.
     r"""Functional API that performs Muon algorithm computation.
 
     See :class:`~torch.optim.Muon` for details.
