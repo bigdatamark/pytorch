@@ -1,4 +1,8 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests inductor's CuTeDSL backend for grouped matrix multiplication
+# (grouped_mm). Compares eager results against max-autotune compiled results with only
+# the CUTEDSL gemm backend allowed and no fallback to aten. The tests are skipped unless
+# the CuTeDSL library is available and the device is a datacenter Blackwell GPU.
 
 
 import unittest
@@ -22,6 +26,8 @@ from torch.testing._internal.common_utils import (
 )
 @instantiate_parametrized_tests
 class TestCuTeDSLGroupedGemm(InductorTestCase):
+    # [CLASS DOC] Parametrized test case for CuTeDSL grouped GEMM on CUDA with bfloat16 data.
+    # Helper method builds inputs; test methods compare eager and compiled outputs.
     def _get_inputs(
         self,
         group_size: int,
@@ -32,6 +38,11 @@ class TestCuTeDSLGroupedGemm(InductorTestCase):
         dtype: torch.dtype,
         alignment: int = 16,
     ) -> tuple[Tensor, Tensor, Tensor]:
+        # [FUNCTION DOC] HELPER: Builds grouped_mm inputs. Draws one random row count per group,
+        # each a multiple of the alignment up to the hint, sums them for the packed
+        # left matrix (small random values), creates a batched right matrix of shape groups by K
+        # by N, and returns both plus an int32 cumulative-sum offsets tensor on the device
+        # (no leading zero, strictly increasing).
         # --- Random, tile-aligned M sizes ---
         M_sizes = (
             torch.randint(1, (M_hint // alignment) + 1, (group_size,), dtype=torch.int)
@@ -54,12 +65,17 @@ class TestCuTeDSLGroupedGemm(InductorTestCase):
     @parametrize("K", (64, 128))
     @parametrize("N", (128, 256))
     def test_grouped_gemm_basic(self, group_size: int, M_hint: int, K: int, N: int):
+        # [FUNCTION DOC] Parametrized over group count, row hint, K and N. Runs grouped_mm eagerly
+        # and compiled with CUTEDSL autotuning, then checks both outputs have bfloat16 dtype and
+        # match within default assert_close tolerances.
         device = "cuda"
         dtype = torch.bfloat16
 
         A, B, offsets = self._get_inputs(group_size, M_hint, K, N, device, dtype)
 
         def grouped_gemm_fn(A_packed, B_batched, offs):
+            # [FUNCTION DOC] HELPER: Calls the grouped matrix multiply on the packed input, batched
+            # weights and offsets.
             return F.grouped_mm(A_packed, B_batched, offs=offs)
 
         # Eager execution
@@ -90,6 +106,11 @@ class TestCuTeDSLGroupedGemm(InductorTestCase):
         layout_A: str,
         layout_B: str,
     ):
+        # [FUNCTION DOC] Parametrized over layouts of the left matrix (contiguous, nonzero storage
+        # offset, padded row pitch, view of flat storage) and the right matrix (contiguous or
+        # broadcast with zero stride over groups) with eight equal groups of 128 rows. Raises
+        # AssertionError if the view or broadcast layout is not as constructed. Compares eager
+        # against CUTEDSL max-autotune compiled output for dtype and values.
         device = "cuda"
         dtype = torch.bfloat16
 
@@ -130,6 +151,8 @@ class TestCuTeDSLGroupedGemm(InductorTestCase):
                 raise AssertionError
 
         def grouped_gemm_fn(A_packed, B_batched, offs):
+            # [FUNCTION DOC] HELPER: Calls the grouped matrix multiply on the packed input, batched
+            # weights and offsets.
             return F.grouped_mm(A_packed, B_batched, offs=offs)
 
         # --- eager ---

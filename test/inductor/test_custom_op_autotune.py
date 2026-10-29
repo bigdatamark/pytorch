@@ -1,4 +1,11 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for autotuning of custom ops in inductor. A custom op is registered with
+# several candidate configs (decomposition functions plus parameters, or a config generator
+# evaluated on input shapes), inductor benchmarks the variants under max autotune and picks one,
+# and the tests compare compiled results with reference implementations. Covers RMSNorm,
+# decompose-k matmul with epilogue, multi-parameter tuning, MLP, fusion, input generators, dtype
+# and layout handling and more. At module level it saves and sets float32 matmul precision to
+# high around the tests. The main class is skipped on macOS and without a GPU and Triton.
 """
 Tests for custom operation autotuning with PyTorch Inductor.
 
@@ -39,12 +46,16 @@ _PRIOR_FP32_MATMUL_PRECISION: str | None = None
 
 
 def setUpModule():
+    # [FUNCTION DOC] HELPER: Module setup: records the current float32 matmul precision in a
+    # module global and sets precision to high.
     global _PRIOR_FP32_MATMUL_PRECISION
     _PRIOR_FP32_MATMUL_PRECISION = torch.get_float32_matmul_precision()
     torch.set_float32_matmul_precision("high")
 
 
 def tearDownModule():
+    # [FUNCTION DOC] HELPER: Module teardown: restores the saved float32 matmul precision if one
+    # was recorded, then clears the saved value.
     global _PRIOR_FP32_MATMUL_PRECISION
     if _PRIOR_FP32_MATMUL_PRECISION is not None:
         torch.set_float32_matmul_precision(_PRIOR_FP32_MATMUL_PRECISION)
@@ -54,9 +65,16 @@ def tearDownModule():
 @unittest.skipIf(IS_MACOS, "TODO: mac")
 @unittest.skipUnless(HAS_GPU and HAS_TRITON, "requires GPU and Triton")
 class TestCustomOpAutoTune(TestCase):
+    # [CLASS DOC] Main test case for custom op autotuning, run on the GPU with Triton. Setup
+    # picks the device and dtype (half precision on cuda and xpu, else float32); shared helper
+    # methods run autotune comparisons, check implementations agree and build inputs for RMSNorm,
+    # MLP and decompose-k matmul tests.
     """Test custom operation autotuning functionality."""
 
     def setUp(self) -> None:
+        # [FUNCTION DOC] Resets dynamo, stores the device (the GPU type) and a dtype on the
+        # instance (half precision for cuda or xpu, otherwise float32), and clears the registry
+        # of user lowerings so earlier custom op registrations do not leak into a test.
         """Set up test environment with appropriate device and dtype."""
         super().setUp()
         torch._dynamo.reset()
@@ -72,10 +90,16 @@ class TestCustomOpAutoTune(TestCase):
         user_lowerings.clear()
 
     def _run_autotune_test(self, op_object, inputs, expected, test_name):
+        # [FUNCTION DOC] HELPER: Compiles a function that calls the given op, with max autotune
+        # on, the gemm backend set to TRITON on cuda and ATEN otherwise, the graph cache off
+        # and kernel benchmarking on. Asserts the compiled output shape equals the expected
+        # shape and that the values are close (relative 0.2, absolute 0.5), with the test name
+        # in failure messages.
         """Shared test infrastructure for autotuning tests."""
 
         @torch.compile
         def test_model(*args):
+            # [FUNCTION DOC] HELPER: Compiled wrapper that forwards its arguments to the op.
             return op_object(*args)
 
         torch._dynamo.reset()
@@ -103,6 +127,10 @@ class TestCustomOpAutoTune(TestCase):
         )
 
     def _assert_implementations_equivalent(self, decompositions, inputs, op_name):
+        # [FUNCTION DOC] HELPER: Runs each decomposition function on the inputs, asserts
+        # every result is finite, then compares each against the first result with
+        # tolerance 0.01 (0.1 when the function name contains Approximated). Raises on non-
+        # finite or mismatching values.
         """Utility to assert that all implementations produce equivalent results."""
         implementations = [(func.__name__, func) for func in decompositions]
         results = {}
@@ -131,6 +159,9 @@ class TestCustomOpAutoTune(TestCase):
                 )
 
     def _create_rmsnorm_inputs(self, batch_size=32, seq_len=2048, hidden_dim=512):
+        # [FUNCTION DOC] HELPER: Creates a random input of shape batch, sequence, hidden
+        # and a random weight of hidden size on the test device and dtype, without
+        # gradients. Returns both.
         """Create test inputs for RMSNorm operations."""
         input_tensor = torch.randn(
             batch_size,
@@ -153,6 +184,9 @@ class TestCustomOpAutoTune(TestCase):
         intermediate_dim=1024,
         output_dim=256,
     ):
+        # [FUNCTION DOC] HELPER: Creates random tensors without gradients: input of shape batch,
+        # sequence, hidden; gate and up weights of hidden by intermediate; down weight of
+        # intermediate by output. Returns the four tensors in that order.
         """Create test inputs for MLP operations."""
         input_tensor = torch.randn(
             batch_size,
@@ -186,6 +220,9 @@ class TestCustomOpAutoTune(TestCase):
         return input_tensor, gate_weight, up_weight, down_weight
 
     def test_rmsnorm_custom_op_autotune_with_dynamic_shape(self):
+        # [FUNCTION DOC] Registers a custom RMSNorm op with two decomposition configs and input
+        # generators (small scaled random input, ones weight), then for two shapes checks the
+        # decompositions agree and the autotuned compiled op matches the first decomposition.
         """Test RMSNorm autotuning with multiple decomposition variants and dynamic shapes.
 
         Validates:
@@ -197,6 +234,8 @@ class TestCustomOpAutoTune(TestCase):
         def rmsnorm_decomposition1(
             x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-8
         ) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: RMSNorm using mean of squares, reciprocal square root, then
+            # multiplication by input and weight.
             """Variance-based approach: compute variance then rsqrt."""
             variance = x.pow(2).mean(dim=-1, keepdim=True)
             rstd = torch.rsqrt(variance + eps)
@@ -205,6 +244,8 @@ class TestCustomOpAutoTune(TestCase):
         def rmsnorm_decomposition2(
             x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-8
         ) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: RMSNorm computed by normalizing the input first, then
+            # scaling by the weight.
             """Separate normalization and scaling: compute normalized value then scale."""
             x_var = x
             variance = x_var.pow(2).mean(dim=-1, keepdim=True)
@@ -216,12 +257,16 @@ class TestCustomOpAutoTune(TestCase):
         def test_rmsnorm_op(
             input_tensor: torch.Tensor, weight: torch.Tensor, eps: float = 1e-8
         ) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op whose eager implementation calls the standard
+            # rms_norm over the last dimension with the given weight and epsilon.
             return torch.nn.functional.rms_norm(
                 input_tensor, input_tensor.shape[-1:], weight, eps=eps
             )
 
         @test_rmsnorm_op.register_fake
         def _(input_tensor: torch.Tensor, weight: torch.Tensor, eps: float = 1e-8):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor
+            # like the input.
             return torch.empty_like(input_tensor)
 
         decompositions = [
@@ -260,6 +305,9 @@ class TestCustomOpAutoTune(TestCase):
             )
 
     def _create_decompose_k_inputs(self, m=256, k=65536, n=1024):
+        # [FUNCTION DOC] HELPER: Creates random a (m by k, with k rounded up to a multiple of 256
+        # so all k split values divide it), b (k by n) and a bias scaled by 0.1 (length n) on the
+        # test device and dtype. Returns a, b and bias.
         """Create test inputs for decompose_k matrix multiplication.
         Tensor a: Input matrix of shape (m, k)
         Tensor b: Weight matrix of shape (k, n)
@@ -277,6 +325,10 @@ class TestCustomOpAutoTune(TestCase):
 
     @skipIfRocm(msg="https://github.com/pytorch/pytorch/issues/171519")
     def test_decompose_k_custom_op_autotune_dynamic_config_for_input_shape(self):
+        # [FUNCTION DOC] Skipped on ROCm. Registers a custom op doing a decompose-k matmul with
+        # bias, relu and scale, with a config generator that computes k split choices from the
+        # input shapes, then for two shapes compiles with max autotune and benchmark fusion and
+        # compares against a plain matmul based reference.
         """Test decompose_k autotuning with epilogue fusion(matmul+bias+relu+scale) and
         dynamic config generation based on matmul input shapes.
 
@@ -291,6 +343,9 @@ class TestCustomOpAutoTune(TestCase):
         def decompose_k_implementation(
             a: torch.Tensor, b: torch.Tensor, k_splits: int = 4
         ) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Matrix multiply that splits the shared dimension into
+            # the given number of parts, does a batched multiply of the parts and sums
+            # over the parts.
             """Matrix multiply with k-way decomposition."""
             m = a.shape[0]
             n = b.shape[1]
@@ -312,6 +367,8 @@ class TestCustomOpAutoTune(TestCase):
         def matmul_relu_epilogue_dynamic_op(
             a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor, k_splits: int = 4
         ) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op performing the decomposed matmul, adding bias,
+            # applying relu and multiplying by two.
             """Matmul with decompose_k + bias + relu + scale (complete epilogue fusion)."""
             matmul_result = decompose_k_implementation(a, b, k_splits)
             biased = matmul_result + bias
@@ -321,12 +378,17 @@ class TestCustomOpAutoTune(TestCase):
 
         @matmul_relu_epilogue_dynamic_op.register_fake
         def _(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor, k_splits: int = 4):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor
+            # of output shape.
             return torch.empty(a.shape[0], b.shape[1], device=a.device, dtype=a.dtype)
 
         # Define dynamic config generator using get_k_splits
         def generate_k_split_configs(
             fake_tensors: dict[str, torch.Tensor],
         ) -> list[CustomOpConfig]:
+            # [FUNCTION DOC] HELPER: Config generator: reads the matrix dimensions from the fake
+            # tensors, asks the shared utility for the candidate k split values and returns one
+            # config per value.
             """Generate k_split configs based on input matrix dimensions."""
             from torch._inductor.utils import get_k_splits
 
@@ -369,6 +431,7 @@ class TestCustomOpAutoTune(TestCase):
 
             @torch.compile
             def test_model(a, b, bias):
+                # [FUNCTION DOC] HELPER: Compiled wrapper calling the custom op on a, b and bias.
                 return matmul_relu_epilogue_dynamic_op(a, b, bias)
 
             torch._dynamo.reset()
@@ -380,6 +443,8 @@ class TestCustomOpAutoTune(TestCase):
                 compiled_result = test_model(a, b, bias)
 
             def reference_model(a, b, bias):
+                # [FUNCTION DOC] HELPER: Reference computation: matmul, add bias, relu,
+                # multiply by two.
                 matmul_result = a @ b
                 biased = matmul_result + bias
                 activated = torch.relu(biased)
@@ -397,6 +462,10 @@ class TestCustomOpAutoTune(TestCase):
             )
 
     def test_multi_parameter_tuning(self):
+        # [FUNCTION DOC] Registers a custom scaling op with four configs over two parameters
+        # (a scale mode and a chunk size), checks each mode and chunk combination of the
+        # reference function matches multiplication by the factor (tolerance 1e-5), then runs
+        # the autotune comparison.
         """Test autotuning with multiple parameters for combinatorial parameter exploration.
 
         Validates parametric tuning with multiple parameters (scale_mode and chunk_size)
@@ -410,6 +479,10 @@ class TestCustomOpAutoTune(TestCase):
             scale_mode: int = 1,
             chunk_size: int = 16,
         ) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Scales the input by the factor in one of three ways chosen
+            # by the mode: direct broadcast multiply, multiply per slice along the sequence
+            # dimension in chunks of the given size then concatenate, or an einsum. Returns None
+            # for any other mode.
             """Different scaling approaches controlled by scale_mode parameter."""
             if scale_mode == 1:
                 # Simple broadcasting
@@ -434,6 +507,8 @@ class TestCustomOpAutoTune(TestCase):
             scale_mode: int = 1,
             chunk_size: int = 16,
         ) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op that delegates to the scaling function with the
+            # given mode and chunk size.
             return multi_param_scaling(x, factor, scale_mode, chunk_size)
 
         @multi_param_op.register_fake
@@ -443,6 +518,8 @@ class TestCustomOpAutoTune(TestCase):
             scale_mode: int = 1,
             chunk_size: int = 16,
         ):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor
+            # like the input.
             return torch.empty_like(x)
 
         # Use explicit configs with scale_mode and chunk_size parameters as tuning knobs
@@ -496,6 +573,12 @@ class TestCustomOpAutoTune(TestCase):
         )
 
     def test_range_based_static_shape_no_cond_dispatch(self):
+        # [FUNCTION DOC] Registers an op with three equivalent addition implementations
+        # dispatched on the second dimension of the first input with split points. Compiles with
+        # max autotune once with static shapes and once with dynamic shapes, capturing generated
+        # code. Asserts results equal the plain sum, no shape dispatch code (found by a regular
+        # expression over the code) for static shapes, and some dispatch code for dynamic shapes.
+        # Prints what it finds.
         """Test dispatch code generation for static vs dynamic shapes.
 
         Static shapes (dynamic=False): No dispatch logic, best impl is inlined.
@@ -508,20 +591,28 @@ class TestCustomOpAutoTune(TestCase):
         test_op_name = f"test_lib::static_no_cond_{id(self)}"
 
         def impl_a(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Candidate implementation: plain addition.
             return x + weight
 
         def impl_b(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Candidate implementation: adds the weight reshaped and
+            # expanded to the input shape.
             return x + weight.view(1, 1, -1).expand_as(x)
 
         def impl_c(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Candidate implementation: addition via the add function.
             return torch.add(x, weight)
 
         @torch.library.custom_op(test_op_name, mutates_args=())
         def static_no_cond_op(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op whose eager implementation adds the weight
+            # to the input.
             return x + weight
 
         @static_no_cond_op.register_fake
         def _(x: torch.Tensor, weight: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor
+            # like the input.
             return torch.empty_like(x)
 
         register_custom_op_autotuning(
@@ -544,6 +635,9 @@ class TestCustomOpAutoTune(TestCase):
         test_weight = torch.randn(32, device=self.device, dtype=self.dtype)
 
         def find_shape_dispatch(code_list):
+            # [FUNCTION DOC] HELPER: Returns the stripped lines from all given code strings that
+            # match a regular expression for shape-dependent conditionals or a selector computed
+            # from a symbol.
             pattern = re.compile(r"if\s+s\d+\s*[<>=]|_selector\s*=\s*int\(.*\bs\d+")
             return [
                 line.strip()
@@ -553,6 +647,7 @@ class TestCustomOpAutoTune(TestCase):
             ]
 
         def test_model(x, weight):
+            # [FUNCTION DOC] HELPER: Model function that calls the registered op.
             return static_no_cond_op(x, weight)
 
         # Static shape (dynamic=False) - should NOT have shape dispatch
@@ -600,6 +695,10 @@ class TestCustomOpAutoTune(TestCase):
     @skipIfRocm(msg="https://github.com/pytorch/pytorch/issues/179943")
     @skipIfXpu
     def test_benchmark_with_cudagraphs_uses_cuda_graph_benchmarking(self):
+        # [FUNCTION DOC] Skipped on ROCm, XPU and non-CUDA devices. Registers a single config
+        # with the benchmark-with-cudagraphs option on, wraps the benchmarker's CUDA-graph
+        # benchmarking method to set a flag when called, compiles with max autotune, then asserts
+        # the flag was set and the result matches a matmul within tolerance 0.1.
         """Test that benchmark_with_cudagraphs flag causes CUDA graph benchmarking to be used."""
         if self.device != "cuda":
             self.skipTest("CUDA graph test requires CUDA device")
@@ -609,14 +708,18 @@ class TestCustomOpAutoTune(TestCase):
         test_op_name = f"test_lib::cudagraph_patch_{id(self)}"
 
         def fast_decomposition(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Candidate implementation: matrix multiply.
             return x @ weight
 
         @torch.library.custom_op(test_op_name, mutates_args=())
         def cudagraph_patch_op(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op whose eager implementation is a matrix multiply.
             return x @ weight
 
         @cudagraph_patch_op.register_fake
         def _(x: torch.Tensor, weight: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor
+            # of output shape.
             return torch.empty(
                 x.shape[0], weight.shape[1], device=x.device, dtype=x.dtype
             )
@@ -637,12 +740,16 @@ class TestCustomOpAutoTune(TestCase):
 
         @torch.compile
         def test_model(x, weight):
+            # [FUNCTION DOC] HELPER: Compiled wrapper that calls the op.
             return cudagraph_patch_op(x, weight)
 
         cuda_graph_benchmark_called = False
         original_benchmark_gpu_with_cuda_graph = torch._inductor.runtime.benchmarking.Benchmarker.benchmark_gpu_with_cuda_graph
 
         def patched_benchmark_gpu_with_cuda_graph(self, fn, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Replacement for the CUDA-graph benchmarking method:
+            # sets the enclosing flag to true then delegates to the saved original method
+            # with the same arguments.
             nonlocal cuda_graph_benchmark_called
             cuda_graph_benchmark_called = True
             return original_benchmark_gpu_with_cuda_graph(self, fn, *args, **kwargs)
@@ -664,18 +771,25 @@ class TestCustomOpAutoTune(TestCase):
 
     @skipIfXpu
     def test_min_speedup_threshold_api(self):
+        # [FUNCTION DOC] Skipped on XPU. Checks that registering with a minimum speedup threshold
+        # of 1.5 is accepted and a compiled call under max autotune still gives a matmul-
+        # equivalent result (tolerance 0.1).
         """Test that min_speedup_threshold parameter is accepted and compilation works."""
         test_op_name = f"test_lib::min_speedup_{id(self)}"
 
         def decomposition(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Candidate implementation: matrix multiply.
             return x @ weight
 
         @torch.library.custom_op(test_op_name, mutates_args=())
         def min_speedup_op(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op whose eager implementation is a matrix multiply.
             return x @ weight
 
         @min_speedup_op.register_fake
         def _(x: torch.Tensor, weight: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor
+            # of output shape.
             return torch.empty(
                 x.shape[0], weight.shape[1], device=x.device, dtype=x.dtype
             )
@@ -697,6 +811,7 @@ class TestCustomOpAutoTune(TestCase):
 
         @torch.compile
         def test_model(x, weight):
+            # [FUNCTION DOC] HELPER: Compiled wrapper that calls the op.
             return min_speedup_op(x, weight)
 
         torch._dynamo.reset()
@@ -707,6 +822,9 @@ class TestCustomOpAutoTune(TestCase):
 
     @skipIfXpu
     def test_config_patching_in_generated_code(self):
+        # [FUNCTION DOC] Skipped on XPU and non-CUDA devices. Registers a config whose config
+        # patches enable coordinate descent tuning, compiles under max autotune and checks the
+        # generated code text includes that option enabled in the inductor metadata.
         """Test that coordinate_descent_tuning config_patches flows through to generated code."""
         if self.device != "cuda":
             self.skipTest(
@@ -716,14 +834,19 @@ class TestCustomOpAutoTune(TestCase):
         test_op_name = f"test_lib::coord_descent_{id(self)}"
 
         def decomposition(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Candidate implementation: returns a tensor of ones shaped
+            # like the input.
             return torch.ones_like(x)
 
         @torch.library.custom_op(test_op_name, mutates_args=())
         def coord_op(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op whose eager implementation is a matrix multiply.
             return x @ weight
 
         @coord_op.register_fake
         def _(x: torch.Tensor, weight: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor
+            # of output shape.
             return torch.empty(
                 x.shape[0], weight.shape[1], device=x.device, dtype=x.dtype
             )
@@ -748,6 +871,7 @@ class TestCustomOpAutoTune(TestCase):
 
         @torch.compile
         def test_model(x, weight):
+            # [FUNCTION DOC] HELPER: Compiled wrapper that calls the op.
             return coord_op(x, weight)
 
         torch._dynamo.reset()
@@ -769,6 +893,17 @@ class TestCustomOpAutoTune(TestCase):
         }
     )
     def test_split_config_patching_in_generated_code(self):
+        # [FUNCTION DOC] Skipped on XPU and non-CUDA devices; forces custom op decomposition and
+        # disables implementation grouping. Registers an op whose eager implementation differs
+        # from its single decomposition config (which fills the output with the row count),
+        # dispatched on the first dimension with split points 128 and 512, with coordinate
+        # descent tuning in the config patches. Compiles with a dynamic first dimension, then
+        # calls it ten times with different row counts under an error on recompile setting and
+        # checks each result equals the decomposition (so no recompile and the decomposition was
+        # used). Also asserts every generated code module contains the coordinate descent tuning
+        # option enabled.
+        # KNOWN ISSUE: the existing docstring is copied from the previous test and does not
+        #   describe the dispatch and recompilation behavior actually exercised here.
         """Test that coordinate_descent_tuning config_patches flows through to generated code."""
         if self.device != "cuda":
             self.skipTest(
@@ -778,6 +913,8 @@ class TestCustomOpAutoTune(TestCase):
         test_op_name = f"test_lib::coord_descent_{id(self)}"
 
         def decomposition(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Candidate implementation: returns a tensor of the output
+            # shape filled with the number of rows of the input.
             return torch.full(
                 (x.shape[0], weight.shape[1]),
                 x.shape[0],
@@ -787,6 +924,8 @@ class TestCustomOpAutoTune(TestCase):
 
         @torch.library.custom_op(test_op_name, mutates_args=())
         def coord_op(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op whose eager implementation returns an
+            # uninitialized tensor when the input has 128 rows and a matrix multiply otherwise.
             if x.shape[0] == 128:
                 return torch.empty(
                     x.shape[0],
@@ -798,6 +937,8 @@ class TestCustomOpAutoTune(TestCase):
 
         @coord_op.register_fake
         def _(x: torch.Tensor, weight: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor
+            # of output shape.
             return torch.empty(
                 x.shape[0], weight.shape[1], device=x.device, dtype=x.dtype
             )
@@ -824,6 +965,7 @@ class TestCustomOpAutoTune(TestCase):
 
         @torch.compile
         def test_model(x, weight):
+            # [FUNCTION DOC] HELPER: Compiled wrapper that calls the op.
             return coord_op(x, weight)
 
         torch._dynamo.mark_dynamic(test_x, 0)
@@ -853,6 +995,11 @@ class TestCustomOpAutoTune(TestCase):
 
     @skipIfXpu
     def test_benchmark_real_trace_symbolic(self):
+        # [FUNCTION DOC] Skipped on XPU and non-CUDA devices. Registers an op that records the
+        # row count of its input every time the real implementation runs, with range dispatch on
+        # the first dimension (split points 128 and 512). Compiles with dynamic shapes under max
+        # autotune and checks that the recorded sizes during benchmarking were concrete integers,
+        # all three ranges were exercised, and the generated code contains symbolic size names.
         """Verify benchmarking uses real values but tracing uses symbolic shapes."""
         if self.device != "cuda":
             self.skipTest("Test requires CUDA")
@@ -863,16 +1010,22 @@ class TestCustomOpAutoTune(TestCase):
         test_op_name = f"test_lib::shape_tracker_{id(self)}"
 
         def decomposition(x, weight):
+            # [FUNCTION DOC] HELPER: Candidate implementation: matrix multiply.
             return x @ weight
 
         @torch.library.custom_op(test_op_name, mutates_args=())
         def shape_tracker_op(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op that appends the input's row count to the
+            # enclosing list (side effect, used to see benchmark shapes) and returns a matrix
+            # multiply.
             # This runs during benchmarking with REAL values
             shapes_seen.append(x.shape[0])
             return x @ weight
 
         @shape_tracker_op.register_fake
         def _(x, weight):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor
+            # of output shape.
             return torch.empty(
                 x.shape[0], weight.shape[1], device=x.device, dtype=x.dtype
             )
@@ -894,6 +1047,7 @@ class TestCustomOpAutoTune(TestCase):
 
         @torch.compile(dynamic=True)
         def test_model(x, weight):
+            # [FUNCTION DOC] HELPER: Compiled (dynamic) wrapper that calls the op.
             return shape_tracker_op(x, weight)
 
         torch._dynamo.mark_dynamic(test_x, 0)
@@ -936,6 +1090,11 @@ class TestCustomOpAutoTune(TestCase):
 
     @skipIfXpu
     def test_torch_cond_with_shape_accessing_implementations(self):
+        # [FUNCTION DOC] Skipped on XPU. Registers an op with two configs, one of which reads the
+        # input's shape and splits the work in four when divisible, dispatched on the first
+        # dimension with split points four and sixteen. Compiles dynamically under max autotune
+        # and checks the result matches a plain matrix multiply (tolerance 0.1), verifying shape-
+        # reading implementations work inside the conditional dispatch.
         """Test torch.cond dispatch with implementations that access tensor shapes.
 
         Validates that implementations like decompose_k that access tensor shapes
@@ -947,6 +1106,9 @@ class TestCustomOpAutoTune(TestCase):
         def shape_accessing_impl(
             mat1: torch.Tensor, mat2: torch.Tensor
         ) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Candidate implementation that unpacks the input shape; if
+            # the shared dimension is divisible by four it uses a split batched multiply,
+            # otherwise a plain matmul.
             m, k = mat1.shape  # Shape access that would break naive make_fx
             n = mat2.shape[1]
             k_splits = 4
@@ -958,14 +1120,18 @@ class TestCustomOpAutoTune(TestCase):
             return mat1 @ mat2
 
         def simple_impl(mat1: torch.Tensor, mat2: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Candidate implementation: plain matrix multiply.
             return mat1 @ mat2
 
         @torch.library.custom_op(test_op_name, mutates_args=())
         def shape_access_op(mat1: torch.Tensor, mat2: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op whose eager implementation is a matrix multiply.
             return mat1 @ mat2
 
         @shape_access_op.register_fake
         def _(mat1: torch.Tensor, mat2: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor
+            # of output shape.
             return torch.empty(
                 mat1.shape[0], mat2.shape[1], device=mat1.device, dtype=mat1.dtype
             )
@@ -987,6 +1153,7 @@ class TestCustomOpAutoTune(TestCase):
 
         @torch.compile(dynamic=True)
         def test_model(mat1, mat2):
+            # [FUNCTION DOC] HELPER: Compiled (dynamic) wrapper that calls the op.
             return shape_access_op(mat1, mat2)
 
         torch._dynamo.reset()
@@ -998,6 +1165,10 @@ class TestCustomOpAutoTune(TestCase):
     @skipIfXpu
     @unittest.skipIf(not IS_BIG_GPU, "Test requires large GPU memory")
     def test_empty_config_generator_falls_back_to_triton(self):
+        # [FUNCTION DOC] Skipped on XPU and without a big GPU. Registers a config generator that
+        # returns no configs for the aten mm op, checks a user lowering entry exists for it, then
+        # compiles a matrix multiply under max autotune with the TRITON backend and checks the
+        # result matches eager (the empty generator must fall back to normal lowering).
         """Test that empty config_generator falls back to normal mm autotuning.
 
         When config_generator returns empty list, the user_lowering returns None
@@ -1007,6 +1178,7 @@ class TestCustomOpAutoTune(TestCase):
 
         # Config generator that returns empty - should trigger fallback
         def empty_config_gen(fake_tensors):
+            # [FUNCTION DOC] HELPER: Config generator that always returns an empty list.
             return []
 
         register_custom_op_autotuning(
@@ -1023,6 +1195,7 @@ class TestCustomOpAutoTune(TestCase):
 
         @torch.compile
         def test_model(a, b):
+            # [FUNCTION DOC] HELPER: Compiled wrapper doing a matrix multiply.
             return torch.mm(a, b)
 
         # Enable max_autotune with TRITON backend
@@ -1041,6 +1214,11 @@ class TestCustomOpAutoTune(TestCase):
     @skipIfXpu
     @config.patch({"test_configs.force_custom_op_decomposition": True})
     def test_guard_safety_drops_unsafe_decomposition(self):
+        # [FUNCTION DOC] Skipped on XPU; forces decomposition use. Registers a decomposition that
+        # only works when the row count is divisible by four, compiles dynamically with eight
+        # rows, asserts the guard-skip counter increased and the result is right, then calls with
+        # seven rows and checks that result too (the unsafe decomposition's guard must not leak
+        # into compiled code).
         """Test that decompositions adding guards are replaced with fallback.
 
         Compiles with m=8 (divisible by 4, satisfies the unsafe impl's guard),
@@ -1051,6 +1229,9 @@ class TestCustomOpAutoTune(TestCase):
         test_op_name = f"test_lib::guard_safety_{id(self)}"
 
         def unsafe_impl(mat1: torch.Tensor, mat2: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Candidate decomposition that, when the row count is
+            # divisible by four, reshapes into four groups and uses a batched multiply, otherwise
+            # a plain matmul.
             m = mat1.shape[0]
             if m % 4 == 0:
                 n = mat2.shape[1]
@@ -1062,14 +1243,18 @@ class TestCustomOpAutoTune(TestCase):
             return mat1 @ mat2
 
         def safe_impl(mat1: torch.Tensor, mat2: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Candidate implementation: plain matrix multiply.
             return mat1 @ mat2
 
         @torch.library.custom_op(test_op_name, mutates_args=())
         def guard_safety_op(mat1: torch.Tensor, mat2: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op whose eager implementation is a matrix multiply.
             return mat1 @ mat2
 
         @guard_safety_op.register_fake
         def _(mat1: torch.Tensor, mat2: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor
+            # of output shape.
             return torch.empty(
                 mat1.shape[0], mat2.shape[1], device=mat1.device, dtype=mat1.dtype
             )
@@ -1088,6 +1273,7 @@ class TestCustomOpAutoTune(TestCase):
 
         @torch.compile(dynamic=True)
         def test_model(mat1, mat2):
+            # [FUNCTION DOC] HELPER: Compiled (dynamic) wrapper that calls the op.
             return guard_safety_op(mat1, mat2)
 
         torch._dynamo.reset()
@@ -1119,6 +1305,8 @@ class TestCustomOpAutoTune(TestCase):
         )
 
     def test_fallback_choice_reuse(self):
+        # [FUNCTION DOC] Defines a custom op and asks the internal fallback-choice creator twice
+        # for its overload; asserts both calls return the identical object.
         """Test that _create_fallback_choice reuses the same choice for the same op.
 
         Since kwargs are passed at bind time rather than baked into the kernel,
@@ -1130,10 +1318,13 @@ class TestCustomOpAutoTune(TestCase):
 
         @torch.library.custom_op(test_op_name, mutates_args=())
         def reuse_test_op(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op that returns a clone of the input.
             return x.clone()
 
         @reuse_test_op.register_fake
         def _(x: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor
+            # like the input.
             return torch.empty_like(x)
 
         op_overload = reuse_test_op._opoverload
@@ -1146,6 +1337,10 @@ class TestCustomOpAutoTune(TestCase):
     @skipIfXpu
     @config.patch({"test_configs.force_custom_op_decomposition": False})
     def test_fallback_different_kwargs(self):
+        # [FUNCTION DOC] Skipped on XPU; decomposition forcing disabled. Registers a scale op and
+        # calls it twice in one compiled function with different scale arguments (two and five),
+        # checking both results and that both argument values appear in the generated code, so
+        # keyword arguments are bound per call to the shared fallback kernel.
         """Test that the same fallback ExternKernelChoice works with different kwargs.
 
         Previously, kwargs were baked into the fallback wrapper at choice creation
@@ -1158,14 +1353,18 @@ class TestCustomOpAutoTune(TestCase):
         test_op_name = "test_lib::fallback_kwargs"
 
         def scale_impl(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Candidate implementation: multiplies the input by the scale.
             return x * scale
 
         @torch.library.custom_op(test_op_name, mutates_args=())
         def kwargs_op(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op that multiplies the input by the scale.
             return x * scale
 
         @kwargs_op.register_fake
         def _(x: torch.Tensor, scale: float = 1.0):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor
+            # like the input.
             return torch.empty_like(x)
 
         register_custom_op_autotuning(
@@ -1178,6 +1377,8 @@ class TestCustomOpAutoTune(TestCase):
 
         @torch.compile
         def test_model(x):
+            # [FUNCTION DOC] HELPER: Compiled wrapper calling the op twice with scale two and
+            # five, returning both results.
             a = kwargs_op(x, scale=2.0)
             b = kwargs_op(x, scale=5.0)
             return a, b
@@ -1196,6 +1397,10 @@ class TestCustomOpAutoTune(TestCase):
     @skipIfXpu
     @config.patch({"test_configs.force_custom_op_decomposition": True})
     def test_config_overrides_runtime_kwargs(self):
+        # [FUNCTION DOC] Skipped on XPU; forces decomposition use. Checks that the explicit
+        # parameter in the config (scale seven) overrides the op's default scale, by compiling
+        # and examining the generated code contains the value seven and the result equals the
+        # input times seven.
         """Test that CustomOpConfig params override runtime default kwargs.
 
         The op has scale=1.0 as default, but the config specifies scale=7.0.
@@ -1207,14 +1412,18 @@ class TestCustomOpAutoTune(TestCase):
         test_op_name = f"test_lib::config_override_{id(self)}"
 
         def scale_impl(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Candidate implementation: multiplies the input by the scale.
             return x * scale
 
         @torch.library.custom_op(test_op_name, mutates_args=())
         def config_override_op(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op that multiplies the input by the scale.
             return x * scale
 
         @config_override_op.register_fake
         def _(x: torch.Tensor, scale: float = 1.0):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor
+            # like the input.
             return torch.empty_like(x)
 
         register_custom_op_autotuning(
@@ -1227,6 +1436,7 @@ class TestCustomOpAutoTune(TestCase):
 
         @torch.compile
         def test_model(x):
+            # [FUNCTION DOC] HELPER: Compiled wrapper that calls the op with its defaults.
             return config_override_op(x)
 
         torch._dynamo.reset()
@@ -1239,19 +1449,27 @@ class TestCustomOpAutoTune(TestCase):
 
     @skipIfXpu
     def test_input_gen_fns_invoked(self):
+        # [FUNCTION DOC] Skipped on XPU. Registers an op whose input generators record the input
+        # name when invoked, compiles and runs it, and asserts both generators were called (so
+        # the custom input generators are used when benchmarking choices).
         """Test that input_gen_fns are actually called during benchmarking."""
         test_op_name = f"test_lib::input_gen_test_{id(self)}"
         gen_calls = []
 
         def decomp(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Candidate implementation: elementwise product of the inputs.
             return x * weight
 
         @torch.library.custom_op(test_op_name, mutates_args=())
         def input_gen_op(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op that returns the elementwise product
+            # of its inputs.
             return x * weight
 
         @input_gen_op.register_fake
         def _(x: torch.Tensor, weight: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor
+            # like the input.
             return torch.empty_like(x)
 
         register_custom_op_autotuning(
@@ -1269,6 +1487,7 @@ class TestCustomOpAutoTune(TestCase):
 
         @torch.compile
         def test_model(x, w):
+            # [FUNCTION DOC] HELPER: Compiled wrapper that calls the op.
             return input_gen_op(x, w)
 
         torch._dynamo.reset()
@@ -1280,6 +1499,10 @@ class TestCustomOpAutoTune(TestCase):
     @skipIfXpu
     @parametrize("force_choice", [None, True, False])
     def test_kwargs_codegen(self, force_choice):
+        # [FUNCTION DOC] Parametrized over the force-decomposition config (unset, true, false)
+        # which selects autotuning, decomposition or fallback. Registers a scale op, calls it
+        # with a non-default scale of three through a compiled function under that setting and
+        # checks the result equals the input times three, naming the path in failure messages.
         """Test that kwargs are correctly passed through codegen for both fallback and decomposition.
 
         This validates that when a custom op is called with non-default kwargs:
@@ -1294,14 +1517,18 @@ class TestCustomOpAutoTune(TestCase):
         test_op_name = f"test_lib::kwargs_codegen_{id(self)}_{force_choice}"
 
         def scale_impl(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Candidate implementation: multiplies the input by the scale.
             return x * scale
 
         @torch.library.custom_op(test_op_name, mutates_args=())
         def kwargs_op(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op that multiplies the input by the scale.
             return x * scale
 
         @kwargs_op.register_fake
         def _(x: torch.Tensor, scale: float = 1.0):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor
+            # like the input.
             return torch.empty_like(x)
 
         register_custom_op_autotuning(
@@ -1316,6 +1543,8 @@ class TestCustomOpAutoTune(TestCase):
 
         @torch.compile
         def test_model(x):
+            # [FUNCTION DOC] HELPER: Compiled wrapper calling the op with the outer scale value
+            # as a keyword argument.
             return kwargs_op(x, scale=scale_value)
 
         torch._dynamo.reset()
@@ -1336,6 +1565,12 @@ class TestCustomOpAutoTune(TestCase):
         }
     )
     def test_shape_dependent_computation(self):
+        # [FUNCTION DOC] Skipped on XPU; forces decomposition use. Registers an op whose
+        # decomposition multiplies the input by its first dimension size while the eager
+        # implementation just clones, compiles once with a dynamic first dimension and checks the
+        # result, then runs the same compiled function with first dimensions 16, 32, 64 and 128
+        # and checks each result equals input times its own size (tolerance 1e-5), showing
+        # tracing used symbolic sizes.
         """Test that decompositions using shape in computation (e.g., x * x.shape[0]) work correctly.
 
         This validates that make_fx tracing uses symbolic inputs so that shape-dependent
@@ -1352,16 +1587,21 @@ class TestCustomOpAutoTune(TestCase):
         test_op_name = f"test_lib::shape_compute_{id(self)}"
 
         def shape_compute_impl(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Candidate decomposition: multiplies the input by
+            # its first dimension.
             """Scale by first dimension size - captures x * s0 with symbolic tracing."""
             return x * x.shape[0]
 
         @torch.library.custom_op(test_op_name, mutates_args=())
         def shape_compute_op(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op whose eager fallback returns a clone of the input.
             # Fallback: just returns x (no shape dependency)
             return x.clone()
 
         @shape_compute_op.register_fake
         def _(x: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor
+            # like the input.
             return torch.empty_like(x)
 
         register_custom_op_autotuning(
@@ -1375,6 +1615,7 @@ class TestCustomOpAutoTune(TestCase):
 
         @torch.compile(dynamic=True)
         def test_model(x):
+            # [FUNCTION DOC] HELPER: Compiled (dynamic) wrapper that calls the op.
             return shape_compute_op(x)
 
         # Compile once with initial size
@@ -1408,6 +1649,10 @@ class TestCustomOpAutoTune(TestCase):
 
     @skipIfXpu
     def test_partial_input_gen_fns(self):
+        # [FUNCTION DOC] Skipped on XPU. Registers an op with an input generator only for the
+        # first input, so the second input uses a tensor built from the graph node with
+        # concrete hints. Compiles under max autotune and checks the result matches a matrix
+        # multiply (tolerance 0.1).
         """Test autotuning when input_gen_fns covers only some inputs.
 
         The uncovered inputs should fall back to ir_node_to_tensor with concrete hints.
@@ -1415,14 +1660,18 @@ class TestCustomOpAutoTune(TestCase):
         test_op_name = f"test_lib::partial_gen_{id(self)}"
 
         def decomposition(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Candidate implementation: matrix multiply.
             return x @ weight
 
         @torch.library.custom_op(test_op_name, mutates_args=())
         def partial_gen_op(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op whose eager implementation is a matrix multiply.
             return x @ weight
 
         @partial_gen_op.register_fake
         def _(x: torch.Tensor, weight: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Fake implementation returning an empty tensor
+            # of output shape.
             return torch.empty(
                 x.shape[0], weight.shape[1], device=x.device, dtype=x.dtype
             )
@@ -1442,6 +1691,7 @@ class TestCustomOpAutoTune(TestCase):
 
         @torch.compile
         def test_model(x, weight):
+            # [FUNCTION DOC] HELPER: Compiled wrapper that calls the op.
             return partial_gen_op(x, weight)
 
         torch._dynamo.reset()
@@ -1452,6 +1702,10 @@ class TestCustomOpAutoTune(TestCase):
 
     @skipIfXpu
     def test_cudagraph_memory_cleanup(self):
+        # [FUNCTION DOC] Skipped on XPU and non-CUDA devices. Clears cuBLAS workspaces, records
+        # memory after matmul warmup as a baseline, captures a matmul into a CUDA graph and
+        # asserts memory grew, deletes the graph and asserts allocated memory returns exactly
+        # to the baseline.
         """Test that CUDA graph destruction automatically cleans up cuBLAS workspaces."""
         if self.device != "cuda":
             self.skipTest("CUDA graph test requires CUDA device")
@@ -1497,6 +1751,10 @@ class TestCustomOpAutoTune(TestCase):
 
     @skipIfXpu
     def test_cudagraph_memory_cleanup_benchmarker(self):
+        # [FUNCTION DOC] Skipped on XPU and non-CUDA devices. Clears cuBLAS workspaces,
+        # benchmarks a matmul callable once with the benchmarker's CUDA graph method, records
+        # allocated memory, benchmarks three more times and asserts allocated memory is
+        # unchanged (no leak).
         """Test that CUDA graph benchmarking cleans up memory without leaking."""
         if self.device != "cuda":
             self.skipTest("CUDA graph test requires CUDA device")
@@ -1513,6 +1771,8 @@ class TestCustomOpAutoTune(TestCase):
         benchmarker = torch._inductor.runtime.benchmarking.benchmarker
 
         def mm_callable():
+            # [FUNCTION DOC] HELPER: Callable under benchmark; performs a matrix multiply of
+            # the outer tensors.
             return torch.mm(a, b)
 
         # This should capture into CUDA graph, benchmark, and clean up properly

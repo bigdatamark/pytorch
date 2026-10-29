@@ -1,5 +1,11 @@
 # Owner(s): ["module: cuda"]
 # run time cuda tests, but with the allocator using expandable segments
+# [MODULE DOC] Reruns the CUDA graph trees test suite with the CUDA caching allocator
+# configured for expandable segments. It imports the existing cudagraph trees test case
+# class (so its tests are collected here) and, when run as a script on a CUDA machine that
+# is not Jetson or Windows and has Triton, it downloads the disabled-tests list, enables
+# the expandable_segments allocator setting and then runs the tests. The repo root is
+# temporarily put on the import path only to import the disabled-tests helper.
 
 import os
 import pathlib
