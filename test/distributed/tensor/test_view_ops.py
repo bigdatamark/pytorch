@@ -1,5 +1,15 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
 # Owner(s): ["oncall: distributed"]
+# [MODULE DOC] Multi-process tests for DTensor view-like operators (view, reshape, flatten,
+# unflatten, permute, transpose, expand, tile, ...) and their sharding propagation in
+# torch.distributed.tensor._ops._view_ops. Covers the dimension-map rules built by view_groups
+# and dim_maps, propagate_shape_and_sharding, _StridedShard outputs of flatten, and the
+# behavior of downstream ops (sum, softmax, layer_norm, transpose, select, unbind, stack,
+# slice, ...) on _StridedShard inputs. Main class: TestViewOps on a 6 rank world, plus
+# TestViewOpsWithLocalTensor built via create_local_tensor_test_class. Import has no side
+# effects beyond imports and that class creation; run_tests is called when run as a script.
+# KNOWN ISSUE: the skipped_tests list for the local tensor class names test_dtensor_flatten_1d
+# and test_dtensor_flatten_2d, which do not exist in TestViewOps, so those entries are stale.
 
 import contextlib
 import itertools
@@ -43,10 +53,19 @@ from torch.utils import _pytree as pytree
 
 
 class TestViewOps(DTensorContinuousTestBase):
+    # [CLASS DOC] Test case for DTensor view ops, run with a world size of 6 ranks. Tests
+    # check dim-map rules against expected rule tuples, run ops over many input placements
+    # asserting zero collective communication and equality with single-device results, and
+    # check that flatten/unflatten produce the right Shard or _StridedShard placements and
+    # local tensors for uneven and even sizes. Some tests set self.device_mesh themselves.
     world_size = 6
 
     @staticmethod
     def _get_all_factorizations(n):
+        # [FUNCTION DOC] HELPER: Returns a list of every factorization of n into factors
+        # greater than 1, kept as non-decreasing tuples, with at least two factors each
+        # (so n itself alone and the empty case for n equal to 1 are excluded). Uses a
+        # recursive search; no side effects.
         """Return all ways to factor n into a sorted tuple of integers > 1.
 
         Each factorization has length >= 2 (non-trivial unflatten).
@@ -59,6 +78,9 @@ class TestViewOps(DTensorContinuousTestBase):
         """
 
         def get_sorted_factorizations(remaining, min_factor=2):
+            # [FUNCTION DOC] HELPER: Recursively lists tuples of non-decreasing factors (each at
+            # least min_factor) whose product is remaining; returns a list holding the empty
+            # tuple when remaining is 1.
             if remaining == 1:
                 return [()]
             result = []
@@ -71,6 +93,11 @@ class TestViewOps(DTensorContinuousTestBase):
         return [f for f in get_sorted_factorizations(n) if len(f) >= 2]
 
     def test_view_groups(self):
+        # [FUNCTION DOC] Checks view_groups on pairs of input and output shapes against the
+        # expected tuples of dimension rules: Split of an InputDim or of a Flatten for
+        # unflatten and mixed cases, Flatten for merges, Singleton for size-1 output dims,
+        # skipped size-1 input dims, and a -1 in the output shape resolved to a plain
+        # InputDim mapping. Pure shape logic; no distributed state.
         self.assertEqual(
             view_groups([2, 3], [3, 2]),
             (
@@ -167,6 +194,14 @@ class TestViewOps(DTensorContinuousTestBase):
         )
 
     def call_dt_test(self, op, args, kwargs, device_mesh: DeviceMesh):
+        # [FUNCTION DOC] HELPER: Runs op on DTensors for many input placements and checks the
+        # result. The mesh must have dim names outer and inner. Computes the dim-map rules and
+        # the single-device output, then excludes dims that cannot be sharded (the repeated
+        # input dim, non-first flattened dims, and the unbind dim). Tries Replicate plus Shard
+        # of each eligible dim on every mesh dim, and for Tensor.view also a _StridedShard on
+        # the outer mesh dim with Shard on the inner (built by distributing over inner then
+        # outer and clearing use_strided_shard_as_shard_order). Asserts zero collective counts
+        # and, on rank 0, that the full output tensor equals the single-device output.
         dim_map = dim_maps[op]
         rules = dim_map(*args, **kwargs)
         outputs = op(*args, **kwargs)
@@ -247,11 +282,18 @@ class TestViewOps(DTensorContinuousTestBase):
                 self.assertEqual(outputs, full_out)
 
     def dimmap_test(self, op, args, expected_rule_output):
+        # [FUNCTION DOC] HELPER: Asserts that the dim-map rule for op, applied to args, equals
+        # expected_rule_output, then runs call_dt_test with empty kwargs on self.device_mesh
+        # (which the caller must have set) to verify sharded execution.
         rules = dim_maps[op](*args)
         self.assertEqual(rules, expected_rule_output)
         self.call_dt_test(op, args, {}, self.device_mesh)
 
     def test_illegal_views(self):
+        # [FUNCTION DOC] On a 1D mesh of 6 ranks, checks which flattening views of a sharded
+        # DTensor are accepted. Shard(0) of (6, 256) and Shard(1) of (6, 256) flatten fine;
+        # Shard(0) of an uneven (8, 256) and a Shard(1) unflatten of (8, 256) to (8, 2, -1)
+        # must raise RuntimeError containing "Sharding propagation failed".
         device_mesh = self.build_device_mesh()
         # 1D mesh [6] (see above)
         tensor = torch.randn((6, 256))
@@ -281,6 +323,10 @@ class TestViewOps(DTensorContinuousTestBase):
             shard.view(8, 2, -1)
 
     def test_split_flatten_non_first_shard_falls_back_to_replicate(self):
+        # [FUNCTION DOC] Calls propagate_shape_and_sharding directly for Shard(1) on shape
+        # (32, 4) viewed as (4, 32) with a mesh of size 4 in strict view mode. Asserts both
+        # the required input placement and the output placement are Replicate, i.e. sharding
+        # a non-first flattened dim under Split(Flatten) falls back to replication.
         rule = view_groups((32, 4), (4, 32))
         input_tgt, output = propagate_shape_and_sharding(
             [Shard(1)],
@@ -293,6 +339,11 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(output, [Replicate()])
 
     def test_double_shard_split_validation(self):
+        # [FUNCTION DOC] Checks divisibility validation for two Shard(0) placements through a
+        # Split rule on mesh sizes (2, 3). Viewing (24,) as (6, 4) succeeds and keeps
+        # Shard(0), Shard(0) for both input and output; viewing (12,) as (3, 4) in strict view
+        # mode raises RuntimeError saying the size is not evenly divisible by the mesh
+        # dimension.
         """[Shard(0), Shard(0)] through Split correctly validates divisibility."""
         # Compatible: reshape (24,)→(6,4) with [Shard(0), Shard(0)] on mesh (2,3)
         # submesh_size = 2*3 = 6, split_id=0 out_size=6, 6%6==0 → passes
@@ -321,6 +372,12 @@ class TestViewOps(DTensorContinuousTestBase):
             )
 
     def test_view_ops(self):
+        # [FUNCTION DOC] Builds a 2D mesh (world_size/2 by 2) named outer and inner, stored
+        # on self.device_mesh, then runs dimmap_test for many ops and argument forms:
+        # atleast_1d/2d/3d, broadcast_to (including -1 and the invalid-size error, which must
+        # raise AssertionError), Tensor.expand, flatten, movedim, permute, ravel, Tensor.repeat,
+        # reshape, tile, transpose, unsqueeze and Tensor.view. Each case verifies the expected
+        # rule tuple and zero-communication sharded results.
         mesh_shape = (dist.get_world_size() // 2, 2)
         self.device_mesh = init_device_mesh(
             self.device_type, mesh_shape=mesh_shape, mesh_dim_names=("outer", "inner")
@@ -618,6 +675,11 @@ class TestViewOps(DTensorContinuousTestBase):
     # )
 
     def test_complex_view_ops(self):
+        # [FUNCTION DOC] Uses a 2D mesh with world_size/2 rows and 2 columns. Verifies the
+        # dim-map rules of view_as_complex (InputDim then Flatten of last two dims) and
+        # view_as_real (Split of the last dim by 13 and 2), then for each combination of
+        # Replicate or Shard(0) per mesh dim runs view_as_complex then view_as_real on a
+        # DTensor, asserting zero collectives and a full tensor equal to the local result.
         self.device_mesh = DeviceMesh(
             self.device_type, torch.arange(dist.get_world_size()).view(-1, 2)
         )
@@ -662,6 +724,9 @@ class TestViewOps(DTensorContinuousTestBase):
             self.assertEqual(out, out_dt.full_tensor())
 
     def test_view_as_complex_no_pmax_pmin(self):
+        # [FUNCTION DOC] On a 1D mesh over all ranks, applies view_as_complex to an (8, 2)
+        # DTensor with Partial sum, which stays Partial with reduce op sum, and with Partial
+        # max, which must be redistributed so the result placement is Replicate.
         """
         view_as_complex converts real tensors to complex. Complex numbers don't
         have a total ordering, so P(max) and P(min) placements are invalid.
@@ -688,6 +753,10 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertIsInstance(result_pmax.placements[0], Replicate)
 
     def test_dtensor_view_op_uneven(self):
+        # [FUNCTION DOC] For first dim sizes 1 and world_size+1 (uneven shards), shards a
+        # (n, 2, 2, 2) tensor on dim 0 and applies several views that keep dim 0 unchanged,
+        # including viewing as its own shape. Under CommDebugMode asserts no communication
+        # happened and the local tensor of each view shares the data pointer of the original.
         """
         When the sharded dimension is unchanged, the view op should not trigger any communication.
         And the behavior should be the same as operating under single-device.
@@ -730,6 +799,9 @@ class TestViewOps(DTensorContinuousTestBase):
                 self.assertEqual(len(comm_mode.get_comm_counts()), 0)
 
     def _get_viewed_tensor_dims(self, tensor_dims, flatten_start, flatten_end):
+        # [FUNCTION DOC] HELPER: Returns a tuple of dims where the entries from flatten_start up
+        # to but excluding flatten_end are replaced by their product (omitted if that range is
+        # empty), keeping leading and trailing dims. Accepts a tuple or list.
         if isinstance(tensor_dims, tuple):
             tensor_dims = list(tensor_dims)
         flatten_dims = tensor_dims[flatten_start:flatten_end]
@@ -749,6 +821,11 @@ class TestViewOps(DTensorContinuousTestBase):
         return tuple(view_shapes)
 
     def _split_flatten_replicate_fallback_mesh_dims(self, rules, placements):
+        # [FUNCTION DOC] HELPER: Returns the list of mesh dim indices whose Shard placement is
+        # expected to fall back to Replicate. For each Shard placement, finds the first
+        # Split rule whose input is a Flatten containing the sharded tensor dim, and records the
+        # mesh dim when that tensor dim is not the first flattened dim. Raises AssertionError
+        # if a Flatten holds anything other than InputDim entries.
         fallback_mesh_dims = []
         for mesh_dim, placement in enumerate(placements):
             if not isinstance(placement, Shard):
@@ -774,6 +851,12 @@ class TestViewOps(DTensorContinuousTestBase):
         return fallback_mesh_dims
 
     def _test_dtensor_flatten_split_case(self, in_shape, out_shape, placements, mesh):
+        # [FUNCTION DOC] HELPER: Distributes an arange tensor of in_shape with the given
+        # placements and views it as out_shape under CommDebugMode. A RuntimeError is accepted
+        # only if its message says "is not supported yet" or "is not evenly divisible by mesh
+        # dimension", then the case ends. Otherwise checks the full tensor equals the reference
+        # view; if fallback mesh dims were predicted, expects some communication and Replicate
+        # on those mesh dims, else expects zero communication.
         """Test a single Split(Flatten) view case.
 
         Representable cases must produce zero communication and correct output. Cases
@@ -809,6 +892,11 @@ class TestViewOps(DTensorContinuousTestBase):
             self.assertEqual(comm_mode.get_total_counts(), 0)
 
     def test_dtensor_flatten_split_multi_mesh(self):
+        # [FUNCTION DOC] Sweeps 1D (world_size) and 2D (3, 2) meshes, each shard mesh dim,
+        # 2D input shapes with sizes around twice the mesh size, and every factorization of
+        # the element count as an output shape whose view rules include a Split of a Flatten.
+        # For each shard dim divisible by the mesh size, runs _test_dtensor_flatten_split_case
+        # in a subTest with Shard on that mesh dim and Replicate elsewhere.
         """Test views producing Split(Flatten) rules.
 
         Complements test_dtensor_flatten_multi_mesh (pure Flatten rules) and
@@ -862,6 +950,12 @@ class TestViewOps(DTensorContinuousTestBase):
                                 )
 
     def test_dtensor_flatten_multi_mesh(self):
+        # [FUNCTION DOC] Drives flatten tests over a 1D mesh (patterns S, R) and a 2D (3, 2)
+        # mesh (patterns SR, RS, SS, RR), for tensor ranks 2 to 4 and every flatten range of
+        # at least two dims. One shard mesh dim goes to _run_flatten_single_shard, two to
+        # _run_flatten_ss, and all-replicate patterns run _test_dtensor_flatten_replicate over
+        # dim size combinations around twice the first mesh size. Skips meshes larger than the
+        # world size.
         """Test flatten operations across 1D and 2D meshes with all placement patterns.
 
         Iterates over 1D and 2D mesh configurations to test single-shard (S, SR, RS),
@@ -928,6 +1022,11 @@ class TestViewOps(DTensorContinuousTestBase):
         flatten_start,
         flatten_end,
     ):
+        # [FUNCTION DOC] HELPER: For each shard dim inside the flatten range and every tensor
+        # shape with dim sizes one below, equal to, and one above twice the shard mesh dim
+        # size, runs _test_dtensor_flatten_single_shard in a subTest. Expects RuntimeError "is
+        # not evenly divisible by mesh dimension" when the sharded dim size is not divisible
+        # and that dim is not the last one of the flatten range.
         even_val = 2 * mesh.size(shard_mesh_dim)
         dim_vals = [even_val - 1, even_val, even_val + 1]
         all_dims = list(itertools.product(dim_vals, repeat=tensor_ndim))
@@ -960,6 +1059,13 @@ class TestViewOps(DTensorContinuousTestBase):
                     )
 
     def _run_flatten_ss(self, mesh, tensor_ndim, flatten_start, flatten_end):
+        # [FUNCTION DOC] HELPER: For a 2D mesh and every ordered pair of shard dims inside the
+        # flatten range, builds shapes where the sharded dims take sizes around twice their
+        # mesh size and other dims equal twice the product of both mesh sizes, and runs
+        # _test_dtensor_flatten_2d_ss with placements Shard of each dim. Expects a RuntimeError
+        # ("is not evenly divisible by mesh dimension") when the first sharded dim is not
+        # divisible by mesh dim 0, or when the second, after dividing by mesh dim 0 if both
+        # shard the same dim, is not divisible by mesh dim 1 and is not the last flattened dim.
         for shard_dim0 in range(flatten_start, flatten_end):
             for shard_dim1 in range(shard_dim0, flatten_end):
                 dim0_values = [
@@ -1023,6 +1129,12 @@ class TestViewOps(DTensorContinuousTestBase):
         shard_dim,
         shard_mesh_dim,
     ):
+        # [FUNCTION DOC] HELPER: Shards an arange tensor of tensor_dims on shard_dim along
+        # shard_mesh_dim (Replicate on other mesh dims), flattens the range, and asserts: the
+        # output placement on that mesh dim is Shard at flatten_start if shard_dim is the first
+        # flattened dim, else _StridedShard with split_factor equal to the product of the dims
+        # before it in the range (must exceed 1); the local tensor matches a direct
+        # distribution of the flattened reference; and no communication occurred.
         mesh_ndim = mesh.ndim
         placements = tuple(
             Shard(shard_dim) if i == shard_mesh_dim else Replicate()
@@ -1062,6 +1174,10 @@ class TestViewOps(DTensorContinuousTestBase):
     def _test_dtensor_flatten_replicate(
         self, tensor_dims, flatten_start, flatten_end, mesh, placements
     ):
+        # [FUNCTION DOC] HELPER: Distributes an arange tensor as Replicate, redistributes to the
+        # given placements, flattens the range via view, and asserts all output placements are
+        # Replicate, the local tensor equals the replicated flattened reference, and no
+        # communication happened.
         mesh_ndim = len(placements)
         nelem = math.prod(tensor_dims)
         global_inps: Tensor = torch.arange(nelem).view(tensor_dims)
@@ -1097,6 +1213,13 @@ class TestViewOps(DTensorContinuousTestBase):
         mesh,
         placements,
     ):
+        # [FUNCTION DOC] HELPER: Computes the expected output placements of flattening with all
+        # Shard placements. Walks mesh dims in order tracking local dim sizes: a Shard on the
+        # first flattened dim is kept; otherwise it becomes _StridedShard at flatten_start with
+        # split_factor equal to the product of the current local dims before it in the range
+        # (asserted greater than 1). An uneven dim is allowed only if
+        # _is_last_shard_in_flatten_range holds, then the local size is rounded up; else it is
+        # divided exactly. Returns a tuple of placements.
         local_tensor_dims = list(tensor_dims)
         expected_placements = []
         for idx, placement in enumerate(placements):
@@ -1136,6 +1259,11 @@ class TestViewOps(DTensorContinuousTestBase):
         mesh,
         placements,
     ):
+        # [FUNCTION DOC] HELPER: Distributes an arange tensor with the given all-Shard
+        # placements, flattens the range via view under CommDebugMode, and asserts the output
+        # placements equal _get_expected_placements_ss, the local tensor equals a direct
+        # distribution of the flattened reference using those placements, and no communication
+        # occurred.
         nelem = math.prod(tensor_dims)
         global_inps: Tensor = torch.arange(nelem).view(tensor_dims)
         inps = distribute_tensor(global_inps, mesh, placements, src_data_rank=None)
@@ -1166,6 +1294,11 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(comm_mode.get_total_counts(), 0)
 
     def test_dtensor_flatten_shard_outside_range(self):
+        # [FUNCTION DOC] Checks that sharding a dim outside the flatten range survives the view
+        # as a plain Shard with the dim index adjusted (unchanged before the range, reduced by
+        # the number of merged dims after it). Runs a table of cases on a 1D mesh, then
+        # 4D cases on a (3, world_size/3) mesh with the shard on each mesh dim in turn, always
+        # asserting expected placements, matching local tensors and zero communication.
         """Test that Shard on a dim outside the flatten range passes through correctly.
 
         When flattening dims [flatten_start, flatten_end), a Shard on a dim outside
@@ -1277,6 +1410,11 @@ class TestViewOps(DTensorContinuousTestBase):
                     self.assertEqual(comm_mode.get_total_counts(), 0)
 
     def test_dtensor_flatten_unflatten_roundtrip(self):
+        # [FUNCTION DOC] On a 1D mesh with evenly divisible dims, checks two round trips for a
+        # table of shapes, flatten ranges and shard dims: shard then flatten then unflatten, and
+        # start from the flattened shape with the mapped shard dim, unflatten then flatten again.
+        # Asserts the final placements equal the starting placements and the local tensor equals
+        # the original local tensor.
         """Flatten then unflatten should recover the original placements and data.
 
         Tests the full round-trip: DTensor -> flatten -> unflatten -> compare with original.
@@ -1374,6 +1512,10 @@ class TestViewOps(DTensorContinuousTestBase):
     def generate_tensor_dims_1d(
         self, tensor_ndim, flatten_start, flatten_end, shard_dim, mesh
     ):
+        # [FUNCTION DOC] HELPER: Generator. For the sharded dim taking sizes one below, equal
+        # to, and one above twice the mesh size (other dims one above), yields a tuple of the
+        # unflattened dims, the local dims (sharded dim rounded up per rank), and the flattened
+        # dims where the range [flatten_start, flatten_end) is merged into its product.
         tensor_dims_unflatten = [2 * mesh.size(0) + 1] * tensor_ndim
         for tensor_dim in [
             2 * mesh.size(0) - 1,
@@ -1400,6 +1542,10 @@ class TestViewOps(DTensorContinuousTestBase):
     def generate_tensor_dims_1d_after_flatten(
         self, tensor_ndim, unflatten_dim, shard_dim, mesh
     ):
+        # [FUNCTION DOC] HELPER: Generator yielding lists of tensor dims. All dims start as the
+        # square of the mesh size; the unflatten dim and the shard dim each take that value minus
+        # one, itself, and plus one (all nine combinations; if both indices coincide the shard
+        # value wins). Each yielded list is a fresh copy.
         tensor_dims = [mesh.size(0) * mesh.size(0)] * tensor_ndim
         for unflatten_dim_value in [
             mesh.size(0) * mesh.size(0) - 1,
@@ -1416,6 +1562,13 @@ class TestViewOps(DTensorContinuousTestBase):
                 yield list(tensor_dims)
 
     def test_dtensor_unflatten_1d(self):
+        # [FUNCTION DOC] On a 1D mesh runs three unflatten checks. First, for ranks 2 to 4 and
+        # flatten ranges, round-trips from a flattened shape with a Shard or _StridedShard input
+        # via _test_dtensor_unflatten_1d_shard, expecting RuntimeError "is not evenly divisible
+        # by mesh dimension" when the sharded size is uneven and not the last dim of the range.
+        # Second, tries every factorization of one dim via
+        # _test_dtensor_unflatten_1d_shard_arbitrary. Third, checks Replicate is preserved and
+        # shape correct when a size-12 dim is viewed as (3, 4).
         mesh: DeviceMesh = init_device_mesh(self.device_type, (self.world_size,))
 
         # flatten -> view -> unflatten
@@ -1501,6 +1654,12 @@ class TestViewOps(DTensorContinuousTestBase):
         expected_placements,
         mesh,
     ):
+        # [FUNCTION DOC] HELPER: Builds the flattened-side input placement: Shard at
+        # flatten_start when the product of local dims between flatten_start and the expected
+        # shard dim is 1 (asserting they coincide), else _StridedShard at flatten_start with
+        # that product as split_factor. Distributes the flattened arange tensor, views it as
+        # the unflattened shape, and asserts the placements equal expected_placements and the
+        # local tensor equals a direct distribution of the unflattened reference.
         shard_dim = expected_placements[0].dim
         split_factor = math.prod(local_tensor_dims_unflatten[flatten_start:shard_dim])
         if split_factor == 1:
@@ -1524,6 +1683,13 @@ class TestViewOps(DTensorContinuousTestBase):
     def _test_dtensor_unflatten_1d_shard_arbitrary(
         self, tensor_dims, unflatten_dim, placements, mesh
     ):
+        # [FUNCTION DOC] HELPER: Requires a plain Shard (not _StridedShard) placement. Distributes
+        # an arange tensor and views it with unflatten_dim split into each non-trivial
+        # factorization of its size (skips primes). When the sharded dim is the unflattened one,
+        # a RuntimeError "is not evenly divisible by mesh dimension" is expected if the size is
+        # uneven or the first factor is not divisible by the mesh size. Otherwise asserts the
+        # output is Shard at the dim shifted by the number of added dims, no communication, and
+        # the expected local tensor.
         shard_dim = placements[0].dim
         self.assertIsInstance(placements[0], Shard)
         self.assertNotIsInstance(placements[0], _StridedShard)
@@ -1599,6 +1765,13 @@ class TestViewOps(DTensorContinuousTestBase):
                 self.assertEqual(inps_viewed._local_tensor, expected_local)
 
     def test_dtensor_unflatten_multi_mesh(self):
+        # [FUNCTION DOC] Iterates over 2D (3, 2) and 3D (2, 2, 2) meshes (skipped if larger than
+        # the world size) with a number of leading Replicate mesh dims. All-replicate cases
+        # unflatten with every factorization and prefix dims and assert Replicate placements
+        # and the new shape. Sharded cases choose, for each factorization, which output factors
+        # the shard mesh dims land on, expect RuntimeError (not evenly divisible, or strided
+        # shard-order unsupported) when an uneven factor is not on the last shard and last
+        # factor, and otherwise call _test_dtensor_unflatten_factors.
         """Test unflatten across 2D and 3D meshes with all placement patterns.
 
         Iterates over 2D and 3D mesh configurations to test multi-shard (SS, SSS),
@@ -1712,6 +1885,13 @@ class TestViewOps(DTensorContinuousTestBase):
         num_rep,
         mesh,
     ):
+        # [FUNCTION DOC] HELPER: Builds a flattened tensor of the product of factors (plus a
+        # trailing size-3 dim when at least two mesh dims shard), with num_rep leading Replicate
+        # placements and _StridedShard(0) on the remaining mesh dims whose split_factor is the
+        # product of the factors before the target index divided by earlier shard mesh sizes.
+        # Clears use_strided_shard_as_shard_order and recomputes shard_order on the spec, views
+        # as the unflattened shape, and asserts Shard(index) placements, zero communication and
+        # matching local tensor.
         """Test unflatten with _StridedShard placements for any mesh dimensionality.
 
         Args:
@@ -1772,6 +1952,12 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(inps_viewed._local_tensor, expected_local_tensor)
 
     def test_dtensor_flatten_unflatten_2d_reversed_mesh(self):
+        # [FUNCTION DOC] On a (2, 3) mesh (requires world size 6, else AssertionError from the
+        # equality check) runs flatten with Shard on two flattened dims for 3D tensors via
+        # _test_dtensor_flatten_2d_ss, then unflatten of several factor triples with
+        # _StridedShard inputs via _test_dtensor_unflatten_factors, expecting RuntimeError
+        # "is not evenly divisible" when the first sharded factor is uneven for mesh dim 0 or
+        # the second is uneven for mesh dim 1 and not last.
         """Test flatten/unflatten with reversed mesh shape (2, 3) to catch ordering bugs."""
         self.assertEqual(self.world_size, 6)
         mesh = init_device_mesh(self.device_type, (2, self.world_size // 2))
@@ -1828,6 +2014,11 @@ class TestViewOps(DTensorContinuousTestBase):
                             )
 
     def test_dtensor_unflatten_ss_and_s_same_dim(self):
+        # [FUNCTION DOC] On a (3, 2) mesh shards a (4, 6, 3) tensor with Shard(1), Shard(0),
+        # flattens dims 0 and 1 and asserts no communication, shape (24, 3), a _StridedShard of
+        # split_factor 4 on mesh dim 0 and Shard on mesh dim 1. Then views dim 0 as (12, 2) and
+        # asserts the placements stay (_StridedShard(0, 4), Shard(0)), no communication, and the
+        # local tensor matches direct distribution.
         """Test unflatten when _StridedShard and Shard both shard the same tensor dim."""
         mesh = init_device_mesh(self.device_type, (3, self.world_size // 3))
 
@@ -1860,6 +2051,10 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(unflattened._local_tensor, expected_local)
 
     def test_flatten_then_sum_non_shard_dim(self):
+        # [FUNCTION DOC] Flattens a Shard to a _StridedShard and checks sum: reducing a
+        # non-sharded dim keeps _StridedShard with unchanged dim and split_factor; reducing the
+        # strided dim gives a Partial placement; reducing a lower dim moves _StridedShard(1)
+        # to _StridedShard(0). Each result's full tensor equals the single-device sum.
         """Verify _StridedShard correctness through sum on a non-shard dim.
 
         sum uses map_placements_after_reduction which must preserve
@@ -1909,6 +2104,9 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(result3.full_tensor(), flat_full2.sum(dim=0))
 
     def test_flatten_then_softmax(self):
+        # [FUNCTION DOC] Flattens a sharded tensor to get a _StridedShard placement, then
+        # asserts softmax over the strided dim and over the last dim each give a full tensor
+        # equal to the single-device softmax.
         """Verify _StridedShard correctness through softmax.
 
         softmax uses replicate_reduction_dims which only checks isinstance(p, Shard).
@@ -1932,6 +2130,9 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(result.full_tensor(), torch.softmax(flat_full, dim=-1))
 
     def test_flatten_then_layer_norm(self):
+        # [FUNCTION DOC] With a _StridedShard input, asserts layer_norm over only the last dim
+        # and layer_norm normalizing over the whole shape (covering the strided dim) both match
+        # the single-device result.
         """Verify _StridedShard correctness through layer_norm.
 
         layer_norm uses _replicate_dims_start_at which only checks isinstance(p, Shard).
@@ -1961,6 +2162,10 @@ class TestViewOps(DTensorContinuousTestBase):
         )
 
     def test_flatten_then_transpose(self):
+        # [FUNCTION DOC] Checks transpose and t on _StridedShard inputs. transpose of dims 0 and
+        # 1 matches single device. For t, the result stays _StridedShard with the dim swapped
+        # (0 to 1 and 1 to 0) and split_factor preserved, for even and uneven shapes, with full
+        # tensors equal to the reference.
         """Verify _StridedShard correctness through transpose.
 
         aten.transpose.int goes through view op propagation which handles
@@ -2048,6 +2253,10 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(result3.full_tensor(), full3.flatten(1, 2).t())
 
     def test_flatten_then_nll_loss(self):
+        # [FUNCTION DOC] Builds flattened _StridedShard input and target DTensors (the target
+        # broadcast from rank 0 for consistency), once for a 2D (N flattened) layout and once for
+        # a 4D layout flattening spatial dims, applies log_softmax then nll_loss and asserts the
+        # full tensor matches the single-device loss.
         """Verify _StridedShard correctness through nll_loss.
 
         nll_loss_forward_strategy uses replicate_reduction_dims on the channel
@@ -2109,6 +2318,9 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(result_3d.full_tensor(), expected_3d)
 
     def test_flatten_then_select(self):
+        # [FUNCTION DOC] On a _StridedShard(dim=2) tensor, select on dim 0 or 1 keeps
+        # _StridedShard at dim 1 with the same split_factor; select on the strided dim gives a
+        # non-_StridedShard placement. All results match single-device values.
         """Verify _StridedShard correctness through select.
 
         select removes a dim, so select_int_strategy must detect
@@ -2147,6 +2359,10 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(result2.full_tensor(), expected2)
 
     def test_flatten_then_unbind(self):
+        # [FUNCTION DOC] Unbinds _StridedShard tensors on dims before and after the strided dim.
+        # Each output keeps _StridedShard with the dim shifted down by one when the unbound dim
+        # is lower (2 to 1) or unchanged otherwise, split_factor preserved, and full tensors
+        # equal the single-device unbind outputs.
         """Verify _StridedShard correctness through unbind.
 
         unbind removes a dim via shift_shard_dims_after_remove, which
@@ -2197,6 +2413,9 @@ class TestViewOps(DTensorContinuousTestBase):
             self.assertEqual(r.full_tensor(), e)
 
     def test_flatten_then_stack(self):
+        # [FUNCTION DOC] Stacks a _StridedShard tensor with itself: stacking at dim 0 shifts the
+        # strided dim from 0 to 1, stacking at dim 2 leaves it at 0; split_factor is preserved and
+        # full tensors match the single-device stack.
         """Verify _StridedShard correctness through stack.
 
         stack inserts a new dim via shift_shard_dims_after_insert, which
@@ -2228,6 +2447,9 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(result2.full_tensor(), expected2)
 
     def test_flatten_then_slice(self):
+        # [FUNCTION DOC] Slices a _StridedShard tensor to its first half along the strided dim
+        # and to the first three columns along a non-sharded dim, asserting each full tensor
+        # equals the same slice of the single-device flattened tensor.
         """Verify _StridedShard correctness through slice.
 
         aten.slice.Tensor goes through gen_slice_strategy which uses
@@ -2255,6 +2477,10 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(result2.full_tensor(), expected2)
 
     def test_flatten_then_slice_scatter(self):
+        # [FUNCTION DOC] Applies slice_scatter with a doubled slice as source on a
+        # _StridedShard tensor, once along the strided dim (first half) and once along a
+        # non-sharded dim (first three columns), comparing full tensors with the single-device
+        # slice_scatter.
         """Verify _StridedShard correctness through slice_scatter.
 
         gen_slice_scatter_strategy uses replicate_tensor_dim which only
@@ -2287,6 +2513,9 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(result2.full_tensor(), expected2)
 
     def test_flatten_then_slice_backward(self):
+        # [FUNCTION DOC] Runs backward on the sum of the first half slice along the strided dim
+        # of a flattened DTensor requiring grad, and on the equivalent plain tensor, then asserts
+        # the DTensor gradient's full tensor equals the flattened gradient of the plain tensor.
         """Verify _StridedShard correctness through slice backward.
 
         slice_backward_rules only checks isinstance(p, Shard), missing
@@ -2312,6 +2541,9 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(dt_flat.grad.full_tensor(), full_req.grad.flatten(0, 1))
 
     def test_flatten_then_cat_on_strided_shard_dim(self):
+        # [FUNCTION DOC] Concatenates a _StridedShard tensor with itself on the strided dim
+        # (dim 0), on a non-sharded dim, and for a _StridedShard(dim=1) tensor on that dim,
+        # asserting full tensors equal the single-device cat.
         """Verify _StridedShard correctness through cat on the shard dim.
 
         cat_strategy uses is_tensor_dim_sharded which calls is_shard(),
@@ -2353,6 +2585,9 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(result3.full_tensor(), expected3)
 
     def test_flatten_then_split_on_strided_shard_dim(self):
+        # [FUNCTION DOC] Splits a _StridedShard tensor into half-size chunks along the strided
+        # dim, into size-3 chunks along a non-sharded dim, and a _StridedShard(dim=1) tensor along
+        # dim 1, comparing each chunk's full tensor with the single-device split.
         """Verify _StridedShard correctness through split on the shard dim.
 
         split_strategy uses is_tensor_dim_sharded which calls is_shard(),
@@ -2399,6 +2634,8 @@ class TestViewOps(DTensorContinuousTestBase):
             self.assertEqual(r.full_tensor(), e)
 
     def test_flatten_then_unbind_on_strided_shard_dim(self):
+        # [FUNCTION DOC] Asserts unbind along the _StridedShard dim (dim 0) of a flattened
+        # tensor raises RuntimeError, matching the behavior for a plain Shard dim.
         """Verify _StridedShard is detected by unbind on the shard dim.
 
         gen_unbind_strategy uses is_tensor_dim_sharded which calls is_shard(),
@@ -2419,6 +2656,9 @@ class TestViewOps(DTensorContinuousTestBase):
             torch.unbind(dt_flat, dim=0)
 
     def test_flatten_then_add_strided_shard_inputs(self):
+        # [FUNCTION DOC] Adds two independently flattened _StridedShard DTensors under
+        # CommDebugMode and asserts the full result equals the single-device sum and that no
+        # collective ran (no unnecessary all-gather).
         """Verify _StridedShard is treated as shard in placement merge.
 
         Binary ops (e.g. add) with two _StridedShard inputs go through
@@ -2452,6 +2692,9 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(comm_mode.get_total_counts(), 0)
 
     def test_flatten_then_redistribute_backward_partial(self):
+        # [FUNCTION DOC] Redistributes a flattened _StridedShard DTensor requiring grad to
+        # Replicate, sums, runs backward, and asserts the gradient's full tensor is all ones in
+        # the flattened shape.
         """Verify backward normalize handles _StridedShard → Partial.
 
         In the backward pass of Redistribute, the code normalizes
@@ -2479,6 +2722,9 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(dt_flat.grad.full_tensor(), expected_grad)
 
     def test_unpack_hook_tp_with_strided_shard(self):
+        # [FUNCTION DOC] Imports _unpack_hook_tp and calls it with the mesh, dim 0 and a
+        # flattened _StridedShard DTensor. Asserts the result is a DTensor with a Replicate
+        # placement whose full tensor equals the flattened input.
         """_unpack_hook_tp must redistribute _StridedShard to Replicate.
 
         _unpack_hook_tp restores activations before recomputation in BWD.
@@ -2501,6 +2747,9 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(result.full_tensor(), full.flatten(0, 1))
 
     def test_view_redistribution(self):
+        # [FUNCTION DOC] Asserts that viewing a (4, 4) DTensor sharded on dim 0 over the world
+        # size as (-1, 8) raises RuntimeError "Sharding propagation failed" instead of
+        # redistributing.
         """
         This test is added to demonstrate "incorrect" view ops behavior if redistribution happens.
         """
@@ -2513,6 +2762,10 @@ class TestViewOps(DTensorContinuousTestBase):
             dtensor_x.view(-1, 8)
 
     def test_squeeze_(self):
+        # [FUNCTION DOC] On a (3, 2) mesh builds a (1, 4) local tensor per rank as
+        # [Partial, Shard(1)], applies in-place squeeze_ on dim 0 through the base class helper
+        # _test_op_on_dtensor, and asserts the DTensor becomes shape (8,), stride (1,) and
+        # placements [Partial, Shard(0)]. A second in-place squeeze_ asserts no communication.
         mesh_2d = init_device_mesh(self.device_type, (3, 2), mesh_dim_names=("a", "b"))
         self.init_manual_seed_for_rank()
         x = torch.randn((1, 4), device=self.device_type)
@@ -2538,6 +2791,12 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(comm_mode.get_total_counts(), 0)
 
     def test_squeeze_variants(self):
+        # [FUNCTION DOC] Table of subTests for squeeze overloads (default, dim, dims, in-place)
+        # on a 1D mesh, each asserting zero communication and the resulting shape and placements:
+        # squeezing unsharded singleton dims, replicated and Partial inputs, a non-singleton
+        # dim as a no-op, never removing a sharded dim whose local size is 1, shifting the shard
+        # index, and that squeezing a sharded singleton dim raises RuntimeError "requires
+        # redistribution" for all six ops.
         """Test squeeze.default, squeeze.dim, and squeeze.dims with DTensor."""
         mesh = init_device_mesh(self.device_type, (self.world_size,))
 
@@ -2686,6 +2945,10 @@ class TestViewOps(DTensorContinuousTestBase):
                     op(*args)
 
     def test_squeeze_comm_free_cases(self):
+        # [FUNCTION DOC] Checks squeeze needs no communication when no sharded dim is removed:
+        # out-of-place and in-place squeeze of an unsharded leading singleton with the shard dim
+        # reindexed, squeeze after explicit redistribute to Replicate, and a (dp, tp) 2D mesh
+        # where both Shard dims reindex. Asserts shape, placements and full tensor.
         """Squeeze is comm-free when no sharded dim is removed."""
         mesh = init_device_mesh(self.device_type, (self.world_size,))
 
@@ -2734,6 +2997,9 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(result3.full_tensor(), x3.squeeze(0))
 
     def test_storage_offset_slice(self):
+        # [FUNCTION DOC] Slices a replicated 10-element DTensor from index 1 with no
+        # communication and asserts the DTensor and its local tensor both report storage offset
+        # 1, shape (9,), and the expected values.
         """
         Test that storage_offset is properly tracked on DTensor when slicing
         a replicated tensor.
@@ -2764,6 +3030,9 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(sliced_dtensor.full_tensor(), expected)
 
     def test_storage_offset_shard_dim0_slice_dim1(self):
+        # [FUNCTION DOC] Slices columns from index 2 of a (12, 8) tensor sharded on dim 0, with
+        # no communication, and asserts storage offset 2 on both the DTensor and its local
+        # tensor, shape (12, 6), and matching values.
         """
         Test that storage_offset is properly tracked when tensor is sharded on dim 0
         and sliced on dim 1.
@@ -2795,6 +3064,9 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(sliced_dtensor.full_tensor(), expected)
 
     def test_storage_offset_shard_dim1_slice_dim0(self):
+        # [FUNCTION DOC] Slices rows from index 2 of a (10, 12) tensor sharded on dim 1, with
+        # no communication, and asserts storage offset equals 2 times the local dim 1 size on
+        # the DTensor and its local tensor, shape (8, 12), and matching values.
         """
         Test that storage_offset is properly tracked when tensor is sharded on dim 1
         and sliced on dim 0.
@@ -2826,11 +3098,16 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(sliced_dtensor.full_tensor(), expected)
 
     def test_view_groups_unbacked_symint(self):
+        # [FUNCTION DOC] Checks view_groups with unbacked symbolic ints from a ShapeEnv: the same
+        # symbol forwards as InputDim, splits and flattens with concrete sizes work, size-1 dims
+        # are dropped, a product of two symbols flattens, distinct symbols map one to one, and a
+        # split by a concrete prefix does not need unbacked divisibility guards.
         from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
         shape_env = ShapeEnv()
 
         def fresh_sym():
+            # [FUNCTION DOC] HELPER: Returns a new unbacked symbolic int from the shape_env.
             return shape_env.create_unbacked_symint()
 
         # Same symbol forwards correctly
@@ -2913,6 +3190,12 @@ class TestViewOps(DTensorContinuousTestBase):
         )
 
     def test_view_groups_unbacked_sharding_propagation(self):
+        # [FUNCTION DOC] Checks propagate_shape_and_sharding with symbolic shapes on mesh sizes
+        # (2, 3): shards forward through identical, split and flatten rules; a strict view
+        # with non-leftmost shard yields _StridedShard whose symbolic split_factor keeps the
+        # symbol and its overridden hint (4), raising RuntimeError "symbolic _StridedShard" when
+        # no hint exists; unflattening a symbolic _StridedShard gives Shard(1); and a
+        # non-leftmost shard under a flatten falls back to Replicate.
         """Test that sharding is correctly propagated through view_groups with symbolic shapes."""
         from torch.fx.experimental.symbolic_shapes import (
             free_symbols,
@@ -2923,6 +3206,7 @@ class TestViewOps(DTensorContinuousTestBase):
         shape_env = ShapeEnv()
 
         def fresh_sym():
+            # [FUNCTION DOC] HELPER: Returns a new unbacked symbolic int from the shape_env.
             return shape_env.create_unbacked_symint()
 
         mesh_sizes = (2, 3)
@@ -3028,6 +3312,10 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(out_plc, [Replicate(), Replicate()])
 
     def test_input_dim_rejects_int_comparison(self):
+        # [FUNCTION DOC] Verifies InputDim equality and hash: equal to another InputDim of the
+        # same index, unequal otherwise, hash matches for equal values and differs from the raw
+        # int hash, and comparing with an int in either order raises TypeError mentioning
+        # .input_dim.
         """InputDim.__eq__ should raise TypeError when compared with int.
 
         Regression guard: shard.dim == in_dim (int == InputDim) silently
@@ -3049,10 +3337,15 @@ class TestViewOps(DTensorContinuousTestBase):
             _ = 0 == dim
 
     def _assert_strided_shard_flag(self, dt, expected_flag):
+        # [FUNCTION DOC] HELPER: Asserts the DTensor spec attribute
+        # use_strided_shard_as_shard_order of dt equals expected_flag.
         """Assert use_strided_shard_as_shard_order matches expected_flag."""
         self.assertEqual(dt._spec.use_strided_shard_as_shard_order, expected_flag)
 
     def test_strided_shard_propagates_through_chained_ops(self):
+        # [FUNCTION DOC] Seeds the RNG, flattens a Shard(1) tensor into _StridedShard, applies
+        # relu, add, mul and abs, asserting the use_strided_shard_as_shard_order flag stays False
+        # at each step and the final full tensor equals the single-device chain.
         """Verify use_strided_shard_as_shard_order=False propagates through
         chained pointwise ops after flatten produces _StridedShard."""
         mesh = init_device_mesh(self.device_type, (self.world_size,))
@@ -3084,6 +3377,9 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(result.full_tensor(), expected)
 
     def test_strided_shard_propagates_through_reduction(self):
+        # [FUNCTION DOC] Flattens a Shard(1) tensor to _StridedShard, sums over the last dim,
+        # asserts the use_strided_shard_as_shard_order flag stays False and the full result
+        # equals the single-device sum.
         """Verify use_strided_shard_as_shard_order=False propagates through
         reduction ops that don't reduce the _StridedShard dim."""
         mesh = init_device_mesh(self.device_type, (self.world_size,))
@@ -3106,6 +3402,10 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(reduced.full_tensor(), expected)
 
     def test_strided_shard_propagates_through_matmul(self):
+        # [FUNCTION DOC] Flattens a (2, 6, 4, 8) Shard(1) tensor into _StridedShard, asserts the
+        # use_strided_shard_as_shard_order flag is False, multiplies by a replicated (8, 16)
+        # weight with matmul, asserts the flag is still False on the result, and the full tensor
+        # equals the single-device matmul.
         """Verify use_strided_shard_as_shard_order=False propagates when a
         _StridedShard tensor participates in matmul."""
         mesh = init_device_mesh(self.device_type, (self.world_size,))
@@ -3129,6 +3429,9 @@ class TestViewOps(DTensorContinuousTestBase):
         self.assertEqual(result.full_tensor(), expected)
 
     def test_strided_shard_propagates_2d_mesh(self):
+        # [FUNCTION DOC] On a (world_size/2, 2) mesh, flattens a (3, 4, 8) tensor placed as
+        # Shard(0), Replicate, asserts the use_strided_shard_as_shard_order flag is False after
+        # flatten and after relu, and the full result equals the single-device flatten and relu.
         """Verify use_strided_shard_as_shard_order=False propagates on a 2D mesh."""
         mesh = init_device_mesh(self.device_type, (self.world_size // 2, 2))
         torch.manual_seed(42)
