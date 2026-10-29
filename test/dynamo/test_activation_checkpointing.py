@@ -1,4 +1,14 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Dynamo/AOTAutograd tests for activation checkpointing
+# (torch.utils.checkpoint) under torch.compile.
+# Contains: helper utilities (op counting on FX graphs, SAC policies, invalid-context stubs), the
+# tag-based checkpoint test class (ActivationCheckpointingViaTagsTests), selective activation
+# checkpointing (SAC) tests, region memory budget tests, the RematerializeACNodesPassTests class, a
+# non-strict tracer test class and a nested-compile test class.
+# Import-time side effects: computes device_type from the current accelerator (else cpu), defines a
+# triton add_one_kernel only when a GPU with triton exists, builds requires_distributed, and
+# instantiates ActivationCheckpointingViaTagsTests per non-CPU device type (so its test methods
+# receive a device argument); run as a script it calls the dynamo run_tests.
 import contextlib
 import copy
 import functools
@@ -62,6 +72,9 @@ if HAS_GPU_AND_TRITON:
     import triton
     from triton import language as tl
 
+    # [FUNCTION DOC] HELPER: triton kernel (defined only when a GPU and triton are available) that
+    # reads n_elements values from in_ptr0, adds one to each and stores them to out_ptr. Each
+    # program handles BLOCK_SIZE consecutive elements and masks out-of-range offsets.
     @triton.jit
     def add_one_kernel(
         in_ptr0,
@@ -84,20 +97,39 @@ requires_distributed = functools.partial(
 
 
 def checkpoint_wrapper(fn):
+    # [FUNCTION DOC] HELPER: wraps fn so the returned callable runs fn through the
+    # reentrant torch.utils.checkpoint.checkpoint. Returns the wrapper; nothing is executed
+    # until it is called.
     def inner(*args):
+        # [FUNCTION DOC] HELPER: calls checkpoint with the closed-over fn and the positional args,
+        # forcing the reentrant implementation. Returns fn's output.
         return torch.utils.checkpoint.checkpoint(fn, *args, use_reentrant=True)
 
     return inner
 
 
 def _grad(*args, **kwargs):
+    # [FUNCTION DOC] HELPER: thin forwarding wrapper around torch.autograd.grad; passes all
+    # positional and keyword arguments through and returns the resulting gradient tuple.
     return torch.autograd.grad(*args, **kwargs)
 
 
 def count_ops(
     gm, args, freq=None, freq_ge=None, op=None, freqs=None, freqs_ge=None, ops=None
 ):
+    # [FUNCTION DOC] HELPER: graph-module "compiler" that checks how often given ops appear in gm
+    # and returns gm unchanged, so it can be used as an fw_compiler or bw_compiler. A single op
+    # (with freq or freq_ge) or parallel lists (ops with freqs or freqs_ge) can be given; a single
+    # op must not be a list.
+    # If freqs are provided each op must appear exactly that many times; otherwise freqs_ge must be
+    # provided and each op must appear at least that many times. RNG higher-order-op wrappers
+    # around an op also count. Raises AssertionError on a wrong count, on an op given as a list, or
+    # when no frequency list is given.
     def match_rng_op(node, op):
+        # [FUNCTION DOC] HELPER: returns True if node is an RNG higher-order op
+        # (run_and_save_rng_state, run_with_rng_state or graphsafe_run_with_rng_state) that wraps
+        # the given op, looking at args[0] or, for run_with_rng_state, at the second argument.
+        # Returns False for every other node.
         if isinstance(node.target, torch._ops.HigherOrderOperator):
             if node.name == "run_and_save_rng_state":
                 return node.args[0] == op
@@ -141,6 +173,11 @@ def count_ops(
 
 
 def collect_fwd_graph_outputs(graph: torch.fx.Graph, *, fwd_outputs: set[str]):
+    # [FUNCTION DOC] HELPER: post-grad custom pass used to record forward graph outputs. When not
+    # inside a compiled autograd region (so the graph is a forward graph) it checks that the last
+    # node is the output node and adds the string name of every returned value to the fwd_outputs
+    # set (mutated in place). Does nothing for backward graphs. Raises AssertionError if the last
+    # node is not an output node.
     if not torch._dynamo.compiled_autograd.in_compiled_autograd_region:  # fwd graph
         return_node = list(graph.nodes)[-1]
         if return_node.target != "output":
@@ -152,21 +189,31 @@ def collect_fwd_graph_outputs(graph: torch.fx.Graph, *, fwd_outputs: set[str]):
 
 
 class _InvalidContext:
+    # [CLASS DOC] HELPER: a context manager that does nothing; entering returns itself and exit
+    # does not suppress exceptions. Used by _invalid_context_gen to build a context_fn result for
+    # invalid-context checkpoint tests.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: no-op constructor with no state.
         pass
 
     def __enter__(self):
+        # [FUNCTION DOC] HELPER: returns the context manager itself.
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # [FUNCTION DOC] HELPER: does nothing and returns None, so exceptions propagate.
         pass
 
 
 def _invalid_context_gen():
+    # [FUNCTION DOC] HELPER: context_fn stand-in that returns a pair of fresh _InvalidContext
+    # objects (one for forward, one for recompute) instead of real selective-checkpoint contexts.
     return _InvalidContext(), _InvalidContext()
 
 
 def find_first_node(gm, func):
+    # [FUNCTION DOC] HELPER: returns the first node in gm.graph whose target is exactly func
+    # (identity comparison), or None when there is no such node.
     for node in gm.graph.nodes:
         if node.target is func:
             return node
@@ -174,6 +221,8 @@ def find_first_node(gm, func):
 
 
 def op_count(gm):
+    # [FUNCTION DOC] HELPER: counts the nodes of gm.graph whose op kind contains "call"
+    # (call_function, call_method, call_module) and returns the count.
     result = 0
     for node in gm.graph.nodes:
         if "call" in node.op:
@@ -182,7 +231,14 @@ def op_count(gm):
 
 
 def _get_custom_policy(no_recompute_list=None, must_recompute_list=None):
+    # [FUNCTION DOC] HELPER: builds a selective-checkpoint policy callable. The policy returns
+    # MUST_SAVE when the op is in no_recompute_list, MUST_RECOMPUTE when it is in
+    # must_recompute_list, and PREFER_RECOMPUTE otherwise; a list left as None is ignored.
+    # no_recompute_list is checked first.
     def _custom_policy(ctx, func, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: the policy: receives ctx, the op func and its args/kwargs and maps
+        # func to a CheckpointPolicy using the closed-over lists (no_recompute_list first, then
+        # must_recompute_list, else PREFER_RECOMPUTE).
         if no_recompute_list is not None and func in no_recompute_list:
             return CheckpointPolicy.MUST_SAVE
         if must_recompute_list is not None and func in must_recompute_list:
@@ -194,6 +250,13 @@ def _get_custom_policy(no_recompute_list=None, must_recompute_list=None):
 
 
 class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Test case for activation checkpointing under torch.compile with the
+    # AOTAutograd backend. Most tests wrap a small function with torch.utils.checkpoint
+    # (reentrant or not, with or without selective-checkpoint context_fn), compile it with a
+    # custom aot_autograd backend whose fw/bw compilers count ops, and compare results and
+    # gradients with eager. Also covers tags in tlparse, graph breaks, kwargs, symints, RNG,
+    # hooks and region activation memory budgets. Helpers _validate and
+    # _compare_orig_and_checkpointed_fns are the shared comparison drivers.
     def _validate(
         self,
         fn,
@@ -203,6 +266,14 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
         fullgraph=True,
         compiled_autograd=False,
     ):
+        # [FUNCTION DOC] HELPER: runs fn eagerly on args (seed 0) and backward on the summed
+        # output, then compiles a deep copy of fn with torch.compile (given backend, fullgraph
+        # flag) and runs it on detached clones of args that keep requires_grad (seed 0 again). With
+        # compiled_autograd the backward runs inside a compiled-autograd context that compiles the
+        # backward graph with the same backend.
+        # Unless skip_check, asserts the outputs and every argument's .grad match eager;
+        # raises through assertEqual on mismatch. Side effects: populates .grad on the
+        # original args and clones.
         cloned_args = []
         for arg in args:
             cloned_args.append(arg.detach().clone().requires_grad_(arg.requires_grad))
@@ -240,10 +311,17 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
     def _compare_orig_and_checkpointed_fns(
         self, orig_fn, checkpointed_fn, *args, fullgraph=True
     ):
+        # [FUNCTION DOC] HELPER: compares orig_fn and checkpointed_fn: each is compiled and run on
+        # cloned inputs with seed 0, then backward on the summed output, and outputs and argument
+        # gradients are asserted equal. The comparison runs once with torch.compile (honoring
+        # fullgraph) and, only when fullgraph is True, a second time after exporting the function
+        # to torch IR and compiling with the aot_eager_decomp_partition backend.
         # The original version and the checkpointed version of the same function
         # should produce the same outputs and the same gradients under torch.compile.
 
         def clone_args(args):
+            # [FUNCTION DOC] HELPER: returns a list of detached clones of args that keep each
+            # original requires_grad flag.
             cloned_args = []
             for arg in args:
                 cloned_args.append(
@@ -252,6 +330,9 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
             return cloned_args
 
         def run(compiler):
+            # [FUNCTION DOC] HELPER: with the given compiler callable, compiles orig_fn and a deep
+            # copy of checkpointed_fn, runs both on freshly cloned args under seed 0,
+            # backpropagates the summed outputs and asserts the outputs and gradients are equal.
             # Run original version
             cloned_args_orig_fn = clone_args(args)
             torch.manual_seed(0)
@@ -287,13 +368,25 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
         if fullgraph:
 
             def export_compiler(fn):
+                # [FUNCTION DOC] HELPER: "compiler" that wraps fn in a module and returns
+                # runtime_wrapper, which exports that module to torch IR and compiles it each time
+                # it is called.
                 class WrapAsModule(nn.Module):
+                    # [CLASS DOC] HELPER: nn.Module whose forward simply calls the enclosed fn with
+                    # the given arguments; lets a plain function be exported.
                     def forward(self, *args, **kwargs):
+                        # [FUNCTION DOC] HELPER: forwards all arguments to the enclosed fn and
+                        # returns its result.
                         return fn(*args, **kwargs)
 
                 mod = WrapAsModule()
 
                 def runtime_wrapper(*runtime_args):
+                    # [FUNCTION DOC] HELPER: exports the module to torch IR (no dynamic shapes,
+                    # using cloned test args as example inputs, not the runtime args), then
+                    # compiles the result with the aot_eager_decomp_partition backend (not
+                    # fullgraph) and calls it with runtime_args; returns the output. The compile
+                    # step is needed so RNG ops get added to the graph.
                     from torch.export import _trace
 
                     gm = _trace._export_to_torch_ir(
@@ -323,10 +416,17 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
         ],
     )
     def test_tags_function(self, device, partition_fn):
+        # [FUNCTION DOC] Checkpointed function (reentrant) computing sigmoid of a matmul on sin(x)
+        # and y. Compiles with aot_autograd using the parametrized partition function and expects 1
+        # mm in the forward graph and 3 in the backward (one recomputed plus two for gradients);
+        # compares with eager through _validate.
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: returns sigmoid of the matmul of x and y.
             return torch.sigmoid(torch.matmul(x, y))
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: applies reentrant torch.utils.checkpoint.checkpoint to gn on
+            # sin(x) and y.
             return torch.utils.checkpoint.checkpoint(
                 gn, torch.sin(x), y, use_reentrant=True
             )
@@ -354,10 +454,16 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
         ],
     )
     def test_tags_function_via_global_checkpoint(self, device, partition_fn):
+        # [FUNCTION DOC] Same as test_tags_function but the checkpoint call goes through the
+        # globally imported checkpoint name (resolved by VariableBuilder in dynamo). Expects 1 mm
+        # forward and 3 mm backward with each partition function and eager parity.
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: returns sigmoid of the matmul of x and y.
             return torch.sigmoid(torch.matmul(x, y))
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: calls the globally imported checkpoint (reentrant) on gn with
+            # sin(x) and y.
             # This goes through VariableBuilder
             return checkpoint(gn, torch.sin(x), y, use_reentrant=True)
 
@@ -384,10 +490,15 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
         ],
     )
     def test_tags_function_with_kwargs(self, device, partition_fn):
+        # [FUNCTION DOC] Same pattern as test_tags_function but using the non-reentrant
+        # checkpoint (use_reentrant False). Expects 1 forward mm, 3 backward mm and eager parity
+        # for each partition function.
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: returns sigmoid of the matmul of x and y.
             return torch.sigmoid(torch.matmul(x, y))
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: non-reentrant checkpoint of gn on sin(x) and y.
             return torch.utils.checkpoint.checkpoint(
                 gn, torch.sin(x), y, use_reentrant=False
             )
@@ -408,10 +519,17 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
 
     @requires_gpu_and_triton
     def test_checkpoint_shows_tags_in_tlparse(self, device):
+        # [FUNCTION DOC] Checks that checkpointed forward nodes are labeled in the joint graph
+        # readable output: the partition_fn asserts the printed joint graph matches an ac_graph_id
+        # comment with PREFER_RECOMPUTE, then delegates to the min-cut partitioner. Compiles only;
+        # no numeric comparison.
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: returns sigmoid of the matmul of x and y.
             return torch.sigmoid(torch.matmul(x, y))
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: reentrant checkpoint of gn on sin(x) and y
+            # with preserve_rng_state disabled.
             return torch.utils.checkpoint.checkpoint(
                 gn, torch.sin(x), y, use_reentrant=True, preserve_rng_state=False
             )
@@ -420,6 +538,9 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
         y = torch.randn(4, 4, device=device, requires_grad=True)
 
         def partition_fn(joint_gm, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: wraps the min-cut partitioner; first prints the joint graph
+            # readably and asserts via assertTrue that it contains an ac_graph_id annotation with
+            # PREFER_RECOMPUTE, then returns the min-cut partition of the joint graph.
             gm_str = joint_gm.print_readable(print_output=False)
             # Check for the pattern with any graph ID (the ID depends on test order)
             self.assertTrue(
@@ -435,31 +556,48 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
 
     @requires_gpu_and_triton
     def test_ac_tags_through_custom_autograd_function(self, device):
+        # [FUNCTION DOC] Verifies that checkpoint tags (recompute and ac_graph_id metadata) reach
+        # forward mm nodes when the checkpointed function uses a custom autograd.Function. Uses a
+        # partition_fn that asserts those metadata keys exist on every forward mm node; then runs
+        # forward and backward with no-op compilers.
         class MyMM(torch.autograd.Function):
+            # [CLASS DOC] HELPER: custom autograd.Function computing a matrix product of x and w,
+            # saving both inputs, with backward returning grad times w transposed and x
+            # transposed times grad.
             @staticmethod
             def forward(x, w):
+                # [FUNCTION DOC] HELPER: returns the matrix product of x and w.
                 return x @ w
 
             @staticmethod
             def setup_context(ctx, inputs, output):
+                # [FUNCTION DOC] HELPER: saves x and w from inputs for backward; the
+                # output is unused.
                 x, w = inputs
                 ctx.save_for_backward(x, w)
 
             @staticmethod
             def backward(ctx, grad):
+                # [FUNCTION DOC] HELPER: returns gradients for x and w computed from
+                # the saved tensors.
                 x, w = ctx.saved_tensors
                 return grad @ w.t(), x.t() @ grad
 
         def gn(x, w):
+            # [FUNCTION DOC] HELPER: applies MyMM to x and w.
             return MyMM.apply(x, w)
 
         def fn(x, w):
+            # [FUNCTION DOC] HELPER: non-reentrant checkpoint of gn on x and w.
             return torch.utils.checkpoint.checkpoint(gn, x, w, use_reentrant=False)
 
         x = torch.randn(4, 4, device=device, requires_grad=True)
         w = torch.randn(4, 4, device=device, requires_grad=True)
 
         def partition_fn(joint_gm, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: collects forward-tagged (partitioner_tag is_forward) aten.mm
+            # nodes in the joint graph, asserts the list is non-empty and that each has recompute
+            # and ac_graph_id metadata, then returns the min-cut partition of the joint graph.
             fwd_mm_nodes = [
                 node
                 for node in joint_gm.graph.nodes
@@ -483,22 +621,35 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
 
     @requires_gpu_and_triton
     def test_sac_tags_through_custom_autograd_function(self, device):
+        # [FUNCTION DOC] Same as the previous test but with selective checkpointing: the context_fn
+        # uses a policy that always returns PREFER_RECOMPUTE. Asserts forward mm nodes carry
+        # recompute and ac_graph_id metadata when a custom autograd.Function is used, then runs
+        # forward and backward with no-op compilers.
         class MyMM(torch.autograd.Function):
+            # [CLASS DOC] HELPER: custom autograd.Function computing a matrix product of x and w,
+            # saving both inputs, with backward returning grad times w transposed and x
+            # transposed times grad.
             @staticmethod
             def forward(x, w):
+                # [FUNCTION DOC] HELPER: returns the matrix product of x and w.
                 return x @ w
 
             @staticmethod
             def setup_context(ctx, inputs, output):
+                # [FUNCTION DOC] HELPER: saves x and w from inputs for backward; the
+                # output is unused.
                 x, w = inputs
                 ctx.save_for_backward(x, w)
 
             @staticmethod
             def backward(ctx, grad):
+                # [FUNCTION DOC] HELPER: returns gradients for x and w computed from
+                # the saved tensors.
                 x, w = ctx.saved_tensors
                 return grad @ w.t(), x.t() @ grad
 
         def gn(x, w):
+            # [FUNCTION DOC] HELPER: applies MyMM to x and w.
             return MyMM.apply(x, w)
 
         context_fn = functools.partial(
@@ -510,6 +661,8 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
         )
 
         def fn(x, w):
+            # [FUNCTION DOC] HELPER: non-reentrant checkpoint of gn on x and w using
+            # the PREFER_RECOMPUTE context_fn.
             return torch.utils.checkpoint.checkpoint(
                 gn, x, w, use_reentrant=False, context_fn=context_fn
             )
@@ -518,6 +671,8 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
         w = torch.randn(4, 4, device=device, requires_grad=True)
 
         def partition_fn(joint_gm, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: asserts that the joint graph has forward-tagged aten.mm nodes
+            # each with recompute and ac_graph_id metadata, then returns the min-cut partition.
             fwd_mm_nodes = [
                 node
                 for node in joint_gm.graph.nodes
@@ -541,12 +696,18 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
 
     @requires_gpu_and_triton
     def test_tangent_placeholders_have_is_backward_tag(self, device):
+        # [FUNCTION DOC] Checks that in the joint graph placeholders whose target mentions tangents
+        # get a partitioner_tag containing is_backward, while all other placeholders get
+        # is_forward. Verified inside a partition_fn that then delegates to the min-cut
+        # partitioner; no numeric comparison.
         """Test that tangent placeholders in the joint graph are tagged with is_backward."""
 
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: returns sigmoid of the matmul of x and y.
             return torch.sigmoid(torch.matmul(x, y))
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: non-reentrant checkpoint of gn on sin(x) and y.
             return torch.utils.checkpoint.checkpoint(
                 gn, torch.sin(x), y, use_reentrant=False
             )
@@ -555,6 +716,9 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
         y = torch.randn(4, 4, device=device, requires_grad=True)
 
         def partition_fn(joint_gm, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: for every placeholder node in the joint graph asserts the
+            # partitioner_tag is_backward for tangent inputs and is_forward otherwise, then returns
+            # the min-cut partition.
             # Check partitioner_tag on placeholder nodes
             for node in joint_gm.graph.nodes:
                 if node.op == "placeholder":
@@ -582,7 +746,12 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
         ],
     )
     def test_tags_sequential_layers(self, device, partition_fn):
+        # [FUNCTION DOC] Two sequential checkpoints of a function with a cos, three matmuls and a
+        # cos. Expects 6 mm in the forward graph and, in the backward, 2 cos and 18 mm
+        # (recomputation plus gradient matmuls); checks eager parity for each partition function.
         def gn(x):
+            # [FUNCTION DOC] HELPER: applies cos, three successive self matmuls and cos to x and
+            # returns the result.
             x = x.cos()
             for _ in range(3):
                 x = torch.mm(x, x)
@@ -590,6 +759,8 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
             return x
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: applies checkpoint (default reentrant setting) to gn
+            # twice in sequence.
             x = torch.utils.checkpoint.checkpoint(gn, x)
             x = torch.utils.checkpoint.checkpoint(gn, x)
             return x
@@ -618,10 +789,16 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
         ],
     )
     def test_tags_multiple_checkpoints(self, device, partition_fn):
+        # [FUNCTION DOC] Two reentrant checkpoints of the same function separated by a sin.
+        # Expects 2 mm in the forward and 6 in the backward graph and eager parity, for
+        # each partition function.
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: returns sigmoid of the matmul of x and y.
             return torch.sigmoid(torch.matmul(x, y))
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: sin of x, checkpoint gn, sin again, checkpoint gn again,
+            # return the final result.
             x = torch.sin(x)
             z = torch.utils.checkpoint.checkpoint(gn, x, y, use_reentrant=True)
             x = torch.sin(z)
@@ -651,17 +828,25 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
         ],
     )
     def test_tags_module(self, device, partition_fn):
+        # [FUNCTION DOC] Checkpoints an nn.Module (linear plus sigmoid) in reentrant mode. Expects
+        # exactly one sigmoid in each of the forward and backward graphs (recomputed) and eager
+        # parity, per partition function.
         class MockModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a Linear(10, 10) layer whose forward applies sigmoid
+            # to the linear output.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the Linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(10, 10)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns sigmoid of the linear layer applied to x.
                 return torch.sigmoid(self.linear(x))
 
         mod = MockModule().to(device)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: reentrant checkpoint of the module on sin(x).
             return torch.utils.checkpoint.checkpoint(
                 mod, torch.sin(x), use_reentrant=True
             )
@@ -690,18 +875,27 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
         ],
     )
     def test_tags_decomps(self, device, partition_fn):
+        # [FUNCTION DOC] Ensures checkpoint tags survive decomposition: a checkpointed linear plus
+        # gelu is compiled with the inductor decomposition table, and exactly one erf must be
+        # present in each of the forward and backward graphs (gelu recomputed). Checks eager parity
+        # for each partition function.
         # Ensures that tags are passed on through decompositions as well
         class MockModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a Linear(10, 10) layer whose forward applies gelu to
+            # the linear output.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the Linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(10, 10)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns gelu of the linear layer applied to x.
                 return torch.nn.functional.gelu(self.linear(x))
 
         mod = MockModule().to(device)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: reentrant checkpoint of the module on sin(x).
             return torch.utils.checkpoint.checkpoint(
                 mod, torch.sin(x), use_reentrant=True
             )
@@ -727,10 +921,17 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
     @requires_gpu_and_triton
     @torch._inductor.config.patch(fallback_random=True)
     def test_tags_recomputed_rand(self, device):
+        # [FUNCTION DOC] Compiles with the inductor backend (fallback_random enabled) two
+        # checkpoints of a function that multiplies by random values, and checks outputs
+        # and gradients against eager through _validate; verifies recomputed random ops
+        # give consistent results.
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: returns sigmoid of a random tensor times y, multiplied by x.
             return torch.sigmoid(torch.rand_like(x) * y) * x
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: sin, checkpoint gn, sin, checkpoint gn again, and returns
+            # the final result.
             x = torch.sin(x)
             x = torch.utils.checkpoint.checkpoint(gn, x, y, use_reentrant=True)
             x = torch.sin(x)
@@ -751,12 +952,17 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
     @requires_gpu_and_triton
     @torch._inductor.config.patch(fallback_random=True)
     def test_tags_rand(self, device):
+        # [FUNCTION DOC] Compiles with inductor (fallback_random enabled) a checkpoint of two
+        # successive matmuls between sin ops and compares result and gradients with eager using
+        # _validate. Despite the name no random ops are called here.
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: applies mm with y twice to x.
             x = torch.mm(x, y)
             x = torch.mm(x, y)
             return x
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: sin, a reentrant checkpoint of gn, and sin again.
             x = torch.sin(x)
             x = torch.utils.checkpoint.checkpoint(gn, x, y, use_reentrant=True)
             x = torch.sin(x)
@@ -778,19 +984,26 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
     @requires_gpu_and_triton
     @torch._inductor.config.patch(fallback_random=True)
     def test_tags_dropout(self, device):
+        # [FUNCTION DOC] Compiles a checkpointed linear plus dropout module with inductor
+        # (fallback_random) and runs forward and backward through _validate with skip_check, since
+        # the decomposed random ops do not match eager numerically.
         # Figure out a way to test the number of inductor_random calls
         class MockModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with a Linear(10, 10) followed by Dropout(0.2).
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the linear and dropout layers.
                 super().__init__()
                 self.linear = torch.nn.Linear(10, 10)
                 self.dropout = torch.nn.Dropout(0.2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: applies the linear layer then dropout.
                 return self.dropout(self.linear(x))
 
         mod = MockModule().to(device)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: reentrant checkpoint of the module on x.
             return torch.utils.checkpoint.checkpoint(mod, x, use_reentrant=True)
 
         x = torch.randn(10, 10, device=device, requires_grad=True)
@@ -802,29 +1015,48 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
     @torch._functorch.config.patch(recompute_views=True)
     @torch._inductor.config.patch(fx_graph_cache=False)
     def test_tags_must_save_tensor_that_has_backward_hook(self):
+        # [FUNCTION DOC] Compiles (inductor, compiled autograd, fullgraph) a module with a non-
+        # reentrant checkpointed submodule twice: once plain and once with a forward hook that
+        # registers a backward hook on the submodule output. Collects the forward graph outputs of
+        # each via a post_grad custom pre-pass and asserts the hooked version saves exactly one
+        # extra non-primal tensor, named mul (the product y times y). Resets dynamo between runs.
+        # Skipped on HPU; runs with recompute_views on and fx_graph_cache off.
         def my_post_forward_hook(submod, args, output):
+            # [FUNCTION DOC] HELPER: forward hook that registers my_backward_hook on the submodule
+            # output tensor and returns that output unchanged.
             output.register_hook(my_backward_hook)
             return output
 
         def my_backward_hook(grad):
+            # [FUNCTION DOC] HELPER: backward hook that returns the incoming gradient unchanged.
             return grad
 
         class MySubmod(torch.nn.Module):
+            # [CLASS DOC] HELPER: module whose forward computes y as the matmul of x with itself
+            # and returns y times y.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: calls the base constructor only.
                 super().__init__()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns the elementwise square of the matmul of
+                # x with itself.
                 y = torch.matmul(x, x)
                 z = y * y
                 return z
 
         class MyMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: holds a MySubmod and a LayerNorm(4); forward runs the submodule
+            # under non-reentrant checkpoint and then the layer norm.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: creates the submodule and the layer norm.
                 super().__init__()
                 self.submod = MySubmod()
                 self.norm = torch.nn.LayerNorm(4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: non-reentrant checkpoint of the submodule on x, followed
+                # by the layer norm; returns the normalized output.
                 out = torch.utils.checkpoint.checkpoint(
                     self.submod, x, use_reentrant=False
                 )
@@ -832,6 +1064,8 @@ class ActivationCheckpointingViaTagsTests(torch._dynamo.test_case.TestCase):
                 return norm_out
 
         def _factory_fn():
+            # [FUNCTION DOC] HELPER: returns a fresh MyMod, a 4x4 float32 ones input that requires
+            # grad, and the backend name inductor.
             mod = MyMod()
             x = torch.ones(4, 4, dtype=torch.float32, requires_grad=True)
             backend = "inductor"
@@ -885,13 +1119,21 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
 
     @requires_gpu_and_triton
     def test_fallback(self, device):
+        # [FUNCTION DOC] Checkpoints (non-reentrant) a function containing two explicit graph
+        # breaks, wrapped between a sin and a cos, and compiles with the aot_eager counting
+        # backend. Asserts the result equals eager and that two frames, two ops and two graphs were
+        # produced (one for sin on the input, one for the final cos).
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: graph break, sigmoid of matmul of x and y, another graph
+            # break, then cos of that value.
             torch._dynamo.graph_break()
             a = torch.sigmoid(torch.matmul(x, y))
             torch._dynamo.graph_break()
             return torch.cos(a)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: cos of the non-reentrant checkpoint of gn applied to
+            # sin(x) and y.
             return torch.cos(checkpoint(gn, torch.sin(x), y, use_reentrant=False))
 
         x = torch.randn(4, 4, requires_grad=True, device=device)
@@ -913,13 +1155,21 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
 
     @requires_gpu_and_triton
     def test_kwargs(self, device):
+        # [FUNCTION DOC] Checks that keyword arguments to checkpoint are forwarded: compiles fn
+        # with the aot_eager counting backend and asserts the result matches eager, a single frame
+        # and graph, that the tag_activation_checkpoint node has 4 args (body plus x, y, z) and
+        # that the body graph has 2 call ops.
         def gn(x, y, z=None):
+            # [FUNCTION DOC] HELPER: matmul of x and y; if z is given, multiplies the result
+            # again by z.
             a = torch.matmul(x, y)
             if z is not None:
                 return torch.matmul(a, z)
             return a
 
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: cos of non-reentrant checkpoint of gn with z passed as
+            # a keyword argument.
             return torch.cos(checkpoint(gn, x, y, use_reentrant=False, z=z))
 
         x = torch.randn(4, 4, requires_grad=True, device=device)
@@ -947,10 +1197,16 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
 
     @requires_gpu_and_triton
     def test_symints_location(self, device):
+        # [FUNCTION DOC] Runs a reentrant-checkpointed matmul with dropout on 4x4 inputs and then
+        # 5x5 inputs under the aot_eager counting backend (not fullgraph). Asserts shapes match
+        # eager, that two frames and two graphs were created (the shape change forces a recompile)
+        # and that the first graph's tag_activation_checkpoint node has 3 args.
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: matmul of x with dropout (p 0.5) of y.
             return torch.matmul(x, torch.nn.functional.dropout(y, 0.5))
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: reentrant checkpoint of gn on x and y.
             return torch.utils.checkpoint.checkpoint(gn, x, y, use_reentrant=True)
 
         backend = "aot_eager"
@@ -985,7 +1241,12 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
         ],
     )
     def test_compile_selective_checkpoint_must_recompute(self, device, partition_fn):
+        # [FUNCTION DOC] Selective checkpointing with mm policies. With a MUST_RECOMPUTE policy for
+        # mm the backward graph must have 6 mm ops; with MUST_SAVE for mm only 4. The forward
+        # always has 2 mm. Eager parity is checked via _validate for each partition function.
         def context_fn_must_recompute_mm():
+            # [FUNCTION DOC] HELPER: context_fn returning selective checkpoint contexts whose
+            # policy marks aten.mm as MUST_RECOMPUTE.
             must_recompute_list = [
                 torch.ops.aten.mm.default,
             ]
@@ -996,6 +1257,8 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
             )
 
         def context_fn_no_recompute_mm():
+            # [FUNCTION DOC] HELPER: context_fn returning selective checkpoint contexts whose
+            # policy marks aten.mm as MUST_SAVE.
             no_recompute_list = [
                 torch.ops.aten.mm.default,
             ]
@@ -1006,10 +1269,16 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
             )
 
         def _test(context_fn, bw_compiler, partition_fn):
+            # [FUNCTION DOC] HELPER: builds a non-reentrant checkpointed function with the given
+            # context_fn, compiles with aot_autograd (forward mm count fixed at 2, the given
+            # bw_compiler, the given partition_fn) and validates against eager.
             def gn(x):
+                # [FUNCTION DOC] HELPER: returns cos of sin of (x matmul x) matmul x.
                 return torch.cos(torch.sin(torch.matmul(x, x) @ x))
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: non-reentrant checkpoint of gn on x with
+                # the enclosing context_fn.
                 return torch.utils.checkpoint.checkpoint(
                     gn,
                     x,
@@ -1052,14 +1321,23 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
         )
 
     def test_sac_with_partial_context_fn(self):
+        # [FUNCTION DOC] Checks that a context_fn built with functools.partial around
+        # create_selective_checkpoint_contexts and a callable policy object works. Compiles fn with
+        # aot_eager_decomp_partition (fullgraph, CPU) and asserts output equals eager.
         class CustomPolicy:
+            # [CLASS DOC] HELPER: policy object whose call always returns MUST_SAVE; note it takes
+            # an extra out argument in its signature.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: calls the base constructor only.
                 super().__init__()
 
             def __call__(self, ctx, out, func, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: ignores all arguments and returns
+                # CheckpointPolicy.MUST_SAVE.
                 return CheckpointPolicy.MUST_SAVE
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: sigmoid of two chained matmuls of x with y, multiplied by y.
             return torch.sigmoid(torch.matmul(torch.matmul(x, y), y)) * y
 
         context_fn1 = functools.partial(
@@ -1067,6 +1345,8 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
         )
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: non-reentrant checkpoint of f on x and y with
+            # the partial context_fn.
             return torch.utils.checkpoint.checkpoint(
                 f,
                 x,
@@ -1095,7 +1375,13 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
     def test_compile_selective_checkpoint_must_not_recompute_gemm(
         self, device, partition_fn
     ):
+        # [FUNCTION DOC] Selective checkpointing where mm is MUST_SAVE: forward has 2 mm and
+        # backward only 4 (the matmuls are not recomputed; 6 would be needed without SAC). Checks
+        # eager parity through _validate and also compares the plain and checkpointed functions
+        # with _compare_orig_and_checkpointed_fns, per partition function.
         def selective_checkpointing_context_fn():
+            # [FUNCTION DOC] HELPER: context_fn with a policy that saves aten.mm and
+            # recomputes everything else.
             no_recompute_list = [
                 torch.ops.aten.mm.default,
             ]
@@ -1104,9 +1390,11 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
             )
 
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: sigmoid of two chained matmuls of x with y, times y.
             return torch.sigmoid(torch.matmul(torch.matmul(x, y), y)) * y
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: non-reentrant checkpoint of gn with the SAC context_fn.
             return torch.utils.checkpoint.checkpoint(
                 gn,
                 x,
@@ -1151,7 +1439,13 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
     def test_compile_selective_checkpoint_must_not_recompute_gemm_no_functionalization(
         self, device, partition_fn
     ):
+        # [FUNCTION DOC] Same selective-checkpoint setup as the previous test but the aot_autograd
+        # backend runs with functionalization disabled. Mainly checks that sigmoid is recomputed
+        # (one sigmoid in each of the forward and backward graphs); also validates against eager
+        # and compares plain versus checkpointed functions.
         def selective_checkpointing_context_fn():
+            # [FUNCTION DOC] HELPER: context_fn with a policy that saves aten.mm and
+            # recomputes everything else.
             no_recompute_list = [
                 torch.ops.aten.mm.default,
             ]
@@ -1160,9 +1454,11 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
             )
 
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: sigmoid of two chained matmuls of x with y, times y.
             return torch.sigmoid(torch.matmul(torch.matmul(x, y), y)) * y
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: non-reentrant checkpoint of gn with the SAC context_fn.
             return torch.utils.checkpoint.checkpoint(
                 gn,
                 x,
@@ -1205,24 +1501,36 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
         ],
     )
     def test_compile_selective_checkpoint_triton_kernel(self, device, partition_fn):
+        # [FUNCTION DOC] Same as the mm-MUST_SAVE selective checkpoint test but the region also
+        # contains a custom autograd.Function that launches the triton add_one_kernel; makes sure
+        # this does not error. Expects 2 forward and 4 backward mm ops and checks eager parity
+        # and plain-versus-checkpointed parity.
         # Copy of the above test, but make sure that having a triton kernel in the
         # region does not error.
         def add_one(x):
+            # [FUNCTION DOC] HELPER: allocates an output like x and runs the triton add_one_kernel
+            # over x (one program per element, BLOCK_SIZE 4); returns the output.
             out = torch.empty_like(x)
             n_elements = x.numel()
             add_one_kernel[(n_elements,)](x, out, n_elements, BLOCK_SIZE=4)
             return out
 
         class AddOne(torch.autograd.Function):
+            # [CLASS DOC] HELPER: custom autograd.Function wrapping the triton add_one kernel;
+            # backward passes the gradient through unchanged.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: returns add_one(x).
                 return add_one(x)
 
             @staticmethod
             def backward(ctx, x):
+                # [FUNCTION DOC] HELPER: returns the incoming gradient unchanged.
                 return x
 
         def selective_checkpointing_context_fn():
+            # [FUNCTION DOC] HELPER: context_fn with a policy that saves aten.mm and
+            # recomputes everything else.
             no_recompute_list = [
                 torch.ops.aten.mm.default,
             ]
@@ -1231,12 +1539,15 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
             )
 
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: sigmoid of two chained matmuls of AddOne(sin(x)) with
+            # y, times y.
             return (
                 torch.sigmoid(torch.matmul(torch.matmul(AddOne.apply(x.sin()), y), y))
                 * y
             )
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: non-reentrant checkpoint of gn with the SAC context_fn.
             return torch.utils.checkpoint.checkpoint(
                 gn,
                 x,
@@ -1279,7 +1590,12 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
         ],
     )
     def test_compile_selective_checkpoint_tensor_subclass(self, device, partition_fn):
+        # [FUNCTION DOC] Selective checkpointing (mm saved) with TwoTensor tensor-subclass inputs.
+        # Expects 4 forward and 8 backward mm ops (12 without SAC) and checks eager parity and
+        # plain-versus-checkpointed parity, per partition function.
         def selective_checkpointing_context_fn():
+            # [FUNCTION DOC] HELPER: context_fn with a policy that saves aten.mm and
+            # recomputes everything else.
             no_recompute_list = [
                 torch.ops.aten.mm.default,
             ]
@@ -1288,9 +1604,11 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
             )
 
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: sigmoid of two chained matmuls of x with y, times y.
             return torch.sigmoid(torch.matmul(torch.matmul(x, y), y)) * y
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: non-reentrant checkpoint of gn with the SAC context_fn.
             return torch.utils.checkpoint.checkpoint(
                 gn,
                 x,
@@ -1336,12 +1654,21 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
         ],
     )
     def test_compile_selective_checkpoint_custom_rule(self, device, partition_fn):
+        # [FUNCTION DOC] Selective checkpointing with a stateful custom policy that returns a bool
+        # and counts mm calls per mode; it keeps mm results except the second one so the second mm
+        # is a recompute candidate. Expects 2 forward mm and at least 4 backward mm (the
+        # partitioner decides on the second); eager parity is checked.
         def _get_custom_policy(meta):
+            # [FUNCTION DOC] HELPER: builds a policy using a meta dict to count mm calls per mode
+            # (shadows the module-level helper of the same name).
             no_recompute_list = [
                 torch.ops.aten.mm.default,
             ]
 
             def _custom_policy(mode, func, *args, **kwargs):
+                # [FUNCTION DOC] HELPER: increments the per-mode mm counter in meta for every mm
+                # call and returns True (save) for ops in the save list, except for the second mm,
+                # which returns False.
                 mm_count_key = f"{mode}_mm_count"
                 if mm_count_key not in meta:
                     meta[mm_count_key] = 0
@@ -1356,15 +1683,20 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
             return _custom_policy
 
         def selective_checkpointing_context_fn():
+            # [FUNCTION DOC] HELPER: context_fn creating a fresh meta dict and selective checkpoint
+            # contexts using the counting policy.
             meta = {}
             return create_selective_checkpoint_contexts(_get_custom_policy(meta))
 
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: a chain of mm, mul by y, mm, mul by y followed
+            # by two sigmoids.
             return torch.sigmoid(
                 torch.sigmoid(torch.matmul(torch.matmul(x, y) * y, y) * y)
             )
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: non-reentrant checkpoint of gn with the SAC context_fn.
             return torch.utils.checkpoint.checkpoint(
                 gn,
                 x,
@@ -1408,15 +1740,23 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
         ],
     )
     def test_compile_selective_checkpoint_partial_ctx_fn(self, device, partition_fn):
+        # [FUNCTION DOC] Selective checkpointing where the context_fn is a functools.partial
+        # binding the no-recompute list (aten.mm). Expects 2 forward and 4 backward mm ops and
+        # checks eager parity and plain-versus-checkpointed parity.
         def selective_checkpointing_context_fn(no_recompute_list):
+            # [FUNCTION DOC] HELPER: builds selective checkpoint contexts from a policy saving the
+            # ops in no_recompute_list.
             return create_selective_checkpoint_contexts(
                 _get_custom_policy(no_recompute_list=no_recompute_list)
             )
 
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: sigmoid of two chained matmuls of x with y, times y.
             return torch.sigmoid(torch.matmul(torch.matmul(x, y), y)) * y
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: non-reentrant checkpoint of gn with a context_fn partial bound
+            # to the mm list.
             return torch.utils.checkpoint.checkpoint(
                 gn,
                 x,
@@ -1461,7 +1801,11 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
         ],
     )
     def test_compile_selective_checkpoint_outplace_op(self, device, partition_fn):
+        # [FUNCTION DOC] Selective checkpointing saving mm and sigmoid for a function using out-of-
+        # place ops (selu, relu). Expects forward counts of 2 mm and 1 sigmoid and backward counts
+        # of 4 mm and 0 sigmoid (sigmoid is not recomputed), and checks parity with eager.
         def selective_checkpointing_context_fn():
+            # [FUNCTION DOC] HELPER: context_fn saving aten.mm and aten.sigmoid.
             no_recompute_list = [
                 torch.ops.aten.mm.default,
                 torch.ops.aten.sigmoid.default,
@@ -1471,9 +1815,11 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
             )
 
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: sigmoid of selu of two chained matmuls, followed by relu.
             return torch.sigmoid(torch.selu(torch.matmul(torch.matmul(x, y), y))).relu()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: non-reentrant checkpoint of gn with the SAC context_fn.
             return torch.utils.checkpoint.checkpoint(
                 gn,
                 x,
@@ -1513,7 +1859,12 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
         ],
     )
     def test_compile_selective_checkpoint_list_ops(self, device, partition_fn):
+        # [FUNCTION DOC] Selective checkpointing with an empty save list (everything recomputed) on
+        # a function whose op takes a list of tensors (cat then sin). Expects one cat in the
+        # forward and one in the backward graph and checks parity with eager.
         def selective_checkpointing_context_fn():
+            # [FUNCTION DOC] HELPER: context_fn with an empty save list, so
+            # everything is recomputed.
             # recompute everything
             no_recompute_list = []
             return create_selective_checkpoint_contexts(
@@ -1521,9 +1872,11 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
             )
 
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: concatenates x and y and applies sin.
             return torch.cat([x, y]).sin()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: non-reentrant checkpoint of gn with the SAC context_fn.
             return torch.utils.checkpoint.checkpoint(
                 gn,
                 x,
@@ -1567,7 +1920,12 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
         ],
     )
     def test_compile_selective_checkpoint_inplace_op(self, device, partition_fn):
+        # [FUNCTION DOC] Selective checkpointing with in-place ops (selu_, relu_) saving mm and
+        # sigmoid; expects 2 mm and 1 sigmoid forward and 4 mm and 0 sigmoid backward. Currently
+        # skipped: in-place op support needs TorchDispatchMode plus torch.compile work, and
+        # skipped on Windows.
         def selective_checkpointing_context_fn():
+            # [FUNCTION DOC] HELPER: context_fn saving aten.mm and aten.sigmoid.
             no_recompute_list = [
                 torch.ops.aten.mm.default,
                 torch.ops.aten.sigmoid.default,
@@ -1577,11 +1935,14 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
             )
 
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: sigmoid of in-place selu on chained matmuls, followed
+            # by in-place relu.
             return torch.sigmoid(
                 torch.selu_(torch.matmul(torch.matmul(x, y), y))
             ).relu_()
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: non-reentrant checkpoint of gn with the SAC context_fn.
             return torch.utils.checkpoint.checkpoint(
                 gn,
                 x,
@@ -1622,9 +1983,15 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
         ],
     )
     def test_compile_selective_checkpoint_random_op(self, device, partition_fn):
+        # [FUNCTION DOC] Selective checkpointing (sigmoid saved) with a dropout in the region, run
+        # for preserve_rng_state True and False under inductor fallback_random. Expects forward 2
+        # sigmoid and 1 native_dropout and backward 0 sigmoid and 1 native_dropout (dropout
+        # recomputed). Output/gradient comparison with eager is skipped when preserve_rng_state is
+        # False, since compile always preserves RNG state.
         for preserve_rng_state in [True, False]:
 
             def selective_checkpointing_context_fn():
+                # [FUNCTION DOC] HELPER: context_fn with a policy saving aten.sigmoid.
                 no_recompute_list = [
                     torch.ops.aten.sigmoid.default,
                 ]
@@ -1633,9 +2000,12 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
                 )
 
             def gn(x):
+                # [FUNCTION DOC] HELPER: sigmoid of dropout (p 0.5, training) of sigmoid of x.
                 return torch.sigmoid(torch.dropout(torch.sigmoid(x), p=0.5, train=True))
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: non-reentrant checkpoint of gn with the SAC context_fn and
+                # the loop's preserve_rng_state value.
                 return torch.utils.checkpoint.checkpoint(
                     gn,
                     x,
@@ -1688,10 +2058,16 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
         ],
     )
     def test_compile_selective_checkpoint_invalid_context(self, partition_fn):
+        # [FUNCTION DOC] Checks the error for a context_fn that returns two objects that are not
+        # TorchDispatchModes (_invalid_context_gen): running _validate must raise an exception
+        # matching must generate a tuple of two TorchDispatchModes. Takes no device argument;
+        # inputs are CPU tensors.
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: sigmoid of matmul of x and y, times y.
             return torch.sigmoid(torch.matmul(x, y)) * y
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: non-reentrant checkpoint of gn with the invalid context_fn.
             return torch.utils.checkpoint.checkpoint(
                 gn,
                 x,
@@ -1732,9 +2108,20 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
         ],
     )
     def test_compile_selective_checkpoint_parametrization(self, partition_fn):
+        # [FUNCTION DOC] Applies a selective-checkpointed parametrization (sigmoid of x times x,
+        # with mul and sigmoid marked MUST_RECOMPUTE and all else MUST_SAVE) to the weight of a
+        # bias-free Linear(16, 16) via nn.utils.parametrize, compiles fullgraph with aot_autograd
+        # and compares output and input gradient with eager. Forward expects 1 mul and 1 sigmoid;
+        # backward expects 1 sigmoid and 2 mul (3 with default_partition, which has no CSE).
         def sac_policy():
+            # [FUNCTION DOC] HELPER: context_fn that builds selective checkpoint contexts from the
+            # policy produced by _recomp_policy.
             def _recomp_policy():
+                # [FUNCTION DOC] HELPER: returns the policy callable that recomputes mul.Tensor and
+                # sigmoid and saves every other op.
                 def _custom_policy(ctx, func, *args, **kwargs):
+                    # [FUNCTION DOC] HELPER: maps aten.mul.Tensor and aten.sigmoid to
+                    # MUST_RECOMPUTE and every other op to MUST_SAVE.
                     to_recompute = func in {
                         torch.ops.aten.mul.Tensor,
                         torch.ops.aten.sigmoid.default,
@@ -1750,18 +2137,27 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
             return create_selective_checkpoint_contexts(_recomp_policy())
 
         class Parametrization(torch.nn.Module):
+            # [CLASS DOC] HELPER: parametrization module that computes sigmoid of x squared,
+            # evaluated under non-reentrant checkpoint with the selective sac_policy context_fn.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: calls the base constructor only.
                 super().__init__()
 
             def parametrization(self, x):
+                # [FUNCTION DOC] HELPER: returns sigmoid of the elementwise square of x.
                 return torch.sigmoid(torch.mul(x, x))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: runs the parametrization under non-reentrant checkpoint
+                # with the sac_policy context_fn and returns its result.
                 return checkpoint(
                     self.parametrization, x, use_reentrant=False, context_fn=sac_policy
                 )
 
         def apply_parametrization(model):
+            # [FUNCTION DOC] HELPER: for every submodule of model, replaces each directly owned
+            # parameter by a fresh nn.Parameter and registers a Parametrization on it (unsafe
+            # mode); mutates and returns model.
             modules = list(model.modules())
 
             for mod in modules:
@@ -1775,15 +2171,21 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
             return model
 
         class MLPModule(nn.Module):
+            # [CLASS DOC] HELPER: tiny model with one bias-free Linear(16, 16) layer, seeded with
+            # torch.manual_seed(5) at construction.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: seeds the global RNG with 5 (side effect) and creates
+                # the linear layer.
                 super().__init__()
                 torch.manual_seed(5)
                 self.net1 = nn.Linear(16, 16, bias=False)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: applies the linear layer to x.
                 return self.net1(x)
 
             def reset_parameters(self):
+                # [FUNCTION DOC] HELPER: re-initializes the parameters of the linear layer.
                 self.net1.reset_parameters()
 
         fw_compiler = functools.partial(
@@ -1827,12 +2229,21 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
     @skipIfXpu(msg="XPU has some known limitations on flash attention.")
     @requires_gpu_and_triton
     def test_autocast_flash_attention(self, device):
+        # [FUNCTION DOC] Runs a reentrant-checkpointed aten efficient scaled-dot-product attention
+        # call under autocast and compares the aot_eager_decomp_partition compiled output to eager
+        # with the same seed. Skipped on XPU.
+        # KNOWN ISSUE: the test name says flash attention but the op used is the memory-
+        # efficient attention op.
         def fn(primals_1, primals_2, primals_3):
+            # [FUNCTION DOC] HELPER: calls the efficient scaled-dot-product attention aten op with
+            # inputs, no mask, compute_log_sumexp true and a fixed scale, and returns the attention
+            # output (first element).
             return torch.ops.aten._scaled_dot_product_efficient_attention.default(
                 primals_1, primals_2, primals_3, None, True, scale=0.17677669529663687
             )[0]
 
         def gn(*args):
+            # [FUNCTION DOC] HELPER: reentrant checkpoint of fn on all given arguments.
             return torch.utils.checkpoint.checkpoint(fn, *args, use_reentrant=True)
 
         with torch.autocast(device_type=device):
@@ -1855,16 +2266,25 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
         "This platform doesn't support efficient attention",
     )
     def test_compile_checkpoint_mem_eff_attention_no_dropout(self, device):
+        # [FUNCTION DOC] Checks checkpointing around a block that contains a reduce-overhead
+        # compiled efficient-attention call with no dropout. Verifies the op's philox seed and
+        # offset outputs are zero scalars and that the checkpointed block gives the same output and
+        # input gradient as eager. Skipped when the platform lacks memory-efficient attention.
         def eager_attn(x):
+            # [FUNCTION DOC] HELPER: efficient attention with q, k, v all x, no mask and dropout 0;
+            # returns the attention output.
             return torch.ops.aten._scaled_dot_product_efficient_attention.default(
                 x, x, x, None, True, dropout_p=0.0
             )[0]
 
         @torch.compile(mode="reduce-overhead")  # noqa: UNSPECIFIED_BACKEND
         def attn(x):
+            # [FUNCTION DOC] HELPER: torch.compile (reduce-overhead mode) wrapper
+            # that returns eager_attn(x).
             return eager_attn(x)
 
         def block(x):
+            # [FUNCTION DOC] HELPER: returns x plus the compiled attention of x.
             return x + attn(x)
 
         x_ref = torch.randn(3, 1, 77, 64, device=device, requires_grad=True)
@@ -1890,11 +2310,18 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
 
     @requires_gpu_and_triton
     def test_error_msg(self, device):
+        # [FUNCTION DOC] Checks that a graph break inside a checkpointed module under
+        # fullgraph compilation raises torch._dynamo.exc.Unsupported with a message about a
+        # user-inserted graph break.
         class MockModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module whose forward applies sin, an explicit dynamo graph
+            # break and cos.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: calls the base constructor only.
                 super().__init__()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: sin, graph break, cos of x; returns the result.
                 x = torch.sin(x)
                 torch._dynamo.graph_break()
                 x = torch.cos(x)
@@ -1903,6 +2330,7 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
         mod = MockModule().to(device)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: reentrant checkpoint of the module on x.
             return torch.utils.checkpoint.checkpoint(mod, x, use_reentrant=True)
 
         x = torch.randn(4, 4).to(device)
@@ -1914,11 +2342,19 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
 
     @requires_gpu_and_triton
     def test_list_inputs(self, device):
+        # [FUNCTION DOC] Checks that checkpointed modules taking a list input and returning a
+        # nested structure (tensor and list) compile fullgraph with aot_eager_decomp_partition and
+        # give the same result as eager.
         class MockModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module whose forward takes x and a list ys and returns x together
+            # with a list of cos of both list elements; the sin result is unused.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: calls the base constructor only.
                 super().__init__()
 
             def forward(self, x, ys):
+                # [FUNCTION DOC] HELPER: returns a tuple of x and the list of cosines of ys
+                # elements 0 and 1.
                 a = torch.sin(x)  # noqa: F841
                 b = torch.cos(ys[0])
                 c = torch.cos(ys[1])
@@ -1927,6 +2363,7 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
         mod = MockModule().to(device)
 
         def fn(x, ys):
+            # [FUNCTION DOC] HELPER: reentrant checkpoint of the module on x and the list ys.
             return torch.utils.checkpoint.checkpoint(mod, x, ys, use_reentrant=True)
 
         x = torch.randn(4, 4).to(device)
@@ -1940,11 +2377,21 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
     @skipIfXpu(msg="https://github.com/intel/torch-xpu-ops/issues/3393")
     @requires_gpu_and_triton
     def test_pattern_matcher(self, device):
+        # [FUNCTION DOC] Compiles with inductor a reentrant-checkpointed half-precision attention
+        # (matmul, scale, softmax, matmul) after a sin and inspects the captured post-AOT graphs.
+        # Expects one fused SDPA op in the forward, no sin in the backward (tags percolate), and
+        # the SDPA op recomputed once in the backward; the op is cudnn attention on preferred
+        # platforms, flash attention otherwise. Skipped on XPU.
+        # KNOWN ISSUE: count_ops returns the graph module (always truthy), so the assertTrue
+        # wrappers are redundant; the real check is the AssertionError raised inside count_ops.
         # Check that the sdpa op is recomputed in the backward graph
         # tests percolate_tags
 
         @checkpoint_wrapper
         def dot_prod_attention(
+            # [FUNCTION DOC] HELPER: reentrant-checkpointed (via checkpoint_wrapper) scaled
+            # dot-product attention written with matmul, scaling by 1/sqrt(last key dim),
+            # softmax and matmul.
             query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
         ) -> torch.Tensor:
             return (
@@ -1955,6 +2402,7 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
             )
 
         def fn(query, key, value):
+            # [FUNCTION DOC] HELPER: attention on sin(query), key, value.
             # Checks that sin is not recomputed in the backward graph
             return dot_prod_attention(query.sin(), key, value)
 
@@ -1971,6 +2419,8 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
         from torch._inductor import compile_fx
 
         def debug_compile_fx_inner(graph, example_inputs, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: inner_compile hook that records each graph in aot_graphs and
+            # delegates to compile_fx_inner, returning its result.
             aot_graphs.append(graph)
             return compile_fx.compile_fx_inner(graph, example_inputs, *args, **kwargs)
 
@@ -2005,17 +2455,25 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
     @requires_distributed()
     @requires_gpu_and_triton
     def test_distributed_utils_checkpoint_wrapper(self):
+        # [FUNCTION DOC] Checks that a module wrapped with the distributed
+        # checkpoint_wrapper (torch.distributed.algorithms._checkpoint) compiles fullgraph
+        # with aot_eager_decomp_partition and matches eager output. Requires distributed and
+        # a GPU with triton.
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
             checkpoint_wrapper as dist_checkpoint_wrapper,
         )
 
         class MockModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: module with Linear(4, 4) and an integer attribute c=2; forward is
+            # sin, linear, cos, then multiplied by c.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: creates the linear layer and sets c to 2.
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4)
                 self.c = 2
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: sin, linear, cos, then scale by c; returns the result.
                 x = torch.sin(x)
                 x = self.linear(x)
                 x = torch.cos(x)
@@ -2033,6 +2491,11 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
     @requires_distributed()
     @requires_gpu_and_triton
     def test_dynamo_does_not_trace_getattr_as_top_frame(self):
+        # [FUNCTION DOC] Checks that dynamo does not trace CheckpointWrapper getattr as the top
+        # frame: wraps a Sequential in a CheckpointWrapper with an extra attribute a on the inner
+        # module, compiles a function using the wrapper and its attribute a with fullgraph and the
+        # aot_eager_decomp_partition counting backend, and asserts equality with eager. Requires
+        # distributed and a GPU with triton.
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
             CheckpointWrapper,
         )
@@ -2045,6 +2508,8 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
         mod._checkpoint_wrapped_module.a = torch.ones(1, 1)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: returns the wrapped module applied to x, multiplied by
+            # the attribute a.
             return mod(x) * mod.a
 
         opt_fn = torch.compile(fn, backend=cnt, fullgraph=True)
@@ -2053,11 +2518,17 @@ Non-primal fwd outputs from model w/o backward hook: {mod_no_hook_fwd_outputs_no
         self.assertEqual(opt_fn(x), fn(x))
 
     def test_return_same_element_twice(self):
+        # [FUNCTION DOC] Checks that a checkpointed function returning the same tensor twice
+        # compiles fullgraph (reentrant) with equal outputs, and that the captured dynamo graph
+        # exposes only one getitem output from the tag_activation_checkpoint higher-order op,
+        # compared to an expected printed graph.
         def gn(x):
+            # [FUNCTION DOC] HELPER: returns sin(x) twice as a tuple.
             y = torch.sin(x)
             return y, y
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: reentrant checkpoint of gn on x.
             return torch.utils.checkpoint.checkpoint(gn, x, use_reentrant=True)
 
         x = torch.randn(4, 4, requires_grad=True)
@@ -2090,14 +2561,21 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(skip_fwd_side_effects_in_bwd_under_checkpoint=True)
     def test_nonlocal_mutation(self):
+        # [FUNCTION DOC] With skip_fwd_side_effects_in_bwd_under_checkpoint enabled, a nonlocal
+        # counter incremented inside a checkpointed function is incremented twice in eager (the
+        # forward and the recompute) but once under compile, since the recompute no longer replays
+        # the side effect.
         counter = 0
 
         def gn(x):
+            # [FUNCTION DOC] HELPER: increments the enclosing counter variable (nonlocal side
+            # effect) and returns sin(x).
             nonlocal counter
             counter += 1
             return torch.sin(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: reentrant checkpoint of gn on x.
             return torch.utils.checkpoint.checkpoint(gn, x, use_reentrant=True)
 
         x = torch.randn(4, 4, requires_grad=True)
@@ -2113,12 +2591,20 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(skip_fwd_side_effects_in_bwd_under_checkpoint=True)
     def test_nonlocal_list_mutation(self):
+        # [FUNCTION DOC] With skip_fwd_side_effects_in_bwd_under_checkpoint enabled, checks that
+        # a list mutation (append of an output) inside a non-reentrant checkpoint compiles
+        # fullgraph with aot_eager_decomp_partition and gives the same returned value and list
+        # element as eager.
         def gn(x, z):
+            # [FUNCTION DOC] HELPER: appends sin(x) to the list z (side effect) and returns the cos
+            # of sin of a chained matmul of x, together with that sin.
             out = x.sin()
             z.append(out)
             return torch.cos(torch.sin(torch.matmul(x, x) @ x)), out
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: creates an empty list, runs the non-reentrant checkpoint of gn
+            # with x and the list, and returns the first output and the first list element.
             z = []
 
             out1, out2 = torch.utils.checkpoint.checkpoint(
@@ -2140,13 +2626,22 @@ class GraphModule(torch.nn.Module):
 
     @torch._dynamo.config.patch(skip_fwd_side_effects_in_bwd_under_checkpoint=True)
     def test_nonlocal_list_mutation_hidden(self):
+        # [FUNCTION DOC] Variant of the list-mutation test where the mutated value is not directly
+        # returned: gn returns two outputs plus mutates a list, fn indexes outputs by first and
+        # last. Compiles fullgraph with the recording backend and checks eager parity, the captured
+        # dynamo graph (one checkpoint op with three outputs) and the forward AOT graph against
+        # expected text. skip_fwd_side_effects_in_bwd_under_checkpoint is enabled.
         def gn(x, z):
+            # [FUNCTION DOC] HELPER: computes a chained matmul, appends sin(x) to list z (side
+            # effect) and returns cos of sin of the matmul and sin(x).
             o = torch.matmul(x, x) @ x
             out = x.sin()
             z.append(out)
             return torch.cos(torch.sin(o)), torch.sin(x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: runs the non-reentrant checkpoint of gn with x and a fresh
+            # list; returns the sum of the first and last outputs, and the list's first element.
             z = []
 
             outs = torch.utils.checkpoint.checkpoint(
@@ -2221,22 +2716,34 @@ class GraphModule(torch.nn.Module):
         )
 
     def test_frozen_dataclass_pytree_output(self):
+        # [FUNCTION DOC] Registers two frozen dataclasses (InputNode and OutputNode) as
+        # pytree nodes and checks that a non-reentrant checkpointed module taking and
+        # returning them compiles fullgraph (aot_eager_decomp_partition) and gives the same
+        # output and input gradient as eager, with the same seed. The pytree registrations
+        # are removed in a finally block.
         import dataclasses
 
         from torch.utils import _pytree as pytree
 
         @dataclasses.dataclass(frozen=True)
         class InputNode:
+            # [CLASS DOC] HELPER: frozen dataclass holding a single tensor field x; registered as
+            # a pytree node.
             x: torch.Tensor
 
         @dataclasses.dataclass(frozen=True)
         class OutputNode:
+            # [CLASS DOC] HELPER: frozen dataclass holding a single tensor field y; registered as
+            # a pytree node.
             y: torch.Tensor
 
         pytree.register_dataclass(InputNode)
         pytree.register_dataclass(OutputNode)
 
         def cleanup():
+            # [FUNCTION DOC] HELPER: removes the two test dataclasses from the pytree
+            # supported-node, serialized-type and constant-node registries so they do not leak
+            # into other tests.
             # Clean up pytree registrations to avoid leaking state to other tests.
             # We manually remove from the registries since _deregister_pytree_node
             # has issues with classes registered without serialized_type_name.
@@ -2248,12 +2755,17 @@ class GraphModule(torch.nn.Module):
         try:
 
             class TinyMLP(nn.Module):
+                # [CLASS DOC] HELPER: MLP with Linear(4, 8) and Linear(8, 4); forward maps an
+                # InputNode through linear, silu, linear to an OutputNode.
                 def __init__(self):
+                    # [FUNCTION DOC] HELPER: creates the two linear layers.
                     super().__init__()
                     self.fc1 = nn.Linear(4, 8)
                     self.fc2 = nn.Linear(8, 4)
 
                 def forward(self, inp: InputNode) -> OutputNode:
+                    # [FUNCTION DOC] HELPER: applies fc1, silu and fc2 to the x field and wraps the
+                    # result in an OutputNode.
                     h = self.fc1(inp.x)
                     h = torch.nn.functional.silu(h)
                     y = self.fc2(h)
@@ -2262,6 +2774,8 @@ class GraphModule(torch.nn.Module):
             mlp = TinyMLP()
 
             def checkpointed_forward(inp):
+                # [FUNCTION DOC] HELPER: non-reentrant checkpoint of the MLP forward on inp
+                # with preserve_rng_state true.
                 return torch.utils.checkpoint.checkpoint(
                     mlp.forward,
                     inp,
@@ -2292,6 +2806,10 @@ class GraphModule(torch.nn.Module):
             cleanup()
 
     def test_checkpoint_with_record_function(self):
+        # [FUNCTION DOC] Checks that torch.profiler.record_function inside a checkpointed function
+        # is allowed when capture_profiler_record_function is enabled: compiles with aot_autograd
+        # (default partitioner), expects exactly one _record_function_enter_new op in the forward
+        # graph and parity with eager.
         # Test that record_function ops are allowed inside checkpointed functions.
         # record_function is technically "impure" but safe to duplicate during
         # activation checkpointing recompute since it only sets up profiling spans.
@@ -2300,10 +2818,13 @@ class GraphModule(torch.nn.Module):
         # 2. Forward graph contains record_function ops
         # 3. Code produces correct results
         def gn(x, y):
+            # [FUNCTION DOC] HELPER: sigmoid of the matmul of x and y inside a record_function
+            # span named matmul_region.
             with torch.profiler.record_function("matmul_region"):
                 return torch.sigmoid(torch.matmul(x, y))
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: non-reentrant checkpoint of gn on sin(x) and y.
             return torch.utils.checkpoint.checkpoint(
                 gn, torch.sin(x), y, use_reentrant=False
             )
@@ -2325,9 +2846,19 @@ class GraphModule(torch.nn.Module):
             self._validate(fn, backend, x, y)
 
     def _get_sac_annotations(self, checkpointed_fn, policy_fn, decompositions=None):
+        # [FUNCTION DOC] HELPER: compiles a non-reentrant checkpoint of checkpointed_fn on a random
+        # 4-element input with a selective-checkpoint context_fn built from policy_fn, using
+        # aot_autograd with no-op compilers and a partition function that records, for each
+        # call_function node of the joint graph with a recompute annotation, a line of node name,
+        # target and policy name before delegating to the min-cut partitioner. Resets dynamo first,
+        # runs forward and backward and returns the recorded lines joined by newlines. Optional
+        # decompositions are passed to aot_autograd.
         annotations = []
 
         def capture_partition(joint_gm, joint_args, **kwargs):
+            # [FUNCTION DOC] HELPER: partition_fn that appends one annotation line per annotated
+            # call_function node (name, target, recompute policy name) to the enclosing list and
+            # returns the min-cut rematerialization partition of the joint graph.
             for node in joint_gm.graph.nodes:
                 if node.op == "call_function":
                     recompute = node.meta.get("recompute", None)
@@ -2345,6 +2876,8 @@ class GraphModule(torch.nn.Module):
         )
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: non-reentrant checkpoint of checkpointed_fn on x with
+            # the selective context_fn.
             return checkpoint(
                 checkpointed_fn,
                 x,
@@ -2362,6 +2895,10 @@ class GraphModule(torch.nn.Module):
         return "\n".join(annotations)
 
     def test_pre_mode_decomp_has_sac_ignored_ops(self):
+        # [FUNCTION DOC] Verifies, via expected text, the SAC annotations when the checkpointed
+        # region (an allow_in_graph function using sin, detach, add, cos) is processed with the
+        # policy saving sin, add and cos: the detach node (an op SAC ignores) is annotated
+        # PREFER_RECOMPUTE while the others are MUST_SAVE.
         SAVE_OPS = {
             torch.ops.aten.sin.default,
             torch.ops.aten.add.Tensor,
@@ -2369,12 +2906,16 @@ class GraphModule(torch.nn.Module):
         }
 
         def policy_fn(ctx, func, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: policy returning MUST_SAVE for ops in SAVE_OPS
+            # and PREFER_RECOMPUTE otherwise.
             if func in SAVE_OPS:
                 return CheckpointPolicy.MUST_SAVE
             return CheckpointPolicy.PREFER_RECOMPUTE
 
         @torch._dynamo.allow_in_graph
         def op_with_detach(x):
+            # [FUNCTION DOC] HELPER: allow_in_graph function: sin of x, adds its detached
+            # copy, then cos.
             a = x.sin()
             out = a.detach() + a
             out = out.cos()
@@ -2390,14 +2931,21 @@ cos: aten.cos.default -> MUST_SAVE""",
         )
 
     def test_post_mode_decomp(self):
+        # [FUNCTION DOC] Verifies, via expected text, the SAC annotations when silu is
+        # decomposed after the SAC mode runs (inductor decomposition table): ops produced by
+        # decomposing silu (neg, exp, add, div) inherit MUST_SAVE from the silu policy while sin
+        # and cos are PREFER_RECOMPUTE.
         from torch._inductor.compile_fx import select_decomp_table
 
         def policy_fn(ctx, func, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: policy returning MUST_SAVE for silu and PREFER_RECOMPUTE for
+            # all other ops.
             if func == torch.ops.aten.silu.default:
                 return CheckpointPolicy.MUST_SAVE
             return CheckpointPolicy.PREFER_RECOMPUTE
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: sin, silu, then cos of x.
             x = x.sin()
             x = torch.nn.functional.silu(x)
             x = x.cos()
@@ -2417,12 +2965,19 @@ cos: aten.cos.default -> PREFER_RECOMPUTE""",
         )
 
     def test_multi_output_op(self):
+        # [FUNCTION DOC] Verifies, via expected text, SAC annotations for a multi-output op: topk
+        # is MUST_SAVE and both getitem nodes extracted from it inherit MUST_SAVE, while sin, sum
+        # and cos are PREFER_RECOMPUTE.
         def policy_fn(ctx, func, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: policy returning MUST_SAVE for topk
+            # and PREFER_RECOMPUTE otherwise.
             if func == torch.ops.aten.topk.default:
                 return CheckpointPolicy.MUST_SAVE
             return CheckpointPolicy.PREFER_RECOMPUTE
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: sin, top-2 values, their sum, then cos; the
+            # indices are unused.
             x = x.sin()
             vals, idxs = torch.topk(x, k=2)
             out = vals.sum()
@@ -2442,10 +2997,20 @@ cos: aten.cos.default -> PREFER_RECOMPUTE""",
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
     def test_region_activation_memory_budget_reduces_act_mem(self):
+        # [FUNCTION DOC] Compares retained activation memory (CUDA allocator requested bytes
+        # between forward and backward) of a 4-layer Linear plus relu stack compiled with
+        # aot_eager. Without a budget it must be greater than zero; with
+        # region_activation_memory_budget(0.0) around the forward it must be exactly zero
+        # (everything recomputed). Requires CUDA.
         N, NUM_LAYERS = 1000, 4
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: stack of NUM_LAYERS Linear(N, N) layers followed by relu; if
+            # budget is not None the forward runs under region_activation_memory_budget(budget),
+            # and returns the sum of the output.
             def __init__(self, budget=None):
+                # [FUNCTION DOC] HELPER: stores the optional budget and creates the
+                # ModuleList of linears.
                 super().__init__()
                 self.budget = budget
                 self.linears = torch.nn.ModuleList(
@@ -2453,6 +3018,8 @@ cos: aten.cos.default -> PREFER_RECOMPUTE""",
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: runs each linear then relu on x, inside the region
+                # activation memory budget context when a budget was given, and returns the sum.
                 if self.budget is not None:
                     with torch.autograd.graph.region_activation_memory_budget(
                         self.budget
@@ -2466,6 +3033,9 @@ cos: aten.cos.default -> PREFER_RECOMPUTE""",
                     return x.sum()
 
         def get_act_mem(f):
+            # [FUNCTION DOC] HELPER: runs f once with backward as warm-up, records current
+            # requested CUDA bytes, runs f again and measures the increase in requested bytes
+            # (activation memory) before calling backward, then returns that increase.
             out = f()
             out.backward()
             start_mem = torch.cuda.memory_stats()["requested_bytes.all.current"]
@@ -2488,12 +3058,21 @@ cos: aten.cos.default -> PREFER_RECOMPUTE""",
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
     def test_region_activation_memory_budget_per_region(self):
+        # [FUNCTION DOC] Checks that graphs separated by an explicit graph break can have different
+        # region activation memory budgets. Compiles four models with budgets (1.0 or 0.0) per half
+        # and asserts activation memory ordering: both save > either one recomputing > both
+        # recomputing. Requires CUDA.
         """Different graphs (separated by a graph break) can have different
         memory budgets."""
         N, NUM_LAYERS = 1000, 2
 
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: two stacks of Linear(N, N) plus relu layers; the first half runs
+            # under budget_a, a dynamo graph break follows, then the second half under budget_b;
+            # returns the sum.
             def __init__(self, budget_a, budget_b):
+                # [FUNCTION DOC] HELPER: stores both budgets and creates the two
+                # ModuleLists of linears.
                 super().__init__()
                 self.budget_a = budget_a
                 self.budget_b = budget_b
@@ -2505,6 +3084,8 @@ cos: aten.cos.default -> PREFER_RECOMPUTE""",
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: first stack under budget_a, graph break, second stack
+                # under budget_b; returns the sum of the output.
                 with torch.autograd.graph.region_activation_memory_budget(
                     self.budget_a
                 ):
@@ -2519,6 +3100,9 @@ cos: aten.cos.default -> PREFER_RECOMPUTE""",
                     return x.sum()
 
         def get_act_mem(f):
+            # [FUNCTION DOC] HELPER: warm-up forward and backward, then measures the increase in
+            # CUDA requested bytes caused by one forward (retained activations), calls backward and
+            # returns the measurement.
             out = f()
             out.backward()
             start_mem = torch.cuda.memory_stats()["requested_bytes.all.current"]
@@ -2554,6 +3138,9 @@ cos: aten.cos.default -> PREFER_RECOMPUTE""",
         self.assertGreater(mem_b_recomp, mem_both_recomp)
 
     def test_region_activation_memory_budget_validation(self):
+        # [FUNCTION DOC] Checks argument validation of region_activation_memory_budget: a bool or
+        # string raises TypeError mentioning a float; values outside 0..1 (2.0 and -0.1) raise
+        # ValueError mentioning the [0, 1] range.
         region_activation_memory_budget = (
             torch.autograd.graph.region_activation_memory_budget
         )
@@ -2567,16 +3154,24 @@ cos: aten.cos.default -> PREFER_RECOMPUTE""",
             region_activation_memory_budget(-0.1)
 
     def test_region_activation_memory_budget_eager_raises(self):
+        # [FUNCTION DOC] Checks that entering region_activation_memory_budget outside a
+        # torch.compile region raises RuntimeError mentioning that it must be used inside
+        # a torch.compile region.
         """Using the context manager outside a torch.compile region is an error."""
         with self.assertRaisesRegex(RuntimeError, "inside a torch.compile region"):
             with torch.autograd.graph.region_activation_memory_budget(0.5):
                 pass
 
     def test_region_activation_memory_budget_conflict_raises(self):
+        # [FUNCTION DOC] Checks that two different budgets (0.3 and 0.8) in one fullgraph compiled
+        # graph raise RuntimeError about conflicting budgets when the backward runs, since the
+        # partitioner applies a single budget per graph.
         """Two different budgets in one graph (no graph break) is an error: the
         partitioner applies a single budget per graph."""
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: two mm plus add and relu blocks, the first in a 0.3 budget
+            # region and the second in a 0.8 budget region; returns the second result.
             with torch.autograd.graph.region_activation_memory_budget(0.3):
                 a = (torch.mm(x, y) + 1).relu()
             with torch.autograd.graph.region_activation_memory_budget(0.8):
@@ -2589,10 +3184,15 @@ cos: aten.cos.default -> PREFER_RECOMPUTE""",
             cfn(x, y).sum().backward()
 
     def test_region_activation_memory_budget_partial_annotation_raises(self):
+        # [FUNCTION DOC] Checks that annotating only part of the forward with a budget raises
+        # RuntimeError saying the budget must cover the entire forward; the ops after the
+        # region are unannotated.
         """Annotating only part of a graph is rejected: the budget is applied
         graph-wide, so it must cover the entire forward."""
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: mm plus one then relu under a 0.3 budget region, followed by
+            # an unannotated multiply by two and relu.
             with torch.autograd.graph.region_activation_memory_budget(0.3):
                 a = (torch.mm(x, y) + 1).relu()
             # This op is outside the region -> partial annotation.
@@ -2607,6 +3207,10 @@ cos: aten.cos.default -> PREFER_RECOMPUTE""",
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_region_activation_memory_budget_covers_invoke_subgraph(self):
+        # [FUNCTION DOC] Checks that a budget around a forward that includes a
+        # nested_compile_region (invoke_subgraph, not inlined) also applies inside the subgraph
+        # body: baseline activation memory is positive and with budget 0.0 it is exactly zero.
+        # Requires CUDA; inline_single_use_invoke_subgraph is off.
         """A budget covering a forward that contains an invoke_subgraph
         (nested_compile_region) applies inside the HOP body too: the budget
         propagates into the body so the whole forward is consistently covered."""
@@ -2615,17 +3219,24 @@ cos: aten.cos.default -> PREFER_RECOMPUTE""",
         N, NUM_LAYERS = 1000, 4
 
         def build(budget):
+            # [FUNCTION DOC] HELPER: builds a function with 4 CUDA Linear(N, N) plus relu layers
+            # inside a nested_compile_region, wrapped in the memory budget context when budget is
+            # not None; returns that function.
             linears = torch.nn.ModuleList(
                 [torch.nn.Linear(N, N) for _ in range(NUM_LAYERS)]
             ).cuda()
 
             @nested_compile_region
             def region(x):
+                # [FUNCTION DOC] HELPER: invoke_subgraph-marked body that applies each captured
+                # linear followed by relu to x.
                 for lin in linears:
                     x = lin(x).relu()
                 return x
 
             def fn(x):
+                # [FUNCTION DOC] HELPER: sum of region(x), inside the memory budget context if a
+                # budget was given.
                 # Wrap the entire forward (HOP call + reduction); the budget must
                 # consistently cover the HOP body too.
                 if budget is None:
@@ -2636,6 +3247,9 @@ cos: aten.cos.default -> PREFER_RECOMPUTE""",
             return fn
 
         def get_act_mem(f):
+            # [FUNCTION DOC] HELPER: warm-up forward and backward, then measures how much CUDA
+            # requested bytes grow after one forward (retained activations), runs backward and
+            # returns the growth.
             out = f()
             out.backward()
             start_mem = torch.cuda.memory_stats()["requested_bytes.all.current"]
@@ -2658,6 +3272,9 @@ cos: aten.cos.default -> PREFER_RECOMPUTE""",
 
     @torch._dynamo.config.patch(inline_single_use_invoke_subgraph=False)
     def test_region_activation_memory_budget_distinct_per_invoke_subgraph_raises(self):
+        # [FUNCTION DOC] Checks that two invoke_subgraph regions with different budgets (0.3 and
+        # 0.8) in one fullgraph graph raise RuntimeError about conflicting budgets, because the
+        # agreement check recurses into nested subgraphs. inline_single_use_invoke_subgraph is off.
         """Different budgets in two invoke_subgraph regions of a single graph are
         rejected: the agreement check recurses into nested subgraphs, so the
         outermost graph sees both budgets. Use a graph break for different
@@ -2669,15 +3286,20 @@ cos: aten.cos.default -> PREFER_RECOMPUTE""",
 
         @nested_compile_region
         def region_a(x):
+            # [FUNCTION DOC] HELPER: nested_compile_region body computing relu of x matmul wa
+            # inside a 0.3 budget region.
             with torch.autograd.graph.region_activation_memory_budget(0.3):
                 return (x @ wa).relu()
 
         @nested_compile_region
         def region_b(x):
+            # [FUNCTION DOC] HELPER: nested_compile_region body computing relu of x matmul wb
+            # inside a 0.8 budget region.
             with torch.autograd.graph.region_activation_memory_budget(0.8):
                 return (x @ wb).relu()
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: sum of region_b applied to region_a of x.
             return region_b(region_a(x)).sum()
 
         cfn = torch.compile(fn, backend="aot_eager", fullgraph=True)
@@ -2687,15 +3309,29 @@ cos: aten.cos.default -> PREFER_RECOMPUTE""",
 
 
 class RematerializeACNodesPassTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Tests for the remat-using-tags pass on a single forward-loss-backward graph (the
+    # backward is traced inside the compiled function via autograd.grad). Uses
+    # _compile_and_capture to get the forward graph with and without
+    # remat_using_tags_for_fwd_loss_bwd_graph and checks recompute counts, RNG error handling,
+    # SDPA dropout RNG classification and selective checkpoint policies.
     """Tests for AC reordering optimization in full graph (forward+backward in one graph)."""
 
     def count_op(self, gm, target):
+        # [FUNCTION DOC] HELPER: returns the number of nodes in gm.graph whose
+        # target equals target.
         return sum(1 for n in gm.graph.nodes if n.target == target)
 
     def _compile_and_capture(self, fn, remat_using_tags_for_fwd_loss_bwd_graph, inputs):
+        # [FUNCTION DOC] HELPER: compiles fn fullgraph with aot_autograd (a capturing forward
+        # compiler, no backward compiler or partitioner) while patching
+        # remat_using_tags_for_fwd_loss_bwd_graph to the given flag and enabling
+        # trace_autograd_ops. Calls the compiled function on inputs and returns the result and
+        # the captured GraphModule.
         captured_gm = None
 
         def compiler(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: forward compiler that stores the graph module in the enclosing
+            # captured_gm and returns its forward.
             nonlocal captured_gm
             captured_gm = gm
             return gm.forward
@@ -2719,10 +3355,16 @@ class RematerializeACNodesPassTests(torch._dynamo.test_case.TestCase):
 
     @unittest.skipIf(not HAS_GPU_AND_TRITON, "GPU not available")
     def test_ac_rematerialize_simple_forward_backward(self):
+        # [FUNCTION DOC] Compiles a fwd-loss-bwd function (checkpointed sigmoid of matmul,
+        # gradients via autograd.grad) with the remat flag off and on. Gradients must match; with
+        # remat the graph has 4 mm and 2 sigmoid instead of 3 and 1 (recompute in the backward),
+        # and the graph code matches the expected text. Skipped without GPU and triton.
         x = torch.randn(4, 4, requires_grad=True)
         y = torch.randn(4, 4, requires_grad=True)
 
         def simple_fwd_bwd(x, y):
+            # [FUNCTION DOC] HELPER: non-reentrant checkpoint of sigmoid of matmul on x and y,
+            # sums, and returns detached gradients with respect to x and y.
             z = torch.utils.checkpoint.checkpoint(
                 lambda a, b: torch.sigmoid(torch.matmul(a, b)),
                 x,
@@ -2776,9 +3418,14 @@ def forward(self, arg0_1, arg1_1):
         )
 
     def test_ac_rematerialize_with_rng_ops_raises_error(self):
+        # [FUNCTION DOC] Checks that compiling with remat enabled a checkpointed region containing
+        # an RNG op (rand_like) in a fwd-loss-bwd graph raises BackendCompilerFailed saying
+        # rematerialization does not support RNG ops in recompute regions.
         x = torch.randn(4, 4, requires_grad=True)
 
         def fwd_bwd_with_rng(x):
+            # [FUNCTION DOC] HELPER: non-reentrant checkpoint of sigmoid of x plus random values,
+            # sums, and returns the gradient with respect to x.
             z = torch.utils.checkpoint.checkpoint(
                 lambda a: torch.sigmoid(a + torch.rand_like(a)), x, use_reentrant=False
             )
@@ -2795,6 +3442,11 @@ def forward(self, arg0_1, arg1_1):
             self._compile_and_capture(fwd_bwd_with_rng, True, (x,))
 
     def test_ac_rematerialize_sdpa_rng_classification(self):
+        # [FUNCTION DOC] Checks has_recomputable_rng_ops and is_rng_op for scaled-dot-product-
+        # attention ops: dropout_p of zero (int, float, negative zero) is not RNG, while 1e-12,
+        # 0.1, nan, a placeholder (dynamic) value and a nonzero SymFloat are. Builds small FX
+        # graphs with a PREFER_RECOMPUTE node per op, passing dropout positionally and as a
+        # keyword, and a SimpleNamespace node for the SymFloat checks.
         sdpa_ops = [
             torch.ops.aten.scaled_dot_product_attention.default,
             torch.ops.aten._scaled_dot_product_attention_math_for_mps.default,
@@ -2902,6 +3554,12 @@ def forward(self, arg0_1, arg1_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
     def test_ac_rematerialize_with_sdpa_dropout_zero(self):
+        # [FUNCTION DOC] On CUDA, runs a checkpointed F.scaled_dot_product_attention with
+        # dropout_p 0.0 and a PREFER_RECOMPUTE policy for sdpa ops (everything else PREFER_SAVE)
+        # in a fwd-loss-bwd graph, for each available fused backend (efficient fp32, flash fp16,
+        # cudnn fp16). Compares remat on, remat off and eager outputs and gradients, and asserts
+        # the remat graph contains exactly 2 sdpa ops (forward plus recompute). Skips if no
+        # fused backend exists.
         from torch.nn.attention import sdpa_kernel, SDPBackend
 
         cases = []
@@ -2922,6 +3580,8 @@ def forward(self, arg0_1, arg1_1):
         }
 
         def policy_fn(ctx, op, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: policy returning PREFER_RECOMPUTE for attention ops in
+            # sdpa_ops and PREFER_SAVE for others.
             if op in sdpa_ops:
                 return torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
             return torch.utils.checkpoint.CheckpointPolicy.PREFER_SAVE
@@ -2944,6 +3604,10 @@ def forward(self, arg0_1, arg1_1):
                 )
 
                 def fwd_bwd_with_sdpa(q, k, v):
+                    # [FUNCTION DOC] HELPER: under the chosen sdpa_kernel backend, checkpoints
+                    # scaled-dot-product attention without dropout (non-reentrant, with
+                    # context_fn), sums it, takes gradients with respect to q, k, v and returns the
+                    # detached output and the three gradients.
                     with sdpa_kernel(backend):
                         z = torch.utils.checkpoint.checkpoint(
                             lambda q, k, v: F.scaled_dot_product_attention(
@@ -2979,9 +3643,14 @@ def forward(self, arg0_1, arg1_1):
                 self.assertEqual(sum(self.count_op(gm_with, op) for op in sdpa_ops), 2)
 
     def test_ac_rematerialize_with_no_annotations(self):
+        # [FUNCTION DOC] Checks remat works without explicit annotations: compiles a checkpointed
+        # sigmoid of x plus 4 with remat on and off, asserts equal gradients and that the graph has
+        # 2 sigmoid ops (recomputed) with remat and 1 without.
         x = torch.randn(4, 4, requires_grad=True)
 
         def fwd_bwd(x):
+            # [FUNCTION DOC] HELPER: non-reentrant checkpoint of sigmoid of x plus 4, sum, and
+            # returns the gradient with respect to x.
             z = torch.utils.checkpoint.checkpoint(
                 lambda a: torch.sigmoid(a + 4), x, use_reentrant=False
             )
@@ -3000,11 +3669,18 @@ def forward(self, arg0_1, arg1_1):
         self.assertEqual(sigmoid_without, 1)
 
     def test_ac_rematerialize_with_selective_checkpoint_policy(self):
+        # [FUNCTION DOC] Checks remat in a fwd-loss-bwd graph with a selective checkpoint policy
+        # saving addmm and recomputing everything else, on a linear plus relu region (x, weight,
+        # bias inputs). Asserts gradients match remat-off, that addmm count is unchanged (saved,
+        # not recomputed) and relu appears once more with remat, and that a recomputed relu node
+        # exists but no recomputed addmm.
         x = torch.randn(4, 128, requires_grad=True)
         w1 = torch.randn(128, 128, requires_grad=True)
         b1 = torch.randn(128, requires_grad=True)
 
         def policy_fn(ctx, op, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: policy returning MUST_SAVE for aten.addmm and PREFER_RECOMPUTE
+            # for all other ops.
             if op == torch.ops.aten.addmm.default:
                 return torch.utils.checkpoint.CheckpointPolicy.MUST_SAVE
             return torch.utils.checkpoint.CheckpointPolicy.PREFER_RECOMPUTE
@@ -3014,7 +3690,11 @@ def forward(self, arg0_1, arg1_1):
         )
 
         def fwd_bwd_with_policy(x, w1, b1):
+            # [FUNCTION DOC] HELPER: non-reentrant checkpoint of linear plus relu with the SAC
+            # context_fn, sums the result and returns gradients with respect to x, w1 and b1.
             def checkpoint_fn(inp, w, b):
+                # [FUNCTION DOC] HELPER: applies a linear layer (weight w, bias b) to inp
+                # and then relu.
                 linear = torch.nn.functional.linear(inp, w, b)
                 return torch.relu(linear)
 
@@ -3057,12 +3737,18 @@ def forward(self, arg0_1, arg1_1):
         )
 
     def _compile_with_joint_graph_pass_and_capture(self, fn, inputs):
+        # [FUNCTION DOC] HELPER: compiles fn fullgraph with aot_autograd whose forward compiler
+        # deep-copies the graph, runs inductor joint_graph_passes on it in place and returns its
+        # forward; trace_autograd_ops is enabled. Returns the result, the copy before the passes
+        # and the graph after the passes.
         from torch._inductor.fx_passes.joint_graph import joint_graph_passes
 
         captured_gm_before = None
         captured_gm_after = None
 
         def custom_compiler(gm, example_inputs):
+            # [FUNCTION DOC] HELPER: forward compiler that stores a deep copy of gm, applies
+            # joint_graph_passes to gm in place, stores gm and returns gm.forward.
             nonlocal captured_gm_before, captured_gm_after
             import copy
 
@@ -3084,10 +3770,17 @@ def forward(self, arg0_1, arg1_1):
         return result, captured_gm_before, captured_gm_after
 
     def test_joint_graph_passes_view_optimization(self):
+        # [FUNCTION DOC] Checks that joint graph passes fold chained views: a checkpointed function
+        # with two view calls in a fwd-loss-bwd graph has 6 view ops before the passes and 0 after;
+        # the gradient matches eager sigmoid gradient and the post-pass code matches expected text.
         x = torch.randn(4, 4, requires_grad=True)
 
         def fwd_bwd_with_views(x):
+            # [FUNCTION DOC] HELPER: non-reentrant checkpoint of a view-to-16, view-to-4x4, sigmoid
+            # region; sums and returns the detached gradient with respect to x.
             def checkpoint_fn(a):
+                # [FUNCTION DOC] HELPER: two successive views of a (flatten to 16 then back to 4x4)
+                # followed by sigmoid.
                 b = a.view(16)
                 c = b.view(4, 4)
                 return torch.sigmoid(c)
@@ -3132,10 +3825,17 @@ def forward(self, arg0_1):
         )
 
     def test_joint_graph_passes_permute_optimization(self):
+        # [FUNCTION DOC] Checks that joint graph passes eliminate double permutes: a checkpointed
+        # function with two permutes has 6 permute ops before the passes and 0 after; gradient
+        # matches eager and the post-pass code matches expected text.
         x = torch.randn(4, 4, requires_grad=True)
 
         def fwd_bwd_with_permute(x):
+            # [FUNCTION DOC] HELPER: non-reentrant checkpoint of a double-permute plus sigmoid
+            # region; sums and returns the detached gradient with respect to x.
             def checkpoint_fn(a):
+                # [FUNCTION DOC] HELPER: two successive transposing permutes of a
+                # followed by sigmoid.
                 b = a.permute(1, 0)
                 c = b.permute(1, 0)
                 return torch.sigmoid(c)
@@ -3181,12 +3881,20 @@ def forward(self, arg0_1):
 
     @torch._dynamo.config.patch(skip_fwd_side_effects_in_bwd_under_checkpoint=True)
     def test_attr_compile_submodules_in_checkpoint_wrapper(self):
+        # [FUNCTION DOC] Checks that compiling each child module of a non-reentrant checkpointed
+        # block with aot_eager does not exceed a recompile limit of 2 (pack hook guards must not
+        # cause recompiles). Compares output and input gradient with an eager block with the same
+        # weights. skip_fwd_side_effects_in_bwd_under_checkpoint is enabled.
         """Compiling submodules inside a checkpointed block should not hit the
         recompile limit due to WeakKeyDictionary guards in the pack_hook."""
         from torch.utils.checkpoint import checkpoint
 
         class Block(nn.Module):
+            # [CLASS DOC] HELPER: residual block of three RMSNorm plus bias-free Linear pairs, each
+            # added to the running activation.
             def __init__(self, dim):
+                # [FUNCTION DOC] HELPER: creates three RMSNorm(dim) and three bias-free
+                # Linear(dim, dim) layers.
                 super().__init__()
                 self.norm1 = nn.RMSNorm(dim)
                 self.linear1 = nn.Linear(dim, dim, bias=False)
@@ -3196,17 +3904,23 @@ def forward(self, arg0_1):
                 self.linear3 = nn.Linear(dim, dim, bias=False)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: applies the three norm-linear residual updates in order
+                # and returns the result.
                 x = x + self.linear1(self.norm1(x))
                 x = x + self.linear2(self.norm2(x))
                 x = x + self.linear3(self.norm3(x))
                 return x
 
         class CheckpointedBlock(nn.Module):
+            # [CLASS DOC] HELPER: wrapper holding a block whose forward runs it
+            # under non-reentrant checkpoint.
             def __init__(self, block):
+                # [FUNCTION DOC] HELPER: stores the wrapped block as a submodule.
                 super().__init__()
                 self.block = block
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: non-reentrant checkpoint of the block on x.
                 return checkpoint(self.block, x, use_reentrant=False)
 
         dim = 32
@@ -3233,10 +3947,16 @@ def forward(self, arg0_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
     def test_multiple_user_phase_annotations_errors(self):
+        # [FUNCTION DOC] Checks that two separate backward-annotated regions (annotate phase
+        # backward) in one fwd-loss-bwd graph, with unannotated work between them, raise
+        # RuntimeError about annotated backward regions when compiled with remat. Requires CUDA.
         x = torch.randn(4, 4, requires_grad=True)
         w = torch.randn(4, 4, requires_grad=True)
 
         def fn(x, w):
+            # [FUNCTION DOC] HELPER: checkpointed sin of a matmul, a backward-annotated gradient,
+            # an add of the gradients, then a second backward-annotated multiply by two; returns
+            # the detached result.
             z = torch.utils.checkpoint.checkpoint(
                 lambda a, b: torch.sin(a @ b), x, w, use_reentrant=False
             )
@@ -3254,12 +3974,18 @@ def forward(self, arg0_1):
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
     def test_user_phase_annotation_with_extra_autograd_grad(self):
+        # [FUNCTION DOC] Checks that only the user-annotated backward region gets
+        # rematerialization: the first gradient is annotated as phase backward and the second
+        # autograd.grad is not; with remat the captured code matches expected text. Requires CUDA.
         """Only the user-annotated backward region gets rematerialization."""
         x = torch.randn(4, 4, requires_grad=True)
         w1 = torch.randn(4, 4, requires_grad=True)
         w2 = torch.randn(4, 4, requires_grad=True)
 
         def fn(x, w1, w2):
+            # [FUNCTION DOC] HELPER: two checkpointed regions (sin of matmul with w1, sigmoid of
+            # matmul with w2); computes the gradient of the first loss inside the backward
+            # annotation and of the second outside it; returns the detached sum of both gradients.
             z1 = torch.utils.checkpoint.checkpoint(
                 lambda a, b: torch.sin(a @ b), x, w1, use_reentrant=False
             )
@@ -3307,6 +4033,10 @@ def forward(self, arg0_1, arg1_1, arg2_1):
         )
 
     def test_chunked_loss_remat(self):
+        # [FUNCTION DOC] Checks remat on a chunked loss pattern: per-chunk backward calls on a
+        # detached input are skipped and only the final backward through the checkpointed block is
+        # rematerialized. Results with remat on and off match and gelu appears once without remat
+        # and twice with it.
         """Chunked loss pattern: multiple backward regions from chunk_loss.backward()
         calls, but only the final x.backward() region needs remat. The pass should
         skip the chunk backwards and only rematerialize for the final one."""
@@ -3314,24 +4044,37 @@ def forward(self, arg0_1, arg1_1, arg2_1):
         chunksz = 4
 
         class Block(nn.Module):
+            # [CLASS DOC] HELPER: block of two bias-free Linear layers with a tanh-approximated
+            # gelu between them, run under non-reentrant checkpoint.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: creates two bias-free linear layers.
                 super().__init__()
                 self.l1 = nn.Linear(dim, dim, bias=False)
                 self.l2 = nn.Linear(dim, dim, bias=False)
 
             def _fn(self, x):
+                # [FUNCTION DOC] HELPER: first linear, tanh-gelu, second linear.
                 return self.l2(F.gelu(self.l1(x), approximate="tanh"))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: non-reentrant checkpoint of _fn on x.
                 return checkpoint(self._fn, x, use_reentrant=False)
 
         class ChunkedLoss(nn.Module):
+            # [CLASS DOC] HELPER: module that runs the checkpointed block, detaches its
+            # output, computes a summed mse loss per chunk of 4 rows through a head layer
+            # with backward called on each chunk, then calls backward on the block output
+            # with the accumulated gradient.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: creates the block and a bias-free head linear.
                 super().__init__()
                 self.block = Block()
                 self.head = nn.Linear(dim, dim, bias=False)
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: runs the block, performs chunked loss backward passes on a
+                # detached copy and a final backward through the block with the accumulated
+                # gradient; returns the total chunk loss as a detached sum.
                 x = self.block(x)
                 x_detached = x.detach().requires_grad_()
                 total = 0
@@ -3367,28 +4110,40 @@ def forward(self, arg0_1, arg1_1, arg2_1):
         self.assertEqual(gelu_with, 2, "gelu should be recomputed in backward")
 
     def test_two_backward_regions_needing_remat_errors(self):
+        # [FUNCTION DOC] Checks that two independent backward calls that both need recomputation in
+        # one graph raise BackendCompilerFailed with a message about requiring recomputation.
         """Two independent backward calls that both need recompute should error."""
         dim = 32
 
         class Block(nn.Module):
+            # [CLASS DOC] HELPER: block of two bias-free Linear layers with a tanh-approximated
+            # gelu between them, run under non-reentrant checkpoint.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: creates two bias-free linear layers.
                 super().__init__()
                 self.l1 = nn.Linear(dim, dim, bias=False)
                 self.l2 = nn.Linear(dim, dim, bias=False)
 
             def _fn(self, x):
+                # [FUNCTION DOC] HELPER: first linear, tanh-gelu, second linear.
                 return self.l2(F.gelu(self.l1(x), approximate="tanh"))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: non-reentrant checkpoint of _fn on x.
                 return checkpoint(self._fn, x, use_reentrant=False)
 
         class TwoBackwards(nn.Module):
+            # [CLASS DOC] HELPER: two checkpointed blocks in sequence whose forward runs two
+            # backward passes (one from z and one from y) and returns the detached z.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: creates two blocks.
                 super().__init__()
                 self.block1 = Block()
                 self.block2 = Block()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: runs both blocks, calls backward on the sum of z with
+                # retain_graph and on the sum of y, and returns detached z.
                 y = self.block1(x)
                 z = self.block2(y)
                 z.sum().backward(retain_graph=True)
@@ -3410,10 +4165,18 @@ instantiate_device_type_tests(
 
 
 class ActivationCheckpointingNonStrictTracerTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Tests for the non-strict tracing flow (make_fx under torch.compiler non-strict
+    # tracing context with autograd.grad/backward patches) interacting with eager
+    # torch.utils.checkpoint: backward node tagging and sequence numbers, patch preconditions, tag
+    # leakage, backward region counting and golden generated code for checkpoint, SAC and RNG
+    # cases. Uses _trace_train_step and _count_backward_regions as shared helpers.
     """Tests for non-strict tracing flag interaction with checkpoint."""
 
     @staticmethod
     def _count_backward_regions(gm):
+        # [FUNCTION DOC] HELPER: counts contiguous runs of nodes in gm.graph whose
+        # autograd_backward metadata is true (a new region starts when a backward node follows a
+        # non-backward node) and returns the count.
         regions = 0
         in_backward = False
         for node in gm.graph.nodes:
@@ -3424,12 +4187,19 @@ class ActivationCheckpointingNonStrictTracerTests(torch._dynamo.test_case.TestCa
         return regions
 
     def test_backward_nodes_have_seq_nr_under_non_strict(self):
+        # [FUNCTION DOC] Traces a train step (make_fx) of a model with a non-reentrant checkpointed
+        # sin of a matmul and checks that the sets of seq_nr values on forward call_function nodes
+        # (not autograd_backward) and on backward nodes are both non-empty and equal.
         class Model(nn.Module):
+            # [CLASS DOC] HELPER: module with a 4x4 parameter w whose forward checkpoints sin of
+            # x matmul w.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: creates the parameter w as a random 4x4 tensor.
                 super().__init__()
                 self.w = nn.Parameter(torch.randn(4, 4))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: non-reentrant checkpoint of a lambda computing sin(x @ w).
                 return checkpoint(
                     lambda x: torch.sin(x @ self.w), x, use_reentrant=False
                 )
@@ -3455,6 +4225,9 @@ class ActivationCheckpointingNonStrictTracerTests(torch._dynamo.test_case.TestCa
         self.assertSetEqual(backward_seq_nrs, forward_seq_nrs)
 
     def test_patch_autograd_grad_requires_non_strict_tracing(self):
+        # [FUNCTION DOC] Checks that calling torch.autograd.grad inside the patch_autograd_grad
+        # context without the non-strict tracing context raises AssertionError saying the patch
+        # must be used under the non-strict tracing context.
         x = torch.randn(2, 4, requires_grad=True)
         loss = torch.sin(x).sum()
 
@@ -3467,6 +4240,9 @@ class ActivationCheckpointingNonStrictTracerTests(torch._dynamo.test_case.TestCa
                 torch.autograd.grad(loss, (x,))
 
     def test_patch_engine_backward_requires_non_strict_tracing(self):
+        # [FUNCTION DOC] Checks that calling backward inside the patch_engine_backward context
+        # without the non-strict tracing context raises AssertionError saying the patch must be
+        # used under the non-strict tracing context.
         x = torch.randn(2, 4, requires_grad=True)
         loss = torch.sin(x).sum()
 
@@ -3479,12 +4255,18 @@ class ActivationCheckpointingNonStrictTracerTests(torch._dynamo.test_case.TestCa
                 loss.backward()
 
     def test_patch_autograd_grad_does_not_leak_backward_tag(self):
+        # [FUNCTION DOC] Under make_fx with the autograd.grad patch and node meta
+        # preservation, checks that backward nodes get the autograd_backward tag but a neg
+        # node after an autograd.grad call inside an annotation does not get it and keeps its
+        # custom annotation metadata.
         from torch.fx.experimental.proxy_tensor import make_fx
         from torch.fx.traceback import preserve_node_meta
 
         x = torch.randn(2, 4, requires_grad=True)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: inside an annotation ac_region_id 0, computes sin, calls
+            # autograd.grad on its sum and returns neg of the sin result.
             with torch.fx.traceback.annotate({"ac_region_id": 0}):
                 y = torch.sin(x)
                 torch.autograd.grad(y.sum(), (x,))
@@ -3510,12 +4292,17 @@ class ActivationCheckpointingNonStrictTracerTests(torch._dynamo.test_case.TestCa
         self.assertEqual(neg_nodes[0].meta.get("custom", {}), {"ac_region_id": 0})
 
     def test_patch_engine_backward_does_not_leak_backward_tag(self):
+        # [FUNCTION DOC] Same as the previous leakage test but for the patched engine backward:
+        # backward nodes are tagged autograd_backward, while the neg node after the backward call
+        # has no such tag and retains the ac_region_id custom metadata.
         from torch.fx.experimental.proxy_tensor import make_fx
         from torch.fx.traceback import preserve_node_meta
 
         x = torch.randn(2, 4, requires_grad=True)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: inside an annotation ac_region_id 0, computes sin, calls
+            # backward on its sum and returns neg of the sin result.
             with torch.fx.traceback.annotate({"ac_region_id": 0}):
                 y = torch.sin(x)
                 y.sum().backward()
@@ -3541,21 +4328,30 @@ class ActivationCheckpointingNonStrictTracerTests(torch._dynamo.test_case.TestCa
         self.assertEqual(neg_nodes[0].meta.get("custom", {}), {"ac_region_id": 0})
 
     def test_patch_autograd_grad_mlp_has_single_contiguous_backward_region(self):
+        # [FUNCTION DOC] Traces a train step of a 6-block residual MLP (no checkpoint) and asserts
+        # the graph has exactly one contiguous backward region.
         class Block(nn.Module):
+            # [CLASS DOC] HELPER: residual block x plus Linear(dim*2 to dim) of relu of
+            # Linear(dim to dim*2).
             def __init__(self, dim):
+                # [FUNCTION DOC] HELPER: creates the two linear layers.
                 super().__init__()
                 self.fc1 = nn.Linear(dim, dim * 2)
                 self.fc2 = nn.Linear(dim * 2, dim)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: returns x plus fc2 of relu of fc1 of x.
                 return x + self.fc2(torch.relu(self.fc1(x)))
 
         class Model(nn.Module):
+            # [CLASS DOC] HELPER: sequence of depth residual Blocks held in a ModuleList.
             def __init__(self, dim=32, depth=6):
+                # [FUNCTION DOC] HELPER: creates depth blocks of width dim.
                 super().__init__()
                 self.blocks = nn.ModuleList([Block(dim) for _ in range(depth)])
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: applies each block in order and returns the result.
                 for block in self.blocks:
                     x = block(x)
                 return x
@@ -3564,6 +4360,11 @@ class ActivationCheckpointingNonStrictTracerTests(torch._dynamo.test_case.TestCa
         self.assertEqual(self._count_backward_regions(gm), 1)
 
     def _trace_train_step(self, mod, x):
+        # [FUNCTION DOC] HELPER: traces a training step of mod with make_fx under non-strict
+        # tracing, the autograd.grad patch and node-meta preservation. The step reparametrizes the
+        # module with the traced parameter inputs, computes the summed output and returns gradients
+        # with respect to all parameters. Returns the traced GraphModule taking the flattened
+        # parameters followed by x.
         import torch.utils._pytree as pytree
         from torch.fx.experimental.proxy_tensor import make_fx
         from torch.fx.traceback import preserve_node_meta
@@ -3574,6 +4375,9 @@ class ActivationCheckpointingNonStrictTracerTests(torch._dynamo.test_case.TestCa
         params_len = len(flat_params)
 
         def train_step(*all_args):
+            # [FUNCTION DOC] HELPER: rebuilds the parameter dictionary from the leading flat
+            # arguments, runs the reparametrized module on the last argument, sums the output as
+            # loss and returns torch.autograd.grad of the loss with respect to the parameters.
             p = pytree.tree_unflatten(list(all_args[:params_len]), params_spec)
             with stateless._reparametrize_module(mod, p):
                 loss = mod(all_args[params_len]).sum()
@@ -3589,12 +4393,19 @@ class ActivationCheckpointingNonStrictTracerTests(torch._dynamo.test_case.TestCa
             return make_fx(train_step)(*full_args)
 
     def test_checkpoint_traces_through_eager_ac_under_non_strict(self):
+        # [FUNCTION DOC] Traces a train step of a model with non-reentrant checkpoint and compares
+        # the generated code with expected text: the forward mm is recomputed in the backward, so
+        # mm appears twice before the gradient mm.
         class Model(nn.Module):
+            # [CLASS DOC] HELPER: module with a 4x4 parameter w whose forward checkpoints sin of
+            # x matmul w.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: creates the parameter w as a random 4x4 tensor.
                 super().__init__()
                 self.w = nn.Parameter(torch.randn(4, 4))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: non-reentrant checkpoint of a lambda computing sin(x @ w).
                 return checkpoint(
                     lambda x: torch.sin(x @ self.w), x, use_reentrant=False
                 )
@@ -3622,21 +4433,32 @@ def forward(self, arg0_1, arg1_1):
         )
 
     def test_sac_traces_through_eager_ac_under_non_strict(self):
+        # [FUNCTION DOC] Same as the previous test but with a selective-checkpoint policy (mm
+        # PREFER_RECOMPUTE, all else MUST_SAVE) and expected generated code: mm is recomputed in
+        # the backward while sin output is saved.
         def policy_fn(ctx, func, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: returns PREFER_RECOMPUTE for aten.mm and MUST_SAVE otherwise.
             if func == torch.ops.aten.mm.default:
                 return CheckpointPolicy.PREFER_RECOMPUTE
             return CheckpointPolicy.MUST_SAVE
 
         def context_fn():
+            # [FUNCTION DOC] HELPER: returns selective checkpoint contexts built from policy_fn.
             return create_selective_checkpoint_contexts(policy_fn)
 
         class Model(nn.Module):
+            # [CLASS DOC] HELPER: module with a 4x4 parameter w whose forward checkpoints sin of x
+            # matmul w using the SAC context_fn.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: creates the parameter w as a random 4x4 tensor.
                 super().__init__()
                 self.w = nn.Parameter(torch.randn(4, 4))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: non-reentrant checkpoint of fn on x with
+                # the SAC context_fn.
                 def fn(x):
+                    # [FUNCTION DOC] HELPER: sin of x matmul w.
                     return torch.sin(x @ self.w)
 
                 return checkpoint(fn, x, use_reentrant=False, context_fn=context_fn)
@@ -3667,15 +4489,26 @@ def forward(self, arg0_1, arg1_1):
         )
 
     def test_checkpoint_with_rng_op_under_non_strict(self):
+        # [FUNCTION DOC] Traces a train step (seeded with 42, under non-strict tracing with the
+        # autograd.grad patch) of a model checkpointing a dropout region with preserve_rng_state,
+        # and compares generated code with expected text. Documents that the traced graph holds two
+        # independent bernoulli_ calls (forward and recompute) so masks differ at replay; this is a
+        # known limitation of tracing eager checkpoint.
         from torch.fx.experimental.proxy_tensor import make_fx
 
         class Model(nn.Module):
+            # [CLASS DOC] HELPER: module with a 4x4 parameter w whose forward checkpoints dropout
+            # (p 0.5) of sin of x matmul w, preserving the RNG state.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: creates the parameter w as a random 4x4 tensor.
                 super().__init__()
                 self.w = nn.Parameter(torch.randn(4, 4))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: non-reentrant checkpoint of fn on x
+                # with preserve_rng_state true.
                 def fn(x):
+                    # [FUNCTION DOC] HELPER: dropout (p 0.5) of sin of x matmul w.
                     return torch.nn.functional.dropout(torch.sin(x @ self.w), p=0.5)
 
                 return checkpoint(fn, x, use_reentrant=False, preserve_rng_state=True)
@@ -3691,6 +4524,9 @@ def forward(self, arg0_1, arg1_1):
         params_len = len(flat_params)
 
         def train_step(*all_args):
+            # [FUNCTION DOC] HELPER: rebuilds the parameter dictionary from leading arguments, runs
+            # the reparametrized module on the last argument, sums as loss and returns gradients
+            # with respect to the parameters.
             p = pytree.tree_unflatten(list(all_args[:params_len]), params_spec)
             with stateless._reparametrize_module(mod, p):
                 loss = mod(all_args[params_len]).sum()
@@ -3737,8 +4573,16 @@ def forward(self, arg0_1, arg1_1):
 
 
 class ActivationCheckpointingNestedCompileTests(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] Tests that checkpoint recompute preserves nested fx trace policy when a
+    # torch.compile function is called inside a checkpointed region while tracing with make_fx.
     @requires_gpu_and_triton
     def test_checkpoint_recompute_preserves_nested_fx_trace_policy(self):
+        # [FUNCTION DOC] Traces with make_fx, under fake mode, a tracing context, node meta
+        # preservation, non-strict tracing and a temporary disable of the nested-fx-trace error, a
+        # model that checkpoints a call to a compiled sin-cos function; the step returns the
+        # detached loss and the input gradient. Compares generated code with expected text,
+        # showing the region recomputed in the backward. Requires GPU and triton; the model is
+        # moved to the accelerator device.
         from torch._guards import tracing, TracingContext
         from torch._subclasses import FakeTensorMode
         from torch.fx.experimental.proxy_tensor import make_fx
@@ -3748,6 +4592,9 @@ class ActivationCheckpointingNestedCompileTests(torch._dynamo.test_case.TestCase
 
         @contextlib.contextmanager
         def skip_nested_compile():
+            # [FUNCTION DOC] HELPER: context manager that sets
+            # torch._dynamo.config.error_on_nested_fx_trace to False for its body and restores the
+            # previous value afterward, even on error.
             prev = torch._dynamo.config.error_on_nested_fx_trace
             torch._dynamo.config.error_on_nested_fx_trace = False
             try:
@@ -3756,16 +4603,22 @@ class ActivationCheckpointingNestedCompileTests(torch._dynamo.test_case.TestCase
                 torch._dynamo.config.error_on_nested_fx_trace = prev
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: module whose forward runs the non-reentrant checkpoint of its
+            # block method, which calls the compiled sin-cos function.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: non-reentrant checkpoint of the block method on x.
                 return checkpoint(self.block, x, use_reentrant=False)
 
             def block(self, x):
+                # [FUNCTION DOC] HELPER: returns the result of the compiled sin-cos function on x.
                 return compiled_f(x)
 
         m = getattr(M(), device_type)()
         x = torch.randn(8, device=device_type, requires_grad=True)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: runs the model, sums it as y, computes the gradient of y with
+            # respect to x and returns the detached y and the gradient.
             y = m(x).sum()
             (gx,) = torch.autograd.grad(y, (x,))
             return y.detach(), gx
