@@ -1,4 +1,9 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Sharded implementation of torch.nn.functional.embedding for a
+# weight held as a ShardedTensor with a ChunkShardingSpec. Provides row-wise
+# (dim 0) and column-wise (dim 1) lookup paths plus parameter validation.
+# Import-time side effect: the decorator registers sharded_embedding as the
+# custom sharding spec op for ChunkShardingSpec and functional embedding.
 
 import torch
 import torch.distributed as dist
@@ -17,6 +22,13 @@ from ._common import (
 
 @custom_sharding_spec_op(ChunkShardingSpec, torch.nn.functional.embedding)
 def sharded_embedding(types, args, kwargs, pg):
+    # [FUNCTION DOC] Torch-function handler for embedding with a sharded weight.
+    # args holds the id tensor and the ShardedTensor weight; kwargs may carry
+    # max_norm, norm_type, padding_idx, scale_grad_by_freq and sparse. Validates,
+    # then dispatches on the weight sharding dim: 1 uses the column-wise path
+    # (and writes the possibly renormed local shard back into the weight's first
+    # local shard), 0 uses the row-wise path. Returns the lookup result tensor.
+    # Raises RuntimeError for any other sharding dim. Performs collectives on pg.
     """
     Handles ``__torch_function__`` dispatch for ``torch.nn.functional.embedding``.
     This method computes a sharded embedding lookup and has the following limitations:
@@ -129,6 +141,14 @@ def sharded_embedding(types, args, kwargs, pg):
 
 
 def _validate_embedding_param(args, kwargs):
+    # [FUNCTION DOC] HELPER: Checks the embedding arguments and returns nothing.
+    # Raises TypeError if input is not a tensor or weight is not a ShardedTensor;
+    # ValueError if weight is not 2-D, ids are out of range, max_norm is not
+    # positive, the spec is not ChunkShardingSpec, or there is not exactly one
+    # local shard; RuntimeError if scale_grad_by_freq or sparse is set.
+    # KNOWN ISSUE: the out-of-range ValueErrors pass printf-style format args as
+    # extra exception arguments instead of formatting them, and the reported
+    # bound is the weight's dim 1 size rather than the row count that was checked.
     """
     Validate input params of sharded embedding op.
 
@@ -186,6 +206,10 @@ def _validate_embedding_param(args, kwargs):
 def _handle_col_wise_sharding(
     input, world_size, weight, local_shard, max_norm, norm_type, padding_idx, pg
 ):
+    # [FUNCTION DOC] HELPER: Column-wise path. All-gathers the ids across pg,
+    # optionally renorms the local shard in place when max_norm is given, then
+    # runs the shared column-wise base routine with functional embedding.
+    # Returns a tuple of (lookup output, local shard possibly renormed).
     """
     Entry-point function to handle the logic of col-wise sharding of weight
     for embedding. (Detailed explanations of the logic can be found in
@@ -234,6 +258,12 @@ def _handle_col_wise_sharding(
 def _handle_row_wise_sharding(
     input, world_size, weight, local_shard, max_norm, norm_type, padding_idx, rank, pg
 ):
+    # [FUNCTION DOC] HELPER: Row-wise path. All-gathers ids, masks ids not owned
+    # by this rank to an extra padding row, optionally applies max_norm renorm
+    # to the looked-up local rows first (workaround for GH issue 81717), looks up
+    # embeddings against the local shard plus the extra row, splits the result
+    # into one chunk per rank and reduce-scatters them. Returns this rank's
+    # reduced output tensor.
     """
     Entry-point function to handle the logic of row-wise sharding of weight
     for embedding. (Detailed explanations of the logic can be found in

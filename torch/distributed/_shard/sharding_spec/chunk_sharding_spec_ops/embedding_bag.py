@@ -1,4 +1,10 @@
 # mypy: allow-untyped-defs
+# [MODULE DOC] Sharded implementation of torch.nn.functional.embedding_bag for
+# a weight held as a ShardedTensor with a ChunkShardingSpec. Provides row-wise
+# (dim 0) and column-wise (dim 1) paths, argument validation, and a helper that
+# gathers ids, per-sample weights and offsets in one collective.
+# Import-time side effect: the decorator registers sharded_embedding_bag as the
+# custom sharding spec op for ChunkShardingSpec and functional embedding_bag.
 
 from typing import cast
 
@@ -20,6 +26,14 @@ from ._common import (
 
 @custom_sharding_spec_op(ChunkShardingSpec, torch.nn.functional.embedding_bag)
 def sharded_embedding_bag(types, args, kwargs, pg):
+    # [FUNCTION DOC] Torch-function handler for embedding_bag with a sharded
+    # weight. args holds the id tensor and ShardedTensor weight; kwargs may carry
+    # offsets, per_sample_weights, mode, max_norm, norm_type, include_last_offset
+    # and padding_idx. Validates, drops the trailing offset when
+    # include_last_offset is set, then dispatches on sharding dim: 1 uses the
+    # column-wise path (writing the possibly renormed shard back into the
+    # weight's first local shard), 0 uses the row-wise path. Returns the
+    # aggregated bag output. Raises RuntimeError for any other sharding dim.
     """
     Handles ``__torch_function__`` dispatch for ``torch.nn.functional.embedding_bag``.
     This method computes a sharded embedding bag aggregation and has the following limitations:
@@ -151,6 +165,16 @@ def sharded_embedding_bag(types, args, kwargs, pg):
 
 
 def _validate_embedding_bag_param(args, kwargs):
+    # [FUNCTION DOC] HELPER: Checks embedding_bag arguments, returns nothing.
+    # Raises TypeError for wrong tensor types (input, offsets, per_sample_weights,
+    # weight); ValueError for input over 2 dims, non-2D weight, out-of-range ids,
+    # inconsistent offsets or per_sample_weights shapes, unsupported mode (default
+    # is mean; allowed sum, mean, max), bad include_last_offset usage,
+    # non-positive max_norm, non-chunk spec, or not exactly one local shard;
+    # RuntimeError if scale_grad_by_freq or sparse is set.
+    # KNOWN ISSUE: the out-of-range ValueErrors pass printf-style args as extra
+    # exception arguments without formatting, and report dim 1 size as the bound.
+    # The error text for scale_grad_by_freq and sparse says nn.Embedding.
     """
     Validate input params of sharded embeddingBag op.
 
@@ -249,6 +273,11 @@ def _handle_col_wise_sharding(
     padding_idx,
     pg,
 ):
+    # [FUNCTION DOC] HELPER: Column-wise path. Gathers ids, per-sample weights
+    # and offsets across pg, optionally renorms the local shard in place when
+    # max_norm is given, then runs the shared column-wise base routine with
+    # functional embedding_bag. Returns a tuple of (output, local shard, which is
+    # the renormed shard when max_norm was used).
     """
     Entry-point function to handle the logic of col-wise sharding of weight
     for embeddingBag. (Detailed explanations of the logic can be found in
@@ -323,6 +352,15 @@ def _handle_row_wise_sharding(
     rank,
     pg,
 ):
+    # [FUNCTION DOC] HELPER: Row-wise path. Gathers ids (plus per-sample weights
+    # and offsets when present, concatenating them and shifting each rank's
+    # offsets), masks ids not owned by this rank to an extra padding row (filled
+    # with negative infinity in max mode), optionally applies the max_norm renorm
+    # workaround for GH issue 81717, runs embedding_bag against local shard plus
+    # padding row (mean is computed as sum), then reduce-scatters across pg with
+    # sum, or max for max mode. For mean mode divides by bag sizes derived from
+    # the input (non-padding counts for 2D input, offset differences for 1D).
+    # Returns this rank's output.
     """
     Entry-point function to handle the logic of row-wise sharding of weight
     for embeddingBag. (Detailed explanations of the logic can be found in
@@ -437,6 +475,13 @@ def _handle_row_wise_sharding(
 
 
 def _all_gather_embedding_bag_input(input, per_sample_weights, offsets, pg):
+    # [FUNCTION DOC] HELPER: Stacks input, optional per_sample_weights and
+    # optional offsets (resized to the input's shape) into one tensor and
+    # all-gathers it once over pg. Returns three values: the list of per-rank
+    # inputs (original dtype), the list of per-rank per_sample_weights or None,
+    # and the list of per-rank offsets (original size and dtype) or None.
+    # Note the stack mixes dtypes, so ids and offsets pass through the common
+    # promoted dtype before being cast back.
     """
     In case we need to gather input and all other parameters of embeddingBag
     ops, we need to stack all input together to perform ``all_gather``

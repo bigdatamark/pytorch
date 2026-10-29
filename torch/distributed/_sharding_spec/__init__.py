@@ -1,3 +1,7 @@
+# [PACKAGE DOC] Deprecated backward-compat alias for
+# torch.distributed._shard.sharding_spec: re-exports its public names, emits a
+# DeprecationWarning at import, and replaces its own sys.modules entry with the
+# new package.
 # Keep old package for BC purposes, this file should be removed once
 # everything moves to the `torch.distributed._shard` package.
 import sys
