@@ -1,4 +1,11 @@
 # Owner(s): ["module: nn"]
+# [MODULE DOC] Tests for torch.nn.Embedding, torch.nn.EmbeddingBag and their functional forms.
+# Covers max_norm renormalization, sparse gradients, from_pretrained constructors, padding_idx
+# handling (forward, backward, double backward, bounds errors), 1D and 2D bag inputs with offsets,
+# per-sample weights, include_last_offset, empty inputs, dimension and out-of-bounds errors,
+# deterministic and atomic-accumulate backward kernels, and large-tensor overflow regressions. At
+# import time it computes a module-level device type string (the current accelerator type or cpu),
+# and instantiates the device-generic class (with XPU allowed) and the parametrized CPU class.
 import itertools
 import random
 import unittest
@@ -42,12 +49,21 @@ device_type = (
 
 
 class TestEmbeddingNN(NNTestCase):
+    # [CLASS DOC] Device-independent Embedding and EmbeddingBag tests that mostly run on CPU; a
+    # few use the accelerator when available. Class flags enable the CUDA memory leak check and
+    # non-default-stream check.
     _do_cuda_memory_leak_check = True
     _do_cuda_non_default_stream = True
 
     @unittest.skipIf(not TEST_CUDA and not TEST_XPU, "CUDA/XPU unavailable")
     def test_embedding_max_norm_unsorted_repeating_indices(self):
+        # [FUNCTION DOC] Skipped without CUDA or XPU. Builds a seeded Embedding with max_norm on
+        # CPU and on the accelerator, looks up a long repeating index sequence of two unsorted-
+        # looking values, and asserts both devices give equal outputs.
         def create_embedding(device):
+            # [FUNCTION DOC] HELPER: Seeds the global generator, creates an Embedding with 20
+            # rows, 64 dims and max_norm 1.0, moves it to the given device and returns it, so
+            # every call produces identical weights.
             # Seed RNG so we get the same Embedding each time
             torch.manual_seed(0)
             return torch.nn.Embedding(
@@ -62,6 +78,8 @@ class TestEmbeddingNN(NNTestCase):
         self.assertEqual(out.cpu(), out_cpu)
 
     def test_embedding_sparse_basic(self):
+        # [FUNCTION DOC] Asserts a sparse Embedding backward through a sum yields a sparse
+        # gradient with the same shape as the weight.
         embedding = nn.Embedding(10, 20, sparse=True)
         input = torch.tensor([[0, 2, 4, 5], [4, 3, 0, 9]], dtype=torch.long)
         embedding(input).sum().backward()
@@ -69,6 +87,9 @@ class TestEmbeddingNN(NNTestCase):
         self.assertEqual(embedding.weight.grad.shape, embedding.weight.shape)
 
     def test_embedding_sparse_empty_tensor(self):
+        # [FUNCTION DOC] Asserts sparse Embedding backward works and yields a sparse gradient of
+        # the weight's shape for a zero-sized table with empty input, and for a zero embedding
+        # dimension with a normal index batch.
         embedding = nn.Embedding(0, 0, sparse=True)
         input = torch.tensor([], dtype=torch.int64)
         embedding(input).sum().backward()
@@ -82,6 +103,9 @@ class TestEmbeddingNN(NNTestCase):
         self.assertEqual(embedding.weight.grad.shape, embedding.weight.shape)
 
     def test_move_sparse_half_embedding(self):
+        # [FUNCTION DOC] Checks a sparse Embedding keeps its dimensions when converted to float16
+        # and, when an accelerator exists, when moved to it and back to CPU, asserting dtype and
+        # device type after each move.
         embedding = nn.Embedding(10, 3, sparse=True)
         self.assertEqual(embedding.weight.device.type, "cpu")
         self.assertEqual(embedding.weight.dtype, torch.get_default_dtype())
@@ -97,6 +121,8 @@ class TestEmbeddingNN(NNTestCase):
             self.assertEqual(embedding.weight.device.type, "cpu")
 
     def test_embedding_max_norm(self):
+        # [FUNCTION DOC] Asserts that with max_norm 1.0 repeated indices give equal rows and every
+        # output row has a 2-norm of at most 1.
         embedding = nn.Embedding(22, 5, max_norm=1.0)
         input = torch.tensor([2, 8, 8, 6], dtype=torch.long)
         output = embedding(input)
@@ -116,6 +142,9 @@ class TestEmbeddingNN(NNTestCase):
         ),
     )
     def test_embedding_from_pretrained(self, dtype):
+        # [FUNCTION DOC] Parametrized over several integer and float dtypes. Asserts
+        # from_pretrained keeps the given matrix as weight and that looking up both rows returns
+        # that matrix.
         a = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=dtype)
         embedding = nn.Embedding.from_pretrained(a)
         self.assertEqual(a, embedding.weight.data)
@@ -125,6 +154,8 @@ class TestEmbeddingNN(NNTestCase):
         self.assertEqual(a, output)
 
     def test_embedding_bag_from_pretrained(self):
+        # [FUNCTION DOC] Asserts EmbeddingBag from_pretrained keeps the matrix as weight and that
+        # a one-index-per-bag lookup with arange offsets reproduces the matrix.
         a = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
         embedding = nn.EmbeddingBag.from_pretrained(a)
         self.assertEqual(a, embedding.weight)
@@ -134,6 +165,8 @@ class TestEmbeddingNN(NNTestCase):
         self.assertEqual(a, output)
 
     def test_embedding_from_pretrained_padding_idx(self):
+        # [FUNCTION DOC] Asserts that from_pretrained with a padding_idx keeps the padding row of
+        # the supplied matrix unchanged (no zeroing).
         padding_idx = 2
         padding_vec = torch.ones(3) * 7
         embeddings = torch.rand(4, 3, requires_grad=True)
@@ -143,6 +176,8 @@ class TestEmbeddingNN(NNTestCase):
         self.assertEqual(embedding_nn.weight[padding_idx], padding_vec)
 
     def test_embedding_bag_from_pretrained_padding_idx(self):
+        # [FUNCTION DOC] Asserts EmbeddingBag from_pretrained with a padding_idx keeps the
+        # supplied matrix as weight.
         padding_idx = 2
         embeddings = torch.rand(4, 3, requires_grad=True)
         embedding_nn = nn.EmbeddingBag.from_pretrained(
@@ -151,6 +186,10 @@ class TestEmbeddingNN(NNTestCase):
         self.assertEqual(embedding_nn.weight, embeddings)
 
     def test_embedding_from_pretrained_options(self):
+        # [FUNCTION DOC] Under double default dtype, builds Embedding from_pretrained with
+        # max_norm, norm_type and sparse options. Asserts output equals the matrix object (which
+        # was renormalized in place so all entries changed) and each row's norm respects the
+        # maximum.
         with set_default_dtype(torch.double):
             a = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
             opts = {
@@ -170,6 +209,9 @@ class TestEmbeddingNN(NNTestCase):
             )
 
     def test_embedding_functional(self):
+        # [FUNCTION DOC] Asserts the functional embedding gives the same result as an Embedding
+        # module sharing the weight data, and likewise when the module is made through
+        # from_pretrained with a padding_idx and the functional call gets the same padding_idx.
         a = torch.tensor([[1, 3, 2], [0, 2, 1]], dtype=torch.long)
         embeddings = torch.rand(4, 3, requires_grad=True)
 
@@ -194,6 +236,9 @@ class TestEmbeddingNN(NNTestCase):
     @unittest.skipIf(not TEST_CUDA and not TEST_XPU, "CUDA/XPU not available")
     @largeTensorTest("40GB", device=device_type)
     def test_large_tensors(self):
+        # [FUNCTION DOC] Skipped without CUDA or XPU and needs a 40GB device (regression for issue
+        # 130806). Looks up 131072 indices in a 16032 by 16384 weight and asserts the result is
+        # 2-D with 2147483648 elements.
         input = torch.randint(low=0, high=16032, size=[131072], device=device_type)
         w = torch.randn([16032, 16384], device=device_type)
         out = torch.nn.functional.embedding(input, w)
@@ -201,6 +246,9 @@ class TestEmbeddingNN(NNTestCase):
         self.assertEqual(out.numel(), 2147483648)
 
     def test_embedding_bag_functional(self):
+        # [FUNCTION DOC] Asserts the functional embedding_bag matches an EmbeddingBag module given
+        # the same weight, also after from_pretrained with a padding_idx on the module and the
+        # functional call.
         a = torch.tensor([[1, 3, 2], [0, 2, 1]], dtype=torch.long)
         embeddings = torch.rand(4, 3, requires_grad=True)
 
@@ -220,6 +268,9 @@ class TestEmbeddingNN(NNTestCase):
 
     # Make sure that error is thrown if padding_idx is out of bounds
     def test_embedding_bag_padding_idx_error(self):
+        # [FUNCTION DOC] For padding_idx values from just below the negative table size to above
+        # the table size, asserts out-of-range values raise RuntimeError from the functional form
+        # and AssertionError from the module constructor, while in-range values raise nothing.
         a = torch.tensor([[1, 3, 2], [0, 2, 1]], dtype=torch.long)
         num_embeddings = 4
         num_features = 3
@@ -243,6 +294,8 @@ class TestEmbeddingNN(NNTestCase):
                 )
 
     def test_embeddingbag_from_pretrained(self):
+        # [FUNCTION DOC] Asserts EmbeddingBag from_pretrained keeps the weight and that a single
+        # 2-D row of indices gives the mean of the rows (default mode is mean).
         a = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
         embeddingbag = nn.EmbeddingBag.from_pretrained(a)
         self.assertEqual(a, embeddingbag.weight.data)
@@ -252,6 +305,9 @@ class TestEmbeddingNN(NNTestCase):
         self.assertEqual(a.mean(0, keepdim=True), output)
 
     def test_embeddingbag_from_pretrained_options(self):
+        # [FUNCTION DOC] Under double default dtype, builds EmbeddingBag from_pretrained with
+        # max_norm, norm_type and max mode. Asserts the output is the column-wise maximum, the
+        # matrix was renormalized in place, and row norms respect the limit.
         with set_default_dtype(torch.double):
             a = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
             opts = {
@@ -272,6 +328,9 @@ class TestEmbeddingNN(NNTestCase):
             )
 
     def test_embeddingbag_include_last_offset(self):
+        # [FUNCTION DOC] Regression for issue 89677. With include_last_offset and a padding_idx,
+        # two offset arrays (the second with a trailing value beyond the end) both give two bags
+        # equal to the mean of the first three rows and the fourth row.
         # Test case from https://github.com/pytorch/pytorch/issues/89677
         embeddingbag = nn.EmbeddingBag(100, 3, include_last_offset=True, padding_idx=61)
         input = torch.tensor([0, 1, 2, 3])
@@ -287,6 +346,8 @@ class TestEmbeddingNN(NNTestCase):
         self.assertEqual(ref_out, out2)
 
     def test_embeddingbag_2d_include_last_offset(self):
+        # [FUNCTION DOC] Regression for issue 167974. Asserts a 2-D input to EmbeddingBag with
+        # include_last_offset yields one output row per input row.
         # Test case from https://github.com/pytorch/pytorch/issues/167974
         embedding_sum = torch.nn.EmbeddingBag(10, 3, include_last_offset=True)
         input = torch.tensor([[1, 2, 4, 5], [4, 3, 2, 9]], dtype=torch.long)
@@ -296,13 +357,23 @@ class TestEmbeddingNN(NNTestCase):
 
 
 class TestEmbeddingNNDeviceType(NNTestCase):
+    # [CLASS DOC] Device-generic Embedding and EmbeddingBag tests, instantiated per device type at
+    # import time. Holds reference implementations and shared helpers for bag tests, plus many
+    # dtype-parametrized forward, backward and error tests.
     def test_embedding_dense_grad(self, device):
+        # [FUNCTION DOC] Under double default dtype, runs gradient and double-gradient checks of
+        # the functional embedding with respect to the weight for a fixed batch of indices.
         with set_default_dtype(torch.double):
             embd = nn.Embedding(20, 20).to(device)
             weight = embd.weight
 
             def fn_wrapper(device):
+                # [FUNCTION DOC] HELPER: Returns a function of the weight that builds a fixed
+                # index batch on the device and looks up the rows with the functional embedding;
+                # used as the function under gradient checking.
                 def fn(weight):
+                    # [FUNCTION DOC] HELPER: Takes the weight, builds a fixed 2 by 4 index
+                    # tensor on the captured device and returns the functional embedding lookup.
                     inp = torch.tensor(
                         [[0, 1, 1, 2], [3, 5, 7, 11]], dtype=torch.long
                     ).to(device)
@@ -314,6 +385,8 @@ class TestEmbeddingNNDeviceType(NNTestCase):
             _assertGradAndGradgradChecks(self, fn, (weight,))
 
     def test_embedding_scalar_weight_error(self, device):
+        # [FUNCTION DOC] Asserts the functional embedding raises RuntimeError saying the weight
+        # must be 2-D for a 0-D and a 3-D weight.
         indices = torch.rand(2, 2, device=device).long()
         weights = [
             torch.tensor(1.0, device=device),
@@ -325,17 +398,29 @@ class TestEmbeddingNNDeviceType(NNTestCase):
                 torch.nn.functional.embedding(indices, weight)
 
     def test_embedding_float_indices_error(self, device):
+        # [FUNCTION DOC] Regression for issue 178042. Defines a small model that applies an
+        # embedding to token ids and discards the result. Asserts float ids raise the same
+        # RuntimeError in eager mode and under compile with the aot_eager and inductor backends in
+        # full-graph mode, resetting dynamo before each compile.
         # Regression test for https://github.com/pytorch/pytorch/issues/178042
         # torch.compile should raise the same dtype error as eager when
         # nn.Embedding receives float indices, even if the result is unused.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Tiny test model with a convolution, an embedding, and a linear
+            # layer. The embedding output is deliberately unused so the test checks that the
+            # indices dtype error is still raised.
             def __init__(self):
+                # [FUNCTION DOC] HELPER: Registers a 1x1 convolution (3 to 16 channels), an
+                # embedding of 100 rows by 32 dims, and a linear layer from 16*32*32 to 10.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(3, 16, kernel_size=1)
                 self.embedding = torch.nn.Embedding(100, 32)
                 self.fc = torch.nn.Linear(16 * 32 * 32, 10)
 
             def forward(self, x, token_ids):
+                # [FUNCTION DOC] HELPER: Applies the convolution and gelu, calls the embedding
+                # on the token ids while discarding the result, and returns the linear layer
+                # applied to the flattened gelu output.
                 conv_out = self.conv(x)
                 gelu_out = torch.nn.functional.gelu(conv_out)
                 self.embedding(token_ids)  # result unused (dead code)
@@ -360,6 +445,10 @@ class TestEmbeddingNNDeviceType(NNTestCase):
     @dtypesIfXPU(torch.float16, torch.float64)
     @dtypes(torch.float64)
     def test_embedding_backward(self, device, dtype):
+        # [FUNCTION DOC] Checks sparse Embedding gradients: one backward gives indices equal to
+        # the lookups and unit values; two backwards accumulate (indices and values repeated);
+        # changing an index between backwards updates the indices accordingly. Runs in float64,
+        # and float16 on CUDA or XPU.
         embedding = nn.Embedding(10, 3, sparse=True)
         tensor = torch.tensor([[7, 1, 3]])
         ones = torch.tensor(1.0, dtype=dtype).expand(3, 3)
@@ -401,6 +490,10 @@ class TestEmbeddingNNDeviceType(NNTestCase):
     @dtypesIfXPU(torch.float32, torch.double, torch.half)
     @dtypes(torch.float32)
     def test_embedding_max_norm_backward(self, device, dtype):
+        # [FUNCTION DOC] Runs the functional embedding with max_norm on a random weight and
+        # checks the weight gradient is the per-row lookup count (rows 0 and 1 once, row 2
+        # twice, row 3 zero), without using gradcheck because in-place renormalization changes
+        # analytic gradients.
         # can't use gradcheck since in place renorm makes analytical gradients different from produced ones
         weight = torch.randn((4, 4), device=device, dtype=dtype) * 2
         weight.requires_grad_()
@@ -426,6 +519,9 @@ class TestEmbeddingNNDeviceType(NNTestCase):
     @dtypesIfXPU(torch.float32, torch.double, torch.half)
     @dtypes(torch.float32)
     def test_embedding_max_norm_fwd_AD(self, device, dtype):
+        # [FUNCTION DOC] Skipped on XLA. Pushes a ones tangent through the functional embedding
+        # with max_norm using forward-mode autodiff and asserts the output tangent is all ones of
+        # the output shape.
         if torch.device(device).type == "xla":
             self.skipTest("forward AD doesn't work on xla")
 
@@ -451,6 +547,11 @@ class TestEmbeddingNNDeviceType(NNTestCase):
     @dtypesIfXPU(torch.float32, torch.double, torch.half)
     @dtypes(torch.float32)
     def test_embedding_padding_idx(self, device, dtype):
+        # [FUNCTION DOC] Checks Embedding padding_idx: padded rows give zero output for dense and
+        # sparse tables, with positive and negative padding_idx; a manually changed padding row is
+        # returned; out-of-range padding_idx values raise AssertionError at construction. For
+        # several counts of padding lookups mixed with other indices, asserts backward and double
+        # backward leave the padding row's weight plus gradient unchanged.
         embedding = nn.Embedding(10, 20, padding_idx=0).to(device, dtype)
         input = torch.tensor([[0, 2, 4, 5], [4, 3, 0, 9]], dtype=torch.long).to(device)
         output = embedding(input)
@@ -543,12 +644,23 @@ class TestEmbeddingNNDeviceType(NNTestCase):
     @dtypesIfCUDA(torch.half, torch.bfloat16)
     @dtypesIfXPU(torch.half, torch.bfloat16)
     def test_embedding_bag_1D_padding_idx(self, device, dtype):
+        # [FUNCTION DOC] Compares functional embedding_bag over 1-D indices with offsets and a
+        # padding_idx against the 2-D formulation where gaps are filled with padding indices, for
+        # modes max, mean and sum, sparse or dense, with or without a last offset, all-padding or
+        # random indices, and with no padding index (a dummy extra row is used for the 2-D case).
+        # Asserts equal outputs and weight gradients with relaxed tolerance for half dtypes.
+        # Skipped under dynamo.
         num_features = 3
         max_indices_per_bag = 10
         num_bags = 10
         num_words = 100
 
         def gen_1D_indices_offsets(include_last_offset, allpad):
+            # [FUNCTION DOC] HELPER: Builds random 1-D indices and offsets for a fixed number of
+            # bags, with one random bag full and one empty, others of random sizes; indices are
+            # all 1 when requested. Appends the total length as a final offset when requested.
+            # Raises AssertionError if the first offset is not 0. Returns the index tensor and
+            # offset tensor on the device.
             indices = []
             offsets = []
             cur_offset = 0
@@ -591,6 +703,10 @@ class TestEmbeddingNNDeviceType(NNTestCase):
         def gen_2D_indices_from_1D(
             indices_1D, offsets, include_last_offset, padding_idx
         ):
+            # [FUNCTION DOC] HELPER: Converts 1-D indices plus offsets to a bags-by-max-length
+            # long tensor, dropping a trailing offset when present, copying each bag's indices and
+            # filling the remaining slots with the padding index. Raises AssertionError if the
+            # first offset is not 0.
             if offsets[0] != 0:
                 raise AssertionError(f"Expected offsets[0] == 0, got {offsets[0]}")
             if include_last_offset:
@@ -697,6 +813,11 @@ class TestEmbeddingNNDeviceType(NNTestCase):
         )
     )
     def test_embedding_backward_atomic_accumulate_kernel(self, device, dtype):
+        # [FUNCTION DOC] Runs only on CUDA or XPU. With deterministic algorithms disabled, trains
+        # an Embedding on many repetitions of five random indices (the case that selects the
+        # atomic accumulate backward kernel). Asserts the gradient shape, that only used rows have
+        # nonzero gradients, and that it matches a manually accumulated reference in float for
+        # half types, with dtype-dependent tolerances.
         """
         Test that embedding_dense_backward works correctly when using the atomic
         accumute kernel path.
@@ -791,6 +912,9 @@ class TestEmbeddingNNDeviceType(NNTestCase):
     def test_embedding_backward_atomic_accumulate_kernel_with_padding_idx(
         self, device, dtype
     ):
+        # [FUNCTION DOC] Runs only on CUDA or XPU. With non-deterministic mode, checks that the
+        # atomic accumulate backward path with padding_idx gives a zero gradient for the padding
+        # row and nonzero gradients for other used rows.
         """
         Test that embedding_dense_backward with padding_idx works correctly
         when using the atomic accmulate kernel path.
@@ -839,6 +963,9 @@ class TestEmbeddingNNDeviceType(NNTestCase):
         )
     )
     def test_embedding_backward_deterministic(self, device, dtype):
+        # [FUNCTION DOC] Runs only on CUDA or XPU. With deterministic algorithms enabled, runs the
+        # functional embedding backward five times on the same repeated indices and asserts the
+        # weight gradient is bitwise identical each time.
         """
         Test that embedding_dense_backward produces bitwise-identical results
         across multiple runs when deterministic algorithms are enabled, even in
@@ -888,6 +1015,11 @@ class TestEmbeddingNNDeviceType(NNTestCase):
     @largeTensorTest("80GB", device="cuda")
     @largeTensorTest("80GB", device="xpu")
     def test_embedding_backward_large_batch_overflow(self, device, dtype):
+        # [FUNCTION DOC] Runs only on CUDA or XPU and needs 80GB. Regression for 32-bit thread id
+        # overflow: builds a bfloat16 gradient for about 8.2 million indices with a skewed repeat
+        # pattern, first verifying with arithmetic that the thread count would exceed the 32-bit
+        # maximum (AssertionError if the setup is too small), then calls the dense embedding
+        # backward op directly and asserts the result shape and bfloat16 dtype.
         """
         Test that embedding_dense_backward handles large batches that exceed INT32_MAX thread IDs.
 
@@ -968,11 +1100,17 @@ class TestEmbeddingNNDeviceType(NNTestCase):
     @dtypes(torch.int32, torch.int64)
     @largeTensorTest("20GB", device="cuda")
     def test_embedding_bag_max_backward_large_offset_overflow(self, device, dtype):
+        # [FUNCTION DOC] Runs only on CUDA with 20GB (issue 188467). For integer index dtypes,
+        # backward through max-mode embedding_bag on a very wide table checks the largest row
+        # receives an all-ones gradient, guarding against offset overflow.
         # chosen to guarantee an int32 overflow
         dim = 2**16
         r = 2**15
 
         def grad_at_r(idx_dtype):
+            # [FUNCTION DOC] HELPER: Creates a zero weight whose last row is set to ones, runs
+            # max-mode embedding_bag over index pair (first row, last row) with a single offset,
+            # backpropagates a sum and returns a copy of the last row's gradient.
             w = torch.zeros(r + 1, dim, device=device, requires_grad=True)
 
             # make the final row contain the matrix's max value
@@ -990,6 +1128,9 @@ class TestEmbeddingNNDeviceType(NNTestCase):
     @onlyNativeDeviceTypes
     @dtypes(torch.float32, torch.float64)
     def test_embedding_bag_scale_grad_by_freq_mixed_counts(self, device, dtype):
+        # [FUNCTION DOC] Regression for issue 190063. For sum and mean modes with frequency
+        # scaling, one bag with indices of mixed repeat counts must scale each row gradient by its
+        # own occurrence count (and by bag size for mean); asserts the expected gradient matrix.
         # scale_grad_by_freq must divide each index's gradient by that index's
         # own occurrence count. Use mixed counts (index 1 twice, index 3 once)
         # so a once-occurring index sorts after a repeated one: this is the case
@@ -1017,9 +1158,19 @@ class TestEmbeddingNNDeviceType(NNTestCase):
     @dtypesIfCUDA(torch.half, torch.bfloat16)
     @dtypesIfXPU(torch.half, torch.bfloat16)
     def test_embedding_bag_2D_padding_idx(self, device, dtype):
+        # [FUNCTION DOC] Compares functional embedding_bag over 2-D indices with a padding_idx
+        # against a Python reference, for modes max, mean and sum, sparse or dense, all-padding or
+        # random indices (with a duplicated row), and every padding value present. Asserts equal
+        # outputs and weight gradients with relaxed tolerance for half dtypes; max mode is skipped
+        # for sparse or bfloat16.
         # Use a Python implementation of embedding_bag with padding_idx support
         # to check torch.nn.functional.embedding_bag correctness
         def embedding_bag_check(indices, weights, mode, sparse, padding_idx):
+            # [FUNCTION DOC] HELPER: Reference embedding_bag: looks up embeddings, then reduces
+            # over the last index dimension while ignoring padding positions (zero weights for sum
+            # and mean, negative infinity for max), divides by the count of non-padding items for
+            # mean, and sets rows consisting only of padding to zero. Raises AssertionError if
+            # padding_idx is None and RuntimeError for an unknown mode.
             if padding_idx is None:
                 raise AssertionError("padding_idx must not be None")
             embedding = torch.nn.functional.embedding(
@@ -1136,6 +1287,9 @@ class TestEmbeddingNNDeviceType(NNTestCase):
         )
     )
     def test_embedding_max_norm_device(self, device, dtype):
+        # [FUNCTION DOC] Runs only on CUDA or XPU. Same as the CPU max_norm check but with the
+        # module and dtype on the device: repeated indices give equal rows and row norms are at
+        # most 1.
         embedding = nn.Embedding(22, 5, max_norm=1.0).to(device, dtype=dtype)
         # nn.Embedding only takes LongTensor as input
         input = torch.tensor([2, 8, 8, 6], device=device, dtype=torch.long)
@@ -1145,6 +1299,9 @@ class TestEmbeddingNNDeviceType(NNTestCase):
 
     @dtypes(*itertools.product((torch.int, torch.long), (torch.int, torch.long)))
     def test_embedding_bag_empty_input(self, device, dtypes):
+        # [FUNCTION DOC] For every combination of index and offset dtypes and sparse or dense
+        # modules, asserts EmbeddingBag on empty input with one or two zero offsets returns all-
+        # zero output.
         m = 4
         n = 3
         x = torch.tensor([], device=device, dtype=dtypes[0])
@@ -1168,6 +1325,11 @@ class TestEmbeddingNNDeviceType(NNTestCase):
     @parametrize_test("padding_idx", [None, 0])
     @parametrize_test("mode", ["sum", "mean", "max"])
     def test_embedding_bag_out_of_bounds_idx(self, device, dtypes, padding_idx, mode):
+        # [FUNCTION DOC] Skipped on CUDA and XPU. Asserts embedding_bag raises RuntimeError about
+        # the index range for a negative and a too large index, in each mode, with and without
+        # per-sample weights (sum only).
+        # KNOWN ISSUE: the padding_idx argument is overwritten with 0 at the start of the body, so
+        # the parametrized None case is never exercised.
         padding_idx = 0
         w_dtype, idx_dtype = dtypes
         # negative out-of-bound
@@ -1196,6 +1358,10 @@ class TestEmbeddingNNDeviceType(NNTestCase):
                 )
 
     def test_embedding_bag_dimension_errors(self, device):
+        # [FUNCTION DOC] For the functional embedding_bag and three lower-level variants, asserts
+        # the expected errors for an input of five dimensions, offsets that are not 1-D, and a
+        # weight that is not 2-D; the functional form may raise ValueError or RuntimeError, the
+        # others RuntimeError. Assertions run with dynamo disabled.
         funcs = (
             lambda x, y, z: torch.nn.functional.embedding_bag(y, x, z),
             torch.embedding_bag,
@@ -1257,6 +1423,9 @@ class TestEmbeddingNNDeviceType(NNTestCase):
 
     @dtypes(*itertools.product((torch.int, torch.long), (torch.int, torch.long)))
     def test_EmbeddingBag_per_sample_weights_failures(self, device, dtypes):
+        # [FUNCTION DOC] Asserts EmbeddingBag errors: mismatched per-sample weight dtype (CPU
+        # only, RuntimeError), per-sample weights with a different shape for 1-D and 2-D input
+        # (ValueError), and per-sample weights with max or mean mode (NotImplementedError).
         # Failure 1: mismatched embeddings / per_sample_weights dtype (only on CPU device)
         es = nn.EmbeddingBag(5, 2, mode="sum").to(dtype=torch.float, device=device)
         input = torch.tensor([3, 1, 1, 1, 4, 0], dtype=dtypes[0], device=device)
@@ -1302,6 +1471,12 @@ class TestEmbeddingNNDeviceType(NNTestCase):
         per_sample_weights=None,
         include_last_offset=False,
     ):
+        # [FUNCTION DOC] HELPER: Reference EmbeddingBag in plain tensor ops. Selects weight rows
+        # for the indices scaled by per-sample weights (ones by default), then reduces each bag by
+        # sum, mean or max, treating empty bags as zero; bag boundaries come from offsets, with
+        # the last offset acting only as an end marker when include_last_offset is set, otherwise
+        # the last bag runs to the input end. Raises AssertionError if weights are given for a
+        # non-sum mode, offsets are missing, or sizes mismatch. Returns the stacked bags.
         if mode != "sum" and per_sample_weights is not None:
             raise AssertionError(
                 f"per_sample_weights must be None for mode '{mode}', got {per_sample_weights}"
@@ -1397,9 +1572,17 @@ class TestEmbeddingNNDeviceType(NNTestCase):
         )
     )
     def test_EmbeddingBag_empty_per_sample_weights_and_offsets(self, device, dtypes):
+        # [FUNCTION DOC] Checks sum-mode EmbeddingBag with empty input, five zero offsets and
+        # empty per-sample weights, trainable or not, for each dtype combination. Compares output
+        # against the reference, and asserts the weight gradient is all zeros after backward (an
+        # old CUDA invalid-configuration bug, issue 46572).
         # Test empty input and per sample weight, and backward pass. There was a CUDA
         # invalid configuration bug (more context in #46572)
         def test_per_sample_weights(mode, trainable_scale):
+            # [FUNCTION DOC] HELPER: Builds an EmbeddingBag of the given mode with arange weights,
+            # runs it on empty input with empty per-sample weights, compares with the reference,
+            # backpropagates and asserts the weight gradient is zero and, if trainable, that the
+            # per-sample weight gradient is empty.
             es = nn.EmbeddingBag(5, 2, mode=mode).to(dtype=dtypes[2], device=device)
             es.weight.data.copy_(
                 torch.arange(1, 11, device=device).view_as(es.weight).to(dtypes[2])
@@ -1470,7 +1653,15 @@ class TestEmbeddingNNDeviceType(NNTestCase):
         )
     )
     def test_EmbeddingBag_per_sample_weights_and_offsets(self, device, dtypes):
+        # [FUNCTION DOC] Checks sum-mode EmbeddingBag with per-sample weights and offsets with
+        # empty bags, trainable or not: output against the reference, and weight and per-sample-
+        # weight gradients against the reference gradients, over all index, offset and float dtype
+        # combinations.
         def test_per_sample_weights(mode, trainable_scale):
+            # [FUNCTION DOC] HELPER: Builds an EmbeddingBag with arange weights, runs it on a
+            # fixed six-index input with offsets and random per-sample weights, compares output
+            # with the reference, backpropagates a random gradient through both, and compares
+            # weight gradients and (if trainable) per-sample-weight gradients.
             es = nn.EmbeddingBag(5, 2, mode=mode).to(dtype=dtypes[2], device=device)
             es.weight.data.copy_(
                 torch.arange(1, 11, device=device).view_as(es.weight).to(dtypes[2])
@@ -1538,9 +1729,15 @@ class TestEmbeddingNNDeviceType(NNTestCase):
         )
     )
     def test_EmbeddingBag_per_sample_weights_and_new_offsets(self, device, dtypes):
+        # [FUNCTION DOC] Runs the nested new-offsets check for sum with and without per-sample
+        # weights, max and mean, trainable or not, with and without a trailing last offset.
         def test_per_sample_weights_new_offsets(
             mode, trainable_scale, include_last_offset, has_weight=True
         ):
+            # [FUNCTION DOC] HELPER: Builds an EmbeddingBag for the given mode and last-offset
+            # setting with arange weights, optionally appends the input length to the offsets and
+            # creates optional per-sample weights. Compares output and gradients (weights and, if
+            # trainable, per-sample weights) with the reference implementation.
             es = nn.EmbeddingBag(
                 5, 2, mode=mode, include_last_offset=include_last_offset
             ).to(dtype=dtypes[2], device=device)
@@ -1629,6 +1826,12 @@ class TestEmbeddingNNDeviceType(NNTestCase):
         test_backward=True,
         backward_prec=None,
     ):
+        # [FUNCTION DOC] HELPER: Builds an EmbeddingBag and an Embedding sharing initial weights
+        # (optional max_norm, sparse), random (batch, length) indices with evenly spaced offsets,
+        # optional softmax-normalized per-sample weights, and compares the bag output with the
+        # embedding followed by a sum, mean or max reduction. Unless backward is disabled, also
+        # compares weight gradients (densified if sparse, tolerance scaled up) and per-sample-
+        # weight gradients. Raises AssertionError for per-sample weights with mean or max mode.
         es = nn.EmbeddingBag(N, D, mode=mode, sparse=sparse, max_norm=max_norm).to(
             device, wdtype
         )
@@ -1714,7 +1917,13 @@ class TestEmbeddingNNDeviceType(NNTestCase):
     )
     @dtypes(*itertools.product((torch.int, torch.long), (torch.float, torch.double)))
     def test_EmbeddingBag_per_sample_weights_and_no_offsets(self, device, dtypes):
+        # [FUNCTION DOC] Runs the bag-versus-embedding comparison with per-sample weights for sum
+        # mode, sparse and dense, trainable or not, over four shapes (small, many items, many
+        # rows, wide); on non-CPU devices additionally repeats the dense case.
         def run_tests(mode, sparse, trainable_per_sample_weights):
+            # [FUNCTION DOC] HELPER: Runs the bag-versus-embedding comparison with per-sample
+            # weights for four shape combinations using the enclosing test's dtypes, for the given
+            # mode, sparsity and trainability.
             kwargs = dict(
                 test_per_sample_weights=True,
                 device=device,
@@ -1765,6 +1974,12 @@ class TestEmbeddingNNDeviceType(NNTestCase):
         odtype=torch.long,
         test_backward=True,
     ):
+        # [FUNCTION DOC] HELPER: Common bag check. Uses a known 5-row example (including empty
+        # bags) with expected outputs and gradients for sum, mean and max, in 1-D with offsets and
+        # in 2-D form; checks all-empty bags give zero gradient; compares against the Embedding
+        # reference for random and small shapes with and without max_norm; and checks that illegal
+        # input and offset combinations raise ValueError, or RuntimeError for bad offsets on CPU.
+        # Error assertions run with dynamo disabled.
         # check a known test example
         es = nn.EmbeddingBag(5, 2, mode=mode, sparse=sparse).to(device, wdtype)
         es.weight.data.copy_(
@@ -1915,6 +2130,9 @@ class TestEmbeddingNNDeviceType(NNTestCase):
         )
     )
     def test_embedding_bag_device(self, device, dtypes):
+        # [FUNCTION DOC] Skipped for bfloat16 on Jetson CPU and for double on XPU. Under double
+        # default dtype, runs the common bag check for sum, mean and max (dense) and for sum and
+        # mean (sparse), with backward checking depending on the device and dtype.
         if IS_JETSON and torch.bfloat16 in dtypes and device == "cpu":
             self.skipTest("bfloat16 not supported with Jetson cpu")
         if dtypes[2] == torch.float64 and "xpu" in device:
@@ -1998,6 +2216,10 @@ class TestEmbeddingNNDeviceType(NNTestCase):
         )
     )
     def test_embedding_bag_non_contiguous_weight(self, device, dtypes):
+        # [FUNCTION DOC] Asserts embedding_bag gives equal results for a column-sliced non-
+        # contiguous weight and its contiguous clone.
+        # KNOWN ISSUE: the final assertion sits outside the mode loop, so only the last mode is
+        # compared.
         weight_tensor = torch.randn(3, 4, dtype=dtypes[2], device=device)
 
         weight_tensor_non_contig = weight_tensor[
@@ -2027,6 +2249,8 @@ class TestEmbeddingNNDeviceType(NNTestCase):
     @onlyNativeDeviceTypes  # currently fails on XLA
     @dtypes(*itertools.product((torch.int, torch.long), (torch.int, torch.long)))
     def test_embedding_bag_bfloat16(self, device, dtypes):
+        # [FUNCTION DOC] Runs the common bag check in bfloat16 with sparse sum and mean modes,
+        # including backward, over index and offset dtype combinations. Native devices only.
         with set_default_dtype(torch.double):
             self._test_EmbeddingBag(
                 device,
@@ -2050,6 +2274,8 @@ class TestEmbeddingNNDeviceType(NNTestCase):
     @onlyNativeDeviceTypes  # currently fails on XLA
     @dtypes(*itertools.product((torch.int, torch.long), (torch.int, torch.long)))
     def test_embedding_bag_half(self, device, dtypes):
+        # [FUNCTION DOC] Runs the common bag check in float16 for sparse sum mode including
+        # backward, over index and offset dtype combinations. Native devices only.
         self._test_EmbeddingBag(
             device,
             "sum",
@@ -2067,6 +2293,9 @@ class TestEmbeddingNNDeviceType(NNTestCase):
     def test_embedding_bag_per_sample_weights_grad(
         self, device, bag_use_grad: bool, per_sample_weights_use_grad: bool
     ):
+        # [FUNCTION DOC] Parametrized over whether the bag weight and per-sample weights require
+        # grad. Runs a sum-mode EmbeddingBag with softmax of random per-sample weights; checks
+        # only that this does not raise.
         bag = torch.nn.EmbeddingBag(256, 256, mode="sum", device=device)
         bag.requires_grad_(bag_use_grad)
         x = torch.arange(1, 5, device=device).expand(3, -1)

@@ -1,4 +1,11 @@
 # Owner(s): ["module: nn"]
+# [MODULE DOC] Tests for torch.nn.init. Defines a table of every public in-place initializer with
+# a sample shape and keyword arguments, then tests gain computation, argument validation errors,
+# statistical distributions of the initialized values (using scipy Kolmogorov-Smirnov tests when
+# scipy is available), special structure (identity, Dirac, orthogonal, sparse), generator support,
+# meta-device and zero-element behavior, and the deprecation warning of non-underscore names. The
+# device-generic class is instantiated per device at import time; scipy is imported only if
+# available.
 import math
 import random
 import string
@@ -47,20 +54,33 @@ ALL_INIT_FNS = [
 
 
 class TestNNInit(TestCase):
+    # [CLASS DOC] Device-independent tests of torch.nn.init functions on CPU tensors. The setUp
+    # hook seeds the Python random module so randomly drawn sizes and parameters are reproducible.
+    # Helper methods build random-shaped zero tensors and run scipy goodness-of-fit checks
+    # (normal, truncated normal, uniform).
     hw_classification = HardwareClassification.GENERIC
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Calls the base setUp and seeds the Python random module with a
+        # fixed seed, so random sizes and parameters used by the tests are deterministic.
         super().setUp()
         random.seed(123)
 
     @torch._dynamo.disable
     def _is_normal(self, tensor, mean, std):
+        # [FUNCTION DOC] HELPER: Flattens the tensor to a list and runs a Kolmogorov-Smirnov test
+        # against a normal distribution with the given mean and standard deviation. Returns True
+        # when the p-value exceeds 0.0001. Needs scipy; excluded from dynamo tracing.
         samples = tensor.view(-1).tolist()
         p_value = stats.kstest(samples, "norm", args=(mean, std))[1]
         return p_value > 0.0001
 
     @torch._dynamo.disable
     def _is_trunc_normal(self, tensor, mean, std, a, b):
+        # [FUNCTION DOC] HELPER: Standardizes the tensor values with the given mean and std,
+        # converts the truncation bounds the same way, and runs a Kolmogorov-Smirnov test against
+        # a standard truncated normal. Returns True when the p-value exceeds 0.0001. Needs scipy;
+        # excluded from dynamo tracing.
         # scipy's trunc norm is suited for data drawn from N(0, 1),
         # so we need to transform our data to test it using scipy.
         z_samples = (tensor.view(-1) - mean) / std
@@ -72,19 +92,28 @@ class TestNNInit(TestCase):
 
     @torch._dynamo.disable
     def _is_uniform(self, tensor, a, b):
+        # [FUNCTION DOC] HELPER: Flattens the tensor to a list and runs a Kolmogorov-Smirnov test
+        # against a uniform distribution on the interval from a to b. Returns True when the
+        # p-value exceeds 0.0001. Needs scipy; excluded from dynamo tracing.
         samples = tensor.view(-1).tolist()
         p_value = stats.kstest(samples, "uniform", args=(a, (b - a)))[1]
         return p_value > 0.0001
 
     def _create_random_nd_tensor(self, dims, size_min, size_max):
+        # [FUNCTION DOC] HELPER: Returns a float zero tensor with the given number of dimensions,
+        # each size drawn at random from the inclusive range between the minimum and maximum.
         size = [random.randint(size_min, size_max) for _ in range(dims)]
         tensor = torch.zeros(size)
         return tensor
 
     def _random_float(self, a, b):
+        # [FUNCTION DOC] HELPER: Returns a random float drawn uniformly between a and b using the
+        # Python random module.
         return (b - a) * random.random() + a
 
     def test_calculate_gain_linear(self):
+        # [FUNCTION DOC] Asserts calculate_gain returns exactly 1 for linear and convolution names
+        # (the conv_transpose2d name is listed twice and conv_transpose1d is not covered).
         for fn in [
             "linear",
             "conv1d",
@@ -98,6 +127,9 @@ class TestNNInit(TestCase):
             self.assertEqual(gain, 1)
 
     def test_calculate_gain_nonlinear(self):
+        # [FUNCTION DOC] Asserts calculate_gain for sigmoid, tanh, relu and leaky_relu equals the
+        # hard-coded constants (1, 5/3, sqrt 2 and the leaky value for the default slope).
+        # KNOWN ISSUE: the final selu branch can never run because selu is not in the tested list.
         for fn in ["sigmoid", "tanh", "relu", "leaky_relu"]:
             gain = init.calculate_gain(fn)
             if fn == "sigmoid":
@@ -112,6 +144,8 @@ class TestNNInit(TestCase):
                 self.assertEqual(gain, 0.75)
 
     def test_calculate_gain_leaky_relu(self):
+        # [FUNCTION DOC] Asserts calculate_gain for leaky_relu with parameter None, 0, 0.01 and 10
+        # returns the expected constants (default slope 0.01; slope 0 equals the relu gain).
         for param in [None, 0, 0.01, 10]:
             gain = init.calculate_gain("leaky_relu", param)
             if param is None:  # Default slope is 0.01
@@ -124,11 +158,15 @@ class TestNNInit(TestCase):
                 self.assertEqual(gain, 0.14071950894605836)
 
     def test_calculate_gain_leaky_relu_only_accepts_numbers(self):
+        # [FUNCTION DOC] Asserts calculate_gain for leaky_relu raises ValueError when the
+        # parameter is a bool, a list or a dict.
         for param in [True, [1], {"a": "b"}]:
             with self.assertRaises(ValueError):
                 init.calculate_gain("leaky_relu", param)
 
     def test_calculate_gain_only_accepts_valid_nonlinearities(self):
+        # [FUNCTION DOC] Asserts calculate_gain raises ValueError for random lowercase strings of
+        # lengths 2, 5 and 25, which are not valid nonlinearity names.
         for n in [2, 5, 25]:
             # Generate random strings of lengths that definitely aren't supported
             random_string = "".join(
@@ -139,6 +177,9 @@ class TestNNInit(TestCase):
 
     @unittest.skipIf(not TEST_SCIPY, "Scipy not found.")
     def test_uniform(self):
+        # [FUNCTION DOC] Initializes random tensors of 1, 2 and 4 dimensions with uniform_ over a
+        # random interval and asserts the values pass the uniform goodness-of-fit check. Skipped
+        # without scipy.
         for dims in [1, 2, 4]:
             input_tensor = self._create_random_nd_tensor(dims, size_min=30, size_max=50)
             a = self._random_float(-3, 3)
@@ -149,6 +190,9 @@ class TestNNInit(TestCase):
 
     @unittest.skipIf(not TEST_SCIPY, "Scipy not found.")
     def test_normal(self):
+        # [FUNCTION DOC] Initializes random tensors of 1, 2 and 4 dimensions with normal_ using a
+        # random mean and std and asserts the values pass the normal goodness-of-fit check.
+        # Skipped without scipy.
         for dims in [1, 2, 4]:
             input_tensor = self._create_random_nd_tensor(dims, size_min=30, size_max=50)
             mean = self._random_float(-3, 3)
@@ -160,6 +204,9 @@ class TestNNInit(TestCase):
 
     @unittest.skipIf(not TEST_SCIPY, "Scipy not found.")
     def test_trunc_normal_generator(self):
+        # [FUNCTION DOC] Asserts trunc_normal_ driven by an explicit generator seeded with 42
+        # gives the same values as the global generator seeded with 42, and that the values pass
+        # the truncated-normal check. Skipped without scipy.
         gen = torch.Generator()
         gen.manual_seed(42)
         input_tensor = torch.empty(5)
@@ -174,6 +221,9 @@ class TestNNInit(TestCase):
             raise AssertionError("Expected truncated normal distribution")
 
     def test_init_methods_meta(self):
+        # [FUNCTION DOC] For every entry of the initializer table, applies the function to an
+        # empty meta tensor of the sample shape inside a subtest and asserts it returns the same
+        # tensor object.
         for fn, shape, kwargs in ALL_INIT_FNS:
             with self.subTest(init_fn=fn.__name__):
                 t = torch.empty(shape, device="meta")
@@ -181,6 +231,8 @@ class TestNNInit(TestCase):
                 self.assertIs(result, t)
 
     def test_init_methods_meta_zero_element(self):
+        # [FUNCTION DOC] Same as the meta test but with the first dimension replaced by zero, so
+        # the meta tensors have no elements; asserts each initializer returns its input object.
         for fn, shape, kwargs in ALL_INIT_FNS:
             with self.subTest(init_fn=fn.__name__):
                 t = torch.empty((0,) + shape[1:], device="meta")
@@ -188,6 +240,8 @@ class TestNNInit(TestCase):
                 self.assertIs(result, t)
 
     def test_constant(self):
+        # [FUNCTION DOC] Asserts constant_ with a random value on tensors of 1, 2 and 4 dimensions
+        # equals a tensor filled with that value.
         for dims in [1, 2, 4]:
             input_tensor = self._create_random_nd_tensor(dims, size_min=1, size_max=5)
             val = self._random_float(1, 10)
@@ -196,6 +250,8 @@ class TestNNInit(TestCase):
             self.assertEqual(input_tensor, input_tensor.clone().fill_(val))
 
     def test_ones_and_zeros(self):
+        # [FUNCTION DOC] Asserts ones_ and zeros_ fill random-shaped tensors of 1, 2 and 4
+        # dimensions with 1 and 0 respectively.
         for init_fn_, val in zip([init.ones_, init.zeros_], [1, 0]):
             for dims in [1, 2, 4]:
                 input_tensor = self._create_random_nd_tensor(
@@ -206,6 +262,8 @@ class TestNNInit(TestCase):
                 self.assertEqual(input_tensor, input_tensor.clone().fill_(val))
 
     def test_eye(self):
+        # [FUNCTION DOC] Applies eye_ to a random 2-D tensor and checks every element: ones on the
+        # diagonal and zeros elsewhere; raises AssertionError on a mismatch.
         input_tensor = self._create_random_nd_tensor(2, size_min=1, size_max=5)
         init.eye_(input_tensor)
 
@@ -224,12 +282,16 @@ class TestNNInit(TestCase):
                         )
 
     def test_eye_only_works_on_2d_inputs(self):
+        # [FUNCTION DOC] Asserts eye_ raises ValueError for tensors with 1 and 3 dimensions.
         for dims in [1, 3]:
             with self.assertRaises(ValueError):
                 tensor = self._create_random_nd_tensor(dims, size_min=1, size_max=3)
                 init.eye_(tensor)
 
     def test_dirac_properties(self):
+        # [FUNCTION DOC] For 3, 4 and 5 dimensional tensors and group counts 1, 2 and 3, applies
+        # dirac_ and asserts the number of nonzero entries and the sum of values both equal the
+        # smaller of per-group output and input channels times the number of groups.
         for dims in [3, 4, 5]:
             for groups in [1, 2, 3]:
                 # prepare random tensor with random sizes, but fits groups
@@ -253,6 +315,10 @@ class TestNNInit(TestCase):
                 self.assertEqual(input_tensor.sum(), min_d * groups)
 
     def test_dirac_identity(self):
+        # [FUNCTION DOC] For 1, 3 groups, builds a Dirac filter for 1D, 2D and 3D convolutions and
+        # applies the matching functional convolution to random input. Asserts that each group's
+        # input channels appear unchanged in the interior of the output (kernel borders cropped)
+        # and that the extra output channels of each group are all zero.
         for groups in [1, 3]:
             batch, in_c, out_c, size, kernel_size = (
                 8,
@@ -342,18 +408,21 @@ class TestNNInit(TestCase):
                     raise AssertionError("Expected extra outputs to be 0")
 
     def test_dirac_only_works_on_3_4_5d_inputs(self):
+        # [FUNCTION DOC] Asserts dirac_ raises ValueError for tensors with 1, 2 and 6 dimensions.
         for dims in [1, 2, 6]:
             with self.assertRaises(ValueError):
                 tensor = self._create_random_nd_tensor(dims, size_min=1, size_max=3)
                 init.dirac_(tensor)
 
     def test_xavier_uniform_errors_on_inputs_smaller_than_2d(self):
+        # [FUNCTION DOC] Asserts xavier_uniform_ raises ValueError for 0-D and 1-D tensors.
         for dims in [0, 1]:
             tensor = self._create_random_nd_tensor(dims, size_min=1, size_max=1)
             with self.assertRaises(ValueError):
                 init.xavier_uniform_(tensor)
 
     def test_xavier_normal_errors_on_inputs_smaller_than_2d(self):
+        # [FUNCTION DOC] Asserts xavier_normal_ raises ValueError for 0-D and 1-D tensors.
         for dims in [0, 1]:
             tensor = self._create_random_nd_tensor(dims, size_min=1, size_max=1)
             with self.assertRaises(ValueError):
@@ -362,6 +431,10 @@ class TestNNInit(TestCase):
     @unittest.skipIf(not TEST_SCIPY, "Scipy not found.")
     @slowTest
     def test_xavier_uniform(self):
+        # [FUNCTION DOC] Applies xavier_uniform_ with and without a random gain on 2-D and 4-D
+        # tensors, computes the expected bound from the gain and the fan sizes (including the
+        # kernel size for 4-D), and asserts the values are uniform on that symmetric interval.
+        # Slow test; skipped without scipy.
         for use_gain in [True, False]:
             for dims in [2, 4]:
                 input_tensor = self._create_random_nd_tensor(
@@ -388,6 +461,9 @@ class TestNNInit(TestCase):
 
     @unittest.skipIf(not TEST_SCIPY, "Scipy not found.")
     def test_xavier_normal(self):
+        # [FUNCTION DOC] Applies xavier_normal_ with and without a random gain on 2-D and 4-D
+        # tensors and asserts the values are normal with the expected zero mean and gain-and-fan-
+        # based standard deviation. Skipped without scipy.
         for use_gain in [True, False]:
             for dims in [2, 4]:
                 input_tensor = self._create_random_nd_tensor(
@@ -412,18 +488,22 @@ class TestNNInit(TestCase):
                     raise AssertionError("Expected normal distribution")
 
     def test_kaiming_uniform_errors_on_inputs_smaller_than_2d(self):
+        # [FUNCTION DOC] Asserts kaiming_uniform_ raises ValueError for 0-D and 1-D tensors.
         for dims in [0, 1]:
             with self.assertRaises(ValueError):
                 tensor = self._create_random_nd_tensor(dims, size_min=1, size_max=1)
                 init.kaiming_uniform_(tensor)
 
     def test_kaiming_normal_errors_on_inputs_smaller_than_2d(self):
+        # [FUNCTION DOC] Asserts kaiming_normal_ raises ValueError for 0-D and 1-D tensors.
         for dims in [0, 1]:
             with self.assertRaises(ValueError):
                 tensor = self._create_random_nd_tensor(dims, size_min=1, size_max=1)
                 init.kaiming_normal_(tensor)
 
     def test_kaiming_uniform_warning_on_0element_tensor(self):
+        # [FUNCTION DOC] Asserts kaiming_uniform_ on a zero-element tensor emits a UserWarning
+        # that initializing zero-element tensors is a no-op.
         tensor = torch.empty(0, 1)
         with self.assertWarnsRegex(
             UserWarning, "Initializing zero-element tensors is a no-op"
@@ -431,6 +511,8 @@ class TestNNInit(TestCase):
             _ = init.kaiming_uniform_(tensor)
 
     def test_kaiming_normal_warning_on_0element_tensor(self):
+        # [FUNCTION DOC] Asserts kaiming_normal_ on a zero-element tensor emits a UserWarning that
+        # initializing zero-element tensors is a no-op.
         tensor = torch.empty(0, 1)
         with self.assertWarnsRegex(
             UserWarning, "Initializing zero-element tensors is a no-op"
@@ -439,6 +521,9 @@ class TestNNInit(TestCase):
 
     @unittest.skipIf(not TEST_SCIPY, "Scipy not found.")
     def test_kaiming_uniform(self):
+        # [FUNCTION DOC] Applies kaiming_uniform_ with and without a negative-slope argument, in
+        # fan_in and fan_out modes, on 2-D and 4-D tensors, and asserts the values are uniform on
+        # the symmetric interval derived from the expected std. Skipped without scipy.
         for use_a in [True, False]:
             for dims in [2, 4]:
                 for mode in ["fan_in", "fan_out"]:
@@ -470,6 +555,9 @@ class TestNNInit(TestCase):
 
     @unittest.skipIf(not TEST_SCIPY, "Scipy not found.")
     def test_kaiming_normal(self):
+        # [FUNCTION DOC] Applies kaiming_normal_ with and without a negative-slope argument, in
+        # fan_in and fan_out modes, on 2-D and 4-D tensors, and asserts the values are normal with
+        # the expected std. Skipped without scipy.
         for use_a in [True, False]:
             for dims in [2, 4]:
                 for mode in ["fan_in", "fan_out"]:
@@ -499,6 +587,7 @@ class TestNNInit(TestCase):
                         raise AssertionError("Expected normal distribution")
 
     def test_sparse_only_works_on_2d_inputs(self):
+        # [FUNCTION DOC] Asserts sparse_ raises ValueError for tensors with 1 and 3 dimensions.
         for dims in [1, 3]:
             with self.assertRaises(ValueError):
                 sparsity = self._random_float(0.1, 0.9)
@@ -507,6 +596,10 @@ class TestNNInit(TestCase):
 
     @unittest.skipIf(not TEST_SCIPY, "Scipy not found.")
     def test_sparse_default_std(self):
+        # [FUNCTION DOC] Applies sparse_ with a random sparsity, with the default std or a random
+        # std, to a random 2-D tensor. Asserts each column has at least the ceiling of sparsity
+        # times rows zeros and the nonzero values are normal with the chosen std. Skipped without
+        # scipy.
         for use_random_std in [True, False]:
             input_tensor = self._create_random_nd_tensor(2, size_min=30, size_max=35)
             rows = input_tensor.size(0)
@@ -531,6 +624,10 @@ class TestNNInit(TestCase):
 
     @skipIfNoLapack
     def test_orthogonal(self):
+        # [FUNCTION DOC] Applies orthogonal_ with and without a random gain to tensors of several
+        # shapes, flattens each to a matrix, and asserts the Gram matrix of the shorter side
+        # equals the identity scaled by the squared gain within a tight tolerance. Skipped without
+        # LAPACK.
         for use_gain in [True, False]:
             for tensor_size in [[3, 4], [4, 3], [20, 2, 3, 4], [2, 3, 4, 5]]:
                 input_tensor = torch.zeros(tensor_size)
@@ -560,9 +657,13 @@ class TestNNInit(TestCase):
                     )
 
     def test_deprecation(self):
+        # [FUNCTION DOC] Asserts that calling the old non-underscore normal function emits a
+        # FutureWarning mentioning deprecation.
         x = torch.randn(3, 3)
 
         def fn():
+            # [FUNCTION DOC] HELPER: Calls the deprecated normal initializer on the enclosing
+            # test's tensor; wrapped so the warning can be asserted.
             init.normal(x)
 
         with self.assertWarnsRegex(
@@ -574,10 +675,16 @@ class TestNNInit(TestCase):
 
 
 class TestNNInitDeviceType(TestCase):
+    # [CLASS DOC] Device-generic tests (accelerator hardware class) for truncated-normal
+    # initialization across dtypes and for running every initializer on each device; instantiated
+    # per device type at import time.
     hw_classification = HardwareClassification.ACCELERATOR
 
     @torch._dynamo.disable
     def _is_trunc_normal(self, tensor, mean, std, a, b):
+        # [FUNCTION DOC] HELPER: Same as the CPU class helper: standardizes samples and bounds,
+        # runs a Kolmogorov-Smirnov test against a truncated normal and returns True when the
+        # p-value exceeds 0.0001. Needs scipy; excluded from dynamo tracing.
         z_samples = (tensor.view(-1) - mean) / std
         z_samples = z_samples.tolist()
         a0 = (a - mean) / std
@@ -592,6 +699,10 @@ class TestNNInitDeviceType(TestCase):
         [torch.float32, torch.float64],
     )
     def test_trunc_normal_all_dtypes(self, device, dims, dtype):
+        # [FUNCTION DOC] Parametrized over dimension count and float32 or float64. Applies
+        # trunc_normal_ with random mean, std and bounds on the device, asserts all values lie
+        # within the bounds rounded to the dtype, and that the values pass the truncated-normal
+        # check. Skipped without scipy.
         size = [random.randint(30, 50) for _ in range(dims)]
         input_tensor = torch.zeros(size, dtype=dtype, device=device)
         mean = random.uniform(-3, 3)
@@ -625,6 +736,9 @@ class TestNNInitDeviceType(TestCase):
         [torch.float16, torch.bfloat16],
     )
     def test_trunc_normal_low_precision(self, device, dtype):
+        # [FUNCTION DOC] For float16 and bfloat16, applies trunc_normal_ with fixed wide
+        # parameters to a 10000-element tensor, asserts the values stay within the bounds and pass
+        # the truncated-normal check. Skipped without scipy.
         n = 10000
         mean, std, a, b = 0.0, 1.0, -2.0, 2.0
         t = torch.empty(n, dtype=dtype, device=device)
@@ -650,6 +764,9 @@ class TestNNInitDeviceType(TestCase):
         [torch.float32, torch.float64, torch.float16, torch.bfloat16],
     )
     def test_trunc_normal_narrow_interval(self, device, dtype):
+        # [FUNCTION DOC] For four float dtypes, applies trunc_normal_ with a narrow interval far
+        # from the mean, asserts the values stay within the bounds and pass the truncated-normal
+        # check. Skipped without scipy.
         n = 10000
         mean, std, a, b = -3.0, 1.0, -0.5, 0.5
         t = torch.empty(n, dtype=dtype, device=device)
@@ -680,6 +797,9 @@ class TestNNInitDeviceType(TestCase):
         ],
     )
     def test_trunc_normal_unique_values(self, device, dtype, min_unique):
+        # [FUNCTION DOC] Applies trunc_normal_ to 10000 elements per dtype, asserts bounds are
+        # respected, the count of distinct values exceeds a per-dtype minimum, and no infinities
+        # or NaNs are produced.
         n = 10000
         t = torch.empty(n, dtype=dtype, device=device)
         init.trunc_normal_(t, mean=0.0, std=1.0, a=-2.0, b=2.0)
@@ -715,6 +835,8 @@ class TestNNInitDeviceType(TestCase):
         [torch.float32, torch.float64, torch.float16, torch.bfloat16],
     )
     def test_trunc_normal_no_boundary_values_small_std(self, device, dtype):
+        # [FUNCTION DOC] For four float dtypes with a small std, asserts that no sampled value
+        # equals either truncation bound exactly.
         t = torch.empty(10000, dtype=dtype, device=device)
         init.trunc_normal_(t, mean=0.0, std=0.1, a=-2.0, b=2.0)
 
@@ -732,6 +854,9 @@ class TestNNInitDeviceType(TestCase):
         )
 
     def _run_init_test(self, device, zero_element=False):
+        # [FUNCTION DOC] HELPER: For each entry of the initializer table, optionally replaces the
+        # first dimension by zero, builds an empty tensor on the device, and inside a subtest
+        # asserts the initializer returns the same tensor object.
         for fn, shape, kwargs in ALL_INIT_FNS:
             if zero_element:
                 shape = (0,) + shape[1:]
@@ -741,11 +866,15 @@ class TestNNInitDeviceType(TestCase):
                 self.assertIs(result, t)
 
     def test_init_methods_no_error(self, device):
+        # [FUNCTION DOC] Smoke test: runs every table initializer on the device and checks the in-
+        # place return value.
         # Smoke test: every public init function must run without error on all
         # devices (including meta where the ops are no-ops).
         self._run_init_test(device)
 
     def test_init_methods_zero_element(self, device):
+        # [FUNCTION DOC] Runs every table initializer on zero-element tensors on the device and
+        # checks the in-place return value.
         # Every init function should handle 0-element tensors as a no-op.
         self._run_init_test(device, zero_element=True)
 

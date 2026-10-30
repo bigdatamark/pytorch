@@ -1,4 +1,9 @@
 # Owner(s): ["module: nn"]
+# [MODULE DOC] Tests for the torch.nn dropout modules (Dropout, Dropout1d/2d/3d, AlphaDropout,
+# FeatureAlphaDropout) and the functional dropout. Covers statistical mean/std preservation,
+# memory-format and stride handling, channel-wise dropping, no-batch inputs, warnings on unusual
+# input ranks, invalid probabilities and the native dropout corner cases. Device-generic tests are
+# instantiated per device at import time.
 import itertools
 import random
 from itertools import product
@@ -23,11 +28,18 @@ from torch.testing._internal.common_utils import (
 
 
 class TestDropoutNN(NNTestCase):
+    # [CLASS DOC] CPU-oriented tests (generic hardware class) for alpha-dropout variants and for
+    # constructor validation of the dropout modules. Class flags enable the CUDA memory leak check
+    # and the non-default-stream check.
     hw_classification = HardwareClassification.GENERIC
     _do_cuda_memory_leak_check = True
     _do_cuda_non_default_stream = True
 
     def _test_alpha_dropout(self, cls, input):
+        # [FUNCTION DOC] HELPER: For each drop probability in a fixed list, builds the given
+        # module class, runs it on a fresh differentiable copy of the input, and asserts that the
+        # output mean and standard deviation stay within 0.1 of the input's, then runs backward
+        # with the input as the gradient. Intended for zero-mean unit-variance input.
         mean = input.mean()
         std = input.std()
 
@@ -42,11 +54,16 @@ class TestDropoutNN(NNTestCase):
             output.backward(input)
 
     def test_AlphaDropout(self):
+        # [FUNCTION DOC] Runs the alpha-dropout statistics check on AlphaDropout with a
+        # 5000-element standard-normal vector.
         # generate random tensor with zero mean and unit std
         input = torch.randn(5000)
         self._test_alpha_dropout(nn.AlphaDropout, input)
 
     def test_FeatureAlphaDropout(self):
+        # [FUNCTION DOC] Runs the alpha-dropout statistics check on FeatureAlphaDropout, first
+        # with a 5-D input whose trailing dimensions are random small sizes and a leading
+        # dimension of 1000, then with a 4-D input (the comment calls it no batch dims).
         b = random.randint(1, 5)
         w = random.randint(1, 5)
         h = random.randint(1, 5)
@@ -60,6 +77,9 @@ class TestDropoutNN(NNTestCase):
         self._test_alpha_dropout(nn.FeatureAlphaDropout, input)
 
     def test_invalid_dropout_p(self):
+        # [FUNCTION DOC] Asserts that constructing Dropout, Dropout1d, Dropout2d and Dropout3d
+        # with a probability below 0 or above 1 raises ValueError, and that the functional dropout
+        # does the same for a one-element tensor.
         v = torch.ones(1)
         self.assertRaises(ValueError, lambda: nn.Dropout(-0.1))
         self.assertRaises(ValueError, lambda: nn.Dropout(1.1))
@@ -74,9 +94,18 @@ class TestDropoutNN(NNTestCase):
 
 
 class TestDropoutNNDeviceType(NNTestCase):
+    # [CLASS DOC] Device-generic dropout tests (accelerator hardware class); instantiated once per
+    # device type at import time. Holds shared helpers that check statistics, layout preservation
+    # and channel-wise behavior, plus the per-module test methods.
     hw_classification = HardwareClassification.ACCELERATOR
 
     def _test_dropout(self, cls, device, input, memory_format=torch.contiguous_format):
+        # [FUNCTION DOC] HELPER: Fills the input with the keep probability on the target device
+        # and applies the dropout class with probability 0.2, both not-in-place and in-place (on
+        # an out-of-place copy of the input). Asserts the output and the input gradient keep the
+        # requested memory format and have mean within 0.05 of the keep probability. Then checks
+        # eval-mode modules return the input unchanged for both inplace settings and that repr and
+        # str do not raise.
         p = 0.2
         input = input.to(device).fill_(1 - p)
 
@@ -110,6 +139,11 @@ class TestDropoutNNDeviceType(NNTestCase):
     def _test_dropout_discontiguous(
         self, cls, device, memory_format=torch.contiguous_format
     ):
+        # [FUNCTION DOC] HELPER: Regression check for issue 47176. For probability 0 and a tiny
+        # positive probability, applies the dropout class to a non-contiguous (every other column)
+        # view built with the given memory format. Asserts the values equal the input, and, for
+        # the nonzero probability, that the output is contiguous in that memory format
+        # (probability 0 keeps the input strides).
         # In this test, we verify that dropout preserves the layout and data for different memory formats.
         # We check whether, we get same values for the output of dropout, when the probability
         # of dropout is 0 or very close to 0.
@@ -130,7 +164,14 @@ class TestDropoutNNDeviceType(NNTestCase):
             self.assertEqual(inp_discontiguous, out)
 
     def _test_dropout_stride_mean_preserve(self, cls, device):
+        # [FUNCTION DOC] HELPER: For every permutation of the four dimensions, four slicing shifts
+        # and several probabilities, builds an input with permuted physical layout, applies the
+        # dropout class, and asserts the output is contiguous in the permuted layout, its mean is
+        # close to the all-ones mean, and the output equals the input only when the probability is
+        # negligible (otherwise it differs).
         def invert_perm(p):
+            # [FUNCTION DOC] HELPER: Returns the four-element inverse of a permutation of the four
+            # dimensions, as a tuple mapping each value to its position.
             d = {x: i for i, x in enumerate(p)}
             return (d[0], d[1], d[2], d[3])
 
@@ -154,6 +195,9 @@ class TestDropoutNNDeviceType(NNTestCase):
                         self.assertNotEqual(permuted_inp, out)
 
     def test_Dropout(self, device):
+        # [FUNCTION DOC] Tests nn.Dropout on a 1000-element input via the shared checks, then
+        # discontiguous inputs for contiguous and channels-last formats, then the stride-
+        # preserving mean check.
         input = torch.empty(1000)
         self._test_dropout(nn.Dropout, device, input)
 
@@ -167,10 +211,15 @@ class TestDropoutNNDeviceType(NNTestCase):
     @dtypes(torch.bfloat16)
     @onlyAccelerator
     def test_Dropout_bfloat16(self, device, dtype):
+        # [FUNCTION DOC] Runs the shared dropout check for nn.Dropout on a 1000-element bfloat16
+        # input; accelerator-only.
         input = torch.empty(1000, dtype=dtype)
         self._test_dropout(nn.Dropout, device, input)
 
     def _test_dropoutNd_no_batch(self, dropout, input):
+        # [FUNCTION DOC] HELPER: Asserts a dropout module gives the same result for an unbatched
+        # input as for the same input with a batch dimension added and removed, using a frozen
+        # random generator state for both calls so the random masks match.
         input_clone = input.clone()
         with freeze_rng_state():
             res_no_batch = dropout(input)
@@ -181,6 +230,9 @@ class TestDropoutNNDeviceType(NNTestCase):
         self.assertEqual(res_no_batch, res_batched)
 
     def _test_dropoutNd_channel_zero(self, dropout, input):
+        # [FUNCTION DOC] HELPER: For a batched channels-first all-positive input, applies the
+        # dropout module and asserts every channel of every sample is either entirely zero or has
+        # no zero entries (nonzero count is zero or the channel size).
         # Verify the number of zeros in a channel is 0 or the number of elements in the channel
         # for a fully positive input tensor
         shape = input.shape
@@ -196,6 +248,9 @@ class TestDropoutNNDeviceType(NNTestCase):
     @dtypes(torch.double)
     @dtypesIfMPS(torch.float32)
     def test_Dropout1d(self, device, dtype):
+        # [FUNCTION DOC] Tests nn.Dropout1d under a default dtype set by the test dtype: shared
+        # statistics checks, RuntimeError for 4-D and 1-D inputs, unbatched equivalence (including
+        # in-place) and whole-channel dropping. Expected failure on XLA.
         with set_default_dtype(dtype):
             N, C, L = (
                 random.randint(50, 60),
@@ -227,6 +282,10 @@ class TestDropoutNNDeviceType(NNTestCase):
 
     @expectedFailureXLA  # seems like freeze_rng_state is not honoured by XLA
     def test_Dropout2d(self, device):
+        # [FUNCTION DOC] Tests nn.Dropout2d: shared statistics checks (also channels-last),
+        # discontiguous inputs, UserWarning for 5-D and 2-D inputs and for 3-D input (treated as
+        # channel-wise 1D dropout), and whole-channel dropping. The unbatched check is disabled
+        # pending a linked issue. Expected failure on XLA.
         b = random.randint(1, 5)
         w = random.randint(1, 5)
         h = random.randint(1, 5)
@@ -268,6 +327,9 @@ class TestDropoutNNDeviceType(NNTestCase):
 
     @expectedFailureXLA  # seems like freeze_rng_state is not honoured by XLA
     def test_Dropout3d(self, device):
+        # [FUNCTION DOC] Tests nn.Dropout3d: shared statistics checks, discontiguous inputs,
+        # UserWarning for 6-D and 3-D inputs, unbatched equivalence including in-place, and whole-
+        # channel dropping. Expected failure on XLA.
         b = random.randint(1, 5)
         w = random.randint(1, 5)
         h = random.randint(1, 5)
@@ -298,12 +360,18 @@ class TestDropoutNNDeviceType(NNTestCase):
         self._test_dropoutNd_channel_zero(nn.Dropout3d(p=0.5, inplace=True), input)
 
     def test_empty_dropout(self, device):
+        # [FUNCTION DOC] Asserts the functional dropout on an empty tensor returns a tensor of the
+        # same size.
         x = torch.tensor([]).to(device)
         out = torch.nn.functional.dropout(x)
         self.assertEqual(out.size(), x.size())
 
     @onlyAccelerator
     def test_native_dropout_corner_case(self, device):
+        # [FUNCTION DOC] For training on and off, probabilities 0 and 1, and both the device and
+        # CPU, compares native_dropout against the regular dropout op on identical inputs: outputs
+        # must be equal and so must the input gradients. Raises AssertionError on mismatch;
+        # accelerator-only.
         for train in [True, False]:
             for p in [0.0, 1.0]:
                 for current_device in [device, "cpu"]:
