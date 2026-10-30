@@ -1,4 +1,13 @@
 # Copyright (c) 2025, Wentao Guo, Tri Dao.
+# [MODULE DOC] Fused GEMM plus activation / generated tensor epilogue front end for the QuACK
+# kernels. Defines the epilogue mixin that adds an auxiliary output (post-activation or arbitrary
+# generated outputs), optional alpha/beta, row and column vector biases, captured
+# tile/vector/scalar inputs and grouped local reductions on top of the default epilogue; gated and
+# grouped-N-contract variants; per-architecture concrete kernel classes (SM80, SM90, SM100,
+# SM120); a cached compile function that builds fake tensors and compiles a kernel; and the public
+# gemm_act entry point (aliased as gemm_gated at the end). Import-time side effects: three module-
+# level registries (generated epilogue functions, local-reduce combine and finalize callbacks)
+# start empty.
 from __future__ import annotations
 import math
 from typing import NamedTuple, Tuple, Optional, Callable, Type
@@ -66,6 +75,9 @@ _local_reduce_finalize_fns: dict[str, Callable] = {}
 
 
 def power_of_2_divisibility(value: int, max_divisibility: int) -> int:
+    # [FUNCTION DOC] HELPER: Return the largest power of two not exceeding max_divisibility that
+    # evenly divides the absolute value of the given number. A value of zero is divisible by
+    # anything, so the cap is returned.
     value = abs(int(value))
     if value == 0:
         return max_divisibility
@@ -80,6 +92,12 @@ def tensor_stride_divisibility(
     dtype: Type[cutlass.Numeric],
     leading_dim: int,
 ) -> int:
+    # [FUNCTION DOC] Compute the divisibility (in elements, capped at 16 bytes worth for the
+    # dtype) that can be assumed for the strides of a torch tensor and its data pointer. Strides
+    # of every dimension except the leading dim are considered; a missing tensor gives 1. Fake or
+    # meta tensors have no real pointer, so only the stride-based value is returned for them; for
+    # real tensors the value is further limited by the divisibility of the pointer expressed in
+    # elements. Returns an integer.
     """Return the strongest 16-byte-capped layout contract true for a tensor."""
     if tensor is None:
         return 1
@@ -104,6 +122,9 @@ def tensor_stride_divisibility(
 def register_tensor_epilogue_fn(
     tensor_epilogue_key: str, tensor_epilogue_fn: Callable
 ) -> None:
+    # [FUNCTION DOC] Register a generated tensor epilogue callable in the module registry under
+    # the given key, replacing any callable previously stored under that key. Used so the cached
+    # compile function can look it up by hashable key.
     _tensor_epilogue_fns[tensor_epilogue_key] = tensor_epilogue_fn
 
 
@@ -113,6 +134,9 @@ def register_local_reduce_fns(
     finalize_key: str,
     finalize_fn: Callable,
 ) -> None:
+    # [FUNCTION DOC] Register a grouped local-reduce combine callable under its key and a finalize
+    # callable under its own key in the module registries, overwriting earlier entries. The
+    # compile function later resolves callbacks by these keys.
     _local_reduce_combine_fns[combine_key] = combine_fn
     _local_reduce_finalize_fns[finalize_key] = finalize_fn
 
@@ -120,6 +144,10 @@ def register_local_reduce_fns(
 def validate_grouped_n_contract_device(
     group: int | None, device_capacity: tuple[int, int]
 ) -> None:
+    # [FUNCTION DOC] Validate that the device supports the grouped-N-contract main output
+    # transform. Does nothing when no group is requested. Raises NotImplementedError for compute
+    # capability major 12, for any major other than 10 or 11, and for groups other than 2 (on 10
+    # or 11) or 4 (on 10 only).
     """Validate grouped-main support at the public dispatch boundary."""
     if group is None:
         return
@@ -140,6 +168,13 @@ def validate_grouped_n_contract_device(
 
 
 class GemmActMixin(ComposableEpiMixin):
+    # [CLASS DOC] Epilogue mixin for GEMM with an auxiliary output tensor. Composes epilogue ops
+    # for alpha, beta, stochastic rounding seed, row and column vector biases, tuples of captured
+    # row, column, tile and scalar inputs, a grouped local reduction and the aux output store; the
+    # extra parameter fields carry the compile-time activation function, generated tensor epilogue
+    # and local-reduce settings. The visit hook either applies a generated tensor epilogue, an
+    # elementwise activation, or passes the accumulator through. Sets the number of contracted N
+    # groups to one; subclasses can change it.
     grouped_n_contract_group = 1
     _epi_ops = (
         Scalar("alpha"),
@@ -167,6 +202,12 @@ class GemmActMixin(ComposableEpiMixin):
 
     @mlir_namedtuple
     class EpilogueArguments(NamedTuple):
+        # [CLASS DOC] Named tuple of epilogue arguments: the aux output tensor (or tuple of
+        # tensors), compile-time constants (activation function, tensor epilogue function and its
+        # argument kinds, flags for aux and local-reduce returns, local reduce feed, group, axis,
+        # combine and finalize callbacks, rounding mode) and optional runtime inputs (alpha, beta,
+        # vectors, captured tuples, local reduce output, stochastic rounding seed). All except the
+        # aux output default to None, empty or fixed constants.
         mAuxOut: cute.Tensor
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
         tensor_epilogue_fn: cutlass.Constexpr[Optional[Callable]] = None
@@ -193,6 +234,9 @@ class GemmActMixin(ComposableEpiMixin):
     # EpilogueParams auto-generated from _epi_ops + _extra_param_fields
 
     def _filter_epi_ops(self, args):
+        # [FUNCTION DOC] Run the base filtering of active ops, then, if the local reduce result
+        # feeds the main output and the reduce op was filtered out because no output tensor was
+        # passed, add the class-level local reduce op back to the instance op list.
         super()._filter_epi_ops(args)
         if args.local_reduce_feeds_main and not any(
             op.name == "mLocalReduce" for op in self._epi_ops
@@ -203,6 +247,13 @@ class GemmActMixin(ComposableEpiMixin):
             self._epi_ops = (*self._epi_ops, *reduce_ops)
 
     def epi_to_underlying_arguments(self, args: EpilogueArguments, *, loc=None, ip=None):
+        # [FUNCTION DOC] Convert epilogue arguments to the parameter object. Side effects on self:
+        # stores the rounding mode, aux output dtype(s) and layout(s) (per-tensor tuples when the
+        # aux output is a tuple), the CTA tile shape of the aux output and the local reduce
+        # settings. Builds the parameter dictionary from the active ops, adds the constants
+        # (activation, tensor epilogue and its kinds and flags, local reduce settings), and
+        # converts concatenated-layout row and column vectors to interleaved form. Returns an
+        # EpilogueParams instance.
         self.rounding_mode = args.rounding_mode
         if isinstance(args.mAuxOut, tuple):
             self.aux_out_dtypes = tuple(tensor.element_type for tensor in args.mAuxOut)
@@ -232,6 +283,10 @@ class GemmActMixin(ComposableEpiMixin):
 
     @classmethod
     def epi_smem_bytes(cls, args, cta_tile_shape_mnk, epi_tile, warp_shape_mnk=None):
+        # [FUNCTION DOC] Class method returning the epilogue shared memory accounting: the base
+        # result plus, when a grouped local reduce output exists and needs smem, unstaged float32
+        # storage of tile N times the number of extra M warps (warp count along M minus one, at
+        # least zero).
         result = super().epi_smem_bytes(args, cta_tile_shape_mnk, epi_tile, warp_shape_mnk)
         if args.mLocalReduce is not None and grouped_local_reduce_uses_smem(
             args.local_reduce_axis, args.local_reduce_group
@@ -248,6 +303,11 @@ class GemmActMixin(ComposableEpiMixin):
     # inherited from ComposableEpiMixin via _epi_ops.
 
     def epi_make_aux_out_copy_atom_r2s(self, params, tiled_copy_t2r, index=None):
+        # [FUNCTION DOC] Build the register-to-shared copy atom for an aux output (optionally the
+        # one at the given index of a tuple of outputs). On architecture 100 uses the blackwell
+        # smem store op chosen from layout, dtype, accumulator dtype and the t2r copy; otherwise
+        # uses the generic smem store atom, transposed unless the layout is row major, with major
+        # mode size derived from the epilogue tile and the N atom layout.
         """Build the register-to-shared copy atom used by aux outputs."""
         aux_out_layout = (
             self.aux_out_layouts[index] if index is not None else self.aux_out_layout
@@ -273,6 +333,8 @@ class GemmActMixin(ComposableEpiMixin):
     def epi_make_aux_out_tiled_copy_r2s(
         self, params, tiled_copy_r2s, tiled_copy_t2r, index=None
     ):
+        # [FUNCTION DOC] Build a tiled copy for storing an aux output from registers to shared
+        # memory by making the copy atom and tiling it like the given r2s tiled copy.
         """Build the register-to-shared tiled copy used by aux outputs."""
         copy_atom_aux_out_r2s = self.epi_make_aux_out_copy_atom_r2s(
             params, tiled_copy_t2r, index
@@ -289,6 +351,11 @@ class GemmActMixin(ComposableEpiMixin):
         varlen_manager,
         tidx,
     ):
+        # [FUNCTION DOC] Prepare aux output stores before the epilogue loop. Returns None if the
+        # parameters have no aux output. For a tuple of outputs, builds for each a tiled r2s copy,
+        # the partitioned smem destination for this thread and the TMA gmem copy (over the per-
+        # batch offset tensor). Returns a tuple with one triple (tiled copy, smem partition, gmem
+        # copy function) per output; a single output yields a one-element tuple.
         """Setup aux output TMA copies and partitions before the epilogue loop.
 
         Returns None when mAuxOut wasn't supplied so the framework skips the aux-out path.
@@ -342,6 +409,11 @@ class GemmActMixin(ComposableEpiMixin):
         num_prev_subtiles,
         epi_idx,
     ):
+        # [FUNCTION DOC] HELPER: Convert one aux output register tensor from the accumulator type
+        # to the requested dtype. When stochastic rounding is selected, the source is float32 and
+        # the target is bfloat16, derives a seed from the sr seed, tile coordinate and running
+        # subtile number, and converts with stochastic rounding; otherwise does a plain cast.
+        # Returns a new register tensor.
         if const_expr(
             self.rounding_mode == RoundingMode.RS
             and tRS_rAuxOut.element_type == cutlass.Float32
@@ -365,6 +437,9 @@ class GemmActMixin(ComposableEpiMixin):
     def epi_convert_aux_out(
         self, tRS_rAuxOut, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
     ):
+        # [FUNCTION DOC] Convert aux outputs from the accumulator dtype to their output dtypes. A
+        # tuple input yields a tuple of converted tensors using each output's dtype; a single
+        # tensor is converted with the single aux dtype.
         """Convert aux outputs from acc_dtype to their output dtypes."""
         if const_expr(isinstance(tRS_rAuxOut, tuple)):
             result = []
@@ -399,6 +474,16 @@ class GemmActMixin(ComposableEpiMixin):
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
+        # [FUNCTION DOC] Per-subtile epilogue visit. If the local reduce feeds the main output,
+        # first computes grouped row reductions broadcast over rows. Without a generated epilogue
+        # (or with no argument kinds) applies the default epilogue to the accumulator. With a
+        # generated tensor epilogue: copies the accumulator, gathers auxiliary values in the
+        # declared order of argument kinds (tile, row, column, scalar codes one to four, with
+        # special scalar and column handling when the N contraction is active), appends the local
+        # reduce value, calls the function, and distributes its results to the accumulator, aux
+        # outputs and the local reduce accumulator depending on the return flags. Without it but
+        # with an activation, applies it elementwise (in pairs on architecture 100). Otherwise the
+        # aux output is the accumulator itself. Returns the aux output tensor or a tuple of them.
         tDrLocalReduceValue = None
         if const_expr(params.local_reduce_feeds_main):
             tDrLocalReduce = epi_loop_tensors.get("mLocalReduce")
@@ -507,36 +592,54 @@ class GemmActMixin(ComposableEpiMixin):
 
 
 class GemmActSm90(GemmActMixin, GemmSm90):
+    # [CLASS DOC] Concrete activation GEMM for SM90 formed from the activation mixin and the SM90
+    # kernel.
     pass
 
 
 class GemmActSm80(GemmActMixin, GemmSm80):
+    # [CLASS DOC] Concrete activation GEMM for SM80 formed from the activation mixin and the SM80
+    # kernel.
     pass
 
 
 class GemmActSm100(GemmActMixin, GemmSm100):
+    # [CLASS DOC] Concrete activation GEMM for SM100 (also used for SM110) formed from the
+    # activation mixin and the SM100 kernel.
     pass
 
 
 class GemmActSm120(GemmActMixin, GemmSm120):
+    # [CLASS DOC] Concrete activation GEMM for SM120 formed from the activation mixin and the
+    # SM120 kernel.
     pass
 
 
 def _grouped_n_contract_epi_tile(epi_tile, group):
+    # [FUNCTION DOC] HELPER: Return the epilogue tile with its N part divided by the group; when
+    # the N entry is a layout it is recast by the group factor.
     if isinstance(epi_tile[1], cute.Layout):
         return (epi_tile[0], cute.recast_layout(group, 1, epi_tile[1]))
     return (epi_tile[0], epi_tile[1] // group)
 
 
 def _grouped_n_contract_epi_tile_fn(gemm, epi_tile):
+    # [FUNCTION DOC] HELPER: Epilogue tile function for group two; ignores the gemm and divides
+    # tile N by two.
     return _grouped_n_contract_epi_tile(epi_tile, 2)
 
 
 def _grouped_n_contract4_epi_tile_fn(gemm, epi_tile):
+    # [FUNCTION DOC] HELPER: Epilogue tile function for group four; ignores the gemm and divides
+    # tile N by four.
     return _grouped_n_contract_epi_tile(epi_tile, 4)
 
 
 class GemmGroupedNContractMixin(GemmActMixin):
+    # [CLASS DOC] Activation mixin variant that stores the contracted (grouped over N) logical
+    # main output through the aux output while the D output is unused. Uses a reduced op list (no
+    # row tile loads or local reduce) and an aux output tile with N divided by the group. Default
+    # group is two.
     """Store the contracted logical main through PostAct while leaving D unused.
 
     TODO: Move this specialization behind a stable provider-extension boundary
@@ -559,6 +662,9 @@ class GemmGroupedNContractMixin(GemmActMixin):
     def epi_to_underlying_arguments(
         self, args: GemmActMixin.EpilogueArguments, *, loc=None, ip=None
     ):
+        # [FUNCTION DOC] Build the parameters like the activation mixin, then set the aux output
+        # CTA tile shape to full M by tile N divided by the contraction group. Returns the
+        # parameters.
         params = super().epi_to_underlying_arguments(args, loc=loc, ip=ip)
         self.cta_tile_shape_aux_out_mn = (
             self.cta_tile_shape_mnk[0],
@@ -567,10 +673,13 @@ class GemmGroupedNContractMixin(GemmActMixin):
         return params
 
 class GemmGroupedNContractSm100(GemmGroupedNContractMixin, GemmSm100):
+    # [CLASS DOC] Concrete grouped-N-contract GEMM for SM100/SM110 with group two.
     pass
 
 
 class GemmGroupedNContract4Sm100(GemmGroupedNContractMixin, GemmSm100):
+    # [CLASS DOC] Concrete grouped-N-contract GEMM for SM100 with group four: overrides the group
+    # and uses an aux store whose epilogue tile has N divided by four.
     grouped_n_contract_group = 4
     _epi_ops = (
         Scalar("alpha"),
@@ -585,6 +694,8 @@ class GemmGroupedNContract4Sm100(GemmGroupedNContractMixin, GemmSm100):
 
 
 def _gated_epi_tile_fn(gemm, epi_tile):
+    # [FUNCTION DOC] HELPER: Epilogue tile function for gated outputs; N is halved, via layout
+    # recasting when the N entry is a layout.
     """Halve the N dimension of the epi_tile for gated postact."""
     if isinstance(epi_tile[1], cute.Layout):
         return (epi_tile[0], cute.recast_layout(2, 1, epi_tile[1]))
@@ -593,6 +704,9 @@ def _gated_epi_tile_fn(gemm, epi_tile):
 
 
 class GemmGatedMixin(GemmActMixin):
+    # [CLASS DOC] Epilogue mixin for gated activations: the output has half as many columns as the
+    # accumulator, produced by applying a gate function to adjacent column pairs. Ops are alpha,
+    # beta, seed, row and column vector loads and the aux store with a halved epilogue tile.
     _epi_ops = (
         Scalar("alpha"),
         Scalar("beta"),
@@ -605,6 +719,11 @@ class GemmGatedMixin(GemmActMixin):
     def epi_to_underlying_arguments(
         self, args: GemmActMixin.EpilogueArguments, *, loc=None, ip=None
     ) -> GemmActMixin.EpilogueParams:
+        # [FUNCTION DOC] Build gated parameters. Asserts the aux output is 16 bit, D (if any) and
+        # the aux output are N-major, and on architecture 90 that tile N is a multiple of 32.
+        # Stores rounding mode, aux dtype and layout and a CTA aux tile with N halved, builds the
+        # op parameter dictionary and the activation, converts concatenated vectors to interleaved
+        # layout, returns the parameters.
         assert args.mAuxOut.element_type.width == 16, (
             "GemmGated only supports 16bit postact for now"
         )
@@ -636,6 +755,10 @@ class GemmGatedMixin(GemmActMixin):
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
+        # [FUNCTION DOC] Apply the default epilogue to the accumulator, then compute the gated
+        # output with half as many elements: the gate function combines adjacent element pairs on
+        # pre-100 architectures, and on architecture 100 handles two pairs at a time with an
+        # interleaved element pattern. Returns the register tensor of gated values.
         GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC)
         tRS_rAuxOut_layout = cute.recast_layout(2, 1, tRS_rD.layout)
         # If we don't have .shape here, the compiler generates local stores and loads
@@ -654,6 +777,9 @@ class GemmGatedMixin(GemmActMixin):
     def epi_convert_aux_out(
         self, tRS_rAuxOut, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
     ):
+        # [FUNCTION DOC] Convert the gated output to its dtype using the activation mixin, and on
+        # architectures 90 and 120 permute the 16-bit register values in place to match the store-
+        # matrix instruction ordering. Returns the converted tensor.
         tRS_rAuxOut_out = GemmActMixin.epi_convert_aux_out(
             self, tRS_rAuxOut, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
         )
@@ -664,18 +790,23 @@ class GemmGatedMixin(GemmActMixin):
 
 
 class GemmGatedSm90(GemmGatedMixin, GemmSm90):
+    # [CLASS DOC] Concrete gated GEMM for SM90.
     pass
 
 
 class GemmGatedSm80(GemmGatedMixin, GemmSm80):
+    # [CLASS DOC] Concrete gated GEMM for SM80.
     pass
 
 
 class GemmGatedSm100(GemmGatedMixin, GemmSm100):
+    # [CLASS DOC] Concrete gated GEMM for SM100 (also used for SM110).
     pass
 
 
 class GemmGatedSm120Mixin:
+    # [CLASS DOC] SM120 specific overrides for the gated epilogue: chooses an epilogue tile and
+    # builds the aux out r2s copy from a tiled mma whose N permutation is doubled.
     @staticmethod
     def _compute_tile_shape_or_override(
         cta_tile_shape_mnk: Tuple[int, int, int],
@@ -683,6 +814,10 @@ class GemmGatedSm120Mixin:
         element_type: Optional[Type[cutlass.Numeric]] = None,
         epi_tile_override: Tuple[int, int] | None = None,
     ) -> Tuple[int, int]:
+        # [FUNCTION DOC] Static method returning the epilogue tile (M, N). An explicit override is
+        # returned as is. Otherwise M is the gcd of sixteen times the M atoms and the CTA M
+        # extent, and N is the gcd of thirty-two times the N atoms and the CTA N extent, so the
+        # gated output keeps sixteen elements per warp.
         if epi_tile_override is not None:
             return epi_tile_override
         # Typically epi_tile is (64, 32) but since we want tile_n = 64 (see below), we might set
@@ -695,6 +830,9 @@ class GemmGatedSm120Mixin:
         return (tile_m, tile_n)
 
     def epi_make_aux_out_tiled_copy_r2s(self, params, tiled_copy_r2s, tiled_copy_t2r):
+        # [FUNCTION DOC] Build the aux out tiled copy for SM120 gated output: a 16-bit copy atom
+        # for the C register layout of an mma tiled with doubled N, then tile the aux store atom
+        # like it. Takes no index argument, unlike the base version.
         copy_atom_aux_out_r2s = self.epi_make_aux_out_copy_atom_r2s(params, tiled_copy_t2r)
         copy_atom_postact_c = self.epi_make_aux_out_copy_atom_r2s(params, cutlass.Float16)
         op = warp.MmaF16BF16Op(self.a_dtype, self.acc_dtype, self.mma_inst_mnk)
@@ -713,6 +851,8 @@ class GemmGatedSm120Mixin:
 
 
 class GemmGatedSm120(GemmGatedSm120Mixin, GemmGatedMixin, GemmSm120):
+    # [CLASS DOC] Concrete gated GEMM for SM120 combining the SM120 overrides, the gated mixin and
+    # the SM120 kernel.
     pass
 
 
@@ -767,6 +907,15 @@ def _compile_gemm_act(
     sr_seed_mode=0,
     use_tma_gather=False,
 ):
+    # [FUNCTION DOC] Compile (with disk and memory caching through the jit cache decorator) a GEMM
+    # with activation, gated or grouped-N-contract epilogue. All arguments are hashable
+    # descriptors: dtypes, majors, tile and cluster shape, activation key, tensor epilogue key and
+    # its argument kinds and dtypes, local reduce settings and callback keys, scalar modes, layout
+    # concatenation, device capacity and class family. Picks the kernel class from device capacity
+    # major and family (group four selects another class), builds fake tensors with symbolic
+    # shapes for every operand, looks up registered callbacks and activation functions, builds
+    # epilogue arguments and scheduler and varlen arguments, and returns the compiled kernel
+    # function. Raises KeyError for unregistered keys.
     sm_to_cls = {
         "act": {
             8: GemmActSm80,
@@ -907,6 +1056,9 @@ def _compile_gemm_act(
     )
 
     def fake_scalar(mode, dtype=Int32):
+        # [FUNCTION DOC] HELPER: Build a placeholder scalar argument for compilation: None when
+        # the mode is zero, a zero-valued constant of the dtype for mode one, otherwise a dummy
+        # global memory pointer of the dtype.
         if mode == 0:
             return None
         elif mode == 1:
@@ -1011,6 +1163,14 @@ def gemm_act(
     beta: float | Tensor = 1.0,
     device_capacity_override: tuple[int, int] | None = None,
 ) -> None:
+    # [FUNCTION DOC] Public entry point: run a GEMM with a post-activation, gated, grouped-N-
+    # contract or generated tensor epilogue, optional bias vectors, varlen M, gathered A, local
+    # reductions and rounding modes. Validates the option combinations (raising RuntimeError or
+    # NotImplementedError for unsupported ones, assertion errors for layout and mode
+    # requirements), chooses the kernel family, permutes tensors to the kernel layout, derives
+    # majors and dtypes, then gets the compiled kernel. In compile-only mode returns right after
+    # compilation. Otherwise it builds the runtime epilogue, scheduler and varlen arguments and
+    # launches the kernel, writing results into the given output tensors. Returns None.
     """Run GEMM with an optional generated tensor epilogue and local reduction.
 
     Local reductions group the logical GEMM output ``[L, M, N]``. Axis 0 groups
@@ -1319,6 +1479,8 @@ def gemm_act(
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
 
     def scalar_arg(scalar, mode, dtype=Int32):
+        # [FUNCTION DOC] HELPER: Convert a runtime scalar argument: None for mode zero, a constant
+        # of the dtype for mode one, otherwise the raw device pointer of the tensor.
         if mode == 0:
             return None
         elif mode == 1:

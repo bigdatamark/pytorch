@@ -1,4 +1,7 @@
 # Copyright (c) 2025, Tri Dao.
+# [MODULE DOC] Shared helpers for GEMM epilogue mixin classes: stride-alignment assumptions for
+# broadcast vectors and construction of TMA copy atoms plus staged shared-memory layouts for extra
+# epilogue tensors. No import-time side effects beyond imports.
 """Epilogue utilities: shared helpers for epilogue mixin classes."""
 
 import cutlass
@@ -10,6 +13,9 @@ from . import copy_utils
 
 
 def assume_stride_divisibility(tensor):
+    # [FUNCTION DOC] Return a copy of the tensor whose dynamic strides carry a divisibility hint
+    # of 32 bits worth of elements (32 divided by element width); static strides are left
+    # unchanged. Returns None when given None. The data pointer is reused, so no data is copied.
     """Assume all strides are divisible by 32 bits (except static strides).
 
     Used for broadcast vectors and similar tensors where stride alignment is guaranteed.
@@ -25,6 +31,8 @@ def assume_stride_divisibility(tensor):
 
 
 def assume_broadcast_strides(*tensors):
+    # [FUNCTION DOC] Map the stride divisibility helper over several tensors and return a list of
+    # results, with None entries preserved as None.
     """Apply stride divisibility assumptions to multiple broadcast vectors.
 
     Returns a list with None preserved for None inputs.
@@ -33,6 +41,12 @@ def assume_broadcast_strides(*tensors):
 
 
 def setup_epi_tensor(gemm, tensor, epi_tile=None, op_type="store", stage=None):
+    # [FUNCTION DOC] Build the TMA atom, TMA tensor and staged epilogue shared-memory layout for
+    # one extra tensor. Epi tile and stage count default to the gemm values; the smem layout
+    # helper is taken from the sm100 module when gemm.arch is at least 100, else from sm90. For
+    # store ops on rank-2 tensors the tensor is first converted to a ragged tensor for TMA (row
+    # offset baked into the descriptor); loads skip this. Returns a 4-tuple of TMA atom, TMA
+    # tensor, staged smem layout and the epi tile used.
     """Create copy metadata + smem layout for a supplemental epilogue tensor.
 
     Args:
