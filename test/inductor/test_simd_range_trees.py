@@ -1,4 +1,7 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for Inductor SIMD range trees, focused on derived reduction roots that
+# split a reduction dimension by a group size. If triton is not installed, the module exits
+# (when run as main) or raises SkipTest at import. Uses a mock graph handler, no GPU.
 
 import sys
 import typing
@@ -25,10 +28,16 @@ except ImportError:
 
 
 class TestSIMDRangeTrees(TestCase):
+    # [CLASS DOC] Test case with builders for a mock graph, a Triton kernel and range-tree
+    # roots, plus tests of derived-root geometry and kernel range-tree switching.
     def _make_graph(self):
+        # [FUNCTION DOC] HELPER: Returns a new mock graph handler for use as the active graph.
         return MockGraphHandler()
 
     def _make_kernel(self, *, persistent: bool):
+        # [FUNCTION DOC] HELPER: Builds a Triton kernel with an x range of 4 and a reduction
+        # range of 512 (no kernel features inputs); the persistent argument is passed as the
+        # persistent reduction override, and cooperative reduction is forced off.
         features = SIMDKernelFeatures([], sympy.Integer(4), sympy.Integer(512))
         return TritonKernel(
             {"x": sympy.Integer(4), "r0_": sympy.Integer(512)},
@@ -38,6 +47,8 @@ class TestSIMDRangeTrees(TestCase):
         )
 
     def _make_parent_reduction_root(self):
+        # [FUNCTION DOC] HELPER: Builds a standalone reduction-range root with prefix r0_,
+        # size 512, loop mode on, tensor dim 1, no grid dim, and a placeholder kernel object.
         return IterationRangesRoot(
             "r0_index",
             sympy.Integer(512),
@@ -51,6 +62,10 @@ class TestSIMDRangeTrees(TestCase):
         )
 
     def _make_derived_root(self, r_tree, *, group_size=sympy.Integer(128)):
+        # [FUNCTION DOC] HELPER: Builds a derived range root from the given parent root,
+        # dividing the parent numel, block size and block offset by group_size (default 128,
+        # floor division) and attaching three named constants: group size, reduced block and
+        # reduced numel (the last is marked non-constexpr, the first two constexpr).
         reduced_block = FloorDiv(r_tree.block_size(), group_size)
         reduced_numel = FloorDiv(r_tree.numel, group_size)
         return DerivedIterationRangesRoot(
@@ -66,6 +81,10 @@ class TestSIMDRangeTrees(TestCase):
         )
 
     def test_derived_root_geometry(self):
+        # [FUNCTION DOC] Checks a derived root mirrors its parent's loop flag and prefix, has
+        # numel, block size and block offset equal to the parent's divided by 128, owns its
+        # own mask but not the parent's, has a distinct mask name, and does not support a
+        # constant mask.
         r_tree = self._make_parent_reduction_root()
         derived = self._make_derived_root(r_tree)
 
@@ -80,6 +99,13 @@ class TestSIMDRangeTrees(TestCase):
         self.assertFalse(derived.supports_constant_mask())
 
     def test_derived_root_uses_active_range_tree_geometry(self):
+        # [FUNCTION DOC] Within a mock graph and kernel, checks that a derived root is not
+        # treated as a constant mask, that an index mixing x and derived symbols is broadcast
+        # under the kernel's default range trees, and that inside the context swapping in the
+        # x tree and derived root it is not broadcast, the block shape becomes XBLOCK by
+        # R0_BLOCK floor-divided by 128, and an indexing option using the derived mask reports
+        # a reduction mask. After leaving the context, range trees are restored and the
+        # reduction mask is gone.
         graph = self._make_graph()
         with V.set_graph_handler(graph):
             kernel = self._make_kernel(persistent=False)
@@ -116,6 +142,10 @@ class TestSIMDRangeTrees(TestCase):
                 self.assertFalse(indexing.has_rmask())
 
     def test_use_range_trees_clears_simplify_indexing_cache(self):
+        # [FUNCTION DOC] Checks that swapping range trees on a kernel invalidates the cached
+        # index simplification: the cache is populated before, empty on entry, repopulated by
+        # a new simplify call inside, and empty again on exit, with the original range trees
+        # restored.
         graph = self._make_graph()
         with V.set_graph_handler(graph):
             kernel = self._make_kernel(persistent=False)
