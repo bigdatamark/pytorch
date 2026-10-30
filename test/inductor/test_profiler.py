@@ -1,4 +1,9 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Inductor tests for torch.profiler integration: checks that compiled triton
+# kernels show up in profiler traces with expected names, input shapes and launch metadata, and
+# that profiler record_function ops are removed from post-grad graphs. Most tests need a GPU
+# with triton; the entry point only runs the suite when a GPU and triton are available. Defines
+# HAS_TRITON at import time from the triton availability check.
 import json
 import os
 import tempfile
@@ -26,13 +31,21 @@ HAS_TRITON = has_triton()
 
 
 class DynamoProfilerTests(torch._inductor.test_case.TestCase):
+    # [CLASS DOC] Test case holding all profiler/inductor integration tests. Stateless; each
+    # test compiles a small function, runs it (often under a profiler) and inspects events or
+    # logs.
     @unittest.skipIf(not HAS_TRITON, "requires cuda & triton")
     def test_inductor_profiling_triton_launch(self):
+        # [FUNCTION DOC] Compiles a pointwise function, profiles one call, exports a chrome
+        # trace to a temporary file, and asserts the trace has a launch event: a CUDA or HIP
+        # kernel launch name, or the named inductor triton kernel. Skipped without triton.
         # Verify that we get some sort of CPU-side indication of triton kernel launches
         # in the profile traces. Currently, those appear as `cuLaunchKernel`. If this
         # detail changes, the test can be updated or removed.
         @torch.compile
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Pointwise function adding two tensors then applying sin and
+            # cos; compiled and run by the enclosing test.
             return (x + y).sin().cos()
 
         x, y = (torch.rand((4, 4), device=GPU_TYPE) for _ in range(2))
@@ -58,6 +71,11 @@ class DynamoProfilerTests(torch._inductor.test_case.TestCase):
     def _test_profiling_kernel_names(
         self, fn, args, kernel_name_str: str, check_fn: Callable | None = None
     ):
+        # [FUNCTION DOC] HELPER: Compiles the given function, runs it twice on the given
+        # arguments to warm up, then calls the optional check callback (it may raise SkipTest).
+        # It then profiles one CPU-activity run with shapes recorded and asserts some event name
+        # contains both the kernel substring and the word triton. Returns the profiler's event
+        # list for further checks.
         """
         We expect a record_function event to be added on the CPU side, surrounding
         the launch of each triton kernel.
@@ -96,7 +114,13 @@ class DynamoProfilerTests(torch._inductor.test_case.TestCase):
 
     @unittest.skipIf(not HAS_TRITON, "requires cuda & triton")
     def test_inductor_profiling_kernel_names_pointwise(self):
+        # [FUNCTION DOC] Profiles a compiled add/sin/cos function and finds the event for the
+        # fused pointwise triton kernel. Asserts its first four recorded input shapes are three
+        # 4x4 tensors followed by an empty (scalar) entry, and that such an event exists. Needs
+        # triton.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Eager function computing sin and cos of the sum of its
+            # inputs.
             return (x + y).sin().cos()
 
         args = [torch.rand((4, 4), device=GPU_TYPE) for _ in range(2)]
@@ -117,16 +141,25 @@ class DynamoProfilerTests(torch._inductor.test_case.TestCase):
         not IS_BIG_GPU, "Skipping triton backend only since not big GPU (not enough SM)"
     )
     def test_inductor_profiling_kernel_names_template(self):
+        # [FUNCTION DOC] With max-autotune on and only the triton GEMM backend, profiles a
+        # compiled matrix multiply, finds the template kernel event, and asserts its first three
+        # input shapes are all 4x4. May skip if autotuning never ran. Skipped when the GPU is
+        # not a big GPU.
         with config.patch(
             {"max_autotune": True, "max_autotune_gemm_backends": "TRITON"}
         ):
 
             def fn(x, y):
+                # [FUNCTION DOC] HELPER: Eager matrix multiply of its two inputs.
                 return x @ y
 
             args = [torch.rand((4, 4), device=GPU_TYPE) for _ in range(2)]
 
             def check_fn():
+                # [FUNCTION DOC] HELPER: Callback passed to the profiling helper. Raises
+                # SkipTest when the inductor counter for select_algorithm autotune is zero,
+                # since then no template kernel profile is expected (the machine may lack enough
+                # SMs).
                 # test_profiling_kernel_names will check this before asserting mm is in the trace.
                 # reason: sometimes testing runs on machines with not enough SMs, and autotuning is skipped.
                 if (
@@ -150,11 +183,15 @@ class DynamoProfilerTests(torch._inductor.test_case.TestCase):
 
     @unittest.skipIf(not HAS_TRITON, "requires cuda & triton")
     def test_inductor_profiling_kernel_names_foreach(self):
+        # [FUNCTION DOC] With max-autotune enabled, profiles a compiled foreach add over lists
+        # of three 4x4 tensors, finds the fused foreach triton kernel event and asserts its
+        # input shapes are nine 4x4 entries. Needs triton.
         with config.patch(
             {"max_autotune": True, "max_autotune_gemm_backends": "TRITON"}
         ):
 
             def fn(x, y):
+                # [FUNCTION DOC] HELPER: Eager foreach add of two tensor lists.
                 return torch._foreach_add(x, y)
 
             x = [torch.rand((4, 4), device=GPU_TYPE) for _ in range(3)]
@@ -188,6 +225,11 @@ class DynamoProfilerTests(torch._inductor.test_case.TestCase):
         "compile_threads", 1
     )  # This test monkey patches global variables, which workers don't see
     def test_inductor_profiling_triton_hooks(self):
+        # [FUNCTION DOC] Installs launch-enter and launch-exit hooks on triton (via the knobs
+        # runtime when available, else on the CompiledKernel class), runs a compiled foreach
+        # add, and asserts both hooks were called. Side effect: leaves the hooks installed
+        # globally after the test; compile threads are forced to 1 so hooks are visible in-
+        # process.
         from triton.compiler import CompiledKernel  # @manual
 
         from torch._inductor.runtime.triton_compat import knobs
@@ -195,9 +237,13 @@ class DynamoProfilerTests(torch._inductor.test_case.TestCase):
         hooks_called = {"enter": False, "exit": False}
 
         def launch_enter_hook(lazy_dict):
+            # [FUNCTION DOC] HELPER: Records in the shared mapping that the launch-enter hook
+            # ran.
             hooks_called["enter"] = True
 
         def launch_exit_hook(lazy_dict):
+            # [FUNCTION DOC] HELPER: Records in the shared mapping that the launch-exit hook
+            # ran.
             hooks_called["exit"] = True
 
         if knobs:
@@ -208,6 +254,7 @@ class DynamoProfilerTests(torch._inductor.test_case.TestCase):
             CompiledKernel.launch_exit_hook = launch_exit_hook
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Eager foreach add of two tensor lists.
             return torch._foreach_add(x, y)
 
         x = [torch.rand((4, 4), device=GPU_TYPE) for _ in range(3)]
@@ -222,6 +269,12 @@ class DynamoProfilerTests(torch._inductor.test_case.TestCase):
 
     @unittest.skipIf(not HAS_TRITON, "requires cuda & triton")
     def test_pt2_triton_attributes(self):
+        # [FUNCTION DOC] Runs a compiled linear+add+cos function under a scheduled profiler for
+        # ten steps, exports a chrome trace to a temporary file and collects events with
+        # kernel_backend metadata. Asserts exactly two such events and that each carries the
+        # triton backend, a stream, an existing kernel file, a hash matching the file source,
+        # and kernel kwargs starting with the XBLOCK setting. Prints the trace path and events.
+        # Needs triton.
         from torch._inductor.codecache import code_hash
 
         device = GPU_TYPE
@@ -229,6 +282,8 @@ class DynamoProfilerTests(torch._inductor.test_case.TestCase):
 
         @torchdynamo.optimize("inductor")
         def fn(a, b, c):
+            # [FUNCTION DOC] HELPER: Linear layer followed by a bias add and cos, compiled with
+            # the inductor backend via dynamo.
             x = torch.nn.functional.linear(a, b)
             x = x + c
             return x.cos()
@@ -269,11 +324,16 @@ class DynamoProfilerTests(torch._inductor.test_case.TestCase):
         self.assertEqual(len(triton_events), 2)
 
         def get_hash(kernel_file: str) -> str:
+            # [FUNCTION DOC] HELPER: Reads the given kernel source file and returns the inductor
+            # code hash of its stripped contents.
             with open(kernel_file) as f:
                 kernel_src = f.read()
             return code_hash(kernel_src.strip())
 
         def check_triton_event(e) -> None:
+            # [FUNCTION DOC] HELPER: Asserts that one trace event has non-empty args with triton
+            # backend, stream, kernel file existing on disk, kernel hash equal to the file's
+            # hash, and kernel kwargs starting with XBLOCK. Failure messages include the event.
             args = e.get("args", {})
             self.assertNotEqual(args, {}, msg=lambda msg: f"{msg}\nevent = {e}")
 
@@ -312,9 +372,13 @@ class DynamoProfilerTests(torch._inductor.test_case.TestCase):
 
     @unittest.skipIf(not HAS_TRITON, "requires cuda & triton")
     def test_cupti_lazy_reinit(self):
+        # [FUNCTION DOC] Runs a function compiled in reduce-overhead mode under a profiler, then
+        # checks the DISABLE_CUPTI_LAZY_REINIT environment variable: unset or zero when the CUDA
+        # version is at least 12.6, one otherwise. Needs triton.
         x, y = (torch.randn(4, 4, device=GPU_TYPE) for _ in range(2))
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Eager add followed by sin.
             return (x + y).sin()
 
         fn_c = torch.compile(fn, mode="reduce-overhead")
@@ -329,12 +393,17 @@ class DynamoProfilerTests(torch._inductor.test_case.TestCase):
 
     @torch._dynamo.config.patch("capture_profiler_record_function", True)
     def test_inductor_remove_profiler_ops(self):
+        # [FUNCTION DOC] Compiles (full graph) a function wrapping ops in profiler
+        # record_function regions, with dynamo capture of those regions enabled, and captures
+        # the post-grad graph log. Asserts the printed graph contains only sin, cos and add, so
+        # profiler ops were removed.
         """
         Test that inductor post_grad graph doesn't have profiler ops even when
         dynamo produce those ops.
         """
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies sin, cos and add-two, each in a profiler region.
             with record_function("my_net1"):
                 a = x.sin()
             with record_function("my_cos"):
