@@ -1,4 +1,8 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for the matrix-construction helpers of the NumPy-compatible layer: eye,
+# diag, fliplr, flipud, histogram2d, tri/tril/triu, tril/triu index helpers and vander. Under
+# dynamo testing the real NumPy functions are imported, otherwise torch._numpy ones. Some
+# tests are skipped or marked expected failures where features are unimplemented.
 
 """Test functions for matrix module"""
 
@@ -76,6 +80,8 @@ skip = functools.partial(skipif, True)
 
 
 def get_mat(n):
+# [FUNCTION DOC] HELPER: Build a square integer matrix of size n whose entry at row i, column
+# j is i + j, using an outer sum of the range of n integers. Returns that array.
     data = np.arange(n)
     # data = np.add.outer(data, data)
     data = data[:, None] + data[None, :]
@@ -83,7 +89,11 @@ def get_mat(n):
 
 
 class TestEye(TestCase):
+# [CLASS DOC] Tests for eye: identity layout, diagonal offsets, rectangular shapes, dtype and
+# order.
     def test_basic(self):
+        # [FUNCTION DOC] Checks the default 4x4 identity, a float-typed identity, and that a
+        # boolean comparison of a 3x3 identity equals the bool-dtype identity.
         assert_equal(
             eye(4), array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
         )
@@ -96,6 +106,8 @@ class TestEye(TestCase):
         assert_equal(eye(3) == 1, eye(3, dtype=bool))
 
     def test_diag(self):
+        # [FUNCTION DOC] Checks a 4x4 matrix with a positive and a negative diagonal offset puts
+        # the ones on the shifted diagonal and zeros elsewhere.
         assert_equal(
             eye(4, k=1), array([[0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1], [0, 0, 0, 0]])
         )
@@ -106,11 +118,14 @@ class TestEye(TestCase):
         )
 
     def test_2d(self):
+        # [FUNCTION DOC] Checks non-square (4 rows by 3 columns and 3 by 4) identity matrices.
         assert_equal(eye(4, 3), array([[1, 0, 0], [0, 1, 0], [0, 0, 1], [0, 0, 0]]))
 
         assert_equal(eye(3, 4), array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]]))
 
     def test_diag2d(self):
+        # [FUNCTION DOC] Checks non-square matrices combined with positive and negative diagonal
+        # offsets.
         assert_equal(eye(3, 4, k=2), array([[0, 0, 1, 0], [0, 0, 0, 1], [0, 0, 0, 0]]))
 
         assert_equal(
@@ -118,6 +133,8 @@ class TestEye(TestCase):
         )
 
     def test_eye_bounds(self):
+        # [FUNCTION DOC] Checks offsets at and beyond the matrix edges for square and tall 2 and 3
+        # row shapes: out-of-range offsets give all zeros, edge offsets give a single one or none.
         assert_equal(eye(2, 2, 1), [[0, 1], [0, 0]])
         assert_equal(eye(2, 2, -1), [[0, 0], [1, 0]])
         assert_equal(eye(2, 2, 2), [[0, 0], [0, 0]])
@@ -129,10 +146,15 @@ class TestEye(TestCase):
         assert_equal(eye(3, 2, -3), [[0, 0], [0, 0], [0, 0]])
 
     def test_bool(self):
+        # [FUNCTION DOC] Checks a boolean-dtype 2x2 identity holds True on the diagonal only.
         assert_equal(eye(2, 2, dtype=bool), [[True, False], [False, True]])
 
     @xpassIfTorchDynamo_np  # (reason="TODO: implement order=non-default")
     def test_order(self):
+        # [FUNCTION DOC] Compares a C-order and a Fortran-order offset identity for equal values
+        # and then raises AssertionError unless contiguity flags match the requested order. Marked
+        # an expected failure outside dynamo because non-default order is not implemented in
+        # torch._numpy; under dynamo it runs against real numpy.
         mat_c = eye(4, 3, k=-1)
         mat_f = eye(4, 3, k=-1, order="F")
         assert_equal(mat_c, mat_f)
@@ -147,7 +169,10 @@ class TestEye(TestCase):
 
 
 class TestDiag(TestCase):
+# [CLASS DOC] Tests for diag in both its vector-to-matrix and matrix-to-vector modes.
     def test_vector(self):
+        # [FUNCTION DOC] Builds a diagonal matrix from a 1-D integer vector and compares it to a
+        # hand-made expected matrix, also for diagonal offsets 2 and -2 in a larger 7x7 result.
         vals = (100 * arange(5)).astype("l")
         b = zeros((5, 5))
         for k in range(5):
@@ -162,9 +187,15 @@ class TestDiag(TestCase):
         assert_equal(diag(vals, k=-2), c)
 
     def test_matrix(self):
+        # [FUNCTION DOC] Runs the shared matrix check on a 5x5 integer matrix derived from the
+        # helper that builds index-sum matrices.
         self.check_matrix(vals=(100 * get_mat(5) + 1).astype("l"))
 
     def check_matrix(self, vals):
+        # [FUNCTION DOC] HELPER: Given a 5x5 matrix, verifies that extracting the main diagonal
+        # and the diagonals at offsets 2 and -2 yields the elements gathered manually by a loop
+        # (first three entries for the offset cases). Shared by the C-order and Fortran-order
+        # tests.
         b = zeros((5,))
         for k in range(5):
             b[k] = vals[k, k]
@@ -179,10 +210,15 @@ class TestDiag(TestCase):
 
     @xpassIfTorchDynamo_np  # (reason="TODO implement orders")
     def test_fortran_order(self):
+        # [FUNCTION DOC] Runs the matrix check on a Fortran-ordered array. Marked an expected
+        # failure outside dynamo (torch._numpy lacks non-default memory order); runs against numpy
+        # under dynamo.
         vals = array((100 * get_mat(5) + 1), order="F", dtype="l")
         self.check_matrix(vals)
 
     def test_diag_bounds(self):
+        # [FUNCTION DOC] Checks diagonal extraction on a 3x2 nested list for offsets from 2 down
+        # to -3, including offsets that give an empty result.
         A = [[1, 2], [3, 4], [5, 6]]
         assert_equal(diag(A, k=2), [])
         assert_equal(diag(A, k=1), [2])
@@ -192,11 +228,15 @@ class TestDiag(TestCase):
         assert_equal(diag(A, k=-3), [])
 
     def test_failure(self):
+        # [FUNCTION DOC] Checks that a 3-D input raises ValueError or RuntimeError.
         assert_raises((ValueError, RuntimeError), diag, [[[1]]])
 
 
 class TestFliplr(TestCase):
+# [CLASS DOC] Tests for fliplr (reverse the column order).
     def test_basic(self):
+        # [FUNCTION DOC] Checks a 1-D input raises ValueError or RuntimeError, that results match
+        # a flip along axis 1 for a 4x4 matrix, and a 2x3 nested-list example.
         assert_raises((ValueError, RuntimeError), fliplr, ones(4))
         a = get_mat(4)
         # b = a[:, ::-1]
@@ -208,7 +248,10 @@ class TestFliplr(TestCase):
 
 
 class TestFlipud(TestCase):
+# [CLASS DOC] Tests for flipud (reverse the row order).
     def test_basic(self):
+        # [FUNCTION DOC] Checks results match a flip along axis 0 for a 4x4 matrix and a 2x3
+        # nested list.
         a = get_mat(4)
         # b = a[::-1, :]
         b = np.flip(a, 0)
@@ -220,7 +263,12 @@ class TestFlipud(TestCase):
 
 @instantiate_parametrized_tests
 class TestHistogram2d(TestCase):
+# [CLASS DOC] Tests for histogram2d: explicit edges, ranges, density, outliers and empty
+# input.
     def test_simple(self):
+        # [FUNCTION DOC] Checks counts for five points against explicit 9x9 edges (compared
+        # transposed), a single shared edge array, and default bins for 10 consecutive integers,
+        # giving a 10x10 identity count matrix with edges evenly spaced from 0 to 9.
         x = array([0.41702200, 0.72032449, 1.1437481e-4, 0.302332573, 0.146755891])
         y = array([0.09233859, 0.18626021, 0.34556073, 0.39676747, 0.53881673])
         xedges = np.linspace(0, 1, 10)
@@ -248,6 +296,9 @@ class TestHistogram2d(TestCase):
         assert_array_equal(yedges, np.linspace(0, 9, 11))
 
     def test_asym(self):
+        # [FUNCTION DOC] Checks a density histogram with differing bin counts per axis and given
+        # ranges: counts normalised by 8 samples (3 decimals) and the returned edges are evenly
+        # spaced.
         x = array([1, 1, 2, 3, 4, 4, 4, 5])
         y = array([1, 3, 2, 0, 1, 2, 3, 4])
         H, xed, yed = histogram2d(x, y, (6, 5), range=[[0, 6], [0, 5]], density=True)
@@ -266,6 +317,8 @@ class TestHistogram2d(TestCase):
         assert_array_equal(yed, np.linspace(0, 5, 6))
 
     def test_density(self):
+        # [FUNCTION DOC] Checks a density histogram with non-uniform bin edges, where the expected
+        # values are count divided by bin area, normalised by the 9 samples.
         x = array([1, 2, 3, 1, 2, 3, 1, 2, 3])
         y = array([1, 1, 1, 2, 2, 2, 3, 3, 3])
         H, xed, yed = histogram2d(x, y, [[1, 2, 3, 5], [1, 2, 3, 5]], density=True)
@@ -273,11 +326,17 @@ class TestHistogram2d(TestCase):
         assert_array_almost_equal(H, answer, 3)
 
     def test_all_outliers(self):
+        # [FUNCTION DOC] Checks that points all outside the given range produce an all-zero
+        # histogram. The offset of 1e6 is there because the reference implementation rounds edges
+        # to 6 decimals.
         r = np.random.rand(100) + 1.0 + 1e6  # histogramdd rounds by decimal=6
         H, xed, yed = histogram2d(r, r, (4, 5), range=([0, 1], [0, 1]))
         assert_array_equal(H, 0)
 
     def test_empty(self):
+        # [FUNCTION DOC] Checks empty inputs: with explicit single bin edges the result is a 1x1
+        # zero matrix, and with an integer bin count of 4 a 4x4 zero matrix (absolute tolerance
+        # 1e-15).
         a, edge1, edge2 = histogram2d([], [], bins=([0, 1], [0, 1]))
         # assert_array_max_ulp(a, array([[0.]]))
         assert_allclose(a, np.array([[0.0]]), atol=1e-15)
@@ -288,6 +347,10 @@ class TestHistogram2d(TestCase):
 
     @xpassIfTorchDynamo_np  # (reason="pytorch does not support bins = [int, array]")
     def test_binparameter_combination(self):
+        # [FUNCTION DOC] Checks mixing an edge sequence on one axis with an integer bin count on
+        # the other in both orders, comparing counts and the computed edges. Marked an expected
+        # failure outside dynamo, since torch does not support such mixed bins; runs against numpy
+        # under dynamo.
         x = array([0, 0.09207008, 0.64575234, 0.12875982, 0.47390599, 0.59944483, 1])
         y = array([0, 0.14344267, 0.48988575, 0.30558665, 0.44700682, 0.15886423, 1])
         edges = (0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1)
@@ -323,18 +386,27 @@ class TestHistogram2d(TestCase):
     @skip(reason="NP_VER: fails on CI with older NumPy")
     @parametrize("x_len, y_len", [(10, 11), (20, 19)])
     def test_bad_length(self, x_len, y_len):
+        # [FUNCTION DOC] Checks that arrays of different lengths (10 vs 11 and 20 vs 19) make
+        # histogram2d raise ValueError with the message about equal length. Always skipped via the
+        # skip decorator.
         x, y = np.ones(x_len), np.ones(y_len)
         with pytest.raises(ValueError, match="x and y must have the same length."):
             histogram2d(x, y)
 
 
 class TestTri(TestCase):
+# [CLASS DOC] Tests for tri, tril, triu and index helpers built on them.
     def test_dtype(self):
+        # [FUNCTION DOC] Checks the 3x3 lower-triangular ones matrix from tri, with default and
+        # bool dtype.
         out = array([[1, 0, 0], [1, 1, 0], [1, 1, 1]])
         assert_array_equal(tri(3), out)
         assert_array_equal(tri(3, dtype=bool), out.astype(bool))
 
     def test_tril_triu_ndim2(self):
+        # [FUNCTION DOC] For every float and integer type code, checks tril/triu of a 2x2 ones
+        # matrix give the expected triangles, are transposes of one another, and keep the input
+        # dtype.
         for dtype in np.typecodes["AllFloat"] + np.typecodes["AllInteger"]:
             a = np.ones((2, 2), dtype=dtype)
             b = np.tril(a)
@@ -346,6 +418,8 @@ class TestTri(TestCase):
             assert_equal(c.dtype, a.dtype)
 
     def test_tril_triu_ndim3(self):
+        # [FUNCTION DOC] For every float and integer type code, checks tril/triu on a 3-D array
+        # apply to each trailing 2-D matrix and preserve dtype.
         for dtype in np.typecodes["AllFloat"] + np.typecodes["AllInteger"]:
             a = np.array(
                 [
@@ -379,6 +453,8 @@ class TestTri(TestCase):
             assert_equal(a_tril_observed.dtype, a.dtype)
 
     def test_tril_triu_with_inf(self):
+        # [FUNCTION DOC] Regression test (issue 4859): infinities in the input are kept in the
+        # retained triangle and zeroed outside it, with no NaN produced.
         # Issue 4859
         arr = np.array([[1, 1, np.inf], [1, 1, 1], [np.inf, 1, 1]])
         out_tril = np.array([[1, 0, 0], [1, 1, 0], [np.inf, 1, 1]])
@@ -387,6 +463,8 @@ class TestTri(TestCase):
         assert_array_equal(np.tril(arr), out_tril)
 
     def test_tril_triu_dtype(self):
+        # [FUNCTION DOC] Regression test (issue 4916): for a list of dtype codes, tril and triu of
+        # a zero matrix keep the input dtype.
         # Issue 4916
         # tril and triu should return the same dtype as input
         for c in "efdFDBbhil?":  # np.typecodes["All"]:
@@ -396,6 +474,10 @@ class TestTri(TestCase):
 
     @xfail  # (reason="TODO: implement mask_indices")
     def test_mask_indices(self):
+        # [FUNCTION DOC] Intended to test mask_indices with and without an offset. Marked expected
+        # failure because it is not implemented.
+        # KNOWN ISSUE: mask_indices is neither imported nor defined here, so the body would raise
+        # NameError.
         # simple test without offset
         iu = mask_indices(3, np.triu)
         a = np.arange(9).reshape(3, 3)
@@ -406,6 +488,9 @@ class TestTri(TestCase):
 
     @xfail  # (reason="np.tril_indices == our tuple(tril_indices)")
     def test_tril_indices(self):
+        # [FUNCTION DOC] Intended to test tril_indices with offset and column count variants,
+        # indexing and assignment through the results. Marked expected failure because the torch
+        # version returns a tuple while numpy returns an array of indices.
         # indices without and with offset
         il1 = tril_indices(4)
         il2 = tril_indices(4, k=2)
@@ -466,7 +551,12 @@ class TestTri(TestCase):
 
 @xfail  # (reason="np.triu_indices == our tuple(triu_indices)")
 class TestTriuIndices(TestCase):
+# [CLASS DOC] Tests for triu_indices; the whole class is marked as an expected failure because
+# the torch return type is a tuple, unlike numpy.
     def test_triu_indices(self):
+        # [FUNCTION DOC] Checks triu_indices with offset and column count variants, using the
+        # results to read from and assign into a 4x4 and a 4x5 array and comparing against
+        # expected contents.
         iu1 = triu_indices(4)
         iu2 = triu_indices(4, k=2)
         iu3 = triu_indices(4, m=5)
@@ -531,21 +621,28 @@ class TestTriuIndices(TestCase):
 
 
 class TestTrilIndicesFrom(TestCase):
+# [CLASS DOC] Tests for tril_indices_from argument validation.
     def test_exceptions(self):
+        # [FUNCTION DOC] Checks 1-D and 3-D inputs raise ValueError.
         assert_raises(ValueError, tril_indices_from, np.ones((2,)))
         assert_raises(ValueError, tril_indices_from, np.ones((2, 2, 2)))
         # assert_raises(ValueError, tril_indices_from, np.ones((2, 3)))
 
 
 class TestTriuIndicesFrom(TestCase):
+# [CLASS DOC] Tests for triu_indices_from argument validation.
     def test_exceptions(self):
+        # [FUNCTION DOC] Checks 1-D and 3-D inputs raise ValueError.
         assert_raises(ValueError, triu_indices_from, np.ones((2,)))
         assert_raises(ValueError, triu_indices_from, np.ones((2, 2, 2)))
         # assert_raises(ValueError, triu_indices_from, np.ones((2, 3)))
 
 
 class TestVander(TestCase):
+# [CLASS DOC] Tests for vander (Vandermonde matrix).
     def test_basic(self):
+        # [FUNCTION DOC] Checks the default number of columns (length of input) and explicit
+        # column counts from 0 to 5, comparing with the corresponding slice of a power table.
         c = np.array([0, 1, -2, 3])
         v = vander(c)
         powers = np.array(
@@ -560,6 +657,8 @@ class TestVander(TestCase):
             assert_array_equal(v, powers[:, m - n : m])
 
     def test_dtypes(self):
+        # [FUNCTION DOC] Checks vander on int8 input and on complex input with three columns gives
+        # the expected integer-valued results.
         c = array([11, -12, 13], dtype=np.int8)
         v = vander(c)
         expected = np.array([[121, 11, 1], [144, -12, 1], [169, 13, 1]])

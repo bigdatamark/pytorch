@@ -1,4 +1,12 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests for histogram, histogram_bin_edges and histogramdd in the NumPy-
+# compatible layer. Contains a class for 1-D histograms (ranges, density, weights, dtypes,
+# error cases, overflow and precision checks), a class for automatic bin-count estimators, and
+# a class for N-dimensional histograms. Real NumPy is used under dynamo testing, otherwise
+# torch._numpy.
+# KNOWN ISSUE: histogram_bin_edges is imported only in the dynamo branch, so tests using that
+# bare name can only run as expected failures outside dynamo. Also the module defines the skip
+# helper before importing the testing utilities, which is only an import-order quirk.
 
 import functools
 from unittest import expectedFailure as xfail, skipIf
@@ -44,7 +52,11 @@ else:
 
 
 class TestHistogram(TestCase):
+    # [CLASS DOC] Tests for 1-D histogram: counts, edges, density, weights, outliers and
+    # invalid input.
     def test_simple(self):
+        # [FUNCTION DOC] Checks that bin counts of 100 random samples sum to 100, and that
+        # evenly spaced data gives equal counts of 10 in each default bin.
         n = 100
         v = np.random.rand(n)
         (a, b) = histogram(v)
@@ -56,6 +68,9 @@ class TestHistogram(TestCase):
         assert_array_equal(a, 10)
 
     def test_one_bin(self):
+        # [FUNCTION DOC] Regression test (ticket 632): a single bin from explicit edges counts
+        # all inside values and returns the edges unchanged; zero bins raises RuntimeError or
+        # ValueError; one bin from an integer count spans the data range.
         # Ticket 632
         hist, edges = histogram([1, 2, 3, 4], [1, 2])
         assert_array_equal(
@@ -71,6 +86,9 @@ class TestHistogram(TestCase):
         assert_allclose(e, np.array([1.0, 2.0]))
 
     def test_density(self):
+        # [FUNCTION DOC] Checks density histograms integrate to one (uniform and non-constant
+        # bin widths, infinite last edge, and a numpy-discussion bug-report case), and that
+        # density=False gives counts.
         # Check that the integral of the density equals 1.
         n = 100
         v = np.random.rand(n)
@@ -102,6 +120,9 @@ class TestHistogram(TestCase):
         assert_equal(counts, [0.25, 0])
 
     def test_outliers(self):
+        # [FUNCTION DOC] Checks values outside the range are not counted (lower and upper),
+        # that density normalisation and weights integrate to one, and that weighted counts
+        # equal the inner weights.
         # Check that outliers are not tallied
         a = np.arange(10) + 0.5
 
@@ -126,12 +147,16 @@ class TestHistogram(TestCase):
         assert_equal(h, w[1:-1])
 
     def test_arr_weights_mismatch(self):
+        # [FUNCTION DOC] Checks weights of a different length than the data raise RuntimeError
+        # or ValueError.
         a = np.arange(10) + 0.5
         w = np.arange(11) + 0.5
         with assert_raises((RuntimeError, ValueError)):  # , "same shape as"):
             h, b = histogram(a, range=[1, 9], weights=w, density=True)
 
     def test_type(self):
+        # [FUNCTION DOC] Checks the dtype category of the counts: integer by default and with
+        # integer weights, floating with density or float weights.
         # Check the type of the returned histogram
         a = np.arange(10) + 0.5
         h, b = histogram(a)
@@ -147,6 +172,8 @@ class TestHistogram(TestCase):
         assert_(np.issubdtype(h.dtype, np.floating))
 
     def test_f32_rounding(self):
+        # [FUNCTION DOC] Regression test (gh-4799): a 2-D histogram of float32 data with 100
+        # bins counts all three points (sum is three).
         # gh-4799, check that the rounding of the edges works with float32
         x = np.array([276.318359, -69.593948, 21.329449], dtype=np.float32)
         y = np.array([5005.689453, 4481.327637, 6010.369629], dtype=np.float32)
@@ -154,6 +181,9 @@ class TestHistogram(TestCase):
         assert_equal(counts_hist.sum(), 3.0)
 
     def test_bool_conversion(self):
+        # [FUNCTION DOC] Regression test (gh-12107): a histogram of boolean data equals the
+        # histogram of the same data as small integers, both counts and edges. The warning
+        # check is commented out.
         # gh-12107
         # Reference integer histogram
         a = np.array([1, 1, 0], dtype=np.uint8)
@@ -171,6 +201,9 @@ class TestHistogram(TestCase):
         assert_array_equal(edges, int_edges)
 
     def test_weights(self):
+        # [FUNCTION DOC] Checks weights: constant weights scale counts by the weight (and
+        # leave density unchanged), zero/one weights select values, integer weights sum per
+        # bin, and non-uniform bin widths with density give the expected normalised values.
         v = np.random.rand(100)
         w = np.ones(100) * 5
         a, b = histogram(v)
@@ -203,6 +236,9 @@ class TestHistogram(TestCase):
 
     @xpassIfTorchDynamo_np  # (reason="histogram complex weights")
     def test_exotic_weights(self):
+        # [FUNCTION DOC] Checks complex and Decimal weights give per-bin sums for custom and
+        # even bins. Marked an expected failure outside dynamo because such weights are
+        # unsupported in torch.
         # Test the use of weights that are not integer or floats, but e.g.
         # complex numbers or object types.
 
@@ -233,6 +269,7 @@ class TestHistogram(TestCase):
         assert_array_almost_equal(wa, [Decimal(1), Decimal(5)])
 
     def test_no_side_effects(self):
+        # [FUNCTION DOC] Regression test: calling histogram does not modify its input values.
         # This is a regression test that ensures that values passed to
         # ``histogram`` are unchanged.
         values = np.array([1.3, 2.5, 2.3])
@@ -240,17 +277,23 @@ class TestHistogram(TestCase):
         assert_array_almost_equal(values, [1.3, 2.5, 2.3])
 
     def test_empty(self):
+        # [FUNCTION DOC] Checks an empty input with two edges gives a single zero count and
+        # those edges.
         a, b = histogram([], bins=([0, 1]))
         assert_array_equal(a, np.array([0]))
         assert_array_equal(b, np.array([0, 1]))
 
     def test_error_binnum_type(self):
+        # [FUNCTION DOC] Checks an integer bin count works and a float bin count raises
+        # TypeError.
         # Tests if right Error is raised if bins argument is float
         vals = np.linspace(0.0, 1.0, num=100)
         histogram(vals, 5)
         assert_raises(TypeError, histogram, vals, 2.4)
 
     def test_finite_range(self):
+        # [FUNCTION DOC] Checks a finite range is accepted while a range containing NaN or
+        # infinity raises RuntimeError or ValueError.
         # Normal ranges should be fine
         vals = np.linspace(0.0, 1.0, num=100)
         histogram(vals, range=[0.25, 0.75])
@@ -258,6 +301,8 @@ class TestHistogram(TestCase):
         assert_raises((RuntimeError, ValueError), histogram, vals, range=[0.25, np.inf])
 
     def test_invalid_range(self):
+        # [FUNCTION DOC] Checks a range whose start exceeds its end raises RuntimeError or
+        # ValueError.
         # start of range must be < end of range
         vals = np.linspace(0.0, 1.0, num=100)
         with assert_raises((RuntimeError, ValueError)):
@@ -265,6 +310,9 @@ class TestHistogram(TestCase):
 
     @xfail  # (reason="edge cases")
     def test_bin_edge_cases(self):
+        # [FUNCTION DOC] Checks that with many bins each sample falls in a bin whose left edge
+        # is not above it and whose right edge is above it (floating-point edge placement).
+        # Marked an expected failure, since edge cases are not handled exactly.
         # Ensure that floating-point computations correctly place edge cases.
         arr = np.array([337, 404, 739, 806, 1007, 1811, 2012])
         hist, edges = np.histogram(arr, bins=8296, range=(2, 2280))
@@ -276,11 +324,14 @@ class TestHistogram(TestCase):
             assert_(x < right, msg=f"{x}, {right}")
 
     def test_last_bin_inclusive_range(self):
+        # [FUNCTION DOC] Checks the last bin includes its right edge: the sample equal to five
+        # is counted in the final bin when the range ends there.
         arr = np.array([0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 4.0, 5.0])
         hist, edges = np.histogram(arr, bins=30, range=(-0.5, 5))
         assert_equal(hist[-1], 1)
 
     def test_bin_array_dims(self):
+        # [FUNCTION DOC] Checks a 2-D bins array raises RuntimeError or ValueError.
         # gracefully handle bins object > 1 dimension
         vals = np.linspace(0.0, 1.0, num=100)
         bins = np.array([[0, 0.5], [0.6, 1.0]])
@@ -289,6 +340,9 @@ class TestHistogram(TestCase):
 
     @xpassIfTorchDynamo_np  # (reason="no uint64")
     def test_unsigned_monotonicity_check(self):
+        # [FUNCTION DOC] Regression test (9222): non-monotonic unsigned bin edges raise
+        # RuntimeError or ValueError. Marked an expected failure outside dynamo (no 64-bit
+        # unsigned dtype).
         # Ensures ValueError is raised if bins not increasing monotonically
         # when bins contain unsigned values (see #9222)
         arr = np.array([2])
@@ -297,6 +351,9 @@ class TestHistogram(TestCase):
             hist, edges = np.histogram(arr, bins=bins)
 
     def test_object_array_of_0d(self):
+        # [FUNCTION DOC] Regression test (gh-7864): lists of 0-d arrays with an infinite value
+        # raise RuntimeError or ValueError, while nearly-constant lists of 0-d arrays do not
+        # crash.
         # gh-7864
         assert_raises(
             (RuntimeError, ValueError),
@@ -315,6 +372,10 @@ class TestHistogram(TestCase):
 
     @xpassIfTorchDynamo_np  # (reason="bins='auto'")
     def test_some_nan_values(self):
+        # [FUNCTION DOC] Regression test (gh-7503): NaN values with automatic bins raise
+        # ValueError, but an explicit range or explicit bin edges make histogram work and NaNs
+        # are not counted. Marked an expected failure outside dynamo (string bins
+        # unsupported).
         # gh-7503
         one_nan = np.array([0, 1, np.nan])
         all_nan = np.array([np.nan, np.nan])
@@ -340,6 +401,9 @@ class TestHistogram(TestCase):
         assert_equal(h.sum(), 0)  # nan is not counted
 
     def do_signed_overflow_bounds(self, dtype):
+        # [FUNCTION DOC] HELPER: For the given signed integer dtype, histograms two values
+        # near the minimum and maximum into two bins and checks the edges and the one-count-
+        # per-bin result (no overflow).
         exponent = 8 * np.dtype(dtype).itemsize - 1
         arr = np.array([-(2**exponent) + 4, 2**exponent - 4], dtype=dtype)
         hist, e = histogram(arr, bins=2)
@@ -347,16 +411,23 @@ class TestHistogram(TestCase):
         assert_equal(hist, [1, 1])
 
     def test_signed_overflow_bounds(self):
+        # [FUNCTION DOC] Runs the overflow-bounds helper for byte, short and intc dtypes.
         self.do_signed_overflow_bounds(np.byte)
         self.do_signed_overflow_bounds(np.short)
         self.do_signed_overflow_bounds(np.intc)
 
     @xfail  # (reason="int->float conversion loses precision")
     def test_signed_overflow_bounds_2(self):
+        # [FUNCTION DOC] Runs the overflow-bounds helper for the int_ and longlong dtypes.
+        # Marked an expected failure because integer to float conversion loses precision.
         self.do_signed_overflow_bounds(np.int_)
         self.do_signed_overflow_bounds(np.longlong)
 
     def do_precision_lower_bound(self, float_small, float_large):
+        # [FUNCTION DOC] HELPER: With one value in the smaller float type and a range in the
+        # larger type that starts just above one, checks histogram with one bin counts it and
+        # returns edges of the smaller type. Returns early if the range would round to exactly
+        # one in the smaller type.
         eps = np.finfo(float_large).eps
 
         arr = np.array([1.0], float_small)
@@ -374,6 +445,9 @@ class TestHistogram(TestCase):
         assert_equal(x_loc.dtype, float_small)
 
     def do_precision_upper_bound(self, float_small, float_large):
+        # [FUNCTION DOC] HELPER: Like the lower-bound helper but with a range ending just
+        # below one: checks the single count and the edge dtype, returning early when the
+        # bound rounds to one.
         eps = np.finfo(float_large).eps
 
         arr = np.array([1.0], float_small)
@@ -391,11 +465,15 @@ class TestHistogram(TestCase):
         assert_equal(x_loc.dtype, float_small)
 
     def do_precision(self, float_small, float_large):
+        # [FUNCTION DOC] HELPER: Runs both the lower-bound and upper-bound precision helpers.
         self.do_precision_lower_bound(float_small, float_large)
         self.do_precision_upper_bound(float_small, float_large)
 
     @xpassIfTorchDynamo_np  # (reason="mixed dtypes")
     def test_precision(self):
+        # [FUNCTION DOC] Runs the precision helper for half/single, half/double and
+        # single/double pairs. Marked an expected failure outside dynamo (mixed dtypes
+        # unsupported).
         # not looping results in a useful stack trace upon failure
         self.do_precision(np.half, np.single)
         self.do_precision(np.half, np.double)
@@ -403,6 +481,9 @@ class TestHistogram(TestCase):
 
     @xpassIfTorchDynamo_np  # (reason="histogram_bin_edges")
     def test_histogram_bin_edges(self):
+        # [FUNCTION DOC] Checks histogram_bin_edges agrees with the edges returned by
+        # histogram for explicit edges, an integer bin count with range, and automatic bins.
+        # Marked an expected failure outside dynamo.
         hist, e = histogram([1, 2, 3, 4], [1, 2])
         edges = histogram_bin_edges([1, 2, 3, 4], [1, 2])
         assert_allclose(edges, e, atol=2e-15)
@@ -420,6 +501,10 @@ class TestHistogram(TestCase):
     @xpassIfTorchDynamo_np  # (reason="pytorch does not support bins = [int, int, array]")
     @slow
     def test_big_arrays(self):
+        # [FUNCTION DOC] Builds a 100-million by 3 sample of zeros and calls the N-dimensional
+        # histogram with mixed integer and array bins, checking a tuple is returned. Marked
+        # slow and an expected failure outside dynamo (mixed bin types unsupported); needs a
+        # lot of memory.
         sample = np.zeros([100000000, 3])
         xbins = 400
         ybins = 400
@@ -431,12 +516,17 @@ class TestHistogram(TestCase):
 @xpassIfTorchDynamo_np  # (reason="TODO")
 @instantiate_parametrized_tests
 class TestHistogramOptimBinNums(TestCase):
+    # [CLASS DOC] Tests for the string bin estimators (fd, scott, rice, sturges, doane, sqrt,
+    # auto, stone). The class is marked an expected failure outside dynamo (estimators not
+    # implemented).
     """
     Provide test coverage when using provided estimators for optimal number of
     bins
     """
 
     def test_empty(self):
+        # [FUNCTION DOC] Checks every estimator on empty data gives one zero count and edges
+        # zero and one.
         estimator_list = [
             "fd",
             "scott",
@@ -454,6 +544,8 @@ class TestHistogramOptimBinNums(TestCase):
             assert_array_equal(b, np.array([0, 1]))
 
     def test_simple(self):
+        # [FUNCTION DOC] For three data sizes of a two-peak linspace mixture, checks the
+        # number of bins each estimator picks against precomputed values.
         """
         Straightforward testing with a mixture of linspace data (for
         consistency). All test values have been precomputed and the values
@@ -509,6 +601,8 @@ class TestHistogramOptimBinNums(TestCase):
                 )
 
     def test_small(self):
+        # [FUNCTION DOC] For data sizes one to three, checks the precomputed number of bins
+        # each estimator chooses (estimators can misbehave on small data, especially fd).
         """
         Smaller datasets have the potential to cause issues with the data
         adaptive methods, especially the FD method. All bin numbers have been
@@ -555,6 +649,7 @@ class TestHistogramOptimBinNums(TestCase):
                 )
 
     def test_incorrect_methods(self):
+        # [FUNCTION DOC] Checks unknown estimator names raise ValueError.
         """
         Check a Value Error is thrown when an unknown string is passed in
         """
@@ -563,6 +658,7 @@ class TestHistogramOptimBinNums(TestCase):
             assert_raises(ValueError, histogram, [1, 2, 3], estimator)
 
     def test_novariance(self):
+        # [FUNCTION DOC] Checks all estimators give one bin for constant data (zero spread).
         """
         Check that methods handle no variance in data
         Primarily for Scott and FD as the SD and IQR are both 0 in this case
@@ -588,6 +684,9 @@ class TestHistogramOptimBinNums(TestCase):
             )
 
     def test_limited_variance(self):
+        # [FUNCTION DOC] Checks that when the interquartile range is zero but the variance is
+        # not, auto and sturges give twelve-point edges while fd gives a single bin from zero
+        # to 100.
         """
         Check when IQR is 0, but variance exists, we return the sturges value
         and not the fd value.
@@ -609,6 +708,8 @@ class TestHistogramOptimBinNums(TestCase):
         assert_allclose(edges_sturges, np.linspace(0, 100, 12), rtol=1e-15)
 
     def test_outlier(self):
+        # [FUNCTION DOC] Checks fd, scott, doane and stone bin counts on data with a far
+        # outlier cluster against precomputed values.
         """
         Check the FD, Scott and Doane with outliers.
 
@@ -629,9 +730,14 @@ class TestHistogramOptimBinNums(TestCase):
             assert_equal(len(a), numbins)
 
     def test_scott_vs_stone(self):
+        # [FUNCTION DOC] Checks that for normal samples of growing size, the average gap from
+        # half between stone and scott bin counts shrinks, against precomputed values to two
+        # decimals.
         """Verify that Scott's rule and Stone's rule converges for normally distributed data"""
 
         def nbins_ratio(seed, size):
+            # [FUNCTION DOC] HELPER: For a seed and size, draws normal samples and returns the
+            # stone bin count divided by the sum of the stone and scott bin counts.
             rng = np.random.RandomState(seed)
             x = rng.normal(loc=0, scale=2, size=size)
             a, b = len(np.histogram(x, "stone")[0]), len(np.histogram(x, "scott")[0])
@@ -650,6 +756,9 @@ class TestHistogramOptimBinNums(TestCase):
         assert_almost_equal(avg, [0.15, 0.09, 0.08, 0.03], decimal=2)
 
     def test_simple_range(self):
+        # [FUNCTION DOC] Like the simple test but with an extra mixture component outside an
+        # explicit range of minus 20 to 20, which must be ignored; checks precomputed bin
+        # counts.
         """
         Straightforward testing with a mixture of linspace data (for
         consistency). Adding in a 3rd mixture that will then be
@@ -700,6 +809,8 @@ class TestHistogramOptimBinNums(TestCase):
 
     @parametrize("bins", ["auto", "fd", "doane", "scott", "stone", "rice", "sturges"])
     def test_signed_integer_data(self, bins):
+        # [FUNCTION DOC] Parametrized over estimators. Regression test (gh-14379): int8 data
+        # gives the same histogram and edges as the same data as int32.
         # Regression test for gh-14379.
         a = np.array([-2, 0, 127], dtype=np.int8)
         hist, edges = np.histogram(a, bins=bins)
@@ -708,6 +819,7 @@ class TestHistogramOptimBinNums(TestCase):
         assert_array_equal(edges, edges32)
 
     def test_simple_weighted(self):
+        # [FUNCTION DOC] Checks that using an estimator with weights raises TypeError.
         """
         Check that weighted data raises a TypeError
         """
@@ -717,7 +829,11 @@ class TestHistogramOptimBinNums(TestCase):
 
 
 class TestHistogramdd(TestCase):
+    # [CLASS DOC] Tests for histogramdd (N-dimensional histogram).
     def test_simple(self):
+        # [FUNCTION DOC] Checks counts for 3-D points with explicit bins and ranges,
+        # normalisation by total volume, resulting shape, a sequence of 1-D arrays as input,
+        # and an integer bin count.
         x = np.array(
             [
                 [-0.5, 0.5, 1.5],
@@ -770,6 +886,8 @@ class TestHistogramdd(TestCase):
         assert_array_equal(H, Z)
 
     def test_shape_3d(self):
+        # [FUNCTION DOC] For all orderings of three different bin counts, checks the result
+        # shape equals the bin counts.
         # All possible permutations for bins of different lengths in 3D.
         bins = ((5, 4, 6), (6, 4, 5), (5, 6, 4), (4, 6, 5), (6, 5, 4), (4, 5, 6))
         r = np.random.rand(10, 3)
@@ -778,6 +896,8 @@ class TestHistogramdd(TestCase):
             assert_(H.shape == b)
 
     def test_shape_4d(self):
+        # [FUNCTION DOC] For all orderings of four different bin counts on random points,
+        # checks the result shape, and that unit weights give the same counts and edges.
         # All possible permutations for bins of different lengths in 4D.
         bins = (
             (7, 4, 5, 6),
@@ -818,6 +938,8 @@ class TestHistogramdd(TestCase):
                     raise AssertionError("Expected all edges to be equal")
 
     def test_weights(self):
+        # [FUNCTION DOC] Checks unit weights equal no weights, equal weights with density
+        # equal the unweighted density, and integer weights of two double the counts.
         v = np.random.rand(100, 2)
         hist, edges = histogramdd(v)
         n_hist, edges = histogramdd(v, density=True)
@@ -829,11 +951,15 @@ class TestHistogramdd(TestCase):
         assert_array_equal(w_hist, 2 * hist)
 
     def test_identical_samples(self):
+        # [FUNCTION DOC] Checks all-identical samples get edges extended by half a unit on
+        # each side.
         x = np.zeros((10, 2), int)
         hist, edges = histogramdd(x, bins=2)
         assert_array_equal(edges[0], np.array([-0.5, 0.0, 0.5]))
 
     def test_empty(self):
+        # [FUNCTION DOC] Checks empty samples give zero counts for explicit edges and for an
+        # integer bin count in two and three dimensions.
         a, b = histogramdd([[], []], bins=([0, 1], [0, 1]))
         # assert_array_max_ulp(a, np.array([[0.]]))
         assert_allclose(a, np.array([[0.0]]), atol=1e-15)
@@ -842,6 +968,8 @@ class TestHistogramdd(TestCase):
         assert_allclose(a, np.zeros((2, 2, 2)), atol=1e-15)
 
     def test_bins_errors(self):
+        # [FUNCTION DOC] Checks invalid bin specifications (negative, fractional, mismatched
+        # dimension or nested negative edges) raise RuntimeError or ValueError.
         # There are two ways to specify bins. Check for the right errors
         # when mixing those.
         x = np.arange(8).reshape(2, 4)
@@ -855,12 +983,16 @@ class TestHistogramdd(TestCase):
 
     @xpassIfTorchDynamo_np  # (reason="pytorch does not support bins = [int, int, array]")
     def test_bins_error_2(self):
+        # [FUNCTION DOC] Checks mixing integer bin counts and an explicit edge array is
+        # accepted. Marked an expected failure outside dynamo (unsupported in torch).
         # mixing scalar (# of bins) and explicit bin arrays, ugh
         x = np.arange(8).reshape(2, 4)
         assert_(np.histogramdd(x, bins=[1, 1, 1, [1, 2, 3, 4]]))
 
     @xpassIfTorchDynamo_np  # (reason="pytorch does not support bins = [int, int, array]")
     def test_inf_edges(self):
+        # [FUNCTION DOC] Checks infinite bin edges mixed with integer bin counts (issue 1788).
+        # Marked an expected failure outside dynamo (unsupported in torch).
         # Test using +/-inf bin edges works. See #1788.
         x = np.arange(6).reshape(3, 2)
         expected = np.array([[1, 0], [0, 1], [0, 1]])
@@ -872,6 +1004,8 @@ class TestHistogramdd(TestCase):
         assert_allclose(h, expected)
 
     def test_rightmost_binedge(self):
+        # [FUNCTION DOC] Regression test (gh issue 4266): values just below or at the last
+        # edge land in the final bin, values just above it are not counted.
         # Test event very close to rightmost binedge. See Github issue #4266
         x = [0.9999999995]
         bins = [[0.0, 0.5, 1.0]]
@@ -895,6 +1029,8 @@ class TestHistogramdd(TestCase):
         assert_(hist[1] == 0.0)
 
     def test_finite_range(self):
+        # [FUNCTION DOC] Checks finite ranges work while a range containing infinity or NaN
+        # raises RuntimeError or ValueError.
         vals = np.random.random((100, 3))
         histogramdd(vals, range=[[0.0, 1.0], [0.25, 0.75], [0.25, 0.5]])
         assert_raises(
@@ -912,6 +1048,9 @@ class TestHistogramdd(TestCase):
 
     @xpassIfTorchDynamo_np  # (reason="pytorch does not allow equal entries")
     def test_equal_edges(self):
+        # [FUNCTION DOC] Checks repeated adjacent edges are allowed and the value on the last
+        # edge is in the final bin. Marked an expected failure outside dynamo (torch rejects
+        # equal edges).
         """Test that adjacent entries in an edge array can be equal"""
         x = np.array([0, 1, 2])
         y = np.array([0, 1, 2])
@@ -928,6 +1067,8 @@ class TestHistogramdd(TestCase):
         assert_equal(hist, hist_expected)
 
     def test_edge_dtype(self):
+        # [FUNCTION DOC] Checks the dtype of supplied edge arrays is preserved in the returned
+        # edges.
         """Test that if an edge array is input, its type is preserved"""
         x = np.array([0, 10, 20])
         y = x / 10
@@ -939,6 +1080,8 @@ class TestHistogramdd(TestCase):
         assert_equal(edges[1].dtype, y_edges.dtype)
 
     def test_large_integers(self):
+        # [FUNCTION DOC] Checks very large integers (beyond float precision) fall in the right
+        # bin.
         big = 2**60  # Too large to represent with a full precision float
 
         x = np.asarray([0], dtype=np.int64)
@@ -951,6 +1094,8 @@ class TestHistogramdd(TestCase):
         assert_equal(hist[0, 0], 1)
 
     def test_density_non_uniform_2d(self):
+        # [FUNCTION DOC] Checks, on a grid of unequal cell sizes, that point counts match the
+        # relative cell areas, and that density then gives a uniform value of one over 64.
         # Defines the following grid:
         #
         #    0 2     8
@@ -976,6 +1121,8 @@ class TestHistogramdd(TestCase):
         assert_equal(hist, 1 / (8 * 8))
 
     def test_density_non_uniform_1d(self):
+        # [FUNCTION DOC] Checks the 1-D N-dimensional histogram with non-uniform bins and
+        # density equals the 1-D histogram results.
         # compare to histogram to show the results are the same
         v = np.arange(10)
         bins = np.array([0, 1, 3, 6, 10])
@@ -985,6 +1132,8 @@ class TestHistogramdd(TestCase):
         assert_equal(edges, edges_dd[0])
 
     def test_bins_array(self):
+        # [FUNCTION DOC] Checks the returned edges are all numpy arrays; raises AssertionError
+        # otherwise.
         x = np.array(
             [
                 [-0.5, 0.5, 1.5],
