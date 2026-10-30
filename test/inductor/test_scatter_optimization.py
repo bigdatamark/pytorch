@@ -1,4 +1,11 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for inductor scatter-related optimizations: rewriting a constant-filled
+# tensor followed by a scatter into a pointwise computation (checked through byte-count and
+# match metrics), and the partitioned scatter FX pass that reduces atomic contention for
+# accumulating index_put (checked via counters, accuracy against eager, config gates and GPU
+# memory budget). Import-time side effects: turns on inductor metrics logging, reads the
+# DO_PERF_TEST environment variable, and sets the default device to the GPU when one is
+# available. The runner only starts when a GPU is present.
 
 import copy
 import os
@@ -21,15 +28,25 @@ DO_PERF_TEST = os.environ.get("DO_PERF_TEST") == "1"
 
 
 class TestScatterOpt(TestCase):
+    # [CLASS DOC] Tests the full-plus-scatter to pointwise rewrite on CPU: each test compiles a
+    # function, compares with eager, and inspects inductor metrics (bytes accessed, pattern
+    # match counts). State is reset before every test.
     def setUp(self):
+        # [FUNCTION DOC] Resets inductor metrics and clears the dynamo counters before each
+        # test.
         super().setUp()
         metrics.reset()
         counters.clear()
 
     def check_metric(self, val=1):
+        # [FUNCTION DOC] HELPER: Asserts the number of scatter-upon-constant-tensor matches
+        # recorded in the metrics equals the expected value (default one).
         self.assertEqual(val, metrics.num_matches_for_scatter_upon_const_tensor)
 
     def do_acc_test(self, f, *args):
+        # [FUNCTION DOC] HELPER: Runs the function eagerly and compiled on the same arguments
+        # and asserts the results agree within a tolerance of 1e-3, with a message showing both
+        # values.
         expect = f(*args)
         actual = torch.compile(f)(*args)
         self.assertTrue(
@@ -37,9 +54,14 @@ class TestScatterOpt(TestCase):
         )
 
     def test_3d_tensor(self):
+        # [FUNCTION DOC] Compiles a fill then scatter along the last dim of a 3D tensor and
+        # checks accuracy plus that the bytes accessed equal the output size plus the index
+        # size, meaning the fill and scatter were fused into a single pass.
         L, M, N = 2, 1024, 2048
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Fills a 3D float tensor with a constant, scatters a second
+            # constant along dim 2 at the given indices, and returns it.
             y = torch.full([L, M, N], 3.14, dtype=torch.float)
             y.scatter_(2, x.unsqueeze(2), 2.718)
             return y
@@ -52,12 +74,16 @@ class TestScatterOpt(TestCase):
         self.assertEqual(metrics.num_bytes_accessed, expected_num_bytes)
 
     def test_non_last_dim(self):
+        # [FUNCTION DOC] Checks the optimization applies when scattering along dim 0 of a 2D
+        # tensor; accuracy and bytes accessed (output plus index) are verified.
         """
         Test the case that the scatter dimension is not the last one.
         """
         M, N = 1024, 2048
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Fills a 2D float tensor with a constant, scatters a
+            # constant along dim 0 using the unsqueezed index, and returns it.
             y = torch.full([M, N], 3.14, dtype=torch.float)
             y.scatter_(0, x.unsqueeze(0), 2.718)
             return y
@@ -68,9 +94,13 @@ class TestScatterOpt(TestCase):
         self.assertEqual(metrics.num_bytes_accessed, expected_num_bytes)
 
     def test_neg_scatter_dim(self):
+        # [FUNCTION DOC] Checks that a negative scatter dim (last dim) is handled; accuracy and
+        # the bytes accessed equal output plus index sizes.
         M, N = 1024, 2048
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Fills a 2D tensor with a constant, scatters a constant
+            # along dim minus one at the unsqueezed index, and returns it.
             y = torch.full([M, N], 3.14, dtype=torch.float)
             y.scatter_(-1, x.unsqueeze(1), 2.718)
             return y
@@ -81,9 +111,14 @@ class TestScatterOpt(TestCase):
         self.assertEqual(metrics.num_bytes_accessed, expected_num_bytes)
 
     def test_shorter_index_tensor(self):
+        # [FUNCTION DOC] Uses an index tensor with half as many rows as the output; accuracy
+        # must hold and no pattern is matched (pattern matcher count is zero) since shorter
+        # indexes are unsupported.
         M, N = 1024, 2048
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Fills a 2D tensor with a constant and scatters a constant
+            # along dim 1 at the unsqueezed (shorter) index; returns the tensor.
             y = torch.full([M, N], 3.14, dtype=torch.float)
             y.scatter_(1, x.unsqueeze(1), 2.718)
             return y
@@ -95,9 +130,13 @@ class TestScatterOpt(TestCase):
         self.assertEqual(0, counters["inductor"]["pattern_matcher_count"])
 
     def test_nonzero_const_tensor(self):
+        # [FUNCTION DOC] Checks the rewrite works for a non-zero fill value; accuracy and bytes
+        # accessed (output plus index) are verified.
         M, N = 1024, 2048
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Fills a 2D tensor with a non-zero constant, scatters a
+            # constant along dim 1 at the unsqueezed index, and returns it.
             y = torch.full([M, N], 3.14, dtype=torch.float)
             y.scatter_(1, x.unsqueeze(1), 2.718)
             return y
@@ -108,9 +147,15 @@ class TestScatterOpt(TestCase):
         self.assertEqual(metrics.num_bytes_accessed, expected_num_bytes)
 
     def test_can_not_optimize_due_to_dense(self):
+        # [FUNCTION DOC] Uses a dense index (one index per half of the columns, not a single
+        # column per row), which cannot be optimized; accuracy is checked and bytes accessed
+        # must be at least the expected sum (lower bound only, because of a known dependency-
+        # accounting imprecision).
         M, N = 1024, 2048
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Fills a 2D tensor with zeros and scatters a constant along
+            # dim 1 using the full 2D index tensor; returns it.
             y = torch.full([M, N], 0, dtype=torch.float)
             y.scatter_(1, x, 0.618)
             return y
@@ -125,9 +170,15 @@ class TestScatterOpt(TestCase):
         self.assertGreaterEqual(metrics.num_bytes_accessed, expected_num_bytes)
 
     def test_can_not_optimize_due_to_non_const(self):
+        # [FUNCTION DOC] Scatters into a tensor passed as an argument rather than a constant
+        # tensor, so no rewrite applies; checks accuracy, a lower bound on bytes accessed, and
+        # then the exact byte count including a known overestimate for the mutation kernels
+        # (three kernels are generated: copy in, scatter, copy back).
         M, N = 1024, 2048
 
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Scatters a constant in place into the argument tensor along
+            # dim 1 at the given index and returns that tensor.
             y.scatter_(1, x, 0.618)
             return y
 
@@ -153,6 +204,9 @@ class TestScatterOpt(TestCase):
         self.assertEqual(metrics.num_bytes_accessed, expected_num_bytes + over_estimate)
 
     def test_dtype_preserved(self):
+        # [FUNCTION DOC] For float16 and bfloat16 constant tensors, checks the rewritten result
+        # keeps the low-precision dtype (not promoted to float32), values agree with eager, and
+        # the rewrite matched once. Metrics are reset per dtype.
         """
         The full+scatter -> pointwise rewrite must preserve the const tensor's
         dtype. torch.where with Python scalar branches promotes to the default
@@ -167,6 +221,8 @@ class TestScatterOpt(TestCase):
             metrics.reset()
 
             def f(x):
+                # [FUNCTION DOC] HELPER: Fills a 2D tensor of the loop's dtype with a constant,
+                # scatters a constant along dim 1 at the unsqueezed index, and returns it.
                 y = torch.full([M, N], 3.14, dtype=dtype)
                 y.scatter_(1, x.unsqueeze(1), 2.718)
                 return y
@@ -187,6 +243,11 @@ class TestScatterOpt(TestCase):
             self.check_metric()
 
     def test_cross_entropy_loss(self):
+        # [FUNCTION DOC] Runs cross entropy loss backward on a bf16 linear model eagerly and
+        # compiled, compares weight gradients, and checks the pattern matched once. The
+        # vocabulary size is reduced unless DO_PERF_TEST is set; in that mode it skips on xpu,
+        # resets peak memory stats, benchmarks the compiled step, and prints time and peak
+        # memory.
         """
         Match full+scatter in CEL and replaces it with a pointwise.
 
@@ -206,6 +267,8 @@ class TestScatterOpt(TestCase):
         ce = nn.CrossEntropyLoss()
 
         def f(m, x, label):
+        # [FUNCTION DOC] HELPER: Computes cross entropy of the model output against labels
+        # (flattened) and runs backward; returns nothing.
             ce(m(x).view(-1, V), label.view(-1)).backward()
 
         opt_f = torch.compile(f)
@@ -236,9 +299,15 @@ class TestScatterOpt(TestCase):
 
 
 class TestPartitionedScatterOpt(TestCase):
+    # [CLASS DOC] Tests the partitioned scatter FX pass for accumulating index_put. setUp
+    # enables the config flag and saves the enable and force flags, tearDown restores them.
+    # Tests inspect counters for applied or skipped reasons and compare compiled output with
+    # eager.
     """Tests for the partitioned scatter FX pass (reduced_atomic_contention.py)."""
 
     def setUp(self):
+        # [FUNCTION DOC] Resets metrics, counters and dynamo, saves the enabled and force config
+        # values for restoration, and turns the pass on.
         super().setUp()
         metrics.reset()
         counters.clear()
@@ -248,11 +317,16 @@ class TestPartitionedScatterOpt(TestCase):
         config.partitioned_scatter_enabled = True
 
     def tearDown(self):
+        # [FUNCTION DOC] Restores the saved enabled and force config values, then calls the
+        # parent tearDown.
         config.partitioned_scatter_enabled = self._saved_enabled
         config.partitioned_scatter_force = self._saved_force
         super().tearDown()
 
     def _check_accuracy(self, f, args, *, atol=1e-1, rtol=1e-2, exact=False):
+        # [FUNCTION DOC] HELPER: Runs a function eagerly and through inductor (no grad, full
+        # graph) and asserts every output (single or sequence) matches: bitwise equal when exact
+        # is set, else close in float32 within the given tolerances.
         """Run f eagerly and through Inductor, assert the results agree."""
         with torch.no_grad():
             expected = f(*args)
@@ -275,6 +349,11 @@ class TestPartitionedScatterOpt(TestCase):
     def _make_scatter_inputs(
         self, N, output_shape, dtype=torch.float32, index_high=None, dim=0
     ):
+        # [FUNCTION DOC] HELPER: Builds CPU inputs for a one-index scatter-add along a
+        # dimension: an all-zero output of the given shape and dtype, a random int64 index of
+        # length N, and a value tensor shaped like the output with that dimension replaced by N
+        # (small ints for int32, normal random otherwise). The index upper bound defaults to
+        # half the dim size (at least one).
         """
         Create (out, idx, vals) for a 1-index scatter-add along `dim`.
         index_high controls contention: smaller = more writes per slot.
@@ -292,11 +371,16 @@ class TestPartitionedScatterOpt(TestCase):
         return out, idx, vals
 
     def test_pr_reference_accuracy(self):
+        # [FUNCTION DOC] Seeds the RNG and runs three accumulating index_puts with only four
+        # distinct slots on a 10k-row input; accuracy is checked with loose tolerance and the
+        # pass must apply at least three times.
         """Scaled-down PR benchmark: three scatter-adds with high contention (4 slots)."""
         torch.manual_seed(42)
         N, D, n_small = 10_000, 10, 51
 
         def f(out0, out1, out2, idx0, idx1, idx2, vals):
+            # [FUNCTION DOC] HELPER: Applies three accumulating index_puts with separate outputs
+            # and indexes but shared values; returns the three results.
             out0 = out0.index_put([idx0], vals, accumulate=True)
             out1 = out1.index_put([idx1], vals, accumulate=True)
             out2 = out2.index_put([idx2], vals, accumulate=True)
@@ -316,22 +400,29 @@ class TestPartitionedScatterOpt(TestCase):
         self.assertGreaterEqual(counters["inductor"]["partitioned_scatter_applied"], 3)
 
     def test_accuracy_int32_exact(self):
+        # [FUNCTION DOC] Integer 32-bit accumulating index_put must match eager exactly.
         """Integer scatter-add must be bit-for-bit identical to eager (addition is associative)."""
         torch.manual_seed(4)
         N = 8192
 
         def f(out, idx, vals):
+            # [FUNCTION DOC] HELPER: Returns the output with values accumulated at the index
+            # positions.
             return out.index_put([idx], vals, accumulate=True)
 
         out, idx, vals = self._make_scatter_inputs(N, (8,), torch.int32, index_high=8)
         self._check_accuracy(f, (out, idx, vals), exact=True)
 
     def test_accuracy_inplace_index_put(self):
+        # [FUNCTION DOC] Checks the in-place accumulating index_put variant is also matched and
+        # correct.
         """index_put_ (in-place) is also matched and produces correct output."""
         torch.manual_seed(7)
         N, n, D = 8192, 8, 4
 
         def f(out, idx, vals):
+            # [FUNCTION DOC] HELPER: Accumulates values in place into out at the index positions
+            # and returns out.
             out.index_put_([idx], vals, accumulate=True)
             return out
 
@@ -342,10 +433,14 @@ class TestPartitionedScatterOpt(TestCase):
         self._check_accuracy(f, (out, idx, vals), atol=1.0, rtol=1e-2)
 
     def test_skip_accumulate_false(self):
+        # [FUNCTION DOC] An index_put without accumulation is not matched: results are exact and
+        # the applied counter stays zero.
         """index_put with accumulate=False doesn't match the registered patterns."""
         n = 256
 
         def f(out, idx, vals):
+            # [FUNCTION DOC] HELPER: Returns the output with values written (not accumulated) at
+            # the index.
             return out.index_put([idx], vals, accumulate=False)
 
         torch.manual_seed(10)
@@ -357,12 +452,16 @@ class TestPartitionedScatterOpt(TestCase):
         self.assertEqual(counters["inductor"]["partitioned_scatter_applied"], 0)
 
     def test_pass_disabled(self):
+        # [FUNCTION DOC] With the enable flag turned off, compiles an accumulating index_put and
+        # checks the result is correct and the applied counter is zero.
         """When partitioned_scatter_enabled=False the pass is a no-op."""
         config.partitioned_scatter_enabled = False
 
         N, n = 8192, 8
 
         def f(out, idx, vals):
+            # [FUNCTION DOC] HELPER: Returns the output with values accumulated at the index
+            # positions.
             return out.index_put([idx], vals, accumulate=True)
 
         out = torch.zeros(n, dtype=torch.float32)
@@ -378,12 +477,18 @@ class TestPartitionedScatterOpt(TestCase):
         self.assertEqual(counters["inductor"]["partitioned_scatter_applied"], 0)
 
     def test_force_mode_bypasses_heuristic_gates(self):
+        # [FUNCTION DOC] Compiles two accumulating scatters, one with too few indices and one
+        # with low contention. Without force both are skipped (applied zero, a skip reason
+        # counter positive); with the force flag set temporarily both are applied (count two)
+        # and outputs match eager.
         """
         partitioned_scatter_force=True bypasses the min_index_size and
         min_contention_ratio gates while still enforcing correctness constraints.
         """
 
         def f(out_a, idx_a, vals_a, out_b, idx_b, vals_b):
+            # [FUNCTION DOC] HELPER: Applies two independent accumulating index_puts and returns
+            # both results.
             out_a = out_a.index_put([idx_a], vals_a, accumulate=True)
             out_b = out_b.index_put([idx_b], vals_b, accumulate=True)
             return out_a, out_b
@@ -433,11 +538,15 @@ class TestPartitionedScatterOpt(TestCase):
             )
 
     def test_skip_cpu_device(self):
+        # [FUNCTION DOC] With force enabled, a CPU scatter is still not rewritten: applied
+        # counter is zero, the CPU device skip counter is positive, and results match eager.
         """CPU scatters are never rewritten, even with force enabled."""
         torch.manual_seed(21)
         N, n = 8192, 8
 
         def f(out, idx, vals):
+            # [FUNCTION DOC] HELPER: Returns the output with values accumulated at the index
+            # positions.
             return out.index_put([idx], vals, accumulate=True)
 
         out = torch.zeros(n, dtype=torch.float32, device="cpu")
@@ -460,6 +569,9 @@ class TestPartitionedScatterOpt(TestCase):
         self.assertTrue(torch.allclose(expected, actual, atol=1e-1, rtol=1e-2))
 
     def test_compute_num_partitions_tight_budget(self):
+        # [FUNCTION DOC] Calls the partition count helper with a 20 MB budget for a one-million
+        # element float32 output: eight partitions would need more extra memory than available,
+        # so the result is four.
         """Memory constraint picks P=4: P=8 overhead (28 MB) exceeds 20 MB budget."""
         # P=4: overhead = 1M * 4 * 3 = 12 MB ≤ 20 MB
         # P=8: overhead = 1M * 4 * 7 = 28 MB > 20 MB
@@ -467,6 +579,9 @@ class TestPartitionedScatterOpt(TestCase):
         self.assertEqual(result, 4)
 
     def test_compute_num_partitions_diminishing_returns_cap(self):
+        # [FUNCTION DOC] With effectively unlimited memory, checks the partition count helper's
+        # cap that depends on writes per slot: 128 (limited by the maximum), 16, and the minimum
+        # of two for sparse writes.
         """Diminishing-returns cap limits P when memory is not the bottleneck."""
         available = 10**12  # effectively unlimited
 
@@ -507,6 +622,9 @@ class TestPartitionedScatterOpt(TestCase):
         self.assertEqual(result, 2)
 
     def test_skip_low_contention_ratio_multidim(self):
+        # [FUNCTION DOC] Regression test that the contention gate divides index size by the
+        # scatter dim size rather than by total output elements, so a vocab by dim output with
+        # many indices still gets the pass applied; also checks output accuracy.
         """
         Contention gate uses index_size / scatter_dim_size, not index_size / output_numel.
 
@@ -517,6 +635,8 @@ class TestPartitionedScatterOpt(TestCase):
         vocab, dim, N = 4096, 64, 50_000
 
         def f(out, idx, vals):
+            # [FUNCTION DOC] HELPER: Returns the output with rows accumulated at the index
+            # positions.
             return out.index_put([idx], vals, accumulate=True)
 
         out = torch.zeros(vocab, dim, dtype=torch.float32)
@@ -543,6 +663,11 @@ class TestPartitionedScatterOpt(TestCase):
     @unittest.skipUnless(HAS_GPU, "requires GPU for CUDA-aware memory tracking")
     @config.patch(partitioned_scatter_min_contention_ratio=1.0)
     def test_memory_aware_partition_count(self):
+        # [FUNCTION DOC] GPU test (contention ratio pinned to one) of the memory aware partition
+        # count. First sets the non-model memory floor so headroom allows four partitions and
+        # expects the pass to apply with correct output; then sets the floor to total GPU memory
+        # and expects it to be skipped for the memory budget with a still-correct result. The
+        # floor option is restored.
         """
         Verify that live tensor memory constrains num_partitions.
 
@@ -564,6 +689,8 @@ class TestPartitionedScatterOpt(TestCase):
         persist_n = 100_000_000
 
         def f(out, idx, vals, persistent):
+            # [FUNCTION DOC] HELPER: Accumulating index_put into the output followed by adding
+            # the sum of a large persistent tensor; returns the result.
             scattered = out.index_put([idx], vals, accumulate=True)
             return scattered + persistent.sum()
 
@@ -634,6 +761,9 @@ class TestPartitionedScatterOpt(TestCase):
     @unittest.skipUnless(HAS_GPU, "requires GPU for CUDA-aware memory tracking")
     @config.patch(partitioned_scatter_min_contention_ratio=1.0)
     def test_memory_budget_shared_across_scatters(self):
+        # [FUNCTION DOC] GPU test that several scatters in one graph share one memory budget:
+        # with headroom for only one extra buffer, exactly one of three scatters may be
+        # rewritten and outputs must match eager. The floor option is restored afterwards.
         """
         Several scatters in one graph must share the budget, not each claim it.
 
@@ -649,6 +779,8 @@ class TestPartitionedScatterOpt(TestCase):
         N = 20_000_000
 
         def f(out0, out1, out2, idx, vals):
+            # [FUNCTION DOC] HELPER: Applies three accumulating index_puts to separate outputs
+            # with shared index and values; returns the three results.
             a = out0.index_put([idx], vals, accumulate=True)
             b = out1.index_put([idx], vals, accumulate=True)
             c = out2.index_put([idx], vals, accumulate=True)
@@ -694,6 +826,10 @@ class TestPartitionedScatterOpt(TestCase):
 
     @unittest.skipUnless(HAS_GPU, "requires GPU")
     def test_perf_atomic_contention(self):
+        # [FUNCTION DOC] GPU performance test: times three accumulating index_puts with the pass
+        # disabled and enabled, prints the speedup and applied count, requires the pass to apply
+        # and the speedup to exceed a 1.5 floor. Changes the enable flag and resets dynamo;
+        # leaves it enabled.
         """
         Reproduce the PR benchmark: three index_put(accumulate=True) ops with
         moderate contention (8 slots). CI on ROCm MI300X delivers ≈1.8×, so the
@@ -704,6 +840,8 @@ class TestPartitionedScatterOpt(TestCase):
         MIN_SPEEDUP = 1.5
 
         def scatter_fn(out0, out1, out2, idx, vals):
+            # [FUNCTION DOC] HELPER: Applies three accumulating index_puts and returns the three
+            # results.
             out0 = out0.index_put([idx], vals, accumulate=True)
             out1 = out1.index_put([idx], vals, accumulate=True)
             out2 = out2.index_put([idx], vals, accumulate=True)

@@ -1,4 +1,10 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for the reorder_for_locality_in_training inductor option. Checks that the
+# environment variable controls the default (off unless set to one) by reading the flag in a
+# fresh subprocess, that inference graphs still run the reorder pass, and that on a compiled
+# two-branch training model the flag runs the pass, moves nodes, and leaves gradients and
+# updated parameters unchanged. Device-generic tests are instantiated at import time for the
+# available devices.
 """Tests for the reorder_for_locality_in_training flag: env parsing, and that on
 a real fwd+bwd training graph the flag reorders a node without changing
 grads/params."""
@@ -21,6 +27,10 @@ from torch.testing._internal.common_utils import (
 
 
 def _flag_in_subprocess(env_value):
+    # [FUNCTION DOC] HELPER: Starts a fresh Python interpreter with the locality-training
+    # environment variable removed (when env_value is None) or set to the given string, imports
+    # the inductor config, and returns the printed integer value of the flag as a stripped
+    # string. Raises CalledProcessError if the child fails.
     # Parse-only: a fresh interpreter imports just the config module and prints
     # the resolved flag. env_value=None means the var is unset (ship default).
     env = os.environ.copy()
@@ -41,16 +51,24 @@ def _flag_in_subprocess(env_value):
 
 
 class _Recorder:
+    # [CLASS DOC] HELPER: Callable stand-in for the reorder_for_locality pass. It keeps the
+    # original function, forwards each graph to it, and records the number of calls (calls) and
+    # whether any call changed the order of node names (moved).
     """Wraps ``reorder_for_locality`` and records, per call, whether the pass
     changed the graph node order. ``orig`` is captured before patching so the
     real pass still runs."""
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Saves the real post_grad reorder function and zeroes the call
+        # counter and the moved flag.
         self.orig = post_grad.reorder_for_locality
         self.calls = 0
         self.moved = False
 
     def __call__(self, graph):
+        # [FUNCTION DOC] HELPER: Runs the real pass on the graph (mutating it), compares node-
+        # name order before and after, increments the call count, and sets moved when the order
+        # differs.
         before = [n.name for n in graph.nodes]
         self.orig(graph)
         after = [n.name for n in graph.nodes]
@@ -60,21 +78,32 @@ class _Recorder:
 
 
 class _TwoBranch(torch.nn.Module):
+    # [CLASS DOC] HELPER: Small module with two independent matmul branches (tanh and sigmoid)
+    # of 16 by 16 parameters that are combined and summed per row; designed so that the reorder
+    # pass has real moves to make after functionalization.
     # Two independent matmul branches that only meet at the end. After
     # functionalization the branch producers land far from their sole
     # consumers, so reorder_for_locality has real moves to make.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Creates the two random 16 by 16 weight parameters.
         super().__init__()
         self.w1 = torch.nn.Parameter(torch.randn(16, 16))
         self.w2 = torch.nn.Parameter(torch.randn(16, 16))
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Computes both branch activations from the input and returns the
+        # row sum of a combination of their product and trig terms.
         a = torch.tanh(x @ self.w1)
         b = torch.sigmoid(x @ self.w2)
         return (a * b + torch.sin(a) * torch.cos(b)).sum(dim=1)
 
 
 def _train_once(device, flag_on, reorder_on=True):
+    # [FUNCTION DOC] HELPER: Compiles and trains the two-branch model for one step with fixed
+    # seed. Resets dynamo, builds the model and input on the device, patches inductor config
+    # (reorder option as given, training flag as given, caches disabled) and patches the pass
+    # with a recorder, then runs compiled forward and backward. Returns parameters after one SGD
+    # step, the gradients, and the recorder.
     rec = _Recorder()
     torch._dynamo.reset()
     torch.manual_seed(1234)
@@ -99,16 +128,27 @@ def _train_once(device, flag_on, reorder_on=True):
 
 
 class TestReorderForLocalityInTrainingEnv(TestCase):
+    # [CLASS DOC] Tests how the training flag's default is parsed from the environment and that
+    # the inference path is unaffected by it.
     def test_default_off(self):
+        # [FUNCTION DOC] Checks the flag defaults to zero when the environment variable is
+        # unset.
         self.assertEqual(_flag_in_subprocess(None), "0")
 
     def test_env_one_turns_on(self):
+        # [FUNCTION DOC] Checks the flag resolves to one when the environment variable is set to
+        # one.
         self.assertEqual(_flag_in_subprocess("1"), "1")
 
     def test_env_zero_keeps_off(self):
+        # [FUNCTION DOC] Checks the flag stays zero when the environment variable is set to
+        # zero.
         self.assertEqual(_flag_in_subprocess("0"), "0")
 
     def test_inference_gate_unchanged(self):
+        # [FUNCTION DOC] Builds a tiny FX graph, runs post grad passes for inference with the
+        # training flag off and the pass patched by a recorder, and asserts the pass was called
+        # at least once.
         # Gate-only check (invocation, not a feature exercise): inference graphs
         # must still run the pass regardless of the training flag. Pure FX, no
         # device execution, so it stays out of the device-generic class below.
@@ -124,8 +164,14 @@ class TestReorderForLocalityInTrainingEnv(TestCase):
 
 
 class TestReorderForLocalityInTraining(TestCase):
+    # [CLASS DOC] Device-generic tests (instantiated per device) of the training flag's effect
+    # on a compiled training graph. Test methods take a device argument and are expected to fail
+    # when no accelerator with Triton is available.
     @xfailIfNoAcceleratorTriton
     def test_training_flag_reorders_and_preserves_semantics(self, device):
+        # [FUNCTION DOC] Trains once with the flag off and once on, then asserts equal gradient
+        # keys and equal gradients and updated parameters, that the pass was never called with
+        # the flag off, and that with it on the pass was called and moved at least one node.
         p_off, g_off, rec_off = _train_once(device, flag_on=False)
         p_on, g_on, rec_on = _train_once(device, flag_on=True)
 
@@ -151,6 +197,8 @@ class TestReorderForLocalityInTraining(TestCase):
 
     @xfailIfNoAcceleratorTriton
     def test_training_flag_noop_when_reorder_off(self, device):
+        # [FUNCTION DOC] With the training flag on but the base reorder option off, trains once
+        # and asserts the pass was never called.
         # The training flag is gated by reorder_for_locality: enabling it while
         # reorder_for_locality is off must not run the pass on a training graph.
         _, _, rec = _train_once(device, flag_on=True, reorder_on=False)

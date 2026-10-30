@@ -1,4 +1,9 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for the activation quantization post-grad pass in inductor. Defines small
+# modules (matmul after relu and tanh, a feedforward net, a module whose intermediate is both an
+# output and saved for backward, and a layer norm wrapper) and a TestCase comparing compiled and
+# eager predictions, parameters and gradients while checking the pass counters. The tests need a
+# GPU; the runner only starts on Linux with a GPU.
 
 import logging
 
@@ -17,10 +22,15 @@ log = logging.getLogger(__name__)
 
 
 class TargetCPModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Test module computing relu then tanh of the first input and returning
+    # its matrix product with the second input.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Calls the base initializer; no parameters.
         super().__init__()
 
     def forward(self, x1, x2):
+        # [FUNCTION DOC] HELPER: Applies relu then tanh to x1 and returns the matrix product
+        # with x2.
         relued = torch.relu(x1)
         tanhed = torch.tanh(relued)
         tensor = torch.matmul(
@@ -31,7 +41,10 @@ class TargetCPModule(torch.nn.Module):
 
 
 class FeedforwardNN(torch.nn.Module):
+    # [CLASS DOC] HELPER: Feedforward network of four linear layers (1 to 64, 64 to 64, 64 to
+    # 64, 64 to 1) with relu activations and an extra tanh branch feeding the third layer.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Creates the four linear layers.
         super().__init__()
         self.fc1 = torch.nn.Linear(1, 64)
         self.fc2 = torch.nn.Linear(64, 64)
@@ -39,6 +52,9 @@ class FeedforwardNN(torch.nn.Module):
         self.fc4 = torch.nn.Linear(64, 1)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Runs relu of the first layer, takes a tanh of that result, then
+        # relu of the second layer; the third layer is applied to the tanh output (not the
+        # second layer output), followed by the last layer, and the result is returned.
         x = torch.relu(self.fc1(x))
         tanh_x = torch.tanh(x)
         x = torch.relu(self.fc2(x))
@@ -48,6 +64,10 @@ class FeedforwardNN(torch.nn.Module):
 
 
 class SharedOutputAndSavedModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Module whose 3D intermediate is both returned as a user output and
+    # saved for backward, used to reproduce a bug where the quantization pass handled both
+    # positions of the same tensor and shifted stride mapping. Holds an 8 by 8 scale and a 64 by
+    # 32 weight.
     """A module where a 3D intermediate is both a user output and saved for backward.
 
     This triggers the bug in T264303372: the activation quantization pass would
@@ -56,11 +76,16 @@ class SharedOutputAndSavedModule(torch.nn.Module):
     """
 
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Creates the scale parameter of ones and the random weight
+        # parameter.
         super().__init__()
         self.scale = torch.nn.Parameter(torch.ones(8, 8))
         self.W = torch.nn.Parameter(torch.randn(64, 32))
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Reshapes the input to batch by 8 by 8, forms a gated
+        # activation, scales it, flattens and multiplies by the weight; returns the matmul
+        # result and the gated activation.
         h = x.view(x.shape[0], 8, 8)
         attn = h * torch.sigmoid(h)
         # attn is both returned (user output) and needed by backward (mul saves it)
@@ -71,10 +96,14 @@ class SharedOutputAndSavedModule(torch.nn.Module):
 
 
 class LayernormNN(torch.nn.Module):
+    # [CLASS DOC] HELPER: Wrapper module around functional layer norm with a fixed epsilon.
     def __init__(self):
+        # [FUNCTION DOC] HELPER: Calls the base initializer; no parameters.
         super().__init__()
 
     def forward(self, input, normalized_shape, weight, bias):
+        # [FUNCTION DOC] HELPER: Applies layer norm to the input with the given normalized
+        # shape, weight and bias and an epsilon of one thousandth of a percent, and returns it.
         x = torch.nn.functional.layer_norm(
             input=input,
             normalized_shape=normalized_shape,
@@ -86,7 +115,15 @@ class LayernormNN(torch.nn.Module):
 
 
 class TestQuantization(TestCase):
+    # [CLASS DOC] GPU tests that compile modules with the activation quantization pass enabled
+    # and compare against eager. Provides comparison helpers for predictions, parameters and
+    # gradients.
     def compare_dict_tensors(self, ref_dict, res_dict, rtol=1e-3, atol=1e-3):
+        # [FUNCTION DOC] HELPER: Compares two mappings from names to tensors. Returns False if
+        # sizes differ or a tensor mismatches within tolerance (logs the gradient mismatch);
+        # entries are looked up in the second mapping under a name prefixed by the compile
+        # wrapper prefix, and a missing key raises AssertionError. Pairs where both entries are
+        # None are skipped. Returns True otherwise.
         if len(set(ref_dict.keys())) != len(set(res_dict.keys())):
             return False
         for key1 in ref_dict:
@@ -120,16 +157,22 @@ class TestQuantization(TestCase):
         return True
 
     def compare_pred(self, module, traced, input, rtol=1e-3, atol=1e-3):
+        # [FUNCTION DOC] HELPER: Runs the eager module and the compiled one on the same inputs
+        # and asserts the outputs are equal within the given tolerances.
         ref = module(*input)
         res = traced(*input)
         self.assertEqual(ref, res, rtol=rtol, atol=atol)
 
     def compare_parameters(self, module, traced, rtol=1e-3, atol=1e-3):
+        # [FUNCTION DOC] HELPER: Asserts that eager and compiled parameter mappings match, using
+        # the dictionary comparison helper with the given tolerances.
         ref_params = dict(module.named_parameters())
         res_params = dict(traced.named_parameters())
         self.assertTrue(self.compare_dict_tensors(ref_params, res_params, rtol, atol))
 
     def compare_gradients(self, module, traced, rtol=1e-3, atol=1e-3):
+        # [FUNCTION DOC] HELPER: Collects gradients of all parameters of both modules and
+        # asserts they match through the dictionary comparison helper.
         ref_grad = {key: param.grad for key, param in module.named_parameters()}
         res_grad = {key: param.grad for key, param in traced.named_parameters()}
         self.assertTrue(
@@ -150,6 +193,11 @@ class TestQuantization(TestCase):
         },
     )
     def test_activation_quantization_aten_with_scaling(self):
+        # [FUNCTION DOC] With scaled float8 activation quantization enabled for all sizes,
+        # compiles the matmul module and then the feedforward net on GPU, comparing predictions,
+        # parameters and gradients with eager and asserting the forward and backward
+        # quantization pass counters each equal one for each module (counters cleared in
+        # between).
         counters.clear()
         module = TargetCPModule().to(GPU_TYPE)
         input = [
@@ -213,6 +261,9 @@ class TestQuantization(TestCase):
         },
     )
     def test_activation_quantization_aten_without_scaling(self):
+        # [FUNCTION DOC] With unscaled float8 quantization enabled, compiles the layer norm
+        # module on bfloat16 GPU inputs, compares predictions, parameters and gradients with
+        # eager, and asserts the forward and backward pass counters each equal one.
         counters.clear()
 
         module = LayernormNN().to(GPU_TYPE)
@@ -266,6 +317,10 @@ class TestQuantization(TestCase):
         },
     )
     def test_activation_quantization_shared_output_and_saved(self):
+        # [FUNCTION DOC] With scaled quantization enabled, compiles the shared output and saved
+        # module, runs forward and backward on a combined loss over both outputs, and asserts
+        # the forward and backward pass counters each equal one (regression test for a duplicate
+        # placeholder bug).
         """Test that activation quantization works when a tensor is both a user
         output and a saved-for-backward activation (T264303372)."""
         counters.clear()
