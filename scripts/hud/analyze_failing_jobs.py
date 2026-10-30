@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Standalone oncall tool that reads the HUD job grid for a branch or commit over
+# HTTP and reports jobs currently on a failure streak. Contains conclusion classification
+# helpers, grid transposition into per-job columns, streak and failure-signature grouping, per-
+# job summaries, the HUD fetcher (paginated, optional bypass token from the environment), text
+# and CSV printers, and a command line entry point. Importing only defines constants and
+# functions; the requests library is imported lazily inside the fetcher.
 """Report stats on continuously failing PyTorch CI jobs from the HUD.
 
 A standalone tool for the pt2 oncall to run by hand. It pulls the recent job
@@ -64,10 +70,14 @@ SIMILARITY_THRESHOLD = 0.75
 
 
 def is_skipped(job: dict[str, Any]) -> bool:
+    # [FUNCTION DOC] HELPER: True when the job has no usable result: its conclusion is missing
+    # or one of the in-flight or non-result conclusions in the skipped set.
     return job.get("conclusion") in SKIPPED_CONCLUSIONS or job.get("conclusion") is None
 
 
 def is_failure(job: dict[str, Any]) -> bool:
+    # [FUNCTION DOC] HELPER: True when the job has a real, completed conclusion other than
+    # success; skipped or missing conclusions never count as failures.
     conclusion = job.get("conclusion")
     return conclusion is not None and conclusion != "success" and not is_skipped(job)
 
@@ -75,6 +85,11 @@ def is_failure(job: dict[str, Any]) -> bool:
 def transpose_grid(
     pages: list[tuple[list[str], list[dict[str, Any]]]],
 ) -> dict[str, list[dict[str, Any]]]:
+    # [FUNCTION DOC] Converts a list of pages, each a pair of job names and a grid of per-commit
+    # rows, into a mapping from job name to a list of that job's results ordered newest first,
+    # each result copied with the commit sha added. Rows are aligned to names by position within
+    # their own page. Raises SystemExit with a message if a row has a different number of
+    # results than its page has names.
     """Turn the HUD sha-grids (rows = commits) into per-job columns.
 
     Each page is a ``(job_names, sha_grid)`` pair. A row's ``jobs`` list is
@@ -102,6 +117,9 @@ def transpose_grid(
 
 
 def current_failure_streak(statuses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] Returns the newest consecutive run of failing results from a newest-first
+    # list, skipping skipped results and stopping at the first real non-failure. Returns an
+    # empty list when the latest real result is not a failure.
     """Most recent run of consecutive failures, ignoring skipped runs.
 
     Walks from newest to oldest; the streak ends at the first non-failing
@@ -119,6 +137,10 @@ def current_failure_streak(statuses: list[dict[str, Any]]) -> list[dict[str, Any
 
 
 def group_failures(jobs: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    # [FUNCTION DOC] Groups failing jobs by similarity of their captured error text. The
+    # signature is the captures joined with spaces, or a fixed unclassified label when there are
+    # none. A job joins the first existing group whose key is more similar than the threshold,
+    # otherwise starts a new group. Returns a mapping from signature to list of jobs.
     """Group failing jobs by similarity of their captured error text."""
     groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for job in jobs:
@@ -140,6 +162,12 @@ def summarize_job(
     oldest_sha: str | None,
     commit_meta: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC] Builds the summary mapping for one job: name, conclusion of the latest real
+    # result, number of real runs, current streak length, sha where the streak began, whether
+    # that start is clipped by the fetched window, the date, pull request URL and title of that
+    # commit (only when not clipped and metadata is available), and the distinct failure
+    # signatures with counts sorted by count descending. A streak is clipped when it covers
+    # every real run and the job still has data at the oldest fetched commit.
     real = [j for j in statuses if not is_skipped(j)]
     streak = current_failure_streak(statuses)
     groups = group_failures(streak)
@@ -188,6 +216,10 @@ def collect_stats(
     filter_job_name: str,
     min_streak: int,
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC] Computes streak statistics for all jobs. Optionally filters job names by a
+    # regular expression anchored at the start of the name, drops jobs with no data at the
+    # newest commit (stale jobs) and jobs whose streak is shorter than the minimum. Returns
+    # summaries sorted by streak length then total runs, descending.
     import re
 
     pattern = re.compile(filter_job_name) if filter_job_name else None
@@ -219,6 +251,11 @@ def collect_stats(
 
 
 def fetch_hud(ref: str, commits: int) -> Any:
+    # [FUNCTION DOC] Fetches up to the requested number of commits from the HUD API for a ref,
+    # one page at a time, trimming the last page. Sends the bypass token header when the
+    # environment variable for it is set. Returns a list of pairs of job names and commit rows.
+    # Prints progress to stderr. Raises SystemExit on a 429 response (with a hint about the
+    # token) and requests errors on other bad statuses.
     import math
     import os
     import sys
@@ -265,6 +302,10 @@ def fetch_hud(ref: str, commits: int) -> Any:
 
 
 def print_report(stats: list[dict[str, Any]], ref: str) -> None:
+    # [FUNCTION DOC] Prints the text report to stdout: a header with the count, then for each
+    # job its current conclusion, streak, runs, start sha, culprit pull request or a note when
+    # the window clipped it, and each distinct failure with its count, truncating captures
+    # longer than 100 characters.
     print(f"\nFound {len(stats)} continuously failing jobs at ref {ref}\n")
     for s in stats:
         print(f"- {s['job_name']}")
@@ -290,6 +331,8 @@ def print_report(stats: list[dict[str, Any]], ref: str) -> None:
 
 
 def write_csv(stats: list[dict[str, Any]]) -> None:
+    # [FUNCTION DOC] Writes the statistics as CSV to stdout with a fixed header row; failure
+    # signatures are joined into one cell as count and capture pairs separated by a bar.
     import csv
     import sys
 
@@ -329,6 +372,9 @@ def write_csv(stats: list[dict[str, Any]]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    # [FUNCTION DOC] Builds the command line parser, using the module docstring as the
+    # description, and returns the parsed namespace: ref (default main), commits (default one
+    # page), job-name regex filter, minimum streak (default 1) and a CSV flag.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "ref", nargs="?", default="main", help="Branch or commit sha (default: main)"
@@ -360,6 +406,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point: parses arguments, fetches HUD data, computes the stats and
+    # prints either CSV or the text report. If any streak is clipped by the window, prints a
+    # note to stderr suggesting twice as many commits.
     import sys
 
     args = parse_args()

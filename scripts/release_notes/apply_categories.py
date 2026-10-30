@@ -1,3 +1,11 @@
+# [MODULE DOC] Script run at import time (no functions) that carries category assignments from a
+# saved categories file into the commit list. Both files are fixed relative paths under a
+# results directory in the current directory. Builds a mapping from commit hash to category,
+# then for each commit list row with a mapped category other than Uncategorized, overwrites its
+# category, and rewrites the commit list file with a header.
+# KNOWN ISSUE: both files are read with explicit field names, so their existing header line is
+#   treated as a data row; the rewritten commit list then holds a duplicated header line as a
+#   bogus data row each time the script runs.
 # Quick script to apply categorized items to the
 # base commitlist . Useful if you are refactoring any code
 # but want to keep the previous data on categories

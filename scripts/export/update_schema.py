@@ -1,3 +1,10 @@
+# [MODULE DOC] Command line tool that regenerates the export serialization schema files. Takes
+# the repository root via a required prefix option, plus a dry-run flag and a force-unsafe flag.
+# Runs schema_check to compute the new schema, refuses version downgrades, checks the schema
+# version was bumped when required, then writes the yaml schema, C++ header, enum converter
+# header and thrift schema (each with a generated-by line and checksum) under the prefix, or
+# prints the yaml in dry-run mode. All work is under the main guard; there are no functions.
+# Raises RuntimeError on version problems and AssertionError on missing paths.
 import argparse
 import os
 

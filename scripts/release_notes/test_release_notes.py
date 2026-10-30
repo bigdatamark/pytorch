@@ -1,3 +1,9 @@
+# [MODULE DOC] Unit tests for the release notes CommitList. They build commit lists from the git
+# history of the current repository between fixed revisions and compare against hard coded
+# counts and hashes, so they need the full pytorch history, git and network access for commit
+# data (a GitHub token through the common module).
+# KNOWN ISSUE: the tests call a write_to_disk method that CommitList does not define (it has
+#   write_result), so the read-write and update tests would fail with an attribute error.
 import tempfile
 import unittest
 
@@ -5,7 +11,12 @@ from commitlist import CommitList
 
 
 class TestCommitList(unittest.TestCase):
+    # [CLASS DOC] Tests for creating, saving, reloading and extending a commit list in a
+    # temporary directory using fixed historic revisions of the repository.
     def test_create_new(self):
+        # [FUNCTION DOC] Creates a list between two fixed revisions and checks the number of
+        # commits, the first and last hashes and that the first and last titles start with the
+        # expected text.
         with tempfile.TemporaryDirectory() as tempdir:
             commit_list_path = f"{tempdir}/commitlist.csv"
             commit_list = CommitList.create_new(
@@ -24,6 +35,9 @@ class TestCommitList(unittest.TestCase):
             )
 
     def test_read_write(self):
+        # [FUNCTION DOC] Creates a list, saves it, reloads it, changes one category, saves
+        # again, reloads and compares every commit with the modified list.
+        # KNOWN ISSUE: relies on a missing write_to_disk method of CommitList, so it fails.
         with tempfile.TemporaryDirectory() as tempdir:
             commit_list_path = f"{tempdir}/commitlist.csv"
             initial = CommitList.create_new(commit_list_path, "v1.5.0", "7543e7e558")
@@ -38,6 +52,10 @@ class TestCommitList(unittest.TestCase):
                 self.assertEqual(commit, expected_commit)
 
     def test_update_to(self):
+        # [FUNCTION DOC] Creates a list to a fixed revision, checks its size, saves it, reloads
+        # it, extends it to a newer revision and checks that four commits were added and the
+        # previous last commit is now fifth from the end.
+        # KNOWN ISSUE: relies on a missing write_to_disk method of CommitList, so it fails.
         with tempfile.TemporaryDirectory() as tempdir:
             commit_list_path = f"{tempdir}/commitlist.csv"
             initial = CommitList.create_new(commit_list_path, "v1.5.0", "7543e7e558")

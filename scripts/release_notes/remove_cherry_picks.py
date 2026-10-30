@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command line tool that removes cherry-picked commits from a release notes commit
+# list CSV. Reads the cherry pick CSV produced by the parse cherry picks tool, matches each
+# commit hash against the commit list by prefix, and writes a filtered copy (the original is
+# never changed) plus a removal log. Import-time side effect: configures root logging at info
+# level.
 """Remove cherry-picked commits from a commitlist CSV.
 
 Usage:
@@ -22,6 +27,15 @@ logger = logging.getLogger(__name__)
 
 
 def main():
+    # [FUNCTION DOC] Entry point. Options: required commit list path, required cherry pick CSV
+    # path, optional output path (default: a sibling file named without cherry picks) and
+    # optional log path (default: a file in a results directory next to the script, created if
+    # missing). Reads the commit list as raw lines to keep exact formatting, indexes lines by
+    # the text before the first comma, and for each cherry pick: skips entries with no hash,
+    # otherwise removes the first line whose abbreviated hash is a prefix of, or has as prefix,
+    # the cherry pick hash; unmatched ones are warned about. Writes the header and the remaining
+    # lines to the output, writes one log line per cherry pick (removed, not found or skipped)
+    # and logs counts. Raises OSError for unreadable inputs.
     parser = argparse.ArgumentParser(
         description="Remove cherry-picked commits from a commitlist CSV"
     )

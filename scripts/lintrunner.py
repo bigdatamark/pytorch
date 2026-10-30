@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Wrapper that runs lintrunner inside the isolated hook virtual environment (the
+# one created by the setup hooks script under the git hooks directory), so developers get the
+# same tool versions as the pre-push hook. Also exports helpers for repository root discovery
+# and for hashing the lintrunner configuration, which other scripts share. The main entry checks
+# that lintrunner is installed, re-runs the plugin init when the configuration hash changed,
+# runs lintrunner with the command line arguments and exits with its status. Import has no side
+# effects.
 """
 Wrapper script to run the isolated hook version of lintrunner.
 
@@ -24,6 +31,8 @@ from pathlib import Path
 
 
 def find_repo_root() -> Path:
+    # [FUNCTION DOC] Returns the repository root by asking git for the top level directory of
+    # the current directory. Exits the process with an error message if git reports a failure.
     """Find repository root using git."""
     try:
         result = subprocess.run(
@@ -38,6 +47,7 @@ def find_repo_root() -> Path:
 
 
 def compute_file_hash(path: Path) -> str:
+    # [FUNCTION DOC] Returns the SHA256 hex digest of a file, reading it in fixed size chunks.
     """Returns SHA256 hash of a file's contents."""
     hasher = hashlib.sha256()
     with path.open("rb") as f:
@@ -47,6 +57,8 @@ def compute_file_hash(path: Path) -> str:
 
 
 def read_stored_hash(path: Path) -> str | None:
+    # [FUNCTION DOC] Returns the stripped text of a stored hash file, or None if the file does
+    # not exist or cannot be read (any exception is swallowed).
     if not path.exists():
         return None
     try:
@@ -60,12 +72,16 @@ HOOK_VENV_PATH = ".git/hooks/linter/.venv"
 
 
 def get_hook_venv_path() -> Path:
+    # [FUNCTION DOC] Returns the hook virtual environment path under the repository root (the
+    # location is a module constant). Does not check that it exists.
     """Get the path to the hook virtual environment."""
     repo_root = find_repo_root()
     return repo_root / HOOK_VENV_PATH
 
 
 def find_hook_venv() -> Path:
+    # [FUNCTION DOC] Returns the hook virtual environment path; exits the process with a message
+    # pointing to the setup hooks script if the directory does not exist.
     """Locate the isolated hook virtual environment."""
     venv_dir = get_hook_venv_path()
 
@@ -79,6 +95,9 @@ def find_hook_venv() -> Path:
 
 
 def check_lintrunner_installed(venv_dir: Path) -> None:
+    # [FUNCTION DOC] Uses the uv tool to query whether the lintrunner package exists in the
+    # venv's python; exits the process with a message if the query fails, otherwise prints a
+    # confirmation.
     """Check if lintrunner is installed in the given venv, exit if not."""
     result = subprocess.run(
         [
@@ -101,6 +120,10 @@ def check_lintrunner_installed(venv_dir: Path) -> None:
 
 
 def run_lintrunner(venv_dir: Path, args: list[str]) -> int:
+    # [FUNCTION DOC] Runs the lintrunner executable from the venv with the given arguments and
+    # returns its exit status. The child environment is a copy of the current one with the venv
+    # bin directory first on PATH and the virtual env variable set. Output goes straight to the
+    # terminal.
     """Run lintrunner command in the specified venv and return exit code."""
     # Run lintrunner directly from the venv's bin directory with environment setup
     lintrunner_exe = venv_dir / "bin" / "lintrunner"
@@ -118,6 +141,11 @@ def run_lintrunner(venv_dir: Path, args: list[str]) -> int:
 
 
 def initialize_lintrunner_if_needed(venv_dir: Path) -> None:
+    # [FUNCTION DOC] Re-initializes lintrunner plugins when the configuration changed. Hashes
+    # the lintrunner config file in the repository root and compares with the hash stored in the
+    # venv; if missing config, prints a warning and returns. On a difference runs the init
+    # command, exits the process if it fails, and stores the new hash; otherwise prints that
+    # plugins are up to date.
     """Check if lintrunner needs initialization and run init if needed."""
     repo_root = find_repo_root()
     lintrunner_toml_path = repo_root / ".lintrunner.toml"
@@ -141,6 +169,10 @@ def initialize_lintrunner_if_needed(venv_dir: Path) -> None:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Finds the hook venv, exits if its python is missing, ensures
+    # lintrunner is installed and initialized, then runs lintrunner with the script's arguments.
+    # If it fails without the auto-fix flag, prints a hint to rerun with that flag. Always exits
+    # with lintrunner's status; a keyboard interrupt prints a message and exits with status 1.
     """Run lintrunner in the isolated hook environment."""
     venv_dir = find_hook_venv()
     python_exe = venv_dir / "bin" / "python"

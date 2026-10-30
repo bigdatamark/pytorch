@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command line tool that updates Dynamo expected-failure and skip marker files from
+# CI results. Downloads the dynamo39 and dynamo313 report directories for a commit (needs the gh
+# cli), compares the two Python versions, then adds or git-removes empty marker files in the
+# dynamo_expected_failures and dynamo_skips directories under the test directory. Optionally
+# takes the path of dynamo_test_failures and the test directory (defaults relative to this
+# script). Import has no side effects; work happens under the main guard.
 import argparse
 import os
 import subprocess
@@ -41,6 +47,17 @@ https://docs.github.com/en/github-cli/github-cli/quickstart
 def patch_file(
     filename, test_dir, unexpected_successes, new_xfails, new_skips, unexpected_skips
 ):
+    # [FUNCTION DOC] Applies computed changes to the marker directories. Lists the existing
+    # marker file names in the expected failures and skips directories under the test directory,
+    # and reads the hand written extra skip names from the given failures file (lines between
+    # the opening of that set and its closing brace). Test cases are formatted as class name dot
+    # test name. Existing xfail markers matching unexpected successes are git-removed, new
+    # xfails get an empty file that is git-added, and unmatched unexpected successes are
+    # reported in a warning. Skip markers matching unexpected skips are git-removed, extra skips
+    # matching them only produce a manual-removal warning, and new skips get empty git-added
+    # files. Exit codes of git are not checked. Arguments: failures file path, test dir,
+    # mappings of key to testcase for each category. Returns None. Raises OSError if the marker
+    # directories are missing.
     failures_directory = os.path.join(test_dir, "dynamo_expected_failures")
     skips_directory = os.path.join(test_dir, "dynamo_skips")
 
@@ -62,6 +79,8 @@ def patch_file(
                     start = True
 
     def format(testcase):
+        # [FUNCTION DOC] HELPER: Returns the marker file name for a testcase element: class name
+        # and test name joined by a dot. Raises KeyError if either attribute is missing.
         classname = testcase.attrib["classname"]
         name = testcase.attrib["name"]
         return f"{classname}.{name}"
@@ -76,11 +95,16 @@ def patch_file(
     formatted_new_skips = [f"{format(test)}" for test in new_skips.values()]
 
     def remove_file(path, name):
+        # [FUNCTION DOC] HELPER: Runs git rm on the named marker file inside the given
+        # directory. The result of the subprocess is ignored, so failures are silent.
         file = os.path.join(path, name)
         cmd = ["git", "rm", file]
         subprocess.run(cmd)
 
     def add_file(path, name):
+        # [FUNCTION DOC] HELPER: Creates an empty marker file with the given name in the
+        # directory (truncating any existing file) and stages it with git add; the result of git
+        # is ignored.
         file = os.path.join(path, name)
         with open(file, "w") as fp:
             pass
@@ -122,12 +146,17 @@ def patch_file(
 
 
 def get_intersection_and_outside(a_dict, b_dict):
+    # [FUNCTION DOC] Splits two mappings by key. Returns a pair: a mapping of keys present in
+    # both inputs, and a mapping of keys present in exactly one input. Values come from the
+    # first mapping when the key is there, otherwise from the second.
     a = set(a_dict.keys())
     b = set(b_dict.keys())
     intersection = a.intersection(b)
     outside = (a.union(b)) - intersection
 
     def build_dict(keys):
+        # [FUNCTION DOC] HELPER: Builds a mapping for the given keys, taking each value from the
+        # first input mapping if present there and otherwise from the second.
         result = {}
         for k in keys:
             if k in a_dict:
@@ -140,7 +169,19 @@ def get_intersection_and_outside(a_dict, b_dict):
 
 
 def update(filename, test_dir, py38_dir, py311_dir, also_remove_skips):
+    # [FUNCTION DOC] Reads test results for the two Python versions, combines them and patches
+    # the marker files. Unexpected successes from either version are used for removal; tests
+    # that are unexpected successes in only one version become new skips. Failures present in
+    # both versions become new xfails and failures in only one version become new skips. When
+    # also_remove_skips is set, passing-but-skipped tests present in both versions become
+    # unexpected skips to remove, otherwise none. Prints a summary of counts and returns the
+    # result of patch_file (None).
+    # KNOWN ISSUE: local names say py38 and py311 but the caller passes the dynamo39 and
+    #   dynamo313 report directories, so the names are stale.
     def read_test_results(directory):
+        # [FUNCTION DOC] HELPER: Parses all xml reports in a directory and returns three
+        # mappings keyed by test key: unexpected successes, failures and passing-but-skipped
+        # tests.
         xmls = open_test_results(directory)
         testcases = get_testcases(xmls)
         unexpected_successes = {

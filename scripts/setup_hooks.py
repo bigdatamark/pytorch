@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Script that installs a git pre-push hook running lintrunner in an isolated
+# virtual environment. It runs entirely at import time (there is no main guard): on Windows it
+# prints a notice and exits with success; otherwise it requires uv on PATH (exits if absent),
+# deletes and recreates the hook venv under the git hooks directory with a pinned Python
+# version, installs lintrunner into it, then writes an executable pre-push shell script that
+# calls the lintrunner wrapper script with the venv python (skipping quietly if the wrapper is
+# missing on an older commit). Temporarily adds the scripts directory to the import path to
+# reuse repository root and venv path helpers from the lintrunner module, then removes it.
 """
 Bootstrap Git pre‑push hook with isolated virtual environment.
 
@@ -44,15 +52,20 @@ sys.path.pop(0)
 # Helper utilities
 # ───────────────────────────────────────────
 def run(cmd: list[str], cwd: Path = None) -> None:
+    # [FUNCTION DOC] HELPER: Echoes the command line to stdout and runs it, raising an error on
+    # a nonzero exit status. Optional working directory.
     print(f"$ {' '.join(cmd)}")
     subprocess.check_call(cmd, cwd=cwd)
 
 
 def which(cmd: str) -> bool:
+    # [FUNCTION DOC] HELPER: Returns True if the named executable is found on PATH.
     return shutil.which(cmd) is not None
 
 
 def ensure_uv() -> None:
+    # [FUNCTION DOC] HELPER: Returns silently if uv is available; otherwise exits the process
+    # with a message telling the user to install uv and rerun this script.
     if which("uv"):
         return
 

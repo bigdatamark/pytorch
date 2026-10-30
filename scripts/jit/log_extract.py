@@ -1,3 +1,8 @@
+# [MODULE DOC] Command line tool that extracts TorchScript graph IR from a log produced with the
+# JIT log level set, then optionally benchmarks each graph with selected backends or prints the
+# IR as a list of triple-quoted strings. Backends are baseline without fusion, NNC static, NNC
+# dynamic and NVFuser, provided by the torch utils jit log_extract helpers. Import has no side
+# effects.
 import argparse
 import functools
 import traceback
@@ -31,6 +36,13 @@ def test_runners(
     runners: List[Tuple[str, Callable]],
     graph_set: List[int] | None,
 ):
+    # [FUNCTION DOC] Benchmarks each selected graph with each runner in order and prints
+    # timings. Arguments: list of IR strings, list of pairs of display name and runner function
+    # taking the IR and its inputs and returning a time in milliseconds, and an optional list of
+    # graph indices to restrict to. The first runner for a graph prints only its time; later
+    # ones also print the percentage improvement relative to the previous runner. A RuntimeError
+    # from a runner is reported with its traceback and the loop continues. Inputs are loaded for
+    # every graph, even skipped ones.
     for i, ir in enumerate(graphs):
         _, inputs = load_graph_and_inputs(ir)
         if graph_set and i not in graph_set:
@@ -57,6 +69,11 @@ def test_runners(
 
 
 def run():
+    # [FUNCTION DOC] Entry point. Defines the command line (log file name, enable and disable
+    # flags for nvfuser, nnc-static, nnc-dynamic, baseline and output, all off by default, and
+    # an optional list of graph indices), extracts the IR list from the log, builds the runner
+    # list from the enabled backends and benchmarks them. With the output flag it also prints
+    # the selected graphs as a list of triple-quoted strings.
     parser = argparse.ArgumentParser(
         description="Extracts torchscript IR from log files and, optionally, benchmarks it or outputs the IR"
     )

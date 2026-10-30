@@ -1,3 +1,11 @@
+# [MODULE DOC] Trains and defines a neural classifier that suggests a release notes category for
+# a commit from its title, changed files and author (used by the categorize tool). Contents: a
+# frozen pretrained XLM-R text encoder wrapped in the CommitClassifier module with learned
+# author and file embeddings, helpers that build and cache the train, validation and test splits
+# and the author and file index maps (files under a results directory), batch building, class
+# weighting, optional oversampling when imblearn is installed, and a training loop with a
+# command line. Import-time side effects: imports torchtext, pandas and tqdm, chooses a global
+# device (cuda if available), and looks up the pretrained encoder bundle.
 import argparse
 import math
 import pickle
@@ -38,16 +46,21 @@ UNKNOWN_TOKEN = "<Unknown>"
 
 
 def truncate_file(file: Path, max_len: int = 5):
+    # [FUNCTION DOC] Returns the first max_len path components of a path joined with forward
+    # slashes, as text.
     return ("/").join(file.parts[:max_len])
 
 
 def build_file_set(all_files: List[Path], max_len: int):
+    # [FUNCTION DOC] Returns the set of distinct truncated path strings for a list of paths.
     truncated_files = [truncate_file(file, max_len) for file in all_files]
     return set(truncated_files)
 
 
 @dataclass
 class CommitClassifierInputs:
+    # [CLASS DOC] Batch input for the classifier: three parallel lists with one entry per commit
+    # holding the title text, the space separated changed file paths, and the author name.
     title: List[str]
     files: List[str]
     author: List[str]
@@ -55,6 +68,10 @@ class CommitClassifierInputs:
 
 @dataclass
 class CategoryConfig:
+    # [CLASS DOC] Hyperparameters for the classifier: the list of category names plus sizes
+    # (text feature width 768, inner width 128, dropout 0.1, author embedding size 8, file
+    # embedding size 32) and the activation class (rectified linear unit). Plain dataclass;
+    # activation is a class attribute, not a configurable field.
     categories: List[str]
     input_dim: int = 768
     inner_dim: int = 128
@@ -65,6 +82,11 @@ class CategoryConfig:
 
 
 class CommitClassifier(nn.Module):
+    # [CLASS DOC] Torch module that scores categories for commits. Holds a frozen XLM-R encoder
+    # and its text transform, author and file index maps, an author embedding table, a summing
+    # embedding bag for files, and for each of title, files and author a dense layer and output
+    # projection to the category count. The output logits are the sum of the three branches.
+    # Only the new layers train.
     def __init__(
         self,
         encoder_base: torchtext.models.XLMR_BASE_ENCODER,
@@ -72,6 +94,10 @@ class CommitClassifier(nn.Module):
         file_map: [str, int],
         config: CategoryConfig,
     ):
+        # [FUNCTION DOC] Builds the layers from the encoder bundle, index maps and config. The
+        # encoder is created from the bundle and its gradients are disabled; the size of each
+        # embedding follows the map sizes; the number of outputs follows the number of
+        # categories.
         super().__init__()
         self.encoder = encoder_base.get_model().requires_grad_(False)
         self.transform = encoder_base.transform()
@@ -94,6 +120,14 @@ class CommitClassifier(nn.Module):
         self.activation_fn = config.activation()
 
     def forward(self, input_batch: CommitClassifierInputs):
+        # [FUNCTION DOC] Computes category logits for a batch. Title branch: tokenizes and pads,
+        # runs the encoder, takes the first token features, then dropout, dense, activation,
+        # dropout, projection. File branch: splits each commit's file string on spaces,
+        # truncates paths, maps them to indexes (unknown path token if missing), sums embeddings
+        # per commit with offsets, then dense, activation, dropout and projection. Author
+        # branch: looks up the author index (unknown token if missing), embeds, then the same
+        # dense stack. Returns the sum of the three, shape batch by category count. Uses the
+        # module global device for new tensors, not the module's own device.
         # Encode input title
         title: List[str] = input_batch.title
         model_input = to_tensor(self.transform(title), padding_value=1).to(device)
@@ -151,12 +185,18 @@ class CommitClassifier(nn.Module):
         return title_embed + files_embed + author_embed
 
     def convert_index_to_category_name(self, most_likely_index):
+        # [FUNCTION DOC] Converts a category index (integer) to its name, or a one dimensional
+        # tensor of indexes to a list of names. Returns None for any other input type.
         if isinstance(most_likely_index, int):
             return self.categories[most_likely_index]
         elif isinstance(most_likely_index, torch.Tensor):
             return [self.categories[i] for i in most_likely_index]
 
     def get_most_likely_category_name(self, input):
+        # [FUNCTION DOC] Returns the list of the highest scoring category names, one per commit
+        # in the batch. Runs forward (no gradient disabling here) and takes the maximum along
+        # the category dimension. The input is a classifier input record, not a dictionary as
+        # the old comment says.
         # Input will be a dict with title and author keys
         logits = self.forward(input)
         most_likely_index = torch.argmax(logits, dim=1)
@@ -164,6 +204,12 @@ class CommitClassifier(nn.Module):
 
 
 def get_train_val_data(data_folder: Path, regen_data: bool, train_percentage=0.95):
+    # [FUNCTION DOC] Returns the training and validation tables. Reads saved split files from
+    # the data folder when they exist and regeneration was not requested. Otherwise reads the
+    # commit list file, sets aside Uncategorized rows as the test set, removes skip rows,
+    # shuffles the rest randomly (unseeded), splits by the training fraction (default 0.95),
+    # writes the three split files into the folder and returns the training and validation
+    # parts. Prints progress.
     if (
         not regen_data
         and Path(data_folder / "train_df.csv").exists()
@@ -196,6 +242,10 @@ def get_train_val_data(data_folder: Path, regen_data: bool, train_percentage=0.9
 
 
 def get_author_map(data_folder: Path, regen_data, assert_stored=False):
+    # [FUNCTION DOC] Returns the mapping from author name to index. Loads the saved mapping from
+    # the data folder if present and regeneration is not requested. Otherwise raises
+    # FileNotFoundError when assert_stored is set; else builds the mapping from the unique
+    # authors in the commit list file plus the unknown token, saves it and returns it.
     if not regen_data and Path(data_folder / "author_map.pkl").exists():
         with open(data_folder / "author_map.pkl", "rb") as f:
             return pickle.load(f)
@@ -215,6 +265,11 @@ def get_author_map(data_folder: Path, regen_data, assert_stored=False):
 
 
 def get_file_map(data_folder: Path, regen_data, assert_stored=False):
+    # [FUNCTION DOC] Returns the mapping from truncated file path to index. Loads the saved
+    # mapping if present and regeneration is not requested. Otherwise raises FileNotFoundError
+    # when assert_stored is set; else collects every path from the space separated file columns
+    # of the commit list file, adds the unknown token, truncates paths, numbers the distinct
+    # ones (order of a set), saves and returns the mapping.
     if not regen_data and Path(data_folder / "file_map.pkl").exists():
         with open(data_folder / "file_map.pkl", "rb") as f:
             return pickle.load(f)
@@ -244,6 +299,8 @@ def get_file_map(data_folder: Path, regen_data, assert_stored=False):
 
 
 def get_title_files_author_categories_zip_list(dataframe: pd.DataFrame):
+    # [FUNCTION DOC] Converts a table to a list of tuples of title, files, author and category,
+    # with missing authors replaced by the unknown token.
     title = dataframe.title.to_list()
     files_str = dataframe.files_changed.to_list()
     author = dataframe.author.fillna(UNKNOWN_TOKEN).to_list()
@@ -252,6 +309,9 @@ def get_title_files_author_categories_zip_list(dataframe: pd.DataFrame):
 
 
 def generate_batch(batch):
+    # [FUNCTION DOC] Collates a list of tuples into a classifier input record and a target
+    # tensor of category indexes on the global device. Raises ValueError if a category is not in
+    # the known list.
     title, files, author, category = zip(*batch)
     title = list(title)
     files = list(files)
@@ -264,6 +324,8 @@ def generate_batch(batch):
 
 
 def train_step(batch, model, optimizer, loss):
+    # [FUNCTION DOC] One optimization step: clears gradients, runs the model, computes the loss
+    # against the targets, backpropagates and steps the optimizer. Returns the loss tensor.
     input, targets = batch
     optimizer.zero_grad()
     output = model(input)
@@ -275,6 +337,8 @@ def train_step(batch, model, optimizer, loss):
 
 @torch.no_grad()
 def eval_step(batch, model, loss):
+    # [FUNCTION DOC] Computes and returns the loss of the model on a batch without tracking
+    # gradients.
     input, targets = batch
     output = model(input)
     l = loss(output, targets)
@@ -282,6 +346,11 @@ def eval_step(batch, model, loss):
 
 
 def balance_dataset(dataset: List):
+    # [FUNCTION DOC] Randomly oversamples a dataset of tuples when imblearn is installed, then
+    # draws a random sample of twice the original size from the result and returns tuples with
+    # category names; returns the dataset unchanged when imblearn is missing. Oversampling uses
+    # a fixed seed but the final draw does not. Raises ValueError if the oversampled set is
+    # smaller than the requested sample.
     if not HAS_IMBLEARN:
         return dataset
     title, files, author, category = zip(*dataset)
@@ -302,6 +371,11 @@ def balance_dataset(dataset: List):
 
 
 def gen_class_weights(dataset: List):
+    # [FUNCTION DOC] Returns a tensor of per-category loss weights on the global device, ordered
+    # like the known categories. Counts examples per category, computes a smoothed mean of the
+    # most frequent third and a reduced mean of the least frequent third, clamps each count
+    # between them and uses the inverse of the clamped count plus a small constant. Raises
+    # ZeroDivisionError for datasets with fewer than three examples.
     from collections import Counter
 
     epsilon = 1e-1
@@ -324,6 +398,13 @@ def gen_class_weights(dataset: List):
 
 
 def train(save_path: Path, data_folder: Path, regen_data: bool, resample: bool):
+    # [FUNCTION DOC] Trains and saves a classifier. Loads splits and maps, builds the model on
+    # the global device, uses weighted cross entropy and Adam with learning rate 3e-3, 25
+    # epochs, batches of 256 over a reshuffled training list (optionally oversampled). Each
+    # epoch evaluates the validation set as one batch and prints losses; finally prints
+    # validation accuracy and saves the state dictionary to the given path.
+    # KNOWN ISSUE: the comment says the last batch is made bigger, but the final batch is
+    #   actually smaller (the end is clipped to the data size).
     train_data, val_data = get_train_val_data(data_folder, regen_data)
     train_zip_list = get_title_files_author_categories_zip_list(train_data)
     val_zip_list = get_title_files_author_categories_zip_list(val_data)
@@ -383,6 +464,9 @@ def train(save_path: Path, data_folder: Path, regen_data: bool, resample: bool):
 
 
 def main():
+    # [FUNCTION DOC] Entry point: parses options (train flag, data folder, save path, regenerate
+    # flag, resample flag). With the train flag it trains and saves; otherwise it prints a
+    # message that only training is supported.
     parser = argparse.ArgumentParser(
         description="Tool to create a classifier for helping to categorize commits"
     )

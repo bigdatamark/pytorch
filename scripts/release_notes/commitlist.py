@@ -1,3 +1,10 @@
+# [MODULE DOC] Release notes commit list tool. Defines the Commit record, the CommitList
+# container backed by a CSV file (default under a results directory), rule-based categorization
+# of commits by labels, title brackets and changed file paths, and a command line that can
+# create a list between two git revisions, extend it, re-run categorization, print per category
+# and topic counts, and export per-category CSV or markdown worksheets. Import-time side effect:
+# raises the CSV field size limit to one million. Uses git through the shared run helper and
+# cached commit data from the common module.
 import argparse
 import csv
 import dataclasses
@@ -41,6 +48,10 @@ verbose = False
 
 @dataclasses.dataclass(frozen=False)
 class Commit:
+    # [CLASS DOC] One row of the commit list: hash, category, topic, title, space separated
+    # changed files, pull request link, author, three accepter columns, and an optional
+    # merge_into hash naming the commit this one is folded into. Mutable dataclass; the field
+    # names define the CSV columns.
     commit_hash: str
     category: str
     topic: str
@@ -57,6 +68,7 @@ class Commit:
     merge_into: str = None
 
     def __repr__(self):
+        # [FUNCTION DOC] Returns a short debugging string with hash, category, topic and title.
         return (
             f"Commit({self.commit_hash}, {self.category}, {self.topic}, {self.title})"
         )
@@ -66,18 +78,27 @@ commit_fields = tuple(f.name for f in dataclasses.fields(Commit))
 
 
 class CommitList:
+    # [CLASS DOC] Ordered list of Commit records tied to a CSV path. The constructor is private
+    # by convention; use from_existing to read a file or create_new to build from git history.
+    # Offers loading and saving, rule based categorization, filtering, extension to a newer
+    # revision and counting.
     # NB: Private ctor. Use `from_existing` or `create_new`.
     def __init__(self, path: str, commits: List[Commit]):
+        # [FUNCTION DOC] Stores the CSV path and the commit list without any validation or IO.
         self.path = path
         self.commits = commits
 
     @staticmethod
     def from_existing(path):
+        # [FUNCTION DOC] Builds a CommitList from an existing CSV file by reading it.
         commits = CommitList.read_from_disk(path)
         return CommitList(path, commits)
 
     @staticmethod
     def create_new(path, base_version, new_version):
+        # [FUNCTION DOC] Builds a new CommitList from git history between two revisions. Raises
+        # ValueError if the target file already exists. Does not write the file; callers save
+        # with write_result.
         if os.path.exists(path):
             raise ValueError(
                 "Attempted to create a new commitlist but one exists already!"
@@ -87,6 +108,9 @@ class CommitList:
 
     @staticmethod
     def read_from_disk(path) -> List[Commit]:
+        # [FUNCTION DOC] Reads the CSV with a header and returns a list of Commit records. A
+        # nonempty new_title column replaces the title; only known commit fields are used and
+        # missing ones become empty strings.
         with open(path) as csvfile:
             reader = csv.DictReader(csvfile)
             rows = []
@@ -98,10 +122,14 @@ class CommitList:
         return rows
 
     def write_result(self):
+        # [FUNCTION DOC] Saves this list's commits to its own path.
         self.write_to_disk_static(self.path, self.commits)
 
     @staticmethod
     def write_to_disk_static(path, commit_list):
+        # [FUNCTION DOC] Writes a commit list to a CSV file: creates the parent directory if
+        # needed, then the header row of field names and one row per commit. Overwrites an
+        # existing file.
         os.makedirs(Path(path).parent, exist_ok=True)
         with open(path, "w") as csvfile:
             writer = csv.writer(csvfile)
@@ -111,6 +139,8 @@ class CommitList:
 
     @staticmethod
     def keywordInFile(file, keywords):
+        # [FUNCTION DOC] HELPER: True if any of the keyword strings is a substring of the given
+        # text.
         for key in keywords:
             if key in file:
                 return True
@@ -118,6 +148,10 @@ class CommitList:
 
     @staticmethod
     def gen_commit(commit_hash):
+        # [FUNCTION DOC] Creates a Commit for a hash. Looks up cached commit data, converts it
+        # to a feature mapping, categorizes it, and takes up to three accepters padded with
+        # empty strings. The pull request link is built from the pull request number or is None
+        # if there is none; changed files are joined with spaces.
         feature_item = get_commit_data_cache().get(commit_hash)
         features = features_to_dict(feature_item)
         category, topic = CommitList.categorize(features)
@@ -142,6 +176,10 @@ class CommitList:
 
     @staticmethod
     def category_remapper(category: str) -> str:
+        # [FUNCTION DOC] Maps a label category to the commit list category name: frontend
+        # categories get a frontend suffix, Meta API becomes composability, quantization,
+        # optimizer and AOT dispatcher category groups map to their group name, anything else is
+        # unchanged.
         if category in frontend_categories:
             category = category + "_frontend"
             return category
@@ -161,6 +199,9 @@ class CommitList:
 
     @staticmethod
     def bracket_category_matcher(title: str):
+        # [FUNCTION DOC] Looks for a known bracketed tag (such as dynamo, inductor, profiler,
+        # mps) in the lowercased title and returns the category of the first listed tag found,
+        # or None if there is none.
         """Categorize a commit based on the presence of a bracketed category in the title.
 
         Args:
@@ -193,6 +234,21 @@ class CommitList:
 
     @staticmethod
     def categorize(features):
+        # [FUNCTION DOC] Chooses a category and topic from a feature mapping (title, labels,
+        # files changed, pull request number). Starts as Uncategorized and Untopiced. Reverts
+        # without a pull request are skipped. Labels beginning with release notes or topic set
+        # category (remapped) and topic; if both exist they are returned immediately. Then title
+        # mentions of caffe2, a Reverted label, a deprecation label, and bracket tags decide
+        # next. Otherwise the first changed file matching a path keyword table (releng,
+        # dataloader, C++ frontend, distributed, vulkan, onnx, fx, quantization, package,
+        # mobile, linalg, sparse, autograd, nn, jit, composability, dynamo, inductor) sets the
+        # category; if no file matched, fallbacks cover CUDA only changes, edge tagged titles,
+        # and single file OpInfo or torch docs edits. An Uncategorized commit with the not user
+        # facing topic becomes skip. Returns the pair of category and topic.
+        # KNOWN ISSUE: the foreach check tests a capitalized word against the lowercased path,
+        #   so it can never match.
+        # KNOWN ISSUE: the caffe2 check looks at the title only although the nearby comment
+        #   speaks of files.
         title = features["title"]
         labels = features["labels"]
         category = "Uncategorized"
@@ -381,6 +437,10 @@ class CommitList:
 
     @staticmethod
     def get_commits_between(base_version, new_version):
+        # [FUNCTION DOC] Returns Commit records for every commit after the merge base of two
+        # revisions up to the new one, oldest first, using git commands. Asserts that git
+        # succeeds; fails with a ValueError on unpacking when the range is empty. Prints
+        # progress every ten commits when verbose is set.
         cmd = f"git merge-base {base_version} {new_version}"
         rc, merge_base, _ = run(cmd)
         assert rc == 0
@@ -402,6 +462,9 @@ class CommitList:
         return result
 
     def filter(self, *, category=None, topic=None):
+        # [FUNCTION DOC] Returns the commits matching the given category and/or topic (keyword-
+        # only; None means no constraint). With neither, returns the internal list itself, not a
+        # copy.
         commits = self.commits
         if category is not None:
             commits = [commit for commit in commits if commit.category == category]
@@ -410,11 +473,14 @@ class CommitList:
         return commits
 
     def update_to(self, new_version):
+        # [FUNCTION DOC] Extends the list in place with commits between the last stored commit
+        # and the new revision. Raises IndexError if the list is empty. Does not save.
         last_hash = self.commits[-1].commit_hash
         new_commits = CommitList.get_commits_between(last_hash, new_version)
         self.commits += new_commits
 
     def stat(self):
+        # [FUNCTION DOC] Returns a nested mapping of category to topic to the number of commits.
         counts = defaultdict(lambda: defaultdict(int))
         for commit in self.commits:
             counts[commit.category][commit.topic] += 1
@@ -422,17 +488,24 @@ class CommitList:
 
 
 def create_new(path, base_version, new_version):
+    # [FUNCTION DOC] Creates a new commit list between two revisions and writes it to the path.
+    # Raises ValueError if the file exists.
     commits = CommitList.create_new(path, base_version, new_version)
     commits.write_result()
 
 
 def update_existing(path, new_version):
+    # [FUNCTION DOC] Loads the commit list at the path, extends it to the new revision and
+    # writes it back.
     commits = CommitList.from_existing(path)
     commits.update_to(new_version)
     commits.write_result()
 
 
 def rerun_with_new_filters(path):
+    # [FUNCTION DOC] Re-categorizes entries whose category is Uncategorized or not in the known
+    # category list, using the current rules and the cached commit data, replacing category and
+    # topic, then writes the file back. Other rows are untouched.
     current_commits = CommitList.from_existing(path)
     for i, commit in enumerate(current_commits.commits):
         current_category = commit.category
@@ -450,6 +523,9 @@ def rerun_with_new_filters(path):
 
 
 def get_hash_or_pr_url(commit: Commit):
+    # [FUNCTION DOC] Returns a markdown link labelled with the pull request number when the
+    # commit has a pull request link in the standard pytorch form; otherwise returns the commit
+    # hash.
     # cdc = get_commit_data_cache()
     pr_link = commit.pr_link
     if pr_link is None:
@@ -464,7 +540,14 @@ def get_hash_or_pr_url(commit: Commit):
 
 
 def to_markdown(commit_list: CommitList, category):
+    # [FUNCTION DOC] Builds markdown lines for one category: a heading, then for each known
+    # topic a subsection listing the commits of that category and topic (also matching the topic
+    # name with underscores and spaces swapped), skipping commits merged into another. Each item
+    # is the title without its trailing pull request number followed by links for the commit and
+    # any commits merged into it. Returns the list of lines.
     def cleanup_title(commit):
+        # [FUNCTION DOC] HELPER: Returns the commit title with a trailing pull request number
+        # removed, or the title unchanged if it has none.
         match = re.match(r"(.*) \(#\d+\)", commit.title)
         if match is None:
             return commit.title
@@ -501,6 +584,9 @@ def to_markdown(commit_list: CommitList, category):
 
 
 def get_markdown_header(category):
+    # [FUNCTION DOC] Returns a one element list holding the worksheet instructions text for the
+    # category (guidance on checking categorization, writing major notes and summarizing other
+    # sections).
     header = f"""
 # Release Notes worksheet {category}
 
@@ -551,6 +637,13 @@ Feel free to use https://github.com/pytorch/pytorch/releases/tag/v2.10.0 as an e
 
 
 def main():
+    # [FUNCTION DOC] Command line entry point. Exactly one action is required: create new
+    # between two revisions, update to a revision, rerun with new filters, stat (pretty prints
+    # counts), export csv categories (one file per category under an export directory) or export
+    # markdown (a worksheet per category). Options give the CSV path and verbose mode, which
+    # sets a module global. Raises AssertionError if no action matched.
+    # KNOWN ISSUE: the creation message always names the default results path even if a
+    #   different path option was given.
     parser = argparse.ArgumentParser(description="Tool to create a commit list")
 
     group = parser.add_mutually_exclusive_group(required=True)

@@ -1,3 +1,8 @@
+# [MODULE DOC] Interactive command line tool for hand categorizing release note commits. Defines
+# the Categorizer class and a main entry that loads the commit list CSV (default under a results
+# directory), optionally with a trained classifier that suggests categories, and prompts for a
+# category and topic for each commit in the chosen category, saving after every answer. Import
+# has no side effects, but the common module it imports needs a GitHub token at import time.
 import argparse
 import os
 import textwrap
@@ -9,7 +14,16 @@ from common import get_commit_data_cache, topics
 
 
 class Categorizer:
+    # [CLASS DOC] Interactive driver over a CommitList. State: cache of commit features, the
+    # commit list, an optional classifier (None when not used) and the category being worked on
+    # (Uncategorized by default, or a real category name). categorize walks the matching commits
+    # and prompts the user for each, writing the list file after every update.
     def __init__(self, path, category="Uncategorized", use_classifier: bool = False):
+        # [FUNCTION DOC] Loads the shared commit data cache and the commit list from the path.
+        # With the classifier option, imports torch and the classifier module, picks cuda when
+        # available, loads stored author and file maps (asserting they exist) and the saved
+        # weights from the results directory, and puts the model in evaluation mode; otherwise
+        # the classifier is None. Stores the category filter.
         self.cache = get_commit_data_cache()
         self.commits = CommitList.from_existing(path)
         if use_classifier:
@@ -46,6 +60,10 @@ class Categorizer:
         self.category = category
 
     def categorize(self):
+        # [FUNCTION DOC] Prompts through every commit whose category equals the filter. Counts
+        # how many commits were already handled, shows each with its position out of the total,
+        # and advances to the commit that followed it in the filtered list (or to the jump
+        # target if the handler returns one, which it currently never does).
         commits = self.commits.filter(category=self.category)
         total_commits = len(self.commits.commits)
         already_done = total_commits - len(commits)
@@ -66,9 +84,18 @@ class Categorizer:
                 i = commits.index(next_commit)
 
     def features(self, commit):
+        # [FUNCTION DOC] Returns the cached features for a commit, fetching them if needed.
         return self.cache.get(commit.commit_hash)
 
     def potential_reverts_of(self, commit, commits):
+        # [FUNCTION DOC] Finds commits that may revert the given one. Returns an empty list for
+        # submodule update titles. Otherwise returns a mapping: an entry from the label name
+        # Reverted when the labels have it, plus entries keyed by a one-based display position
+        # (offset by 2) for every later commit whose title contains this title with its last ten
+        # characters cut off (intended to drop the pull request suffix) and which has a
+        # different hash.
+        # KNOWN ISSUE: the comment says the cut is eight characters but ten are removed; and the
+        #   position keys are approximate by the author's own note.
         submodule_update_str = [
             "Update TensorPipe submodule",
             "Updating submodules",
@@ -98,6 +125,13 @@ class Categorizer:
         return reasons
 
     def handle_commit(self, commit, i, total, commits):
+        # [FUNCTION DOC] Shows one commit and asks the user to choose its category and topic.
+        # Warns about potential reverts, bc-breaking and deprecation labels, and prints title,
+        # body, files, labels, current category and the choices after clearing the terminal. The
+        # default category is the classifier's top suggestion if a classifier exists, otherwise
+        # the current category. Input is accepted by unique prefix of a category or topic; an
+        # empty answer takes the default (the current topic for topics); ambiguous input re-
+        # prompts. Then updates the commit and returns None.
         potential_reverts = self.potential_reverts_of(commit, commits)
         if potential_reverts:
             potential_reverts = f"!!!POTENTIAL REVERTS!!!: {potential_reverts}"
@@ -182,6 +216,8 @@ Select from: {", ".join(common.categories)}
         return None
 
     def update_commit(self, commit, category, topic):
+        # [FUNCTION DOC] Sets the commit's category and topic and saves the whole list file.
+        # Asserts that both values are known.
         assert category in common.categories
         assert topic in topics
         commit.category = category
@@ -190,6 +226,8 @@ Select from: {", ".join(common.categories)}
 
 
 def main():
+    # [FUNCTION DOC] Entry point: parses the category filter, file path and classifier flag,
+    # builds a Categorizer and runs it.
     parser = argparse.ArgumentParser(description="Tool to help categorize commits")
     parser.add_argument(
         "--category",

@@ -1,3 +1,8 @@
+# [MODULE DOC] Command line tool that computes the Dynamo unittest pass rate from CI reports.
+# Downloads the dynamo311 and eager311 test report directories for a commit (via
+# download_reports, which needs the gh cli) and prints the pass rate. Importing only defines
+# functions; work happens under the main guard. Depends on sibling modules common and
+# download_reports.
 import argparse
 
 from common import (
@@ -30,12 +35,19 @@ https://docs.github.com/en/github-cli/github-cli/quickstart
 
 
 def testcases_by_time(xmls):
+    # [FUNCTION DOC] Parses all testcase elements from the given xml reports and returns them as
+    # a list sorted by the time attribute, slowest first. Raises KeyError if a testcase lacks a
+    # time attribute.
     testcases = get_testcases(xmls)
     testcases.sort(reverse=True, key=lambda x: float(x.attrib["time"]))
     return testcases
 
 
 def should_exclude(key):
+    # [FUNCTION DOC] HELPER: Decides whether a test key (file, class and name joined by double
+    # colons) is left out of the pass rate. Returns True for C++ tests (file reported as
+    # UNKNOWN) and for files under the inductor, export or dynamo test directories; False
+    # otherwise.
     test_file = key.split("::")[0]
     # C++ tests
     if test_file == "UNKNOWN":
@@ -45,6 +57,13 @@ def should_exclude(key):
 
 
 def compute_pass_rate(eager_dir, dynamo_dir):
+    # [FUNCTION DOC] Computes and prints the Dynamo pass rate from two result directories.
+    # Parses the xml reports, takes keys of passing tests in each mode minus excluded files, and
+    # removes from the eager set any test the Dynamo run reports as excluded. The pass rate is
+    # the fraction of those eager passing tests that also pass under Dynamo; printed with the
+    # two counts. Returns the set of eager-passing keys that did not pass under Dynamo. Raises
+    # ZeroDivisionError if no eager test qualifies. Prints progress lines.
+    # KNOWN ISSUE: the not_there_keys set is built but never used or returned (debug leftover).
     print("parsing xmls")
     eager_xmls = open_test_results(eager_dir)
     dynamo_xmls = open_test_results(dynamo_dir)

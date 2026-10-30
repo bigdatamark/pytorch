@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command line tool that reads the comments of a cherry-pick request issue on
+# GitHub (through the gh cli), extracts the landed trunk pull request or commit listed in each,
+# looks up each pull request's title and landed commit, checks the commits against the release
+# notes commit list, and writes a CSV of comment id, pull request number, title and commit.
+# Import-time side effect: configures root logging at info level with a level-and-message
+# format.
 """Parse cherry-pick comments from a PyTorch GitHub issue and extract trunk PR info.
 
 Usage:
@@ -27,6 +33,8 @@ logger = logging.getLogger(__name__)
 
 
 def parse_issue_url(url: str) -> tuple[str, str]:
+    # [FUNCTION DOC] Splits a GitHub issue URL into the owner and repository text and the issue
+    # number text. Raises ValueError if the URL does not match the expected form.
     """Extract owner/repo and issue number from a GitHub issue URL."""
     m = re.match(r"https://github\.com/([^/]+/[^/]+)/issues/(\d+)", url)  # @lint-ignore
     if not m:
@@ -35,6 +43,10 @@ def parse_issue_url(url: str) -> tuple[str, str]:
 
 
 def gh_api(endpoint: str) -> list | dict:
+    # [FUNCTION DOC] Runs the gh api command with automatic pagination and returns the parsed
+    # JSON. Returns an empty list for empty output; parses a single JSON value if possible,
+    # otherwise decodes several concatenated JSON values (one per page) and merges them,
+    # flattening lists. Raises CalledProcessError if gh fails.
     """Call gh api with pagination and return parsed JSON."""
     result = subprocess.run(
         ["gh", "api", endpoint, "--paginate"],
@@ -76,6 +88,8 @@ def gh_api(endpoint: str) -> list | dict:
 
 
 def fetch_comments(repo: str, issue_number: str) -> list[dict]:
+    # [FUNCTION DOC] Returns all comments of the issue (as mappings from the API) and logs how
+    # many were found.
     """Fetch all comments from a GitHub issue."""
     endpoint = f"repos/{repo}/issues/{issue_number}/comments?per_page=100"
     comments = gh_api(endpoint)
@@ -84,6 +98,8 @@ def fetch_comments(repo: str, issue_number: str) -> list[dict]:
 
 
 def fetch_pr_title(repo: str, pr_number: str) -> str:
+    # [FUNCTION DOC] Returns the title of a pull request from the API, or an empty string (with
+    # a warning) if the request fails.
     """Fetch the title of a PR."""
     try:
         result = subprocess.run(
@@ -99,6 +115,11 @@ def fetch_pr_title(repo: str, pr_number: str) -> str:
 
 
 def fetch_landed_commit(repo: str, pr_number: str) -> str:
+    # [FUNCTION DOC] Returns the commit hash that landed a pull request, or an empty string if
+    # not found. First tries the closing event of the issue timeline that carries a commit id;
+    # if absent or the call fails, searches commits for the pull request reference in the
+    # message and takes the first hit. Logs a note when falling back and a warning when nothing
+    # is found. Failures of gh are swallowed.
     """Fetch the actual landed commit SHA for a PR.
 
     PyTorch uses a merge bot that squash-merges outside of GitHub's standard
@@ -155,6 +176,12 @@ def fetch_landed_commit(repo: str, pr_number: str) -> str:
 
 
 def extract_trunk_prs(comment_body: str) -> list[dict]:
+    # [FUNCTION DOC] Parses a comment for its landed-trunk section (case-insensitive, text after
+    # the matching heading up to the release branch section, criteria heading or the end).
+    # Returns an empty list if the heading is absent. Returns a list of mappings with a pull
+    # request number and a raw commit: one per pull request URL, then one per standalone
+    # 40-digit hexadecimal hash outside URLs. If the section says not applicable, or nothing was
+    # found, returns a single entry with both fields empty.
     """Extract trunk PR numbers/commit hashes from a comment body.
 
     Returns a list of dicts with keys: pr_number (str or ""), raw_commit (str or "").
@@ -201,6 +228,13 @@ def extract_trunk_prs(comment_body: str) -> list[dict]:
 
 
 def main():
+    # [FUNCTION DOC] Entry point. Parses the issue URL, output path option and the required
+    # commit list path; without an output path, creates the results directory next to the script
+    # and names the file by issue number. Fetches comments, extracts trunk entries (warning on
+    # several per comment), fills in title and landed commit for pull requests (replacing any
+    # raw commit) and collects rows. Loads the first column of the commit list (header skipped)
+    # and counts commits matching by prefix in either direction, warning about mismatches and
+    # counting empty hashes as skipped. Writes the CSV and logs counts.
     parser = argparse.ArgumentParser(
         description="Parse cherry-pick comments from a PyTorch GitHub issue"
     )
