@@ -1,5 +1,12 @@
 # Owner(s): ["oncall: quantization"]
 # ruff: noqa: F841
+# [MODULE DOC] Tests for FX graph mode quantization (prepare_fx, prepare_qat_fx, convert_fx,
+# convert_to_reference_fx, fuse_fx) and its configuration objects. Contains small model helpers
+# for binary ops, and these test classes: fusion tests, general quantization tests (patterns,
+# qconfig mapping and custom config round trips, custom modules, LSTM, backend config
+# constraints, decomposed reference conversion), per-op tests, and model-level tests (device
+# switching, torchvision, QAT embeddings). Importing has no side effects beyond imports; the
+# file raises an error if run directly.
 
 from collections import OrderedDict
 import contextlib
@@ -207,7 +214,11 @@ import io
 from collections.abc import Callable
 
 class BinaryOp(torch.nn.Module):
+    # [CLASS DOC] Test helper module: two 1x1 Conv2d layers feeding a binary op. Holds conv1,
+    # conv2, a scalar flag and the chosen op.
     def __init__(self, binary_op, ibinary_op, is_inplace, is_scalar):
+        # [FUNCTION DOC] HELPER: Builds the two convs; op is the in-place variant only when both
+        # ibinary_op is given and is_inplace is true, else binary_op.
         """ ibinary_op means inplace binary op
         """
         super().__init__()
@@ -217,6 +228,9 @@ class BinaryOp(torch.nn.Module):
         self.op = ibinary_op if ibinary_op and is_inplace else binary_op
 
     def forward(self, x, y):
+        # [FUNCTION DOC] HELPER: Applies conv1 to x; y becomes the constant 3 if is_scalar, else
+        # conv2 applied to y. Applies the op to x and y, then to y and the result, and returns
+        # the second result.
         x = self.conv1(x)
         y = 3 if self.is_scalar else self.conv2(y)
         # x = x + y
@@ -226,7 +240,11 @@ class BinaryOp(torch.nn.Module):
         return x
 
 class BinaryOpNonQuantizedInput(torch.nn.Module):
+    # [CLASS DOC] Test helper module: a binary op applied to inputs that are not quantized
+    # upstream (no convs). Stores the scalar flag and the chosen op.
     def __init__(self, binary_op, ibinary_op, is_inplace, is_scalar):
+        # [FUNCTION DOC] HELPER: Stores is_scalar and selects the in-place op if requested and
+        # available, otherwise the regular binary op.
         """ ibinary_op means inplace binary op
         """
         super().__init__()
@@ -234,13 +252,19 @@ class BinaryOpNonQuantizedInput(torch.nn.Module):
         self.op = ibinary_op if ibinary_op and is_inplace else binary_op
 
     def forward(self, x, y):
+        # [FUNCTION DOC] HELPER: Replaces y by the constant 3 when is_scalar; returns the op
+        # applied to x and y.
         y = 3 if self.is_scalar else y
         x = self.op(x, y)
         return x
 
 class BinaryOpRelu(torch.nn.Module):
+    # [CLASS DOC] Test helper module: two convs, a binary op and a relu applied twice. The relu
+    # is a module instance, or the callable itself if not a ReLU class.
     def __init__(self, binary_op, ibinary_op, is_inplace, relu_callable,
                  is_scalar):
+        # [FUNCTION DOC] HELPER: Builds convs and selects the op as in BinaryOp. If
+        # relu_callable is the ReLU class a module is instantiated, else it is used directly.
         """ ibinary_op means inplace binary op
         """
         super().__init__()
@@ -255,6 +279,8 @@ class BinaryOpRelu(torch.nn.Module):
             self.relu = relu_callable
 
     def forward(self, x, y):
+        # [FUNCTION DOC] HELPER: Applies conv1 to x, takes y as 3 or conv2 of y, then op, relu,
+        # op of y and the result, relu again; returns the final tensor.
         x = self.conv1(x)
         y = 3 if self.is_scalar else self.conv2(y)
         x = self.op(x, y)
@@ -265,12 +291,22 @@ class BinaryOpRelu(torch.nn.Module):
 
 @torch.fx.wrap
 def _user_func_with_complex_return_type(x):
+    # [FUNCTION DOC] HELPER: Wrapped (kept as a leaf in FX tracing) function returning the input
+    # split along dim 1 into a list of single-channel tensors.
     return list(torch.split(x, 1, 1))
 
 class TestFuseFx(QuantizationTestCase):
+    # [CLASS DOC] Tests for fuse_fx and fusion behavior during prepare_fx/prepare_qat_fx
+    # (conv/bn/relu, linear/bn, onednn-only patterns, custom fusers).
     def test_fuse_conv_bn_relu(self):
+        # [FUNCTION DOC] Checks fusion of conv plus bn, with or without relu, in 1d/2d/3d. In
+        # train mode (prepare_qat_fx) expects ConvBn/ConvBnReLU modules and no standalone ReLU;
+        # in eval mode (fuse_fx) expects Conv and ConvReLU modules.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model with 1d/2d/3d conv-bn pairs, and three conv-bn-relu
+            # groups.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the convs, batch norms and shared ReLU.
                 super().__init__()
                 self.conv1d = nn.Conv1d(1, 1, 1)
                 self.conv2d = nn.Conv2d(1, 1, 1)
@@ -287,6 +323,8 @@ class TestFuseFx(QuantizationTestCase):
                 self.relu = nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs conv1d-bn1d, conv2d-bn2d, conv3d-bn3d then three
+                # conv-bn-relu chains (1d, 2d, 3d); returns the result.
                 x = self.conv1d(x)
                 x = self.bn1d(x)
                 x = self.conv2d(x)
@@ -349,13 +387,18 @@ class TestFuseFx(QuantizationTestCase):
             expected_node_occurrence=expected_occurrence)
 
     def test_fuse_linear_bn_eval(self):
+        # [FUNCTION DOC] Checks that fuse_fx in eval mode folds BatchNorm1d into a Linear: only
+        # Linear remains and no BatchNorm1d node.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Linear followed by BatchNorm1d.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear and bn1d layers.
                 super().__init__()
                 self.linear = nn.Linear(1, 1)
                 self.bn1d = nn.BatchNorm1d(1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies linear then bn1d.
                 x = self.linear(x)
                 x = self.bn1d(x)
                 return x
@@ -377,6 +420,8 @@ class TestFuseFx(QuantizationTestCase):
 
     @skipIfNoONEDNN
     def test_fuse_linear_bn_leaky_relu_onednn(self):
+        # [FUNCTION DOC] Checks linear, optional bn, and leaky relu fusion into LinearLeakyReLU
+        # using the onednn backend config, with and without bn. Skipped without ONEDNN.
         # linear - bn - leaky_relu is fused for onednn backend only
         from torch.ao.quantization.backend_config import get_onednn_backend_config
         expected_nodes = [
@@ -399,6 +444,8 @@ class TestFuseFx(QuantizationTestCase):
                 expected_node_occurrence=expected_occurrence)
 
     def test_linear_bn_leaky_relu_not_fused_by_default(self):
+        # [FUNCTION DOC] Checks default fuse_fx (no backend config) leaves Linear and LeakyReLU
+        # unfused, with and without bn.
         # Make sure linear - bn - leaky_relu is not fused by default
         for with_bn in [True, False]:
             # test eval mode
@@ -419,6 +466,8 @@ class TestFuseFx(QuantizationTestCase):
 
     @skipIfNoONEDNN
     def test_fuse_linear_tanh_for_onednn_backend(self):
+        # [FUNCTION DOC] Checks LinearTanh fusion with the onednn backend config; Linear and
+        # Tanh nodes disappear. Skipped without ONEDNN.
         # linear - tanh is fused for onednn backend only
         from torch.ao.quantization.backend_config import get_onednn_backend_config
         expected_nodes = [
@@ -440,6 +489,7 @@ class TestFuseFx(QuantizationTestCase):
             expected_node_occurrence=expected_occurrence)
 
     def test_linear_tanh_not_fused_by_default(self):
+        # [FUNCTION DOC] Checks default fuse_fx does not fuse Linear and Tanh.
         # Make sure linear - tanh is not fused by default
         # test eval mode
         m = LinearTanhModel().eval()
@@ -458,6 +508,9 @@ class TestFuseFx(QuantizationTestCase):
             expected_node_occurrence=expected_occurrence)
 
     def test_fuse_conv_bn_add_relu_onednn(self):
+        # [FUNCTION DOC] Iterates all flag combinations (bn, relu, conv side, two convs,
+        # torch.add) and checks the onednn config fuses to ConvAdd2d or ConvAddReLU2d with no
+        # BatchNorm2d left.
         # conv - bn - add - relu is fused for onednn backend only
         from torch.ao.quantization.backend_config import get_onednn_backend_config
         options = itertools.product(
@@ -492,6 +545,8 @@ class TestFuseFx(QuantizationTestCase):
                 expected_node_occurrence=expected_occurrence)
 
     def test_fuse_conv_bn_add_relu_by_default(self):
+        # [FUNCTION DOC] Iterates all flag combinations and checks the default config only folds
+        # bn into Conv2d and does not create ConvAdd2d.
         options = itertools.product(
             [True, False],  # with_bn
             [True, False],  # with_relu
@@ -521,6 +576,9 @@ class TestFuseFx(QuantizationTestCase):
 
     @skipIfNoONEDNN
     def test_fuse_conv_bn_add_relu_lowering(self):
+        # [FUNCTION DOC] For each flag combination under the onednn engine: prepares, converts
+        # (quantized) and converts to reference, checking quantized-op fusion and node counts,
+        # then runs the quantized model. Skipped without ONEDNN.
         """ Test fusion and lowering of Conv2d - (bn -) ReLU
             by FX. For onednn backend only.
         """
@@ -566,6 +624,8 @@ class TestFuseFx(QuantizationTestCase):
                 m(*example_x)
 
     def test_fuse_convtranspose_bn_eval(self):
+        # [FUNCTION DOC] Checks fuse_fx folds batch norms into ConvTranspose 1d/2d/3d, leaving
+        # no BatchNorm nodes.
 
         m = ModelForConvTransposeBNFusion().eval()
         m = fuse_fx(m)
@@ -587,8 +647,11 @@ class TestFuseFx(QuantizationTestCase):
 
 
     def test_fuse_module_relu(self):
+        # [FUNCTION DOC] Checks fuse_fx fuses conv+relu (1d,2d,3d) and bn+relu (2d,3d) patterns.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Convs and bns each followed by a shared ReLU.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates three convs, three bns and one ReLU.
                 super().__init__()
                 self.conv1d = nn.Conv1d(1, 1, 1)
                 self.conv2d = nn.Conv2d(1, 1, 1)
@@ -599,6 +662,8 @@ class TestFuseFx(QuantizationTestCase):
                 self.relu = nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies each conv then relu, then each bn then relu in
+                # turn.
                 x = self.conv1d(x)
                 x = self.relu(x)
                 x = self.conv2d(x)
@@ -626,6 +691,9 @@ class TestFuseFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_qconfig_fused_module(self):
+        # [FUNCTION DOC] Checks that a qconfig applied to Linear/ReLU/F.relu is honored for
+        # fused Linear-ReLU models: expects quantized LinearReLU (and Linear) with
+        # quantize/dequantize around. Skipped without FBGEMM.
         """ TODO: add test for all fused modules
         """
         qconfig_dict = {
@@ -662,20 +730,27 @@ class TestFuseFx(QuantizationTestCase):
             self.checkGraphModuleNodes(quantized, expected_node_list=node_list)
 
     def test_problematic_fuse_example(self):
+        # [FUNCTION DOC] Checks prepare_fx finds the fused LinearReLU when the fusable pair is
+        # inside a custom Sequential submodule and the other Linear is separate.
         class LinearRelu(nn.Sequential):
+            # [CLASS DOC] HELPER: Sequential of a 5x5 Linear and a ReLU.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Builds the Sequential with the Linear and ReLU.
                 super().__init__(
                     nn.Linear(5, 5),
                     nn.ReLU(),
                 )
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Holds a LinearRelu submodule and a Linear.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the two submodules.
                 super().__init__()
                 self.lin_relu = LinearRelu()
                 self.linear = nn.Linear(5, 5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies lin_relu then linear.
                 x = self.lin_relu(x)
                 x = self.linear(x)
                 return x
@@ -696,19 +771,27 @@ class TestFuseFx(QuantizationTestCase):
     @unittest.skip("Temporarily skipping the test case, will enable after the simple"
                    "pattern format is supported")
     def test_fuse_addtional_fuser_method(self):
+        # [FUNCTION DOC] Skipped test (disabled until a simpler pattern format exists); defines
+        # a custom conv-relu fuser and is not executed.
         class MyConvReLU(torch.nn.Module):
+            # [CLASS DOC] HELPER: Empty marker module standing in for a fused conv-relu result.
             pass
 
         def my_conv_relu_fuser(conv, relu):
+            # [FUNCTION DOC] HELPER: Custom fuser method that ignores its conv and relu
+            # arguments and returns a new MyConvReLU instance.
             return MyConvReLU()
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model with a Conv2d followed by a ReLU.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv and relu submodules.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(3, 3, 3)
                 self.relu = torch.nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the conv then the relu.
                 return self.relu(self.conv(x))
 
         m = M().eval()
@@ -720,8 +803,15 @@ class TestFuseFx(QuantizationTestCase):
         self.checkGraphModuleNodes(m, expected_node=ns.call_module(MyConvReLU))
 
     def test_fuse_custom_pattern(self):
+        # [FUNCTION DOC] Checks fuse_fx with a custom BackendConfig whose complex-format pattern
+        # (relu over add of MatchAllNode and bn over conv) is registered for both torch.add and
+        # operator.add, with a fuser returning the conv. Verifies the conv stays a Conv2d and
+        # bn/relu submodules are removed.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model with conv, bn, relu, maxpool; the add function is
+            # torch.add or operator.add per use_torch_add.
             def __init__(self, use_torch_add=True):
+                # [FUNCTION DOC] HELPER: Creates the layers and stores the chosen add callable.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(3, 3, 3)
                 self.bn = torch.nn.BatchNorm2d(3)
@@ -733,6 +823,8 @@ class TestFuseFx(QuantizationTestCase):
                     self.add = operator.add
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Max-pools the input as the residual branch, runs conv
+                # and bn on the input, adds the residual, then applies relu; returns the result.
                 y = x
                 y = self.maxpool(x)
                 x = self.conv(x)
@@ -745,6 +837,8 @@ class TestFuseFx(QuantizationTestCase):
             m = M(use_torch_add).eval()
 
             def fuse_conv_bn_relu(is_qat, relu, add_pattern):
+                # [FUNCTION DOC] HELPER: Fuser method for the add pattern: unpacks the nested
+                # bn/conv pattern and returns the conv module, discarding the others.
                 _, _, bn_pattern = add_pattern
                 bn, conv = bn_pattern
                 return conv
@@ -765,6 +859,10 @@ class TestFuseFx(QuantizationTestCase):
             self.assertFalse(hasattr(m, "relu"))
 
     def test_fusion_pattern_with_multiple_inputs(self):
+        # [FUNCTION DOC] Checks root_node_getter and extra_inputs_getter in a backend pattern
+        # config: the pattern (relu, add of (bn, conv) and a wildcard) fuses into the conv, the
+        # wildcard input is added as an extra argument, bn/relu are removed, and each Conv2d
+        # call node ends up with two arguments.
         """ This test tests two keys in backend_config: root_node_getter and
         extra_inputs_getter,
         root_node_getter is used to identify a "root" module in the node pattern,
@@ -773,7 +871,10 @@ class TestFuseFx(QuantizationTestCase):
         fused node as extra inputs.
         """
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model with conv, bn, relu and maxpool where the max-pooled
+            # input is the residual added after bn.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the four submodules.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(3, 3, 3)
                 self.bn = torch.nn.BatchNorm2d(3)
@@ -781,6 +882,8 @@ class TestFuseFx(QuantizationTestCase):
                 self.maxpool = torch.nn.MaxPool2d(3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Residual is max-pool of the input; conv, bn, add
+                # residual, relu.
                 y = x
                 y = self.maxpool(x)
                 x = self.conv(x)
@@ -792,17 +895,23 @@ class TestFuseFx(QuantizationTestCase):
         m = M().eval()
 
         def fuse_conv_bn_relu(is_qat, relu, add_pattern):
+            # [FUNCTION DOC] HELPER: Fuser method returning the conv module found inside the
+            # nested add pattern.
             _, bn_pattern, _ = add_pattern
             bn, conv = bn_pattern
             return conv
 
         def conv_bn_res_relu_root_node_getter(pattern):
+            # [FUNCTION DOC] HELPER: Root node getter returning the conv from the (relu, add)
+            # pattern.
             relu, add_pattern = pattern
             _, bn_pattern, _ = add_pattern
             bn, conv = bn_pattern
             return conv
 
         def conv_bn_res_relu_extra_inputs_getter(pattern):
+            # [FUNCTION DOC] HELPER: Extra inputs getter returning a one-element list with the
+            # wildcard-matched residual input of the add pattern.
             """ get inputs pattern for extra inputs, inputs for root node
             are assumed to be copied over from root node to the fused node
             """
@@ -830,6 +939,9 @@ class TestFuseFx(QuantizationTestCase):
                 self.assertTrue(len(node.args) == 2, msg="Expecting the fused op to have two arguments")
 
     def test_fusion_pattern_with_matchallnode(self):
+        # [FUNCTION DOC] Checks that a node matched by MatchAllNode is treated as an input, not
+        # fused by that pattern: a conv-relu branch feeding an add pattern with a second conv
+        # must still fuse as conv-relu. Both relus are expected removed.
         """This test tests that the node matched by MatchAllNode will be regared as an input
         instead of a module to be fused. For instance, we have two patterns:
             (nn.ReLU, (torch.add, MatchAllNode, nn.Conv2d))
@@ -842,7 +954,10 @@ class TestFuseFx(QuantizationTestCase):
         """
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Two conv branches; the first conv-relu result is added to the
+            # second conv output, followed by a second relu.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates conv1, relu1, conv2, relu2.
                 super().__init__()
                 self.conv1 = torch.nn.Conv2d(3, 3, 3)
                 self.relu1 = torch.nn.ReLU()
@@ -850,6 +965,8 @@ class TestFuseFx(QuantizationTestCase):
                 self.relu2 = torch.nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Computes conv1 then relu1 as y; conv2 of x added to y;
+                # relu2.
                 y = self.conv1(x)
                 y = self.relu1(y)
 
@@ -861,17 +978,25 @@ class TestFuseFx(QuantizationTestCase):
         m = M().eval()
 
         def fuse_conv_relu(is_qat, conv, relu):
+            # [FUNCTION DOC] HELPER: Fuser for the conv-relu pattern; returns the conv
+            # unchanged.
             return conv
 
         def fuse_conv_res_relu(is_qat, relu, add_pattern):
+            # [FUNCTION DOC] HELPER: Fuser for the residual pattern; returns the conv found in
+            # the add pattern.
             _, conv, _ = add_pattern
             return conv
 
         def conv_res_relu_root_node_getter(pattern):
+            # [FUNCTION DOC] HELPER: Root node getter returning the conv of the residual
+            # pattern.
             relu, (_, conv, _) = pattern
             return conv
 
         def conv_res_relu_extra_inputs_getter(pattern):
+            # [FUNCTION DOC] HELPER: Extra inputs getter returning the wildcard residual input
+            # in a list.
             relu, (_, _, extra_input) = pattern
             return [extra_input]
 
@@ -895,18 +1020,27 @@ class TestFuseFx(QuantizationTestCase):
 
 @skipIfNoFBGEMM
 class TestQuantizeFx(QuantizationTestCase):
+    # [CLASS DOC] Tests for FX graph mode quantization (prepare_fx, convert_fx and the reference
+    # variants): pattern matching, conv/linear/conv-transpose quantization, qconfig handling,
+    # custom config, observers and more. Skipped as a whole when FBGEMM is unavailable.
     def test_pattern_match(self):
+        # [FUNCTION DOC] Checks _is_match for a conv-bn-add-relu pattern with a wildcard for the
+        # second add input: every ReLU module node in the traced model must match.
         """ test MatchAllNode with
             conv - bn - add - relu pattern
         """
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv, bn, add of a second input, relu.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates conv, bn and relu.
                 super().__init__()
                 self.conv = nn.Conv2d(1, 1, 1)
                 self.bn = nn.BatchNorm2d(1)
                 self.relu = nn.ReLU()
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: conv, bn, adds the second input y, relu; returns the
+                # result.
                 x = self.conv(x)
                 x = self.bn(x)
                 x = x + y
@@ -921,8 +1055,14 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.assertTrue(_is_match(modules, n, pattern))
 
     def test_pattern_match_constant(self):
+        # [FUNCTION DOC] Checks _is_match on a function-call pattern with a constant element:
+        # getitem index 0 of the max-pool-with-indices op. Dead code that reads the second
+        # output is removed before matching.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model whose forward calls the aten max-pool-with-indices op
+            # and keeps only the first output.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Takes the first element of the op result.
                 x, _ = torch.ops.aten.max_pool2d_with_indices.default(x)
                 return x
 
@@ -937,24 +1077,34 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.assertTrue(_is_match(modules, n, pattern))
 
     def test_fused_module_qat_swap(self):
+        # [FUNCTION DOC] Checks that prepare_qat_fx swaps a Linear-ReLU pair nested in a
+        # Sequential submodule to the intrinsic QAT LinearReLU module.
         class Tmp(torch.nn.Module):
+            # [CLASS DOC] HELPER: A Linear followed by a ReLU in one module.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear and relu.
                 super().__init__()
                 self.tmp = torch.nn.Linear(5, 5)
                 self.relu = torch.nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear then the relu.
                 x = self.tmp(x)
                 return self.relu(x)
 
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Sequential of the Tmp module and a Linear plus another Linear,
+            # with scalar adds on the input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the two submodule groups.
                 super().__init__()
                 self.mods1 = torch.nn.Sequential(Tmp(), torch.nn.Linear(5, 5))
                 self.mods2 = torch.nn.Linear(5, 5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the Sequential output and the chain of add 5,
+                # second Linear, add 5 on the input.
                 a = self.mods1(x)
                 x = torch.add(x, 5)
                 x = self.mods2(x)
@@ -974,12 +1124,20 @@ class TestQuantizeFx(QuantizationTestCase):
         self.assertTrue(isinstance(getattr(prepared.mods1, "0").tmp, torch.ao.nn.intrinsic.qat.LinearReLU))
 
     def _get_conv_linear_test_cases(self, is_reference):
+        # [FUNCTION DOC] HELPER: Builds the shared conv/linear test table. Returns a list of
+        # tuples: is_dynamic flag, module class, constructor arguments, example inputs, expected
+        # quantized node and weight prepack node (or none). The expected node depends on
+        # is_reference (functional/ref ops vs quantized ops).
         """ Returns a list of test cases, with format:
         is_dynamic, ModuleClass, module_constructor_inputs,
         inputs, quantized_node, weight_prepack_op
         """
         class FunctionalConv1d(torch.nn.Module):
+            # [CLASS DOC] HELPER: Functional 1d conv model with a weight parameter and default
+            # stride, padding, dilation and groups.
             def __init__(self, weight):
+                # [FUNCTION DOC] HELPER: Wraps the given weight as a Parameter and stores conv
+                # settings.
                 super().__init__()
                 self.weight = torch.nn.Parameter(weight)
                 self.stride = 1
@@ -988,15 +1146,20 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.groups = 1
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Calls the functional conv1d with the stored weight and
+                # settings.
                 return F.conv1d(x, self.weight, None, self.stride, self.padding, self.dilation, self.groups)
 
 
         class Conv1d(torch.nn.Module):
+            # [CLASS DOC] HELPER: Wrapper around a Conv1d module built from the given arguments.
             def __init__(self, *args):
+                # [FUNCTION DOC] HELPER: Creates the Conv1d from the passed arguments.
                 super().__init__()
                 self.conv = torch.nn.Conv1d(*args)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the conv module.
                 return self.conv(x)
 
         conv1d_input = torch.rand(1, 3, 224)
@@ -1004,7 +1167,10 @@ class TestQuantizeFx(QuantizationTestCase):
         conv1d_module_args = (3, 3, 3)
 
         class FunctionalConv2d(torch.nn.Module):
+            # [CLASS DOC] HELPER: Functional 2d conv model with a weight parameter.
             def __init__(self, weight):
+                # [FUNCTION DOC] HELPER: Wraps the weight as a Parameter and stores conv
+                # settings.
                 super().__init__()
                 self.weight = torch.nn.Parameter(weight)
                 self.stride = (1, 1)
@@ -1013,14 +1179,19 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.groups = 1
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Calls the functional conv2d with the stored weight and
+                # settings.
                 return F.conv2d(x, self.weight, None, self.stride, self.padding, self.dilation, self.groups)
 
         class Conv2d(torch.nn.Module):
+            # [CLASS DOC] HELPER: Wrapper around a Conv2d module.
             def __init__(self, *args):
+                # [FUNCTION DOC] HELPER: Creates the Conv2d from the passed arguments.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(*args)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the conv module.
                 return self.conv(x)
 
         conv2d_input = torch.rand(1, 3, 224, 224)
@@ -1028,7 +1199,10 @@ class TestQuantizeFx(QuantizationTestCase):
         conv2d_module_args = (3, 3, 3)
 
         class FunctionalConv3d(torch.nn.Module):
+            # [CLASS DOC] HELPER: Functional 3d conv model with a weight parameter.
             def __init__(self, weight):
+                # [FUNCTION DOC] HELPER: Wraps the weight as a Parameter and stores conv
+                # settings.
                 super().__init__()
                 self.weight = torch.nn.Parameter(weight)
                 self.stride = (1, 1, 1)
@@ -1037,6 +1211,8 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.groups = 1
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Calls the functional conv3d with the stored weight and
+                # settings.
                 return F.conv3d(
                     x,
                     self.weight,
@@ -1048,11 +1224,14 @@ class TestQuantizeFx(QuantizationTestCase):
                 )
 
         class Conv3d(torch.nn.Module):
+            # [CLASS DOC] HELPER: Wrapper around a Conv3d module.
             def __init__(self, *args):
+                # [FUNCTION DOC] HELPER: Creates the Conv3d from the passed arguments.
                 super().__init__()
                 self.conv = torch.nn.Conv3d(*args)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the conv module.
                 return self.conv(x)
 
         conv3d_input = torch.rand(1, 3, 32, 224, 224)
@@ -1060,22 +1239,28 @@ class TestQuantizeFx(QuantizationTestCase):
         conv3d_module_args = (3, 3, 3)
 
         class Linear(torch.nn.Module):
+            # [CLASS DOC] HELPER: Functional linear model with a weight parameter and no bias.
             def __init__(self, weight):
+                # [FUNCTION DOC] HELPER: Wraps the weight as a Parameter.
                 super().__init__()
                 self.weight = torch.nn.Parameter(weight)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Calls the functional linear with the stored weight.
                 return F.linear(x, self.weight)
 
         linear_input = torch.rand(8, 5)
         linear_weight = torch.rand(10, 5)
 
         class LinearModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Wrapper around a Linear module with 5 inputs and 10 outputs.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear layer.
                 super().__init__()
                 self.linear = torch.nn.Linear(5, 10)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer.
                 return self.linear(x)
 
         linear_module_input = torch.rand(8, 5)
@@ -1168,6 +1353,9 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_conv_linear_not_reference(self):
+        # [FUNCTION DOC] Quantizes each conv/linear case with the non-reference flow via
+        # checkGraphModeFxOp, expecting the quantized node and that no weight prepack node
+        # remains in the graph. Skipped without FBGEMM.
         """ Test quantizing conv and linear
         """
         tests = self._get_conv_linear_test_cases(is_reference=False)
@@ -1186,11 +1374,16 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_conv_linear_reference(self):
+        # [FUNCTION DOC] Quantizes each conv/linear case with the reference flow and checks the
+        # reference modules keep weight qscheme, scale and zero point, that they survive a deep
+        # copy, and that state dict save/load restores the scale.
         """ Test quantizing functional conv and linear with reference option
         """
         tests = self._get_conv_linear_test_cases(is_reference=True)
 
         def _get_keys(prefix, is_dynamic):
+            # [FUNCTION DOC] HELPER: Returns state dict key names for a module prefix: weight
+            # qscheme and dtype, plus weight scale and zero point when not dynamic.
             all_keys = [prefix + "." + k for k in ["weight_qscheme", "weight_dtype"]]
             if not is_dynamic:
                 all_keys.extend([prefix + "." + k for k in ["weight_scale", "weight_zero_point"]])
@@ -1211,6 +1404,9 @@ class TestQuantizeFx(QuantizationTestCase):
             qr = result_dict["quantized_reference"]
 
             def checkWeightQParams(model):
+                # [FUNCTION DOC] HELPER: Asserts the reference quantized model has weight
+                # qscheme, scale, zero point and a reference class name for its linear and conv
+                # submodules.
                 for module_name in ("linear", "conv"):
                     if hasattr(model, module_name):
                         self.assertTrue(hasattr(qr.get_submodule(module_name), "weight_qscheme"))
@@ -1219,6 +1415,9 @@ class TestQuantizeFx(QuantizationTestCase):
                         self.assertTrue("Reference" in qr.get_submodule(module_name)._get_name())
 
             def checkSerDeser(model, is_dynamic):
+                # [FUNCTION DOC] HELPER: For linear and conv submodules, checks state dict keys
+                # exist, then clears the scale, reloads the state dict and checks the scale is
+                # restored.
                 for module_name in ("linear", "conv"):
                     if hasattr(model, module_name):
                         # make sure serialization works
@@ -1243,12 +1442,19 @@ class TestQuantizeFx(QuantizationTestCase):
             checkSerDeser(qr, is_dynamic)
 
     def _get_conv_transpose_test_cases(self, use_relu, is_reference):
+        # [FUNCTION DOC] HELPER: Conv-transpose analogue of the conv/linear case builder.
+        # Returns a list of test tuples; use_relu adds a relu after each model and is_reference
+        # picks reference versus quantized expected nodes.
         """ Returns a list of test cases, with format:
         is_dynamic, ModuleClass, module_constructor_inputs,
         inputs, quantized_node, weight_prepack_op
         """
         class FunctionalConvTranspose1d(torch.nn.Module):
+            # [CLASS DOC] HELPER: Functional 1d conv-transpose model, optionally followed by
+            # relu.
             def __init__(self, weight):
+                # [FUNCTION DOC] HELPER: Wraps the weight as a Parameter and stores conv
+                # settings.
                 super().__init__()
                 self.weight = torch.nn.Parameter(weight)
                 self.stride = 1
@@ -1258,6 +1464,8 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.groups = 1
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Calls the functional conv transpose and applies relu if
+                # use_relu.
                 y = F.conv_transpose1d(
                     x,
                     self.weight,
@@ -1273,12 +1481,15 @@ class TestQuantizeFx(QuantizationTestCase):
                 return y
 
         class ConvTranspose1d(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module wrapper around a ConvTranspose1d and a ReLU.
             def __init__(self, *args):
+                # [FUNCTION DOC] HELPER: Creates the deconv from arguments and a ReLU.
                 super().__init__()
                 self.deconv = torch.nn.ConvTranspose1d(*args)
                 self.relu = torch.nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies deconv, then relu if use_relu is set.
                 y = self.deconv(x)
                 if use_relu:
                     y = self.relu(y)
@@ -1289,7 +1500,11 @@ class TestQuantizeFx(QuantizationTestCase):
         conv_transpose1d_module_args = (3, 3, 3)
 
         class FunctionalConvTranspose2d(torch.nn.Module):
+            # [CLASS DOC] HELPER: Functional 2d conv-transpose model, optionally followed by
+            # relu.
             def __init__(self, weight):
+                # [FUNCTION DOC] HELPER: Wraps the weight as a Parameter and stores conv
+                # settings.
                 super().__init__()
                 self.weight = torch.nn.Parameter(weight)
                 self.stride = (1, 1)
@@ -1299,6 +1514,8 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.groups = 1
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Calls the functional conv transpose and applies relu if
+                # use_relu.
                 y = F.conv_transpose2d(
                     x,
                     self.weight,
@@ -1314,12 +1531,15 @@ class TestQuantizeFx(QuantizationTestCase):
                 return y
 
         class ConvTranspose2d(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module wrapper around a ConvTranspose2d and a ReLU.
             def __init__(self, *args):
+                # [FUNCTION DOC] HELPER: Creates the deconv from arguments and a ReLU.
                 super().__init__()
                 self.deconv = torch.nn.ConvTranspose2d(*args)
                 self.relu = torch.nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies deconv, then relu if use_relu is set.
                 y = self.deconv(x)
                 if use_relu:
                     y = self.relu(y)
@@ -1330,7 +1550,11 @@ class TestQuantizeFx(QuantizationTestCase):
         conv_transpose2d_module_args = (3, 3, 3)
 
         class FunctionalConvTranspose3d(torch.nn.Module):
+            # [CLASS DOC] HELPER: Functional 3d conv-transpose model, optionally followed by
+            # relu.
             def __init__(self, weight):
+                # [FUNCTION DOC] HELPER: Wraps the weight as a Parameter and stores conv
+                # settings.
                 super().__init__()
                 self.weight = torch.nn.Parameter(weight)
                 self.stride = (1, 1, 1)
@@ -1340,6 +1564,8 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.groups = 1
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Calls the functional conv transpose and applies relu if
+                # use_relu.
                 y = F.conv_transpose3d(
                     x,
                     self.weight,
@@ -1355,12 +1581,15 @@ class TestQuantizeFx(QuantizationTestCase):
                 return y
 
         class ConvTranspose3d(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module wrapper around a ConvTranspose3d and a ReLU.
             def __init__(self, *args):
+                # [FUNCTION DOC] HELPER: Creates the deconv from arguments and a ReLU.
                 super().__init__()
                 self.deconv = torch.nn.ConvTranspose3d(*args)
                 self.relu = torch.nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies deconv, then relu if use_relu is set.
                 y = self.deconv(x)
                 if use_relu:
                     y = self.relu(y)
@@ -1431,6 +1660,8 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_conv_transpose_not_reference(self):
+        # [FUNCTION DOC] Quantizes each conv-transpose case (no relu) with the non-reference
+        # flow and checks the expected quantized node and absence of weight prepack nodes.
         """ Test quantizing transposed conv
         """
         tests = self._get_conv_transpose_test_cases(use_relu=False, is_reference=False)
@@ -1449,11 +1680,16 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_conv_transpose_reference(self):
+        # [FUNCTION DOC] Quantizes conv-transpose cases (no relu) with the reference flow and
+        # checks reference module weight qparams, deep copy preservation and state dict round
+        # trip of the deconv submodule.
         """ Test quantizing transposed conv with reference option
         """
         tests = self._get_conv_transpose_test_cases(use_relu=False, is_reference=True)
 
         def _get_keys(prefix, is_dynamic):
+            # [FUNCTION DOC] HELPER: Returns state dict key names for a prefix: weight qscheme,
+            # dtype, and weight scale and zero point when not dynamic.
             all_keys = [prefix + "." + k for k in ["weight_qscheme", "weight_dtype"]]
             if not is_dynamic:
                 all_keys.extend([prefix + "." + k for k in ["weight_scale", "weight_zero_point"]])
@@ -1474,6 +1710,10 @@ class TestQuantizeFx(QuantizationTestCase):
             qr = result_dict["quantized_reference"]
 
             def checkWeightQParams(model):
+                # [FUNCTION DOC] HELPER: Asserts the deconv submodule of the closed-over
+                # reference model has weight qscheme, scale, zero point and a reference class
+                # name. Only the model argument is used to decide whether a deconv attribute
+                # exists.
                 module_name = "deconv"
                 if hasattr(model, module_name):
                     self.assertTrue(hasattr(qr.get_submodule(module_name), "weight_qscheme"))
@@ -1482,6 +1722,8 @@ class TestQuantizeFx(QuantizationTestCase):
                     self.assertTrue("Reference" in qr.get_submodule(module_name)._get_name())
 
             def checkSerDeser(model, is_dynamic):
+                # [FUNCTION DOC] HELPER: Checks deconv state dict keys exist, clears the scale,
+                # reloads the state dict and asserts the scale equals the saved one.
                 module_name = "deconv"
                 if hasattr(model, module_name):
                     # make sure serialization works
@@ -1506,6 +1748,8 @@ class TestQuantizeFx(QuantizationTestCase):
             checkSerDeser(qr, is_dynamic)
 
     def test_conv_transpose_relu_not_reference(self):
+        # [FUNCTION DOC] Quantizes conv-transpose followed by relu without reference; fusion is
+        # unsupported, so a separate relu (module or functional) must remain once.
         """ Test quantizing transposed conv + relu
             Fusion with relu is not supported.
         """
@@ -1529,12 +1773,16 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_conv_transpose_relu_reference(self):
+        # [FUNCTION DOC] Reference-flow variant of the conv-transpose plus relu test: relu stays
+        # unfused; also checks weight qparams, deep copy and state dict round trip.
         """ Test quantizing transposed conv with reference option
             Fusion with relu is not supported.
         """
         tests = self._get_conv_transpose_test_cases(use_relu=True, is_reference=True)
 
         def _get_keys(prefix, is_dynamic):
+            # [FUNCTION DOC] HELPER: Returns state dict key names for a prefix: weight qscheme,
+            # dtype, and weight scale and zero point when not dynamic.
             all_keys = [prefix + "." + k for k in ["weight_qscheme", "weight_dtype"]]
             if not is_dynamic:
                 all_keys.extend([prefix + "." + k for k in ["weight_scale", "weight_zero_point"]])
@@ -1559,6 +1807,9 @@ class TestQuantizeFx(QuantizationTestCase):
             qr = result_dict["quantized_reference"]
 
             def checkWeightQParams(model):
+                # [FUNCTION DOC] HELPER: Asserts the deconv submodule of the closed-over
+                # reference model has weight qscheme, scale, zero point and a reference class
+                # name.
                 module_name = "deconv"
                 if hasattr(model, module_name):
                     self.assertTrue(hasattr(qr.get_submodule(module_name), "weight_qscheme"))
@@ -1567,6 +1818,8 @@ class TestQuantizeFx(QuantizationTestCase):
                     self.assertTrue("Reference" in qr.get_submodule(module_name)._get_name())
 
             def checkSerDeser(model, is_dynamic):
+                # [FUNCTION DOC] HELPER: Checks deconv state dict keys exist, clears the scale,
+                # reloads the state dict and asserts the scale equals the saved one.
                 module_name = "deconv"
                 if hasattr(model, module_name):
                     # make sure serialization works
@@ -1592,15 +1845,21 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_dynamic_quant_weight_observer(self):
+        # [FUNCTION DOC] Checks that for dynamic quantization the weight observer is run during
+        # conversion to reference: the stored scale and zero point of a linear weight match
+        # those of a freshly run weight observer.
         ''' Test that weight observer is run in convert step
         '''
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Functional linear model holding a weight parameter.
             def __init__(self, weight):
+                # [FUNCTION DOC] HELPER: Wraps the weight as a Parameter.
                 super().__init__()
                 self.weight = torch.nn.Parameter(weight)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the functional linear with the stored weight.
                 return F.linear(x, self.weight)
 
         m = M(torch.rand(1, 1)).eval()
@@ -1617,6 +1876,10 @@ class TestQuantizeFx(QuantizationTestCase):
         self.assertEqual(qparams, ref_qparams)
 
     def test_conv_bn_relu(self):
+        # [FUNCTION DOC] Checks fusion and quantization of conv-bn and conv-bn-relu for 1d/2d/3d
+        # with static and QAT quant types: the expected quantized conv (or conv-relu) module
+        # appears and the result equals an eager-mode pipeline (fuse, prepare, calibrate,
+        # convert) output.
         """ Tests fusion and quantization for "Conv - Bn" and "Conv - Bn - ReLU"
         """
         convs = {
@@ -1641,7 +1904,11 @@ class TestQuantizeFx(QuantizationTestCase):
         }
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Quant stub, conv, bn, optional relu (identity otherwise),
+            # dequant stub; conv and bn classes are chosen by dimension.
             def __init__(self, dim, has_relu):
+                # [FUNCTION DOC] HELPER: Builds the dimension-specific conv and bn, relu or
+                # identity and the quant/dequant stubs.
                 super().__init__()
                 self.conv = convs[dim](3, 3, 3)
                 self.bn = bns[dim](3)
@@ -1651,6 +1918,8 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.dequant = DeQuantStub()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Quantize, conv, bn, optional relu, dequantize; returns
+                # the result.
                 x = self.quant(x)
                 x = self.conv(x)
                 x = self.bn(x)
@@ -1704,8 +1973,12 @@ class TestQuantizeFx(QuantizationTestCase):
             self.assertEqual(result, result_eager)
 
     def test_linear_bn(self):
+        # [FUNCTION DOC] Checks linear-bn quantization for static and QAT types yields a
+        # quantized Linear and matches the eager-mode fused pipeline output.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Quant stub, linear, bn, dequant stub.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates linear, bn and stubs.
                 super().__init__()
                 self.linear = nn.Linear(4, 4)
                 self.bn = nn.BatchNorm1d(4)
@@ -1713,6 +1986,7 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.dequant = DeQuantStub()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs quant, linear, bn, dequant in order.
                 x = self.quant(x)
                 x = self.linear(x)
                 x = self.bn(x)
@@ -1749,24 +2023,35 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_dynamic_quant_fp16(self):
+        # [FUNCTION DOC] Checks fp16 dynamic quantization under the fbgemm engine for a
+        # functional linear and a linear module, both reference and non-reference converts,
+        # expecting no weight prepack node. Skipped without FBGEMM.
         with override_quantized_engine('fbgemm'):
             class Linear(torch.nn.Module):
+                # [CLASS DOC] HELPER: Functional linear model with a weight parameter.
                 def __init__(self, weight):
+                    # [FUNCTION DOC] HELPER: Wraps the weight as a Parameter.
                     super().__init__()
                     self.weight = torch.nn.Parameter(weight)
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies the functional linear with the stored
+                    # weight.
                     return F.linear(x, self.weight)
 
             linear_input = torch.rand(8, 5)
             linear_weight = torch.rand(10, 5)
 
             class LinearModule(torch.nn.Module):
+                # [CLASS DOC] HELPER: Wrapper around a Linear module with 5 inputs and 10
+                # outputs.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates the linear layer.
                     super().__init__()
                     self.linear = torch.nn.Linear(5, 10)
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies the linear layer.
                     return self.linear(x)
 
             linear_module_input = torch.rand(8, 5)
@@ -1798,18 +2083,24 @@ class TestQuantizeFx(QuantizationTestCase):
     @unittest.skipIf(not TEST_CUDA, "CUDA unavailable")
     @override_qengines
     def test_qat_prepare_device_affinity(self):
+        # [FUNCTION DOC] Checks prepare_qat_fx keeps all parameters and buffers on the model's
+        # original CUDA device and that the prepared model runs on CUDA. Skipped without CUDA
+        # and multi-GPU; runs for each quantization engine.
         """
         Tests that FX QAT prepare pass respects device affinity
         """
         class Model(nn.Module):
+            # [CLASS DOC] HELPER: Conv, bn, relu model.
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates conv, bn and relu.
                 super().__init__()
                 self.conv = nn.Conv2d(1, 1, 1)
                 self.bn = nn.BatchNorm2d(1)
                 self.relu = nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv, bn, relu in order.
                 x = self.conv(x)
                 x = self.bn(x)
                 x = self.relu(x)
@@ -1837,14 +2128,22 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_dict_output(self):
+        # [FUNCTION DOC] Checks prepare and convert work for a model taking and returning
+        # dictionaries (the conv is applied to the input entry and returned under an output
+        # key). Skipped without FBGEMM.
         """ Make sure quantization runs for models with dictionary output
         """
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv model reading a dictionary input and returning a
+            # dictionary.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(1, 1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the conv to the input entry and returns it in a
+                # mapping.
                 return {"output": self.conv(x["input"])}
 
         example_inputs = ({"input": torch.randn(1, 1, 1, 1)},)
@@ -1857,14 +2156,23 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @override_qengines
     def test_attention(self):
+        # [FUNCTION DOC] Regression test that quantization runs on an attention-like corner
+        # case: conv then chunk, reshape, a size assertion and matrix multiply. Only the conv is
+        # quantized; the test checks prepare, run, convert, run succeed.
         """ Make sure quantization runs for a corner case in attention module
         """
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv followed by chunk into three parts, reshapes, an
+            # assertion that the key length is one, a matrix product and a combination of them.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(1, 1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs the conv, splits into q, k, v, reshapes them,
+                # asserts the key has size one, and returns q times k plus the product of k and
+                # v.
                 x = self.conv(x)
                 q, k, v = x.chunk(3, dim=0)
                 q = q.contiguous().view(-1, 1).transpose(0, 1)
@@ -1897,35 +2205,50 @@ class TestQuantizeFx(QuantizationTestCase):
             standalone_prepare_count_check,
             convert_count_check,
             standalone_convert_count_check):
+        # [FUNCTION DOC] HELPER: Shared implementation for standalone module tests. For both the
+        # by-name and by-class configurations it prepares and converts a model with a standalone
+        # submodule, checks observer/quant node counts for the parent and the standalone module,
+        # and compares the output with a reference model that has the same weights but no
+        # standalone module.
         """ Test standalone module with different quantized input/quantized output
         configurations
         """
         class StandaloneModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Single-conv module used as the standalone submodule.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(1, 1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the conv.
                 return self.conv(x)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv followed by the standalone module.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv and the standalone submodule.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(1, 1, 1)
                 self.standalone = StandaloneModule()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the conv, then the standalone module.
                 x = self.conv(x)
                 x = self.standalone(x)
                 return x
 
         class RefM(torch.nn.Module):
+            # [CLASS DOC] HELPER: Two plain convs, the reference for the model with a standalone
+            # part.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the two convs.
                 super().__init__()
                 self.conv1 = torch.nn.Conv2d(1, 1, 1)
                 self.conv2 = torch.nn.Conv2d(1, 1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the two convs in sequence.
                 x = self.conv1(x)
                 x = self.conv2(x)
                 return x
@@ -1983,6 +2306,9 @@ class TestQuantizeFx(QuantizationTestCase):
             self.assertEqual(res, ref_res)
 
     def test_standalone_module_float_interface(self):
+        # [FUNCTION DOC] Runs the standalone module check with a float interface (no quantized
+        # input or output indexes); expects observers on the parent and the standalone module as
+        # specified in the count dictionaries.
         float_interface_config = {
             "input_quantized_idxs": [],  # float input
             "output_quantized_idxs": [],  # float output
@@ -2017,6 +2343,10 @@ class TestQuantizeFx(QuantizationTestCase):
             standalone_convert_count_check)
 
     def test_standalone_module_quantized_interface(self):
+        # [FUNCTION DOC] Runs the standalone module check with a quantized interface (quantized
+        # input and output index zero). The parent observes the first conv's input and output,
+        # the standalone module has one observer; after convert the quantize and dequantize
+        # steps live in the parent and not the standalone.
         quantized_interface_config = {
             "input_quantized_idxs": [0],  # quantized input
             "output_quantized_idxs": [0],  # quantized output
@@ -2054,13 +2384,18 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_qconfig_none(self):
+        # [FUNCTION DOC] Checks a module_name entry mapped to no qconfig disables quantization
+        # of that conv: the first conv becomes quantized, the second stays float.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Two sequential 1x1 convs.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates conv1 and conv2.
                 super().__init__()
                 self.conv1 = nn.Conv2d(1, 1, 1)
                 self.conv2 = nn.Conv2d(1, 1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv1 then conv2.
                 x = self.conv1(x)
                 x = self.conv2(x)
                 return x
@@ -2083,13 +2418,18 @@ class TestQuantizeFx(QuantizationTestCase):
         self.checkGraphModuleNodes(m, expected_node_list=node_list)
 
     def test_qconfig_module_type(self):
+        # [FUNCTION DOC] Checks an object_type qconfig for Conv2d quantizes the conv but leaves
+        # the Linear in float.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv, reshape to a single row, then Linear.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv and the linear.
                 super().__init__()
                 self.conv = nn.Conv2d(1, 1, 1)
                 self.linear = nn.Linear(9, 3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv, reshapes to one row, applies linear.
                 x = self.conv(x)
                 x = x.reshape((1, -1))
                 x = self.linear(x)
@@ -2112,20 +2452,28 @@ class TestQuantizeFx(QuantizationTestCase):
         self.checkGraphModuleNodes(m, expected_node_list=node_list)
 
     def test_qconfig_qat_module_type(self):
+        # [FUNCTION DOC] Checks QAT flow with object_type qconfigs for Linear and ReLU on a
+        # model containing a Linear-ReLU Sequential: after convert, a quantized LinearReLU
+        # followed by a quantized Linear appears.
         class LinearRelu(nn.Sequential):
+            # [CLASS DOC] HELPER: Sequential of a 5x5 Linear and ReLU.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Builds the Sequential of Linear and ReLU.
                 super().__init__(
                     nn.Linear(5, 5),
                     nn.ReLU(),
                 )
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: A LinearRelu submodule followed by a Linear.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates both submodules.
                 super().__init__()
                 self.lin_relu = LinearRelu()
                 self.linear = nn.Linear(5, 5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies lin_relu, then linear.
                 x = self.lin_relu(x)
                 x = self.linear(x)
                 return x
@@ -2153,8 +2501,12 @@ class TestQuantizeFx(QuantizationTestCase):
         self.checkGraphModuleNodes(m, expected_node_list=node_list)
 
     def test_qconfig_function(self):
+        # [FUNCTION DOC] Checks an object_type qconfig keyed on the add operator function
+        # quantizes the add into the quantized add op.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Adds two inputs.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the sum of the two inputs.
                 return x + y
 
         m = M().eval()
@@ -2174,13 +2526,20 @@ class TestQuantizeFx(QuantizationTestCase):
         self.checkGraphModuleNodes(m, expected_node_list=node_list)
 
     def test_qconfig_module_name_regex(self):
+        # [FUNCTION DOC] Checks a module_name_regex qconfig matching both convs quantizes both
+        # into quantized Conv2d modules.
+        # KNOWN ISSUE: a comment inside the test says only the first conv is quantized, but the
+        # expected node list shows both convs quantized.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Two sequential convs.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates conv1 and conv2.
                 super().__init__()
                 self.conv1 = nn.Conv2d(1, 1, 1)
                 self.conv2 = nn.Conv2d(1, 1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv1 then conv2.
                 x = self.conv1(x)
                 x = self.conv2(x)
                 return x
@@ -2202,9 +2561,16 @@ class TestQuantizeFx(QuantizationTestCase):
         self.checkGraphModuleNodes(m, expected_node_list=node_list)
 
     def test_qconfig_precedence(self):
+        # [FUNCTION DOC] For each supported device checks qconfig precedence on prepared module
+        # attributes: global applies to the linear, object_type to conv, regex to module_conv1
+        # and module_name to module_conv2 (more specific wins). Compares the activation and
+        # weight observer constructors.
         for device in get_supported_device_types():
             class M(torch.nn.Module):
+                # [CLASS DOC] HELPER: Linear, plain conv and two named convs applied in
+                # sequence.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates the linear and three convs.
                     super().__init__()
                     self.linear = nn.Linear(1, 1)
                     self.conv = nn.Conv2d(1, 1, 1)
@@ -2212,6 +2578,8 @@ class TestQuantizeFx(QuantizationTestCase):
                     self.module_conv2 = nn.Conv2d(1, 1, 1)
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies linear, conv, module_conv1, module_conv2 in
+                    # order.
                     # global
                     x = self.linear(x)
                     # global + object_type --> object_type
@@ -2244,13 +2612,21 @@ class TestQuantizeFx(QuantizationTestCase):
             self.assertEqual(m_prep.module_conv2.qconfig.weight.p.func, module_name_qconfig.weight.p.func)
 
     def test_qconfig_module_name_object_type_order(self):
+        # [FUNCTION DOC] Checks module_name_object_type_order qconfigs select the nth occurrence
+        # of an object type (Linear or add) within nested modules by qualified name, using a
+        # three-level nested model, and verifies the resulting node sequence. Then checks a
+        # function order entry mapped to no qconfig overrides the global qconfig for the second
+        # occurrence.
         class M1(torch.nn.Module):
+            # [CLASS DOC] HELPER: Two linears followed by two adds.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates fc1 and fc2.
                 super().__init__()
                 self.fc1 = nn.Linear(1, 1)
                 self.fc2 = nn.Linear(1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: fc1, fc2, then add of the value to itself twice.
                 x = self.fc1(x)
                 x = self.fc2(x)
                 x = torch.add(x, x)
@@ -2258,13 +2634,16 @@ class TestQuantizeFx(QuantizationTestCase):
                 return x
 
         class M2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Two linears, two adds, then the nested M1.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates fc1, fc2 and the nested M1.
                 super().__init__()
                 self.fc1 = nn.Linear(1, 1)
                 self.fc2 = nn.Linear(1, 1)
                 self.m1 = M1()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: fc1, fc2, two adds, then m1.
                 x = self.fc1(x)
                 x = self.fc2(x)
                 x = torch.add(x, x)
@@ -2273,13 +2652,16 @@ class TestQuantizeFx(QuantizationTestCase):
                 return x
 
         class M3(torch.nn.Module):
+            # [CLASS DOC] HELPER: Two linears, two adds, then the nested M2.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates fc1, fc2 and the nested M2.
                 super().__init__()
                 self.fc1 = nn.Linear(1, 1)
                 self.fc2 = nn.Linear(1, 1)
                 self.m2 = M2()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: fc1, fc2, two adds, then m2.
                 x = self.fc1(x)
                 x = self.fc2(x)
                 x = torch.add(x, x)
@@ -2336,12 +2718,15 @@ class TestQuantizeFx(QuantizationTestCase):
 
         # test that function order overrides global qconfig
         class M4(torch.nn.Module):
+            # [CLASS DOC] HELPER: Same layout as M1: two linears followed by two adds.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates fc1 and fc2.
                 super().__init__()
                 self.fc1 = nn.Linear(1, 1)
                 self.fc2 = nn.Linear(1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: fc1, fc2, then two adds of the value to itself.
                 x = self.fc1(x)
                 x = self.fc2(x)
                 x = torch.add(x, x)
@@ -2377,36 +2762,48 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @override_qengines
     def test_qconfig_dict_with_fused_modules(self):
+        # [FUNCTION DOC] Regression test that prepare_fx does not crash on a default qconfig
+        # mapping for fused Linear-ReLU, Conv-ReLU and Conv-BN-ReLU models with module,
+        # functional and torch-level relu variants. Runs for each engine.
         class LinearReLUModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Linear followed by a caller-supplied relu callable.
             def __init__(self, relu):
+                # [FUNCTION DOC] HELPER: Creates the linear and stores the relu.
                 super().__init__()
                 self.linear = torch.nn.Linear(3, 3)
                 self.relu = relu
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies linear then the relu.
                 x = self.linear(x)
                 x = self.relu(x)
                 return x
 
         class ConvReLUModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: 1d conv followed by a caller-supplied relu callable.
             def __init__(self, relu):
+                # [FUNCTION DOC] HELPER: Creates the conv and stores the relu.
                 super().__init__()
                 self.conv = torch.nn.Conv1d(3, 3, 3)
                 self.relu = relu
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv then the relu.
                 x = self.conv(x)
                 x = self.relu(x)
                 return x
 
         class ConvBnReLUModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: 1d conv, batch norm, then a caller-supplied relu callable.
             def __init__(self, relu):
+                # [FUNCTION DOC] HELPER: Creates conv, bn and stores the relu.
                 super().__init__()
                 self.conv = torch.nn.Conv1d(3, 3, 3)
                 self.bn = torch.nn.BatchNorm1d(3)
                 self.relu = relu
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv, bn, then the relu.
                 x = self.conv(x)
                 x = self.bn(x)
                 x = self.relu(x)
@@ -2422,6 +2819,8 @@ class TestQuantizeFx(QuantizationTestCase):
 
     # TODO: move QConfigMapping tests to test/quantization/core
     def test_qconfig_mapping_set_global(self):
+        # [FUNCTION DOC] Checks QConfigMapping starts with no global qconfig and set_global
+        # stores it.
         qconfig = get_default_qconfig()
         qconfig_mapping = QConfigMapping()
         self.assertEqual(qconfig_mapping.global_qconfig, None)
@@ -2429,6 +2828,9 @@ class TestQuantizeFx(QuantizationTestCase):
         self.assertEqual(qconfig_mapping.global_qconfig, qconfig)
 
     def test_qconfig_mapping_set_object_type(self):
+        # [FUNCTION DOC] Checks QConfigMapping object type entries: insertion, overriding an
+        # existing key, and lookup through the object type helper (unknown type yields no
+        # qconfig).
         qconfig1 = get_default_qconfig()
         qconfig2 = get_default_qconfig()
         qconfig3 = get_default_qconfig()
@@ -2451,6 +2853,9 @@ class TestQuantizeFx(QuantizationTestCase):
         self.assertEqual(_get_object_type_qconfig(qconfig_mapping, "nomatch", None), None)
 
     def test_qconfig_mapping_set_module_name_regex(self):
+        # [FUNCTION DOC] Checks module name regex entries: insertion, override, and lookups
+        # where a later matching regex wins over earlier ones depending on the match; an
+        # unmatched name gives no qconfig.
         qconfig1 = get_default_qconfig()
         qconfig2 = get_default_qconfig()
         qconfig3 = get_default_qconfig()
@@ -2475,6 +2880,8 @@ class TestQuantizeFx(QuantizationTestCase):
         self.assertEqual(_get_module_name_regex_qconfig(qconfig_mapping, "nomatch", None), None)
 
     def test_qconfig_mapping_set_module_name(self):
+        # [FUNCTION DOC] Checks module name entries: insertion, override of an existing name,
+        # and lookups with a missing name giving no qconfig.
         qconfig1 = get_default_qconfig()
         qconfig2 = get_default_qconfig()
         qconfig3 = get_default_qconfig()
@@ -2497,6 +2904,9 @@ class TestQuantizeFx(QuantizationTestCase):
         self.assertEqual(_get_module_name_qconfig(qconfig_mapping, "nomatch", None), None)
 
     def test_qconfig_mapping_set_module_name_object_type_order(self):
+        # [FUNCTION DOC] Checks module name plus object type plus order entries: insertion order
+        # is preserved, overriding keeps the key position, and the adjust helper finds exact
+        # matches and gives none for unknown names, indexes or types.
         qconfig1 = get_default_qconfig()
         qconfig2 = get_default_qconfig()
         qconfig3 = get_default_qconfig()
@@ -2538,6 +2948,11 @@ class TestQuantizeFx(QuantizationTestCase):
                          qconfig_mapping, "mod2", torch.nn.Conv2d, 1, None), None)
 
     def _get_qconfig_dict_for_qconfig_mapping_test(self, global_qconfig, qconfig1, qconfig2):
+        # [FUNCTION DOC] HELPER: Builds a qconfig dictionary with global, object type, module
+        # name regex, module name and name-object-type-order entries for the QConfigMapping dict
+        # conversion tests.
+        # KNOWN ISSUE: the statements after the return are unreachable dead code (an assertion
+        # block referring to an undefined model variable, silenced by noqa); it never executes.
         """
         Return a dummy qconfig_dict to test QConfigMapping's to_dict and from_dict methods.
         """
@@ -2569,6 +2984,8 @@ class TestQuantizeFx(QuantizationTestCase):
         self.assertTrue('But found \'object_typo\' instead.' in str(context.exception))
 
     def test_qconfig_mapping_from_dict(self):
+        # [FUNCTION DOC] Checks QConfigMapping from_dict builds all five internal tables in
+        # order and ignores an unrecognized dictionary key.
         global_qconfig = QConfig(123, "global")
         qconfig1 = QConfig(1, "one")
         qconfig2 = QConfig(2, "two")
@@ -2594,6 +3011,8 @@ class TestQuantizeFx(QuantizationTestCase):
         }))
 
     def test_qconfig_mapping_to_dict(self):
+        # [FUNCTION DOC] Checks QConfigMapping to_dict output equals the dictionary built by the
+        # helper for a mapping assembled through chained setters.
         global_qconfig = QConfig(123, "global")
         qconfig1 = QConfig(1, "one")
         qconfig2 = QConfig(2, "two")
@@ -2610,15 +3029,22 @@ class TestQuantizeFx(QuantizationTestCase):
         self.assertEqual(qconfig_mapping.to_dict(), qconfig_dict)
 
     def test_qconfig_mapping_repr(self):
+        # [FUNCTION DOC] Checks that the default mapping's representation is a string.
         self.assertTrue(isinstance(get_default_qconfig_mapping().__repr__(), str))
 
     def test_default_qconfig_mapping_override_global(self):
+        # [FUNCTION DOC] Checks overriding the global qconfig of the default mapping: after
+        # prepare_fx both observers on the conv are MinMaxObserver instances, while the old
+        # default global activation was a HistogramObserver.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Single conv model.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(1, 1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the conv.
                 return self.conv(x)
 
         m = M().eval()
@@ -2640,24 +3066,34 @@ class TestQuantizeFx(QuantizationTestCase):
     # Dummy classes for PrepareCustomConfig testing
 
     class _DummyStandaloneModule:
+        # [CLASS DOC] HELPER: Empty dummy class used as a standalone module key in custom config
+        # tests.
         pass
 
     class _DummyFloatModule:
+        # [CLASS DOC] HELPER: Empty dummy class standing in for a float module in custom config
+        # tests.
         pass
 
     class _DummyObservedModule:
+        # [CLASS DOC] HELPER: Empty dummy class standing in for an observed module.
         pass
 
     class _DummyQuantizedModule:
+        # [CLASS DOC] HELPER: Empty dummy class standing in for a quantized module.
         pass
 
     class _DummyNonTraceableModule1:
+        # [CLASS DOC] HELPER: Empty dummy class used as a non-traceable module class.
         pass
 
     class _DummyNonTraceableModule2:
+        # [CLASS DOC] HELPER: Second empty dummy class used as a non-traceable module class.
         pass
 
     def test_prepare_custom_config_set_standalone_module_name(self):
+        # [FUNCTION DOC] Checks PrepareCustomConfig set_standalone_module_name stores a
+        # StandaloneModuleConfigEntry under the module name.
         qconfig_mapping = QConfigMapping()
         example_inputs = (torch.randn(3),)
         child_prepare_custom_config = PrepareCustomConfig()
@@ -2672,6 +3108,8 @@ class TestQuantizeFx(QuantizationTestCase):
         self.assertEqual(prepare_custom_config.standalone_module_names["module1"], config_entry)
 
     def test_prepare_custom_config_set_standalone_module_class(self):
+        # [FUNCTION DOC] Checks PrepareCustomConfig set_standalone_module_class stores a config
+        # entry keyed by the class.
         qconfig_mapping = QConfigMapping()
         example_inputs = (torch.randn(3),)
         child_prepare_custom_config = PrepareCustomConfig()
@@ -2687,6 +3125,8 @@ class TestQuantizeFx(QuantizationTestCase):
         self.assertEqual(prepare_custom_config.standalone_module_classes[self._DummyStandaloneModule], config_entry)
 
     def test_prepare_custom_config_set_float_to_observed_mapping(self):
+        # [FUNCTION DOC] Checks set_float_to_observed_mapping stores the float to observed class
+        # mapping under the given quantization type.
         prepare_custom_config = PrepareCustomConfig()
         self.assertEqual(len(prepare_custom_config.float_to_observed_mapping), 0)
         prepare_custom_config.set_float_to_observed_mapping(self._DummyFloatModule, self._DummyObservedModule, QuantType.STATIC)
@@ -2698,12 +3138,14 @@ class TestQuantizeFx(QuantizationTestCase):
                          self._DummyObservedModule)
 
     def test_prepare_custom_config_set_non_traceable_module_names(self):
+        # [FUNCTION DOC] Checks set_non_traceable_module_names stores the given name list.
         prepare_custom_config = PrepareCustomConfig()
         self.assertEqual(len(prepare_custom_config.non_traceable_module_names), 0)
         prepare_custom_config.set_non_traceable_module_names(["module1", "module2"])
         self.assertEqual(prepare_custom_config.non_traceable_module_names, ["module1", "module2"])
 
     def test_prepare_custom_config_set_non_traceable_module_classes(self):
+        # [FUNCTION DOC] Checks set_non_traceable_module_classes stores the given class list.
         prepare_custom_config = PrepareCustomConfig()
         self.assertEqual(len(prepare_custom_config.non_traceable_module_classes), 0)
         prepare_custom_config.set_non_traceable_module_classes([self._DummyNonTraceableModule1, self._DummyNonTraceableModule2])
@@ -2711,24 +3153,32 @@ class TestQuantizeFx(QuantizationTestCase):
                          [self._DummyNonTraceableModule1, self._DummyNonTraceableModule2])
 
     def test_prepare_custom_config_set_input_quantized_indexes(self):
+        # [FUNCTION DOC] Checks set_input_quantized_indexes stores the given index list.
         prepare_custom_config = PrepareCustomConfig()
         self.assertEqual(len(prepare_custom_config.input_quantized_indexes), 0)
         prepare_custom_config.set_input_quantized_indexes([0, 1])
         self.assertEqual(prepare_custom_config.input_quantized_indexes, [0, 1])
 
     def test_prepare_custom_config_set_output_quantized_indexes(self):
+        # [FUNCTION DOC] Checks set_output_quantized_indexes stores the given index list.
         prepare_custom_config = PrepareCustomConfig()
         self.assertEqual(len(prepare_custom_config.output_quantized_indexes), 0)
         prepare_custom_config.set_output_quantized_indexes([0, 1])
         self.assertEqual(prepare_custom_config.output_quantized_indexes, [0, 1])
 
     def test_prepare_custom_config_set_preserved_attributes(self):
+        # [FUNCTION DOC] Checks set_preserved_attributes on a prepare config stores the names.
         prepare_custom_config = PrepareCustomConfig()
         self.assertEqual(len(prepare_custom_config.preserved_attributes), 0)
         prepare_custom_config.set_preserved_attributes(["attr1", "attr2"])
         self.assertEqual(prepare_custom_config.preserved_attributes, ["attr1", "attr2"])
 
     def _get_dummy_prepare_custom_config_dict(self):
+        # [FUNCTION DOC] HELPER: Builds a dictionary with every prepare custom config key:
+        # standalone module by name and by class (each with qconfig mapping, example inputs,
+        # child config and backend config), float to observed mapping, non traceable names and
+        # classes, quantized input and output indexes and preserved attributes. Used by the
+        # from_dict and to_dict tests.
         """
         Return a dummy prepare_custom_config_dict to test PrepareCustomConfig's to_dict and from_dict methods.
         """
@@ -2760,6 +3210,9 @@ class TestQuantizeFx(QuantizationTestCase):
         }
 
     def test_prepare_custom_config_from_dict(self):
+        # [FUNCTION DOC] Checks PrepareCustomConfig from_dict populates standalone module
+        # tables, the float to observed mapping (keyed by the static quant type) and the
+        # list-valued fields from the helper dictionary.
         prepare_custom_config_dict = self._get_dummy_prepare_custom_config_dict()
         (sm_name, qm1, ei1, pcc1, bcd1) = prepare_custom_config_dict[STANDALONE_MODULE_NAME_DICT_KEY][0]
         (sm_class, qm2, ei2, pcc2, bcd2) = prepare_custom_config_dict[STANDALONE_MODULE_CLASS_DICT_KEY][0]
@@ -2792,6 +3245,9 @@ class TestQuantizeFx(QuantizationTestCase):
         self.assertEqual(prepare_custom_config.preserved_attributes, ["attr1", "attr2"])
 
     def test_prepare_custom_config_to_dict(self):
+        # [FUNCTION DOC] Checks PrepareCustomConfig to_dict equals the helper dictionary for a
+        # config built by chained setters, after converting nested qconfig mappings and child
+        # configs in the expected dictionary to plain dictionaries.
         prepare_custom_config_dict = self._get_dummy_prepare_custom_config_dict()
         (sm_name, qm1, ei1, pcc1, bcd1) = prepare_custom_config_dict[STANDALONE_MODULE_NAME_DICT_KEY][0]
         (sm_class, qm2, ei2, pcc2, bcd2) = prepare_custom_config_dict[STANDALONE_MODULE_CLASS_DICT_KEY][0]
@@ -2810,6 +3266,8 @@ class TestQuantizeFx(QuantizationTestCase):
         self.assertEqual(prepare_custom_config.to_dict(), prepare_custom_config_dict)
 
     def test_convert_custom_config_set_observed_to_quantized_mapping(self):
+        # [FUNCTION DOC] Checks ConvertCustomConfig set_observed_to_quantized_mapping records
+        # the observed to quantized class mapping under the static quant type.
         convert_custom_config = ConvertCustomConfig()
         self.assertEqual(len(convert_custom_config.observed_to_quantized_mapping), 0)
         convert_custom_config.set_observed_to_quantized_mapping(
@@ -2821,12 +3279,15 @@ class TestQuantizeFx(QuantizationTestCase):
                          self._DummyQuantizedModule)
 
     def test_convert_custom_config_set_preserved_attributes(self):
+        # [FUNCTION DOC] Checks ConvertCustomConfig set_preserved_attributes stores the names.
         convert_custom_config = ConvertCustomConfig()
         self.assertEqual(len(convert_custom_config.preserved_attributes), 0)
         convert_custom_config.set_preserved_attributes(["attr1", "attr2"])
         self.assertEqual(convert_custom_config.preserved_attributes, ["attr1", "attr2"])
 
     def _get_dummy_convert_custom_config_dict(self):
+        # [FUNCTION DOC] HELPER: Builds a dictionary with the observed to quantized mapping
+        # (static) and preserved attributes for the ConvertCustomConfig dict conversion tests.
         """
         Return a dummy convert_custom_config_dict to test ConvertCustomConfig's to_dict and from_dict methods.
         """
@@ -2840,6 +3301,8 @@ class TestQuantizeFx(QuantizationTestCase):
         }
 
     def test_convert_custom_config_from_dict(self):
+        # [FUNCTION DOC] Checks ConvertCustomConfig from_dict restores the mapping and preserved
+        # attributes from the helper dictionary.
         convert_custom_config_dict = self._get_dummy_convert_custom_config_dict()
         convert_custom_config = ConvertCustomConfig.from_dict(convert_custom_config_dict)
         self.assertEqual(len(convert_custom_config.observed_to_quantized_mapping), 1)
@@ -2851,34 +3314,44 @@ class TestQuantizeFx(QuantizationTestCase):
         self.assertEqual(convert_custom_config.preserved_attributes, ["attr1", "attr2"])
 
     def test_convert_custom_config_to_dict(self):
+        # [FUNCTION DOC] Checks ConvertCustomConfig to_dict equals the helper dictionary for a
+        # config built by chained setters.
         convert_custom_config = ConvertCustomConfig() \
             .set_observed_to_quantized_mapping(self._DummyObservedModule, self._DummyQuantizedModule) \
             .set_preserved_attributes(["attr1", "attr2"])
         self.assertEqual(convert_custom_config.to_dict(), self._get_dummy_convert_custom_config_dict())
 
     def test_fuse_custom_config_set_preserved_attributes(self):
+        # [FUNCTION DOC] Checks FuseCustomConfig set_preserved_attributes stores the names.
         fuse_custom_config = FuseCustomConfig()
         self.assertEqual(len(fuse_custom_config.preserved_attributes), 0)
         fuse_custom_config.set_preserved_attributes(["attr1", "attr2"])
         self.assertEqual(fuse_custom_config.preserved_attributes, ["attr1", "attr2"])
 
     def test_fuse_custom_config_from_dict(self):
+        # [FUNCTION DOC] Checks FuseCustomConfig from_dict restores preserved attributes.
         fuse_custom_config_dict = {PRESERVED_ATTRIBUTES_DICT_KEY: ["attr1", "attr2"]}
         fuse_custom_config = FuseCustomConfig.from_dict(fuse_custom_config_dict)
         self.assertEqual(fuse_custom_config.preserved_attributes, ["attr1", "attr2"])
 
     def test_fuse_custom_config_to_dict(self):
+        # [FUNCTION DOC] Checks FuseCustomConfig to_dict produces the preserved attributes key.
         fuse_custom_config_dict = {PRESERVED_ATTRIBUTES_DICT_KEY: ["attr1", "attr2"]}
         fuse_custom_config = FuseCustomConfig().set_preserved_attributes(["attr1", "attr2"])
         self.assertEqual(fuse_custom_config.to_dict(), fuse_custom_config_dict)
 
     def test_remove_qconfig(self):
+        # [FUNCTION DOC] Checks that after prepare, run and convert no module in the converted
+        # model retains a qconfig attribute.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Wraps a 1x1 average pool.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the pool layer.
                 super().__init__()
                 self.avg_pool = torch.nn.AvgPool2d(1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the average pool.
                 return self.avg_pool(x)
 
         m = M().eval()
@@ -2893,8 +3366,12 @@ class TestQuantizeFx(QuantizationTestCase):
                              'qconfig is not removed for ' + name)
 
     def test_return_none(self):
+        # [FUNCTION DOC] Checks prepare_fx and convert_fx succeed on a model whose forward
+        # returns nothing.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model whose forward does nothing and returns none.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Does nothing; returns none.
                 pass
 
         m = M().eval()
@@ -2903,14 +3380,21 @@ class TestQuantizeFx(QuantizationTestCase):
         m = convert_fx(m)
 
     def test_default_quant_after_none_qconfig(self):
+        # [FUNCTION DOC] Smoke test that default quantization is inserted correctly after a
+        # module configured with no qconfig (first conv disabled, followed by a transpose and a
+        # second conv). Prepare and convert must not fail.
         """ Make sure default quant is inserted properly"""
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Two convs separated by a transpose; forward returns nothing.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates conv1 and conv2.
                 super().__init__()
                 self.conv1 = torch.nn.Conv2d(1, 1, 1)
                 self.conv2 = torch.nn.Conv2d(1, 1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv1, transposes dims 1 and 2, applies conv2;
+                # no return.
                 x = self.conv1(x)
                 x = x.transpose(1, 2)
                 x = self.conv2(x)
@@ -2926,24 +3410,33 @@ class TestQuantizeFx(QuantizationTestCase):
         m = convert_fx(m)
 
     def test_qconfig_for_call_method(self):
+        # [FUNCTION DOC] Checks qconfig handling around call-method nodes (transpose) with a
+        # submodule disabled or enabled: expected node sequences for two qconfig dictionaries
+        # (sub disabled, or only sub enabled), then runs the model.
         class Sub(torch.nn.Module):
+            # [CLASS DOC] HELPER: Transpose, conv, transpose back.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(1, 1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Transposes dims 2 and 3, applies conv, transposes back.
                 x = x.transpose(2, 3)
                 x = self.conv(x)
                 return x.transpose(2, 3)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv, the Sub module, conv, then a transpose.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates sub and two convs.
                 super().__init__()
                 self.sub = Sub()
                 self.conv1 = torch.nn.Conv2d(1, 1, 1)
                 self.conv2 = torch.nn.Conv2d(1, 1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: conv1, sub, conv2, transposes dims 2 and 3.
                 x = self.conv1(x)
                 x = self.sub(x)
                 x = self.conv2(x)
@@ -2996,17 +3489,25 @@ class TestQuantizeFx(QuantizationTestCase):
             m(*example_inputs)
 
     def test_qconfig_for_call_func(self):
+        # [FUNCTION DOC] Checks qconfig for functional linear calls: with module_name disabling
+        # mods2, the two linears in mods1 are quantized and the last remains the float
+        # functional linear after a dequantize.
         class Linear(torch.nn.Module):
+            # [CLASS DOC] HELPER: Functional linear with constant ones weight and zero bias.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates fixed weight and bias tensors (not parameters).
                 super().__init__()
                 self.w = torch.ones(5, 5)
                 self.b = torch.zeros(5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the functional linear.
                 return torch.nn.functional.linear(x, self.w, self.b)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Sequential of two Linear helpers followed by a third.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates mods1 and mods2.
                 super().__init__()
                 self.mods1 = torch.nn.Sequential(
                     Linear(),
@@ -3015,6 +3516,7 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.mods2 = Linear()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies mods1 then mods2.
                 x = self.mods1(x)
                 x = self.mods2(x)
                 return x
@@ -3037,12 +3539,17 @@ class TestQuantizeFx(QuantizationTestCase):
         m(torch.rand(5, 5))
 
     def test_preserve_attributes(self):
+        # [FUNCTION DOC] Checks the preserved_attributes custom config keeps a custom attribute
+        # on the module through prepare_fx and convert_fx.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Single conv model.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(1, 1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the conv.
                 return self.conv(x)
 
         m = M()
@@ -3059,6 +3566,8 @@ class TestQuantizeFx(QuantizationTestCase):
             prepare_custom_config=prepare_custom_config_dict)
 
         def assertAttrPreserved(m):
+            # [FUNCTION DOC] HELPER: Asserts the module has the preserved attribute equal to
+            # three.
             self.assertTrue(hasattr(m, "preserved_attr"))
             self.assertEqual(m.preserved_attr, 3)
 
@@ -3071,6 +3580,10 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_qat_and_script(self):
+        # [FUNCTION DOC] Checks a QAT-prepared model can be scripted and run, that the scripted
+        # graph has four fake quantize attributes, and that applying the disable and enable
+        # observer/fake-quant helpers toggles the stored enabled flags to zero and back to one.
+        # Skipped without FBGEMM.
         model = LinearModelWithSubmodule().train()
         qengine = torch.backends.quantized.engine
         qconfig_dict = {'': torch.ao.quantization.get_default_qat_qconfig(qengine)}
@@ -3107,6 +3620,9 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_save_observer_state_dict(self):
+        # [FUNCTION DOC] Checks observer state dict save and load: calibrated statistics are
+        # saved with torch.save, loaded (with and without weights-only) into a freshly prepared
+        # model, and the resulting quantized model matches the original.
         orig = LinearModelWithSubmodule().eval()
         model = orig
         qconfig_dict = {'': torch.ao.quantization.get_default_qconfig('fbgemm')}
@@ -3139,24 +3655,38 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_custom_module_class(self):
+        # [FUNCTION DOC] Checks custom module classes with prepare/convert custom configs for
+        # static (8-bit and 16-bit activation) and dynamic quantization: a float custom module
+        # is replaced by an observed one then a quantized one; checks observer counts, node
+        # counts, the final module type and that outputs equal a reference model of two linears
+        # with matching weights.
         class CustomModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Custom float module wrapping one Linear.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear.
                 super().__init__()
                 self.linear = torch.nn.Linear(3, 3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear.
                 return self.linear(x)
 
         class ObservedCustomModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Observed form of the custom module, wrapping the given linear.
             def __init__(self, linear):
+                # [FUNCTION DOC] HELPER: Stores the given linear.
                 super().__init__()
                 self.linear = linear
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear.
                 return self.linear(x)
 
             @classmethod
             def from_float(cls, float_module):
+                # [FUNCTION DOC] HELPER: Builds an observed module from a float custom module
+                # that must have a qconfig (otherwise raises an assertion error); copies the
+                # qconfig.
                 if not hasattr(float_module, 'qconfig'):
                     raise AssertionError(f"float_module missing 'qconfig': {type(float_module)}")
                 observed = cls(float_module.linear)
@@ -3164,15 +3694,23 @@ class TestQuantizeFx(QuantizationTestCase):
                 return observed
 
         class StaticQuantCustomModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Statically quantized custom module wrapping a quantized
+            # linear.
             def __init__(self, linear):
+                # [FUNCTION DOC] HELPER: Stores the given linear.
                 super().__init__()
                 self.linear = linear
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear.
                 return self.linear(x)
 
             @classmethod
             def from_observed(cls, observed_module):
+                # [FUNCTION DOC] HELPER: Builds the quantized module from an observed one, which
+                # must have a qconfig and an activation post process (else raises an assertion
+                # error); shares the observer with the inner linear and converts it to a
+                # quantized Linear.
                 if not hasattr(observed_module, 'qconfig'):
                     raise AssertionError(f"observed_module missing 'qconfig': {type(observed_module)}")
                 if not hasattr(observed_module, 'activation_post_process'):
@@ -3183,15 +3721,21 @@ class TestQuantizeFx(QuantizationTestCase):
                 return quantized
 
         class DynamicQuantCustomModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Dynamically quantized custom module wrapping a dynamic linear.
             def __init__(self, linear):
+                # [FUNCTION DOC] HELPER: Stores the given linear.
                 super().__init__()
                 self.linear = linear
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear.
                 return self.linear(x)
 
             @classmethod
             def from_observed(cls, observed_module):
+                # [FUNCTION DOC] HELPER: Builds the dynamic quantized module from an observed
+                # one, which must have a qconfig (else raises an assertion error); converts the
+                # inner linear to a dynamic quantized Linear.
                 if not hasattr(observed_module, 'qconfig'):
                     raise AssertionError(f"observed_module missing 'qconfig': {type(observed_module)}")
                 observed_module.linear.qconfig = observed_module.qconfig
@@ -3199,23 +3743,29 @@ class TestQuantizeFx(QuantizationTestCase):
                 return quantized
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: A Linear followed by the custom module.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear and the custom module.
                 super().__init__()
                 self.linear = torch.nn.Linear(3, 3)
                 self.custom = CustomModule()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear then the custom module.
                 x = self.linear(x)
                 x = self.custom(x)
                 return x
 
         class RefM(torch.nn.Module):
+            # [CLASS DOC] HELPER: Reference model of two plain Linear layers.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates linear1 and linear2.
                 super().__init__()
                 self.linear1 = torch.nn.Linear(3, 3)
                 self.linear2 = torch.nn.Linear(3, 3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies linear1 then linear2.
                 x = self.linear1(x)
                 x = self.linear2(x)
                 return x
@@ -3310,27 +3860,37 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_custom_module_class_input_has_multiple_users(self):
+        # [FUNCTION DOC] Checks the custom module flow still works when the custom module's
+        # input is also consumed by another node: prepare, convert and run only.
         """ Tests that the flow still works when the input of custom module
         has multiple users
         """
         class CustomModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Custom float module wrapping one Linear.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear.
                 super().__init__()
                 self.linear = torch.nn.Linear(3, 3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear.
                 return self.linear(x)
 
         class ObservedCustomModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Observed form of the custom module.
             def __init__(self, linear):
+                # [FUNCTION DOC] HELPER: Stores the given linear.
                 super().__init__()
                 self.linear = linear
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear.
                 return self.linear(x)
 
             @classmethod
             def from_float(cls, float_module):
+                # [FUNCTION DOC] HELPER: Builds an observed module from a float module that must
+                # have a qconfig (else raises an assertion error) and copies the qconfig.
                 if not hasattr(float_module, 'qconfig'):
                     raise AssertionError(f"float_module missing 'qconfig': {type(float_module)}")
                 observed = cls(float_module.linear)
@@ -3338,15 +3898,22 @@ class TestQuantizeFx(QuantizationTestCase):
                 return observed
 
         class StaticQuantCustomModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Statically quantized custom module wrapping a quantized
+            # linear.
             def __init__(self, linear):
+                # [FUNCTION DOC] HELPER: Stores the given linear.
                 super().__init__()
                 self.linear = linear
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear.
                 return self.linear(x)
 
             @classmethod
             def from_observed(cls, observed_module):
+                # [FUNCTION DOC] HELPER: Builds the quantized module from an observed one with a
+                # qconfig and activation post process (else raises an assertion error); converts
+                # the inner linear to a quantized Linear sharing the observer.
                 if not hasattr(observed_module, 'qconfig'):
                     raise AssertionError(f"observed_module missing 'qconfig': {type(observed_module)}")
                 if not hasattr(observed_module, 'activation_post_process'):
@@ -3357,12 +3924,17 @@ class TestQuantizeFx(QuantizationTestCase):
                 return quantized
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Adds the output of the custom module and a Linear applied to
+            # the same input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear and the custom module.
                 super().__init__()
                 self.linear = torch.nn.Linear(3, 3)
                 self.custom = CustomModule()
 
             def forward(self, x0):
+                # [FUNCTION DOC] HELPER: Runs the custom module and linear on the same input and
+                # sums.
                 x1 = self.custom(x0)
                 x2 = self.linear(x0)
                 return x1 + x2
@@ -3397,27 +3969,37 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_custom_module_class_input_has_duplicate_nodes(self):
+        # [FUNCTION DOC] Checks the custom module flow when the graph calls the same custom
+        # module twice (two nodes sharing a target): prepare, convert and run only.
         """ Tests that the flow still works when the graph has
         multiple nodes with the same custom module target.
         """
         class CustomModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Custom float module wrapping one Linear.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear.
                 super().__init__()
                 self.linear = torch.nn.Linear(3, 3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear.
                 return self.linear(x)
 
         class ObservedCustomModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Observed form of the custom module.
             def __init__(self, linear):
+                # [FUNCTION DOC] HELPER: Stores the given linear.
                 super().__init__()
                 self.linear = linear
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear.
                 return self.linear(x)
 
             @classmethod
             def from_float(cls, float_module):
+                # [FUNCTION DOC] HELPER: Builds an observed module from a float module that must
+                # have a qconfig (else raises an assertion error) and copies the qconfig.
                 if not hasattr(float_module, 'qconfig'):
                     raise AssertionError(f"float_module missing 'qconfig': {type(float_module)}")
                 observed = cls(float_module.linear)
@@ -3425,15 +4007,22 @@ class TestQuantizeFx(QuantizationTestCase):
                 return observed
 
         class StaticQuantCustomModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Statically quantized custom module wrapping a quantized
+            # linear.
             def __init__(self, linear):
+                # [FUNCTION DOC] HELPER: Stores the given linear.
                 super().__init__()
                 self.linear = linear
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear.
                 return self.linear(x)
 
             @classmethod
             def from_observed(cls, observed_module):
+                # [FUNCTION DOC] HELPER: Builds the quantized module from an observed one that
+                # has a qconfig and activation post process (else raises an assertion error);
+                # converts the inner linear to a quantized Linear sharing the observer.
                 if not hasattr(observed_module, 'qconfig'):
                     raise AssertionError(f"observed_module missing 'qconfig': {type(observed_module)}")
                 if not hasattr(observed_module, 'activation_post_process'):
@@ -3444,11 +4033,16 @@ class TestQuantizeFx(QuantizationTestCase):
                 return quantized
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Calls one custom module twice on the same input and sums the
+            # results.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the custom module.
                 super().__init__()
                 self.custom = CustomModule()
 
             def forward(self, x0):
+                # [FUNCTION DOC] HELPER: Applies the custom module twice to the input and adds
+                # the outputs.
                 x1 = self.custom(x0)
                 x2 = self.custom(x0)
                 return x1 + x2
@@ -3483,26 +4077,38 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_non_traceable_module(self):
+        # [FUNCTION DOC] Checks that modules listed as non-traceable by name or by class are
+        # kept as call-module nodes (not traced into) when prepared with example inputs that are
+        # a dictionary. Skipped without FBGEMM.
         class NonTraceable(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that iterates over a dictionary input, prints entries,
+            # and returns the input; not symbolically traceable.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Prints each value in the mapping and returns the input.
                 for k in x:
                     print(x[k])
                 return x
 
         class NonTraceable2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward loops over its input, which is not
+            # traceable because of data-dependent iteration.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Prints each element of the input and returns it.
                 # data dependent control flow is not traceable
                 for i in x:
                     print(i)
                 return x
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Applies the two non-traceable modules in sequence.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the two non-traceable submodules.
                 super().__init__()
                 self.m1 = NonTraceable()
                 self.m2 = NonTraceable2()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies m1 then m2.
                 x = self.m1(x)
                 x = self.m2(x)
                 return x
@@ -3530,16 +4136,21 @@ class TestQuantizeFx(QuantizationTestCase):
         self.checkGraphModuleNodes(m, expected_node_occurrence=node_occurrence)
 
     def test_prepared_model_deepcopy(self):
+        # [FUNCTION DOC] Checks a prepared (calibrated) model can be deep copied and the copy
+        # can be converted without errors, including models with string attributes.
         """Ensures that copy.deepcopy works correctly on a prepared model.
         """
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv model with two plain string attributes.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv and the string attributes.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(1, 1, 1)
                 self._foobar = 'foobar'
                 self.foobar2 = 'foobar2'
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the conv.
                 x = self.conv(x)
                 return x
 
@@ -3556,14 +4167,19 @@ class TestQuantizeFx(QuantizationTestCase):
         quantized = convert_fx(prepared_copy)
 
     def test_quantized_model_type(self):
+        # [FUNCTION DOC] Checks a converted quantized model can be deep copied and have its
+        # state dict loaded into a newly converted model, with identical outputs.
         """ Test state_dict and deepcopy works properly in the quantized model
         """
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Single linear model.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear.
                 super().__init__()
                 self.linear = torch.nn.Linear(5, 5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear.
                 return self.linear(x)
 
         example_inputs = (torch.rand(8, 5),)
@@ -3583,16 +4199,21 @@ class TestQuantizeFx(QuantizationTestCase):
         self.assertEqual(m_new(*example_inputs), m(*example_inputs))
 
     def test_dequantize(self):
+        # [FUNCTION DOC] Checks that for static quant types a dequantize node is placed between
+        # a quantized conv and the following GELU (which is not quantizable).
         r""" Test to make sure dequantize node are placed before
         non-quantizable node
         """
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv followed by GELU.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv and GELU.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(1, 1, 1)
                 self.act = torch.nn.GELU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv then GELU.
                 x = self.conv(x)
                 return self.act(x)
 
@@ -3607,8 +4228,12 @@ class TestQuantizeFx(QuantizationTestCase):
                 M().eval(), (data,), quant_type, expected_node_list=node_list)
 
     def test_sequential(self):
+        # [FUNCTION DOC] Checks a Sequential of two convs is quantized into two quantized conv
+        # modules for static quant types.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model with a Sequential of two convs.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the Sequential.
                 super().__init__()
                 self.convs = torch.nn.Sequential(
                     torch.nn.Conv2d(1, 1, 1),
@@ -3616,6 +4241,7 @@ class TestQuantizeFx(QuantizationTestCase):
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the Sequential.
                 x = self.convs(x)
                 return x
 
@@ -3631,16 +4257,22 @@ class TestQuantizeFx(QuantizationTestCase):
     def _test_quantized_inputs_outputs(
             self, prepare_custom_config_dict, prepare_count_check,
             convert_count_check):
+        # [FUNCTION DOC] HELPER: Shared implementation for quantized-input/output tests:
+        # prepares a two-conv model with the given prepare custom config, checks observer
+        # counts, calibrates, converts and checks quantize and dequantize counts.
         """
         Test the option to have inputs and outputs of the graph quantized
         """
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Two sequential convs.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates conv1 and conv2.
                 super().__init__()
                 self.conv1 = torch.nn.Conv2d(1, 1, 1)
                 self.conv2 = torch.nn.Conv2d(1, 1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv1 then conv2.
                 x = self.conv1(x)
                 x = self.conv2(x)
                 return x
@@ -3660,6 +4292,8 @@ class TestQuantizeFx(QuantizationTestCase):
         self.checkGraphModuleNodes(mq, expected_node_occurrence=convert_count_check)
 
     def test_quantized_input_quantized_output(self):
+        # [FUNCTION DOC] Quantized input and quantized output: expects two observers and no
+        # quantize or dequantize nodes after convert.
         prepare_custom_config_dict = {
             'input_quantized_idxs': [0], 'output_quantized_idxs': [0]}
         prepare_count_check = {
@@ -3673,6 +4307,8 @@ class TestQuantizeFx(QuantizationTestCase):
             prepare_custom_config_dict, prepare_count_check, convert_count_check)
 
     def test_fp32_input_quantized_output(self):
+        # [FUNCTION DOC] Float input, quantized output: expects three observers, one quantize
+        # node and no dequantize node after convert.
         prepare_custom_config_dict = {
             'output_quantized_idxs': [0]}
         prepare_count_check = {
@@ -3686,6 +4322,8 @@ class TestQuantizeFx(QuantizationTestCase):
             prepare_custom_config_dict, prepare_count_check, convert_count_check)
 
     def test_quantized_input_fp32_output(self):
+        # [FUNCTION DOC] Quantized input, float output: expects two observers, no quantize node
+        # and one dequantize node after convert.
         prepare_custom_config_dict = {
             'input_quantized_idxs': [0]}
         prepare_count_check = {
@@ -3699,6 +4337,8 @@ class TestQuantizeFx(QuantizationTestCase):
             prepare_custom_config_dict, prepare_count_check, convert_count_check)
 
     def test_fp32_input_fp32_output(self):
+        # [FUNCTION DOC] Float input and output (no custom config): expects three observers and
+        # one quantize node and one dequantize node after convert.
         prepare_custom_config_dict = {}
         prepare_count_check = {
             ns.call_module(torch.ao.quantization.MinMaxObserver): 3,
@@ -3712,6 +4352,9 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_convtranspose_per_channel_fails_early(self):
+        # [FUNCTION DOC] Checks that preparing a ConvTranspose2d with the default fbgemm
+        # per-channel qconfig raises an assertion error at prepare time with the message about
+        # per-channel weight observers being unsupported. Skipped without FBGEMM.
         r"""
         Verifies that attempting to quantize a ConvTranspose module with per-Channel
         weight observers fails in the prepare step, as opposed to the convert step.
@@ -3727,17 +4370,26 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_qparams_buffers(self):
+        # [FUNCTION DOC] Checks quantized model state dict contains scale and zero point entries
+        # for three quantized linears, the model can be scripted with the same non-packed state
+        # dict keys, and the generated scale and zero point attribute names exist.
         class Linear(torch.nn.Module):
+            # [CLASS DOC] HELPER: Functional linear using fixed ones weight and zeros bias
+            # tensors.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the fixed weight and bias tensors.
                 super().__init__()
                 self.w = torch.ones(5, 5)
                 self.b = torch.zeros(5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the functional linear.
                 return torch.nn.functional.linear(x, self.w, self.b)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Sequential of two Linear helpers followed by a third.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates mods1 and mods2.
                 super().__init__()
                 self.mods1 = torch.nn.Sequential(
                     Linear(),
@@ -3746,6 +4398,7 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.mods2 = Linear()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies mods1 then mods2.
                 x = self.mods1(x)
                 x = self.mods2(x)
                 return x
@@ -3790,17 +4443,27 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_packed_weight_fused_op(self):
+        # [FUNCTION DOC] Checks packed weight attributes are created on the converted model for
+        # each of the three functional linears (followed by a functional relu). Raises an
+        # assertion error if an attribute is missing.
         class Linear(torch.nn.Module):
+            # [CLASS DOC] HELPER: Functional linear using fixed ones weight and zeros bias
+            # tensors.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the fixed weight and bias tensors.
                 super().__init__()
                 self.w = torch.ones(5, 5)
                 self.b = torch.zeros(5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the functional linear.
                 return F.linear(x, self.w, self.b)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Two Linear helpers in a Sequential, a third, then functional
+            # relu.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates mods1, mods2 and stores the relu function.
                 super().__init__()
                 self.mods1 = torch.nn.Sequential(
                     Linear(),
@@ -3810,6 +4473,7 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.relu = F.relu
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies mods1, mods2, then relu.
                 x = self.mods1(x)
                 x = self.mods2(x)
                 x = self.relu(x)
@@ -3830,18 +4494,27 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_mul_add_fp16_config(self):
+        # [FUNCTION DOC] Checks multiply and add of constants before dynamic fp16 linears are
+        # handled: prepare, convert and run under the fbgemm engine. Skipped without FBGEMM.
         with override_quantized_engine('fbgemm'):
             class Linear(torch.nn.Module):
+                # [CLASS DOC] HELPER: Functional linear using fixed ones weight and zeros bias
+                # tensors.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates the fixed weight and bias tensors.
                     super().__init__()
                     self.w = torch.ones(5, 5)
                     self.b = torch.zeros(5)
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies the functional linear.
                     return torch.nn.functional.linear(x, self.w, self.b)
 
             class M(torch.nn.Module):
+                # [CLASS DOC] HELPER: Sequential of two linears and a third linear with
+                # preceding scalar multiply and add.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates mods1 and mods2.
                     super().__init__()
                     self.mods1 = torch.nn.Sequential(
                         Linear(),
@@ -3850,6 +4523,8 @@ class TestQuantizeFx(QuantizationTestCase):
                     self.mods2 = Linear()
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Multiplies by 5, adds 5, then applies mods1 and
+                    # mods2.
                     x = x * 5
                     x = x + 5
                     x = self.mods1(x)
@@ -3864,13 +4539,19 @@ class TestQuantizeFx(QuantizationTestCase):
             m(*example_inputs)
 
     def test_getattr_with_nontensor_result(self):
+        # [FUNCTION DOC] Checks ops whose arguments are nodes that are not tensors (ndim, size,
+        # shape derived values) are prepared and converted without errors, for three small
+        # models.
         """
         Verifies that binary ops get quantized correctly if some
         of the args are nodes but not Tensors, such as an `x.ndim`
         pattern.
         """
         class M1(torch.nn.Module):
+            # [CLASS DOC] HELPER: Adds an integer computed from the number of dimensions.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Computes ndim minus two and adds it to the input via
+                # torch.add.
                 dims = x.ndim
                 dims_sub = dims - 1
                 dims_sub2 = dims_sub - 1
@@ -3878,7 +4559,10 @@ class TestQuantizeFx(QuantizationTestCase):
                 return x
 
         class M2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Reshapes the input using a size list built from ndim and size.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Builds a view shape list from ndim and the channel
+                # size, views x.
                 dims = x.ndim
                 dims_sub = dims - 2
                 mul = [1] * dims_sub
@@ -3887,7 +4571,9 @@ class TestQuantizeFx(QuantizationTestCase):
                 return x
 
         class M3(torch.nn.Module):
+            # [CLASS DOC] HELPER: Views the input with its own shape.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Takes the shape and views the input with it.
                 shape = x.shape
                 x = x.view(shape)
                 return x
@@ -3902,7 +4588,11 @@ class TestQuantizeFx(QuantizationTestCase):
             mc = convert_fx(mp)
 
     class _NonReferenceTestModel(nn.Module):
+        # [CLASS DOC] HELPER: Test model with conv, relu, max pool, flatten, a caller supplied
+        # function applied to the features and extra arguments, then a linear.
         def __init__(self, func, lin_in, lin_out):
+            # [FUNCTION DOC] HELPER: Creates conv, pool and a linear of the given sizes; stores
+            # func.
             super().__init__()
             self.conv1 = nn.Conv2d(3, 6, 5)
             self.pool = nn.MaxPool2d(2, 2)
@@ -3910,6 +4600,8 @@ class TestQuantizeFx(QuantizationTestCase):
             self.func = func
 
         def forward(self, x, y, z):
+            # [FUNCTION DOC] HELPER: Conv, relu, pool and flatten x; applies func with y and z;
+            # then applies the linear and returns the result.
             x = self.pool(F.relu(self.conv1(x)))
             x = torch.flatten(x, 1)
             x = self.func(x, y, z)
@@ -3922,10 +4614,16 @@ class TestQuantizeFx(QuantizationTestCase):
     # are a tuple/list (which do not show up as nodes) the function checks the
     # individual elements of the tuple/list recursively.
     def _check_not_observed(self, model, node_info_to_non_tensor_args):
+        # [FUNCTION DOC] HELPER: For each node in the prepared model, looks up argument indexes
+        # expected to be non-tensors (by node op and target) and asserts that the corresponding
+        # arguments, recursing into tuples and lists, are not activation post process modules.
+        # Fails the test otherwise.
 
         # this is a helper function (for easier recursion) that checks whether
         # arg_node is observed
         def _check_node_not_observed(model, arg_node, node):
+            # [FUNCTION DOC] HELPER: Recursive check: for tuples or lists recurses into
+            # elements; for call-module nodes asserts the module is not an observer.
             if isinstance(arg_node, (tuple, list)):
                 for new_node in arg_node:
                     _check_node_not_observed(model, new_node, node)
@@ -3947,6 +4645,8 @@ class TestQuantizeFx(QuantizationTestCase):
     # This test checks that the model gets prepared correct, doesn't have observers
     # on specific ops (see _check_not_observed) and that the prepared model runs
     def _test_dtype_propagation(self, model, node_info_to_non_tensor_args, *args):
+        # [FUNCTION DOC] HELPER: Puts the model in eval mode, prepares it with the default
+        # fbgemm qconfig, checks the not-observed condition and runs the prepared model.
         model.eval()
         qconfig_dict = {"": torch.ao.quantization.get_default_qconfig("fbgemm")}
         prepared_model = prepare_fx(model, qconfig_dict, example_inputs=tuple(args))
@@ -3954,7 +4654,9 @@ class TestQuantizeFx(QuantizationTestCase):
         prepared_model(*args)
 
     def test_masked_fill_nontensor_args_not_observed(self):
+        # [FUNCTION DOC] Checks the non-tensor arguments of masked_fill are not observed.
         def func(x, y, z):
+            # [FUNCTION DOC] HELPER: Calls masked_fill on x using y and z.
             return x.masked_fill(y, z)
 
         model = self._NonReferenceTestModel(func, 1176, 1)
@@ -3963,7 +4665,9 @@ class TestQuantizeFx(QuantizationTestCase):
         self._test_dtype_propagation(model, node_info_to_non_tensor_args, *args)
 
     def test_permute_nontensor_args_not_observed(self):
+        # [FUNCTION DOC] Checks the non-tensor arguments of permute are not observed.
         def func(x, y, z):
+            # [FUNCTION DOC] HELPER: Permutes x with y and z.
             return x.permute(y, z)
 
         model = self._NonReferenceTestModel(func, 1176, 1)
@@ -3972,7 +4676,9 @@ class TestQuantizeFx(QuantizationTestCase):
         self._test_dtype_propagation(model, node_info_to_non_tensor_args, *args)
 
     def test_repeat_nontensor_args_not_observed(self):
+        # [FUNCTION DOC] Checks the non-tensor arguments of repeat are not observed.
         def func(x, y, z):
+            # [FUNCTION DOC] HELPER: Repeats x by y and z.
             return x.repeat(y, z)
 
         model = self._NonReferenceTestModel(func, 1176, 1)
@@ -3981,7 +4687,9 @@ class TestQuantizeFx(QuantizationTestCase):
         self._test_dtype_propagation(model, node_info_to_non_tensor_args, *args)
 
     def test_reshape_nontensor_args_not_observed(self):
+        # [FUNCTION DOC] Checks the non-tensor argument of reshape is not observed.
         def func(x, y, z):
+            # [FUNCTION DOC] HELPER: Reshapes x to a flattened leading dimension and y columns.
             return x.reshape(-1, y)
 
         model = self._NonReferenceTestModel(func, 5, 1)
@@ -3990,7 +4698,9 @@ class TestQuantizeFx(QuantizationTestCase):
         self._test_dtype_propagation(model, node_info_to_non_tensor_args, *args)
 
     def test_size_nontensor_args_not_observed(self):
+        # [FUNCTION DOC] Checks the non-tensor argument of size is not observed.
         def func(x, y, z):
+            # [FUNCTION DOC] HELPER: Reshapes x using its size along dimension y.
             return x.reshape((-1, x.size(y)))
 
         model = self._NonReferenceTestModel(func, 5, 1)
@@ -3999,7 +4709,10 @@ class TestQuantizeFx(QuantizationTestCase):
         self._test_dtype_propagation(model, node_info_to_non_tensor_args, *args)
 
     def test_transpose_nontensor_args_not_observed(self):
+        # [FUNCTION DOC] Checks the non-tensor arguments of the transpose method are not
+        # observed.
         def func(x, y, z):
+            # [FUNCTION DOC] HELPER: Transposes x over dimensions y and z.
             return x.transpose(y, z)
 
         model = self._NonReferenceTestModel(func, 5, 1)
@@ -4008,10 +4721,16 @@ class TestQuantizeFx(QuantizationTestCase):
         self._test_dtype_propagation(model, node_info_to_non_tensor_args, *args)
 
     def test_torch_transpose_nontensor_args_not_observed(self):
+        # [FUNCTION DOC] Checks the torch-level transpose with constant dimensions.
+        # KNOWN ISSUE: the node info key names a call-method op for the function form of
+        # transpose, which is traced as a function call, and the function uses constants instead
+        # of y and z, so the check likely matches nothing.
         # TODO: make torch.transpose traceable by fx when using
         # variable nontensor arguments
         # func = lambda x, y, z: torch.transpose(x, y, z) # error
         def func(x, y, z):
+            # [FUNCTION DOC] HELPER: Applies the torch transpose to x with constant dimensions
+            # zero and one.
             return torch.transpose(x, 0, 1)
 
         model = self._NonReferenceTestModel(func, 5, 1)
@@ -4022,7 +4741,9 @@ class TestQuantizeFx(QuantizationTestCase):
         self._test_dtype_propagation(model, node_info_to_non_tensor_args, *args)
 
     def test_unsqueeze_nontensor_args_not_observed(self):
+        # [FUNCTION DOC] Checks the non-tensor argument of unsqueeze is not observed.
         def func(x, y, z):
+            # [FUNCTION DOC] HELPER: Unsqueezes x at dimension y.
             return x.unsqueeze(y)
 
         model = self._NonReferenceTestModel(func, 1176, 1)
@@ -4031,7 +4752,9 @@ class TestQuantizeFx(QuantizationTestCase):
         self._test_dtype_propagation(model, node_info_to_non_tensor_args, *args)
 
     def test_unsqueeze__nontensor_args_not_observed(self):
+        # [FUNCTION DOC] Checks the non-tensor argument of in-place unsqueeze is not observed.
         def func(x, y, z):
+            # [FUNCTION DOC] HELPER: Unsqueezes x in place at dimension y.
             return x.unsqueeze_(y)
 
         model = self._NonReferenceTestModel(func, 1176, 1)
@@ -4040,10 +4763,15 @@ class TestQuantizeFx(QuantizationTestCase):
         self._test_dtype_propagation(model, node_info_to_non_tensor_args, *args)
 
     def test_torch_unsqueeze_nontensor_args_not_observed(self):
+        # [FUNCTION DOC] Checks the torch-level unsqueeze with a constant dimension.
+        # KNOWN ISSUE: the node info key names a call-method op for the function form of
+        # unsqueeze, which is traced as a function call, so the check likely matches nothing.
         # TODO: make torch.unsqueeze scriptable by fx when using
         # variable nontensor arguments
         # func = lambda x, y, z: torch.unsqueeze(x, y) # error
         def func(x, y, z):
+            # [FUNCTION DOC] HELPER: Applies the torch unsqueeze to x with the constant
+            # dimension one.
             return torch.unsqueeze(x, 1)
 
         model = self._NonReferenceTestModel(func, 1176, 1)
@@ -4052,7 +4780,9 @@ class TestQuantizeFx(QuantizationTestCase):
         self._test_dtype_propagation(model, node_info_to_non_tensor_args, *args)
 
     def test_view_nontensor_args_not_observed(self):
+        # [FUNCTION DOC] Checks the non-tensor argument of view is not observed.
         def func(x, y, z):
+            # [FUNCTION DOC] HELPER: Views x with a flattened leading dimension and y columns.
             return x.view(-1, y)
 
         model = self._NonReferenceTestModel(func, 5, 1)
@@ -4061,7 +4791,10 @@ class TestQuantizeFx(QuantizationTestCase):
         self._test_dtype_propagation(model, node_info_to_non_tensor_args, *args)
 
     def test_propagate_dtypes_for_known_nodes_list_args(self):
+        # [FUNCTION DOC] Checks a list argument of reshape is not observed (recursively
+        # checked).
         def func(x, y, z):
+            # [FUNCTION DOC] HELPER: Reshapes x using the list y.
             return x.reshape(y)
 
         model = self._NonReferenceTestModel(func, 5, 1)
@@ -4070,7 +4803,10 @@ class TestQuantizeFx(QuantizationTestCase):
         self._test_dtype_propagation(model, node_info_to_non_tensor_args, *args)
 
     def test_propagate_dtypes_for_known_nodes_split_list_args(self):
+        # [FUNCTION DOC] Checks list elements built inside the function for reshape are not
+        # observed.
         def func(x, y, z):
+            # [FUNCTION DOC] HELPER: Reshapes x with a list built from y and z.
             return x.reshape([y, z])
 
         model = self._NonReferenceTestModel(func, 5, 1)
@@ -4079,7 +4815,9 @@ class TestQuantizeFx(QuantizationTestCase):
         self._test_dtype_propagation(model, node_info_to_non_tensor_args, *args)
 
     def test_propagate_dtypes_for_known_nodes_tuple_args(self):
+        # [FUNCTION DOC] Checks a tuple argument of reshape is not observed.
         def func(x, y, z):
+            # [FUNCTION DOC] HELPER: Reshapes x using the tuple y.
             return x.reshape(y)
 
         model = self._NonReferenceTestModel(func, 5, 1)
@@ -4088,7 +4826,10 @@ class TestQuantizeFx(QuantizationTestCase):
         self._test_dtype_propagation(model, node_info_to_non_tensor_args, *args)
 
     def test_propagate_dtypes_for_known_nodes_split_tuple_args(self):
+        # [FUNCTION DOC] Checks tuple elements built inside the function for reshape are not
+        # observed.
         def func(x, y, z):
+            # [FUNCTION DOC] HELPER: Reshapes x with a tuple built from y and z.
             return x.reshape((y, z))
 
         model = self._NonReferenceTestModel(func, 5, 1)
@@ -4097,7 +4838,11 @@ class TestQuantizeFx(QuantizationTestCase):
         self._test_dtype_propagation(model, node_info_to_non_tensor_args, *args)
 
     def test_propagate_dtypes_for_known_nodes_dict_args(self):
+        # [FUNCTION DOC] Checks entries of a dictionary argument used as transpose dimensions
+        # are not observed.
         def func(x, y, z):
+            # [FUNCTION DOC] HELPER: Transposes x using two entries looked up from the mapping
+            # y.
             return x.transpose(y["first"], y["second"])
 
         model = self._NonReferenceTestModel(func, 5, 1)
@@ -4106,8 +4851,13 @@ class TestQuantizeFx(QuantizationTestCase):
         self._test_dtype_propagation(model, node_info_to_non_tensor_args, *args)
 
     def test_propagate_dtypes_for_known_nodes_dict_tuple_args(self):
+        # [FUNCTION DOC] Checks a tuple stored inside a dictionary argument of reshape is not
+        # observed, using a module instance as the function.
         class reshape_module(nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward reshapes x with the tuple stored under a
+            # key of y.
             def forward(self, x, y, z):
+                # [FUNCTION DOC] HELPER: Reshapes x with the shape found in y.
                 return x.reshape(y["shape"])
 
         model = self._NonReferenceTestModel(reshape_module(), 5, 1)
@@ -4116,7 +4866,11 @@ class TestQuantizeFx(QuantizationTestCase):
         self._test_dtype_propagation(model, node_info_to_non_tensor_args, *args)
 
     def test_propagate_dtypes_for_known_nodes_dict_split_tuple_args(self):
+        # [FUNCTION DOC] Checks tuple elements built from dictionary entries for reshape.
+        # KNOWN ISSUE: the node info key names the transpose method while the function calls
+        # reshape, so the check matches no node and is vacuous.
         def func(x, y, z):
+            # [FUNCTION DOC] HELPER: Reshapes x with a tuple built from two entries of y.
             return x.reshape((y["first"], y["second"]))
 
         model = self._NonReferenceTestModel(func, 5, 1)
@@ -4125,16 +4879,22 @@ class TestQuantizeFx(QuantizationTestCase):
         self._test_dtype_propagation(model, node_info_to_non_tensor_args, *args)
 
     def test_assert_on_size_after_quant_layer(self):
+        # [FUNCTION DOC] Checks that taking the size of a quantized tensor inside an assert
+        # works through prepare, convert and run.
         """
         Verifies that calculating a size of a quantized tensor works
         correctly in quantization passes.
         """
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv followed by an assertion on the channel size.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv.
                 super().__init__()
                 self.conv1 = nn.Conv2d(1, 1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv, asserts the channel size is one, returns
+                # x.
                 x = self.conv1(x)
                 torch._assert(x.size(1) == 1, 'foobar')
                 return x
@@ -4149,28 +4909,36 @@ class TestQuantizeFx(QuantizationTestCase):
         mc(*example_inputs)
 
     def test_fp32_sum(self):
+        # [FUNCTION DOC] Checks float sum works before or after quantized convs: one model sums
+        # after a conv, the other sums between two convs. Prepare, convert and run.
         """
         Verifies that fp32 sum works correctly if it's before or after
         quantized layers.
         """
         class M1(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv, stack into a list, then sum all elements.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv.
                 super().__init__()
                 self.conv1 = nn.Conv2d(1, 1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv, stacks, sums over everything.
                 x = self.conv1(x)
                 x = torch.stack([x])
                 x = torch.sum(x)
                 return x
 
         class M2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv, stack and sum along the first dim, then a second conv.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates conv1 and conv2.
                 super().__init__()
                 self.conv1 = nn.Conv2d(1, 1, 1)
                 self.conv2 = nn.Conv2d(1, 1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv1, stack, sum over dim zero, then conv2.
                 x = self.conv1(x)
                 x1 = torch.stack([x])
                 x1 = torch.sum(x1, dim=0)
@@ -4188,27 +4956,36 @@ class TestQuantizeFx(QuantizationTestCase):
             mc(*example_inputs)
 
     def test_fusion_pattern_unquantized(self):
+        # [FUNCTION DOC] Checks that leaving a multi-node fusable pattern (add and relu in a
+        # child module) unquantized via module_name works through prepare, run and convert.
         """
         Ensure that leaving a possible fusion pattern of multiple nodes
         unquantized runs through the APIs without errors.
         """
         class Child(torch.nn.Module):
+            # [CLASS DOC] HELPER: Child module that adds one to the input and applies functional
+            # relu.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates an unused ReLU module.
                 super().__init__()
                 self.relu = nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds 1.0 then applies functional relu.
                 x = torch.add(x, 1.0)
                 x = torch.nn.functional.relu(x)
                 return x
 
         class Parent(torch.nn.Module):
+            # [CLASS DOC] HELPER: Child module followed by a conv.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the child and conv.
                 super().__init__()
                 self.child = Child()
                 self.conv = nn.Conv2d(1, 1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the child then the conv.
                 x = self.child(x)
                 x = self.conv(x)
                 return x
@@ -4226,17 +5003,25 @@ class TestQuantizeFx(QuantizationTestCase):
         mc = convert_fx(mp)
 
     def test_state_dict(self):
+        # [FUNCTION DOC] Checks packed weights of quantized functional linear and conv appear in
+        # the state dict, that loading that state dict into a fresh converted model restores
+        # weight, bias and outputs, and that saving to disk and loading back (not weights-only,
+        # since packed params are script objects) works.
         """ Make sure packed params appear in state_dict
         """
 
         # test linear packed weight
         class M1(torch.nn.Module):
+            # [CLASS DOC] HELPER: Functional linear with random constant weight and bias
+            # tensors.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the constant weight and bias.
                 super().__init__()
                 self.w = torch.rand(4, 30)
                 self.b = torch.rand(4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies functional linear.
                 return F.linear(x, self.w, self.b)
 
         m = M1().eval()
@@ -4248,7 +5033,10 @@ class TestQuantizeFx(QuantizationTestCase):
 
         # test conv packed weight
         class M2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Functional conv2d with random weight, bias and conv settings.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates weight, bias and stride, padding, dilation,
+                # groups.
                 super().__init__()
                 self.w = torch.rand(3, 3, 3, 3)
                 self.b = torch.rand(3)
@@ -4258,6 +5046,7 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.groups = 1
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies functional conv2d with the stored settings.
                 return F.conv2d(x, self.w, self.b, self.stride, self.padding, self.dilation, self.groups)
 
         m = M2().eval()
@@ -4283,6 +5072,8 @@ class TestQuantizeFx(QuantizationTestCase):
         m.load_state_dict(state_dict)
 
         def checkModel(m, data, ref_weight, ref_bias, ref_res):
+            # [FUNCTION DOC] HELPER: Runs the model; asserts the unpacked weight and bias equal
+            # the reference ones and the output equals the reference output.
             res = m(data)
             weight, bias = m._packed_weight_0.unpack()
             # check that weight/bias matches after load the state_dict
@@ -4306,22 +5097,29 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_preserve_qconfig(self):
+        # [FUNCTION DOC] Checks that passing remove_qconfig false when converting keeps the
+        # qconfig attribute on a module (the sigmoid). Runs under the fbgemm engine.
         """
         Test to make sure the temporary config option to preserve qconfig attributes
         in the model works
         """
         with override_quantized_engine('fbgemm'):
             class Linear(torch.nn.Module):
+                # [CLASS DOC] HELPER: Functional linear with fixed ones weight and zeros bias.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates the fixed weight and bias.
                     super().__init__()
                     self.w = torch.ones(5, 5)
                     self.b = torch.zeros(5)
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies functional linear.
                     return torch.nn.functional.linear(x, self.w, self.b)
 
             class M(torch.nn.Module):
+                # [CLASS DOC] HELPER: Sequential of two Linear helpers followed by a sigmoid.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates mods1 and mods2.
                     super().__init__()
                     self.mods1 = torch.nn.Sequential(
                         Linear(),
@@ -4330,6 +5128,7 @@ class TestQuantizeFx(QuantizationTestCase):
                     self.mods2 = torch.nn.Sigmoid()
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies mods1 then mods2.
                     x = self.mods1(x)
                     x = self.mods2(x)
                     return x
@@ -4348,10 +5147,14 @@ class TestQuantizeFx(QuantizationTestCase):
             self.assertTrue(hasattr(m.mods2, 'qconfig'))
 
     def test_not_used(self):
+        # [FUNCTION DOC] Checks that quantization runs when a value is computed but unused
+        # except by an in-place op, with a float16 static global qconfig.
         """ Test quantizing a not used value"""
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Adds x to itself and applies in-place sigmoid.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Doubles x, applies in-place sigmoid, returns x.
                 x = x + x
                 x.sigmoid_()
                 return x
@@ -4363,19 +5166,28 @@ class TestQuantizeFx(QuantizationTestCase):
         m = convert_fx(m)
 
     def test_qparams_fqn(self):
+        # [FUNCTION DOC] Checks the generated scale and zero point attributes for the first
+        # functional linear input and each linear output exist on the converted model, named
+        # after the first linear use.
         """ Test that the FQN of input_scale/zero_point is set
         to that of first linear use. """
         class Linear(torch.nn.Module):
+            # [CLASS DOC] HELPER: Functional linear with fixed ones weight and zeros bias.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the fixed weight and bias.
                 super().__init__()
                 self.w = torch.ones(5, 5)
                 self.b = torch.zeros(5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies functional linear.
                 return torch.nn.functional.linear(x, self.w, self.b)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Concatenates input, records its size, applies two linears and
+            # scales by the first size entry.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates mods1.
                 super().__init__()
                 self.mods1 = torch.nn.Sequential(
                     Linear(),
@@ -4383,6 +5195,8 @@ class TestQuantizeFx(QuantizationTestCase):
                 )
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: cat of the input, size, mods1, multiply by the first
+                # size entry.
                 x = torch.cat((x,), 1)
                 tmp = x.size()
                 x = self.mods1(x)
@@ -4411,6 +5225,9 @@ class TestQuantizeFx(QuantizationTestCase):
             self.assertTrue(hasattr(m, attr_name), attr_name + " not found.")
 
     def test_no_obs_between_unmatched_node_and_copy_node(self):
+        # [FUNCTION DOC] Checks no observer is inserted between an unmatched (wrapped user
+        # function) node and a copy-node consumer, since its output may not be a tensor;
+        # prepare, convert and run must succeed.
         """
         Verifies that an observer is not inserted between an unmatched
         node and a node matched to CopyNodeQuantizeHandler.  This is done
@@ -4419,11 +5236,16 @@ class TestQuantizeFx(QuantizationTestCase):
         """
 
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Calls a wrapped function returning a list, adds one to its
+            # first element and returns it with the second element.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates an unused ReLU.
                 super().__init__()
                 self.relu = nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Calls the wrapped function, adds one to the first piece
+                # and returns it with the second piece.
                 x = _user_func_with_complex_return_type(x)
                 x1 = x[0] + 1
                 return x1, x[1]
@@ -4440,16 +5262,23 @@ class TestQuantizeFx(QuantizationTestCase):
         mc(*example_inputs)
 
     def test_fold_quant_dequant(self):
+        # [FUNCTION DOC] Checks quantize/dequantize folding: with only the functional linear
+        # quantized, the converted graph has exactly one quantize and one dequantize node.
         """ Test that the sequence of quant-dequant nodes in the
             graph, get folded and we erase the extra dequant nodes.
         """
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Concatenates input, records size, applies functional linear
+            # with fixed tensors and scales by the first size entry.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the fixed weight and bias.
                 super().__init__()
                 self.w = torch.ones(5, 5)
                 self.b = torch.zeros(5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: cat of x, size, functional linear, multiply by size
+                # entry.
                 x = torch.cat((x,), 1)
                 tmp = x.size()
                 x = torch.nn.functional.linear(x, self.w, self.b)
@@ -4480,6 +5309,10 @@ class TestQuantizeFx(QuantizationTestCase):
         self.assertEqual(quant, 1)
 
     def test_quant_output_always_observed(self):
+        # [FUNCTION DOC] Checks that when the output is hardcoded to be quantized (QAT flow), an
+        # output observer is always inserted, for a non-quantizable identity, a conv, and a conv
+        # returning a dictionary; checks fake quant counts at prepare and one quantize node
+        # after convert.
         """
         If the output is hardcoded to be quantized, ensure that
         there is always an observer, even if the last non-output node is not
@@ -4491,11 +5324,14 @@ class TestQuantizeFx(QuantizationTestCase):
 
         # non-quantizeable node, quantized output
         class M1(torch.nn.Module):
+            # [CLASS DOC] HELPER: Identity module wrapper.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the identity.
                 super().__init__()
                 self.identity = torch.nn.Identity()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the identity.
                 x = self.identity(x)
                 return x
 
@@ -4512,11 +5348,14 @@ class TestQuantizeFx(QuantizationTestCase):
 
         # quantizeable node, quantized output
         class M2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Single conv model.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(1, 1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the conv.
                 x = self.conv(x)
                 return x
 
@@ -4534,11 +5373,14 @@ class TestQuantizeFx(QuantizationTestCase):
 
         # quantizeable node, quantized dictionary output
         class M3(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv model returning the result in a dictionary.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(1, 1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv and returns a mapping with the output.
                 x = self.conv(x)
                 return {"output": x}
 
@@ -4555,12 +5397,17 @@ class TestQuantizeFx(QuantizationTestCase):
             prepare_custom_config=prepare_custom_config_dict)
 
     def test_deepcopy_preserve_attributes(self):
+        # [FUNCTION DOC] Checks preserved attributes survive prepare, convert and deep copy and
+        # are tracked in the module meta under the user preserved attributes key.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with an integer attribute and identity forward.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Sets the attribute to three.
                 super().__init__()
                 self.attr = 3
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input.
                 return x
 
         m = M().eval()
@@ -4584,14 +5431,21 @@ class TestQuantizeFx(QuantizationTestCase):
         self.assertTrue("attr" in m2.meta[_USER_PRESERVED_ATTRIBUTES_KEY])
 
     def test_output_lists_and_dicts(self):
+        # [FUNCTION DOC] Checks prepare and convert do not crash for nested list and dictionary
+        # outputs.
         """Verify that specifying complicated output types does not crash.
         """
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv model returning nested dictionaries and lists of the
+            # result.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv.
                 super().__init__()
                 self.conv = nn.Conv2d(1, 1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv and returns the result wrapped in nested
+                # containers.
                 x = self.conv(x)
                 return {'foo': [x]}, [{'foo': [[x]]}]
 
@@ -4601,16 +5455,21 @@ class TestQuantizeFx(QuantizationTestCase):
         mc = convert_fx(mp)
 
     def test_shape_followed_by_quantized_op(self):
+        # [FUNCTION DOC] Checks taking a shape between two convs does not force a dequantize:
+        # after convert there is one quantize and one dequantize node in total.
         """ Make sure that shape does not dequantize
         the Tensor before the next operator
         """
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv, shape query with an assertion, then a second conv.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates conv1 and conv2.
                 super().__init__()
                 self.conv1 = torch.nn.Conv2d(2, 2, 2)
                 self.conv2 = torch.nn.Conv2d(2, 2, 2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv1, asserts shape equality, applies conv2.
                 x = self.conv1(x)
                 s = x.shape
                 torch._assert(s == x.shape, "")
@@ -4630,12 +5489,17 @@ class TestQuantizeFx(QuantizationTestCase):
         self.checkGraphModuleNodes(m, expected_node_occurrence=node_occurrence)
 
     def test_trace_quantize_per_tensor(self):
+        # [FUNCTION DOC] Checks a converted model can be transformed with the FX Transformer
+        # without error.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Single conv model.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(1, 1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the conv.
                 x = self.conv(x)
                 return x
 
@@ -4646,16 +5510,24 @@ class TestQuantizeFx(QuantizationTestCase):
         m = torch.fx.Transformer(m).transform()
 
     def test_copy_node_has_shared_actpp_instance(self):
+        # [FUNCTION DOC] Checks that the observer or fake quant after a copy node (average pool)
+        # is a shared instance with its input: two references when counted with duplicates and
+        # one without. Also checks node sequences for the normal converted model (one quantize,
+        # pool, one dequantize) and the reference model (quantize/dequantize pairs around the
+        # pool).
         """ Test the output of CopyNode to have the same
         observer/fake_quant instance as the input
         """
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Average pool model.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the pool with kernel size three.
                 super().__init__()
                 self.avgpool2d = torch.nn.AvgPool2d(kernel_size=3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the pool.
                 x = self.avgpool2d(x)
                 return x
 
@@ -4729,15 +5601,21 @@ class TestQuantizeFx(QuantizationTestCase):
             self.checkGraphModuleNodes(m_reference, expected_node_occurrence=node_occurrence, expected_node_list=node_list)
 
     def test_linear_qint8_activation(self):
+        # [FUNCTION DOC] Checks conversion to reference with qint8 symmetric histogram
+        # activations and per-channel weights for a conv-flatten-linear model runs.
         """Test support for qint8 activation in reference pattern
         """
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv, flatten, then linear.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv and linear.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(1, 2, 2, 2)
                 self.linear = torch.nn.Linear(8, 5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv, flattens from dimension one, applies
+                # linear.
                 x = self.conv(x)
                 x = torch.flatten(x, 1)
                 x = self.linear(x)
@@ -4756,15 +5634,21 @@ class TestQuantizeFx(QuantizationTestCase):
         m(*example_inputs)
 
     def test_preserve_tuple(self):
+        # [FUNCTION DOC] Checks that preparing an LSTM module keeps the second argument of the
+        # lstm call node a tuple.
         """ Test tuple input type is preserved
         """
 
         class LSTM(nn.Module):
+            # [CLASS DOC] HELPER: Wraps an LSTM; takes inputs and a list of two states.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the LSTM with 50 features.
                 super().__init__()
                 self.lstm = nn.LSTM(50, 50, 1)
 
             def forward(self, inputs: torch.Tensor, state: list[torch.Tensor]):
+                # [FUNCTION DOC] HELPER: Builds the hidden and cell state tuple from the state
+                # list and runs the LSTM.
                 h = state[0]
                 c = state[1]
                 return self.lstm(inputs, (h, c))
@@ -4778,6 +5662,10 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.assertEqual(type(n.args[1]), tuple)
 
     def _test_static_lstm_helper(self, model, prepare_node_occurrence, convert_node_occurrence):
+        # [FUNCTION DOC] HELPER: Prepares a model with the quantizable LSTM mapping and default
+        # qconfig mapping, checks the prepared node counts, runs it, converts with the quantized
+        # LSTM mapping, checks the converted node counts and runs it. Arguments are the model
+        # and the two expected node count mappings.
         """
         Helper method to validate the graph of a model with static LSTM.
         """
@@ -4797,12 +5685,19 @@ class TestQuantizeFx(QuantizationTestCase):
         model(*example_inputs)
 
     def test_static_lstm(self):
+        # [FUNCTION DOC] Checks a static quantized LSTM custom module followed by three linears
+        # that consume the output and both hidden states: one quantizable LSTM after prepare;
+        # after convert one quantized LSTM, three quantize, three dequantize and four getitem
+        # nodes, and no tuple nodes.
         """
         Test statically quantized custom module LSTM followed by ops that consume individual
         tensors of the output tuple.
         """
         class MyModel(nn.Module):
+            # [CLASS DOC] HELPER: LSTM with three linears applied to its output and hidden
+            # states.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the LSTM and the three linears.
                 super().__init__()
                 self.lstm = nn.LSTM(50, 50, 1)
                 self.linear1 = nn.Linear(50, 10)
@@ -4810,6 +5705,8 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.linear3 = nn.Linear(50, 10)
 
             def forward(self, inputs: torch.Tensor, h0: torch.Tensor, c0: torch.Tensor):
+                # [FUNCTION DOC] HELPER: Runs the LSTM, applies a separate linear to the output
+                # and each hidden state, returns them as a nested tuple.
                 (out, (h0_out, c0_out)) = self.lstm(inputs, (h0, c0))
                 out = self.linear1(out)
                 h0_out = self.linear2(h0_out)
@@ -4835,31 +5732,45 @@ class TestQuantizeFx(QuantizationTestCase):
         self._test_static_lstm_helper(m, prepare_node_occurrence, convert_node_occurrence)
 
     def test_static_lstm_consume_tuple(self):
+        # [FUNCTION DOC] Checks a static quantized LSTM whose output tuple is consumed by a
+        # later module either as a whole (two tuple nodes rebuilt after dequantize) or only its
+        # hidden state tuple (one tuple node).
         """
         Test statically quantized custom module LSTM followed by a module that consumes the
         output tuple, either as a whole or part of it.
         """
         class ModuleAfterLSTM(nn.Module):
+            # [CLASS DOC] HELPER: Identity wrapper used to consume an LSTM result.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the identity.
                 super().__init__()
                 self.identity = torch.nn.Identity()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the identity.
                 return self.identity(x)
 
         class ConsumeWholeTuple(nn.Module):
+            # [CLASS DOC] HELPER: Runs an LSTM and passes the whole result tuple to the
+            # following module.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the LSTM and the following module.
                 super().__init__()
                 self.lstm = nn.LSTM(50, 50, 1)
                 self.module_after_lstm = ModuleAfterLSTM()
 
             def forward(self, inputs: torch.Tensor, h0: torch.Tensor, c0: torch.Tensor):
+                # [FUNCTION DOC] HELPER: Runs the LSTM and applies the following module to the
+                # full tuple.
                 x = self.lstm(inputs, (h0, c0))
                 x = self.module_after_lstm(x)  # consume tuple (output, (hidden0, hidden1))
                 return x
 
         class ConsumeHiddenTuple(ConsumeWholeTuple):
+            # [CLASS DOC] HELPER: Variant that passes only the hidden state tuple on.
             def forward(self, inputs: torch.Tensor, h0: torch.Tensor, c0: torch.Tensor):
+                # [FUNCTION DOC] HELPER: Runs the LSTM and applies the following module to the
+                # hidden state part of the result.
                 x = self.lstm(inputs, (h0, c0))
                 x = self.module_after_lstm(x[1])  # consume tuple (hidden0, hidden1)
                 return x
@@ -4899,17 +5810,26 @@ class TestQuantizeFx(QuantizationTestCase):
         self._test_static_lstm_helper(m2, prepare_node_occurrence, convert_node_occurrence2)
 
     def test_static_lstm_with_custom_fixed_qparams(self):
+        # [FUNCTION DOC] Checks a user subclass of the quantizable LSTM that assigns fixed
+        # qparams observers to inner ops, with a qnnpack backend config extended for qint32 on
+        # sigmoid, tanh, add and mul. After convert, verifies that gate ops are preceded by
+        # dequantize and followed by quantize ops with the expected scale, zero point and dtype,
+        # and that all expected nodes were found.
         """
         Test statically quantized LSTM with custom fixed qparams assigned to each of the
         inner submodules. This flow requires users to extend `torch.ao.nn.quantizable.LSTM`
         and use the child class in the custom module mapping.
         """
         class MyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model holding one LSTM named my_lstm.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the LSTM.
                 super().__init__()
                 self.my_lstm = torch.nn.LSTM(50, 50, 1)
 
             def forward(self, inputs: torch.Tensor, h0: torch.Tensor, c0: torch.Tensor):
+                # [FUNCTION DOC] HELPER: Runs the LSTM with the given hidden and cell state
+                # tuple.
                 x = self.my_lstm(inputs, (h0, c0))
                 return x
 
@@ -4922,12 +5842,17 @@ class TestQuantizeFx(QuantizationTestCase):
                 config.add_dtype_config(qint32_dtype_config)
 
         class UserObservedLSTM(torch.ao.nn.quantizable.LSTM):
+            # [CLASS DOC] HELPER: Observed LSTM subclass that builds its observed form with
+            # fixed qparams observer constructors for the inner ops.
             """
             Example of user provided LSTM implementation that assigns fixed qparams
             to the inner ops.
             """
             @classmethod
             def from_float(cls, float_lstm):
+                # [FUNCTION DOC] HELPER: Builds the observed LSTM from a float LSTM using fixed
+                # qparams observers for linear outputs, sigmoid, tanh, cell state and hidden
+                # state. Raises an assertion error if the input is not the expected float class.
                 if not isinstance(float_lstm, cls._FLOAT_MODULE):
                     raise AssertionError(f"Expected instance of {cls._FLOAT_MODULE}, got {type(float_lstm)}")
                 # uint16, [-16, 16)
@@ -4953,12 +5878,16 @@ class TestQuantizeFx(QuantizationTestCase):
                 )
 
         class UserQuantizedLSTM(torch.ao.nn.quantized.LSTM):
+            # [CLASS DOC] HELPER: Quantized LSTM subclass creating a reference quantized module.
             """
             Example of user provided LSTM implementation that produces a reference
             quantized module from a `UserObservedLSTM`.
             """
             @classmethod
             def from_observed(cls, observed_lstm):
+                # [FUNCTION DOC] HELPER: Builds the reference quantized LSTM from an observed
+                # one using the custom backend config. Raises an assertion error if the input is
+                # not an instance of the expected class.
                 if not isinstance(observed_lstm, cls._FLOAT_MODULE):
                     raise AssertionError(f"Expected instance of {cls._FLOAT_MODULE}, got {type(observed_lstm)}")
                 return torch.ao.quantization.fx.lstm_utils._get_reference_quantized_lstm_module(
@@ -5025,6 +5954,10 @@ class TestQuantizeFx(QuantizationTestCase):
         self.assertEqual(matched_names, set(node_name_to_expected_quantize_args.keys()))
 
     def test_reroute_tuple_getitem_patterns(self):
+        # [FUNCTION DOC] Checks the tuple and getitem rerouting pass on a manually built graph
+        # where a tuple is taken apart and rebuilt, expecting the output to be connected
+        # directly to the original second input and all other nodes to no longer be ancestors of
+        # the output.
         """
         The following graph should redirect the output to `b`. After the transformation,
         all other nodes, including the inputs `a` and `c`, are no longer needed.
@@ -5081,6 +6014,8 @@ class TestQuantizeFx(QuantizationTestCase):
         # Assert that output reroutes to `b` directly, and all other nodes can be removed
         output_ancestors = []
         def gather_ancestors(current_node):  # noqa: E306
+            # [FUNCTION DOC] HELPER: Recursively collects all argument nodes reachable from a
+            # node into the shared ancestors list.
             for arg in current_node.args:
                 output_ancestors.append(arg)
                 gather_ancestors(arg)
@@ -5089,8 +6024,12 @@ class TestQuantizeFx(QuantizationTestCase):
         self.assertEqual(output.args[0], b)
 
     def test_relu_lowering(self):
+        # [FUNCTION DOC] Checks relu lowering: the converted model has one quantize and one
+        # dequantize node around the relu, while the reference model has two of each.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Applies functional relu.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns functional relu of the input.
                 return torch.nn.functional.relu(x)
 
         m = M().eval()
@@ -5112,37 +6051,50 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_dynamic_with_fusion(self):
+        # [FUNCTION DOC] Checks dynamic quantization (fp16 and int8) fuses Linear and ReLU
+        # modules into dynamic LinearReLU modules, while a functional linear followed by
+        # functional relu becomes a dynamic linear relu op. Skipped without FBGEMM.
         """
         Tests that dynamic quantization APIs work with Linear + Relu fusion
         """
         with override_quantized_engine('fbgemm'):
             class LinearRelu(torch.nn.Module):
+                # [CLASS DOC] HELPER: Linear followed by ReLU.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates the linear and relu.
                     super().__init__()
                     self.linear = torch.nn.Linear(5, 5)
                     self.relu = torch.nn.ReLU()
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies linear then relu.
                     x = self.linear(x)
                     return self.relu(x)
 
             class Linear(torch.nn.Module):
+                # [CLASS DOC] HELPER: Functional linear with fixed ones weight and zeros bias.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates the fixed weight and bias.
                     super().__init__()
                     self.w = torch.ones(5, 5)
                     self.b = torch.zeros(5)
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies functional linear.
                     return torch.nn.functional.linear(x, self.w, self.b)
 
             class M(torch.nn.Module):
+                # [CLASS DOC] HELPER: Two LinearRelu modules, a functional linear and a
+                # functional relu.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates mods1, mods2 and stores the relu function.
                     super().__init__()
                     self.mods1 = torch.nn.Sequential(LinearRelu(), LinearRelu())
                     self.mods2 = Linear()
                     self.relu = F.relu
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies mods1, mods2, then relu.
                     x = self.mods1(x)
                     x = self.mods2(x)
                     x = self.relu(x)
@@ -5170,26 +6122,34 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_dynamic_with_fusion_multiple_uses(self):
+        # [FUNCTION DOC] Checks dynamic fusion when the same LinearRelu module is used twice:
+        # two dynamic LinearReLU call nodes expected for fp16 and int8 dynamic qconfigs.
         """
         Tests that dynamic quantization APIs work with Linear + Relu fusion
         """
         with override_quantized_engine('fbgemm'):
             class LinearRelu(torch.nn.Module):
+                # [CLASS DOC] HELPER: Linear followed by ReLU.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates the linear and relu.
                     super().__init__()
                     self.linear = torch.nn.Linear(5, 5)
                     self.relu = torch.nn.ReLU()
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies linear then relu.
                     x = self.linear(x)
                     return self.relu(x)
 
             class M(torch.nn.Module):
+                # [CLASS DOC] HELPER: Applies one LinearRelu module twice in a row.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates the shared module.
                     super().__init__()
                     self.linear_relu = LinearRelu()
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies linear_relu twice.
                     x = self.linear_relu(x)
                     x = self.linear_relu(x)
                     return x
@@ -5211,27 +6171,37 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_dynamic_linear_input_multiple_use(self):
+        # [FUNCTION DOC] Checks dynamic linear-relu fusion when one input feeds two LinearRelu
+        # modules whose outputs are added: two dynamic LinearReLU modules appear.
         """
         Tests input for dynamic linear being used by multiple ops
         """
         with override_quantized_engine('fbgemm'):
             class LinearRelu(torch.nn.Module):
+                # [CLASS DOC] HELPER: Linear followed by ReLU.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates the linear and relu.
                     super().__init__()
                     self.linear = torch.nn.Linear(5, 5)
                     self.relu = torch.nn.ReLU()
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies linear then relu.
                     x = self.linear(x)
                     return self.relu(x)
 
             class M(torch.nn.Module):
+                # [CLASS DOC] HELPER: Two LinearRelu modules applied to the same input and
+                # summed.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates mod1 and mod2.
                     super().__init__()
                     self.mod1 = LinearRelu()
                     self.mod2 = LinearRelu()
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies both modules to the input and returns the
+                    # sum.
                     y1 = self.mod1(x)
                     y2 = self.mod2(x)
                     return y1 + y2
@@ -5252,24 +6222,32 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.checkGraphModuleNodes(m, expected_node_list=node_list)
 
     def test_ref_linear_module(self):
+        # [FUNCTION DOC] Checks the converted quantized model and the reference-converted model
+        # give identical outputs for a linear and a linear with relu.
         """ Make sure the numerics for models with ref linear module
         matches models with fbgemm/qnnpack module
         """
         class M1(torch.nn.Module):
+            # [CLASS DOC] HELPER: Linear model with ten inputs and five outputs.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear.
                 super().__init__()
                 self.linear = torch.nn.Linear(10, 5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear.
                 return self.linear(x)
 
         class M2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Linear followed by ReLU.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates linear and relu.
                 super().__init__()
                 self.linear = torch.nn.Linear(10, 5)
                 self.relu = torch.nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies linear then relu.
                 return self.relu(self.linear(x))
 
         for M in [M1, M2]:
@@ -5284,6 +6262,8 @@ class TestQuantizeFx(QuantizationTestCase):
             self.assertTrue(torch.equal(result, result_ref))
 
     def test_ref_conv_module(self):
+        # [FUNCTION DOC] Checks converted and reference-converted models give identical outputs
+        # for 1d/2d/3d convs with and without relu.
         """ Make sure the numerics for models with ref conv module
         matches models with fbgemm/qnnpack module
         """
@@ -5294,20 +6274,26 @@ class TestQuantizeFx(QuantizationTestCase):
         }
 
         class M1(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv of the given dimension.
             def __init__(self, dim):
+                # [FUNCTION DOC] HELPER: Creates the conv from the dimension lookup.
                 super().__init__()
                 self.conv = convs[dim](3, 3, 3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the conv.
                 return self.conv(x)
 
         class M2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv of the given dimension followed by relu.
             def __init__(self, dim):
+                # [FUNCTION DOC] HELPER: Creates the conv and relu.
                 super().__init__()
                 self.conv = convs[dim](3, 3, 3)
                 self.relu = torch.nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv then relu.
                 return self.relu(self.conv(x))
 
         for dim, M in itertools.product([1, 2, 3], [M1, M2]):
@@ -5322,8 +6308,12 @@ class TestQuantizeFx(QuantizationTestCase):
             self.assertTrue(torch.equal(result, result_ref))
 
     def test_sub_scalar(self):
+        # [FUNCTION DOC] Checks scalar add and subtract that cancel out are handled: the
+        # converted graph has two quantize and two dequantize nodes.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Adds one, subtracts one, adds three, subtracts four.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the four scalar operations in order.
                 x = x + 1
                 x = x - 1
                 x = x + 3
@@ -5340,23 +6330,33 @@ class TestQuantizeFx(QuantizationTestCase):
         self.checkGraphModuleNodes(m, expected_node_occurrence=occurrence)
 
     def test_observer_fqn(self):
+        # [FUNCTION DOC] Checks observer names in the prepared model follow the order of the
+        # observed ops; the expected list skips some indexes.
+        # KNOWN ISSUE: the example inputs argument is a bare tensor in parentheses (no trailing
+        # comma), not a tuple as the API expects.
         """
         Test to make sure the observer FQN is based on the quantizable op/module that it is observing
         and uses the modules FQN to determine the observer name.
         """
         class Linear(torch.nn.Module):
+            # [CLASS DOC] HELPER: Functional linear with fixed ones weight and zeros bias.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the fixed weight and bias.
                 super().__init__()
                 self.w = torch.ones(5, 5)
                 self.b = torch.zeros(5)
 
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies functional linear.
                 return torch.nn.functional.linear(x, self.w, self.b)
 
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Sequential of two linears, add, third linear, add and mul with
+            # a trailing module linear, returning two outputs.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates mods1, mods2 and mods3.
                 super().__init__()
                 self.mods1 = torch.nn.Sequential(
                     Linear(),
@@ -5366,6 +6366,8 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.mods3 = torch.nn.Linear(5, 5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: mods1, add 4, mods2, then add 2 feeding mods3 and mul
+                # 5; returns the mods3 result and the mul result.
                 x = self.mods1(x)
                 x = torch.add(x, 4)
                 x = self.mods2(x)
@@ -5393,15 +6395,21 @@ class TestQuantizeFx(QuantizationTestCase):
             raise AssertionError(f"name_list mismatch: {name_list} != {expected_name_list}")
 
     def test_conv_lowering(self):
+        # [FUNCTION DOC] Checks that for 1d/2d/3d convs the converted model uses the quantized
+        # conv module with one quantize and one dequantize node, and equals the
+        # reference-converted model output.
         convs = {1: nn.Conv1d, 2: nn.Conv2d, 3: nn.Conv3d}
         qconvs = {1: nn.quantized.Conv1d, 2: nn.quantized.Conv2d, 3: nn.quantized.Conv3d}
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv of the given dimension.
             def __init__(self, dim):
+                # [FUNCTION DOC] HELPER: Creates the conv from the dimension lookup.
                 super().__init__()
                 self.conv = convs[dim](3, 3, 3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the conv.
                 return self.conv(x)
 
         for dim in range(1, len(convs) + 1):
@@ -5424,18 +6432,26 @@ class TestQuantizeFx(QuantizationTestCase):
             self.assertTrue(torch.equal(out_ref, out))
 
     def test_convert_qconfig_mapping(self):
+        # [FUNCTION DOC] Checks that qconfigs given to convert (a module_name or object_type
+        # variant) take effect after QAT preparation: expected quantized and float nodes and
+        # their order depend on the variant.
         class Linear(torch.nn.Module):
+            # [CLASS DOC] HELPER: Functional linear with fixed ones weight and zeros bias.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the fixed weight and bias.
                 super().__init__()
                 self.w = torch.ones(5, 5)
                 self.b = torch.zeros(5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies functional linear.
                 return torch.nn.functional.linear(x, self.w, self.b)
 
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Sequential of two linears, add, mul, then a module linear.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates mods1 and mods3.
                 super().__init__()
                 self.mods1 = torch.nn.Sequential(
                     Linear(),
@@ -5444,6 +6460,7 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.mods3 = torch.nn.Linear(5, 5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: mods1, add 4, mul 5, then mods3.
                 x = self.mods1(x)
                 x = torch.add(x, 4)
                 z = torch.mul(x, 5)
@@ -5522,10 +6539,19 @@ class TestQuantizeFx(QuantizationTestCase):
                 expected_node_list=order_check)
 
     def _assertFixedQParamsFakeQuantizeEqual(self, fq1, fq2):
+        # [FUNCTION DOC] HELPER: Asserts two fixed-qparams fake quantize constructors create
+        # objects whose observer constructors are equal.
         self.assertEqual(fq1()._observer_ctr, fq2()._observer_ctr)
 
     def test_register_patterns(self):
+        # [FUNCTION DOC] Checks the private pattern registration decorators add classes to the
+        # default fusion and quantization pattern tables, that the output observer and fake
+        # quantize maps receive the supplied fixed-qparams observers, and that the default
+        # output activation map getter reflects them for both training and eval. Registered
+        # entries are removed by a cleanup.
         def cleanUp():
+            # [FUNCTION DOC] HELPER: Removes the dummy entries added by the test from the
+            # pattern tables and the output observer and fake quantize maps.
             del _DEFAULT_FUSION_PATTERNS["dummy_fusion"]
             del _DEFAULT_QUANTIZATION_PATTERNS["dummy_quant"]
             del _DEFAULT_QUANTIZATION_PATTERNS["dummy_quant2"]
@@ -5538,18 +6564,24 @@ class TestQuantizeFx(QuantizationTestCase):
 
         @_register_fusion_pattern("dummy_fusion")
         class DummyFusion:
+            # [CLASS DOC] HELPER: Empty class registered as a dummy fusion pattern.
             pass
 
         @_register_quant_pattern("dummy_quant")
         class DummyQuant:
+            # [CLASS DOC] HELPER: Empty class registered as a dummy quantization pattern.
             pass
 
         @_register_quant_pattern("dummy_quant2", default_fixed_qparams_range_0to1_observer)
         class DummyQuant2:
+            # [CLASS DOC] HELPER: Empty class registered with a zero-to-one fixed qparams
+            # observer.
             pass
 
         @_register_quant_pattern("dummy_quant3", default_fixed_qparams_range_neg1to1_observer)
         class DummyQuant3:
+            # [CLASS DOC] HELPER: Empty class registered with a negative-one-to-one fixed
+            # observer.
             pass
 
         self.assertEqual(_DEFAULT_FUSION_PATTERNS["dummy_fusion"], DummyFusion)
@@ -5571,18 +6603,28 @@ class TestQuantizeFx(QuantizationTestCase):
 
 
     def test_reuse_input_qconfig(self):
+        # [FUNCTION DOC] Checks reuse-input handling of reshape after a quantized conv and of a
+        # reshape-only model, expecting no quantize/dequantize for the latter.
+        # KNOWN ISSUE: the loop variables are unused (the first model is always the conv model
+        # and the second always the reshape model), reshape is called without arguments, and the
+        # occurrence key for dequantize is misspelled, so that count is never really checked.
         class M1(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv followed by a reshape call without arguments.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(3, 3, 3)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the conv, then reshape without arguments.
                 x = self.conv(x)
                 x = x.reshape()
                 return x
 
         class M2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Reshape-only model.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Calls reshape without arguments on the input.
                 x = x.reshape()
                 return x
 
@@ -5618,12 +6660,17 @@ class TestQuantizeFx(QuantizationTestCase):
                 expected_node_list=node_list)
 
     def test_stack_trace_preserved_linear(self):
+        # [FUNCTION DOC] Checks the stack trace of the linear call node is preserved after
+        # prepare and after both reference and normal convert.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Single linear model.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear.
                 super().__init__()
                 self.linear = nn.Linear(1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear.
                 x = self.linear(x)
                 return x
 
@@ -5656,29 +6703,44 @@ class TestQuantizeFx(QuantizationTestCase):
         self.assertTrue(found_stack_trace, f"stack trace not found, node: {n.format_node()}, is_reference: False")
 
     def test_qat_skip_untraced(self):
+        # [FUNCTION DOC] Checks prepare_qat_fx does not replace layers inside modules listed as
+        # non-traceable by class or by name: inner linears remain float.
+        # KNOWN ISSUE: the name-keyed attribute is built from the class-keyed helper (the
+        # name-based helper class is unused), and prepare is called twice with the same
+        # arguments.
         class UnTraceableModuleClass(nn.Module):
+            # [CLASS DOC] HELPER: Wraps a 2x2 linear (non-traceable by class).
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear.
                 super().__init__()
                 self.linear = nn.Linear(2, 2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear.
                 return self.linear(x)
 
         class UnTraceableModuleName(nn.Module):
+            # [CLASS DOC] HELPER: Wraps a 2x2 linear (intended as non-traceable by name).
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear.
                 super().__init__()
                 self.linear = nn.Linear(2, 2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear.
                 return self.linear(x)
 
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Model with two untraceable submodules applied in sequence.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates both submodules.
                 super().__init__()
                 self.untraceable_module_class = UnTraceableModuleClass()
                 self.untraceable_module_name = UnTraceableModuleClass()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the class-listed submodule then the name-listed
+                # one.
                 x = self.untraceable_module_class(x)
                 x = self.untraceable_module_name(x)
                 return x
@@ -5717,8 +6779,15 @@ class TestQuantizeFx(QuantizationTestCase):
         )
 
     def test_qconfig_dict_setup(self):
+        # [FUNCTION DOC] Checks the default qconfig mappings for qnnpack and fbgemm (static and
+        # QAT) produce unsigned 8-bit activation observers with the right quant range: 0 to 127
+        # for fbgemm and 0 to 255 for qnnpack.
+        # KNOWN ISSUE: the example inputs argument is a bare tensor in parentheses, not a tuple.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Convs, conv transposes, linear and functional variants in
+            # order.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates 1d/2d/3d convs, conv transposes and a linear.
                 super().__init__()
                 self.Conv1d = torch.nn.Conv1d(1, 1, 1)
                 self.Conv2d = torch.nn.Conv2d(1, 1, 1)
@@ -5729,6 +6798,8 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.Linear = torch.nn.Linear(1, 1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies every module in order then the functional
+                # conv1d, conv2d, conv3d and linear with random weights.
                 x = self.Conv1d(x)
                 x = self.Conv2d(x)
                 x = self.Conv3d(x)
@@ -5764,15 +6835,22 @@ class TestQuantizeFx(QuantizationTestCase):
                             self.assertEqual(mod.quant_max, upper_bnd)
 
     def test_prepare_mode(self):
+        # [FUNCTION DOC] Checks prepare_fx and prepare_qat_fx both work on models in train and
+        # eval mode.
         class LinearModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Single linear model.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear.
                 super().__init__()
                 self.linear = torch.nn.Linear(5, 10)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear.
                 return self.linear(x)
 
         def _test(prepare_fn, qconfig_dict):
+            # [FUNCTION DOC] HELPER: Prepares a train-mode copy and an eval-mode copy of the
+            # model with the given prepare function and qconfig mapping.
             m = LinearModel()
             m1 = copy.deepcopy(m)
             m1.train()
@@ -5793,6 +6871,10 @@ class TestQuantizeFx(QuantizationTestCase):
             backend_config: BackendConfig,
             satisfies_constraints: bool,
             qconfig_name: str | None = None):
+        # [FUNCTION DOC] HELPER: Prepares and converts a model with a qconfig applied to Linear
+        # under a backend config, then checks whether it was quantized (one quantized Linear and
+        # no float Linear) or left float, according to the flag. If the check fails and a name
+        # was given, prints it and re-raises the error.
         """
         Helper method to validate whether `qconfig` satisfies the constraints specified in `backend_config`.
         """
@@ -5819,16 +6901,22 @@ class TestQuantizeFx(QuantizationTestCase):
             raise e
 
     def test_backend_config_quantization_range(self):
+        # [FUNCTION DOC] Checks quantization range constraints from the backend config: a
+        # qconfig whose activation or weight range exceeds the backend limits, or that gives no
+        # range, is rejected, while a range inside the limits is accepted.
         """
         Check that quantization ranges specified through the BackendConfig are reflected in
         the observers inserted into the model.
         """
         class MyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Single linear model with 30 inputs and 4 outputs.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear.
                 super().__init__()
                 self.linear = torch.nn.Linear(30, 4).float()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear.
                 return self.linear(x)
 
         dtype_config = DTypeConfig(
@@ -5857,6 +6945,8 @@ class TestQuantizeFx(QuantizationTestCase):
                 .set_reference_quantized_module(nnqr.Linear))
 
         def validate_qconfig(qconfig: QConfig, satisfies_constraints: bool):
+            # [FUNCTION DOC] HELPER: Runs the shared validation helper with this test's model
+            # and backend config.
             self._validate_qconfig_against_backend_config_constraints(
                 MyModel(), qconfig, backend_config, satisfies_constraints)
 
@@ -5883,15 +6973,21 @@ class TestQuantizeFx(QuantizationTestCase):
         validate_qconfig(qconfig4, satisfies_constraints=False)
 
     def test_backend_config_scale_min(self):
+        # [FUNCTION DOC] Checks the minimum scale constraint of the backend config: qconfigs
+        # with epsilon equal to or above the limit are accepted; smaller epsilon, or observers
+        # without an epsilon, are rejected.
         """
         Test QConfig eps validation against the BackendConfig's min scale value.
         """
         class MyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Single linear model with 30 inputs and 4 outputs.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear.
                 super().__init__()
                 self.linear = torch.nn.Linear(30, 4).float()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear.
                 return self.linear(x)
 
         dtype_config = DTypeConfig(
@@ -5909,6 +7005,8 @@ class TestQuantizeFx(QuantizationTestCase):
                 .set_reference_quantized_module(nnqr.Linear))
 
         def validate_qconfig(qconfig: QConfig, satisfies_constraints: bool):
+            # [FUNCTION DOC] HELPER: Runs the shared validation helper with this test's model
+            # and backend config.
             self._validate_qconfig_against_backend_config_constraints(
                 MyModel(), qconfig, backend_config, satisfies_constraints)
 
@@ -5943,15 +7041,20 @@ class TestQuantizeFx(QuantizationTestCase):
         validate_qconfig(qconfig5, satisfies_constraints=False)
 
     def test_qnnpack_backend_config(self):
+        # [FUNCTION DOC] Checks the default qnnpack qconfigs (static, QAT versions, symmetric)
+        # satisfy the constraints of the qnnpack backend config.
         """
         Test whether default QNNPACK QConfigs are compatible with the QNNPACK BackendConfig.
         """
         class MyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Single linear model with 30 inputs and 4 outputs.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear.
                 super().__init__()
                 self.linear = torch.nn.Linear(30, 4).float()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear.
                 return self.linear(x)
 
         all_qconfigs: list[tuple[QConfig, str]] = [
@@ -5970,6 +7073,9 @@ class TestQuantizeFx(QuantizationTestCase):
                 MyModel(), qconfig, backend_config, satisfies_constraints=True, qconfig_name=qconfig_name)
 
     def test_symmetric_qnnpack_qconfig_mapping(self):
+        # [FUNCTION DOC] Checks the symmetric qnnpack qconfig mapping works with the qnnpack
+        # backend config, producing a quantized Linear. Returns early without checking if
+        # qnnpack is unsupported.
         """
         Test whether `torch.ao.quantization.qconfig_mapping._get_symmetric_qnnpack_qconfig_mapping`
         works with the QNNPACK BackendConfig.
@@ -5978,11 +7084,14 @@ class TestQuantizeFx(QuantizationTestCase):
             return
 
         class MyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Single linear model with 30 inputs and 4 outputs.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear.
                 super().__init__()
                 self.linear = torch.nn.Linear(30, 4).float()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear.
                 return self.linear(x)
 
         with override_quantized_engine("qnnpack"):
@@ -6001,6 +7110,9 @@ class TestQuantizeFx(QuantizationTestCase):
             model(*example_inputs)
 
     def test_symmetric_qnnpack_qat_qconfig_mapping(self):
+        # [FUNCTION DOC] QAT-flavored mapping counterpart: checks the symmetric qnnpack QAT
+        # mapping produces a quantized Linear under the qnnpack backend config. Note the test
+        # prepares with the non-QAT prepare function. Returns early if qnnpack is unsupported.
         """
         Test whether `torch.ao.quantization.qconfig_mapping._get_symmetric_qnnpack_qat_qconfig_mapping`
         works with the QNNPACK BackendConfig.
@@ -6009,11 +7121,14 @@ class TestQuantizeFx(QuantizationTestCase):
             return
 
         class MyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Single linear model with 30 inputs and 4 outputs.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear.
                 super().__init__()
                 self.linear = torch.nn.Linear(30, 4).float()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear.
                 return self.linear(x)
 
         with override_quantized_engine("qnnpack"):
@@ -6033,11 +7148,14 @@ class TestQuantizeFx(QuantizationTestCase):
 
 
     def test_get_executorch_backend_config(self):
+        # [FUNCTION DOC] Smoke test that the executorch backend config can be constructed.
         from torch.ao.quantization.backend_config import get_executorch_backend_config
         # make sure this runs
         executorch_backend_config = get_executorch_backend_config()
 
     def test_backend_config_check_for_weight_and_bias(self):
+        # [FUNCTION DOC] Checks that preparing with a backend config where addmm has weight and
+        # bias input indexes and the qconfig mapping is empty does not raise.
         """ Test to make sure the backend_config check for weight and bias
         runs when the qconfig is None for the ops with weight and bias
         previously the error was not hit because we first check input, and
@@ -6045,12 +7163,17 @@ class TestQuantizeFx(QuantizationTestCase):
         """
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model calling addmm with a stored bias, input and weight
+            # tensor.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the weight and bias tensors from small tuples.
                 super().__init__()
                 self.weight = torch.tensor((5, 5))
                 self.bias = torch.tensor((5,))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Calls addmm with the stored bias, the input and the
+                # weight.
                 return torch.addmm(self.bias, x, self.weight)
 
         m = M().eval()
@@ -6074,6 +7197,9 @@ class TestQuantizeFx(QuantizationTestCase):
         m = prepare_fx(m, qconfig_mapping, example_inputs, backend_config=backend_config)
 
     def test_get_default_qconfig_valid_backend(self):
+        # [FUNCTION DOC] Checks the default qconfig and qconfig mapping getters (static and QAT)
+        # raise an assertion error mentioning an unsupported backend for an unknown name and for
+        # a non-string value.
         """ Checks that AssertionError is raised when non expected backend input is specified
         """
         invalid_backends = ["imaginary_backend", 3]
@@ -6088,12 +7214,17 @@ class TestQuantizeFx(QuantizationTestCase):
                 qconfig_mapping = get_default_qat_qconfig_mapping(invalid_backend)
 
     def test__convert_to_reference_decomposed_fx(self):
+        # [FUNCTION DOC] Checks the decomposed reference conversion gives two quantize and two
+        # dequantize decomposed ops for a linear and equals the reference output.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Single linear model.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear.
                 super().__init__()
                 self.linear = torch.nn.Linear(5, 10)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear.
                 return self.linear(x)
 
         m = M().eval()
@@ -6117,12 +7248,18 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoQNNPACK
     def test__convert_to_reference_decomposed_fx_dynamic_quant(self):
+        # [FUNCTION DOC] Dynamic quantization variant: checks one choose-qparams, one quantize
+        # and one dequantize decomposed op and equal output to the reference conversion. Uses
+        # the qnnpack engine to avoid reduce range. Skipped without QNNPACK.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Single linear model.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear.
                 super().__init__()
                 self.linear = torch.nn.Linear(5, 10)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear.
                 return self.linear(x)
 
         # to avoid reduce_range
@@ -6150,8 +7287,13 @@ class TestQuantizeFx(QuantizationTestCase):
             self.assertEqual(res, res_ref)
 
     def test__convert_to_reference_decomposed_fx_per_channel_quant(self):
+        # [FUNCTION DOC] Per-channel variant on a functional linear with weight and bias inputs:
+        # checks per-tensor quantize/dequantize for activations and one per-channel pair for the
+        # weight, and output equal to the reference.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Functional linear model taking input, weight and bias.
             def forward(self, x, weight, bias):
+                # [FUNCTION DOC] HELPER: Applies the functional linear to the given tensors.
                 return F.linear(x, weight, bias)
 
         m = M().eval()
@@ -6180,15 +7322,21 @@ class TestQuantizeFx(QuantizationTestCase):
         self.assertEqual(res, res_ref)
 
     def test_change_backend_config_for_fixed_qparam_ops(self):
+        # [FUNCTION DOC] Checks prepare_fx succeeds with a global qconfig when the backend
+        # config has no entries for fixed-qparams ops such as Tanh (qconfigs are not validated
+        # there).
         """ Making sure we can skip validation of qconfigs for fixedqparam ops based
         on BackendConfig
         """
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Single Tanh model.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the Tanh.
                 super().__init__()
                 self.tanh = torch.nn.Tanh()
 
             def forward(self, x: torch.Tensor):
+                # [FUNCTION DOC] HELPER: Applies tanh.
                 x = self.tanh(x)
                 return x
 
@@ -6208,21 +7356,32 @@ class TestQuantizeFx(QuantizationTestCase):
         )
 
     def test_channel_shuffle_lowering(self):
+        # [FUNCTION DOC] Checks channel shuffle lowering for the module, torch function and
+        # functional forms: each stays as one channel shuffle node between quantize and
+        # dequantize, in the quantized and reference models.
         # Three versions of channel shuffle
         class M1(torch.nn.Module):
+            # [CLASS DOC] HELPER: Channel shuffle module applied to the doubled input plus
+            # input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the channel shuffle module with two groups.
                 super().__init__()
                 self.op = torch.nn.ChannelShuffle(2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds the input to the shuffle of the doubled input.
                 return self.op(x + x) + x
 
         class M2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Uses the torch channel shuffle function with two groups.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds the input to the shuffled doubled input.
                 return torch.channel_shuffle(x + x, 2) + x
 
         class M3(torch.nn.Module):
+            # [CLASS DOC] HELPER: Uses the functional channel shuffle with two groups.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds the input to the shuffled doubled input.
                 return torch.nn.functional.channel_shuffle(x + x, 2) + x
 
         x = torch.randn(4, 4, 4, 4)
@@ -6251,6 +7410,9 @@ class TestQuantizeFx(QuantizationTestCase):
             self.checkGraphModuleNodes(m_ref, expected_node_occurrence=node_occurrence_ref)
 
     def test_match_pattern_with_multiple_args(self):
+        # [FUNCTION DOC] Checks a backend pattern with a complex format of reshape over
+        # transpose and a wildcard input (reshape has two arguments) is matched: after prepare
+        # there are two observers, one at the pattern input and one at its output.
         """ Test that we can match a pattern that has multiple arguments
         Pattern:
                            shape \
@@ -6260,6 +7422,9 @@ class TestQuantizeFx(QuantizationTestCase):
         """
 
         def _get_pattern_configs():
+            # [FUNCTION DOC] HELPER: Builds a list with one backend pattern config for the
+            # reshape, transpose, wildcard pattern, sharing observers with the input and using
+            # the transpose as root node.
             backend_pattern_configs = []
             observation_type = ObservationType.OUTPUT_SHARE_OBSERVER_WITH_INPUT
             weighted_op_quint8_dtype_config = DTypeConfig(
@@ -6271,6 +7436,8 @@ class TestQuantizeFx(QuantizationTestCase):
             dtype_configs = [weighted_op_quint8_dtype_config]
 
             def root_node_getter(node_pattern):
+                # [FUNCTION DOC] HELPER: Root node getter returning the transpose from the
+                # pattern.
                 reshape, transpose, shape = node_pattern
                 return transpose
 
@@ -6286,7 +7453,10 @@ class TestQuantizeFx(QuantizationTestCase):
         backend_config = BackendConfig().set_backend_pattern_configs(_get_pattern_configs())
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Transposes dims 0 and 1 then reshapes to a flat tensor.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies torch transpose then torch reshape to one
+                # dimension.
                 x = torch.transpose(x, 0, 1)
                 x = torch.reshape(x, (-1,))
                 return x
@@ -6304,6 +7474,11 @@ class TestQuantizeFx(QuantizationTestCase):
     def _test_linear_activation_fusion_lowering_helper(
             self, module, example_inputs, qconfig_mapping,
             backend_config, fused_module, root_module, activation_module):
+        # [FUNCTION DOC] HELPER: Shared check for linear-activation fusion: prepares with the
+        # given backend config and qconfig mapping, converts both the quantized and the
+        # reference models, checks the quantized model has the fused module and none of the root
+        # or activation modules, the reference has two quantize and two dequantize nodes, and
+        # runs the quantized model.
         node_occurrence = {
             ns.call_function(torch.quantize_per_tensor): 1,
             ns.call_method("dequantize"): 1,
@@ -6329,6 +7504,8 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoONEDNN
     def test_linear_leaky_relu_lowering(self):
+        # [FUNCTION DOC] Checks Linear (optionally bn) plus LeakyReLU fuses and lowers to
+        # LinearLeakyReLU with the onednn engine and backend config. Skipped without ONEDNN.
         """ Test fusion and lowering of Linear - (bn -) LeakyReLU
             by FX. For onednn backend only.
         """
@@ -6348,6 +7525,9 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoONEDNN
     def test_linear_tanh_lowering(self):
+        # [FUNCTION DOC] Checks Linear plus Tanh fuses and lowers to LinearTanh with the onednn
+        # engine and backend config, setting the same qconfig for both ops. Skipped without
+        # ONEDNN.
         """ Test fusion and lowering of Linear - Tanh
             by FX. For onednn backend only.
         """
@@ -6376,14 +7556,22 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @override_qengines
     def test_linear_size_view(self):
+        # [FUNCTION DOC] Checks a linear (optionally with relu) followed by a view using the
+        # size of the output is quantized as one quantized Linear or LinearReLU with one
+        # quantize and one dequantize node. Runs for each engine.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Linear, optional relu, then a view using the size of the
+            # output.
             def __init__(self, use_relu=False):
+                # [FUNCTION DOC] HELPER: Creates linear and relu and stores the relu flag.
                 super().__init__()
                 self.linear = torch.nn.Linear(16, 32)
                 self.relu = torch.nn.ReLU()
                 self.use_relu = use_relu
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Linear, relu if enabled, view to a four-dimensional
+                # shape.
                 x = self.linear(x)
                 if self.use_relu:
                     x = self.relu(x)
@@ -6408,14 +7596,20 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @override_qengines
     def test_linear_shape_view(self):
+        # [FUNCTION DOC] Same as the size view test but the view uses the shape attribute of the
+        # output.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Linear, optional relu, then a view using the shape of the
+            # output.
             def __init__(self, use_relu=False):
+                # [FUNCTION DOC] HELPER: Creates linear and relu and stores the relu flag.
                 super().__init__()
                 self.linear = torch.nn.Linear(16, 32)
                 self.relu = torch.nn.ReLU()
                 self.use_relu = use_relu
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Linear, relu if enabled, view with the shape entry.
                 x = self.linear(x)
                 if self.use_relu:
                     x = self.relu(x)
@@ -6439,12 +7633,20 @@ class TestQuantizeFx(QuantizationTestCase):
             self.checkGraphModuleNodes(quantized_model, expected_node_occurrence=node_occurrence)
 
     def test_mixed_dtypes(self):
+        # [FUNCTION DOC] Checks different dtypes and fixed qparams per layer using a custom
+        # qnnpack backend config with qint32 for linear, sigmoid and tanh. Converts to reference
+        # and verifies each op is preceded by dequantize nodes and followed by a single quantize
+        # with the expected dtype, and the add node takes the dequantized linear2 and tanh
+        # outputs.
         """
         Test that multiple dtypes can be used in the same model for different layers,
         and the dtypes will be converted correctly between the layers.
         """
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Two linears, sigmoid, tanh and a float functional add of the
+            # second linear output and the tanh output.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the layers and float functional.
                 super().__init__()
                 self.linear1 = torch.nn.Linear(5, 5)
                 self.linear2 = torch.nn.Linear(5, 5)
@@ -6453,6 +7655,8 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.float_functional = torch.ao.nn.quantized.FloatFunctional()
 
             def forward(self, x: torch.Tensor):
+                # [FUNCTION DOC] HELPER: Applies linear1, linear2, sigmoid, tanh and adds
+                # linear2 and tanh.
                 x = self.linear1(x)  # qint32
                 x = self.linear2(x)  # quint8
                 linear2 = x
@@ -6462,6 +7666,8 @@ class TestQuantizeFx(QuantizationTestCase):
                 return x
 
         def make_qconfig(scale, zp, dtype):
+            # [FUNCTION DOC] HELPER: Builds a QConfig with a fixed qparams observer of the given
+            # scale, zero point and dtype, and the default weight observer.
             return QConfig(
                 activation=FixedQParamsObserver.with_args(scale=scale, zero_point=zp, dtype=dtype),
                 weight=torch.ao.quantization.default_weight_observer)
@@ -6550,6 +7756,8 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.assertEqual(linear2_dq.args[0].args[0], linear2_node)
 
     def test_lowering_functional_conv_with_kwargs(self):
+        # [FUNCTION DOC] Checks functional conv1d/2d/3d called with keyword arguments is lowered
+        # to the matching quantized conv op and runs.
         dim_to_op = {
             1: F.conv1d,
             2: F.conv2d,
@@ -6562,7 +7770,9 @@ class TestQuantizeFx(QuantizationTestCase):
         }
 
         class Mod(nn.Module):
+            # [CLASS DOC] HELPER: Functional conv of a given dimension with a weight parameter.
             def __init__(self, in_channels, out_channels, kernel_size, dimension):
+                # [FUNCTION DOC] HELPER: Picks the op for the dimension and creates the weight.
                 super().__init__()
                 self.dim = dimension
                 self.op = dim_to_op[dimension]
@@ -6570,6 +7780,8 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.weight = nn.Parameter(torch.randn(out_channels, in_channels, *kernel_sizes))
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Calls the functional conv with keyword arguments for
+                # bias, stride, padding, dilation and groups.
                 return self.op(input, self.weight, bias=None, stride=[1] * self.dim,
                                padding=[0] * self.dim, dilation=[1] * self.dim, groups=1)
 
@@ -6591,6 +7803,8 @@ class TestQuantizeFx(QuantizationTestCase):
             self.checkGraphModuleNodes(quantized_model, expected_node_occurrence=node_occurrence)
 
     def test_lowering_functional_conv_transpose_with_kwargs(self):
+        # [FUNCTION DOC] Checks functional conv_transpose 1d/2d/3d called with keyword arguments
+        # is lowered to the quantized conv transpose op and runs.
         dim_to_op = {
             1: F.conv_transpose1d,
             2: F.conv_transpose2d,
@@ -6603,7 +7817,9 @@ class TestQuantizeFx(QuantizationTestCase):
         }
 
         class Mod(nn.Module):
+            # [CLASS DOC] HELPER: Functional conv transpose of a given dimension with a weight.
             def __init__(self, in_channels, out_channels, kernel_size, dimension):
+                # [FUNCTION DOC] HELPER: Picks the op for the dimension and creates the weight.
                 super().__init__()
                 self.dim = dimension
                 self.op = dim_to_op[dimension]
@@ -6611,6 +7827,8 @@ class TestQuantizeFx(QuantizationTestCase):
                 self.weight = nn.Parameter(torch.randn(in_channels, out_channels, *kernel_sizes))
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Calls the functional op with keyword arguments for
+                # bias, stride, padding, output padding, dilation and groups.
                 return self.op(input, self.weight, bias=None, stride=[1] * self.dim,
                                padding=[0] * self.dim, output_padding=[0] * self.dim,
                                dilation=[1] * self.dim, groups=1)
@@ -6633,12 +7851,17 @@ class TestQuantizeFx(QuantizationTestCase):
             self.checkGraphModuleNodes(quantized_model, expected_node_occurrence=node_occurrence)
 
     def test_lowering_functional_linear_with_kwargs(self):
+        # [FUNCTION DOC] Checks functional linear called with a keyword bias argument is lowered
+        # to the quantized linear op and runs.
         class Mod(nn.Module):
+            # [CLASS DOC] HELPER: Functional linear with a weight parameter and no bias.
             def __init__(self, in_channels, out_channels):
+                # [FUNCTION DOC] HELPER: Creates the weight parameter.
                 super().__init__()
                 self.weight = nn.Parameter(torch.randn(out_channels, in_channels))
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Calls functional linear with keyword bias none.
                 return F.linear(input, self.weight, bias=None)
 
         model = Mod(8, 4)
@@ -6658,25 +7881,37 @@ class TestQuantizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_keep_original_weights(self):
+        # [FUNCTION DOC] Checks convert with keep original weights records the unpacked weight
+        # and bias of each linear keyed by the generated packed weight name, including submodule
+        # names with special characters; the last linear has no bias recorded. Skipped without
+        # FBGEMM.
         class SubModule(nn.Module):
+            # [CLASS DOC] HELPER: Submodule holding weight and bias parameters used by a
+            # functional linear.
             """
             A simple submodule containing a linear layer.
             """
 
             def __init__(self, input_dim, output_dim):
+                # [FUNCTION DOC] HELPER: Creates random weight and bias parameters.
                 super().__init__()
                 self.w = nn.Parameter(torch.randn(input_dim, output_dim))
                 self.b = nn.Parameter(torch.randn(input_dim))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies functional linear with the stored weight and
+                # bias.
                 return F.linear(x, self.w, self.b)
 
         class MainModule(nn.Module):
+            # [CLASS DOC] HELPER: Main module with five submodules registered under names
+            # containing special characters, followed by a functional linear with a parameter.
             """
             The main module containing the submodule.
             """
 
             def __init__(self, input_dim, hidden_dim, output_dim):
+                # [FUNCTION DOC] HELPER: Creates the submodules and the final weight parameter.
                 super().__init__()
                 self.submodule_1 = SubModule(hidden_dim, input_dim)
                 setattr(self, 'submodule|2', SubModule(hidden_dim, hidden_dim))
@@ -6686,6 +7921,8 @@ class TestQuantizeFx(QuantizationTestCase):
                 self._w = nn.Parameter(torch.randn(output_dim, hidden_dim))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Chains the five submodules and then applies functional
+                # linear.
                 x1 = self.submodule_1(x)
                 x2 = getattr(self, 'submodule|2')(x1)
                 x3 = getattr(self, 'submodule/3')(x2)
@@ -6764,7 +8001,12 @@ class TestQuantizeFx(QuantizationTestCase):
 
 @skipIfNoFBGEMM
 class TestQuantizeFxOps(QuantizationTestCase):
+    # [CLASS DOC] Unit tests for individual quantized ops through FX graph mode quantization
+    # (linear, conv, activations, pooling and more) across static, QAT and dynamic quantization
+    # types. Skipped without FBGEMM.
     def setUp(self):
+        # [FUNCTION DOC] Creates a symmetric qint8 histogram plus per-channel custom qconfig and
+        # a table mapping common modules and functions to the default node quantize handler.
         super().setUp()
         self.custom_qconfig = torch.ao.quantization.QConfig(
             activation=torch.ao.quantization.observer.HistogramObserver.with_args(
@@ -6802,17 +8044,26 @@ class TestQuantizeFxOps(QuantizationTestCase):
     """
     @skipIfNoFBGEMM
     def test_linear_module(self):
+        # [FUNCTION DOC] Checks quantizing a linear module, a linear with relu (static, QAT) and
+        # a linear with bn across quant types; checks the quantized node and that quantized
+        # output equals the reference quantized output (for static and QAT). Runs under the
+        # fbgemm engine.
         with override_quantized_engine('fbgemm'):
             class LinearModel(torch.nn.Module):
+                # [CLASS DOC] HELPER: Linear model with 30 inputs and 4 outputs.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates the linear.
                     super().__init__()
                     self.linear = torch.nn.Linear(30, 4).float()
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies the linear.
                     return self.linear(x)
 
             class LinearReLUModel(torch.nn.Module):
+                # [CLASS DOC] HELPER: Linear followed by module or functional relu.
                 def __init__(self, f_relu=False):
+                    # [FUNCTION DOC] HELPER: Creates linear and the module or functional relu.
                     super().__init__()
                     self.linear = torch.nn.Linear(30, 4).float()
                     if f_relu:
@@ -6821,17 +8072,21 @@ class TestQuantizeFxOps(QuantizationTestCase):
                         self.relu = torch.nn.ReLU()
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies linear then relu.
                     x = self.linear(x)
                     x = self.relu(x)
                     return x
 
             class LinearBnModel(torch.nn.Module):
+                # [CLASS DOC] HELPER: Linear followed by batch norm.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates linear and bn.
                     super().__init__()
                     self.linear = torch.nn.Linear(4, 4).float()
                     self.bn = torch.nn.BatchNorm1d(4)
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies linear then bn.
                     x = self.linear(x)
                     x = self.bn(x)
                     return x
@@ -6864,9 +8119,17 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_functional_linear(self):
+        # [FUNCTION DOC] Checks functional linear with and without bias, relu (module or
+        # functional) or identity across quant types: observer counts at prepare, quantize and
+        # dequantize counts at convert, the chosen quantized function, output equal to the
+        # reference and a folded packed weight in the state dict for static types.
         with override_quantized_engine('fbgemm'):
             class FuncLinear(torch.nn.Module):
+                # [CLASS DOC] HELPER: Functional linear with constant weight and bias, optional
+                # bias use, and relu, module relu or identity afterwards.
                 def __init__(self, use_bias, has_relu, f_relu):
+                    # [FUNCTION DOC] HELPER: Creates random weight and bias and selects the relu
+                    # or identity.
                     super().__init__()
                     self.w = torch.randn(4, 30)
                     self.b = torch.randn(4)
@@ -6880,6 +8143,8 @@ class TestQuantizeFxOps(QuantizationTestCase):
                         self.relu_or_id = torch.nn.Identity()
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies functional linear with or without bias,
+                    # then relu or identity.
                     if self.use_bias:
                         x = F.linear(x, self.w, self.b)
                     else:
@@ -6959,9 +8224,18 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_linear_dynamic_fp16(self):
+        # [FUNCTION DOC] Checks fp16 dynamic quantization of a functional linear (with or
+        # without bias and relu) for reference and non-reference conversion: two placeholder
+        # observers at prepare; the reference keeps the float linear with one cast node for the
+        # weight, else the dynamic fp16 (relu) linear op is expected. Runs under the fbgemm
+        # engine.
         with override_quantized_engine('fbgemm'):
             class FuncLinear(torch.nn.Module):
+                # [CLASS DOC] HELPER: Functional linear with constant weight and bias, optional
+                # bias use, and relu, module relu or identity afterwards.
                 def __init__(self, use_bias, has_relu, f_relu):
+                    # [FUNCTION DOC] HELPER: Creates random weight and bias and selects the relu
+                    # or identity.
                     super().__init__()
                     self.w = torch.randn(4, 30)
                     self.b = torch.randn(4)
@@ -6975,6 +8249,8 @@ class TestQuantizeFxOps(QuantizationTestCase):
                         self.relu = torch.nn.Identity()
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies functional linear with or without bias,
+                    # then the relu.
                     if self.use_bias:
                         x = F.linear(x, self.w, self.b)
                     else:
@@ -7015,8 +8291,16 @@ class TestQuantizeFxOps(QuantizationTestCase):
                     expected_node_occurrence=convert_node_occurrence)
 
     def test_linear_static_fp16(self):
+        # [FUNCTION DOC] Checks static fp16 quantization of a functional linear (with or without
+        # bias and relu) using the legacy native backend config: the float linear stays unfused
+        # with cast and dequantize nodes for activation, weight, bias and output (plus extra
+        # ones for the identity copy node in reference mode).
         class FuncLinear(torch.nn.Module):
+            # [CLASS DOC] HELPER: Functional linear with constant weight and bias, optional bias
+            # use, and relu, module relu or identity afterwards.
             def __init__(self, use_bias, has_relu, f_relu):
+                # [FUNCTION DOC] HELPER: Creates random weight and bias and selects the relu or
+                # identity.
                 super().__init__()
                 self.w = torch.randn(4, 30)
                 self.b = torch.randn(4)
@@ -7030,6 +8314,8 @@ class TestQuantizeFxOps(QuantizationTestCase):
                     self.relu = torch.nn.Identity()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies functional linear with or without bias, then
+                # the relu.
                 if self.use_bias:
                     x = F.linear(x, self.w, self.b)
                 else:
@@ -7079,14 +8365,19 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_conv_module(self):
+        # [FUNCTION DOC] Checks conv modules of 1d/2d/3d are converted to the matching quantized
+        # conv module for the static quant types.
         conv_module = {1 : torch.nn.Conv1d, 2 : torch.nn.Conv2d, 3 : torch.nn.Conv3d}
 
         class ConvWrapper(torch.nn.Module):
+            # [CLASS DOC] HELPER: Wraps a conv of the requested dimension with three channels.
             def __init__(self, dim):
+                # [FUNCTION DOC] HELPER: Creates the conv from the dimension lookup.
                 super().__init__()
                 self.conv = conv_module[dim](3, 3, 3).float()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the conv.
                 return self.conv(x)
 
         options = itertools.product([1, 2, 3], self.static_quant_types)
@@ -7103,6 +8394,10 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_functional_conv(self):
+        # [FUNCTION DOC] Checks functional conv 1d/2d/3d with and without bias and relu (module,
+        # functional or identity) for static and QAT types: observer counts at prepare, node
+        # counts at convert, the quantized conv or conv-relu op, output equal to the reference
+        # and a folded packed weight in the state dict. Runs under the fbgemm engine.
         with override_quantized_engine('fbgemm'):
             """ Test for function conv and functional conv + relu
             """
@@ -7113,7 +8408,11 @@ class TestQuantizeFxOps(QuantizationTestCase):
             }
 
             class FuncConv(torch.nn.Module):
+                # [CLASS DOC] HELPER: Functional conv of a given dimension with constant weight,
+                # optional bias, default stride, padding, dilation, groups and relu or identity.
                 def __init__(self, dim, use_bias, has_relu, f_relu):
+                    # [FUNCTION DOC] HELPER: Creates weight, optional bias, conv settings and
+                    # the relu or identity.
                     super().__init__()
                     self.dim = dim
                     self.w = torch.randn(tuple([3] * (dim + 2)))
@@ -7132,6 +8431,8 @@ class TestQuantizeFxOps(QuantizationTestCase):
                         self.relu = torch.nn.Identity()
 
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Applies the functional conv with the stored
+                    # settings, then the relu.
                     x = convs[self.dim](x, self.w, self.b, self.stride, self.padding, self.dilation, self.groups)
                     x = self.relu(x)
                     return x
@@ -7211,32 +8512,44 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_quantized_conv_relu(self):
+        # [FUNCTION DOC] Checks conv followed by relu (module in-place or not, functional,
+        # in-place functional) converts to the fused quantized ConvReLU module for 1d/2d/3d and
+        # static quant types.
         """tests for conv1d_relu/conv2d_relu/conv3d_relu"""
         conv_module = {1 : torch.nn.Conv1d, 2 : torch.nn.Conv2d, 3 : torch.nn.Conv3d}
 
         class ConvNdRelu(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv of the given dimension followed by a ReLU module.
             def __init__(self, dim, inplace):
+                # [FUNCTION DOC] HELPER: Creates the conv and the ReLU with the in-place flag.
                 super().__init__()
                 self.conv = conv_module[dim](3, 3, 3).float()
                 self.relu = torch.nn.ReLU(inplace)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv then relu.
                 return self.relu(self.conv(x))
 
         class ConvNdFunctionalRelu(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv followed by the functional relu.
             def __init__(self, dim):
+                # [FUNCTION DOC] HELPER: Creates the conv.
                 super().__init__()
                 self.conv = conv_module[dim](3, 3, 3).float()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv then functional relu.
                 return F.relu(self.conv(x))
 
         class ConvNdInplaceFunctionalRelu(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv followed by the in-place functional relu.
             def __init__(self, dim):
+                # [FUNCTION DOC] HELPER: Creates the conv.
                 super().__init__()
                 self.conv = conv_module[dim](3, 3, 3).float()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv then functional relu in place.
                 return F.relu(self.conv(x), True)
 
         options = itertools.product([1, 2, 3], self.static_quant_types)
@@ -7257,6 +8570,10 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
 
     def _test_binary_op_int8_impl(self, binary_op, ibinary_op, quantized_op):
+        # [FUNCTION DOC] HELPER: Shared int8 binary op check: for in-place, scalar and reference
+        # variations, quantizes a model with the op after convs and one with unquantized inputs,
+        # expecting the quantized op, or the dequantize, op, quantize sequence in reference
+        # mode.
         data = (torch.randn(1, 1, 1, 1, dtype=torch.float),
                 torch.randn(1, 1, 1, 1, dtype=torch.float))
         options = itertools.product([True, False], [True, False], [True, False])
@@ -7286,6 +8603,9 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
 
     def _test_binary_op_float16_impl(self, binary_op, ibinary_op):
+        # [FUNCTION DOC] HELPER: Shared fp16 binary op check: for in-place and scalar
+        # variations, quantizes with an fp16 static qconfig on the op using the legacy native
+        # backend config and checks the number of cast nodes for both models.
         data = (torch.randn(1, 1, 1, 1, dtype=torch.float),
                 torch.randn(1, 1, 1, 1, dtype=torch.float))
         quant_type = QuantType.STATIC
@@ -7320,6 +8640,8 @@ class TestQuantizeFxOps(QuantizationTestCase):
                 backend_config=backend_config)
 
     def _test_binary_op_relu_int8_impl(self, binary_op, ibinary_op, quantized_op):
+        # [FUNCTION DOC] HELPER: Shared int8 binary op plus relu check over in-place, relu kind
+        # (module, functional, torch) and scalar options, expecting the fused quantized op.
         data = (torch.rand((1, 1, 1, 1), dtype=torch.float),
                 torch.rand((1, 1, 1, 1), dtype=torch.float))
         quant_type = QuantType.STATIC
@@ -7333,6 +8655,8 @@ class TestQuantizeFxOps(QuantizationTestCase):
                 model, data, quant_type, quantized_node)
 
     def _test_binary_op_relu_float16_impl(self, binary_op, ibinary_op):
+        # [FUNCTION DOC] HELPER: Shared fp16 binary op plus relu check with convs unquantized:
+        # the number of cast nodes is three for scalar and four otherwise.
         data = (torch.rand((1, 1, 1, 1), dtype=torch.float),
                 torch.rand((1, 1, 1, 1), dtype=torch.float))
         quant_type = QuantType.STATIC
@@ -7357,6 +8681,7 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_add(self):
+        # [FUNCTION DOC] Checks int8 and fp16 handling of add. Skipped without FBGEMM.
         self._test_binary_op_int8_impl(
             operator.add, operator.iadd, torch.ops.quantized.add)
         self._test_binary_op_float16_impl(
@@ -7364,24 +8689,33 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @unittest.skip("This is no longer needed right now, can enable later with new api")
     def test_sub(self):
+        # [FUNCTION DOC] Skipped test of fp16 handling for subtraction (operator and torch).
         self._test_binary_op_float16_impl(operator.sub, operator.isub)
         self._test_binary_op_float16_impl(torch.sub, None)
 
     @unittest.skip("This is no longer needed right now, can enable later with new api")
     def test_div(self):
+        # [FUNCTION DOC] Skipped test of fp16 handling for division (operator and torch).
         self._test_binary_op_float16_impl(operator.truediv, operator.itruediv)
         self._test_binary_op_float16_impl(torch.div, None)
 
     @skipIfNoFBGEMM
     def test_mul(self):
+        # [FUNCTION DOC] Checks int8 and fp16 handling of multiplication. Skipped without
+        # FBGEMM.
         self._test_binary_op_int8_impl(
             operator.mul, operator.imul, torch.ops.quantized.mul)
         self._test_binary_op_float16_impl(operator.mul, operator.imul)
 
     @unittest.skip("This is no longer needed right now, can enable later with new api")
     def test_sum(self):
+        # [FUNCTION DOC] Skipped test of fp16 handling of sum along a dimension: expects three
+        # cast nodes.
         class Sum(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model summing along dimension one twice, once keeping the
+            # dimension.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Sums over dimension one with keep-dims then without.
                 x = torch.sum(x, [1], keepdim=True)
                 x = torch.sum(x, [1])
                 return x
@@ -7404,8 +8738,12 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @unittest.skip("This is no longer needed right now, can enable later with new api")
     def test_bmm(self):
+        # [FUNCTION DOC] Skipped test of fp16 handling of batched matrix multiply for the torch
+        # function form; the method form is a TODO.
         class BMMMethod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model calling the bmm method (unused, see the TODO).
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the bmm of the two inputs.
                 return x.bmm(y)
 
         data = (torch.randn(1, 1, 1, dtype=torch.float),
@@ -7436,6 +8774,8 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_add_relu(self):
+        # [FUNCTION DOC] Checks add followed by relu for int8 and fp16 using the shared helpers.
+        # Skipped without FBGEMM.
         self._test_binary_op_relu_int8_impl(
             operator.add, operator.iadd, torch.ops.quantized.add_relu)
         self._test_binary_op_relu_float16_impl(
@@ -7443,17 +8783,26 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_add_relu_multiple_uses_of_relu(self):
+        # [FUNCTION DOC] Checks a shared in-place relu module used twice after adds fuses both
+        # into the quantized add-relu op (two quantize, two add-relu, one dequantize), and the
+        # converted model can be scripted and run.
         class Sub(torch.nn.Module):
+            # [CLASS DOC] HELPER: Holds an in-place ReLU.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the relu.
                 super().__init__()
                 self.relu = torch.nn.ReLU(inplace=True)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Adds, relu through the submodule, adds, relu again.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the Sub module.
                 super().__init__()
                 self.sub = Sub()
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Computes x plus y, relu, plus y, relu using the shared
+                # relu.
                 x = x + y
                 x = self.sub.relu(x)
                 x = x + y
@@ -7477,6 +8826,8 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_mul_relu(self):
+        # [FUNCTION DOC] Checks multiplication followed by relu for int8 and fp16 using the
+        # shared helpers. Skipped without FBGEMM.
         self._test_binary_op_relu_int8_impl(
             operator.mul, operator.imul, torch.ops.quantized.mul_relu)
         self._test_binary_op_relu_float16_impl(
@@ -7484,6 +8835,8 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     # TODO(future PR): make more generic
     def _test_quantized_add_mul_qat(self, model, example_inputs, expected_node_occurrence):
+        # [FUNCTION DOC] HELPER: Prepares the model with the QAT fbgemm qconfig and checks node
+        # counts of the prepared graph.
         qconfig_dict = {'': torch.ao.quantization.get_default_qat_qconfig('fbgemm')}
         mp = prepare_qat_fx(model, qconfig_dict, example_inputs=example_inputs)
         self.checkGraphModuleNodes(
@@ -7491,13 +8844,18 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_quantized_add_qat(self):
+        # [FUNCTION DOC] Checks the number of fake quantize modules (five) in a QAT prepared
+        # model with adds of constants around convs and a relu. Skipped without FBGEMM.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Add constant, conv, add constant, relu, conv.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates conv1 and conv2.
                 super().__init__()
                 self.conv1 = torch.nn.Conv2d(1, 1, 1)
                 self.conv2 = torch.nn.Conv2d(1, 1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies add, conv1, add, relu, conv2.
                 x = torch.add(x, 1.0)
                 x = self.conv1(x)
                 x = torch.add(x, 1.0)
@@ -7514,13 +8872,19 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_quantized_mul_qat(self):
+        # [FUNCTION DOC] Checks the number of fake quantize modules (five) in a QAT prepared
+        # model with multiplications by constants around convs and a relu. Skipped without
+        # FBGEMM.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Mul constant, conv, mul constant, relu, conv.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates conv1 and conv2.
                 super().__init__()
                 self.conv1 = torch.nn.Conv2d(1, 1, 1)
                 self.conv2 = torch.nn.Conv2d(1, 1, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies mul, conv1, mul, relu, conv2.
                 x = torch.mul(x, 1.0)
                 x = self.conv1(x)
                 x = torch.mul(x, 1.0)
@@ -7536,18 +8900,24 @@ class TestQuantizeFxOps(QuantizationTestCase):
         self._test_quantized_add_mul_qat(m, example_inputs, expected_node_occurrence)
 
     def test_int8_input_no_unnecessary_fq(self):
+        # [FUNCTION DOC] Checks that when the graph input is quantized and the only op does not
+        # need an activation observer, only one fake quantize module is inserted (not an extra
+        # one for the input).
         """
         If the inputs to the graph are quantized and the only node
         does not need an activation observer, verifies that the
         activation observer is not inserted.
         """
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Applies a float functional add of a scalar.
             def __init__(self, scalar):
+                # [FUNCTION DOC] HELPER: Stores the scalar and creates the float functional.
                 super().__init__()
                 self.scalar = scalar
                 self.add_func = torch.ao.nn.quantized.FloatFunctional()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds the scalar to the input via the float functional.
                 return self.add_func.add_scalar(x, self.scalar)
 
         m = M(0.5)
@@ -7563,16 +8933,22 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_cat(self):
+        # [FUNCTION DOC] Checks concatenation of two conv outputs: quantized output and node
+        # counts for normal and reference modes; also checks the two inputs and output of the
+        # cat share one observer (two duplicate references). Skipped without FBGEMM.
         """ quantization of the output of cat will depend on the
         input of cat. we only quantize the output of cat when its inputs are quantized.
         """
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Two convs whose outputs are concatenated along dimension one.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates conv1 and conv2.
                 super().__init__()
                 self.conv1 = torch.nn.Conv2d(2, 2, 2).float()
                 self.conv2 = torch.nn.Conv2d(2, 2, 2).float()
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Applies conv1 to x, conv2 to y and concatenates.
                 x = self.conv1(x)
                 y = self.conv2(y)
                 return torch.cat([x, y], 1)
@@ -7628,6 +9004,8 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_qbatch_norm(self):
+        # [FUNCTION DOC] Checks quantizing 2d and 3d batch norm yields quantized BatchNorm or
+        # (reference mode) the float module; 1d is not available. Skipped without FBGEMM.
         bn_module = {
             # TODO: quantized batchnorm 1d module is missing
             # 1 : torch.nn.BatchNorm1d,
@@ -7636,11 +9014,14 @@ class TestQuantizeFxOps(QuantizationTestCase):
         }
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Batch norm of the requested dimension with three features.
             def __init__(self, dim):
+                # [FUNCTION DOC] HELPER: Creates the bn from the dimension lookup.
                 super().__init__()
                 self.bn = bn_module[dim](3).to(torch.float)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the bn.
                 return self.bn(x)
 
         options = itertools.product(self.static_quant_types, [2, 3], [True, False])
@@ -7662,31 +9043,44 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_qbatch_norm_relu(self):
+        # [FUNCTION DOC] Checks batch norm followed by relu (module in-place or not, functional,
+        # in-place functional) fuses into BNReLU for 2d/3d, in quantized or (reference)
+        # intrinsic form. Skipped without FBGEMM.
         bn_module = {2 : torch.nn.BatchNorm2d, 3 : torch.nn.BatchNorm3d}
 
         class BNRelu(torch.nn.Module):
+            # [CLASS DOC] HELPER: Batch norm followed by a ReLU module.
             def __init__(self, dim, inplace):
+                # [FUNCTION DOC] HELPER: Creates the bn and the ReLU with the in-place flag.
                 super().__init__()
                 self.bn = bn_module[dim](3).to(torch.float)
                 self.relu = torch.nn.ReLU(inplace=inplace)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies bn then relu.
                 return self.relu(self.bn(x))
 
         class BNFuncRelu(torch.nn.Module):
+            # [CLASS DOC] HELPER: Batch norm followed by functional relu not in place.
             def __init__(self, dim):
+                # [FUNCTION DOC] HELPER: Creates the bn.
                 super().__init__()
                 self.bn = bn_module[dim](3).to(torch.float)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies bn then functional relu with the in-place flag
+                # false.
                 return F.relu(self.bn(x), False)
 
         class BNFuncInplaceRelu(torch.nn.Module):
+            # [CLASS DOC] HELPER: Batch norm followed by in-place functional relu.
             def __init__(self, dim):
+                # [FUNCTION DOC] HELPER: Creates the bn.
                 super().__init__()
                 self.bn = bn_module[dim](3).to(torch.float)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies bn then in-place functional relu.
                 return F.relu(self.bn(x), True)
 
         options = itertools.product(self.static_quant_types, [2, 3], [True, False])
@@ -7709,11 +9103,18 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     def _test_activation_impl(
             self, float_module, float_op, quantized_module, quantized_op):
+        # [FUNCTION DOC] HELPER: Shared activation check: builds a model using the float module
+        # or op with an in-place option, then checks over module/functional, in-place, quant
+        # type and reference options that the expected node (float or quantized module, or
+        # function) appears.
         ''' Test for activation op(with inplace options), float_op can be
         torch op or functional op
         '''
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Wraps an activation either as a module built with the in-place
+            # flag or as a function called with the in-place flag.
             def __init__(self, is_module, inplace):
+                # [FUNCTION DOC] HELPER: Builds the activation module or stores the function.
                 super().__init__()
                 self.is_module = is_module
                 self.inplace = inplace
@@ -7723,6 +9124,8 @@ class TestQuantizeFxOps(QuantizationTestCase):
                     self.op = float_op
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Applies the module, or the function with the in-place
+                # flag.
                 if self.is_module:
                     return self.op(input)
                 else:
@@ -7748,21 +9151,32 @@ class TestQuantizeFxOps(QuantizationTestCase):
                 quant_type, quantized_nodes[is_module][is_reference], is_reference=is_reference)
 
     def test_hardswish(self):
+        # [FUNCTION DOC] Checks Hardswish module and functional quantization via the shared
+        # activation helper.
         self._test_activation_impl(nn.Hardswish, F.hardswish, nnq.Hardswish, torch.ops.quantized.hardswish)
 
     def test_elu(self):
+        # [FUNCTION DOC] Checks ELU module and functional quantization via the shared activation
+        # helper.
         self._test_activation_impl(nn.ELU, F.elu, nnq.ELU, torch.ops.quantized.elu)
 
     def test_leaky_relu(self):
+        # [FUNCTION DOC] Checks LeakyReLU module and functional quantization via the shared
+        # activation helper.
         self._test_activation_impl(nn.LeakyReLU, F.leaky_relu, nnq.LeakyReLU, torch.ops.quantized.leaky_relu)
 
     def test_prelu(self):
+        # [FUNCTION DOC] Checks PReLU with one or four parameters becomes the quantized PReLU
+        # module (or stays float in reference mode) for static quant types.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Wraps a PReLU with the given number of parameters.
             def __init__(self, num_param: int):
+                # [FUNCTION DOC] HELPER: Creates the PReLU.
                 super().__init__()
                 self.op = torch.nn.PReLU(num_parameters=num_param)
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Applies the PReLU.
                 return self.op(input)
 
         X = [[torch.randn(4, 4, 4, 4, dtype=torch.float)]]
@@ -7781,11 +9195,18 @@ class TestQuantizeFxOps(QuantizationTestCase):
     def _test_norm_impl(
             self, float_module, float_op, op_args, data, quantized_module, quantized_op,
             skip_op_arg_for_functional=False):
+        # [FUNCTION DOC] HELPER: Shared normalization check: builds a model using the module
+        # with the given constructor arguments or the function with the same arguments
+        # (optionally omitted for functional use) and checks the quantized module or function
+        # appears for static quant types.
         ''' Test for normalization op, float_op can be torch op or functional op,
         op_args is a list of positional argument for the module/op
         '''
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Wraps a norm module or a norm function.
             def __init__(self, is_module):
+                # [FUNCTION DOC] HELPER: Creates the module from the positional arguments or
+                # stores the function.
                 super().__init__()
                 self.is_module = is_module
                 if self.is_module:
@@ -7794,6 +9215,8 @@ class TestQuantizeFxOps(QuantizationTestCase):
                     self.op = float_op
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Applies the module, or the function with the input plus
+                # the positional arguments unless they are skipped.
                 if self.is_module:
                     return self.op(input)
                 else:
@@ -7816,11 +9239,16 @@ class TestQuantizeFxOps(QuantizationTestCase):
     def _test_norm_float16_impl(
             self, float_module, float_op, op_args, data,
             skip_op_arg_for_functional=False):
+        # [FUNCTION DOC] HELPER: Shared fp16 normalization check: with an fp16 static qconfig on
+        # the module and function types, expects exactly two cast nodes.
         ''' Test for normalization op, float_op can be torch op or functional op,
         op_args is a list of positional argument for the module/op
         '''
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Wraps a norm module or a norm function.
             def __init__(self, is_module):
+                # [FUNCTION DOC] HELPER: Creates the module from the positional arguments or
+                # stores the function.
                 super().__init__()
                 self.is_module = is_module
                 if self.is_module:
@@ -7829,6 +9257,8 @@ class TestQuantizeFxOps(QuantizationTestCase):
                     self.op = float_op
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Applies the module, or the function with the input plus
+                # the positional arguments unless they are skipped.
                 if self.is_module:
                     return self.op(input)
                 else:
@@ -7852,11 +9282,14 @@ class TestQuantizeFxOps(QuantizationTestCase):
                 M(is_module), data, quant_type, custom_qconfig_dict=qconfig_dict, expected_node_occurrence=node_occurrence)
 
     def test_layer_norm(self):
+        # [FUNCTION DOC] Checks layer norm module and functional quantization.
         data = (torch.rand((1, 2, 5, 5), dtype=torch.float),)
         self._test_norm_impl(
             nn.LayerNorm, F.layer_norm, [[2, 5, 5]], data, nnq.LayerNorm, torch.ops.quantized.layer_norm)
 
     def test_instance_norm(self):
+        # [FUNCTION DOC] Checks instance norm 1d/2d/3d module and functional quantization; the
+        # functional form is called without extra arguments.
         data_1d = (torch.rand((1, 4, 5), dtype=torch.float),)
         data_2d = (torch.rand((1, 4, 5, 1), dtype=torch.float),)
         data_3d = (torch.rand((1, 4, 5, 1, 1), dtype=torch.float),)
@@ -7879,23 +9312,33 @@ class TestQuantizeFxOps(QuantizationTestCase):
                 skip_op_arg_for_functional=True)
 
     def test_norm_weight_bias(self):
+        # [FUNCTION DOC] Checks layer norm with weight and bias tensors after a functional
+        # linear becomes quantized linear and quantized layer norm, using the default qconfig
+        # mapping converted to a dictionary.
         class Linear(torch.nn.Module):
+            # [CLASS DOC] HELPER: Functional linear with fixed ones weight and zeros bias.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the fixed weight and bias.
                 super().__init__()
                 self.w = torch.ones(5, 5)
                 self.b = torch.zeros(5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies functional linear.
                 return torch.nn.functional.linear(x, self.w, self.b)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Linear followed by functional layer norm with weight and bias.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the linear and random scale and bias tensors.
                 super().__init__()
                 self.mods1 = Linear()
                 self.scale = torch.randn(5, 5)
                 self.bias = torch.randn(5, 5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear then layer norm with the stored
+                # scale and bias.
                 x1 = self.mods1(x)
                 y = F.layer_norm(x1, [5, 5], weight=self.scale, bias=self.bias)
                 return y
@@ -7919,13 +9362,22 @@ class TestQuantizeFxOps(QuantizationTestCase):
     def _test_default_node_quant_handler_ops(
             self, module, functional, qconfig, is_reference=True, node_list=None, additional_quant_pattern_dict=None
     ):
+        # [FUNCTION DOC] HELPER: Builds a model applying a module and a function in sequence,
+        # prepares it with an optional additional quant pattern config, calibrates, converts
+        # (reference or normal) and checks the node list.
+        # KNOWN ISSUE: the custom config dictionary is passed as the third positional argument
+        # of the prepare function, which takes the example inputs there; only skipped tests use
+        # this helper.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Applies a module instance then a function.
             def __init__(self, mod, func):
+                # [FUNCTION DOC] HELPER: Creates the module and stores the function.
                 super().__init__()
                 self.module = mod()
                 self.functional = func
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the module then the function.
                 x = self.module(x)
                 x = self.functional(x)
                 return x
@@ -7951,6 +9403,8 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @unittest.skip("TODO: reenable with backend_config api")
     def test_gelu_normal(self):
+        # [FUNCTION DOC] Skipped test (pending the backend config API) for GELU module and
+        # functional with the default fbgemm qconfig and no reference mode.
         module = torch.nn.GELU
         functional = torch.nn.functional.gelu
         qconfig = torch.ao.quantization.get_default_qconfig("fbgemm")
@@ -7964,6 +9418,8 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @unittest.skip("TODO: reenable with backend_config api")
     def test_softmax_normal(self):
+        # [FUNCTION DOC] Skipped test (pending the backend config API) for Softmax module and
+        # functional with the default fbgemm qconfig, expecting a quantized softmax.
         module = torch.nn.Softmax
         functional = torch.nn.functional.softmax
         qconfig = torch.ao.quantization.get_default_qconfig("fbgemm")
@@ -7977,6 +9433,8 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @unittest.skip("This is no longer needed right now, can enable later with new api")
     def test_gelu_reference(self):
+        # [FUNCTION DOC] Skipped test of reference quantization patterns for GELU with the
+        # default and custom qconfig.
         module = torch.nn.GELU
         functional = torch.nn.functional.gelu
         qconfig = torch.ao.quantization.get_default_qconfig("fbgemm")
@@ -8002,6 +9460,8 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @unittest.skip("This is no longer needed right now, can enable later with new api")
     def test_softmax_reference(self):
+        # [FUNCTION DOC] Skipped test of reference quantization patterns for Softmax with the
+        # default and custom qconfig.
         module = torch.nn.Softmax
         functional = torch.nn.functional.softmax
         qconfig = torch.ao.quantization.get_default_qconfig("fbgemm")
@@ -8026,6 +9486,8 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @unittest.skip("This is no longer needed right now, can enable later with new api")
     def test_silu_reference(self):
+        # [FUNCTION DOC] Skipped test of reference patterns for SiLU with fp16 static qconfig
+        # and then the custom qconfig.
         module = torch.nn.SiLU
         functional = torch.nn.functional.silu
         qconfig = float16_static_qconfig
@@ -8058,6 +9520,8 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @unittest.skip("This is no longer needed right now, can enable later with new api")
     def test_mish_reference(self):
+        # [FUNCTION DOC] Skipped test of reference patterns for Mish with fp16 static qconfig
+        # and then the custom qconfig.
         module = torch.nn.Mish
         functional = torch.nn.functional.mish
         qconfig = float16_static_qconfig
@@ -8089,15 +9553,20 @@ class TestQuantizeFxOps(QuantizationTestCase):
                                                   additional_quant_pattern_dict=self.common_quant_patterns)
 
     def test_bmm_int_reference(self):
+        # [FUNCTION DOC] Checks that batched matrix multiply stays a float function call after
+        # reference conversion, as int8 is unsupported for it.
         """ int8 is not supported for bmm so we won't produce reference
             pattern for it
         """
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Stores the torch bmm function as a member.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Stores the bmm function.
                 super().__init__()
                 self.bmm = torch.bmm
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Applies the stored bmm function to the two inputs.
                 out = self.bmm(x, y)
                 return out
 
@@ -8121,8 +9590,14 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_clamp(self):
+        # [FUNCTION DOC] Checks conv followed by many clamp variants (relu6, hardtanh, clamp
+        # functions and methods, in-place variants) quantizes as one quantized conv in the
+        # expected order. Skipped without FBGEMM.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv followed by relu6, clamp and hardtanh variants.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv, relu6 and hardtanh modules, also
+                # in-place ones.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(2, 2, 2).float()
                 self.relu6 = torch.nn.ReLU6()
@@ -8131,6 +9606,8 @@ class TestQuantizeFxOps(QuantizationTestCase):
                 self.hardtanh_ = torch.nn.Hardtanh(inplace=True)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the conv then all the clamp-like operations in
+                # order.
                 x = self.conv(x)
                 x = self.relu6(x)
                 self.relu6_(x)
@@ -8155,13 +9632,18 @@ class TestQuantizeFxOps(QuantizationTestCase):
                 M(), data, quant_type, expected_node_list=node_list)
 
     def test_fixed_qparams_ops_fp16(self):
+        # [FUNCTION DOC] Checks sigmoid and tanh variants (module, torch, method) with an fp16
+        # static qconfig and the legacy native backend config produce seven cast nodes.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Sigmoid and tanh as module, torch function and method.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates sigmoid and tanh modules.
                 super().__init__()
                 self.sigmoid = torch.nn.Sigmoid()
                 self.tanh = torch.nn.Tanh()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies sigmoid and tanh in the three call forms each.
                 x = self.sigmoid(x)
                 x = torch.sigmoid(x)
                 x = x.sigmoid()
@@ -8184,13 +9666,18 @@ class TestQuantizeFxOps(QuantizationTestCase):
             backend_config=backend_config)
 
     def test_fixed_qparams_ops_qint8(self):
+        # [FUNCTION DOC] Checks sigmoid and tanh variants quantize with a qint8 symmetric
+        # histogram qconfig in reference mode: seven quantize and dequantize nodes.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Sigmoid and tanh as module, torch function and method.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates sigmoid and tanh modules.
                 super().__init__()
                 self.sigmoid = torch.nn.Sigmoid()
                 self.tanh = torch.nn.Tanh()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies sigmoid and tanh in the three call forms each.
                 x = self.sigmoid(x)
                 x = torch.sigmoid(x)
                 x = x.sigmoid()
@@ -8214,15 +9701,20 @@ class TestQuantizeFxOps(QuantizationTestCase):
             expected_node_occurrence=node_occurrence, is_reference=True)
 
     def test_fixed_qparams_ops_wrong_qconfig(self):
+        # [FUNCTION DOC] Checks the default qconfig is not valid for fixed qparams ops: no
+        # quantize or dequantize nodes appear and the sigmoid and tanh modules stay as they are.
         """ Test that wrong qconfigs for fixed qparams ops results in the ops not being quantized.
         """
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Sigmoid and tanh as module, torch function and method.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates sigmoid and tanh modules.
                 super().__init__()
                 self.sigmoid = torch.nn.Sigmoid()
                 self.tanh = torch.nn.Tanh()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies sigmoid and tanh in the three call forms each.
                 x = self.sigmoid(x)
                 x = torch.sigmoid(x)
                 x = x.sigmoid()
@@ -8246,12 +9738,20 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_general_shape_ops(self):
+        # [FUNCTION DOC] Checks the dequantize is propagated through a long list of shape-like
+        # ops between two convs, so only one quantize and one dequantize pair (plus those around
+        # the unsupported chunk) are inserted, the two convs fuse as quantized convs, and
+        # conversion to reference also succeeds. The model is not executable. Skipped without
+        # FBGEMM.
         """ A test that checks dequantize will be swapped for
         all supported general shape ops like aten::flatten
         without actually checking for execution of these ops
         """
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model listing many shape-like and copy-like ops in one forward
+            # between two convs. Not executable.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates pooling, dropout, two convs and relu modules.
                 super().__init__()
                 self.maxpool1d = torch.nn.MaxPool1d(kernel_size=3)
                 self.maxpool2d = torch.nn.MaxPool2d(kernel_size=3)
@@ -8262,6 +9762,10 @@ class TestQuantizeFxOps(QuantizationTestCase):
                 self.relu = torch.nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv1, scalar adds and muls with relu, pools,
+                # reshaping and viewing ops, list and tuple packing and unpacking, chunk,
+                # dropout, permute, repeat, relu forms, squeeze, unsqueeze, detach, stack, then
+                # conv2.
                 x = self.conv1(x)
                 # add_scalar
                 x = x + 3
@@ -8373,16 +9877,22 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_ave_pool_with_custom_cfg(self):
+        # [FUNCTION DOC] Checks avg pool with a quantized input index in the custom config: the
+        # converted graph is the pool followed by one dequantize. Not executed. Skipped without
+        # FBGEMM.
         """ A test that checks correct patterns are produced for
         avg_pool2d with customized config
         """
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Single average pool model.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the pool.
                 super().__init__()
                 self.avg_pool2d = torch.nn.AvgPool2d(3)
 
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the pool.
                 x = self.avg_pool2d(x)
                 return x
 
@@ -8417,12 +9927,18 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_general_value_ops(self):
+        # [FUNCTION DOC] Checks that general value ops (average pools, adaptive pools, mean,
+        # interpolate) keep the dequantize propagated past them: one quantize and one dequantize
+        # with two quantized convs. Not executed. Skipped without FBGEMM.
         """ A test that checks correct patterns are produced for
         all supported general value ops like aten::avg_pool2d \
         without actually checking for execution of these ops
         """
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv, many average and adaptive pool forms, mean forms, two
+            # interpolate modes, then the conv again.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv and the pooling modules.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(3, 3, 3)
                 self.avg_pool1d = torch.nn.AvgPool1d(3)
@@ -8433,6 +9949,8 @@ class TestQuantizeFxOps(QuantizationTestCase):
                 self.adaptive_avg_pool3d = torch.nn.AdaptiveAvgPool3d((1, 1, 1))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the conv, module and functional pools, mean
+                # variants, interpolation and the conv a second time.
                 x = self.conv(x)
                 x = self.avg_pool1d(x)
                 x = self.avg_pool2d(x)
@@ -8485,11 +10003,15 @@ class TestQuantizeFxOps(QuantizationTestCase):
             expected_node_list=order_check)
 
     def test_copy_node_fp32_input(self):
+        # [FUNCTION DOC] Checks a copy node (relu method) with the reuse-input qconfig prepares,
+        # converts and runs on float input.
         """ CopyNode works for both fp32 and int8 inputs, this is a test to make
         sure that a CopyNode can be successfully quantized in both cases
         """
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Calls relu as a method on the input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the relu method and returns it.
                 x = x.relu()
                 return x
 
@@ -8500,11 +10022,17 @@ class TestQuantizeFxOps(QuantizationTestCase):
         m(torch.rand(1))
 
     def test_getitem(self):
+        # [FUNCTION DOC] Checks observers are inserted for getitem only when the consumer needs
+        # quantization: none for a plain getitem, two fixed-qparams observers when followed by
+        # sigmoid (including a list input), and also when getitem takes a slice of a shape
+        # (non-tensor input). Converts and runs each.
         """ Make sure we only insert observer for getitem if the following node is matched
         or needs to be quantized
         """
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Returns the first element of the input.
             def forward(self, xs):
+                # [FUNCTION DOC] HELPER: Indexes element zero of the input.
                 x = xs[0]
                 return x
 
@@ -8519,7 +10047,9 @@ class TestQuantizeFxOps(QuantizationTestCase):
         m(*example_inputs)
 
         class M2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Takes the first element of the input and applies sigmoid.
             def forward(self, xs):
+                # [FUNCTION DOC] HELPER: Indexes element zero then sigmoid.
                 x = xs[0]
                 x = torch.sigmoid(x)
                 return x
@@ -8540,7 +10070,11 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
         # testing prepare recognizes non-Tensor input for getitem
         class M3(torch.nn.Module):
+            # [CLASS DOC] HELPER: Unpacks the first two entries of the input shape then applies
+            # sigmoid.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Reads the shape, unpacks two sizes, returns sigmoid of
+                # the input.
                 s = x.shape
                 n, c = s[:2]
                 x = torch.sigmoid(x)
@@ -8563,8 +10097,17 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_fixed_qparams_ops(self):
+        # [FUNCTION DOC] Checks fixed qparams ops (sigmoid, hardsigmoid, tanh in module, torch
+        # and method forms) and softmax after a conv in eval and training modes: prepare leaves
+        # outputs unchanged in eval, ten fixed qparams observers or fake quants are inserted,
+        # one quantize and one dequantize after convert, twelve pairs for the reference model,
+        # and the quantized softmax scale and zero point are checked. The model is not
+        # executable. Skipped without FBGEMM.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Conv followed by many fixed qparams activations and softmax.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv, sigmoid, hardsigmoid, tanh and
+                # softmax modules.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(3, 3, 3)
                 self.sigmoid = torch.nn.Sigmoid()
@@ -8573,6 +10116,8 @@ class TestQuantizeFxOps(QuantizationTestCase):
                 self.softmax = torch.nn.Softmax(dim=0)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the conv and the activations in module,
+                # function and method forms.
                 x = self.conv(x)
                 # F.sigmoid is deprecated
                 x = self.sigmoid(x)
@@ -8670,17 +10215,28 @@ class TestQuantizeFxOps(QuantizationTestCase):
             self.assertTrue(quantized.softmax.zero_point == 0)
 
     def test_float_functional(self):
+        # [FUNCTION DOC] Checks float functional modules (add, add scalar, mul, mul scalar, add
+        # relu, cat) are replaced by the quantized ops in the converted model with seven
+        # observers or fake quants and no FloatFunctional left. Also prepares an eager mode
+        # version, whose result is not compared.
         class TorchAdd(nn.Module):
+            # [CLASS DOC] HELPER: Wrapper module around a float functional add.
             """Wrapper around torch.add so that all ops can be found at build"""
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the float functional.
                 super().__init__()
                 self.add_func = nnq.FloatFunctional()
 
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Adds the two inputs via the float functional.
                 return self.add_func.add(x, y)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Chain of six float functional ops: add, add scalar, mul, mul
+            # scalar, add relu and cat.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the wrapper and five float functional
+                # instances.
                 super().__init__()
                 self.ff1 = TorchAdd()
                 self.ff2 = nnq.FloatFunctional()
@@ -8690,6 +10246,7 @@ class TestQuantizeFxOps(QuantizationTestCase):
                 self.ff6 = nnq.FloatFunctional()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the six ops in order and returns the result.
                 x = self.ff1(x, x)
                 x = self.ff2.add_scalar(x, 3)
                 x = self.ff3.mul(x, x)
@@ -8749,12 +10306,19 @@ class TestQuantizeFxOps(QuantizationTestCase):
             # self.assertEqual(m(data), ref_m(data))
 
     def test_embedding(self):
+        # [FUNCTION DOC] Checks embedding quantization: dynamic quant with weight-only qparams
+        # qconfigs (8-bit and 4-bit) gives a quantized embedding; in the static flow the qconfig
+        # is applied (quantized embedding), none or the default qconfig leaves it float; no
+        # observers are inserted and the model runs.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Embedding with ten entries of twelve dimensions.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the embedding.
                 super().__init__()
                 self.emb = torch.nn.Embedding(num_embeddings=10, embedding_dim=12)
 
             def forward(self, indices):
+                # [FUNCTION DOC] HELPER: Looks up the indices.
                 return self.emb(indices)
 
         for qconfig_type in [float_qparams_weight_only_qconfig, float_qparams_weight_only_qconfig_4bit]:
@@ -8792,12 +10356,21 @@ class TestQuantizeFxOps(QuantizationTestCase):
                 m(*example_inputs)
 
     def test_embedding_bag(self):
+        # [FUNCTION DOC] Checks embedding bag quantization: dynamic quant with float qparams
+        # per-channel weight observers for 8-bit and 4-bit gives a quantized embedding bag; none
+        # or the default qconfig keeps it float and runs.
+        # KNOWN ISSUE: in the last loop the freshly built model is unused, because the prepare
+        # call uses the model variable left over from the earlier loop.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Embedding bag of ten entries by twelve dimensions with last
+            # offset included.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the embedding bag.
                 super().__init__()
                 self.emb = torch.nn.EmbeddingBag(num_embeddings=10, embedding_dim=12, include_last_offset=True)
 
             def forward(self, indices, offsets):
+                # [FUNCTION DOC] HELPER: Looks up the indices with offsets.
                 return self.emb(indices, offsets)
 
         indices = torch.tensor([9, 6, 5, 7, 8, 8, 9, 2, 8, 6, 6, 9, 1, 6, 8, 8, 3, 2, 3, 6, 3, 6, 5, 7, 0, 8, 4, 6, 5, 8, 2, 3])
@@ -8834,6 +10407,9 @@ class TestQuantizeFxOps(QuantizationTestCase):
             m(*example_inputs)
 
     def _test_rnn_impl(self, qconfigs, M, module_type_strs, module_types, sample_input):
+        # [FUNCTION DOC] HELPER: Shared check for dynamic RNN quantization: for each qconfig and
+        # module kind, quantizes with the eager dynamic API and the FX flow and asserts equal
+        # outputs and scriptability. Skips fp16 dynamic on qnnpack.
         options = itertools.product(qconfigs, module_type_strs)
         for qconfig, module_type_str in options:
             model_eager = M(module_type_str).eval()
@@ -8858,6 +10434,9 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @override_qengines
     def test_rnn_cell(self):
+        # [FUNCTION DOC] Checks dynamic quantization of LSTMCell, GRUCell and RNNCell with three
+        # dynamic qconfigs against eager mode. Returns early if the engine is not fbgemm or
+        # qnnpack; runs for each engine.
         if torch.backends.quantized.engine not in ('fbgemm', 'qnnpack'):
             return
         qconfigs = [per_channel_dynamic_qconfig, default_dynamic_qconfig, float16_dynamic_qconfig]
@@ -8870,6 +10449,9 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     @override_qengines
     def test_rnn(self):
+        # [FUNCTION DOC] Checks dynamic quantization of LSTM and GRU with three dynamic qconfigs
+        # against eager mode on a repeated sequence input. Returns early if the engine is not
+        # fbgemm or qnnpack; runs for each engine.
         if torch.backends.quantized.engine not in ('fbgemm', 'qnnpack'):
             return
         qconfigs = [per_channel_dynamic_qconfig, default_dynamic_qconfig, float16_dynamic_qconfig]
@@ -8883,6 +10465,9 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
     def _test_conv_transpose_impl(
             self, float_cls: Callable, q_cls: Callable, data: torch.Tensor):
+        # [FUNCTION DOC] HELPER: Under qnnpack, quantizes a single conv transpose with the FX
+        # flow and compares with an eager mode quantized copy of identical weights, expecting
+        # the quantized module once and equal outputs.
         with override_quantized_engine('qnnpack'):
             # Create fp32 versions of FX and Eager models
             m1 = torch.nn.Sequential(float_cls(1, 1, 1))
@@ -8909,23 +10494,34 @@ class TestQuantizeFxOps(QuantizationTestCase):
     @unittest.skipUnless('qnnpack' in supported_qengines,
                          "This Pytorch Build has not been built with or does not support QNNPACK")
     def test_conv_transpose_1d(self):
+        # [FUNCTION DOC] Checks 1d conv transpose quantization matches eager mode. Skipped
+        # without QNNPACK.
         self._test_conv_transpose_impl(
             torch.nn.ConvTranspose1d, nnq.ConvTranspose1d, torch.randn(4, 1, 4))
 
     @unittest.skipUnless('qnnpack' in supported_qengines,
                          "This Pytorch Build has not been built with or does not support QNNPACK")
     def test_conv_transpose_2d(self):
+        # [FUNCTION DOC] Checks 2d conv transpose quantization matches eager mode. Skipped
+        # without QNNPACK.
         self._test_conv_transpose_impl(
             torch.nn.ConvTranspose2d, nnq.ConvTranspose2d, torch.randn(4, 1, 4, 4))
 
     def test_reshape_fp16(self):
+        # [FUNCTION DOC] Checks reshape inherits the fp16 global qconfig between two int8
+        # linears: placeholder observers around the reshape, a cast to fp16 before it, and the
+        # expected quantize and dequantize counts after convert.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Stores a weight and an unused bias.
             def __init__(self, w, b):
+                # [FUNCTION DOC] HELPER: Stores the weight and bias tensors.
                 super().__init__()
                 self.w = w
                 self.b = b
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies linear with the weight, reshapes to four
+                # columns, applies the same linear again.
                 x = torch.nn.functional.linear(x, self.w)
                 x = x.reshape(-1, 4)
                 x = torch.nn.functional.linear(x, self.w)
@@ -8973,14 +10569,20 @@ class TestQuantizeFxOps(QuantizationTestCase):
         m(torch.randn(2, 4))
 
     def test_multiple_qconfigs_for_single_value(self):
+        # [FUNCTION DOC] Checks a value that has different qconfigs from producer and consumer:
+        # linear with the default qconfig followed by sigmoid under the fp16 global qconfig
+        # yields the expected observers and cast and dequantize counts.
         """ Test multiple qconfigs for a single value"""
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Stores a weight and an unused bias.
             def __init__(self, w, b):
+                # [FUNCTION DOC] HELPER: Stores the weight and bias tensors.
                 super().__init__()
                 self.w = w
                 self.b = b
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies linear with the weight then sigmoid.
                 x = torch.nn.functional.linear(x, self.w)
                 x = torch.sigmoid(x)
                 return x
@@ -9020,9 +10622,15 @@ class TestQuantizeFxOps(QuantizationTestCase):
         )
 
     def test_boolean_tensor(self):
+        # [FUNCTION DOC] Checks no observer is inserted for a boolean mask tensor argument to
+        # masked fill, and the converted model runs.
         """ Make sure we don't insert observer for boolean Tensors """
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Unsqueezes the mask twice and fills the input where the mask
+            # is set.
             def forward(self, x, mask):
+                # [FUNCTION DOC] HELPER: Unsqueezes the mask at dimensions zero and one then
+                # masked fill.
                 mask = mask.unsqueeze(0)
                 mask = mask.unsqueeze(1)
                 x = x.masked_fill(mask, 1)
@@ -9041,8 +10649,11 @@ class TestQuantizeFxOps(QuantizationTestCase):
         m(*example_inputs)
 
     def test_chunk(self):
+        # [FUNCTION DOC] Checks chunk followed by add prepares, converts and runs.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Chunks the input in two and adds the halves.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Splits and adds the two parts.
                 x, y = torch.chunk(x, 2)
                 x = x + y
                 return x
@@ -9055,13 +10666,20 @@ class TestQuantizeFxOps(QuantizationTestCase):
         # make sure everything runs
 
     def test_ref_pattern_multi_use(self):
+        # [FUNCTION DOC] Checks a value consumed by a quantized and by float ops: quantizing two
+        # linears with the second feeding mul and add leaves those float ops, with one quantize
+        # and two dequantize nodes.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Two linears; the second feeds a mul and an add.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates linear and linear1.
                 super().__init__()
                 self.linear = torch.nn.Linear(5, 5)
                 self.linear1 = torch.nn.Linear(5, 5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns linear of x, and the mul and add results of
+                # linear1 of x.
                 y = self.linear(x)
                 z = self.linear1(x)
                 a = torch.mul(z, 5)
@@ -9091,8 +10709,12 @@ class TestQuantizeFxOps(QuantizationTestCase):
             expected_node_occurrence=expected_occurrence)
 
     def test_qmatmul(self):
+        # [FUNCTION DOC] Checks matmul is replaced by the quantized matmul op under the fbgemm
+        # default qconfig mapping and runs.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Matrix product of two inputs.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Returns the matmul of the two inputs.
                 z = torch.matmul(x, y)
                 return z
 
@@ -9113,18 +10735,27 @@ class TestQuantizeFxOps(QuantizationTestCase):
         res = mq(*example_inputs)
 
     def test_pixel_shuffle(self):
+        # [FUNCTION DOC] Checks pixel shuffle after a conv under the qnnpack backend config is
+        # left in float with two quantize and one dequantize node, with a bias parameter held in
+        # a submodule.
         class MyBias(nn.Module):
+            # [CLASS DOC] HELPER: Holder of a bias parameter of eight elements.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the bias parameter.
                 super().__init__()
                 self.bias = nn.Parameter(torch.randn(8))
 
         class MyModel(nn.Module):
+            # [CLASS DOC] HELPER: Conv without bias, functional pixel shuffle, view and a bias
+            # add.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv and the bias holder.
                 super().__init__()
                 self.conv = nn.Conv2d(8, 8, 1, bias=False)
                 self.bias = MyBias()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv, pixel shuffle, a view and adds the bias.
                 x = self.conv(x)
                 x = nn.functional.pixel_shuffle(x, 2)
                 x = x.view(-1, 8, 2, 2)
@@ -9148,19 +10779,27 @@ class TestQuantizeFxOps(QuantizationTestCase):
         self.checkGraphModuleNodes(m, expected_node_occurrence=expected_occurrence)
 
     def test_pixel_shuffle_module(self) -> None:
+        # [FUNCTION DOC] Same as the pixel shuffle test but using the PixelShuffle module; also
+        # expects the module call to remain.
         class MyBias(nn.Module):
+            # [CLASS DOC] HELPER: Holder of a bias parameter of eight elements.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the bias parameter.
                 super().__init__()
                 self.bias = nn.Parameter(torch.randn(8))
 
         class MyModel(nn.Module):
+            # [CLASS DOC] HELPER: Conv without bias, PixelShuffle module, view and a bias add.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv, pixel shuffle and bias holder.
                 super().__init__()
                 self.conv = nn.Conv2d(8, 8, 1, bias=False)
                 self.ps = nn.PixelShuffle(upscale_factor=2)
                 self.bias = MyBias()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv, pixel shuffle module, a view and adds the
+                # bias.
                 x = self.conv(x)
                 x = self.ps(x)
                 x = x.view(-1, 8, 2, 2)
@@ -9185,18 +10824,25 @@ class TestQuantizeFxOps(QuantizationTestCase):
         self.checkGraphModuleNodes(m, expected_node_occurrence=expected_occurrence)
 
     def test_pixel_unshuffle(self):
+        # [FUNCTION DOC] Checks pixel unshuffle after a conv under the fbgemm and qnnpack
+        # backend configs is quantized as expected (two quantize and one dequantize node).
         class MyBias(nn.Module):
+            # [CLASS DOC] HELPER: Holder of a bias parameter of 64 elements.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the bias parameter.
                 super().__init__()
                 self.bias = nn.Parameter(torch.randn(64))
 
         class MyModel(nn.Module):
+            # [CLASS DOC] HELPER: Conv without bias, functional pixel unshuffle and a bias add.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv and the bias holder.
                 super().__init__()
                 self.conv = nn.Conv2d(8, 8, 1, bias=False)
                 self.bias = MyBias()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv, pixel unshuffle and adds the bias.
                 x = self.conv(x)
                 x = nn.functional.pixel_unshuffle(x, 2)
                 bias = self.bias.bias
@@ -9223,19 +10869,25 @@ class TestQuantizeFxOps(QuantizationTestCase):
             self.checkGraphModuleNodes(m, expected_node_occurrence=expected_occurrence)
 
     def test_pixel_unshuffle_module(self) -> None:
+        # [FUNCTION DOC] Same as the pixel unshuffle test but using the PixelUnshuffle module.
         class MyBias(nn.Module):
+            # [CLASS DOC] HELPER: Holder of a bias parameter of 64 elements.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the bias parameter.
                 super().__init__()
                 self.bias = nn.Parameter(torch.randn(64))
 
         class MyModel(nn.Module):
+            # [CLASS DOC] HELPER: Conv without bias, PixelUnshuffle module and a bias add.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv, unshuffle module and bias holder.
                 super().__init__()
                 self.conv = nn.Conv2d(8, 8, 1, bias=False)
                 self.unshuffle = nn.PixelUnshuffle(downscale_factor=2)
                 self.bias = MyBias()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv, the unshuffle module and adds the bias.
                 x = self.conv(x)
                 x = self.unshuffle(x)
                 bias = self.bias.bias
@@ -9265,18 +10917,26 @@ class TestQuantizeFxOps(QuantizationTestCase):
 
 
     def test_narrow(self):
+        # [FUNCTION DOC] Checks narrow after a conv under the fbgemm and qnnpack backend configs
+        # is quantized: two quantize and one dequantize node.
         class MyBias(nn.Module):
+            # [CLASS DOC] HELPER: Holder of a bias parameter of four elements.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the bias parameter.
                 super().__init__()
                 self.bias = nn.Parameter(torch.randn(4))
 
         class MyModel(nn.Module):
+            # [CLASS DOC] HELPER: Conv without bias, narrow of four channels and a bias add.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the conv and bias holder.
                 super().__init__()
                 self.conv = nn.Conv2d(8, 8, 1, bias=False)
                 self.bias = MyBias()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv, narrows dimension one to four entries,
+                # adds the bias.
                 x = self.conv(x)
                 x = torch.narrow(x, 1, 0, 4)
                 bias = self.bias.bias
@@ -9303,18 +10963,27 @@ class TestQuantizeFxOps(QuantizationTestCase):
             self.checkGraphModuleNodes(m, expected_node_occurrence=expected_occurrence)
 
 class TestQuantizeFxModels(QuantizationTestCase):
+    # [CLASS DOC] Model-level tests: GPU and device switching of prepared and converted models,
+    # torchvision model comparisons with eager mode, building blocks, and QAT with embeddings
+    # and functional linears.
     @skipIfNoFBGEMM
     @unittest.skipIf(not TEST_CUDA, "gpu is not available.")
     def test_static_gpu_convert_basic(self):
+        # [FUNCTION DOC] Checks a model prepared and converted to reference on CUDA outputs a
+        # CUDA tensor. Skipped without FBGEMM or CUDA.
 
         class Net(nn.Module):
+            # [CLASS DOC] HELPER: ReLU, conv and a linear applied to the flattened conv output.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates relu, conv and linear.
                 super().__init__()
                 self.relu1 = nn.ReLU()
                 self.conv1 = nn.Conv2d(1, 6, 5)
                 self.linear1 = nn.Linear(120, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv and relu, flattens the result and applies
+                # the linear.
                 x = self.relu1(self.conv1(x))
                 y = self.linear1(x.view(-1))
                 return y
@@ -9332,15 +11001,22 @@ class TestQuantizeFxModels(QuantizationTestCase):
     @skipIfNoFBGEMM
     @unittest.skipIf(not TEST_CUDA, "gpu is not available.")
     def test_switch_device_prepare_convert(self):
+        # [FUNCTION DOC] Checks that a prepared model can be moved to the other device (CUDA to
+        # CPU and the reverse) before conversion to reference, with the output on the new
+        # device. Skipped without FBGEMM or CUDA.
 
         class Net(nn.Module):
+            # [CLASS DOC] HELPER: ReLU, conv and a linear applied to the flattened conv output.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates relu, conv and linear.
                 super().__init__()
                 self.relu1 = nn.ReLU()
                 self.conv1 = nn.Conv2d(1, 6, 5)
                 self.linear1 = nn.Linear(120, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv and relu, flattens the result and applies
+                # the linear.
                 x = self.relu1(self.conv1(x))
                 y = self.linear1(x.view(-1))
                 return y
@@ -9360,13 +11036,19 @@ class TestQuantizeFxModels(QuantizationTestCase):
     @skipIfNoFBGEMM
     @unittest.skipIf(not TEST_CUDA, "gpu is not available.")
     def test_prepare_serialize_switch_device_convert(self):
+        # [FUNCTION DOC] Checks the state dict of a prepared model can be loaded into a second
+        # prepared model, which is then moved to each device before reference conversion, with
+        # output on the new device. Skipped without FBGEMM or CUDA.
         class Net(nn.Module):
+            # [CLASS DOC] HELPER: Conv followed by a linear on the flattened output.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates conv and linear.
                 super().__init__()
                 self.conv1 = nn.Conv2d(1, 6, 5)
                 self.linear1 = nn.Linear(120, 1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies conv, flattens and applies the linear.
                 x = self.conv1(x)
                 y = self.linear1(x.view(-1))
                 return y
@@ -9390,6 +11072,9 @@ class TestQuantizeFxModels(QuantizationTestCase):
     @skipIfTorchDynamo("too slow")
     @skip_if_no_torchvision
     def test_model_dropout(self):
+        # [FUNCTION DOC] Checks QAT preparation, run and conversion of a torchvision mobilenet
+        # v3 small (with dropout), using qnnpack on ARM64. Skipped under Dynamo or without
+        # torchvision.
         from torchvision import models
         m = models.mobilenet_v3_small()
         qconfig_mapping = torch.ao.quantization.get_default_qat_qconfig_mapping('fbgemm')
@@ -9405,6 +11090,14 @@ class TestQuantizeFxModels(QuantizationTestCase):
             check_with_eager=True,
             diff_of_quant=None,
             diff_from_eager=None):
+        # [FUNCTION DOC] HELPER: Shared model comparison: scripts the float model, prepares for
+        # static, QAT or distributed mode, calibrates or trains, converts, scripts the quantized
+        # graph and checks it agrees with its scripted form; records differences in the passed
+        # dictionaries and, if an eager quantizable model is given, runs the same flow in eager
+        # mode and asserts zero difference when requested.
+        # KNOWN ISSUE: the prepare call is made without example inputs, which the prepare
+        # functions require; the distributed branch reads a world size name that is not defined
+        # in the file (silenced with noqa); the model is only used by skipped tests.
         if diff_of_quant is None or diff_from_eager is None:
             diff_of_quant = {}
             diff_from_eager = {}
@@ -9521,6 +11214,10 @@ class TestQuantizeFxModels(QuantizationTestCase):
                                      ' diff:' + str(diff_from_eager[mode][name]))
 
     def _test_building_block(self, quant_type, BB):
+        # [FUNCTION DOC] HELPER: Prepares, runs and converts a building block in eager mode
+        # (inside a quant wrapper) and in FX graph mode, for static or QAT, and runs both
+        # quantized models on the first data batch. Numerics are not compared. Raises an
+        # assertion error for any quant type other than static or QAT.
         eager = BB().float()
         graph = copy.deepcopy(eager)
 
@@ -9572,6 +11269,8 @@ class TestQuantizeFxModels(QuantizationTestCase):
 
     @override_qengines
     def test_resnet_base(self):
+        # [FUNCTION DOC] Checks eager and FX flows run on the base ResNet block for static and
+        # QAT quant types and each engine.
         models = [ResNetBase]
         options = itertools.product(self.static_quant_types, models)
         for quant_type, M in options:
@@ -9581,11 +11280,16 @@ class TestQuantizeFxModels(QuantizationTestCase):
     @skipIfNoFBGEMM
     @unittest.skip("skip for now since tbb failed")
     def test_torchvision(self):
+        # [FUNCTION DOC] Skipped test (tbb failure) comparing FX graph mode against eager mode
+        # quantization on torchvision classification models in static and QAT modes, with
+        # exceptions for models that do not match in QAT.
         from torchvision import models
         from torchvision.models import quantization as quantized_models
         from torchvision.models.quantization.utils import _replace_relu
 
         def get_available_classification_models(models):
+            # [FUNCTION DOC] HELPER: Returns names of callable entries in a module whose names
+            # start with a lowercase letter and are not private.
             return [k for k, v in models.__dict__.items() if callable(v) and k[0].lower() == k[0] and k[0] != "_"]
 
         model_list = get_available_classification_models(models)
@@ -9639,6 +11343,8 @@ class TestQuantizeFxModels(QuantizationTestCase):
                 diff_of_quant, diff_from_eager)
 
         def print_diffs(diffs):
+            # [FUNCTION DOC] HELPER: Prints the difference tables per mode (only referenced by
+            # commented out lines).
             for mode, diffs_for_mode in diffs.items():
                 print('mode:', mode)
                 for name, diff in diffs_for_mode.items():
@@ -9655,6 +11361,9 @@ class TestQuantizeFxModels(QuantizationTestCase):
     @skipIfNoFBGEMM
     @unittest.skip("TODO: Test is always failing - https://github.com/pytorch/pytorch/issues/54979")
     def test_resnet18_ddp(self):
+        # [FUNCTION DOC] Skipped test of distributed data parallel flow for resnet18.
+        # KNOWN ISSUE: refers to an undefined model name variable (silenced with noqa), so it
+        # could not run even if enabled.
         from torchvision import models
         from torchvision.models import quantization as quantized_models
         eager_quantizable_model = quantized_models.__dict__[name](pretrained=False, quantize=False).eval().float()  # noqa: F821
@@ -9664,6 +11373,11 @@ class TestQuantizeFxModels(QuantizationTestCase):
 
     @override_qengines
     def test_qat_embeddingbag_linear(self):
+        # [FUNCTION DOC] Checks QAT with EmbeddingBag followed by a linear on CPU:
+        # prepare_qat_fx, train, convert, run eval, check scriptability and that no qconfig
+        # remains.
+        # KNOWN ISSUE: the type checks use assertTrue with a second argument, which is only a
+        # message, so they never compare types.
         for device in get_supported_device_types():
             # Quantization backends (qnnpack, fbgemm, onednn) only support CPU tensors
             # Skip other device for quantization tests (e.g. CUDA)
@@ -9671,13 +11385,17 @@ class TestQuantizeFxModels(QuantizationTestCase):
                 continue
 
             class EmbeddingBagLinear(torch.nn.Module):
+                # [CLASS DOC] HELPER: Embedding bag with sum mode followed by a linear.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates the embedding bag and linear.
                     super().__init__()
                     self.emb = torch.nn.EmbeddingBag(num_embeddings=10, embedding_dim=12, mode='sum')
                     self.linear = torch.nn.Linear(12, 1).to(dtype=torch.float)
 
                 def forward(self, input: torch.Tensor, offsets: torch.Tensor | None = None,
                             per_sample_weights: torch.Tensor | None = None):
+                    # [FUNCTION DOC] HELPER: Looks up the embedding bag with optional offsets
+                    # and per-sample weights, then applies the linear.
                     x = self.emb(input, offsets, per_sample_weights)
                     x = self.linear(x)
                     return x
@@ -9697,6 +11415,9 @@ class TestQuantizeFxModels(QuantizationTestCase):
                                      qconfig_mapping=qconfig_dict)
 
             def checkQuantized(model):
+                # [FUNCTION DOC] HELPER: Asserts the model embedding and linear are quantized
+                # (weak checks), runs eval, checks scriptability and that qconfig attributes are
+                # removed.
                 # Make sure EmbeddingBag is now a quantized EmbeddingBag.
                 self.assertTrue(type(model.emb), nn.quantized.EmbeddingBag)
                 # Also test that Linear has been quantized.
@@ -9710,14 +11431,22 @@ class TestQuantizeFxModels(QuantizationTestCase):
 
     @override_qengines
     def test_qat_embedding_linear(self):
+        # [FUNCTION DOC] Checks QAT with Embedding followed by a sum and linear: prepare_qat_fx,
+        # train, convert, eval, check scriptability and no remaining qconfig.
+        # KNOWN ISSUE: the type checks use assertTrue with a second argument, which is only a
+        # message, so they never compare types.
         for device in get_supported_device_types():
             class EmbeddingLinear(torch.nn.Module):
+                # [CLASS DOC] HELPER: Embedding, sum over dimension one, then a linear.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Creates the embedding and linear.
                     super().__init__()
                     self.emb = torch.nn.Embedding(num_embeddings=10, embedding_dim=12)
                     self.linear = torch.nn.Linear(12, 1).to(dtype=torch.float)
 
                 def forward(self, input: torch.Tensor):
+                    # [FUNCTION DOC] HELPER: Looks up, sums over dimension one and applies the
+                    # linear.
                     x = torch.sum(self.emb(input), dim=1)
                     x = self.linear(x)
                     return x
@@ -9737,6 +11466,9 @@ class TestQuantizeFxModels(QuantizationTestCase):
                                      qconfig_mapping=qconfig_dict)
 
             def checkQuantized(model):
+                # [FUNCTION DOC] HELPER: Asserts the model embedding and linear are quantized
+                # (weak checks), runs eval, checks scriptability and that qconfig attributes are
+                # removed.
                 # Make sure EmbeddingBag is now a quantized EmbeddingBag.
                 self.assertTrue(type(model.emb), nn.quantized.Embedding)
                 # Also test that Linear has been quantized.
@@ -9755,25 +11487,37 @@ class TestQuantizeFxModels(QuantizationTestCase):
     @settings(deadline=None)
     @override_qengines
     def test_qat_functional_linear(self, device):
+        # [FUNCTION DOC] Property-based test (device chosen by hypothesis, no deadline, per
+        # engine): compares a QAT-prepared model using the standard fake quantize with one using
+        # the fused moving average fake quantize, over ten steps with observers and fake quant
+        # enabled at different steps, checking equal outputs and input gradients. Then, with
+        # fbgemm available, converts both on CPU and compares outputs. Returns early for other
+        # engines.
         if torch.backends.quantized.engine not in ('fbgemm', 'qnnpack'):
             return
 
         class Linear(torch.nn.Module):
+            # [CLASS DOC] HELPER: Functional linear with fixed ones weight and zeros bias.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the fixed weight and bias.
                 super().__init__()
                 self.w = torch.ones(5, 5)
                 self.b = torch.zeros(5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies functional linear.
                 return torch.nn.functional.linear(x, self.w, self.b)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Two Linear helpers in a Sequential followed by a third.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates mods1 and mods2.
                 super().__init__()
                 self.mods1 = torch.nn.Sequential(Linear(), Linear())
                 self.mods2 = Linear()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies mods1 then mods2.
                 x = self.mods1(x)
                 x = self.mods2(x)
                 return x
