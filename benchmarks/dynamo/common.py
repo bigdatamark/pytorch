@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Shared driver for the TorchDynamo/Inductor benchmark suites (torchbench,
+# huggingface, timm_models). Provides result writers (CSV and benchmark-database JSON), timing and
+# latency helpers, the experiment functions (speedup, accuracy, coverage, compilation profile),
+# the BenchmarkRunner base class with its accuracy-check machinery, and the command line parser
+# and main entry point used by the per-suite scripts. Import-time side effects: enables TF32
+# matmul, sets the KINETO_LOG_LEVEL environment variable, initializes torch_xla when it is
+# installed, and defines module-level mutable globals (current_name, current_device,
+# output_filename, ...) that the writers read to label each result row.
 
 from __future__ import annotations
 
@@ -119,6 +127,9 @@ MAX_DOWNLOAD_ATTEMPTS = 5
 
 
 class CI(NamedTuple):
+    # [CLASS DOC] Named tuple describing one CI configuration key: compiler backend name,
+    # whether it is a training run, whether dynamic shapes are on (default off), and
+    # device (default cuda).
     backend: str  # aot_eager or inductor
     training: bool
     dynamic: bool = False
@@ -258,6 +269,12 @@ CI_PRESERVE_COMPILE_DEBUG = {
 
 @functools.lru_cache(maxsize=1)
 def load_yaml_file(filename):
+    # [FUNCTION DOC] Load a YAML file located next to this module and return its contents with
+    # every list converted to a set (lists nested inside lists are flattened first; mappings are
+    # converted recursively; other values are unchanged). If a same-named file exists in the
+    # "fb" subdirectory, its top-level entries are merged over the public data with a shallow
+    # update. Cached for one filename by an LRU cache of size one. Raises if the public file is
+    # missing or unparsable.
     filepath = os.path.join(os.path.dirname(__file__), filename)
 
     with open(filepath) as f:
@@ -270,6 +287,8 @@ def load_yaml_file(filename):
             data.update(internal_data)
 
     def flatten(lst):
+        # [FUNCTION DOC] HELPER: Generator that yields the leaf items of an arbitrarily nested
+        # list, descending into any list element and yielding non-list elements as they are.
         for item in lst:
             if isinstance(item, list):
                 yield from flatten(item)
@@ -277,6 +296,9 @@ def load_yaml_file(filename):
                 yield item
 
     def maybe_list_to_set(obj):
+        # [FUNCTION DOC] HELPER: Recursively convert YAML data: mappings keep their keys
+        # with converted values, lists become a set of their flattened items, anything else
+        # is returned unchanged.
         if isinstance(obj, dict):
             return {k: maybe_list_to_set(v) for k, v in obj.items()}
         if isinstance(obj, list):
@@ -287,10 +309,19 @@ def load_yaml_file(filename):
 
 
 def model_specified_by_path(path_and_class_str):
+    # [FUNCTION DOC] Return True when the --only style string names a model by path and class,
+    # which is detected by the presence of a colon character anywhere in the string.
     return ":" in path_and_class_str
 
 
 def load_model_from_path(path_and_class_str):
+    # [FUNCTION DOC] Instantiate a model from a comma-separated list of key:value pairs. Both a
+    # path key (must be an absolute file path) and a class key must be present. The file is
+    # imported as an anonymous module, the named class is fetched, and it is instantiated with no
+    # arguments. Returns the model and the result of its get_example_inputs method. Raises
+    # RuntimeError for a missing key or a relative path, AssertionError if the class is not a
+    # torch.nn.Module subclass or the instance lacks get_example_inputs, and ValueError if a pair
+    # does not split into two parts.
     configs = {}
     for kvstr in path_and_class_str.split(","):
         k, v = kvstr.split(":")
@@ -329,6 +360,9 @@ def load_model_from_path(path_and_class_str):
 
 
 def write_outputs(filename, headers, row, upload_to_benchmark_db: bool = True):
+    # [FUNCTION DOC] Append one result row to the CSV file and, when upload_to_benchmark_db is
+    # true, also to the sibling JSON file. Does nothing at all when the global disable_output
+    # flag is set.
     """
     Write both CSV and JSON outputs using the original CSV output interface
     """
@@ -342,6 +376,11 @@ def write_outputs(filename, headers, row, upload_to_benchmark_db: bool = True):
 
 
 def output_csv(filename, headers, row):
+    # [FUNCTION DOC] Append one row to a CSV file, creating it with the headers when absent. If
+    # the file exists, its first line is reused as the header, except that a longer headers
+    # argument replaces it (earlier failed runs may have left a short header). Float cells are
+    # formatted with six decimals, and every written line is padded with "0" cells up to the
+    # header width. The whole file is rewritten, with Unix line endings.
     if os.path.exists(filename):
         with open(filename) as fd:
             lines = list(csv.reader(fd)) or [[]]
@@ -360,6 +399,14 @@ def output_csv(filename, headers, row):
 
 
 def output_json(filename, headers, row):
+    # [FUNCTION DOC] Append benchmark-database records, one JSON object per line, to the file
+    # named like the CSV but with a json extension. The origin (torchbench, huggingface or
+    # timm_models) is guessed from the CSV filename. Each header/value pair becomes one record,
+    # except the dev, name and batch_size columns, and nothing is written when current_name is
+    # unset. Records carry the global mode, dtype, backend, device, quantization and batch size
+    # and any current_settings. String metric values (such as an accuracy status) are stored
+    # under extra_info because the database does not accept mixed value types; numeric values
+    # go in benchmark_values.
     """
     Write the result into JSON format, so that it can be uploaded to the benchmark database
     to be displayed on OSS dashboard. The JSON format is defined at
@@ -427,6 +474,10 @@ def output_json(filename, headers, row):
 
 
 def get_suite_from_model_iter_fn(model_iter_fn):
+    # [FUNCTION DOC] Best-effort lookup of the suite name for a model iteration function. Returns
+    # the suite_name attribute of the object the function is bound to, or None when it is not a
+    # bound method or that object has no such attribute.
+    # KNOWN ISSUE: self-described hack in the source (relies on the bound-method owner).
     # TODO: This is a bit of a hack
     suite = None
     if (runner := getattr(model_iter_fn, "__self__", None)) and hasattr(
@@ -437,6 +488,13 @@ def get_suite_from_model_iter_fn(model_iter_fn):
 
 
 def output_signpost(data, args, suite, error=None):
+    # [FUNCTION DOC] Emit an open-source signpost event named after the run kind (accuracy,
+    # quantization, performance, else unknown). The payload merges the result data (name and dev
+    # filled from the globals when absent) with the suite, wall-time phase breakdown from
+    # dynamo, aggregated and detailed compilation timings, the simple call counter, the error,
+    # and the command line args with a fixed list of irrelevant or redundant options removed.
+    # Returns the total wall time. Raises KeyError if the args namespace lacks any of the
+    # options to be removed.
     from torch.utils._stats import simple_call_counter
 
     data = data.copy()
@@ -542,14 +600,22 @@ def output_signpost(data, args, suite, error=None):
 
 
 def nothing(f):
+    # [FUNCTION DOC] HELPER: Identity decorator used as a no-op stand-in; returns its argument.
     return f
 
 
 @functools.cache
 def patch_torch_manual_seed():
+    # [FUNCTION DOC] Replace torch.manual_seed with a version that always uses seed 1337, to make
+    # accuracy runs deterministic. The replacement also seeds all CUDA and XPU devices (unless in
+    # a bad fork) and returns the result of seeding the default CPU generator. Cached so the
+    # global patch is applied only once per process.
     """Make torch manual seed deterministic. Helps with accuracy testing."""
 
     def deterministic_torch_manual_seed(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Replacement for torch.manual_seed; ignores any arguments given,
+        # seeds CUDA and XPU (when available and not in a forked child) and the default generator
+        # with the fixed seed 1337, and returns the default generator.
         from torch._C import default_generator
 
         seed = 1337
@@ -569,6 +635,9 @@ def patch_torch_manual_seed():
 
 
 def empty_gpu_cache(device):
+    # [FUNCTION DOC] Free the cached allocator memory of the given device type to avoid out-of-
+    # memory errors in later runs. Supported types are cuda, xpu and mps; for any other type a
+    # warning is logged and nothing is done.
     """
     Explicitly empty gpu cache to avoid OOM in subsequent run.
     """
@@ -584,10 +653,19 @@ def empty_gpu_cache(device):
 
 
 def synchronize():
+    # [FUNCTION DOC] Placeholder device-synchronization hook that does nothing here; the runner
+    # may rebind it elsewhere in the module.
     pass
 
 
 def summarize_graph_break(filename):
+    # [FUNCTION DOC] Post-process the graph-break log that sits beside a results CSV: read it,
+    # sort by reason, drop rows with a duplicate reason (best-effort de-duplication), keep only
+    # one row of the multi-tensor SGD reasons, and write the result to a sibling file with a
+    # deduped suffix. Does nothing if the graph-break log does not exist.
+    # KNOWN ISSUE: the string method that strips characters is used to remove the csv
+    # suffix, so it strips any trailing run of the characters ".", "c", "s", "v" rather than
+    # the suffix itself.
     """
     Sorts and de-dupes the graphs breaks on the reason string. Note that this
     function is just a best effort to reduce the logging information. We could
@@ -612,6 +690,10 @@ def summarize_graph_break(filename):
 
 
 def print_summary(filename, print_dataframe=False):
+    # [FUNCTION DOC] Print summary statistics of a results CSV and then de-duplicate its graph-
+    # break log. Does nothing for a falsy or non-existent filename. If a tag column exists, one
+    # summary per tag is printed (the tag "0.0000", produced by failed runs, is skipped);
+    # otherwise one for all rows. The print_dataframe flag is forwarded to print the full table.
     if not (filename and os.path.exists(filename)):
         return
     data = pd.read_csv(filename)
@@ -627,6 +709,14 @@ def print_summary(filename, print_dataframe=False):
 
 
 def print_summary_table(data, print_dataframe=False):
+    # [FUNCTION DOC] Print one summary line per column of a results table, using a format by
+    # column kind: percentages for pct_ops and pct_time, plain means for graph counts, mean
+    # seconds for compilation_latency, mean ratio for compression_ratio, pass rate for accuracy,
+    # and geometric mean plus mean for all other (speedup-like) columns. Identification columns
+    # are skipped, and any column that fails to summarize is silently ignored. Optionally widens
+    # pandas display limits (a global side effect) and prints the full table first.
+    # KNOWN ISSUE: single-element membership tests are written without a trailing comma, so they
+    # are substring tests on a string, not tuple membership.
     if print_dataframe:
         pd.options.display.max_rows = 1000
         pd.options.display.max_columns = 1000
@@ -659,7 +749,11 @@ def print_summary_table(data, print_dataframe=False):
 
 
 def tensor_is_on_xla(tensors):
+    # [FUNCTION DOC] Return True if any tensor found in the (nested) input structure lives on
+    # an XLA device.
     def visit(x: torch.Tensor):
+        # [FUNCTION DOC] HELPER: Visitor that sets the enclosing result flag to True when the
+        # tensor is on an XLA device.
         nonlocal result
         if x.device.type == "xla":
             result = True
@@ -678,6 +772,14 @@ def timed(
     collect_outputs=False,
     batch_size=None,
 ):
+    # [FUNCTION DOC] Time running model_iter_fn on the example inputs the given number of times
+    # and return the total wall time in seconds (plus the last iteration result when
+    # return_result is set). The device is synchronized before and after (and XLA steps are
+    # marked and awaited when inputs are on XLA). When batch_size is greater than one, each
+    # iteration varies the batch dimension by up to 20 percent to exercise dynamic shapes, and
+    # the random state is reset before every iteration (outside the timed region). The time to
+    # synchronize at the end is added to the total. Side effect: when batch_size is given,
+    # torch.manual_seed gets patched globally.
     use_xla = tensor_is_on_xla(example_inputs)
     synchronize()
 
@@ -689,6 +791,10 @@ def timed(
         xm.wait_device_ops()
 
     def vary_batch(t: torch.Tensor, new_batch_size) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Resize the tensor along the first dimension whose size equals
+        # the original batch size: truncate if the new size is smaller, otherwise pad by
+        # repeating the last slice. Only that first matching dimension is changed. Returns the
+        # (possibly new) tensor.
         for i, s in enumerate(t.size()):
             if s == batch_size:
                 # If new batch is smaller, we truncate
@@ -753,15 +859,22 @@ def timed(
 
 @overload
 def _normalize_bench_inputs(example_inputs: _D) -> tuple[tuple[()], _D]: ...
+    # [FUNCTION DOC] HELPER: Typing overload: a dict of keyword inputs maps to empty positional
+    # args plus that dict.
 
 
 @overload
 def _normalize_bench_inputs(
     example_inputs: Sequence[_T],
 ) -> tuple[tuple[_T, ...], dict[str, Any]]: ...
+    # [FUNCTION DOC] HELPER: Typing overload: a sequence of positional inputs maps to a tuple of
+    # args plus an empty dict of keyword args.
 
 
 def _normalize_bench_inputs(example_inputs):
+    # [FUNCTION DOC] HELPER: Split example inputs into positional and keyword arguments. A dict
+    # (the huggingface convention) becomes an empty tuple plus that dict; anything else (the
+    # convention for the other suites) becomes a tuple of its items plus an empty dict.
     # NOTE(bowbao): For huggingface benchmark, example_inputs are formatted as dictionary,
     # and consumed like `model(**example_inputs)`.
     # For other benchmarks, example_inputs are formatted as tuple and consumed
@@ -773,6 +886,10 @@ def _normalize_bench_inputs(example_inputs):
 
 
 def _register_dataclass_output_as_pytree(example_outputs) -> None:
+    # [FUNCTION DOC] HELPER: Register every dataclass type found among the leaves of the example
+    # outputs as a pytree node (via the export utility, using module-qualified type name as the
+    # serialized name) so that export can flatten huggingface style dataclass outputs. Mutates
+    # global pytree registry; returns nothing.
     # NOTE(angelayi): For huggingface benchmark, some example outputs are
     # formatted as a dataclass which pytree cannot consume. So we want
     # to register the pytree implementation here
@@ -790,10 +907,16 @@ def _register_dataclass_output_as_pytree(example_outputs) -> None:
 
 
 class Stats:
+    # [CLASS DOC] Process-wide accumulator of dynamo counters. The class attribute totals is a
+    # mapping from counter group name to a Counter, shared across all uses; the methods are class
+    # methods and no instances are needed.
     totals = collections.defaultdict(collections.Counter)
 
     @classmethod
     def reset_counters(cls):
+        # [FUNCTION DOC] Fold the current dynamo counters into the class totals, then
+        # clear the dynamo counters. Returns the pair (ok, total) of the frames counts
+        # read just before clearing.
         for k, v in torch._dynamo.utils.counters.items():
             cls.totals[k].update(v)
         ok = torch._dynamo.utils.counters["frames"]["ok"]
@@ -803,16 +926,24 @@ class Stats:
 
     @classmethod
     def print_summary(cls):
+        # [FUNCTION DOC] Print, for each counter group in sorted order, up to the 50 most common
+        # entries of the accumulated totals.
         for k, v in sorted(cls.totals.items()):
             lines = "\n  ".join(map(str, v.most_common(50)))
             print(f"STATS {k}\n  {lines}")
 
     @classmethod
     def aot_summary(cls):
+        # [FUNCTION DOC] Return a two element list from the accumulated aot_autograd totals: the
+        # total count first and the ok count second.
         return [cls.totals["aot_autograd"]["total"], cls.totals["aot_autograd"]["ok"]]
 
 
 def coverage_experiment(args, model_iter_fn, model, example_inputs, **kwargs):
+    # [FUNCTION DOC] Run the model under dynamo's frozen run wrapper with a profiler active, then
+    # write a row of coverage statistics (graphs, graph calls, captured ops, total ops,
+    # percentages) to the global output file, and return the profiler results. The args and extra
+    # keyword arguments are unused.
     """
     Test operator/model coverage of TorchDynamo and record statistics
     taken from a profiler.  This target is mainly intended to check
@@ -849,6 +980,9 @@ def coverage_experiment(args, model_iter_fn, model, example_inputs, **kwargs):
 
 
 def speedup_experiment_fx2trt(args, model_iter_fn, model, example_inputs):
+    # [FUNCTION DOC] Thin wrapper that just delegates to speedup_experiment with the same
+    # arguments; the documented intent is a speedup measurement with the TensorRT backend, but
+    # nothing TRT specific happens here.
     """
     Measure speedups over eager using the trt inference backend. TRT backend is based fx graph
     generated by torch._dynamo.
@@ -859,6 +993,10 @@ def speedup_experiment_fx2trt(args, model_iter_fn, model, example_inputs):
 
 # TODO: CompilerProfiler is deprecated, remove this
 def recompile_profiler_experiment(args, model_iter_fn, model, example_inputs):
+    # [FUNCTION DOC] Run the model iteration function once under dynamo with the deprecated
+    # compiler profiler, write its report as a row to the output file, and return a one
+    # element list holding the number of recorded guard failure entries. Honors the nopython
+    # option in args.
     prof = torch._dynamo.utils.CompilerProfiler()
     opt_model_iter_fn = torch._dynamo.optimize(prof, nopython=args.nopython)(
         model_iter_fn
@@ -873,6 +1011,11 @@ def recompile_profiler_experiment(args, model_iter_fn, model, example_inputs):
 
 
 def randomize_input(inputs):
+    # [FUNCTION DOC] Recursively build random inputs: lists and tuples are rebuilt element by
+    # element keeping their type, float32 and float64 tensors are replaced by normal random
+    # tensors (counting the use in dynamo counters), int64 tensors are returned unchanged
+    # because they may encode indices or lengths. Raises RuntimeError for tensors of other
+    # dtypes or non-tensor inputs.
     if isinstance(inputs, (list, tuple)):
         return type(inputs)([randomize_input(x) for x in inputs])
     elif isinstance(inputs, torch.Tensor):
@@ -897,11 +1040,19 @@ def randomize_input(inputs):
 
 
 def maybe_mark_step(args):
+    # [FUNCTION DOC] Call the XLA mark step if the trace_on_xla option is set;
+    # otherwise do nothing.
     if args.trace_on_xla:
         xm.mark_step()
 
 
 def latency_experiment(args, model_iter_fn, model, example_inputs, mark, **kwargs):
+    # [FUNCTION DOC] Measure latency of the model: for each of args.repeat repetitions, run timed
+    # for iterations_per_run iterations (optionally on freshly randomized deep-copied inputs)
+    # inside an optional profiler and a profile-record scope named by mark, and return a float64
+    # array of the timings. When export_profiler_trace is set, the Chrome trace is written under
+    # the dynamo base directory using the profiler trace name, the model name and the rank if any.
+    # Extra keyword arguments are ignored.
     """
     Measure latency on a specific backend.
     """
@@ -916,6 +1067,10 @@ def latency_experiment(args, model_iter_fn, model, example_inputs, mark, **kwarg
 
     @contextlib.contextmanager
     def maybe_mark_profile(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Context manager that takes a profiler under keyword p and a label
+        # under keyword mark (both popped from the keyword arguments; positional arguments are
+        # ignored). With a profiler it wraps the body in a record scope with that label; otherwise
+        # it just yields.
         prof: torch.profiler.profile = kwargs.pop("p", None)
         mark = kwargs.pop("mark", None)
         if prof:
@@ -960,6 +1115,15 @@ def latency_experiment(args, model_iter_fn, model, example_inputs, mark, **kwarg
 
 # TODO: This seems to be specifically triggered by torchao testing
 def latency_experiment_summary(suite_name, args, model, timings, **kwargs):
+    # [FUNCTION DOC] Summarize paired latency timings (an array with two columns: baseline and
+    # compiled) into one result row. Computes column medians and the speedup of the first over the
+    # second, optionally saves the raw timings as an npy file, builds a row with device, name,
+    # batch size, optional tag, speedup and compiled latency in milliseconds, optionally compares
+    # against a previous CSV given by args.baseline (zeros when the model is absent or the ratio
+    # is not computable), and appends optional compilation, cache lookup and dynamo stats columns
+    # taken from the keyword arguments. Writes the row and a separate compilation metrics CSV,
+    # emits a signpost, and returns a human readable summary string. Raises AssertionError if the
+    # output file is not a csv or if neither the quantization nor optimus option is set.
     median = np.median(timings, axis=0)
     speedup = median[0] / median[1]
     if args.dump_raw_metrics:
@@ -1048,6 +1212,16 @@ def latency_experiment_summary(suite_name, args, model, timings, **kwargs):
 
 
 def speedup_experiment(args, model_iter_fn, model, example_inputs, **kwargs):
+    # [FUNCTION DOC] Measure speedup of the dynamo-compiled (or exported/AOT variant) model versus
+    # eager. Chooses the compiled callable from the export_aot_inductor, export_nativert,
+    # torchscript_jit_trace and aot_precompile options, else dynamo run (for hf_llm models only
+    # the model forward is wrapped; the kwargs must contain hf_llm). For each repeat, the eager
+    # run (under the force_eager stance) and the compiled run are interleaved on the same,
+    # optionally randomized, inputs. Optionally records a separate profiler trace run and exports
+    # it (Chrome trace, or the perfdoctor handler). Then computes medians and speedup, writes the
+    # result CSV row and a compilation metrics CSV, emits a signpost, and returns a summary
+    # string. Side effect: sets the dynamo repro tolerance (looser for XLA). Raises AssertionError
+    # if the output is not a csv.
     """
     Measure speedups over eager.
 
@@ -1063,6 +1237,9 @@ def speedup_experiment(args, model_iter_fn, model, example_inputs, **kwargs):
 
     @contextlib.contextmanager
     def maybe_mark_profile(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Context manager that takes a profiler under keyword p and a label
+        # under keyword mark (popped from the keyword arguments). With a profiler it wraps the
+        # body in a record scope with that label; otherwise it just yields.
         prof: torch.profiler.profile = kwargs.pop("p", None)
         mark = kwargs.pop("mark", None)
         if prof:
@@ -1252,6 +1429,9 @@ def speedup_experiment(args, model_iter_fn, model, example_inputs, **kwargs):
 
 
 def overhead_experiment(*args, model_iter_fn):
+    # [FUNCTION DOC] Measure TorchDynamo overhead with no backend by delegating
+    # to speedup_experiment; the keyword-only model_iter_fn is appended as the
+    # last positional argument.
     """
     Measure overheads of TorchDynamo by running with no backend (only
     eager+FX), and reporting speedup/slowdown over eager.
@@ -1262,14 +1442,20 @@ def overhead_experiment(*args, model_iter_fn):
 
 
 def print_fx(gm, example_inputs):
+    # [FUNCTION DOC] Debug backend that prints the FX graph of the module and
+    # returns it unchanged.
     print(gm.graph)
     return gm
 
 
 def print_aten_ops(gm, example_inputs):
+    # [FUNCTION DOC] Debug backend that traces the module with AOT autograd and prints the forward
+    # and backward graphs through a printing compiler. Returns the AOT-wrapped module.
     from functorch.compile import aot_module
 
     def trace_printer(gm, _):
+        # [FUNCTION DOC] HELPER: Compiler for aot_module that prints the graph and
+        # returns it unchanged.
         print(gm.graph)
         return gm
 
@@ -1277,6 +1463,11 @@ def print_aten_ops(gm, example_inputs):
 
 
 def baselines(models, model_iter_fn, example_inputs, args):
+    # [FUNCTION DOC] Compare several (name, model) variants against the first one. The first model
+    # defines the expected result; any other model whose output differs (or raises) is reported
+    # and dropped. Then times each remaining variant for the repeat count (failures stay at a huge
+    # sentinel time), computes t-test p-values and median speedups against the first, writes a row
+    # to the output file, and returns a space separated string of formatted speedups.
     """
     Common measurement code across all baseline experiments.
     """
@@ -1327,6 +1518,10 @@ def baselines(models, model_iter_fn, example_inputs, args):
 
 
 def xla(args, model_iter_fn, model, example_inputs):
+    # [FUNCTION DOC] Compare the eager model against a copy moved to an XLA device. Does
+    # three warmup rounds for each, times both for args.repeat rounds, computes a t-test
+    # p-value and the median speedup, writes a row with speedup and both times, and returns
+    # the formatted speedup string.
     xla_dev = xm.xla_device(devkind=current_device)
     model_xla = copy.deepcopy(model).to("cpu").to(device=xla_dev)
     example_inputs_xla = tree_map_only(
@@ -1360,6 +1555,8 @@ def xla(args, model_iter_fn, model, example_inputs):
 
 
 def try_script(model, example_inputs):
+    # [FUNCTION DOC] Try to TorchScript the model; return the scripted module, or None if
+    # scripting raises any exception. The example inputs are ignored.
     try:
         return torch.jit.script(model)
     except Exception:
@@ -1367,6 +1564,10 @@ def try_script(model, example_inputs):
 
 
 def _produce_dynamic_shapes_for_export(path, x):
+    # [FUNCTION DOC] HELPER: Build the dynamic-shapes spec of one tensor for export, because the
+    # dynamic marking is ignored by export. Returns None for non-tensors, otherwise a mapping from
+    # each dimension index recorded in the tensor's dynamic indices attribute (empty if missing)
+    # to the automatic dimension marker. The path argument is unused.
     # mark_dynamic() is ignored for export.
     # use this to produce dynamic_shapes spec instead.
     from torch.export.dynamic_shapes import Dim
@@ -1377,10 +1578,21 @@ def _produce_dynamic_shapes_for_export(path, x):
 
 
 class AOTInductorModelCache:
+    # [CLASS DOC] HELPER: Cache of AOTInductor-compiled packages keyed by a weak reference to
+    # the eager model. The class attribute cache maps each key to the loaded package and the
+    # extra memory in GB used by the transient model clone made for export. Used through
+    # class methods only.
     cache: dict[weakref.ref, tuple[Any, float]] = {}
 
     @classmethod
     def load(cls, model, example_inputs, mode):
+        # [FUNCTION DOC] Return the AOTInductor-loaded callable for the model, building it on
+        # first use. Builds by running the model once on deep copies to find output types,
+        # registering namedtuple or dataclass outputs as pytree nodes, deriving dynamic shapes
+        # from the inputs, measuring the memory used by a clone (CUDA or HPU only; zero
+        # otherwise), exporting the clone non-strictly and compiling and packaging it
+        # (max_autotune is enabled when mode is max-autotune), then loading the package. Side
+        # effects: empties the GPU cache and resets peak memory stats; stores in the class cache.
         import torch._inductor
         from torch.export.dynamic_shapes import _combine_args, _tree_map_with_path
 
@@ -1465,14 +1677,23 @@ class AOTInductorModelCache:
 
     @classmethod
     def get_excess_memory(cls, model) -> float:
+        # [FUNCTION DOC] Return the clone memory in GB recorded for the model when it was built,
+        # or 0.0 if the model has no cache entry.
         return cls.cache.get(weakref.ref(model), (None, 0.0))[1]
 
 
 class NativeRTCache:
+    # [CLASS DOC] HELPER: Cache of NativeRT model runners keyed by a weak reference to the
+    # eager model; the class attribute cache maps each key to a runner object. Used through
+    # class methods only.
     cache: dict[weakref.ref, Any] = {}
 
     @classmethod
     def load(cls, model, example_inputs):
+        # [FUNCTION DOC] Return the cached NativeRT runner for the model, building it on first
+        # use: run the model once, register dataclass outputs for pytree, export with dynamic
+        # shapes, run decompositions, write a PT2 archive to a temporary file that is not deleted,
+        # and create a runner for the forward entry from it.
         from torch.export.dynamic_shapes import _combine_args, _tree_map_with_path
 
         key = weakref.ref(model)
@@ -1501,10 +1722,16 @@ class NativeRTCache:
 
 
 class JitTracedCache:
+    # [CLASS DOC] HELPER: Cache of TorchScript traced modules keyed by a weak reference to
+    # the eager model; the class attribute cache maps each key to the traced module. Used
+    # through class methods.
     cache: dict[weakref.ref, Any] = {}
 
     @classmethod
     def load(cls, model, example_inputs):
+        # [FUNCTION DOC] Return the cached traced module for the model, tracing on first
+        # use non-strictly with positional example inputs when there are any, else with
+        # keyword example inputs.
         key = weakref.ref(model)
         if key not in cls.cache:
             example_args, example_kwargs = _normalize_bench_inputs(example_inputs)
@@ -1523,6 +1750,9 @@ class JitTracedCache:
 
 
 def export(model, example_inputs):
+    # [FUNCTION DOC] Export the model strictly with dynamic shapes derived from the inputs (after
+    # running it once and registering dataclass outputs for pytree) and return a function that
+    # runs the exported module on given inputs, ignoring its first argument.
     from torch.export.dynamic_shapes import _combine_args, _tree_map_with_path
 
     example_args, example_kwargs = _normalize_bench_inputs(example_inputs)
@@ -1542,6 +1772,8 @@ def export(model, example_inputs):
     )
 
     def opt_export(_, example_inputs):
+        # [FUNCTION DOC] HELPER: Run the exported program's module on the normalized positional
+        # and keyword inputs; the first argument is ignored.
         example_args, example_kwargs = _normalize_bench_inputs(example_inputs)
         return ep.module()(*example_args, **example_kwargs)
 
@@ -1549,6 +1781,10 @@ def export(model, example_inputs):
 
 
 def aot_precompile(model, example_inputs):
+    # [FUNCTION DOC] Compile the model with full-graph AOT precompile in a fresh cache, save the
+    # compiled function to a temporary file (left on disk), reset dynamo, reload it while timing
+    # and printing the load time, and return a runner function bound to the loaded function.
+    # Guards are filtered out so none are ever checked. Side effect: resets dynamo.
     example_args, example_kwargs = _normalize_bench_inputs(example_inputs)
 
     with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
@@ -1573,6 +1809,8 @@ def aot_precompile(model, example_inputs):
             )
 
             def opt_aot_precompile(_, example_inputs, collect_outputs=False):
+                # [FUNCTION DOC] HELPER: Call the loaded precompiled function with the model and
+                # the normalized inputs; the first argument and collect_outputs flag are ignored.
                 example_args, example_kwargs = _normalize_bench_inputs(example_inputs)
                 return loaded_fn(model, *example_args, **example_kwargs)
 
@@ -1580,9 +1818,13 @@ def aot_precompile(model, example_inputs):
 
 
 def export_nativert(model, example_inputs):
+    # [FUNCTION DOC] Load (or build) the NativeRT runner for the model and return a function that
+    # runs it on normalized example inputs.
     optimized = NativeRTCache.load(model, example_inputs)
 
     def opt_nativert(_, example_inputs, collect_outputs=False):
+        # [FUNCTION DOC] HELPER: Run the NativeRT runner on the normalized inputs; the first
+        # argument and collect_outputs flag are ignored.
         example_args, example_kwargs = _normalize_bench_inputs(example_inputs)
         return optimized.run(*example_args, **example_kwargs)
 
@@ -1590,9 +1832,13 @@ def export_nativert(model, example_inputs):
 
 
 def export_aot_inductor(model, example_inputs, mode):
+    # [FUNCTION DOC] Load (or build) the AOTInductor callable for the model and mode and return a
+    # function that runs it on normalized example inputs.
     optimized = AOTInductorModelCache.load(model, example_inputs, mode)
 
     def opt_aot_inductor(_, example_inputs, collect_outputs=False):
+        # [FUNCTION DOC] HELPER: Run the AOTInductor callable on the normalized inputs; the first
+        # argument and collect_outputs flag are ignored.
         example_args, example_kwargs = _normalize_bench_inputs(example_inputs)
         return optimized(*example_args, **example_kwargs)
 
@@ -1600,9 +1846,13 @@ def export_aot_inductor(model, example_inputs, mode):
 
 
 def torchscript_jit_trace(model, example_inputs):
+    # [FUNCTION DOC] Load (or build) the traced module for the model and return a function that
+    # runs it on normalized example inputs.
     optimized = JitTracedCache.load(model, example_inputs)
 
     def opt_jit_trace(_, example_inputs, collect_outputs=False):
+        # [FUNCTION DOC] HELPER: Run the traced module on the normalized inputs; the first
+        # argument and collect_outputs flag are ignored.
         example_args, example_kwargs = _normalize_bench_inputs(example_inputs)
         return optimized(*example_args, **example_kwargs)
 
@@ -1610,6 +1860,11 @@ def torchscript_jit_trace(model, example_inputs):
 
 
 def download_retry_decorator(download_fn):
+    # [FUNCTION DOC] Decorator factory for methods that download models: the wrapper retries the
+    # wrapped method (called with self) when it raises, up to MAX_DOWNLOAD_ATTEMPTS retries after
+    # the first try, sleeping 30 seconds times the try count between attempts and printing a
+    # message. After the last failure it raises a RuntimeError naming the positional arguments
+    # and the error.
     """
     Decorator function for applying retry logic to a download function.
 
@@ -1624,6 +1879,9 @@ def download_retry_decorator(download_fn):
 
     @functools.wraps(download_fn)
     def wrapper(self, *args, **kwargs) -> Any:
+        # [FUNCTION DOC] HELPER: Retrying wrapper described by the decorator; returns the
+        # wrapped method's result on the first success, else raises RuntimeError once
+        # retries are exhausted.
         tries = 0
         total_allowed_tries = MAX_DOWNLOAD_ATTEMPTS
         while tries <= total_allowed_tries:
@@ -1647,6 +1905,11 @@ def download_retry_decorator(download_fn):
 
 
 def read_batch_size_from_file(args, filename, model_name):
+    # [FUNCTION DOC] Look up the batch size of a model in a comma separated "name,size" text file
+    # (prefixing the benchmarks directory when it exists in the current directory). Returns an int
+    # or None (with a warning) when the model is not listed; the last matching line wins. Prints
+    # the result. Raises AssertionError if the file is missing and RuntimeError when the stored
+    # size is -1 (meaning unset). Raises ValueError on a malformed line.
     batch_size = None
     if os.path.exists("benchmarks"):
         filename = os.path.join("benchmarks", filename)
@@ -1670,21 +1933,32 @@ def read_batch_size_from_file(args, filename, model_name):
 
 
 class TimeOutException(Exception):
+    # [CLASS DOC] HELPER: Exception raised by the alarm signal handler when a timed call
+    # runs too long.
     pass
 
 
 def alarm_handler(signum, frame):
+    # [FUNCTION DOC] HELPER: Signal handler for the alarm signal; ignores its arguments
+    # and raises TimeOutException.
     raise TimeOutException
 
 
 def exit_after(s):
+    # [FUNCTION DOC] Decorator factory: wraps a function so that it is interrupted with a
+    # TimeOutException if it runs longer than the given number of seconds. Uses the process alarm
+    # signal (Unix, main thread only), installing the handler on each call.
     """
     Decorator to raise TimeoutException if the fn is taking more than s seconds
     to run.
     """
 
     def outer(fn):
+        # [FUNCTION DOC] HELPER: Takes the function to guard and returns the guarded wrapper.
         def inner(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Install the alarm handler, arm the alarm for the
+            # timeout, call the function, and always cancel the alarm afterwards; returns
+            # the function's result.
             signal.signal(signal.SIGALRM, alarm_handler)
             signal.alarm(s)
             try:
@@ -1699,10 +1973,14 @@ def exit_after(s):
 
 
 def get_peak_memory():
+    # [FUNCTION DOC] Return the peak CUDA memory allocated so far in decimal gigabytes (bytes
+    # divided by 10**9).
     return torch.cuda.max_memory_allocated() / 10**9
 
 
 def null_experiment(args, model_iter_fn, model, example_inputs):
+    # [FUNCTION DOC] Experiment that measures nothing and returns an empty list; used to check
+    # that the model suite alone runs.
     """
     A no-op experiment useful for making sure TorchBenchark alone works properly.
     """
@@ -1711,6 +1989,10 @@ def null_experiment(args, model_iter_fn, model, example_inputs):
 
 
 def cast_to(dtype, model, inputs):
+    # [FUNCTION DOC] Cast the model to the given dtype and cast all floating point tensors in the
+    # inputs (nested structure) to it, leaving other values alone and copying dynamo's dynamic and
+    # unbacked markings onto the new tensors. Returns the model and inputs. The model is modified
+    # in place by the module conversion methods.
     # cast model and inputs to fp16
     if dtype == torch.float16:
         model = model.half()
@@ -1718,6 +2000,9 @@ def cast_to(dtype, model, inputs):
         model = model.to(dtype)
 
     def cast_and_preserve_markings(x):
+        # [FUNCTION DOC] HELPER: Convert one value: non-tensors and non floating point tensors are
+        # returned as is; otherwise a converted copy is returned with dynamo tensor attributes
+        # copied from the source.
         if not isinstance(x, torch.Tensor) or not x.is_floating_point():
             return x
         y = x.to(dtype)
@@ -1730,27 +2015,37 @@ def cast_to(dtype, model, inputs):
 
 
 def cast_to_bf16(model, inputs):
+    # [FUNCTION DOC] Cast model and inputs to bfloat16 through cast_to.
     return cast_to(torch.bfloat16, model, inputs)
 
 
 def cast_to_fp16(model, inputs):
+    # [FUNCTION DOC] Cast model and inputs to float16 through cast_to.
     return cast_to(torch.float16, model, inputs)
 
 
 def cast_to_fp64(model, inputs):
+    # [FUNCTION DOC] Cast model and inputs to float64 through cast_to.
     return cast_to(torch.float64, model, inputs)
 
 
 def cast_to_fp32(model, inputs):
+    # [FUNCTION DOC] Cast model and inputs to float32 through cast_to.
     return cast_to(torch.float32, model, inputs)
 
 
 class DummyGradScaler:
+    # [CLASS DOC] HELPER: Stand-in for a gradient scaler whose only operation returns the loss
+    # unscaled; gradient scaling is disabled in the benchmarks.
     def scale(self, loss):
+        # [FUNCTION DOC] HELPER: Return the loss unchanged.
         return loss
 
 
 def get_dynamo_stats():
+    # [FUNCTION DOC] Snapshot a Counter of current dynamo statistics: captured calls, unique
+    # graphs, fallbacks to eager (total frames minus ok frames), total graph breaks, number of
+    # unique graph break reasons, compiled autograd captures and compiles, and cudagraph skips.
     # TODO: consider deepcopy'ing the entire counters struct and
     # adding a helper to do subtraction on it
     return collections.Counter(
@@ -1781,6 +2076,10 @@ def get_dynamo_stats():
 
 @contextmanager
 def maybe_init_distributed(should_init_distributed, rank, world_size, port="6789"):
+    # [FUNCTION DOC] Context manager that, when enabled, selects the CUDA device for the rank,
+    # sets the master address and port environment variables, and initializes an NCCL process
+    # group of the given world size; on exit (even after errors) it destroys the process group.
+    # Does nothing when disabled.
     try:
         if should_init_distributed:
             torch.cuda.set_device(rank)
@@ -1797,6 +2096,12 @@ def maybe_init_distributed(should_init_distributed, rank, world_size, port="6789
 
 @contextmanager
 def maybe_snapshot_memory(should_snapshot_memory, suffix):
+    # [FUNCTION DOC] Context manager that, when enabled, starts CUDA memory history recording
+    # for up to 100000 entries; on exit it dumps a snapshot pickle under the dynamo base
+    # directory named from the output file and suffix (failures are logged, not raised) and
+    # turns recording off.
+    # KNOWN ISSUE: the string method that strips characters is used to drop the csv suffix, so it
+    # strips any trailing run of ".", "c", "s", "v" characters rather than the suffix itself.
     # Enables Memory Snapshot tool for memory deep dives:
     # https://pytorch.org/blog/understanding-gpu-memory-1/
     try:
@@ -1819,7 +2124,14 @@ def maybe_snapshot_memory(should_snapshot_memory, suffix):
 
 
 class BenchmarkRunner:
+    # [CLASS DOC] Base class of the suite runners. Holds the iteration function, a dummy gradient
+    # scaler, the autocast factory and its keyword arguments, the optional optimizer and the
+    # parsed command line args (via a property). Subclasses supply the model loading, the per-
+    # suite lists (such as fp32_only_models) and the iteration functions; this class supplies the
+    # common accuracy and performance checking driver.
     def __init__(self):
+        # [FUNCTION DOC] Initialize the runner state: no iteration function yet, a dummy grad
+        # scaler, a null autocast context factory with no arguments, no optimizer, and no args.
         self.model_iter_fn = None
         self.grad_scaler = DummyGradScaler()
         self.autocast = contextlib.nullcontext
@@ -1828,6 +2140,12 @@ class BenchmarkRunner:
         self._args = None
 
     def setup_amp(self, current_device=None):
+        # [FUNCTION DOC] Configure autocast when AMP is requested. Does nothing for models in
+        # the fp32-only list. Otherwise, when args.amp is set, autocast becomes a partial of
+        # the autocast class for the first device, and the dtype entry is set to float16 or
+        # bfloat16 per args.amp_dtype (when no amp dtype is given, bfloat16 only for models
+        # in the bfloat16 list). Gradient scaling is deliberately left disabled. Mutates
+        # autocast and autocast_arg.
         if self.args.only in self.fp32_only_models:
             return
 
@@ -1869,6 +2187,11 @@ class BenchmarkRunner:
                 self.autocast_arg["dtype"] = amp_dtype
 
     def init_optimizer(self, name, device, params):
+        # [FUNCTION DOC] Create the optimizer for training on CUDA, or set it to None. For CUDA
+        # training of a model not in the skip list it chooses SGD (foreach, lr 0.01, step excluded
+        # from dynamo compile) for models in the CI list when in CI, the benchmark list, or the
+        # inductor accuracy list on non-ROCm builds; otherwise Adam (lr 0.01, capturable,
+        # foreach). Stores it on self.optimizer.
         if device == "cuda" and self.args.training and name not in CI_SKIP_OPTIMIZER:
             use_sgd = (
                 (name in CI_USE_SGD and self.args.ci)
@@ -1897,131 +2220,200 @@ class BenchmarkRunner:
 
     @property
     def args(self):
+        # [FUNCTION DOC] Property getter returning the parsed command line args namespace stored
+        # on the runner.
         return self._args
 
     @args.setter
     def args(self, args):
+        # [FUNCTION DOC] Property setter that stores the args namespace on the runner.
         self._args = args
 
     @property
     def skip_models(self):
+        # [FUNCTION DOC] Property: set of models to skip for every device; the base version
+        # returns a new empty set on each access, so suite runners must override it with a
+        # persistent set because run adds to it.
         return set()
 
     @property
     def skip_models_for_cuda(self):
+        # [FUNCTION DOC] Property: default empty set of models to skip when running on CUDA; suite
+        # runners override it.
         return set()
 
     @property
     def skip_models_for_xpu(self):
+        # [FUNCTION DOC] Property: default empty set of models to skip when running on XPU; suite
+        # runners override it.
         return set()
 
     @property
     def skip_models_for_cpu(self):
+        # [FUNCTION DOC] Property: default empty set of models to skip when running on CPU; suite
+        # runners override it.
         return set()
 
     @property
     def skip_models_for_cpu_aarch64(self):
+        # [FUNCTION DOC] Property: default empty set of models to skip on CPU of the aarch64
+        # architecture; suite runners override it.
         return set()
 
     @property
     def skip_models_for_freezing_cpu(self):
+        # [FUNCTION DOC] Property: default empty set of models to skip for freezing runs on CPU;
+        # suite runners override it.
         return set()
 
     @property
     def skip_models_for_freezing_cuda(self):
+        # [FUNCTION DOC] Property: default empty set of models to skip for freezing runs on CUDA;
+        # suite runners override it.
         return set()
 
     @property
     def slow_models(self):
+        # [FUNCTION DOC] Property: default empty set of models considered slow; suite
+        # runners override it.
         return set()
 
     @property
     def very_slow_models(self):
+        # [FUNCTION DOC] Property: empty set of models considered very slow; not read in this
+        # module; suite runners may override it.
         return set()
 
     @property
     def non_deterministic_models(self):
+        # [FUNCTION DOC] Property: default empty set of models whose accuracy results are not
+        # deterministic, so failures are reported as pass; suite runners override it.
         return set()
 
     @property
     def fp32_only_models(self):
+        # [FUNCTION DOC] Property: default empty set of models that only support float32, so they
+        # are never cast or run under AMP; suite runners override it.
         return set()
 
     @property
     def force_amp_for_fp16_bf16_models(self):
+        # [FUNCTION DOC] Property: default empty set of models that run with AMP instead of being
+        # cast when float16 or bfloat16 is requested; suite runners override it.
         return set()
 
     @property
     def force_fp16_for_bf16_models(self):
+        # [FUNCTION DOC] Property: default empty set of models that run in float16 when bfloat16
+        # is requested; suite runners override it.
         return set()
 
     @property
     def amp_dtype_bfloat16(self):
+        # [FUNCTION DOC] Property: default empty set of models that use bfloat16 as the AMP dtype
+        # when none is given; suite runners override it.
         return set()
 
     @property
     def skip_not_suitable_for_training_models(self):
+        # [FUNCTION DOC] Property: default empty set of models not suitable for training runs;
+        # suite runners override it.
         return set()
 
     @property
     def failing_torchinductor_models(self):
+        # [FUNCTION DOC] Property: empty set of models known to fail with inductor; not read in
+        # this module; suite runners may override it.
         return set()
 
     @property
     def failing_fx2trt_models(self):
+        # [FUNCTION DOC] Property: empty set of models known to fail with TensorRT; not read in
+        # this module; suite runners may override it.
         return set()
 
     @property
     def skip_accuracy_checks_large_models_dashboard(self):
+        # [FUNCTION DOC] Property: default empty set of large models whose accuracy checks are
+        # skipped (reported as pass_due_to_skip); suite runners override it.
         return set()
 
     @property
     def skip_accuracy_check_as_eager_non_deterministic(self):
+        # [FUNCTION DOC] Property: default empty set of models whose eager results are non-
+        # deterministic, so the accuracy comparison is skipped; suite runners override it.
         return set()
 
     @property
     def skip_multiprocess_models(self):
+        # [FUNCTION DOC] Property: default empty set of models to skip in multiprocess runs; suite
+        # runners override it.
         return set()
 
     @property
     def skip_models_due_to_control_flow(self):
+        # [FUNCTION DOC] Property: default empty set of models to skip because they use
+        # unsupported control flow; suite runners override it.
         return set()
 
     @property
     def skip_models_due_to_export_not_supported(self):
+        # [FUNCTION DOC] Property: default empty set of models to skip because export does not
+        # support them; suite runners override it.
         return set()
 
     @property
     def disable_cudagraph_models(self):
+        # [FUNCTION DOC] Property: default empty set of models for which CUDA graphs are disabled;
+        # suite runners override it.
         return set()
 
     @property
     def guard_on_nn_module_models(self):
+        # [FUNCTION DOC] Property: default empty set of models whose run is wrapped in the dynamo
+        # setting that guards on nn modules; suite runners override it.
         return set()
 
     def get_tolerance_and_cosine_flag(self, is_training, current_device, name):
+        # [FUNCTION DOC] Abstract hook: subclasses return the pair (tolerance, use cosine
+        # similarity flag) for a training or inference run on the device and model name. The base
+        # version always raises NotImplementedError.
         raise NotImplementedError
 
     @property
     def equal_nan(self):
+        # [FUNCTION DOC] Property: whether NaN values compare as equal in accuracy checks; True
+        # unless the float32 option is set.
         equal_nan = True
         if self.args.float32:
             equal_nan = False
         return equal_nan
 
     def use_larger_multiplier_for_smaller_tensor(self, name):
+        # [FUNCTION DOC] Hook: whether the accuracy comparison should use a larger tolerance
+        # multiplier for small tensors for this model; the base version always returns False.
         return False
 
     def use_iou_for_bool_accuracy(self, name):
+        # [FUNCTION DOC] Hook: whether boolean outputs should be compared using intersection over
+        # union for this model; the base version always returns False.
         return False
 
     def get_iou_threshold(self, name):
+        # [FUNCTION DOC] Hook: intersection over union threshold for boolean accuracy; the base
+        # version returns 0.99 for every model.
         return 0.99
 
     def get_accuracy_check_runs(self, name):
+        # [FUNCTION DOC] Hook: number of accuracy check runs for a model (majority vote when more
+        # than one); the base version returns 1.
         return 1
 
     def iter_models(self, args):
+        # [FUNCTION DOC] Generator over every (model name, device) combination from the
+        # subclass model name iterator and args.devices, yielding the result of load_model
+        # with the requested batch size. Combinations whose loader raises NotImplementedError
+        # are silently skipped.
         for model_name in self.iter_model_names(args):
             for device in args.devices:
                 try:
@@ -2034,9 +2426,16 @@ class BenchmarkRunner:
                     continue  # bad benchmark implementation
 
     def deepcopy_model(self, model):
+        # [FUNCTION DOC] Return a deep copy of the model; subclasses may override.
         return copy.deepcopy(model)
 
     def cast_based_on_args(self, model, example_inputs):
+        # [FUNCTION DOC] Cast the model and inputs according to the options. float32 (or a model
+        # in the fp32-only list, with a warning) casts to float32. Under float16 or bfloat16,
+        # models in the force AMP list instead turn on args.amp (a mutation) and set up autocast
+        # with a warning; for bfloat16, models in the force-fp16 list are cast to float16;
+        # otherwise the model is cast to the requested dtype. With no dtype option nothing is
+        # cast. Returns the model and inputs.
         if self.args.float32 or self.args.only in self.fp32_only_models:
             if not self.args.float32:
                 log.warning("Model %s supports float32 only", self.args.only)
@@ -2071,6 +2470,9 @@ class BenchmarkRunner:
         return model, example_inputs
 
     def validate_model(self, name, model, example_inputs):
+        # [FUNCTION DOC] Run the eager model once on a deep copy of the model and cloned, cast
+        # inputs (under the training gradient mode) to check it works. Raises RuntimeError
+        # chaining the original error if the eager run fails.
         """
         Runs the eager model with example inputs to ensure that eager passes.
         """
@@ -2084,10 +2486,15 @@ class BenchmarkRunner:
                 raise RuntimeError("Eager run failed") from e
 
     def maybe_cast(self, model, example_inputs):
+        # [FUNCTION DOC] Cast the model and inputs by delegating to
+        # cast_based_on_args; returns both.
         model, example_inputs = self.cast_based_on_args(model, example_inputs)
         return model, example_inputs
 
     def decay_batch_exp(self, batch_size, factor=0.5, divisor=2):
+        # [FUNCTION DOC] Compute the next smaller batch size to try: multiply by the factor; if
+        # the result is larger than the divisor, round it up to a multiple of the divisor,
+        # otherwise decrease the batch size by one. Returns a non-negative int.
         out_batch_size = batch_size * factor
         if out_batch_size > divisor:
             out_batch_size = (out_batch_size + 1) // divisor * divisor
@@ -2096,6 +2503,11 @@ class BenchmarkRunner:
         return max(0, int(out_batch_size))
 
     def batch_size_finder(self, device, model_name, initial_batch_size=1024):
+        # [FUNCTION DOC] Find the largest workable batch size by starting at the initial value and
+        # loading the model and running one iteration, shrinking via decay_batch_exp after any
+        # RuntimeError. Stops shrinking when an error mentions channels_last. Returns the working
+        # batch size, or 1 if none worked. Empties the GPU cache for the global current device
+        # each try; other exceptions propagate.
         batch_size = initial_batch_size
         while batch_size >= 1:
             empty_gpu_cache(current_device)
@@ -2115,6 +2527,8 @@ class BenchmarkRunner:
         return 1
 
     def run_n_iterations(self, mod, inputs, model_iter_fn):
+        # [FUNCTION DOC] Run the iteration function args.iterations times, without collecting
+        # outputs on all but the last call, and return the outputs of the last call.
         n = self.args.iterations
         for _ in range(n - 1):
             model_iter_fn(mod, inputs, collect_outputs=False)
@@ -2122,16 +2536,22 @@ class BenchmarkRunner:
 
     @torch._disable_dynamo(recursive=True)
     def optimizer_zero_grad(self, mod):
+        # [FUNCTION DOC] Zero gradients with set-to-none behavior, using the optimizer when one
+        # exists, otherwise the module. Excluded from dynamo tracing recursively.
         if self.optimizer is not None:
             self.optimizer.zero_grad(True)
         else:
             mod.zero_grad(True)
 
     def optimizer_step(self):
+        # [FUNCTION DOC] Step the optimizer if one is configured; otherwise do nothing.
         if self.optimizer is not None:
             self.optimizer.step()
 
     def get_benchmark_indices(self, length):
+        # [FUNCTION DOC] Return the start and end indices of this partition's slice of a list of
+        # the given length, based on partition_id and total_partitions in the args. The last
+        # partition extends to the end to include the remainder.
         start = self._args.partition_id * (length // self._args.total_partitions)
         end = (
             (self._args.partition_id + 1) * (length // self._args.total_partitions)
@@ -2141,6 +2561,10 @@ class BenchmarkRunner:
         return start, end
 
     def get_fsdp_auto_wrap_policy(self, model_name: str):
+        # [FUNCTION DOC] Return the FSDP auto-wrap policy for the model name. Imports diffusers,
+        # torchbenchmark and transformers classes (so those packages must be installed). Known
+        # models (stable_diffusion_unet, llama_v2_7b_16h, nanogpt) get a module-class wrap policy,
+        # other models a size-based policy that recurses with a minimum of 100000 parameters.
         from diffusers.models.transformer_2d import Transformer2DModel
         from torchbenchmark.models.nanogpt.model import Block
         from transformers.models.llama.modeling_llama import LlamaDecoderLayer
@@ -2166,6 +2590,13 @@ class BenchmarkRunner:
         return ModuleWrapPolicy(MODEL_FSDP_WRAP[model_name])
 
     def deepcopy_and_maybe_parallelize(self, model):
+        # [FUNCTION DOC] Deep copy the model and wrap it for distributed runs: with args.ddp in
+        # DistributedDataParallel (finding unused parameters), or with args.fsdp in
+        # FullyShardedDataParallel using original params, a mixed precision policy of the
+        # requested float16 or bfloat16 (else float32) dtype, limited all-gathers, the auto-wrap
+        # policy for args.only, and the current CUDA device when the last device is cuda. Without
+        # either option, only the copy is returned. Raises AssertionError if distributed is not
+        # available in the build.
         model = self.deepcopy_model(model)
         if self.args.ddp:
             if not torch.distributed.is_available():
@@ -2213,6 +2644,11 @@ class BenchmarkRunner:
         return model
 
     def _write_accuracy_row(self, status, dynamo_start_stats, tag):
+        # [FUNCTION DOC] HELPER: Write an accuracy result: build the row (device, name, batch
+        # size, optional tag inserted before the status column position, status), emit a signpost
+        # for it, then append the change in dynamo stats since the start snapshot and the total
+        # compilation wall time and write the row to the output file. Prints the compile time if
+        # args.print_compilation_time is set.
         """
         Shared CSV + signpost writer for accuracy checks.
         """
@@ -2247,6 +2683,14 @@ class BenchmarkRunner:
     def check_accuracy(
         self, name, model, example_inputs, optimize_ctx, experiment, tag
     ):
+        # [FUNCTION DOC] Run the accuracy check for one model and write its status row. Returns
+        # the status string. Steps: skip for large dashboard models or the torchao backend;
+        # collect fp64 reference outputs (falling back to cosine similarity if that fails); run
+        # eager twice (statuses for OOM or failure, and a differing status when the two runs
+        # differ); run the compiled variant, either by export-style entry points or the iteration
+        # function, possibly several runs with majority vote; optionally save or compare model
+        # outputs bitwise; compare with the tolerance rules. The experiment argument is unused.
+        # Mutates args.cosine on fp64 failure and resets dynamo.
         """
         Checks accuracy.
         1) Collect the outputs with fp64 datatype. This is useful for error checking.
@@ -2255,6 +2699,9 @@ class BenchmarkRunner:
         start_stats = get_dynamo_stats()
 
         def record_status(accuracy_status, dynamo_start_stats):
+            # [FUNCTION DOC] HELPER: Write the status row for this check and return the status.
+            # For models in the non-deterministic list, pass, fail_accuracy and
+            # eager_two_runs_differ statuses are all converted to pass.
             """
             Records the status in the csv file
             """
@@ -2558,6 +3005,13 @@ class BenchmarkRunner:
     def check_batch_invariance(
         self, name, model, example_inputs, optimize_ctx, experiment, tag
     ):
+        # [FUNCTION DOC] Check that compiled forward outputs do not depend on batch size. Runs the
+        # full batch as reference, then successively halved batch sizes down to one, each time on
+        # a freshly copied model in eval mode with a reset dynamo, and requires the batch-first
+        # output tensors to equal the reference slices bitwise. Writes and returns a status: pass,
+        # pass_due_to_skip (skip lists, batch below two, no batch-first inputs, or
+        # skip_accuracy_check option on mismatch), OOM, fail_to_run, fail_to_run_at_batch_N, or
+        # fail_batch_invariance_at_N. The experiment argument is unused.
         """
         Batch invariance check: run the compiled forward at N, N/2, ..., 1 and
         verify each output matches the reference sliced to that range bitwise.
@@ -2571,6 +3025,7 @@ class BenchmarkRunner:
         start_stats = get_dynamo_stats()
 
         def record_status(status, dynamo_start_stats):
+            # [FUNCTION DOC] HELPER: Write the status row and return the status.
             self._write_accuracy_row(status, dynamo_start_stats, tag)
             return status
 
@@ -2597,7 +3052,12 @@ class BenchmarkRunner:
             return record_status("pass_due_to_skip", dynamo_start_stats=start_stats)
 
         def make_slicer(target):
+            # [FUNCTION DOC] HELPER: Return a function that cuts a tensor to the first target
+            # entries along the first dimension (contiguous) when its first dimension equals the
+            # full batch, else returns it as is.
             def slicer(x):
+                # [FUNCTION DOC] HELPER: Slice a tensor to the target batch size when its leading
+                # dimension is the full batch; return other tensors unchanged.
                 if x.dim() > 0 and x.shape[0] == full_batch:
                     return x[:target].contiguous()
                 return x
@@ -2605,6 +3065,10 @@ class BenchmarkRunner:
             return slicer
 
         def run_fresh(inputs):
+            # [FUNCTION DOC] HELPER: Reset RNG state and dynamo, deep copy the model in eval mode,
+            # run the compiled forward pass on the given inputs, and return the outputs; the copy
+            # is deleted and the GPU cache emptied afterwards. Fresh copies prevent state
+            # carryover between comparisons.
             # Rebuild model for every run so parameter-mutating side effects
             # (BN running stats, caches, etc.) from a prior run don't bleed
             # into the next comparison. Force eval mode regardless of
@@ -2662,6 +3126,9 @@ class BenchmarkRunner:
                 # dim and legitimately differ between batch sizes; comparing
                 # them would produce misleading failures.
                 def keep_batch_first(x):
+                    # [FUNCTION DOC] HELPER: Keep a tensor only if its leading dimension equals
+                    # the current batch size under test, otherwise replace it with None so it
+                    # is not compared.
                     return x if x.dim() > 0 and x.shape[0] == size else None
 
                 ref_for_cmp = tree_map_only(
@@ -2693,6 +3160,15 @@ class BenchmarkRunner:
     def check_tolerance(
         self, name, model, example_inputs, optimize_ctx, base_device="cpu"
     ):
+        # [FUNCTION DOC] Measure numerical deviation between a base-device reference run and the
+        # compiled run, and write a row of max, mean and standard deviation of the relative
+        # errors. Skipped models return pass_due_to_skip. The reference runs on a deep copy moved
+        # to base_device (default cpu); then dynamo is reset and the optimized iteration function
+        # runs. Returns pass, or fail_to_run when the optimized run raises (error logged). The
+        # returned status never reflects the error magnitude.
+        # KNOWN ISSUE: the optimized run uses the base-device model copy with the original
+        # (not copied to base_device) inputs, while the optimizer is created from the
+        # original model parameters.
         """
         Checks tolerance based on https://pytorch.org/docs/stable/generated/torch.allclose.html.
         """
@@ -2736,6 +3212,11 @@ class BenchmarkRunner:
                 return "fail_to_run"
 
             def dump_max_mean_values(tol, ref, res):
+                # [FUNCTION DOC] HELPER: Recursively walk matching reference and result structures
+                # (sequences, mappings, tensors) and append to the list the flattened float32
+                # relative error, absolute difference divided by one plus the absolute reference,
+                # of every tensor pair; the result tensor is first moved to the base device. Other
+                # value types are ignored. Returns the same list.
                 if isinstance(ref, (list, tuple, torch.nn.ParameterList, torch.Size)):
                     for refi, resi in zip(ref, res):
                         dump_max_mean_values(tol, refi, resi)
@@ -2770,6 +3251,16 @@ class BenchmarkRunner:
     def run_performance_test_non_alternate(
         self, name, model, example_inputs, optimize_ctx, experiment, tag=None
     ):
+        # [FUNCTION DOC] Performance run used for the torchao and optimus backends: eager and
+        # backend are measured one after the other (not interleaved) with the latency experiment.
+        # Casts and wraps the model, warms up eager (and records cold or warm peak memory),
+        # measures baseline timings, resets dynamo, warms up the optimized function, measures
+        # backend timings, stacks both into a two column array, and returns the string from
+        # latency_experiment_summary. Raises AssertionError if the experiment is not the latency
+        # experiment. Side effects: resets dynamo, may snapshot memory, may print memory or
+        # compile time, writes CSV rows.
+        # KNOWN ISSUE: the branch that adds compile statistics only fires for the speedup
+        # experiment, which is impossible here because only the latency experiment is accepted.
         "Run performance test in non-alternately."
         if experiment.func is not latency_experiment:
             raise AssertionError(
@@ -2777,6 +3268,11 @@ class BenchmarkRunner:
             )
 
         def warmup(fn, model, example_inputs, mode, niters=10):
+            # [FUNCTION DOC] HELPER: Run fn niters times on the model and inputs and return (total
+            # seconds, peak memory in GB, dynamo stats difference). Resets CUDA or HPU peak stats
+            # before; peak memory is the CUDA peak, the HPU peak, or for CPU the process memory
+            # share times total memory. On any exception it logs, writes a warmup_failed row,
+            # emits a signpost and exits the process with status -1.
             gc.collect()
             peak_mem = 0
             start_stats = get_dynamo_stats()
@@ -2945,6 +3441,15 @@ class BenchmarkRunner:
         tag=None,
         batch_size=None,
     ):
+        # [FUNCTION DOC] Run the standard speedup or coverage performance test and return a result
+        # string. For hf_llm runners it uses the generate function and one warmup iteration; for
+        # XLA it just casts and calls the experiment. Otherwise it casts and wraps the model,
+        # measures an eager warmup under the forced eager stance (with cold or warm peak memory),
+        # builds the optimized function (directly for export-style options, via the model for
+        # hf_llm), warms it up, optionally profiles dynamo cache lookup latency, computes
+        # compilation time and the memory compression ratio, runs the coverage statistics passes
+        # for the coverage experiment, then runs the experiment with the collected keyword
+        # arguments and returns the joined results. Side effects: prints, writes CSV.
         niters = 5
         if getattr(self, "hf_llm", False):
             # If we're benchmarking an llm, we want to use the generate function
@@ -2958,6 +3463,10 @@ class BenchmarkRunner:
                 )
 
         def warmup(fn, model, example_inputs, mode, niters=5):
+            # [FUNCTION DOC] HELPER: Run fn niters times (default 5) on the model and inputs and
+            # return (total seconds, peak memory in GB, dynamo stats difference). Peak memory
+            # comes from CUDA, HPU or the CPU process share; on any exception it logs, writes a
+            # warmup_failed row, emits a signpost and exits the process with status -1.
             gc.collect()
             peak_mem = 0
             start_stats = get_dynamo_stats()
@@ -3147,6 +3656,11 @@ class BenchmarkRunner:
         experiment,
         tag,
     ):
+        # [FUNCTION DOC] Reproduce an accuracy failure with a minified graph. Sets the compile
+        # debug and repro environment variables (process wide side effect), runs the accuracy
+        # check, and then moves the generated repro script from the current directory into the
+        # output directory (or the dynamo base directory) renamed with the model name; logs an
+        # error if no repro script exists.
         log.info("Minifying %s...", name)
         os.environ["TORCH_COMPILE_DEBUG"] = "1"
         os.environ["TORCHDYNAMO_REPRO_AFTER"] = "dynamo"
@@ -3171,6 +3685,10 @@ class BenchmarkRunner:
             )
 
     def maybe_preserve_compile_debug(self, name, status):
+        # [FUNCTION DOC] In CI, keep the compile debug directory when the model/status pair is
+        # listed in CI_PRESERVE_COMPILE_DEBUG: moves the dynamo debug directory under the
+        # test/debug directory of the current directory. Failures to move are logged; nothing
+        # happens for unlisted models.
         if (
             name in CI_PRESERVE_COMPILE_DEBUG
             and status in CI_PRESERVE_COMPILE_DEBUG[name]
@@ -3199,6 +3717,17 @@ class BenchmarkRunner:
         tag=None,
         batch_size=None,
     ):
+        # [FUNCTION DOC] Run one model through the selected mode and print and write the results.
+        # Prints a header line, then depending on args runs batch invariance or accuracy checking
+        # (with optional minification on fail_accuracy), the tolerance check, or a performance
+        # test (non-alternating for torchao and optimus backends). Then empties the GPU cache, may
+        # preserve compile debug files, optionally prints timing statistics, prints the dynamo
+        # graph explanation when requested, and writes graph break reasons to a separate CSV (not
+        # uploaded to the database). Prints suite stats if requested.
+        # KNOWN ISSUE: if none of the accuracy, tolerance or performance options is
+        # set, the status variable is never assigned and the call to preserve compile
+        # debug raises UnboundLocalError.
+        # KNOWN ISSUE: the string method that strips characters is used to remove the csv suffix.
         mode = "train" if self.args.training else "eval"
         msg = f"{current_device:4} {mode:5} {current_name:34} "
         if tag:
@@ -3271,6 +3800,8 @@ class BenchmarkRunner:
             filename = f"{output_filename.rstrip('.csv')}_graph_breaks.csv"
 
             def add_double_quotes(x):
+                # [FUNCTION DOC] HELPER: Wrap the text in double quotes (the reason may
+                # itself contain commas).
                 # Delimiter because reason could have comma
                 return f'"{x}"'
 
@@ -3295,6 +3826,8 @@ class BenchmarkRunner:
 
 
 def help(fn):
+    # [FUNCTION DOC] Return the docstring of the given function (used to print
+    # descriptions of experiments).
     return fn.__doc__
 
 
@@ -3302,10 +3835,21 @@ diff_branch_default = "DIFF-BRANCH-DEFAULT"
 
 
 def should_diff_branch(args):
+    # [FUNCTION DOC] Return True when the diff_branch option differs from the default placeholder,
+    # that is when the user asked for a comparison with another branch.
     return args.diff_branch != diff_branch_default
 
 
 def parse_args(args=None):
+    # [FUNCTION DOC] Build the command line parser for all benchmark scripts and parse the given
+    # list (or the process arguments when None). Defines filtering, partition, device, timing,
+    # precision, dynamic-shape, profiling, export, caching and output options, mutually exclusive
+    # groups for the precision, experiment kind (coverage, overhead, inductor, export variants,
+    # backends, and so on) and printout level, plus required groups choosing accuracy, performance
+    # or tolerance and training or inference. After parsing: errors out if batch-invariant is
+    # given without accuracy, and turns on warm peak memory for dashboard performance runs.
+    # Returns the namespace.
+    # KNOWN ISSUE: the help text of the persistent reductions option says split reductions.
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--filter", "-k", action="append", help="filter benchmarks with regexp"
@@ -3929,6 +4473,9 @@ def parse_args(args=None):
 
 
 def process_caching_precompile():
+    # [FUNCTION DOC] Save the precompile artifacts accumulated by the process to the dynamo cache
+    # and print how many dynamo artifacts and backends were saved. Raises AssertionError if the
+    # dynamo caching precompile config is not enabled.
     """
     After every process_entry, save precompile artifacts to DynamoCache
     """
@@ -3945,6 +4492,11 @@ def process_caching_precompile():
 
 
 def process_entry(rank, runner, original_dir, args):
+    # [FUNCTION DOC] Entry point of one (possibly distributed) worker: records the rank in args,
+    # enters the maybe-distributed context (NCCL init using the world size and master port when
+    # init_distributed is set), runs the benchmark through run, saves precompile artifacts when
+    # caching precompile is requested, and returns the result of run. Also the target of the
+    # multiprocess spawn, which passes the rank first.
     args.rank = rank
     with maybe_init_distributed(
         args.init_distributed,
@@ -3959,6 +4511,9 @@ def process_entry(rank, runner, original_dir, args):
 
 
 def maybe_fresh_cache(args):
+    # [FUNCTION DOC] Return a fresh inductor cache context when no cache directory environment
+    # variable is set and cold-start latency, warm-start latency or CI mode is requested;
+    # otherwise a null context.
     cache_dir_assigned = "TORCHINDUCTOR_CACHE_DIR" in os.environ
     if not cache_dir_assigned and (
         args.cold_start_latency or args.warm_start_latency or args.ci
@@ -3969,6 +4524,15 @@ def maybe_fresh_cache(args):
 
 
 def main(runner, original_dir=None, args=None):
+    # [FUNCTION DOC] Top-level entry used by the suite scripts. Optionally changes into
+    # original_dir, parses arguments (list given, else the process arguments) and makes the
+    # baseline path absolute. With a diff-branch option it verifies, through git, that the
+    # checkout is clean and not already on that branch (raising RuntimeError). Under a fresh cache
+    # context it then: enables caching precompile if requested; for a single model with
+    # multiprocess spawns one process per CUDA device with the world size set; for a single model
+    # with warm-start latency runs the command twice as subprocesses (a one-repeat, no-output cold
+    # run, then the real run) with the FX graph cache on; otherwise runs in-process, optionally in
+    # the backed-versus-unbacked comparison mode.
     if original_dir:
         os.chdir(original_dir)
     args = parse_args() if not args else parse_args(args)
@@ -4034,11 +4598,21 @@ def main(runner, original_dir=None, args=None):
 
 
 def _run_compare_backed_unbacked(runner, args):
+    # [FUNCTION DOC] HELPER: Compare backed and unbacked dynamic batch handling. Rebuilds the
+    # command line without the comparison, only and filter options, then for each model (the one
+    # named, or all those listed by the runner) runs two subprocesses, one with each batch option
+    # and the hidden latency printing flag, with a 600 second timeout. Parses the speedup and the
+    # eager and compiled milliseconds out of the output text, prints a running difference for each
+    # model and a final comparison table. Sets the runner args and fills in default filter options
+    # as a side effect.
     """Run backed and unbacked per-model, alternating, and compare speedup."""
     import re
     import subprocess
 
     def print_comparison(all_results):
+        # [FUNCTION DOC] HELPER: Print a table with one line per model giving the backed and
+        # unbacked milliseconds and their percentage difference; falls back to a single available
+        # side, or to speedup ratios or FAILED when no millisecond data exists.
         print(f"\n{'=' * 80}", flush=True)
         print("COMPARISON", flush=True)
         print(f"{'=' * 80}", flush=True)
@@ -4183,6 +4757,11 @@ def _run_compare_backed_unbacked(runner, args):
 
 
 def write_csv_when_exception(args, name: str, status: str, device=None):
+    # [FUNCTION DOC] Write placeholder result rows for a model that failed outside the normal
+    # flow, and print the status. For each given device (or all args.devices when none): in
+    # accuracy mode a row with the status; in performance mode a row with zero speedup and
+    # latency; otherwise a row with a zero. The batch size is recorded as zero. Rows go to the
+    # global output file.
     print(status)
     placeholder_batch_size = 0
     devices = [device] if device is not None else args.devices
@@ -4201,6 +4780,11 @@ def write_csv_when_exception(args, name: str, status: str, device=None):
 
 
 def setup_determinism(args):
+    # [FUNCTION DOC] Make runs reproducible: enables deterministic algorithms for every selected
+    # model except a list of models that do not support them (when only is set), or warn-only mode
+    # for the rocm device list; forces cudnn and mkldnn deterministic with benchmarking off; sets
+    # the cublas workspace environment variable; disables TF32 and reduced-precision math sdp
+    # reductions; and patches torch.manual_seed to a fixed seed. Global process state is changed.
     if args.only is not None and args.only not in {
         "alexnet",
         "Background_Matting",
@@ -4244,6 +4828,10 @@ def setup_determinism(args):
 
 
 def setup_batch_invariant(args):
+    # [FUNCTION DOC] When CUDA is available, prepare for batch invariance checking: apply the
+    # determinism setup, enable inductor batch invariant mode, turn off inductor CUDA graphs,
+    # prefer the cublasLt backend, and disable reduced precision reductions for fp16 and bf16
+    # matmuls. Does nothing without CUDA.
     if not torch.cuda.is_available():
         return
     setup_determinism(args)
@@ -4255,6 +4843,24 @@ def setup_batch_invariant(args):
 
 
 def run(runner, args, original_dir=None):
+    # [FUNCTION DOC] Configure everything from the parsed args and run the benchmark. Stores args
+    # on the runner, fills filter defaults, resolves the backend from the inductor, optimus and
+    # quantization shortcuts (AssertionError if one conflicts with an explicit backend), applies
+    # dynamic shape, compiled autograd, real tensor and int specialization settings, sets accuracy
+    # mode defaults (small batch sizes per suite, eval mode, deterministic setup, inductor random
+    # fallback, skipping some models), device, partition and thread settings, logging levels, the
+    # iteration function and skip sets for the chosen mode and device, and chooses the optimize
+    # context, experiment function and output filename for the selected experiment kind (inductor,
+    # export variants, XLA, backends including torchao and optimus, and so on). Then applies
+    # inductor config overrides, sets up profiler options, and either runs the single model named
+    # by only (loading it, marking dynamic batch dimensions, casting, and delegating to
+    # run_one_model on each device, possibly diffing branches) or, with no model chosen, launches
+    # one subprocess per model with a timeout and prints the summary. Sets many module globals.
+    # Exits the process on invalid device index, multiprocess or partition arguments.
+    # KNOWN ISSUE: the partition id check uses a strict greater-than comparison against the total,
+    # so an id equal to the total is accepted.
+    # KNOWN ISSUE: the performance-only eval mode reset sits in the else branch of the device
+    # index check, so it is skipped whenever a device index was given or set earlier.
     # Pass the parsed args object to benchmark runner object
     torch._dynamo.reset()
     runner.args = args
@@ -4591,6 +5197,10 @@ def run(runner, args, original_dir=None):
             # needed to avoid CUDAGraph fast-path warning / inconsistent timing when prior
             # outputs still require backward (see torch._inductor.cudagraph_trees)
             def model_iter_fn_and_mark_step(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Mark the CUDA graph step boundary and then call the
+                # compiled baseline iteration function with the same arguments.
+                # KNOWN ISSUE: the result of the baseline call is not returned, so callers
+                # always receive None.
                 torch.compiler.cudagraph_mark_step_begin()
                 model_iter_fn(*args, **kwargs)
 
@@ -4866,6 +5476,11 @@ def run(runner, args, original_dir=None):
             marked = False
 
             def detect_and_mark_batch(t, use_unbacked=False):
+                # [FUNCTION DOC] HELPER: Find the first dimension of the tensor whose size equals
+                # the batch size and mark it dynamic (a backed dynamic mark, or an unbacked one
+                # sharing a batch shape id with the batch size as hint and a minimum of 1 when
+                # use_unbacked is set). Records through the enclosing flag that something was
+                # marked; at most one dimension per tensor.
                 nonlocal marked
                 for i, s in enumerate(t.size()):
                     if s == batch_size:
@@ -4981,6 +5596,11 @@ def run(runner, args, original_dir=None):
 
 
 def log_operator_inputs(model, example_inputs, model_iter_fn, name, args):
+    # [FUNCTION DOC] Record the operator inputs used by one model and write them to a text file
+    # named after the model and mode beside the output file. Skips when the file already exists.
+    # First tries to run the iteration function on fake copies of the model and inputs under the
+    # operator inputs recording mode; on failure retries with the real model and inputs, and re-
+    # raises if that fails as well. Prints progress messages.
     mode = "training" if args.training else "eval"
     output = os.path.join(os.path.dirname(args.output), f"{name}_{mode}.txt")
 
