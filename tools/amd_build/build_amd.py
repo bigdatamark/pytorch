@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Top-level script that HIPifies the source tree for AMD builds. At import (it is a
+# script, not a library) it parses arguments, builds include and ignore path lists, rewrites HIP
+# platform macro names in a fixed list of third-party files, rewrites old HIP stream names to CUDA
+# names in listed files, runs the hipify conversion, and finally copies the generated MSLK tuning
+# cache header to its expected name unless built under buck. Prints a skipped or updated line per
+# file touched and exits with an error message if the expected hipify output is missing.
 
 
 import argparse
@@ -152,6 +158,8 @@ ignores = [os.path.join(proj_dir, ignore) for ignore in ignores]
 # This used to be a useful function but now we can safely always assume hip-clang.
 # Leaving the function here avoids bc-linter errors.
 def is_hip_clang() -> bool:
+    # [FUNCTION DOC] HELPER: Always returns True; kept as a stub because hip-clang is the only
+    # supported compiler and removing it would trip the backward-compatibility linter.
     return True
 
 
@@ -183,6 +191,8 @@ hip_platform_files = [
 
 
 def remove_hcc(line: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the input line with the old HIP platform macro name replaced
+    # by the AMD one and the old HCC flags name replaced by the clang flags name.
     line = line.replace("HIP_PLATFORM_HCC", "HIP_PLATFORM_AMD")
     line = line.replace("HIP_HCC_FLAGS", "HIP_CLANG_FLAGS")
     return line
@@ -257,6 +267,9 @@ hipify_v1_to_v2_files = [
 
 
 def hipify_v1_to_v2(line: str) -> str:
+    # [FUNCTION DOC] HELPER: Returns the input line with HIP masquerading stream types, stream
+    # guard, pool getter and current-stream getter names replaced by their plain CUDA equivalents
+    # (hipify v1 to v2 naming).
     line = line.replace("hip::HIPStreamMasqueradingAsCUDA", "cuda::CUDAStream")
     line = line.replace(
         "hip::HIPStreamGuardMasqueradingAsCUDA", "cuda::CUDAStreamGuard"

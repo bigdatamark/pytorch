@@ -1,4 +1,10 @@
 # Owner(s): ["module: intel"]
+# [MODULE DOC] XPU GEMM tests: checks matrix-multiply family operators (addmm, addmv, mm, bmm,
+# addbmm, baddbmm, tensordot, matmul, int4/int8 packed matmuls, dtype-overload variants and fused
+# activations) on the XPU device against numpy or naive reference computations. Defines TF32
+# helper context managers and decorators (using the mkldnn backend flags), and one TestCase class.
+# At import time it instantiates the device-generic tests for XPU only; run as a script it invokes
+# the test runner.
 
 import contextlib
 import functools
@@ -36,6 +42,9 @@ from torch.testing._internal.common_utils import (
 
 @contextlib.contextmanager
 def tf32_off():
+    # [FUNCTION DOC] HELPER: Context manager that re-applies the current mkldnn enabled and
+    # deterministic flags with TF32 explicitly disallowed for the duration of the with block, then
+    # restores the previous flags on exit. Yields nothing.
     enabled = torch.backends.mkldnn.enabled
     deterministic = torch.backends.mkldnn.deterministic
     with torch.backends.mkldnn.flags(
@@ -46,6 +55,10 @@ def tf32_off():
 
 @contextlib.contextmanager
 def tf32_on(self, tf32_precision=1e-5):
+    # [FUNCTION DOC] HELPER: Context manager used by the TF32 decorator. Saves the test's
+    # precision attribute, sets it to the given looser tolerance, and enables TF32 in the mkldnn
+    # flags while yielding. The precision is restored in a cleanup block even if the body raises.
+    # Takes the test case instance and the tolerance.
     enabled = torch.backends.mkldnn.enabled
     deterministic = torch.backends.mkldnn.deterministic
     old_precision = self.precision
@@ -83,20 +96,36 @@ def tf32_on(self, tf32_precision=1e-5):
 # @tf32_on_and_off(0.005)
 # def test_my_op(self, dtype)
 def tf32_on_and_off(tf32_precision=1e-5):
+    # [FUNCTION DOC] Decorator factory (arguments: the relaxed precision for TF32 mode, default
+    # tight) that returns a decorator for device-generic tests. The decorated test is run once
+    # with TF32 off and once with TF32 on and the test precision relaxed, when the device is XPU
+    # and the dtype is float32; see the nested wrapper for the exact conditions.
     def with_tf32_disabled(self, function_call):
+        # [FUNCTION DOC] HELPER: Runs the given zero-argument callable with TF32 disabled via the
+        # TF32-off context manager.
         with tf32_off():
             function_call()
 
     def with_tf32_enabled(self, function_call):
+        # [FUNCTION DOC] HELPER: Runs the given zero-argument callable with TF32 enabled and the
+        # test precision relaxed to the decorator tolerance.
         with tf32_on(self, tf32_precision):
             function_call()
 
     def wrapper(f):
+        # [FUNCTION DOC] HELPER: Decorator applied to a test function. Reads the parameter names
+        # of the function so positional arguments can be mapped to names, and returns the wrapper
+        # that implements the double run.
         params = inspect.signature(f).parameters
         arg_names = tuple(params.keys())
 
         @functools.wraps(f)
         def wrapped(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Wrapper test. Merges positional arguments into keyword ones
+            # by parameter name. Runs the test twice (TF32 off, then TF32 on with relaxed
+            # precision) only if any given device argument is an XPU device and any given dtype
+            # argument is float32; otherwise runs it once with no TF32 handling. Requires the self
+            # argument. Returns nothing (the test result is discarded).
             kwargs.update(zip(arg_names, args))
             cond = True
             if "device" in kwargs:
@@ -122,8 +151,13 @@ def tf32_on_and_off(tf32_precision=1e-5):
 # Disabling TF32 will enforce torch.float tensors to be always computed
 # at full precision.
 def with_tf32_off(f):
+    # [FUNCTION DOC] Decorator that makes a test run with TF32 disabled, for tests where matmul or
+    # convolution is incidental. Returns a wrapper (keeping the original name) that executes the
+    # test inside the TF32-off context and returns its result.
     @functools.wraps(f)
     def wrapped(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Wrapper returned by the decorator; runs the original function
+        # under the TF32-off context manager and returns its return value.
         with tf32_off():
             return f(*args, **kwargs)
 
@@ -131,9 +165,23 @@ def with_tf32_off(f):
 
 
 class TestBasicGEMM(TestCase):
+    # [CLASS DOC] Device-generic test case holding GEMM-related correctness tests for the XPU
+    # backend. Contains shared helper methods for comparing addmm and addmv style operators with
+    # numpy references, plus many test methods for matmul variants, error cases, empty and strided
+    # inputs and quantized packed matmuls. Instantiated for the xpu device only at the bottom of
+    # the module.
     def _test_addmm_addmv(
         self, f, t, m, v, *, alpha=None, beta=None, transpose_out=False, activation=None
     ):
+        # [FUNCTION DOC] HELPER: Core checker for addmm and addmv style functions. Given the
+        # function, bias t, matrix m and operand v, with optional alpha, beta (defaults depend on
+        # complex or real dtype), transpose_out and activation (None, relu or gelu), it computes
+        # the result normally, then via an out argument prefilled with NaN (optionally with
+        # transposed memory layout), and compares both with a reference computed with numpy (low
+        # precision types upcast to float; relu zeroes negatives; gelu uses the tanh form on CUDA
+        # tensors, exact otherwise). Raises AssertionError for any other activation. If the tensor
+        # has an in-place method matching the function name, that is also checked against a
+        # broadcast copy of the bias.
         dtype = t.dtype
         numpy_dtype = dtype
         if dtype in {torch.bfloat16, torch.half}:
@@ -181,6 +229,10 @@ class TestBasicGEMM(TestCase):
             self.assertEqual(res1, out_tensor)
 
     def _test_addmm_impl(self, func, activation, device, dtype):
+        # [FUNCTION DOC] HELPER: Drives the checker with many input configurations for one
+        # function and activation: a matrix bias, a vector bias with beta of one, zero-strided
+        # inputs, a NaN bias with beta of zero, and every combination of transposing the bias, the
+        # two matrices and the output (also with the vector bias when the bias is transposed).
         M = torch.randn(10, 25, device="cpu", dtype=torch.float32).to(dtype).to(device)
         m1 = torch.randn(10, 50, device="cpu", dtype=torch.float32).to(dtype).to(device)
         m2 = torch.randn(50, 25, device="cpu", dtype=torch.float32).to(dtype).to(device)
@@ -220,6 +272,9 @@ class TestBasicGEMM(TestCase):
         for t1, t2, t3, t4 in itertools.product([True, False], repeat=4):
 
             def maybe_transpose(cond, m):
+                # [FUNCTION DOC] HELPER: Returns the matrix unchanged if cond is false; otherwise
+                # returns an equal-valued matrix whose memory layout is column-major (transposed
+                # storage).
                 if not cond:
                     return m
                 return m.t().clone(memory_format=torch.contiguous_format).t()
@@ -247,11 +302,16 @@ class TestBasicGEMM(TestCase):
     @dtypes(torch.float32, torch.half, torch.double, torch.complex64)
     @tf32_on_and_off(0.05)
     def test_addmm(self, device, dtype):
+        # [FUNCTION DOC] Runs the addmm configuration sweep with plain addmm and no activation for
+        # each dtype, under TF32 on and off for float32.
         self._test_addmm_impl(torch.addmm, None, device, dtype)
 
     @precisionOverride({torch.float: 1e-4, torch.half: 1e-1})
     @dtypes(torch.float, torch.half, torch.double)
     def test_addmm_badmm_scalar_tnesor_input(self, device, dtype):
+        # [FUNCTION DOC] Checks that addmm and baddbmm accept a zero-dimensional tensor as the
+        # bias input: the result must equal the numpy matrix product plus one. The test name
+        # contains a typo (tnesor).
         input = torch.tensor(1).to(device=device, dtype=dtype)
 
         # test addmm
@@ -274,6 +334,10 @@ class TestBasicGEMM(TestCase):
     @dtypes(torch.bfloat16, torch.half, torch.float, torch.double)
     @tf32_on_and_off(0.005)
     def test_addmv(self, device, dtype):
+        # [FUNCTION DOC] Tests addmv over a set of bias vectors, matrices (broadcast from scalar,
+        # row or column, plus dense and transposed) and operand vectors built at reduced scale for
+        # low-precision accuracy, via the shared checker; then repeats with a NaN bias and beta of
+        # zero, which must not propagate.
         # have to use torch.randn(...).to(bfloat16) instead of
         # torch.randn(..., dtype=bfloat16). randn does not support
         # bfloat16 yet.
@@ -317,6 +381,9 @@ class TestBasicGEMM(TestCase):
 
     @dtypes(torch.complex64, torch.complex128, torch.float64)
     def test_blas_alpha_beta_empty(self, device, dtype):
+        # [FUNCTION DOC] Verifies that addmv and addmm with an empty reduction dimension return
+        # the bias scaled by beta (the alpha term vanishes), both without and with an out tensor,
+        # for complex and double dtypes.
         value = 11
         input = torch.full((2,), value, dtype=dtype, device=device)
         mat = torch.ones((2, 0), dtype=dtype, device=device)
@@ -359,9 +426,18 @@ class TestBasicGEMM(TestCase):
     )
     @tf32_on_and_off(0.05)
     def test_mm(self, device, dtype):
+        # [FUNCTION DOC] Tests mm against a naive loop reference for contiguous, three
+        # non-contiguous layouts, a zero-stride operand and two out-variant cases, for three shape
+        # triples; the generator of random inputs is chosen by dtype.
         def _test_mm(n, m, p, dtype, genf):
+            # [FUNCTION DOC] HELPER: Runs the sequence of mm comparisons for one shape (n by m
+            # times m by p) with the supplied input generator, comparing against the naive
+            # reference each time.
             # helper function
             def matrixmultiply(mat1, mat2):
+                # [FUNCTION DOC] HELPER: Naive triple-loop reference matrix product; half
+                # precision inputs are computed in float and converted back to half. Returns the
+                # result tensor.
                 n = mat1.size(0)
                 m = mat1.size(1)
                 p = mat2.size(1)
@@ -435,15 +511,23 @@ class TestBasicGEMM(TestCase):
             self.assertEqual(res, res2)
 
         def genf_int(x, y):
+            # [FUNCTION DOC] HELPER: Generator of random integer matrices of the requested shape
+            # in the test dtype (not used for the dtypes tested here).
             return torch.randint(0, 100, (x, y), dtype=dtype, device=device)
 
         def genf_bfloat(x, y):
+            # [FUNCTION DOC] HELPER: Generator of float32 random matrices converted to the test
+            # dtype and scaled by 0.1.
             return torch.randn(x, y, dtype=torch.float32, device=device).to(dtype) * 0.1
 
         def genf_float(x, y):
+            # [FUNCTION DOC] HELPER: Generator of random normal matrices directly in the test
+            # dtype.
             return torch.randn(x, y, dtype=dtype, device=device)
 
         def genf_Half(x, y):
+            # [FUNCTION DOC] HELPER: Generator of random normal half matrices (same as the float
+            # generator, kept separate for half dtype).
             return torch.randn(x, y, dtype=dtype, device=device)
 
         for n, m, p in [(20, 10, 15), (15, 20, 10), (25, 18, 10)]:
@@ -462,15 +546,26 @@ class TestBasicGEMM(TestCase):
     @dtypes(torch.float32, torch.bfloat16, torch.half, torch.float64, torch.complex64)
     @tf32_on_and_off(0.05)
     def test_bmm(self, device, dtype):
+        # [FUNCTION DOC] Tests bmm and its out variant against a numpy batched matmul reference
+        # for batch sizes one and ten. Inputs cover every pair of permuted memory layouts, all
+        # combinations of broadcast (expanded) dimensions, and zero-sized shapes; the out tensor
+        # is NaN-prefilled in every layout permutation. The mixed-device error checks only run on
+        # CUDA, so they are skipped here.
         batch_sizes = [1, 10]
         M, N, O = 23, 15, 12
         numpy_dtype = dtype if dtype != torch.bfloat16 else torch.float32
 
         def invert_perm(p):
+            # [FUNCTION DOC] HELPER: Returns the inverse of a three-element dimension permutation,
+            # as a tuple, used to undo a permute.
             d = {x: i for i, x in enumerate(p)}
             return (d[0], d[1], d[2])
 
         def generate_inputs(num_batches):
+            # [FUNCTION DOC] HELPER: Generator yielding pairs of batched operands for the given
+            # batch count: first all pairs of layout permutations of random values, then all
+            # broadcast shape combinations expanded to full size, then zero-sized shape
+            # combinations.
             # transposed tensors
             for perm1, perm2 in itertools.product(
                 itertools.permutations((0, 1, 2)), repeat=2
@@ -532,6 +627,12 @@ class TestBasicGEMM(TestCase):
                     )
 
     def _test_addbmm_baddbmm(self, func, b1, b2, ref, out_tensor):
+        # [FUNCTION DOC] HELPER: Exercises the in-place and functional forms of addbmm or baddbmm,
+        # selected by name, with the expected product ref and a zero-initialized out tensor.
+        # Checks the in-place default result, the deprecated positional scalar overloads (each
+        # expected to emit a one-time deprecation warning) with beta and alpha accumulation to
+        # two, 2.5 and 3 times the reference, a NaN input with zero beta that must be ignored,
+        # complex or real scalar beta and alpha, and the out-variant.
         getattr(out_tensor, func + "_")(b1, b2)
         self.assertEqual(out_tensor, ref)
         res3 = out_tensor.clone()
@@ -579,14 +680,22 @@ class TestBasicGEMM(TestCase):
     @dtypes(torch.float64, torch.float32, torch.bfloat16, torch.half, torch.complex64)
     @tf32_on_and_off(0.005)
     def test_addbmm(self, device, dtype):
+        # [FUNCTION DOC] Tests in-place and functional addbmm (batch-summed product) with the
+        # shared helper over generated operand sets: permuted layouts, broadcast shapes and
+        # zero-sized shapes, with values scaled by 0.1 and the reference computed in numpy.
         num_batches = 2
         M, N, O = 16, 17, 18
 
         def invert_perm(p):
+            # [FUNCTION DOC] HELPER: Returns the inverse of a three-element dimension permutation,
+            # as a tuple.
             d = {x: i for i, x in enumerate(p)}
             return (d[0], d[1], d[2])
 
         def generate_tensor():
+            # [FUNCTION DOC] HELPER: Generator yielding tuples of the two operands, the reference
+            # batch-summed product and a zero output tensor, across layout permutations, broadcast
+            # combinations and zero-sized shapes.
             numpy_dtype = dtype if dtype != torch.bfloat16 else torch.float32
             # transposed tensors
             for perm1, perm2 in itertools.product(
@@ -683,14 +792,22 @@ class TestBasicGEMM(TestCase):
     @dtypes(torch.float64, torch.float32, torch.bfloat16, torch.half, torch.complex64)
     @tf32_on_and_off(0.01)
     def test_baddbmm(self, device, dtype):
+        # [FUNCTION DOC] Tests in-place and functional baddbmm with the shared helper over
+        # generated operand sets (permuted layouts including the output layout, broadcast shapes,
+        # zero-sized shapes), with the reference computed in numpy.
         num_batches = 10
         M, N, O = 12, 8, 50
 
         def invert_perm(p):
+            # [FUNCTION DOC] HELPER: Returns the inverse of a three-element dimension permutation,
+            # as a tuple.
             d = {x: i for i, x in enumerate(p)}
             return (d[0], d[1], d[2])
 
         def generate_tensor():
+            # [FUNCTION DOC] HELPER: Generator yielding tuples of the two batched operands, the
+            # numpy reference product and a zeroed output tensor in a permuted layout, across
+            # layout permutations, broadcast combinations and zero-sized shapes.
             numpy_dtype = (
                 dtype if dtype not in [torch.bfloat16, torch.half] else torch.float32
             )
@@ -746,6 +863,10 @@ class TestBasicGEMM(TestCase):
 
     @tf32_on_and_off(0.05)
     def test_tensordot(self, device):
+        # [FUNCTION DOC] Compares tensordot with numpy: explicit dimension lists (also with an out
+        # tensor), an integer dims count, the default dims, and scalar operands with zero dims.
+        # Asserts that a negative dims count raises a RuntimeError mentioning that dims must be
+        # non-negative.
         a = torch.arange(60.0, device=device).reshape(3, 4, 5)
         b = torch.arange(24.0, device=device).reshape(4, 3, 2)
         c = torch.tensordot(a, b, dims=([1, 0], [0, 1])).cpu()
@@ -783,6 +904,8 @@ class TestBasicGEMM(TestCase):
     @precisionOverride({torch.float32: 1e-4})
     @tf32_on_and_off(0.005)
     def test_1_sized_with_0_strided(self, device, dtype):
+        # [FUNCTION DOC] Checks that bmm gives the numpy result when the left operand has a
+        # size-one dimension with zero stride and the right operand has a custom stride layout.
         a = make_tensor((8, 1, 64), dtype=dtype, device=device)
         a_strided = torch.as_strided(a, size=[8, 1, 64], stride=[64, 0, 1])
         b = make_tensor((8, 64, 512), dtype=dtype, device=device)
@@ -794,6 +917,11 @@ class TestBasicGEMM(TestCase):
         self.assertEqual(expect, res)
 
     def _select_broadcastable_dims(self, dims_full=None):
+        # [FUNCTION DOC] HELPER: Randomly picks a full shape (one to four dimensions, sizes one to
+        # eight) unless one is given, then returns a tuple of three shapes: a smaller shape
+        # (possibly fewer dimensions, some sizes reduced to one), a larger shape (same number of
+        # dimensions as the full shape, some sizes reduced to one) and the full shape. The first
+        # two broadcast to the full shape. Uses the global random generator.
         # select full dimensionality
         if dims_full is None:
             dims_full = []
@@ -826,6 +954,10 @@ class TestBasicGEMM(TestCase):
 
     @tf32_on_and_off(0.005)
     def test_broadcast_fused_matmul(self, device):
+        # [FUNCTION DOC] For each of five fused ops (baddbmm, addbmm, addmm, addmv, addr) picks
+        # random dimension sizes, builds operands and a bias with a randomly reduced broadcastable
+        # shape, and asserts the result using the small bias equals the result using the same bias
+        # explicitly expanded to full size.
         fns = ["baddbmm", "addbmm", "addmm", "addmv", "addr"]
 
         for fn in fns:
@@ -835,6 +967,9 @@ class TestBasicGEMM(TestCase):
             p_dim = random.randint(1, 8)
 
             def dims_full_for_fn():
+                # [FUNCTION DOC] HELPER: Returns the full bias shape and the two operand shapes
+                # for the current op name under test (from the enclosing loop), using the
+                # enclosing batch, n, m and p sizes. Raises AssertionError for an unknown op name.
                 if fn == "baddbmm":
                     return (
                         [batch_dim, n_dim, p_dim],
@@ -873,6 +1008,9 @@ class TestBasicGEMM(TestCase):
     @dtypes(torch.float32, torch.float64)
     @tf32_on_and_off(0.005)
     def test_strided_mm_bmm(self, device, dtype):
+        # [FUNCTION DOC] Checks bmm and mm against numpy on a strided view whose stride is smaller
+        # than the matching dimension size (overlapping memory), using the compare-with-numpy
+        # helper of the test case.
         # Tests strided view case with stride smaller than corresponding dimension size
         x = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=dtype, device=device)
         new_shape = [2, 2, 2]
@@ -888,6 +1026,8 @@ class TestBasicGEMM(TestCase):
 
     @tf32_on_and_off(0.005)
     def test_mm_empty_inputs_mixed_dtype_errors(self, device):
+        # [FUNCTION DOC] Asserts that mm of an int16 matrix with a float32 matrix raises a
+        # RuntimeError saying the two inputs must have the same dtype.
         a = torch.randint(0, 10, [1, 10], dtype=torch.int16, device=device)
         b = torch.randn(10, 20, dtype=torch.float32, device=device)
         with self.assertRaisesRegex(
@@ -897,6 +1037,9 @@ class TestBasicGEMM(TestCase):
 
     @tf32_on_and_off(0.005)
     def test_matmul_45724(self, device):
+        # [FUNCTION DOC] Regression test for a large batch of 65537 small half-precision matrices:
+        # matmul into a NaN-filled out tensor must equal the result computed on CPU in float and
+        # converted to half.
         # https://github.com/pytorch/pytorch/issues/45724
         a = torch.rand(65537, 22, 64, device=device, dtype=torch.half)
         b = torch.rand(65537, 64, 22, device=device, dtype=torch.half)
@@ -908,6 +1051,9 @@ class TestBasicGEMM(TestCase):
     @parametrize("shape", [513, 767])
     @dtypes(torch.bfloat16, torch.half, torch.float, torch.double)
     def test_matmul_deterministic_mode(self, device, shape, dtype):
+        # [FUNCTION DOC] Under the deterministic-algorithms guard, runs matmul of a square matrix
+        # with itself repeatedly (ten more times) and asserts every result is bitwise identical
+        # (zero tolerances) to the first.
         with DeterministicGuard(True):
             inp = torch.randn(shape, shape, device=device, dtype=dtype)
             first = torch.matmul(inp, inp)
@@ -924,6 +1070,9 @@ class TestBasicGEMM(TestCase):
     )
     @tf32_on_and_off(0.005)
     def test_baddbmm_input_dtypes_compatibility(self, device, dtype):
+        # [FUNCTION DOC] For non-float32 bias dtypes (differing from float32 operands) asserts
+        # baddbmm with zero beta raises a RuntimeError saying input dtypes must be the same; for
+        # float32 asserts baddbmm with zero beta into a NaN-filled out tensor equals bmm.
         batch1 = torch.rand((1, 2, 2), dtype=torch.float32, device=device)
         batch2 = torch.rand((1, 2, 2), dtype=torch.float32, device=device)
         input_tensor = torch.rand((1, 2, 2), device=device).to(dtype)
@@ -939,6 +1088,9 @@ class TestBasicGEMM(TestCase):
     @dtypes(torch.float)
     @tf32_on_and_off(0.005)
     def test_baddbmm_nan_input_with_zero_beta(self, device, dtype):
+        # [FUNCTION DOC] Asserts baddbmm with beta zero ignores NaN in the bias and in a
+        # preexisting out tensor: all combinations of finite or NaN input and no, finite or NaN
+        # out give the plain bmm result.
         for shape in [[3, 2, 2], [2, 20, 20]]:
             mat1, mat2 = (
                 torch.randn(shape, dtype=dtype, device=device) for _ in range(2)
@@ -961,6 +1113,9 @@ class TestBasicGEMM(TestCase):
     @dtypes(torch.float, torch.double)
     @tf32_on_and_off(0.005)
     def test_addmm_sizes(self, device, dtype):
+        # [FUNCTION DOC] Sweeps the sizes zero, one and larger for the output columns, rows and
+        # inner dimension: addmm must match the shared checker, and an inner-dimension mismatch
+        # must raise a RuntimeError whose message mentions both shapes, for both addmm and mm.
         for m in [0, 1, 25]:
             for n in [0, 1, 10]:
                 for k in [0, 1, 8]:
@@ -982,6 +1137,8 @@ class TestBasicGEMM(TestCase):
 
     @dtypes(torch.float)
     def test_addmm_expanded_errors(self, device, dtype):
+        # [FUNCTION DOC] Asserts that addmm with a bias that has an extra leading dimension raises
+        # a RuntimeError saying the dimension count must be greater or equal.
         mat1 = torch.randn(3, 3, device=device, dtype=dtype)
         mat2 = torch.randn(3, 3, device=device, dtype=dtype)
         self_ = torch.randn(3, 3, device=device, dtype=dtype)
@@ -1003,6 +1160,8 @@ class TestBasicGEMM(TestCase):
     @dtypes(torch.double, torch.float32, torch.bfloat16, torch.half)
     @tf32_on_and_off(0.05)
     def test_addmm_gelu(self, device, dtype):
+        # [FUNCTION DOC] Runs the addmm configuration sweep on the fused addmm-plus-GELU
+        # activation function with gelu as the expected activation.
         self._test_addmm_impl(torch._addmm_activation, "gelu", device, dtype)
 
     @precisionOverride(
@@ -1017,11 +1176,17 @@ class TestBasicGEMM(TestCase):
     @dtypes(torch.double, torch.float32, torch.bfloat16, torch.half)
     @tf32_on_and_off(0.05)
     def test_addmm_relu(self, device, dtype):
+        # [FUNCTION DOC] Runs the addmm configuration sweep on the fused addmm-plus-activation
+        # function with its default activation, relu, as the expected activation.
         self._test_addmm_impl(torch._addmm_activation, "relu", device, dtype)
 
     @dtypes(torch.float, torch.bfloat16, torch.half)
     @tf32_on_and_off(0.005)
     def test_addmv_rowmajor_colmajor_incx_incy_lda(self, device, dtype):
+        # [FUNCTION DOC] Tests addmv with a row-major or column-major matrix stored with extra
+        # leading-dimension padding and with vector inputs and outputs of increments one and two,
+        # by taking slices of NaN-filled storage; the shared checker verifies results, and NaN
+        # padding must not leak.
         # tests (o, s)*(s).  o is output size, s is summed size.
         o = 5
         s = 3
@@ -1030,6 +1195,10 @@ class TestBasicGEMM(TestCase):
         y_data = torch.ones(o, device=device, dtype=dtype)
 
         def _test(row_major, incx, incy, lda_tail):
+            # [FUNCTION DOC] HELPER: Builds the matrix, operand and bias views for one layout
+            # configuration (row or column major, vector increments, matrix leading-dimension
+            # padding) inside NaN-filled storage, copies the test data in, and runs the addmv
+            # checker.
             if row_major:
                 a_storage = torch.full(
                     (o, s + lda_tail), float("nan"), device=device, dtype=dtype
@@ -1056,6 +1225,9 @@ class TestBasicGEMM(TestCase):
     @dtypes(torch.double, torch.float32, torch.bfloat16, torch.half)
     @tf32_on_and_off()
     def test_addmv_out_noncontiguous_preserves_strides(self, device, dtype):
+        # [FUNCTION DOC] Asserts that addmv with an out tensor that is non-contiguous gives the
+        # expected values while keeping the out tensor's original strides and storage pointer (no
+        # reallocation).
         M, K = 5, 3
         mat = torch.randn(M, K, device=device, dtype=dtype)
         vec = torch.randn(K, device=device, dtype=dtype)
@@ -1092,6 +1264,10 @@ class TestBasicGEMM(TestCase):
     @dtypes(torch.double, torch.bfloat16, torch.half, torch.float32)
     @tf32_on_and_off(0.005)
     def test_corner_cases_of_cublasltmatmul(self, device, dtype):
+        # [FUNCTION DOC] Smoke test (only checks that no exception is raised) of linear and addmm
+        # calls with corner-case layouts: operand with a leading dimension much larger than its
+        # rows, a transposed operand sliced from a wider matrix, and a dimension above 65535. The
+        # name refers to the CUDA cublasLt path.
         # common case
         M = torch.randn(128, device=device).to(dtype)
         m1 = torch.randn(2048, 2400, device=device).to(dtype)
@@ -1114,8 +1290,23 @@ class TestBasicGEMM(TestCase):
         torch.nn.functional.linear(m1, m2, M)
 
     def test_blas_empty(self, device):
+        # [FUNCTION DOC] Checks degenerate empty-dimension behavior of mm, addmm, mv, addmv, bmm,
+        # baddbmm, addbmm, matmul and dot: result shapes for zero-sized inputs, zero results for
+        # empty reductions, bias passthrough (scaled by beta, including a negative beta regression
+        # for issue 33467) for the add variants, each also through the out argument for a subset
+        # of cases.
         def fn(torchfn, *args, test_out=False, **kwargs):
+            # [FUNCTION DOC] HELPER: Calls a torch function with arguments in which each tuple is
+            # replaced by a random tensor of that shape on the test device and other values are
+            # passed unchanged. With test_out set it also calls again with a NaN-filled out tensor
+            # shaped like the result and returns that out tensor; otherwise returns the plain
+            # result.
+            # KNOWN ISSUE: the out-variant call result is discarded (see the FIXME in the code);
+            # the NaN-filled tensor itself is returned instead.
             def call_torch_fn(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Replaces tuple arguments by random tensors on the test
+                # device and calls the enclosing torch function with the resulting arguments and
+                # given keyword arguments; returns its result.
                 return torchfn(
                     *tuple(
                         torch.randn(shape, device=device)
@@ -1232,6 +1423,9 @@ class TestBasicGEMM(TestCase):
 
     @tf32_on_and_off(0.005)
     def test_large_bmm_backward(self, device):
+        # [FUNCTION DOC] Runs backward of a batched matmul where the batch of 1024 left matrices
+        # with transposed storage multiplies a single right matrix of 1024 by 65536, asserting
+        # only that backward completes without materializing a huge intermediate (no OOM).
         A = torch.randn([1024, 2, 1024], device=device).mT.contiguous().mT
         B = torch.randn([1, 1024, 65536], device=device, requires_grad=True)
         G = torch.randn([1024, 2, 65536], device=device)
@@ -1241,6 +1435,9 @@ class TestBasicGEMM(TestCase):
 
     @tf32_on_and_off(0.005)
     def test_large_bmm_mm_backward(self, device):
+        # [FUNCTION DOC] Same as the large bmm backward test but the right operand is a plain
+        # two-dimensional matrix of 1024 by 65536 that requires gradients; only completion without
+        # memory exhaustion is checked.
         A = torch.randn([1024, 2, 1024], device=device).mT.contiguous().mT
         B = torch.randn([1024, 65536], device=device, requires_grad=True)
         G = torch.randn([1024, 2, 65536], device=device)
@@ -1249,7 +1446,14 @@ class TestBasicGEMM(TestCase):
         (A @ B).backward(G)
 
     def check_single_matmul(self, x, y):
+        # [FUNCTION DOC] HELPER: Checks matmul of two tensors against numpy on CPU values: the
+        # result must be contiguous and match; then matmul with an out tensor must return that
+        # same out object, contiguous, with matching values.
         def assertEqual(answer, expected):
+            # [FUNCTION DOC] HELPER: Compares an answer tensor with the expected one. Floating and
+            # complex inputs use an absolute tolerance scaled by the size of the last dimension of
+            # the left operand and a fixed relative tolerance; other dtypes require exact
+            # equality. Failure messages include the operand and result shapes.
             if x.dtype.is_floating_point or x.dtype.is_complex:
                 k = max(x.shape[-1], 1)  # Scale the atol with the size of the matrix
                 self.assertEqual(
@@ -1280,6 +1484,11 @@ class TestBasicGEMM(TestCase):
         assertEqual(ans, expected)
 
     def gen_sizes_matmul(self, x_dim, y_dim=4, matrix_size=4, batch_size=3):
+        # [FUNCTION DOC] HELPER: Generator of size pairs for the left and right operands of
+        # matmul. The left operand has exactly x_dim dimensions and the right has between one and
+        # y_dim dimensions; batch sizes range below batch_size and matrix sizes below matrix_size,
+        # so zero-sized dimensions occur. Raises AssertionError if x_dim is below one or y_dim is
+        # below two.
         """
         Generates sequences of tuples (x, y) of with size(x) = x_dim and
         size(y) <= y_dim that are compatible wrt. matmul
@@ -1310,6 +1519,9 @@ class TestBasicGEMM(TestCase):
 
     @dtypes(torch.float)
     def test_matmul_small_brute_force_1d_Nd(self, device, dtype):
+        # [FUNCTION DOC] Brute-force matmul check over all small generated shapes where the left
+        # operand is one-dimensional, with every combination of contiguous and non-contiguous
+        # operands, using the single matmul checker.
         make_arg = partial(make_tensor, device=device, dtype=dtype)
 
         for (size_x, size_y), nctg_x, nctg_y in product(
@@ -1321,6 +1533,9 @@ class TestBasicGEMM(TestCase):
 
     @dtypes(torch.float)
     def test_matmul_small_brute_force_2d_Nd(self, device, dtype):
+        # [FUNCTION DOC] Brute-force matmul check over all small generated shapes where the left
+        # operand is two-dimensional, with every combination of contiguous and non-contiguous
+        # operands.
         make_arg = partial(make_tensor, device=device, dtype=dtype)
 
         for (size_x, size_y), nctg_x, nctg_y in product(
@@ -1332,6 +1547,9 @@ class TestBasicGEMM(TestCase):
 
     @dtypes(torch.float)
     def test_matmul_small_brute_force_3d_Nd(self, device, dtype):
+        # [FUNCTION DOC] Brute-force matmul check over all small generated shapes where the left
+        # operand is three-dimensional, with every combination of contiguous and non-contiguous
+        # operands.
         make_arg = partial(make_tensor, device=device, dtype=dtype)
 
         for (size_x, size_y), nctg_x, nctg_y in product(
@@ -1344,6 +1562,9 @@ class TestBasicGEMM(TestCase):
     @dtypes(torch.float)
     @tf32_on_and_off(0.005)
     def test_matmul_out_kernel_errors_with_autograd(self, device, dtype):
+        # [FUNCTION DOC] Asserts that matmul with an out tensor works on detached inputs, raises a
+        # RuntimeError stating that out arguments do not support automatic differentiation when
+        # inputs require grad, and works again under no-grad mode.
         a = torch.empty(
             (256, 512), device=device, dtype=dtype, requires_grad=True
         ).unsqueeze(0)
@@ -1364,6 +1585,14 @@ class TestBasicGEMM(TestCase):
             torch.matmul(a, b, out=c)
 
     def _group_quantize_tensor(self, w, n_bit=4, q_group_size=16):
+        # [FUNCTION DOC] HELPER: Asymmetric per-group quantization of a two-dimensional weight (k
+        # by n) to n_bit unsigned integers. Transposes to n by k, splits rows into groups of
+        # q_group_size, computes per-group scales (range divided by the maximum integer, with a
+        # floor on the range) and integer zero points clamped to the valid range, and quantizes.
+        # Each stage asserts no NaN appears. On non-CPU devices the 4-bit values are packed two
+        # per byte into uint8. Returns the quantized tensor and the scales and zeros transposed to
+        # group-major contiguous layout. Raises AssertionError for a non-2D input, a group size of
+        # one or less, a group size not dividing k, or any NaN.
         # w [k, n] = [32, 48]
         if w.dim() != 2:
             raise AssertionError(f"Expected w.dim() == 2, got {w.dim()}")
@@ -1420,6 +1649,9 @@ class TestBasicGEMM(TestCase):
     @parametrize("k", [512, 1024])
     @parametrize("n", [512, 1024])
     def test__int4_mm(self, device, m, k, n):
+        # [FUNCTION DOC] Quantizes a random weight to int4 with group size 32, packs it with the
+        # int4 conversion op, and for bfloat16 and float16 asserts the mean relative error of the
+        # int4 weight matmul with scales and zeros versus the full-precision matmul is below 0.05.
         q_group = 32
         inner_k_tiles = 2
 
@@ -1428,6 +1660,9 @@ class TestBasicGEMM(TestCase):
         b_bf16 = torch.rand((k, n), dtype=torch.float32, device=device)
 
         def convert_weight_to_int4pack(b):
+            # [FUNCTION DOC] HELPER: Quantizes the weight with the group quantizer, packs the
+            # result with the int4 pack conversion using the enclosing inner k tile count, and
+            # returns the packed weight with the scales and zeros.
             # b_uint8 [n, k //2]
             b_uint8, scales, zeros = self._group_quantize_tensor(
                 b, n_bit=4, q_group_size=q_group
@@ -1438,6 +1673,8 @@ class TestBasicGEMM(TestCase):
             return b_int4pack, scales, zeros
 
         def weight_int4pack_mm(a, b_int4pack, qscale, qzeros):
+            # [FUNCTION DOC] HELPER: Runs the int4 packed weight matmul with scales and zeros on
+            # the activations with the enclosing group size and returns the result.
             return torch._weight_int4pack_mm_with_scales_and_zeros(
                 a, b_int4pack, q_group, qscale, qzeros
             )
@@ -1456,6 +1693,9 @@ class TestBasicGEMM(TestCase):
             self.assertTrue(mean_err < 0.05)
 
     def test_mm_with_offset(self, device):
+        # [FUNCTION DOC] Compares matmul on the device with matmul on CPU for half-precision
+        # operands where the left operand is a strided view with a nonzero storage offset into a
+        # larger allocation, and the right operand has transposed-style strides.
         from torch._dynamo.testing import rand_strided
 
         offset = 997
@@ -1484,12 +1724,22 @@ class TestBasicGEMM(TestCase):
     def test__int_mm(
         self, device, m, k, n, use_transpose_a, use_transpose_b, non_contig_type
     ):
+        # [FUNCTION DOC] Tests the int8 by int8 to int32 matmul op for sizes including zero, with
+        # each operand optionally transposed and in one of three layouts (contiguous, inner stride
+        # one but gapped rows, neither stride one). Checks the result dtype is int32, lies on the
+        # device, equals the float matmul of the same values, and that the out variant gives the
+        # same values. Cases with zero sizes and non-contiguous layouts are skipped by returning
+        # early.
         # non_contig_type:
         # 0: the whole data buffer is contiguous (can be transposed)
         # 1: stride of one dimension is 1, but the whole buffer is not contiguous
         # 2: Neither stride is 1
 
         def genf_int_float(x, y, use_transpose, non_contig_type):
+            # [FUNCTION DOC] HELPER: Builds a random int8 matrix of the requested rows and columns
+            # and the float32 copy with identical values, optionally transposed and optionally
+            # made non-contiguous by slicing every second column or the first half of doubled
+            # columns; returns the int8 and float32 views.
             if use_transpose:
                 x, y = y, x
             if non_contig_type != 0:
@@ -1520,7 +1770,12 @@ class TestBasicGEMM(TestCase):
         self.assertEqual(c_int32_result.float(), torch.mm(a_float, b_float))
 
     def test_out_dtype_inductor_decomp_trace(self, device) -> None:
+        # [FUNCTION DOC] Traces the out_dtype higher-order op for an int8 matmul producing int32,
+        # with symbolic tracing and the inductor decomposition table, and asserts the generated
+        # code consists of one call to the integer matmul op.
         def func(x, w):
+            # [FUNCTION DOC] HELPER: Function traced by the test: calls the out_dtype higher-order
+            # op on the default aten mm op with int32 output dtype.
             return out_dtype(torch.ops.aten.mm.default, torch.int32, x, w)
 
         w = torch.randint(-128, 127, (32, 32), dtype=torch.int8, device=device)
@@ -1538,7 +1793,11 @@ def forward(self, x_1, w_1):
         )
 
     def test_out_dtype_int_mm_default_trace(self, device) -> None:
+        # [FUNCTION DOC] Traces the same out_dtype int8 matmul with symbolic tracing but without
+        # decompositions and asserts the generated code keeps the out_dtype higher-order op call.
         def func(x, w):
+            # [FUNCTION DOC] HELPER: Function traced by the test: calls the out_dtype higher-order
+            # op on the default aten mm op with int32 output dtype.
             return out_dtype(torch.ops.aten.mm.default, torch.int32, x, w)
 
         w = torch.randint(-128, 127, (32, 32), dtype=torch.int8, device=device)
@@ -1561,6 +1820,11 @@ def forward(self, x_1, w_1):
     @parametrize("compile", [True, False])
     @parametrize("slice", [True, False])
     def test__int8_mm(self, device, m, k, n, compile, slice):
+        # [FUNCTION DOC] Tests the bfloat16 activation by int8 packed weight matmul (with
+        # per-channel scales) against the bfloat16 matmul for several sizes, either eagerly or via
+        # torch.compile, with the activation optionally a non-contiguous last-token slice
+        # flattened to two dimensions (as in a language-model head). Asserts mean relative error
+        # below 0.05. Runs on native device types only.
         torch.manual_seed(1)
         if slice:
             # logits are generated from LLaMA LM head like this -
@@ -1579,12 +1843,16 @@ def forward(self, x_1, w_1):
         b = torch.rand((n, k), dtype=torch.bfloat16, device=device)
 
         def convert_weight_to_int8pack(b):
+            # [FUNCTION DOC] HELPER: Quantizes the bfloat16 weight per channel to int8 using the
+            # shared quantization utility and returns the int8 weights and the scales.
             b_int8pack, b_scales, _ = _dynamically_quantize_per_channel(
                 b, -128, 127, torch.int8
             )
             return b_int8pack, b_scales
 
         def weight_int8pack_mm(a, b_int8pack, b_scales):
+            # [FUNCTION DOC] HELPER: Runs the int8 weight-only packed matmul op on the activation
+            # with the given weights and scales and returns the result.
             return torch._weight_int8pack_mm(a, b_int8pack, b_scales)
 
         b_int8pack, b_scales = convert_weight_to_int8pack(b)
@@ -1604,10 +1872,18 @@ def forward(self, x_1, w_1):
     @parametrize("K", [1, 32, 64])
     @parametrize("batch_size", [None, 1, 16])
     def test_mm_bmm_dtype_overload(self, input_dtype, M, N, K, batch_size):
+        # [FUNCTION DOC] Tests mm and bmm with the out_dtype argument (float32 output, plus the
+        # input dtype for half-precision inputs) over several sizes and batch settings; asserts
+        # the output dtype and values (tolerance 1e-3) against a baseline computed in float32 or
+        # in native precision. The test hard-codes the xpu device rather than using a device
+        # argument.
         device = "xpu"
         dtype = input_dtype
 
         def create_inputs(B=None):
+            # [FUNCTION DOC] HELPER: Returns a pair of random matrices (or batched matrices when a
+            # batch size is given) of the test dtype on the xpu device with shapes M by K and K by
+            # N.
             if B is None:
                 a = torch.randn(M, K, device=device, dtype=dtype)
                 b = torch.randn(K, N, device=device, dtype=dtype)
@@ -1651,10 +1927,17 @@ def forward(self, x_1, w_1):
     @parametrize("K", [1, 32, 64])
     @parametrize("batch_size", [None, 1, 32])
     def test_addmm_baddmm_dtype_overload(self, input_dtype, M, N, K, batch_size):
+        # [FUNCTION DOC] Tests addmm and baddbmm with the out_dtype argument (float32 output, plus
+        # the input dtype for half-precision inputs) over several sizes and batch settings;
+        # asserts the output dtype and values (tolerance 1e-3) against a baseline computed in
+        # float32 or in native precision. The test hard-codes the xpu device.
         device = "xpu"
         dtype = input_dtype
 
         def create_inputs(B=None):
+            # [FUNCTION DOC] HELPER: Returns random A, B and bias matrices (batched when a batch
+            # size is given) of the test dtype on the xpu device with shapes M by K, K by N and M
+            # by N.
             if B is None:
                 a = torch.randn(M, K, device=device, dtype=dtype)
                 b = torch.randn(K, N, device=device, dtype=dtype)

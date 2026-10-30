@@ -1,4 +1,9 @@
 # Owner(s): ["module: intel"]
+# [MODULE DOC] XPU-only scaled dot product attention tests for the OneDNN (overrideable) backend.
+# Defines a Tolerances named tuple of absolute and relative tolerances and a test class comparing
+# OneDNN SDPA against the math backend for misaligned inputs and for a broadcast mask with grouped
+# query attention. At import it instantiates the device-generic class for XPU only; run as a
+# script it invokes the test runner.
 
 from collections import namedtuple
 
@@ -14,9 +19,21 @@ Tolerances = namedtuple("Tolerances", ["atol", "rtol"])
 
 
 class TestSDPAXpuOnly(NNTestCase):
+    # [CLASS DOC] Device-generic test case (derived from NNTestCase) with XPU-specific SDPA tests;
+    # each test compares the overrideable backend result with the math backend reference under
+    # dtype-dependent tolerances. Instantiated for the xpu device only at the bottom of the
+    # module.
     @parametrize("dtype", [torch.half, torch.bfloat16, torch.float32])
     @parametrize("train", [False])
     def test_onednn_attention_unaligned_input(self, device, dtype, train):
+        # [FUNCTION DOC] Builds Q, K, V and an attention mask whose data pointers are deliberately
+        # not 64-byte aligned (by slicing off the first element of a larger allocation), asserts
+        # the misalignment, then runs SDPA with the overrideable backend and with the math backend
+        # on float32 copies and asserts the results match within the dtype tolerance (looser for
+        # half and bfloat16). The gradient comparison branch only runs when train is true, but
+        # train is parametrized only as false, so it is currently not exercised.
+        # KNOWN ISSUE: the docstring says forward and backward are verified, but only the forward
+        # pass runs because train is always false.
         """Verify that Q/K/V and attn_mask whose data pointers are not 64-byte
         aligned are handled correctly by the OneDNN SDPA forward and backward
         kernels.
@@ -36,6 +53,10 @@ class TestSDPAXpuOnly(NNTestCase):
         qkv_numel = batch_size * n_head * q_size * head_dim
 
         def make_unaligned(numel):
+            # [FUNCTION DOC] HELPER: Allocates a random tensor of one more element than requested
+            # on the test device and dtype and returns the view without the first element, so its
+            # data pointer is offset by one element and not 64-byte aligned. Returns a
+            # one-dimensional tensor of the requested length.
             """Return a 1-D tensor of length `numel` whose data_ptr is not
             64-byte aligned, by slicing off a 1-element prefix."""
             t = torch.randn(numel + 1, device=device, dtype=dtype)
@@ -117,6 +138,12 @@ class TestSDPAXpuOnly(NNTestCase):
 
     @parametrize("dtype", [torch.half, torch.bfloat16])
     def test_onednn_attention_broadcast_mask_gqa(self, device, dtype):
+        # [FUNCTION DOC] Runs SDPA with the overrideable backend using grouped query attention
+        # (two query heads sharing one key/value head) and an attention mask that is broadcast
+        # over batch, heads and query positions through a zero-stride strided view of a vector.
+        # The reference expands key and value to the query head count, makes everything contiguous
+        # and runs the math backend; the results are compared within a dtype tolerance. Uses a
+        # fixed random seed.
         """Verify SDPA with GQA (grouped query attention) and a broadcast
         attn_mask works correctly.
 

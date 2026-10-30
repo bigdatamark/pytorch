@@ -1,3 +1,7 @@
+# [MODULE DOC] Driver for the autograd C++ and Python code generators. It delegates to the sibling
+# generators for Node subclasses, VariableType, InplaceOrView, TraceType, variable factories, view
+# functions and Python bindings. Provides a function for the C++ outputs, one for the
+# Python-facing outputs, and a command line main. Importing has no side effects beyond imports.
 """
 To run this file by hand from the root of the PyTorch
 repository, run:
@@ -56,6 +60,13 @@ def gen_autograd(
     operator_selector: SelectiveBuilder,
     disable_autograd: bool = False,
 ) -> None:
+    # [FUNCTION DOC] Generates the C++ autograd sources into the output directory. Loads
+    # derivatives.yaml from the autograd directory, parses the native functions, keeps those the
+    # operator selector selects for training (sorted by C++ name) and pairs them with their
+    # differentiability info. Unless disable_autograd is set it writes VariableType, InplaceOrView
+    # and TraceType files (tracing uses all native functions, unfiltered). It always writes the
+    # autograd Functions library, the variable factories and the view functions. Returns nothing;
+    # writes files as a side effect.
     # Parse and load derivatives.yaml
     differentiability_infos, used_dispatch_keys = load_derivatives(
         os.path.join(autograd_dir, "derivatives.yaml"), native_functions_path, tags_path
@@ -107,6 +118,9 @@ def gen_autograd_python(
     out: str,
     autograd_dir: str,
 ) -> None:
+    # [FUNCTION DOC] Generates the Python-facing autograd outputs: loads derivatives.yaml, writes
+    # the Python part of the autograd Functions files and the Python bindings (using
+    # deprecated.yaml and the templates folder), all into the output directory. Returns nothing.
     differentiability_infos, _ = load_derivatives(
         os.path.join(autograd_dir, "derivatives.yaml"), native_functions_path, tags_path
     )
@@ -124,6 +138,10 @@ def gen_autograd_python(
 
 
 def main() -> None:
+    # [FUNCTION DOC] Command line entry point: parses four positional paths (native functions
+    # yaml, tags yaml, output directory, autograd directory) and runs the C++ generation with a
+    # selector that selects everything. The tags argument reuses the metavar NATIVE, which only
+    # affects help text.
     parser = argparse.ArgumentParser(description="Generate autograd C++ files script")
     parser.add_argument(
         "native_functions", metavar="NATIVE", help="path to native_functions.yaml"

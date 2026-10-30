@@ -1,3 +1,8 @@
+# [MODULE DOC] Generator script that writes annotated_fn_args.py, a table of method names and
+# argument signatures (name, simple type, size, kwarg-only flag) used by the __torch_function__
+# override tests. Run as a module with four positional paths: native_functions.yaml, tags.yaml,
+# output directory and the autograd directory holding the templates. Importing has no side
+# effects.
 """
 For procedural tests needed for __torch_function__, we use this function
 to export method names and signatures as needed by the tests in
@@ -45,6 +50,12 @@ if TYPE_CHECKING:
 
 
 def gen_annotated(
+    # [FUNCTION DOC] Parses the native functions yaml and, for each Python namespace (torch
+    # functions, nn, linalg, special, fft and Tensor methods), collects the ops that get a Python
+    # binding and match that namespace, producing one annotated entry per overload prefixed by the
+    # namespace. Writes annotated_fn_args.py into the output directory from the matching template
+    # in the templates folder under the autograd directory, with entries indented by four spaces.
+    # Returns nothing; raises on missing or invalid input files.
     native_yaml_path: str, tags_yaml_path: str, out: str, autograd_dir: str
 ) -> None:
     native_functions = parse_native_yaml(
@@ -82,7 +93,13 @@ def gen_annotated(
 
 @with_native_function
 def gen_annotated_args(f: NativeFunction) -> str:
+    # [FUNCTION DOC] Builds one text entry for a native function: its base operator name followed
+    # by the list of argument descriptions, ending in a comma. Only arguments without a default
+    # are described, positional ones first and then keyword-only ones (skipped for operators in an
+    # exclusion list). Wrapped so errors are reported in the context of the native function.
     def _get_kwargs_func_exclusion_list() -> list[str]:
+        # [FUNCTION DOC] HELPER: Returns the fixed list of operator names (diagonal, round_,
+        # round, scatter_) that the override tests cannot call with keyword arguments.
         # functions that currently don't work with kwargs in test_overrides.py
         return [
             "diagonal",
@@ -94,6 +111,10 @@ def gen_annotated_args(f: NativeFunction) -> str:
     def _add_out_arg(
         out_args: list[dict[str, Any]], args: Sequence[Argument], *, is_kwarg_only: bool
     ) -> None:
+        # [FUNCTION DOC] HELPER: Appends one description mapping per argument lacking a default to
+        # the given output list (mutated in place). Each mapping holds the kwarg-only flag as a
+        # string, the argument name, the simple type string and, only when the type has a nonzero
+        # size, that size.
         for arg in args:
             if arg.default is not None:
                 continue
@@ -117,6 +138,9 @@ def gen_annotated_args(f: NativeFunction) -> str:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Command line entry point: defines four positional arguments (native functions
+    # yaml, tags yaml, output directory, template directory), parses them and calls the generation
+    # function.
     parser = argparse.ArgumentParser(description="Generate annotated_fn_args script")
     parser.add_argument(
         "native_functions", metavar="NATIVE", help="path to native_functions.yaml"
