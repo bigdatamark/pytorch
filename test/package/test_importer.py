@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: package/deploy"]
+# [MODULE DOC] Tests for the importer abstractions in torch.package: the system importer,
+# OrderedImporter combinations with a PackageImporter, whichmodule resolution order, and the
+# handling of objects without a module attribute. Falls back to a non-relative import of the
+# shared base test case. Run as a script, it starts the test runner.
 
 from io import BytesIO
 
@@ -21,9 +25,13 @@ except ImportError:
 
 
 class TestImporter(PackageTestCase):
+    # [CLASS DOC] Test case for Importer and its derived classes, using the fake packages in
+    # this directory and in-memory buffers.
     """Tests for Importer and derived classes."""
 
     def test_sys_importer(self):
+        # [FUNCTION DOC] Checks the system importer returns the identical module objects as the
+        # regular import statement, for a package and its submodule.
         import package_a
         import package_a.subpackage
 
@@ -33,6 +41,8 @@ class TestImporter(PackageTestCase):
         )
 
     def test_sys_importer_roundtrip(self):
+        # [FUNCTION DOC] Asks the system importer for the module and type names of a class,
+        # imports that module, and checks the named attribute is the same class object.
         import package_a
         import package_a.subpackage
 
@@ -44,6 +54,10 @@ class TestImporter(PackageTestCase):
         self.assertIs(getattr(module, type_name), type_)
 
     def test_single_ordered_importer(self):
+        # [FUNCTION DOC] Packages one package, wraps its importer alone in an OrderedImporter,
+        # and checks that the module comes from the package (identical to the importer's,
+        # different from the regular one) and that a module not packaged
+        # raises ModuleNotFoundError.
         import module_a  # noqa: F401
         import package_a
 
@@ -71,6 +85,8 @@ class TestImporter(PackageTestCase):
             ordered_importer.import_module("module_a")
 
     def test_ordered_importer_basic(self):
+        # [FUNCTION DOC] Combines the system importer and a package importer in both orders and
+        # checks that the first importer in the order wins for the shared module name.
         import package_a
 
         buffer = BytesIO()
@@ -90,21 +106,33 @@ class TestImporter(PackageTestCase):
         )
 
     def test_ordered_importer_whichmodule(self):
+        # [FUNCTION DOC] Checks that whichmodule on an OrderedImporter asks the underlying
+        # importers in order and takes the first answer, skipping an importer that reports the
+        # main module name as a stand-in for not found.
         """OrderedImporter's implementation of whichmodule should try each
         underlying importer's whichmodule in order.
         """
 
         class DummyImporter(Importer):
+            # [CLASS DOC] HELPER: Importer stub with a fixed answer to whichmodule;
+            # import_module is not supported.
             def __init__(self, whichmodule_return):
+                # [FUNCTION DOC] HELPER: Stores the fixed module name that whichmodule
+                # will return.
                 self._whichmodule_return = whichmodule_return
 
             def import_module(self, module_name):
+                # [FUNCTION DOC] HELPER: Always raises NotImplementedError; this stub never
+                # imports anything.
                 raise NotImplementedError
 
             def whichmodule(self, obj, name):
+                # [FUNCTION DOC] HELPER: Ignores its arguments and returns the stored
+                # module name.
                 return self._whichmodule_return
 
         class DummyClass:
+            # [CLASS DOC] HELPER: Empty class whose instances are passed to whichmodule.
             pass
 
         dummy_importer_foo = DummyImporter("foo")
@@ -125,6 +153,10 @@ class TestImporter(PackageTestCase):
         self.assertEqual(notfound_then_foo.whichmodule(DummyClass(), ""), "foo")
 
     def test_package_importer_whichmodule_no_dunder_module(self):
+        # [FUNCTION DOC] Pickles the float16 dtype object (which has no module attribute) into a
+        # package, loads it back, repackages the loaded object using the first importer, and
+        # loads again. Checks the loaded objects are identical to the original dtype, so the
+        # package importer reproduces the default pickler's module search.
         """Exercise corner case where we try to pickle an object whose
         __module__ doesn't exist because it's from a C extension.
         """

@@ -1,4 +1,9 @@
 # Owner(s): ["module: optimizer"]
+# [MODULE DOC] Tests for the stateless optimizer helper that temporarily swaps in externally
+# supplied parameters, optimizer state and param-group hyperparameters (a context manager). They
+# cover restoration after exit or error, input validation messages, frozen parameters,
+# optimizers built from named parameters, and tracing with make_fx. Import-time side effect:
+# rebinds the sharding test-filter hook. Run as a script, it starts the test runner.
 
 import re
 from copy import deepcopy
@@ -22,22 +27,37 @@ load_tests = load_tests  # noqa: PLW0127
 
 
 class ChainedLinear(torch.nn.Module):
+    # [CLASS DOC] HELPER: Two stacked linear layers (two inputs to two to one outputs), named l1
+    # and l2.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the two linear layers l1 and l2.
         super().__init__()
         self.l1 = torch.nn.Linear(2, 2)
         self.l2 = torch.nn.Linear(2, 1)
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Applies l1 and then l2 to the input and returns the result.
         return self.l2(self.l1(x))
 
 
 class TestSwapInOptimizerParamsAndState(TestCase):
+    # [CLASS DOC] Test case for the swap-in context manager. Helper methods build a small AdamW
+    # optimizer that has taken one step, produce replacement parameters and a modified copy of
+    # its state dict, and assert the optimizer's original state is restored. A nested exception
+    # class is used to signal an error inside the context.
     hw_classification = HardwareClassification.GENERIC
 
     class _TestException(Exception):
+        # [CLASS DOC] HELPER: Private exception type raised inside the context to check
+        # restoration on errors.
         pass
 
     def _init_optimizer(self, freeze_l1: bool = False):
+        # [FUNCTION DOC] HELPER: Builds a ChainedLinear and an AdamW optimizer, runs one
+        # forward, backward and step on a random batch, then clears gradients to none. With the
+        # freeze flag, l1 parameters do not require grad (so the optimizer never creates state
+        # for them) and a single parameter group is used; otherwise two groups with different
+        # learning rate and weight decay are used. Returns the module and the optimizer.
         # ChainedLinear + AdamW stepped once. With freeze_l1=True, l1's
         # params have requires_grad=False so no state is lazy-init'd for them
         # (their packed ids appear in param_groups but are absent from state).
@@ -68,6 +88,11 @@ class TestSwapInOptimizerParamsAndState(TestCase):
         return module, optimizer
 
     def _make_reparam_inputs(self):
+        # [FUNCTION DOC] HELPER: Uses the init helper to get a stepped module and optimizer,
+        # builds a mapping of parameter names to random replacement tensors, and a deep copy of
+        # the optimizer state dict in which every tensor state value is shifted by 0.1 so tests
+        # can tell swapped-in state from live state. Returns the module, optimizer, parameter
+        # mapping and modified state dict.
         module, optimizer = self._init_optimizer()
         parameters = {
             name: torch.randn_like(param, requires_grad=param.requires_grad)
@@ -85,15 +110,29 @@ class TestSwapInOptimizerParamsAndState(TestCase):
     def _assert_optimizer_restored(
         self, optimizer, state_before, state_dict_before, params_before
     ):
+        # [FUNCTION DOC] HELPER: Asserts that the optimizer's state object is the identical one
+        # as before, that its state dict equals the saved one, and that each group's parameter
+        # list is the identical list object as before (groups and saved lists are paired, and
+        # lengths must match).
         self.assertIs(optimizer.state, state_before)
         self.assertEqual(optimizer.state_dict(), state_dict_before)
         for group, params in zip(optimizer.param_groups, params_before, strict=True):
             self.assertIs(group["params"], params)
 
     def test_swap_in_optimizer_params_and_state_rejects_invalid_inputs(self):
+        # [FUNCTION DOC] Table-driven check of the validation errors, using subtests. Each case
+        # perturbs a valid state dict (or the live optimizer or parameter mapping) and expects
+        # RuntimeError whose message contains an expected fragment: uninitialized optimizer
+        # state, state keyed by names instead of packed ids, wrong types for the state and param
+        # groups fields, group count and group size mismatches, non-mapping per-parameter state,
+        # extra state keys, extra or missing group keys, too few parameters, and
+        # tensor-keyed state.
         _, optimizer, parameters, base_osd = self._make_reparam_inputs()
 
         def expect(opt, params, bad_input, pattern):
+            # [FUNCTION DOC] HELPER: Enters the swap-in context with the given inputs and
+            # expects RuntimeError whose message contains the given text (escaped, so
+            # matched literally).
             with self.assertRaisesRegex(RuntimeError, re.escape(pattern)):
                 with swap_in_optimizer_params_and_state(opt, params, bad_input):
                     pass
@@ -214,6 +253,10 @@ class TestSwapInOptimizerParamsAndState(TestCase):
             )
 
     def test_swap_in_optimizer_params_and_state_handles_missing_param_state(self):
+        # [FUNCTION DOC] With the first layer frozen, the saved state has entries for only two
+        # of the four parameter ids. Asserts those counts, then swaps in and checks the shape is
+        # accepted; a state entry created inside the context for a frozen parameter must not
+        # appear in the input state dict after.
         # When some params have ``requires_grad=False`` their grads stay
         # ``None`` after ``loss.backward(); step()`` and the optimizer never
         # lazy-inits state for them. The resulting state_dict has packed ids
@@ -246,6 +289,9 @@ class TestSwapInOptimizerParamsAndState(TestCase):
         self.assertNotIn(frozen_param_id, swapin_optim_state["state"])
 
     def test_swap_in_optimizer_params_and_state_supports_named_parameters_init(self):
+        # [FUNCTION DOC] Builds an AdamW from named parameters (which adds a param names entry
+        # to each group), steps once, and swaps in replacements. Checks the names of each group
+        # are unchanged both inside the context and after exit.
         # Optimizer initialized with named_parameters() adds a ``param_names``
         # key to each param group; ``state`` is still keyed by packed ints.
         # Swap-in must round-trip param_names along with the other group fields.
@@ -281,6 +327,9 @@ class TestSwapInOptimizerParamsAndState(TestCase):
         )
 
     def test_swap_in_optimizer_params_and_state_restores_after_exception(self):
+        # [FUNCTION DOC] Inside the context, checks the live state and group parameter list were
+        # replaced, mutates state and learning rate, then raises the private exception. After
+        # catching it, asserts the optimizer was fully restored.
         _, optimizer, parameters, swapin_optim_state = self._make_reparam_inputs()
         state_before = optimizer.state
         state_dict_before = deepcopy(optimizer.state_dict())
@@ -310,6 +359,11 @@ class TestSwapInOptimizerParamsAndState(TestCase):
     # the user's CPU optimizer. See https://github.com/pytorch/pytorch/issues/182706.
     @skipIfTorchDynamo("https://github.com/pytorch/pytorch/issues/182706")
     def test_swap_in_optimizer_params_and_state_reflects_state_mutations(self):
+        # [FUNCTION DOC] Inside the context, adds one in place to a first-moment tensor,
+        # replaces the step entry and changes the learning rate. After exit, asserts restoration
+        # and that the in-place tensor change is visible in the input state dict (tensors are
+        # shared) while the step replacement is not (dictionaries are copied). Skipped under
+        # Dynamo because of a linked bug.
         _, optimizer, parameters, swapin_optim_state = self._make_reparam_inputs()
         state_before = optimizer.state
         state_dict_before = deepcopy(optimizer.state_dict())
@@ -345,6 +399,11 @@ class TestSwapInOptimizerParamsAndState(TestCase):
     def test_make_fx_swap_in_optimizer_params_and_state_tensor_reassignment_stays_local(
         self,
     ):
+        # [FUNCTION DOC] Takes a stepped SGD with momentum and traces with make_fx a function
+        # that reparametrizes the module, swaps in the optimizer state, replaces one momentum
+        # buffer with a fresh tensor, sets all gradients to ones, runs a step and then the
+        # module. Checks that the reassignment did not leak into the input state dict, and
+        # compares the generated graph code with an expected golden string.
         module = ChainedLinear()
         optimizer = torch.optim.SGD(module.parameters(), lr=0.1, momentum=0.9)
         x = torch.randn(4, 2)
@@ -364,6 +423,10 @@ class TestSwapInOptimizerParamsAndState(TestCase):
         ]
 
         def f(state, x):
+            # [FUNCTION DOC] HELPER: Traced function; unpacks parameters and optimizer state,
+            # reparametrizes the module and swaps in the optimizer state, overwrites one
+            # momentum buffer with a zeros tensor, sets every gradient to ones, steps the
+            # optimizer, and returns the module output on the input.
             params, optimizer_state = state
             with stateless._reparametrize_module(module, params):
                 with swap_in_optimizer_params_and_state(
@@ -418,6 +481,10 @@ def forward(self, state, x):
         )
 
     def test_make_fx_reparametrize_module_and_optimizer_records_aten_ops(self):
+        # [FUNCTION DOC] Same setup as the previous trace test but without overwriting any
+        # buffer: traces the module forward followed by gradient assignment and an optimizer
+        # step, and compares the graph code against an expected golden string showing the
+        # operator calls.
         module = ChainedLinear()
         optimizer = torch.optim.SGD(module.parameters(), lr=0.1, momentum=0.9)
         x = torch.randn(4, 2)
@@ -433,6 +500,9 @@ def forward(self, state, x):
         swapin_optim_state = deepcopy(optimizer.state_dict())
 
         def f(state, x):
+            # [FUNCTION DOC] HELPER: Traced function; reparametrizes the module and swaps in the
+            # optimizer state, runs the module, sets every gradient to ones, steps the
+            # optimizer, and returns the module output.
             params, optimizer_state = state
             with stateless._reparametrize_module(module, params):
                 with swap_in_optimizer_params_and_state(

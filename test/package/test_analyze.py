@@ -1,4 +1,7 @@
 # Owner(s): ["oncall: package/deploy"]
+# [MODULE DOC] Tests for the torch.package analyze helpers. Falls back to a non-relative import
+# of the shared base test case when the file is run directly. Run as a script, it starts the
+# test runner.
 
 import unittest
 
@@ -15,10 +18,15 @@ except ImportError:
 
 
 class TestAnalyze(PackageTestCase):
+    # [CLASS DOC] Test case for the dependency tracing helper in the analyze module.
     """Dependency analysis API tests."""
 
     @unittest.skipIf(IS_LINUX, "https://github.com/pytorch/pytorch/issues/81213")
     def test_trace_dependencies(self):
+        # [FUNCTION DOC] Imports the test_trace_dep module, traces dependencies of one of its
+        # module instances run on a random tensor of four elements, and checks that the returned
+        # set of module names excludes yaml and includes test_trace_dep. Skipped on Linux
+        # because of a linked issue.
         import test_trace_dep
 
         obj = test_trace_dep.SumMod()

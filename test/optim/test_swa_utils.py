@@ -1,4 +1,8 @@
 # Owner(s): ["module: optimizer"]
+# [MODULE DOC] Tests for the weight-averaging utilities (averaged model wrapper with mean or
+# exponential averaging, and batch-norm statistics refresh) in torch.optim.swa_utils. The test
+# class is instantiated per device by the main optimizer test file; running this file directly
+# only prints a note saying so.
 
 import itertools
 import pickle
@@ -19,26 +23,41 @@ from torch.testing._internal.common_utils import (
 
 
 class TestSWAUtils(TestCase):
+    # [CLASS DOC] Device-generic tests for averaged models and the batch-norm update helper.
+    # Class attribute marks hardware classification as accelerator. Holds two small nested
+    # network classes and helpers for averaging runs and batch-norm checks.
     # Instantiated via instantiate_device_type_tests in test/test_optim.py.
     hw_classification = HardwareClassification.ACCELERATOR
 
     class SWATestDNN(torch.nn.Module):
+        # [CLASS DOC] HELPER: Small fully connected network with a linear layer of 100 features
+        # followed by a one-dimensional batch norm; exposes the pre-activation computation.
         def __init__(self, input_features):
+            # [FUNCTION DOC] HELPER: Records the feature count (100) and creates the linear
+            # layer and batch norm.
             super().__init__()
             self.n_features = 100
             self.fc1 = torch.nn.Linear(input_features, self.n_features)
             self.bn = torch.nn.BatchNorm1d(self.n_features)
 
         def compute_preactivation(self, x):
+            # [FUNCTION DOC] HELPER: Returns the linear layer output, i.e. the input of the
+            # batch norm.
             return self.fc1(x)
 
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Applies the linear layer and then the batch norm.
             x = self.fc1(x)
             x = self.bn(x)
             return x
 
     class SWATestCNN(torch.nn.Module):
+        # [CLASS DOC] HELPER: Small convolutional network with a 3x3 convolution of 10 features
+        # followed by a two-dimensional batch norm with momentum 0.3; exposes
+        # the pre-activation.
         def __init__(self, input_channels):
+            # [FUNCTION DOC] HELPER: Records the feature count (10) and creates the convolution
+            # (padding one) and the batch norm.
             super().__init__()
             self.n_features = 10
             self.conv1 = torch.nn.Conv2d(
@@ -47,14 +66,22 @@ class TestSWAUtils(TestCase):
             self.bn = torch.nn.BatchNorm2d(self.n_features, momentum=0.3)
 
         def compute_preactivation(self, x):
+            # [FUNCTION DOC] HELPER: Returns the convolution output, i.e. the input of the
+            # batch norm.
             return self.conv1(x)
 
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Applies the convolution and then the batch norm.
             x = self.conv1(x)
             x = self.bn(x)
             return x
 
     def _test_averaged_model(self, net_device, swa_device, ema):
+        # [FUNCTION DOC] HELPER: Builds a small convolutional and linear network on the net
+        # device, runs the averaging helper with the swa device and the ema flag, then checks
+        # each averaged model parameter equals the manually averaged one, that the averaged
+        # model parameters live on the swa device while the reference ones live on the net
+        # device, and that the update counter lives on the swa device.
         net_device = torch.device(net_device)
         swa_device = torch.device(swa_device)
         dnn = torch.nn.Sequential(
@@ -79,6 +106,12 @@ class TestSWAUtils(TestCase):
         self.assertTrue(averaged_dnn.n_averaged.device == swa_device)
 
     def _run_averaged_steps(self, dnn, swa_device, ema):
+        # [FUNCTION DOC] HELPER: Wraps the network in an averaged model with a multi-tensor
+        # average function (exponential with decay 0.999 if the flag is set, otherwise
+        # equal-weight mean). Then for ten updates perturbs each parameter in place with random
+        # noise, accumulates the expected running average by hand (with decay weights for the
+        # exponential case) and updates the averaged model. Returns the hand-computed averages
+        # and the averaged model.
         ema_decay = 0.999
         if ema:
             averaged_dnn = AveragedModel(
@@ -109,11 +142,15 @@ class TestSWAUtils(TestCase):
 
     @parametrize("ema", [True, False])
     def test_averaged_model_same_device(self, device, ema):
+        # [FUNCTION DOC] Runs the averaged model check with the network and averaged copy both
+        # on the test device, for exponential and equal-weight averaging.
         self._test_averaged_model(device, device, ema)
 
     @onlyAccelerator
     @parametrize("ema", [True, False])
     def test_averaged_model_cross_device(self, device, ema):
+        # [FUNCTION DOC] Accelerator-only. Runs the averaged model check with the network on the
+        # device and the averaged copy on the CPU, then the reverse, for both averaging modes.
         cpu = torch.device("cpu")
         self._test_averaged_model(device, cpu, ema)
         self._test_averaged_model(cpu, device, ema)
@@ -121,6 +158,9 @@ class TestSWAUtils(TestCase):
     @onlyAccelerator
     @parametrize("ema", [True, False])
     def test_averaged_model_mixed_device(self, device, ema):
+        # [FUNCTION DOC] Accelerator-only. Builds a network whose first layer is on the device
+        # and second on the CPU, runs the averaging helper with no target device, and checks
+        # each averaged parameter equals the reference and stays on the same device as it.
         dnn = torch.nn.Sequential(
             torch.nn.Conv2d(1, 5, kernel_size=3), torch.nn.Linear(5, 10)
         )
@@ -136,6 +176,9 @@ class TestSWAUtils(TestCase):
 
     @onlyCPU
     def test_averaged_model_state_dict(self, device):
+        # [FUNCTION DOC] CPU-only. Updates one averaged model ten times with perturbed
+        # parameters, loads its state dict into a second averaged model, and checks parameters
+        # and the update counter match.
         dnn = torch.nn.Sequential(
             torch.nn.Conv2d(1, 5, kernel_size=3), torch.nn.Linear(5, 10)
         )
@@ -153,6 +196,8 @@ class TestSWAUtils(TestCase):
 
     @onlyCPU
     def test_averaged_model_default_avg_fn_picklable(self, device):
+        # [FUNCTION DOC] CPU-only. Checks that an averaged model with the default average
+        # function can be pickled without error.
         dnn = torch.nn.Sequential(
             torch.nn.Conv2d(1, 5, kernel_size=3),
             torch.nn.BatchNorm2d(5),
@@ -165,6 +210,11 @@ class TestSWAUtils(TestCase):
     @parametrize("use_multi_avg_fn", [True, False])
     @parametrize("use_buffers", [True, False])
     def test_averaged_model_exponential(self, device, use_multi_avg_fn, use_buffers):
+        # [FUNCTION DOC] CPU-only, parametrized over multi-tensor versus single-tensor average
+        # function and over whether buffers are averaged. Uses an exponential average with decay
+        # 0.9, tracks the expected averages by hand (skipping scalar tensors) over ten perturbed
+        # updates, and compares with the averaged model's parameters, plus its buffers (or,
+        # without buffer averaging, checks buffers match the source network's buffers).
         # Test AveragedModel with EMA as avg_fn and use_buffers as True.
         dnn = torch.nn.Sequential(
             torch.nn.Conv2d(1, 5, kernel_size=3),
@@ -180,6 +230,9 @@ class TestSWAUtils(TestCase):
         else:
 
             def avg_fn(p_avg, p, n_avg):
+                # [FUNCTION DOC] HELPER: Exponential moving average of one tensor: decay times
+                # the running average plus one minus decay times the new value. The count
+                # argument is ignored.
                 return decay * p_avg + (1 - decay) * p
 
             averaged_dnn = AveragedModel(dnn, avg_fn=avg_fn, use_buffers=use_buffers)
@@ -226,6 +279,11 @@ class TestSWAUtils(TestCase):
                 self.assertEqual(b_avg, b_swa)
 
     def _test_update_bn(self, dnn, dl_x, dl_xy, device):
+        # [FUNCTION DOC] HELPER: Computes the mean and biased variance of the network's
+        # pre-batch-norm activations over all batches of the plain loader. Runs the batch-norm
+        # update on the loader of input-target pairs and checks running mean and variance
+        # (variance with loose tolerance) match. Then resets running statistics and repeats with
+        # the pair loader, and again with the plain loader.
         preactivation_sum = torch.zeros(dnn.n_features, device=device)
         preactivation_squared_sum = torch.zeros(dnn.n_features, device=device)
         total_num = 0
@@ -251,6 +309,9 @@ class TestSWAUtils(TestCase):
         self.assertEqual(preactivation_var, dnn.bn.running_var, atol=1e-1, rtol=0)
 
         def _reset_bn(module):
+            # [FUNCTION DOC] HELPER: For a batch-norm module, resets running mean to zeros and
+            # running variance to ones by assigning new tensors; other modules are
+            # left untouched.
             if issubclass(module.__class__, torch.nn.modules.batchnorm._BatchNorm):
                 module.running_mean = torch.zeros_like(module.running_mean)
                 module.running_var = torch.ones_like(module.running_var)
@@ -267,6 +328,9 @@ class TestSWAUtils(TestCase):
         self.assertEqual(preactivation_var, dnn.bn.running_var, atol=1e-1, rtol=0)
 
     def test_update_bn_dnn(self, device):
+        # [FUNCTION DOC] Builds random data and loaders (with and without targets), a fully
+        # connected network with batch norm on the device in training mode, runs the shared
+        # batch-norm check, and asserts the network is still in training mode afterwards.
         # Test update_bn for a fully-connected network with BatchNorm1d
         objects, input_features = 100, 5
         x = torch.rand(objects, input_features)
@@ -281,6 +345,8 @@ class TestSWAUtils(TestCase):
         self.assertTrue(dnn.training)
 
     def test_update_bn_cnn(self, device):
+        # [FUNCTION DOC] Same as the fully connected variant but with random image-shaped data
+        # and the convolutional network; also asserts training mode is preserved.
         # Test update_bn for convolutional network and BatchNorm2d
         objects = 100
         input_channels = 3
@@ -298,6 +364,9 @@ class TestSWAUtils(TestCase):
 
     @onlyCPU
     def test_bn_update_eval_momentum(self, device):
+        # [FUNCTION DOC] CPU-only. Puts the convolutional network in evaluation mode, runs the
+        # batch-norm update with no device argument, and checks the network is still in
+        # evaluation mode and the batch norm momentum is still 0.3.
         # check that update_bn preserves eval mode
         objects = 100
         input_channels = 3

@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: package/deploy"]
+# [MODULE DOC] Tests for loading a package from an extracted directory (the directory reader
+# backend of PackageImporter) instead of a zip archive: pickles, modules, record queries,
+# resource readers, importlib resources access and the unsupported script-object case.
+# Import-time side effects: tries to import torchvision (recording availability and defining a
+# skip decorator) and computes the directory of this file. Falls back to a non-relative import
+# of the base test case.
 
 import os
 import zipfile
@@ -43,6 +49,9 @@ packaging_directory = Path(__file__).parent
     "Tests that use temporary files are disabled in fbcode",
 )
 class DirectoryReaderTest(PackageTestCase):
+    # [CLASS DOC] Test case whose tests each export a package to a temporary file, extract the
+    # archive into a temporary directory and open that directory with PackageImporter. The whole
+    # class is skipped under fbcode, sandcastle and on Windows.
     """Tests use of DirectoryReader as accessor for opened packages."""
 
     @skipIfNoTorchVision
@@ -51,6 +60,10 @@ class DirectoryReaderTest(PackageTestCase):
         "Does not work with latest TorchVision, see https://github.com/pytorch/pytorch/issues/81115",
     )
     def test_loading_pickle(self):
+        # [FUNCTION DOC] Pickles a resnet18 into a package with everything interned, extracts
+        # it, loads the model from the directory and compares outputs on a random image-sized
+        # batch with the original. Currently always skipped (an unconditional skip citing a
+        # torchvision incompatibility), and also skipped when torchvision is missing.
         """
         Test basic saving and loading of modules and pickles from a DirectoryReader.
         """
@@ -71,6 +84,8 @@ class DirectoryReaderTest(PackageTestCase):
             self.assertEqual(dir_mod(input), resnet(input))
 
     def test_loading_module(self):
+        # [FUNCTION DOC] Saves the fake package_a into a package, extracts it and imports it
+        # from the directory, checking its result string equals the regular package's.
         """
         Test basic saving and loading of a packages from a DirectoryReader.
         """
@@ -89,6 +104,8 @@ class DirectoryReaderTest(PackageTestCase):
             self.assertEqual(dir_mod.result, package_a.result)
 
     def test_loading_has_record(self):
+        # [FUNCTION DOC] Checks the directory reader reports a record exists for the packaged
+        # init file of package_a but not for the bare package directory name.
         """
         Test DirectoryReader's has_record().
         """
@@ -107,6 +124,11 @@ class DirectoryReaderTest(PackageTestCase):
             self.assertFalse(dir_importer.zip_reader.has_record("package_a"))
 
     def test_resource_reader(self):
+        # [FUNCTION DOC] Saves text resources into three packages (one, one.three and two),
+        # extracts and opens the directory, then checks the resource reader of each: the path of
+        # a resource is a path inside the extracted directory, resource existence checks (a
+        # subpackage is not a resource), data read from a resource, sorted listings of contents,
+        # and that an unknown package yields None.
         """Tests DirectoryReader as the base for get_resource_reader."""
         filename = self.temp()
         with PackageExporter(filename) as pe:
@@ -178,6 +200,10 @@ class DirectoryReaderTest(PackageTestCase):
 
     @skipIf(version_info >= (3, 13), "https://github.com/python/cpython/issues/127012")
     def test_package_resource_access(self):
+        # [FUNCTION DOC] Packages a source module that reads a text resource with the standard
+        # resources API, together with that resource, and checks the module returns the stored
+        # text when imported from the extracted directory. Skipped on Python 3.13 and newer
+        # because of an upstream bug.
         """Packaged modules should be able to use the importlib.resources API to access
         resources saved in the package.
         """
@@ -206,6 +232,9 @@ class DirectoryReaderTest(PackageTestCase):
             )
 
     def test_importer_access(self):
+        # [FUNCTION DOC] Saves a text and a binary resource plus a package source module that
+        # loads both through the package importer's resource helpers. After extraction,
+        # importing the module must expose the original text string and bytes.
         filename = self.temp()
         with PackageExporter(filename) as he:
             he.save_text("main", "main", "my string")
@@ -231,6 +260,9 @@ class DirectoryReaderTest(PackageTestCase):
             self.assertEqual(m.b, b"my string")
 
     def test_resource_access_by_path(self):
+        # [FUNCTION DOC] Saves a binary resource and a package source that opens it through the
+        # standard resources path helper and reads it as text. Importing it from the extracted
+        # directory must expose the stored string.
         """
         Tests that packaged code can used importlib.resources.path.
         """
@@ -258,6 +290,9 @@ class DirectoryReaderTest(PackageTestCase):
             self.assertEqual(m.s, "my string")
 
     def test_scriptobject_failure_message(self):
+        # [FUNCTION DOC] Scripts a small module, pickles it into a package, extracts it and
+        # loads the pickle from the directory. Expects RuntimeError saying script objects cannot
+        # be loaded from a directory-based importer and an archive file should be used.
         """
         Test basic saving and loading of a ScriptModule in a directory.
         Currently not supported.

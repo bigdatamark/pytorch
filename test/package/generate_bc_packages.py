@@ -1,3 +1,8 @@
+# [MODULE DOC] Script that produces the backwards-compatibility package archives (an eager
+# module, a TorchScript module and an FX module) into a package_bc directory next to this file,
+# for later loading by the load-bc-packages test. Import-time side effect: computes the output
+# directory path and sets the exporter flag that gates TorchScript serialization to False.
+# Running it as a script calls generate_bc_packages.
 from pathlib import Path
 
 import torch
@@ -11,6 +16,12 @@ torch.package.package_exporter._gate_torchscript_serialization = False
 
 
 def generate_bc_packages():
+    # [FUNCTION DOC] Writes three package archives (test_nn_module, test_torchscript_module and
+    # test_fx_module, each ending in the pt extension) into the package_bc directory. It only
+    # does anything when not running in fbcode, or when running under sandcastle. It builds a
+    # TestNnModule, a scripted copy and a symbolically traced copy, and pickles each into its
+    # own archive with a single resource entry, interning all dependencies. Returns None; the
+    # output directory must exist.
     """Function to create packages for testing backwards compatibility"""
     if not IS_FBCODE or IS_SANDCASTLE:
         from package_a.test_nn_module import TestNnModule
