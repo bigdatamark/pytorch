@@ -1,4 +1,10 @@
 # Owner(s): ["module: cuda"]
+# [MODULE DOC] Tests for the NVML-based CUDA availability check and for parsing of the
+# CUDA_VISIBLE_DEVICES environment variable in torch.cuda. Each test must run in a fresh
+# process so CUDA is uninitialized. Import-time: imports the test utilities while the
+# NVML-based check variable is set to 1 in the environment, replaces the helper that strips
+# device and dtype suffixes with an identity function to avoid creating a CUDA context, and
+# swaps TestCase for NoTest when CUDA is unavailable.
 
 import multiprocessing
 import os
@@ -37,6 +43,10 @@ with patch.dict(os.environ, {"PYTORCH_NVML_BASED_CUDA_CHECK": "1"}):
 
 @torch.testing._internal.common_utils.markDynamoStrictTest
 class TestExtendedCUDAIsAvail(TestCase):
+    # [CLASS DOC] Tests that the weaker NVML-based availability check does not initialize the
+    # CUDA driver in a forked child, while the default runtime check does.
+    # SUBPROCESS_REMINDER_MSG is the failure message reminding the user to run each test in
+    # its own process.
     SUBPROCESS_REMINDER_MSG = (
         "\n REMINDER: Tests defined in test_cuda_nvml_based_avail.py must be run in a process "
         "where there CUDA Driver API has not been initialized. Before further debugging, ensure you are either using "
@@ -44,6 +54,8 @@ class TestExtendedCUDAIsAvail(TestCase):
     )
 
     def setUp(self):
+        # [FUNCTION DOC] Calls the base setUp and clears the cached device count in torch.cuda
+        # so each test recomputes availability.
         super().setUp()
         torch.cuda._cached_device_count = (
             None  # clear the lru_cache on this method before our test
@@ -51,6 +63,9 @@ class TestExtendedCUDAIsAvail(TestCase):
 
     @staticmethod
     def in_bad_fork_test() -> bool:
+        # [FUNCTION DOC] HELPER: Static method run inside a forked child. Calls the
+        # availability check, then returns whether torch.cuda reports the process as being in
+        # a bad fork (CUDA was initialized before forking).
         _ = torch.cuda.is_available()
         return torch.cuda._is_in_bad_fork()
 
@@ -62,6 +77,14 @@ class TestExtendedCUDAIsAvail(TestCase):
     @parametrize("nvml_avail", [True, False])
     @parametrize("avoid_init", ["1", "0", None])
     def test_cuda_is_available(self, avoid_init, nvml_avail):
+        # [FUNCTION DOC] Parametrized over whether the NVML path is usable and over the value
+        # of the NVML-based check environment variable (1, 0 or unset). Skipped on Windows
+        # (needs fork) and for the Jetson case with NVML available and the variable set to 1.
+        # With the environment patched, calls the availability check in the parent (with the
+        # NVML device count patched to return -1 when NVML is treated as unavailable), then
+        # queries a forked pool worker for the bad-fork flag. If the variable is 1 and NVML is
+        # available, the child must not be in a bad fork; otherwise it must be, and an
+        # AssertionError is raised if not.
         if IS_JETSON and nvml_avail and avoid_init == "1":
             self.skipTest("Not working for Jetson")
         patch_env = {"PYTORCH_NVML_BASED_CUDA_CHECK": avoid_init} if avoid_init else {}
@@ -84,8 +107,16 @@ class TestExtendedCUDAIsAvail(TestCase):
 
 @torch.testing._internal.common_utils.markDynamoStrictTest
 class TestVisibleDeviceParses(TestCase):
+    # [CLASS DOC] Tests for parsing visible-device specifications: the environment variable
+    # parser, the partial UUID to ordinal resolver, and the NVML-based device count.
     def test_env_var_parsing(self):
+        # [FUNCTION DOC] Checks the visible-devices parser on many inputs: trailing text
+        # ignored, negatives stop parsing, duplicate ordinals give an empty result, signs are
+        # accepted, garbage gives an empty or truncated result, and GPU and MIG identifiers
+        # are returned as strings with mixed ordinals dropped.
         def _parse_visible_devices(val):
+            # [FUNCTION DOC] HELPER: Sets the visible devices variable to the given string in
+            # a cleared environment and returns the result of the torch.cuda parser.
             from torch.cuda import _parse_visible_devices as _pvd
 
             with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": val}, clear=True):
@@ -111,6 +142,10 @@ class TestVisibleDeviceParses(TestCase):
         self.assertEqual(_parse_visible_devices("MIG-89c850dc"), ["MIG-89c850dc"])
 
     def test_partial_uuid_resolver(self):
+        # [FUNCTION DOC] Checks the partial UUID resolver against a fixed list of eight UUIDs:
+        # unique prefixes map to their ordinals in order, and an unknown prefix, an ambiguous
+        # prefix stops parsing (returning the ordinals found so far), while duplicates give an
+        # empty list.
         from torch.cuda import _transform_uuid_to_ordinals
 
         uuids = [
@@ -150,7 +185,12 @@ class TestVisibleDeviceParses(TestCase):
         )
 
     def test_ordinal_parse_visible_devices(self):
+        # [FUNCTION DOC] With the raw NVML device count patched to return 2, checks the
+        # NVML-based device count with ordinal lists: valid ordinals count 2, and an
+        # out-of-range ordinal aborts parsing so only the preceding one counts.
         def _device_count_nvml(val):
+            # [FUNCTION DOC] HELPER: Sets the visible devices variable to the given string in
+            # a cleared environment and returns the NVML-based device count from torch.cuda.
             from torch.cuda import _device_count_nvml as _dc
 
             with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": val}, clear=True):
