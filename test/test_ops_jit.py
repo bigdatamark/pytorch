@@ -1,4 +1,9 @@
 # Owner(s): ["module: unknown"]
+# [MODULE DOC] Tests that JIT (traced and scripted) execution of OpInfo operators agrees with
+# eager execution, and that alias names of operators are remapped to the canonical operator in
+# JIT graphs. Defines one device-generic test class, restricted to float32 and complex64 (floats
+# only for alias tests). Importing instantiates the device-specific classes; running as main
+# enables the default dtype check and calls the test runner.
 
 from functools import partial
 from textwrap import dedent
@@ -48,6 +53,10 @@ _variant_ops = partial(
 #   functionality with original test_jit.py method operator tests
 @unMarkDynamoStrictTest
 class TestJit(JitCommonTestCase):
+    # [CLASS DOC] JIT versus eager consistency tests, deriving from the shared JIT test case
+    # base so it can reuse its graph checking helpers. Requires exact dtype comparison. Tests
+    # are generated per operator and dtype; the alias test uses a partial of the ops decorator
+    # defined in the class body, limited to float32.
     exact_dtype = True
 
     # Tests that the forward and backward passes of operations produce the
@@ -56,6 +65,14 @@ class TestJit(JitCommonTestCase):
     # TODO WARNING: inplace x {traced, scripted} not currently tested
     @_variant_ops(op_db)
     def test_variant_consistency_jit(self, device, dtype, op):
+        # [FUNCTION DOC] For each sample of the operator, run forward and backward consistency
+        # checks between eager, traced and scripted runs for the function and method variants
+        # (in-place is not tested). Gradients are enabled only when the dtype supports backward.
+        # Skips operator overload objects and, for the two resize operators, uses only the
+        # method on tensor with samples that do not require grad. Variants that are missing or
+        # are lambdas are ignored. Any failure is re-raised as a generic exception whose message
+        # names the operator, variant, dtype and sample, chained to the original error. Raises
+        # AssertionError if no variant was actually tested.
         _requires_grad = dtype in op.supported_backward_dtypes(
             torch.device(device).type
         )
@@ -125,6 +142,16 @@ class TestJit(JitCommonTestCase):
     def indiv_variant_test_jit(
         self, device, dtype, op, sample, func_type, variant, has_fake_function
     ):
+        # [FUNCTION DOC] Run all JIT checks for one sample and variant. With autodiff subgraph
+        # inlining disabled, it (1) compares a scripted version (if the operator supports
+        # scripting) against the eager operator for outputs, grads and gradgrads; (2) does the
+        # same for a traced version if tracing is supported and the operator is not one of the
+        # fake function ones, requiring tracing support when shape analysis is asserted; (3) for
+        # float32 only, checks the alias annotation schema (skipped for rsub and unscriptable
+        # ops) and checks that traced output sizes match the shape analysis when required; (4)
+        # for float32, asserts the expected autodiff, fusible and non fusible nodes in the
+        # traced and scripted last graphs, moving fusible nodes to the non fusible list under
+        # Sandcastle. Failures surface as assertion errors.
         _requires_grad = dtype in op.supported_backward_dtypes(
             torch.device(device).type
         )
@@ -141,12 +168,17 @@ class TestJit(JitCommonTestCase):
                 script_fn = create_script_fn(self, name, func_type)
 
             def out_fn(output):
+                # [FUNCTION DOC] HELPER: Apply the sample's output processing function for
+                # gradient checks if one is defined, otherwise return the output unchanged.
                 # Processes the output for autograd
                 if sample.output_process_fn_grad is not None:
                     return sample.output_process_fn_grad(output)
                 return output
 
             def get_sample():
+                # [FUNCTION DOC] HELPER: Return the sample input, cloned when the operator name
+                # ends with an underscore (in-place operators) so repeated runs do not see a
+                # mutated input.
                 return (
                     clone_input_helper(sample.input)
                     if op.name[-1] == "_"
@@ -255,6 +287,13 @@ class TestJit(JitCommonTestCase):
 
     @_alias_ops(op for op in op_db if op.aliases)
     def test_jit_alias_remapping(self, device, dtype, op):
+        # [FUNCTION DOC] For operators that have aliases, check that scripting and tracing each
+        # alias variant (function, method, in-place) produce a graph that uses the canonical
+        # aten name and does not contain the alias name. Uses only the first sample and a
+        # float32 dtype. Scripts are built from string templates, compiled in a compilation unit
+        # and run; for in-place variants whose result dtype cannot be cast back to the input
+        # dtype, the scripted call must raise, else the test fails. Traced graphs are checked
+        # with a file check for the expected name.
         # NOTE: only tests on first sample
         samples = op.sample_inputs(device, dtype, requires_grad=True)
         sample = first_sample(self, samples)
@@ -269,6 +308,9 @@ class TestJit(JitCommonTestCase):
         args = ["t0"]
 
         def quote_strs(v):
+            # [FUNCTION DOC] HELPER: Return the string source form of a value for use in a
+            # generated script, wrapping strings in single quotes and using plain string
+            # conversion otherwise.
             if isinstance(v, str):
                 return f"'{v}'"
 
@@ -354,6 +396,8 @@ class TestJit(JitCommonTestCase):
                 op_name = original_name_inplace if variant is inplace else original_name
 
                 def _fn(*sample_args, **sample_kwargs):
+                    # [FUNCTION DOC] HELPER: Trace target that forwards all arguments to the
+                    # alias variant bound by the enclosing loop and returns its result.
                     return variant(*sample_args, **sample_kwargs)
 
                 inp = (clone_input_helper(sample.input),) + sample_args_kwargs

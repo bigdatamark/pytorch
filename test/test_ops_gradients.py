@@ -1,4 +1,10 @@
 # Owner(s): ["module: unknown"]
+# [MODULE DOC] Gradient correctness tests for every operator in the OpInfo database (plus higher
+# order op and custom op databases). Defines one device-generic test class that runs gradcheck
+# and gradgradcheck on functional and in-place variants, over double and complex double dtypes
+# only. Per-operator skips and expected failures are given by shared sets of skip decorators.
+# Importing instantiates the device-specific classes (XPU allowed); running as main enables the
+# default dtype check and calls the test runner.
 
 from functools import partial
 
@@ -52,6 +58,11 @@ _bwd_grad_all = {
 
 @unMarkDynamoStrictTest
 class TestBwdGradients(TestGradients):
+    # [CLASS DOC] Device-generic gradient test class, derived from the shared gradients base
+    # class and not marked strict for Dynamo. Each test is parametrized over operators and
+    # double precision dtypes via the module level decorator, with skip and expected-failure
+    # sets applied per test. Method variant tests are intentionally disabled (commented out) as
+    # redundant.
     # Tests that gradients are computed correctly
     @skipOps(
         _bwd_grad_all
@@ -69,6 +80,11 @@ class TestBwdGradients(TestGradients):
     )
     @_gradcheck_ops(op_db + hop_db + custom_op_db)
     def test_fn_grad(self, device, dtype, op):
+        # [FUNCTION DOC] Check first order gradients of the functional variant of an operator
+        # with gradcheck. Skips if the dtype is not among the operator's supported backward
+        # dtypes for the device type; otherwise delegates to the base class gradient helper
+        # using the operator's function. Covers the OpInfo, higher order op and custom op
+        # databases.
         # This is verified by test_dtypes in test_ops.py
         if dtype not in op.supported_backward_dtypes(torch.device(device).type):
             self.skipTest("Skipped! Dtype is not in supported backward dtypes!")
@@ -91,6 +107,11 @@ class TestBwdGradients(TestGradients):
     )
     @_gradcheck_ops(op_db + custom_op_db)
     def test_inplace_grad(self, device, dtype, op):
+        # [FUNCTION DOC] Check first order gradients of the in-place variant. Skips for
+        # unsupported dtypes/autograd and when the operator has no in-place variant. If the
+        # operator claims no in-place autograd support, verifies that running the in-place
+        # variant (on cloned inputs) then backward raises some exception for each non-
+        # broadcasting sample; otherwise runs the gradient helper on the safe in-place wrapper.
         self._skip_helper(op, device, dtype)
         if not op.inplace_variant:
             self.skipTest("Op has no inplace variant!")
@@ -131,6 +152,10 @@ class TestBwdGradients(TestGradients):
     )
     @_gradcheck_ops(op_db + hop_db + custom_op_db)
     def test_fn_gradgrad(self, device, dtype, op):
+        # [FUNCTION DOC] Check second order gradients of the functional variant with the
+        # backward-over-backward gradgradcheck. Skips for unsupported dtype/autograd, and when
+        # the operator declares it lacks gradgrad support (this claim is not verified here);
+        # otherwise runs the shared check helper.
         self._skip_helper(op, device, dtype)
         if not op.supports_gradgrad:
             self.skipTest(
@@ -143,6 +168,10 @@ class TestBwdGradients(TestGradients):
     @skipOps(_bwd_grad_all | {skip("sparse.mm", variant_name="reduce")})
     @_gradcheck_ops(op_db + custom_op_db)
     def test_fn_fail_gradgrad(self, device, dtype, op):
+        # [FUNCTION DOC] For operators that declare no gradgrad support, verify that a second
+        # order check raises a RuntimeError whose message says the derivative is not
+        # implemented. Skips for unsupported dtype/autograd or when the operator does support
+        # gradgrad.
         self._skip_helper(op, device, dtype)
         if op.supports_gradgrad:
             self.skipTest("Skipped! Operation does support gradgrad")
@@ -168,6 +197,9 @@ class TestBwdGradients(TestGradients):
     )
     @_gradcheck_ops(op_db)
     def test_inplace_gradgrad(self, device, dtype, op):
+        # [FUNCTION DOC] Check second order gradients of the in-place variant (on cloned inputs)
+        # using the backward-over-backward check. Skips for unsupported dtype/autograd, when
+        # there is no in-place variant, or when it does not support in-place autograd.
         self._skip_helper(op, device, dtype)
         if not op.inplace_variant or not op.supports_inplace_autograd:
             self.skipTest("Skipped! Operation does not support inplace autograd.")
