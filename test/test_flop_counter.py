@@ -1,5 +1,10 @@
 # Owner(s): ["module: unknown"]
 # ruff: noqa: F841
+# [MODULE DOC] Tests for torch.utils.flop_counter: checks flop totals counted for matmul, conv,
+# autograd, module-scoped, custom-formula, SDPA (flash, memory-efficient, cudnn, math, nested),
+# varlen, scaled_mm, triton-kernel and flex attention paths. Import-time side effects: probes for
+# torchvision and CUDA to set the module flags HAS_TORCHVISION and HAS_CUDA, and defines a skip
+# decorator for missing torchvision.
 import functools
 import unittest
 
@@ -36,14 +41,21 @@ HAS_CUDA = torch.cuda.is_available()
 
 
 def FlopCounterMode(*args, **kwargs):
+    # [FUNCTION DOC] HELPER: Builds the real flop counter mode from torch.utils.flop_counter,
+    # forwarding all arguments and forcing the display option off so no summary table is printed
+    # on exit.
     return torch.utils.flop_counter.FlopCounterMode(*args, **kwargs, display=False)
 
 
 def get_total_flops(mode):
+    # [FUNCTION DOC] HELPER: Adds up every per-operator count recorded under the Global entry of
+    # the mode and returns the sum as a string, so it can be compared with expected-inline text.
     return str(sum(v for _, v in mode.flop_counts["Global"].items()))
 
 
 def T(*shape, requires_grad=False):
+    # [FUNCTION DOC] HELPER: Returns a tensor of standard-normal random values with the given
+    # shape, with the requires_grad flag set as asked.
     return torch.randn(*shape, requires_grad=requires_grad)
 
 
@@ -51,7 +63,13 @@ def T(*shape, requires_grad=False):
     TEST_WITH_TORCHDYNAMO, "torchdynamo doesn't work with __torch_dispatch__ right now"
 )
 class TestFlopCounter(TestCase):
+    # [CLASS DOC] Flop counter tests, skipped when running under torchdynamo (it cannot handle
+    # dispatch interception). Stateless; each test counts flops inside a counter mode and
+    # compares against expected totals.
     def test_sdpa_flop_count_gqa(self):
+        # [FUNCTION DOC] Checks that the sdpa flop formula gives the same count for multi-head
+        # and grouped-query shapes (fewer key/value heads than query heads) and that it raises an
+        # AssertionError when the query head count is not a multiple of the key/value head count.
         """sdpa_flop_count should handle GQA where KV heads < Q heads."""
         # MHA: q_heads == kv_heads
         q_shape = (2, 32, 128, 64)
@@ -74,6 +92,8 @@ class TestFlopCounter(TestCase):
             sdpa_flop_count(q_shape, k_bad, v_bad)
 
     def test_flop_counter_variety(self):
+        # [FUNCTION DOC] Counts mm, addmm, matmul, einsum and a Linear forward in one mode and
+        # checks the summed total against the expected text 3012.
         mod = torch.nn.Linear(9, 10)
         with FlopCounterMode() as mode:
             torch.mm(T(4, 5), T(5, 6))
@@ -85,6 +105,10 @@ class TestFlopCounter(TestCase):
         self.assertExpectedInline(get_total_flops(mode), """3012""")
 
     def test_op(self):
+        # [FUNCTION DOC] Counts mm, bmm, addmm (three bias broadcast shapes), baddbmm, conv2d and
+        # conv1d in turn, re-entering the same mode each time, and checks each expected total.
+        # Convolution padding is not accounted for in the expected numbers, as the in-test note
+        # says.
         with FlopCounterMode() as mode:
             torch.mm(T(4, 5), T(5, 6))
         # 4 * 6 * 2 * 5 = 240
@@ -134,6 +158,8 @@ class TestFlopCounter(TestCase):
         self.assertExpectedInline(get_total_flops(mode), """1440""")
 
     def test_backward(self):
+        # [FUNCTION DOC] Counts a forward mm and bmm chain plus the backward pass of its summed
+        # result and checks the total (5184) includes backward matmuls.
         with FlopCounterMode() as mode:
             a = T(4, 5, requires_grad=True)
             a = torch.mm(a, T(5, 6))
@@ -144,6 +170,9 @@ class TestFlopCounter(TestCase):
         self.assertExpectedInline(get_total_flops(mode), """5184""")
 
     def test_backward_reset(self):
+        # [FUNCTION DOC] Runs the forward and backward of the same matmul expression twice in one
+        # mode and checks the total (960), i.e. the second backward is counted again and not
+        # skipped or reset incorrectly.
         with FlopCounterMode() as mode:
             a = T(4, 5, requires_grad=True)
             a.mm(a.t()).sum().backward()
@@ -152,7 +181,10 @@ class TestFlopCounter(TestCase):
         self.assertExpectedInline(get_total_flops(mode), """960""")
 
     def test_torchscript(self):
+        # [FUNCTION DOC] Checks that a scripted (TorchScript) version of a function that calls mm
+        # produces the same flop total as the eager version when run under the same counter mode.
         def foo(x):
+            # [FUNCTION DOC] HELPER: Returns the matrix product of the input with itself.
             return torch.mm(x, x)
 
         with FlopCounterMode() as mode:
@@ -164,13 +196,24 @@ class TestFlopCounter(TestCase):
         self.assertEqual(unscripted_flops, get_total_flops(mode))
 
     def test_autograd_op(self):
+        # [FUNCTION DOC] Counts flops of a custom autograd function whose forward is one mm and
+        # whose backward is two mm calls, including the backward through a sum, and checks the
+        # total (750).
         class _CustomOp(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom autograd function: forward squares a matrix via mm,
+            # backward returns the sum of two mm products of the incoming gradient with itself
+            # (not a mathematically exact gradient; it exists only to produce a known flop
+            # count).
             @staticmethod
             def forward(ctx, input: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Forward of the custom op; returns the matrix product of
+                # the input with itself.
                 return torch.mm(input, input)
 
             @staticmethod
             def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Backward of the custom op; returns two mm products of
+                # the gradient with itself added together.
                 return torch.mm(grad_output, grad_output) + torch.mm(
                     grad_output, grad_output
                 )
@@ -183,11 +226,20 @@ class TestFlopCounter(TestCase):
         self.assertExpectedInline(get_total_flops(mode), """750""")
 
     def test_conv_backwards_as_decomposition(self):
+        # [FUNCTION DOC] Checks with torch.func grad that a custom autograd function made only of
+        # convolutions (forward conv or transposed conv, backward expressed as convolutions)
+        # gives the same gradients as the plain conv-plus-pow-sum function, for the transposed
+        # case on double tensors.
         # [conv backwards decomposition as conv forwards]
 
         class onlyConvs(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Autograd function computing a 1d convolution or a transposed 1d
+            # convolution (chosen by the flag input), whose backward is written using only
+            # convolution calls.
             @staticmethod
             def forward(inp, weight, transposed):
+                # [FUNCTION DOC] HELPER: Forward without a context argument; runs a 1d conv, or a
+                # transposed 1d conv when the transposed flag is set.
                 if not transposed:
                     return F.conv1d(inp, weight)
                 else:
@@ -195,12 +247,17 @@ class TestFlopCounter(TestCase):
 
             @staticmethod
             def setup_context(ctx, inputs, output):
+                # [FUNCTION DOC] HELPER: Saves the input and weight for backward and stores the
+                # transposed flag on the context.
                 inp, weight, transposed = inputs
                 ctx.save_for_backward(inp, weight)
                 ctx.transposed = transposed
 
             @staticmethod
             def backward(ctx, grad_out):
+                # [FUNCTION DOC] HELPER: Computes input and weight gradients using convolutions
+                # (swapping roles by the saved flag); returns the two gradients plus None for the
+                # flag input.
                 inp, weight = ctx.saved_tensors
                 if not ctx.transposed:
                     grad_inp = F.conv_transpose1d(grad_out, weight)
@@ -219,12 +276,16 @@ class TestFlopCounter(TestCase):
         weight = torch.randn(3, 4, 4, dtype=torch.float64)
 
         def boring_conv(x, weight, transposed):
+            # [FUNCTION DOC] HELPER: Reference function: plain conv or transposed conv, squared
+            # and summed to a scalar.
             if not transposed:
                 return F.conv1d(x, weight).pow(2).sum()
             else:
                 return F.conv_transpose1d(x, weight).pow(2).sum()
 
         def only_convs(x, weight, transposed):
+            # [FUNCTION DOC] HELPER: Same scalar as the reference function but computed through
+            # the custom op.
             return onlyConvs.apply(x, weight, transposed).pow(2).sum()
 
         boring_grads = grad(boring_conv, argnums=(0, 1))(x, weight, True)
@@ -233,7 +294,13 @@ class TestFlopCounter(TestCase):
         self.assertEqual(boring_grads, fun_grads)
 
     def test_convs(self):
+        # [FUNCTION DOC] Checks for several conv and transposed conv setups (plus grouped channel
+        # configs) that the counted backward conv flops are exactly twice the forward conv flops,
+        # and that two fixed forward counts (32 and 8) match.
         def assert_equivalence(f, expected_forward=None):
+            # [FUNCTION DOC] HELPER: Runs the given callable under a counter, reads the forward
+            # and backward convolution totals, asserts backward equals twice forward, and
+            # optionally asserts the forward total equals the expected value.
             with FlopCounterMode() as mode:
                 f()
             conv_forward_flops = mode.get_flop_counts()["Global"][
@@ -275,6 +342,9 @@ class TestFlopCounter(TestCase):
 
     @skipIfNoTorchVision
     def test_module(self):
+        # [FUNCTION DOC] Counts a resnet18 forward and backward with module tracking, and checks
+        # the global total and the layer1 convolution forward and backward totals. Skipped
+        # without torchvision.
         resnet18 = torchvision_models.resnet18()
         with FlopCounterMode(resnet18) as mode:
             a = T(1, 3, 224, 224, requires_grad=True)
@@ -291,6 +361,8 @@ class TestFlopCounter(TestCase):
         self.assertExpectedInline(str(layer1_conv_back_flops), """1849688064""")
 
     def test_conv_transpose_loop(self):
+        # [FUNCTION DOC] Runs 50 forward and backward passes of a transposed conv layer and
+        # checks the total from the mode's total-flops method (1536000).
         x = torch.rand(1, 4, 30, 2)
         model = torch.nn.ConvTranspose2d(4, 8, (2, 2), stride=2)
 
@@ -301,6 +373,9 @@ class TestFlopCounter(TestCase):
         self.assertExpectedInline(str(mode.get_total_flops()), """1536000""")
 
     def test_custom(self):
+        # [FUNCTION DOC] Checks custom_mapping: a formula given for add contributes its constant
+        # value; a formula flagged as taking raw arguments receives the output value and its
+        # element count is used.
         mode = FlopCounterMode(
             custom_mapping={torch.ops.aten.add: lambda *args, out_shape: 5}
         )
@@ -311,6 +386,8 @@ class TestFlopCounter(TestCase):
         self.assertExpectedInline(get_total_flops(mode), """5""")
 
         def count(*args, out_val):
+            # [FUNCTION DOC] HELPER: Custom flop formula that takes the raw output value and
+            # returns its element count.
             return out_val.numel()
 
         count._get_raw = True
@@ -323,6 +400,8 @@ class TestFlopCounter(TestCase):
         self.assertExpectedInline(get_total_flops(mode), """20""")
 
     def test_noop(self):
+        # [FUNCTION DOC] Runs a cos op under the counter, which has no registered formula; only
+        # checks that no error is raised.
         with FlopCounterMode() as mode:
             T(4, 5).cos()
 
@@ -334,6 +413,10 @@ class TestFlopCounter(TestCase):
         "Does not support all SDPA backends (pre-SM80 hardware on CUDA)",
     )
     def test_sdpa(self):
+        # [FUNCTION DOC] CUDA only. Compares flop totals of scaled dot product attention across
+        # math, flash, memory-efficient and cudnn backends, forward only and with backward, for
+        # uniform and non-uniform sequence lengths and head dims, checking expected totals and
+        # ratios.
         batch_size = 4
         n_heads = 8
         seq_len_q = 128
@@ -355,6 +438,9 @@ class TestFlopCounter(TestCase):
             backend,
             with_backward=False,
         ):
+            # [FUNCTION DOC] HELPER: Builds random half-precision CUDA query, key, value tensors,
+            # enables only the requested backend, runs causal attention (plus backward when
+            # asked) under a counter and returns the total flops as an integer.
             query = torch.randn(
                 batch_size,
                 n_heads,
@@ -494,6 +580,9 @@ class TestFlopCounter(TestCase):
         "Flash attention not supported (pre-SM80 hardware on CUDA)",
     )
     def test_sdpa_gqa(self):
+        # [FUNCTION DOC] CUDA only. Checks that attention with grouped key/value heads
+        # (enable_gqa) is counted the same as multi-head attention where the key and value are
+        # repeated to the query head count.
         """Test flop counting for grouped-query attention (GQA)."""
         batch_size = 2
         n_heads_q = 32
@@ -559,7 +648,13 @@ class TestFlopCounter(TestCase):
         "Does not support all SDPA backends (pre-SM80 hardware on CUDA)",
     )
     def test_sdpa_nested_tensor(self):
+        # [FUNCTION DOC] CUDA only. Checks that flop totals for jagged nested tensor attention
+        # equal the sum of per-sequence dense attention totals, for flash and memory-efficient
+        # backends, uniform and differing key lengths, with and without backward.
         def get_flops(q, k, v, backend, with_backward=False):
+            # [FUNCTION DOC] HELPER: Runs causal attention on the given inputs with only the
+            # named backend enabled under a counter (plus backward on summed output, using the
+            # values for nested outputs) and returns the integer total.
             mode = FlopCounterMode()
 
             if backend == "math":
@@ -605,6 +700,9 @@ class TestFlopCounter(TestCase):
             head_dim_v,
             dtype,
         ):
+            # [FUNCTION DOC] HELPER: Creates jagged nested CUDA query, key, value tensors with
+            # four sequences of lengths in quarters of the maximum, viewed as batch, head,
+            # sequence, dim layout; returns the three tensors.
             q_lengths = torch.tensor(
                 [
                     max_seq_len_q // 4,
@@ -658,7 +756,12 @@ class TestFlopCounter(TestCase):
             return q, k, v
 
         def get_dense_flops(q, k, v, backend, with_backward=False):
+            # [FUNCTION DOC] HELPER: Splits the nested inputs per sequence into dense tensors and
+            # sums the flops of running attention on each one separately.
             def split_tensor(x):
+                # [FUNCTION DOC] HELPER: Returns a generator that unbinds a tensor along batch
+                # and yields each slice as a detached tensor needing gradients, with the sequence
+                # and head dims swapped.
                 return (
                     y.unsqueeze(0).transpose(1, 2).detach().requires_grad_(True)
                     for y in x.transpose(1, 2).unbind(0)
@@ -777,6 +880,9 @@ class TestFlopCounter(TestCase):
         "Does not support all SDPA backends (pre-SM80 hardware on CUDA)",
     )
     def test_nested_attention_fake_tensors(self):
+        # [FUNCTION DOC] CUDA only. Checks flash attention forward on fake tensors with offsets
+        # (variable length) gives the same flop total as the dense real-tensor call of equivalent
+        # shape.
         x = torch.randn(123, 4, 16, device="cuda", dtype=torch.bfloat16)
         offsets = torch.tensor([0, 30, 60, 90, 123], device="cuda")
         max_seqlen = 40
@@ -820,6 +926,8 @@ class TestFlopCounter(TestCase):
         )
 
     def test_flash_attention_forward_flop_layout(self):
+        # [FUNCTION DOC] Checks the flop count of the flash forward op on meta tensors in batch,
+        # sequence, head, dim layout equals the sdpa formula for the head-first shape.
         B, S, H, D = 2, 128, 8, 64
         q = torch.randn(B, S, H, D, device="meta", dtype=torch.float16)
         k = torch.randn(B, S, H, D, device="meta", dtype=torch.float16)
@@ -844,6 +952,8 @@ class TestFlopCounter(TestCase):
         self.assertEqual(flash_flops, expected)
 
     def test_flash_attention_backward_flop_layout(self):
+        # [FUNCTION DOC] Checks the flop count of the flash backward op on meta tensors equals
+        # the sdpa backward formula for the head-first shape.
         B, S, H, D = 2, 128, 8, 64
         q = torch.randn(B, S, H, D, device="meta", dtype=torch.float16)
         k = torch.randn(B, S, H, D, device="meta", dtype=torch.float16)
@@ -881,7 +991,10 @@ class TestFlopCounter(TestCase):
         self.assertEqual(bwd_flops, expected)
 
     def test_addmm_out(self):
+        # [FUNCTION DOC] Checks mm with an out argument is counted (total 2000).
         def f(x):
+            # [FUNCTION DOC] HELPER: Multiplies the input by itself writing into a freshly made
+            # zero matrix.
             y = torch.zeros(10, 10)
             return torch.mm(x, x, out=y)
 
@@ -891,6 +1004,9 @@ class TestFlopCounter(TestCase):
         self.assertExpectedInline(get_total_flops(mode), """2000""")
 
     def test_matmul_flop_formula_extra_positional_out(self):
+        # [FUNCTION DOC] Regression test: the registered matmul-type formulas (bmm, baddbmm,
+        # addmm) must tolerate an extra trailing positional output shape while the output shape
+        # is also passed by keyword, and return the expected counts.
         # Regression test: Inductor's count_flops_fx can hand a matmul flop
         # formula the output as an extra trailing positional arg, while
         # shape_wrapper simultaneously passes out_shape by keyword.
@@ -919,6 +1035,8 @@ class TestFlopCounter(TestCase):
         )
 
     def test_hook_registration(self):
+        # [FUNCTION DOC] Checks entering the counter mode registers one global forward pre-hook
+        # and one global forward hook, and that both are removed on exit.
         model = torch.nn.Linear(100, 100)
         x = torch.randn(3, 100)
 
@@ -931,18 +1049,28 @@ class TestFlopCounter(TestCase):
         self.assertEqual(len(torch.nn.modules.module._global_forward_hooks), 0)
 
     def test_pytrees(self):
+        # [FUNCTION DOC] Checks module-level flop attribution when module inputs and outputs are
+        # dicts or tuples (pytrees): the per-module mm totals are 12000 for the nested module and
+        # 6000 for the single one.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward applies relu in place to the dict entry
+            # and returns a dict holding its matrix square.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies relu in place to the entry in the input dict,
+                # returns a dict with the mm of that entry with itself.
                 x = x["a"].relu_()
                 return {"a": torch.mm(x, x)}
 
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding two Foo children that are applied in sequence.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the two Foo child modules.
                 super().__init__()
                 self.a = Foo()
                 self.b = Foo()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs the first child then the second on the input.
                 return self.b(self.a(x))
 
         mod = Mod()
@@ -955,7 +1083,10 @@ class TestFlopCounter(TestCase):
         )
 
         class Mod2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning a one-element tuple holding the matrix square
+            # of its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns a tuple with the mm of the input with itself.
                 return (torch.mm(x, x),)
 
         mod = Mod2()
@@ -966,15 +1097,21 @@ class TestFlopCounter(TestCase):
         )
 
     def test_warning(self):
+        # [FUNCTION DOC] Checks that creating the counter mode with a module argument emits a
+        # UserWarning mentioning that it is not needed.
         mod = torch.nn.Linear(2, 2)
         with self.assertWarnsRegex(UserWarning, "not needed"):
             FlopCounterMode(mod)
 
     def test_custom_op(self):
+        # [FUNCTION DOC] Registers a flop formula for a custom library op: registering with a
+        # non-packet overload raises ValueError; with the packet, the formula is called once and
+        # its value 9001 is the total.
         from torch.utils.flop_counter import FlopCounterMode, register_flop_formula
 
         @torch.library.custom_op("mylib::foo", mutates_args=())
         def foo(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Custom op returning the sine of the input.
             return x.sin()
 
         called = 0
@@ -986,6 +1123,8 @@ class TestFlopCounter(TestCase):
 
         @register_flop_formula(torch.ops.mylib.foo)
         def formula(*args, **kwargs):
+            # [FUNCTION DOC] HELPER: Flop formula that increments the enclosing call counter and
+            # returns 9001.
             nonlocal called
             called += 1
             return 9001
@@ -999,11 +1138,17 @@ class TestFlopCounter(TestCase):
 
     @requires_cuda_and_triton
     def test_flop_counter_custom_triton_manual_decomp(self):
+        # [FUNCTION DOC] CUDA and triton. Registers a flop formula for a triton kernel and checks
+        # the direct kernel launch counts it. Then wraps the kernel launch in a triton op,
+        # registers a dispatch rule that re-runs the kernel under the counter, and checks the op
+        # also yields the formula's count.
         import triton
         import triton.language as tl
 
         from torch.utils.flop_counter import _FlopCounterMode, register_flop_formula
 
+        # [FUNCTION DOC] HELPER: Triton kernel writing the sine of each input element to the
+        # output, masked by the element count.
         @triton.jit
         def sin_kernel(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(axis=0)
@@ -1019,10 +1164,13 @@ class TestFlopCounter(TestCase):
 
         @register_flop_formula(sin_kernel)
         def compute_sin_kernel_flops(*args, **kwargs) -> int:
+            # [FUNCTION DOC] HELPER: Dummy flop formula returning 2 for the sin kernel.
             # dummy implementation
             return 2
 
         def sin_grid(meta):
+            # [FUNCTION DOC] HELPER: Launch grid: ceiling division of 3 elements by the block
+            # size.
             return (triton.cdiv(3, meta["BLOCK_SIZE"]),)
 
         with FlopCounterMode() as m:
@@ -1033,9 +1181,12 @@ class TestFlopCounter(TestCase):
         # Now, wrap in a triton op and do the decomp
         @torch._library.triton.triton_op("mylib::sin_op", mutates_args=())
         def op() -> None:
+            # [FUNCTION DOC] HELPER: Triton op body launching the sin kernel on the test tensors.
             torch.library.wrap_triton(sin_kernel)[sin_grid](x, out, 3, 256)
 
         def op_decompose(mode, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Dispatch rule that launches the sin kernel inside the given
+            # counter mode so its formula is counted.
             with mode:
                 torch.library.wrap_triton(sin_kernel)[sin_grid](x, out, 3, 256)
 
@@ -1049,11 +1200,16 @@ class TestFlopCounter(TestCase):
 
     @requires_cuda_and_triton
     def test_flop_counter_custom_triton_op_two_kernels_manual_decomp(self):
+        # [FUNCTION DOC] CUDA and triton. Like the single-kernel decomposition test, but the
+        # triton op launches a sin and a cos kernel with formulas of 1 each; checks direct
+        # launches and the decomposed op both total 2.
         import triton
         import triton.language as tl
 
         from torch.utils.flop_counter import _FlopCounterMode, register_flop_formula
 
+        # [FUNCTION DOC] HELPER: Triton kernel writing the sine of each input element, masked by
+        # element count.
         @triton.jit
         def sin_kernel(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(axis=0)
@@ -1064,6 +1220,8 @@ class TestFlopCounter(TestCase):
             out = tl.sin(x)
             tl.store(out_ptr + offsets, out, mask=mask)
 
+        # [FUNCTION DOC] HELPER: Triton kernel writing the cosine of each input element, masked
+        # by element count.
         @triton.jit
         def cos_kernel(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(axis=0)
@@ -1079,16 +1237,22 @@ class TestFlopCounter(TestCase):
 
         @register_flop_formula(sin_kernel)
         def compute_sin_kernel_flops(*args, **kwargs) -> int:
+            # [FUNCTION DOC] HELPER: Flop formula returning 1 for the sin kernel.
             return 1
 
         @register_flop_formula(cos_kernel)
         def compute_cos_kernel_flops(*args, **kwargs) -> int:
+            # [FUNCTION DOC] HELPER: Flop formula returning 1 for the cos kernel.
             return 1
 
         def sin_grid(meta):
+            # [FUNCTION DOC] HELPER: Launch grid for the sin kernel, ceiling division of 3 by
+            # block size.
             return (triton.cdiv(3, meta["BLOCK_SIZE"]),)
 
         def cos_grid(meta):
+            # [FUNCTION DOC] HELPER: Launch grid for the cos kernel, ceiling division of 3 by
+            # block size.
             return (triton.cdiv(3, meta["BLOCK_SIZE"]),)
 
         with FlopCounterMode() as m:
@@ -1100,10 +1264,14 @@ class TestFlopCounter(TestCase):
         # Now, wrap in a triton op and do the decomp
         @torch._library.triton.triton_op("mylib::trig_op", mutates_args=())
         def trig_op() -> None:
+            # [FUNCTION DOC] HELPER: Triton op body launching the sin and cos kernels on the test
+            # tensors.
             torch.library.wrap_triton(sin_kernel)[sin_grid](x, out, 3, 256)
             torch.library.wrap_triton(cos_kernel)[cos_grid](x, out, 3, 256)
 
         def op_decompose(mode, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Dispatch rule launching both kernels inside the given
+            # counter mode.
             with mode:
                 torch.library.wrap_triton(sin_kernel)[sin_grid](x, out, 3, 256)
                 torch.library.wrap_triton(cos_kernel)[cos_grid](x, out, 3, 256)
@@ -1126,11 +1294,17 @@ class TestFlopCounter(TestCase):
     @torch._functorch.config.patch("activation_memory_budget_solver", "dp")
     @torch._functorch.config.patch("is_non_builtin_to_include", True)
     def test_flop_counter_custom_triton_op_two_kernels_auto_ac(self):
+        # [FUNCTION DOC] CUDA and triton, with memory budget solver config patched. Defines a
+        # triton op with sin and cos kernels, custom autograd, and compiles three chained calls
+        # with the decomposing partition backend; checks each kernel formula was invoked 3 times
+        # during partitioning.
         import triton
         import triton.language as tl
 
         from torch.utils.flop_counter import register_flop_formula
 
+        # [FUNCTION DOC] HELPER: Triton kernel writing the sine of each input element, masked by
+        # element count.
         @triton.jit
         def sin_kernel(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(axis=0)
@@ -1141,6 +1315,8 @@ class TestFlopCounter(TestCase):
             out = tl.sin(x)
             tl.store(out_ptr + offsets, out, mask=mask)
 
+        # [FUNCTION DOC] HELPER: Triton kernel writing the cosine of each input element, masked
+        # by element count.
         @triton.jit
         def cos_kernel(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
             pid = tl.program_id(axis=0)
@@ -1158,6 +1334,8 @@ class TestFlopCounter(TestCase):
 
         @register_flop_formula(sin_kernel)
         def compute_sin_kernel_flops(*args, **kwargs) -> int:
+            # [FUNCTION DOC] HELPER: Flop formula for the sin kernel; increments the enclosing
+            # sin call counter and returns 1.
             # dummy implementation
             nonlocal sin_flops_recorded
             sin_flops_recorded += 1
@@ -1165,19 +1343,25 @@ class TestFlopCounter(TestCase):
 
         @register_flop_formula(cos_kernel)
         def compute_cos_kernel_flops(*args, **kwargs) -> int:
+            # [FUNCTION DOC] HELPER: Flop formula for the cos kernel; increments the enclosing
+            # cos call counter and returns 1.
             # dummy implementation
             nonlocal cos_flops_recorded
             cos_flops_recorded += 1
             return 1
 
         def sin_grid(meta):
+            # [FUNCTION DOC] HELPER: Launch grid for the sin kernel over the full element count.
             return (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
 
         def cos_grid(meta):
+            # [FUNCTION DOC] HELPER: Launch grid for the cos kernel over the full element count.
             return (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
 
         @torch._library.triton.triton_op("mylib::trig_op", mutates_args=())
         def trig_op(x_inp: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Triton op that allocates an output like the input and runs
+            # the sin kernel then the cos kernel on it; returns the output.
             output = torch.empty_like(x_inp)
             torch.library.wrap_triton(sin_kernel)[sin_grid](
                 x_inp, output, n_elements, 256
@@ -1189,15 +1373,19 @@ class TestFlopCounter(TestCase):
 
         # Register a backward
         def trig_op_backward(ctx, grad_output):
+            # [FUNCTION DOC] HELPER: Backward for the triton op; multiplies the gradient by the
+            # saved output.
             (out,) = ctx.saved_tensors
             return grad_output * out
 
         def trig_op_setup_context(ctx, inputs, output):
+            # [FUNCTION DOC] HELPER: Saves the op output for backward.
             ctx.save_for_backward(output)
 
         trig_op.register_autograd(trig_op_backward, setup_context=trig_op_setup_context)
 
         def fn(x_inp: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Applies the triton op three times in sequence.
             y1 = torch.ops.mylib.trig_op(x_inp)
             y2 = torch.ops.mylib.trig_op(y1)
             y3 = torch.ops.mylib.trig_op(y2)
@@ -1219,7 +1407,11 @@ class TestFlopCounter(TestCase):
 
     @skipIfNoTorchVision
     def test_inference_mode(self):
+        # [FUNCTION DOC] Checks flop totals and resnet layer1 conv totals are the same when the
+        # model is counted normally and inside inference mode. Skipped without torchvision.
         def get_flops(model):
+            # [FUNCTION DOC] HELPER: Runs a resnet forward on a random image under a counter
+            # attached to the model and returns the finished mode.
             with FlopCounterMode(model) as mode:
                 a = T(1, 3, 224, 224)
                 model(a).sum()
@@ -1250,6 +1442,8 @@ class TestFlopCounter(TestCase):
         "FP8 is only supported on H100+, SM 8.9 and MI300+ devices",
     )
     def test_scaled_mm(self):
+        # [FUNCTION DOC] CUDA with fp8 support only. Counts a scaled matrix multiply on fp8
+        # inputs with unit scales and bfloat16 output, expecting a total of 860160.
         dtype = e4m3_type
         with FlopCounterMode() as mode:
             torch._scaled_mm(
@@ -1268,6 +1462,9 @@ class TestFlopCounter(TestCase):
         "Flash attention not supported (pre-SM80 hardware on CUDA)",
     )
     def test_varlen_attn(self):
+        # [FUNCTION DOC] CUDA with flash attention only. Counts the varlen attention op on packed
+        # sequences of length 128 and 64: forward must equal the sum of per-sequence sdpa counts
+        # (41943040), and forward plus backward must be seven halves of that (146800640).
         import torch.nn.attention.varlen
 
         n_heads = 8
@@ -1352,7 +1549,13 @@ class TestFlopCounter(TestCase):
 
 
 class TestFlexAttentionEstimation(TestCase):
+    # [CLASS DOC] Tests for flop estimation of flex attention higher-order ops and its sparsity
+    # hint. No state.
     def test_flex_attention_flop_registration(self):
+        # [FUNCTION DOC] Checks flex attention forward and backward ops are in the flop registry,
+        # that the overlap scheduling compute-node check accepts a flex attention node and an mm
+        # node but not a placeholder, and that the registry formula on grouped-query shapes
+        # equals the sdpa formula.
         """flex_attention HOPs are registered in flop_registry and recognized as compute nodes."""
         from torch._inductor.fx_passes.overlap_scheduling import is_compute_node
         from torch.utils.flop_counter import flop_registry
@@ -1402,6 +1605,9 @@ class TestFlexAttentionEstimation(TestCase):
     @xfailIfNoAcceleratorTriton
     @unittest.skipIf(not HAS_CUDA, "requires CUDA")
     def test_flex_attention_roofline_estimate(self):
+        # [FUNCTION DOC] Requires CUDA and triton (expected failure without accelerator triton).
+        # Checks that the roofline runtime estimator returns a positive time for a flex attention
+        # node whose output tuple mixes bfloat16 and float32 tensors.
         """estimate_roofline_runtime_ms works for flex_attention with mixed-dtype output."""
         from torch._inductor.fx_passes.overlap_scheduling import (
             estimate_roofline_runtime_ms,
@@ -1434,13 +1640,20 @@ class TestFlexAttentionEstimation(TestCase):
         self.assertGreater(est_ms, 0.0)
 
     def test_sparsity_hint_annotate_propagates(self):
+        # [FUNCTION DOC] Exports a small module whose flex attention call is wrapped in an
+        # annotation with a sparsity hint of 0.9 under fake mode, and checks the exported flex
+        # attention node carries that hint in its custom metadata.
         """fx_traceback.annotate propagates sparsity_hint to flex_attention node."""
         from torch._subclasses.fake_tensor import FakeTensorMode
         from torch.fx.traceback import annotate, preserve_node_meta
         from torch.nn.attention.flex_attention import flex_attention
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module calling flex attention inside an annotation setting a
+            # sparsity hint.
             def forward(self, q, k, v):
+                # [FUNCTION DOC] HELPER: Returns flex attention of the inputs within the
+                # annotated region.
                 with annotate({"sparsity_hint": 0.9}):
                     return flex_attention(q, k, v)
 
@@ -1463,6 +1676,9 @@ class TestFlexAttentionEstimation(TestCase):
         self.assertAlmostEqual(custom["sparsity_hint"], 0.9)
 
     def test_sparsity_hint_affects_flex_attention_flops(self):
+        # [FUNCTION DOC] Exports dense and 0.5-sparsity-hint modules of flex attention, computes
+        # each node's flops from the registry formula, and checks the sparse count is half the
+        # dense count.
         """sparsity_hint via annotate reduces flex_attention flop count."""
         from torch._subclasses.fake_tensor import FakeTensorMode
         from torch.fx.traceback import annotate, preserve_node_meta
@@ -1470,11 +1686,17 @@ class TestFlexAttentionEstimation(TestCase):
         from torch.utils._pytree import tree_map
 
         class Dense(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module calling flex attention without any annotation.
             def forward(self, q, k, v):
+                # [FUNCTION DOC] HELPER: Returns flex attention of the inputs.
                 return flex_attention(q, k, v)
 
         class Sparse(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module calling flex attention inside an annotation with a 0.5
+            # sparsity hint.
             def forward(self, q, k, v):
+                # [FUNCTION DOC] HELPER: Returns flex attention of the inputs within the
+                # annotated region.
                 with annotate({"sparsity_hint": 0.5}):
                     return flex_attention(q, k, v)
 
@@ -1485,6 +1707,8 @@ class TestFlexAttentionEstimation(TestCase):
                 sparse_ep = torch.export.export(Sparse(), (q, q, q), strict=False)
 
         def find_flex(graph):
+            # [FUNCTION DOC] HELPER: Returns the first call node in the graph whose target
+            # mentions flex attention, or None.
             return next(
                 (
                     n
@@ -1500,11 +1724,16 @@ class TestFlexAttentionEstimation(TestCase):
         self.assertIsNotNone(sparse_node)
 
         def get_flops(node):
+            # [FUNCTION DOC] HELPER: Looks up the registry formula for the node's target and
+            # evaluates it on the argument values taken from node metadata, passing the output
+            # value and node metadata; returns the flop count. Asserts the registry key exists.
             from torch._inductor.fx_passes.overlap_scheduling import (
                 _get_flop_registry_key,
             )
 
             def _get_val(n):
+                # [FUNCTION DOC] HELPER: Returns the metadata value of a graph node, or the input
+                # unchanged if not a node.
                 return n.meta.get("val") if isinstance(n, torch.fx.Node) else n
 
             args = tree_map(_get_val, node.args)
