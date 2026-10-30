@@ -1,4 +1,11 @@
 # Owner(s): ["module: cpp"]
+# [MODULE DOC] Entry point that generates C++ API parity tests for torch.nn modules and
+# functionals. At import time it parses the parity tracker table, builds one test per eligible
+# test-parameter dictionary and device (cpu and cuda) from the sample and common_nn test lists
+# and installs them on the TestCppApiParity class, raises AssertionError if the generated counts
+# do not match the expected totals (including four tests each for the sample module and sample
+# functional), and then builds the C++ side tests. PRINT_CPP_SOURCE can be turned on to print
+# generated C++ source.
 
 
 import os
@@ -31,6 +38,9 @@ parity_table = parse_parity_tracker_table(PARITY_TABLE_PATH)
 
 @torch.testing._internal.common_utils.markDynamoStrictTest
 class TestCppApiParity(common.TestCase):
+    # [CLASS DOC] Container for generated parity tests, marked as dynamo strict. Test methods
+    # are attached dynamically by the parity check helpers; the two mappings from test name to
+    # parameters are class attributes filled by those helpers.
     module_test_params_map = {}
     functional_test_params_map = {}
 

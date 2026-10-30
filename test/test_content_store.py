@@ -1,4 +1,8 @@
 # Owner(s): ["oncall: pt2"]
+# [MODULE DOC] Tests for the content store used to dump and reload tensors by content hash:
+# writing tensors, reading them back with shared storage deduplication, hashing scalar and
+# repeated storages, and the debug load-tensor operator under real and fake tensor modes. Device
+# tests are instantiated at import time with MPS and XPU allowed.
 
 import torch
 from torch._prims.debug_prims import load_tensor_reader
@@ -18,7 +22,14 @@ from torch.utils._content_store import (
 
 
 class TestContentStore(TestCase):
+    # [CLASS DOC] Device-generic tests for ContentStoreWriter, ContentStoreReader, hash_storage
+    # and the debug load-tensor operator.
     def test_basic(self, device):
+        # [FUNCTION DOC] Writes tensors x, y and a view z of x into a temporary store, then
+        # mutates x in place through its data attribute (not tracked by the version counter) and
+        # writes x, y, z again under new names. Reads everything back and checks: old entries
+        # have the pre-mutation values, x and z share one storage, new entries match the current
+        # values, and the unchanged y reuses the same storage as its first read.
         # setup test data
         x = torch.randn(4, device=device)
         y = torch.randn(6, device=device)
@@ -59,22 +70,35 @@ class TestContentStore(TestCase):
             )
 
     def test_scalar(self, device):
+        # [FUNCTION DOC] Hashes the storage of a zero-dimensional tensor; the only check is that
+        # no error is raised.
         # Should not raise an error
         hash_storage(torch.tensor(2, device=device).untyped_storage())
 
     @torch._dynamo.config.patch(recompile_limit=1)
     def test_repeated_hash(self, device):
+        # [FUNCTION DOC] With the dynamo recompile limit patched to one, hashes the same kind of
+        # scalar storage four times; guards against the hash function recompiling, which would
+        # run an unsupported primitive in eager mode and fail.
         # Test that repeated hashing doesn't trigger a recompile in dynamo
         # If it does, we will execute prims.xor_sum in eager which fails
         for _ in range(4):
             hash_storage(torch.tensor(2, device=device).untyped_storage())
 
     def test_load_tensor(self, device):
+        # [FUNCTION DOC] Writes a four-element tensor into a temporary store and, with the
+        # tensor reader active, loads it via the debug load-tensor operator several times:
+        # values equal and storages are distinct (no aliasing), a fake tensor mode returns a
+        # FakeTensor with matching metadata, and float64 loading works except on MPS. After
+        # leaving the reader context, one more load must still return a tensor with matching
+        # metadata.
         with TemporaryDirectoryName() as loc:
             writer = ContentStoreWriter(loc)
             x = torch.randn(4, device=device)
 
             def same_meta_as_x(t):
+            # [FUNCTION DOC] HELPER: Asserts that the given tensor has the same size, stride,
+            # dtype and device as the original tensor x of the enclosing test.
                 self.assertEqual(t.size(), x.size())
                 self.assertEqual(t.stride(), x.stride())
                 self.assertEqual(t.dtype, x.dtype)

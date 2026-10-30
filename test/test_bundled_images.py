@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # Owner(s): ["oncall: mobile"]
 # mypy: allow-untyped-defs
+# [MODULE DOC] Test of bundling JPEG-compressed images as inflatable bundled inputs for a
+# scripted module and decoding them after a save/load round trip. Requires cv2 and an internal
+# operator library (loaded at import time); running the file as a script raises RuntimeError
+# because the test is not enabled in the open-source test discovery.
 
 import io
 
@@ -15,12 +19,16 @@ torch.ops.load_library("//caffe2/torch/fb/operators:decode_bundled_image")
 
 
 def model_size(sm):
+    # [FUNCTION DOC] HELPER: Returns the byte size of the module when serialized with the jit
+    # save function into an in-memory buffer.
     buffer = io.BytesIO()
     torch.jit.save(sm, buffer)
     return len(buffer.getvalue())
 
 
 def save_and_load(sm):
+    # [FUNCTION DOC] HELPER: Serializes the scripted module into an in-memory buffer, rewinds it
+    # and returns the module loaded back with the jit load function.
     buffer = io.BytesIO()
     torch.jit.save(sm, buffer)
     buffer.seek(0)
@@ -37,6 +45,11 @@ def save_and_load(sm):
 
 
 def bundle_jpeg_image(img_tensor, quality):
+    # [FUNCTION DOC] HELPER: Wraps an image tensor as a bundled-inputs InflatableArg. A 4-D
+    # tensor must have batch size one (else an AssertionError is raised) and is converted from
+    # NCHW to HWC. The pixels are JPEG-encoded with cv2 at the given quality, flattened into a
+    # byte tensor, and paired with a decode expression using the internal decode_bundled_image
+    # operator.
     # turn NCHW to HWC
     if img_tensor.dim() == 4:
         if img_tensor.size(0) != 1:
@@ -56,6 +69,8 @@ def bundle_jpeg_image(img_tensor, quality):
 
 
 def get_tensor_from_raw_BGR(im) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Converts a BGR image array into a float RGB tensor in NCHW layout
+    # with a batch dimension of one and values scaled to the 0-1 range.
     raw_data = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
     raw_data = torch.from_numpy(raw_data).float()
     raw_data = raw_data.permute(2, 0, 1)
@@ -64,9 +79,19 @@ def get_tensor_from_raw_BGR(im) -> torch.Tensor:
 
 
 class TestBundledImages(TestCase):
+    # [CLASS DOC] Test case for bundling compressed images with
+    # augment_model_with_bundled_inputs.
     def test_single_tensors(self):
+        # [FUNCTION DOC] Reads a sample jpg, bundles it with quality 90 into an identity
+        # scripted model, saves/loads the model and checks the inflated bundled input matches
+        # the raw image tensor within loose tolerances. Then decodes the raw file bytes with the
+        # internal NCHW decode operator (diagonal 1/255 weight, zero bias) and compares to the
+        # same raw tensor. Uses hard-coded internal file paths.
         class SingleTensorModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Minimal module whose forward returns its single argument
+            # unchanged.
             def forward(self, arg):
+            # [FUNCTION DOC] HELPER: Returns the argument unchanged.
                 return arg
 
         im = cv2.imread("caffe2/test/test_img/p1.jpg")

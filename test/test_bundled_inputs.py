@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # Owner(s): ["oncall: mobile"]
 # mypy: allow-untyped-defs
+# [MODULE DOC] Tests for torch.utils.bundled_inputs: attaching sample inputs to scripted
+# modules, keeping the serialized size small via compact encodings, inflating them after
+# save/load, bundling several methods, rejecting invalid inputs, repeated augmentation, and
+# custom inflatable arguments with format functions. No import-time side effects.
 
 import io
 import textwrap
@@ -11,12 +15,16 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 
 def model_size(sm):
+    # [FUNCTION DOC] HELPER: Returns the number of bytes of the module serialized with the jit
+    # save function into an in-memory buffer.
     buffer = io.BytesIO()
     torch.jit.save(sm, buffer)
     return len(buffer.getvalue())
 
 
 def save_and_load(sm):
+    # [FUNCTION DOC] HELPER: Saves the scripted module into an in-memory buffer, rewinds it and
+    # returns the module loaded back with the jit load function.
     buffer = io.BytesIO()
     torch.jit.save(sm, buffer)
     buffer.seek(0)
@@ -24,9 +32,20 @@ def save_and_load(sm):
 
 
 class TestBundledInputs(TestCase):
+    # [CLASS DOC] Test case for augmenting scripted modules with bundled inputs and reading them
+    # back.
     def test_single_tensors(self):
+        # [FUNCTION DOC] Bundles seven kinds of tensor samples (small, expanded, tiny view of
+        # large storage, zeros, channels-last ones, random bundle, quantized) into an identity
+        # scripted model. Checks the serialized size grows under 4096 bytes, the loaded model
+        # reports the right count, the model returns its argument unchanged, and every inflated
+        # sample is a one-tuple tensor whose stride and values match the original, except the
+        # random one (index 5), which is only checked for shape, mean near zero and standard
+        # deviation near one.
         class SingleTensorModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Identity module used as the scripting target.
             def forward(self, arg):
+                # [FUNCTION DOC] HELPER: Returns the argument unchanged.
                 return arg
 
         sm = torch.jit.script(SingleTensorModel())
@@ -84,8 +103,13 @@ class TestBundledInputs(TestCase):
         self.assertEqual(inflated[5][0].std().item(), 1, atol=0.02, rtol=0)
 
     def test_large_tensor_with_inflation(self):
+        # [FUNCTION DOC] Bundles a large random tensor through bundle_large_tensor (custom
+        # inflation) into an identity scripted model, saves/loads, and checks the single
+        # inflated input equals the tensor.
         class SingleTensorModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Identity module used as the scripting target.
             def forward(self, arg):
+                # [FUNCTION DOC] HELPER: Returns the argument unchanged.
                 return arg
 
         sm = torch.jit.script(SingleTensorModel())
@@ -102,10 +126,19 @@ class TestBundledInputs(TestCase):
         self.assertEqual(inflated[0][0], sample_tensor)
 
     def test_rejected_tensors(self):
+        # [FUNCTION DOC] Checks that tensors which cannot be compactly encoded are rejected: a
+        # plain big tensor and a two-element tensor with widely spaced storage. Both must make
+        # augmentation raise an exception whose message mentions the bundled input argument.
         def check_tensor(sample):
+            # [FUNCTION DOC] HELPER: For one sample tensor, scripts a fresh identity module and
+            # asserts that augmenting it with that single input raises an exception matching the
+            # bundled-input message.
             # Need to define the class in this scope to get a fresh type for each run.
             class SingleTensorModel(torch.nn.Module):
+                # [CLASS DOC] HELPER: Identity module defined inside the helper to get a fresh
+                # type on every call.
                 def forward(self, arg):
+                    # [FUNCTION DOC] HELPER: Returns the argument unchanged.
                     return arg
 
             sm = torch.jit.script(SingleTensorModel())
@@ -124,8 +157,13 @@ class TestBundledInputs(TestCase):
         check_tensor(small_sparse)
 
     def test_non_tensors(self):
+        # [FUNCTION DOC] Bundles two non-tensor samples (a format string and an int) for a
+        # scripted module, checks the inflated inputs equal the samples and that running the
+        # model on the first inflated input returns the formatted text.
         class StringAndIntModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module taking a string and an int.
             def forward(self, fmt: str, num: int):
+                # [FUNCTION DOC] HELPER: Returns the string formatted with the integer.
                 return fmt.format(num)
 
         sm = torch.jit.script(StringAndIntModel())
@@ -142,12 +180,21 @@ class TestBundledInputs(TestCase):
         self.assertTrue(loaded(*inflated[0]) == "first 1")
 
     def test_multiple_methods_with_inputs(self):
+        # [FUNCTION DOC] Bundles the same samples and info strings for two methods (forward and
+        # an exported foo) with the many-functions API. Checks the generic and per-method
+        # inflated inputs all equal the samples, the count helper, the function-and-info mapping
+        # (keys, getter names, info lists), and that each getter named in the mapping returns
+        # the samples.
         class MultipleMethodModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with forward and an exported method, both returning
+            # their argument.
             def forward(self, arg):
+                # [FUNCTION DOC] HELPER: Returns the argument unchanged.
                 return arg
 
             @torch.jit.export
             def foo(self, arg):
+                # [FUNCTION DOC] HELPER: Exported method returning the argument unchanged.
                 return arg
 
         mm = torch.jit.script(MultipleMethodModel())
@@ -210,12 +257,19 @@ class TestBundledInputs(TestCase):
             self.assertEqual(func_to_run(), samples)
 
     def test_multiple_methods_with_inputs_both_defined_failure(self):
+        # [FUNCTION DOC] Defines the forward input generator by hand on the scripted module and
+        # then also passes inputs for both methods to the many-functions augmentation; expects
+        # an exception because the inputs would be defined two ways.
         class MultipleMethodModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with forward and an exported method, both returning
+            # their argument.
             def forward(self, arg):
+                # [FUNCTION DOC] HELPER: Returns the argument unchanged.
                 return arg
 
             @torch.jit.export
             def foo(self, arg):
+                # [FUNCTION DOC] HELPER: Exported method returning the argument unchanged.
                 return arg
 
         samples = [(torch.tensor([1]),)]
@@ -239,12 +293,19 @@ class TestBundledInputs(TestCase):
             )
 
     def test_multiple_methods_with_inputs_neither_defined_failure(self):
+        # [FUNCTION DOC] Within an exception-expecting block, calls a never-defined forward
+        # input generator on the scripted module and then augments with missing inputs for
+        # forward; expects an exception because no input source exists.
         class MultipleMethodModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with forward and an exported method, both returning
+            # their argument.
             def forward(self, arg):
+                # [FUNCTION DOC] HELPER: Returns the argument unchanged.
                 return arg
 
             @torch.jit.export
             def foo(self, arg):
+                # [FUNCTION DOC] HELPER: Exported method returning the argument unchanged.
                 return arg
 
         samples = [(torch.tensor([1]),)]
@@ -262,8 +323,12 @@ class TestBundledInputs(TestCase):
             )
 
     def test_bad_inputs(self):
+        # [FUNCTION DOC] Expects TypeError when the inputs argument is a string and when it is a
+        # list of bare tensors instead of tuples.
         class SingleTensorModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Identity module used as the scripting target.
             def forward(self, arg):
+                # [FUNCTION DOC] HELPER: Returns the argument unchanged.
                 return arg
 
         # Non list for input list
@@ -283,8 +348,12 @@ class TestBundledInputs(TestCase):
             )
 
     def test_double_augment_fail(self):
+        # [FUNCTION DOC] Augments a scripted model, then augments it again and expects an
+        # exception saying models can only be augmented with bundled inputs once.
         class SingleTensorModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Identity module used as the scripting target.
             def forward(self, arg):
+                # [FUNCTION DOC] HELPER: Returns the argument unchanged.
                 return arg
 
         m = torch.jit.script(SingleTensorModel())
@@ -299,8 +368,13 @@ class TestBundledInputs(TestCase):
             )
 
     def test_double_augment_non_mutator(self):
+        # [FUNCTION DOC] Uses bundle_inputs, which returns a new model: the original has no
+        # bundled-input accessor (AttributeError) while the returned model returns the bundled
+        # inputs and still runs forward as an identity.
         class SingleTensorModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Identity module used as the scripting target.
             def forward(self, arg):
+                # [FUNCTION DOC] HELPER: Returns the argument unchanged.
                 return arg
 
         m = torch.jit.script(SingleTensorModel())
@@ -313,8 +387,13 @@ class TestBundledInputs(TestCase):
         self.assertEqual(bundled_model.forward(torch.ones(1)), torch.ones(1))
 
     def test_double_augment_success(self):
+        # [FUNCTION DOC] Bundles inputs for forward with bundle_inputs, then bundles the
+        # resulting model again with different inputs; each returned model reports only its own
+        # bundled inputs.
         class SingleTensorModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Identity module used as the scripting target.
             def forward(self, arg):
+                # [FUNCTION DOC] HELPER: Returns the argument unchanged.
                 return arg
 
         m = torch.jit.script(SingleTensorModel())
@@ -329,13 +408,23 @@ class TestBundledInputs(TestCase):
         self.assertEqual(bundled_model2.get_all_bundled_inputs(), [(torch.ones(2),)])
 
     def test_dict_args(self):
+        # [FUNCTION DOC] Scripts a model with optional dict, optional list and tensor arguments,
+        # builds big and small bundled inputs using condensed single-storage tensors and custom
+        # inflatable args that regenerate random tensors, and augments the model. Checks
+        # serialized growth stays under 8192 bytes, the inflated first input has the right
+        # arity, and exactly four inflate helper methods exist (two inputs times two custom
+        # arguments).
         class MyModel(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module taking an optional dict, an optional list and a tensor.
             def forward(
                 self,
                 arg1: dict[str, torch.Tensor] | None,
                 arg2: list[torch.Tensor] | None,
                 arg3: torch.Tensor,
             ):
+                # [FUNCTION DOC] HELPER: Returns the tensor argument if the dict is missing;
+                # otherwise the sum of two dict entries, plus the first list element when the
+                # list is present.
                 if arg1 is None:
                     return arg3
                 elif arg2 is None:
@@ -358,6 +447,9 @@ class TestBundledInputs(TestCase):
         big_list = [torch.zeros([1 << 5, 1 << 8, 1 << 10])]
 
         def condensed(t):
+            # [FUNCTION DOC] HELPER: Returns a tensor with the shape of the input backed by a
+            # single stored element (first element of an empty-like copy, expanded). Raises
+            # AssertionError if the storage size is not one.
             ret = torch.empty_like(t).flatten()[0].clone().expand(t.shape)
             if ret.storage().size() != 1:
                 raise AssertionError(
@@ -367,6 +459,9 @@ class TestBundledInputs(TestCase):
             return ret
 
         def bundle_optional_dict_of_randn(template):
+            # [FUNCTION DOC] HELPER: Wraps an optional dict of tensors as an InflatableArg whose
+            # stored value is the dict of condensed tensors (or none) and whose format function
+            # regenerates random tensors of the same shapes on inflation.
             return torch.utils.bundled_inputs.InflatableArg(
                 value=(
                     None
@@ -386,6 +481,9 @@ class TestBundledInputs(TestCase):
             )
 
         def bundle_optional_list_of_randn(template):
+            # [FUNCTION DOC] HELPER: Wraps an optional list of tensors as an InflatableArg whose
+            # stored value is the list of condensed tensors (or none) and whose format function
+            # regenerates random tensors of the same shapes on inflation.
             return torch.utils.bundled_inputs.InflatableArg(
                 value=(None if template is None else [condensed(v) for v in template]),
                 fmt="{}",
