@@ -1,5 +1,14 @@
 # Owner(s): ["module: sparse"]
 # ruff: noqa: F841
+# [MODULE DOC] Tests for semi-structured (2:4) sparse tensors: SparseSemiStructuredTensor and
+# its CUTLASS and cuSPARSELt backends. Defines random 2:4 test-data generators, a
+# torch.compile test class, inference tests (to_sparse_semi_structured, mm, linear,
+# shape/dtype validation), training tests (pruning, tile/apply ops, sparse matmuls, SM8x
+# only), CUTLASS-only op tests, and cuSPARSELt-only tests (fp8, alpha, search, padding, .to).
+# At import time it probes CUDA/ROCm capability to fill the mapping of available backends,
+# builds dtype and backend parametrization decorators, and instantiates the device-type test
+# classes for cuda only when a matching backend exists. Running the file as a script calls
+# run_tests.
 import itertools
 import random
 import unittest
@@ -87,17 +96,27 @@ atol_rtol_kw = {
 
 
 def sparse24_largest_mask_2d(original):
+    # [FUNCTION DOC] HELPER: Prunes the 2D input to 2:4 sparsity using the CUTLASS static-sort
+    # pruning, converts the result back to dense, and returns a boolean mask that is true
+    # where values were kept. Requires CUDA and the CUTLASS backend.
     sparse = SparseSemiStructuredTensorCUTLASS.prune_dense_static_sort(original)
     return sparse.to_dense().bool()
 
 
 def sparsify24_dense(original):
+    # [FUNCTION DOC] HELPER: Returns the input with every element outside its 2:4 largest-
+    # magnitude mask zeroed, by multiplying with the mask from sparse24_largest_mask_2d.
     return sparse24_largest_mask_2d(original) * original
 
 
 def rand_sparse_semi_structured_mask(
     r, c, dtype=torch.float16, device="cuda", choice=None
 ):
+    # [FUNCTION DOC] HELPER: Builds an r by c tensor of the given dtype and device whose
+    # entries come in pairs that are each either zero-one or one-zero (1:2 sparsity, so also
+    # valid 2:4). A fixed pair can be forced through the choice argument; otherwise each pair
+    # is drawn with the global random module. Returns a contiguous tensor holding only zeros
+    # and ones.
     """
     This function returns a 1:2 sparse matrix of size (r, c).
     Note that this means this matrix will also be 2:4 and 4:8 sparse as well.
@@ -114,6 +133,11 @@ def rand_sparse_semi_structured_mask(
 
 
 def rand_sparse_semi_structured(r, c, dtype, device, choice=None):
+    # [FUNCTION DOC] HELPER: Returns a random dense r by c tensor satisfying semi-structured
+    # sparsity. Uses a 1:2 pattern for float32 and a 2:4 pattern for other dtypes, draws a
+    # pattern per group (or uses the given choice), builds values with make_tensor, replaces
+    # any natural zeros with one so zeros occur only under the mask, and zeroes masked
+    # entries.
     pattern = "2by4" if dtype != torch.float32 else "1by2"
     if pattern == "1by2":
         ksparse = 2
@@ -137,6 +161,11 @@ def rand_sparse_semi_structured(r, c, dtype, device, choice=None):
 
 
 def rand_sparse_semi_structured_all_patterns(r, c, dtype, device):
+    # [FUNCTION DOC] HELPER: Builds test data covering every valid 2:4 (or 1:2 for float32)
+    # pattern. Each table row pairs an input group with the group that results after
+    # compression and decompression. Randomly picks a row per group and returns two tensors:
+    # the input with the first pattern applied, and the expected tensor after compression
+    # with the second pattern applied on top. Natural zeros are replaced by one first.
     pattern = "2by4" if dtype != torch.float32 else "1by2"
     if pattern == "1by2":
         ksparse = 2
@@ -182,16 +211,29 @@ def rand_sparse_semi_structured_all_patterns(r, c, dtype, device):
 
 
 class SparseSemiStructuredTensorCompileTest(torch._dynamo.test_case.TestCase):
+    # [CLASS DOC] torch.compile tests for semi-structured sparse tensors. Derives from the
+    # dynamo TestCase. Skips every test when no semi-structured backend is available. Tests
+    # cover compiling an MLP with a sparse weight under inductor for each backend, compiling
+    # pruning plus a matmul with gradients, and functionalization of the CUTLASS custom op.
     def setUp(self):
+        # [FUNCTION DOC] Skips the test if no semi-structured backend was detected at import;
+        # otherwise runs the base class setUp.
         if len(SEMI_STRUCTURED_SUPPORTED_BACKENDS) == 0:
             self.skipTest("semi-structured sparsity has no available backend!")
         super().setUp()
 
     def tearDown(self):
+        # [FUNCTION DOC] Runs the base class tearDown; adds no extra cleanup.
         super().tearDown()
 
     @staticmethod
     def _test_mlp_contiguous_relu_compile(backend, dense_input_shape):
+        # [FUNCTION DOC] HELPER: Static method shared by the compile tests. Builds a small
+        # model of a linear layer, contiguous call and relu on CUDA in half precision, masks
+        # the weight with a repeating 2:4 pattern, records the dense output, swaps in a sparse
+        # weight made with the chosen backend from_dense, records the sparse eager output,
+        # then compiles with inductor (full graph) and compares to the dense output within
+        # tolerance. Raises an error if eager and compiled outputs differ in strides.
         """
         Test nn.Linear + .contiguous() + nn.ReLU with SparseSemiStructuredTensor + torch.compile
         We expect:
@@ -200,11 +242,17 @@ class SparseSemiStructuredTensorCompileTest(torch._dynamo.test_case.TestCase):
         """
 
         class Model(nn.Module):
+            # [CLASS DOC] HELPER: Tiny module with one 128 by 128 linear layer followed by a
+            # contiguous call and relu, used as the compile target.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the single linear layer of 128 input and 128
+                # output features.
                 super().__init__()
                 self.linear = nn.Linear(128, 128)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer, makes the result
+                # contiguous, and returns the relu of it.
                 x = self.linear(x)
                 x = x.contiguous()
                 return torch.nn.functional.relu(x)
@@ -248,6 +296,9 @@ class SparseSemiStructuredTensorCompileTest(torch._dynamo.test_case.TestCase):
         "HIPSPARSELt is not available for ROCm versions < 7.12"
     )
     def test_mlp_contiguous_relu_compile_cusparselt(self):
+        # [FUNCTION DOC] Runs the shared MLP compile helper with the cusparselt backend for
+        # four input shapes, including a three-dimensional batch. Skipped on Windows, when the
+        # backend is unavailable, or on ROCm without hipSPARSELt support.
         """
         test for cuSPASRELt meta registrations (_cslt_sparse_mm) + torch.compile
         """
@@ -263,6 +314,9 @@ class SparseSemiStructuredTensorCompileTest(torch._dynamo.test_case.TestCase):
     @unittest.skipIf(IS_WINDOWS, "torch.compile not supported on windows")
     @unittest.skipIf(TEST_WITH_ROCM, "Not supported on ROCm")
     def test_mlp_contiguous_relu_compile_cutlass(self):
+        # [FUNCTION DOC] Runs the shared MLP compile helper with the cutlass backend for four
+        # input shapes, including a three-dimensional batch. Skipped without the backend, on
+        # Windows, or on ROCm.
         """
         test for CUTLASS meta registrations (_sparse_semi_structured_addmm) + torch.compile
         """
@@ -282,11 +336,18 @@ class SparseSemiStructuredTensorCompileTest(torch._dynamo.test_case.TestCase):
         "failing in debug build, see https://github.com/pytorch/pytorch/pull/165158 for context",
     )
     def test_sp24_compile(self) -> None:
+        # [FUNCTION DOC] Checks that pruning a requires-grad half tensor to cuSPARSELt 2:4
+        # format, transposing it and multiplying with the original works both eagerly and
+        # under torch.compile, including running backward on the output in both modes. Only
+        # checks that nothing raises; no numerical comparison.
         x = torch.randn(
             [1024, 512], device="cuda", dtype=torch.float16, requires_grad=True
         )
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Prunes the input with the cuSPARSELt static-sort pruning,
+            # transposes the sparse result, and returns the dense input matrix-multiplied with
+            # it.
             y = SparseSemiStructuredTensorCUSPARSELT.prune_dense_static_sort(x)
             y = y.t()
             return x @ y
@@ -302,6 +363,10 @@ class SparseSemiStructuredTensorCompileTest(torch._dynamo.test_case.TestCase):
     @unittest.skipIf(IS_WINDOWS, "torch.compile not supported on windows")
     @unittest.skipIf(TEST_WITH_ROCM, "Not supported on ROCm")
     def test_cutlass_mm_functionalization_decomp(self):
+        # [FUNCTION DOC] Under fake tensor mode and functional tensor mode, calls the
+        # semi_structured cutlass_mm custom op on fake dense, packed and metadata inputs,
+        # after registering the op, and checks the output shape is out_features by n. Verifies
+        # the functionalization decomposition without running real CUTLASS kernels.
         """Test that semi_structured::cutlass_mm decomposes under FunctionalTensorMode.
 
         This verifies the register_torch_dispatch(FunctionalTensorMode) registration
@@ -337,7 +402,14 @@ class SparseSemiStructuredTensorCompileTest(torch._dynamo.test_case.TestCase):
 
 
 class TestSparseSemiStructured(TestCase):
+    # [CLASS DOC] Inference tests for SparseSemiStructuredTensor, parametrized over dtype and
+    # backend (and shapes). Setup skips the class when no backend is available or on Windows.
+    # Tests cover conversion, mm with the sparse operand in each position/transposition,
+    # linear and MLP numerics, values and indices accessors, and error cases for unsupported
+    # shape, dtype or dimension.
     def setUp(self):
+        # [FUNCTION DOC] Calls the base setUp and skips the test if no backend is available or
+        # the platform is Windows.
         super().setUp()
         if len(SEMI_STRUCTURED_SUPPORTED_BACKENDS) == 0:
             self.skipTest("semi-structured sparsity has no available backend!")
@@ -347,6 +419,10 @@ class TestSparseSemiStructured(TestCase):
     @inference_dtypes
     @parametrize_backends
     def test_to_sparse_semi_structured(self, dtype, backend):
+        # [FUNCTION DOC] Selects the backend via the class-level force-CUTLASS flag, converts
+        # a 128 by 256 masked matrix with to_sparse_semi_structured, and asserts the result
+        # keeps shape, device and dtype and is a SparseSemiStructuredTensor. Raises
+        # AssertionError on mismatch.
         SparseSemiStructuredTensor._FORCE_CUTLASS = backend == "cutlass"
         A = rand_sparse_semi_structured_mask(128, 256, dtype=dtype)
         A_sparse = to_sparse_semi_structured(A)
@@ -369,6 +445,11 @@ class TestSparseSemiStructured(TestCase):
     @parametrize_backends
     @parametrize("dense_input_shape", [(128, 1), (128, 64), (128, 128)])
     def test_mm_sparse_first_NN(self, dense_input_shape, dtype, device, backend):
+        # [FUNCTION DOC] Checks sparse-first mm (sparse times dense, no transposes). For int8
+        # the expected outcome is an error: a RuntimeError about layout dispatch for CUTLASS,
+        # the matching cuSPARSELt operation-not-supported error on CUDA, or on ROCm a result
+        # matching a CPU reference. For other dtypes the sparse result must be close to the
+        # dense mm result.
         """
         Ensure torch.mm(A_sparse, B) is correct for float16 and will throw error for int8
         """
@@ -411,6 +492,11 @@ class TestSparseSemiStructured(TestCase):
     @parametrize_backends
     @parametrize("dense_input_shape", [(1, 128), (64, 128), (128, 128)])
     def test_mm_sparse_first_NT(self, dense_input_shape, dtype, device, backend):
+        # [FUNCTION DOC] Checks sparse-first mm with a transposed dense operand. For int8 with
+        # the single-row shape it expects the same backend errors as the plain case (CUTLASS
+        # layout error, cuSPARSELt unsupported on CUDA, CPU-matching result on ROCm); other
+        # int8 shapes compare with a CPU reference; other dtypes compare with dense mm.
+        # Tolerances are loose.
         """
         Ensure torch.mm(A_sparse, B.t()) is correct for float16/bfloat16
         and will throw an error for int8 + padding
@@ -464,6 +550,9 @@ class TestSparseSemiStructured(TestCase):
     @parametrize("dense_input_shape", [(1, 128), (64, 128), (128, 128)])
     @parametrize_backends
     def test_mm_sparse_first_TN(self, dtype, dense_input_shape, device, backend):
+        # [FUNCTION DOC] Verifies that multiplying a transposed sparse matrix by a dense
+        # matrix raises NotImplementedError saying the matmul operation is not supported.
+        # Skips for CUTLASS on Windows.
         """
         Ensure torch.mm(A_sparse.t(), B) throws error
         """
@@ -485,6 +574,10 @@ class TestSparseSemiStructured(TestCase):
     @parametrize("dense_input_shape", [(1, 128), (64, 128), (128, 128)])
     @parametrize_backends
     def test_mm_sparse_second_NT(self, dense_input_shape, dtype, device, backend):
+        # [FUNCTION DOC] Checks mm of a dense matrix by the transposed sparse matrix. int8
+        # reference is computed on CPU and copied to the device; other dtypes use device mm.
+        # The sparse result must be close to the dense reference. Skips for CUTLASS on
+        # Windows.
         """
         Ensure torch.mm(A, B_sparse.t()) is correct
         """
@@ -510,6 +603,9 @@ class TestSparseSemiStructured(TestCase):
     @parametrize("dense_input_shape", [(1, 128), (64, 128), (128, 128)])
     @parametrize_backends
     def test_mm_sparse_second_NN(self, dense_input_shape, dtype, device, backend):
+        # [FUNCTION DOC] Verifies that multiplying a dense matrix by an untransposed sparse
+        # matrix raises NotImplementedError reporting the matmul operation as unsupported.
+        # Skips for CUTLASS on Windows.
         """
         Ensure torch.mm(A, B_sparse) throws error
         """
@@ -531,6 +627,10 @@ class TestSparseSemiStructured(TestCase):
     @parametrize("inference_mode", [subtest(True), subtest(False)])
     @parametrize_backends
     def test_linear(self, dense_input_shape, inference_mode, device, backend):
+        # [FUNCTION DOC] Compares a half-precision linear layer with a randomly 2:4-masked
+        # weight against the same layer after the weight is replaced by its semi-structured
+        # version, for several input shapes and with or without inference mode. Outputs must
+        # be close. Skips for CUTLASS on Windows.
         """
         Test nn.Linear has the same numerics
         """
@@ -559,6 +659,9 @@ class TestSparseSemiStructured(TestCase):
     @parametrize("dense_input_shape", [(1, 128), (64, 128), (128, 128), (64, 128, 128)])
     @parametrize_backends
     def test_mlp(self, device, dense_input_shape, backend):
+        # [FUNCTION DOC] Builds a two-layer half-precision MLP, masks both weights with random
+        # 2:4 masks, records the dense output, converts both weights to semi-structured, and
+        # checks the sparse model output is close to the dense one for several input shapes.
         SparseSemiStructuredTensor._FORCE_CUTLASS = backend == "cutlass"
         input = torch.rand(dense_input_shape, device=device).half()
         model = (
@@ -589,6 +692,9 @@ class TestSparseSemiStructured(TestCase):
 
     @parametrize_backends
     def test_values(self, backend):
+        # [FUNCTION DOC] Converts a fully ones-valued 128 by 128 masked matrix and checks the
+        # values accessor returns a 128 by 64 tensor that is all ones. Raises AssertionError
+        # otherwise. Skips for CUTLASS on Windows.
         SparseSemiStructuredTensor._FORCE_CUTLASS = backend == "cutlass"
         if backend == "cutlass" and IS_WINDOWS:
             self.skipTest("CUTLASS not supported on Windows")
@@ -603,6 +709,9 @@ class TestSparseSemiStructured(TestCase):
 
     @parametrize_backends
     def test_indices(self, backend):
+        # [FUNCTION DOC] Converts a 128 by 128 masked matrix and checks the indices accessor
+        # returns a tensor of shape 128 by 8. Raises AssertionError otherwise. Skips for
+        # CUTLASS on Windows.
         SparseSemiStructuredTensor._FORCE_CUTLASS = backend == "cutlass"
         if backend == "cutlass" and IS_WINDOWS:
             self.skipTest("CUTLASS not supported on Windows")
@@ -616,6 +725,11 @@ class TestSparseSemiStructured(TestCase):
     @inference_dtypes
     @parametrize_backends
     def test_min_sparse_shape(self, dtype, device, backend):
+        # [FUNCTION DOC] Uses the backend minimum sparse rows/cols and dense columns from its
+        # dtype-shape constraints table to build the smallest valid sparse matrix and dense
+        # operand, and checks sparse mm matches dense mm. For int8 the dense reference is
+        # computed on CPU and the operand is passed as a transposed contiguous copy to get a
+        # supported layout.
         SparseSemiStructuredTensor._FORCE_CUTLASS = backend == "cutlass"
         config = SEMI_STRUCTURED_SUPPORTED_BACKENDS[backend]._DTYPE_SHAPE_CONSTRAINTS[
             dtype
@@ -640,6 +754,9 @@ class TestSparseSemiStructured(TestCase):
     @inference_dtypes
     @parametrize_backends
     def test_unsupported_shape(self, dtype, device, backend):
+        # [FUNCTION DOC] Checks that converting a 2 by 2 matrix, too small for the backend,
+        # raises RuntimeError mentioning the original tensor shape. Skips for CUTLASS on
+        # Windows.
         SparseSemiStructuredTensor._FORCE_CUTLASS = backend == "cutlass"
         if backend == "cutlass" and IS_WINDOWS:
             self.skipTest("CUTLASS not supported on Windows")
@@ -650,6 +767,9 @@ class TestSparseSemiStructured(TestCase):
     @dtypes(*all_types_and_complex())
     @parametrize_backends
     def test_unsupported_dtype(self, dtype, device, backend):
+        # [FUNCTION DOC] For every dtype, builds a masked matrix and converts it. If the dtype
+        # is absent from the backend constraints table a RuntimeError mentioning the dtype is
+        # expected; otherwise conversion must succeed. Skips for CUTLASS on Windows.
         SparseSemiStructuredTensor._FORCE_CUTLASS = backend == "cutlass"
         if backend == "cutlass" and IS_WINDOWS:
             self.skipTest("CUTLASS not supported on Windows")
@@ -666,6 +786,8 @@ class TestSparseSemiStructured(TestCase):
 
     @parametrize_backends
     def test_unsupported_dim(self, device, backend):
+        # [FUNCTION DOC] Checks that converting a three-dimensional half tensor raises
+        # RuntimeError mentioning the tensor dimension. Skips for CUTLASS on Windows.
         SparseSemiStructuredTensor._FORCE_CUTLASS = backend == "cutlass"
         if backend == "cutlass" and IS_WINDOWS:
             self.skipTest("CUTLASS not supported on Windows")
@@ -676,6 +798,10 @@ class TestSparseSemiStructured(TestCase):
 
 
 def create_random_mask(shape) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Returns a boolean mask of the given 2D shape with exactly two
+    # true entries in every group of four consecutive columns of each row. Uses a locally
+    # seeded random generator (fixed seed), so the mask is deterministic. The column count is
+    # expected to be a multiple of four.
     r = random.Random(0)
     mask = torch.zeros(shape, dtype=torch.bool)
     for line in range(mask.shape[0]):
@@ -695,7 +821,13 @@ def create_random_mask(shape) -> torch.Tensor:
 
 
 class TestSparseSemiStructuredTraining(TestCase):
+    # [CLASS DOC] Training-oriented tests for 2:4 sparse tensors (pruning, tile packing,
+    # apply, and sparse matmuls with CUTLASS and cuSPARSELt). Setup skips unless the device is
+    # SM8x (Ampere) and the platform is not Windows. Most tests are skipped on ROCm and in
+    # RelWithAssert builds.
     def setUp(self):
+        # [FUNCTION DOC] Calls base setUp, then skips the test unless running on an SM8x GPU
+        # and not on Windows.
         super().setUp()
         if not _IS_SM8X:
             self.skipTest(
@@ -716,6 +848,11 @@ class TestSparseSemiStructuredTraining(TestCase):
         "failing in debug build, see https://github.com/pytorch/pytorch/pull/165158 for context",
     )
     def test_prune_dense_static_sort(self, dtype) -> None:
+        # [FUNCTION DOC] Prunes a random matrix with the tile op to get a 2:4 pattern, then
+        # checks both backends: prune_dense_static_sort with the greedy algorithm must
+        # reproduce the pruned matrix when densified, and a sparse tensor manually assembled
+        # from packed data, metadata and bitmask (CUTLASS) or compressed buffers (cuSPARSELt)
+        # must densify to the same result as the reference.
         # Ideally we would like to clone and compare, but that won't work because the sorting order will be different
         # instead we pass the pruned matrix to the CUDA implementation and preserve the sparsity pattern.
         dense = torch.randn(128, 128, device="cuda", dtype=dtype)
@@ -782,6 +919,10 @@ class TestSparseSemiStructuredTraining(TestCase):
         "failing in debug build, see https://github.com/pytorch/pytorch/pull/165158 for context",
     )
     def test_pruning_algo_largest_abs_values_greedy(self, dtype, backend) -> None:
+        # [FUNCTION DOC] Prunes a padded matrix whose top-left 4 by 4 block has known values
+        # with the greedy largest-absolute-value algorithm of the backend, derives the kept-
+        # element mask by dividing the dense result by the input, and checks the top-left
+        # block equals the expected pattern. Raises AssertionError otherwise.
         inp = torch.tensor(
             [[4, 3, 2, 1], [-1, -3, 0.6, 0.5], [1, 2, 3, 4], [10, 2, -1, 5]],
             device="cuda",
@@ -810,6 +951,9 @@ class TestSparseSemiStructuredTraining(TestCase):
         "cuSPARSELt not available",
     )
     def test_gemm(self, dtype) -> None:
+        # [FUNCTION DOC] Converts a randomly 2:4-masked 32 by 64 matrix to semi-structured and
+        # checks the sparse matmul with a dense matrix matches the masked dense product within
+        # dtype-specific tolerances.
         M, N, K = 32, 32, 64
         a = torch.randn([M, K], device="cuda", dtype=dtype)
         b = torch.randn([K, N], device="cuda", dtype=dtype)
@@ -832,6 +976,10 @@ class TestSparseSemiStructuredTraining(TestCase):
         "failing in debug build, see https://github.com/pytorch/pytorch/pull/165158 for context",
     )
     def test_pack_both_ways_meta_correctness(self, dtype, backend) -> None:
+        # [FUNCTION DOC] Builds a matrix with exactly eight kept elements per 4 by 4 tile,
+        # prunes it with the backend, and for CUTLASS also checks the result type and that its
+        # metadata equals the metadata from the tile op on the mask. Finally compares the
+        # sparse matmul with the masked dense matmul.
         M, N = 128, 256
         # Construct x to make sure we always have exactly 8 elements per 4x4 tile
         a = (4 * torch.arange(8))[:, None] + torch.arange(8)[None, :]
@@ -879,6 +1027,10 @@ class TestSparseSemiStructuredTraining(TestCase):
         "failing in debug build, see https://github.com/pytorch/pytorch/pull/165158 for context",
     )
     def test_pack_both_ways_id(self, dtype) -> None:
+        # [FUNCTION DOC] Tiles a random square matrix into packed and transposed-packed forms,
+        # checks the sums of packed values agree, then multiplies an identity by each packed
+        # form through the sparse linear op and compares both results with the masked dense
+        # matrix. The failure message reports the position of the largest difference.
         N = 512
         torch.manual_seed(0)
         a = torch.randn([N, N], dtype=dtype, device="cuda")
@@ -920,6 +1072,10 @@ class TestSparseSemiStructuredTraining(TestCase):
         "failing in debug build, see https://github.com/pytorch/pytorch/pull/165158 for context",
     )
     def test_pack_both_ways_edge_case1(self, dtype) -> None:
+        # [FUNCTION DOC] Edge case where the pruning heuristic keeps seven values in a 4 by 4
+        # tile rather than eight. Checks the first row of the packed output and first row of
+        # the transposed packed output hold the value two followed by zero padding. Raises
+        # AssertionError otherwise.
         # In this case, the heuristic will keep 7 values out of 16
         # instead of 8. let's see how the kernel handles this
         quad = torch.tensor(
@@ -957,6 +1113,9 @@ class TestSparseSemiStructuredTraining(TestCase):
         "failing in debug build, see https://github.com/pytorch/pytorch/pull/165158 for context",
     )
     def test_sp24_apply(self, dtype) -> None:
+        # [FUNCTION DOC] Checks that applying a bitmask produced by the tile op to the same
+        # input via the apply op reproduces the packed and transposed packed values from the
+        # tile op.
         M, N = 256, 1024
         x = torch.randn([M, N], dtype=dtype, device="cuda")
         (
@@ -977,6 +1136,10 @@ class TestSparseSemiStructuredTraining(TestCase):
         "failing in debug build, see https://github.com/pytorch/pytorch/pull/165158 for context",
     )
     def test_sp24_apply_dense(self, dtype) -> None:
+        # [FUNCTION DOC] Checks the apply and apply-dense ops: builds a reference CUTLASS
+        # sparse tensor from tile op output and densifies it, then rebuilds a sparse tensor
+        # from the apply op output and compares both it and the apply-dense output with the
+        # reference.
         M, N = 256, 1024
         x = torch.randn([M, N], dtype=dtype, device="cuda")
         (
@@ -1018,6 +1181,10 @@ class TestSparseSemiStructuredTraining(TestCase):
         "failing in debug build, see https://github.com/pytorch/pytorch/pull/165158 for context",
     )
     def test_sp24_matmuls(self, dtype) -> None:
+        # [FUNCTION DOC] Wraps the tile op output for two random matrices as CUTLASS sparse
+        # tensors and checks four matmul forms (sparse times dense, dense times sparse, dense
+        # times transposed sparse, transposed sparse times dense) against dense products with
+        # the 2:4 mask applied. Uses loose tolerances.
         M, N, K = 64, 256, 1024
         a = torch.randn([M, K], device="cuda", dtype=dtype)
         b = torch.randn([K, N], device="cuda", dtype=dtype)
@@ -1063,6 +1230,8 @@ class TestSparseSemiStructuredTraining(TestCase):
         "failing in debug build, see https://github.com/pytorch/pytorch/pull/165158 for context",
     )
     def test_sp24_matmuls_mat_vec(self) -> None:
+        # [FUNCTION DOC] Checks that multiplying a semi-structured matrix by a one-dimensional
+        # vector raises NotImplementedError. Requires cuSPARSELt.
         a = torch.randn([64, 128], device="cuda", dtype=torch.float16)
         b = torch.randn([128], device="cuda", dtype=torch.float16)
         a_m = sparse24_largest_mask_2d(a)
@@ -1081,6 +1250,8 @@ class TestSparseSemiStructuredTraining(TestCase):
         "failing in debug build, see https://github.com/pytorch/pytorch/pull/165158 for context",
     )
     def test_sp24_matmuls_bmm(self) -> None:
+        # [FUNCTION DOC] Checks that multiplying a semi-structured matrix by a three-
+        # dimensional batched tensor raises NotImplementedError. Requires cuSPARSELt.
         a = torch.randn([64, 128], device="cuda", dtype=torch.float16)
         b = torch.randn([5, 6, 128], device="cuda", dtype=torch.float16)
         a_m = sparse24_largest_mask_2d(a)
@@ -1091,18 +1262,24 @@ class TestSparseSemiStructuredTraining(TestCase):
 
 
 class TestSparseSemiStructuredCUTLASS(TestCase):
+    # [CLASS DOC] CUTLASS-specific tests (sparse linear, mm and addmm ops, and conversion
+    # kernels). Setup forces the CUTLASS backend through the class-level flag and skips when
+    # CUTLASS is not enabled; tearDown resets the flag.
     """
     This contains CUTLASS specific tests for
          - torch._sparse_semi_structured_linear
     """
 
     def setUp(self):
+        # [FUNCTION DOC] Calls base setUp, forces the CUTLASS backend, and skips when CUTLASS
+        # is unavailable.
         super().setUp()
         SparseSemiStructuredTensor._FORCE_CUTLASS = True
         if "cutlass" not in SEMI_STRUCTURED_SUPPORTED_BACKENDS:
             self.skipTest("CUTLASS not enabled")
 
     def tearDown(self):
+        # [FUNCTION DOC] Resets the force-CUTLASS flag to false and calls base tearDown.
         SparseSemiStructuredTensor._FORCE_CUTLASS = False
         super().tearDown()
 
@@ -1111,6 +1288,12 @@ class TestSparseSemiStructuredCUTLASS(TestCase):
     )
     @inference_dtypes
     def test_linear_cutlass(self, device, dtype):
+        # [FUNCTION DOC] Sweeps batch shapes, power-of-two sizes, optional bias and
+        # activations (none, relu, silu) through the CUTLASS sparse linear op and compares to
+        # a float32 dense linear. Skips silu for int8. Tolerances vary by dtype. Skipped on
+        # ROCm and Windows.
+        # KNOWN ISSUE: The float32 branch restores fp32_precision but sets the allow_tf32
+        #   flag; it is never exercised since float32 is not among the inference dtypes.
         def run_test(
             batch_shape,
             m,
@@ -1124,6 +1307,10 @@ class TestSparseSemiStructuredCUTLASS(TestCase):
             rtol,
             atol,
         ):
+            # [FUNCTION DOC] HELPER: Runs one configuration: builds a sparse weight and random
+            # input, optional bias, computes the float32 dense reference with the activation,
+            # compresses the weight to values and metadata, calls the sparse linear op (with
+            # output dtype for int8), and asserts closeness within the given tolerances.
             weight = rand_sparse_semi_structured(m, k, dtype, device)
             input = make_tensor((*batch_shape, n, k), dtype=dtype, device=device)
             bias = (
@@ -1212,11 +1399,21 @@ class TestSparseSemiStructuredCUTLASS(TestCase):
     @parametrize("backend", ["cutlass"])
     @inference_dtypes
     def test_sparse_semi_structured_ops_cutlass(self, device, dtype, backend):
+        # [FUNCTION DOC] Sweeps sizes and presence of an input vector through the CUTLASS
+        # sparse mm and addmm ops, comparing with float32 dense mm or addmm using alpha and
+        # beta. Also sets the force flag and skips on Windows. Skipped on ROCm and Windows.
+        # KNOWN ISSUE: The float32 branch restores fp32_precision but sets the allow_tf32
+        #   flag; it is never exercised since float32 is not among the inference dtypes.
         SparseSemiStructuredTensor._FORCE_CUTLASS = backend == "cutlass"
         if backend == "cutlass" and IS_WINDOWS:
             self.skipTest("CUTLASS not supported on Windows")
 
         def run_test(m, n, k, device, dtype, dtype_out, use_input, rtol, atol):
+            # [FUNCTION DOC] HELPER: Runs one size configuration: builds a sparse first
+            # operand and a transposed dense second operand, optional bias input with alpha
+            # and beta (floating or integer values), computes the dense float32 reference,
+            # compresses the first operand, calls the sparse mm or addmm op with the given
+            # output dtype, and asserts closeness.
             mat1 = rand_sparse_semi_structured(m, k, dtype, device)
             # mat2 transposed as int8 case supports only row-major/column-major combination
             mat2 = make_tensor((n, k), dtype=dtype, device=device).t()
@@ -1298,7 +1495,14 @@ class TestSparseSemiStructuredCUTLASS(TestCase):
     @inference_dtypes
     @unittest.skipIf(TEST_WITH_ROCM, "Not supported on ROCm")
     def test_conversions(self, device, dtype):
+        # [FUNCTION DOC] For several matrix shapes, checks that the compressed tensor's
+        # metadata equals the metadata from the ATen conversion operator exactly and that
+        # densifying returns the original matrix exactly. Needs a GPU with triton; skipped on
+        # ROCm.
         def run_test(r, c, device, dtype):
+            # [FUNCTION DOC] HELPER: Converts one random sparse matrix and checks exact
+            # equality of the metadata with the ATen operator output and of the densified
+            # result with the original.
             dense_ref = rand_sparse_semi_structured(r, c, dtype, device)
 
             compressed = to_sparse_semi_structured(dense_ref)
@@ -1326,6 +1530,9 @@ class TestSparseSemiStructuredCUTLASS(TestCase):
     @inference_dtypes
     @unittest.skipIf(TEST_WITH_ROCM, "Not supported on ROCm")
     def test_conversions_all_patterns(self, device, dtype):
+        # [FUNCTION DOC] Builds data covering all valid 2:4 patterns, converts the input to
+        # semi-structured, densifies, and checks it exactly equals the expected result. Needs
+        # a GPU with triton; skipped on ROCm.
         r, c = 32, 128
 
         dense_inv, dense_val = rand_sparse_semi_structured_all_patterns(
@@ -1342,6 +1549,10 @@ CUSPARSELT_MIXED_DTYPE_SUPPORT = [torch.float16, torch.bfloat16, torch.int32]
 
 
 def to_float8(x, dtype=torch.float8_e4m3fn):
+    # [FUNCTION DOC] HELPER: Quantizes a tensor to float8. Computes a scale as the dtype max
+    # divided by the clamped absolute maximum, scales and clamps to the dtype range, and
+    # returns the float8 tensor with the reciprocal scale as float32, as needed by the scaled
+    # mm op.
     finfo = torch.finfo(dtype)
     # Calculate the scale as dtype max divided by absmax
     scale = finfo.max / x.abs().max().clamp(min=1e-12)
@@ -1355,6 +1566,10 @@ def to_float8(x, dtype=torch.float8_e4m3fn):
 
 
 class TestSparseSemiStructuredCUSPARSELT(TestCase):
+    # [CLASS DOC] cuSPARSELt-specific tests for the compress and sparse mm ops, fp8 and scaled
+    # mm, alpha scaling, algorithm search, padding of outputs, tensor .to behaviour, and
+    # cloning. Setup disables CUTLASS forcing and skips when the cusparselt backend is not
+    # available.
     """
     This contains cuSPARSELt specific tests for
         torch._cslt_compress
@@ -1362,6 +1577,8 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
     """
 
     def setUp(self):
+        # [FUNCTION DOC] Calls base setUp, clears the force-CUTLASS flag, and skips when
+        # cuSPARSELt is not enabled.
         super().setUp()
         SparseSemiStructuredTensor._FORCE_CUTLASS = False
         if "cusparselt" not in SEMI_STRUCTURED_SUPPORTED_BACKENDS:
@@ -1375,6 +1592,9 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
     @xfailIfSM89PreCUDA13
     @parametrize("dense_input_shape", [(256, 128)])
     def test_sparse_fp8fp8_mm(self, dense_input_shape, device):
+        # [FUNCTION DOC] Skips on old cuSPARSELt without fp8. Converts a masked matrix and a
+        # dense operand to float8 and checks that mm of a semi-structured fp8 tensor raises
+        # NotImplementedError pointing at the scaled mm op.
         if torch.backends.cusparselt.version() < 602 and not torch.version.hip:
             self.skipTest("fp8 matmul requires cuSPARSELt v0.6.2+")
         A = rand_sparse_semi_structured_mask(256, 128, dtype=torch.float16)
@@ -1397,6 +1617,9 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
     )
     @xfailIfSM89PreCUDA13
     def test_sparse_semi_structured_scaled_mm_fp8(self, device) -> None:
+        # [FUNCTION DOC] Compares the scaled mm op on a float8 masked matrix with the semi-
+        # structured version of the same matrix, with unit scales and float8 output, after
+        # casting results to float32. Tolerance is loose.
         (k, l, m) = (32, 64, 32)
         x = rand_sparse_semi_structured_mask(
             k, l, dtype=torch.float8_e4m3fn, device=device
@@ -1428,6 +1651,9 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
     def test_sparse_semi_structured_scaled_mm(
         self, dense_input_shape, device, out_dtype
     ):
+        # [FUNCTION DOC] Quantizes a masked matrix and dense operand to float8 with scales,
+        # runs the scaled mm op with both dense and semi-structured first operand for the
+        # given output dtype, and checks the results are close.
         A = rand_sparse_semi_structured_mask(256, 128, dtype=torch.float16)
         B = torch.rand(dense_input_shape, device=device).to(torch.float16).t()
 
@@ -1447,6 +1673,9 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
     @parametrize("out_dtype", [torch.float16, torch.bfloat16, torch.int32])
     @parametrize("dense_input_shape", [(128, 128)])
     def test_cslt_sparse_mm_mixed_dtype(self, dense_input_shape, out_dtype, device):
+        # [FUNCTION DOC] Compresses an int8 masked matrix with the cslt compress op, runs the
+        # cslt sparse mm op with a mixed output dtype (half, bfloat16 or int32), and compares
+        # with an int64 CPU matmul cast to that dtype.
         A = rand_sparse_semi_structured_mask(128, 128, dtype=torch.int8)
         A_compressed = torch._cslt_compress(A)
 
@@ -1462,6 +1691,9 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
     @training_dtypes
     @unittest.skipIf(TEST_WITH_ROCM, "Not supported on ROCm")
     def test_cslt_sparse_mm_alpha(self, dtype, device):
+        # [FUNCTION DOC] Intended to check alpha and bias in the cslt sparse mm op against a
+        # dense reference scaled per row. Unconditionally skipped because cuSPARSELt 0.6.x
+        # lacks half alpha scaling.
         A = torch.Tensor([0, 0, 1, 1]).tile((128, 64)).to(dtype).cuda()
         B = torch.ones((256, 128), device=device).to(dtype)
         alpha = torch.Tensor([2 ** (-i) for i in range(128)]).cuda()
@@ -1482,6 +1714,9 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
         "HIPSPARSELt is not available for ROCm versions < 7.12"
     )
     def test_cslt_sparse_mm_alpha_compile_autotune(self, device, out_dtype):
+        # [FUNCTION DOC] Runs the cslt sparse mm op under torch.compile in max-autotune mode
+        # with an int8 operand, per-row alpha and a chosen output dtype, and compares with a
+        # CPU int64 reference scaled by alpha.
         A = torch.Tensor([0, 0, 1, 1]).tile((128, 64)).to(torch.int8).to(device)
         B = torch.ones((128, 256), device=device, dtype=torch.int8).t()
         alpha = torch.Tensor([2 ** (-i) for i in range(128)]).cuda()
@@ -1496,6 +1731,9 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
         # disable this otherwise inductor will attempt to reorder strides and pass a contiguous B
         @torch.compiler.disable
         def get_dense_result():
+            # [FUNCTION DOC] HELPER: Computes the dense reference on CPU: int64 matmul of the
+            # operands, scaled by the stacked alpha values, cast to the output dtype. Kept
+            # outside compilation so strides of B stay unchanged.
             alpha_scaled = torch.stack([alpha] * 128).t().cpu().float()
             dense_result = alpha_scaled * torch.mm(
                 A.to(torch.int64).cpu(), B.to(torch.int64).cpu()
@@ -1513,6 +1751,9 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
         "HIPSPARSELt is not available for ROCm versions < 7.12"
     )
     def test_cslt_sparse_mm_alpha_mixed_dtype(self, out_dtype, device):
+        # [FUNCTION DOC] Runs the cslt sparse mm op with int8 inputs, per-row alpha (all ones
+        # for int32 output) and a mixed output dtype, and compares with a CPU int64 reference
+        # scaled by alpha.
         A = torch.Tensor([0, 0, 10, 10]).tile((128, 64)).to(torch.int8).cuda()
         B = torch.ones((128, 256), device=device).to(torch.int8).t()
         alpha = torch.Tensor(
@@ -1538,6 +1779,9 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
     )
     @inference_dtypes
     def test_cslt_sparse_mm_search(self, device, dtype):
+        # [FUNCTION DOC] Calls the cslt algorithm search op for a compressed matrix, uses the
+        # returned algorithm id in the sparse mm op, and checks the result matches a float32
+        # dense product cast to the dtype.
         A = rand_sparse_semi_structured_mask(256, 128, dtype=dtype)
         B = torch.ones((128, 128), device=device).to(dtype)
 
@@ -1554,6 +1798,9 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
     )
     @inference_dtypes
     def test_csrc_cslt_sparse_mm_search(self, device, dtype):
+        # [FUNCTION DOC] Same as the search test but calls the low-level C binding for the
+        # search, which returns algorithm id, split-k and split-k mode, and passes all three
+        # to the sparse mm op; checks against a dense product.
         A = rand_sparse_semi_structured_mask(256, 128, dtype=dtype)
         B = torch.ones((128, 128), device=device).to(dtype)
 
@@ -1579,6 +1826,9 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
     @dtypes(torch.float16, torch.bfloat16)
     @parametrize("dense_input_shape", [(128, 1), (128, 3)])
     def test_mm_padded_output_shape(self, dtype, dense_input_shape, device):
+        # [FUNCTION DOC] Checks that mm with a sparse first operand and dense columns not a
+        # multiple of the minimum (padding path) returns the same output shape as the dense
+        # mm.
         """Explicitly verify the padded path in cusparselt_mm trims output to the correct shape.
 
         Shapes like (128, 1) and (128, 3) have n % dense_min_cols != 0 (dense_min_cols=8),
@@ -1600,6 +1850,8 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
     @dtypes(torch.float16, torch.bfloat16)
     @parametrize("dense_input_shape", [(1, 128), (3, 128)])
     def test_mm_padded_output_shape_sparse_second(self, dtype, dense_input_shape, device):
+        # [FUNCTION DOC] Checks that mm of a dense matrix with the transposed sparse matrix,
+        # with rows needing padding, returns the same output shape as the dense computation.
         """Verify cusparselt_mm trims output correctly for dense @ sparse.t() (Branch B).
 
         Shapes like (1, 128) and (3, 128) have m % dense_min_rows != 0 (dense_min_rows=8),
@@ -1622,6 +1874,9 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
     @dtypes(torch.float16, torch.bfloat16)
     @parametrize("dense_input_shape", [(1, 128), (3, 128)])
     def test_addmm_padded_output_shape_sparse_second(self, dtype, dense_input_shape, device):
+        # [FUNCTION DOC] Checks that addmm with a bias, a dense matrix and a transposed sparse
+        # matrix, with padding-triggering shapes, returns the same output shape as the dense
+        # addmm.
         """Verify cusparselt_mm trims output correctly for addmm with dense @ sparse.t() (Branch B + bias).
 
         Covers the semi_sparse_addmm path (used by nn.Linear) with should_transpose_dense=True
@@ -1642,6 +1897,8 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
         "HIPSPARSELt is not available for ROCm versions < 7.12"
     )
     def test_cusparselt_backend(self):
+        # [FUNCTION DOC] Checks cuSPARSELt is available and, on CUDA, that its version is at
+        # least 602. Raises AssertionError otherwise.
         if not torch.backends.cusparselt.is_available():
             raise AssertionError("cusparselt backend should be available")
 
@@ -1653,6 +1910,10 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
 
     @inference_dtypes
     def test_cslt_sparse_tensor_clone(self, dtype):
+        # [FUNCTION DOC] Clones a semi-structured tensor and checks the packed data of the
+        # clone equals the original.
+        # KNOWN ISSUE: data_ptr is referenced without being called, so the not-equal check
+        #   compares bound methods and does not verify separate storage.
         A = rand_sparse_semi_structured_mask(256, 128, dtype=dtype).cuda()
         A_sparse = to_sparse_semi_structured(A)
         A_clone = A_sparse.clone()
@@ -1661,6 +1922,8 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
 
     @dtypes(torch.float16, torch.bfloat16)
     def test_semi_sparse_to_device_cpu(self, dtype):
+        # [FUNCTION DOC] Checks converting a semi-structured tensor to cpu yields a plain
+        # dense CPU tensor (not the sparse subclass) equal to the densified original.
         """Test .to('cpu') converts sparse semi-structured tensor to dense on CPU."""
         A = rand_sparse_semi_structured_mask(128, 128, dtype=dtype).cuda()
         A_sparse = to_sparse_semi_structured(A)
@@ -1673,6 +1936,8 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
 
     @dtypes(torch.float16, torch.bfloat16)
     def test_semi_sparse_to_device_cuda(self, dtype):
+        # [FUNCTION DOC] Checks that moving a semi-structured tensor to its own device with
+        # copy raises NotImplementedError.
         """Test .to('cuda') / .to(device) raises NotImplementedError."""
         A = rand_sparse_semi_structured_mask(128, 128, dtype=dtype).cuda()
         A_sparse = to_sparse_semi_structured(A)
@@ -1682,6 +1947,8 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
 
     @dtypes(torch.float16, torch.bfloat16)
     def test_semi_sparse_to_dtype(self, dtype):
+        # [FUNCTION DOC] Checks that converting a semi-structured tensor to float32 alone
+        # raises NotImplementedError.
         """Test .to(dtype) raises NotImplementedError (only to('cpu') is supported)."""
         A = rand_sparse_semi_structured_mask(128, 128, dtype=dtype).cuda()
         A_sparse = to_sparse_semi_structured(A)
@@ -1691,6 +1958,8 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
 
     @dtypes(torch.float16, torch.bfloat16)
     def test_semi_sparse_to_device_and_dtype(self, dtype):
+        # [FUNCTION DOC] Checks converting to cpu and float32 together with copy gives a dense
+        # CPU float32 tensor (not sparse) equal to the densified original cast to float32.
         """Test .to(device, dtype) converts both device and dtype."""
         A = rand_sparse_semi_structured_mask(128, 128, dtype=dtype).cuda()
         A_sparse = to_sparse_semi_structured(A)
@@ -1706,6 +1975,9 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
 
     @dtypes(torch.float16, torch.bfloat16)
     def test_semi_sparse_to_same_dtype_noop(self, dtype):
+        # [FUNCTION DOC] Checks that converting to the same dtype with copy raises
+        # NotImplementedError.
+        # KNOWN ISSUE: The test name says noop but the test expects an error.
         """Test .to(same_dtype) raises NotImplementedError (only to('cpu') is supported)."""
         A = rand_sparse_semi_structured_mask(128, 128, dtype=dtype).cuda()
         A_sparse = to_sparse_semi_structured(A)
@@ -1715,6 +1987,8 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
 
     @dtypes(torch.float16, torch.bfloat16)
     def test_semi_sparse_to_kwargs(self, dtype):
+        # [FUNCTION DOC] Checks the keyword form of the conversion with device and dtype gives
+        # a dense CPU float32 tensor equal to the densified original.
         """Test .to() with keyword arguments (device=, dtype=)."""
         A = rand_sparse_semi_structured_mask(128, 128, dtype=dtype).cuda()
         A_sparse = to_sparse_semi_structured(A)
@@ -1733,6 +2007,9 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
         "HIPSPARSELt is not available for ROCm versions < 7.12"
     )
     def test_cslt_sparse_tensor_with_alg_id(self, device):
+        # [FUNCTION DOC] Compresses a matrix, finds an algorithm id via search, builds a semi-
+        # structured tensor with that id, checks the stored id attribute matches and that the
+        # sparse mm result is close to the dense one.
         A = rand_sparse_semi_structured_mask(256, 128, dtype=torch.float16).cuda()
         A_compressed = torch._cslt_compress(A)
         B = torch.ones((128, 128), device=device).to(torch.float16)
@@ -1749,6 +2026,8 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
         "FP8 sparse requires cuSPARSELt v0.6.2+ on SM 8.9+ or MI350+ (gfx950) on ROCm",
     )
     def test_cslt_compress_fp8(self, device):
+        # [FUNCTION DOC] Quantizes a masked half matrix to float8 and checks the cslt compress
+        # op returns a float8 tensor.
         A = rand_sparse_semi_structured_mask(256, 128, dtype=torch.float16)
         A_fp8, _ = to_float8(A)
         compressed = torch._cslt_compress(A_fp8)
@@ -1760,6 +2039,9 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
     )
     @parametrize("dense_input_shape", [(256, 128)])
     def test_cslt_sparse_mm_fp8_to_fp32(self, dense_input_shape, device):
+        # [FUNCTION DOC] Compresses a float8 sparse matrix, multiplies it with a float8 dense
+        # operand through the cslt sparse mm op with float32 output, and checks the output
+        # dtype is float32 and the values are close to a float32 dense product.
         A = rand_sparse_semi_structured_mask(256, 128, dtype=torch.float16)
         B = torch.rand(dense_input_shape, device=device).to(torch.float16).t()
 
@@ -1781,6 +2063,9 @@ class TestSparseSemiStructuredCUSPARSELT(TestCase):
     @unittest.skipIf(not TEST_WITH_ROCM, "ROCm-specific out_dtype restriction")
     @parametrize("out_dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
     def test_cslt_sparse_mm_fp8_unsupported_out_dtype_rocm(self, out_dtype, device):
+        # [FUNCTION DOC] ROCm only: checks the cslt sparse mm op with fp8 inputs raises
+        # RuntimeError saying the output dtype must be float32 when the requested output dtype
+        # is half, bfloat16 or float8.
         A = rand_sparse_semi_structured_mask(256, 128, dtype=torch.float16)
         B = torch.rand(128, 128, device=device).to(torch.float16).t()
 
