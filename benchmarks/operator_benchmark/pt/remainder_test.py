@@ -1,3 +1,6 @@
+# [MODULE DOC] Microbenchmark for the fmod and remainder ops on dense tensors of int32, float
+# and double, on cpu and cuda, with short and long shape configs. Registers the benchmark at
+# import time; running as a script starts the benchmark runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -40,7 +43,13 @@ remainder_long_configs = op_bench.cross_product_configs(
 
 
 class RemainderOpBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark of a binary remainder-style op applied to a dividend and a divisor
+    # tensor of the same shape. The op comes from the op list.
     def init(self, M, N, K, device, dtype, op_func):
+        # [FUNCTION DOC] Args: M, N, K (shape), device, dtype, op_func. Builds a dividend of
+        # random values in [-500, 500) and a divisor of random values in [1, 41), both cast to
+        # dtype so the divisor is never zero. For integer dtype the cast truncates the values.
+        # Stores both in self.inputs and keeps op_func.
         self.dividend = torch.rand(M, N, K, device=device)
         self.dividend = (self.dividend * 1000 - 500).to(dtype=dtype)
 
@@ -53,6 +62,7 @@ class RemainderOpBenchmark(op_bench.TorchBenchmarkBase):
         self.op_func = op_func
 
     def forward(self, dividend, divisor):
+        # [FUNCTION DOC] Applies the op to the dividend and divisor and returns the result.
         return self.op_func(dividend, divisor)
 
 

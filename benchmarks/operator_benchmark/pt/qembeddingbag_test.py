@@ -1,3 +1,6 @@
+# [MODULE DOC] Microbenchmark for the quantized EmbeddingBag module (torch.ao.nn.quantized).
+# Registers one benchmark class over the short embedding-bag configs from pt.configs at import
+# time; running as a script starts the benchmark runner.
 import numpy
 from pt import configs
 
@@ -13,6 +16,8 @@ Microbenchmarks for qEmbeddingBag operators.
 
 
 class QEmbeddingBagBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark of a quantized EmbeddingBag module lookup with random indices and
+    # offsets.
     def init(
         self,
         embeddingbags,
@@ -24,6 +29,12 @@ class QEmbeddingBagBenchmark(op_bench.TorchBenchmarkBase):
         include_last_offset,
         device,
     ):
+        # [FUNCTION DOC] Builds the benchmark. Args: embeddingbags (table rows), dim, mode,
+        # input_size, offset, sparse (accepted but unused), include_last_offset, device.
+        # Creates the quantized module on the device, seeds numpy with a fixed value, and draws
+        # random indices in [0, embeddingbags) as a long tensor. The offset tensor is the given
+        # start offset followed by the index count, concatenated. Stores indices and offsets in
+        # self.inputs and sets the module name.
         self.embedding = nnq.EmbeddingBag(
             num_embeddings=embeddingbags,
             embedding_dim=dim,
@@ -42,6 +53,8 @@ class QEmbeddingBagBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("qEmbeddingBag")
 
     def forward(self, input, offset):
+        # [FUNCTION DOC] Runs the embedding bag module on the indices and offsets and returns
+        # the output.
         return self.embedding(input, offset)
 
 

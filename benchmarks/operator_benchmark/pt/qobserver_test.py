@@ -1,3 +1,8 @@
+# [MODULE DOC] Benchmarks for quantization observers from torch.ao.quantization.observer.
+# Builds short and long config sets as dictionaries and op_bench config lists for per-tensor,
+# per-channel and histogram observers (device cpu and cuda, except histogram which is cpu
+# only), three op lists and two benchmark classes, then registers them at import time. Running
+# as a script starts the benchmark runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -104,23 +109,37 @@ q_hist_observer_list = op_bench.op_list(
 
 
 class QObserverBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark that feeds a random float tensor to an observer and then asks for
+    # the quantization parameters, so the timing covers both observation and calculate_qparams.
     def init(self, C, M, N, dtype, qscheme, op_func, device):
+        # [FUNCTION DOC] Args: C, M, N (input shape), dtype, qscheme, op_func (observer class),
+        # device. Stores a random float tensor of shape C x M x N on the device in self.inputs
+        # and builds the observer with the dtype and qscheme, moved to the device.
         self.inputs = {"f_input": torch.rand(C, M, N, device=device)}
         self.op_func = op_func(dtype=dtype, qscheme=qscheme).to(device)
 
     def forward(self, f_input):
+        # [FUNCTION DOC] Runs the observer on the input (updating its statistics) and returns
+        # the result of calculate_qparams, the scale and zero point.
         self.op_func(f_input)
         return self.op_func.calculate_qparams()
 
 
 class QObserverBenchmarkCalculateQparams(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark that times only calculate_qparams. The observer is fed the data
+    # once during setup so the timed call works on already collected statistics.
     def init(self, C, M, N, dtype, qscheme, op_func, device):
+        # [FUNCTION DOC] Args: C, M, N, dtype, qscheme, op_func, device. Creates a random float
+        # tensor of shape C x M x N and an observer on the device, runs the observer once on
+        # the tensor, and leaves the inputs mapping empty so forward takes no arguments.
         self.f_input = torch.rand(C, M, N, device=device)
         self.q_observer = op_func(dtype=dtype, qscheme=qscheme).to(device)
         self.q_observer(self.f_input)
         self.inputs = {}
 
     def forward(self):
+        # [FUNCTION DOC] Returns the quantization parameters computed by the already populated
+        # observer.
         return self.q_observer.calculate_qparams()
 
 

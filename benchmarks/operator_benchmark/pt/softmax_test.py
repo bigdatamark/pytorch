@@ -1,3 +1,7 @@
+# [MODULE DOC] Microbenchmarks for softmax style modules. One group applies Softmax, Softmax2d
+# and LogSoftmax to 4D inputs; another applies Softmax and LogSoftmax to 2D inputs along a
+# chosen dimension, including large shapes. Config sets and op lists are built and registered
+# at import time. Running as a script starts the benchmark runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -77,20 +81,32 @@ softmax_two_dims_configs = op_bench.config_list(
 
 
 class SoftmaxBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark of a softmax module (constructed with default arguments) on a
+    # random 4D input.
     def init(self, N, C, H, W, device, op_func):
+        # [FUNCTION DOC] Args: N, C, H, W (input shape), device, op_func (module class). Stores
+        # a random tensor of that shape on the device in self.inputs and instantiates the
+        # module class with no arguments.
         self.inputs = {"input": torch.rand(N, C, H, W, device=device)}
         self.op_func = op_func()
 
     def forward(self, input):
+        # [FUNCTION DOC] Applies the softmax module to the input and returns the result.
         return self.op_func(input)
 
 
 class Softmax2DimsBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark of a softmax module constructed with an explicit dim on a random 2D
+    # input.
     def init(self, M, N, dim, device, op_func):
+        # [FUNCTION DOC] Args: M, N (input shape), dim, device, op_func (module class). Stores
+        # a random M x N tensor on the device in self.inputs and instantiates the module class
+        # with the given dim.
         self.inputs = {"input": torch.rand(M, N, device=device)}
         self.op_func = op_func(dim=dim)
 
     def forward(self, input):
+        # [FUNCTION DOC] Applies the softmax module to the input and returns the result.
         return self.op_func(input)
 
 

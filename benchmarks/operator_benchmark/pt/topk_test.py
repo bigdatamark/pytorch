@@ -1,3 +1,6 @@
+# [MODULE DOC] Microbenchmark for the topk operator. Short configs use two small cases on cpu;
+# long configs cross several shapes, k values, devices and float dtypes. Registers the
+# benchmark at import time; running as a script starts the benchmark runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -27,7 +30,11 @@ topk_configs_long = op_bench.cross_product_configs(
 
 
 class TopkBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark of topk on a random tensor of configurable shape.
     def init(self, shape, k, dim, dtype, device):
+        # [FUNCTION DOC] Args: shape, k, dim, dtype, device. Stores a random normal tensor of
+        # that shape, dtype and device, plus k and dim, in self.inputs and sets the module
+        # name.
         self.inputs = {
             "input": torch.randn(shape, device=device, dtype=dtype),
             "k": k,
@@ -37,6 +44,8 @@ class TopkBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("topk")
 
     def forward(self, input, k, dim):
+        # [FUNCTION DOC] Returns the topk values and indices of the input along the given
+        # dimension.
         return torch.topk(input, k=k, dim=dim)
 
 

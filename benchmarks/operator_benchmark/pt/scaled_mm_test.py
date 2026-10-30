@@ -1,3 +1,9 @@
+# [MODULE DOC] Operator microbenchmark for the scaled_mm functional op. Supports FP8
+# tensorwise, rowwise and blockwise (DeepSeek style) scaling, MXFP8/MXFP4 and NVFP4 inputs,
+# built with the helper functions from the scaled matmul CUDA test file. At import time it
+# deduplicates the base shapes, builds long configs per scaling family gated by platform
+# checks, and registers benchmarks only when the platform supports the op. Running as a script
+# starts the runner.
 from types import ModuleType
 
 from pt.scaled_mm_common import (
@@ -27,6 +33,9 @@ Uses the same dtype + scale/quantize helpers as `test/test_scaled_matmul_cuda.py
 
 
 def _should_generate_scaled_mm_configs() -> bool:
+    # [FUNCTION DOC] HELPER: Returns true when benchmarks should be registered: the torch
+    # version is at least 2.9, the functional scaled_mm exists, and the device is either a
+    # non-ROCm build on SM90 or newer or a ROCm build with FP8 support.
     # Benchmarks are CUDA-centric; register nothing when the op can't run.
     # Minimum requirements:
     # - PyTorch 2.9+ (scaled_mm introduced)
@@ -42,6 +51,9 @@ def _should_generate_scaled_mm_configs() -> bool:
 
 
 def _supports_fp8_rowwise_fp32_output() -> bool:
+    # [FUNCTION DOC] HELPER: Returns whether FP32 output is available for FP8 rowwise scaling:
+    # false on ROCm, without CUDA, with CUDA older than 12.9, or when device zero has compute
+    # capability below 9.0. Not referenced anywhere else in this module.
     # Mirrors test_scaled_mm_vs_emulated_row_wise gating:
     # fp32 rowwise kernels are cuBLAS-only, CUDA 12.9+, and SM90-only.
     if torch.version.hip is not None:
@@ -54,6 +66,10 @@ def _supports_fp8_rowwise_fp32_output() -> bool:
 
 
 def _supports_scaled_mm_benchmark() -> tuple[bool, str]:
+    # [FUNCTION DOC] HELPER: Reports whether scaled_mm can run. Returns a pair of a flag and a
+    # reason message (empty on success). Fails with a message if the functional op is missing,
+    # CUDA is unavailable, a ROCm device is not gfx94x, or the CUDA capability is neither at
+    # least 9.0 nor 8.9. Not referenced anywhere else in this module.
     # `scaled_mm` was introduced in PyTorch 2.9.
     if not hasattr(torch.nn.functional, "scaled_mm"):
         return False, "torch.nn.functional.scaled_mm requires PyTorch 2.9+"
@@ -79,11 +95,18 @@ def _supports_scaled_mm_benchmark() -> tuple[bool, str]:
 
 
 class ScaledMMBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark of scaled_mm for one scaling recipe selected by the scaling config.
+    # Setup methods create low precision operands and scales and record the scale recipes and
+    # swizzle settings used by forward. Class constants give block sizes for MX (32), NVFP4
+    # (16) and FP8 blockwise (128) scaling. Instance state includes base_dtype, output_dtype,
+    # float8_dtype and the recipe and swizzle fields.
     _MX_BLOCK_SIZE: int = 32
     _NVFP4_BLOCK_SIZE: int = 16
     _FP8_BLOCK_K: int = 128
 
     def _set_output_dtype(self, output_dtype: str) -> None:
+        # [FUNCTION DOC] HELPER: Sets the output dtype from its name: float32 for the float32
+        # name and bfloat16 for bfloat16 or any other value.
         if output_dtype == "bfloat16":
             self.output_dtype = torch.bfloat16
         elif output_dtype == "float32":
@@ -99,6 +122,9 @@ class ScaledMMBenchmark(op_bench.TorchBenchmarkBase):
         swizzle_a: SwizzleType | list[SwizzleType] | None = None,
         swizzle_b: SwizzleType | list[SwizzleType] | None = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Records keyword-only scale recipes and optional swizzle
+        # settings for both operands (single values or lists) in instance fields, so forward
+        # only has to read them.
         # Store call-time config so forward() is a single straight-line call.
         self._scale_recipe_a = scale_recipe_a
         self._scale_recipe_b = scale_recipe_b
@@ -108,6 +134,12 @@ class ScaledMMBenchmark(op_bench.TorchBenchmarkBase):
     def _init_fp8_tensorwise(
         self, M: int, N: int, K: int, device: str, helpers: ModuleType
     ) -> None:
+        # [FUNCTION DOC] HELPER: Sets up FP8 tensorwise scaling. Args: M, N, K, device, helpers
+        # (module of test helpers). Picks the FP8 dtype, creates random base-dtype matrices x
+        # (M x K) and y (N x K, transposed to K x N) whose gradient flags come from the
+        # framework auto_set, computes detached per-tensor scales, and quantizes both under
+        # no-grad to saturated FP8 leaf tensors. self.inputs holds the FP8 tensors and
+        # reciprocal scales; the recipe is tensorwise on both sides.
         self.float8_dtype = get_float8_dtype(self._float8_dtype_arg)
 
         # Base tensors carry grad in backward benches; fp8 tensors are created as leaves.
@@ -157,6 +189,10 @@ class ScaledMMBenchmark(op_bench.TorchBenchmarkBase):
     def _init_fp8_rowwise(
         self, M: int, N: int, K: int, device: str, helpers: ModuleType
     ) -> None:
+        # [FUNCTION DOC] HELPER: Sets up FP8 rowwise scaling. Same structure as the tensorwise
+        # setup, but the scales are per row of x (M x 1) and per column of the transposed y (1
+        # x N). Inputs hold the FP8 tensors and reciprocal scales; the recipe is rowwise on
+        # both sides.
         # Row-wise scaling (per-row A scales and per-column B scales).
         # Mirrors `test_scaled_mm_vs_emulated_row_wise` in test_scaled_matmul_cuda.py.
         self.float8_dtype = get_float8_dtype(self._float8_dtype_arg)
@@ -222,6 +258,14 @@ class ScaledMMBenchmark(op_bench.TorchBenchmarkBase):
         use_padding_a: bool,
         use_padding_b: bool,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Shared setup for FP8 blockwise scaling. Args: M, N, K, device,
+        # helpers, block_m_a and block_m_b (outer block size per side: 1 or 128), block_k, the
+        # scaling types per side and flags saying whether to pad the scales per side. Raises
+        # RuntimeError if a CUDA device is not SM90, if K is not divisible by block_k, or if a
+        # 128 sided operand has its outer dimension not divisible by block_k. Quantizes random
+        # matrices with block scales; padded sides get padded then transposed scales, other
+        # sides get an outer-dimension-major layout. Stores the tensors (y transposed) and
+        # reciprocal scales in self.inputs and records the recipes.
         """
         Common initialization for FP8 blockwise scaling.
 
@@ -304,6 +348,8 @@ class ScaledMMBenchmark(op_bench.TorchBenchmarkBase):
     def _init_fp8_blockwise_1x128(
         self, M: int, N: int, K: int, device: str, helpers: ModuleType
     ) -> None:
+        # [FUNCTION DOC] HELPER: FP8 blockwise setup with 1x128 blocks on both operands, no
+        # scale padding.
         # FP8 blockwise scaling with 1x128 blocks on both sides.
         self._init_fp8_blockwise_common(
             M,
@@ -323,6 +369,8 @@ class ScaledMMBenchmark(op_bench.TorchBenchmarkBase):
     def _init_fp8_blockwise_128x128_1x128(
         self, M: int, N: int, K: int, device: str, helpers: ModuleType
     ) -> None:
+        # [FUNCTION DOC] HELPER: FP8 blockwise setup with 128x128 blocks on the left operand
+        # and 1x128 on the right; only the left scales are padded.
         # FP8 blockwise scaling: 128x128 lhs, 1x128 rhs.
         self._init_fp8_blockwise_common(
             M,
@@ -342,6 +390,8 @@ class ScaledMMBenchmark(op_bench.TorchBenchmarkBase):
     def _init_fp8_blockwise_1x128_128x128(
         self, M: int, N: int, K: int, device: str, helpers: ModuleType
     ) -> None:
+        # [FUNCTION DOC] HELPER: FP8 blockwise setup with 1x128 blocks on the left operand and
+        # 128x128 on the right; only the right scales are padded.
         # FP8 blockwise scaling: 1x128 lhs, 128x128 rhs.
         self._init_fp8_blockwise_common(
             M,
@@ -361,6 +411,12 @@ class ScaledMMBenchmark(op_bench.TorchBenchmarkBase):
     def _init_mx_blockwise(
         self, M: int, N: int, K: int, device: str, *, mx_format: str
     ) -> None:
+        # [FUNCTION DOC] HELPER: Sets up MX (mxfp8 or mxfp4) scaling; mx_format is
+        # keyword-only. Raises RuntimeError for a non-cuda device. Creates random matrices,
+        # converts them with the test reference to MX data and e8m0 scales using block size 32,
+        # and rearranges the scales to the blocked layout. The right operand is passed as a
+        # transposed view so it is column-major. Records 1x32 blockwise recipes with no swizzle
+        # on ROCm and the 32-4-4 swizzle on CUDA.
         # MX uses BlockWise1x32 with swizzled scales on CUDA, NO_SWIZZLE on HIP.
         if device != "cuda":
             raise RuntimeError(f"MX scaling requires CUDA device, got: {device}")
@@ -412,6 +468,12 @@ class ScaledMMBenchmark(op_bench.TorchBenchmarkBase):
     def _init_nvfp4_blockwise_and_tensorwise(
         self, M: int, N: int, K: int, device: str, helpers: ModuleType
     ) -> None:
+        # [FUNCTION DOC] HELPER: Sets up NVFP4 scaling with a blockwise decode scale plus a
+        # global tensorwise scale per operand. Raises RuntimeError for a non-cuda device, ROCm,
+        # or K not divisible by 32. Creates large-magnitude random matrices, converts them to
+        # packed fp4 with global scale using block size 16, and rearranges block scales.
+        # Scales, recipes and swizzles are lists of two entries (blockwise with swizzle,
+        # tensorwise without).
         # NVFP4 uses packed fp4 inputs and two-level scaling:
         # - blockwise (1x16) decode scales (swizzled for CUDA)
         # - tensorwise (global) decode scale (NO_SWIZZLE)
@@ -464,6 +526,11 @@ class ScaledMMBenchmark(op_bench.TorchBenchmarkBase):
         output_dtype="bfloat16",
         scaling="fp8_tensorwise",
     ):
+        # [FUNCTION DOC] Args: M, N, K, device, float8_dtype, output_dtype, scaling. Loads the
+        # shared test helper module, stores the settings, sets the output dtype and calls the
+        # setup method for the requested scaling: fp8 tensorwise, rowwise or one of three
+        # blockwise variants, mxfp8, mxfp4 or nvfp4. Raises ValueError for an unknown scaling
+        # name. Sets the module name.
         helpers = get_test_scaled_matmul_cuda()
         self._float8_dtype_arg = float8_dtype
         self.base_dtype = torch.bfloat16
@@ -494,6 +561,9 @@ class ScaledMMBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("scaled_mm")
 
     def forward(self, x, y, scale_a, scale_b):
+        # [FUNCTION DOC] Args: x, y, scale_a, scale_b. Calls scaled_mm with the scales, stored
+        # recipes and output dtype, adding swizzle arguments only when they were recorded.
+        # Returns the result.
         kwargs = {
             "scale_a": scale_a,
             "scale_recipe_a": self._scale_recipe_a,

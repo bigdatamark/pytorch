@@ -1,3 +1,9 @@
+# [MODULE DOC] Benchmarks for quantized embedding-bag rowwise-offsets lookups (4-bit and byte
+# variants) with optional per-sample weights, last-offset inclusion, pruned weights and 32-bit
+# indices or offsets. Defines short and long config sets and two benchmark classes registered
+# at import time. Import-time side effect: loads an internal sparsenn operator library by a
+# build-system path; the import fails where that library is unavailable, and the pruning helper
+# depends on its ops.
 import numpy as np
 
 import operator_benchmark as op_bench
@@ -68,6 +74,10 @@ byte_rowwise_ops = op_bench.op_list(
 
 
 def get_pruned_weights_and_mapping(q_weights):
+    # [FUNCTION DOC] HELPER: Prunes a prepacked quantized weight table. Args: q_weights (packed
+    # weights). Draws a random float indicator in [-1, 1) per row with numpy, calls the
+    # internal rowwise prune op with threshold 0.01 and int32 mapping type, and returns the
+    # pruned weights and the compressed indices mapping.
     indicator = torch.from_numpy(
         np.random.uniform(low=-1.0, high=1.0, size=[q_weights.shape[0]]).astype(
             np.float32
@@ -85,6 +95,9 @@ def get_pruned_weights_and_mapping(q_weights):
 
 
 class EmbedddingBag4BitRowwiseOffsetsTest(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark of the 4-bit rowwise-offsets embedding bag lookup on a randomly
+    # built prepacked table. State set in init includes the lengths, indices, offsets,
+    # prepacked weights, optional per-sample weights and optional compressed index mapping.
     def init(
         self,
         num_embeddings: int,
@@ -97,6 +110,15 @@ class EmbedddingBag4BitRowwiseOffsetsTest(op_bench.TorchBenchmarkBase):
         use_32bit_offsets: bool,
         op_func,
     ):
+        # [FUNCTION DOC] Args: num_embeddings, embedding_dim, num_offsets (upper bound on bag
+        # count), enable_per_sample_weights, include_last_offset, is_pruned_weights,
+        # use_32bit_indices, use_32bit_offsets, op_func. Draws a random bag count and random
+        # bag lengths up to 20, builds begin offsets from them (optionally cast to 32-bit and
+        # extended with the total index count), random float weights in [1, 2) prepacked to 4
+        # bits, optional random per-sample weights, and optional pruning with a compressed
+        # mapping. Stores everything in self.inputs with mode 0.
+        # KNOWN ISSUE: the index tensor is built and optionally cast to 32 bit, then replaced
+        # by a fresh 64-bit random tensor, so the 32-bit indices option has no effect.
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.num_offsets = num_offsets
@@ -183,6 +205,10 @@ class EmbedddingBag4BitRowwiseOffsetsTest(op_bench.TorchBenchmarkBase):
         is_pruned_weights: bool,
         compressed_indices: torch.Tensor | None,
     ):
+        # [FUNCTION DOC] Args mirror the entries in self.inputs. Calls the 4-bit
+        # rowwise-offsets op with the mode, per-sample weights, last-offset flag, pruned flag
+        # and compressed mapping all taken from the arguments. Returns the embedding bag
+        # output.
         return self.op_func(
             prepacked_weights,
             indices,
@@ -196,6 +222,8 @@ class EmbedddingBag4BitRowwiseOffsetsTest(op_bench.TorchBenchmarkBase):
 
 
 class EmbedddingBagByteRowwiseOffsetsTest(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark of the byte rowwise-offsets embedding bag lookup on a randomly
+    # built prepacked table. Setup mirrors the 4-bit benchmark but uses byte prepacking.
     def init(
         self,
         num_embeddings: int,
@@ -208,6 +236,14 @@ class EmbedddingBagByteRowwiseOffsetsTest(op_bench.TorchBenchmarkBase):
         use_32bit_offsets: bool,
         op_func,
     ):
+        # [FUNCTION DOC] Args: num_embeddings, embedding_dim, num_offsets (upper bound on bag
+        # count), enable_per_sample_weights, include_last_offset, is_pruned_weights,
+        # use_32bit_indices, use_32bit_offsets, op_func. Same procedure as the 4-bit benchmark
+        # but with byte prepacking of float weights in [1, 2). Stores prepacked weights,
+        # indices, offsets, mode 0, per-sample weights, flags and the compressed mapping in
+        # self.inputs.
+        # KNOWN ISSUE: as in the 4-bit benchmark, the indices are regenerated as 64-bit after
+        # the optional 32-bit cast, so the 32-bit indices option has no effect.
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.num_offsets = num_offsets
@@ -295,6 +331,10 @@ class EmbedddingBagByteRowwiseOffsetsTest(op_bench.TorchBenchmarkBase):
         is_pruned_weights: bool,
         compressed_indices: torch.Tensor | None,
     ):
+        # [FUNCTION DOC] Args mirror the entries in self.inputs. Calls the byte rowwise-offsets
+        # op with the per-sample weights from the arguments but mode, last-offset flag, pruned
+        # flag and compressed mapping read from instance fields, with mode fixed at zero.
+        # Returns the embedding bag output.
         return self.op_func(
             prepacked_weights,
             indices,

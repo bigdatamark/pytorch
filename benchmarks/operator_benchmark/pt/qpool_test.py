@@ -1,3 +1,7 @@
+# [MODULE DOC] Benchmarks for 2D pooling (max, average, adaptive average) on quantized tensors.
+# Defines long and short config sets (a rank-3 input is selected by a batch size of zero), a
+# shared base class and three concrete benchmarks, registered at import time. Running as a
+# script starts the benchmark runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -64,7 +68,16 @@ qadaptive_avgpool2d_short_configs = op_bench.config_list(
 
 
 class _QPool2dBenchmarkBase(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] HELPER: Base class for quantized pooling benchmarks. Subclasses set the
+    # pool_op module in init and call setup to prepare the quantized input; forward applies
+    # pool_op.
     def setup(self, N, C, H, W, dtype, contig):
+        # [FUNCTION DOC] HELPER: Args: N (batch, zero means no batch dimension), C, H, W,
+        # dtype, contig. Builds a random float tensor in roughly [-128, 128) of shape N x C x H
+        # x W (or C x H x W when N is zero) and quantizes it with scale 1.0 and zero point 0.
+        # When contig is false the tensor is permuted to channels-last, made contiguous, and
+        # permuted back so that it is logically the same but non-contiguous. Stores the result
+        # in self.q_input and in self.inputs.
         # Input
         if N == 0:
             f_input = (torch.rand(C, H, W) - 0.5) * 256
@@ -90,11 +103,17 @@ class _QPool2dBenchmarkBase(op_bench.TorchBenchmarkBase):
         self.inputs = {"q_input": self.q_input}
 
     def forward(self, q_input):
+        # [FUNCTION DOC] HELPER: Applies the pooling module to the quantized input and returns
+        # the result.
         return self.pool_op(q_input)
 
 
 class QMaxPool2dBenchmark(_QPool2dBenchmarkBase):
+    # [CLASS DOC] Benchmark of MaxPool2d on a quantized tensor.
     def init(self, N, C, H, W, k, s, p, contig, dtype):
+        # [FUNCTION DOC] Args: N, C, H, W, k (kernel), s (stride), p (padding), contig, dtype.
+        # Creates a MaxPool2d module with the given kernel, stride and padding, unit dilation,
+        # no ceil mode and no indices, then calls the base setup to build the input.
         self.pool_op = torch.nn.MaxPool2d(
             kernel_size=k,
             stride=s,
@@ -107,7 +126,11 @@ class QMaxPool2dBenchmark(_QPool2dBenchmarkBase):
 
 
 class QAvgPool2dBenchmark(_QPool2dBenchmarkBase):
+    # [CLASS DOC] Benchmark of AvgPool2d on a quantized tensor.
     def init(self, N, C, H, W, k, s, p, contig, dtype):
+        # [FUNCTION DOC] Args: N, C, H, W, k (kernel), s (stride), p (padding), contig, dtype.
+        # Creates an AvgPool2d module with the given kernel, stride and padding and no ceil
+        # mode, then calls the base setup to build the input.
         self.pool_op = torch.nn.AvgPool2d(
             kernel_size=k, stride=s, padding=p, ceil_mode=False
         )
@@ -115,7 +138,11 @@ class QAvgPool2dBenchmark(_QPool2dBenchmarkBase):
 
 
 class QAdaptiveAvgPool2dBenchmark(_QPool2dBenchmarkBase):
+    # [CLASS DOC] Benchmark of AdaptiveAvgPool2d on a quantized tensor.
     def init(self, N, C, input_size, output_size, contig, dtype):
+        # [FUNCTION DOC] Args: N, C, input_size (height and width pair), output_size, contig,
+        # dtype. Creates an AdaptiveAvgPool2d module with the target output size, then calls
+        # the base setup with the unpacked input height and width to build the input.
         self.pool_op = torch.nn.AdaptiveAvgPool2d(output_size=output_size)
         super().setup(N, C, *input_size, dtype=dtype, contig=contig)
 

@@ -1,3 +1,7 @@
+# [MODULE DOC] Microbenchmark for the stack operator with the out argument. Defines config sets
+# for static runtime shapes, short and long shapes, and shapes with more than four dimensions
+# (which take a separate CUDA code path), each crossed with device and stack dim. Registers all
+# of them at import time; running as a script starts the benchmark runner.
 import random
 
 import operator_benchmark as op_bench
@@ -57,7 +61,15 @@ stack_configs_multidim = op_bench.config_list(
 
 
 class StackBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark of stacking several random tensors into a preallocated output
+    # tensor.
     def init(self, sizes, N, dim, device):
+        # [FUNCTION DOC] Args: sizes, N (number of tensors), dim, device. Seeds the python
+        # random module with 42. If sizes is a list and N is minus one, sizes is taken as the
+        # list of shapes; otherwise N shapes are generated, each by copying the entries of
+        # sizes, calling any entry that is callable. Creates a random tensor per shape and a
+        # random result tensor with the first shape to serve as the out argument. Stores
+        # result, inputs and dim in self.inputs and sets the module name.
         random.seed(42)
         inputs = []
         gen_sizes = []
@@ -79,6 +91,8 @@ class StackBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("stack")
 
     def forward(self, result: torch.Tensor, inputs: list[torch.Tensor], dim: int):
+        # [FUNCTION DOC] Args: result (output tensor), inputs (list of tensors), dim. Stacks
+        # the inputs along dim, writing into result, and returns it.
         return torch.stack(inputs, dim=dim, out=result)
 
 

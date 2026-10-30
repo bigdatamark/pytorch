@@ -1,3 +1,6 @@
+# [MODULE DOC] Benchmark for quantized tensor methods, currently only an in-place copy. Defines
+# short and long config sets (shape, dtype, contiguity), a base class and one concrete
+# benchmark, registered at import time. Running as a script starts the benchmark runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -26,7 +29,13 @@ qmethods_configs_long = op_bench.cross_product_configs(
 
 
 class _QMethodBenchmarkBase(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] HELPER: Base class that prepares a quantized input tensor. It defines no
+    # forward, which concrete subclasses supply.
     def init(self, M, N, dtype, contig):
+        # [FUNCTION DOC] HELPER: Args: M, N (shape), dtype, contig. Quantizes a random float
+        # tensor with scale 1.0 and zero point 0. When contig is false the dimensions are
+        # reversed by a permute so the tensor is non-contiguous. Stores it in self.q_input and
+        # self.inputs.
         f_input = torch.rand(M, N)
         scale = 1.0
         zero_point = 0
@@ -43,7 +52,10 @@ class _QMethodBenchmarkBase(op_bench.TorchBenchmarkBase):
 
 
 class QMethodTensorInputCopyBenchmark(_QMethodBenchmarkBase):
+    # [CLASS DOC] Benchmark of the in-place copy method of a quantized tensor.
     def forward(self, q_input):
+        # [FUNCTION DOC] Copies the quantized input onto itself in place and returns the same
+        # tensor.
         return q_input.copy_(q_input)
 
 

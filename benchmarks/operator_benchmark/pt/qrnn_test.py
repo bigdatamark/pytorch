@@ -1,3 +1,6 @@
+# [MODULE DOC] Microbenchmark for dynamically quantized LSTM. Defines one short config set
+# (input size, hidden size, layer count, plus bias, bidirectional and qint8 dtype) and a
+# benchmark class registered at import time. Running as a script starts the benchmark runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -25,7 +28,15 @@ qrnn_configs = op_bench.config_list(
 
 
 class LSTMBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark of a dynamically quantized LSTM forward pass on random inputs.
     def init(self, I, H, NL, B, D, dtype):
+        # [FUNCTION DOC] Args: I (input size), H (hidden size), NL (layers), B (bias), D
+        # (bidirectional), dtype. Builds a regular LSTM, wraps it in a Sequential and applies
+        # dynamic quantization to LSTM and Linear modules, keeping the quantized LSTM as
+        # self.cell. This avoids the known problem with building the quantized dynamic LSTM
+        # directly. Creates random inputs with sequence length 128 and batch size 16: x, and
+        # initial hidden and cell states whose first dimension is layers times directions.
+        # Stores them in self.inputs and sets the module name.
         sequence_len = 128
         batch_size = 16
 
@@ -65,6 +76,8 @@ class LSTMBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("QLSTM")
 
     def forward(self, x, h, c):
+        # [FUNCTION DOC] Runs the quantized LSTM with the initial states and returns only the
+        # output sequence, not the final states.
         return self.cell(x, (h, c))[0]
 
 

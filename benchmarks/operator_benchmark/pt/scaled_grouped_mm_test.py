@@ -1,3 +1,9 @@
+# [MODULE DOC] Operator microbenchmark for the scaled_grouped_mm functional op. Covers FP8
+# tensorwise and rowwise scaling (CUDA SM90 or ROCm with grouped GEMM) and MXFP8, MXFP4 and
+# NVFP4 blocked scaling (reusing conversion helpers from the scaled matmul CUDA test file). At
+# import time it builds the shape and group-count list and, only if the platform supports the
+# op, long configs per scaling family, and registers the benchmark. Running as a script starts
+# the runner.
 from pt import configs  # noqa: F401
 from pt.scaled_mm_common import (
     build_equal_k_group_offs,
@@ -35,6 +41,10 @@ All modes reuse the same conversion helpers as `test/test_scaled_matmul_cuda.py`
 
 
 def _should_generate_scaled_grouped_mm_configs() -> bool:
+    # [FUNCTION DOC] HELPER: Decides whether any configs should be generated. Returns false if
+    # the torch version is below 2.9, the functional op does not exist, or CUDA is unavailable.
+    # On ROCm it returns whether FP8 grouped GEMM is supported. On CUDA it returns false for
+    # CUDA older than 12.8, otherwise true only for SM90 or SM100 devices.
     # Minimum requirements:
     # - PyTorch 2.9+ (scaled_grouped_mm introduced)
     # - CUDA: compute capability exactly 9.0 (SM90) or 10.0 (SM100) and CUDA 12.8+
@@ -57,6 +67,9 @@ def _should_generate_scaled_grouped_mm_configs() -> bool:
 
 
 class ScaledGroupedMMBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark of the grouped scaled matmul with groups along the K dimension. The
+    # setup chosen by the scaling config produces quantized operands, scales, recipes and
+    # swizzle settings that forward passes to the op.
     def init(
         self,
         M,
@@ -68,6 +81,11 @@ class ScaledGroupedMMBenchmark(op_bench.TorchBenchmarkBase):
         output_dtype="bfloat16",
         float8_dtype="e4m3fn",
     ):
+        # [FUNCTION DOC] Args: M, N, K, G (groups), device, scaling, output_dtype,
+        # float8_dtype. Raises ValueError if the output dtype is not bfloat16, the device is
+        # not cuda, ROCm lacks grouped GEMM support, or the scaling name is unknown. Stores the
+        # output dtype and scaling, then calls the FP8 setup for tensorwise or rowwise scaling,
+        # or the MX and NVFP4 setup for mxfp8, mxfp4 and nvfp4. Sets the module name.
         if output_dtype != "bfloat16":
             raise ValueError(
                 "scaled_grouped_mm benchmark currently supports bfloat16 output only"
@@ -94,6 +112,12 @@ class ScaledGroupedMMBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("scaled_grouped_mm")
 
     def _init_fp8(self, M, N, K, G, device, float8_dtype, scaling):
+        # [FUNCTION DOC] HELPER: Sets up FP8 inputs. Args: M, N, K, G, device, float8_dtype,
+        # scaling. Creates equal-sized group end offsets along K, random bfloat16 matrices of
+        # shape M x K and N x K cast to FP8, and random float32 scales: for tensorwise one
+        # value per group repeated M or N times, for rowwise M times G and N times G values.
+        # Both recipes are rowwise and no swizzle is used. self.inputs holds the activations,
+        # the transposed weight (K x N), offsets and scales.
         """Initialize FP8 tensorwise or rowwise scaling."""
         self.float8_dtype = get_float8_dtype(float8_dtype)
 
@@ -148,6 +172,13 @@ class ScaledGroupedMMBenchmark(op_bench.TorchBenchmarkBase):
         }
 
     def _init_mx_nvfp4(self, M, N, K, G, device, scaling):
+        # [FUNCTION DOC] HELPER: Sets up MX or NVFP4 inputs. Args: M, N, K, G, device, scaling.
+        # Raises ValueError for nvfp4 on HIP. Creates group offsets, small-magnitude bfloat16
+        # matrices of shape M x K and N x K, quantizes them per group with the test helper
+        # (blocked scales, plus global scales for nvfp4), and builds the op keyword arguments
+        # with another test helper. Saves the scale recipes and optional swizzle settings from
+        # those arguments, and fills self.inputs with the quantized activations, transposed
+        # quantized weight, offsets and scales.
         """Initialize MX or NVFP4 blocked scaling."""
         helpers = get_test_scaled_matmul_cuda()
 
@@ -199,6 +230,9 @@ class ScaledGroupedMMBenchmark(op_bench.TorchBenchmarkBase):
         }
 
     def forward(self, x, w_t, offs, scale_a, scale_b):
+        # [FUNCTION DOC] Args: x, w_t, offs, scale_a, scale_b. Calls scaled_grouped_mm with the
+        # scales, the stored scale recipes, offsets and output dtype, adding the swizzle
+        # settings only when they were set. Returns the bfloat16 output.
         call_kwargs = {
             "scale_a": scale_a,
             "scale_recipe_a": self._scale_recipe_a,

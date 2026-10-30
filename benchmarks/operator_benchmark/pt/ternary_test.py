@@ -1,3 +1,6 @@
+# [MODULE DOC] Microbenchmark for the ternary ops addcmul and addcdiv with float and bfloat16
+# inputs. The short config is cpu only, the long one also uses cuda. Registers the benchmarks
+# at import time; running as a script starts the benchmark runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -37,7 +40,11 @@ ternary_configs_long = op_bench.cross_product_configs(
 
 
 class TernaryOpBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark of a three-tensor op applied to same-shaped random tensors.
     def init(self, M, N, device, dtype, op_func):
+        # [FUNCTION DOC] Args: M, N (shape), device, dtype, op_func. Stores three random M x N
+        # tensors on the device, cast to dtype, in self.inputs under the names for the base
+        # tensor and the two operands, and keeps op_func.
         self.inputs = {
             "input_": torch.rand((M, N), device=device).to(dtype=dtype),
             "tensor1": torch.rand((M, N), device=device).to(dtype=dtype),
@@ -46,6 +53,8 @@ class TernaryOpBenchmark(op_bench.TorchBenchmarkBase):
         self.op_func = op_func
 
     def forward(self, input_, tensor1, tensor2):
+        # [FUNCTION DOC] Calls the op with the base tensor and two operand tensors and returns
+        # the result.
         return self.op_func(input_, tensor1, tensor2)
 
 

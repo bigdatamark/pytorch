@@ -1,3 +1,8 @@
+# [MODULE DOC] Microbenchmarks for unary operators on quantized tensors. One group covers
+# point-wise and reduction ops (currently argsort, clone, mean, relu, in-place relu and sort;
+# many others are commented out until supported for quantized tensors), and another covers
+# topk. Config sets, op list and benchmarks are registered at import time. Running as a script
+# starts the benchmark runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -27,7 +32,11 @@ qunary_ops_configs_long = op_bench.cross_product_configs(
 
 
 class QUnaryOpBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark of a single unary op applied to a quantized 2D tensor. The op comes
+    # from the op list.
     def init(self, M, N, dtype, op_func):
+        # [FUNCTION DOC] Args: M, N (shape), dtype, op_func. Quantizes a random float tensor
+        # with scale 1.0 and zero point 0, stores it in self.inputs, and keeps op_func.
         f_input = torch.rand(M, N)
         scale = 1.0
         zero_point = 0
@@ -39,6 +48,7 @@ class QUnaryOpBenchmark(op_bench.TorchBenchmarkBase):
         self.op_func = op_func
 
     def forward(self, q_input):
+        # [FUNCTION DOC] Applies the op to the quantized input and returns its result.
         return self.op_func(q_input)
 
 
@@ -158,7 +168,10 @@ qunary_ops_topk_configs_long = op_bench.cross_product_configs(
 
 
 class QTopkOpBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark of topk on a quantized 2D tensor with a configurable k.
     def init(self, M, N, dtype, k):
+        # [FUNCTION DOC] Args: M, N (shape), dtype, k. Quantizes a random float tensor with
+        # scale 1.0 and zero point 0 and stores it with k in self.inputs. Sets the module name.
         f_input = torch.rand(M, N)
         scale = 1.0
         zero_point = 0
@@ -171,6 +184,8 @@ class QTopkOpBenchmark(op_bench.TorchBenchmarkBase):
         self.set_module_name("qtopk")
 
     def forward(self, q_input, k: int):
+        # [FUNCTION DOC] Returns the topk values and indices of the quantized input along the
+        # last dimension.
         return torch.topk(q_input, k)
 
 

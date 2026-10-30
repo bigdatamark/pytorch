@@ -1,3 +1,8 @@
+# [MODULE DOC] Microbenchmarks for general quantization operations: per-tensor and per-channel
+# quantize and dequantize, the FakeQuantize module, and fake-quantize operators (learnable and
+# original kernels, per-tensor and per-channel, including gradient variants and float zero
+# points). Config dictionaries are shared between short and long variants, and the benchmarks
+# are registered at import time. Running as a script starts the benchmark runner.
 import operator_benchmark as op_bench
 
 import torch
@@ -38,9 +43,17 @@ quantize_per_tensor_configs_long = op_bench.cross_product_configs(
 
 
 class QuantizePerTensorBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark of per-tensor quantize or dequantize with a fixed scale and zero
+    # point. The mode config picks the direction: Q quantizes a float tensor, D dequantizes a
+    # tensor that was quantized during setup.
     r"""Benchmarks both quantization and dequantization."""
 
     def init(self, C, M, N, dtype, mode):
+        # [FUNCTION DOC] Args: C, M, N (shape), dtype, mode. Raises an error if mode is not Q
+        # or D. Creates a random float input and a Quantize module with scale 1.0 and zero
+        # point 0. In D mode the input is first quantized by that module and the op is replaced
+        # by a DeQuantize module. Sets the module name accordingly and stores the input in
+        # self.inputs.
         if mode not in ("Q", "D"):
             raise AssertionError(f"mode must be 'Q' or 'D', but got '{mode}'")
         self.input = torch.rand(C, M, N)
@@ -56,6 +69,8 @@ class QuantizePerTensorBenchmark(op_bench.TorchBenchmarkBase):
         self.inputs = {"input": self.input}
 
     def forward(self, input):
+        # [FUNCTION DOC] Applies the quantize or dequantize module to the input and returns the
+        # result.
         return self.op(input)
 
 
@@ -76,9 +91,17 @@ quantize_per_channel_configs_long = op_bench.cross_product_configs(
 
 
 class QuantizePerChannelBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark of per-channel quantize or dequantize. The mode config picks the
+    # direction as in the per-tensor benchmark.
     r"""Benchmarks both quantization and dequantization."""
 
     def init(self, C, M, N, dtype, axis, mode):
+        # [FUNCTION DOC] Args: C, M, N (shape), dtype, axis, mode. Raises an error if mode is
+        # not Q or D. Creates a random float input and uses the per-channel quantize function
+        # with unit scales and zero zero points, one per element along the chosen axis. In D
+        # mode the input is quantized first and the op becomes a local dequantize function.
+        # Stores the input, scales, zero points, axis and dtype in self.inputs and sets the
+        # module name.
         if mode not in ("Q", "D"):
             raise AssertionError(f"mode must be 'Q' or 'D', but got '{mode}'")
         self.input = torch.rand(C, M, N)
@@ -99,6 +122,9 @@ class QuantizePerChannelBenchmark(op_bench.TorchBenchmarkBase):
             self.input = self.op(self.input, **self.kwargs)
 
             def dequant(input, scales, zero_points, axis: int, dtype: int):
+                # [FUNCTION DOC] HELPER: Ignores scales, zero_points, axis and dtype and
+                # returns the dequantized float version of the input tensor. Its signature
+                # matches the quantize function so forward can call either.
                 return input.dequantize()
 
             self.op = dequant
@@ -113,6 +139,8 @@ class QuantizePerChannelBenchmark(op_bench.TorchBenchmarkBase):
         }
 
     def forward(self, input, scales, zero_points, axis: int, dtype: int):
+        # [FUNCTION DOC] Calls the configured op (quantize or dequantize) with the input,
+        # scales, zero points, axis and dtype as keyword arguments and returns the result.
         return self.op(
             input, scales=scales, zero_points=zero_points, axis=axis, dtype=dtype
         )
@@ -157,14 +185,20 @@ fake_quantize_configs_long = op_bench.cross_product_configs(
 
 
 class FakeQuantizeBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark of the FakeQuantize module with its default observer and
+    # parameters.
     r"""Benchmarks fake quantization with default parameters."""
 
     def init(self, N, C, H, W, zero_point_dtype, device):
+        # [FUNCTION DOC] Args: N, C, H, W, zero_point_dtype (unused), device. Stores a random
+        # float input of shape N x C x H x W on the device in self.inputs, builds a default
+        # FakeQuantize module moved to the device, and sets the module name.
         self.inputs = {"input": torch.rand(N, C, H, W).to(device)}
         self.op = tq.FakeQuantize().to(device)
         self.set_module_name("FakeQuantize")
 
     def forward(self, input):
+        # [FUNCTION DOC] Applies the fake quantize module to the input and returns the result.
         return self.op(input)
 
 
@@ -182,6 +216,9 @@ op_bench.generate_pt_test(
 def fakeQuantizePerTensorLearnableKernel(
     input, scale, zero_point, quant_min: int, quant_max: int
 ):
+    # [FUNCTION DOC] HELPER: Fake quantize with a learnable per-tensor scale and zero point.
+    # Args are the input, scale, zero point and integer quant_min and quant_max. Calls the
+    # learnable kernel and returns the fake quantized tensor.
     return torch._fake_quantize_learnable_per_tensor_affine(
         input, scale, zero_point, quant_min, quant_max
     )
@@ -190,6 +227,9 @@ def fakeQuantizePerTensorLearnableKernel(
 def fakeQuantizePerTensorOriginalKernel(
     input, scale, zero_point, quant_min: int, quant_max: int
 ):
+    # [FUNCTION DOC] HELPER: Fake quantize with the original per-tensor kernel. The scale and
+    # zero point arguments are ignored: the kernel is called with a fixed scale of 1.0 and zero
+    # point 0, together with quant_min and quant_max. Returns the fake quantized tensor.
     return torch.fake_quantize_per_tensor_affine(input, 1.0, 0, quant_min, quant_max)
 
 
@@ -232,9 +272,19 @@ fake_quantize_operator_configs_long_float_zero_point = op_bench.cross_product_co
 
 
 class FakeQuantizePerTensorBaseOpBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark of per-tensor fake quantize operators. Holds trainable parameters
+    # for input, scale and zero point so the same class serves forward and gradient tests.
     r"""Benchmarks 3 different fake quantize per tensor operators."""
 
     def init(self, N, C, H, W, zero_point_dtype, nbits, device, op_func):
+        # [FUNCTION DOC] Args: N, C, H, W, zero_point_dtype, nbits, device, op_func. Sets
+        # quant_min to 0 and quant_max to 2 to the power nbits minus 1. Creates the input, a
+        # one element scale of 1.0 and a one element zero point of 0.0 as parameters on the
+        # device, each with requires_grad taken from the framework auto_set. Stores them and
+        # the bounds in self.inputs and keeps op_func.
+        # KNOWN ISSUE: the branch that uses zero_point_dtype only triggers for the per-channel
+        # original kernel name, which this class is never given, so zero_point_dtype is
+        # effectively unused here.
         self.quant_min = 0
         self.quant_max = 2**nbits - 1
         self.quant_range = 2**nbits
@@ -265,6 +315,8 @@ class FakeQuantizePerTensorBaseOpBenchmark(op_bench.TorchBenchmarkBase):
         self.op_func = op_func
 
     def forward(self, input, scale, zero_point, quant_min: int, quant_max: int):
+        # [FUNCTION DOC] Calls the operator with the input, scale, zero point and bounds and
+        # returns the fake quantized tensor.
         return self.op_func(input, scale, zero_point, quant_min, quant_max)
 
 
@@ -284,6 +336,9 @@ op_bench.generate_pt_gradient_tests_from_op_list(
 def fakeQuantizePerChannelLearnableKernel(
     input, scale, zero_point, axis: int, quant_min: int, quant_max: int
 ):
+    # [FUNCTION DOC] HELPER: Fake quantize with learnable per-channel scale and zero point
+    # along the given axis. Args are the input, scale, zero point, axis and integer quant_min
+    # and quant_max. Calls the learnable kernel and returns the fake quantized tensor.
     return torch._fake_quantize_learnable_per_channel_affine(
         input, scale, zero_point, axis, quant_min, quant_max
     )
@@ -292,6 +347,8 @@ def fakeQuantizePerChannelLearnableKernel(
 def fakeQuantizePerChannelOriginalKernel(
     input, scale, zero_point, axis: int, quant_min: int, quant_max: int
 ):
+    # [FUNCTION DOC] HELPER: Fake quantize with the original per-channel kernel using the given
+    # scale, zero point, axis, quant_min and quant_max. Returns the fake quantized tensor.
     return torch.fake_quantize_per_channel_affine(
         input, scale, zero_point, axis, quant_min, quant_max
     )
@@ -312,9 +369,20 @@ fake_quantize_per_channel_float_zero_point_ops = op_bench.op_list(
 
 
 class FakeQuantizePerChannelOpBenchmark(op_bench.TorchBenchmarkBase):
+    # [CLASS DOC] Benchmark of per-channel fake quantize operators, with the axis fixed to the
+    # channel dimension. Scale and zero point have one element per channel.
     r"""Benchmarks 3 different fake quantize per channel operators."""
 
     def init(self, N, C, H, W, zero_point_dtype, nbits, device, op_func):
+        # [FUNCTION DOC] Args: N, C, H, W, zero_point_dtype, nbits, device, op_func. Sets
+        # quant_min to 0, quant_max to 2 to the power nbits minus 1, and axis to 1. Creates the
+        # input as a parameter. For the original kernel, scale (ones, float32) and zero point
+        # (zeros, zero_point_dtype) are plain tensors without gradient; for the learnable
+        # kernel they are float32 parameters with requires_grad from the framework auto_set.
+        # Stores everything in self.inputs and keeps op_func.
+        # KNOWN ISSUE: the requires_grad value given to the random input is overridden because
+        # wrapping a tensor as a parameter defaults to requiring gradients, so the input always
+        # requires gradients.
         self.quant_min = 0
         self.quant_max = 2**nbits - 1
         self.quant_range = 2**nbits
@@ -363,6 +431,8 @@ class FakeQuantizePerChannelOpBenchmark(op_bench.TorchBenchmarkBase):
     def forward(
         self, input, scale, zero_point, axis: int, quant_min: int, quant_max: int
     ):
+        # [FUNCTION DOC] Calls the operator with the input, scale, zero point, axis and bounds
+        # and returns the fake quantized tensor.
         return self.op_func(input, scale, zero_point, axis, quant_min, quant_max)
 
 

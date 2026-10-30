@@ -1,3 +1,7 @@
+# [MODULE DOC] Shared helpers for the scaled_mm and scaled_grouped_mm benchmarks: the list of
+# base benchmark shapes, a loader that imports the test module of scaled matmul helpers by file
+# path, an FP8 dtype normalizer, a group offset builder and a platform check for DeepSeek-style
+# FP8 blockwise scaling. Only a module-level cache variable is created at import time.
 import importlib.util
 import os
 from types import ModuleType
@@ -35,6 +39,12 @@ SCALED_MM_BASE_SHAPES = [
 
 
 def get_test_scaled_matmul_cuda() -> ModuleType:
+    # [FUNCTION DOC] Returns the test module holding scaled matmul helpers, loading it on first
+    # use. The path is computed relative to this file (the repository root three directories
+    # up, then test and the scaled matmul CUDA test file). Raises RuntimeError if the file is
+    # missing or if no import spec can be created. The loaded module is executed (running its
+    # top-level code) and cached in a module-level variable; it is not registered in the module
+    # registry.
     """
     Reuse scale/quantization helpers from `test/test_scaled_matmul_cuda.py`.
 
@@ -66,6 +76,11 @@ def get_test_scaled_matmul_cuda() -> ModuleType:
 
 
 def get_float8_dtype(float8_dtype):
+    # [FUNCTION DOC] Maps an FP8 dtype designation to the platform specific dtype. Args:
+    # float8_dtype, a string or dtype. Returns the e4m3 alias for the strings and dtypes naming
+    # the e4m3 variant, the e5m2 alias for the e5m2 ones, and defaults to the e4m3 alias for
+    # anything else. The aliases come from the device-type test utilities and handle ROCm fnuz
+    # types.
     """Normalize the FP8 dtype arg (handles ROCm fnuz variants via test aliases)."""
     from torch.testing._internal.common_device_type import e4m3_type, e5m2_type
 
@@ -77,6 +92,10 @@ def get_float8_dtype(float8_dtype):
 
 
 def build_equal_k_group_offs(total_k: int, groups: int, device: str) -> torch.Tensor:
+    # [FUNCTION DOC] Args: total_k, groups, device. Splits the K dimension into equal groups
+    # and returns a 1D int32 tensor of group end offsets on the device, one per group. Raises
+    # ValueError if groups is not positive, if total_k is not divisible by groups, or if the
+    # per-group size is not a multiple of 32.
     """
     Build equal-sized group offsets for grouped-K operations.
 
@@ -106,6 +125,12 @@ def build_equal_k_group_offs(total_k: int, groups: int, device: str) -> torch.Te
 
 
 def supports_fp8_deepseek_blockwise_scaling() -> bool:
+    # [FUNCTION DOC] Returns whether DeepSeek-style FP8 blockwise scaling can be benchmarked.
+    # It is false without CUDA availability, when the CUDA version string is missing, on CUDA
+    # builds older than 12.9, and when a ROCm device is not gfx950. Otherwise it is true only
+    # for device zero with compute capability exactly 9.0.
+    # KNOWN ISSUE: the ROCm check can never be reached for real ROCm builds because
+    # torch.version.cuda is None there and the function already returned false.
     """
     Check if the platform supports DeepSeek-style FP8 blockwise scaling.
 
