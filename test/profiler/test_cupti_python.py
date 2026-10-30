@@ -1,4 +1,7 @@
 # Owner(s): ["oncall: profiler"]
+# [MODULE DOC] Tests for the pylibcupti wrapper over the real libcupti library, gated on
+# libcupti 13.3 or newer. The wrapper symbols are imported at load only when cupti-python is
+# available.
 
 import ctypes
 import subprocess
@@ -20,10 +23,17 @@ if TEST_CUPTI:
 
 @unittest.skipIf(not TEST_CUPTI_V13_3, "requires a loaded libcupti >= 13.3")
 class TestPyLibCupti(TestCase):
+    # [CLASS DOC] Exercises the version, record accessor, error check, subscribe, activity
+    # lifecycle, hardware trace and finalize entry points of the CUPTI wrapper against the live
+    # library. Class skipped unless libcupti 13.3 or newer is loaded.
     def test_get_version(self):
+        # [FUNCTION DOC] Asserts the reported libcupti version number is at least 130300.
         self.assertGreaterEqual(pylibcupti().get_version(), 130300)
 
     def test_get_next_record_fn_address(self):
+        # [FUNCTION DOC] The next-record function address must be positive. The test then calls
+        # it through ctypes with null subscriber and buffer and a zero size and asserts the
+        # status is not success rather than crashing.
         # cuptiActivityGetNextRecord_v2 is present on >= 13.2, so its address (used
         # by the native decode worker) is nonzero here.
         addr = pylibcupti().get_next_record_fn_address()
@@ -45,6 +55,10 @@ class TestPyLibCupti(TestCase):
         )
 
     def test_result_string_and_check(self):
+        # [FUNCTION DOC] The error check helper must not raise for the success code, and the
+        # result string helper must give CUPTI_SUCCESS for it. A failing code must raise
+        # CuptiError whose message holds the operation name and the invalid parameter error
+        # string.
         lib = pylibcupti()
         # A successful rc never raises and decodes to CUPTI's real success string --
         # the actual cuptiGetResultString lookup, not the "rc=<n>" fallback.
@@ -59,6 +73,9 @@ class TestPyLibCupti(TestCase):
 
     @unittest.skipIf(not torch.cuda.is_available(), "needs a CUDA context")
     def test_v2_subscribe_timestamp_roundtrip(self):
+        # [FUNCTION DOC] Needs CUDA. Subscribes (skips if unsupported), asserts the timestamp
+        # for the subscriber is positive and that toggling kernel latency timestamps returns a
+        # boolean, then always unsubscribes.
         torch.cuda.init()
         lib = pylibcupti()
         try:
@@ -78,6 +95,13 @@ class TestPyLibCupti(TestCase):
 
     @unittest.skipIf(not torch.cuda.is_available(), "needs a CUDA context")
     def test_v2_activity_lifecycle(self):
+        # [FUNCTION DOC] Needs CUDA. Walks the subscription-scoped sequence the monitor uses:
+        # push and pop an external correlation id and check it round-trips, arm user defined
+        # records with the native buffer callback addresses, enable concurrent kernel and
+        # runtime kinds with field registry selections, run a kernel, flush, and check the
+        # dropped record count is non-negative. Also calls the versioned dropped-count function
+        # directly and asserts success, then disables the kinds, disarms, and always
+        # unsubscribes.
         # Drive the subscription-scoped wrapper surface against real libcupti, the
         # same sequence the monitor runs: push/pop external correlation, arm UDR
         # with the native buffer callbacks, enable/disable kinds with field
@@ -132,6 +156,9 @@ class TestPyLibCupti(TestCase):
 
     @unittest.skipIf(not torch.cuda.is_available(), "needs a CUDA context")
     def test_activity_enable_hw_trace_toggle(self):
+        # [FUNCTION DOC] Needs CUDA. Hardware trace is a global toggle, so a child Python
+        # process enables then disables it. A child exit code of two means the platform rejects
+        # it and the test skips; any other nonzero code fails with the captured stderr.
         # HW-trace is a GLOBAL toggle -- it perturbs process-wide CUPTI state (and
         # breaks a sibling UDR session), so exercise it in an isolated child that
         # inherits this process's libcupti via LD_PRELOAD: enable then restore to
@@ -156,6 +183,9 @@ class TestPyLibCupti(TestCase):
 
     @unittest.skipIf(not torch.cuda.is_available(), "needs a CUDA context")
     def test_finalize_in_subprocess(self):
+        # [FUNCTION DOC] Needs CUDA. Runs the global finalize call in a child Python process so
+        # sibling tests are unaffected, and asserts a zero exit code, reporting stderr on
+        # failure.
         # finalize() is cuptiFinalize -- a global, process-wide teardown the monitor
         # never calls. Run it in a child (which inherits this process's libcupti via
         # LD_PRELOAD) so it can't tear CUPTI down for sibling tests; a clean exit

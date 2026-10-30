@@ -1,4 +1,6 @@
 # Owner(s): ["oncall: profiler"]
+# [MODULE DOC] Test that Kineto initialises correctly in daemon mode, instantiated for the cuda
+# device type only. Runs subprocesses; no import-time side effects beyond test instantiation.
 import os
 import subprocess
 import sys
@@ -10,8 +12,15 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 
 class SimpleKinetoInitializationTest(TestCase):
+    # [CLASS DOC] Device-generic test class checking Kineto initialisation behaviour when the
+    # daemon environment variable is set.
     @patch.dict(os.environ, {"KINETO_USE_DAEMON": "1"})
     def test_kineto_profiler_with_environment_variable(self, device):
+        # [FUNCTION DOC] Runs under a patched environment enabling the Kineto daemon. Spawns a
+        # Python subprocess that imports torch and initialises the device module when available;
+        # a non-zero exit fails the test. Then runs a second process that only loads the torch C
+        # shared library via ctypes and asserts stderr does not contain the daemon config loader
+        # registration message, so Kineto must not initialise on direct library load.
         """
         This test checks whether kineto works with torch in daemon mode, please refer to issue #112389 and #131020.
         Besides that, this test will also check that kineto will not be initialized when user loads the shared library

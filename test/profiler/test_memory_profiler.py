@@ -1,4 +1,11 @@
 # Owner(s): ["oncall: profiler"]
+# [MODULE DOC] Tests for the memory profiler in torch.profiler (MemoryProfile). Covers gradient
+# identification from op and python-call events, the tensor data flow graph, end-to-end tensor
+# category assignment (input, parameter, activation, gradient, optimizer state, temporary,
+# autograd detail), the memory timeline and unidentified allocations. Defines a profile factory
+# enabling shapes, memory and stacks, small helper modules, a dispatch recording mode, and
+# device-instantiated tests (cpu only, plus XPU for the timeline class). Many expectations are
+# golden strings.
 import functools
 import gc
 import itertools as it
@@ -32,6 +39,11 @@ profile = functools.partial(
 def _lookup_tensor_categories(
     t: torch.Tensor, memory_profile: _memory_profiler.MemoryProfile
 ) -> dict[_memory_profiler.TensorAndID, _memory_profiler.Category | None]:
+    # [FUNCTION DOC] HELPER: Finds the allocation ids of all storages in the memory profile
+    # category snapshot that share the data pointer and device of the tensor storage, then
+    # returns a mapping from (tensor key, version) to category restricted to the entries with
+    # the newest of those ids (so a live tensor maps to its latest allocation). Raises
+    # ValueError if the tensor has no storage.
     storage = t.storage()
     if storage is None:
         raise ValueError("Cannot look up uninitialized Tensor.")
@@ -54,9 +66,15 @@ def _lookup_tensor_categories(
 
 @skipIfTorchDynamo("TorchDynamo removes profiler altogether.")
 class TestMemoryProfiler(TestCase):
+    # [CLASS DOC] Tests the profiler memory profile configuration check, run when torch dynamo
+    # is not active (skipped under dynamo). Classified as generic hardware.
     hw_classification = HardwareClassification.GENERIC
 
     def test_config_check(self) -> None:
+        # [FUNCTION DOC] Checks that requesting a memory profile from a profile lacking shapes,
+        # memory or stacks raises ValueError naming all three required settings, that one
+        # lacking only memory profiling raises ValueError with a specific message, and that a
+        # fully configured profile returns a MemoryProfile.
         with torch.profiler.profile() as prof:
             pass
 
@@ -78,21 +96,33 @@ class TestMemoryProfiler(TestCase):
 
 
 class ScaleLayer(torch.nn.Module):
+    # [CLASS DOC] HELPER: Tiny module holding one learnable scalar scale parameter (random,
+    # requires grad) that multiplies its input.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the scalar scale parameter from a random value that
+        # requires gradients.
         super().__init__()
         self.scale = torch.nn.Parameter(torch.rand(()), requires_grad=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: Returns the input multiplied by the scale parameter.
         return x * self.scale
 
 
 class LazyLinear(torch.nn.Module):
+    # [CLASS DOC] HELPER: Linear layer whose weight and bias are created on the first forward
+    # call, on the input device, so parameters appear during profiling. Stores the in and out
+    # feature sizes only at construction.
     def __init__(self, in_features: int, out_features: int):
+        # [FUNCTION DOC] HELPER: Stores input and output feature counts; creates no parameters
+        # yet.
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
 
     def forward(self, x) -> torch.Tensor:
+        # [FUNCTION DOC] HELPER: On first use creates weight and bias parameters (uninitialised
+        # memory, on the input device), then applies a linear transform and returns the result.
         if getattr(self, "weight", None) is None:
             self.weight = torch.nn.Parameter(
                 torch.empty((self.out_features, self.in_features), device=x.device)
@@ -105,14 +135,25 @@ class LazyLinear(torch.nn.Module):
 
 
 class RecordInputOutputDispatchMode(torch.utils._python_dispatch.TorchDispatchMode):
+    # [CLASS DOC] HELPER: Dispatch mode that records each executed op as a tuple of op name,
+    # input tensor ids and output tensor ids, giving ground truth of tensors the ops touched.
+    # Attribute results is the ordered list. Ops that enter record function are skipped, as are
+    # ops with no tensors.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Initialises the empty results list (does not call the parent
+        # initialiser).
         self.results = []
 
     def mark_region(self, name: str):
+        # [FUNCTION DOC] HELPER: Appends a marker entry with the given name and empty input and
+        # output ids, labelling a region in the recorded sequence.
         self.results.append((name, (), ()))
 
     @staticmethod
     def flat_ids(args):
+        # [FUNCTION DOC] HELPER: Static. Flattens a nested structure of arguments and returns a
+        # tuple with one pair (implementation id, storage data pointer) for every tensor leaf
+        # that has storage.
         flat_args = pytree.tree_leaves(args)
         return tuple(
             (t._cdata, t.storage().data_ptr())
@@ -121,6 +162,10 @@ class RecordInputOutputDispatchMode(torch.utils._python_dispatch.TorchDispatchMo
         )
 
     def __torch_dispatch__(self, func, types, args=..., kwargs=None):
+        # [FUNCTION DOC] HELPER: Dispatch hook: executes the op, collects ids of tensors in the
+        # inputs (positional and keyword) and the outputs, and records the op name with them
+        # when any exist and the op is not a record function entry. Returns the op result
+        # unchanged.
         args = args or []
         kwargs = kwargs or {}
         flat_inputs = self.flat_ids(args) + self.flat_ids(kwargs)
@@ -135,6 +180,9 @@ class RecordInputOutputDispatchMode(torch.utils._python_dispatch.TorchDispatchMo
 
 @skipIfTorchDynamo("TorchDynamo changes Python calls that memory profiling relies on.")
 class TestIdentifyGradients(TestCase):
+    # [CLASS DOC] Tests that extract_gradients in the memory profiler identifies gradient
+    # tensors (and their parameters) from the profiler event tree, for ops, modules and
+    # optimizers. Skipped under dynamo. Provides assertion helpers. Instantiated for cpu only.
     hw_classification = HardwareClassification.ACCELERATOR
 
     def gradient_detected(
@@ -144,9 +192,18 @@ class TestIdentifyGradients(TestCase):
         grad_tensor: torch.Tensor,
         parameter: torch.Tensor | None = None,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Walks the profiler event tree depth first and, for each
+        # gradient (parameter key, gradient key) pair extracted from a node with the given event
+        # type, checks whether the gradient matches the expected tensor. Returns True on the
+        # first match, additionally asserting the parameter matches when one is given and a
+        # parameter key was found; returns False if nothing matches.
+        # KNOWN ISSUE: the return annotation says None, but the method returns a boolean.
         # This is not an exhaustive check, but for the purpose of unit testing
         # it is sufficient.
         def key_matches_tensor(key, tensor) -> bool:
+            # [FUNCTION DOC] HELPER: Returns True when the tensor is None, False when the key is
+            # None, otherwise whether the tensor storage data pointer equals the key storage
+            # pointer.
             # Vacuous case.
             if tensor is None:
                 return True
@@ -176,6 +233,9 @@ class TestIdentifyGradients(TestCase):
         return False
 
     def assertGradientDetected(self, name: str, *args, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Asserts that gradient_detected, called with the forwarded
+        # arguments, returns true; the failure message names the gradient that was not
+        # identified.
         self.assertTrue(
             self.gradient_detected(*args, **kwargs),
             lambda msg: f"{msg}\nFailed to identify gradient `{name}` from profile.",
@@ -184,6 +244,9 @@ class TestIdentifyGradients(TestCase):
     def assertOnlyGradients(
         self, prof: torch.profiler.profile, tensors: Iterator[torch.Tensor]
     ) -> None:
+        # [FUNCTION DOC] HELPER: Walks the event tree and asserts every extracted gradient key
+        # has a storage pointer belonging to the given tensors; the failure message names the
+        # offending node and key.
         allowed_set = {t.storage().data_ptr() for t in tensors}
 
         tree = prof.profiler.kineto_results.experimental_event_tree()
@@ -195,11 +258,18 @@ class TestIdentifyGradients(TestCase):
                 )
 
     def test_extract_gradients_low_level(self, device) -> None:
+        # [FUNCTION DOC] Two parameters, profiled once with no existing gradients (cold) and
+        # once with them (warm) around a forward and backward pass. Checks gradients are
+        # detected through op events (not parameter linkage) and that only these gradients are
+        # flagged.
         x = torch.ones((1,), device=device)
         w0 = torch.ones((1,), requires_grad=True, device=device)
         w1 = torch.ones((1,), requires_grad=True, device=device)
 
         def check(cold_start: bool):
+            # [FUNCTION DOC] HELPER: Asserts the gradient presence matches cold start, profiles
+            # a multiply and backward, and checks both gradients are found from op events and no
+            # other tensor is marked as a gradient.
             self.assertEqual(w0.grad is None, cold_start)
             self.assertEqual(w1.grad is None, cold_start)
             with profile() as prof:
@@ -216,16 +286,26 @@ class TestIdentifyGradients(TestCase):
         check(cold_start=False)
 
     def test_extract_gradients_from_module(self, device) -> None:
+        # [FUNCTION DOC] Uses a linear plus scale module with three parameters. For cold and
+        # warm runs, profiles a forward and backward pass and checks python call detection of
+        # each parameter gradient only when warm (the opposite of cold start), while op
+        # detection always works, then profiles a forward only and checks python call detection
+        # finds gradients but op detection does not.
         model = torch.nn.Sequential(torch.nn.Linear(2, 1), ScaleLayer()).to(device)
         named_parameters = dict(model.named_parameters())
         self.assertEqual(len(named_parameters), 3)
 
         def assert_only_gradients(prof: torch.profiler.profile):
+            # [FUNCTION DOC] HELPER: Asserts every parameter has a gradient and that only the
+            # parameter gradients are marked as gradients in the profile.
             gradients = tuple(i.grad for i in named_parameters.values())
             self.assertFalse(any(i is None for i in gradients))
             self.assertOnlyGradients(prof, gradients)
 
         def check(cold_start: bool):
+            # [FUNCTION DOC] HELPER: Runs the forward and backward profile then the forward-only
+            # profile described in the enclosing test, performing the detection assertions for
+            # each named parameter.
             x = torch.ones((2, 2), device=device)
             with profile() as prof:
                 model(x).sum().backward()
@@ -259,12 +339,19 @@ class TestIdentifyGradients(TestCase):
         check(cold_start=False)
 
     def _test_extract_gradients_from_optimizer(self, device, set_to_none: bool) -> None:
+        # [FUNCTION DOC] HELPER: Shared body for the optimizer tests with a momentum SGD
+        # optimizer over two parameters; set_to_none selects how gradients are cleared. Profiles
+        # zero_grad, forward, backward and step, checks detection through python calls and ops.
+        # On cpu only, profiles two iterations and checks python-call detection is lost exactly
+        # when gradients are replaced by none, and that other tensors are then wrongly flagged.
         x = torch.ones((1,), device=device)
         w0 = torch.ones((1,), requires_grad=True, device=device)
         w1 = torch.ones((1,), requires_grad=True, device=device)
         optimizer = torch.optim.SGD((w0, w1), lr=0.1, momentum=0.9)
 
         def check(cold_start: bool):
+            # [FUNCTION DOC] HELPER: Runs the profiled cold or warm step and the assertions
+            # described in the enclosing method.
             self.assertEqual(w0.grad is None, cold_start)
             self.assertEqual(w1.grad is None, cold_start)
             with profile() as prof:
@@ -316,15 +403,21 @@ class TestIdentifyGradients(TestCase):
         check(cold_start=False)
 
     def test_extract_gradients_from_optimizer(self, device) -> None:
+        # [FUNCTION DOC] Runs the shared optimizer gradient test with zero_grad keeping gradient
+        # tensors.
         self._test_extract_gradients_from_optimizer(device, set_to_none=False)
 
     @unittest.skipIf(
         IS_MACOS or IS_WINDOWS, "https://github.com/pytorch/pytorch/issues/88721"
     )
     def test_extract_gradients_from_optimizer_set_to_none(self, device) -> None:
+        # [FUNCTION DOC] Runs the shared optimizer gradient test with zero_grad setting
+        # gradients to none. Skipped on macOS and Windows.
         self._test_extract_gradients_from_optimizer(device, set_to_none=True)
 
     def test_extract_gradients_from_module_and_optimizer(self, device) -> None:
+        # [FUNCTION DOC] Lightweight check that a module and optimizer used together still allow
+        # the first layer weight gradient to be linked to its parameter via python calls.
         # Module and optimizer are thoroughly tested individually and should be
         # additive. Thus we can manage with a lightweight check that they don't
         # interact adversely.
@@ -341,9 +434,14 @@ class TestIdentifyGradients(TestCase):
 
 @skipIfTorchDynamo("TorchDynamo removes profiler altogether.")
 class TestDataFlow(TestCase):
+    # [CLASS DOC] Tests the data flow graph of the memory profiler, comparing formatted text of
+    # op inputs, outputs and tensor versions to golden strings. Skipped under dynamo; generic
+    # hardware.
     hw_classification = HardwareClassification.GENERIC
 
     def setUp(self) -> None:
+        # [FUNCTION DOC] Calls the parent setup and removes the diff length limit so failures
+        # show full text.
         super().setUp()
         self.maxDiff = None
 
@@ -351,6 +449,10 @@ class TestDataFlow(TestCase):
     def formatSchemas(
         prof: torch.profiler.profile, indent: int = 12
     ) -> tuple[tuple[str, tuple[bool, ...]], ...]:
+        # [FUNCTION DOC] HELPER: Static. For every torch op in the event tree returns the op
+        # name (with the overload name appended, or a brace list of overloads when several
+        # schemas match) paired with the mutability flags of its inputs.
+        # KNOWN ISSUE: the indent parameter is never used.
         tree = prof.profiler.kineto_results.experimental_event_tree()
         out: list[tuple[str, tuple[bool, ...]]] = []
         for node in _utils.traverse_dfs(tree):
@@ -372,6 +474,11 @@ class TestDataFlow(TestCase):
         f: Callable[..., dict[str, torch.Tensor] | None],
         indent: int = 12,
     ) -> str:
+        # [FUNCTION DOC] HELPER: Static. Profiles the given function called with the input
+        # tensors (its returned tensors are extra outputs), builds the memory profile data flow
+        # graph and renders text: lines mapping tensor names (and gradients) to ids, a blank
+        # line, then one line per flow node with event name, inputs and versions (star marks
+        # destroyed inputs) and outputs. Returns the text indented by the given amount.
         with profile() as prof:
             outputs = f(**inputs) or {}
             gc.collect()
@@ -407,6 +514,8 @@ class TestDataFlow(TestCase):
         return textwrap.indent("\n".join([l.rstrip() for l in lines]), " " * indent)
 
     def test_match_schemas(self) -> None:
+        # [FUNCTION DOC] Profiles multiplication, in-place addition and a sine with out argument
+        # and compares op names and mutability flags to the expected tuple.
         with profile() as prof:
             x = torch.ones((1,)).mul(2).add_(2)
             _ = torch.sin(x, out=torch.empty_like(x))
@@ -444,6 +553,8 @@ class TestDataFlow(TestCase):
         )
 
     def test_match_schemas_backward(self) -> None:
+        # [FUNCTION DOC] Same schema matching check for a multiply with backward pass, covering
+        # autograd engine events whose mutability is unknown.
         x = torch.ones((1,))
         w = torch.ones((1,), requires_grad=True)
         with profile() as prof:
@@ -473,6 +584,7 @@ class TestDataFlow(TestCase):
         )
 
     def test_match_schemas_tensorlist(self) -> None:
+        # [FUNCTION DOC] Schema matching check for concatenating a list of two tensors.
         x = torch.ones((1,))
         y = torch.ones((1,))
         with profile() as prof:
@@ -484,7 +596,12 @@ class TestDataFlow(TestCase):
         )
 
     def test_data_flow_graph_with_annotations(self) -> None:
+        # [FUNCTION DOC] Checks annotations created with record function (one namespaced, one
+        # not) do not break the data flow graph: golden text shows zero_ and fill ops with their
+        # versions.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Zeroes both inputs inside two nested annotations and
+            # returns ones-like and zeros-like outputs.
             # torch._C._jit_get_schemas_for_operator will reject any name that
             # is missing a namespace. (denoted by the presence of "::") We want
             # to check that we skip both annotations which have no schema
@@ -513,7 +630,11 @@ class TestDataFlow(TestCase):
         )
 
     def test_data_flow_graph_non_op_allocations(self) -> None:
+        # [FUNCTION DOC] Checks that a scalar converted to a temporary tensor argument and its
+        # deletion appear as memory events not owned by an op, in the golden text.
         def f(x):
+            # [FUNCTION DOC] HELPER: Multiplies the input by the scalar two, discarding the
+            # result.
             x.mul(2)
 
         # The python arg parser will convert the python scalar `2` to a Tensor
@@ -531,13 +652,19 @@ class TestDataFlow(TestCase):
         )
 
     def test_data_flow_graph_simple(self) -> None:
+        # [FUNCTION DOC] Checks the data flow of an out of place multiply and view for both
+        # inputs, one requiring gradients; the text is the same with the same function repeated.
         inputs = {"x": torch.ones((25,)), "y": torch.ones((25,), requires_grad=True)}
 
         def f0(x, y):
+            # [FUNCTION DOC] HELPER: Multiplies the inputs and returns a mapping holding a view
+            # of the product.
             z = x.mul(y)
             return {"z": z.view_as(z)}
 
         def f1(x, y):
+            # [FUNCTION DOC] HELPER: Same as the first function but under no-grad mode.
+            # KNOWN ISSUE: this function is never used by the test.
             with torch.no_grad():
                 return f0(x, y)
 
@@ -565,12 +692,16 @@ class TestDataFlow(TestCase):
         )
 
     def test_data_flow_graph_simple_inplace(self) -> None:
+        # [FUNCTION DOC] Checks in-place multiply data flow. With autograd, an extra saved
+        # tensor is created; under no-grad mode only the version of the first input is bumped.
         inputs = {"x": torch.ones((25,)), "y": torch.ones((25,), requires_grad=True)}
 
         def f0(x, y):
+            # [FUNCTION DOC] HELPER: Multiplies the first input by the second in place.
             x.mul_(y)
 
         def f1(x, y):
+            # [FUNCTION DOC] HELPER: Calls the in-place function under no-grad mode.
             with torch.no_grad():
                 return f0(x, y)
 
@@ -595,6 +726,8 @@ class TestDataFlow(TestCase):
         )
 
     def test_data_flow_graph_simple_backward(self) -> None:
+        # [FUNCTION DOC] Checks data flow for a multiply, sine and backward pass, including
+        # gradient accumulation and freed temporaries, against a golden string.
         inputs = {
             "x": torch.ones((1,)),
             "w": torch.ones((1,), requires_grad=True),
@@ -621,7 +754,12 @@ class TestDataFlow(TestCase):
         )
 
     def test_data_flow_graph_complicated(self) -> None:
+        # [FUNCTION DOC] Checks data flow for a sequence with scalar arguments and in-place add
+        # and an out argument sine, then confirms the multiply node has exactly one intermediate
+        # tensor with id two.
         def f():
+            # [FUNCTION DOC] HELPER: Builds ones, a multiply, in-place add and sine into an
+            # empty output; returns a mapping of x, y and z tensors.
             x = torch.ones((25,))
             y = x.mul(2).add_(2)
             z = torch.sin(y, out=torch.empty_like(y))
@@ -659,6 +797,9 @@ class TestDataFlow(TestCase):
         self.assertEqual(mul_node.intermediates[0].id, 2)
 
     def test_data_flow_graph_stacked(self) -> None:
+        # [FUNCTION DOC] Compares golden data flow text for a stack of multiply, relu and sum
+        # ops in forward only mode, the first forward and backward, and a second run where
+        # gradients already exist.
         inputs = {
             "x": torch.ones((25,)),
             "w0": torch.ones((1,), requires_grad=True),
@@ -666,13 +807,19 @@ class TestDataFlow(TestCase):
         }
 
         def f(x, w0, w1):
+            # [FUNCTION DOC] HELPER: Computes multiply, relu, multiply, relu and sum of the
+            # inputs.
             return x.mul(w0).relu().mul(w1).relu().sum()
 
         def f_fwd(**kwargs):
+            # [FUNCTION DOC] HELPER: Runs the stack under no-grad mode and returns the loss in a
+            # mapping.
             with torch.no_grad():
                 return {"loss": f(**kwargs)}
 
         def f_fwd_bwd(**kwargs):
+            # [FUNCTION DOC] HELPER: Runs the stack, calls backward on the loss and returns the
+            # loss in a mapping.
             loss = f(**kwargs)
             loss.backward()
             return {"loss": loss}
@@ -774,9 +921,18 @@ class TestDataFlow(TestCase):
 
 @skipIfTorchDynamo("TorchDynamo changes Python calls that memory profiling relies on.")
 class TestMemoryProfilerE2E(TestCase):
+    # [CLASS DOC] End to end tests that profile small training steps and compare, to golden
+    # text, the category assigned to each tensor an op touched against ground truth recorded by
+    # the dispatch mode. Skipped under dynamo; generic hardware.
     hw_classification = HardwareClassification.GENERIC
 
     def _run_and_format_categories(self, fn, indent=12):
+        # [FUNCTION DOC] HELPER: Runs the given step function (passed a region marking callback)
+        # under the recording dispatch mode and a profile. Maps observed tensor identities to
+        # profiler tensor keys, then renders one line per recorded op listing input and output
+        # allocation ids with the sequence of categories each had (unknown shown as question
+        # marks), and a separator line for marked regions. Raises AssertionError if a key has no
+        # snapshot entry. Returns the text indented.
         """Generate summary of assigned categories for expecttest."""
 
         # Use `__torch_dispatch__` to collect ground truth.
@@ -798,6 +954,10 @@ class TestMemoryProfilerE2E(TestCase):
                         ptr_pair_to_key[(t.impl_ptr, t.storage_data_ptr)] = key
 
         def format_categories(ptr_pair: int):
+            # [FUNCTION DOC] HELPER: Looks up an identity pair; returns question marks if
+            # unknown, else the allocation id followed by the comma separated category names
+            # over versions with consecutive duplicates removed. Raises AssertionError if the
+            # key is absent from the snapshot.
             target_key = ptr_pair_to_key.get(ptr_pair)
             if target_key is None:
                 return "???"
@@ -833,10 +993,14 @@ class TestMemoryProfilerE2E(TestCase):
         return textwrap.indent("\n".join(out), " " * indent)
 
     def test_categories_e2e_simple_fwd(self) -> None:
+        # [FUNCTION DOC] Profiles a forward only computation with no inputs from the caller;
+        # expects every category to be unknown, as a check against over-labelling.
         w0 = torch.ones((1,), requires_grad=True)
         w1 = torch.ones((1,), requires_grad=True)
 
         def step_fn(_):
+            # [FUNCTION DOC] HELPER: Builds a ones tensor and concatenates two products with the
+            # closed-over parameters.
             x = torch.ones((2, 2))
             y = torch.cat([x * w0, x * w1], dim=1)  # noqa: F841
 
@@ -852,10 +1016,15 @@ class TestMemoryProfilerE2E(TestCase):
         )
 
     def test_categories_e2e_simple_fwd_bwd(self) -> None:
+        # [FUNCTION DOC] Profiles a forward, loss and backward without an optimizer and compares
+        # golden text; without an optimizer step parameters are not identified so tensors are
+        # input or autograd detail, with gradients identified from the sum ops.
         w0 = torch.ones((1,), requires_grad=True)
         w1 = torch.ones((1,), requires_grad=True)
 
         def step_fn(mark_region):
+            # [FUNCTION DOC] HELPER: Builds inputs and targets, marks forward and backward
+            # regions, computes a binary cross entropy loss and runs backward.
             x = torch.ones((2, 2))
             targets = torch.ones((2, 4))
 
@@ -897,11 +1066,16 @@ class TestMemoryProfilerE2E(TestCase):
         )
 
     def test_categories_e2e_simple_fwd_bwd_step(self) -> None:
+        # [FUNCTION DOC] Same as the forward and backward test but with an optimizer step, so
+        # parameters, activations and gradients are labelled and the optimizer region updates
+        # parameters from gradients.
         w0 = torch.ones((1,), requires_grad=True)
         w1 = torch.ones((1,), requires_grad=True)
         optimizer = torch.optim.SGD([w0, w1], lr=0.1)
 
         def step_fn(mark_region):
+            # [FUNCTION DOC] HELPER: Forward, loss, backward, then optimizer step and zero_grad,
+            # marking each region.
             x = torch.ones((2, 2))
             targets = torch.ones((2, 4))
 
@@ -951,6 +1125,8 @@ class TestMemoryProfilerE2E(TestCase):
         )
 
     def test_categories_e2e_simple_module_fwd(self) -> None:
+        # [FUNCTION DOC] Profiles forward of a linear module on ones input and checks the golden
+        # category text (input, parameter, activation).
         model = torch.nn.Linear(2, 4, bias=True)
         self.assertExpectedInline(
             self._run_and_format_categories(lambda _: model(torch.ones((2, 2)))),
@@ -961,9 +1137,13 @@ class TestMemoryProfilerE2E(TestCase):
         )
 
     def test_categories_e2e_simple_module_fwd_bwd(self) -> None:
+        # [FUNCTION DOC] Profiles forward and backward of a linear module with sum loss and
+        # checks categories including gradients, with detach results unknown.
         model = torch.nn.Linear(2, 1, bias=True)
 
         def step_fn(mark_region):
+            # [FUNCTION DOC] HELPER: Marks forward and backward regions around a linear forward
+            # and sum, then backward.
             mark_region("Forward & loss")
             loss = model(torch.ones((2, 2))).sum()
 
@@ -994,10 +1174,14 @@ class TestMemoryProfilerE2E(TestCase):
         )
 
     def test_categories_e2e_simple_module_fwd_bwd_step(self) -> None:
+        # [FUNCTION DOC] Same as the linear module test but with a momentum SGD step, adding the
+        # optimizer state category.
         model = torch.nn.Linear(2, 1, bias=True)
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
 
         def step_fn(mark_region):
+            # [FUNCTION DOC] HELPER: Marks regions for forward, backward and optimizer step plus
+            # zero_grad.
             mark_region("Forward & loss")
             loss = model(torch.ones((2, 2))).sum()
 
@@ -1040,6 +1224,8 @@ class TestMemoryProfilerE2E(TestCase):
         )
 
     def test_categories_e2e_sequential_fwd(self) -> None:
+        # [FUNCTION DOC] Profiles forward of a sequential model (linear, relu, linear without
+        # bias, softmax) and compares golden category text.
         model = torch.nn.Sequential(
             torch.nn.Linear(2, 4, bias=True),
             torch.nn.ReLU(),
@@ -1061,6 +1247,8 @@ class TestMemoryProfilerE2E(TestCase):
         )
 
     def test_categories_e2e_sequential_fwd_bwd(self) -> None:
+        # [FUNCTION DOC] Same sequential model with forward, loss and backward regions; compares
+        # golden category text including temporaries and autograd detail.
         model = torch.nn.Sequential(
             torch.nn.Linear(2, 4, bias=True),
             torch.nn.ReLU(),
@@ -1069,6 +1257,8 @@ class TestMemoryProfilerE2E(TestCase):
         )
 
         def step_fn(mark_region):
+            # [FUNCTION DOC] HELPER: Marks regions around the forward pass, a squared error loss
+            # and the backward pass.
             x = torch.ones((2, 2))
             targets = torch.ones((2, 4))
 
@@ -1133,6 +1323,10 @@ class TestMemoryProfilerE2E(TestCase):
         )
 
     def test_memory_timeline(self) -> None:
+        # [FUNCTION DOC] Profiles a training step of a small sequential model with Adam. Checks
+        # timeline times are non-decreasing, preexisting entries have time minus one and others
+        # positive, then renders entries larger than one kilobyte (action, category, renumbered
+        # id with version, size) and compares to a golden string.
         model = torch.nn.Sequential(
             torch.nn.Linear(64, 512, bias=True),
             torch.nn.ReLU(),
@@ -1162,9 +1356,12 @@ class TestMemoryProfilerE2E(TestCase):
         )
 
         def category_name(category):
+            # [FUNCTION DOC] HELPER: Returns the category name, or question marks for none.
             return category.name if category else "???"
 
         def format_action(action, key, version):
+            # [FUNCTION DOC] HELPER: Renders the category of a tensor version; for a version
+            # increment whose category changes, renders old and new separated by an arrow.
             category = memory_profile._categories.get(key, version)
             if action == _memory_profiler.Action.INCREMENT_VERSION:
                 new_category = memory_profile._categories.get(key, version + 1)
@@ -1173,6 +1370,8 @@ class TestMemoryProfilerE2E(TestCase):
             return category_name(category)
 
         def format_size(size: int):
+            # [FUNCTION DOC] HELPER: Formats a byte size as kilobytes, with one decimal for
+            # sizes below 1024 bytes and integer division otherwise.
             if size < 1024:
                 return f"{size / 1024:3.1f} kB"
             return f"{size // 1024} kB"
@@ -1186,6 +1385,8 @@ class TestMemoryProfilerE2E(TestCase):
         id_map = {}
 
         def id_for_testing(key):
+            # [FUNCTION DOC] HELPER: Maps an allocation id to a sequential number in order of
+            # first use, hiding platform dependent ids.
             return id_map.setdefault(key.storage.allocation_id, len(id_map))
 
         lines = [
@@ -1267,11 +1468,18 @@ class TestMemoryProfilerE2E(TestCase):
 
 @skipIfTorchDynamo("TorchDynamo changes Python calls that memory profiling relies on.")
 class TestMemoryProfilerE2EDeviceType(TestCase):
+    # [CLASS DOC] Device-type tests of categories for parameters, gradients and inputs in a
+    # memory profile. Skipped under dynamo; instantiated for cpu only; accelerator hardware
+    # classification.
     hw_classification = HardwareClassification.ACCELERATOR
 
     def _run_and_check_parameters_and_gradients(
         self, inner_fn, model, grads_none: bool = False
     ):
+        # [FUNCTION DOC] HELPER: Profiles the inner function, builds the memory profile, asserts
+        # each model parameter has only the parameter category and its gradient the gradient
+        # category (or is none when grads_none is set), then reads the timeline to trigger
+        # internal consistency checks.
         with profile() as prof:
             inner_fn()
 
@@ -1282,6 +1490,9 @@ class TestMemoryProfilerE2EDeviceType(TestCase):
             category: _memory_profiler.Category,
             should_be_none: bool = False,
         ):
+            # [FUNCTION DOC] HELPER: If should_be_none, raises AssertionError when the tensor is
+            # not none; else asserts the tensor exists and all of its categories equal the
+            # expected one.
             if should_be_none:
                 if t is not None:
                     raise AssertionError("tensor should be None but is not.")
@@ -1299,15 +1510,21 @@ class TestMemoryProfilerE2EDeviceType(TestCase):
         _ = memory_profile.timeline
 
     def test_parameters_and_gradients(self, device):
+        # [FUNCTION DOC] Checks parameter and gradient categories across a forward only run
+        # (gradients none), the first forward and backward step, a second step and a forward
+        # only run with existing gradients.
         model = torch.nn.Sequential(
             torch.nn.Linear(2, 2), ScaleLayer(), torch.nn.Linear(2, 1), ScaleLayer()
         ).to(device)
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
 
         def fwd_only():
+            # [FUNCTION DOC] HELPER: Runs the model forward once.
             _ = model(torch.ones((2, 2), device=device))
 
         def fwd_bwd_step():
+            # [FUNCTION DOC] HELPER: Zeroes gradients, runs forward, backward on a mean squared
+            # error loss, and steps the optimizer.
             optimizer.zero_grad()
             y = model(torch.ones((2, 2), device=device))
             torch.nn.functional.mse_loss(
@@ -1336,12 +1553,16 @@ class TestMemoryProfilerE2EDeviceType(TestCase):
         self._run_and_check_parameters_and_gradients(inner_fn=fwd_only, model=model)
 
     def test_parameters_and_gradients_set_to_none(self, device):
+        # [FUNCTION DOC] With gradients set to none at the start of every step, checks
+        # categories after running steps with live gradients and again after clearing them.
         model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 1)).to(
             device
         )
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
 
         def fwd_bwd_step():
+            # [FUNCTION DOC] HELPER: Three repetitions of zero_grad with none, forward, backward
+            # and optimizer step.
             for _ in range(3):
                 # zero grads at the start so gradients are still live to be
                 # checked.
@@ -1362,6 +1583,9 @@ class TestMemoryProfilerE2EDeviceType(TestCase):
         self._run_and_check_parameters_and_gradients(inner_fn=fwd_bwd_step, model=model)
 
     def test_inputs_fwd(self, device):
+        # [FUNCTION DOC] Profiles forward of a model on pre-made and newly created inputs and
+        # checks all categories of every input are the input category, which appears in the
+        # snapshot.
         model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 1)).to(
             device
         )
@@ -1389,6 +1613,8 @@ class TestMemoryProfilerE2EDeviceType(TestCase):
         self.assertTrue(_memory_profiler.Category.INPUT in snapshot.values())
 
     def test_inputs_fwd_lazy(self, device):
+        # [FUNCTION DOC] Same as the input test but with lazily created parameters and no
+        # backward; checks all categories are unknown and the input category never appears.
         model = torch.nn.Sequential(LazyLinear(2, 2), LazyLinear(2, 1)).to(device)
         inputs = [torch.ones((2, 2), device=device) for _ in range(2)]
 
@@ -1414,6 +1640,8 @@ class TestMemoryProfilerE2EDeviceType(TestCase):
         self.assertFalse(_memory_profiler.Category.INPUT in snapshot.values())
 
     def test_inputs_fwd_bwd(self, device):
+        # [FUNCTION DOC] Profiles training steps with inputs and targets, including new ones
+        # created during the profile, and checks the input category for all of them.
         model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 1)).to(
             device
         )
@@ -1424,6 +1652,8 @@ class TestMemoryProfilerE2EDeviceType(TestCase):
         ]
 
         def fwd_bwd_step(x, targets):
+            # [FUNCTION DOC] HELPER: Forward, mean squared error backward, optimizer step and
+            # zero_grad.
             y = model(x)
             torch.nn.functional.mse_loss(y, targets).backward()
             optimizer.step()
@@ -1442,6 +1672,8 @@ class TestMemoryProfilerE2EDeviceType(TestCase):
         memory_profile = prof._memory_profile()
 
         def check(t):
+            # [FUNCTION DOC] HELPER: Asserts all categories of a tensor are non-empty and equal
+            # to the input category.
             categories = _lookup_tensor_categories(t, memory_profile)
             self.assertGreater(len(categories), 0)
             self.assertTrue(
@@ -1453,6 +1685,9 @@ class TestMemoryProfilerE2EDeviceType(TestCase):
             check(targets)
 
     def test_lazily_initialized(self, device) -> None:
+        # [FUNCTION DOC] Checks parameters of a model with a lazily initialised layer are
+        # categorised correctly after a profiled step that creates them, and the parameter count
+        # grows from four to six.
         model = torch.nn.Sequential(
             torch.nn.Linear(2, 2),
             torch.nn.ReLU(),
@@ -1464,6 +1699,7 @@ class TestMemoryProfilerE2EDeviceType(TestCase):
         self.assertEqual(len(list(model.parameters())), 4)
 
         def inner_fn():
+            # [FUNCTION DOC] HELPER: Forward, new SGD optimizer, zero_grad, backward and step.
             y = model(torch.ones((2, 2), device=device))
             optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
             optimizer.zero_grad()
@@ -1476,11 +1712,15 @@ class TestMemoryProfilerE2EDeviceType(TestCase):
         self.assertEqual(len(list(model.parameters())), 6)
 
     def test_manual_optimizer_step(self, device) -> None:
+        # [FUNCTION DOC] Checks categories when parameters are updated by a manual in-place step
+        # under no-grad mode instead of an optimizer.
         model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 1)).to(
             device
         )
 
         def inner_fn():
+            # [FUNCTION DOC] HELPER: Forward and backward, then adds the scaled gradient into
+            # each parameter under no-grad mode, asserting gradients exist.
             y = model(torch.ones((2, 2), device=device))
             torch.nn.functional.mse_loss(
                 y, torch.rand((2, 1), device=device)
@@ -1497,6 +1737,8 @@ class TestMemoryProfilerE2EDeviceType(TestCase):
 
 @skipIfTorchDynamo("TorchDynamo changes Python calls that memory profiling relies on.")
 class TestMemoryProfilerTimeline(TestCase):
+    # [CLASS DOC] Memory timeline tests; skipped under dynamo; instantiated for cpu and XPU;
+    # accelerator hardware classification.
     hw_classification = HardwareClassification.ACCELERATOR
 
     @skipXPUIf(
@@ -1504,6 +1746,10 @@ class TestMemoryProfilerTimeline(TestCase):
         "The XPU Profiler will not cover this case for now. Will support it in next period.",
     )
     def test_memory_timeline_no_id(self, device) -> None:
+        # [FUNCTION DOC] Checks allocations the profiler cannot tie to a tensor: a preexisting
+        # tensor freed in the profile, an empty tensor never used, and one used once. On cpu
+        # only the last two events must be present; on other devices the timeline must equal the
+        # full expected list. Skipped on XPU.
         # On CPU the default behavior is to simply forward to malloc. That
         # means that when we free `x` the allocator doesn't actually know how
         # many bytes are in the allocation, and thus there's no point to
