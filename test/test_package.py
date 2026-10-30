@@ -1,5 +1,7 @@
 # Owner(s): ["oncall: package/deploy"]
 
+# [MODULE DOC] Aggregator that imports every torch.package test class so one runner invocation
+# executes them all. Defines no tests itself; imports are kept despite being unused.
 from package.package_a.test_all_leaf_modules_tracer import (  # noqa: F401
     TestAllLeafModulesTracer,
 )

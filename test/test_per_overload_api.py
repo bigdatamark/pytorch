@@ -1,4 +1,6 @@
 # Owner(s): ["module: unknown"]
+# [MODULE DOC] Tests for the per-overload operator API: OpOverloadPacket and OpOverload
+# attributes, caching, deepcopy, repr, calling, out variants and decompose.
 import copy
 
 import torch
@@ -6,7 +8,12 @@ from torch.testing._internal.common_utils import run_tests, TestCase
 
 
 class TestPerOverloadAPI(TestCase):
+    # [CLASS DOC] Tests basic behavior of operator packets and overloads obtained via the
+    # ops namespace.
     def test_basics_opoverloadpacket(self):
+        # [FUNCTION DOC] Checks the add packet: name, string form, callable result,
+        # module, identity caching, deepcopy returning the same object, repr, and
+        # AttributeError on unknown attributes.
         # add is only used as an example here. It is ok to update the test
         # if the semantics of add are modified in the future.
         add_packet = torch.ops.aten.add
@@ -34,6 +41,9 @@ class TestPerOverloadAPI(TestCase):
         self.assertRaises(AttributeError, lambda: add_packet.foo)
 
     def test_basics_opoverload(self):
+        # [FUNCTION DOC] Checks the add Tensor overload: names, parent packet, deepcopy
+        # identity, caching, repr, call result, the out overload writing into a tensor,
+        # and that passing out to the non-out overload raises a RuntimeError.
         add_packet = torch.ops.aten.add
         add_tensoroverload = add_packet.Tensor
 
@@ -67,6 +77,8 @@ class TestPerOverloadAPI(TestCase):
         self.assertRaises(RuntimeError, lambda: add_tensoroverload(a, a, out=b))
 
     def test_decompose(self):
+        # [FUNCTION DOC] Checks that decompose on the linear overload matches calling it
+        # directly.
         x = torch.randn(2, 3)
         y = torch.randn(5, 3)
         self.assertEqual(
