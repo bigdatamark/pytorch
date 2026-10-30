@@ -19,6 +19,12 @@
 # enabled on nightlies (and not trunk or on PRs) due to OOM errors in CI.
 # See https://github.com/pytorch/pytorch/issues/79992.
 
+# [MODULE DOC] Sphinx configuration for the PyTorch C++ API documentation. Enables the
+# intersphinx, breathe (Doxygen XML bridge, reading from the sibling build xml directory) and
+# myst_parser extensions, sets the cpp primary domain and highlighting, the pytorch_sphinx_theme2
+# HTML theme with its options and template paths, project metadata, and the LaTeX, man page and
+# Texinfo settings. Importing it requires the pytorch_sphinx_theme2 package and has no side
+# effects beyond defining configuration values and the build hook functions below.
 import os
 
 # sys.path.insert(0, os.path.abspath('.'))
@@ -219,6 +225,10 @@ html_context = {
 # Remove "Subclassed by" paragraphs that Breathe renders as plain text
 # (not links) because per-class pages don't exist without exhale.
 def remove_subclassed_by(app, doctree, docname):
+    # [FUNCTION DOC] Sphinx doctree-resolved handler. Walks every paragraph node in the resolved
+    # document tree and deletes from its parent any paragraph whose text begins with the
+    # phrase "Subclassed by" and which contains no reference (link) nodes. Paragraphs with
+    # real links are kept. Mutates the tree in place; the app and docname arguments are unused.
     from docutils import nodes
 
     for node in doctree.traverse(nodes.paragraph):
@@ -230,6 +240,9 @@ def remove_subclassed_by(app, doctree, docname):
 
 
 def setup(app):
+    # [FUNCTION DOC] Sphinx extension hook, called automatically because this configuration file
+    # acts as an extension. Registers the subclassed-by removal handler on the doctree-resolved
+    # event of the given application object. Returns nothing.
     app.connect("doctree-resolved", remove_subclassed_by)
 
 

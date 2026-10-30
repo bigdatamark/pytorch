@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command line tool that measures how much of the public C++ API is covered by the
+# C++ documentation sources. It reads the Doxygen XML index to discover classes, structs, free
+# functions in a fixed set of public namespaces, and TORCH_LIBRARY / TORCH_MODULE macros, drops
+# anything matching the exclusion patterns or exact exclusion names (unless force-included), and
+# compares the remainder with the symbols named in breathe or cpp domain directives found in the
+# RST and Markdown sources. It also scans built HTML for broken rendering and can optionally
+# run the external coverxygen tool. Reports are written next to this script. Importing the
+# module only defines constants and functions; the work happens in main when run as a script.
 """C++ API documentation coverage checker.
 
 Auto-discovers public C++ APIs from Doxygen XML output and checks which ones
@@ -303,6 +311,10 @@ PUBLIC_FUNCTION_NAMESPACES = {
 
 
 def _is_excluded(symbol: str) -> bool:
+    # [FUNCTION DOC] HELPER: Decide whether a fully qualified symbol name is skipped for coverage.
+    # A symbol in the force-include set is never excluded; otherwise it is excluded if it is in
+    # the exact-name exclusion set or if any exclusion regular expression matches the whole name.
+    # Returns a boolean and has no side effects.
     """Check if a symbol should be excluded from coverage tracking."""
     if symbol in INCLUDED_SYMBOLS:
         return False
@@ -315,6 +327,12 @@ def _is_excluded(symbol: str) -> bool:
 
 
 def _categorize(name: str) -> str:
+    # [FUNCTION DOC] HELPER: Map a qualified symbol name to a report category label by checking
+    # namespace prefixes in a fixed order (nn functional, init, utils, then other nn symbols,
+    # optim, data, autograd, serialize including the save and load functions, stable, fft,
+    # special, device namespaces, other torch, c10 variants, at variants). Names directly under
+    # the nn namespace whose last component starts with an uppercase letter are labelled as
+    # modules, others as plain nn. Anything unmatched yields the label "other". Pure function.
     """Assign a category based on the symbol's namespace."""
     if name.startswith("torch::nn::functional::"):
         return "torch::nn::functional"
@@ -360,6 +378,13 @@ def _categorize(name: str) -> str:
 
 
 def discover_apis_from_xml(xml_dir: Path) -> dict[str, list[tuple[str, str]]]:
+    # [FUNCTION DOC] Parse the Doxygen index file in the given directory and build a mapping from
+    # category label to a sorted, de-duplicated list of (symbol, kind) pairs. Three passes:
+    # class and struct compounds; function members of namespaces listed as public (only the
+    # first overload of each name is kept); and define members of file compounds whose names
+    # start with the TORCH_LIBRARY or TORCH_MODULE prefixes (category for macros). Excluded
+    # symbols are skipped. If the index file is missing, prints an error to stderr and exits
+    # the process with status 1.
     """Parse Doxygen index.xml to discover all public APIs.
 
     Returns dict of category -> list of (symbol, kind).
@@ -457,6 +482,12 @@ MYST_CPP_DIRECTIVE_RE = re.compile(
 
 
 def scan_sources(source_dir: Path) -> set[str]:
+    # [FUNCTION DOC] Recursively read every RST and Markdown file under the source directory
+    # (undecodable bytes are replaced) and collect the symbol names given to breathe doxygen
+    # directives and to cpp domain directives in both RST and MyST syntax. For each symbol a
+    # leading template parameter list is stripped (everything up to the first closing angle
+    # bracket) and any function parameter list from the first opening parenthesis onward is
+    # removed. Returns the set of documented names; only reads files.
     """Extract all documented symbols from RST/MyST breathe and cpp domain directives."""
     documented = set()
     for src_file in list(source_dir.rglob("*.rst")) + list(source_dir.rglob("*.md")):
@@ -489,6 +520,12 @@ def scan_sources(source_dir: Path) -> set[str]:
 def generate_coverage_report(
     apis: dict[str, list[tuple[str, str]]], documented: set[str]
 ) -> str:
+    # [FUNCTION DOC] Build the text coverage report. For each category (sorted) a symbol counts
+    # as documented if either its full name or its last name component is in the documented
+    # set. Categories with gaps get a heading and a bullet list of missing symbols with their
+    # kind. The end of the report has totals (discovered, documented, missing, percentage) and
+    # a per-category table of covered count, total and percentage. Returns the report as one
+    # newline joined string; no I/O.
     """Generate a coverage report comparing discovered APIs against RST docs."""
     lines = []
     lines.append("Undocumented C++ objects")
@@ -574,6 +611,13 @@ MIN_CONTENT_LENGTH = 500
 
 
 def check_html_output(build_dir: Path) -> str:
+    # [FUNCTION DOC] Scan all HTML files under the build directory (skipping search and index
+    # pages) for rendering problems and return a text report. Each file is searched for the
+    # known broken-output patterns (unresolved directives, raw directive text, problematic
+    # nodes, system messages) and unreadable files are recorded as issues. Pages under the api
+    # directory whose tag-stripped, whitespace-collapsed text is shorter than the minimum
+    # content length are flagged as possibly empty. If the directory does not exist, returns a
+    # short error string instead. Only reads files.
     """Check built HTML for broken formatting and empty pages."""
     issues = []
 
@@ -625,6 +669,14 @@ def check_html_output(build_dir: Path) -> str:
 
 
 def run_coverxygen(xml_dir: Path) -> str:
+    # [FUNCTION DOC] Optionally run the coverxygen tool on the Doxygen XML directory and return
+    # a text report. If the directory is absent, reports an error. It looks for the tool as an
+    # executable or as a module of the current interpreter; if neither works it returns
+    # installation and usage hints. Otherwise it runs the tool (public scope, classes, structs
+    # and functions, several path exclusions, 120 second timeout), counts lcov line records
+    # with a non-zero hit count as documented, reports totals and percentage, and writes the raw
+    # lcov output to a file beside this script. Failure, timeout and other errors are reported
+    # in the text rather than raised.
     """Run coverxygen on Doxygen XML output for doc-comment coverage."""
     lines = []
     lines.append("Coverxygen Report (Doxygen doc-comment coverage)")
@@ -722,6 +774,12 @@ def run_coverxygen(xml_dir: Path) -> str:
 
 
 def main():
+    # [FUNCTION DOC] Entry point. Parses the optional flags (run coverxygen; only run HTML
+    # checks). Unless HTML-only, discovers APIs from the build XML, scans the source directory
+    # for documented symbols, builds the coverage report and writes it to the coverage output
+    # file. Always runs the HTML check and writes its report file, optionally runs coverxygen,
+    # then prints all reports to stdout. Returns 0; may exit early with status 1 when the XML
+    # index is missing.
     parser = argparse.ArgumentParser(description="C++ docs coverage checker")
     parser.add_argument(
         "--coverxygen",
