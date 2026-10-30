@@ -1,4 +1,11 @@
 # Owner(s): ["module: nn"]
+# [MODULE DOC] Device-generic tests that run over every ModuleInfo entry in module_db: forward
+# and reference output, factory kwargs, device transfer, repr, pickling, inplace variants,
+# non-contiguous inputs, gradcheck, CPU/accelerator parity, memory formats, train/eval flag
+# detection, meta-device init, error inputs, to and to_empty. Also tests the JIT helper that
+# replaces a submodule of a scripted module. Import-time effects: on ROCm builds sets the MIOpen
+# NHWC environment variables, and the TestModule class is expanded per device through
+# instantiate_device_type_tests (MPS and XPU allowed).
 
 from itertools import chain, product
 from inspect import signature, isgenerator
@@ -25,12 +32,21 @@ if TEST_WITH_ROCM:
     os.environ["PYTORCH_MIOPEN_SUGGEST_NHWC_BATCHNORM"] = "1"
 
 class TestModule(TestCase):
+    # [CLASS DOC] Parameterized module tests (decorated with the modules decorator, which
+    # supplies device, dtype, module_info and training for each ModuleInfo, dtype and train or
+    # eval mode). Class attributes enable the CUDA memory-leak check and non-default-stream runs
+    # and set precision and relative tolerance to 1e-5. Helper methods handle recursive traversal
+    # of nested tensor containers and gradient bookkeeping.
     _do_cuda_memory_leak_check = True
     _do_cuda_non_default_stream = True
     precision = 1e-5
     rel_tol = 1e-5
 
     def _assert_module_parameters_and_buffer_are(self, module, device, dtype):
+        # [FUNCTION DOC] HELPER: Asserts every parameter and buffer of the module (recursive
+        # named iteration) lives on the expected device (a string is converted to a device
+        # object) and, for floating-point items only, has the expected dtype. Failures include
+        # the item name.
         # Check device placement and dtype for created parameters and buffers.
         # Only verify floating point dtypes since that's what the kwarg or methods
         # such as `float()` applies to.
@@ -38,6 +54,9 @@ class TestModule(TestCase):
             device = torch.device(device)
 
         def _check_module(items, name, device=device, dtype=dtype):
+            # [FUNCTION DOC] HELPER: Checks one iterable of name and tensor pairs against the
+            # device and dtype captured from the enclosing scope; non-floating-point tensors skip
+            # the dtype check.
             for item_name, item in items:
                 self.assertEqual(
                     item.device, device,
@@ -51,6 +70,12 @@ class TestModule(TestCase):
 
     @modules(module_db)
     def test_forward(self, device, dtype, module_info, training):
+        # [FUNCTION DOC] For each module input that has a forward input: under a frozen RNG
+        # state, builds the module, moves it to device and dtype, sets train or eval mode and
+        # runs forward. If the input supplies a reference function, the output must equal the
+        # reference output. For float32 and float64 it also calls the matching conversion
+        # method, reruns forward and checks all parameters and buffers have the expected device
+        # and dtype.
         module_cls = module_info.module_cls
         module_inputs = module_info.module_inputs_func(module_info, device=device, dtype=dtype,
                                                        requires_grad=False, training=training)
@@ -90,6 +115,13 @@ class TestModule(TestCase):
     # They should be applied to any created parameters and buffers.
     @modules(module_db)
     def test_factory_kwargs(self, device, dtype, module_info, training):
+        # [FUNCTION DOC] Skips module inputs whose construction creates no parameters or buffers
+        # from new tensors (detected by wrapping Parameter creation and register_buffer with
+        # pass-through mocks and comparing tensors in the call arguments with those passed to the
+        # constructor). For the rest, adds device and dtype keyword arguments (mutating the
+        # stored constructor kwargs) and rebuilds. Lazy modules must create all uninitialized
+        # parameters and buffers with exactly those device and dtype keywords; others must end up
+        # with every parameter and buffer on that device and dtype.
         module_cls = module_info.module_cls
         module_inputs = module_info.module_inputs_func(module_info, device=device, dtype=dtype,
                                                        requires_grad=False, training=training)
@@ -148,6 +180,11 @@ class TestModule(TestCase):
     @onlyAccelerator
     @modules(module_db)
     def test_multiple_device_transfer(self, device, dtype, module_info, training):
+        # [FUNCTION DOC] Accelerator only, not MPS. For inputs with a forward input, builds the
+        # module on device, runs forward, moves it to CPU and runs with the matching CPU inputs,
+        # moves it back and runs again, checking parameter and buffer placement after each step.
+        # With two or more accelerators it also moves the module and inputs to device index 1,
+        # runs forward under that device context and checks placement on that index.
         module_cls = module_info.module_cls
         module_inputs_device = module_info.module_inputs_func(module_info, device=device, dtype=dtype,
                                                               requires_grad=False, training=training)
@@ -185,6 +222,9 @@ class TestModule(TestCase):
                 if torch.accelerator.device_count() >= 2:
                     # === test cross-GPU transfer works
                     def _to_device1(objs):
+                        # [FUNCTION DOC] HELPER: Recursively moves tensors inside tuples, lists
+                        # and dicts to device index 1, rebuilding containers with their original
+                        # type; other objects are returned as is.
                         if isinstance(objs, (tuple, list)):
                             return type(objs)(_to_device1(item) for item in objs)
                         elif isinstance(objs, dict):
@@ -203,6 +243,9 @@ class TestModule(TestCase):
 
     @modules(module_db)
     def test_repr(self, device, dtype, module_info, training):
+        # [FUNCTION DOC] For every module input, constructs the module, moves it to device and
+        # dtype, sets train or eval mode and calls the repr and str conversions. Passes if
+        # neither raises.
         # Test module can be represented with repr and str without errors.
         module_cls = module_info.module_cls
         module_inputs = module_info.module_inputs_func(module_info, device=device, dtype=dtype,
@@ -219,6 +262,11 @@ class TestModule(TestCase):
 
     @modules(module_db)
     def test_save_load(self, device, dtype, module_info, training):
+        # [FUNCTION DOC] For inputs with a forward input: builds the module under a frozen RNG
+        # state, takes its state dict, runs forward, then saves the whole module to a temporary
+        # file, loads it back with weights_only disabled and checks the copy gives an equal
+        # output. Also saves the state dict and checks it loads equal both with the default
+        # loader and with weights_only enabled.
         # Test that module can be pickled and unpickled.
         module_cls = module_info.module_cls
         module_inputs = module_info.module_inputs_func(module_info, device=device, dtype=dtype,
@@ -265,6 +313,13 @@ class TestModule(TestCase):
     @modules([module_info for module_info in module_db
               if 'inplace' in signature(module_info.module_cls).parameters])
     def test_check_inplace(self, device, dtype, module_info, training):
+        # [FUNCTION DOC] Skipped for meta. Runs only for modules whose constructor accepts an
+        # inplace argument. Builds out-of-place and inplace variants and checks that the
+        # out-of-place run leaves the first input version counter unchanged, the inplace run on a
+        # cloned copy bumps it, the outputs are equal, and after backward with the same random
+        # gradient the input gradients agree.
+        # KNOWN ISSUE: first_param_name is a name and parameter pair taken from the signature
+        # items, so the check that it is absent from the input keyword arguments can never fail.
         # Check if the inplace variant of the module gives the same result as the out of place
         # variant.
         module_cls = module_info.module_cls
@@ -315,6 +370,10 @@ class TestModule(TestCase):
             self.assertEqual(input_args[0].grad, input_arg_copy[0].grad)
 
     def _traverse_obj(self, obj, func):
+        # [FUNCTION DOC] HELPER: Recursively applies a function to every tensor or Parameter
+        # found in tuples and lists (type preserved), generators (consumed into a tuple) and
+        # dict values (dict rebuilt). Returns the rebuilt structure; other objects are passed
+        # through unchanged.
         if isinstance(obj, (tuple, list)):
             return type(obj)(self._traverse_obj(o, func) for o in obj)
         elif isgenerator(obj):
@@ -327,27 +386,44 @@ class TestModule(TestCase):
             return obj
 
     def _retain_grad(self, obj):
+        # [FUNCTION DOC] HELPER: Calls retain_grad on every tensor in the nested structure that
+        # requires grad so non-leaf gradients are populated after backward. Mutates tensors only.
         # gradients needs to be retained to check for grad. This is useful when
         # non-leaves are present in the graph.
         def inner_retain_grad(obj):
+            # [FUNCTION DOC] HELPER: Calls retain_grad on the tensor if it requires grad; no
+            # return value.
             if obj.requires_grad:
                 obj.retain_grad()
         self._traverse_obj(obj, inner_retain_grad)
 
     def _get_grads(self, obj):
+        # [FUNCTION DOC] HELPER: Returns a structure mirroring the input holding the grad of each
+        # tensor that requires grad (None for tensors that do not).
         def inner_get_grad(obj):
+            # [FUNCTION DOC] HELPER: Returns the grad of the tensor if it requires grad,
+            # else None.
             if obj.requires_grad:
                 return obj.grad
         return self._traverse_obj(obj, inner_get_grad)
 
     def _zero_grad(self, obj):
+        # [FUNCTION DOC] HELPER: Resets the grad attribute to None on every tensor in the nested
+        # structure (generators are consumed). Mutates tensors; returns nothing.
         def inner_zero_grad(obj):
+            # [FUNCTION DOC] HELPER: Sets the tensor grad to None if one is present.
             if obj.grad is not None:
                 obj.grad = None
         self._traverse_obj(obj, inner_zero_grad)
 
     @modules(module_db)
     def test_non_contiguous_tensors(self, device, dtype, module_info, training):
+        # [FUNCTION DOC] Checks module results do not depend on input or gradient strides. For
+        # each input with at least one non-scalar tensor, computes the default output, a random
+        # output gradient, input gradients and parameter gradients. Then, for every combination
+        # of contiguous or non-contiguous inputs and contiguous or non-contiguous output
+        # gradients, it reruns forward and backward and requires equal outputs, input gradients
+        # (absolute tolerance 1e-4) and parameter gradients.
         # Check modules work with non-contiguous tensors
 
         module_cls = module_info.module_cls
@@ -355,7 +431,14 @@ class TestModule(TestCase):
                                                        requires_grad=True, training=training)
 
         def _make_non_contiguous(obj):
+            # [FUNCTION DOC] HELPER: Returns a copy of the nested structure in which every
+            # non-scalar tensor is replaced by a detached, non-contiguous tensor with the same
+            # values and the same requires_grad flag.
             def inner_make_non_contiguous(obj):
+                # [FUNCTION DOC] HELPER: Leaves non-tensors and zero-dimensional tensors
+                # untouched. Otherwise duplicates each element along the last dimension and takes
+                # every other element by slicing, yielding equal values in a strided layout;
+                # detaches and restores requires_grad.
                 # Scalar tensors can not be made non-contiguous
                 if not isinstance(obj, torch.Tensor) or obj.dim() == 0:
                     return obj
@@ -367,6 +450,8 @@ class TestModule(TestCase):
             return self._traverse_obj(obj, inner_make_non_contiguous)
 
         def _can_be_noncontiguous(obj):
+            # [FUNCTION DOC] HELPER: Returns True if the nested tuple, list or dict structure
+            # contains at least one tensor with one or more dimensions, else False.
             if isinstance(obj, (tuple, list)):
                 return any(_can_be_noncontiguous(o) for o in obj)
             elif isinstance(obj, dict):
@@ -441,6 +526,14 @@ class TestModule(TestCase):
                 self.assertEqual(param_grad, default_param_grad)
 
     def _test_gradients_helper(self, device, dtype, module_info, training, check):
+        # [FUNCTION DOC] HELPER: Shared body of the gradient tests. Skips XPU MultiheadAttention.
+        # Uses the module-specific nondeterminism tolerance only on CUDA with cuDNN enabled or on
+        # XPU, otherwise zero. For each input with a forward input, builds the module (lazy
+        # modules get one no-grad forward to initialize), then runs the given check function
+        # (gradcheck or gradgradcheck) over all inputs, parameters and tensor keyword arguments
+        # together, and then with each parameter and tensor keyword argument enabled one at a
+        # time. Asserts every check passes. Parameters and tensor keyword arguments are left not
+        # requiring grad at the end.
         # Check gradients
         module_cls = module_info.module_cls
         module_inputs = module_info.module_inputs_func(module_info, device=device, dtype=dtype,
@@ -480,6 +573,11 @@ class TestModule(TestCase):
                     other_kwargs[name] = obj
 
             def fn_to_gradcheck(*flat_input_and_params):
+                # [FUNCTION DOC] HELPER: Function under gradient check. Rebuilds the structured
+                # inputs from the flat tensor list using a spec computed later in the enclosing
+                # scope, splits them into positional inputs and tensor keyword arguments, runs
+                # the module forward under a frozen RNG state with the non-tensor keyword
+                # arguments, and returns the flattened output tensors.
                 input_and_params = torch.utils._pytree.tree_unflatten(flat_input_and_params, flat_spec)
                 new_input_args = input_and_params[:len(input_args)]
                 kwarg_args = input_and_params[-len(kwarg_tensors):]
@@ -491,6 +589,9 @@ class TestModule(TestCase):
                     return output_flattened
 
             def do_check(flat_input):
+                # [FUNCTION DOC] HELPER: Asserts the chosen check function returns true for the
+                # flat input list, passing the nondeterminism tolerance and the fast mode flag
+                # from the ModuleInfo.
                 self.assertTrue(
                     check(
                         fn_to_gradcheck,
@@ -529,11 +630,14 @@ class TestModule(TestCase):
 
     @modules(module_db, allowed_dtypes=[torch.double])
     def test_grad(self, device, dtype, module_info, training):
+        # [FUNCTION DOC] Runs the gradient helper with gradcheck for double dtype only.
         self._test_gradients_helper(device, dtype, module_info, training, gradcheck)
 
     @modules([m for m in module_db if m.supports_gradgrad],
              allowed_dtypes=[torch.double])
     def test_gradgrad(self, device, dtype, module_info, training):
+        # [FUNCTION DOC] Runs the gradient helper with gradgradcheck for double dtype only,
+        # limited to ModuleInfo entries that support double backward.
         self._test_gradients_helper(device, dtype, module_info, training, gradgradcheck)
 
     @skipMPS
@@ -543,6 +647,13 @@ class TestModule(TestCase):
                         torch.float64: tol(4e-4, 0)})
     @modules(module_db)
     def test_cpu_gpu_parity(self, device, dtype, module_info, training):
+        # [FUNCTION DOC] Accelerator only, not MPS; TF32 disabled and per-dtype tolerance
+        # overrides applied. Returns early for RNN, GRU and LSTM in eval mode on CUDA with cuDNN.
+        # Builds the CPU and device modules from the same constructor arguments, copies CPU
+        # parameter data to the device module, and checks forward outputs are equal. Then, five
+        # times, backpropagates a random gradient through both and compares input, parameter and
+        # keyword input gradients.
+        # KNOWN ISSUE: the forward input is used without a check for None, unlike sibling tests.
         # TODO: RNN / GRU / LSTM don't support backwards on eval mode for cuDNN; skip this in a
         # nicer way for eval mode only.
         # See https://github.com/pytorch/pytorch/issues/79161
@@ -559,6 +670,10 @@ class TestModule(TestCase):
                                                            requires_grad=True, training=training)
 
         def _to_device(obj):
+            # [FUNCTION DOC] HELPER: Copies a nested structure to the target device. Tensors are
+            # detached, moved and given the original requires_grad flag; tuples and dicts are
+            # handled recursively; any other object (including lists) is deep-copied without
+            # being moved.
             if isinstance(obj, torch.Tensor):
                 res = obj.detach().to(device=device)
                 res.requires_grad = obj.requires_grad
@@ -604,6 +719,10 @@ class TestModule(TestCase):
 
             # === Run backwards on CPU and GPU and compare results ===
             def check_backward(cpu_output, gpu_output):
+                # [FUNCTION DOC] HELPER: Backpropagates one random gradient (generated on the CPU
+                # output and converted to the device output type) through both outputs, retaining
+                # the graph, then asserts equal gradients for positional inputs, every parameter
+                # and keyword inputs.
                 cpu_grad_output = cpu_output.clone().normal_()
                 gpu_grad_output = cpu_grad_output.type_as(gpu_output)
 
@@ -634,6 +753,14 @@ class TestModule(TestCase):
     @with_tf32_off
     @modules(module_db)
     def test_memory_format(self, device, dtype, module_info, training):
+        # [FUNCTION DOC] TF32 disabled. Uses looser tolerances on CUDA devices with compute
+        # capability 8.0 or 8.6. For each input computes a reference output in the all-contiguous
+        # configuration and, in training mode, reference gradients from random output gradients.
+        # Then loops over input memory formats and module memory formats (channels_last variants
+        # are chosen by whether an input has 4 or 5 dimensions), converts inputs and module, and
+        # checks outputs and gradients equal the reference (unless both formats are contiguous)
+        # and that output and gradient memory formats match the expectation. Overwrites the
+        # stored forward inputs with the converted tensors as it goes.
         is_sm86or80 = torch.device(device).type == "cuda" and (torch.cuda.get_device_capability(0) == (8, 6)
                                                                or torch.cuda.get_device_capability(0) == (8, 0))
         # TODO tighten it to a specific module
@@ -644,6 +771,10 @@ class TestModule(TestCase):
         module_memformat_affects_out = module_info.module_memformat_affects_out
 
         def _get_mem_formats(channels_last=False, channels_last_3d=False):
+            # [FUNCTION DOC] HELPER: Returns a pair of lists: input memory formats to try and
+            # module memory formats to try. The channels_last (4D) and channels_last_3d (5D)
+            # variants add that format; otherwise only contiguous inputs, and preserve or
+            # contiguous modules.
             if channels_last:
                 return ([torch.contiguous_format, torch.channels_last],
                         [torch.preserve_format, torch.contiguous_format, torch.channels_last])
@@ -656,6 +787,8 @@ class TestModule(TestCase):
 
         # Check that at least one Tensor input has dim == n
         def _check_dims(obj, n):
+            # [FUNCTION DOC] HELPER: Returns True if any tensor in the nested tuple or list has
+            # exactly the given number of dimensions; dicts and other objects count as no match.
             if isinstance(obj, torch.Tensor):
                 return obj.dim() == n
             elif isinstance(obj, (tuple, list)):
@@ -665,7 +798,13 @@ class TestModule(TestCase):
 
         # Called after _check_dims, when we know that >= 1 tensor can be converted to mem_format
         def _to_mem_format(mem_format, obj):
+            # [FUNCTION DOC] HELPER: Returns a copy of the nested structure with every
+            # tensor converted to the requested memory format as a detached tensor
+            # keeping requires_grad.
             def inner_to_mem_format(obj):
+                # [FUNCTION DOC] HELPER: Converts one tensor to the target format; if the format
+                # is channels_last without 4 dimensions or channels_last_3d without 5, only
+                # clones and detaches.
                 d = obj.dim()
                 if ((mem_format == torch.channels_last and d != 4)
                    or (mem_format == torch.channels_last_3d and d != 5)):
@@ -675,7 +814,13 @@ class TestModule(TestCase):
             return self._traverse_obj(obj, inner_to_mem_format)
 
         def _check_out_mem_format(output, input_mem_format, module_mem_format):
+            # [FUNCTION DOC] HELPER: Asserts the memory format of each tensor in the nested
+            # output. Expected channels_last for 4D (or channels_last_3d for 5D) when the input
+            # has that format, or when the module has it and the ModuleInfo says it affects the
+            # output; empty tensors always pass; everything else must simply be contiguous.
             def inner_check_out_mem_format(output):
+                # [FUNCTION DOC] HELPER: Performs the per-tensor memory format assertion
+                # described by the enclosing function, based on the tensor dimension count.
                 d = output.dim()
                 if (d == 4 and ((input_mem_format == torch.channels_last)
                                 or (module_mem_format == torch.channels_last and module_memformat_affects_out))):
@@ -688,6 +833,7 @@ class TestModule(TestCase):
             return self._traverse_obj(output, inner_check_out_mem_format)
 
         def _req_grad(t):
+            # [FUNCTION DOC] HELPER: Returns True if the object is a tensor that requires grad.
             return isinstance(t, torch.Tensor) and t.requires_grad
 
         for module_input in module_inputs:
@@ -799,6 +945,11 @@ class TestModule(TestCase):
     # that the ModuleInfo entry flag is correct.
     @modules(module_db, train_eval_mode=TrainEvalMode.train_only)
     def test_if_train_and_eval_modes_differ(self, device, dtype, module_info, training):
+        # [FUNCTION DOC] Train-only mode. For each input with a forward input, builds the module,
+        # deletes its training attribute and runs forward. If an AttributeError mentions
+        # training, asserts the ModuleInfo train_and_eval_differ flag is true (with an
+        # explanatory message); any other AttributeError is re-raised. Nothing is asserted when
+        # forward succeeds.
         module_cls = module_info.module_cls
         module_inputs = module_info.module_inputs_func(module_info, device=device, dtype=dtype,
                                                        requires_grad=False, training=training)
@@ -835,6 +986,10 @@ class TestModule(TestCase):
     @onlyCPU
     @modules(module_db)
     def test_device_ctx_init(self, device, dtype, module_info, training):
+        # [FUNCTION DOC] CPU only. Builds each module twice from the same inputs: normally on CPU
+        # and inside a meta device context with inputs generated under that context. For every
+        # parameter and buffer pair (lazy ones skipped) asserts the meta tensor is on the meta
+        # device and its metadata matches the CPU tensor.
         module_cls = module_info.module_cls
         module_inputs = module_info.module_inputs_func(module_info, device=device, dtype=dtype,
                                                        requires_grad=False, training=training)
@@ -862,6 +1017,10 @@ class TestModule(TestCase):
 
     @modules([module for module in module_db if module.module_error_inputs_func is not None])
     def test_errors(self, device, dtype, module_info, training):
+        # [FUNCTION DOC] Runs only for ModuleInfo entries with an error-inputs function. For each
+        # error input, construction errors must raise the given exception matching the regex
+        # during construction; forward errors build the module first and must raise during
+        # forward. Any other error kind raises NotImplementedError.
         module_cls = module_info.module_cls
         error_inputs = module_info.module_error_inputs_func(module_info, device=device, dtype=dtype,
                                                             requires_grad=False, training=training)
@@ -886,6 +1045,15 @@ class TestModule(TestCase):
     @parametrize('set_grad', [True, False])
     @wrapSwapTensorsTest()
     def test_to(self, device, dtype, module_info, training, swap, set_grad):
+        # [FUNCTION DOC] Float32 only, not MPS, run for swap on or off and set_grad on or off.
+        # Sets the global swap-on-conversion flag. Builds each module, replaces its parameters
+        # and buffers by copies on the device and dtype (optionally with random grads),
+        # optionally runs forward and backward then converts to half and back (swap, no
+        # grads). Then for every device and dtype combination converts the module and asserts
+        # parameter type, device and dtype, and identity: with swap the Python ids stay the
+        # same while the underlying tensor handles change; without swap both stay the same,
+        # and gradients likewise.
+        # KNOWN ISSUE: forward input is read without a check for None for each module input.
         module_cls = module_info.module_cls
         devices = ['cpu']
         if torch.accelerator.is_available():
@@ -903,6 +1071,10 @@ class TestModule(TestCase):
 
             # Avoid using `module.to()` when constructing module since that is the method we are testing
             def _to(m, set_grad=False):
+                # [FUNCTION DOC] HELPER: Recursively (children first) replaces the direct
+                # parameters of a module with new Parameters detached, cloned and moved to the
+                # device and dtype, optionally assigning random gradients, and does the same for
+                # direct buffers, without using the module to method under test.
                 for c in m.children():
                     _to(c, set_grad=set_grad)
                 for n, p in m.named_parameters(recurse=False):
@@ -974,6 +1146,11 @@ class TestModule(TestCase):
     @parametrize('swap', [True, False])
     @wrapSwapTensorsTest()
     def test_to_empty(self, device, dtype, module_info, swap, training):
+        # [FUNCTION DOC] Float32 only, not MPS, run for swap on or off. Builds each module inside
+        # a meta device context, records parameter ids and underlying handles, calls to_empty
+        # with the target device, and asserts all parameters are Parameters on that device with
+        # the test dtype. With swap the ids stay the same and the handles change; without swap
+        # both change because new Parameter objects are created.
         module_cls = module_info.module_cls
 
         with torch.device("meta"):
@@ -1012,31 +1189,51 @@ class TestModule(TestCase):
 
 
 class TestJitReplaceSubmodule(TestCase):
+    # [CLASS DOC] Tests for the C++ binding that replaces a named submodule of a scripted module.
+    # Each test scripts small module trees, calls the binding with the underlying C++ module, a
+    # dotted path and the replacement C++ module, and checks results or error messages.
     def test_jit_replace_submodule(self):
+        # [FUNCTION DOC] Scripts a parent with a child and a replacement child that doubles its
+        # output. Replaces the child by name, wraps the returned C++ module, and asserts the
+        # output changed and the child C++ type name equals the replacement's.
         from torch.jit._recursive import wrap_cpp_module
 
         class SubA(torch.nn.Module):
+            # [CLASS DOC] HELPER: Child module with a linear layer whose forward returns
+            # its output.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates a linear layer with 4 inputs and 4 outputs as
+                # an attribute.
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer to the input.
                 return self.linear(x)
 
         class SubB(torch.nn.Module):
+            # [CLASS DOC] HELPER: Replacement child; same layout as SubA but forward doubles
+            # the output.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates a linear layer with 4 inputs and 4 outputs as
+                # an attribute.
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer and multiplies the result
+                # by two.
                 return self.linear(x) * 2
 
         class Parent(torch.nn.Module):
+            # [CLASS DOC] HELPER: Parent module holding a SubA instance as its child attribute.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the child attribute holding a SubA instance.
                 super().__init__()
                 self.child = SubA()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Forwards the input through the child.
                 return self.child(x)
 
         root = torch.jit.script(Parent())
@@ -1057,6 +1254,10 @@ class TestJitReplaceSubmodule(TestCase):
         )
 
     def test_jit_replace_submodule_mutates_in_place(self):
+        # [FUNCTION DOC] Checks the replacement binding mutates the input C++ module in place.
+        # The return value is discarded; asserts the original C++ module object is the same
+        # instance and that re-wrapping it (to bypass the cached Python children) shows the
+        # replacement type. Also asserts beforehand that the two child type names differ.
         # _jit_replace_submodule must mutate the input ``root._c`` in
         # place rather than swap on a clone.  Old behaviour cloned root
         # first, returned the clone, and left ``root._c`` untouched --
@@ -1073,27 +1274,39 @@ class TestJitReplaceSubmodule(TestCase):
         from torch.jit._recursive import wrap_cpp_module
 
         class SubA(torch.nn.Module):
+            # [CLASS DOC] HELPER: Original child module with a linear layer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates a linear layer with 4 inputs and 4 outputs as
+                # an attribute.
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer to the input.
                 return self.linear(x)
 
         class SubB(torch.nn.Module):
+            # [CLASS DOC] HELPER: Replacement child; forward doubles the linear output.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates a linear layer with 4 inputs and 4 outputs as
+                # an attribute.
                 super().__init__()
                 self.linear = torch.nn.Linear(4, 4)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the linear layer and multiplies the result
+                # by two.
                 return self.linear(x) * 2
 
         class Parent(torch.nn.Module):
+            # [CLASS DOC] HELPER: Parent module holding a SubA instance as its child attribute.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the child attribute holding a SubA instance.
                 super().__init__()
                 self.child = SubA()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Forwards the input through the child.
                 return self.child(x)
 
         root = torch.jit.script(Parent())
@@ -1120,28 +1333,41 @@ class TestJitReplaceSubmodule(TestCase):
         )
 
     def test_jit_replace_submodule_nested(self):
+        # [FUNCTION DOC] Replaces a leaf two levels down using a dotted path to the leaf, with
+        # a scripted leaf of scale 3. Asserts the whole tree then outputs the input multiplied
+        # by 3.
         class Leaf(torch.nn.Module):
+            # [CLASS DOC] HELPER: Leaf module storing a float scale and multiplying its input
+            # by it.
             def __init__(self, scale: float) -> None:
+                # [FUNCTION DOC] HELPER: Stores the scale as an attribute.
                 super().__init__()
                 self.scale = scale
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input multiplied by the scale.
                 return x * self.scale
 
         class Mid(torch.nn.Module):
+            # [CLASS DOC] HELPER: Middle module holding a Leaf with scale 1.0.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the leaf attribute with scale 1.0.
                 super().__init__()
                 self.leaf = Leaf(1.0)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Forwards the input through the leaf.
                 return self.leaf(x)
 
         class Root(torch.nn.Module):
+            # [CLASS DOC] HELPER: Root module holding a Mid instance.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the mid attribute.
                 super().__init__()
                 self.mid = Mid()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Forwards the input through the mid module.
                 return self.mid(x)
 
         root = torch.jit.script(Root())
@@ -1156,16 +1382,23 @@ class TestJitReplaceSubmodule(TestCase):
         self.assertEqual(out_after, inp * 3.0)
 
     def test_jit_replace_submodule_empty_qualified_name(self):
+        # [FUNCTION DOC] Asserts an empty qualified name makes the binding raise a RuntimeError
+        # whose message mentions needing a non-empty qualified name.
         class Leaf(torch.nn.Module):
+            # [CLASS DOC] HELPER: Identity leaf module.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input unchanged.
                 return x
 
         class Root(torch.nn.Module):
+            # [CLASS DOC] HELPER: Root module holding an identity Leaf as its child.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the child attribute.
                 super().__init__()
                 self.child = Leaf()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Forwards the input through the child.
                 return self.child(x)
 
         root = torch.jit.script(Root())
@@ -1175,16 +1408,24 @@ class TestJitReplaceSubmodule(TestCase):
             torch._C._jit_replace_submodule(root._c, "", new_child._c)
 
     def test_jit_replace_submodule_missing_segment(self):
+        # [FUNCTION DOC] Asserts that a path whose first segment names a missing submodule raises
+        # a RuntimeError saying the path segment could not be found, both for a two-segment path
+        # and for a single missing name.
         class Leaf(torch.nn.Module):
+            # [CLASS DOC] HELPER: Identity leaf module.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input unchanged.
                 return x
 
         class Root(torch.nn.Module):
+            # [CLASS DOC] HELPER: Root module holding an identity Leaf as its child.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the child attribute.
                 super().__init__()
                 self.child = Leaf()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Forwards the input through the child.
                 return self.child(x)
 
         root = torch.jit.script(Root())
@@ -1197,19 +1438,27 @@ class TestJitReplaceSubmodule(TestCase):
             torch._C._jit_replace_submodule(root._c, "missing", new_child._c)
 
     def test_jit_replace_submodule_non_module_attribute(self):
+        # [FUNCTION DOC] Asserts that naming an integer attribute, alone or as the start of a
+        # longer path, raises a RuntimeError saying that attribute is not a submodule.
         class Leaf(torch.nn.Module):
+            # [CLASS DOC] HELPER: Identity leaf module.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input unchanged.
                 return x
 
         class Root(torch.nn.Module):
+            # [CLASS DOC] HELPER: Root module with a child Leaf and an integer attribute set to 7
+            # (class level annotation so scripting treats it as an int).
             scalar: int
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the child and sets the integer attribute to 7.
                 super().__init__()
                 self.child = Leaf()
                 self.scalar = 7
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the child output plus the integer attribute.
                 return self.child(x) + self.scalar
 
         root = torch.jit.script(Root())
@@ -1222,29 +1471,43 @@ class TestJitReplaceSubmodule(TestCase):
             torch._C._jit_replace_submodule(root._c, "scalar.nested", new_child._c)
 
     def test_jit_replace_submodule_shared_parent_type(self):
+        # [FUNCTION DOC] Builds a root with two Mid instances of the same class and tries to
+        # replace the leaf under one of them. Asserts an exception mentioning unique parent
+        # types, because the two parents share a scripted type.
         class Leaf(torch.nn.Module):
+            # [CLASS DOC] HELPER: Leaf module storing a float scale and multiplying its input
+            # by it.
             def __init__(self, scale: float) -> None:
+                # [FUNCTION DOC] HELPER: Stores the scale as an attribute.
                 super().__init__()
                 self.scale = scale
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input multiplied by the scale.
                 return x * self.scale
 
         class Mid(torch.nn.Module):
+            # [CLASS DOC] HELPER: Middle module holding a Leaf with scale 1.0.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the leaf attribute with scale 1.0.
                 super().__init__()
                 self.leaf = Leaf(1.0)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Forwards the input through the leaf.
                 return self.leaf(x)
 
         class Root(torch.nn.Module):
+            # [CLASS DOC] HELPER: Root module holding two separate Mid instances of the
+            # same class.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the two Mid attributes.
                 super().__init__()
                 self.mid_a = Mid()
                 self.mid_b = Mid()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the sum of both Mid outputs.
                 return self.mid_a(x) + self.mid_b(x)
 
         root = torch.jit.script(Root())
@@ -1254,24 +1517,34 @@ class TestJitReplaceSubmodule(TestCase):
             torch._C._jit_replace_submodule(root._c, "mid_a.leaf", new_leaf._c)
 
     def test_jit_replace_submodule_empty_path_segment(self):
+        # [FUNCTION DOC] Asserts a path containing an empty segment between two separators raises
+        # a RuntimeError mentioning empty path segments.
         class Leaf(torch.nn.Module):
+            # [CLASS DOC] HELPER: Identity leaf module.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input unchanged.
                 return x
 
         class Mid(torch.nn.Module):
+            # [CLASS DOC] HELPER: Middle module holding an identity Leaf.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the leaf attribute.
                 super().__init__()
                 self.leaf = Leaf()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Forwards the input through the leaf.
                 return self.leaf(x)
 
         class Root(torch.nn.Module):
+            # [CLASS DOC] HELPER: Root module holding a Mid instance.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the mid attribute.
                 super().__init__()
                 self.mid = Mid()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Forwards the input through the mid module.
                 return self.mid(x)
 
         root = torch.jit.script(Root())
