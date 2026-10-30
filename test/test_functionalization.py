@@ -1,5 +1,11 @@
 # Owner(s): ["module: codegen"]
 # ruff: noqa: F841
+# [MODULE DOC] Tests for the functionalization pass (conversion of in-place and view ops into
+# functional ones). Defines a small Python driver that wraps a function so it runs on functional
+# tensors using the C++ pass, a test class that compares eager, functionalized and reinplaced
+# results and checks the traced graph text via expected-output assertions, a variant that runs
+# every test with the cross-reference checker, and serialization tests for view metadata
+# objects. Import time has no side effects other than defining classes.
 
 import pickle
 import unittest
@@ -32,6 +38,8 @@ from torch.utils._pytree import tree_map_only
 
 
 def are_aliased(x, y):
+    # [FUNCTION DOC] HELPER: Returns whether two tensors share the same underlying storage, by
+    # comparing weak references to their storages.
     x_storage = StorageWeakRef(x.storage())
     y_storage = StorageWeakRef(y.storage())
     return x_storage == y_storage
@@ -43,12 +51,25 @@ def are_aliased(x, y):
 def _functionalize(
     f, *, reapply_views: bool, crossref: bool, skip_input_mutations: bool = False
 ):
+    # [FUNCTION DOC] HELPER: Wraps the function so that calling the wrapper functionalizes it.
+    # The wrapper converts tensor inputs to functional tensors, enables functionalization (with
+    # the given view reapplication setting) while running the function, syncs, and unwraps the
+    # outputs. Unless input mutation skipping is requested, it also copies updated values back
+    # into the original inputs when shapes match (input metadata mutations are not propagated).
+    # With the crossref flag the call runs under the cross-reference functionalize context.
+    # Returns the wrapper.
     def to_fun(t: torch.Tensor):
+        # [FUNCTION DOC] HELPER: Converts a tensor to a functional tensor and preserves its
+        # requires_grad flag.
         func_t = torch._to_functional_tensor(t)
         func_t.requires_grad = t.requires_grad
         return func_t
 
     def wrapped(*inputs):
+        # [FUNCTION DOC] HELPER: Runs the user function on functional versions of the inputs,
+        # always disabling functionalization afterwards, then syncs and copies mutated inputs
+        # back into the originals where the shape is unchanged. Returns the outputs converted
+        # back to plain tensors.
         ctx = nullcontext()
         if crossref:
             ctx = enable_crossref_functionalize()
@@ -83,9 +104,18 @@ def _functionalize(
     TEST_WITH_TORCHDYNAMO, "https://github.com/pytorch/pytorch/issues/81457"
 )
 class TestFunctionalization(TestCase):
+    # [CLASS DOC] Base functionalization test suite. Skipped when running under TorchDynamo. The
+    # class attribute crossref selects whether the driver runs under the crossref checker; the
+    # subclass below flips it. Helper methods produce traced graph code and compare outputs; the
+    # tests exercise views, in-place ops, out= ops, resizing, mixed wrappers, norms and the
+    # Python functionalization shims.
     crossref = False
 
     def get_logs(self, func, *inpts, reapply_views=False, run_reinplace=False):
+        # [FUNCTION DOC] HELPER: Traces the functionalized function with make_fx on the given
+        # inputs and returns the generated graph code as text. When reinplace is requested, it
+        # first runs the reinplace pass using cloned inputs. The reapply_views flag is passed to
+        # the driver.
         inpts_clone = tree_map_only(torch.Tensor, torch.clone, inpts)
         traced_f = make_fx(
             _functionalize(func, reapply_views=reapply_views, crossref=self.crossref)
@@ -97,6 +127,12 @@ class TestFunctionalization(TestCase):
     def assert_functionalization(
         self, func, *inpts, reapply_views=False, mutated_input_metadata=False
     ):
+        # [FUNCTION DOC] HELPER: Checks functionalization against eager execution. It runs the
+        # function eagerly, functionalized, and as a traced graph processed by the reinplace
+        # pass (always traced with view reapplication), each on fresh input clones. Unless
+        # mutated_input_metadata is set it asserts the cloned inputs received the same input
+        # mutations as the originals. Then it asserts all outputs (a single tensor or a tuple)
+        # match the eager ones.
         clones1 = tree_map_only(torch.Tensor, torch.clone, inpts)
         clones2 = tree_map_only(torch.Tensor, torch.clone, inpts)
         clones3 = tree_map_only(torch.Tensor, torch.clone, inpts)
@@ -153,13 +189,19 @@ class TestFunctionalization(TestCase):
             self.assertEqual(out_ref_, out_reinplace_)
 
     def test_save_for_backwards_segfault(self):
+        # [FUNCTION DOC] Regression test: calls exp on a functional tensor wrapping a logging
+        # tensor that requires grad; passes if it does not crash. Nothing is asserted.
         inp = torch._to_functional_tensor(
             LoggingTensor(torch.randn(2, 2))
         ).requires_grad_(True)
         inp.exp()
 
     def test_multiple_views_of_same_base(self):
+        # [FUNCTION DOC] Checks that two views of the same base both observe an in-place add on
+        # the base, by comparing eager and functionalized results.
         def f(x):
+            # [FUNCTION DOC] HELPER: Makes two views of the input, adds one in place to the
+            # input, and returns the second view plus one.
             y = x.view(-1)
             z = x.view(-1)
             x.add_(1)
@@ -172,7 +214,12 @@ class TestFunctionalization(TestCase):
         self.assert_functionalization(f, torch.ones(4))
 
     def test_freeze(self):
+        # [FUNCTION DOC] Checks that freezing a functional tensor makes later in-place ops on it
+        # or on its views raise a RuntimeError, while mutating the original input is still fine.
         def f(x):
+            # [FUNCTION DOC] HELPER: Clones the input, indexes it, freezes the clone, mutates
+            # the input, and asserts in-place adds on the clone and the index result raise
+            # RuntimeError.
             y = x.clone()
             z = y[0]
             torch._freeze_functional_tensor(y)
@@ -184,7 +231,11 @@ class TestFunctionalization(TestCase):
         _functionalize(f, reapply_views=True, crossref=self.crossref)(torch.ones(3, 3))
 
     def test_copy_stride_mismatch(self):
+        # [FUNCTION DOC] Checks that copying into an empty strided tensor with non-default
+        # strides keeps that stride (5, 1) in the functionalized result.
         def f(x):
+            # [FUNCTION DOC] HELPER: Creates a 2x2 tensor with strides 5 and 1 and copies the
+            # input into it.
             y = torch.empty_strided((2, 2), (5, 1))
             y.copy_(x)
             return y
@@ -195,7 +246,11 @@ class TestFunctionalization(TestCase):
         self.assertEqual(r.stride(), (5, 1))
 
     def test_set_(self):
+        # [FUNCTION DOC] Checks functionalization handles setting a tensor to a storage; the
+        # crossref mode is deliberately not used. Asserts the result is on the cpu device.
         def f(x):
+            # [FUNCTION DOC] HELPER: Makes a ones tensor and sets it to the storage of the
+            # input.
             y = torch.ones(2)
             y.set_(x.storage())
             return y
@@ -206,7 +261,11 @@ class TestFunctionalization(TestCase):
         self.assertEqual(str(r.device), "cpu")
 
     def test_advanced_indexing(self):
+        # [FUNCTION DOC] Checks functionalization of an advanced indexing assignment into a zero
+        # matrix with no tensor inputs.
         def f():
+            # [FUNCTION DOC] HELPER: Builds a 3x3 zero tensor and assigns a column of ones
+            # through an index tensor.
             x = torch.zeros(3, 3)
             idx = torch.tensor([0])
             val = torch.ones(3, 1)
@@ -216,7 +275,12 @@ class TestFunctionalization(TestCase):
         self.assert_functionalization(f)
 
     def test_view_clone_view_inplace(self):
+        # [FUNCTION DOC] Checks the graph for a view, clone, view, in-place relu pattern on a
+        # large tensor, including its backward pass, traced with anomaly detection and stack
+        # trace hooks enabled. Asserts the expected traced graph text.
         def f(input):
+            # [FUNCTION DOC] HELPER: Views the input with a different shape, clones it, views it
+            # back and applies relu in place.
             shape = [1, 1024, 128, 128]
             input_reshaped = input.view(shape)
             out = input_reshaped.clone()
@@ -225,6 +289,9 @@ class TestFunctionalization(TestCase):
             return r
 
         def g(x):
+            # [FUNCTION DOC] HELPER: Sums the output of the previous function, registers stack
+            # trace preservation hooks on the loss graph node, runs backward with node metadata
+            # preserved, and returns the input gradient.
             loss = f(x).sum()
             import torch.fx.traceback as fx_traceback
             from torch._functorch.aot_autograd import (
@@ -274,7 +341,12 @@ def forward(self, arg0_1):
         )
 
     def test_simple(self):
+        # [FUNCTION DOC] Checks a simple view followed by an in-place add, with the expected
+        # functionalized graph and the reinplaced graph (reapply views and reinplace pass)
+        # asserted as text.
         def f(x):
+            # [FUNCTION DOC] HELPER: Views the input as 4x2, adds a ones tensor in place and
+            # returns the view; also computes an unused product.
             # simple test: 1 view op, 1 inplace op
             tmp = torch.ones(4, 2)
             y = x.view(4, 2)
@@ -324,7 +396,12 @@ def forward(self, arg0_1):
         )
 
     def test_simple_out(self):
+        # [FUNCTION DOC] Checks an add with an out= tensor that has to be resized; asserts
+        # expected graphs for plain functionalization and the reinplaced variant, plus equality
+        # with eager.
         def f(x):
+            # [FUNCTION DOC] HELPER: Adds a view of the input to a ones tensor into an empty out
+            # tensor and returns the square of that out tensor.
             tmp = torch.ones(4, 2)
             y = x.view(4, 2)
             # the out= tensor will get resized, since it has size=0 to start.
@@ -371,7 +448,11 @@ def forward(self, arg0_1):
         )
 
     def test_multi_out(self):
+        # [FUNCTION DOC] Checks an out= op with a tuple of outputs (aminmax) is functionalized
+        # properly; asserts plain and reinplaced expected graphs.
         def f(x):
+            # [FUNCTION DOC] HELPER: Calls aminmax along the first dimension with two empty out
+            # tensors and returns the max out tensor.
             # aminmax.out returns a tuple of tensors.
             # functionalization should properly handle the tuple.
             out_min = torch.empty(4)
@@ -420,7 +501,11 @@ def forward(self, arg0_1):
         )
 
     def test_tensor_ctr(self):
+        # [FUNCTION DOC] Checks that a tensor made from a Python tuple then viewed and mutated
+        # in place is functionalized; asserts plain and reinplaced expected graphs.
         def f(x):
+            # [FUNCTION DOC] HELPER: Builds a tensor from a literal tuple, views it, adds one in
+            # place to the view and returns the original tensor.
             y = torch.tensor((1, 2, 3))
             z = y.view(-1)
             z.add_(1)
@@ -466,7 +551,12 @@ def forward(self, arg0_1):
         )
 
     def test_advanced_indexing_correct_strides(self):
+        # [FUNCTION DOC] Checks that scatter-style ops in the functionalized graph can return
+        # non-contiguous results, by running a masked in-place fill on a column and comparing
+        # results.
         def f(a):
+            # [FUNCTION DOC] HELPER: Takes a column of a clone, builds a boolean mask of ones
+            # and fills the column in place with zero through the mask.
             # This test requires that *_scatter ops are able to return
             # non-contiguous tensors.
             b = a.clone()[:, 1]
@@ -477,9 +567,14 @@ def forward(self, arg0_1):
         self.assert_functionalization(f, torch.ones(2, 2), reapply_views=True)
 
     def test_tensor_list_mixed_functional_nonfunctional(self):
+        # [FUNCTION DOC] Checks that an indexing op mixing a functional tensor and a captured
+        # non-functional tensor as indices gives the same result as eager under
+        # functionalization.
         nonfunctional_tensor = torch.ones(2, dtype=torch.long)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Indexes the input with a locally created tensor and the
+            # captured tensor.
             # simple test: 1 view op, 1 inplace op
             functional_tensor = torch.ones(2, dtype=torch.long)
             out = x[functional_tensor, nonfunctional_tensor]
@@ -492,7 +587,12 @@ def forward(self, arg0_1):
         self.assertEqual(out, out_functional)
 
     def test_inplace_on_non_view(self):
+        # [FUNCTION DOC] Checks an in-place op on a base tensor (not a view) while a view
+        # exists, a case with an empty view metadata stack; asserts plain and reinplaced
+        # expected graphs.
         def f(x):
+            # [FUNCTION DOC] HELPER: Views the input, adds a ones tensor in place to the input
+            # itself and returns the view.
             # test for the case where we functionalize an inplace op on the other tensor - not a view.
             # This is worth checking because the tensor will have an empty ViewMeta stack, which needs to be special cased.
             tmp = torch.ones(4, 2)
@@ -540,7 +640,11 @@ def forward(self, arg0_1):
     # Some ops that are mutable are neither inplace nor out= ops.
     # They also need special handling.
     def test_mutable_op_not_inplace_or_other(self):
+        # [FUNCTION DOC] Checks a mutable op that is neither in-place nor out= (the fused moving
+        # average observer fake-quant helper) is handled; asserts the expected graph text.
         def f(x):
+            # [FUNCTION DOC] HELPER: Calls the fused moving average observer fake-quant helper
+            # with the input for all tensor arguments and fixed scalar settings.
             return torch._fused_moving_avg_obs_fq_helper(
                 x, x, x, x, x, x, x, 1.0, 0, 1, 0
             )
@@ -566,7 +670,12 @@ def forward(self, arg0_1):
         )
 
     def test_as_strided(self):
+        # [FUNCTION DOC] Checks as_strided followed by an in-place add. Asserts the plain graph
+        # and, with view reapplication but no reinplace pass, a graph that still contains a
+        # scatter op.
         def f(x):
+            # [FUNCTION DOC] HELPER: Takes an as_strided view of the input, adds one in place,
+            # returns the input.
             y = x.as_strided((2,), (2,), 1)
             y.add_(1)
             return x
@@ -610,7 +719,10 @@ def forward(self, arg0_1):
         )
 
     def test_tensor_list_composite(self):
+        # [FUNCTION DOC] Checks functionalization of an op taking a list of tensors (block_diag)
+        # by comparing to eager and asserting the expected graph.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the block diagonal of the input with itself.
             # Test an op with TensorList input
             y = torch.block_diag(x, x)
             return y
@@ -630,7 +742,11 @@ def forward(self, arg0_1):
         )
 
     def test_cat(self):
+        # [FUNCTION DOC] Checks concatenation with an out= tensor; asserts plain and reinplaced
+        # graphs.
         def f(x):
+            # [FUNCTION DOC] HELPER: Concatenates the input alone into an empty out tensor and
+            # returns it.
             out = torch.empty(0)
             torch.cat((x,), out=out)
             return out
@@ -667,7 +783,11 @@ def forward(self, arg0_1):
         )
 
     def test_diagonal(self):
+        # [FUNCTION DOC] Checks a view op taking a subset of the tensor (diagonal) followed by
+        # an in-place add; asserts plain and reinplaced graphs.
         def f(x):
+            # [FUNCTION DOC] HELPER: Adds a ones vector in place to the diagonal of a clone and
+            # returns the square of the input.
             # test: view ops that take a subset of the original tensor (select/diagonal)
             tmp = torch.ones(2)
             y = x.clone().diagonal()
@@ -716,7 +836,12 @@ def forward(self, arg0_1):
         )
 
     def test_diagonal_mutated_input(self):
+        # [FUNCTION DOC] Checks the diagonal of an input mutated in place and the input
+        # returned, where pending updates must be synced; asserts the plain graph and the
+        # reapply-views graph without reinplace.
         def f(x):
+            # [FUNCTION DOC] HELPER: Adds a ones vector in place to the diagonal of the input
+            # and returns the input.
             # simple test: there are pending updates afterwards, which the test syncs manually
             tmp = torch.ones(2)
             y = x.diagonal()
@@ -765,7 +890,13 @@ def forward(self, arg0_1):
         )
 
     def test_channels_last_contiguous(self):
+        # [FUNCTION DOC] Checks that making a channels-last contiguous copy of an already
+        # channels-last permuted input leaves no clone in the graph; the stripped graph text is
+        # asserted.
+        # KNOWN ISSUE: the helper function contains unreachable statements after its return.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the input made contiguous in channels-last format;
+            # the statements after the return never run.
             return x.contiguous(memory_format=torch.channels_last)
             tmp = torch.ones(2)
             y = x.diagonal()
@@ -784,7 +915,13 @@ def forward(self, arg0_1):
         )
 
     def test_split(self):
+        # [FUNCTION DOC] Checks a view op returning multiple tensors (split) followed by a
+        # diagonal and an in-place add; asserts the plain graph and the reapply-views graph
+        # without reinplace.
         def f(x):
+            # [FUNCTION DOC] HELPER: Splits the input into two parts, adds ones in place to the
+            # diagonal of the second part and returns that diagonal; also computes an unused
+            # product.
             # test: view ops that return multiple tensors (split)
             tmp = torch.ones(2)
             y1, y2 = x.split(2)
@@ -856,7 +993,12 @@ def forward(self, arg0_1):
         )
 
     def test_split_with_sizes(self):
+        # [FUNCTION DOC] Same as the split test but using split_with_sizes with sizes two and
+        # two; asserts the plain graph and the reapply-views graph without reinplace.
         def f(x):
+            # [FUNCTION DOC] HELPER: Splits the input by sizes, adds ones in place to the
+            # diagonal of the first part and returns that diagonal; also computes an unused
+            # product.
             # test: view ops that return multiple tensors (split_with_sizes)
             tmp = torch.ones(2)
             y1, y2 = x.split_with_sizes([2, 2])
@@ -928,7 +1070,11 @@ def forward(self, arg0_1):
         )
 
     def test_slice(self):
+        # [FUNCTION DOC] Checks a transpose in place followed by a slice mutated in place. Input
+        # metadata is mutated so those output comparisons are skipped; asserts both graphs.
         def f(x):
+            # [FUNCTION DOC] HELPER: Transposes the input in place, slices the first two rows,
+            # adds a ones vector in place and returns the input.
             tmp = torch.ones(4)
             x.transpose_(1, 0)
             y = x[0:2]
@@ -984,7 +1130,11 @@ def forward(self, arg0_1):
         )
 
     def test_view_inplace(self):
+        # [FUNCTION DOC] Checks a transpose in place followed by a select mutated in place, with
+        # input metadata mutated; asserts the plain and the reapply-views graphs.
         def f(x):
+            # [FUNCTION DOC] HELPER: Transposes the input in place, selects the first row, adds
+            # a ones vector in place to it and returns the input.
             # test: view + inplace op (transpose_)
             tmp = torch.ones(4)
             x.transpose_(1, 0)
@@ -1041,7 +1191,12 @@ def forward(self, arg0_1):
         )
 
     def test_unbind(self):
+        # [FUNCTION DOC] Checks a transpose in place followed by unbind with an in-place add on
+        # the first piece, with input metadata mutated; asserts the plain and the reapply-views
+        # graphs.
         def f(x):
+            # [FUNCTION DOC] HELPER: Transposes the input in place, unbinds along the first
+            # dimension, adds a ones vector in place to the first piece and returns the input.
             # test: view + inplace op (transpose_)
             tmp = torch.ones(4)
             x.transpose_(1, 0)
@@ -1106,7 +1261,11 @@ def forward(self, arg0_1):
         )
 
     def test_optional_tensor_list(self):
+        # [FUNCTION DOC] Checks an op taking an optional tensor list argument (index_put) on a
+        # view; asserts the expected graph text.
         def f(x):
+            # [FUNCTION DOC] HELPER: Views the input flat, then writes values at given indices
+            # in place without accumulation and returns the view.
             # test: an operator that takes in a List[Optional[Tensor]] argument
             # (index_put)
             y = x.view(8)
@@ -1136,7 +1295,11 @@ def forward(self, arg0_1):
         )
 
     def test_scalars(self):
+        # [FUNCTION DOC] Checks scalar arguments are handled: an in-place add and divide of
+        # scalars on a view and a scalar-times-tensor product; asserts the graph text.
         def f(x):
+            # [FUNCTION DOC] HELPER: Views the input, adds one in place, doubles it into a new
+            # tensor, divides that in place by one and returns it.
             # test: the pass can handle scalar inputs properly
             tmp = torch.ones(4, 2)
             y = x.view(4, 2)
@@ -1168,7 +1331,11 @@ def forward(self, arg0_1):
 
     @skipIfTorchDynamo("Test does not work with TorchDynamo")
     def test_metadata_change(self):
+        # [FUNCTION DOC] Skipped under TorchDynamo. Checks an in-place comparison that changes
+        # the dtype is picked up by functionalization; asserts the plain and reinplaced graphs.
         def f(x):
+            # [FUNCTION DOC] HELPER: Clones the input and applies the in-place greater-or-equal
+            # comparison against zero, returning the result.
             # ops like ge_() are allowed to change the dtype of the input.
             # functionalization should pick up on that.
             y = x.clone()
@@ -1210,7 +1377,12 @@ def forward(self, arg0_1):
 
     @skipIfTorchDynamo("Test does not work with TorchDynamo")
     def test_metadata_change_out_op(self):
+        # [FUNCTION DOC] Skipped under TorchDynamo. Checks an add with an out= tensor whose
+        # metadata differs from the result, run directly with functionalization enabled; the
+        # result converted back must equal the eager result.
         def f(t, y):
+            # [FUNCTION DOC] HELPER: Adds two tensors into a freshly created one-element out
+            # tensor.
             out_1 = torch.ones(1)
             return torch.add(t, y, out=out_1)
 
@@ -1229,7 +1401,10 @@ def forward(self, arg0_1):
         self.assertEqual(out_ref, torch._from_functional_tensor(out_functional))
 
     def test_only_one_view(self):
+        # [FUNCTION DOC] Checks that a function that only views its input produces a single op
+        # in the traced graph (no extra view regeneration); asserts the graph text.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the input viewed as 4x2.
             # This tests that we don't have any unnecessary views in the trace.
             # If the input wasn't mutated, we don't need to regenerate it,
             # so there should be a total of 1 op in the output trace.
@@ -1249,7 +1424,12 @@ def forward(self, arg0_1):
         )
 
     def test_everything(self):
+        # [FUNCTION DOC] Combined scenario: add, view, reshape, transpose, in-place unsqueeze
+        # and squeeze, split and an in-place add on one piece. Compares to eager and asserts
+        # plain and reinplaced graph text.
         def f(x):
+            # [FUNCTION DOC] HELPER: Runs the chain of view and in-place ops and returns the
+            # mutated piece; also computes an unused sum.
             # test: everything
             tmp = torch.ones(2, 2)
             x2 = x + x
@@ -1372,7 +1552,11 @@ def forward(self, arg0_1):
         )
 
     def test_reapply_views_simple(self):
+        # [FUNCTION DOC] Checks the simple view plus in-place add case with views reapplied
+        # instead of using view copies; asserts the graph text.
         def f(x):
+            # [FUNCTION DOC] HELPER: Views the input, adds a ones tensor in place and returns
+            # the view; also computes an unused product.
             tmp = torch.ones(4, 2)
             y = x.view(4, 2)
             y.add_(tmp)
@@ -1400,7 +1584,11 @@ def forward(self, arg0_1):
         )
 
     def test_aliases_maintained_after_pass_when_reapplying_views(self):
+        # [FUNCTION DOC] Checks that two views of the same base remain aliased of each other
+        # after functionalization with reapplied views, using the storage identity helper.
         def f(x):
+            # [FUNCTION DOC] HELPER: Makes two views of the input, mutates the first in place
+            # and returns both.
             tmp = torch.ones(4, 2)
             y = x.view(4, 2)
             z = x.view(4, 2)
@@ -1424,7 +1612,13 @@ def forward(self, arg0_1):
     # copy_() gets its own test, because it used to be special cased in functionalization.
     # However, now it works pretty similar to other functional ops
     def test_copy_(self):
+        # [FUNCTION DOC] Checks copy_ in four cases (same or different dtype crossed with same
+        # or different shape, input of size two or one, long dtype). For each it asserts the
+        # plain and reinplaced graph text; cases 2 to 4 also compare against eager. The first
+        # case's eager check is commented out.
         def f(x):
+            # [FUNCTION DOC] HELPER: Copies the input into the diagonal of a zero matrix, then
+            # adds the input in place and returns that result.
             tmp = torch.zeros(2, 2)
             tmp_slice = tmp.diagonal()
             y = tmp_slice.copy_(x)
@@ -1601,9 +1795,12 @@ def forward(self, arg0_1):
         )
 
     def test_expand_symint(self):
+        # [FUNCTION DOC] Checks expand with sizes taken from the input's own size calls; asserts
+        # the graph.
         # Once some existing SymInt bugs are ironed out, we should update
         # this test to plumb FakeSymbolicTensors through it
         def f(x):
+            # [FUNCTION DOC] HELPER: Expands the input to its own first and second sizes.
             return x.expand(x.size(0), x.size(1))
 
         self.assert_functionalization(f, torch.ones(2, 2))
@@ -1621,7 +1818,11 @@ def forward(self, arg0_1):
         )
 
     def test_fill_(self):
+        # [FUNCTION DOC] Checks fill_ on a diagonal view of an intermediate; asserts plain and
+        # reinplaced graphs.
         def f(x):
+            # [FUNCTION DOC] HELPER: Doubles the input, fills its diagonal with zero in place
+            # and returns the doubled tensor.
             y = x + x
             z = y.diagonal()
             z.fill_(0)
@@ -1664,7 +1865,12 @@ def forward(self, arg0_1):
         )
 
     def test_resize_smaller(self):
+        # [FUNCTION DOC] Checks resizing a view to a smaller size, which does not change
+        # storage, followed by in-place mutation through another view; asserts plain and
+        # reinplaced graphs.
         def f(w):
+            # [FUNCTION DOC] HELPER: Adds one, views as 4x4, resizes to 3x3, mutates a flat view
+            # in place and returns the resized view plus one.
             # Resizing to a smaller size doesn't affect storage
             x = w + 1
             y = x.view(4, 4)
@@ -1735,7 +1941,10 @@ def forward(self, arg0_1):
         )
 
     def test_resize_same_size_diff_rank(self):
+        # [FUNCTION DOC] Checks resize to the same number of elements but a different rank
+        # compares equal to eager.
         def f(x):
+            # [FUNCTION DOC] HELPER: Clones the input and resizes the clone to 25x5.
             y = x.clone()
             y.resize_(25, 5)
             return y
@@ -1743,7 +1952,12 @@ def forward(self, arg0_1):
         self.assert_functionalization(f, torch.ones(5, 5, 5))
 
     def test_resize_larger_valid(self):
+        # [FUNCTION DOC] Checks resizing a non-view tensor with no outstanding views to a larger
+        # size, including propagation of a later fill through an alias; asserts plain and
+        # reinplaced graphs.
         def f(x):
+            # [FUNCTION DOC] HELPER: Resizes a derived tensor to 5x5, fills a flat view with
+            # ones and returns the tensor plus a shifted copy.
             y = x + 1
             # resizing a tensor to a larger size is only currently allowed
             # if the tensor-to-resize is not a view / has no outstanding views.
@@ -1801,7 +2015,11 @@ def forward(self, arg0_1):
         )
 
     def test_resize_larger_invalid(self):
+        # [FUNCTION DOC] Checks resizing a view to a larger size raises a RuntimeError saying it
+        # is not allowed in the functionalization pass.
         def f(x):
+            # [FUNCTION DOC] HELPER: Resizes a view of a derived tensor to 5x5 (expected to
+            # fail) and returns the base and a derived result.
             y = x + 1
             z = y.view(4, 4)
             # resizing a tensor to a larger size is only currently allowed
@@ -1821,13 +2039,19 @@ def forward(self, arg0_1):
             self.assert_functionalization(f, torch.ones(8, 2))
 
     def test_nested_functions_propagate_updates(self):
+        # [FUNCTION DOC] Checks updates made through a view created and discarded in a nested
+        # call are visible to the caller after functionalization.
         def g(x):
+            # [FUNCTION DOC] HELPER: Takes the first row of the input and adds one in place,
+            # returning nothing.
             # Create a view of x
             y = x[0]
             y.add_(1)
             # The view, y, gets deallocated at the end of this function
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Calls the nested mutating function and then returns the
+            # input doubled by self addition.
             # Calling g(x) should mutate x
             g(x)
             # We expect x to be synced here, even though the alias created in g() has been deallocated!
@@ -1837,7 +2061,12 @@ def forward(self, arg0_1):
         self.assert_functionalization(f, torch.ones(2, 2))
 
     def test_mixed_wrappers_valid(self):
+        # [FUNCTION DOC] Runs an add and an in-place add with one logging tensor and one
+        # functional tensor wrapping a logging tensor, capturing the logs; asserts the captured
+        # op log text.
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Adds the two inputs, then adds one to the sum in place, and
+            # returns it.
             z = x + y
             z.add_(1)
             return z
@@ -1858,6 +2087,8 @@ $3: f32[4] = torch._ops.aten.add.Tensor($2, 1)""",
         )
 
     def test_mixed_wrappers_invalid(self):
+        # [FUNCTION DOC] Checks that an in-place add of a functional tensor into a plain tensor
+        # raises a RuntimeError.
         x1_not_functional = torch.ones(4)
         x2_functional = torch._to_functional_tensor(torch.ones(4))
 
@@ -1868,7 +2099,11 @@ $3: f32[4] = torch._ops.aten.add.Tensor($2, 1)""",
             x1_not_functional.add_(x2_functional)
 
     def test_index_mutation_on_non_input(self):
+        # [FUNCTION DOC] Checks an in-place fill on an indexed element of a locally created
+        # tensor; asserts plain and reinplaced graph text.
         def f(x):
+            # [FUNCTION DOC] HELPER: Fills the sixth element of a zero vector in place and
+            # returns the vector.
             tmp = torch.zeros(10)
             tmp[5].fill_(1)
             return tmp
@@ -1910,9 +2145,15 @@ def forward(self, arg0_1):
         )
 
     def test_instance_norm(self):
+        # [FUNCTION DOC] Checks instance norm with running statistics under the python
+        # dispatcher. The graph text assertions are skipped on Windows, where op ordering
+        # differs.
         size = 100
 
         def f(x, running_mean, running_var):
+            # [FUNCTION DOC] HELPER: Calls instance norm under the python dispatcher with input
+            # stats and momentum 0.1, epsilon 1e-5 and cudnn disabled; running stats are
+            # mutated.
             with enable_python_dispatcher():
                 return torch.instance_norm(
                     x,
@@ -2021,7 +2262,11 @@ def forward(self, arg0_1, arg1_1, arg2_1):
             )
 
     def test_mutation_overlapping_mem(self):
+        # [FUNCTION DOC] Checks that mutating a tensor with internal overlap (an unfolded view)
+        # in place raises a RuntimeError about internal overlap.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Adds the input to itself, unfolds the result and applies
+            # absolute value in place.
             # x: (1, 5)
             t1 = torch.add(x, x)
             t2 = t1.unfold(1, 3, 2)
@@ -2036,7 +2281,11 @@ def forward(self, arg0_1, arg1_1, arg2_1):
             out = _functionalize(fn, reapply_views=True, crossref=False)(x)
 
     def test_batch_norm(self):
+        # [FUNCTION DOC] Checks batch norm with running statistics under the python dispatcher;
+        # asserts plain and reinplaced graph text.
         def f(x, running_mean, running_var):
+            # [FUNCTION DOC] HELPER: Calls batch norm under the python dispatcher in training
+            # mode with given running statistics.
             with enable_python_dispatcher():
                 return torch.batch_norm(
                     x, None, None, running_mean, running_var, True, 0.1, 1e-5, False
@@ -2098,12 +2347,18 @@ def forward(self, arg0_1, arg1_1, arg2_1):
 
     # This tests our python shims around C++ Functionalization: FunctionalTensor and FunctionalTensorMode
     def test_python_functionalization(self):
+        # [FUNCTION DOC] Checks the Python functionalization shims (functional tensor and mode)
+        # on a view plus in-place multiply, traced with make_fx, and asserts the graph text.
         def f(x):
+            # [FUNCTION DOC] HELPER: Views the input flat, multiplies the input in place by two
+            # and returns the view plus one.
             x_view = x.view(-1)
             x.mul_(2)
             return x_view + 1
 
         def f_functionalized(x):
+            # [FUNCTION DOC] HELPER: Runs the function with the python functional tensor mode,
+            # with the functionalize dispatch key excluded, then syncs and unwraps the result.
             # Note [Disabling Functionalize TLS Above Python Functionalization]
             # This UX is pretty annoying (although python functionalization's main customer is AOTAutograd,
             # and is not really advertised as a user API).
@@ -2141,7 +2396,11 @@ def forward(self, x_1):
         )
 
     def test_python_functionalization_zero_tensor(self):
+        # [FUNCTION DOC] Checks the Python and C++ functionalization of an op using an efficient
+        # zero tensor input, and that both generate the same graph code.
         def f(x):
+            # [FUNCTION DOC] HELPER: Adds an efficient zero tensor to the input and multiplies
+            # the result by two in place.
             y = torch.ops.aten._efficientzerotensor([4])
             out = x + y
             out.mul_(2)
@@ -2164,6 +2423,9 @@ def forward(self, x_1):
         self.assertEqual(fx_g_cpp.code.strip(), fx_g.code.strip())
 
     def test_python_functionalization_to_dense(self):
+        # [FUNCTION DOC] Checks converting sparse (and mkldnn if available) inputs to dense
+        # inside the functional tensor mode, both by method and by op, gives a strided tensor
+        # equal to the dense one.
         maybe_disable = torch._C._ExcludeDispatchKeyGuard(
             torch._C.DispatchKeySet(torch._C.DispatchKey.Functionalize)
         )
@@ -2187,7 +2449,11 @@ def forward(self, x_1):
                 self.assertEqual(out, x.to_dense())
 
     def test_python_functionalization_is_conj(self):
+        # [FUNCTION DOC] Checks conjugation and its query are preserved in the Python and C++
+        # functionalization.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the conjugate of the input and whether it is
+            # conjugated.
             out = x.conj()
             return out, out.is_conj()
 
@@ -2201,7 +2467,10 @@ def forward(self, x_1):
         self.assertEqual(out_ref[1], out_test_cpp[1])
 
     def test_python_functionalization_is_neg(self):
+        # [FUNCTION DOC] Same as the conjugate query test but for negation and its query.
         def f(x):
+            # [FUNCTION DOC] HELPER: Returns the negation of the input and whether it is
+            # negative.
             out = x.neg()
             return out, out.is_neg()
 
@@ -2215,7 +2484,12 @@ def forward(self, x_1):
         self.assertEqual(out_ref[1], out_test_cpp[1])
 
     def test_python_functionalization_conj(self):
+        # [FUNCTION DOC] Checks a conjugate view plus in-place multiply on a complex input under
+        # Python and C++ functionalization; compares outputs and asserts the graph code, which
+        # equals the C++ one.
         def f(x):
+            # [FUNCTION DOC] HELPER: Clones and conjugates the input, multiplies in place by two
+            # and returns the resolved real view.
             y = x.clone().conj()
             y.mul_(2)
             return torch.view_as_real(y.resolve_conj())
@@ -2253,7 +2527,11 @@ def forward(self, arg0_1):
         self.assertEqual(fx_g_cpp.code.strip(), fx_g.code.strip())
 
     def test_python_functionalization_neg(self):
+        # [FUNCTION DOC] Checks the negative view bit with resolve in Python and C++
+        # functionalization; asserts the graph code, and equality with the C++ graph.
         def f(x):
+            # [FUNCTION DOC] HELPER: Makes a lazy negative view, resolves it and returns the
+            # result plus one.
             y = x._neg_view()
             z = y.resolve_neg()
             return z + 1
@@ -2284,6 +2562,8 @@ def forward(self, arg0_1):
         self.assertEqual(fx_g_cpp.code.strip(), fx_g.code.strip())
 
     def test_python_functionalization_lift_fresh_storage(self):
+        # [FUNCTION DOC] Checks lift_fresh inside the functional tensor mode returns a tensor
+        # with different storage from the original.
         unlifted = torch.tensor([0.0])
 
         maybe_disable = torch._C._ExcludeDispatchKeyGuard(
@@ -2295,7 +2575,10 @@ def forward(self, arg0_1):
         self.assertNotEqual(unlifted.untyped_storage(), lifted.untyped_storage())
 
     def test_python_functionalization_lift_functional_tensor(self):
+        # [FUNCTION DOC] Checks lifting a functional tensor gives equal results under Python and
+        # C++ functionalization.
         def f(x):
+            # [FUNCTION DOC] HELPER: Adds one to the input and passes it through the lift op.
             tmp = x + 1
             return torch.ops.aten.lift.default(tmp)
 
@@ -2309,7 +2592,11 @@ def forward(self, arg0_1):
         self.assertEqual(out_ref, out_test_cpp)
 
     def test_python_functionalization_lift_fresh(self):
+        # [FUNCTION DOC] Checks lift_fresh of a constant tensor under Python and C++
+        # functionalization; asserts graph code and equality with the C++ graph.
         def f(x):
+            # [FUNCTION DOC] HELPER: Creates a constant tensor and returns it added to the
+            # input.
             tmp = torch.tensor([0.0])
             return tmp + x
 
@@ -2359,10 +2646,15 @@ def forward(self, arg0_1):
     TEST_WITH_TORCHDYNAMO, "dynamo-ing code with proxy + fake doesn't work well"
 )
 class TestCrossRefFunctionalization(TestFunctionalization):
+    # [CLASS DOC] Runs every test of the base suite with the crossref flag enabled so
+    # functionalization runs under the cross-reference checker. Tests listed in the xfail
+    # decorator are expected to fail. Skipped under TorchDynamo.
     crossref = True
 
 
 class TestViewMetaSerialization(TestCase):
+    # [CLASS DOC] Tests serialization of view metadata objects as tuples and by pickling; each
+    # element kind that used to dangle is covered (vector, tensor and optional tensor).
     # Exercise to_serializable_tuple() via as_tuple() and pickle, covering each
     # element kind that used to be a dangling reference: std::vector (resize_/
     # _unsafe_view_), const at::Tensor& (_make_dual), and const
@@ -2370,6 +2662,9 @@ class TestViewMetaSerialization(TestCase):
     # under ASAN before the fix; the tensor cases segfault even without ASAN.
 
     def _make_dual_view_meta(self, tangent, level=0):
+        # [FUNCTION DOC] HELPER: Builds a make-dual view metadata object from a tangent tensor
+        # and level, with symbolic inputs false, reapply views true and the always-view return
+        # mode.
         # _make_dual_ViewMeta's SerializableTuple is (has_symbolic_inputs,
         # reapply_views, inverse_return_mode, tangent, level); the tangent
         # element is the `const at::Tensor&` reference that used to dangle.
@@ -2384,6 +2679,9 @@ class TestViewMetaSerialization(TestCase):
         )
 
     def _nested_jagged_view_meta(self, offsets, lengths):
+        # [FUNCTION DOC] HELPER: Builds a nested-from-jagged view metadata object from offsets
+        # and lengths, with a zero tensor of one fewer than offsets length, ragged index one and
+        # no min or max sequence length.
         # _nested_view_from_jagged_ViewMeta's SerializableTuple is
         # (has_symbolic_inputs, reapply_views, inverse_return_mode, offsets,
         # dummy, lengths, ragged_idx, min_seqlen, max_seqlen). lengths/min_seqlen/
@@ -2404,18 +2702,24 @@ class TestViewMetaSerialization(TestCase):
         )
 
     def test_resize_view_meta_as_tuple(self):
+        # [FUNCTION DOC] Checks the resize view metadata returns its reapply flag and size list
+        # unchanged.
         view_meta = torch._C._functionalization.resize__ViewMeta((True, [3, 4, 5]))
         reapply_views, size = view_meta.as_tuple()
         self.assertEqual(reapply_views, True)
         self.assertEqual(size, [3, 4, 5])
 
     def test_unsafe_view_meta_as_tuple(self):
+        # [FUNCTION DOC] Checks the unsafe view metadata returns its symbolic flag and size list
+        # unchanged.
         view_meta = torch._C._functionalization._unsafe_view_ViewMeta((False, [2, 6]))
         has_symbolic_inputs, size = view_meta.as_tuple()
         self.assertEqual(has_symbolic_inputs, False)
         self.assertEqual(size, [2, 6])
 
     def test_make_dual_view_meta_tensor_element_as_tuple(self):
+        # [FUNCTION DOC] Checks the tangent tensor, level and flags come back unchanged from the
+        # make-dual metadata.
         tangent = torch.arange(6.0).reshape(2, 3)
         view_meta = self._make_dual_view_meta(tangent, level=0)
         has_symbolic_inputs, reapply_views, _, restored_tangent, level = (
@@ -2427,6 +2731,8 @@ class TestViewMetaSerialization(TestCase):
         self.assertEqual(restored_tangent, tangent)
 
     def test_nested_jagged_view_meta_optional_tensor_elements_as_tuple(self):
+        # [FUNCTION DOC] Checks present optional tensors (offsets, lengths) round trip and
+        # absent min and max sequence lengths stay none.
         offsets = torch.tensor([0, 2, 4])
         lengths = torch.tensor([2, 2])
         view_meta = self._nested_jagged_view_meta(offsets, lengths)
@@ -2438,6 +2744,8 @@ class TestViewMetaSerialization(TestCase):
         self.assertEqual(restored[8], None)
 
     def test_view_meta_pickle_roundtrip(self):
+        # [FUNCTION DOC] Checks that pickling and unpickling each of four view metadata kinds
+        # yields an object with an identical tuple form.
         for view_meta in (
             torch._C._functionalization.resize__ViewMeta((True, [3, 4, 5])),
             torch._C._functionalization._unsafe_view_ViewMeta((False, [2, 6])),

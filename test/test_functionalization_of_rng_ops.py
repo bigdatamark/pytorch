@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: pt2"]
+# [MODULE DOC] Tests for the functionalize_rng_ops option of the functorch AOT compilation path,
+# which replaces stateful random ops with philox_rand primitives so rng state is threaded
+# explicitly. Compares eager results against aot_function and torch.compile with the aot_eager
+# backend under identical seeds. Import time: on Windows CI it writes a message to stderr and
+# exits (when run as a script) or raises SkipTest. Device-generic tests are instantiated for
+# cuda only; the negative test is instantiated for cpu only.
 import functools
 import sys
 import unittest
@@ -23,6 +29,10 @@ if IS_WINDOWS and IS_CI:
 
 
 def count_philox_rand(gm, args, freq):
+    # [FUNCTION DOC] HELPER: Graph compiler used by tests. Counts nodes in the traced graph
+    # module whose target is the philox_rand primitive and raises an AssertionError if the count
+    # differs from the expected frequency; otherwise returns the graph module unchanged. The
+    # args are unused.
     count = [node.target for node in gm.graph.nodes].count(
         torch.ops.rngprims.philox_rand.default
     )
@@ -32,10 +42,17 @@ def count_philox_rand(gm, args, freq):
 
 
 class TestFunctionalizationRngOps(TestCase):
+    # [CLASS DOC] CUDA-only device-generic tests checking that AOT-compiled functions with rng
+    # ops functionalized produce the same random values as eager execution, and that the
+    # expected number of philox_rand ops appears in the forward and backward graphs.
     @dtypes(torch.float32)
     @patch.object(torch._functorch.config, "functionalize_rng_ops", True)
     def test_rand_like(self, dtype, device):
+        # [FUNCTION DOC] For ten seeds, compares eager and aot_function results of a function
+        # applying rand_like twice, with the compiler asserting two philox_rand ops. Seeds the
+        # cuda generator.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Multiplies the input by two successive rand_like draws.
             a = torch.rand_like(x) * x
             a = torch.rand_like(x) * a
             return a
@@ -55,7 +72,11 @@ class TestFunctionalizationRngOps(TestCase):
     @dtypes(torch.float32)
     @patch.object(torch._functorch.config, "functionalize_rng_ops", True)
     def test_rand_like_dynamic(self, dtype, device):
+        # [FUNCTION DOC] Same as the rand_like test but compiled with torch.compile (aot_eager
+        # backend, dynamic shapes) over square inputs of growing size; compares to eager under
+        # equal seeds.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Multiplies the input by two successive rand_like draws.
             a = torch.rand_like(x) * x
             a = torch.rand_like(x) * a
             return a
@@ -75,7 +96,11 @@ class TestFunctionalizationRngOps(TestCase):
     @dtypes(torch.float32)
     @patch.object(torch._functorch.config, "functionalize_rng_ops", True)
     def test_rand_like_dynamic_bwd(self, dtype, device):
+        # [FUNCTION DOC] Dynamic-shape aot_eager compile of two rand_like draws with
+        # requires_grad inputs; runs backward on eager and compiled outputs and compares forward
+        # outputs under equal seeds.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Multiplies the input by two successive rand_like draws.
             a = torch.rand_like(x) * x
             a = torch.rand_like(x) * a
             return a
@@ -97,9 +122,14 @@ class TestFunctionalizationRngOps(TestCase):
     @dtypes(torch.float32)
     @patch.object(torch._functorch.config, "functionalize_rng_ops", True)
     def test_rand(self, dtype, device):
+        # [FUNCTION DOC] Like the rand_like test but uses the factory rand with an explicit
+        # shape, device and dtype twice inside the function; expects two philox_rand ops and
+        # equal results.
         shape = (10,)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Multiplies the closed-over input by two successive rand
+            # draws of the captured shape.
             a = torch.rand(*shape, device=device, dtype=dtype) * x
             a = torch.rand(*shape, device=device, dtype=dtype) * a
             return a
@@ -119,11 +149,19 @@ class TestFunctionalizationRngOps(TestCase):
     @dtypes(torch.float32)
     @patch.object(torch._functorch.config, "functionalize_rng_ops", True)
     def test_autograd_function(self, dtype, device):
+        # [FUNCTION DOC] Checks a custom autograd Function using rand_like in forward (two
+        # draws) and in backward (one draw) matches eager outputs and gradients, with forward
+        # and backward compilers asserting two and one philox_rand ops respectively.
         shape = (16, 16)
 
         class Custom(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom autograd Function saving the input, with a forward
+            # applying two random scalings and a backward scaling the gradient by a random draw
+            # and the cosine of input.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Saves the input for backward and returns it scaled by
+                # two rand_like draws.
                 ctx.save_for_backward(x)
                 a = torch.rand_like(x) * x
                 a = torch.rand_like(x) * a
@@ -131,6 +169,8 @@ class TestFunctionalizationRngOps(TestCase):
 
             @staticmethod
             def backward(ctx, grad_out):
+                # [FUNCTION DOC] HELPER: Returns the incoming gradient times a random draw times
+                # cosine of the saved input.
                 (x,) = ctx.saved_tensors
                 return grad_out * torch.rand_like(grad_out) * torch.cos(x)
 
@@ -157,13 +197,20 @@ class TestFunctionalizationRngOps(TestCase):
     @dtypes(torch.float32)
     @patch.object(torch._functorch.config, "functionalize_rng_ops", True)
     def test_multiple_subgraphs(self, dtype, device):
+        # [FUNCTION DOC] Checks rng state is carried correctly across two separately AOT-
+        # compiled custom Functions chained together (with a sin in between), comparing outputs
+        # and input gradients to the eager chain for ten seeds.
         # Checks that rng state is maintained when there are multiple aot traced
         # graphs.
         shape = (16, 16)
 
         class CustomOp1(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function with two rand_like draws in forward and one in
+            # backward.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Saves the input and returns it scaled by two rand_like
+                # draws.
                 ctx.save_for_backward(x)
                 a = torch.rand_like(x) * x
                 a = torch.rand_like(x) * a
@@ -171,18 +218,26 @@ class TestFunctionalizationRngOps(TestCase):
 
             @staticmethod
             def backward(ctx, grad_out):
+                # [FUNCTION DOC] HELPER: Returns gradient times a random draw times cosine of
+                # the saved input.
                 (x,) = ctx.saved_tensors
                 return grad_out * torch.rand_like(grad_out) * torch.cos(x)
 
         class CustomOp2(torch.autograd.Function):
+            # [CLASS DOC] HELPER: Custom Function with one rand_like draw in forward and two in
+            # backward.
             @staticmethod
             def forward(ctx, x):
+                # [FUNCTION DOC] HELPER: Saves the input and returns it scaled by one rand_like
+                # draw.
                 ctx.save_for_backward(x)
                 a = torch.rand_like(x) * x
                 return a
 
             @staticmethod
             def backward(ctx, grad_out):
+                # [FUNCTION DOC] HELPER: Returns gradient times two random draws (one shaped
+                # like the gradient, one like the saved input).
                 (x,) = ctx.saved_tensors
                 return grad_out * torch.rand_like(grad_out) * torch.rand_like(x)
 
@@ -190,6 +245,8 @@ class TestFunctionalizationRngOps(TestCase):
         custom_op2 = CustomOp2.apply
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Eager reference: applies the first custom op, sin, then the
+            # second op.
             a = custom_op1(x)
             b = a.sin()
             return custom_op2(b)
@@ -202,6 +259,8 @@ class TestFunctionalizationRngOps(TestCase):
         aot_custom_op2 = aot_function(custom_op2, fwd_compiler, bwd_compiler)
 
         def aot_fn(x):
+            # [FUNCTION DOC] HELPER: Same chain as the eager reference but using the AOT-
+            # compiled ops.
             a = aot_custom_op1(x)
             b = a.sin()
             return aot_custom_op2(b)
@@ -225,7 +284,13 @@ class TestFunctionalizationRngOps(TestCase):
     @dtypes(torch.float32)
     @patch.object(torch._functorch.config, "functionalize_rng_ops", True)
     def test_set_get_rng_state(self, dtype, device):
+        # [FUNCTION DOC] Checks that getting and restoring the cuda rng state inside a function
+        # under AOT compilation reproduces eager results, expecting three philox_rand ops in the
+        # forward graph.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Draws rand_like, saves the cuda rng state, draws again,
+            # restores the state, then draws a third time (the last two draws repeat the same
+            # values).
             a = torch.rand_like(x) * x
             state = torch.cuda.get_rng_state()
             a = torch.rand_like(x) * a
@@ -249,10 +314,14 @@ class TestFunctionalizationRngOps(TestCase):
     @dtypes(torch.float32)
     @patch.object(torch._functorch.config, "functionalize_rng_ops", True)
     def test_min_cut_partitioner(self, dtype, device):
+        # [FUNCTION DOC] Checks that using the min cut rematerialization partitioner keeps the
+        # calling convention intact: forward has two philox_rand ops and backward has none;
+        # compares outputs and gradients with eager under seed 123.
         # Checks that the calling convention is maintained
         shape = (16, 16)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Two random scalings followed by three sin operations.
             a = torch.rand_like(x) * x
             a = torch.rand_like(x) * a
             a = torch.sin(a)
@@ -288,10 +357,19 @@ class TestFunctionalizationRngOps(TestCase):
     @patch.object(torch._functorch.config, "functionalize_rng_ops", True)
     @dtypes(torch.float32)
     def test_checkpoint(self, dtype, device):
+        # [FUNCTION DOC] Smoke test of non-reentrant activation checkpointing around dropout:
+        # expects one philox_rand in forward and none in backward (state passed from forward).
+        # Does not compare numerics. Uses cuda tensors with a hard-coded cuda device.
+        # KNOWN ISSUE: the device argument is ignored; tensors are created on the cuda device
+        #   directly.
         def g(x, y):
+            # [FUNCTION DOC] HELPER: Applies dropout with probability 0.6 to the first argument;
+            # second unused.
             return torch.nn.functional.dropout(x, 0.6)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Runs the dropout function under non-reentrant
+            # checkpointing.
             return torch.utils.checkpoint.checkpoint(g, x, y, use_reentrant=False)
 
         # x = torch.rand(2, 2, device="cuda", requires_grad=True)
@@ -311,7 +389,11 @@ class TestFunctionalizationRngOps(TestCase):
     @dtypes(torch.float32)
     @patch.object(torch._functorch.config, "functionalize_rng_ops", True)
     def test_dropout_decomp(self, dtype, device):
+        # [FUNCTION DOC] Checks the dropout decomposition produces one philox_rand op in the
+        # traced graph. Does not check numerics because dropout draws differ from rand_like.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Applies dropout with probability 0.6 then multiplies by the
+            # input.
             return torch.nn.functional.dropout(x, 0.6) * x
 
         x = torch.rand(10, device=device, dtype=dtype)
@@ -323,6 +405,10 @@ class TestFunctionalizationRngOps(TestCase):
 
     @dtypes(torch.float32)
     def test_checkpoint_with_unused_rng_in_backward(self, dtype, device):
+        # [FUNCTION DOC] Regression test: a checkpointed region whose rng value is not needed in
+        # the backward graph (additive noise) must not raise a KeyError during rng
+        # functionalization. Compares compiled-with-checkpoint to compiled-without outputs and
+        # gradients under seed 123.
         # Test that RNG ops in checkpointed regions that are not needed for
         # backward computation don't cause KeyError in functionalize_rng_ops.
         #
@@ -337,6 +423,7 @@ class TestFunctionalizationRngOps(TestCase):
         # exist in both forward and backward graphs.
 
         def g(x):
+            # [FUNCTION DOC] HELPER: Adds a random per-row noise column to the input.
             # rand used additively - NOT needed in backward
             # (gradient of add doesn't depend on the value)
             # This pattern matches real-world jitter/noise augmentation
@@ -345,6 +432,7 @@ class TestFunctionalizationRngOps(TestCase):
             return x
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Runs the noise function under non-reentrant checkpointing.
             return torch.utils.checkpoint.checkpoint(g, x, use_reentrant=False)
 
         x = torch.ones(2, 4, device=device, dtype=dtype, requires_grad=True)
@@ -372,10 +460,14 @@ instantiate_device_type_tests(TestFunctionalizationRngOps, globals(), only_for=o
 
 
 class NegativeTest(TestCase):
+    # [CLASS DOC] CPU-only negative tests for rng functionalization.
     @dtypes(torch.float32)
     @patch.object(torch._functorch.config, "functionalize_rng_ops", True)
     def test_on_cpu(self, dtype, device):
+        # [FUNCTION DOC] Checks that AOT compiling a function with rand_like on a cpu tensor
+        # with functionalize_rng_ops enabled raises a RuntimeError when called.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Multiplies the input by two successive rand_like draws.
             a = torch.rand_like(x) * x
             a = torch.rand_like(x) * a
             return a
