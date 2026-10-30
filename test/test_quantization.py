@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: quantization"]
+# [MODULE DOC] Aggregator entry point for the quantization test suite. It defines no tests itself;
+# it imports test classes from the quantization subpackages (core ops and modules, eager mode,
+# FX graph mode, backward compatibility, JIT, AO migration, experimental bits and float8) so that
+# running this file collects them all. FX, model report, equalization, backward compatibility and
+# experimental imports are wrapped so an ImportError only logs a warning (FBCode splits them out).
+# Import-time side effect: creates a module logger. Running as a script calls run_tests.
 
 import logging
 from torch.testing._internal.common_utils import run_tests
