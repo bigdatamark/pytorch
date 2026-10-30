@@ -1,4 +1,9 @@
 # Owner(s): ["module: inductor"]
+# [MODULE DOC] Tests for the Inductor template heuristic registry and related config classes.
+# Covers default and custom fields of BlackwellGPUGemmConfig, the registration decorator and
+# hierarchical lookup of get_template_heuristic, and pinned A100 flex-attention head-dim-192
+# entries. No import-time side effects beyond imports; run_tests is invoked only when run as a
+# script.
 import torch
 from torch._inductor.heuristics.registry import (
     _TEMPLATE_HEURISTIC_REGISTRY,
@@ -16,9 +21,14 @@ from torch._inductor.test_case import run_tests, TestCase
 
 
 class TestBlackwellGPUGemmConfig(TestCase):
+    # [CLASS DOC] Tests for the BlackwellGPUGemmConfig dataclass: inherited GEMM fields plus its
+    # own epilogue_subtile, warp_specialize and flatten fields. Stateless.
     """Tests for BlackwellGPUGemmConfig class."""
 
     def test_default_values(self):
+        # [FUNCTION DOC] Builds a config with only the base GEMM fields and checks they are
+        # stored, and that epilogue_subtile defaults to 1 while warp_specialize and flatten
+        # default to true.
         """Test that BlackwellGPUGemmConfig has correct default values."""
         config = BlackwellGPUGemmConfig(
             block_m=128,
@@ -40,6 +50,8 @@ class TestBlackwellGPUGemmConfig(TestCase):
         self.assertTrue(config.flatten)  # default=True
 
     def test_custom_values(self):
+        # [FUNCTION DOC] Builds a config with explicit epilogue_subtile of 2 and warp_specialize
+        # and flatten false, and checks the custom values are stored.
         """Test that BlackwellGPUGemmConfig accepts custom values for new fields."""
         config = BlackwellGPUGemmConfig(
             block_m=64,
@@ -58,25 +70,35 @@ class TestBlackwellGPUGemmConfig(TestCase):
 
 
 class TestTemplateHeuristicsRegistry(TestCase):
+    # [CLASS DOC] Tests registration and cascading lookup of template heuristics. setUp snapshots
+    # the global registry and empties it; tearDown empties it and restores the snapshot, so tests
+    # can register throwaway heuristic classes without leaking.
     def setUp(self):
+        # [FUNCTION DOC] Saves a copy of the global template heuristic registry, then clears it, so
+        # each test starts with no registered heuristics.
         super().setUp()
         # Save original registry state
         self.original_registry = _TEMPLATE_HEURISTIC_REGISTRY.copy()
         clear_registry()  # Test heuristic classes using the decorator registration
 
     def tearDown(self):
+        # [FUNCTION DOC] Clears the registry and restores the entries saved in setUp, undoing test
+        # registrations.
         # Restore original registry
         clear_registry()
         _TEMPLATE_HEURISTIC_REGISTRY.update(self.original_registry)
         super().tearDown()
 
     def test_register_class(self):
+        # [FUNCTION DOC] Registers a class for a template and cuda device with no op name and
+        # checks the registry holds that class under the key with a None op slot.
         """Test basic registration of a heuristic class."""
         # Clear registry for this isolated test
         clear_registry()
 
         @register_template_heuristic("test_mm", "cuda")
         class TestHeuristic(TemplateConfigHeuristics):
+            # [CLASS DOC] HELPER: Empty heuristic subclass used only to check registration.
             pass
 
         # Verify registration
@@ -85,8 +107,14 @@ class TestTemplateHeuristicsRegistry(TestCase):
         self.assertEqual(_TEMPLATE_HEURISTIC_REGISTRY[key], TestHeuristic)
 
     def test_assertion_existing_class(self):
+        # [FUNCTION DOC] Registers a cuda-specific heuristic for a template (no op) and checks
+        # that lookup for the same template on cuda with an unrelated op returns an instance
+        # of that class. The second docstring in the body is a stray string expression and is
+        # not the real docstring.
         @register_template_heuristic("triton::mm", "cuda")
         class _CrossOpHeuristic(TemplateConfigHeuristics):
+            # [CLASS DOC] HELPER: Empty heuristic subclass registered for a template on cuda for
+            # any op.
             """(template, device, None) - Cross-op for specific device"""
 
         """Test that registered class can be retrieved."""
@@ -96,22 +124,30 @@ class TestTemplateHeuristicsRegistry(TestCase):
         self.assertIsInstance(heuristic, _CrossOpHeuristic)
 
     def test_hierarchy_lookup(self):
+        # [FUNCTION DOC] Registers four heuristics at decreasing specificity (device and op, op
+        # only, device only, neither) and checks lookup picks the most specific match for cuda/xpu
+        # with scaled_mm or bmm.
         """Test complete hierarchy: (template, device, op) -> (template, None, None)"""
 
         @register_template_heuristic("triton::mm", "cuda", op_name="scaled_mm")
         class _MostSpecificHeuristic(TemplateConfigHeuristics):
+            # [CLASS DOC] HELPER: Heuristic registered for a specific device and op (most
+            # specific).
             """(template, device, op) - Most specific"""
 
         @register_template_heuristic("triton::mm", None, op_name="scaled_mm")
         class _CrossDeviceHeuristic(TemplateConfigHeuristics):
+            # [CLASS DOC] HELPER: Heuristic registered for any device but a specific op.
             """(template, None, op) - Cross-device for specific op"""
 
         @register_template_heuristic("triton::mm", "cuda")
         class _CrossOpHeuristic(TemplateConfigHeuristics):
+            # [CLASS DOC] HELPER: Heuristic registered for a specific device and any op.
             """(template, device, None) - Cross-op for specific device"""
 
         @register_template_heuristic("triton::mm", None)
         class _MostGeneralHeuristic(TemplateConfigHeuristics):
+            # [CLASS DOC] HELPER: Heuristic registered for any device and any op (most general).
             """(template, None, None) - Most general"""
 
         # All classes are already registered via decorators:
@@ -137,15 +173,20 @@ class TestTemplateHeuristicsRegistry(TestCase):
         self.assertIsInstance(heuristic, _MostGeneralHeuristic)
 
     def test_partial_hierarchy_scenarios(self):
+        # [FUNCTION DOC] Checks lookup with only some registration levels present: op-only plus
+        # general, device-only (other devices fall back to the base class instance), and general
+        # only (matches every device and op).
         """Test hierarchy behavior with partial registrations"""
 
         # Scenario 1: Register partial hierarchy using decorators
         @register_template_heuristic("triton::tma", None, op_name="scaled_tma")
         class _TestCrossDeviceHeuristic(TemplateConfigHeuristics):
+            # [CLASS DOC] HELPER: Empty heuristic registered for any device with a specific op.
             pass
 
         @register_template_heuristic("triton::tma", None)
         class _TestGeneralHeuristic(TemplateConfigHeuristics):
+            # [CLASS DOC] HELPER: Empty heuristic registered for any device and op.
             pass
 
         # Should get cross-device for matching op, regardless of device
@@ -159,6 +200,7 @@ class TestTemplateHeuristicsRegistry(TestCase):
         # Scenario 2: Only specific device exists
         @register_template_heuristic("triton::bmm", "cuda")
         class _TestDeviceSpecificHeuristic(TemplateConfigHeuristics):
+            # [CLASS DOC] HELPER: Empty heuristic registered for cuda and any op.
             pass
 
         # Should get device-specific for cuda
@@ -174,6 +216,8 @@ class TestTemplateHeuristicsRegistry(TestCase):
         # Scenario 3: Only most general exists
         @register_template_heuristic("triton::mm", None)
         class _TestMostGeneralHeuristic(TemplateConfigHeuristics):
+            # [CLASS DOC] HELPER: Empty heuristic registered for any device and op, for the
+            # final scenario.
             pass
 
         # Should always get general regardless of device/op
@@ -184,6 +228,10 @@ class TestTemplateHeuristicsRegistry(TestCase):
         self.assertIsInstance(heuristic, _TestMostGeneralHeuristic)
 
     def test_fallback_behavior(self):
+        # [FUNCTION DOC] Checks that an unregistered template yields a fresh base
+        # TemplateConfigHeuristics instance on each call (not cached), and that after registering a
+        # class for that key lookups return an instance of the registered class, and repeated
+        # lookups return the same cached instance.
         """Test that fallback TemplateConfigHeuristics is returned when no heuristic is found"""
 
         # Test 1: Get fallback for unregistered template
@@ -202,6 +250,8 @@ class TestTemplateHeuristicsRegistry(TestCase):
         # Test 3: After registering a heuristic, should get the registered one instead
         @register_template_heuristic("unknown_template", "cuda", op_name="unknown_op")
         class _NewlyRegisteredHeuristic(TemplateConfigHeuristics):
+            # [CLASS DOC] HELPER: Empty heuristic registered to replace the fallback in the
+            # caching check.
             pass
 
         # Now should get the registered heuristic, not the fallback
@@ -216,7 +266,12 @@ class TestTemplateHeuristicsRegistry(TestCase):
 
 
 class TestA100DefaultFlexConfig(TestCase):
+    # [CLASS DOC] Tests pinned A100 default flex-attention configs of CUDAConfigHeuristic.
+    # Stateless.
     def test_head_dim_192_entries(self):
+        # [FUNCTION DOC] Checks the a100_default_flex_config table maps both bfloat16 and
+        # float16 with head dim 192 to the same FlexConfig of 128, 32, 2, 8 (needed for
+        # DeepSeek V3 MLA on sm_8.6/8.9).
         """``(bf16, 192)`` and ``(fp16, 192)`` entries are required for
         DeepSeek V3 MLA (qk_nope_head_dim=128 + qk_rope_head_dim=64 = 192,
         v_head_dim=128) on every ``capability >= (8, 0)`` board.
