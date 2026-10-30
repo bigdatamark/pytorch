@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Command-line benchmark for the PyTorch DataLoader with a chosen multiprocessing
+# start method. Loads an image-folder dataset (optionally concatenated several times), runs a
+# short training loop of a small image model on the available device, and reports iterator
+# start-up time, per-batch and data-loading time, throughput and memory use (proportional set
+# size summed over child processes). Needs psutil and torchvision. No import-time side effects.
 """
 Benchmark script for PyTorch DataLoader with different worker methods.
 
@@ -29,6 +34,11 @@ from torch.utils.data.dataset import ConcatDataset
 
 
 def get_memory_usage():
+    # [FUNCTION DOC] HELPER: Return the memory used by this process and all its descendants in
+    # megabytes, using proportional set size. If a child cannot be read, it prints a message
+    # and falls back to the unique set size of that child.
+    # KNOWN ISSUE: the fallback reads a field that the basic memory info does not provide, so
+    # it can raise an attribute error instead of recovering.
     """
     Get current memory usage in MB. This includes all child processes.
 
@@ -54,6 +64,8 @@ def get_memory_usage():
 
 
 def print_detailed_memory():
+    # [FUNCTION DOC] HELPER: Print unique, proportional and resident set sizes of the current
+    # process in megabytes; prints a notice instead if the information is unavailable.
     """Print detailed memory information."""
     process = psutil.Process()
     print("\nDetailed memory information:")
@@ -72,6 +84,8 @@ def print_detailed_memory():
 
 
 def create_model():
+    # [FUNCTION DOC] HELPER: Return a new, untrained image classification model of the resnet18
+    # type from torchvision.
     """Create a simple model for benchmarking."""
     model = resnet18()
     return model
@@ -86,6 +100,18 @@ def benchmark_dataloader(
     multiprocessing_context=None,
     logging_freq=10,
 ):
+    # [FUNCTION DOC] Benchmark a data loader built on the given dataset. Clears memory, builds a
+    # model, measures memory, then times creation of a shuffled loader and its iterator
+    # (pinned memory on CUDA, prefetch factor of two when workers are used). Trains the model on
+    # the device with SGD for the given epochs, stopping once the maximum number of batches
+    # (counted across all epochs) is reached or the iterator is exhausted. Records data-load
+    # time and batch time per batch, samples memory every five batches and logs by the given
+    # frequency.
+    # Prints a summary and returns a mapping with init time, worker and batch counts, averages,
+    # throughput and peak memory figures.
+    # KNOWN ISSUE: the iterator is created once, so extra epochs get no new data; the logging
+    # may use a memory value before it is first set if the logging frequency is not a multiple
+    # of five and fires first.
     """Benchmark a dataloader with specific configuration."""
     print("\n--- Benchmarking DataLoader ---")
 
@@ -228,6 +254,11 @@ def benchmark_dataloader(
 
 
 def main():
+    # [FUNCTION DOC] Entry point: parse options (data path required; batch size, worker count,
+    # batch limit, epochs, start method, dataset copies, logging frequency), print system and
+    # library information, build the image transforms (resize, center crop, tensor, normalize),
+    # load the dataset as an image folder repeated by the requested number of copies using
+    # deep copies, concatenate them and run the benchmark. Returns None.
     parser = argparse.ArgumentParser(
         description="Benchmark PyTorch DataLoader with different worker methods"
     )

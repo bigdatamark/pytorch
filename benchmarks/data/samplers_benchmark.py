@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Benchmark comparing the standard batch sampler against an alternative
+# implementation over a sequential sampler of a fixed size, for several batch sizes with and
+# without dropping the last partial batch. Prints the average time of each, the relative
+# speedup, and a final grid table. Needs numpy and tabulate. No import-time side effects.
 
 import time
 from collections.abc import Iterable, Iterator
@@ -10,6 +14,10 @@ from torch.utils.data import BatchSampler, Sampler, SequentialSampler
 
 
 class NewBatchSampler(Sampler[list[int]]):
+    # [CLASS DOC] Alternative batch sampler used as the candidate in the benchmark. Stores
+    # the underlying sampler, a positive integer batch size and a boolean drop-last flag
+    # (validated at construction). Iteration yields lists of indices of the batch size;
+    # length is the number of batches, defined only if the wrapped sampler has a length.
     """Alternative implementation of BatchSampler for benchmarking purposes."""
 
     def __init__(
@@ -18,6 +26,9 @@ class NewBatchSampler(Sampler[list[int]]):
         batch_size: int,
         drop_last: bool,
     ) -> None:
+        # [FUNCTION DOC] Validate and store the wrapped sampler, batch size and drop-last flag.
+        # Raises a value error if the batch size is not a positive integer (booleans are
+        # rejected) or the drop-last flag is not a boolean.
         if (
             not isinstance(batch_size, int)
             or isinstance(batch_size, bool)
@@ -35,6 +46,10 @@ class NewBatchSampler(Sampler[list[int]]):
         self.drop_last = drop_last
 
     def __iter__(self) -> Iterator[list[int]]:
+        # [FUNCTION DOC] Generator over batches of indices. With drop-last it pulls exactly the
+        # batch size items at a time and stops at the first incomplete batch, discarding it.
+        # Otherwise it fills a preallocated list and yields it when full, allocating a new
+        # one afterwards, and finally yields the leftover partial batch as a shorter list.
         if self.drop_last:
             sampler_iter = iter(self.sampler)
             while True:
@@ -57,6 +72,9 @@ class NewBatchSampler(Sampler[list[int]]):
                 yield batch[:idx_in_batch]
 
     def __len__(self) -> int:
+        # [FUNCTION DOC] Return the number of batches: the floor division of the sampler length
+        # by the batch size when dropping the last batch, else the ceiling division. Fails if
+        # the wrapped sampler has no length.
         # Can only be called if self.sampler has __len__ implemented
         if self.drop_last:
             return len(self.sampler) // self.batch_size  # type: ignore[arg-type]
@@ -65,6 +83,11 @@ class NewBatchSampler(Sampler[list[int]]):
 
 
 def main():
+    # [FUNCTION DOC] Run the benchmark. For each batch size and drop-last option, times full
+    # iteration over the baseline sampler and the new sampler ten times each (sleeping briefly
+    # between runs), averages the times, computes the percentage speedup of the new one
+    # (not available if an average is zero), prints it, and finally prints all results as a
+    # grid table. Prints output only; returns None.
     """Run benchmark with specified parameters."""
     DATA_SIZE = 99999
     AVG_TIMES = 10

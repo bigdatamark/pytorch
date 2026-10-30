@@ -1,3 +1,9 @@
+# [MODULE DOC] Custom spin commands for the PyTorch repo (loaded by the spin CLI).
+# Defines click commands for regenerating version.py, type stubs, clang-tidy files and
+# GitHub workflows, setting up and running lintrunner (lint, fixlint, quicklint, quickfix),
+# cleaning, building docs, editable and regular installs, and a pyrefly command group.
+# Import-time side effects: adds the repo root to the front of the module search path
+# and imports the repo clean tool from it. Also defines the linter category sets.
 import hashlib
 import importlib.util
 import re
@@ -24,6 +30,9 @@ from tools.clean import clean as _clean
 
 
 def file_digest(file, algorithm: str):
+    # [FUNCTION DOC] HELPER: Return a hash object for the open binary file using the named
+    # algorithm. Uses the standard library file digest helper when available, otherwise
+    # reads the file in 8192-byte chunks into a new hash object. Consumes the file position.
     try:
         return hashlib.file_digest(file, algorithm)
     except AttributeError:
@@ -35,17 +44,22 @@ def file_digest(file, algorithm: str):
 
 
 def _hash_file(file):
+    # [FUNCTION DOC] HELPER: Return the hex SHA-256 digest of the file at the given path.
     with open(file, "rb") as f:
         hash = file_digest(f, "sha256")
     return hash.hexdigest()
 
 
 def _hash_files(files):
+    # [FUNCTION DOC] HELPER: Return a mapping from each given file path to its SHA-256 hex digest.
     hashes = {file: _hash_file(file) for file in files}
     return hashes
 
 
 def _read_hashes(hash_file: Path):
+    # [FUNCTION DOC] HELPER: Parse a stored hash file into a mapping of file name to hash.
+    # Each line holds a 64-char hash, two separator chars, then the file name (stripped).
+    # Returns an empty mapping when the hash file does not exist.
     if not hash_file.exists():
         return {}
     with hash_file.open("r") as f:
@@ -59,6 +73,9 @@ def _read_hashes(hash_file: Path):
 
 
 def _updated_hashes(hash_file, files_to_hash):
+    # [FUNCTION DOC] HELPER: Hash the given files and compare with the hashes stored in the
+    # hash file. Returns the new mapping of file to hash when it differs from the stored one
+    # (including when nothing is stored), otherwise None. Does not write anything.
     old_hashes = _read_hashes(hash_file)
     new_hashes = _hash_files(files_to_hash)
     if new_hashes != old_hashes:
@@ -68,6 +85,8 @@ def _updated_hashes(hash_file, files_to_hash):
 
 @click.command()
 def regenerate_version():
+    # [FUNCTION DOC] Spin command: run the tools.generate_torch_version module in a
+    # subprocess with debug mode off, which regenerates version.py.
     """Regenerate version.py."""
     cmd = [
         sys.executable,
@@ -113,6 +132,10 @@ TYPE_STUBS = [
 
 @click.command()
 def regenerate_type_stubs():
+    # [FUNCTION DOC] Spin command: regenerate type stubs for each entry of the stub table.
+    # Entries with a hash file are regenerated only when the hashed input files changed,
+    # and the new hashes are then written to that hash file (creating its directory).
+    # Entries without a hash file are always regenerated. Prints progress messages.
     """Regenerate type stubs."""
     for name, hash_file, files_to_hash, cmd in TYPE_STUBS:
         if hash_file:
@@ -136,6 +159,8 @@ def regenerate_type_stubs():
 
 @click.command()
 def regenerate_clangtidy_files():
+    # [FUNCTION DOC] Spin command: run the clang-tidy build-file generator module in a
+    # subprocess to regenerate the clang-tidy files.
     """Regenerate clang-tidy files."""
     cmd = [
         sys.executable,
@@ -244,6 +269,9 @@ LINTRUNNER_BASE_CMD = [
 
 
 def _check_linter_python_versions():
+    # [FUNCTION DOC] HELPER: Validate the lintrunner config file in the current directory.
+    # Every linter whose command runs a uv script must pin Python 3.10 via the python flag.
+    # Raises a click exception listing the codes of all linters that do not.
     invalid_linters = []
 
     with Path(".lintrunner.toml").open("rb") as config_file:
@@ -270,12 +298,18 @@ def _check_linter_python_versions():
 
 @click.command()
 def setup_lint():
+    # [FUNCTION DOC] Spin command: initialize lintrunner (pinned version, run through uvx).
+    # Raises a called-process error on failure; output is captured, not shown.
     """Set up lintrunner with current CI version."""
     cmd = LINTRUNNER_BASE_CMD + ["init"]
     subprocess.run(cmd, check=True, capture_output=True, text=True)
 
 
 def _check_linters():
+    # [FUNCTION DOC] HELPER: Check that the python-version rule holds and that the set of
+    # linters reported by lintrunner matches the union of the three category sets.
+    # Raises a click exception naming unknown or missing linters. Returns the two (empty)
+    # sets of unknown and missing linters when everything matches.
     _check_linter_python_versions()
     cmd = LINTRUNNER_BASE_CMD + ["list"]
     ret = spin.util.run(cmd, output=False, stderr=subprocess.PIPE)
@@ -308,6 +342,10 @@ def _check_linters():
 )
 @click.pass_context
 def lazy_setup_lint(ctx, parent_callback, **kwargs):
+    # [FUNCTION DOC] Spin command extending setup-lint: runs the parent setup only when the
+    # hashes of the lint configuration files changed, then stores the new hashes. Always
+    # regenerates version.py and the type stubs afterwards and validates the linter
+    # categories (which can raise a click exception). The parent callback is passed in.
     if hashes := _updated_hashes(*LINTRUNNER_CACHE_INFO):
         click.echo(
             "Changes detected in lint configuration files. Setting up linting tools..."
@@ -330,6 +368,11 @@ def lazy_setup_lint(ctx, parent_callback, **kwargs):
 
 
 def _check_arg(check_arg, arg, args_iter):
+    # [FUNCTION DOC] HELPER: Match one command-line argument against an option name.
+    # Handles the joined form with an equals sign (returns the stripped value) and the
+    # separate form (consumes and returns the next item of the shared iterator, raising
+    # StopIteration if none is left). Returns None if the argument is not that option or
+    # has the joined form with a longer name. Note an empty value is returned as an empty string.
     if arg.startswith(check_arg):
         found_arg, sep, value = arg.partition("=")
         if sep == "=":
@@ -342,6 +385,10 @@ def _check_arg(check_arg, arg, args_iter):
 
 
 def _process_lintrunner_args(lintrunner_args):
+    # [FUNCTION DOC] HELPER: Split lintrunner arguments into those spin handles and the rest.
+    # Extracts the take and skip option values as sets of linter codes, the tee-json file
+    # name, and the all-files flag. Records whether any non-option argument (a path) exists.
+    # Returns the remaining arguments, take, skip, tee file, has-paths and has-all-files flags.
     take = None
     skip = None
     args_iter = iter(arg.strip() for arg in lintrunner_args)
@@ -374,6 +421,12 @@ def _run_lintrunner(
     lintrunner_args=None,
     return_json_output=False,
 ):
+    # [FUNCTION DOC] HELPER: Run lintrunner for a set of linters and report the outcome.
+    # The linters are the default set narrowed by the take set and reduced by the skip set;
+    # if none remain it prints a message and skips the run. Otherwise it builds the command
+    # with optional patch application, all-files and extra args, runs it without exiting,
+    # and (when JSON output is requested) reads then deletes a temporary tee file.
+    # Returns a pair: whether lint problems were found, and the JSON text (None if not requested).
     cmd = LINTRUNNER_BASE_CMD
     if return_json_output:
         tee_file = mktemp(prefix="spinlint_", suffix=".json")
@@ -422,6 +475,11 @@ def _run_lintrunner(
 @click.argument("lintrunner_args", metavar="", nargs=-1)
 @click.pass_context
 def lint(ctx, *, lintrunner_args, apply_patches, **kwargs):
+    # [FUNCTION DOC] Spin command: lint the whole tree. Runs the lazy setup, then runs the
+    # very fast and fast linters on all files unless explicit paths were given, and the slow
+    # linters on changed files (all files only if all-files was requested). Optionally
+    # concatenates the JSON outputs into the tee-json file. Prints a failure message and
+    # exits with status 1 if any linter found problems.
     """Lint all files."""
     ctx.invoke(lazy_setup_lint)
     lintrunner_args, take, skip, tee_file, has_paths, has_all_files = (
@@ -464,6 +522,7 @@ def lint(ctx, *, lintrunner_args, apply_patches, **kwargs):
 @click.argument("lintrunner_args", metavar="", nargs=-1)
 @click.pass_context
 def fixlint(ctx, *, lintrunner_args, **kwargs):
+    # [FUNCTION DOC] Spin command: invoke the lint command with patch application enabled.
     """Autofix all files."""
     ctx.invoke(lint, lintrunner_args=lintrunner_args, apply_patches=True)
 
@@ -473,6 +532,8 @@ def fixlint(ctx, *, lintrunner_args, **kwargs):
 @click.argument("lintrunner_args", metavar="", nargs=-1)
 @click.pass_context
 def quicklint(ctx, *, lintrunner_args, apply_patches, **kwargs):
+    # [FUNCTION DOC] Spin command: run the lazy setup, then run lintrunner directly on its
+    # default (changed) files with the extra arguments, adding patch application on request.
     """Lint changed files."""
     ctx.invoke(lazy_setup_lint)
     cmd = LINTRUNNER_BASE_CMD + list(lintrunner_args)
@@ -485,18 +546,23 @@ def quicklint(ctx, *, lintrunner_args, apply_patches, **kwargs):
 @click.argument("lintrunner_args", metavar="", nargs=-1)
 @click.pass_context
 def quickfix(ctx, *, lintrunner_args, **kwargs):
+    # [FUNCTION DOC] Spin command: invoke quicklint with patch application enabled.
+    # KNOWN ISSUE: the extra lintrunner arguments are accepted but not forwarded.
     """Autofix changed files."""
     ctx.invoke(quicklint, apply_patches=True)
 
 
 @click.command()
 def clean():
+    # [FUNCTION DOC] Spin command: remove git-ignored files using the repo clean tool.
     """Clean, that is remove all files in .gitignore except in the NOT-CLEAN-FILES section."""
     _clean()
 
 
 @click.command()
 def regenerate_github_workflows():
+    # [FUNCTION DOC] Spin command: run the CI workflow generator script from the .github
+    # directory to regenerate the GitHub workflows.
     """Regenerate GitHub workflows from templates."""
     cmd = [sys.executable, "scripts/generate_ci_workflows.py"]
     spin.util.run(cmd, cwd="./.github")
@@ -512,6 +578,10 @@ _DOCS_DEP_CANARIES = ("sphinx", "matplotlib")
 @click.command(context_settings={"ignore_unknown_options": True})
 @click.argument("make_args", nargs=-1, type=click.UNPROCESSED)
 def docs(make_args):
+    # [FUNCTION DOC] Spin command: build the documentation by running make in the docs
+    # directory, passing extra arguments through (default target is html). First checks
+    # that the canary dependencies are importable, raising a click exception if not. Prints
+    # a warning to standard error when node is missing and KaTeX prerender is not disabled.
     """Build documentation.
 
     Wraps `make` in `docs/`. With no arguments runs `make html`. Pass any
@@ -559,6 +629,9 @@ def docs(make_args):
 
 
 def _pip_install_cmd(editable):
+    # [FUNCTION DOC] HELPER: Build the install command list, using uv pip when uv is found
+    # on the path and the current interpreter's pip otherwise. Adds the editable flag on
+    # request and always installs the current directory verbosely without build isolation.
     """Build the pip install command, preferring uv when available."""
     if shutil.which("uv"):
         cmd = ["uv", "pip", "install"]
@@ -571,6 +644,7 @@ def _pip_install_cmd(editable):
 
 @click.command()
 def develop():
+    # [FUNCTION DOC] Spin command: run an editable install of the repo via the helper command.
     """Build PyTorch (editable install).
 
     Runs an editable pip install using uv when available, falling back to
@@ -587,6 +661,7 @@ editable.help = develop.help
 
 @click.command()
 def install():
+    # [FUNCTION DOC] Spin command: run a non-editable install of the repo via the helper command.
     """Install PyTorch (non-editable).
 
     Runs a regular pip install using uv when available, falling back to
@@ -601,6 +676,8 @@ PYREFLY_CONFIG = CWD / "pyrefly.toml"
 
 
 def _pyrefly_version() -> str:
+    # [FUNCTION DOC] HELPER: Read the pyrefly linter adapter and extract the pinned pyrefly
+    # version. Raises a runtime error if no pin is found.
     """Read the pyrefly version pinned in the linter adapter so spin stays in sync."""
     text = PYREFLY_LINTER_SCRIPT.read_text()
     match = re.search(r'"pyrefly==([^"]+)"', text)
@@ -612,16 +689,21 @@ def _pyrefly_version() -> str:
 
 
 def _pyrefly_base_cmd() -> list[str]:
+    # [FUNCTION DOC] HELPER: Return the command list that runs the pinned pyrefly via uvx
+    # with Python 3.12.
     return ["uvx", "--python", "3.12", f"pyrefly@{_pyrefly_version()}"]
 
 
 def _pyrefly_init():
+    # [FUNCTION DOC] HELPER: Run the pyrefly init subcommand through spin.
     cmd = _pyrefly_base_cmd() + ["init"]
     spin.util.run(cmd)
 
 
 @click.group()
 def pyrefly():
+    # [FUNCTION DOC] Click group for pyrefly subcommands. Its body prints a startup message
+    # whenever any subcommand is invoked.
     """Commands for managing PyRefly stubs and checks."""
     click.echo("Starting Pyrefly...")
 
@@ -629,6 +711,8 @@ def pyrefly():
 @pyrefly.command()
 @click.argument("files", metavar="", nargs=-1)
 def infer(files):
+    # [FUNCTION DOC] Spin subcommand: print a warning that infer is experimental, then run
+    # pyrefly infer with the repo pyrefly config file on the given files.
     """Infer type annotations using `pyrefly infer`.
 
     Note: pyrefly's `infer` is still under development and has a known bug

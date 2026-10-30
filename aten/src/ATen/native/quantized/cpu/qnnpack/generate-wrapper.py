@@ -1,3 +1,8 @@
+# [MODULE DOC] Generator for QNNPACK wrapper source files. Holds a table mapping an optional
+# preprocessor condition (None for generic code) to lists of kernel source files, and a
+# banner comment. When run as a script it writes one wrapper file per source under a local
+# wrappers directory (creating folders), each including the original source, guarded by the
+# condition if there is one. No functions; the script part runs only as main.
 import os
 
 

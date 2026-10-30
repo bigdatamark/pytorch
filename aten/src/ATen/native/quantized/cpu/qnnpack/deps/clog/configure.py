@@ -6,6 +6,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [MODULE DOC] Configuration script for the clog logging library, using the confu build
+# configuration framework. Builds a static library from the clog source and a unit test
+# target (linking googletest, and the log library on Android). Run as a script, it builds
+# the configuration from the command-line arguments and generates the build files.
+# Import-time side effects: creates the standard argument parser.
 import confu
 
 
@@ -13,6 +18,9 @@ parser = confu.standard_parser("clog configuration script")
 
 
 def main(args):
+    # [FUNCTION DOC] Parse the arguments, create a confu build, export the clog public header
+    # directory, define the static library clog from the source file and the clog unit test
+    # executable. Returns the build object; the caller generates the build files from it.
     options = parser.parse_args(args)
     build = confu.Build.from_options(options)
 

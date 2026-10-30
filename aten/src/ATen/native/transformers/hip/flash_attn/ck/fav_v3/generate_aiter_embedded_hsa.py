@@ -2,6 +2,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Generate aiter_embedded_hsa.h with embedded binary .co files for AITER HSA kernels.
 
+# [MODULE DOC] Command-line tool that generates a C++ header embedding AITER HSA code object
+# files (binary files with the extension co) as byte arrays, plus a lookup map from a
+# relative path key to each array as a string view. Scans chosen subdirectories of an hsa
+# folder. Run as a script; has no import-time side effects.
 import argparse
 import re
 import sys
@@ -9,11 +13,17 @@ from pathlib import Path
 
 
 def sanitize_identifier(name: str) -> str:
+    # [FUNCTION DOC] HELPER: Replace every character that is not an ASCII letter or digit with
+    # an underscore and return the result, making the path usable as part of a C++ identifier.
     """Convert a file path to a valid C++ identifier."""
     return re.sub(r"[^a-zA-Z0-9]", "_", name)
 
 
 def bytes_to_hex_array(data: bytes, bytes_per_line: int = 16) -> str:
+    # [FUNCTION DOC] HELPER: Format the bytes as text of two-digit lowercase hex literals
+    # separated by commas, starting a new line indented by four spaces before every item whose
+    # position is a multiple of the per-line count (default 16). Returns an empty string for
+    # empty data. No trailing comma is added after the last byte.
     """Convert bytes to a formatted C hex array string."""
     hex_bytes = []
     for i, byte in enumerate(data):
@@ -28,6 +38,13 @@ def bytes_to_hex_array(data: bytes, bytes_per_line: int = 16) -> str:
 def generate_embedded_hsa_header(
     hsa_dir: Path, output_file: Path, subdirs: list[str]
 ) -> int:
+    # [FUNCTION DOC] Write a C++ header embedding the code object files found in the given
+    # subdirectories of the base directory. Files within each subdirectory are visited in sorted
+    # order and keyed by the string hsa plus slash plus the posix-style relative path. Empty
+    # files are skipped. Each non-empty file becomes a 4096-aligned byte array, and a map from key
+    # to string view is emitted along with a macro naming that map. The output parent folder is
+    # created. If no files are found it prints a warning, writes nothing and returns 0.
+    # Returns the number of arrays embedded.
     """
     Generate a C++ header file embedding all .co files from specified subdirectories.
 
@@ -117,6 +134,10 @@ def generate_embedded_hsa_header(
 
 
 def main():
+    # [FUNCTION DOC] Entry point: parse the required hsa directory and output path options and
+    # the optional list of subdirectories (default: the two fmha v3 backward folders for
+    # gfx942 and gfx950). Returns 1 after printing an error to standard error if the hsa
+    # directory is missing; otherwise generates the header, prints the count and returns 0.
     parser = argparse.ArgumentParser(
         description="Generate aiter_embedded_hsa.h with embedded binary .co files"
     )

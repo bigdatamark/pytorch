@@ -1,3 +1,8 @@
+# [MODULE DOC] Standard-library-only replacement for the aiter hsa codegen script used in
+# ROCm builds on Python versions without pandas and numpy wheels. Reads per-architecture CSV
+# config files for a module from the aiter hsa folder and emits a C++ header of config tables.
+# Run as a script with module name, output folder and hsa folder options; needs the
+# environment variable naming the GPU architectures. No import-time side effects.
 """Stdlib reimplementation of third_party/aiter/hsa/codegen.py for Python 3.15+.
 
 aiter's codegen.py imports pandas/numpy solely to read a handful of small CSV
@@ -36,6 +41,9 @@ from collections import defaultdict
 
 
 def _is_number(value: str) -> bool:
+    # [FUNCTION DOC] HELPER: Return whether the string can be parsed as a floating-point
+    # number, used to decide whether a CSV column is treated as numeric. Returns False when
+    # parsing raises a value error.
     # pandas read_csv infers a numeric (int64/float64) dtype only when every
     # value in the column parses as a number; otherwise the column is object
     # (str). codegen.py's isinstance(..., (int, float, np.integer)) check
@@ -49,6 +57,18 @@ def _is_number(value: str) -> bool:
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point: generate the asm config header for one module. Parses the
+    # module, output folder and hsa folder options, reads the architecture list from the
+    # environment (a missing variable raises a key error), and finds supported architectures
+    # as subfolders of the hsa folder. Groups CSV files by config name across architectures,
+    # checks each has the knl_name and co_name columns (otherwise prints an error and exits
+    # with status 1), tags rows with their architecture and keeps only rows for requested
+    # architectures. Emits, once, a macro and a config struct whose extra fields are an integer
+    # when all values in the column are numeric, else a string, then one static table per group.
+    # Writes the header file in the output folder, which must already exist.
+    # KNOWN ISSUE: the struct columns come from the first group only, so later groups with other
+    # columns would fail; the path prefix uses leftover loop values (last file and architecture);
+    # decimal values count as numeric but are converted as integers, which raises a value error.
     parser = argparse.ArgumentParser(
         prog="codegen_compat",
         description="pandas-free reimplementation of aiter hsa/codegen.py",

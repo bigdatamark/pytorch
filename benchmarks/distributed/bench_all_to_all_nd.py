@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Multi-GPU benchmark comparing the symmetric-memory all-to-all-nd operation
+# with a baseline of permute followed by the standard single all-to-all, for a column-scatter
+# layout. Defines a timing helper, the baseline function and a multi-process test class with
+# a timing test and a profiling test. Import-time side effect: if the distributed package or
+# NCCL is unavailable, it prints a message and exits the process with status 0.
 """
 Compare ``torch.distributed._symmetric_memory.all_to_all_nd`` against
 ``permute`` + ``torch.distributed.all_to_all_single`` (equivalent data movement).
@@ -58,6 +63,9 @@ _COL_SCATTER_BENCH_SEQ_LEN = 4096
 def _mean_cuda_ms_per_iter(
     device: torch.device, n_iters: int, run_iter: Callable[[], None]
 ) -> float:
+    # [FUNCTION DOC] HELPER: Time repeated calls on the GPU. Creates start and end timing
+    # events, sets the current device, records start, calls the callable the given number of
+    # times, records end, synchronizes the device and returns the mean milliseconds per call.
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     torch.cuda.set_device(device)
@@ -75,6 +83,10 @@ def _permute_all_to_all_single_col_scatter(
     *,
     world_size: int,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Baseline for the column-scatter layout. Views the two-dimensional
+    # input as rows, ranks and local columns, moves the rank axis first, makes it contiguous,
+    # and calls the single all-to-all collective writing into the flattened output tensor.
+    # The result lands in the output tensor in place; returns None.
     """Baseline: ``view -> permute(1,0,2) -> all_to_all_single`` for (1,0) layout."""
     rows, plocal = inp.shape
     lc = plocal // world_size
@@ -86,15 +98,23 @@ def _permute_all_to_all_single_col_scatter(
 @requires_cuda_p2p_access()
 @skip_but_pass_in_sandcastle_if(not TEST_CUDA, "CUDA not available")
 class AllToAllNdBenchmark(MultiProcContinuousTest):
+    # [CLASS DOC] Multi-process test class (NCCL backend, one process per GPU) holding the
+    # benchmark and profiling tests. Skipped without CUDA peer access or CUDA. Each test runs
+    # on every rank; only rank 0 prints. Tests need at least two GPUs and a recent NCCL.
     @classmethod
     def backend_str(cls) -> str | None:
+        # [FUNCTION DOC] Class method returning the name of the process group backend, nccl.
         return "nccl"
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] Property returning the CUDA device of this rank, the device whose
+        # index equals the rank.
         return torch.device("cuda", self.rank)
 
     def _init_nccl_symm(self) -> None:
+        # [FUNCTION DOC] HELPER: Switch the symmetric memory backend to NCCL, select this rank's
+        # device and run a small all-reduce to initialize communication. Global side effects.
         symm_mem.set_backend("NCCL")
         torch.cuda.set_device(self.device)
         dist.all_reduce(torch.ones(1, device=self.device))
@@ -102,6 +122,14 @@ class AllToAllNdBenchmark(MultiProcContinuousTest):
     @requires_nccl_version((2, 29, 0), "nccl_all_to_all_nd requires nccl 2.29.0")
     @skip_if_lt_x_gpu(2)
     def test_bench_col_scatter_vs_permute_a2a(self) -> None:
+        # [FUNCTION DOC] Benchmark test. Allocates a symmetric input (filled with the rank value)
+        # and output for a fixed global sequence length of 4096 split across ranks, in half
+        # precision, with 1024 local columns. Times the symmetric all-to-all-nd operation (20
+        # warmup, 40 timed iterations) and the permute baseline on regular tensors with the same
+        # data. Rank 0 prints sizes, both times per iteration and their ratio. Raises an
+        # assertion error if the sequence length is not divisible by the world size.
+        # KNOWN ISSUE: the module docstring says NCCL 2.29.7 or newer but the version guard
+        # requires only 2.29.0.
         """
         Benchmark (scatter_dim=1, gather_dim=0): ``[seq_len/G, G*lc]`` -> ``[G, seq_len/G, lc]``.
         """
@@ -185,6 +213,13 @@ class AllToAllNdBenchmark(MultiProcContinuousTest):
     @requires_nccl_version((2, 29, 0), "nccl_all_to_all_nd requires nccl 2.29.0")
     @skip_if_lt_x_gpu(2)
     def test_profile_col_scatter_implementations(self) -> None:
+        # [FUNCTION DOC] Profiling test. Prepares the same buffers as the benchmark test, runs
+        # three warmup rounds of both implementations, then profiles 13 steps (one warmup plus
+        # twelve active) where each step runs the symmetric operation then the baseline and
+        # advances the profiler. On rank 0 writes a Chrome trace and a stacks file into a new
+        # run directory under a trace folder in the current directory and prints a table of
+        # the 30 largest self CUDA time entries and the file paths. Raises an assertion error
+        # if the sequence length is not divisible by the world size.
         """Profile both paths in one session: each step runs symm then baseline (rank 0 prints + traces)."""
         self._init_nccl_symm()
         group_name = dist.group.WORLD.group_name

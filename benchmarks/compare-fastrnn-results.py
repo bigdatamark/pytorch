@@ -1,3 +1,8 @@
+# [MODULE DOC] Command-line script that compares two pytest benchmark JSON result files
+# (base and diff) for the fast RNN benchmarks. Builds a sorted list of named timings, with
+# missing entries as not-a-number, and prints a table in the chosen format (table, md, csv,
+# or json) with the percentage change of the diff times against the base times. Runs at import
+# time: parses arguments, reads files and prints; raises a value error on an unknown format.
 import argparse
 import json
 from collections import namedtuple
@@ -7,12 +12,18 @@ Result = namedtuple("Result", ["name", "base_time", "diff_time"])
 
 
 def construct_name(fwd_bwd, test_name):
+    # [FUNCTION DOC] HELPER: Build a display name for a test from the suite key and test name.
+    # A key containing the word backward is labeled as the backward pass with that suffix
+    # removed from the suite name, otherwise as forward. Returns the suite, test name in
+    # brackets, a colon and the label.
     bwd = "backward" in fwd_bwd
     suite_name = fwd_bwd.replace("-backward", "")
     return f"{suite_name}[{test_name}]:{'bwd' if bwd else 'fwd'}"
 
 
 def get_times(json_data):
+    # [FUNCTION DOC] HELPER: Flatten the nested mapping from suite key to test name to timing
+    # into a single mapping from the constructed display name to the timing value.
     r = {}
     for fwd_bwd in json_data:
         for test_name in json_data[fwd_bwd]:

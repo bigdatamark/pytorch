@@ -6,6 +6,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# [MODULE DOC] Configuration script for the QNNPACK quantized-operator library, using the
+# confu build configuration framework. Declares the dependencies and picks source files per
+# target architecture (ARM, ARM64, x86), defines the qnnpack static library, unit tests,
+# and benchmarks. Run as a script, it builds the configuration from command-line arguments
+# and generates the build files. Import-time side effect: creates the standard argument parser.
 import confu
 from confu import arm, x86
 
@@ -14,6 +19,11 @@ parser = confu.standard_parser()
 
 
 def main(args):
+    # [FUNCTION DOC] Parse the arguments, create a confu build and describe all targets.
+    # Collects the requantization objects per instruction set, then the library objects
+    # (common, operators, scalar, psimd and architecture-specific micro-kernels), and defines
+    # the qnnpack static library, the test executables and the benchmarks. The requantization
+    # objects are also linked into the requantization test and benchmark. Returns the build object.
     options = parser.parse_args(args)
     build = confu.Build.from_options(options)
 

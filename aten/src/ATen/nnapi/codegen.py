@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Generator for the NNAPI dynamic-loading wrapper sources. Holds the table of
+# NNAPI function signatures (return type, name, argument text) and the license prefix. When
+# run as a script it writes nnapi_wrapper.h and nnapi_wrapper.cpp next to this file: a struct
+# of function pointers, a loader that opens the NNAPI shared library lazily and resolves each
+# symbol, and a second set of checking wrappers. No import-time side effects.
 """
 Code generator for NNAPI wrapper.  We can't link directly against
 libneuralnetworks.so because we want PyTorch to work on Android
@@ -190,6 +195,13 @@ NNAPI_FUNCTIONS = [
 
 
 def main(argv):
+    # [FUNCTION DOC] Generate the two wrapper files from the function table. For each entry it
+    # builds a struct member for the pointer, lines that resolve the symbol and install the
+    # checking function, and the checking function itself: for void functions it requires the
+    # pointer to be set and forwards the call; for int functions it also enforces that the
+    # status equals the no-error code. Call arguments are the parameter names taken from the
+    # argument text. Writes both files to the script directory, overwriting them. The argument
+    # list is accepted but not used; returns None.
     struct_members = []
     load_functions = []
     define_checks = []
