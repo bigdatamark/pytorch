@@ -1,4 +1,11 @@
 # Owner(s): ["module: onnx"]
+# [MODULE DOC] Numerical consistency tests between PyTorch eager results and exported ONNX models
+# run in ONNX Runtime, driven by the operator database. Holds the list of tested op names, the
+# expected skip/xfail rules per op and per sample, a single-op wrapper module, and a test class
+# parameterized by opset. Import-time side effects: deep-copies the operator database, raises
+# AssertionError if a tested op is missing from it, then for each tested opset attaches the
+# skip/xfail decorators to the database entries (mutating the copy) and instantiates CPU-only
+# device-specific test classes into the module namespace.
 
 """Test consistency between the output values of torch.onnx exported operators
 and torch operators given the same inputs.
@@ -222,20 +229,30 @@ if not TESTED_OPS.issubset(ALL_OPS_IN_DB):
 
 
 class SingleOpModel(torch.nn.Module):
+    # [CLASS DOC] HELPER: Module wrapping one callable (an OpInfo or function) plus fixed keyword
+    # arguments so the op can be exported; forward applies it to the positional inputs and returns
+    # the result.
     """Test model to wrap around a single op for export."""
 
     def __init__(self, op, kwargs):
+        # [FUNCTION DOC] HELPER: Store the op and its keyword arguments on the module.
         super().__init__()
         self.operator = op
         self.kwargs = kwargs
 
     def forward(self, *args):
+        # [FUNCTION DOC] HELPER: Call the stored op with the given positional arguments and the
+        # stored keyword arguments, returning its result.
         return self.operator(*args, **self.kwargs)
 
 
 def _should_skip_xfail_test_sample(
     op_name: str, sample
 ) -> tuple[str | None, str | None]:
+    # [FUNCTION DOC] HELPER: Look up per-sample skip/xfail rules. Returns a pair of test behavior
+    # and reason (both None when nothing applies). Only ops with rules are scanned; the first rule
+    # for this op whose matcher accepts the sample wins. Raises AssertionError if a rule for the op
+    # has no matcher.
     """Returns a reason if a test sample should be skipped."""
     if op_name not in OP_WITH_SKIPPED_XFAIL_SUBTESTS:
         return None, None
@@ -250,6 +267,8 @@ def _should_skip_xfail_test_sample(
 
 
 def _get_test_class_name(cls, num, params_dict) -> str:
+    # [FUNCTION DOC] HELPER: Name function for generating parameterized classes. Ignores the base
+    # class and index and returns the name entry of the parameter mapping.
     del cls  # unused
     del num  # unused
     return params_dict["name"]
@@ -266,6 +285,10 @@ def _get_test_class_name(cls, num, params_dict) -> str:
     class_name_func=_get_test_class_name,
 )
 class TestOnnxModelOutputConsistency(onnx_test_common._TestONNXRuntime):
+    # [CLASS DOC] Parameterized (one generated subclass per tested opset, named with the opset)
+    # test class that exports each tested operator through a single-op model and compares ONNX
+    # Runtime output with eager PyTorch. The base opset_version is a placeholder (-1) replaced per
+    # generated class. Device-specific variants are generated at module level (CPU only).
     """Test output consistency between exported ONNX models and PyTorch eager mode.
 
     This is a parameterized test suite.
@@ -280,6 +303,12 @@ class TestOnnxModelOutputConsistency(onnx_test_common._TestONNXRuntime):
         + onnx_test_common.BOOL_TYPES,
     )
     def test_output_match(self, device: str, dtype: torch.dtype, op):
+        # [FUNCTION DOC] For one op, device and dtype, iterates all sample inputs of the op (no
+        # grad), wraps the op in a single-op model in eval mode, and verifies the export through
+        # run_test inside a subtest labelled with the opset, sample index and reprs of inputs and
+        # kwargs. Sample skip/xfail rules are applied through the xfail/skip context manager.
+        # Tolerances are rtol 1e-5 and atol 2e-5 for float32 and float64; for other dtypes both
+        # are passed as none. Raises AssertionError if the device is not cpu.
         """Test the ONNX exporter."""
         # device is provided by instantiate_device_type_tests, but we only want to run in cpu.
         if device != "cpu":
