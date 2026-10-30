@@ -1,5 +1,9 @@
 # Owner(s): ["module: unknown"]
 
+# [MODULE DOC] Checks that an installed torch wheel ships third-party license files.
+# At import time it locates the parent of the torch package directory and globs for a
+# torch dist-info directory there; the test is skipped when none exists (e.g. source builds).
+
 import glob
 import os
 import unittest
@@ -13,8 +17,14 @@ distinfo = glob.glob(os.path.join(site_packages, "torch-*dist-info"))
 
 
 class TestLicense(TestCase):
+    # [CLASS DOC] Single-test case class for packaging license checks; uses the module-level
+    # dist-info glob result and holds no state of its own.
     @unittest.skipIf(len(distinfo) == 0, "no installation in site-package to test")
     def test_distinfo_license(self):
+        # [FUNCTION DOC] Skipped if no dist-info directory was found. Raises AssertionError if
+        # more than one dist-info directory matched; otherwise recursively lists regular files
+        # under the licenses/third_party folder of the first match and asserts the list is
+        # non-empty, with a failure message naming that folder.
         """If pytorch is installed via a wheel, third-party licenses live at
         site-packages/torch-*.dist-info/licenses/third_party/<lib>/<file>
         per PEP 639. Verify at least one is shipped."""
