@@ -1,6 +1,10 @@
 """Define some common setup blocks which benchmarks can reuse."""
 
 # mypy: ignore-errors
+# [MODULE DOC] Reusable setup snippets for the benchmark definitions: trivial all-ones tensors in
+# two, three and four dimensions, and a small training setup with inputs and weights that require
+# gradients, each given as Python and C++ code in a GroupedSetup. The Setup enum exposes them by
+# name. Import-time work: the training setup is parsed from a side-by-side table.
 
 import enum
 
@@ -43,6 +47,8 @@ _TRAINING = GroupedSetup(
 
 
 class Setup(enum.Enum):
+    # [CLASS DOC] Enum whose members wrap the predefined setup snippets (trivial tensors of 2, 3
+    # and 4 dimensions and the training setup). Member values are GroupedSetup objects.
     TRIVIAL_2D = _TRIVIAL_2D
     TRIVIAL_3D = _TRIVIAL_3D
     TRIVIAL_4D = _TRIVIAL_4D

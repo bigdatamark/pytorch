@@ -1,6 +1,11 @@
 """Run benchmarks while handling parallelism, isolation, and fault tolerance."""
 
 # mypy: ignore-errors
+# [MODULE DOC] Parallel execution of benchmark work orders with core pinning and fault handling.
+# Contains a failure exception, CorePool which hands out contiguous CPU core ranges, and Runner
+# which launches jobs as cores free up, polls them, reports progress and an estimate of time left,
+# and shuts children down on errors or interrupts. Import-time side effect: reads the CPU count of
+# the machine into a module constant.
 
 import math
 import multiprocessing
@@ -18,15 +23,22 @@ CPU_COUNT: int = multiprocessing.cpu_count()
 
 
 class WorkerFailed(Exception):
+    # [CLASS DOC] Exception raised in the main process when a worker reports failure. Attributes:
+    # the command line that was run and an optional formatted trace string from the worker.
     """Raised in the main process when a worker failure is detected."""
 
     def __init__(self, cmd: str, wrapped_trace: str | None = None) -> None:
+        # [FUNCTION DOC] Stores the command and the optional worker trace; the exception message is
+        # empty.
         self.cmd: str = cmd
         self.wrapped_trace: str | None = wrapped_trace
         super().__init__()
 
 
 class CorePool:
+    # [CLASS DOC] Allocator that gives each task a contiguous range of CPU cores (inclusive bounds)
+    # so the machine is not overloaded and wall times are less noisy. Tracks which cores are free
+    # and the live reservations, guarded by a lock so it can be used from several threads.
     """Allocator style helper class to assign individual tasks to a core range.
 
     Pinning tasks to separate cores (or core ranges if `num_threads` > 1)
@@ -41,6 +53,9 @@ class CorePool:
     """
 
     def __init__(self, min_core_id: int, max_core_id: int) -> None:
+        # [FUNCTION DOC] Validates the core bounds (AssertionError if the minimum is negative, the
+        # maximum is below the minimum or not below the machine CPU count), prints the pool range,
+        # and marks all cores available.
         if min_core_id < 0:
             raise AssertionError(f"min_core_id must be >= 0, got {min_core_id}")
         if max_core_id < min_core_id:
@@ -65,6 +80,9 @@ class CorePool:
         self._lock = threading.Lock()
 
     def reserve(self, n: int) -> str | None:
+        # [FUNCTION DOC] First-fit reservation of n contiguous cores under the lock. On success
+        # marks them used, remembers the reservation and returns a taskset style string (a single
+        # core id or first-last range). Returns None if no free range is large enough.
         """Simple first-fit policy.
 
         If successful, return a string for `taskset`. Otherwise, return None.
@@ -84,6 +102,8 @@ class CorePool:
         return None
 
     def release(self, key: str) -> None:
+        # [FUNCTION DOC] Frees the cores of the reservation named by the key and forgets it. Raises
+        # KeyError for an unknown key.
         with self._lock:
             for i in self._reservations[key]:
                 self._available[i] = True
@@ -91,12 +111,19 @@ class CorePool:
 
 
 class Runner:
+    # [CLASS DOC] Runs a tuple of work orders concurrently. State: the order queue not yet started,
+    # the active jobs, results per order, durations (for ETA), the order being handled (for error
+    # messages) and a polling cadence in seconds. Jobs are pinned to cores from a CorePool.
     def __init__(
         self,
         work_items: tuple[WorkOrder, ...],
         core_pool: CorePool | None = None,
         cadence: float = 1.0,
     ) -> None:
+        # [FUNCTION DOC] Stores the orders, a core pool (default: cores zero up to the CPU count
+        # minus four, which fails the pool check on small machines), and the polling cadence.
+        # Initializes queue, active list, results and timing state. Raises ValueError when the same
+        # order object appears twice.
         self._work_items: tuple[WorkOrder, ...] = work_items
         self._core_pool: CorePool = core_pool or CorePool(0, CPU_COUNT - 4)
         self._cadence: float = cadence
@@ -115,6 +142,10 @@ class Runner:
             raise ValueError("Duplicate work items.")
 
     def run(self) -> dict[WorkOrder, WorkerOutput]:
+        # [FUNCTION DOC] Runs everything and returns the mapping from order to worker output. On a
+        # keyboard interrupt, job timeout, worker failure or any other exception it shuts the
+        # children down (printing diagnostics, including the failing command and trace for worker
+        # failures) and re-raises the original exception.
         try:
             return self._run()
 
@@ -144,6 +175,10 @@ class Runner:
             raise
 
     def _run(self) -> dict[WorkOrder, WorkerOutput]:
+        # [FUNCTION DOC] HELPER: Main loop. Checks the canary import, then until the queue and
+        # active list are empty it updates jobs, starts new ones, prints progress and sleeps for
+        # the rest of the cadence interval. Prints the total time and returns a copy of the
+        # results.
         self._start_time = time.time()
         self._canary_import()
         while self._work_queue or self._active_jobs:
@@ -156,6 +191,10 @@ class Runner:
         return self._results.copy()
 
     def _update_active_jobs(self) -> None:
+        # [FUNCTION DOC] HELPER: Polls all active jobs. Unfinished ones are kept. A finished job
+        # with a successful output has its result and duration stored and its cores released
+        # (AssertionError if it had no cpu list). A finished job with a failure raises WorkerFailed
+        # carrying the command and trace. A timeout exception from a job propagates.
         active_jobs: list[InProgress] = []
         for job in self._active_jobs:
             self._currently_processed = job.work_order
@@ -180,6 +219,9 @@ class Runner:
         self._active_jobs.extend(active_jobs)
 
     def _enqueue_new_jobs(self) -> None:
+        # [FUNCTION DOC] HELPER: Walks the queue and tries to reserve as many cores as the order
+        # has threads; orders that get cores become active jobs (with a half second pause between
+        # launches to reduce contention), the rest stay queued.
         work_queue: list[WorkOrder] = []
         for i, work_order in enumerate(self._work_queue):
             self._currently_processed = work_order
@@ -197,6 +239,10 @@ class Runner:
         self._work_queue.extend(work_queue)
 
     def _print_progress(self) -> None:
+        # [FUNCTION DOC] HELPER: Prints a carriage-return progress line with finished over total,
+        # elapsed seconds and an ETA. The ETA is unknown until five results exist, then rounds
+        # remaining work (counted in rounds over the pool core count) times the mean job duration,
+        # in whole minutes.
         fraction = f"{len(self._results)} / {len(self._work_items)}"
         elapsed = f"{time.time() - self._start_time:.0f} seconds"
         if len(self._results) < 5:
@@ -210,6 +256,10 @@ class Runner:
         print(f"\r{fraction} ({elapsed}), ETA: {eta}", end="")
 
     def _force_shutdown(self, verbose: bool = False) -> None:
+        # [FUNCTION DOC] HELPER: Stops all active jobs. Sends SIGINT to each, optionally prints the
+        # label, auto labels and source command of the job being processed, waits half a second,
+        # and if some processes remain polls up to five times every two seconds, returning early
+        # when all exit. Then terminates the stragglers.
         """Try to interrupt jobs, and kill if need be.
         We would prefer to softly terminate jobs so that they have a chance to
         clean up before shutting down.
@@ -256,6 +306,9 @@ class Runner:
                 j.proc.terminate()
 
     def _canary_import(self) -> None:
+        # [FUNCTION DOC] HELPER: Runs a command importing torch once per distinct source command
+        # (or once without one) before launching workers. Raises ImportError with the command and
+        # output if the import exits with an error.
         """Make sure we can import torch before launching a slew of workers."""
         source_cmds: set[str] = set()
         for w in self._work_items:

@@ -1,6 +1,11 @@
 """Collect instruction counts for continuous integration."""
 
 # mypy: ignore-errors
+# [MODULE DOC] Entry point logic for collecting instruction counts in continuous integration. Holds
+# run constants (repeats, per-job timeout in seconds, retries, expected version and an expected md5
+# of the work order list) and one function that runs every benchmark and returns nothing. Not
+# runnable by itself; it is invoked from the package main script. Imports sibling packages core,
+# definitions and execution, so it needs the benchmark directory on the path.
 
 import argparse
 import hashlib
@@ -22,6 +27,15 @@ MD5 = "4d55e8abf881ad38bb617a96714c1296"
 
 
 def main(argv: list[str]) -> None:
+    # [FUNCTION DOC] Runs the benchmark suite and optionally writes results. Parses a destination
+    # file option and a subset flag from argv. Expands the standard benchmark definitions, repeats
+    # them several times into work orders (with timeout and retries), and hashes the unique work
+    # order keys. If the hash differs from the expected one (and not in subset mode) the version
+    # becomes minus one and a warning is printed. Subset mode also uses version minus one and only
+    # the first ten benchmarks. Runs the work through the Runner and groups wall times and
+    # instruction counts per work order key. Writes a JSON document (version, md5, start and end
+    # time, values) to the destination if given. In debug mode (subset, or no destination) prints a
+    # truncated copy and stops in the pdb debugger. Returns None.
     parser = argparse.ArgumentParser()
     parser.add_argument("--destination", type=str, default=None)
     parser.add_argument("--subset", action="store_true")

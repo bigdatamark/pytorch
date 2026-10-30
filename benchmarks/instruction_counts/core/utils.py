@@ -1,4 +1,8 @@
 # mypy: ignore-errors
+# [MODULE DOC] Utilities for the instruction count benchmark: a lazily created temporary directory
+# that is deleted at interpreter exit, flattening of nested benchmark definitions into a mapping
+# keyed by tuples of strings, and a parser for side-by-side Python and C++ statement tables. Holds
+# one module global caching the temp directory path.
 import atexit
 import re
 import shutil
@@ -14,6 +18,10 @@ _TEMPDIR: str | None = None
 
 
 def get_temp_dir() -> str:
+    # [FUNCTION DOC] Returns the path of a process-wide temporary directory, creating it on first
+    # use (with an instruction count name prefix, also cleaning stale shared-memory directories)
+    # and registering removal of the whole tree at interpreter exit. Later calls return the cached
+    # path.
     global _TEMPDIR
     if _TEMPDIR is None:
         _TEMPDIR = _make_temp_dir(
@@ -26,6 +34,12 @@ def get_temp_dir() -> str:
 def _flatten(
     key_prefix: Label, sub_schema: Definition, result: FlatIntermediateDefinition
 ) -> None:
+        # [FUNCTION DOC] HELPER: Recursive worker of flatten. Walks the nested mapping, turning
+        # each key into a tuple (a tuple key must contain only strings, None adds nothing, a string
+        # becomes a one-element tuple) appended to the accumulated prefix. Leaf values (timer
+        # arguments or grouped benchmarks) are stored in the result mapping, which is mutated;
+        # nested mappings are recursed into. Raises AssertionError for bad key types, duplicate
+        # flat keys or values that are neither leaves nor mappings.
     for k, value in sub_schema.items():
         if isinstance(k, tuple):
             if not all(isinstance(ki, str) for ki in k):
@@ -52,6 +66,10 @@ def _flatten(
 
 
 def flatten(schema: Definition) -> FlatIntermediateDefinition:
+    # [FUNCTION DOC] Flattens a nested benchmark definition into a mapping from tuple keys to timer
+    # arguments or grouped benchmarks (see the types module for the schema). Runs a final
+    # validation that every key is a tuple of strings and every value is a leaf type, raising
+    # AssertionError otherwise. Returns the new mapping.
     """See types.py for an explanation of nested vs. flat definitions."""
     result: FlatIntermediateDefinition = {}
     _flatten(key_prefix=(), sub_schema=schema, result=result)
@@ -72,6 +90,14 @@ def flatten(schema: Definition) -> FlatIntermediateDefinition:
 
 
 def parse_stmts(stmts: str) -> tuple[str, str]:
+    # [FUNCTION DOC] Parses a side-by-side table of Python and C++ code into two code strings. The
+    # text is dedented and stripped and needs at least three lines (AssertionError otherwise). The
+    # first line must be the header with a 40 column Python column, a separator bar and C++
+    # (ValueError otherwise); the second a separator line of dashes (AssertionError); each
+    # following line is split at a fixed 40 character left column and a bar, with the right part
+    # optional (ValueError for a line that does not fit). Each line must round trip back to the
+    # same text, else AssertionError. Returns the Python lines and the C++ lines, each joined with
+    # newlines.
     """Helper function for side-by-side Python and C++ stmts.
 
     For more complex statements, it can be useful to see Python and C++ code

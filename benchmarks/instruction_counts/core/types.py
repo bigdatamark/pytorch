@@ -1,6 +1,11 @@
 """Type annotations for various benchmark objects."""
 
 # mypy: ignore-errors
+# [MODULE DOC] Type aliases describing the benchmark definition schema: a nested mapping of labels
+# (strings, tuples or None for base cases) to timer arguments or grouped benchmarks, the flat
+# intermediate mapping used while building TorchScript models, and the final flat tuple of label,
+# auto labels and timer arguments. Contains only declarations, no functions or classes. The large
+# string in the middle documents the schema.
 
 from core.api import AutoLabels, GroupedBenchmark, TimerArgs
 

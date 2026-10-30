@@ -1,3 +1,10 @@
+# [MODULE DOC] Benchmark script comparing GEMM backends of torch.compile (ATen, Triton with and
+# without persistent TMA, CUTLASS at several instantiation levels) on CUDA. Defines the experiment
+# configuration dataclasses, input builders, a runner that compiles and times each backend, and
+# table formatting that reports the percent difference against ATen. Import-time side effects: sets
+# the TORCH_LOGS environment variable to inductor before torch is imported, and changes inductor
+# config so all autotune choices are displayed and the local autotune cache is off. Run as a script
+# to execute everything; needs CUDA, triton, tabulate and tqdm.
 import os
 import sys
 
@@ -83,20 +90,30 @@ CUTLASS_INSTANTIATION_LEVELS = [
 
 
 def benchmark_torch_function_in_microseconds(func: Callable, *args, **kwargs) -> float:
+    # [FUNCTION DOC] Times a call with triton do_bench (warmup 100, repetitions 10000) and returns
+    # the measured time converted to microseconds (do_bench reports milliseconds). Runs the
+    # function.
     return do_bench(lambda: func(*args, **kwargs), warmup=100, rep=10000) * 1e3
 
 
 @dataclass(frozen=True, kw_only=True)
 class ExperimentConfig:
+    # [CLASS DOC] Frozen, keyword-only base config of one benchmarked backend: autotune flags and
+    # the gemm backend list string. Subclasses add backend specific knobs and a short name.
     max_autotune: bool = True
     coordinate_descent_tuning: bool = True
     max_autotune_gemm_backends: str = "ATEN"
 
     @abstractmethod
     def name(self) -> str:
+        # [FUNCTION DOC] Abstract-style hook for the experiment label; the base body does nothing
+        # and returns None (the class is not an abstract base class, so nothing enforces
+        # overriding).
         pass
 
     def to_options(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Returns the torch.compile inductor options mapping for this config: the
+        # max_autotune, coordinate_descent_tuning and max_autotune_gemm_backends settings.
         return {
             "max_autotune": self.max_autotune,
             "coordinate_descent_tuning": self.coordinate_descent_tuning,
@@ -106,15 +123,21 @@ class ExperimentConfig:
 
 @dataclass(frozen=True, kw_only=True)
 class AtenExperimentConfig(ExperimentConfig):
+    # [CLASS DOC] Config for the ATen baseline (uses only the base options).
     def name(self) -> str:
+        # [FUNCTION DOC] Returns the label aten.
         return "aten"
 
 
 @dataclass(frozen=True, kw_only=True)
 class CutlassExperimentConfig(ExperimentConfig):
+    # [CLASS DOC] Config for CUTLASS backend runs; adds the required cutlass instantiation level
+    # string.
     cutlass_instantiation_level: str
 
     def name(self) -> str:
+        # [FUNCTION DOC] Returns the label cutlass_lvl_ followed by the level, where level 0 is
+        # shown as default.
         level_name = (
             self.cutlass_instantiation_level
             if self.cutlass_instantiation_level != "0"
@@ -123,6 +146,7 @@ class CutlassExperimentConfig(ExperimentConfig):
         return f"cutlass_lvl_{level_name}"
 
     def to_options(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Returns the base options plus the cutlass instantiation level option.
         return {
             **super().to_options(),
             "cutlass.cutlass_instantiation_level": self.cutlass_instantiation_level,
@@ -131,15 +155,20 @@ class CutlassExperimentConfig(ExperimentConfig):
 
 @dataclass(frozen=True, kw_only=True)
 class TritonExperimentConfig(ExperimentConfig):
+    # [CLASS DOC] Config for Triton backend runs; adds a flag enabling persistent TMA matmul
+    # templates.
     enable_persistent_tma_matmul: bool = False
 
     def name(self) -> str:
+        # [FUNCTION DOC] Returns triton_persistent_tma when the persistent TMA flag is set, else
+        # triton.
         if self.enable_persistent_tma_matmul:
             return "triton_persistent_tma"
         else:
             return "triton"
 
     def to_options(self) -> dict[str, Any]:
+        # [FUNCTION DOC] Returns the base options plus the persistent TMA matmul option.
         return {
             **super().to_options(),
             "triton.enable_persistent_tma_matmul": self.enable_persistent_tma_matmul,
@@ -148,6 +177,8 @@ class TritonExperimentConfig(ExperimentConfig):
 
 @dataclass(frozen=True, kw_only=True)
 class ExperimentGroupConfig:
+    # [CLASS DOC] Frozen config of one problem instance (op name, M N K shape, dtype, batch size)
+    # together with the list of backend experiments to run on it.
     op_name: str
     shape: tuple[int, int, int]
     dtype: torch.dtype
@@ -156,6 +187,8 @@ class ExperimentGroupConfig:
     experiments: list[ExperimentConfig] = field(default_factory=list)
 
     def name(self) -> str:
+        # [FUNCTION DOC] Returns a label with the op name, the matrix sizes (including the batch
+        # size for bmm only) and the dtype. Reads the shape as M, N, K.
         M, N, K = self.shape
         B = self.batch_size
         sizes = (
@@ -168,17 +201,21 @@ class ExperimentGroupConfig:
 
 @dataclass(frozen=True, kw_only=True)
 class ExperimentResults:
+    # [CLASS DOC] Frozen result of one backend experiment: label, forward time in microseconds,
+    # achieved teraflops and compilation time in seconds.
     name: str
     forward_time: float
     teraflops: float
     compilation_time: float
 
     def asdict(self):
+        # [FUNCTION DOC] Returns the fields as a plain mapping.
         return asdict(self)
 
 
 @dataclass(frozen=True, kw_only=True)
 class ExperimentGroup:
+    # [CLASS DOC] Pairs a problem config with the list of results measured for it.
     config: ExperimentGroupConfig
     results: list[ExperimentResults] = field(default_factory=list)
 
@@ -186,6 +223,12 @@ class ExperimentGroup:
 def get_inputs(
     config: ExperimentGroupConfig,
 ) -> tuple[torch.Tensor, ...]:
+        # [FUNCTION DOC] Builds CUDA input tensors for the config's op. For mm: a matrix and a
+        # transposed view of a random matrix. For addmm: bias vector, matrix, transposed matrix.
+        # For bmm: batched matrices, second one a permuted view. For _scaled_mm: requires the
+        # float8 e4m3 dtype, quantizes bfloat16 inputs rowwise and returns the arguments tuple for
+        # that op including fast-accum flag. Raises ValueError for non-fp8 dtype with _scaled_mm
+        # and for unknown op names.
     op_name = config.op_name
     M, N, K = config.shape
     batch_size = config.batch_size
@@ -240,6 +283,11 @@ def get_inputs(
 def run_single_experiment_group(
     group_config: ExperimentGroupConfig,
 ) -> list[ExperimentResults]:
+        # [FUNCTION DOC] Runs all backend experiments of one group. For each: resets dynamo and
+        # clears inductor caches, compiles the torch op with the config options, and times the
+        # first call as compilation time. If that raises, logs a warning with the traceback and
+        # records infinite times and zero teraflops. Otherwise benchmarks the compiled op and
+        # computes teraflops from the flop count. Returns the list of results in experiment order.
     inputs = get_inputs(group_config)
     op = getattr(torch, group_config.op_name)
 
@@ -306,6 +354,9 @@ def generate_experiment_groups(
     cutlass_instantiation_levels: list[str],
     batch_sizes: list[int],
 ) -> list[ExperimentGroupConfig]:
+        # [FUNCTION DOC] Builds one group config for every combination of op, shape, dtype and
+        # batch size, fills each with the experiment configs from the config generator, and returns
+        # the list.
     groups = []
     for (
         op_name,
@@ -331,6 +382,8 @@ def generate_experiment_groups(
 def generate_experiment_configs(
     enable_persistent_tma_matmuls: list[bool], cutlass_instantiation_levels: list[str]
 ) -> list[ExperimentConfig]:
+        # [FUNCTION DOC] Returns the list of experiment configs: one ATen, one Triton per
+        # persistent TMA flag value, and one CUTLASS per instantiation level, in that order.
     configs = []
 
     # add aten configs
@@ -362,6 +415,10 @@ def generate_experiment_configs(
 
 
 def calculate_table_data(results: list[ExperimentResults]) -> dict:
+        # [FUNCTION DOC] Turns results into a column mapping for tabulate, keys carrying unit
+        # suffixes plus a percent column versus ATen. The ATen row, and every row when ATen has not
+        # come first, gets NA; others get the relative difference of forward time to the ATen time.
+        # Raises AssertionError for result fields missing from the units table.
     table_data = defaultdict(list)
     aten_perf: float | None = None
 
@@ -389,6 +446,8 @@ def calculate_table_data(results: list[ExperimentResults]) -> dict:
 
 
 def calculate_flops(op_name: str, shape: tuple[int, int, int], batch_size: int) -> int:
+        # [FUNCTION DOC] Returns the floating point operation count: two times the batch, M, N, K
+        # product for bmm, plus the bias elements for addmm, and two times M, N, K otherwise.
     """
     Calculate the number of floating point operations based on operation type and shape.
     """
@@ -405,6 +464,10 @@ def calculate_flops(op_name: str, shape: tuple[int, int, int], batch_size: int) 
 
 
 def get_printable_results(experiment_groups: list[ExperimentGroup]) -> list[str]:
+        # [FUNCTION DOC] Formats result tables for every group and a summary of average edge over
+        # ATen (negated percent clipped at zero, skipping infinite and NA values) per backend, when
+        # an ATen entry exists. Returns one newline-joined string.
+        # KNOWN ISSUE: annotated as returning a list of strings but returns a single string.
     edge_over_aten = defaultdict(list)
     output = []
 
@@ -439,6 +502,9 @@ def get_printable_results(experiment_groups: list[ExperimentGroup]) -> list[str]
 
 
 def main():
+        # [FUNCTION DOC] Script entry point: seeds torch, builds all experiment groups from the
+        # module constants, runs them one by one with a progress bar, writes cumulative
+        # intermediate tables to stderr after each group, and prints the final tables to stdout.
     seed = 123
     torch.manual_seed(seed)
     results = []

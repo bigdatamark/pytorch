@@ -1,3 +1,10 @@
+# [MODULE DOC] Script that post-processes one csv produced by the inference server benchmark. Takes
+# the csv path (relative to results) and an experiment name, reads the metric columns
+# warmup_latency, average_latency, throughput and gpu_util, computes their mean and standard
+# deviation, and appends a markdown table row to the results markdown file for the batch size and
+# compile flag parsed from the file name (batch size is the second underscore-separated field,
+# compile flag the last one). Writes the table header only when the markdown file is new. No
+# functions or classes; all work runs under the main-script guard.
 """
 This file will take the csv outputs from server.py, calculate the mean and
 variance of the warmup_latency, average_latency, throughput and gpu_util

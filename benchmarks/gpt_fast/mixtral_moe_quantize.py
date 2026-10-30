@@ -1,4 +1,8 @@
 # flake8: noqa: E266
+# [MODULE DOC] Weight-only int8 per-channel quantization utilities for the Mixtral MoE model of the
+# gpt-fast benchmark. Provides a row-wise symmetric quantizer, a handler that builds an int8 state
+# dict, and int8 replacements for linear layers and the conditional (expert) feed-forward. Imports
+# ConditionalFeedForward from a sibling module named mixtral_moe_model (must be on path).
 from mixtral_moe_model import ConditionalFeedForward
 
 import torch
@@ -10,6 +14,12 @@ import torch.nn.functional as F
 
 
 def dynamically_quantize_per_channel(x, quant_min, quant_max, target_dtype):
+    # [FUNCTION DOC] Symmetric per-row dynamic quantization of a 2-D tensor (axis 0 per channel).
+    # Computes min/max along dim 1, takes the larger magnitude of the negated min and the max (both
+    # bounded at zero), divides by half the quant range to get scales (clamped to the float32
+    # epsilon, cast to the input dtype), and uses all-zero int64 zero points. Returns the rounded
+    # and clamped values cast to target_dtype, the scales (one per row) and the zero points. No
+    # side effects.
     # assumes symmetric quantization
     # assumes axis == 0
     # assumes dense memory format
@@ -48,6 +58,11 @@ def dynamically_quantize_per_channel(x, quant_min, quant_max, target_dtype):
 
 
 def replace_linear_weight_only_int8_per_channel(module):
+    # [FUNCTION DOC] Recursively swaps modules in place for their int8 counterparts. Every linear
+    # child not named gate becomes an uninitialized int8 weight-only linear of the same sizes, and
+    # every ConditionalFeedForward child becomes the int8 conditional feed-forward using the shape
+    # of its first weight. Other children are recursed into. Mutates the given module; returns
+    # nothing.
     for name, child in module.named_children():
         if isinstance(child, nn.Linear) and name != "gate":
             setattr(
@@ -71,11 +86,22 @@ def replace_linear_weight_only_int8_per_channel(module):
 
 
 class WeightOnlyInt8QuantHandler:
+    # [CLASS DOC] Quantization driver for a Mixtral model. Holds the model in the mod attribute.
+    # create_quantized_state_dict builds an int8 state dict; convert_for_runtime swaps modules for
+    # their int8 variants so that the state dict can be loaded.
     def __init__(self, mod):
+        # [FUNCTION DOC] Stores the model to be quantized in the mod attribute.
         self.mod = mod
 
     @torch.no_grad()
     def create_quantized_state_dict(self):
+        # [FUNCTION DOC] Builds a state dict in which linear weights (except ones whose name ends
+        # with gate) and expert weights w1, w2, w3 are replaced by int8 tensors with matching
+        # scales entries. Linear layers are quantized per output row from float copies; experts are
+        # quantized one expert at a time and concatenated along a new leading expert dimension.
+        # Runs without gradients. Starts from the model's own state dict (the returned dict is a
+        # shallow copy of references). Returns the dict with the replaced entries; the model itself
+        # is not modified.
         cur_state_dict = self.mod.state_dict()
         for fqn, mod in self.mod.named_modules():
             if isinstance(mod, torch.nn.Linear) and not fqn.endswith(".gate"):
@@ -112,11 +138,15 @@ class WeightOnlyInt8QuantHandler:
         return cur_state_dict
 
     def convert_for_runtime(self):
+        # [FUNCTION DOC] Converts the held model in place to its int8 runtime form via the module
+        # replacement helper and returns the same model object.
         replace_linear_weight_only_int8_per_channel(self.mod)
         return self.mod
 
 
 class WeightOnlyInt8Linear(torch.nn.Module):
+    # [CLASS DOC] Linear layer with int8 weights and per-output-channel bfloat16 scales, both kept
+    # as buffers (not parameters). Weights are uninitialized until a state dict is loaded.
     __constants__ = ["in_features", "out_features"]
     in_features: int
     out_features: int
@@ -131,6 +161,10 @@ class WeightOnlyInt8Linear(torch.nn.Module):
         dtype=None,
         target_dtype=None,
     ) -> None:
+        # [FUNCTION DOC] Creates the weight buffer (out_features by in_features, target_dtype) and
+        # a bfloat16 scales buffer of ones. Raises AssertionError when target_dtype is None.
+        # KNOWN ISSUE: bias, device and dtype arguments are accepted but ignored; no bias is
+        #   created.
         if target_dtype is None:
             raise AssertionError("target_dtype must not be None")
         super().__init__()
@@ -142,11 +176,18 @@ class WeightOnlyInt8Linear(torch.nn.Module):
         self.register_buffer("scales", torch.ones(out_features, dtype=torch.bfloat16))
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC] Applies a bias-free linear with the weight cast to the input dtype, then
+        # multiplies the result by the per-channel scales (broadcast over the last dimension).
         return F.linear(input, self.weight.to(dtype=input.dtype)) * self.scales
 
 
 class ConditionalFeedForwardInt8(nn.Module):
+    # [CLASS DOC] Int8 version of the Mixtral expert feed-forward. Stores stacked expert weights
+    # w1, w2, w3 in the target dtype plus bfloat16 per-row scales buffers, all uninitialized until
+    # loaded.
     def __init__(self, num_experts, intermediate_size, dim, target_dtype):
+        # [FUNCTION DOC] Allocates the three stacked weight buffers (num_experts leading dimension)
+        # and three scales buffers, and records target_dtype.
         super().__init__()
 
         self.target_dtype = target_dtype
@@ -172,6 +213,11 @@ class ConditionalFeedForwardInt8(nn.Module):
         )
 
     def forward(self, x, expert_indices):
+        # [FUNCTION DOC] Computes the expert outputs for the selected experts. Gathers weights by
+        # expert index for every token, casts them to the activation dtype, and runs a gated MLP
+        # via einsum (silu of the first projection times the third), applying each projection's
+        # scales. Takes activations x per token and expert_indices per token (active experts).
+        # Returns per-token, per-active-expert outputs without combining them.
         w1_weights = self.w1.to(x.dtype)[expert_indices]  # [T, A, D, D]
         w3_weights = self.w3.to(x.dtype)[expert_indices]  # [T, A, D, D]
         w2_weights = self.w2.to(x.dtype)[expert_indices]

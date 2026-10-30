@@ -7,6 +7,10 @@ underlying benchmark generation infrastructure in the mean time.
 """
 
 # mypy: ignore-errors
+# [MODULE DOC] Placeholder command line runner for the instruction count benchmarks. As a script it
+# takes a mode option, either debug (the default; runs main here) or ci (runs the CI module), and
+# passes the remaining arguments to the chosen function. Import-time side effect: none beyond
+# importing sibling packages, which need the benchmark directory on the import path.
 
 import argparse
 import sys
@@ -19,6 +23,10 @@ from execution.work import WorkOrder
 
 
 def main(argv: list[str]) -> None:
+    # [FUNCTION DOC] Debug mode: materializes the standard benchmarks, wraps each into a work order
+    # (timeout 600 seconds, two retries), runs them all with a default Runner, then prints the
+    # label, auto labels, thread count and instruction counts of every order in order. argv is
+    # unused. Returns None.
     work_orders = tuple(
         WorkOrder(label, autolabels, timer_args, timeout=600, retries=2)
         for label, autolabels, timer_args in materialize(BENCHMARKS)

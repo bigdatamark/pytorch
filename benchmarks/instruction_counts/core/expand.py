@@ -4,6 +4,12 @@ This is mostly string manipulation, with just a bit of importlib magic.
 """
 
 # mypy: ignore-errors
+# [MODULE DOC] Converts human-readable benchmark definitions into executable form. The public
+# function materialize flattens a mapping of labels to timer arguments or grouped benchmarks into a
+# tuple of label, auto labels and timer arguments, generating TorchScript model files on disk where
+# requested. Private helpers build the timed statement, the setup code and the saved model
+# artifact. Import-time side effect: builds the table of all runtime, autograd and language mode
+# combinations. Imports Language from torch.utils.benchmark.
 
 import importlib.abc
 import importlib.util
@@ -38,6 +44,13 @@ _ALL_MODES = tuple(
 
 
 def _generate_torchscript_file(model_src: str, name: str) -> str | None:
+    # [FUNCTION DOC] HELPER: Turns model source text into a saved TorchScript artifact and returns
+    # its file path. Raises AssertionError if the source lacks the scripted model definition, if
+    # the module cannot be loaded, or if the loaded object is not a script function or module;
+    # raises ValueError if the temporary python file already exists. Side effects: creates a
+    # TorchScript_models folder under the temp dir, writes the source (with an import of torch
+    # prepended) to a python file, executes it as a module, saves the model next to it and deletes
+    # the python file (not on failure).
     """Returns the path a saved model if one can be constructed from `spec`.
 
     Because TorchScript requires actual source code in order to script a
@@ -100,6 +113,13 @@ def _get_stmt(
     autograd: AutogradMode,
     language: Language,
 ) -> str | None:
+        # [FUNCTION DOC] HELPER: Returns the statement to time for one runtime, autograd and
+        # language combination, or None when the group has no statement for that language. Eager
+        # mode reuses the stored statements; TorchScript mode generates a call of the loaded model
+        # from the signature (AssertionError if signature arguments are missing or the runtime is
+        # neither eager nor TorchScript). For forward plus backward it appends a backward call on
+        # the signature output (AssertionError if there is no output); the C++ TorchScript case
+        # first converts the result to a tensor.
     """Specialize a GroupedBenchmark for a particular configuration."""
     is_python = language == Language.PYTHON
 
@@ -145,6 +165,12 @@ def _get_setup(
     stmt: str,
     model_path: str | None,
 ) -> str:
+        # [FUNCTION DOC] HELPER: Builds the setup code for one runtime and language. Eager mode
+        # joins the shared setup and the model setup (or nothing). TorchScript mode needs a model
+        # file path (AssertionError if None or if the path has a double quote) and appends code
+        # loading the saved model and warming it up by running the statement three times, as a
+        # Python loop or a C++ loop. Any other runtime or language raises AssertionError. Returns
+        # the setup string.
     """Specialize a GroupedBenchmark for a particular configuration.
 
     Setup requires two extra pieces of information:
@@ -214,6 +240,15 @@ def _get_setup(
 
 
 def materialize(benchmarks: FlatIntermediateDefinition) -> FlatDefinition:
+    # [FUNCTION DOC] Flattens benchmark definitions into the executable tuple of label, auto labels
+    # and timer arguments. Explicit timer arguments pass through with explicit modes. Grouped
+    # benchmarks (anything else raises AssertionError) with TorchScript and Python model setup
+    # first get a saved model artifact with a unique name. Then for every thread count and
+    # combination of runtime, autograd and language, skipping explicit modes and modes the group
+    # did not request, and groups without a statement, it builds the statement, setup and (for C++
+    # TorchScript) the global setup with the needed includes. Side effects: model files are written
+    # under the temp dir. Note that TorchScript groups without Python model setup reach the setup
+    # helper with no model path and raise AssertionError. Returns a tuple of results.
     """Convert a heterogeneous benchmark into an executable state.
 
     This entails generation of TorchScript model artifacts, splitting
