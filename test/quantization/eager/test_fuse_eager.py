@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: quantization"]
+# [MODULE DOC] Eager-mode tests for module fusion (fuse_modules and fuse_modules_qat) and its
+# interaction with prepare, prepare_qat, convert and quantize. Checks the resulting fused module
+# types (intrinsic, QAT and quantized variants), numerics of folded batch norm, custom fuser
+# functions and forward hook preservation. Importing has no side effects besides defining the test
+# class; running the file directly raises an error and tells the user to go through the
+# quantization test driver.
 
 import copy
 
@@ -40,7 +46,17 @@ from torch.testing._internal.common_quantized import (
 
 @skipIfNoFBGEMM
 class TestFuseEager(QuantizationTestCase):
+    # [CLASS DOC] Test case (skipped when FBGEMM is unavailable) covering eager-mode fusion of
+    # conv, bn, relu, linear and conv-transpose sequences in both training (QAT) and eval (PTQ)
+    # flows. Uses model fixtures and image data attributes from QuantizationTestCase.
     def test_fuse_module_train(self):
+        # [FUNCTION DOC] Fuses conv+bn+relu and conv+bn groups of a training-mode model step by
+        # step with fuse_modules_qat, checks that the fused slots hold QAT-style intrinsic types
+        # and the remaining slots become identity modules while unfused submodules stay plain.
+        # Then runs prepare_qat, a training pass, and convert. The converted model still contains
+        # an unfused batch norm path, so evaluating it must raise a RuntimeError saying batch norm
+        # cannot run on the quantized CPU backend; the same expectation is verified for a model
+        # built via quantize_qat with list-of-lists fusion.
         model = ModelForFusion(default_qat_qconfig).train()
         # Test step by step fusion
         model = fuse_modules_qat(model, ["conv1", "bn1", "relu1"])
@@ -79,6 +95,9 @@ class TestFuseEager(QuantizationTestCase):
         self.checkObservers(model)
 
         def checkQAT(model):
+            # [FUNCTION DOC] HELPER: Asserts the post-prepare_qat module types: QAT fused conv
+            # modules for the fused slots, identity for the absorbed bn and relu slots, and
+            # unchanged conv/relu in the non-fused submodule.
             self.assertEqual(type(model.conv1), nniqat.ConvBnReLU2d)
             self.assertEqual(type(model.bn1), nn.Identity)
             self.assertEqual(type(model.relu1), nn.Identity)
@@ -92,6 +111,10 @@ class TestFuseEager(QuantizationTestCase):
         model = convert(model)
 
         def checkQuantized(model):
+            # [FUNCTION DOC] HELPER: Asserts the converted module types (quantized fused
+            # conv-relu, quantized conv, identity placeholders, untouched float conv and relu),
+            # runs the model on the 1d eval data and checks that no qconfig attributes remain.
+            # Evaluation is expected to fail by the caller with a batch norm error.
             self.assertEqual(type(model.conv1), nniq.ConvReLU2d)
             self.assertEqual(type(model.bn1), nn.Identity)
             self.assertEqual(type(model.relu1), nn.Identity)
@@ -120,6 +143,12 @@ class TestFuseEager(QuantizationTestCase):
             checkQuantized(model)
 
     def test_fuse_module_eval(self):
+        # [FUNCTION DOC] Eval-mode fusion test: fuses several groups (conv-bn-relu in 1d and 2d,
+        # conv-relu in 3d, bn-relu in 3d, conv-bn in a submodule) with fuse_modules and asserts
+        # the resulting intrinsic module classes, their inner float modules and the identity
+        # replacements. Then prepare, calibrate on eval data, convert and verify types through the
+        # nested checker. Repeats the flow with quantize and a reordered group list to confirm the
+        # same quantized structure.
         model = ModelForFusion(default_qconfig)
         model.eval()
         model = fuse_modules(
@@ -224,6 +253,10 @@ class TestFuseEager(QuantizationTestCase):
         model = convert(model)
 
         def checkQuantized(model):
+            # [FUNCTION DOC] HELPER: Asserts the converted eval-mode module types (quantized
+            # conv-relu in 1d and 2d, quantized bn-relu 3d, quantized conv in the submodule, float
+            # conv/relu in the non-fused submodule), runs eval data through the model and checks
+            # the qconfig attributes were removed.
             self.assertEqual(type(model.conv3), nniq.ConvReLU1d)
             self.assertEqual(type(model.conv1), nniq.ConvReLU2d)
             self.assertEqual(type(model.bn1), nn.Identity)
@@ -253,6 +286,12 @@ class TestFuseEager(QuantizationTestCase):
         checkQuantized(model)
 
     def test_fusion_sequential_model_train(self):
+        # [FUNCTION DOC] For each supported quantization engine, fuses a sequential-containing
+        # model in train mode with fuse_modules_qat in place (conv-relu, three conv-bn-relu groups
+        # inside features, linear-relu in the classifier). Verifies fused/identity types, assigns
+        # the engine's default QAT qconfig, runs prepare_qat in place, checks observers, runs
+        # data, verifies QAT module types, converts in place, runs again and verifies the final
+        # quantized types.
         for qengine in supported_qengines:
             with override_quantized_engine(qengine):
                 model = ModelWithSequentialFusion().train()
@@ -306,6 +345,8 @@ class TestFuseEager(QuantizationTestCase):
                 model(self.img_data_2d[0][0])
 
                 def checkQAT(model):
+                # [FUNCTION DOC] HELPER: Asserts that after prepare_qat the first conv is the QAT
+                # conv-relu type and the relu slot is an identity module.
                     self.assertEqual(type(model.conv1), nniqat.ConvReLU2d)
                     self.assertEqual(type(model.relu1), nn.Identity)
 
@@ -335,6 +376,10 @@ class TestFuseEager(QuantizationTestCase):
                 self.checkModelWithSequentialQuantized(model)
 
     def test_fusion_sequential_model_eval(self):
+        # [FUNCTION DOC] Same as the sequential train test but for eval mode: for each supported
+        # engine, fuses with fuse_modules in place, checks intrinsic float types, sets the default
+        # qconfig, prepares, calibrates with one batch, converts and checks quantized types with
+        # the shared helper.
         for qengine in supported_qengines:
             with override_quantized_engine(qengine):
                 model = ModelWithSequentialFusion().eval()
@@ -391,6 +436,9 @@ class TestFuseEager(QuantizationTestCase):
                 self.checkModelWithSequentialQuantized(model)
 
     def checkModelWithSequentialQuantized(self, model):
+    # [FUNCTION DOC] Helper asserting that a converted sequential-fusion model has quantized
+    # conv-relu modules for the first conv and each of the three features blocks, quantized
+    # linear-relu in the classifier, and identity modules for the absorbed slots.
         self.assertEqual(type(model.conv1), nniq.ConvReLU2d)
         self.assertEqual(type(model.relu1), nn.Identity)
         for i in range(3):
@@ -401,6 +449,11 @@ class TestFuseEager(QuantizationTestCase):
         self.assertEqual(type(model.classifier[1]), nn.Identity)
 
     def test_fusion_conv_with_bias(self):
+        # [FUNCTION DOC] For each supported engine, checks that fusing conv+bn(+relu) with bias in
+        # QAT mode preserves numerics: the unfused reference output must equal the output of the
+        # fused, prepared model when the qconfig uses identity observers/fake-quant, the batch
+        # norm parameters and running stats must be copied into the fused module, and after
+        # preparing with the real default qconfig the QAT module types are verified.
         for qengine in supported_qengines:
             with override_quantized_engine(qengine):
                 model_orig = ModelForFusionWithBias().train()
@@ -424,6 +477,9 @@ class TestFuseEager(QuantizationTestCase):
                 self.assertEqual(out_ref, out_fused)
 
                 def checkBN(bn_ref, bn):
+                # [FUNCTION DOC] HELPER: Asserts that weight, bias, running mean and running
+                # variance of the reference batch norm equal those of the batch norm embedded in
+                # the fused module.
                     self.assertEqual(bn_ref.weight, bn.weight)
                     self.assertEqual(bn_ref.bias, bn.bias)
                     self.assertEqual(bn_ref.running_mean, bn.running_mean)
@@ -438,6 +494,8 @@ class TestFuseEager(QuantizationTestCase):
                 model(self.img_data_2d[0][0])
 
                 def checkQAT(model):
+                    # [FUNCTION DOC] HELPER: Asserts the QAT fused types for conv1 (conv-bn-relu),
+                    # conv2 (conv-bn) and identity placeholders for the absorbed slots.
                     self.assertEqual(type(model.conv1), nniqat.ConvBnReLU2d)
                     self.assertEqual(type(model.bn1), nn.Identity)
                     self.assertEqual(type(model.relu1), nn.Identity)
@@ -447,6 +505,9 @@ class TestFuseEager(QuantizationTestCase):
                 checkQAT(model)
 
     def test_fusion_linear_bn_eval(self):
+        # [FUNCTION DOC] Trains a linear+bn model for one batch to populate running statistics,
+        # records the eval output, fuses linear and bn with fuse_modules, and asserts the bn slot
+        # is identity and the output on the same input matches the pre-fusion output.
         model = ModelForLinearBNFusion().train()
         inp1 = torch.randn(8, 20)
         inp2 = torch.randn(8, 20)
@@ -461,6 +522,9 @@ class TestFuseEager(QuantizationTestCase):
         self.assertEqual(golden, model(inp2))
 
     def test_fusion_convtranspose_bn_eval(self):
+        # [FUNCTION DOC] Same as the linear/bn fusion test but for three conv-transpose + bn
+        # pairs: the bn slots must become identity and the fused eval output must equal the
+        # unfused eval output.
         model = ModelForConvTransposeBNFusion().train()
         inp1 = torch.randn(8, 3, 16)
         inp2 = torch.randn(8, 3, 16)
@@ -480,17 +544,26 @@ class TestFuseEager(QuantizationTestCase):
         self.assertEqual(golden, model(inp2))
 
     def test_fuse_function_customization(self):
+        # [FUNCTION DOC] Checks that fuse_modules accepts a custom fuser_func: a single-module
+        # group is replaced by whatever the custom function returns, here an identity module.
         dummy_model = SingleLayerLinearModel().train()
         dummy_model.eval()
 
         # A custom fuse funct
         def custom_fuse_func(module, is_qat, add_fuser_mapping):
+        # [FUNCTION DOC] HELPER: Custom fuser function used by the test; ignores its arguments and
+        # returns a one-element list holding an identity module.
             return [torch.nn.Identity()]
 
         dummy_model = fuse_modules(dummy_model, [["fc1"]], fuser_func=custom_fuse_func)
         self.assertEqual(type(dummy_model.fc1), nn.Identity)
 
     def test_forward_hooks_preserved(self):
+        # [FUNCTION DOC] Registers forward pre-hooks on the first module of two fusion groups and
+        # forward hooks on the last module of each. Runs eval data before and after fusing with
+        # fuse_modules_qat and asserts that each hook still fires exactly twice per batch, and
+        # that after fusion the hook owner is the fused module class (checked inside the hook
+        # callbacks).
         r"""Test case that checks whether forward pre hooks of the first module and
         post forward hooks of the last module in modules list passed to fusion function preserved.
         (e.g. before fusion: [nn.Conv2d (with pre forward hooks), nn.BatchNorm2d, nn.ReLU (with post forward hooks)]
@@ -505,6 +578,9 @@ class TestFuseEager(QuantizationTestCase):
         fused = False
 
         def fw_pre_hook(fused_module_class, h_module, input):
+        # [FUNCTION DOC] HELPER: Forward pre-hook callback: after fusion it asserts the hook's
+        # owning module type is the expected fused class; always increments the pre-forward
+        # counter in the enclosing scope.
             if fused:
                 self.assertEqual(
                     type(h_module),
@@ -514,6 +590,9 @@ class TestFuseEager(QuantizationTestCase):
             counter["pre_forwards"] += 1
 
         def fw_hook(fused_module_class, h_module, input, output):
+        # [FUNCTION DOC] HELPER: Forward hook callback: after fusion it asserts the hook's owning
+        # module type is the expected fused class; always increments the forward counter in the
+        # enclosing scope.
             if fused:
                 self.assertEqual(
                     type(h_module),
@@ -553,12 +632,18 @@ class TestFuseEager(QuantizationTestCase):
         )
 
     def test_fuse_modules_with_nested_hooks(self):
+        # [FUNCTION DOC] Regression guard: registers a forward hook on every layer of every
+        # sequential container for each supported engine, then fuses one conv-bn-relu group in
+        # place and asserts it does not fail and yields fused conv-relu followed by identity
+        # modules.
         r"""Test case that checks whether a nested module with sub-sub modules registered with hooks
         can be safely fused. Safeguard for issues similar to https://github.com/pytorch/pytorch/issues/105063
         in the future.
         """
 
         def myhook(*x):
+        # [FUNCTION DOC] HELPER: Trivial hook accepting any arguments and returning an empty
+        # string.
             return ""
 
         for qengine in supported_qengines:

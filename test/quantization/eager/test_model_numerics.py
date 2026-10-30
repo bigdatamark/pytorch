@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: quantization"]
+# [MODULE DOC] Eager-mode numerics tests that compare float models against post-training
+# quantized, fake-quantized (QAT) and partially quantized versions using
+# signal-to-quantization-noise ratio thresholds. Uses the multi-op toy models from
+# common_quantization. No import-time side effects; running the file directly raises an error
+# pointing to the quantization test driver.
 
 import torch
 from torch.testing._internal.common_quantization import (
@@ -13,7 +18,14 @@ from torch.testing._internal.common_quantized import (
 
 
 class TestModelNumericsEager(QuantizationTestCase):
+    # [CLASS DOC] Numerics test case for eager-mode quantization flows. Each test seeds the random
+    # generator, builds a toy model, and asserts that the SQNR in decibels between reference and
+    # quantized outputs exceeds a threshold.
     def test_float_quant_compare_per_tensor(self):
+        # [FUNCTION DOC] For every supported quantization engine, builds a float multi-op model in
+        # eval mode, wraps it in a quantization wrapper with the default per-tensor qconfig, fuses
+        # conv, bn and relu, prepares, calibrates on random data, converts, and asserts the SQNR
+        # against the float output on separate eval data is above 30 dB.
         for qengine in supported_qengines:
             with override_quantized_engine(qengine):
                 torch.manual_seed(42)
@@ -45,6 +57,9 @@ class TestModelNumericsEager(QuantizationTestCase):
                 )
 
     def test_float_quant_compare_per_channel(self):
+        # [FUNCTION DOC] Same flow as the per-tensor test (single default engine, no engine
+        # override) but uses the default per-channel qconfig with different seed and data sizes,
+        # and requires SQNR above 35 dB against the float output.
         # Test for per-channel Quant
         torch.manual_seed(67)
         my_model = ModelMultipleOps().to(torch.float32)
@@ -72,6 +87,12 @@ class TestModelNumericsEager(QuantizationTestCase):
         )
 
     def test_fake_quant_true_quant_compare(self):
+        # [FUNCTION DOC] For every supported engine, builds a QAT-prepared model of the
+        # no-average-pool variant: fuses with the QAT fuser, prepares for QAT, then calibrates
+        # with fake quant disabled and batch norm statistics frozen, enables fake quant and
+        # disables observers, and requires SQNR above 35 dB versus the float model. Then converts
+        # to a true quantized model and requires fake-quant versus true-quant outputs to agree
+        # above 60 dB SQNR.
         for qengine in supported_qengines:
             with override_quantized_engine(qengine):
                 torch.manual_seed(67)
@@ -118,6 +139,13 @@ class TestModelNumericsEager(QuantizationTestCase):
     # Test to compare weight only quantized model numerics and
     # activation only quantized model numerics with float
     def test_weight_only_activation_only_fakequant(self):
+        # [FUNCTION DOC] For every supported engine, runs the fake-quant calibration flow twice,
+        # once with the weight-only qconfig and once with the activation-only qconfig, and checks
+        # SQNR against the float model exceeds the per-config target (35 and 45 dB paired by
+        # iteration index).
+        # KNOWN ISSUE: the qconfigs are held in a set, so the iteration order, and thus which
+        # target is paired with which qconfig, is not defined by the code; the test only works if
+        # the pairing happens to be right.
         for qengine in supported_qengines:
             with override_quantized_engine(qengine):
                 torch.manual_seed(67)
