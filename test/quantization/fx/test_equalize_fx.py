@@ -1,4 +1,11 @@
 # Owner(s): ["oncall: quantization"]
+# [MODULE DOC] FX graph mode tests for input-weight equalization: the equalization observers and
+# scale computation, the graph produced by prepare_fx with an equalization config, the reference
+# conversion that folds equalization scales into weights and biases, the quantized graph node order
+# after convert_fx, accuracy versus no equalization, and selective equalization chosen from layer
+# SQNR. Defines shared qconfig mappings at import time (all-default, specific-object-type and
+# equalization variants). Not runnable directly: the main guard calls the helper that reports the
+# file must be run through the test_quantization driver.
 
 import torch
 import torch.nn as nn
@@ -78,7 +85,15 @@ default_equalization_qconfig_dict = {
 
 
 class TestEqualizeFx(QuantizationTestCase):
+    # [CLASS DOC] Tests for input-weight equalization with FX graph mode quantization. Holds
+    # numpy-based reference helpers (min/max per channel, expected scales, weights, biases and
+    # observer ranges) and the tests that compare library results with them for linear, conv and
+    # relu model variants.
     def channel_minmax(self, input, axis=1):
+        # [FUNCTION DOC] HELPER: Computes the per-channel minimum and maximum of a numpy array
+        # along every dimension except the given channel axis (default one), by reducing the other
+        # axes from the last to the first. Returns a pair of arrays (mins, maxs). Does not modify
+        # the input.
         ''' Finds the min/max of inputs associated with a specific channel
         '''
         size_of_tensor_dim = input.ndim
@@ -101,6 +116,17 @@ class TestEqualizeFx(QuantizationTestCase):
            weight_qscheme=st.sampled_from((torch.per_channel_affine, torch.per_channel_symmetric,
                                            torch.per_channel_affine_float_qparams)))
     def test_input_weight_eq_observer(self, ndim, input_qdtype, input_qscheme, weight_qdtype, weight_qscheme):
+        # [FUNCTION DOC] Hypothesis test over tensor rank two to five and input/weight dtype and
+        # scheme choices. Builds random float arrays (rounded to two decimals) with a shared
+        # channel dimension, feeds them through the input and weight equalization observers, and
+        # checks the outputs pass through unchanged, that recorded input and weight column min/max
+        # match numpy references, and that the equalization scale equals the square root of the
+        # weight range over the input range. Then sets the scale on both observers and compares the
+        # scaled input quantization parameters and the per-channel observer parameters on the
+        # reciprocal-scaled weights with references for each scheme (symmetric, affine, float
+        # qparams).
+        # KNOWN ISSUE: the numpy clip call on the reference zero point discards its result, so the
+        # reference zero point is never actually clipped to the dtype range.
         sizes = []
         for _ in range((ndim - 1) * 2):
             sizes.append(np.random.randint(2, 10))
@@ -226,6 +252,10 @@ class TestEqualizeFx(QuantizationTestCase):
             ref_zero_points, dtype=weight_qparams[1].dtype), rtol=1e-5, atol=1)
 
     def test_input_weight_equalization_prepare(self):
+        # [FUNCTION DOC] Prepares many linear, conv and relu model variants with prepare_fx using
+        # the specific object-type qconfig and the default equalization config, then checks the
+        # expected count of input equalization observers, weight equalization observers and min/max
+        # observers in the prepared graph for each.
         """ Tests that graphs created after prepare_fx is as expected
         """
 
@@ -284,6 +314,9 @@ class TestEqualizeFx(QuantizationTestCase):
             self.checkGraphModuleNodes(prepared, expected_node_occurrence=node_occurrence)
 
     def test_input_weight_equalization_branching(self):
+        # [FUNCTION DOC] Checks equalization observer insertion around branches. When both branch
+        # heads are layers to be equalized, no input equalization observer is inserted (three
+        # min/max observers only); when only one head is, one is inserted (two min/max observers).
         """ Tests that graphs containing branches are prepared correctly.
         Specifically, equalization observers should not be inserted in front of
         branches in which both initial layers in the branches plan to be
@@ -295,12 +328,17 @@ class TestEqualizeFx(QuantizationTestCase):
         # Note that this should print out 2 warning messages for not being able
         # to equalize layers linear1 and linear1 because it is part of a branch
         class TestBranchingWithoutEqualizationModel(nn.Module):
+            # [CLASS DOC] HELPER: Model where two linear layers consume the same input and the
+            # results are added.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates two linear layers of width five.
                 super().__init__()
                 self.linear1 = nn.Linear(5, 5)
                 self.linear2 = nn.Linear(5, 5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies both linear layers to the input and returns their
+                # sum.
                 y = self.linear1(x)
                 z = self.linear2(x)
                 return torch.add(y, z)
@@ -320,11 +358,16 @@ class TestEqualizeFx(QuantizationTestCase):
         # Tests that we will add an equalization observer because there is only
         # one initial node in the branch that needs to be equalized
         class TestBranchingWithEqualizationModel(nn.Module):
+            # [CLASS DOC] HELPER: Model where one linear layer and a scalar add on the same input
+            # are summed.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates one linear layer of width five.
                 super().__init__()
                 self.linear1 = nn.Linear(5, 5)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Adds five to the input, applies the linear layer to the
+                # input, and returns the sum.
                 y = self.linear1(x)
                 z = torch.add(x, 5)
                 return torch.add(y, z)
@@ -343,6 +386,10 @@ class TestEqualizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_input_weight_equalization_convert(self):
+        # [FUNCTION DOC] For each model variant (rank two or four inputs), prepares twice, with the
+        # reference equalization conversion applied to the first and a normal quantized conversion
+        # on the second. Asserts the equalized float graph output equals the prepared graph output,
+        # and that the full conversion still compiles. Requires the FBGEMM backend.
         """ Tests that the modified model for equalization (before quantization)
         returns the same output as the original model
         """
@@ -386,6 +433,9 @@ class TestEqualizeFx(QuantizationTestCase):
             self.assertEqual(output, convert_ref_output)
 
     def calculate_equalization_scale_ref(self, x, w):
+        # [FUNCTION DOC] HELPER: Returns the numpy equalization scale for an input and weight: the
+        # square root of the per-column weight range divided by the per-column input range (reduced
+        # over rows).
         """ Calculates the equalization scale based on the input and weight
         """
         min_inputs = x.min(axis=0)
@@ -399,6 +449,10 @@ class TestEqualizeFx(QuantizationTestCase):
         return equalization_scale
 
     def get_expected_eq_scales(self, model, x):
+        # [FUNCTION DOC] HELPER: Walks the model child modules in order, computing the reference
+        # equalization scale from the current activations and that child's weight, and propagating
+        # the activations through the child's affine map. Returns the list of scales. Assumes every
+        # child has a weight and a bias, i.e. only chains of linear layers.
         """ For each module in the graph, we want to calculate the equalization
         scale at that point. This only works for models containing single or
         connected linear layers.
@@ -416,6 +470,9 @@ class TestEqualizeFx(QuantizationTestCase):
         return exp_eq_scales
 
     def test_input_weight_equalization_equalization_scales(self):
+        # [FUNCTION DOC] Runs prepare_fx and the reference equalization conversion on single and
+        # two layer linear models, then checks every equalization scale buffer in the converted
+        # graph equals the reference scale, in order.
         """ After applying the equalization functions, check if the equalization
         scales are the expected values
         """
@@ -444,6 +501,10 @@ class TestEqualizeFx(QuantizationTestCase):
                     counter += 1
 
     def get_expected_weights_bias(self, model, x, exp_eq_scales):
+        # [FUNCTION DOC] HELPER: For each child linear layer computes the expected equalized weight
+        # (divided by its own scale, rows then multiplied by the next layer's scale when there is
+        # one) and bias (scaled by the next scale). Returns the lists of expected weights and
+        # biases.
         """ For each module in the graph, we want to calculate the expected
         scaled weight and bias values. This only works for models containing
         single or connected linear layers.
@@ -468,6 +529,9 @@ class TestEqualizeFx(QuantizationTestCase):
         return exp_weights, exp_bias
 
     def test_input_weight_equalization_weights_bias(self):
+        # [FUNCTION DOC] Runs prepare_fx, calibration and the reference equalization conversion on
+        # linear models and checks each linear module weight and bias in the converted graph equals
+        # the expected scaled values, in order.
         """ After applying the equalization functions check if the weights and
         biases are as expected
         """
@@ -499,6 +563,10 @@ class TestEqualizeFx(QuantizationTestCase):
                     counter += 1
 
     def get_expected_inp_act_vals(self, model, x, exp_eq_scales, exp_weights, exp_bias):
+        # [FUNCTION DOC] HELPER: Computes expected (min, max) pairs for each input activation of a
+        # chain of linear layers: the input is multiplied by the first scale, and activations are
+        # propagated through the expected scaled weights and biases. Returns the list, including
+        # the final output.
         """ For each module in the graph, we want to calculate the expected
         min/max values for every input activation node. This only works for
         models containing only single or connected linear layers.
@@ -514,6 +582,8 @@ class TestEqualizeFx(QuantizationTestCase):
         return exp_inp_activation_vals
 
     def get_expected_weight_act_vals(self, exp_weights):
+        # [FUNCTION DOC] HELPER: Returns a list of (min, max) pairs, one per expected scaled weight
+        # array.
         """ For each module in the graph, we want to calculate the expected
         min/max values for every weight activation node. This is assuming that
         the weight observers are all MinMaxObservers.
@@ -526,6 +596,11 @@ class TestEqualizeFx(QuantizationTestCase):
         return exp_weight_activation_vals
 
     def test_input_weight_equalization_activation_values(self):
+        # [FUNCTION DOC] After equalization conversion, checks the min and max stored in the
+        # min/max observers. Observers that feed only the weight argument of a functional linear
+        # are compared with the expected weight ranges; all other observers with the expected input
+        # activation ranges, in graph order. Tests single and two layer linear and single
+        # functional linear models.
         """ After applying the equalization functions check if the input
         observer's min/max values are as expected
         """
@@ -571,6 +646,11 @@ class TestEqualizeFx(QuantizationTestCase):
 
 
     def check_orig_and_eq_graphs(self, orig_model, eq_model):
+        # [FUNCTION DOC] HELPER: Compares two graph modules node by node, skipping an equalization
+        # scale attribute node followed by a multiply node in the equalized graph. Returns False
+        # when a node operation differs, a called module has a different type, or a called function
+        # differs; True otherwise.
+        # KNOWN ISSUE: this helper is not called by any test in this file.
         """ Given a non-equalized model and an equalized model, check that the
         graphs are structured in the same way, except the equalized model has
         additional 'equalization_scale' and 'mul' nodes.
@@ -610,6 +690,10 @@ class TestEqualizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_input_weight_equalization_graphs(self):
+        # [FUNCTION DOC] Prepares and converts each model variant with equalization and checks the
+        # converted graph contains the expected ordered nodes: multiply by the scale, quantize, the
+        # quantized layer (module or functional, with relu fused where applicable), then
+        # dequantize. Requires FBGEMM.
         """ Tests that the modified model for equalization has the same graph
         structure as the model without equalization (before and after
         quantization).
@@ -792,6 +876,9 @@ class TestEqualizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_input_weight_equalization_results(self):
+        # [FUNCTION DOC] Compares outputs of quantized small linear models built without
+        # equalization and with default equalization; asserts they agree within an absolute
+        # tolerance of one tenth. Requires FBGEMM.
         """ Tests that for small models, the results of quantized models that
         have been equalized are very close to models that have not been equalized.
         """
@@ -828,6 +915,10 @@ class TestEqualizeFx(QuantizationTestCase):
 
     @skipIfNoFBGEMM
     def test_selective_equalization(self):
+        # [FUNCTION DOC] Quantizes a two layer model, measures per-layer SQNR with the numeric
+        # suite helper, builds an equalization config for the single worst layer, prepares and
+        # converts with it, and checks the resulting graph has the scale multiply only before the
+        # second quantization. Requires FBGEMM.
         """ Tests that we are able to run numeric suite on the equalized model
         and construct a valid equalization_config equalizing only the top
         4 layers with the highest quantization errors.
@@ -836,12 +927,18 @@ class TestEqualizeFx(QuantizationTestCase):
         torch.manual_seed(1)
 
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Model with a bottom linear sequence, a scalar add of five, and a
+            # top linear sequence.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the bottom and top sequential modules, each with
+                # one linear layer.
                 super().__init__()
                 self.bot = torch.nn.Sequential(torch.nn.Linear(5, 5))
                 self.top = torch.nn.Sequential(torch.nn.Linear(5, 5))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies bottom, adds five, then applies top and returns
+                # the result.
                 x = self.bot(x)
                 x = torch.add(x, 5)
                 x = self.top(x)

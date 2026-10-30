@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: quantization"]
+# [MODULE DOC] Eager-mode quantization-aware training (QAT) tests: prepare_qat/convert flows on
+# hand-written models (linear, conv, dropout, embedding bag), dynamic QAT, state_dict round trips,
+# hook preservation, and numerical equivalence of fused conv-bn(-relu) and linear-bn QAT modules
+# against float and explicit-folding references. Disables the hypothesis deadline at import time.
+# Not runnable directly: the main guard raises an error telling the reader to use the
+# test_quantization driver script.
 
 import copy
 import math
@@ -63,6 +69,11 @@ from functools import reduce
 
 
 class _ReferenceConvBnNd(torch.nn.Conv2d, torch.nn.modules.conv._ConvNd):
+    # [CLASS DOC] HELPER: Reference QAT conv+batchnorm module that folds the batchnorm scale into
+    # the conv weight explicitly (fake-quantizing the scaled weight, then undoing the scale to get
+    # batch statistics). Holds conv weight, optional bias, gamma/beta parameters, running stats
+    # buffers, an activation fake-quant and a weight fake-quant built from the qconfig. Used only
+    # to check numerics of the library fused modules.
     """
     Conv-BN fusion implemented with explicit folding. Useful
     to verify numerical equivalency with non-folded version.
@@ -92,6 +103,11 @@ class _ReferenceConvBnNd(torch.nn.Conv2d, torch.nn.modules.conv._ConvNd):
         freeze_bn=False,
         qconfig=None,
     ):
+        # [FUNCTION DOC] HELPER: Builds the conv base with its own bias disabled, then creates
+        # gamma, beta, running mean/var and batch counter, the activation and weight fake-quant
+        # modules from the qconfig, and a separate bias parameter if requested. Raises
+        # AssertionError when qconfig is missing. freeze_bn is forced True when the module is not
+        # in training mode. Initializes batchnorm parameters at the end.
         nn.modules.conv._ConvNd.__init__(
             self,
             in_channels,
@@ -129,11 +145,15 @@ class _ReferenceConvBnNd(torch.nn.Conv2d, torch.nn.modules.conv._ConvNd):
         self.reset_bn_parameters()
 
     def reset_running_stats(self):
+        # [FUNCTION DOC] HELPER: Zeroes the running mean and the batch counter, and sets running
+        # variance to one.
         self.running_mean.zero_()
         self.running_var.fill_(1)
         self.num_batches_tracked.zero_()
 
     def reset_bn_parameters(self):
+        # [FUNCTION DOC] HELPER: Resets running stats, fills gamma uniformly, zeroes beta, and if a
+        # bias exists re-initializes it uniformly in a range derived from the weight fan-in.
         self.reset_running_stats()
         init.uniform_(self.gamma)
         init.zeros_(self.beta)
@@ -143,20 +163,33 @@ class _ReferenceConvBnNd(torch.nn.Conv2d, torch.nn.modules.conv._ConvNd):
             init.uniform_(self.bias, -bound, bound)
 
     def reset_parameters(self):
+        # [FUNCTION DOC] HELPER: Runs the parent conv reset, then resets the batchnorm parameters
+        # only if gamma already exists (guards against being called from the parent constructor
+        # before gamma is made).
         super().reset_parameters()
         # A hack to avoid resetting on undefined parameters
         if hasattr(self, "gamma"):
             self.reset_bn_parameters()
 
     def update_bn_stats(self):
+        # [FUNCTION DOC] HELPER: Un-freezes batchnorm statistic updates and returns self.
         self.freeze_bn = False
         return self
 
     def freeze_bn_stats(self):
+        # [FUNCTION DOC] HELPER: Freezes batchnorm statistic updates and returns self.
         self.freeze_bn = True
         return self
 
     def _forward(self, input):
+        # [FUNCTION DOC] HELPER: Conv-bn forward with explicit folding. The weight is scaled by
+        # gamma over the running std (from previous-batch running stats), fake-quantized, and
+        # convolved with a zero bias. When training and not frozen, the original conv output is
+        # recovered by undoing the scale, batch mean and variance are computed, the output is
+        # renormalized, and running mean and variance are updated with the momentum (cumulative
+        # average when momentum is None and the batch counter is incremented). Otherwise the
+        # running-stat shift and bias are added. Returns the conv output without the activation
+        # fake-quant.
         # exponential_average_factor is self.momentum set to
         # (when it is available) only so that if gets updated
         # in ONNX graph when this node is exported to ONNX.
@@ -230,14 +263,21 @@ class _ReferenceConvBnNd(torch.nn.Conv2d, torch.nn.modules.conv._ConvNd):
         return conv
 
     def extra_repr(self):
+        # [FUNCTION DOC] HELPER: Returns the parent extra representation unchanged.
         # TODO(jerryzh): extend
         return super().extra_repr()
 
     def forward(self, input):
+        # [FUNCTION DOC] HELPER: Applies the folded forward and passes the result through the
+        # activation fake-quant module.
         return self.activation_post_process(self._forward(input))
 
     @classmethod
     def from_float(cls, mod, qconfig=None):
+        # [FUNCTION DOC] HELPER: Builds the reference module from a fused float conv-bn container.
+        # Raises AssertionError if the input type is not the class float module, or if no qconfig
+        # is given and the input has none or an empty one. Copies conv parameters and shares the
+        # batchnorm weight, bias, running stats and batch counter with the new module. Returns it.
         r"""Create a qat module from a float module or qparams_dict
         Args: `mod` a float module, either produced by torch.ao.quantization utilities
         or directly from user
@@ -282,6 +322,8 @@ class _ReferenceConvBnNd(torch.nn.Conv2d, torch.nn.modules.conv._ConvNd):
 
 
 class _ReferenceConvBn2d(_ReferenceConvBnNd, nn.Conv2d):
+    # [CLASS DOC] HELPER: Two-dimensional specialization of the reference conv-bn module. Declares
+    # the fused float module it converts from and gives conv-style defaults for the constructor.
     _FLOAT_MODULE = torch.ao.nn.intrinsic.ConvBn2d
 
     def __init__(
@@ -306,6 +348,8 @@ class _ReferenceConvBn2d(_ReferenceConvBnNd, nn.Conv2d):
         freeze_bn=False,
         qconfig=None,
     ):
+        # [FUNCTION DOC] HELPER: Expands kernel size, stride, padding and dilation to pairs, then
+        # calls the base constructor with transposed disabled and zero output padding.
         kernel_size = _pair(kernel_size)
         stride = _pair(stride)
         padding = _pair(padding)
@@ -331,7 +375,11 @@ class _ReferenceConvBn2d(_ReferenceConvBnNd, nn.Conv2d):
 
 
 class TestQuantizeEagerQAT(QuantizationTestCase):
+    # [CLASS DOC] Tests of the eager QAT workflow (prepare_qat, training, convert) on manual
+    # models, run for each supported quantized engine, plus embedding, hook and scalar-op checks.
     def setUp(self):
+        # [FUNCTION DOC] Creates embedding-bag training data (two index/target batches) and a
+        # single embedding index batch used by the embedding tests.
         super().setUp()
 
         self.embed_linear_data_train = [
@@ -344,6 +392,10 @@ class TestQuantizeEagerQAT(QuantizationTestCase):
         self.embed_data = [[torch.randint(0, 10, (12, 1))]]
 
     def test_manual(self):
+        # [FUNCTION DOC] For each supported engine, prepares a manual linear QAT model, trains it,
+        # converts it, and checks both fc layers became quantized linear modules, that eval runs,
+        # that the model is scriptable and has no qconfig left. Repeats the check on a model built
+        # by quantize_qat.
         for qengine in supported_qengines:
             with override_quantized_engine(qengine):
                 model = ManualLinearQATModel(qengine)
@@ -353,6 +405,8 @@ class TestQuantizeEagerQAT(QuantizationTestCase):
                 model = convert(model)
 
                 def checkQuantized(model):
+                    # [FUNCTION DOC] HELPER: Asserts both linear layers are quantized linear, runs
+                    # eval, checks scriptability and that no qconfig remains.
                     self.assertEqual(type(model.fc1), nnq.Linear)
                     self.assertEqual(type(model.fc2), nnq.Linear)
                     test_only_eval_fn(model, self.calib_data)
@@ -367,6 +421,9 @@ class TestQuantizeEagerQAT(QuantizationTestCase):
                 checkQuantized(model)
 
     def test_dropout(self):
+        # [FUNCTION DOC] Same flow as the manual linear test but with a dropout model: after
+        # conversion the dropout becomes a quantized dropout module; also checked through
+        # quantize_qat.
         for qengine in supported_qengines:
             with override_quantized_engine(qengine):
                 model = ManualDropoutQATModel(qengine)
@@ -376,6 +433,8 @@ class TestQuantizeEagerQAT(QuantizationTestCase):
                 model = convert(model)
 
                 def checkQuantized(model):
+                    # [FUNCTION DOC] HELPER: Asserts fc1 is quantized linear and dropout is
+                    # quantized dropout, runs eval, checks scriptability and no remaining qconfig.
                     self.assertEqual(type(model.fc1), nnq.Linear)
                     self.assertEqual(type(model.dropout), nnq.Dropout)
                     test_only_eval_fn(model, self.calib_data)
@@ -392,6 +451,8 @@ class TestQuantizeEagerQAT(QuantizationTestCase):
                 checkQuantized(model)
 
     def test_eval_only_fake_quant(self):
+        # [FUNCTION DOC] Prepares a QAT model, switches it to eval, and runs it so fake-quant is
+        # used without training; checks only that observers exist and that eval runs.
         r"""Using FakeQuant in evaluation only mode,
         this is useful for estimating accuracy loss when we quantize the
         network
@@ -407,6 +468,9 @@ class TestQuantizeEagerQAT(QuantizationTestCase):
                 test_only_eval_fn(model, self.calib_data)
 
     def test_conv_linear(self):
+        # [FUNCTION DOC] Conv plus linear QAT flow per engine: prepare, check observers, train on
+        # 2D image data, convert, and verify the conv becomes quantized conv and the linears
+        # quantized linear. Also repeats via quantize_qat.
         for qengine in supported_qengines:
             with override_quantized_engine(qengine):
                 model = ManualConvLinearQATModel()
@@ -418,6 +482,8 @@ class TestQuantizeEagerQAT(QuantizationTestCase):
                 model = convert(model)
 
                 def checkQuantized(model):
+                    # [FUNCTION DOC] HELPER: Asserts conv is quantized conv and both linears
+                    # quantized linear, runs eval, checks scriptability and no remaining qconfig.
                     self.assertEqual(type(model.conv), nnq.Conv2d)
                     self.assertEqual(type(model.fc1), nnq.Linear)
                     self.assertEqual(type(model.fc2), nnq.Linear)
@@ -435,6 +501,8 @@ class TestQuantizeEagerQAT(QuantizationTestCase):
 
     @skipIfNoXNNPACK
     def test_conv_linear_symm(self):
+        # [FUNCTION DOC] Symmetric-quantization variant of the conv-linear flow. Skipped without
+        # XNNPACK and only run for the qnnpack engine, since other engines are skipped by the loop.
         r"""Same as test_conv_linear but with Symmetric quantization.
         Supported only with qengine=qnnpack, which uses symmetric
         kernels from xnnpack library."""
@@ -451,6 +519,8 @@ class TestQuantizeEagerQAT(QuantizationTestCase):
                 model = convert(model)
 
                 def checkQuantized(model):
+                    # [FUNCTION DOC] HELPER: Same checks as the plain conv-linear test: quantized
+                    # conv and linears, eval, scriptable, no qconfig.
                     self.assertEqual(type(model.conv), nnq.Conv2d)
                     self.assertEqual(type(model.fc1), nnq.Linear)
                     self.assertEqual(type(model.fc2), nnq.Linear)
@@ -467,6 +537,11 @@ class TestQuantizeEagerQAT(QuantizationTestCase):
                 checkQuantized(model)
 
     def test_dynamic_qat_linear(self):
+        # [FUNCTION DOC] Dynamic QAT with linear mapped to the dynamic QAT linear. First asserts
+        # that preparing with the default static QAT qconfig raises ValueError complaining about a
+        # missing memoryless observer. Then prepares with the proper model, checks the swapped
+        # types, trains, converts to dynamic quantized linear, and checks eval, scriptability and
+        # no qconfig.
         for qengine in supported_qengines:
             with override_quantized_engine(qengine):
                 # Dynamic QAT without memoryless observers should fail
@@ -492,6 +567,10 @@ class TestQuantizeEagerQAT(QuantizationTestCase):
                 self.checkNoQconfig(model)
 
     def test_defused_embedding_bag_linear(self):
+        # [FUNCTION DOC] Embedding plus linear QAT with the embedding mappings. Checks the linear
+        # gets a fused moving-average fake-quant as activation post process, the embedding gets a
+        # no-op observer, and weight zero points are float for the embedding and int32 for the
+        # linear. Converts with the embedding static mappings and checks the quantized types.
         for qengine in supported_qengines:
             with override_quantized_engine(qengine):
                 model = DeFusedEmbeddingBagLinear().train()
@@ -519,6 +598,9 @@ class TestQuantizeEagerQAT(QuantizationTestCase):
                 )
 
                 def checkQuantized(model):
+                    # [FUNCTION DOC] HELPER: Asserts the embedding is a quantized embedding and the
+                    # linear a quantized linear, then runs eval, checks scriptability and no
+                    # remaining qconfig.
                     # make sure Embedding is now a QuantizedEmbedding
                     self.assertEqual(type(model.emb), nn.quantized.Embedding)
                     # make sure Linear is now a QuantizedLinear
@@ -531,6 +613,11 @@ class TestQuantizeEagerQAT(QuantizationTestCase):
                 checkQuantized(model)
 
     def test_embedding_bag_linear(self):
+        # [FUNCTION DOC] Embedding-bag plus linear QAT with embedding mappings. Checks no
+        # model-level activation post process exists and zero point dtypes (float for embedding
+        # bag, int32 for linear), converts, and runs the post-convert checks.
+        # KNOWN ISSUE: the nested check uses the truthiness assertion with a type and a class as
+        # arguments, so the type checks always pass; the trailing model construction is unused.
         for qengine in supported_qengines:
             with override_quantized_engine(qengine):
                 model = ManualEmbeddingBagLinear().train()
@@ -552,6 +639,9 @@ class TestQuantizeEagerQAT(QuantizationTestCase):
                 )
 
                 def checkQuantized(model):
+                    # [FUNCTION DOC] HELPER: Intended to check embedding bag and linear were
+                    # quantized, but the type assertions are always true (see parent). Runs eval,
+                    # scriptability and no-qconfig checks.
                     # Make sure EmbeddingBag is now a quantized EmbeddingBag.
                     self.assertTrue(type(model.emb), nn.quantized.EmbeddingBag)
                     # Also test that Linear has been quantized.
@@ -566,6 +656,12 @@ class TestQuantizeEagerQAT(QuantizationTestCase):
                 model = ManualEmbeddingBagLinear()
 
     def test_train_save_load_eval(self):
+        # [FUNCTION DOC] Round trip of a QAT model through state dicts. Prepares and trains a
+        # wrapped model, converts it, records the quantized output, then rebuilds a fresh
+        # prepared-and-converted model, checks the prepared key set equals the original fake-quant
+        # key set, loads the quantized state dict and checks equal output. Finally checks a model
+        # built with the post training static flow has the same keys and also reproduces the
+        # output.
         r"""Test QAT flow of creating a model, doing QAT and saving the quantized state_dict
         During eval, we first call prepare_qat and convert on the model and then load the state_dict
         and compare results against original model
@@ -620,6 +716,9 @@ class TestQuantizeEagerQAT(QuantizationTestCase):
 
     @override_qengines
     def test_forward_hooks_preserved(self):
+        # [FUNCTION DOC] Checks forward pre-hooks and forward hooks registered by the user on a
+        # submodule survive prepare_qat (observer hook added on the quant stub) and convert (only
+        # the user hooks remain). Uses a counter mapping, which is not asserted on after running.
         r"""Test QAT on preserving pre forward and post forward hooks of original model"""
         qengine = torch.backends.quantized.engine
         model = QuantStubModel()
@@ -629,9 +728,11 @@ class TestQuantizeEagerQAT(QuantizationTestCase):
         }
 
         def fw_pre_hook(h_module, input):
+            # [FUNCTION DOC] HELPER: User forward pre-hook that increments the pre-forward counter.
             counter["pre_forwards"] += 1
 
         def fw_hook(h_module, input, output):
+            # [FUNCTION DOC] HELPER: User forward hook that increments the forward counter.
             counter["forwards"] += 1
 
         model.fc.register_forward_pre_hook(fw_pre_hook)
@@ -641,6 +742,10 @@ class TestQuantizeEagerQAT(QuantizationTestCase):
         model = prepare_qat(model)
 
         def checkHooksIsPresent(model, before_convert=True):
+            # [FUNCTION DOC] HELPER: Asserts the user pre-hook and hook are still registered on the
+            # fc layer, with exactly one pre-hook and one forward hook (two before convert, because
+            # of the observer hook added by preparation). Before convert also asserts the quant
+            # stub has one hook.
             forward_hooks = 1
             if before_convert:
                 self.assertEqual(
@@ -669,13 +774,20 @@ class TestQuantizeEagerQAT(QuantizationTestCase):
         checkHooksIsPresent(model, False)
 
     def test_add_scalar_uses_input_qparams(self):
+        # [FUNCTION DOC] Checks that after prepare_qat, calibration and convert, adding a scalar
+        # through the float functional keeps the input quantization parameters: output scale equals
+        # quant stub scale within a small tolerance.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Test model with a quant stub and a float functional add-scalar.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the quant stub and float functional submodules.
                 super().__init__()
                 self.quant = torch.ao.quantization.QuantStub()
                 self.ff = torch.ao.nn.quantized.FloatFunctional()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Quantizes the input then adds the scalar one via float
+                # functional.
                 x = self.quant(x)
                 x = self.ff.add_scalar(x, 1.0)
                 return x
@@ -690,13 +802,19 @@ class TestQuantizeEagerQAT(QuantizationTestCase):
         self.assertTrue(torch.abs(mq.quant.scale - res.q_scale()) < eps)
 
     def test_mul_scalar_uses_input_qparams(self):
+        # [FUNCTION DOC] Same as the add-scalar test but with scalar multiplication by two: output
+        # scale is expected to equal twice the quant stub scale within a small tolerance.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Test model with a quant stub and a float functional mul-scalar.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the quant stub and float functional submodules.
                 super().__init__()
                 self.quant = torch.ao.quantization.QuantStub()
                 self.ff = torch.ao.nn.quantized.FloatFunctional()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Quantizes the input then multiplies by the scalar two via
+                # float functional.
                 x = self.quant(x)
                 x = self.ff.mul_scalar(x, 2.0)
                 return x
@@ -712,6 +830,11 @@ class TestQuantizeEagerQAT(QuantizationTestCase):
 
     @override_qengines
     def test_qat_embedding_bag_errors(self):
+        # [FUNCTION DOC] Checks the error messages of the QAT embedding bag: missing qconfig and a
+        # qconfig whose weight scheme is not per-channel float qparams raise AssertionError at
+        # construction, and from_float raises AssertionError for a wrong module type, a module
+        # without qconfig, one with an empty qconfig, and one with the default QAT qconfig (wrong
+        # scheme).
         default_qat_qconfig = get_default_qat_qconfig(torch.backends.quantized.engine)
 
         # Test constructor parameters checks here.
@@ -752,6 +875,9 @@ class TestQuantizeEagerQAT(QuantizationTestCase):
             nnqat.EmbeddingBag.from_float(embed_bag)
 
     def test_embedding_qat_qconfig_equal(self):
+        # [FUNCTION DOC] Checks the qconfig attached to the embedding by prepare_qat compares equal
+        # to the default embedding QAT qconfig, which mixes a class-based and a partial-based
+        # entry.
         # Embedding QAT uses a NoopObserver class for activation,
         # and a FakeQuant for weight, make sure that qconfig comparison
         # functions properly for a mix of partial function and class in
@@ -765,15 +891,25 @@ class TestQuantizeEagerQAT(QuantizationTestCase):
 
 
 class TestQuantizeEagerQATNumerics(QuantizationTestCase):
+    # [CLASS DOC] Numerical-equivalence tests for eager QAT: activation conversion, fixed-qparam
+    # ops, relu handling, fused conv-bn-relu against float reference, and folded vs unfolded
+    # conv-bn.
     def _test_activation_convert_numerics_impl(self, Act, data):
+        # [FUNCTION DOC] HELPER: Builds a quant-stub, activation, dequant-stub model for the given
+        # activation class, prepares it for QAT and runs the data; converts and asserts the output
+        # equals the pre-convert fake-quant output.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model wrapping an activation between a quant stub and a dequant
+            # stub.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the activation and the quant and dequant stubs.
                 super().__init__()
                 self.act = Act()
                 self.quant = QuantStub()
                 self.dequant = DeQuantStub()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Quantize, apply the activation, dequantize.
                 x = self.quant(x)
                 x = self.act(x)
                 x = self.dequant(x)
@@ -788,8 +924,15 @@ class TestQuantizeEagerQATNumerics(QuantizationTestCase):
         self.assertEqual(before_convert, after_convert)
 
     def test_fixed_qparam_ops(self):
+        # [FUNCTION DOC] Checks sigmoid, hardsigmoid and tanh get fixed-qparams fake-quant after
+        # prepare_qat, convert preserves outputs and removes the post-process module and hooks.
+        # Also checks that static prepare in eval mode never inserts such modules.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model applying sigmoid, hardsigmoid and tanh between quant and
+            # dequant stubs.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the three activations and the quant and dequant
+                # stubs.
                 super().__init__()
                 self.sigmoid = torch.nn.Sigmoid()
                 self.hardsigmoid = torch.nn.Hardsigmoid()
@@ -798,6 +941,8 @@ class TestQuantizeEagerQATNumerics(QuantizationTestCase):
                 self.dequant = DeQuantStub()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Quantize, apply sigmoid, hardsigmoid, tanh in order, then
+                # dequantize.
                 x = self.quant(x)
                 x = self.sigmoid(x)
                 x = self.hardsigmoid(x)
@@ -827,6 +972,8 @@ class TestQuantizeEagerQATNumerics(QuantizationTestCase):
         # make sure no fake quantize module is inserted for eval mode
 
         def checkNoFQModule(m):
+            # [FUNCTION DOC] HELPER: Asserts each of the three activations has no post-process
+            # attribute and no forward hooks.
             for attr in ["sigmoid", "hardsigmoid", "tanh"]:
                 self.assertFalse(hasattr(getattr(m, attr), "activation_post_process"))
                 self.assertTrue(len(getattr(m, attr)._forward_hooks.items()) == 0)
@@ -839,16 +986,24 @@ class TestQuantizeEagerQATNumerics(QuantizationTestCase):
         checkNoFQModule(m)
 
     def test_leaky_relu(self):
+        # [FUNCTION DOC] Runs the activation convert-numerics check with leaky relu on random 4D
+        # data.
         data = torch.randn(1, 3, 2, 4)
         self._test_activation_convert_numerics_impl(nn.LeakyReLU, data)
 
     def test_relu(self):
+        # [FUNCTION DOC] Checks that relu gets no activation post process under prepare_qat and is
+        # left as a relu module after convert.
+        # KNOWN ISSUE: the final type check uses the truthiness assertion, so it always passes.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Model containing only a relu module.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the relu submodule.
                 super().__init__()
                 self.relu = nn.ReLU()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the relu to the input.
                 x = self.relu(x)
                 return x
 
@@ -908,6 +1063,11 @@ class TestQuantizeEagerQATNumerics(QuantizationTestCase):
         has_bias,
         use_slow_fusion,
     ):
+        # [FUNCTION DOC] Hypothesis-driven comparison of the fused QAT conv-bn(-relu) module with a
+        # double precision float conv, batchnorm and optional relu reference, with fake-quant
+        # disabled and batchnorm either frozen or updating, optionally using the slow numerically
+        # stable path and zeroed gamma. Over two iterations checks outputs, input and parameter
+        # gradients, running statistics and batch counters match within a tight tolerance.
         input_channels = input_channels_per_group * groups
         output_channels = output_channels_per_group * groups
         dilation_h = dilation_w = dilation
@@ -972,17 +1132,23 @@ class TestQuantizeEagerQATNumerics(QuantizationTestCase):
         bn_op.bias = torch.nn.Parameter(qat_op.bn.bias.detach())
 
         def compose(functions):
+            # [FUNCTION DOC] HELPER: Composes a list of functions into one callable applying them
+            # in list order.
             # functions are reversed for natural reading order
             return reduce(lambda f, g: lambda x: f(g(x)), functions[::-1], lambda x: x)
 
         if not use_relu:
 
             def relu_op(x):
+                # [FUNCTION DOC] HELPER: Identity replacement for the relu, rebinding the name when
+                # relu is not used.
                 return x
 
         if freeze_bn:
 
             def ref_op(x):
+                # [FUNCTION DOC] HELPER: Frozen-batchnorm reference: convolves, normalizes with the
+                # running statistics and affine parameters by hand, then applies the relu stand-in.
                 x = conv_op(x)
                 x = (x - bn_op.running_mean.reshape([1, -1, 1, 1])) * (
                     bn_op.weight / torch.sqrt(bn_op.running_var + bn_op.eps)
@@ -1080,6 +1246,11 @@ class TestQuantizeEagerQATNumerics(QuantizationTestCase):
         freeze_bn,
         bias,
     ):
+        # [FUNCTION DOC] Hypothesis-driven check that the library fused conv-bn module matches the
+        # explicit folding reference over five SGD steps, with fake-quant disabled. Verifies train
+        # mode calls do not undo batchnorm freezing, freezes stats after the third step and
+        # disables observers after the fourth. Compares outputs, input/weight/gamma/beta gradients,
+        # running stats and batch counters within a tolerance each step.
         input_channels = input_channels_per_group * groups
         output_channels = output_channels_per_group * groups
         dilation_h = dilation_w = dilation
@@ -1211,6 +1382,8 @@ class TestQuantizeEagerQATNumerics(QuantizationTestCase):
 
     @override_qengines
     def test_linear_bn_numerics(self):
+        # [FUNCTION DOC] Checks a fused linear-batchnorm QAT module built with from_float matches
+        # the float linear-batchnorm sequence when fake-quant is disabled.
         qengine = torch.backends.quantized.engine
         m_ref = nn.Sequential(
             nn.Linear(4, 4),
@@ -1232,6 +1405,8 @@ class TestQuantizeEagerQATNumerics(QuantizationTestCase):
     @skipIfNoXNNPACK
     @override_qengines
     def test_linear_bn_symm_numerics(self):
+        # [FUNCTION DOC] Same as the linear-bn numerics test but with the symmetric qnnpack QAT
+        # qconfig; returns immediately unless the engine is qnnpack, and requires XNNPACK.
         qengine = torch.backends.quantized.engine
         if qengine != "qnnpack":
             return  # Only qnnpack support symmetric quantization
@@ -1254,6 +1429,9 @@ class TestQuantizeEagerQATNumerics(QuantizationTestCase):
 
     @override_qengines
     def test_linear_bn_workflow(self):
+        # [FUNCTION DOC] Fuses linear and batchnorm for QAT, prepares, runs data and converts;
+        # asserts the linear becomes quantized linear and the batchnorm slot becomes an identity
+        # module.
         qengine = torch.backends.quantized.engine
         m = nn.Sequential(
             QuantStub(),
@@ -1272,6 +1450,12 @@ class TestQuantizeEagerQATNumerics(QuantizationTestCase):
     @skipIfNoXNNPACK
     @override_qengines
     def test_linear_precomputed_fake_quant(self):
+        # [FUNCTION DOC] Checks quantized linear from_float with the precomputed fake-quant flag
+        # uses the supplied weight observer min and max (set to minus one and one) rather than
+        # recomputing, by comparing weight scale accessors of the two quantized linears. Only runs
+        # for qnnpack with XNNPACK.
+        # KNOWN ISSUE: the compared q_scale values are bound methods that are never called, so the
+        # final assertion passes trivially.
         qengine = torch.backends.quantized.engine
         if qengine != "qnnpack":
             return  # Only qnnpack support symmetric quantization
