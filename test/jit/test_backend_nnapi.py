@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: jit"]
+# [MODULE DOC] Tests for the NNAPI backend delegate. Subclasses the NNAPI test case from the
+# sibling test_nnapi module (or a plain test case under fbcode, where that module is unavailable)
+# and overrides lowering to go through the to-backend path with the nnapi backend. Import time
+# side effects: extends sys.path and computes the path of the built libnnapi_backend shared
+# library; the whole class is skipped if that library is missing, under fbcode, or under Dynamo.
 
 import os
 import sys
@@ -49,7 +54,13 @@ lib_path = torch_root / "build" / "lib" / "libnnapi_backend.so"
 )
 @unittest.skipIf(IS_FBCODE, "test_nnapi.py not found")
 class TestNnapiBackend(TestNNAPI):
+    # [CLASS DOC] Runs the inherited NNAPI tests via the delegate backend, loading the shared
+    # library in setUp and restoring the default dtype in tearDown. Adds tests for tensor input
+    # forms and for compile-spec validation errors.
     def setUp(self):
+        # [FUNCTION DOC] Calls the parent setUp, remembers the default dtype (taken from a PReLU
+        # weight), switches the global default dtype to float32 because the delegate lacks float64
+        # support, and loads the nnapi backend shared library into the torch ops registry.
         super().setUp()
 
         # Save default dtype
@@ -65,10 +76,15 @@ class TestNnapiBackend(TestNNAPI):
 
     # Override
     def call_lowering_to_nnapi(self, traced_module, args):
+        # [FUNCTION DOC] Override of the parent hook: lowers the traced module to the nnapi
+        # backend with a compile spec mapping the forward method to the given example inputs;
+        # returns the lowered module.
         compile_spec = {"forward": {"inputs": args}}
         return torch._C._jit_to_backend("nnapi", traced_module, compile_spec)
 
     def test_tensor_input(self):
+        # [FUNCTION DOC] Lowers a traced PReLU once with a single tensor as input and once with a
+        # list containing that tensor; both must succeed.
         # Lower a simple module
         args = torch.tensor([[1.0, -1.0, 2.0, -2.0]]).unsqueeze(-1).unsqueeze(-1)
         module = torch.nn.PReLU()
@@ -81,6 +97,10 @@ class TestNnapiBackend(TestNNAPI):
 
     # Test exceptions for incorrect compile specs
     def test_compile_spec_santiy(self):
+        # [FUNCTION DOC] Checks the RuntimeError raised for malformed compile specs: missing
+        # forward key, forward not a dictionary, dictionary lacking the inputs key, and inputs
+        # that are neither a tensor nor a list of tensors (an integer and a list of an integer).
+        # Each message must match the expected text followed by the shared usage tail.
         args = torch.tensor([[1.0, -1.0, 2.0, -2.0]]).unsqueeze(-1).unsqueeze(-1)
         module = torch.nn.PReLU()
         traced = torch.jit.trace(module, args)
@@ -134,6 +154,8 @@ method_compile_spec must use the following format:
             torch._C._jit_to_backend("nnapi", traced, compile_spec)
 
     def tearDown(self):
+        # [FUNCTION DOC] Restores the global default dtype saved during setUp so later tests are
+        # not affected.
         # Change dtype back to default (Otherwise, other unit tests will complain)
         torch.set_default_dtype(self.default_dtype)
 

@@ -1,4 +1,7 @@
 # Owner(s): ["oncall: jit"]
+# [MODULE DOC] Tests for TorchScript support of Python builtins (hasattr, del, torch._check) and
+# for tensor properties and methods (property access, subscript assignment, item, implicit tensor
+# to number conversion). Import time side effect: extends sys.path with the test directory.
 
 import inspect
 import os
@@ -18,27 +21,42 @@ from torch.testing._internal.jit_utils import JitTestCase, RUN_CUDA
 
 
 class TestBuiltins(JitTestCase):
+    # [CLASS DOC] Test case for builtin function support in TorchScript: hasattr with static
+    # arguments, del statements on variables, lists and dictionaries, and torch._check forms.
     """
     Tests for TorchScript support of Python builtin functions.
     """
 
     def test_has_attr(self):
+        # [FUNCTION DOC] Scripts a module looping over submodules, one with attribute a and one
+        # with attribute b, collecting hasattr flags and the attribute values via static
+        # refinement; compares scripted and eager with checkModule.
         class HasA(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with an integer attribute a.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Sets attribute a to zero.
                 super().__init__()
                 self.a = 0
 
         class HasB(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with an integer attribute b.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Sets attribute b to one.
                 super().__init__()
                 self.b = 1
 
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding a list of the two modules above and reporting
+            # hasattr results.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Stores a module list of one instance of each
+                # helper module.
                 super().__init__()
                 self.mods = torch.nn.ModuleList([HasA(), HasB()])
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Returns a list holding, for each submodule, the hasattr
+                # flags for a and b as integers followed by each attribute that exists.
                 # use a list to encode hasattr results
                 l = torch.jit.annotate(List[int], [])
                 for mod in self.mods:
@@ -54,12 +72,20 @@ class TestBuiltins(JitTestCase):
         self.checkModule(Mod(), ())
 
     def test_has_attr_invalid_args(self):
+        # [FUNCTION DOC] Asserts scripting raises RuntimeError mentioning hasattr, highlighting
+        # the name argument, when the attribute name is not static or the object is not a class
+        # type (tensor).
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a linear layer whose forward calls hasattr with a
+            # runtime name.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Stores a one by one linear layer.
                 super().__init__()
                 self.mod = torch.nn.Linear(1, 1)
 
             def forward(self, name):
+                # [FUNCTION DOC] HELPER: Calls hasattr on the linear layer with a non constant
+                # name (rejected).
                 # not allowed, `name` must be static.
                 return hasattr(self.mod, name)
 
@@ -67,7 +93,11 @@ class TestBuiltins(JitTestCase):
             torch.jit.script(Mod())
 
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward calls hasattr on a tensor with a
+            # runtime name.
             def forward(self, name):
+                # [FUNCTION DOC] HELPER: Calls hasattr on a new random tensor with a non constant
+                # name (rejected).
                 # not allowed, `torch.rand` is not a class type
                 return hasattr(torch.rand(2, 3), name)
 
@@ -75,7 +105,12 @@ class TestBuiltins(JitTestCase):
             torch.jit.script(Mod())
 
     def test_del(self):
+        # [FUNCTION DOC] Checks that del of a local works and compares with eager, then asserts
+        # scripting raises RuntimeError mentioning an undefined value when a deleted variable
+        # is used afterwards, when it is deleted only in one branch, and when an unknown name
+        # is deleted.
         def fn(x: List[int]) -> List[int]:
+            # [FUNCTION DOC] HELPER: Deletes a temporary and returns the input list.
             a = x * 2
             del a
             return x
@@ -86,6 +121,8 @@ class TestBuiltins(JitTestCase):
 
             @torch.jit.script
             def fn(x):
+                # [FUNCTION DOC] HELPER: Deletes a variable then returns it (error expected at
+                # compile time).
                 a = x**2
                 del a
                 return a  # noqa: F821
@@ -94,6 +131,8 @@ class TestBuiltins(JitTestCase):
 
             @torch.jit.script
             def fn(x):
+                # [FUNCTION DOC] HELPER: Deletes a variable only in one branch then returns it
+                # (error expected).
                 a = x**2
                 if a:
                     del a
@@ -103,12 +142,16 @@ class TestBuiltins(JitTestCase):
 
             @torch.jit.script
             def fn(x):
+                # [FUNCTION DOC] HELPER: Deletes a name that was never defined (error expected).
                 a = x**2
                 del b  # noqa: F821
                 return a
 
     def test_del_multiple_operands(self):
+        # [FUNCTION DOC] Checks del with several operands: on local names, on list elements and on
+        # dictionary keys; the scripted results must equal eager results.
         def fn(x: List[int]) -> List[int]:
+            # [FUNCTION DOC] HELPER: Unpacks three elements and deletes the three names at once.
             a, b, c = x[0], x[1], x[2]
             del a, b, c
             return x
@@ -116,6 +159,8 @@ class TestBuiltins(JitTestCase):
         self.checkScript(fn, ([1, 2, 3],))
 
         def del_list_multiple_operands(x: List[int]) -> List[int]:
+            # [FUNCTION DOC] HELPER: Deletes two elements of a list in one statement and returns
+            # the list.
             del x[0], x[1]
             return x
 
@@ -124,6 +169,8 @@ class TestBuiltins(JitTestCase):
         self.assertEqual(py_out, jit_out)
 
         def del_dict_multiple_operands(x: Dict[str, int]) -> Dict[str, int]:
+            # [FUNCTION DOC] HELPER: Deletes two keys of a dictionary in one statement and
+            # returns it.
             del x["hi"], x["there"]
             return x
 
@@ -132,35 +179,50 @@ class TestBuiltins(JitTestCase):
         self.assertEqual(py_out, jit_out)
 
     def test_torch_check(self):
+        # [FUNCTION DOC] Checks torch._check in scripted code with positional and keyword
+        # condition and message, reversed keyword order and use in a loop: results equal the
+        # input, message constants appear in graphs, and graphs contain a conditional leading to a
+        # raise (plus a loop where used).
         """Test torch._check functionality with flexible argument handling"""
 
         def test_check_basic(x):
+            # [FUNCTION DOC] HELPER: Checks a condition on the tensor sum without a message and
+            # returns x.
             torch._check(x.sum().item() > -1000)
             return x
 
         def test_check_with_message(x):
+            # [FUNCTION DOC] HELPER: Checks a condition with a positional message and returns x.
             torch._check(x.sum().item() > -1000, "Tensor sum must be reasonable")
             return x
 
         def test_check_with_kwarg_message(x):
+            # [FUNCTION DOC] HELPER: Checks a condition with the message passed by keyword and
+            # returns x.
             torch._check(
                 x.sum().item() > -1000, message="Tensor sum must be reasonable"
             )
             return x
 
         def test_check_cond_kwarg(x):
+            # [FUNCTION DOC] HELPER: Passes only the condition, by keyword, and returns x.
             torch._check(cond=x.sum().item() > -1000)
             return x
 
         def test_check_both_kwargs(x):
+            # [FUNCTION DOC] HELPER: Passes condition and message both by keyword and returns x.
             torch._check(cond=x.sum().item() > -1000, message="Both as kwargs")
             return x
 
         def test_check_kwargs_reversed(x):
+            # [FUNCTION DOC] HELPER: Passes message before condition, both by keyword, and
+            # returns x.
             torch._check(message="Reversed order", cond=x.sum().item() > -1000)
             return x
 
         def test_check_in_loop(x):
+            # [FUNCTION DOC] HELPER: Checks a condition for every element of the list form of
+            # the tensor.
             sizes = torch.jit.annotate(List[int], x.tolist())
             for s in sizes:
                 torch._check(s > -100)
@@ -231,6 +293,9 @@ class TestBuiltins(JitTestCase):
             )
 
     def test_torch_check_invalid_args(self):
+        # [FUNCTION DOC] Asserts scripting raises RuntimeError for invalid argument usage of
+        # torch._check: too many arguments, unknown keyword, condition given twice, missing
+        # condition, no arguments, and too many total arguments with keywords.
         """Test torch._check with invalid arguments"""
 
         # Test too many arguments
@@ -240,6 +305,8 @@ class TestBuiltins(JitTestCase):
 
             @torch.jit.script
             def too_many_args(x):
+                # [FUNCTION DOC] HELPER: Calls the check with three positional
+                # arguments (rejected).
                 torch._check(True, "msg", "extra")
                 return x
 
@@ -248,6 +315,8 @@ class TestBuiltins(JitTestCase):
 
             @torch.jit.script
             def invalid_kwarg(x):
+                # [FUNCTION DOC] HELPER: Calls the check with an unknown keyword
+                # argument (rejected).
                 torch._check(True, invalid_arg="msg")
                 return x
 
@@ -258,6 +327,8 @@ class TestBuiltins(JitTestCase):
 
             @torch.jit.script
             def duplicate_cond(x):
+                # [FUNCTION DOC] HELPER: Passes the condition positionally and as a
+                # keyword (rejected).
                 torch._check(True, cond=False)
                 return x
 
@@ -266,6 +337,7 @@ class TestBuiltins(JitTestCase):
 
             @torch.jit.script
             def missing_cond(x):
+                # [FUNCTION DOC] HELPER: Passes only a message keyword (rejected).
                 torch._check(message="msg only")
                 return x
 
@@ -276,6 +348,7 @@ class TestBuiltins(JitTestCase):
 
             @torch.jit.script
             def no_args(x):
+                # [FUNCTION DOC] HELPER: Calls the check with no arguments (rejected).
                 torch._check()
                 return x
 
@@ -286,13 +359,23 @@ class TestBuiltins(JitTestCase):
 
             @torch.jit.script
             def too_many_total_args(x):
+                # [FUNCTION DOC] HELPER: Passes two positionals plus the condition
+                # keyword (rejected).
                 torch._check(True, "msg", cond=False)
                 return x
 
 
 class TestTensorBuiltins(JitTestCase):
+    # [CLASS DOC] Test case for tensor attribute, subscript assignment, item and scalar conversion
+    # behavior in TorchScript.
     def test_tensor_properties(self):
+        # [FUNCTION DOC] Enumerates the non-callable, non-underscore attributes of a float tensor
+        # (skipping imag, which raises for non complex tensors), compiles an accessor for each,
+        # and compares compiled results with eager values; grad_fn, output_nr and grad_dtype are
+        # not compiled and dtype and layout are compiled but their values not compared.
         def should_keep(tensor, name):
+            # [FUNCTION DOC] HELPER: True if the named attribute is not a routine and does not
+            # start with an underscore.
             if inspect.isroutine(getattr(tensor, name)):
                 return False
             if name.startswith("_"):
@@ -338,27 +421,34 @@ class TestTensorBuiltins(JitTestCase):
             self.assertEqual(getattr(tensor, p), cu.fn(tensor))
 
     def test_tensor_subscript_assign(self):
+        # [FUNCTION DOC] Runs checkScript on five functions assigning into a zero tensor with a
+        # tensor or integer index and a tensor or integer value, in uint8 and float32.
         def fn1(x):
+            # [FUNCTION DOC] HELPER: Assigns a uint8 tensor value at a tensor index.
             a = torch.zeros_like(x, dtype=torch.uint8)
             a[torch.tensor(0)] = torch.tensor(2, dtype=torch.uint8)
             return a
 
         def fn2(x):
+            # [FUNCTION DOC] HELPER: Assigns an integer at an integer index of a uint8 tensor.
             a = torch.zeros_like(x, dtype=torch.uint8)
             a[0] = 2
             return a
 
         def fn3(x):
+            # [FUNCTION DOC] HELPER: Assigns an integer at a tensor index of a uint8 tensor.
             a = torch.zeros_like(x, dtype=torch.uint8)
             a[torch.tensor(0)] = 2
             return a
 
         def fn4(x):
+            # [FUNCTION DOC] HELPER: Assigns a uint8 tensor value at an integer index.
             a = torch.zeros_like(x, dtype=torch.uint8)
             a[0] = torch.tensor(2, dtype=torch.uint8)
             return a
 
         def fn5(x):
+            # [FUNCTION DOC] HELPER: Assigns an integer at a tensor index of a float32 tensor.
             a = torch.zeros_like(x, dtype=torch.float32)
             a[torch.tensor(0)] = 2
             return a
@@ -368,7 +458,10 @@ class TestTensorBuiltins(JitTestCase):
 
     @unittest.skipIf(not RUN_CUDA, "requires CUDA")
     def test_tensor_subscript_assign_device(self):
+        # [FUNCTION DOC] CUDA only (skipped otherwise): tensor index assignment on a CUDA float
+        # tensor via checkScript.
         def fn6(x):
+            # [FUNCTION DOC] HELPER: Assigns an integer at a tensor index of a CUDA float tensor.
             a = torch.zeros_like(x, dtype=torch.float32, device="cuda")
             a[torch.tensor(0)] = 2
             return a
@@ -376,7 +469,11 @@ class TestTensorBuiltins(JitTestCase):
         self.checkScript(fn6, (torch.zeros(2, dtype=torch.float32, device="cuda"),))
 
     def test_tensor_item(self):
+        # [FUNCTION DOC] Checks that casting the result of item to int and float yields a
+        # tuple typed as int and float in the graph, and that float and int tensors both
+        # pass checkScript.
         def test_scalar_cast(x):
+            # [FUNCTION DOC] HELPER: Returns the item cast to both int and float.
             scalar = x.item()
             return int(scalar), float(scalar)
 
@@ -386,7 +483,10 @@ class TestTensorBuiltins(JitTestCase):
         self.checkScript(test_scalar_cast, (torch.tensor(1),))
 
     def test_method_on_number(self):
+        # [FUNCTION DOC] Asserts scripting a function that calls a method on an integer constant
+        # raises RuntimeError saying the object has no attribute or method.
         def func():
+            # [FUNCTION DOC] HELPER: Calls an add method on an integer constant (rejected).
             c = 1
             return c.add(1)
 
@@ -395,8 +495,13 @@ class TestTensorBuiltins(JitTestCase):
 
     # testing implicit conversion of tensors to scalars to match function arguments
     def test_scalar_to_num_conversions(self):
+        # [FUNCTION DOC] Checks implicit conversion of tensors to scalars: no implicit tensor to
+        # number node for a plain function, the error location appears in the message for a bad
+        # dimension tensor, and for several tensors scripted and eager versions either give equal
+        # results or both raise.
         @torch.jit.script
         def multiple_defs(x):
+            # [FUNCTION DOC] HELPER: Scripted function adding an integer constant to its input.
             c = 1
             x = x + c
             return x
@@ -405,6 +510,8 @@ class TestTensorBuiltins(JitTestCase):
 
         @torch.jit.script
         def tensor_to_int_script(x, tensor):
+            # [FUNCTION DOC] HELPER: Scripted function using a tensor argument as the dimension
+            # of unsqueeze.
             return x.unsqueeze(tensor)
 
         # location present in error message
@@ -412,13 +519,17 @@ class TestTensorBuiltins(JitTestCase):
             tensor_to_int_script(torch.tensor([2]), torch.tensor([2, 2]))
 
         def tensor_to_int(x, tensor):
+            # [FUNCTION DOC] HELPER: Eager counterpart using the tensor as the
+            # unsqueeze dimension.
             return x.unsqueeze(tensor)
 
         @torch.jit.script
         def tensor_to_float_script(x, tensor):
+            # [FUNCTION DOC] HELPER: Scripted function passing a tensor as the value of addcmul.
             return x.addcmul(tensor, tensor, value=tensor)
 
         def tensor_to_float(x, tensor):
+            # [FUNCTION DOC] HELPER: Eager counterpart passing a tensor as the value of addcmul.
             return x.addcmul(tensor, tensor, value=tensor)
 
         x = torch.zeros(10)
@@ -435,6 +546,8 @@ class TestTensorBuiltins(JitTestCase):
 
         # return the result, or whether exception was thrown
         def test_func(func, x, tensor):
+            # [FUNCTION DOC] HELPER: Calls the function; returns its result, or True if it raises
+            # a runtime or type error.
             try:
                 result = func(x, tensor)
             except RuntimeError:

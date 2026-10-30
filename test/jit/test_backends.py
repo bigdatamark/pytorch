@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: jit"]
+# [MODULE DOC] Tests for the JIT to-backend lowering machinery using two test backends: a plain
+# test backend (library libjitbackend_test) and a demo backend with a compiler (library
+# libbackend_with_compiler). Defines small modules, lowering helper functions, base test cases
+# that compare Python, scripted, lowered (and mobile) outputs, and wrapper test cases that drive
+# the subclass tests so test_jit need not import each. Import time side effect: extends sys.path.
+# Most classes are skipped on Windows, macOS, Sandcastle and fbcode.
 
 import io
 import os
@@ -26,34 +32,48 @@ sys.path.append(pytorch_test_dir)
 
 
 def to_test_backend(module, method_compile_spec):
+    # [FUNCTION DOC] HELPER: Lowers a module to the test backend, using the given compile spec as
+    # the spec for the forward method only; returns the lowered module.
     return torch._C._jit_to_backend(
         "test_backend", module, {"forward": method_compile_spec}
     )
 
 
 def to_test_backend_multi(module, method_compile_spec):
+    # [FUNCTION DOC] HELPER: Lowers a module to the test backend with a full mapping from method
+    # name to compile spec; returns the lowered module.
     return torch._C._jit_to_backend("test_backend", module, method_compile_spec)
 
 
 def to_test_backend_selective(module, method_compile_spec, submodules):
+    # [FUNCTION DOC] HELPER: Selectively lowers the named submodules of a scripted module to the
+    # test backend, using a per-submodule lowering callback built from the given forward compile
+    # spec; returns the resulting module.
     def _to_test_backend(module):
+        # [FUNCTION DOC] HELPER: Callback that lowers one submodule with the enclosing
+        # compile spec.
         return to_test_backend(module, method_compile_spec)
 
     return torch._C._jit_to_backend_selective(module, _to_test_backend, submodules)
 
 
 class BasicModule(torch.nn.Module):
+    # [CLASS DOC] HELPER: Tiny module with forward, accum (addition) and sub_accum (subtraction)
+    # methods; forward returns both results as a tuple.
     """
     A simple Module used to test to_backend lowering machinery.
     """
 
     def forward(self, x, h):
+        # [FUNCTION DOC] HELPER: Returns a tuple of the accumulate result and the subtract result.
         return self.accum(x, h), self.sub_accum(x, h)
 
     def accum(self, x, h):
+        # [FUNCTION DOC] HELPER: Returns the sum of the two inputs.
         return x + h
 
     def sub_accum(self, x, h):
+        # [FUNCTION DOC] HELPER: Returns the difference of the two inputs.
         return x - h
 
 
@@ -63,12 +83,17 @@ class BasicModule(torch.nn.Module):
     "Non-portable load_library call used in test",
 )
 class JitBackendTestCase(JitTestCase):
+    # [CLASS DOC] HELPER: Base test case for plain test backend tests. setUp loads the backend
+    # library; subclasses must set a Python module, a scripted module and a lowered module.
+    # Provides output comparison and save/load helpers and empty stub tests.
     """
     A common base class for JIT backend tests that contains common utility
     functions for output comparison and serialization/deserialization.
     """
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Calls the parent setUp and loads the shared library of the test
+        # backend found by the library location helper into the torch ops registry.
         super().setUp()
         lib_file_path = find_library_location("libjitbackend_test.so")
         torch.ops.load_library(str(lib_file_path))
@@ -78,6 +103,8 @@ class JitBackendTestCase(JitTestCase):
         # lowered_module - a version of module lowered to a backend
 
     def check_function(self, function_name, input):
+        # [FUNCTION DOC] HELPER: Runs the named method on the Python, scripted and lowered modules
+        # with the same inputs and asserts that all three outputs are equal.
         """
         Check that the function named 'function_name' produces the same output using
         Python, regular JIT and the backend for the given 'input'.
@@ -97,33 +124,41 @@ class JitBackendTestCase(JitTestCase):
         self.assertEqual(jit_output, backend_output)
 
     def save_load(self):
+        # [FUNCTION DOC] HELPER: Replaces the lowered module with a copy produced by exporting and
+        # re-importing it.
         """
         Save and load the lowered module.
         """
         self.lowered_module = self.getExportImportCopy(self.lowered_module)
 
     def test_execution(self):
+        # [FUNCTION DOC] Stub for correctness tests in subclasses; does nothing here.
         """
         Stub for correctness tests.
         """
 
     def test_save_load(self):
+        # [FUNCTION DOC] Stub for serialization tests in subclasses; does nothing here.
         """
         Stub for serialization tests.
         """
 
     def test_errors(self):
+        # [FUNCTION DOC] Stub for error checking tests in subclasses; does nothing here.
         """
         Stub for testing error checking.
         """
 
 
 class BasicModuleTest(JitBackendTestCase):
+    # [CLASS DOC] Tests lowering of the basic module with all three methods lowered.
     """
     Tests for BasicModule.
     """
 
     def setUp(self):
+        # [FUNCTION DOC] Creates the Python, scripted and lowered versions of the basic module,
+        # lowering accum, sub_accum and forward with empty compile specs.
         super().setUp()
         # Create Python, JIT and backend versions of BasicModule.
         self.module = BasicModule()
@@ -134,6 +169,8 @@ class BasicModuleTest(JitBackendTestCase):
         )
 
     def test_execution(self):
+        # [FUNCTION DOC] Compares Python, scripted and lowered outputs of all three methods on one
+        # random vector input.
         # Test execution with backend against Python and JIT.
         input = torch.randn(5)
 
@@ -143,6 +180,9 @@ class BasicModuleTest(JitBackendTestCase):
         self.check_function("forward", (input, input))
 
     def test_save_load(self):
+        # [FUNCTION DOC] Runs execution, saves the stored compile spec, round trips the lowered
+        # module through save and load, asserts the compile spec is unchanged and execution
+        # still matches.
         # Lowered module should produce the same outputs.
         self.test_execution()
 
@@ -167,6 +207,8 @@ class BasicModuleTest(JitBackendTestCase):
 
 
 class BasicModuleUnavailableTest(JitBackendTestCase):
+    # [CLASS DOC] Tests lowering to a backend that is unavailable: lowering succeeds, running
+    # raises, saving works and loading raises.
     """
     Tests for BasicModule with a backend that is not available.
     Fundamentally:
@@ -177,6 +219,8 @@ class BasicModuleUnavailableTest(JitBackendTestCase):
     """
 
     def setUp(self):
+        # [FUNCTION DOC] Creates the Python and scripted modules and lowers the scripted one to
+        # the unavailable test backend with an empty forward compile spec.
         super().setUp()
         # Create Python, JIT and backend versions of BasicModule.
         self.module = BasicModule()
@@ -188,6 +232,8 @@ class BasicModuleUnavailableTest(JitBackendTestCase):
         )
 
     def test_execution(self):
+        # [FUNCTION DOC] Asserts that calling forward on the lowered module raises an exception
+        # whose message says the backend is not available.
         # Test execution with backend fails because the backend that is not available.
         input = torch.randn(5)
 
@@ -201,6 +247,8 @@ class BasicModuleUnavailableTest(JitBackendTestCase):
             backend_method(*(input, input))
 
     def test_save_load(self):
+        # [FUNCTION DOC] Saves the lowered module to an in-memory buffer (succeeds) and asserts
+        # that loading it back raises an exception saying the backend is not available.
         # Test that saving the lowered module is OK but loading fails because the backend is not available.
         buffer = io.BytesIO()
         torch.jit.save(self.lowered_module, buffer)
@@ -214,25 +262,31 @@ class BasicModuleUnavailableTest(JitBackendTestCase):
 
 
 class NestedModuleTest(JitBackendTestCase):
+    # [CLASS DOC] Tests that a lowered module can be used as the submodule of another module.
     """
     Tests for NestedModule that check that a module lowered to a backend can be used
     as a submodule.
     """
 
     class NestedModule(torch.nn.Module):
+        # [CLASS DOC] HELPER: Module with one submodule whose forward delegates to the submodule.
         """
         A Module with one submodule that is used to test that lowered Modules
         can be used as submodules.
         """
 
         def __init__(self, submodule):
+            # [FUNCTION DOC] HELPER: Stores the submodule.
             super().__init__()
             self.submodule = submodule
 
         def forward(self, x, h):
+            # [FUNCTION DOC] HELPER: Returns the submodule forward result for the inputs.
             return self.submodule.forward(x, h)
 
     def setUp(self):
+        # [FUNCTION DOC] Builds Python and scripted nested modules, lowers a separate basic module
+        # with all methods, and scripts a nested module around it as the lowered module.
         super().setUp()
         # Create Python, JIT and backend versions of NestedModule.
         # Both modules in self.module are regular Python modules.
@@ -254,6 +308,7 @@ class NestedModuleTest(JitBackendTestCase):
         )
 
     def test_execution(self):
+        # [FUNCTION DOC] Compares the forward outputs of the Python, scripted and lowered modules.
         # Test execution with backend against Python and JIT.
         input = torch.randn(5)
 
@@ -261,6 +316,8 @@ class NestedModuleTest(JitBackendTestCase):
         self.check_function("forward", (input, input))
 
     def test_save_load(self):
+        # [FUNCTION DOC] Checks execution, round trips the lowered module through save and load,
+        # and checks execution again.
         # Lowered module should produce the same outputs.
         self.test_execution()
 
@@ -272,18 +329,24 @@ class NestedModuleTest(JitBackendTestCase):
 
 
 class SelectiveLoweringTest(JitBackendTestCase):
+    # [CLASS DOC] Tests the selective lowering API on a three-way module hierarchy where two basic
+    # modules are lowered and one is left alone.
     """
     Tests for the selective lowering API.
     """
 
     class OuterModule(torch.nn.Module):
+        # [CLASS DOC] HELPER: Top module with three submodules (sub1, sub2, other).
         def __init__(self, sub1, sub2, other):
+            # [FUNCTION DOC] HELPER: Stores the three submodules.
             super().__init__()
             self.sub1 = sub1
             self.sub2 = sub2
             self.other = other
 
         def forward(self, x, y):
+            # [FUNCTION DOC] HELPER: Calls the first submodule's inner module directly, then the
+            # second and third submodules, and returns the elementwise sums of the paired results.
             # Call the module that will be lowered directly to test
             # type remapping in modules that are not its parent.
             a, b = self.sub1.submodule.forward(x, y)
@@ -292,19 +355,26 @@ class SelectiveLoweringTest(JitBackendTestCase):
             return a + c + e, b + d + f
 
     class MiddleModule(torch.nn.Module):
+        # [CLASS DOC] HELPER: Wrapper module holding a single submodule.
         def __init__(self, submodule):
+            # [FUNCTION DOC] HELPER: Stores the submodule.
             super().__init__()
             self.submodule = submodule
 
         def forward(self, x, y):
+            # [FUNCTION DOC] HELPER: Returns the submodule forward result.
             return self.submodule.forward(x, y)
 
     def setUp(self):
+        # [FUNCTION DOC] Builds the hierarchy three times (Python, scripted and lowered).
+        # Scripting is done without type sharing so lowering one instance does not alter the
+        # others; then selectively lowers the inner modules of sub1 and sub2 on the lowered copy.
         super().setUp()
         OuterModule = SelectiveLoweringTest.OuterModule
         MiddleModule = SelectiveLoweringTest.MiddleModule
 
         def script_without_type_sharing(mod):
+            # [FUNCTION DOC] HELPER: Scripts a module without sharing types between instances.
             return torch.jit._recursive.create_script_module(
                 mod, torch.jit._recursive.infer_methods_to_compile, share_types=False
             )
@@ -341,12 +411,16 @@ class SelectiveLoweringTest(JitBackendTestCase):
         )
 
     def test_execution(self):
+        # [FUNCTION DOC] Compares forward outputs across the three versions and then runs the type
+        # remap check.
         input = torch.randn(5)
         self.check_function("forward", (input, input))
 
         self.test_selective_lowering_type_remap()
 
     def test_save_load(self):
+        # [FUNCTION DOC] Runs execution, round trips through save and load, runs execution again,
+        # and reruns the type remap check.
         self.test_execution()
         self.save_load()
         self.test_execution()
@@ -354,6 +428,10 @@ class SelectiveLoweringTest(JitBackendTestCase):
         self.test_selective_lowering_type_remap()
 
     def test_selective_lowering_type_remap(self):
+        # [FUNCTION DOC] Inspects graphs with file checks: the unlowered scripted module keeps
+        # basic modules; the lowered module's outer and middle graphs refer to the lowered
+        # wrapper; the lowered inner modules of sub1 and sub2 mention the backend class; the other
+        # branch is left untouched.
         """
         Check that type remapping and replacement occurred during selective lowering.
         """
@@ -403,6 +481,8 @@ class SelectiveLoweringTest(JitBackendTestCase):
         )
 
     def test_errors(self):
+        # [FUNCTION DOC] Asserts selective lowering raises RuntimeError for a non script module,
+        # for a named attribute that is not a module, and for hierarchies without unique types.
         """
         Check errors associated with selective lowering.
         """
@@ -447,12 +527,15 @@ class SelectiveLoweringTest(JitBackendTestCase):
     "Non-portable load_library call used in test",
 )
 class TestBackends(JitTestCase):
+    # [CLASS DOC] Wrapper test case that owns instances of the plain backend test classes and
+    # calls their tests so test_jit need not import each one; skipped on unsupported platforms.
     """
     This class wraps and invokes all subclasses of JitBackendTestCase so that each one
     does not have to be individually imported in test_jit.py.
     """
 
     def __init__(self, name):
+        # [FUNCTION DOC] Creates the four wrapped test instances with the same test name.
         super().__init__(name)
         self.basic_module_test = BasicModuleTest(name)
         self.basic_module_unavailable_test = BasicModuleUnavailableTest(name)
@@ -460,6 +543,7 @@ class TestBackends(JitTestCase):
         self.selective_lowering_test = SelectiveLoweringTest(name)
 
     def setUp(self):
+        # [FUNCTION DOC] Calls the parent setUp and each wrapped test's setUp.
         super().setUp()
         self.basic_module_test.setUp()
         self.basic_module_unavailable_test.setUp()
@@ -467,18 +551,21 @@ class TestBackends(JitTestCase):
         self.selective_lowering_test.setUp()
 
     def test_execution(self):
+        # [FUNCTION DOC] Runs the execution test of each of the four wrapped test cases.
         self.basic_module_test.test_execution()
         self.basic_module_unavailable_test.test_execution()
         self.nested_module_test.test_execution()
         self.selective_lowering_test.test_execution()
 
     def test_save_load(self):
+        # [FUNCTION DOC] Runs the save/load test of each of the four wrapped test cases.
         self.basic_module_test.test_save_load()
         self.basic_module_unavailable_test.test_save_load()
         self.nested_module_test.test_save_load()
         self.selective_lowering_test.test_save_load()
 
     def test_errors(self):
+        # [FUNCTION DOC] Runs only the error test of the selective lowering test case.
         self.selective_lowering_test.test_errors()
 
 
@@ -492,11 +579,13 @@ However, this test cannot cover the selective_lowering for now, which is covered
 
 
 class BasicModuleAdd(torch.nn.Module):
+    # [CLASS DOC] HELPER: Module whose forward adds its two inputs.
     """
     A simple add Module used to test to_backend lowering machinery.
     """
 
     def forward(self, x, h):
+        # [FUNCTION DOC] HELPER: Returns the sum of the inputs.
         return x + h
 
 
@@ -506,12 +595,16 @@ class BasicModuleAdd(torch.nn.Module):
     "Non-portable load_library call used in test",
 )
 class JitBackendTestCaseWithCompiler(JitTestCase):
+    # [CLASS DOC] HELPER: Base test case for the compiler backend. setUp loads the backend
+    # library; subclasses must set Python, scripted, lowered and mobile modules.
     """
     A common base class for JIT backend tests with compilers that contains common utility
     functions for output comparison.
     """
 
     def setUp(self):
+        # [FUNCTION DOC] HELPER: Calls the parent setUp and loads the shared library of the
+        # compiler backend into the torch ops registry.
         super().setUp()
         lib_file_path = find_library_location("libbackend_with_compiler.so")
         torch.ops.load_library(str(lib_file_path))
@@ -522,6 +615,8 @@ class JitBackendTestCaseWithCompiler(JitTestCase):
         # mobile_module - a module with a format that Pytorch Mobile can execute
 
     def check_forward(self, input):
+        # [FUNCTION DOC] HELPER: Runs forward on the Python, scripted, lowered and mobile modules
+        # for the same input tuple and asserts all outputs match.
         """
         Check that the forward function produces the same output using
         Python, regular JIT, the backend, and mobile for the given 'input'.
@@ -539,22 +634,29 @@ class JitBackendTestCaseWithCompiler(JitTestCase):
         self.assertEqual(mobile_output, backend_output)
 
     def test_execution(self):
+        # [FUNCTION DOC] Stub for correctness tests; does nothing here.
         """
         Stub for correctness tests.
         """
 
     def test_errors(self):
+        # [FUNCTION DOC] Stub for error tests; does nothing here.
         """
         Stub for testing error checking.
         """
 
 
 class BasicModuleTestWithCompiler(JitBackendTestCaseWithCompiler):
+    # [CLASS DOC] Tests lowering the add module with the compiler backend and comparing
+    # with mobile.
     """
     Tests for BasicModuleAdd.
     """
 
     def setUp(self):
+        # [FUNCTION DOC] Creates Python and scripted adds, lowers with a compile spec of input
+        # shapes and an extra option, serializes the lowered module for the lite interpreter into
+        # a buffer and loads it as the mobile module.
         super().setUp()
         # Create Python, JIT and backend versions of BasicModuleAdd.
         self.module = BasicModuleAdd()
@@ -574,27 +676,39 @@ class BasicModuleTestWithCompiler(JitBackendTestCaseWithCompiler):
         self.mobile_module = _load_for_lite_interpreter(buffer)
 
     def test_execution(self):
+        # [FUNCTION DOC] Runs forward comparison on a single ones input used for both arguments.
         # Test execution with backend against Python and JIT.
         input = torch.ones(1, dtype=torch.float)
         self.check_forward((input, input))
 
 
 class ErrorMessagesWithCompiler(JitBackendTestCase):
+    # [CLASS DOC] Tests error messages from the compiler backend when an operator is unsupported.
     """
     Tests for errors that occur with compiler, specifically:
         * an operator is not supported by the backend
     """
 
     class ModuleNotSupported(torch.nn.Module):
+        # [CLASS DOC] HELPER: Module whose forward multiplies, an operator the demo
+        # compiler rejects.
         """
         A module with an operator that is not supported.
         """
 
         def forward(self, x, h):
+            # [FUNCTION DOC] HELPER: Returns the product of the inputs (a following line
+            # is unreachable).
+            # KNOWN ISSUE: the expected error text in test_errors embeds this method's source
+            # lines, so any comment added in this body changes the source shown and makes that
+            # expectation fail.
             return x * h
             self._loweredmodule.forward()
 
     def test_errors(self):
+        # [FUNCTION DOC] Asserts lowering the multiply module raises RuntimeError whose
+        # message names the unsupported operator and shows the source context with the
+        # highlighted multiply.
         scripted_module_n = torch.jit.script(
             ErrorMessagesWithCompiler.ModuleNotSupported()
         )
@@ -616,35 +730,45 @@ class ErrorMessagesWithCompiler(JitBackendTestCase):
 
 
 class CompModuleTestWithCompiler(JitBackendTestCase):
+    # [CLASS DOC] Tests a module with two lowered submodules (addition and subtraction).
     """
     Tests for CompModule, which is a module with two lowered submodules
     """
 
     class BasicModuleSub(torch.nn.Module):
+        # [CLASS DOC] HELPER: Module whose forward subtracts the second input from the first.
         """
         A simple subtraction Module to be used in CompModule.
         """
 
         def forward(self, x, h):
+            # [FUNCTION DOC] HELPER: Returns the difference of the inputs.
             return x - h
 
     class CompModule(torch.nn.Module):
+        # [CLASS DOC] HELPER: Module holding a lowered add and a lowered subtract submodule.
         """
         A module with two lowered submodules.
         """
 
         def __init__(self, addmodule, submodule):
+            # [FUNCTION DOC] HELPER: Stores the two lowered submodules.
             super().__init__()
             self.lowered_add = addmodule
             self.lowered_sub = submodule
 
         def forward(self, a, b, s):
+            # [FUNCTION DOC] HELPER: Calls both lowered submodules and returns the third argument
+            # times the product of their results.
             c = self.lowered_add.forward(a, b)
             d = self.lowered_sub.forward(a, b)
             y = s * (c * d)
             return y
 
     def setUp(self):
+        # [FUNCTION DOC] Lowers an add module (with a shape compile spec) and a subtract module,
+        # builds Python and scripted composite modules, uses the scripted module as the stand-in
+        # lowered module, and creates a mobile module from its lite interpreter serialization.
         super().setUp()
         # Create Python and JIT versions of CompModule with lowered submodules.
         compile_spec = {
@@ -675,6 +799,8 @@ class CompModuleTestWithCompiler(JitBackendTestCase):
         self.mobile_module = _load_for_lite_interpreter(buffer)
 
     def test_execution(self):
+        # [FUNCTION DOC] Compares forward outputs on ones inputs across the Python, scripted and
+        # stand-in lowered modules.
         # Test execution with backend against Python and JIT.
         input1 = torch.ones(1, dtype=torch.float)
         input2 = torch.ones(1, dtype=torch.float)
@@ -689,50 +815,68 @@ class CompModuleTestWithCompiler(JitBackendTestCase):
     "Non-portable load_library call used in test",
 )
 class TestBackendsWithCompiler(JitTestCase):
+    # [CLASS DOC] Wrapper test case that owns and invokes the compiler backend test classes;
+    # skipped on unsupported platforms.
     """
     This class wraps and invokes all subclasses of JitBackendTestCaseWithCompiler
     so that each one does not have to be individually imported in test_jit.py.
     """
 
     def __init__(self, name):
+        # [FUNCTION DOC] Creates the basic, error and composite compiler test instances with the
+        # same name.
         super().__init__(name)
         self.basic_module_compiler_test = BasicModuleTestWithCompiler(name)
         self.error_module_compiler_test = ErrorMessagesWithCompiler(name)
         self.comp_module_compiler_test = CompModuleTestWithCompiler(name)
 
     def setUp(self):
+        # [FUNCTION DOC] Calls the parent setUp and then each wrapped compiler test's setUp.
         super().setUp()
         self.basic_module_compiler_test.setUp()
         self.error_module_compiler_test.setUp()
         self.comp_module_compiler_test.setUp()
 
     def test_execution(self):
+        # [FUNCTION DOC] Runs the execution test of the basic and composite compiler test cases.
         self.basic_module_compiler_test.test_execution()
         self.comp_module_compiler_test.test_execution()
 
     def test_errors(self):
+        # [FUNCTION DOC] Runs the error test of the error message test case.
         self.error_module_compiler_test.test_errors()
 
 
 class CompModuleTestSameNameWithCompiler(JitBackendTestCase):
+    # [CLASS DOC] Intended to test a composite module whose two lowered submodules share the same
+    # module name.
+    # KNOWN ISSUE: the nested module classes are referenced by bare names that are not defined at
+    # module scope (suppressed with F821), so setUp would raise a name error, and lowered_module
+    # is never set although the execution test needs it.
     """
     Tests for CompModule, which is a module with two lowered submodules with same module name
     """
 
     class ModuleAdd(torch.nn.Module):
+        # [CLASS DOC] HELPER: Module whose forward adds its inputs.
         """
         A simple Module used to test to_backend lowering machinery.
         """
 
         def forward(self, x, h):
+            # [FUNCTION DOC] HELPER: Returns the sum of the inputs.
             return x + h
 
     class CompModule(torch.nn.Module):
+        # [CLASS DOC] HELPER: Module with two lowered copies of the add module, named add and sub.
         """
         A module with two lowered submodules.
         """
 
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Lowers two scripted add modules with the compiler backend
+            # using one compile spec and stores them.
+            # KNOWN ISSUE: refers to an undefined global name for the add module.
             super().__init__()
             compile_spec = {
                 "forward": {
@@ -751,12 +895,16 @@ class CompModuleTestSameNameWithCompiler(JitBackendTestCase):
             )
 
         def forward(self, a, b, s: int):
+            # [FUNCTION DOC] HELPER: Calls both lowered submodules and returns the integer
+            # argument times the product of their results.
             c = self.add.forward(a, b)
             d = self.sub.forward(a, b)
             y = s * (c * d)
             return y
 
     def setUp(self):
+        # [FUNCTION DOC] Builds the composite module (by an undefined global name, see class
+        # note), scripts it, and loads a mobile module from its lite interpreter serialization.
         super().setUp()
 
         self.module = CompModule()  # noqa: F821
@@ -766,6 +914,7 @@ class CompModuleTestSameNameWithCompiler(JitBackendTestCase):
         self.mobile_module = _load_for_lite_interpreter(buffer)
 
     def test_execution(self):
+        # [FUNCTION DOC] Compares forward outputs on tensor inputs and an integer scale.
         a = torch.ones(1)
         b = 3 * torch.ones(1)
         s = 3
@@ -774,11 +923,14 @@ class CompModuleTestSameNameWithCompiler(JitBackendTestCase):
 
 
 class AddedAttributesTest(JitBackendTestCase):
+    # [CLASS DOC] Tests adding attributes (bundled inputs) to a lowered model.
     """
     Tests for adding attributes to a model after lowering.
     """
 
     def setUp(self):
+        # [FUNCTION DOC] Creates Python, scripted and lowered versions of the basic module,
+        # lowering all three methods.
         super().setUp()
         # Create Python, JIT and backend versions of BasicModule.
         self.module = BasicModule()
@@ -789,6 +941,10 @@ class AddedAttributesTest(JitBackendTestCase):
         )
 
     def test_attribute(self):
+        # [FUNCTION DOC] Runs the lowered module, augments it with bundled inputs, runs it on the
+        # bundled inputs, round trips through save and load, and asserts outputs are preserved.
+        # KNOWN ISSUE: the augment call passes a bare name lowered_module (undefined, suppressed
+        # with F821) instead of the instance attribute, so it would raise a name error.
         input = [(torch.ones(5),)]
         pre_bundled = self.lowered_module(*input[0])
         # Attach bundled inputs which adds several attributes and functions to the model
