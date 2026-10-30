@@ -1,5 +1,10 @@
 # Owner(s): ["oncall: jit"]
 # ruff: noqa: F841
+# [MODULE DOC] Main TorchScript (JIT) regression suite. It imports many test classes from the
+# jit/ test directory so one run covers them, defines LSTM/MiLSTM reference cells and graph
+# helpers, and holds the large TestJit class plus several script/trace/export test classes.
+# Import-time side effects: parses command line args when run as main, requires a GRAPH_EXECUTOR
+# mode, and enables/disables the TensorExpr fuser and profiling executor.
 
 import torch
 
@@ -158,12 +163,20 @@ from torch.testing._internal.common_utils import (
 
 
 def canonical(graph):
+    # [FUNCTION DOC] HELPER: Return the canonicalized text form of a graph, without
+    # source ranges.
     return torch._C._jit_pass_canonicalize(graph).str(False)
 
 def LSTMCellF(input, hx, cx, *params):
+    # [FUNCTION DOC] HELPER: Wrapper that regroups hx and cx into a state tuple and
+    # calls LSTMCell.
     return LSTMCell(input, (hx, cx), *params)
 
 def doAutodiffCheck(testname):
+    # [FUNCTION DOC] Decide whether a generated test name should be checked for autodiff nodes.
+    # Returns False for the plain transpose test and for the simple executor, True for the legacy
+    # executor, and for the profiling executor True unless the name is in a hard-coded exception
+    # list. Raises an error if GRAPH_EXECUTOR is unset.
     # TODO: setting false on test itself is not working
     if "test_t_" in testname or testname == "test_t":
         return False
@@ -220,6 +233,8 @@ torch._C._jit_set_texpr_fuser_enabled(GRAPH_EXECUTOR == ProfilingMode.PROFILING)
 torch._C._jit_set_profiling_executor(GRAPH_EXECUTOR != ProfilingMode.LEGACY)
 
 def LSTMCell(input, hidden, w_ih, w_hh, b_ih=None, b_hh=None):
+    # [FUNCTION DOC] HELPER: Reference LSTM cell; hidden is a pair (hx, cx). Computes the four
+    # gates from linear layers, applies sigmoid/tanh, and returns the new hidden and cell state.
     hx, cx = hidden
     gates = F.linear(input, w_ih, b_ih) + F.linear(hx, w_hh, b_hh)
 
@@ -235,11 +250,14 @@ def LSTMCell(input, hidden, w_ih, w_hh, b_ih=None, b_hh=None):
 
 
 def LSTMCellC(*args, **kwargs):
+    # [FUNCTION DOC] HELPER: Run LSTMCellF and return its two outputs concatenated along dim 0.
     hy, cy = LSTMCellF(*args, **kwargs)
     return torch.cat((hy, cy))
 
 
 def LSTMCellS(x, hx, cx, w_ih, w_hh, b_ih, b_hh):
+    # [FUNCTION DOC] HELPER: LSTM cell written with explicit matrix multiplies and bias adds
+    # instead of linear layers. Returns the new hidden state and cell state.
     gates = x.mm(w_ih.t()) + hx.mm(w_hh.t()) + b_ih + b_hh
     ingate, forgetgate, cellgate, outgate = gates.chunk(4, 1)
     ingate = torch.sigmoid(ingate)
@@ -253,6 +271,9 @@ def LSTMCellS(x, hx, cx, w_ih, w_hh, b_ih, b_hh):
 
 # Code reference: https://github.com/pytorch/translate/blob/master/pytorch_translate/rnn_cell.py#L27:44
 def MiLSTMCell(x, hx, cx, w_ih, w_hh, alpha, beta_i, beta_h, bias):
+    # [FUNCTION DOC] HELPER: Multiplicative-integration LSTM cell. Combines the input and hidden
+    # projections with alpha and beta scaling plus a bias, then applies the usual LSTM gate math.
+    # Returns the new hidden and cell state.
     Wx = x.mm(w_ih.t())
     Uz = hx.mm(w_hh.t())
     # Section 2.1 in https://arxiv.org/pdf/1606.06630.pdf
@@ -270,6 +291,9 @@ def MiLSTMCell(x, hx, cx, w_ih, w_hh, alpha, beta_i, beta_h, bias):
 
 
 def get_lstm_inputs(device, training=False, seq_length=None):
+    # [FUNCTION DOC] HELPER: Build random LSTM cell inputs (input, hx, cx, then module
+    # parameters). With seq_length the input has a leading time dimension. requires_grad follows
+    # training; when not training the parameters are marked as not requiring grad.
     input_shape = (3, 10) if seq_length is None else (seq_length, 3, 10)
     input = torch.randn(*input_shape, dtype=torch.float, device=device, requires_grad=training)
     hx = torch.randn(3, 20, dtype=torch.float, device=device, requires_grad=training)
@@ -283,6 +307,8 @@ def get_lstm_inputs(device, training=False, seq_length=None):
 
 
 def get_milstm_inputs(device, training=False):
+    # [FUNCTION DOC] HELPER: Build random inputs for the MiLSTM cell: x, hx, cx, the two weight
+    # matrices, alpha, the two betas and bias. Gradients are required only if training is set.
     minibatch = 3
     input_size = 10
     hidden_size = 20
@@ -300,6 +326,8 @@ def get_milstm_inputs(device, training=False):
 
 
 def get_fn(file_name, script_path):
+    # [FUNCTION DOC] HELPER: Load a python file by path as a module and return its fn attribute.
+    # Executes the loaded file as a side effect.
     import importlib.util
     spec = importlib.util.spec_from_file_location(file_name, script_path)
     module = importlib.util.module_from_spec(spec)
@@ -308,6 +336,10 @@ def get_fn(file_name, script_path):
     return fn
 
 def get_grad_executor(plan_state, diff_graph_idx=None, skip_check=False):
+    # [FUNCTION DOC] HELPER: Get the autodiff grad executor state from an execution plan state.
+    # When no index is given and skip_check is false, it verifies the graph is a single
+    # differentiable node (optionally followed by a tuple construct or a guarded if), ignoring
+    # bailout nodes, and raises RuntimeError otherwise. Returns the executor at the given index.
     if diff_graph_idx is None:
         nodes = list(plan_state.graph.nodes())
 
@@ -324,6 +356,8 @@ def get_grad_executor(plan_state, diff_graph_idx=None, skip_check=False):
 
 
 def all_backward_graphs(script_module, diff_graph_idx=None):
+    # [FUNCTION DOC] HELPER: Return copies of all backward graphs of the grad executor found in
+    # the module's debug state, for the optional diff graph index.
     # Note: for Python 2 the order seems to be unstable
     ge_state = script_module.get_debug_state()
     fwd_plan = get_execution_plan(ge_state)
@@ -333,6 +367,9 @@ def all_backward_graphs(script_module, diff_graph_idx=None):
 
 
 def backward_graph(script_module, diff_graph_idx=None, skip_check=False):
+    # [FUNCTION DOC] HELPER: Return a copy of the backward graph of the differentiable graph
+    # in the module's debug state. The copy is needed because the debug state does not own
+    # its graph.
     ge_state = script_module.get_debug_state()
     fwd_plan = get_execution_plan(ge_state)
     grad_executor_state = get_grad_executor(fwd_plan, diff_graph_idx=diff_graph_idx, skip_check=skip_check)
@@ -344,6 +381,7 @@ def backward_graph(script_module, diff_graph_idx=None, skip_check=False):
 
 # helper function to get sum of List[Tensor]
 def _sum_of_list(tensorlist):
+    # [FUNCTION DOC] HELPER: Sum the elements of every tensor in a list and return the total.
     s = 0
     for t in tensorlist:
         s += t.sum()
@@ -352,12 +390,17 @@ def _sum_of_list(tensorlist):
 
 # has to be at top level or Pickle complains
 class FooToPickle(torch.nn.Module):
+    # [CLASS DOC] HELPER: Module holding a ScriptModule attribute; defined at top level so pickle
+    # can find it.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Create the module with an empty ScriptModule stored as bar.
         super().__init__()
         self.bar = torch.jit.ScriptModule()
 
 
 class TestJitProfiler(JitTestCase):
+    # [CLASS DOC] Test case that isolates tests changing the global graph executor optimize flag,
+    # saving it in setUp and restoring it in tearDown so a failure cannot leak the setting.
     """
     This runs tests that requires setting some global states like torch._C._set_graph_executor_optimize
     and restore the values afterward, i.e. test_profiler. This is to address the flaky issue in
@@ -370,10 +413,12 @@ class TestJitProfiler(JitTestCase):
     """
 
     def setUp(self):
+        # [FUNCTION DOC] Run base setup and remember the current graph executor optimize flag.
         super().setUp()
         self.graph_executor_optimize_opt = torch._C._get_graph_executor_optimize()
 
     def tearDown(self):
+        # [FUNCTION DOC] Run base teardown and restore the saved graph executor optimize flag.
         super().tearDown()
         # Resetting
         torch._C._set_graph_executor_optimize(
@@ -383,15 +428,21 @@ class TestJitProfiler(JitTestCase):
     @unittest.skipIf(IS_LINUX, "https://github.com/pytorch/pytorch/issues/81626")
     @unittest.skip("https://github.com/pytorch/pytorch/issues/65521")
     def test_profiler(self):
+        # [FUNCTION DOC] Trace a function calling another traced function (also through
+        # fork/wait) under the autograd profiler and check mul and the traced callee show up in
+        # two threads. The test is skipped unconditionally.
         torch._C._set_graph_executor_optimize(False)
 
         def other_fn(x):
+            # [FUNCTION DOC] HELPER: Return the input multiplied by two.
             return x * 2
 
         x = torch.rand(3, 4)
         traced_other_fn = torch.jit.trace(other_fn, x)
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Call the traced function directly and via fork/wait, return
+            # the latter.
             y = traced_other_fn(x)
             fut = torch.jit._fork(traced_other_fn, x)
             y = torch.jit._wait(fut)
@@ -424,8 +475,12 @@ class TestJitProfiler(JitTestCase):
 
 
 class TestJit(JitTestCase):
+    # [CLASS DOC] The main JIT test case, with a large collection of script, trace, export and
+    # graph pass tests. Many helpers and models used are defined in this module.
     @unittest.skip("Requires a lot of RAM")
     def test_big(self):
+        # [FUNCTION DOC] Export/import a module with large parameters spanning the 4GB boundary
+        # and check the parameters round trip. Skipped: it needs a lot of RAM.
         m = torch.jit.ScriptModule()
         gig = int(1024 * 1024 * 1024 / 4)
         # a small tensor in the first 4GB
@@ -442,13 +497,19 @@ class TestJit(JitTestCase):
         self.assertEqual(tuple(m.parameters()), tuple(m2.parameters()))
 
     def test_inferred_as_tensor(self):
+        # [FUNCTION DOC] Scripting a function with an unannotated argument that is used as a
+        # dimension must raise RuntimeError saying the type was inferred as Tensor.
         with self.assertRaisesRegex(RuntimeError, "Inferred the value for argument 'dim' to be of type 'Tensor' "
                                                   "because it was not annotated with an explicit type"):
             @torch.jit.script
             def dot(points, query, dim):
+                # [FUNCTION DOC] HELPER: Scripted function expected to fail compilation (dim is
+                # not annotated).
                 return (points * query).sum(dim)
 
     def test_constants_pkl(self):
+        # [FUNCTION DOC] Save a scripted function and check the zip archive has a constants file,
+        # which torch.load uses to distinguish jit archives from eager ones.
         # This test asserts that the serialization archive includes a `constants.pkl`
         # file. This file is used by `torch.load` to determine whether a zip file
         # is a normal eager-mode serialization zip or a jit serialization zip. If
@@ -456,6 +517,7 @@ class TestJit(JitTestCase):
         # so it is still able to figure out which is which.
         @torch.jit.script
         def fn(x):
+            # [FUNCTION DOC] HELPER: Identity function that is scripted and saved.
             return x
 
         buf = io.BytesIO()
@@ -466,24 +528,35 @@ class TestJit(JitTestCase):
         self.assertTrue(any('archive/constants.pkl' == f.filename for f in files))
 
     def test_script_fn_pkl(self):
+        # [FUNCTION DOC] Pickling a script function must raise a PickleError.
         with self.assertRaisesRegex(pickle.PickleError, "ScriptFunction cannot be pickled"):
 
             @torch.jit.script
             def fn(x: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Identity function scripted for the pickle test.
                 return x
 
             pkl_fn = pickle.dumps(fn, protocol=0)
 
     def test_script_fn_valid_name(self):
+        # [FUNCTION DOC] A scripted function must expose non-None name and qualified
+        # name attributes.
         @torch.jit.script
         def fn(x: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Identity function that is scripted.
             return x
         self.assertIsNotNone(fn.__name__)
         self.assertIsNotNone(fn.__qualname__)
 
     def test_restore_device(self):
+        # [FUNCTION DOC] Export/import a module with a parameter and a tensor attribute on cpu
+        # and check values match and that nothing ends up on cuda.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a parameter and a plain tensor on the
+            # given device.
             def __init__(self, cpu_device_str):
+                # [FUNCTION DOC] HELPER: Store a parameter and a tensor created on the given
+                # device string.
                 super().__init__()
                 self.p0 = nn.Parameter(torch.tensor([0.3], dtype=torch.float,
                                                     device=cpu_device_str))
@@ -500,14 +573,22 @@ class TestJit(JitTestCase):
 
     @unittest.skipIf(not RUN_CUDA, "restore device requires CUDA")
     def test_restore_device_cuda(self):
+        # [FUNCTION DOC] On a multi-GPU or single GPU setup, export/import a cuda module and
+        # check the default restore keeps devices, map_location of a string or device object
+        # remaps them, and outputs agree. Skipped without CUDA.
         class MyModule(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module adding a random buffer and parameter to
+            # its input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random buffer of shape 1x3 and a random
+                # parameter of 2x3.
                 super().__init__()
                 self.b0 = nn.Buffer(torch.randn(1, 3))
                 self.p0 = nn.Parameter(torch.randn(2, 3))
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the input plus the buffer plus the parameter.
                 return x + self.b0 + self.p0
 
         m = MyModule()
@@ -544,8 +625,12 @@ class TestJit(JitTestCase):
         self.assertEqual(origin_result, m4(input.cuda(0)))
 
     def test_trace_retains_train(self):
+        # [FUNCTION DOC] Tracing an eval-mode module must keep the training flag false on the
+        # traced module.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward returns its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the input unchanged.
                 return x
         m = M()
         m.eval()
@@ -554,8 +639,15 @@ class TestJit(JitTestCase):
 
     @unittest.skipIf(not RUN_CUDA, "restore device requires CUDA")
     def test_restore_shared_storage_on_cuda(self):
+        # [FUNCTION DOC] Export/import a module whose parameter and buffer are views of one cpu
+        # tensor, mapped to cuda, and check both land on cuda and still share storage. Skipped
+        # without CUDA.
         class Foo(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a parameter and a buffer that are views of
+            # one tensor.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create one random cpu tensor and store two narrowed
+                # views of it.
                 super().__init__()
                 whole_tensor = torch.randn(4, 5, dtype=torch.float, device='cpu')
                 self.p0 = nn.Parameter(whole_tensor.narrow(0, 0, 1))
@@ -572,12 +664,20 @@ class TestJit(JitTestCase):
         self.assertEqual(m2.b0.storage().data_ptr(), m2.p0.storage().data_ptr())
 
     def test_add_relu_fusion(self):
+        # [FUNCTION DOC] Check the add/relu fusion pass rewrites add followed by relu, relu in
+        # place, in-place add, and add with out argument into the fused add-relu ops, via
+        # FileCheck on the reloaded graph, and that results (and in-place mutation of the input)
+        # match the unfused run.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module computing a relu_op of a plus b, plus a plus c.
             def __init__(self, relu_op):
+                # [FUNCTION DOC] HELPER: Store the relu callable used by forward.
                 super().__init__()
                 self.relu_op = relu_op
 
             def forward(self, a, b, c):
+                # [FUNCTION DOC] HELPER: Add a and b, apply relu_op, add the sum of a and c,
+                # return the total.
                 tmp = torch.add(a, b)
                 x = self.relu_op(tmp)
                 d = torch.add(a, c)
@@ -620,11 +720,15 @@ class TestJit(JitTestCase):
         torch.testing.assert_close(orig_res, new_res)
 
         class Madd_(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module doing in-place add of b into a, then applying relu_op.
             def __init__(self, relu_op):
+                # [FUNCTION DOC] HELPER: Store the relu callable used by forward.
                 super().__init__()
                 self.relu_op = relu_op
 
             def forward(self, a, b):
+                # [FUNCTION DOC] HELPER: Add b into a in place, apply relu_op to the result and
+                # return it.
                 x = a.add_(b)
                 x = self.relu_op(x)
                 return x
@@ -654,11 +758,16 @@ class TestJit(JitTestCase):
         torch.testing.assert_close(orig_res, a_copy)
 
         class Madd_out(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module doing add with the out argument set to a, then
+            # applying relu_op.
             def __init__(self, relu_op):
+                # [FUNCTION DOC] HELPER: Store the relu callable used by forward.
                 super().__init__()
                 self.relu_op = relu_op
 
             def forward(self, a, b):
+                # [FUNCTION DOC] HELPER: Add a and b writing into a, apply relu_op to the result
+                # and return it.
                 x = torch.add(a, b, out=a)
                 x = self.relu_op(x)
                 return x
@@ -692,7 +801,10 @@ class TestJit(JitTestCase):
         torch.testing.assert_close(orig_res, a_copy)
 
     def test_repeat_interleave_script(self):
+        # [FUNCTION DOC] Script a function using repeat_interleave with a tensor of repeats and
+        # check the scripted output equals eager.
         def fn(input: torch.Tensor, repeats: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Repeat input elements according to the repeats tensor.
             output = input.repeat_interleave(repeats)
             return output
         fn_scripted = torch.jit.script(fn)
@@ -706,7 +818,11 @@ class TestJit(JitTestCase):
 
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.LEGACY, "Simple executor doesn't have shape information")
     def test_peephole_optimize_shape_ops(self):
+        # [FUNCTION DOC] Check the peephole pass folds shape queries (dim, size, dtype ...) into
+        # constants so no conditional remains in the graph. Only runs on the legacy executor.
         def test_input(func, input, result):
+            # [FUNCTION DOC] HELPER: Run func with profile and replay, assert the expected
+            # result, and assert the optimized graph for the input has no if node.
             # if result == 2 we will trigger a bailout and
             # the unprofiled graph should return the correct result
             self.assertEqual(func(input, profile_and_replay=True), result)
@@ -714,8 +830,10 @@ class TestJit(JitTestCase):
             FileCheck().check_not("prim::If").run(gre)
 
         def test_dim():
+            # [FUNCTION DOC] HELPER: Check folding of the dimension query for 1-d and 2-d inputs.
             @torch.jit.script
             def func(x):
+                # [FUNCTION DOC] HELPER: Return 1 if the input is 1-dimensional, else 2.
                 if x.dim() == 1:
                     return 1
                 else:
@@ -726,8 +844,11 @@ class TestJit(JitTestCase):
         test_dim()
 
         def test_size_index():
+            # [FUNCTION DOC] HELPER: Check folding of size queries with positive and
+            # negative indexes.
             @torch.jit.script
             def func(x):
+                # [FUNCTION DOC] HELPER: Return 1 if the size of dimension 0 is 1, else 2.
                 if x.size(0) == 1:
                     return 1
                 else:
@@ -738,6 +859,7 @@ class TestJit(JitTestCase):
 
             @torch.jit.script
             def neg_index(x):
+                # [FUNCTION DOC] HELPER: Return 1 if the size of dimension -2 is 1, else 2.
                 if x.size(-2) == 1:
                     return 1
                 else:
@@ -750,8 +872,10 @@ class TestJit(JitTestCase):
             test_size_index()
 
         def test_dtype():
+            # [FUNCTION DOC] HELPER: Check folding of dtype comparisons.
             @torch.jit.script
             def func(x):
+                # [FUNCTION DOC] HELPER: Return 1 if the input dtype is float32, else 2.
                 if x.dtype == torch.float32:
                     return 1
                 else:
@@ -762,8 +886,12 @@ class TestJit(JitTestCase):
         test_dtype()
 
         def test_is_floating_poiint():
+            # [FUNCTION DOC] HELPER: Check folding of the floating-point query on a float and an
+            # int tensor.
             @torch.jit.script
             def func(x):
+                # [FUNCTION DOC] HELPER: Return 1 if the input is a floating point tensor,
+                # else 2.
                 if x.is_floating_point():
                     return 1
                 else:
@@ -774,8 +902,11 @@ class TestJit(JitTestCase):
         test_is_floating_poiint()
 
         def test_device():
+            # [FUNCTION DOC] HELPER: Check folding of device and is_cuda queries; cuda inputs are
+            # tried only when CUDA is available.
             @torch.jit.script
             def func_1(x):
+                # [FUNCTION DOC] HELPER: Return 0 if the input device is cuda:0, else 1.
                 if x.device == torch.device('cuda:0'):
                     a = 0
                 else:
@@ -784,6 +915,7 @@ class TestJit(JitTestCase):
 
             @torch.jit.script
             def func_2(x):
+                # [FUNCTION DOC] HELPER: Return 0 if the input is a cuda tensor, else 1.
                 if x.is_cuda:
                     a = 0
                 else:
@@ -800,7 +932,11 @@ class TestJit(JitTestCase):
         test_device()
 
     def test_attrs(self):
+        # [FUNCTION DOC] Script a function returning many tensor attributes (device, shape,
+        # flags, transposes) and check the scripted result equals eager.
         def foo(x):
+            # [FUNCTION DOC] HELPER: Return a tuple of tensor attributes: device, shape,
+            # cuda/mkldnn/quantized flags, requires_grad and the T, mT, H, mH views.
             return (
                 # x.dtype, TODO: dtype long -> instance conversion
                 x.device,
@@ -821,8 +957,10 @@ class TestJit(JitTestCase):
         self.assertEqual(scripted(x), foo(x))
 
     def test_layout(self):
+        # [FUNCTION DOC] Scripted comparison of the layouts of two dense tensors must be true.
         @torch.jit.script
         def check(x, y):
+            # [FUNCTION DOC] HELPER: Return whether two tensors have the same layout.
             return x.layout == y.layout
 
         x = torch.rand(3, 4)
@@ -831,24 +969,33 @@ class TestJit(JitTestCase):
         self.assertTrue(check(x, y))
 
     def test_matrix_transpose(self):
+        # [FUNCTION DOC] Scripted check that the mT attribute equals swapping the last two dims.
         @torch.jit.script
         def check(x):
+            # [FUNCTION DOC] HELPER: Compare mT with an explicit transpose of the last
+            # two dimensions.
             return torch.equal(x.mT, x.transpose(-2, -1))
 
         x = torch.rand(3, 4)
         self.assertTrue(check(x))
 
     def test_transpose(self):
+        # [FUNCTION DOC] Scripted check that the T attribute equals the t method result.
         @torch.jit.script
         def check(x):
+            # [FUNCTION DOC] HELPER: Compare the T attribute with the t method result.
             return torch.equal(x.T, x.t())
 
         x = torch.rand(3, 4)
         self.assertTrue(check(x))
 
     def test_matrix_conj_transpose(self):
+        # [FUNCTION DOC] Scripted check that mH equals the conjugate of the last-two-dim
+        # transpose, on a real and a complex tensor.
         @torch.jit.script
         def check(x):
+            # [FUNCTION DOC] HELPER: Compare mH with the conjugated transpose of the last
+            # two dimensions.
             return torch.equal(x.mH, x.transpose(-2, -1).conj())
 
         x = torch.rand(3, 4)
@@ -858,8 +1005,11 @@ class TestJit(JitTestCase):
         self.assertTrue(check(x))
 
     def test_conj_transpose(self):
+        # [FUNCTION DOC] Scripted check that H equals the conjugate of the 2-d transpose, on a
+        # real and a complex tensor.
         @torch.jit.script
         def check(x):
+            # [FUNCTION DOC] HELPER: Compare H with the conjugated result of the t method.
             return torch.equal(x.H, x.t().conj())
 
         x = torch.rand(3, 4)
@@ -869,16 +1019,25 @@ class TestJit(JitTestCase):
         self.assertTrue(check(x))
 
     def test_T_mT_H_mH(self):
+        # [FUNCTION DOC] Use checkScript on four small functions returning the mT, H and mH
+        # attributes for a real and a complex input.
         def T(x):
+            # [FUNCTION DOC] HELPER: Return the mT attribute (named T but reads mT, so T itself
+            # is unchecked).
+            # KNOWN ISSUE: despite its name this helper reads the batched transpose, not the
+            # T attribute.
             return x.mT
 
         def mT(x):
+            # [FUNCTION DOC] HELPER: Return the mT attribute of the input.
             return x.mT
 
         def H(x):
+            # [FUNCTION DOC] HELPER: Return the H attribute of the input.
             return x.H
 
         def mH(x):
+            # [FUNCTION DOC] HELPER: Return the mH attribute of the input.
             return x.mH
 
         x = torch.rand(3, 4)
@@ -894,12 +1053,17 @@ class TestJit(JitTestCase):
         self.checkScript(mH, (y, ))
 
     def test_nn_conv(self):
+        # [FUNCTION DOC] Run checkModule on wrapped 1d/2d/3d convolution and transposed
+        # convolution layers with random inputs.
         class Mod(nn.Module):
+            # [CLASS DOC] HELPER: Wrapper module that applies the given layer to its input.
             def __init__(self, conv):
+                # [FUNCTION DOC] HELPER: Store the wrapped layer.
                 super().__init__()
                 self.conv = conv
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Apply the wrapped layer to the input.
                 return self.conv(input)
 
         inputs = [
@@ -918,11 +1082,17 @@ class TestJit(JitTestCase):
 
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.PROFILING, 'Not implemented for Simple or Legacy')
     def test_debug_flush_compilation_cache(self):
+        # [FUNCTION DOC] Check that flushing the compilation cache of a function or a scripted
+        # module method removes its optimized plan so get_debug_state raises an internal assert
+        # error. Runs only with the profiling executor.
         def foo(x):
+            # [FUNCTION DOC] HELPER: Return the input plus two.
             return x + 2
 
         class Mod(nn.Module):
+            # [CLASS DOC] HELPER: Module that adds two to its input.
             def forward(self, t):
+                # [FUNCTION DOC] HELPER: Return the input plus two.
                 return t + 2
 
         m = torch.jit.script(Mod())
@@ -953,8 +1123,10 @@ class TestJit(JitTestCase):
                     states = m.get_debug_state()
 
     def test_numel(self):
+        # [FUNCTION DOC] A scripted function calling numel must return the same count as eager.
         @torch.jit.script
         def get_numel_script(x):
+            # [FUNCTION DOC] HELPER: Return the element count of the tensor.
             return x.numel()
 
         x = torch.rand(3, 4)
@@ -962,8 +1134,10 @@ class TestJit(JitTestCase):
         self.assertEqual(numel, x.numel())
 
     def test_element_size(self):
+        # [FUNCTION DOC] A scripted function calling element_size must return the eager value.
         @torch.jit.script
         def get_element_size_script(x):
+            # [FUNCTION DOC] HELPER: Return the per-element size in bytes of the tensor.
             return x.element_size()
 
         x = torch.rand(3, 4)
@@ -971,13 +1145,21 @@ class TestJit(JitTestCase):
         self.assertEqual(element_size, x.element_size())
 
     def test_Sequential(self):
+        # [FUNCTION DOC] Script a module holding a Sequential that is iterated in forward,
+        # asserting the scripted graph exists.
         class Seq(nn.Module):
+            # [CLASS DOC] HELPER: Module with a two-layer linear Sequential applied one layer at
+            # a time.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a Sequential of linear layers 10 to 20 and 20
+                # to 30.
                 super().__init__()
                 self.seq = nn.Sequential(nn.Linear(10, 20), nn.Linear(20, 30))
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply each layer of the Sequential in order and return
+                # the result.
                 for l in self.seq:
                     x = l(x)
                 return x
@@ -987,8 +1169,15 @@ class TestJit(JitTestCase):
             raise AssertionError("jit was unable to compile")  # ensure jit was able to compile
 
     def test_ModuleList(self):
+        # [FUNCTION DOC] Script a module whose ModuleList is built with comprehension,
+        # concatenation, append and extend, asserting compilation yields a graph.
         class Mod(nn.Module):
+            # [CLASS DOC] HELPER: Module holding a ModuleList of chained linear layers built in
+            # several ways.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Build the list of linear layers using list
+                # comprehension, in-place add, append and extend (10 to 10 repeated, then up to
+                # 50 features).
                 super().__init__()
                 self.model = nn.ModuleList([nn.Linear(10, 10) for _ in range(10)])
                 self.model += (nn.Linear(10, 20),)
@@ -996,6 +1185,8 @@ class TestJit(JitTestCase):
                 self.model.extend([nn.Linear(30, 40), nn.Linear(40, 50)])
 
             def forward(self, v):
+                # [FUNCTION DOC] HELPER: Pass the value through every layer in order and
+                # return it.
                 for m in self.model:
                     v = m(v)
                 return v
@@ -1005,17 +1196,23 @@ class TestJit(JitTestCase):
             raise AssertionError("jit was unable to compile")  # ensure jit was able to compile
 
     def test_disabled(self):
+        # [FUNCTION DOC] With the jit globally disabled, trace and script return the original
+        # function and script methods stay plain methods. The jit is re-enabled afterwards even
+        # on failure.
         torch.jit._state.disable()
         try:
             def f(x, y):
+                # [FUNCTION DOC] HELPER: Return the sum of two inputs.
                 return x + y
 
             self.assertIs(torch.jit.trace(f, (torch.randn(2, 2), torch.randn(2, 2))), f)
             self.assertIs(torch.jit.script(f), f)
 
             class MyModule(torch.jit.ScriptModule):
+                # [CLASS DOC] HELPER: Script module with a single method returning its input.
                 @torch.jit.script_method
                 def method(self, x):
+                    # [FUNCTION DOC] HELPER: Return the input unchanged.
                     return x
 
             # XXX: Unfortunately ScriptModule won't simply become Module now,
@@ -1027,20 +1224,29 @@ class TestJit(JitTestCase):
             torch.jit._state.enable()
 
     def test_train_eval(self):
+        # [FUNCTION DOC] Check train/eval mode propagates into script modules wrapping a custom
+        # module, batch norm and dropout, comparing against the eager module outputs.
         class Sub(nn.Module):
+            # [CLASS DOC] HELPER: Module returning the input in training mode and its negation in
+            # eval mode.
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Return the input if training, otherwise the
+                # negated input.
                 if self.training:
                     return input
                 else:
                     return -input
 
         class MyModule(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module that calls a wrapped submodule and adds one.
             def __init__(self, module):
+                # [FUNCTION DOC] HELPER: Store the wrapped submodule.
                 super().__init__()
                 self.module = module
 
             @torch.jit.script_method
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Return the submodule output plus one.
                 return self.module(input) + 1
 
         m = MyModule(Sub())
@@ -1066,13 +1272,21 @@ class TestJit(JitTestCase):
         self.assertEqual(dropout(input) + 1, m_dropout(input))
 
     def test_nn_lp_pool2d(self):
+        # [FUNCTION DOC] checkModule on LPPool2d layers and the functional lp_pool2d with float
+        # and int norm and with square and rectangular kernels.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning outputs of module and functional 2d
+            # power-average pooling.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create two LPPool2d layers with norm 2 (kernel 3, and
+                # kernel 7 by 1).
                 super().__init__()
                 self.l = torch.nn.LPPool2d(2, 3)
                 self.n = torch.nn.LPPool2d(2, (7, 1))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return a tuple of five pooling results from layers and
+                # functional calls.
                 return (self.l(x),
                         self.n(x),
                         torch.nn.functional.lp_pool2d(x, float(2), 3),
@@ -1082,13 +1296,21 @@ class TestJit(JitTestCase):
         self.checkModule(Mod(), (torch.rand(1, 3, 7, 7),))
 
     def test_nn_lp_pool1d(self):
+        # [FUNCTION DOC] checkModule on LPPool1d layers and the functional lp_pool1d with float
+        # and int norm values.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning outputs of module and functional 1d
+            # power-average pooling.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create two LPPool1d layers with norm 2 (kernel 3 and
+                # kernel 7).
                 super().__init__()
                 self.l = torch.nn.LPPool1d(2, 3)
                 self.n = torch.nn.LPPool1d(2, 7)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return a tuple of five pooling results from layers and
+                # functional calls.
                 return (self.l(x),
                         self.n(x),
                         torch.nn.functional.lp_pool1d(x, float(2), 3),
@@ -1098,12 +1320,18 @@ class TestJit(JitTestCase):
         self.checkModule(Mod(), (torch.rand(1, 3, 7),))
 
     def test_nn_padding_functional(self):
+        # [FUNCTION DOC] checkModule on functional constant padding for 1, 2 and 3
+        # padded dimensions.
         class Mod(nn.Module):
+            # [CLASS DOC] HELPER: Module padding its input with a stored pad tuple, constant
+            # mode, value 3.5.
             def __init__(self, *pad):
+                # [FUNCTION DOC] HELPER: Store the pad sizes given as varargs.
                 super().__init__()
                 self.pad = pad
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Pad the input in constant mode with value 3.5.
                 return F.pad(x, self.pad, mode='constant', value=3.5)
 
         inputs = [
@@ -1116,12 +1344,17 @@ class TestJit(JitTestCase):
             self.checkModule(m, (inp,))
 
     def test_nn_padding(self):
+        # [FUNCTION DOC] checkModule on wrapped constant, reflection, replication and zero
+        # padding layers.
         class Mod(nn.Module):
+            # [CLASS DOC] HELPER: Wrapper module applying a given padding layer.
             def __init__(self, padding):
+                # [FUNCTION DOC] HELPER: Store the padding layer.
                 super().__init__()
                 self.padding = padding
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Apply the padding layer to the input.
                 return self.padding(input)
 
         inputs = [
@@ -1141,23 +1374,33 @@ class TestJit(JitTestCase):
             self.checkModule(m, (inp,))
 
     def test_script_autograd_grad(self):
+        # [FUNCTION DOC] checkScript on functions calling autograd grad with plain, explicit grad
+        # outputs, unused-allowed and retain-graph variants, with inputs requiring grad.
         def test_simple_grad(x, y):
+            # [FUNCTION DOC] HELPER: Return gradients of the sum of an expression with respect to
+            # x and y.
             # type: (Tensor, Tensor) -> List[Optional[Tensor]]
             z = x + 2 * y + x * y
             return torch.autograd.grad((z.sum(), ), (x, y))
 
         def test_simple_grad_with_grad_outputs(x, y):
+            # [FUNCTION DOC] HELPER: Return gradients with explicit all-ones grad outputs for x
+            # and y.
             # type: (Tensor, Tensor) -> List[Optional[Tensor]]
             z = x + 2 * y + x * y
             grad_outputs = torch.jit.annotate(List[Optional[torch.Tensor]], [torch.ones((2, 2)), ])
             return torch.autograd.grad((z, ), (x, y), grad_outputs)
 
         def test_one_output_not_requires_grad(x, y):
+            # [FUNCTION DOC] HELPER: Gradient where the output ignores x, with unused
+            # inputs allowed.
             # type: (Tensor, Tensor) -> List[Optional[Tensor]]
             z = 2 * y + y
             return torch.autograd.grad((z.sum(),), (x, y), allow_unused=True)
 
         def test_retain_graph(x, y):
+            # [FUNCTION DOC] HELPER: Call grad twice on the same graph, the first with
+            # retain_graph set.
             # type: (Tensor, Tensor) -> None
             z = x + 2 * y + x * y
             torch.autograd.grad((z.sum(), ), (x, y), retain_graph=True)
@@ -1171,7 +1414,12 @@ class TestJit(JitTestCase):
         self.checkScript(test_retain_graph, (x, y), inputs_requires_grad=True)
 
     def test_script_backward(self):
+        # [FUNCTION DOC] Script functions that call tensor backward, autograd backward and
+        # backward with grad tensors, and check gradients on inputs match the eager run.
         def checkBackwardScript(fn, inputs):
+            # [FUNCTION DOC] HELPER: Script fn, check its code mentions autograd backward,
+            # run eager and scripted on separate copies of the inputs and compare the
+            # accumulated gradients.
             scripted_fn = torch.jit.script(fn)
             FileCheck().check("torch.autograd.backward").run(scripted_fn.code)
             recording_inputs = do_input_map(lambda t: t.detach().requires_grad_(), inputs)
@@ -1183,6 +1431,7 @@ class TestJit(JitTestCase):
                 self.assertEqual(inp1.grad, inp2.grad)
 
         def test_tensor_backward(input):
+            # [FUNCTION DOC] HELPER: Run relu and softmax and call backward on the summed output.
             # type: (Tensor) -> None
             output = torch.relu(input)
             output = output.softmax(0)
@@ -1190,12 +1439,15 @@ class TestJit(JitTestCase):
             sum_out.backward()
 
         def test_torch_autograd_backward(input):
+            # [FUNCTION DOC] HELPER: Run relu and softmax and call autograd backward on the sum.
             # type: (Tensor) -> None
             output = torch.relu(input)
             output = output.softmax(0)
             torch.autograd.backward(output.sum())
 
         def test_torch_autograd_backward_with_grad_tensors(input):
+            # [FUNCTION DOC] HELPER: Run relu and softmax and call autograd backward with
+            # explicit grads.
             # type: (Tensor) -> None
             output = torch.relu(input)
             output = output.softmax(0)
@@ -1208,12 +1460,22 @@ class TestJit(JitTestCase):
         checkBackwardScript(test_torch_autograd_backward_with_grad_tensors, (inp,))
 
     def test_script_backward_twice(self):
+        # [FUNCTION DOC] Check a scripted function with a differentiable graph: backward a second
+        # time raises unless retain_graph was set on the first call.
         def checkBackwardTwiceScript(fn, inputs, retain_graph_=False):
+            # [FUNCTION DOC] HELPER: Script fn with the profiling executor off, check a
+            # differentiable graph node exists, run backward, then assert the second backward
+            # fails or succeeds depending on retain_graph_.
             class jit_profiling_executor_false:
+                # [CLASS DOC] HELPER: Context manager turning the profiling executor off,
+                # restoring it on exit to enabled unless the legacy executor is in use.
                 def __enter__(self):
+                    # [FUNCTION DOC] HELPER: Disable the profiling executor.
                     torch._C._jit_set_profiling_executor(False)
 
                 def __exit__(self, *args):
+                    # [FUNCTION DOC] HELPER: Re-enable the profiling executor unless running in
+                    # legacy mode.
                     torch._C._jit_set_profiling_executor(GRAPH_EXECUTOR != ProfilingMode.LEGACY)
 
             with jit_profiling_executor_false(), torch.jit.optimized_execution(True):
@@ -1229,6 +1491,8 @@ class TestJit(JitTestCase):
                     result.sum().backward()
 
         def test_script_backward_twice_with_saved_values(input1, input2):
+            # [FUNCTION DOC] HELPER: Compute a result using multiply, abs, a conditional acos or
+            # atan, and add, so backward needs saved values.
             # type: (Tensor, Tensor) -> Tensor
             tmp1 = torch.mul(input1, input2)
             tmp2 = torch.abs(tmp1)
@@ -1245,11 +1509,15 @@ class TestJit(JitTestCase):
         checkBackwardTwiceScript(test_script_backward_twice_with_saved_values, (inp1, inp2), True)
 
     def test_diff_subgraph_clones_constants(self):
+        # [FUNCTION DOC] Check that creating autodiff subgraphs after CSE keeps one constant in
+        # the outer graph and one in the subgraph.
         @torch.jit.script
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Return a long chain of additions of x and y.
             return x + x + y + x + y + x + y + x + y + x
 
         def count_constants(graph):
+            # [FUNCTION DOC] HELPER: Count constant nodes in a graph.
             return sum(node.kind() == 'prim::Constant' for node in graph.nodes())
 
         graph = f.graph.copy()
@@ -1262,6 +1530,9 @@ class TestJit(JitTestCase):
     # TODO: adapt this test to check that GraphExecutor treats them differently
     @unittest.skip("Need to be adjusted to Graph Executor")
     def test_arg_configurations(self):
+        # [FUNCTION DOC] Check that different argument configurations (dtype, grad,
+        # containers, cuda) each need a new trace. Skipped: marked as needing adjustment to
+        # the graph executor.
         """Different arg configurations should trigger different traces"""
         x = Variable(torch.FloatTensor(4, 4).uniform_())
         x_double = Variable(x.data.double())
@@ -1293,6 +1564,8 @@ class TestJit(JitTestCase):
 
         @torch.jit.compile(nderivs=0)
         def fn(*args):
+            # [FUNCTION DOC] HELPER: Flatten the arguments and return the first flattened value
+            # plus one.
             in_vars, _ = torch._C._jit_flatten(args)
             return in_vars[0] + 1
 
@@ -1305,10 +1578,14 @@ class TestJit(JitTestCase):
         self.assertEqual(fn.hits, 0)
 
     def test_torch_sum(self):
+        # [FUNCTION DOC] checkScript for the sum over all elements and for the sum along a
+        # given dim.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the sum of all elements.
             return torch.sum(x)
 
         def fn1(x, dim: int):
+            # [FUNCTION DOC] HELPER: Return the sum along the given dimension.
             return torch.sum(x, dim)
 
         x = torch.randn(3, 4)
@@ -1317,10 +1594,13 @@ class TestJit(JitTestCase):
         self.checkScript(fn1, (x, 0, ))
 
     def test_cse(self):
+        # [FUNCTION DOC] Run CSE on a traced graph and use FileCheck to confirm repeated sums and
+        # tanh calls were merged, then check export/import of the graph.
         x = torch.tensor([0.4, 0.3], requires_grad=True)
         y = torch.tensor([0.7, 0.5], requires_grad=True)
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Compute a cubed sum, a doubled tanh, and combine them.
             w = (x + y) * (x + y) * (x + y)
             t = torch.tanh(w) + torch.tanh(w)
             z = (x + y) * (x + y) * (x + y) + t
@@ -1336,8 +1616,11 @@ class TestJit(JitTestCase):
         self.assertExportImport(g, (x, y))
 
     def test_cse_not_introduce_aliasing(self):
+        # [FUNCTION DOC] CSE must not merge two tensor-returning adds that are both outputs
+        # (aliasing), but may merge int adds.
         @torch.jit.script
         def tensor_alias_outputs(x):
+            # [FUNCTION DOC] HELPER: Return two separately computed tensor sums of x with itself.
             return x + x, x + x
 
         self.run_pass('cse', tensor_alias_outputs.graph)
@@ -1345,6 +1628,7 @@ class TestJit(JitTestCase):
 
         @torch.jit.script
         def ints_alias_outputs(x):
+            # [FUNCTION DOC] HELPER: Return two separately computed int sums of x with itself.
             # type: (int) -> Tuple[int, int]
             return x + x, x + x
 
@@ -1353,6 +1637,8 @@ class TestJit(JitTestCase):
         FileCheck().check_count("aten::add", 1, exactly=True).run(ints_alias_outputs.graph)
 
     def test_recursive_cse(self):
+        # [FUNCTION DOC] Run CSE on IR parsed from text containing a conditional, and check that
+        # the duplicate add inside the block is removed using FileCheck directives in the text.
         input_str = """
 graph(%x : Tensor,
       %y : Tensor,
@@ -1376,6 +1662,10 @@ graph(%x : Tensor,
         FileCheck().run(input_str, graph)
 
     def test_pattern_based_rewrite(self):
+        # [FUNCTION DOC] Exercise the custom pattern based rewrite pass on parsed IR: chained
+        # mul fusion, overlapping matches, add-of-mul replacement, a pattern replaced by sub and
+        # add, and a replacement that returns an input directly. Each is validated with
+        # FileCheck directives.
         # mul(mul(mul(mul(x,y),z),x),y) --> mul(mul(mulmul(x,y,z), x), y) -->
         # --> mulmul(mulmul(x,y,z), x, y)
         input_str = """
@@ -1488,14 +1778,20 @@ graph(%Ra, %Rb):
 
     @_tmp_donotuse_dont_inline_everything
     def test_pattern_based_module_rewrite(self):
+        # [FUNCTION DOC] Use the custom pattern rewrite with a module match to replace a
+        # conv followed by batch norm in a scripted module forward with a custom op. Runs
+        # without inlining.
         # Check match::module behavior
         class Test(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module applying a conv then batch norm.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a 2d conv and a 2d batch norm.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(1, 20, 5, 1)
                 self.bn = torch.nn.BatchNorm2d(num_features=20)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the convolution then the batch norm.
                 x = self.conv(x)
                 x = self.bn(x)
                 return x
@@ -1514,8 +1810,14 @@ graph(%Ra, %Rb):
         FileCheck().check("my::matched_conv_bn").run(m._c._get_method("forward").graph)
 
     def test_pattern_based_rewrite_with_source_range_preserved(self):
+        # [FUNCTION DOC] Check source ranges are preserved by pattern rewrites when value
+        # name pairs map replacement values to matched ones: for one-to-one replacement,
+        # fusing two adds, and splitting a mul into two adds; and are not preserved when no
+        # mapping is given.
         class TestModule1(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with an add, multiply and subtract in forward.
             def forward(self, x, y, z, w):
+                # [FUNCTION DOC] HELPER: Return w minus the product of the sum of x and y with z.
                 x = x + y
                 x = x * z
                 return w - x
@@ -1544,7 +1846,10 @@ graph(%Ra, %Rb):
         self.assertTrue(source_range_1 == source_range_2)
 
         class TestModule2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with chained adds and multiplies and a final subtract.
             def forward(self, x, y, z, w):
+                # [FUNCTION DOC] HELPER: Compute add, add, mul, mul and subtract two, returning
+                # the result.
                 x = x + y
                 x = x + z
                 x = x * z
@@ -1660,13 +1965,18 @@ graph(%Ra, %Rb):
         self.assertFalse(source_range_1 == source_range_2)
 
     def test_expand_quantlint(self):
+        # [FUNCTION DOC] Placeholder test with an empty body; checks nothing.
         pass
 
     def test_expand_fold_quant_inputs(self):
+        # [FUNCTION DOC] Placeholder test with an empty body; checks nothing.
         pass
 
     def test_shape_analysis_broadcast(self):
+        # [FUNCTION DOC] Run complete shape analysis on a scripted broadcasting add and check the
+        # printed graph shows the broadcast float tensor type with its strides on cpu.
         def broadcast(a, b):
+            # [FUNCTION DOC] HELPER: Return the sum of two tensors (broadcasting).
             return a + b
 
         x = torch.randn(3, 1, 5, requires_grad=True)
@@ -1677,6 +1987,9 @@ graph(%Ra, %Rb):
         FileCheck().check("Float(4, 3, 8, 5, strides=[120, 40, 5, 1], device=cpu)").run(str(graph))
 
     def test_shape_analysis_unsqueeze_in_loop(self):
+        # [FUNCTION DOC] Run shape analysis on parsed IR with an unsqueeze inside a loop and use
+        # the FileCheck lines embedded in the IR text to verify the loop and block types are
+        # float tensors.
         input_str = """graph(%x.1 : Tensor):
           %4 : bool = prim::Constant[value=1]()
           %1 : int = prim::Constant[value=2]()
@@ -1694,7 +2007,10 @@ graph(%Ra, %Rb):
         FileCheck().run(input_str, graph)
 
     def test_script_tensor_type(self):
+        # [FUNCTION DOC] Script a function calling the type method with a dtype argument and
+        # compare against eager for several dtypes including complex and bool.
         def foo(x, t: torch.dtype):
+            # [FUNCTION DOC] HELPER: Cast the tensor to the given dtype using the type method.
             return x.type(t)
         scr = torch.jit.script(foo)
         x = torch.rand(3, 4)
@@ -1703,13 +2019,19 @@ graph(%Ra, %Rb):
             self.assertEqual(scr(x, t), foo(x, t))
 
     def test_script_bool_literal_conversion(self):
+        # [FUNCTION DOC] Script a function multiplying a tensor by a bool literal; result must
+        # match eager.
         def foo(x):
+            # [FUNCTION DOC] HELPER: Multiply the tensor by True.
             return torch.mul(x, True)
         scr = torch.jit.script(foo)
         x = torch.rand(3, 4)
         self.assertEqual(scr(x), foo(x))
 
     def test_shape_analysis_masked_select(self):
+        # [FUNCTION DOC] Run shape analysis on parsed IR with masked_select of a scalar and
+        # a mask and check the output is an unknown-length float tensor via embedded
+        # FileCheck lines.
         input_str = """graph(%0 : Float(),
           %1 : Bool()):
           # CHECK: Float(*, requires_grad=0, device=cpu) = aten::masked_select
@@ -1724,11 +2046,15 @@ graph(%Ra, %Rb):
     # TODO: update verify to work with GraphExecutors
     @unittest.skip("verify needs to be updated to work with GraphExecutors")
     def test_verify(self):
+        # [FUNCTION DOC] Verify a compiled function with the old verify API. Skipped: verify
+        # needs updating to work with graph executors.
         x = torch.tensor([0.4], requires_grad=True)
         y = torch.tensor([0.7], requires_grad=True)
 
         @torch.jit.compile
         def f(x, y):
+            # [FUNCTION DOC] HELPER: Return a sigmoid and an absolute value result built from x
+            # and y.
             z = torch.sigmoid(x * (x + y))
             w = torch.abs(x * x * x + y) + Variable(torch.ones(1))
             return z, w
@@ -1738,11 +2064,14 @@ graph(%Ra, %Rb):
     # TODO: adapt to a GraphExecutor test
     @unittest.skip("Need to instrument GraphExecutors a bit more")
     def test_flags(self):
+        # [FUNCTION DOC] Check compiled function trace flags over all requires_grad combinations
+        # and gradients. Skipped: graph executors need more instrumentation.
         x, y = torch.randn(2, 2)
         y = Variable(torch.randn(2, 2))
 
         @torch.jit.compile
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return the sum of squares plus cross term of x and y.
             return (x * x + y * y + x * y).sum()
 
         grads = {}
@@ -1763,10 +2092,14 @@ graph(%Ra, %Rb):
             self.assertEqual(fn.has_trace_for(x, y), rx or ry)
 
     def test_python_ir(self):
+        # [FUNCTION DOC] Trace a function, copy its graph node by node into a fresh graph through
+        # the python IR API, add a node with a tensor attribute, and check attributes and node
+        # lookup work.
         x = torch.tensor([0.4], requires_grad=True)
         y = torch.tensor([0.7], requires_grad=True)
 
         def doit(x, y):
+            # [FUNCTION DOC] HELPER: Return sigmoid of tanh of x times the sum of x and y.
             return torch.sigmoid(torch.tanh(x * (x + y)))
 
         g, _ = torch.jit._get_trace_graph(doit, (x, y))
@@ -1795,12 +2128,16 @@ graph(%Ra, %Rb):
     @unittest.skipIf(RUN_CUDA, "covered by test_cpp_cuda")
     @unittest.skipIf(not torch._C._jit_has_cpp_tests(), "Tests were not built, use BUILD_TEST=1")
     def test_cpp(self):
+        # [FUNCTION DOC] Run the C++ JIT tests after python setup, tearing the setup down
+        # afterwards. Skipped on sandcastle, with CUDA, or when the C++ tests were not built.
         from cpp.jit import tests_setup
         tests_setup.setup()
         torch._C._jit_run_cpp_tests()
         tests_setup.shutdown()
 
     def test_batchnorm(self):
+        # [FUNCTION DOC] Trace a batch norm layer with forced out-of-place ops, rebuild a
+        # function from the graph and check it reproduces the traced outputs.
         x = torch.ones(2, 2, 2, 2)
         g, outputs, inputs = torch.jit._get_trace_graph(nn.BatchNorm2d(2), x,
                                                         _force_outplace=True, return_inputs=True)
@@ -1808,6 +2145,8 @@ graph(%Ra, %Rb):
         self.assertEqual(outputs, m(*inputs))
 
     def test_dropout(self):
+        # [FUNCTION DOC] Trace a dropout layer and rebuild a function from the graph; with the
+        # RNG state forked in both phases the outputs must match.
         x = torch.ones(2, 2)
         with torch.random.fork_rng(devices=[]):
             g, outputs, inputs = torch.jit._get_trace_graph(nn.Dropout(0.6), x, return_inputs=True)
@@ -1818,8 +2157,12 @@ graph(%Ra, %Rb):
     @unittest.skipIf(not RUN_CUDA, "test requires CUDA")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.PROFILING, "skip if profiling isn't enabled")
     def test_native_dropout_corner_case(self):
+        # [FUNCTION DOC] On CUDA with the profiling executor, script a dropout function and check
+        # a differentiable graph appears; then for train flag, probability 0 or 1, and cuda/cpu
+        # devices compare outputs and gradients with eager, raising AssertionError on mismatch.
         with disable_autodiff_subgraph_inlining():
             def t(x, p: float, t: bool):
+                # [FUNCTION DOC] HELPER: Apply dropout with probability p and training flag t.
                 o = torch.dropout(x, p, t)
                 return o
 
@@ -1844,19 +2187,27 @@ graph(%Ra, %Rb):
     @slowTest
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.LEGACY, 'Testing differentiable graph')
     def test_dropout_module_requires_grad(self):
+        # [FUNCTION DOC] Check a scripted dropout plus linear module calls the random bernoulli
+        # op exactly when in training mode, for both requires_grad settings. Slow; legacy
+        # executor only.
         with enable_profiling_mode_for_profiling_tests():
             class MyModule(torch.nn.Module):
+                # [CLASS DOC] HELPER: Module applying dropout 0.5 then a square linear layer.
                 def __init__(self, M):
+                    # [FUNCTION DOC] HELPER: Create the dropout layer and an M by M linear layer.
                     super().__init__()
                     self.dropout = torch.nn.Dropout(0.5)
                     self.linear = torch.nn.Linear(M, M)
 
                 def forward(self, input):
+                    # [FUNCTION DOC] HELPER: Apply dropout then linear and return the output.
                     input = self.dropout(input)
                     output = self.linear(input)
                     return output
 
             def profile(func, X):
+                # [FUNCTION DOC] HELPER: Run func on X under the autograd profiler and return
+                # event names.
                 with torch.autograd.profiler.profile() as prof:
                     func(X)
                 return [e.name for e in prof.function_events]
@@ -1887,13 +2238,20 @@ graph(%Ra, %Rb):
     @unittest.skipIf(GRAPH_EXECUTOR == ProfilingMode.SIMPLE, 'Testing differentiable graph')
     @skipIfTorchDynamo("Torchdynamo cannot correctly handle profiler.profile calls")
     def test_dropout_func_requires_grad(self):
+        # [FUNCTION DOC] Check functional dropout in training mode runs bernoulli while eval mode
+        # does not, using profiler event names, and that native dropout appears in the graph when
+        # grad is required. Skipped for the simple executor and under dynamo.
         def dropout_training(input):
+            # [FUNCTION DOC] HELPER: Functional dropout with p 0.5 in training mode.
             return F.dropout(input, 0.5, training=True)
 
         def dropout_eval(input):
+            # [FUNCTION DOC] HELPER: Functional dropout with p 0.5 in eval mode.
             return F.dropout(input, 0.5, training=False)
 
         def profile(func, X):
+            # [FUNCTION DOC] HELPER: Run func on X under the autograd profiler and return
+            # event names.
             with torch.autograd.profiler.profile() as prof:
                 func(X)
             return [e.name for e in prof.function_events]
@@ -1912,9 +2270,13 @@ graph(%Ra, %Rb):
 
     @unittest.skipIf(not RUN_CUDA, "test_dropout_cuda require CUDA")
     def test_dropout_cuda(self):
+        # [FUNCTION DOC] On CUDA, compare scripted functional dropout and eager dropout (with
+        # frozen RNG) only by the fraction of zeros in output and gradient, within tolerance.
+        # CUDA only.
         # Dropout AD is dispatched to _fused_dropout in CUDA case,
         # which is not included in TestJitGeneratedFunctional
         def _zero_rate(t):
+            # [FUNCTION DOC] HELPER: Return the fraction of exactly zero elements in a tensor.
             return torch.true_divide((t == 0).sum(), t.numel())
 
         x = torch.ones(1000, 1000).cuda().requires_grad_()
@@ -1922,6 +2284,7 @@ graph(%Ra, %Rb):
         with enable_profiling_mode_for_profiling_tests():
             @torch.jit.script
             def func(x):
+                # [FUNCTION DOC] HELPER: Apply functional dropout with default settings.
                 return torch.nn.functional.dropout(x)
 
             with freeze_rng_state():
@@ -1942,6 +2305,8 @@ graph(%Ra, %Rb):
             self.assertEqual(_zero_rate(grad[0]), _zero_rate(grad_ref[0]), rtol=1e-3, atol=1e-4)
 
     def test_torch_ops_overloaded(self):
+        # [FUNCTION DOC] The torch.ops aten add accepts string and tensor overloads, and raises
+        # RuntimeError when no schema matches (string plus int).
         with self.assertRaisesRegex(RuntimeError, "failed to match any schema"):
             torch.ops.aten.add("a", 1)
         self.assertEqual("ab", torch.ops.aten.add("a", "b"))
@@ -1950,6 +2315,8 @@ graph(%Ra, %Rb):
         self.assertEqual(a + 1, torch.ops.aten.add(a, 1))
 
     def test_torch_ops_kwonly(self):
+        # [FUNCTION DOC] The ops aten add rejects a third positional argument for a keyword-only
+        # parameter, while prod with a positional dim matches eager.
         a, b = torch.rand(3, 4), torch.rand(3, 4)
         with self.assertRaisesRegex(RuntimeError, "positional argument"):
             torch.ops.aten.add(a, b, 2)
@@ -1957,10 +2324,15 @@ graph(%Ra, %Rb):
         self.assertEqual(a.prod(1), torch.ops.aten.prod(a, 1))
 
     def test_torch_complex(self):
+        # [FUNCTION DOC] checkScript of complex construction from real and imaginary parts, with
+        # and without an out tensor, over many shapes (broadcast, empty, float32 and float64).
         def fn(real, img):
+            # [FUNCTION DOC] HELPER: Build a complex tensor from real and imaginary parts.
             return torch.complex(real, img)
 
         def fn_out(real, img, out):
+            # [FUNCTION DOC] HELPER: Build a complex tensor from real and imaginary parts
+            # into out.
             return torch.complex(real, img, out=out)
         self.checkScript(fn, (torch.rand(3, 4), torch.rand(3, 4), ))
         self.checkScript(fn, (torch.ones(5, 1, 4), torch.ones(5, 1, 4), ))
@@ -2009,17 +2381,26 @@ graph(%Ra, %Rb):
         self.checkScript(fn_out, (real, img, out, ))
 
     def test_einsum(self):
+        # [FUNCTION DOC] Scripted and traced einsum in equation, varargs and sublist formats must
+        # keep an einsum op in the graph and equal eager results.
         def check(fn, jitted, *args):
+            # [FUNCTION DOC] HELPER: Assert the jitted graph contains an einsum node and results
+            # equal eager.
             self.assertGraphContains(jitted.graph, kind='aten::einsum')
             self.assertEqual(fn(*args), jitted(*args))
 
         def equation_format(x, y):
+            # [FUNCTION DOC] HELPER: Outer product via einsum with operands given as a tuple.
             return torch.einsum('i,j->ij', (x, y))
 
         def equation_format_varargs(x, y):
+            # [FUNCTION DOC] HELPER: Outer product via einsum with operands given as
+            # separate arguments.
             return torch.einsum('i,j->ij', x, y)
 
         def sublist_format(x, y):
+            # [FUNCTION DOC] HELPER: Outer product via einsum using the sublist (index
+            # list) format.
             return torch.einsum(x, [0], y, [1], [0, 1])
 
         x = make_tensor((5,), dtype=torch.float32, device="cpu")
@@ -2031,6 +2412,9 @@ graph(%Ra, %Rb):
 
     @skipIfTorchDynamo("TorchDynamo fails with unknown reason")
     def test_python_ivalue(self):
+        # [FUNCTION DOC] Check python objects (numpy array, function) can be stored as an
+        # IValue and converted back unchanged, and that reference counts are balanced after the
+        # round trip.
         # Test if pure python object can be hold as IValue and conversion
         # between IValue and PyObject are correct
         # test for numpy object
@@ -2046,6 +2430,8 @@ graph(%Ra, %Rb):
         # we need to ensure IValue correctly call incref/decref to avoid
         # dangling behavior and potential memory leaks during conversions
         def test_func_scope_helper(inp):
+            # [FUNCTION DOC] HELPER: Round trip a python object through an IValue, assert
+            # refcount grew by one, and return the held object plus one.
             # create a scope and do the conversion -> ivalue -> pyobject
             # this func return a new pyobject that refcount + 1
             inp_refcount = sys.getrefcount(inp)
@@ -2063,9 +2449,15 @@ graph(%Ra, %Rb):
         self.assertEqual(before_count, after_count)
 
     def test_decompose_addmm(self):
+        # [FUNCTION DOC] Check the decompose_ops pass rewrites addmm with constant alpha and beta
+        # of 1 but leaves it unchanged for non-constant-one scalars.
         def does_decompose():
+            # [FUNCTION DOC] HELPER: Script addmm calls, run the pass, check the output is
+            # unchanged and no addmm node is left in the graph.
             @torch.jit.script
             def addmm(mat, mat1, mat2):
+                # [FUNCTION DOC] HELPER: Sum of two addmm calls, one default and one with alpha
+                # and beta 1.0.
                 a = mat.addmm(mat1, mat2)
                 b = mat.addmm(mat1, mat2, alpha=1.0, beta=1.0)
                 return a + b
@@ -2081,8 +2473,12 @@ graph(%Ra, %Rb):
             FileCheck().check_not("addmm").run(str(addmm.graph))
 
         def doesnt_decompose():
+            # [FUNCTION DOC] HELPER: Script addmm with non-trivial scalars and assert the pass
+            # leaves the graph text unchanged.
             @torch.jit.script
             def addmm(mat, mat1, mat2, alpha, beta):
+                # [FUNCTION DOC] HELPER: Sum of two addmm calls with alpha and beta constant or
+                # runtime ints.
                 a = mat.addmm(mat1, mat2, alpha=4.20, beta=2.0)
                 b = mat.addmm(mat1, mat2, alpha=int(alpha), beta=int(beta))
 
@@ -2097,12 +2493,17 @@ graph(%Ra, %Rb):
 
     @suppress_warnings
     def test_sparse_tensors(self):
+        # [FUNCTION DOC] Check scripting with sparse tensors: is_sparse attribute, returning a
+        # sparse tensor from an ignored function, sparse sum, mm and addmm (with and without
+        # alpha, beta).
         @torch.jit.ignore
         def get_sparse():
+            # [FUNCTION DOC] HELPER: Return an empty sparse COO tensor of shape 2x3.
             return torch.sparse_coo_tensor((2, 3), dtype=torch.float32)
 
         @torch.jit.script
         def test_is_sparse(input):
+            # [FUNCTION DOC] HELPER: Return whether the input tensor is sparse.
             # type: (Tensor) -> bool
             return input.is_sparse
 
@@ -2112,6 +2513,7 @@ graph(%Ra, %Rb):
         self.assertEqual(script_out_is_dense, False)
 
         def test_basic_sparse(input):
+            # [FUNCTION DOC] HELPER: Return a sparse tensor and the input as a pair.
             output = get_sparse()
             return output, input
 
@@ -2119,19 +2521,23 @@ graph(%Ra, %Rb):
         self.checkScript(test_basic_sparse, (torch.tensor([1]),))
 
         def test_sparse_sum(input):
+            # [FUNCTION DOC] HELPER: Sum a sparse tensor.
             return torch.sparse.sum(input)
 
         self.checkScript(test_sparse_sum, (get_sparse(),))
 
         def test_sparse_mm(input1, input2):
+            # [FUNCTION DOC] HELPER: Sparse-dense matrix multiply.
             return torch.sparse.mm(input1, input2)
 
         self.checkScript(test_sparse_mm, (get_sparse(), torch.randn(3, 4)))
 
         def test_sparse_addmm(input, input1, input2):
+            # [FUNCTION DOC] HELPER: Sparse addmm of input, input1 and input2.
             return torch.sparse.addmm(input, input1, input2)
 
         def test_sparse_addmm_alpha_beta(input, input1, input2):
+            # [FUNCTION DOC] HELPER: Sparse addmm with alpha 1.3 and beta 1.5.
             return torch.sparse.addmm(input, input1, input2, alpha=1.3, beta=1.5)
 
         self.checkScript(test_sparse_addmm, (torch.randn(2, 4), get_sparse(), torch.randn(3, 4)))
@@ -2139,12 +2545,16 @@ graph(%Ra, %Rb):
 
     @suppress_warnings
     def test_sparse_csr_tensors(self):
+        # [FUNCTION DOC] Check scripted is_sparse_csr returns true for a CSR tensor and false for
+        # a dense tensor.
         @torch.jit.ignore
         def get_sparse_csr():
+            # [FUNCTION DOC] HELPER: Return a random 3x3 tensor converted to CSR layout.
             return torch.randn(3, 3).to_sparse_csr()
 
         @torch.jit.script
         def test_is_sparse_csr(input):
+            # [FUNCTION DOC] HELPER: Return whether the input tensor uses CSR layout.
             # type: (Tensor) -> bool
             return input.is_sparse_csr
 
@@ -2156,19 +2566,26 @@ graph(%Ra, %Rb):
 
     @unittest.skipIf(not RUN_CUDA, "requires CUDA")
     def test_device_not_equal(self):
+        # [FUNCTION DOC] checkScript of device inequality against a constant and between two
+        # devices. Needs CUDA.
 
         def compare_device(x: torch.device):
+            # [FUNCTION DOC] HELPER: Return whether the device differs from cuda:0.
             return x != torch.device("cuda:0")
 
         def compare_two_device(x: torch.device, y: torch.device):
+            # [FUNCTION DOC] HELPER: Return whether two devices differ.
             return x != y
 
         self.checkScript(compare_device, (torch.device("cuda:0"),))
         self.checkScript(compare_two_device, (torch.device("cuda:0"), torch.device("cuda:1"), ))
 
     def test_constant_prop_simple(self):
+        # [FUNCTION DOC] Constant propagation must fold integer arithmetic leaving one constant 8
+        # and no add or mul nodes, with output unchanged.
         @torch.jit.script
         def constant_prop(input_int):
+            # [FUNCTION DOC] HELPER: Compute constant arithmetic then subtract the integer input.
             # type: (int) -> int
             a = 2 * 3
             b = a + 2
@@ -2184,8 +2601,12 @@ graph(%Ra, %Rb):
         self.assertEqual(const, 8)
 
     def test_constant_prop_nested(self):
+        # [FUNCTION DOC] Constant propagation must reduce both branches of a conditional on a
+        # runtime value to only constant nodes.
         @torch.jit.script
         def constant_prop(a):
+            # [FUNCTION DOC] HELPER: Branch on a tensor comparison and compute a constant in
+            # each branch.
             b = 2 + 1
             if bool(a < 2):
                 c = b + 2
@@ -2202,8 +2623,11 @@ graph(%Ra, %Rb):
                 self.assertTrue(node.kind() == "prim::Constant")
 
     def test_constant_prop_print(self):
+        # [FUNCTION DOC] Constant propagation must keep the print node and fold its argument
+        # to 6.
         @torch.jit.script
         def constant_prop(input_tensor):
+            # [FUNCTION DOC] HELPER: Print a constant, then add constants and the input tensor.
             a = 2 * 3
             print(a)
             b = a + 2
@@ -2215,8 +2639,11 @@ graph(%Ra, %Rb):
         self.assertTrue(print_node.input().toIValue() == 6)
 
     def test_constant_prop_rand(self):
+        # [FUNCTION DOC] Constant propagation must not fold a random op: randn must remain in
+        # the graph.
         @torch.jit.script
         def constant_prop():
+            # [FUNCTION DOC] HELPER: Return a random tensor plus two.
             a = torch.randn([3])
             b = a + 2
             return b
@@ -2225,13 +2652,18 @@ graph(%Ra, %Rb):
         self.assertTrue("aten::randn" in str(constant_prop.graph))
 
     def test_constant_prop_none(self):
+        # [FUNCTION DOC] After constant propagation the graph with typed None calls still
+        # has constants.
         @torch.jit.script
         def typed_none():
+            # [FUNCTION DOC] HELPER: Return None, typed as an optional int.
             # type: () -> Optional[int]
             return None
 
         @torch.jit.script
         def constant_prop():
+            # [FUNCTION DOC] HELPER: Branch on whether two None results are None and return
+            # an int.
             a = typed_none()
             b = typed_none()
             if (a is None and b is None):
@@ -2244,8 +2676,12 @@ graph(%Ra, %Rb):
         FileCheck().check("prim::Constant").run(constant_prop.graph)
 
     def test_constant_prop_if_inline(self):
+        # [FUNCTION DOC] Constant propagation must inline a conditional on a constant without
+        # evaluating the dead branch (which would divide by zero).
         @torch.jit.script
         def constant_prop():
+            # [FUNCTION DOC] HELPER: Constant condition choosing between a safe and a
+            # division-by-zero branch.
             cond = True
             a = 1
             if cond:
@@ -2258,8 +2694,12 @@ graph(%Ra, %Rb):
         self.run_pass('constant_propagation', constant_prop.graph)
 
     def test_constant_prop_exception(self):
+        # [FUNCTION DOC] Constant propagation must not fail on an out-of-range index in a branch
+        # that is not taken at runtime.
         # checking y = a[4] does not error in constant propagation
         def bad_index(x):
+            # [FUNCTION DOC] HELPER: Return an out-of-range list element only when the flag
+            # is set.
             # type: (bool)
             y = 0
             if x:
@@ -2270,14 +2710,19 @@ graph(%Ra, %Rb):
         self.checkScript(bad_index, (False,))
 
     def test_constant_prop_aliasing_type(self):
+        # [FUNCTION DOC] Constant propagation keeps tensor creation and length ops (aliasing
+        # kinds) and folds a conditional on equal constants so no conditional remains.
         @torch.jit.script
         def foo():
+            # [FUNCTION DOC] HELPER: Return the lengths of a list literal and a
+            # one-element tensor.
             return len([1]), len(torch.tensor([2]))
 
         FileCheck().check_dag("aten::tensor").check_dag("aten::len").run(foo.graph)
 
         @torch.jit.script
         def fn():
+            # [FUNCTION DOC] HELPER: Return 1 when comparing equal constants, else 2.
             if 1 == 1:
                 return 1
             else:
@@ -2286,7 +2731,11 @@ graph(%Ra, %Rb):
         FileCheck().check_not("prim::If").run(fn.graph)
 
     def test_unchecked_cast(self):
+        # [FUNCTION DOC] checkScript of a function that conditionally holds an optional alias to
+        # a tensor and writes through it after a None check.
         def test(cond):
+            # [FUNCTION DOC] HELPER: Set b to None or a, and if not None assign into its
+            # first element.
             # type: (bool)
             a = torch.tensor([10])
             if cond:
@@ -2301,8 +2750,13 @@ graph(%Ra, %Rb):
         self.checkScript(test, (False,))
 
     def test_constant_prop_if_constant(self):
+        # [FUNCTION DOC] Constant propagation on nested conditionals: the constant condition
+        # is inlined, leaving an outer conditional with two outputs and an inner one with
+        # one output.
         @torch.jit.script
         def constant_prop(a, b):
+            # [FUNCTION DOC] HELPER: Nested conditionals updating three counters, some with
+            # constant conditions.
             c0 = 1
             c1 = 1
             c2 = 1
@@ -2333,8 +2787,13 @@ graph(%Ra, %Rb):
         self.assertTrue(second_if.findNode("prim::If") is None)
 
     def test_constant_prop_loop_constant(self):
+        # [FUNCTION DOC] Constant propagation on loops: loops with constant false or non-positive
+        # trip counts are removed, others keep their bodies, and four print nodes with one pooled
+        # string remain.
         @torch.jit.script
         def constant_prop(cond, iter):
+            # [FUNCTION DOC] HELPER: Several loops with constant, runtime and removable trip
+            # counts printing.
             # type: (bool, int) -> int
             b = 0
             while True:
@@ -2360,8 +2819,12 @@ graph(%Ra, %Rb):
         self.assertTrue(graph.count("prim::Print") == 4)
 
     def test_constant_prop_remove_output(self):
+        # [FUNCTION DOC] Constant propagation must drop loop-carried values that are never
+        # changed, so the loop keeps two outputs.
         @torch.jit.script
         def constant_prop(iter):
+            # [FUNCTION DOC] HELPER: Loop with three variables, one set under a
+            # never-true condition.
             # type: (int) -> None
             a = 1
             b = 1
@@ -2380,6 +2843,10 @@ graph(%Ra, %Rb):
 
     # TODO(gmagogsfm): Refactor this test to reduce complexity.
     def test_constant_insertion(self):
+        # [FUNCTION DOC] Build many functions returning constants (primitives, lists, tuples,
+        # dicts, empties of fixed types) from a template, compile them, and check constant
+        # propagation yields a single constant, export/import keeps the value, and node hashing
+        # keeps distinct constants separate under common subexpression elimination.
         funcs_template = dedent('''
         def func():
             return {constant_constructor}
@@ -2388,6 +2855,9 @@ graph(%Ra, %Rb):
         # constants: primitives: int, double, bool, str, lists of primitives,
         # and tuples
         def check_constant(constant_constructor):
+            # [FUNCTION DOC] HELPER: Compile a function returning the constant text, run the
+            # pass, check one constant remains, results equal the python eval result, and an
+            # exported copy agrees.
             scope = {}
             funcs_str = funcs_template.format(constant_constructor=constant_constructor)
             execWrapper(funcs_str, globals(), scope)
@@ -2475,22 +2945,29 @@ graph(%Ra, %Rb):
 
     @unittest.skipIf(not RUN_CUDA, "requires CUDA")
     def test_cuda_export_restore(self):
+        # [FUNCTION DOC] Export/import a script module on CUDA and compare outputs. Needs CUDA.
         class Sub(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module that adds a random parameter to its input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random 3x4 parameter.
                 super().__init__()
                 self.weight = nn.Parameter(torch.randn(3, 4))
 
             @torch.jit.script_method
             def forward(self, thing):
+                # [FUNCTION DOC] HELPER: Return the parameter plus the input.
                 return self.weight + thing
 
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module wrapping a Sub submodule.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the submodule.
                 super().__init__()
                 self.mod = Sub()
 
             @torch.jit.script_method
             def forward(self, v):
+                # [FUNCTION DOC] HELPER: Return the submodule output for the input.
                 return self.mod(v)
         m = M()
         m.cuda()
@@ -2501,6 +2978,8 @@ graph(%Ra, %Rb):
 
     @slowTest
     def test_export_batchnorm(self):
+        # [FUNCTION DOC] For eval and train mode and 1d/2d batch norm with and without affine,
+        # trace, export/import and compare outputs. Slow.
         for mode in ['eval', 'train']:
             for clazz in [
                     torch.nn.BatchNorm1d(100),
@@ -2517,13 +2996,20 @@ graph(%Ra, %Rb):
                 self.assertEqual(traced(x), imported(x))
 
     def test_export_rnn(self):
+        # [FUNCTION DOC] Trace RNN and GRU modules using packed sequences, export/import, and
+        # compare outputs on a batch with a different maximum sequence length.
         for clazz in [nn.RNN(10, 20, 2), nn.GRU(10, 20, 2)]:
             class RNNTest(torch.nn.Module):
+                # [CLASS DOC] HELPER: Module packing a padded batch, running the captured
+                # recurrent layer, and unpacking.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Store the recurrent layer from the enclosing loop.
                     super().__init__()
                     self.rnn = clazz
 
                 def forward(self, x, lengths, h0):
+                    # [FUNCTION DOC] HELPER: Pack by lengths, run the layer with h0, and return
+                    # the padded outputs.
                     packed = torch.nn.utils.rnn.pack_padded_sequence(x, lengths)
                     out, h = self.rnn(packed, h0)
                     padded_outs, _ = torch.nn.utils.rnn.pad_packed_sequence(out)
@@ -2540,12 +3026,19 @@ graph(%Ra, %Rb):
             self.assertEqual(traced(x, lengths, h0), imported(x, lengths, h0))
 
     def test_export_lstm(self):
+        # [FUNCTION DOC] Trace an LSTM using packed sequences, export/import it, and compare
+        # outputs on a batch with a different maximum sequence length.
         class LSTMTest(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module packing a padded batch, running a two-layer LSTM,
+            # and unpacking.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a two-layer LSTM from 10 to 20 features.
                 super().__init__()
                 self.rnn = nn.LSTM(10, 20, 2)
 
             def forward(self, x, lengths, hiddens):
+                # [FUNCTION DOC] HELPER: Pack by lengths, run the LSTM with the (h0, c0) pair,
+                # return padded outputs.
                 h0, c0 = hiddens
                 packed = torch.nn.utils.rnn.pack_padded_sequence(x, lengths)
                 out, (h, c) = self.rnn(packed, (h0, c0))
@@ -2563,14 +3056,20 @@ graph(%Ra, %Rb):
         self.assertEqual(traced(x, lengths, (h0, c0)), imported(x, lengths, (h0, c0)))
 
     def test_unique_state_dict(self):
+        # [FUNCTION DOC] A module registering one parameter under two names must produce a unique
+        # state dict with a single entry, with or without keeping variables.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module registering one shared parameter under two names
+            # (w1, w2).
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create one parameter and register it twice.
                 super().__init__()
                 shared_param = torch.nn.Parameter(torch.ones(1))
                 self.register_parameter('w1', shared_param)
                 self.register_parameter('w2', shared_param)
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Return the input plus both registered parameters.
                 return input + self.w1 + self.w2
 
         model = MyModule()
@@ -2580,6 +3079,8 @@ graph(%Ra, %Rb):
             self, len(torch.jit._unique_state_dict(model, keep_vars=True)), 1)
 
     def test_export_dropout(self):
+        # [FUNCTION DOC] Trace an eval-mode dropout without trace checking, export/import it, and
+        # compare outputs.
         test = torch.nn.Dropout()
         test.eval()
 
@@ -2589,8 +3090,12 @@ graph(%Ra, %Rb):
         self.assertEqual(traced(x), imported(x))
 
     def test_pretty_printer(self):
+        # [FUNCTION DOC] Script several control-flow functions (if, while, nested, ignored python
+        # call, empty lists, odd print string) and compare each printed code against stored
+        # expected text.
         @torch.jit.script
         def if_test(a, b):
+            # [FUNCTION DOC] HELPER: Pick the larger of a and b through a conditional.
             # FIXME: use 0 instead of a.
             # c = 0
             c = a
@@ -2602,6 +3107,7 @@ graph(%Ra, %Rb):
 
         @torch.jit.script
         def if_one(a, b):
+            # [FUNCTION DOC] HELPER: Conditional that conditionally replaces b by a.
             c = b
             if bool(a < b):
                 c = a
@@ -2609,6 +3115,7 @@ graph(%Ra, %Rb):
 
         @torch.jit.script
         def while_test(a, i):
+            # [FUNCTION DOC] HELPER: Square the value in a loop while a counter is below three.
             while bool(i < 3):
                 a *= a
                 i += 1
@@ -2616,6 +3123,7 @@ graph(%Ra, %Rb):
 
         @torch.jit.script
         def while_if_test(a, b):
+            # [FUNCTION DOC] HELPER: While loop containing a conditional that sets c to 2 or 3.
             c = 0
             while bool(a < 10):
                 a = a + 1
@@ -2628,6 +3136,7 @@ graph(%Ra, %Rb):
 
         @torch.jit.script
         def loop_use_test(y):
+            # [FUNCTION DOC] HELPER: Loop updating y and z where z is reassigned from x.
             x = y + 1
             z = x + 5
             while bool(y < 8):
@@ -2637,23 +3146,29 @@ graph(%Ra, %Rb):
 
         @torch.jit.ignore
         def python_fn(x):
+            # [FUNCTION DOC] HELPER: Ignored python function returning the input plus ten.
             return x + 10
 
         @torch.jit.script
         def python_op_name_test(y):
+            # [FUNCTION DOC] HELPER: Script function calling the ignored python function.
             return python_fn(y)
 
         @torch.jit.script
         def empty_int_list_test(y):
+            # [FUNCTION DOC] HELPER: Index into an annotated empty int list.
             x = torch.jit.annotate(List[int], [])
             return x[0]
 
         @torch.jit.script
         def empty_float_list_test(y):
+            # [FUNCTION DOC] HELPER: Return a literal list of three floats.
             return [1.0, 2.0, 3.0]
 
         @torch.jit.script
         def print_weird_test(y):
+            # [FUNCTION DOC] HELPER: Print a string containing an escaped
+            # non-printable character.
             print("hi\016")
 
         self.assertExpected(if_test.code, "if_test")
@@ -2667,6 +3182,8 @@ graph(%Ra, %Rb):
         self.assertExpected(print_weird_test.code, "print_weird_test")
 
     def test_cu_escaped_number(self):
+        # [FUNCTION DOC] Compile a function from source text printing an escaped character and
+        # compare its printed code to expected text.
         cu = torch.jit.CompilationUnit('''
             def foo(a):
                 print("hi\016")
@@ -2674,10 +3191,14 @@ graph(%Ra, %Rb):
         self.assertExpected(cu.foo.code)
 
     def test_import_method(self):
+        # [FUNCTION DOC] Save a script module and load it with emit hooks disabled, then compare
+        # the loaded forward code to stored expected text.
         with torch._jit_internal._disable_emit_hooks():
             class Foo(torch.jit.ScriptModule):
+                # [CLASS DOC] HELPER: Script module computing twice x plus y.
                 @torch.jit.script_method
                 def forward(self, x, y):
+                    # [FUNCTION DOC] HELPER: Return two times x plus y.
                     return 2 * x + y
 
             foo = Foo()
@@ -2690,13 +3211,20 @@ graph(%Ra, %Rb):
 
     @unittest.skip("temporarily disable the test for fwd compatibility")
     def test_non_ascii_string(self):
+        # [FUNCTION DOC] Save/load a module with non-ascii string attribute and literal and
+        # compare the code. Skipped for forward compatibility.
         class Foo(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a non-ascii string attribute and
+            # non-ascii literal.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Store a non-ascii string attribute.
                 super().__init__()
                 self.a = "Over \u0e55\u0e57 57"
 
             @torch.jit.script_method
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Return the string attribute concatenated with a
+                # non-ascii literal.
                 return self.a + "hi\xA1"
 
         foo = Foo()
@@ -2708,6 +3236,10 @@ graph(%Ra, %Rb):
         self.assertExpected(foo_loaded.forward.code)
 
     def test_function_default_values(self):
+        # [FUNCTION DOC] Check default argument values of scripted functions: values captured
+        # from the enclosing scope (including computed ones), tensor flags, None defaults with
+        # optional type comments, and type-hinted defaults; mismatched defaults raise
+        # RuntimeError about the expected default value.
         outer_var = torch.tensor(20)
         outer_var2 = torch.tensor(30)
         a = torch.tensor(0.5)
@@ -2715,6 +3247,7 @@ graph(%Ra, %Rb):
 
         @torch.jit.script
         def simple_fn(x, a=a, b=b, c=outer_var + outer_var2):
+            # [FUNCTION DOC] HELPER: Add x and defaults a, b and a computed default c.
             return x + a + b + c
 
         self.assertEqual(
@@ -2729,6 +3262,8 @@ graph(%Ra, %Rb):
 
         @torch.jit.script
         def bool_fn(x, a=outer_c, flag=outer_flag):
+            # [FUNCTION DOC] HELPER: Return x, or x plus a, depending on a tensor bool
+            # flag default.
             if bool(flag):
                 result = x
             else:
@@ -2742,6 +3277,7 @@ graph(%Ra, %Rb):
 
         @torch.jit.script
         def none_fn(x=None):
+            # [FUNCTION DOC] HELPER: Return the optional int argument unchanged (default None).
             # type: (Optional[int]) -> Optional[int]
             return x
 
@@ -2750,6 +3286,7 @@ graph(%Ra, %Rb):
 
         @torch.jit.script
         def hints(x, a=0.5, b=10):
+            # [FUNCTION DOC] HELPER: Add float and int defaults to a tensor.
             # type: (Tensor, float, int) -> Tensor
             return x + a + b
 
@@ -2759,35 +3296,50 @@ graph(%Ra, %Rb):
 
             @torch.jit.script
             def hints_bad_types(x, a=10, b=0.5):  # noqa: T484
+                # [FUNCTION DOC] HELPER: Function whose type comment disagrees with its defaults;
+                # scripting it must fail.
                 # type: (Tensor, float, int) -> Tensor
                 return x + a + b
         with self.assertRaisesRegex(RuntimeError, "Expected a default value"):
             @torch.jit.script
             def bad_no_optional(x=None):
+                # [FUNCTION DOC] HELPER: Function with a None default but a non-optional dict
+                # signature comment; scripting it must fail.
                 # type: (Dict[str, int]) -> Dict[str, int]
                 return x
 
 
     def test_module_default_values(self):
+        # [FUNCTION DOC] A script method with a tensor default value argument must use the
+        # default when not passed.
         four = torch.tensor(4)
 
         class Test(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module whose forward has a tensor default argument.
             @torch.jit.script_method
             def forward(self, input, other=four):
+                # [FUNCTION DOC] HELPER: Return the input plus the other argument (default is a
+                # captured tensor).
                 return input + other
 
         t = Test()
         self.assertEqual(t(torch.ones(1)), torch.ones(1) + 4)
 
     def test_mutable_default_values(self):
+        # [FUNCTION DOC] Scripting a function or module with a mutable (list-containing) default
+        # must raise an exception mentioning mutable default parameters.
         with self.assertRaisesRegex(Exception, "Mutable default parameters"):
             @torch.jit.script
             def foo(x=(1, [])):
+                # [FUNCTION DOC] HELPER: Function with a tuple default containing a list;
+                # scripting must fail.
                 # type: (Tuple[int, List[Tensor]])
                 return x
 
         class Test(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward has an empty list default argument.
             def forward(self, input=[]):  # noqa: B006
+                # [FUNCTION DOC] HELPER: Return the list argument.
                 return input
 
         with self.assertRaisesRegex(Exception, "Mutable default parameters"):
@@ -2795,15 +3347,20 @@ graph(%Ra, %Rb):
 
     @skipIfTorchDynamo("TorchDynamo fails with unknown reason")
     def test_warnings(self):
+        # [FUNCTION DOC] Check python warnings emitted from a scripted function and module match
+        # the eager warning text, and the module warns exactly once. Skipped under dynamo.
         import warnings
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Warn when the input is below two, then return it.
             if bool(x < 2):
                 warnings.warn("x is less than 2")
             return x
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that warns in forward when the input is below two.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Warn when the input is below two, then return it.
                 if bool(x < 2):
                     warnings.warn("x is less than 2")
                 return x
@@ -2826,9 +3383,12 @@ graph(%Ra, %Rb):
         self.assertEqual(str(warns[0].message), str(script_mod_warns[0].message))
 
     def test_no_erroneous_warnings(self):
+        # [FUNCTION DOC] Scripting and running a function whose warning branch is not taken must
+        # emit no warnings (apart from the script deprecation notice, which is filtered out).
         import warnings
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Warn and increment only when the input is positive.
             if bool(x > 0):
                 warnings.warn('This should NOT be printed')
                 x += 1
@@ -2847,9 +3407,13 @@ graph(%Ra, %Rb):
 
     @unittest.skipIf(True, "TODO: re-enable with https://github.com/pytorch/pytorch/pull/29339")
     def test_torch_load_error(self):
+        # [FUNCTION DOC] torch.load of a saved script module should raise an error mentioning
+        # zip. Skipped unconditionally pending a re-enable.
         class J(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module adding 100 to its input.
             @torch.jit.script_method
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Return the input plus 100.
                 return input + 100
 
         j = J()
@@ -2859,8 +3423,11 @@ graph(%Ra, %Rb):
                 torch.load(fname)
 
     def test_torch_load_zipfile_check(self):
+        # [FUNCTION DOC] Save a script function to a temporary file and check the file is
+        # recognized as a zip archive by the serialization helper.
         @torch.jit.script
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the input plus ten.
             return x + 10
 
         with TemporaryFileName() as fname:
@@ -2869,9 +3436,14 @@ graph(%Ra, %Rb):
                 self.assertTrue(torch.serialization._is_zipfile(f))
 
     def test_python_bindings(self):
+        # [FUNCTION DOC] Script an LSTM loop, run it with backward, and walk all nodes and blocks
+        # of the forward graph checking the python bindings expose types, inputs, outputs, return
+        # and param nodes. Stores the graph in a module-level global.
         lstm_cell = torch.jit.script(LSTMCellS)
 
         def lstm(x, hx, cx, w_ih, w_hh, b_ih, b_hh):
+            # [FUNCTION DOC] HELPER: Run the scripted LSTM cell over each time step, returning
+            # the final hx.
             for i in range(x.size(0)):
                 hx, cx = lstm_cell(x[i], hx, cx, w_ih, w_hh, b_ih, b_hh)
             return hx
@@ -2908,27 +3480,37 @@ graph(%Ra, %Rb):
         self.assertTrue(tested_blocks)
 
     def test_export_opnames(self):
+        # [FUNCTION DOC] Check export_opnames for a nested script module lists the add and mul
+        # ops used.
         class Foo(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with helper methods one (add) and two (double)
+            # used by forward.
             def one(self, x, y):
+                # [FUNCTION DOC] HELPER: Return x plus y.
                 # type: (Tensor, Tensor) -> Tensor
                 return x + y
 
             def two(self, x):
+                # [FUNCTION DOC] HELPER: Return twice x.
                 # type: (Tensor) -> Tensor
                 return 2 * x
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return one applied to two of x and x.
                 # type: (Tensor) -> Tensor
                 return self.one(self.two(x), x)
 
         class Bar(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module delegating to a submodule of the previous class.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the Foo submodule.
                 super().__init__()
                 self.sub = Foo()
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the submodule forward result.
                 # type: (Tensor) -> Tensor
                 return self.sub.forward(x)
 
@@ -2938,6 +3520,8 @@ graph(%Ra, %Rb):
         self.assertTrue(set(expected).issubset(set(ops)))
 
     def test_pytorch_jit_env_off(self):
+        # [FUNCTION DOC] Launch a subprocess importing torch with the environment variable
+        # disabling the jit set to 0; raises RuntimeError if the import fails.
         import subprocess
         env = os.environ.copy()
         env['PYTORCH_JIT'] = '0'
@@ -2947,6 +3531,7 @@ graph(%Ra, %Rb):
             raise RuntimeError("Could not 'import torch' with PYTORCH_JIT=0") from e
 
     def test_print_op_module(self):
+        # [FUNCTION DOC] The string form of the torch ops module must contain the word ops.
         # Issue #19351: python2 and python3 go through different paths.
         # python2 returns '<module 'torch.ops' (built-in)>'
         # python3 uses __file__ and return
@@ -2955,18 +3540,24 @@ graph(%Ra, %Rb):
         self.assertRegex(s, r'ops')
 
     def test_print_classes_module(self):
+        # [FUNCTION DOC] The string form of the torch classes module must contain the
+        # word classes.
         s = str(torch.classes)
         self.assertRegex(s, r'classes')
 
     def test_print_torch_ops_modules(self):
+        # [FUNCTION DOC] The string form of nested ops namespaces and ops must mention torch.ops.
         s = str(torch._ops.ops.quantized)
         self.assertRegex(s, r'torch.ops')
         s = str(torch._ops.ops.atan)
         self.assertRegex(s, r'torch.ops')
 
     def test_hide_source_ranges_context_manager(self):
+        # [FUNCTION DOC] Check a graph repr includes source ranges, the hide-source-ranges
+        # context manager removes them (unless explicitly requested), and they return afterwards.
         @torch.jit.script
         def foo(x):
+            # [FUNCTION DOC] HELPER: Return the tensor added to itself.
             return torch.add(x, x)
 
         graph = foo.graph
@@ -2979,15 +3570,29 @@ graph(%Ra, %Rb):
 
 
 class TestFrontend(JitTestCase):
+    # [CLASS DOC] Tests for errors raised by the scripting frontend and for tracing with keyword
+    # example inputs.
 
     def test_instancing_error(self):
+        # [FUNCTION DOC] Scripting a module that instantiates an ignored (unscriptable) class
+        # must raise FrontendError whose message says the class cannot be instantiated and quotes
+        # the forward source.
+        # KNOWN ISSUE: the assertion checks quoted source text, so the forward block is above its
+        # def line.
         @torch.jit.ignore
         class MyScriptClass:
+            # [CLASS DOC] HELPER: Class marked ignored whose method would not script (adds a
+            # string and int).
             def unscriptable(self):
+                # [FUNCTION DOC] HELPER: Method that would fail at runtime (string plus int);
+                # never compiled.
                 return "a" + 200
 
 
         class TestModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward instantiates the ignored class.
+            # [FUNCTION DOC] HELPER: Return a new instance of the ignored class, which
+            # scripting rejects.
             def forward(self, x):
                 return MyScriptClass()
 
@@ -3000,15 +3605,24 @@ class TestFrontend(JitTestCase):
         checker.run(str(cm.exception))
 
     def test_dictionary_as_example_inputs_for_jit_trace(self):
+        # [FUNCTION DOC] Trace modules and a function with example keyword inputs given as dicts
+        # (with trace_module too), run the traced objects with keyword arguments, and check
+        # results and the missing-argument errors raised when a keyword name is wrong.
         class TestModule_v1(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward takes many optional keywords and sums
+            # three of them.
             def forward(self, key2=None, key3=None, key4=None, key5=None, key1=None, key6=None):
+                # [FUNCTION DOC] HELPER: Return key1 plus key2 plus key3.
                 return key1 + key2 + key3
 
         class TestModule_v2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module adding its two inputs.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Return x plus y.
                 return x + y
 
         def test_func(x, y):
+            # [FUNCTION DOC] HELPER: Return x plus y.
             return x + y
         model_1 = TestModule_v1()
         model_2 = TestModule_v2()
@@ -3035,43 +3649,62 @@ class TestFrontend(JitTestCase):
 
 
 class TestScript(JitTestCase):
+    # [CLASS DOC] Large collection of tests for scripting functions, modules, attributes, control
+    # flow, defaults, classes and the frontend parser.
 
     # Tests that calling torch.jit.script repeated on function is allowed.
     def test_repeated_script_on_function(self):
+        # [FUNCTION DOC] Applying script repeatedly on a function (decorator stacking and
+        # nesting) is allowed.
         @torch.jit.script
         @torch.jit.script
         def fn(x):
+            # [FUNCTION DOC] HELPER: Identity function.
             return x
 
         torch.jit.script(torch.jit.script(fn))
 
     def test_pretty_print_function(self):
+        # [FUNCTION DOC] The printed code of a scripted function calling interpolate
+        # mentions interpolate.
         @torch.jit.script
         def foo(x):
+            # [FUNCTION DOC] HELPER: Call functional interpolate on the input with
+            # default arguments.
             return torch.nn.functional.interpolate(x)
 
         FileCheck().check("interpolate").run(foo.code)
 
     def test_inlined_graph(self):
+        # [FUNCTION DOC] The inlined_graph property of a scripted module must contain the nested
+        # module sub, function add and mul ops in order, so calls are inlined.
         """
         Check that the `inlined_graph` property correctly returns an inlined
         graph, both through function calls and method calls.
         """
         @torch.jit.script
         def foo(x):
+            # [FUNCTION DOC] HELPER: Return the tensor added to itself.
             return torch.add(x, x)
 
         class MyNestedMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module subtracting its input from itself.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the input minus itself.
                 return torch.sub(x, x)
 
 
         class MyMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module chaining a nested module, a script function and
+            # a multiply.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the nested submodule.
                 super().__init__()
                 self.nested = MyNestedMod()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the submodule, then the script function foo, then
+                # square the value.
                 x = self.nested(x)  # sub
                 x = foo(x)  # add
                 return torch.mul(x, x)
@@ -3083,16 +3716,22 @@ class TestScript(JitTestCase):
             .run(m.inlined_graph)
 
     def test_static_method_on_module(self):
+        # [FUNCTION DOC] A static method on a module can be called from forward after scripting
+        # and gives the same result as eager.
         """
         Check that the `@staticmethod` annotation on a function on a module works.
         """
         class MyCell(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a static method computing a tanh cell, called
+            # by forward.
             @staticmethod
             def do_it(x, h):
+                # [FUNCTION DOC] HELPER: Static method returning tanh of x plus h twice.
                 new_h = torch.tanh(x + h)
                 return new_h, new_h
 
             def forward(self, x, h):
+                # [FUNCTION DOC] HELPER: Call the static method.
                 return self.do_it(x, h)
 
         my_cell = torch.jit.script(MyCell())
@@ -3104,16 +3743,21 @@ class TestScript(JitTestCase):
         self.assertEqual(jitted_cell, non_jitted_cell)
 
     def test_code_with_constants(self):
+        # [FUNCTION DOC] code_with_constants on a scripted module returns the same source as code
+        # and a constants table where c0 is the tensor default of the called function.
         """
         Check that the `code_with_constants` property correctly returns graph CONSTANTS in the
         CONSTANTS.cN format used in the output of the `code` property.
         """
         @torch.jit.script
         def foo(x=torch.ones(1)):
+            # [FUNCTION DOC] HELPER: Script function with a tensor default argument; returns x.
             return x
 
         class Moddy(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward calls foo with its default argument.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the result of foo called without arguments.
                 return foo()
 
         m = torch.jit.script(Moddy())
@@ -3123,15 +3767,20 @@ class TestScript(JitTestCase):
         self.assertEqual(src, m.code)
 
     def test_code_with_constants_restore(self):
+        # [FUNCTION DOC] code_with_constants after save and load must give the same source and
+        # the same first constant.
         """
         Check that the `code_with_constants` property correctly works on restoration after save() + load()
         """
         @torch.jit.script
         def foo(x=torch.ones(1)):
+            # [FUNCTION DOC] HELPER: Script function with a tensor default argument; returns x.
             return x
 
         class Moddy(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward calls foo with its default argument.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the result of foo called without arguments.
                 return foo()
 
         m = torch.jit.script(Moddy())
@@ -3145,14 +3794,20 @@ class TestScript(JitTestCase):
 
 
     def test_oneline_func(self):
+        # [FUNCTION DOC] checkScript works on a function defined on one source line.
+        # [FUNCTION DOC] HELPER: One-line identity function (this doc sits above because the body
+        # shares the def line).
         def fn(x): return x
 
         self.checkScript(fn, (torch.ones(2, 2), ))
 
     def test_request_bailout(self):
+        # [FUNCTION DOC] With profiling on, script a loop function, run twice (profile,
+        # optimize), then request each bailout in turn and check results still equal eager.
         with enable_profiling_mode_for_profiling_tests():
 
             def fct_loop(x):
+                # [FUNCTION DOC] HELPER: Concatenate x with itself three times along dim 0.
                 for _ in range(3):
                     x = torch.cat((x, x), 0)
                 return x
@@ -3174,10 +3829,15 @@ class TestScript(JitTestCase):
 
     @unittest.skip("bailouts are being deprecated")
     def test_dominated_bailout(self):
+        # [FUNCTION DOC] Check how many bailout nodes the optimized graph has for dominated
+        # guards, including after a mutation and after grad mode changes. Skipped: bailouts
+        # are deprecated.
         with enable_profiling_mode_for_profiling_tests():
             # functional dominated guard
             @torch.jit.script
             def foo(x):
+                # [FUNCTION DOC] HELPER: Return the last dimension size, or an int when the input
+                # is a scalar.
                 dim = x.dim()
                 if dim == 0:
                     y = int(x)
@@ -3196,6 +3856,8 @@ class TestScript(JitTestCase):
             # dominated guard of non-functional value
             @torch.jit.script
             def foo(x):
+                # [FUNCTION DOC] HELPER: Mutate the input in place, then return 0 or the last
+                # dimension size.
                 dim = x.dim()
                 x.add_(3)
                 if dim == 0:
@@ -3212,14 +3874,18 @@ class TestScript(JitTestCase):
             with torch.enable_grad():
                 @torch.jit.ignore
                 def disable_grad():
+                    # [FUNCTION DOC] HELPER: Ignored python function that turns grad mode off.
                     torch.set_grad_enabled(False)
 
                 @torch.jit.ignore
                 def enable_grad():
+                    # [FUNCTION DOC] HELPER: Ignored python function that turns grad mode on.
                     torch.set_grad_enabled(True)
 
                 @torch.jit.script
                 def foo(x):
+                    # [FUNCTION DOC] HELPER: Add one, turn grad off, compute a size or int, turn
+                    # grad on, return it.
                     x = x + 1
                     dim = x.dim()
                     disable_grad()
@@ -3240,8 +3906,12 @@ class TestScript(JitTestCase):
     @skipIfTorchDynamo("Torchdynamo cannot correctly handle profiler.profile calls")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.PROFILING, "skip if profiling isn't enabled")
     def test_profiling_merge(self):
+        # [FUNCTION DOC] After two profiled runs with different first dimension, the optimized
+        # graph must profile a type with an unknown first dimension. Profiling executor only, not
+        # under dynamo.
         @torch.jit.script
         def test_not_const(x):
+            # [FUNCTION DOC] HELPER: Return 1 if the first dimension is 1, else 2.
             if x.size(0) == 1:
                 return 1
             else:
@@ -3258,8 +3928,11 @@ class TestScript(JitTestCase):
 
 
     def test_nested_bailouts(self):
+        # [FUNCTION DOC] Script and trace a loop function that concatenates its input with
+        # itself; the test only checks both run without error.
         @torch.jit.script
         def fct_loop(x):
+            # [FUNCTION DOC] HELPER: Concatenate x with itself three times along dim 0.
             for _ in range(3):
                 x = torch.cat((x, x), 0)
             return x
@@ -3270,22 +3943,33 @@ class TestScript(JitTestCase):
         out_trace = jit_trace(x)
 
     def test_no_self_arg_ignore_function(self):
+        # [FUNCTION DOC] Scripting a module with an ignored method lacking a self argument must
+        # raise an exception saying there is no self argument.
         class MyModule(nn.Module):
+            # [CLASS DOC] HELPER: Module with an ignored method defined without self, used
+            # in forward.
             @torch.jit.ignore
             def call_np():
+                # [FUNCTION DOC] HELPER: Ignored function returning a random choice of 0 or 1 (no
+                # self parameter).
                 # type: () -> int
                 return np.random.choice(2, p=[.95, .05])
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Return the result of the ignored method.
                 return self.call_np()
 
         with self.assertRaisesRegex(Exception, "does not have a self argument"):
             torch.jit.script(MyModule())
 
     def test_loop_liveness(self):
+        # [FUNCTION DOC] Run a scripted function building a list of tensors in a loop over a
+        # literal list, twice, to exercise liveness handling when profiling.
         with enable_profiling_mode_for_profiling_tests():
             @torch.jit.script
             def f(i):
+                # [FUNCTION DOC] HELPER: Append zero tensors of growing shapes to a list and
+                # return the first.
                 # type: (int) -> Tensor
                 l = []
                 for n in [2, 1]:
@@ -3297,11 +3981,15 @@ class TestScript(JitTestCase):
             f(1)
 
     def test_bailout_loop_carried_deps_name_clash(self):
+        # [FUNCTION DOC] Check bailout handling of loops whose carried variables share names:
+        # results of a loop with counters equal expected values for several inputs.
         with enable_profiling_mode_for_profiling_tests():
             NUM_ITERATIONS = 10
 
             @torch.jit.script
             def fct_loop(z, size):
+                # [FUNCTION DOC] HELPER: Loop building a counters list of i plus j and
+                # concatenating ones.
                 # type: (int, int) -> Tuple[Tensor, List[int]]
                 counters = torch.jit.annotate(List[int], [])
                 j = 0
@@ -3319,11 +4007,15 @@ class TestScript(JitTestCase):
                 self.assertEqual(results[1], expected)
 
     def test_bailout_loop_counter_transition(self):
+        # [FUNCTION DOC] Check bailout handling of the loop counter: counters returned by a
+        # scripted loop equal the range for several inputs.
         with enable_profiling_mode_for_profiling_tests():
             NUM_ITERATIONS = 10
 
             @torch.jit.script
             def fct_loop(z, size):
+                # [FUNCTION DOC] HELPER: Loop appending i to counters and concatenating ones
+                # to y.
                 # type: (int, int) -> Tuple[Tensor, List[int]]
                 counters = torch.jit.annotate(List[int], [])
                 y = torch.ones(2)
@@ -3339,21 +4031,29 @@ class TestScript(JitTestCase):
                 self.assertEqual(results[1], expected)
 
     def test_ignored_method_binding(self):
+        # [FUNCTION DOC] Scripting a module with exported and ignored methods: both view and
+        # modify the same attribute consistently with eager state.
         class Bar(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with an int attribute, exported setter and getter, and
+            # ignored getter.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Initialize the int attribute x to zero.
                 super().__init__()
                 self.x : int = 0
 
             @torch.jit.export
             def setx(self, x : int):
+                # [FUNCTION DOC] HELPER: Exported setter for the x attribute.
                 self.x = x
 
             @torch.jit.export
             def getx(self):
+                # [FUNCTION DOC] HELPER: Exported getter for the x attribute.
                 return self.x
 
             @torch.jit.ignore
             def ignored_getx(self):
+                # [FUNCTION DOC] HELPER: Ignored getter (python call) for the x attribute.
                 return self.x
 
         b = Bar()
@@ -3367,20 +4067,28 @@ class TestScript(JitTestCase):
         self.assertEqual(sb.ignored_getx(), 456)
 
     def test_set_attribute_through_optional(self):
+        # [FUNCTION DOC] An ignored python method may set an optional tensor attribute of a
+        # scripted module; the attribute starts as None and holds the tensor after the call.
         class A(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with an optional tensor attribute set lazily by an
+            # ignored method.
             __annotations__ = {"x": Optional[torch.Tensor]}
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Set the optional tensor attribute to None.
                 super().__init__()
                 self.x = None
 
             @torch.jit.ignore
             def foo(self):
+                # [FUNCTION DOC] HELPER: Ignored method that creates the tensor on first use and
+                # returns it.
                 if self.x is None:
                     self.x = torch.tensor([3])
                 return self.x
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Call the ignored method and return the input plus one.
                 a = self.foo()
                 return x + 1
 
@@ -3390,10 +4098,14 @@ class TestScript(JitTestCase):
         self.assertEqual(m.x, torch.tensor([3]))
 
     def test_mutate_constant(self):
+        # [FUNCTION DOC] Assigning to a constant attribute of a script module must
+        # raise RuntimeError.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module declaring one attribute as a constant.
             __constants__ = ["foo"]
 
             def __init__(self, foo):
+                # [FUNCTION DOC] HELPER: Store the constant attribute foo.
                 super().__init__()
                 self.foo = foo
 
@@ -3404,35 +4116,55 @@ class TestScript(JitTestCase):
             m.foo = 6
 
     def test_class_attribute(self):
+        # [FUNCTION DOC] A class level attribute can be copied to an instance attribute of a
+        # script module.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with class attribute FOO copied into an
+            # instance attribute.
             FOO = 0
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Copy FOO into the foo instance attribute.
                 super().__init__()
                 self.foo = self.FOO
         m = M()
         self.assertEqual(m.foo, M.FOO)
 
     def test_class_attribute_in_script(self):
+        # [FUNCTION DOC] Using a class attribute inside a script method is unsupported:
+        # instantiation must raise RuntimeError.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module whose script method reads a class attribute.
             FOO = 0
 
             @torch.jit.script_method
             def forward(self):
+                # [FUNCTION DOC] HELPER: Return the class attribute FOO.
                 return self.FOO
         with self.assertRaises(RuntimeError):
             M()
 
     def test_not_initialized_err(self):
+        # [FUNCTION DOC] A script module whose constructor does not call the base initializer
+        # must raise RuntimeError on creation.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module that skips the base class constructor.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Set a tensor attribute without calling the
+                # base constructor.
                 self.foo = torch.rand(2, 3)
         with self.assertRaises(RuntimeError):
             M()
 
     def test_attribute_in_init(self):
+        # [FUNCTION DOC] A typed Attribute set in the constructor can be used as a plain
+        # float there.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module storing an annotated float attribute and checking
+            # its value.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Store a float attribute and assert it is greater
+                # than zero.
                 super().__init__()
                 self.foo = torch.jit.Attribute(0.1, float)
                 # we should be able to use self.foo as a float here
@@ -3440,12 +4172,17 @@ class TestScript(JitTestCase):
         M()
 
     def test_scriptable_fn_as_attr(self):
+        # [FUNCTION DOC] checkModule on a module that stores a scriptable function as
+        # an attribute.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that stores a callable and applies it in forward.
             def __init__(self, fn):
+                # [FUNCTION DOC] HELPER: Store the callable.
                 super().__init__()
                 self.fn = fn
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the stored callable to x.
                 return self.fn(x)
 
         m = M(torch.sigmoid)
@@ -3453,6 +4190,9 @@ class TestScript(JitTestCase):
         self.checkModule(m, (inp, ))
 
     def test_sequence_parsing(self):
+        # [FUNCTION DOC] Compile small functions from source text with different list/tuple
+        # literal forms (trailing commas, missing commas, bad for-targets) and assert each either
+        # compiles or raises RuntimeError matching the expected message.
         tests = [
             ("return [x, x,]", True),
             ("return [x x]", "expected ]"),
@@ -3477,29 +4217,42 @@ def foo(x):
                 cu.define(full)
 
     def test_namedtuple_python(self):
+        # [FUNCTION DOC] Check a namedtuple defined at python scope can be used in the return
+        # annotation of an unused function and a script function and in a module forward; the
+        # graph mentions NamedTuple and scripting the module raises no type error. Defines
+        # module-level globals.
         global MyTuple, MyMod  # see [local resolution in python]
         MyTuple = namedtuple('MyTuple', ['a'])
 
         @torch.jit.unused
         def fn():
+            # [FUNCTION DOC] HELPER: Unused (never compiled) function returning a
+            # namedtuple instance.
             # type: () -> MyTuple
             return MyTuple(1)
 
         # Only check compilation
         @torch.jit.script
         def fn2():
+            # [FUNCTION DOC] HELPER: Script function that calls the unused function; only
+            # compilation matters.
             # type: () -> MyTuple
             return fn()
 
         FileCheck().check("NamedTuple").run(fn2.graph)
 
         class MyMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with an unused method returning a namedtuple and a
+            # forward that always takes a constant-true branch returning a namedtuple.
             @torch.jit.unused
             def fn(self):
+                # [FUNCTION DOC] HELPER: Unused method returning a namedtuple instance.
                 # type: () -> MyTuple
                 return MyTuple(1)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return a namedtuple of a random tensor in the
+                # always-true branch.
                 if 1 == 1:
                     return MyTuple(torch.rand(2, 3))
                 else:
@@ -3509,21 +4262,34 @@ def foo(x):
         torch.jit.script(MyMod())
 
     def test_unused_decorator(self):
+        # [FUNCTION DOC] An unused method stacked with another decorator and with invalid body
+        # must be skipped by scripting, so scripting the module succeeds.
         class MyMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with an unused, no-grad decorated method whose body
+            # is invalid.
             @torch.jit.unused
             @torch.no_grad()
             def fn(self, x):
+                # [FUNCTION DOC] HELPER: Unused method whose body (advancing a tensor) would be
+                # invalid if compiled.
                 # type: (Tensor) -> int
                 return next(x)  # invalid, but should be ignored
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Call the unused method.
                 return self.fn(x)
 
         torch.jit.script(MyMod())
 
     @_inline_everything
     def test_lazy_script(self):
+        # [FUNCTION DOC] Check script_if_tracing: tracing a function with data-dependent printing
+        # drops the branch it did not take, wrapping it with script_if_tracing keeps the control
+        # flow, and a decorated function with defaults can be scripted directly or called from
+        # script code.
         def untraceable(x):
+            # [FUNCTION DOC] HELPER: Print one of two strings depending on the rank, return input
+            # plus two.
             if x.ndim > 2:
                 print("hello")
             else:
@@ -3532,6 +4298,7 @@ def foo(x):
 
         # Non-working example
         def fn(x):
+            # [FUNCTION DOC] HELPER: Call untraceable on x (the unwrapped version).
             return untraceable(x)
 
         with self.capture_stdout():
@@ -3543,6 +4310,7 @@ def foo(x):
         untraceable = torch.jit.script_if_tracing(untraceable)
 
         def fn2(x):
+            # [FUNCTION DOC] HELPER: Call untraceable on x (the wrapped version captured later).
             return untraceable(x)
 
         with self.capture_stdout():
@@ -3551,10 +4319,13 @@ def foo(x):
         FileCheck().check("goodbye").run(traced.graph)
 
         def foo(x: int):
+            # [FUNCTION DOC] HELPER: Return the int plus one.
             return x + 1
 
         @torch.jit.script_if_tracing
         def fee(x: int = 2):
+            # [FUNCTION DOC] HELPER: Script-if-tracing function returning foo of one plus x (x
+            # defaults to 2).
             return foo(1) + x
 
         # test directly compiling function
@@ -3564,21 +4335,28 @@ def foo(x):
         # test compiling it within another function
         @torch.jit.script
         def hum():
+            # [FUNCTION DOC] HELPER: Script function calling fee with keyword argument 3.
             return fee(x=3)
 
         self.assertEqual(hum(), 5)
 
     def test_big_int_literals(self):
+        # [FUNCTION DOC] Integer literals up to the signed 64-bit maximum script fine; larger
+        # ones raise RuntimeError saying out of range.
         def ok():
+            # [FUNCTION DOC] HELPER: Return the largest signed 64-bit integer literal.
             # signed 64 bit max
             a = 9223372036854775807
             return a
 
         def toobig():
+            # [FUNCTION DOC] HELPER: Return an integer literal one past the signed
+            # 64-bit maximum.
             a = 9223372036854775808
             return a
 
         def waytoobig():
+            # [FUNCTION DOC] HELPER: Return a far too big integer literal.
             a = 99999999999999999999
             return a
 
@@ -3591,13 +4369,18 @@ def foo(x):
             torch.jit.script(waytoobig)
 
     def test_hex_literals(self):
+        # [FUNCTION DOC] Hexadecimal integer literals script fine up to the signed 64-bit maximum
+        # and negation works; larger values raise RuntimeError saying out of range.
         def test1():
+            # [FUNCTION DOC] HELPER: Return a hexadecimal literal.
             return 0xaaaaaa
 
         def test2():
+            # [FUNCTION DOC] HELPER: Return a hexadecimal literal (duplicate of the first case).
             return 0xaaaaaa
 
         def test3():
+            # [FUNCTION DOC] HELPER: Return a negated hexadecimal literal.
             return -0xaaaaaa
 
         self.checkScript(test1, [])
@@ -3605,14 +4388,18 @@ def foo(x):
         self.checkScript(test3, [])
 
         def ok():
+            # [FUNCTION DOC] HELPER: Return the largest signed 64-bit hexadecimal literal.
             a = 0x7FFFFFFFFFFFFFFF
             return a
 
         def toobig():
+            # [FUNCTION DOC] HELPER: Return an unsigned 64-bit maximum hexadecimal literal, out
+            # of range.
             a = 0xFFFFFFFFFFFFFFFF
             return a
 
         def waytoobig():
+            # [FUNCTION DOC] HELPER: Return a 128-bit hexadecimal literal, out of range.
             a = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
             return a
 
@@ -3625,12 +4412,18 @@ def foo(x):
             torch.jit.script(waytoobig)
 
     def test_big_float_literals(self):
+        # [FUNCTION DOC] A float literal too large for double becomes infinity in python and
+        # in script, both when scripted directly and when its source is compiled in a
+        # compilation unit.
         def ok():
+            # [FUNCTION DOC] HELPER: Return a float literal that overflows to infinity.
             # Python interprets this as inf
             a = 1.2E400
             return a
 
         def check(fn):
+            # [FUNCTION DOC] HELPER: Assert the function returns the same value as ok (compared
+            # directly because infinity does not work with the usual equality helper).
             self.assertTrue(fn() == ok())
 
         # checkScript doesn't work since assertEqual doesn't consider
@@ -3642,7 +4435,10 @@ def foo(x):
         check(cu.ok)
 
     def _test_device_type(self, dest):
+        # [FUNCTION DOC] HELPER: checkScript a function that returns type name and index of a
+        # device created from the destination string.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the device type string and optional index.
             # type: (Device) -> Tuple[str, Optional[int]]
             return x.type, x.index
 
@@ -3650,15 +4446,20 @@ def foo(x):
         self.checkScript(fn, [device])
 
     def test_device_type(self):
+        # [FUNCTION DOC] Run the device type check for cpu.
         self._test_device_type('cpu')
 
     @unittest.skipIf(not RUN_CUDA, "Requires CUDA")
     def test_device_type_cuda(self):
+        # [FUNCTION DOC] Run the device type check for cuda. Needs CUDA.
         self._test_device_type('cuda')
 
     def test_string_device_implicit_conversion(self):
+        # [FUNCTION DOC] A script function with a device argument accepts a string and converts
+        # it; an invalid device string raises RuntimeError listing expected values.
         @torch.jit.script
         def fn(x: torch.device):
+            # [FUNCTION DOC] HELPER: Return the device argument unchanged.
             return x
 
         self.assertEqual(fn("cpu"), torch.device("cpu"))
@@ -3667,7 +4468,12 @@ def foo(x):
             fn("invalid_device")
 
     def test_eval_python(self):
+        # [FUNCTION DOC] Check eval() on scripted modules (new style and ScriptModule) flips the
+        # training flag in python and C++ state, changes forward output, and persists through
+        # save and load.
         def _test(m):
+            # [FUNCTION DOC] HELPER: Assert training state, call eval, assert it flipped, and
+            # check a saved and reloaded copy is also in eval mode.
             self.assertTrue(m(torch.ones(2, 2)))
             self.assertTrue(m.training)
             self.assertTrue(m._c.getattr('training'))
@@ -3688,26 +4494,39 @@ def foo(x):
             self.assertFalse(loaded._c.getattr('training'))
 
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward returns its training flag.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the training flag.
                 return self.training
 
         class OldM(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Old-style script module whose forward returns its
+            # training flag.
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the training flag.
                 return self.training
 
         _test(torch.jit.script(M()))
         _test(OldM())
 
     def test_inherit_method(self):
+        # [FUNCTION DOC] Script methods are inherited: a base whose forward needs a method only a
+        # subclass defines cannot be instantiated (RuntimeError), the subclass and a
+        # multiple-inheritance class produce the expected outputs.
         class A(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Base script module whose forward adds x and a bar method it
+            # does not define.
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return x plus the result of bar.
                 return x + self.bar(x)
 
         class B(A):
+            # [CLASS DOC] HELPER: Subclass defining bar as the square.
             @torch.jit.script_method
             def bar(self, x):
+                # [FUNCTION DOC] HELPER: Return x times x.
                 return x * x
 
         with self.assertRaisesRegex(RuntimeError, 'attribute'):
@@ -3718,19 +4537,29 @@ def foo(x):
         self.assertEqual(b(v), v + v * v)
 
         class C(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module defining bar as identity.
             @torch.jit.script_method
             def bar(self, x):
+                # [FUNCTION DOC] HELPER: Return x.
                 return x
 
         class D(C, B):
+            # [CLASS DOC] HELPER: Class inheriting from C then B, so C's bar is used.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Call the base initializer.
                 super().__init__()
 
         self.assertEqual(D()(v), v + v)
 
     @skipIfTorchDynamo(msg="https://github.com/pytorch/pytorch/issues/119949")
     def test_tensor_subclasses(self):
+        # [FUNCTION DOC] Check typed tensor subclasses (long, double, int, bool tensors) are
+        # accepted as annotations of scripted source, and that scripting emits a warning that
+        # annotations of Tensor subclasses are treated as plain Tensor. Skipped under dynamo for
+        # a known issue.
         def check_subclass(x, tensor):
+            # [FUNCTION DOC] HELPER: Build function source with the subclass annotation and check
+            # the code with the given sample tensor.
             template = dedent("""
                 def func(input: {}) -> {}:
                     return torch.zeros((input.shape[0], 1), dtype=input.dtype)
@@ -3744,6 +4573,8 @@ def foo(x):
         check_subclass("torch.BoolTensor", torch.BoolTensor([[False, True], [True, False]]))
 
         def check_subclass_warn(input: torch.LongTensor) -> torch.LongTensor:
+            # [FUNCTION DOC] HELPER: Function annotated with a Tensor subclass returning zeros of
+            # matching dtype.
             return torch.zeros((input.shape[0], 1), dtype=input.dtype)
 
         with warnings.catch_warnings(record=True) as warns:
@@ -3753,13 +4584,19 @@ def foo(x):
         FileCheck().check("TorchScript will treat type annotations of Tensor").run(str(warns[0]))
 
     def test_first_class_module(self):
+        # [FUNCTION DOC] A script method can assign to a parameter attribute; after calling
+        # forward the attribute holds the input.
         class Foo(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a parameter that its script
+            # method overwrites.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random 3x4 parameter foo.
                 super().__init__()
                 self.foo = nn.Parameter(torch.rand(3, 4))
 
             @torch.jit.script_method
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Store the input into the foo attribute and return it.
                 self.foo = input
                 return self.foo
         foo = Foo()
@@ -3769,40 +4606,56 @@ def foo(x):
 
     @_tmp_donotuse_dont_inline_everything
     def test_first_class_calls(self):
+        # [FUNCTION DOC] Script a class, a function using the class, and a function calling that
+        # function (without inlining), and check the numeric result.
         @torch.jit.script
         class Foo:
+            # [CLASS DOC] HELPER: Script class holding one value and adding it to an argument.
             def __init__(self, x):
+                # [FUNCTION DOC] HELPER: Store the value as bar.
                 self.bar = x
 
             def stuff(self, x):
+                # [FUNCTION DOC] HELPER: Return the stored value plus x.
                 return self.bar + x
 
         @torch.jit.script
         def foo(x):
+            # [FUNCTION DOC] HELPER: Return x squared plus the class method result on twice x.
             return x * x + Foo(x).stuff(2 * x)
 
         @torch.jit.script
         def bar(x):
+            # [FUNCTION DOC] HELPER: Return the product of two calls to foo.
             return foo(x) * foo(x)
 
         x = torch.rand(3, 4)
         self.assertEqual(bar(x), (x * x + 3 * x) * (x * x + 3 * x))
 
     def test_static_methods(self):
+        # [FUNCTION DOC] checkModule on modules calling static methods of their own and
+        # another class.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module with a static method adding 100, called from forward.
             @staticmethod
             def my_method(x):
+                # [FUNCTION DOC] HELPER: Static method returning x plus 100.
                 return x + 100
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return x plus the static method result.
                 return x + M.my_method(x)
 
         class N(nn.Module):
+            # [CLASS DOC] HELPER: Module with a static method multiplying by 100, using both
+            # classes' methods.
             @staticmethod
             def my_method(x):
+                # [FUNCTION DOC] HELPER: Static method returning x times 100.
                 return x * 100
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return x minus M's static result plus N's static result.
                 return x - M.my_method(x) + N.my_method(x)
 
         self.checkModule(M(), (torch.ones(2, 2),))
@@ -3810,10 +4663,15 @@ def foo(x):
         self.checkModule(N(), (torch.ones(2, 2),))
 
     def test_invalid_prefix_annotation(self):
+        # [FUNCTION DOC] Scripting functions whose annotation comment has a malformed prefix
+        # (no space, extra spaces) must raise RuntimeError about the annotation prefix, with
+        # stdout captured.
         with self.assertRaisesRegex(RuntimeError, "annotation prefix in line"):
             with self.capture_stdout() as captured:
                 @torch.jit.script
                 def invalid_prefix_annotation1(a):
+                    # [FUNCTION DOC] HELPER: Function with a malformed annotation comment lacking
+                    # a space; add two.
                     #type: (Int) -> Int # noqa: E265
                     return a + 2
 
@@ -3821,6 +4679,8 @@ def foo(x):
             with self.capture_stdout() as captured:
                 @torch.jit.script
                 def invalid_prefix_annotation2(a):
+                    # [FUNCTION DOC] HELPER: Function with a malformed annotation comment with a
+                    # gap; add two.
                     #type   : (Int) -> Int # noqa: E265
                     return a + 2
 
@@ -3828,23 +4688,33 @@ def foo(x):
             with self.capture_stdout() as captured:
                 @torch.jit.script
                 def invalid_prefix_annotation3(a):
+                    # [FUNCTION DOC] HELPER: Function with a malformed annotation comment with
+                    # extra leading spaces.
                     #     type: (Int) -> Int
                     return a + 2
 
     def test_builtin_function_attributes(self):
+        # [FUNCTION DOC] checkModule on a module storing a builtin function as an attribute.
         class Add(nn.Module):
+            # [CLASS DOC] HELPER: Module storing torch add as an attribute and applying it to
+            # input and itself.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Store the builtin add function.
                 super().__init__()
                 self.add = torch.add
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Return the stored function applied to input twice.
                 return self.add(input, input)
 
         self.checkModule(Add(), [torch.randn(2, 2)])
 
     def test_pybind_type_comparisons(self):
+        # [FUNCTION DOC] The output type of a node of a scripted function can be fetched through
+        # the bindings and is not None.
         @torch.jit.script
         def f():
+            # [FUNCTION DOC] HELPER: Return None.
             return None
 
         node = list(f.graph.nodes())[0]
@@ -3853,16 +4723,26 @@ def foo(x):
 
     @unittest.skipIf(IS_WINDOWS, 'TODO: need to fix the test case')
     def test_unmatched_type_annotation(self):
+        # [FUNCTION DOC] Mismatch between the number of annotations and parameters must raise
+        # RuntimeError with the count message, and the error for scripted source must show the
+        # source lines with a marker. Skipped on Windows.
+        # KNOWN ISSUE: the regex checks quoted source, so invalid2 and invalid4 docs sit
+        # above them.
         message1 = re.escape("Number of type annotations (2) did not match the number of function parameters (1):")
         message2 = 'def invalid2\\(a\\):\n\\s*~+\\.*\\s+<--- HERE\n\\s+# type: \\(Int, Int\\) -> Int\n\\s+return a \\+ 2'
         message3 = 'def invalid4\\(a\\):\n\\s*~+\\.*\\s+<--- HERE\n\\s+# type: \\(Int, Int\\) -> Int\n\\s+return a \\+ 2'
         with self.assertRaisesRegex(RuntimeError, message1):
             @torch.jit.script
             def invalid1(a):
+                # [FUNCTION DOC] HELPER: Function with two annotated types but one parameter;
+                # scripting must fail.
                 # type: (Int, Int) -> Int
                 return a + 2
 
         with self.assertRaisesRegex(RuntimeError, message2):
+            # [FUNCTION DOC] HELPER: Decorated function with two annotated types but one
+            # parameter; scripting must fail with the source quoted (this doc is above the
+            # decorator so quoted text is unchanged).
             @torch.jit.script
             def invalid2(a):
                 # type: (Int, Int) -> Int
@@ -3870,29 +4750,43 @@ def foo(x):
 
         with self.assertRaisesRegex(RuntimeError, message1):
             def invalid3(a):
+                # [FUNCTION DOC] HELPER: Function with two annotated types but one parameter,
+                # scripted afterwards.
                 # type: (Int, Int) -> Int
                 return a + 2
             torch.jit.script(invalid3)
 
         with self.assertRaisesRegex(RuntimeError, message3):
+            # [FUNCTION DOC] HELPER: Undecorated function with two annotated types but one
+            # parameter, whose scripting must fail with the source quoted (doc above the def
+            # keeps the quoted text unchanged).
             def invalid4(a):
                 # type: (Int, Int) -> Int
                 return a + 2
             torch.jit.script(invalid4)
 
     def test_calls_in_type_annotations(self):
+        # [FUNCTION DOC] A signature comment containing a call expression must be rejected with a
+        # RuntimeError saying calls are not allowed.
         with self.assertRaisesRegex(RuntimeError, "Type annotation should not contain calls"):
             def spooky(a):
+                # [FUNCTION DOC] HELPER: Function whose signature comment contains a call; only
+                # parsed, not run.
                 # type: print("Hello") -> Tensor
                 return a + 2
             print(torch.__file__)
             torch.jit.annotations.get_signature(spooky, None, 1, True)
 
     def test_is_optional(self):
+        # [FUNCTION DOC] Smoke test calling the optional-type check on a union of two list types;
+        # no assertion on the result.
         ann = Union[List[int], List[float]]
         torch._jit_internal.is_optional(ann)
 
     def test_interpreter_fuzz(self):
+        # [FUNCTION DOC] Fuzz the interpreter: 100 times generate a random program of tree-like
+        # tensor expressions with 50 steps, run it in python and in a compilation unit with the
+        # same random state, and compare the returned tuples.
         import builtins
         # This test generates random tree-like programs to fuzz test
         # that the interpreter does not have a bug in its stack manipulation
@@ -3908,17 +4802,23 @@ def foo(x):
         ]
 
         def gen_code():
+            # [FUNCTION DOC] HELPER: Generate source text of a function f that builds random
+            # expressions and variables from the templates and returns a tuple of all variables.
             src_lines = ['def f():']
             exprs = []
             n_variables = 0
 
             def get_expr(idx):
+                # [FUNCTION DOC] HELPER: Remove and return the expression at the index (swap with
+                # last, pop).
                 elem = exprs[idx]
                 exprs[idx] = exprs[-1]
                 exprs.pop()
                 return elem
 
             def select_expr_or_var():
+                # [FUNCTION DOC] HELPER: Randomly choose and consume a pending expression or name
+                # an existing variable.
                 idx = random.randrange(0, len(exprs) + n_variables)
                 if idx < len(exprs):
                     return get_expr(idx)
@@ -3953,6 +4853,9 @@ def foo(x):
 
     @skipIfTorchDynamo("TorchDynamo fails with unknown reason")
     def test_cpp_module_iterator(self):
+        # [FUNCTION DOC] Compare the C++ module iterators (parameters, buffers, children, modules
+        # and named variants, recursive or not) of a scripted module tree against the expected
+        # sorted listing. Skipped under dynamo.
         a = nn.Module()
         a.name = 'a'
         a.p = nn.Parameter(torch.rand(3, 4))
@@ -3968,6 +4871,8 @@ def foo(x):
         result = torch._C._jit_debug_module_iterators(sa._c)
 
         def replace(e):
+            # [FUNCTION DOC] HELPER: Replace the parameter and buffer with markers P and B and
+            # script modules with their name attribute; other values pass through.
             if e is a.p:
                 return 'P'
             elif e is a.foo.b:
@@ -4028,6 +4933,8 @@ def foo(x):
         self.assertEqual(expected, result)
 
     def test_parameter_order(self):
+        # [FUNCTION DOC] Parameters of a scripted module keep the registration order of the
+        # eager module.
         m = nn.Module()
         for i, name in enumerate(string.ascii_letters):
             setattr(m, name, nn.Parameter(torch.tensor([float(i)])))
@@ -4037,32 +4944,45 @@ def foo(x):
         self.assertEqual(list(m.parameters()), list(ms.parameters()))
 
     def test_python_op_builtins(self):
+        # [FUNCTION DOC] Compile a script function calling an unused python function using a
+        # builtin; only compilation is checked.
         @torch.jit.unused
         def fn(x):
+            # [FUNCTION DOC] HELPER: Unused function summing a list.
             # type: (List[int]) -> int
             return sum(x)
 
         @torch.jit.script
         def script_fn(x):
+            # [FUNCTION DOC] HELPER: Script function that calls the unused function.
             # type: (List[int]) -> int
             return fn(x)
 
     def test_submodule_twice(self):
+        # [FUNCTION DOC] The same script function can be stored as attribute in two modules.
         @torch.jit.script
         def foo(x):
+            # [FUNCTION DOC] HELPER: Return x squared.
             return x * x
 
         class What(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module storing a given object as attribute foo.
             def __init__(self, x):
+                # [FUNCTION DOC] HELPER: Store the argument as attribute foo.
                 super().__init__()
                 self.foo = x
         a = What(foo)
         c = What(foo)
 
     def test_training_param(self):
+        # [FUNCTION DOC] The training flag is usable in script methods (twice) and switching to
+        # eval changes the result; the flag is not in the state dict.
         class What(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module whose forward returns x or x plus 4 by training
+            # flag, plus one more when training.
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Branch twice on the training flag to compute the result.
                 # type: (int) -> int
                 if self.training:
                     r = x
@@ -4080,17 +5000,25 @@ def foo(x):
         self.assertFalse("training" in w.state_dict())
 
     def test_class_as_attribute(self):
+        # [FUNCTION DOC] A script class instance stored as module attribute works after scripting
+        # and after export/import.
         @torch.jit.script
         class Foo321:
+            # [CLASS DOC] HELPER: Script class with one int field of value 3.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Set field x to 3.
                 self.x = 3
 
         class FooBar1234(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module holding the script class instance and adding its field
+            # to the input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the script class instance.
                 super().__init__()
                 self.f = Foo321()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return x plus the field of the instance.
                 return x + self.f.x
 
         scripted = torch.jit.script(FooBar1234())
@@ -4099,8 +5027,12 @@ def foo(x):
         self.assertEqual(scripted(x), eic(x))
 
     def test_module_str(self):
+        # [FUNCTION DOC] The string of a scripted module's C++ object starts with ScriptObject
+        # and names the torch module namespace and the class.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module applying relu.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return relu of the input.
                 return torch.relu(x)
 
         f = torch.jit.script(Foo())
@@ -4111,8 +5043,12 @@ def foo(x):
         self.assertTrue('.Foo' in str_f)
 
     def test_jitter_bug(self):
+        # [FUNCTION DOC] Regression test that scripting a function with a conditional list
+        # assignment and a call to it compiles; there are no assertions.
         @torch.jit.script
         def fn2(input, kernel_size):
+            # [FUNCTION DOC] HELPER: Pick a one-element list or the kernel list, print it, return
+            # the input.
             # type: (Tensor, List[int]) -> Tensor
             if kernel_size[0] > 1:
                 _stride = [2]
@@ -4123,10 +5059,14 @@ def foo(x):
 
         @torch.jit.script
         def fn(input):
+            # [FUNCTION DOC] HELPER: Call fn2 with a literal list.
             # type: (Tensor) -> Tensor
             return fn2(input, [1])
 
     def test_parser_kwargonly(self):
+        # [FUNCTION DOC] Parse source text with keyword-only arguments: the schema shows a
+        # star, and a call omitting the keyword-only argument raises RuntimeError saying it was
+        # not provided.
         cu = torch.jit.CompilationUnit('''
             def foo(x, *, y) -> Tuple[Tensor, Tensor]:
                 return x, x
@@ -4143,6 +5083,9 @@ def foo(x):
             ''')
 
     def test_annoying_doubles(self):
+        # [FUNCTION DOC] Save and load a script module returning tricky doubles (pi, 0.1,
+        # infinities, the smallest normal double, NaN); values must match exactly after reload,
+        # NaN stays NaN.
         mod = types.ModuleType("temp")
         mod.inf = float("inf")
         mod.ninf = float("-inf")
@@ -4150,8 +5093,12 @@ def foo(x):
 
         with torch._jit_internal._disable_emit_hooks():
             class Foo(torch.jit.ScriptModule):
+                # [CLASS DOC] HELPER: Script module whose forward returns tricky
+                # double constants.
                 @torch.jit.script_method
                 def forward(self):
+                    # [FUNCTION DOC] HELPER: Return pi, 0.1, infinity, negative infinity, a tiny
+                    # double and NaN.
                     return math.pi, 0.1, mod.inf, mod.ninf, 2.225073858507201e-308, mod.nan
 
             foo = Foo()
@@ -4168,13 +5115,17 @@ def foo(x):
             self.assertTrue(math.isnan(r[-1]) and math.isnan(r2[-1]))
 
     def test_type_annotate(self):
+        # [FUNCTION DOC] checkScript of the annotate call with a tensor, a typed empty list that
+        # is appended to, a float and an optional tensor of None.
 
         def foo(a):
+            # [FUNCTION DOC] HELPER: Annotate a value as a tensor.
             return torch.jit.annotate(torch.Tensor, a)
 
         self.checkScript(foo, (torch.rand(3),))
 
         def bar():
+            # [FUNCTION DOC] HELPER: Fill an annotated empty int list with ten fours.
             a = torch.jit.annotate(List[int], [])
             for _ in range(10):
                 a.append(4)
@@ -4183,56 +5134,75 @@ def foo(x):
         self.checkScript(bar, ())
 
         def baz(a):
+            # [FUNCTION DOC] HELPER: Annotate a value as a float.
             return torch.jit.annotate(float, a)
         self.checkScript(baz, (torch.rand(()),))
 
         # test annotate none types
         def annotate_none():
+            # [FUNCTION DOC] HELPER: Return None annotated as an optional tensor.
             return torch.jit.annotate(Optional[torch.Tensor], None)
 
         self.checkScript(annotate_none, ())
 
 
     def test_robust_op_resolution(self):
+        # [FUNCTION DOC] Operators are resolved by function identity, not by variable name: a
+        # local name bound to add is compiled as add.
         neg = torch.add  # misleading name to make sure we resolve by function
 
         def stuff(x):
+            # [FUNCTION DOC] HELPER: Call the alias of add on x and x.
             return neg(x, x)
 
         a = (torch.rand(3),)
         self.checkScript(stuff, a)
 
     def test_nested_aug_assign(self):
+        # [FUNCTION DOC] Check in-place augmented assignment on nested module attributes (int,
+        # script class with and without in-place add, list), eager and script results agree, and
+        # that a class without add support raises RuntimeError about inplace ops.
         @torch.jit.script
         class SomeClass:
+            # [CLASS DOC] HELPER: Script class with a number field supporting in-place add
+            # and equality.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Set num to 99.
                 self.num = 99
 
             def __iadd__(self, x):
+                # [FUNCTION DOC] HELPER: In-place add: add x to num and return self.
                 # type: (int)
                 self.num += x
                 return self
 
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: Compare num with the other instance's num.
                 # type: (SomeClass) -> bool
                 return self.num == other.num
 
         @torch.jit.script
         class SomeOutOfPlaceClass:
+            # [CLASS DOC] HELPER: Script class with only out-of-place add and equality.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Set num to 99.
                 self.num = 99
 
             def __add__(self, x):
+                # [FUNCTION DOC] HELPER: Out-of-place add: set num to x and return self.
                 # type: (int)
                 self.num = x
                 return self
 
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: Compare num with the other instance's num.
                 # type: (SomeClass) -> bool
                 return self.num == other.num
 
         class Child(nn.Module):
+            # [CLASS DOC] HELPER: Module holding an int, both script class instances, and a list.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the int, two instances and the list.
                 super().__init__()
                 self.x = 2
                 self.o = SomeClass()
@@ -4240,11 +5210,16 @@ def foo(x):
                 self.list = [1, 2, 3]
 
         class A(nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward applies augmented assignments to the
+            # child's attributes.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the child module.
                 super().__init__()
                 self.child = Child()
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Augment-assign the int, both instances and the list;
+                # return all four.
                 self.child.x += 1
                 self.child.o += 5
                 self.child.oop += 5
@@ -4264,20 +5239,28 @@ def foo(x):
 
         @torch.jit.script
         class SomeNonAddableClass:
+            # [CLASS DOC] HELPER: Script class with equality but no add of any kind.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Set num to 99.
                 self.num = 99
 
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: Compare num with the other instance's num.
                 # type: (SomeClass) -> bool
                 return self.num == other.num
 
         # with self.assertRaisesRegex(RuntimeError, "")
         class A(nn.Module):
+            # [CLASS DOC] HELPER: Module trying an augmented assignment on a class without
+            # add support.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the non-addable instance.
                 super().__init__()
                 self.x = SomeNonAddableClass()
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Augment-assign a new instance onto the attribute; must
+                # fail to script.
                 self.x += SomeNonAddableClass()
                 return self.x
 
@@ -4285,51 +5268,70 @@ def foo(x):
             torch.jit.script(A())
 
     def test_var_aug_assign(self):
+        # [FUNCTION DOC] Augmented assignment on local variables: unsupported class raises
+        # RuntimeError; in-place classes, out-of-place classes, lists and tensors keep identity
+        # semantics in script.
         @torch.jit.script
         class SomeNonAddableClass:
+            # [CLASS DOC] HELPER: Script class with equality but no add.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Set num to 99.
                 self.num = 99
 
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: Compare num with the other instance's num.
                 # type: (SomeNonAddableClass) -> bool
                 return self.num == other.num
 
         with self.assertRaisesRegex(RuntimeError, "Cannot emit inplace op"):
             @torch.jit.script
             def fn():
+                # [FUNCTION DOC] HELPER: Augment-assign one instance onto another; scripting
+                # must fail.
                 a = SomeNonAddableClass()
                 a += SomeNonAddableClass()
                 return a
 
         @torch.jit.script
         class SomeClass:
+            # [CLASS DOC] HELPER: Script class with in-place add and equality.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Set num to 99.
                 self.num = 99
 
             def __iadd__(self, x):
+                # [FUNCTION DOC] HELPER: In-place add: add x to num and return self.
                 # type: (int)
                 self.num += x
                 return self
 
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: Compare num with the other instance's num.
                 # type: (SomeClass) -> bool
                 return self.num == other.num
 
         @torch.jit.script
         class SomeOutOfPlaceClass:
+            # [CLASS DOC] HELPER: Script class with out-of-place add and equality.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Set num to 99.
                 self.num = 99
 
             def __add__(self, x):
+                # [FUNCTION DOC] HELPER: Out-of-place add: set num to x and return self.
                 # type: (int)
                 self.num = x
                 return self
 
             def __eq__(self, other):
+                # [FUNCTION DOC] HELPER: Compare num with the other instance's num.
                 # type: (SomeClass) -> bool
                 return self.num == other.num
 
         def fn2():
+            # [FUNCTION DOC] HELPER: Apply augmented assignment to class instances, list
+            # and tensor, checking identity is preserved for in-place semantics; return all
+            # four values.
             a = SomeClass()
             a_copy = a
             a += 20
@@ -4352,11 +5354,18 @@ def foo(x):
         self.checkScript(fn2, [])
 
     def test_nested_list_construct(self):
+        # [FUNCTION DOC] checkScript of concatenating two nested list literals.
         def foo():
+            # [FUNCTION DOC] HELPER: Return the concatenation of two lists of lists.
             return [[4]] + [[4, 5]]
         self.checkScript(foo, ())
 
     def test_file_line_error(self):
+        # [FUNCTION DOC] Scripting a function calling an unknown torch attribute must raise
+        # RuntimeError whose message points at this file and the offending line.
+        # KNOWN ISSUE: the expected line is the definition line plus one, so the doc of foobar
+        # sits above its def.
+        # [FUNCTION DOC] HELPER: Call a nonexistent torch function; scripting it must fail.
         def foobar(xyz):
             return torch.blargh(xyz)
 
@@ -4365,6 +5374,13 @@ def foo(x):
             scripted = torch.jit.script(foobar)
 
     def test_file_line_error_class_defn(self):
+        # [FUNCTION DOC] Scripting a plain class with a bad method must raise RuntimeError
+        # pointing at the file and the failing line.
+        # KNOWN ISSUE: the expected line is the class line plus two, so the class and method docs
+        # sit above class.
+        # [CLASS DOC] HELPER: Plain class with one method calling a nonexistent torch function.
+        # [FUNCTION DOC] HELPER: Method baz of the class below: call a nonexistent torch
+        # function; scripting the class must fail.
         class FooBar:
             def baz(self, xyz):
                 return torch.blargh(xyz)
@@ -4374,6 +5390,11 @@ def foo(x):
             torch.jit.script(FooBar)
 
     def test_file_line_graph(self):
+        # [FUNCTION DOC] The graph of a scripted function carries source range info with this
+        # file and the line and column of the negation.
+        # KNOWN ISSUE: the expected line is the definition line plus one, so the doc of foobar
+        # sits above its def.
+        # [FUNCTION DOC] HELPER: Return the negation of the input.
         def foobar(xyz):
             return torch.neg(xyz)
 
@@ -4385,6 +5406,12 @@ def foo(x):
         fc.run(str(scripted.graph))
 
     def test_file_line_save_load(self):
+        # [FUNCTION DOC] Save a script module to a buffer and load it; the loaded graph keeps the
+        # source line information of forward.
+        # KNOWN ISSUE: the expected line is the class line plus three, so class and forward docs
+        # sit above class.
+        # [CLASS DOC] HELPER: Script module whose script method negates its input.
+        # [FUNCTION DOC] HELPER: Forward of the class below: return the negation of the input.
         class Scripted(torch.jit.ScriptModule):
             @torch.jit.script_method
             def forward(self, xyz):
@@ -4405,6 +5432,8 @@ def foo(x):
         fc.run(str(scripted.graph))
 
     def test_file_line_string(self):
+        # [FUNCTION DOC] Compile source text and check the graph's source range reports a pseudo
+        # file named string with the expected line and column.
         scripted = torch.jit.CompilationUnit('''
 def foo(xyz):
     return torch.neg(xyz)
@@ -4416,6 +5445,11 @@ def foo(xyz):
 
     @skipIfCrossRef
     def test_file_line_trace(self):
+        # [FUNCTION DOC] Trace a function and check the traced graph carries this file's line
+        # number of the traced operation. Skipped under cross-ref testing.
+        # KNOWN ISSUE: the expected line is the definition line plus one, so the doc of foobar
+        # sits above its def.
+        # [FUNCTION DOC] HELPER: Return the negation of the input; the traced operation.
         def foobar(xyz):
             return torch.neg(xyz)
 
@@ -4427,7 +5461,15 @@ def foo(xyz):
         fc.run(str(scripted.graph))
 
     def test_serialized_source_ranges(self):
+        # [FUNCTION DOC] Export/import a script module and check a runtime error message from the
+        # reloaded module cites this file and the right line of forward.
+        # KNOWN ISSUE: the expected line is the class line plus three, so class and forward docs
+        # sit above class.
 
+        # [CLASS DOC] HELPER: Script module whose script method does a matrix multiply with
+        # a transpose.
+        # [FUNCTION DOC] HELPER: Forward of the class below: multiply x by the transpose of w
+        # (shape mismatch triggers the error).
         class FooTest(torch.jit.ScriptModule):
             @torch.jit.script_method
             def forward(self, x, w):
@@ -4441,7 +5483,14 @@ def foo(xyz):
             loaded(torch.rand(3, 4), torch.rand(30, 40))
 
     def test_serialized_source_ranges_graph(self):
+        # [FUNCTION DOC] Export/import a script module and check the reloaded graph still has
+        # source ranges pointing at this file and the right line.
+        # KNOWN ISSUE: the expected line is the class line plus three, so class and forward docs
+        # sit above class.
 
+        # [CLASS DOC] HELPER: Script module whose script method does a matrix multiply with
+        # a transpose.
+        # [FUNCTION DOC] HELPER: Forward of the class below: multiply x by the transpose of w.
         class FooTest3(torch.jit.ScriptModule):
             @torch.jit.script_method
             def forward(self, x, w):
@@ -4455,7 +5504,14 @@ def foo(xyz):
         fc.run(loaded.graph)
 
     def test_serialized_source_ranges2(self):
+        # [FUNCTION DOC] An exception raised in a reloaded script module must be reported with
+        # this file and the right line.
+        # KNOWN ISSUE: the expected line is the class line plus three, so class and forward docs
+        # sit above class.
 
+        # [CLASS DOC] HELPER: Script module whose script method always raises an error.
+        # [FUNCTION DOC] HELPER: Forward of the class below: raise RuntimeError with a
+        # fixed message.
         class FooTest2(torch.jit.ScriptModule):
             @torch.jit.script_method
             def forward(self):
@@ -4469,9 +5525,15 @@ def foo(xyz):
             loaded()
 
     def test_serialized_source_ranges_dont_jitter(self):
+        # [FUNCTION DOC] Save a module, load it, save the loaded copy, and so on; the serialized
+        # debug source range records must be identical in every generation.
         class FooTest3(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with nested loops and several variables, to give
+            # many source ranges.
             @torch.jit.script_method
             def forward(self, lim):
+                # [FUNCTION DOC] HELPER: Run a Fibonacci-like loop with an inner loop and return
+                # three values.
                 first = 1
                 second = 1
                 i = 1
@@ -4496,6 +5558,9 @@ def foo(xyz):
         ft3 = FooTest3()
 
         def debug_records_from_mod(self, mod):
+            # [FUNCTION DOC] HELPER: Save the module (always ft3, ignoring mod), open the
+            # archive, require exactly one debug pickle file, and return its unpickled records
+            # and the buffer.
             buffer = io.BytesIO()
             torch.jit.save(ft3, buffer)
             buffer.seek(0)
@@ -4520,9 +5585,15 @@ def foo(xyz):
         self.assertEqual(records2, records3)
 
     def test_serialized_source_ranges_no_dups(self):
+        # [FUNCTION DOC] In the serialized debug records of a saved module, consecutive source
+        # ranges must not be equal (no duplicate entries).
         class FooTest3(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with nested loops and several variables, to give
+            # many source ranges.
             @torch.jit.script_method
             def forward(self, lim):
+                # [FUNCTION DOC] HELPER: Run a Fibonacci-like loop with an inner loop and return
+                # three values.
                 first = 1
                 second = 1
                 i = 1
@@ -4547,6 +5618,8 @@ def foo(xyz):
         ft3 = FooTest3()
 
         def debug_records_from_mod(mod):
+            # [FUNCTION DOC] HELPER: Save the module (always ft3), read every debug pickle in the
+            # archive and return the third element of each record.
             buffer = io.BytesIO()
             torch.jit.save(ft3, buffer)
             buffer.seek(0)
@@ -4566,60 +5639,82 @@ def foo(xyz):
                 self.assertNotEqual(source_range, source_range2)
 
     def test_circular_dependency(self):
+        # [FUNCTION DOC] Export/import of nested script modules (module list, sequential) with a
+        # shared submodule type must not fail with circular dependency problems (issue 25871).
         """
         https://github.com/pytorch/pytorch/issues/25871
         """
         class A(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module returning its input.
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return x.
                 return x
 
         class B(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module applying a ModuleList of the first class in
+            # a loop.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a ModuleList holding one A.
                 super().__init__()
                 self.foo = torch.nn.ModuleList([A()])
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply each submodule in order.
                 for f in self.foo:
                     x = f(x)
                 return x
 
         class C(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module applying a Sequential holding a B in a loop.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a Sequential holding one B.
                 super().__init__()
                 self.foo = torch.nn.Sequential(B())
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply each submodule in order.
                 for f in self.foo:
                     x = f(x)
                 return x
         self.getExportImportCopy(C())
 
     def test_serialize_long_lines(self):
+        # [FUNCTION DOC] Scripted code for a long expression keeps evaluation order: the first
+        # element is read before argmax is computed.
         class OrderModuleLong(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning a list of tuples built from elements of a
+            # tensor list.
             def forward(self, long_arg_name: List[torch.Tensor]):
+                # [FUNCTION DOC] HELPER: Return a list with a tuple of the second tensor and a
+                # tuple of the argmax of the first.
                 return [(long_arg_name[1],), (long_arg_name[0].argmax(),)]
         src = str(torch.jit.script(OrderModuleLong()).code)
         # make long_arg_name[1] does not get reordered after the argmax
         FileCheck().check("long_arg_name[1]").check("argmax").run(src)
 
     def test_tensor_shape(self):
+        # [FUNCTION DOC] checkScript of reading the shape of a tensor.
         x = torch.empty(34, 56, 78)
 
         def f(x):
+            # [FUNCTION DOC] HELPER: Return the shape.
             return x.shape
 
         self.checkScript(f, (x,))
 
 
     def test_block_input_grad_in_loop(self):
+        # [FUNCTION DOC] The input of a loop block that holds the loop-carried value must be
+        # marked requiring grad when the loop body mixes in a tensor requiring grad.
 
         x = torch.randn(3, 3, requires_grad=False)
         y = torch.randn(3, 3, requires_grad=True)
 
         def grad_in_loop(x, y):
+            # [FUNCTION DOC] HELPER: Multiply y by x repeatedly in a loop of 100 iterations.
             for _ in range(100):
                 x = y @ x
             return x
@@ -4633,16 +5728,20 @@ def foo(xyz):
         self.assertTrue(x_value.requires_grad())
 
     def test_tensor_grad(self):
+        # [FUNCTION DOC] checkScript of requires_grad and grad attribute reads for tensors with
+        # and without grad.
         x = torch.randn(3, 4, requires_grad=True)
         y = torch.randn(3, 4, requires_grad=False)
 
         def f_requires_grad(x):
+            # [FUNCTION DOC] HELPER: Return the requires_grad flag.
             return x.requires_grad
 
         self.checkScript(f_requires_grad, (x,))
         self.checkScript(f_requires_grad, (y,))
 
         def f_grad(x):
+            # [FUNCTION DOC] HELPER: Return the grad attribute.
             return x.grad
 
         x.sum().backward()
@@ -4652,10 +5751,13 @@ def foo(xyz):
     @unittest.skipIf(IS_LINUX, "https://github.com/pytorch/pytorch/issues/91493")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.LEGACY, "shape analysis is only enabled in Legacy")
     def test_prim_grad_undefined(self):
+        # [FUNCTION DOC] The graph for a scripted grad read has a grad node whose output type has
+        # no undefined flag. Legacy executor only and not on Linux.
 
         x = torch.ones(2)
 
         def f_grad(x):
+            # [FUNCTION DOC] HELPER: Return the grad attribute.
             return x.grad
 
         scripted = self.checkScript(f_grad, (x,))
@@ -4665,10 +5767,13 @@ def foo(xyz):
         self.assertTrue(next(prim_grad_node.outputs()).type().undefined() is None)
 
     def test_tensor_data(self):
+        # [FUNCTION DOC] Reading the data attribute in script returns tensors equal to eager and
+        # not requiring grad.
         x = torch.randn(3, 4, requires_grad=True)
         y = torch.randn(4, 5)
 
         def f_data(x):
+            # [FUNCTION DOC] HELPER: Return the data attribute.
             return x.data
 
         scripted_f_data = torch.jit.script(f_data)
@@ -4682,20 +5787,25 @@ def foo(xyz):
         self.assertEqual(scripted_x.requires_grad, False)
 
     def test_tensor_dtype(self):
+        # [FUNCTION DOC] Scripted dtype comparisons with constants are true only for the matching
+        # dtype among uint8, long and float32 tensors.
         x_byte = torch.empty(34, 56, 78, dtype=torch.uint8)
         x_long = torch.empty(34, 56, 78, dtype=torch.long)
         x_float32 = torch.empty(34, 56, 78, dtype=torch.float32)
 
         @torch.jit.script
         def byte(x):
+            # [FUNCTION DOC] HELPER: Return whether the dtype is uint8.
             return x.dtype == torch.uint8
 
         @torch.jit.script
         def long(x):
+            # [FUNCTION DOC] HELPER: Return whether the dtype is long.
             return x.dtype == torch.long
 
         @torch.jit.script
         def float32(x):
+            # [FUNCTION DOC] HELPER: Return whether the dtype is float32.
             return x.dtype == torch.float32
 
         self.assertTrue(byte(x_byte))
@@ -4710,11 +5820,14 @@ def foo(xyz):
 
     @unittest.skipIf(not RUN_CUDA, "device tests require CUDA")
     def test_tensor_device(self):
+        # [FUNCTION DOC] Scripted device comparison is true for same-device pairs and false for a
+        # cpu and a cuda tensor. Needs CUDA.
         cpu = torch.empty(34, 56, 78, device='cpu')
         gpu = torch.empty(34, 56, 78, device='cuda')
 
         @torch.jit.script
         def same_device(x, y):
+            # [FUNCTION DOC] HELPER: Return whether two tensors are on the same device.
             return x.device == y.device
 
         self.assertTrue(same_device(cpu, cpu))
@@ -4723,13 +5836,17 @@ def foo(xyz):
 
     @unittest.skipIf(not RUN_CUDA, "device tests require CUDA")
     def test_tensor_to_device(self):
+        # [FUNCTION DOC] checkScript of moving a tensor to cuda and back to cpu. Needs CUDA.
         def to_device(x):
+            # [FUNCTION DOC] HELPER: Move to cuda then to cpu by device keyword.
             return x.to(device="cuda").to(device=torch.device("cpu"))
 
         self.checkScript(to_device, (torch.ones(3, 4),))
 
     def test_tensor_to_cpu(self):
+        # [FUNCTION DOC] Scripted cpu() keeps the device equal to eager and passes checkScript.
         def to_cpu(x):
+            # [FUNCTION DOC] HELPER: Return the tensor on cpu.
             return x.cpu()
 
         x = torch.ones(3, 4)
@@ -4739,7 +5856,10 @@ def foo(xyz):
 
     @unittest.skipIf(not RUN_CUDA, "device tests require CUDA")
     def test_tensor_to_cuda(self):
+        # [FUNCTION DOC] Scripted cuda() gives the same device as eager and passes checkScript.
+        # Needs CUDA.
         def to_cuda(x):
+            # [FUNCTION DOC] HELPER: Return the tensor on cuda.
             return x.cuda()
 
         x = torch.ones(3, 4)
@@ -4748,12 +5868,17 @@ def foo(xyz):
         self.checkScript(to_cuda, (x,))
 
     def test_generic_list_errors(self):
+        # [FUNCTION DOC] Mixing nested list element types in a list concatenation must fail
+        # scripting with a RuntimeError about a previously matched type.
         with self.assertRaisesRegex(RuntimeError, "previously matched to type"):
             @torch.jit.script
             def foo(x):
+                # [FUNCTION DOC] HELPER: Concatenate a list of lists of tensors with a list of
+                # lists of ints.
                 return [[x]] + [[1]]
 
     def test_script_cu(self):
+        # [FUNCTION DOC] Compile a function from source text and call it.
         cu = torch.jit.CompilationUnit('''
             def foo(a):
                 b = a
@@ -4765,6 +5890,8 @@ def foo(xyz):
     # because the compilation unit ingests python strings
     # to use an escape sequence escape the backslash (\\n = \n)
     def test_string_cu(self):
+        # [FUNCTION DOC] Compile source text with escape sequences and a line continuation inside
+        # string literals and check the printed graph shows the processed strings.
         cu = torch.jit.CompilationUnit('''
             def foo(a):
                 print(a, """a\\n\tb\\n""", 2, "a\
@@ -4774,7 +5901,11 @@ a")
         FileCheck().check("aa").check("a\\n\\tb\\n").run(str(cu.foo.graph))
 
     def test_function_compilation_caching(self):
+        # [FUNCTION DOC] Scripting the same python function twice returns graphs that are the
+        # same object; a new function with the same qualified name is compiled afresh, and the
+        # cache holds only a weak reference (refcount unchanged).
         def fun():
+            # [FUNCTION DOC] HELPER: Return the sum of two constants (1 and 2).
             return 1 + 2
 
         fun_compiled = torch.jit.script(fun)
@@ -4783,6 +5914,8 @@ a")
         self.assertIs(fun_compiled.graph, torch.jit.script(fun).graph)
 
         def fun():
+            # [FUNCTION DOC] HELPER: Redefined function with the same name returning the sum of 3
+            # and 4.
             return 3 + 4
 
         num_ref_counts = sys.getrefcount(fun)
@@ -4796,14 +5929,19 @@ a")
         self.assertTrue(sys.getrefcount(fun), num_ref_counts)
 
     def test_string_ops(self):
+        # [FUNCTION DOC] checkScript of string concatenation and equality comparisons.
         def foo():
+            # [FUNCTION DOC] HELPER: Concatenate strings and compare string pairs.
             a = "a" + "b"
             return a + a, "ab" == "b", "ab" != "b", "ab" == "ab", "ab" != "ab"
 
         self.checkScript(foo, ())
 
     def test_string_sorted(self):
+        # [FUNCTION DOC] Sorted on a list of strings produces the sorted op in the graph and
+        # matches eager results.
         def foo(strs: List[str]):
+            # [FUNCTION DOC] HELPER: Return the sorted copy of a list of strings.
             return sorted(strs)
 
         FileCheck() \
@@ -4816,7 +5954,9 @@ a")
         self.checkScript(foo, (inputs,))
 
     def test_string_sort(self):
+        # [FUNCTION DOC] checkScript of in-place sorting of a list of strings.
         def foo(strs: List[str]):
+            # [FUNCTION DOC] HELPER: Sort the list in place and return it.
             strs.sort()
             return strs
 
@@ -4824,14 +5964,18 @@ a")
         self.checkScript(foo, (inputs,))
 
     def test_tuple_sorted(self):
+        # [FUNCTION DOC] checkScript of sorted on a list of int pairs.
         def foo(tups: List[Tuple[int, int]]):
+            # [FUNCTION DOC] HELPER: Return the sorted copy of a list of tuples.
             return sorted(tups)
 
         inputs = [(1, 2), (0, 2), (1, 3)]
         self.checkScript(foo, (inputs,))
 
     def test_tuple_sort(self):
+        # [FUNCTION DOC] checkScript of in-place sort on a list of int pairs.
         def foo(tups: List[Tuple[int, int]]):
+            # [FUNCTION DOC] HELPER: Sort the list of tuples in place and return it.
             tups.sort()
             return tups
 
@@ -4839,7 +5983,10 @@ a")
         self.checkScript(foo, (inputs,))
 
     def test_tuple_sort_reverse(self):
+        # [FUNCTION DOC] checkScript of in-place sort in reverse order on a list of int pairs.
         def foo(tups: List[Tuple[int, int]]):
+            # [FUNCTION DOC] HELPER: Sort the list of tuples in descending order in place and
+            # return it.
             tups.sort(reverse=True)
             return tups
 
@@ -4847,8 +5994,11 @@ a")
         self.checkScript(foo, (inputs,))
 
     def test_tuple_unsortable_element_type(self):
+        # [FUNCTION DOC] Sorting a list whose tuple elements contain dicts must raise
+        # RuntimeError saying the elements are not sortable, highlighting the sort call.
         @torch.jit.script
         def foo():
+            # [FUNCTION DOC] HELPER: Build a list holding a tuple of two dicts and sort it.
             tups = [({1: 2}, {2: 3})]
             tups.sort()
             return tups
@@ -4857,8 +6007,11 @@ a")
             foo()
 
     def test_tuple_unsortable_diff_type(self):
+        # [FUNCTION DOC] Sorting a list of Any holding values of different types must raise
+        # RuntimeError about comparing values of the same type only, highlighting the sort call.
         @torch.jit.script
         def foo(inputs: List[Any]):
+            # [FUNCTION DOC] HELPER: Sort a list of Any in place and return it.
             inputs.sort()
             return inputs
 
@@ -4867,7 +6020,9 @@ a")
             foo(inputs)
 
     def test_tuple_nested_sort(self):
+        # [FUNCTION DOC] checkScript of in-place sort on nested tuples of int and string.
         def foo(inputs: List[Tuple[int, Tuple[int, str]]]):
+            # [FUNCTION DOC] HELPER: Sort a list of nested tuples in place and return it.
             inputs.sort()
             return inputs
 
@@ -4875,8 +6030,11 @@ a")
         self.checkScript(foo, (inputs,))
 
     def test_tuple_unsortable_nested_diff_type(self):
+        # [FUNCTION DOC] Sorting nested tuples with differing inner types must raise RuntimeError
+        # about comparing values of the same type only, highlighting the sort call.
         @torch.jit.script
         def foo(inputs: List[Any]):
+            # [FUNCTION DOC] HELPER: Sort a list of Any in place and return it.
             inputs.sort()
             return inputs
 
@@ -4885,6 +6043,8 @@ a")
             foo(inputs)
 
     def test_string_new_line(self):
+        # [FUNCTION DOC] Source text with a raw newline inside a string literal must raise
+        # RuntimeError about an invalid token.
         with self.assertRaisesRegex(RuntimeError, "expected a valid token*"):
             torch.jit.CompilationUnit('''
             def test_while(a):
@@ -4894,6 +6054,8 @@ a")
             ''')
 
     def test_string_single_escape(self):
+        # [FUNCTION DOC] Source text with a lone escaped backslash that leaves a string
+        # unterminated must raise RuntimeError about an invalid token.
         with self.assertRaisesRegex(RuntimeError, "expected a valid token*"):
             torch.jit.CompilationUnit('''
             def test_while(a):
@@ -4902,31 +6064,41 @@ a")
             ''')
 
     def test_script_annotation(self):
+        # [FUNCTION DOC] A scripted function adding a tensor three times matches eager.
         @torch.jit.script
         def foo(a):
+            # [FUNCTION DOC] HELPER: Return a plus a plus a.
             return a + a + a
         s = Variable(torch.rand(2))
         self.assertEqual(s + s + s, foo(s))
 
     def test_torch_pow(self):
+        # [FUNCTION DOC] checkScript of the builtin power function on tensors, ints, floats and
+        # scalar items, skipping negative bases for the item-based case.
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Return a raised to b.
             return pow(a, b)
 
         def func2(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Return the nested power of (c plus a) to b, then to d.
             return pow(pow(c + a, b), d)
 
         def func3(a : int, b : float):
+            # [FUNCTION DOC] HELPER: Power of an int base and a float exponent returning float.
             # type: (int, float) -> float
             return pow(a, b)
 
         def func4():
+            # [FUNCTION DOC] HELPER: Power of constants 2 and -2 returning float.
             # type: () -> float
             return pow(2, -2)
 
         def func5(x, y):
+            # [FUNCTION DOC] HELPER: Power of the scalar items of two tensors.
             return pow(x.item(), y.item())
 
         def func6(a : int, b : int):
+            # [FUNCTION DOC] HELPER: Power of two ints returning float.
             # type: (int, int) -> float
             return pow(a, b)
 
@@ -4950,11 +6122,15 @@ a")
 
     @unittest.skipIf(not RUN_CUDA, "device tests require CUDA")
     def test_pow_scalar_backward_cuda(self):
+        # [FUNCTION DOC] Backward through a scripted power with a scalar exponent or scalar base
+        # on cuda tensors, for float and double. Needs CUDA.
         # see that scalar exponent works with cuda base (#19253)
         with enable_profiling_mode_for_profiling_tests():
             for dtype in [torch.float, torch.double]:
                 @torch.jit.script
                 def func(a, b):
+                    # [FUNCTION DOC] HELPER: Return the doubled tensor raised to a
+                    # float exponent.
                     # type: (Tensor, float) -> Tensor
                     return (a * 2) ** b
 
@@ -4963,6 +6139,7 @@ a")
 
                 @torch.jit.script
                 def func(a, b):
+                    # [FUNCTION DOC] HELPER: Return a float base raised to the tensor expression.
                     # type: (float, Tensor) -> Tensor
                     return a ** (b * 2 + 1)
 
@@ -4970,6 +6147,9 @@ a")
                 func(2, a, profile_and_replay=True).backward()
 
     def _check_code(self, code_str, fn_name, inputs):
+        # [FUNCTION DOC] HELPER: Execute the source text in python and in a compilation unit and
+        # check the function func in the unit gives the same result as the python function of the
+        # given name.
         scope = {}
         exec(code_str, globals(), scope)
         cu = torch.jit.CompilationUnit(code_str)
@@ -4977,12 +6157,18 @@ a")
 
     @unittest.skipIf(not RUN_CUDA, 'no CUDA')
     def test_scriptmodule_releases_tensors_cuda(self):
+        # [FUNCTION DOC] Run a scripted function in a repeated loop, and with backward, and
+        # require that no cuda tensors are leaked. Needs CUDA; the backward leg is skipped for
+        # the simple executor.
         with enable_profiling_mode_for_profiling_tests():
             @torch.jit.script
             def fn(x, y):
+                # [FUNCTION DOC] HELPER: Return sigmoid of x times tanh of y.
                 return x.sigmoid() * y.tanh()
 
             def test(backward=False):
+                # [FUNCTION DOC] HELPER: Create two random double cuda tensors, run the function
+                # (optionally running backward on the summed output).
                 x = torch.randn(3, 3, dtype=torch.double, device='cuda', requires_grad=True)
                 y = torch.randn(3, 3, dtype=torch.double, device='cuda', requires_grad=True)
                 out = fn(x, y, profile_and_replay=True)
@@ -5002,18 +6188,27 @@ a")
 
     @skipIfTorchDynamo("Not a TorchDynamo suitable test")
     def test_index(self):
+        # [FUNCTION DOC] Compare scripted and python indexing and slicing for tensors, lists and
+        # strings across many forms: basic, multi-dim, None, dynamic, positive and negative
+        # strides; checks the out-of-bounds and zero-step errors. Skipped under dynamo.
         def consec(size, start=0):
+            # [FUNCTION DOC] HELPER: Return a tensor of consecutive integers with the
+            # given shape.
             numel = torch.tensor(size).prod().item()
             return torch.arange(numel).view(size)
 
         def consec_list(size):
+            # [FUNCTION DOC] HELPER: Return a list of consecutive integers up to size.
             return list(range(size))
 
         def random_string(size):
+            # [FUNCTION DOC] HELPER: Return a random lowercase string of the given length.
             letters = string.ascii_lowercase
             return "".join(random.choice(letters) for i in range(size))
 
         def check_indexing(indexing, tensor):
+            # [FUNCTION DOC] HELPER: Build source text indexing a tensor with the expression
+            # and compare.
             template = dedent("""
             def func(x):
                 return x{}
@@ -5022,6 +6217,8 @@ a")
             self._check_code(template.format(indexing), "func", [tensor])
 
         def check_dynamic_indexing(indexing, tensor, value1, value2):
+            # [FUNCTION DOC] HELPER: Build source text indexing a tensor with variables made from
+            # two int values and compare scripted and python results.
             value1 = torch.tensor(value1)
             value2 = torch.tensor(value2)
 
@@ -5037,6 +6234,8 @@ a")
         # Torchscript assumes type Tensor by default, so we need this explicit
         # declaration.
         def check_indexing_list_int(indexing, list):
+            # [FUNCTION DOC] HELPER: Build source text indexing an int list with the expression
+            # and compare.
             template = dedent("""
             def func(x):
                 # type: (List[int]) -> Any
@@ -5046,6 +6245,8 @@ a")
             self._check_code(template.format(indexing), "func", [list])
 
         def check_indexing_str(indexing, str):
+            # [FUNCTION DOC] HELPER: Build source text indexing a string with the expression
+            # and compare.
             template = dedent("""
             def func(x):
                 # type: (str) -> Any
@@ -5189,8 +6390,14 @@ a")
             check_indexing_str('[::0]', random_string(42))
 
     def test_module_copy_with_attributes(self):
+        # [FUNCTION DOC] Copying a script module with typed list, int and dict attributes
+        # must work.
         class Vocabulary(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a vocabulary list, a default index and a
+            # word to index dict.
             def __init__(self, vocab_list):
+                # [FUNCTION DOC] HELPER: Store the vocabulary, default index 2, and a mapping
+                # word to position.
                 super().__init__()
                 self._vocab = torch.jit.Attribute(vocab_list, List[str])
                 self.some_idx = torch.jit.Attribute(2, int)
@@ -5200,6 +6407,8 @@ a")
 
             @torch.jit.script_method
             def lookup_indices_1d(self, values):
+                # [FUNCTION DOC] HELPER: Map each word to its index, using the default for
+                # unknown words.
                 # type: (List[str]) -> List[int]
                 result = torch.jit.annotate(List[int], [])
                 # Direct list iteration not supported
@@ -5210,6 +6419,7 @@ a")
 
             @torch.jit.script_method
             def forward(self, values):
+                # [FUNCTION DOC] HELPER: Apply the lookup to each inner list of words.
                 # type: (List[List[str]]) -> List[List[int]]
                 result = torch.jit.annotate(List[List[int]], [])
                 # Direct list iteration not supported
@@ -5221,18 +6431,24 @@ a")
         v.__copy__()
 
     def test_tuple_to_opt_list(self):
+        # [FUNCTION DOC] A tuple argument can be passed where an optional list of ints is
+        # expected; only compilation is checked.
         @torch.jit.script
         def foo(x):
+            # [FUNCTION DOC] HELPER: Function taking an optional list and returning 1.
             # type: (Optional[List[int]]) -> int
             return 1
 
         @torch.jit.script
         def tuple_call():
+            # [FUNCTION DOC] HELPER: Call foo with a tuple of two ints.
             return foo((1, 2))
 
     def test_keyword(self):
+        # [FUNCTION DOC] Scripted sum with a dim keyword matches eager.
         @torch.jit.script
         def func(x):
+            # [FUNCTION DOC] HELPER: Sum along dimension zero.
             return torch.sum(x, dim=0)
 
         x = torch.rand(10, dtype=torch.float, requires_grad=True)
@@ -5241,13 +6457,18 @@ a")
         self.assertEqual(y, y2)
 
     def test_constant_pooling_none(self):
+        # [FUNCTION DOC] Typed None values in both branches are pooled into one NoneType constant
+        # in the graph.
         @torch.jit.script
         def typed_nones(a=None, b=None, c=None):
+            # [FUNCTION DOC] HELPER: Return three optional arguments defaulting to None.
             # type: (Optional[int], Optional[bool], Optional[Tensor]) -> Tuple[Optional[int], Optional[bool], Optional[Tensor]]
             return a, b, c
 
         @torch.jit.script
         def test(a):
+            # [FUNCTION DOC] HELPER: Print the result of typed_nones in both branches of
+            # a conditional.
             # type: (bool) -> None
             if a:
                 print(typed_nones())
@@ -5258,7 +6479,11 @@ a")
         self.assertTrue(graph_str.count("NoneType = prim::Constant") == 1)
 
     def test_constant_pooling_same_identity(self):
+        # [FUNCTION DOC] After constant propagation and pooling, two reads of the same tuple
+        # element give one constant, and results equal eager.
         def foo():
+            # [FUNCTION DOC] HELPER: Index a tuple twice by the same computed index and
+            # return both.
             a = torch.tensor([4])
             b = (a,)
             index = len(a) - 1
@@ -5275,8 +6500,11 @@ a")
         self.assertEqual(foo(), foo_script())
 
     def test_constant_pooling_introduce_aliasing(self):
+        # [FUNCTION DOC] Pooling must not merge two tensor constants into one object, as that
+        # would introduce aliasing; the returned tensors are distinct objects.
         @torch.jit.script
         def foo():
+            # [FUNCTION DOC] HELPER: Return two separately created tensors with the same value.
             a = torch.tensor(1)
             b = torch.tensor(1)
             return a, b
@@ -5288,18 +6516,25 @@ a")
         self.assertIsNot(a, b)
 
     def test_literal(self):
+        # [FUNCTION DOC] checkScript of tuple literals in several forms (nested unpacking, typed
+        # floats, loops, ...).
         def func1(a, b):
+            # [FUNCTION DOC] HELPER: Build a tuple, unpack it and return the sum.
             c = a, b
             d, e = c
             return d + e
 
         def func2(a, b):
+            # [FUNCTION DOC] HELPER: Build a nested tuple, unpack it and return the sum of
+            # the pieces.
             c = a, (a, b)
             d, e = c
             f, g = e
             return d + f + g
 
         def func3(a, b):
+            # [FUNCTION DOC] HELPER: Float-typed function that overwrites a nested tuple inside a
+            # while loop, unpacks it and returns the sum of three entries.
             # type: (float, float) -> float
             c = 0., (0., 0.)
             x = True
@@ -5317,8 +6552,11 @@ a")
         self.checkScript(func3, (a.item(), b.item()), optimize=True)
 
     def test_expand(self):
+        # [FUNCTION DOC] A scripted broadcasting add equals eager, and its backward produces the
+        # expected gradients (full for the larger input, summed over dim 0 for the smaller).
         @torch.jit.script
         def func(x, y):
+            # [FUNCTION DOC] HELPER: Return the sum of x and y (broadcasting).
             return x + y
 
         x = torch.rand(2, 3, dtype=torch.float, requires_grad=True)
@@ -5332,12 +6570,16 @@ a")
         self.assertEqual(y.grad, grad.sum(dim=0))
 
     def test_sum(self):
+        # [FUNCTION DOC] Shape propagation for sum with a dim argument given as list or single
+        # int must run without error after constant propagation.
         @torch.jit.script
         def func(x):
+            # [FUNCTION DOC] HELPER: Sum along dimension 4 given as a list.
             return x.sum(dim=[4])
 
         @torch.jit.script
         def func2(x):
+            # [FUNCTION DOC] HELPER: Sum along dimension 4 given as an int.
             return x.sum(dim=4)
 
         # test that shape analysis is written correctly for sum with OptionalIntArrayRef[1] dim argument
@@ -5347,9 +6589,13 @@ a")
         g2 = _propagate_shapes(func2.graph, (torch.zeros(1, 1, 1, 1, 4),), False)
 
     def test_cat(self):
+        # [FUNCTION DOC] Scripted cat matches eager with fixed and tensor dim; with autodiff
+        # subgraphs not inlined, check the cat node is differentiable (non-simple executors) and
+        # gradients match, including for empty inputs.
         with enable_profiling_mode_for_profiling_tests():
             @torch.jit.script
             def func(x):
+                # [FUNCTION DOC] HELPER: Concatenate x with itself along dim 0.
                 return torch.cat((x, x), dim=0)
 
             x = torch.rand(10, dtype=torch.float, requires_grad=True)
@@ -5357,6 +6603,8 @@ a")
 
             @torch.jit.script
             def func2(x, y):
+                # [FUNCTION DOC] HELPER: Concatenate x with itself along the dimension given as a
+                # tensor y.
                 return torch.cat((x, x), y)
 
             with disable_autodiff_subgraph_inlining():
@@ -5376,31 +6624,40 @@ a")
                         self.assertEqual(grad, grad_ref)
 
     def test_cat_lifts(self):
+        # [FUNCTION DOC] Concatenation of a list is lifted so each graph has an int constant, a
+        # list construct and the cat op in order, for lists of two, zero and one tensors.
         @torch.jit.script
         def foo(x):
+            # [FUNCTION DOC] HELPER: Concatenate a two-element list along dim 1.
             return torch.cat([x, x], dim=1)
 
         @torch.jit.script
         def foo2(x):
+            # [FUNCTION DOC] HELPER: Concatenate an empty list along dim 1.
             return torch.cat([], dim=1)
 
         @torch.jit.script
         def foo3(x):
+            # [FUNCTION DOC] HELPER: Concatenate a one-element list along dim 1.
             return torch.cat([x], dim=1)
 
         for g in [foo.graph, foo2.graph, foo3.graph]:
             FileCheck().check("int =").check("ListConstruct").check("aten::cat").run(str(g))
 
     def test_stack(self):
+        # [FUNCTION DOC] Scripted stack matches eager; with autodiff subgraphs not inlined, check
+        # the stack node is differentiable (non-simple executors) and gradients match.
         with enable_profiling_mode_for_profiling_tests():
             @torch.jit.script
             def func(x):
+                # [FUNCTION DOC] HELPER: Stack x with itself along dim 1.
                 return torch.stack((x, x), dim=1)
             x = torch.rand(10, 10)
             self.assertEqual(func(x, profile_and_replay=True), torch.stack((x, x), dim=1))
 
             @torch.jit.script
             def func2(x, y):
+                # [FUNCTION DOC] HELPER: Stack x and y along dim 0.
                 return torch.stack((x, y), dim=0)
 
             with disable_autodiff_subgraph_inlining():
@@ -5420,9 +6677,12 @@ a")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.LEGACY,
                      "Profiling executor will be using different heuristics for constructing differentiable graphs")
     def test_unbind(self):
+        # [FUNCTION DOC] Scripted unbind matches eager, is inside an autodiff node, and gradients
+        # of the summed outputs match. Legacy executor only.
         with enable_profiling_mode_for_profiling_tests():
             @torch.jit.script
             def func(x, y):
+                # [FUNCTION DOC] HELPER: Unbind x along dimension y.
                 # type: (Tensor, int) -> List[Tensor]
                 return torch.unbind(x, y)
 
@@ -5442,9 +6702,13 @@ a")
     @unittest.skipIf(GRAPH_EXECUTOR == ProfilingMode.PROFILING,
                      "Profiling executor fails to recognize that tensors in a list require gradients")
     def test_meshgrid(self):
+        # [FUNCTION DOC] Scripted meshgrid of a list of tensors matches eager and, outside the
+        # simple executor, forms an autodiff node with matching gradients. Skipped with the
+        # profiling executor.
         with enable_profiling_mode_for_profiling_tests():
             @torch.jit.script
             def func(a):
+                # [FUNCTION DOC] HELPER: Return the meshgrid of a list of tensors.
                 # type: (List[Tensor]) -> List[Tensor]
                 return torch.meshgrid(a)
             with disable_autodiff_subgraph_inlining():
@@ -5464,19 +6728,26 @@ a")
                     self.assertEqual(grads, grads_ref)
 
     def test_tensor_len(self):
+        # [FUNCTION DOC] checkScript of length of a tensor.
         def func(x):
+            # [FUNCTION DOC] HELPER: Return the size of the first dimension.
             return len(x)
 
         self.checkScript(func, [torch.ones(4, 5, 6)])
 
     def test_func_call(self):
+        # [FUNCTION DOC] checkScript of nested calls to plain python helper functions, without
+        # optimization because broadcasts are not inserted before the fuser.
         def add(a, b):
+            # [FUNCTION DOC] HELPER: Return a plus b.
             return a + b
 
         def mul(a, x):
+            # [FUNCTION DOC] HELPER: Return a times x.
             return a * x
 
         def func(alpha, beta, x, y):
+            # [FUNCTION DOC] HELPER: Return add of two mul results with alpha, x and beta, y.
             return add(mul(alpha, x), mul(beta, y))
 
         alpha = torch.rand(1, dtype=torch.float, requires_grad=True)
@@ -5489,8 +6760,11 @@ a")
 
     @unittest.skip("bailouts are being deprecated")
     def test_profiling_graph_executor(self):
+        # [FUNCTION DOC] Check profile nodes are inserted and bailout nodes appear after a shape
+        # change, and the right number of bailouts trigger. Skipped: bailouts are deprecated.
         @torch.jit.script
         def def_in_one_branch(x, z):
+            # [FUNCTION DOC] HELPER: Conditionally redefine y in one branch only, return its sum.
             # type: (Tensor, bool) -> float
             y = x
             if z is False:
@@ -5520,8 +6794,11 @@ a")
 
     @unittest.skip("bailouts are being deprecated")
     def test_maxpool_guard_elimination(self):
+        # [FUNCTION DOC] Check guard elimination leaves one bailout after a max pool. Skipped:
+        # bailouts are deprecated.
         @torch.jit.script
         def my_maxpool(x):
+            # [FUNCTION DOC] HELPER: Max pool with kernel one plus a ones tensor.
             return F.max_pool1d(x, kernel_size=[1]) + torch.ones([32, 32, 32])
 
         a = torch.rand(32, 32, 32)
@@ -5533,8 +6810,11 @@ a")
 
     @unittest.skip("bailouts are being deprecated")
     def test_slice_guard_elimination(self):
+        # [FUNCTION DOC] Check guard elimination leaves one bailout around a repeated strided
+        # slice. Skipped: bailouts are deprecated.
         @torch.jit.script
         def my_slice(x):
+            # [FUNCTION DOC] HELPER: Add two identical strided slices of x.
             return x[0:16:2] + x[0:16:2]
 
         a = torch.rand(32, 4)
@@ -5546,8 +6826,11 @@ a")
 
     @unittest.skip("bailouts are being deprecated")
     def test_unsqueeze_guard_elimination(self):
+        # [FUNCTION DOC] Check guard elimination leaves two bailouts around repeated unsqueeze.
+        # Skipped: bailouts are deprecated.
         @torch.jit.script
         def my_unsqueeze(x):
+            # [FUNCTION DOC] HELPER: Add two identical unsqueezed copies of x.
             return torch.unsqueeze(x, 0) + torch.unsqueeze(x, 0)
 
         a = torch.rand(32, 4)
@@ -5558,14 +6841,20 @@ a")
             FileCheck().check_count("prim::BailOut", 2).run(bailout_graph_str)
 
     def test_resize_input_ops(self):
+        # [FUNCTION DOC] Shape propagation must treat tensors that can alias a resized tensor as
+        # the base unsized Tensor type: for an out op on a graph input, for resize_ in a loop and
+        # for resize_as.
         # resize_ and resize_as resize the input tensor. because our shape analysis
         # is flow invariant, we set any Tensor that can alias a resized Tensor
         # to the base Tensor Type, without size information.
 
         # testing that value which is an input of a graph gets handled
         def out_op_graph_input():
+            # [FUNCTION DOC] HELPER: Check an out-variant multiply writing to z makes the graph
+            # output a plain Tensor type after shape propagation.
             @torch.jit.script
             def test(x, y, z):
+                # [FUNCTION DOC] HELPER: Multiply x and y into z and return z.
                 torch.mul(x, y, out=z)
                 return z
 
@@ -5575,8 +6864,12 @@ a")
         out_op_graph_input()
 
         def test_resize():
+            # [FUNCTION DOC] HELPER: Check the resized tensor and its aliases before and after
+            # the resize are typed as the base Tensor type.
             @torch.jit.script
             def test(x):
+                # [FUNCTION DOC] HELPER: In a loop add one, subtract in place, resize and add in
+                # place; return the alias.
                 after_resize_alias = torch.zeros([2])
                 for _ in range(5):
                     b = x + 1
@@ -5605,8 +6898,12 @@ a")
         test_resize()
 
         def test_resize_as():
+            # [FUNCTION DOC] HELPER: Check resize_as makes the output a base Tensor while the
+            # input keeps its shape type.
             @torch.jit.script
             def test(x):
+                # [FUNCTION DOC] HELPER: Create a zero 2x2 tensor, resize it like x in place, and
+                # return it.
                 b = torch.zeros([2, 2])
                 b.resize_as_(x)
                 return b
@@ -5623,6 +6920,8 @@ a")
         test_resize_as()
 
     def test_uninitialized(self):
+        # [FUNCTION DOC] Parse IR using an uninitialized int, build a function, export/import it,
+        # and check calling it raises RuntimeError about an expected int.
         graph_str = """graph():
           %1 : int = prim::Uninitialized()
           %2 : int = prim::Constant[value=1]()
@@ -5640,8 +6939,12 @@ a")
     @unittest.skipIf(GRAPH_EXECUTOR == ProfilingMode.SIMPLE, "Simple Executor doesn't use requires_grad information")
     @unittest.skipIf(GRAPH_EXECUTOR == ProfilingMode.PROFILING, "Peeling is now disabled")
     def test_requires_grad_loop(self):
+        # [FUNCTION DOC] Requires-grad analysis through a loop where x requires grad and y does
+        # not: inspects loop input/output flags (peeled loops for the profiling executor).
+        # Skipped on Linux, for the simple executor and for the profiling executor.
         @torch.jit.script
         def test(x, y, z):
+            # [FUNCTION DOC] HELPER: Loop z times assigning y to x; return x.
             # type: (Tensor, Tensor, int) -> Tensor
             for _ in range(z):
                 x = y
@@ -5677,6 +6980,8 @@ a")
             self.assertFalse(loop_outputs[1].requires_grad())
 
     def test_view_shape_prop(self):
+        # [FUNCTION DOC] Compile source text calling view with a size keyword of -1 and check the
+        # result is flattened.
         cu = torch.jit.CompilationUnit('''
         def test_view_shape_prop(a):
             return a.view(size=[-1])
@@ -5689,7 +6994,11 @@ a")
 
     @skipIfTorchDynamo("TorchDynamo fails with unknown reason")
     def test_view_listconstruct_shape_prop(self):
+        # [FUNCTION DOC] Shape propagation through a view built from size reads yields a Float
+        # output. Skipped under dynamo.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Reorder dimensions by reading three sizes and viewing as
+            # time, batch, channel.
             B = x.size(0)
             C = x.size(1)
             T = x.size(2)
@@ -5701,8 +7010,11 @@ a")
         self.assertTrue(next(graph.outputs()).type().scalarType() == 'Float')
 
     def test_shape_prop_promotion(self):
+        # [FUNCTION DOC] Shape propagation on a float plus double add yields a double output type
+        # in the graph.
         @torch.jit.script
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return x plus y.
             return x + y
 
         x, y = torch.rand(3, 4, dtype=torch.float), torch.rand(3, 4, dtype=torch.double)
@@ -5710,8 +7022,11 @@ a")
         FileCheck().check('Double(*, *, device=cpu) = aten::add').run(graph)
 
     def test_shape_prop_promote_scalar_arg(self):
+        # [FUNCTION DOC] Adding a python float constant to a long tensor yields a default-dtype
+        # float (or double) result type in shape propagation.
         @torch.jit.script
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return pi plus x.
             return math.pi + x
 
         x = torch.zeros(3, 4, dtype=torch.long)
@@ -5723,6 +7038,8 @@ a")
             FileCheck().check('Double(*, *, requires_grad=0, device=cpu) = aten::add').run(graph)
 
     def test_integral_shape_inference(self):
+        # [FUNCTION DOC] Compile source text multiplying integer tensors and check the
+        # integer result.
         cu = torch.jit.CompilationUnit('''
         def test_integral_shape_inference(a):
             return a * a
@@ -5736,6 +7053,9 @@ a")
     @unittest.skipIf(IS_SANDCASTLE, "NYI: fuser support for Sandcastle")
     @enable_cpu_fuser
     def test_batchnorm_fuser_cpu(self):
+        # [FUNCTION DOC] Generate CPU fuser kernel code for a parsed batch norm pattern and
+        # check it uses the single-precision sqrt. Skipped with CUDA or on sandcastle; enables
+        # the cpu fuser.
         code = '''
             graph(%3 : Tensor,
                   %7 : Tensor,
@@ -5766,15 +7086,22 @@ a")
     @unittest.skipIf(IS_SANDCASTLE, "NYI: fuser support for Sandcastle")
     @enable_cpu_fuser
     def test_fuser_double_float_codegen(self):
+        # [FUNCTION DOC] For many unary math ops and pow, generate CPU fuser code for double and
+        # float tensors and check the C function name (with or without the f suffix). Slow; cpu
+        # fuser only.
         fns = ['log', 'log10', 'log1p', 'log2', 'lgamma', 'exp', 'expm1', 'erf',
                'erfc', 'cos', 'acos', 'cosh', 'sin', 'asin', 'sinh', 'tan',
                'atan', 'tanh', 'sqrt', 'ceil', 'floor', 'round', 'trunc',
                'frac']
 
         def lookup_c_equivalent_fn(aten_fn):
+            # [FUNCTION DOC] HELPER: Return the aten op name unchanged as the C function name.
             return aten_fn
 
         def test_dispatch(op, expects, dtype, binary=False):
+            # [FUNCTION DOC] HELPER: Build IR text for a unary or binary op followed by relu for
+            # the dtype (raises RuntimeError for unknown dtypes), generate fused kernel code and
+            # check it has the expected text.
             if dtype == torch.double:
                 dtype_str = 'Double'
             elif dtype == torch.float:
@@ -5817,6 +7144,8 @@ a")
     @unittest.skipIf(IS_SANDCASTLE, "NYI: fuser support for Sandcastle")
     @enable_cpu_fuser
     def test_fuser_double_literal_precision(self):
+        # [FUNCTION DOC] The CPU fuser must print a double constant literal with full precision
+        # in generated code. Skipped with CUDA or on sandcastle.
         code = '''
         graph(%2 : Float(*, *)):
             %4 : int = prim::Constant[value=1]()
@@ -5831,6 +7160,8 @@ a")
         FileCheck().check('1.282549830161864').run(code)
 
     def test_fuser_multiple_blocks(self):
+        # [FUNCTION DOC] Compile source text with a while loop concatenating three tensors and
+        # check the outputs after 20 iterations.
         cu = torch.jit.CompilationUnit('''
         def test_fuser_multiple_blocks(this, that, theother, meme):
             i = 0
@@ -5850,6 +7181,8 @@ a")
 
     @unittest.skip("RuntimeError: VariableType::ID() not implemented")
     def test_cast(self):
+        # [FUNCTION DOC] Cast a float tensor to int using checkScript on source text. Skipped:
+        # the variable type ID is not implemented.
         script = '''
         def to_int(x):
             return int(x)
@@ -5859,16 +7192,22 @@ a")
         self.checkScript(script, [x], optimize=True, outputs=[out], func='to_int')
 
     def test_str_cast(self):
+        # [FUNCTION DOC] Converting a tuple to a string in script gives the python text of
+        # the tuple.
         @torch.jit.script
         def to_str(x):
+            # [FUNCTION DOC] HELPER: Return the string of the pair of x and x.
             # type: (int) -> str
             return str((x, x))
 
         self.assertEqual("(1, 1)", to_str(1))
 
     def test_int_cast(self):
+        # [FUNCTION DOC] Converting strings to int in script handles signs and 32-bit limits and
+        # raises RuntimeError for hex and binary literals.
         @torch.jit.script
         def to_int(x):
+            # [FUNCTION DOC] HELPER: Convert a string to an int.
             # type: (str) -> int
             return int(x)
 
@@ -5884,7 +7223,12 @@ a")
             to_int('0b0001')
 
     def test_python_frontend(self):
+        # [FUNCTION DOC] Parse a function with many constructs (arithmetic, print, unary minus,
+        # boolean ops, ternary, chained compare, while, assert) with the python frontend and
+        # compare the printed tree with stored expected text.
         def fn(x, y, z):
+            # [FUNCTION DOC] HELPER: Function with assorted statements to exercise the
+            # frontend parser.
             q = None
             q = x + y - z.sigmoid()
             print(q)
@@ -5900,6 +7244,10 @@ a")
         self.assertExpected(str(ast))
 
     def test_python_frontend_source_range(self):
+        # [FUNCTION DOC] Parse a function with the frontend and check the source range text shows
+        # the definition line, an underline, the raise statement and a marker.
+        # KNOWN ISSUE: the checks quote source text, so the doc of fn sits above its def line.
+        # [FUNCTION DOC] HELPER: Function that raises a generic exception.
         def fn():
             raise Exception("hello")  # noqa: TRY002
         ast = torch.jit.frontend.get_jit_def(fn, fn.__name__)
@@ -5911,17 +7259,25 @@ a")
                    .run(str(ast.range()))
 
     def test_python_frontend_py3(self):
+        # [FUNCTION DOC] Parse a function raising an exception with the frontend and compare the
+        # printed tree with stored expected text.
         def fn():
+            # [FUNCTION DOC] HELPER: Function that raises a generic exception.
             raise Exception("hello")  # noqa: TRY002
         ast = torch.jit.frontend.get_jit_def(fn, fn.__name__)
         self.assertExpected(str(ast))
 
     def _make_scalar_vars(self, arr, dtype):
+        # [FUNCTION DOC] HELPER: Build a list of scalar tensors with the given dtype from
+        # python numbers.
         return [torch.tensor(val, dtype=dtype) for val in arr]
 
 
     def test_string_print(self):
+        # [FUNCTION DOC] checkScript with captured output for a print with concatenated string
+        # literals in several quote styles.
         def func(a):
+            # [FUNCTION DOC] HELPER: Print several string literals and numbers, return the input.
             print(a, "a" 'b' '''c''' """d""", 2, 1.5)
             return a
 
@@ -5929,7 +7285,9 @@ a")
         self.checkScript(func, inputs, capture_output=True)
 
     def test_while(self):
+        # [FUNCTION DOC] checkScript (optimized) of a while loop that increments two counters.
         def func(a, b, max):
+            # [FUNCTION DOC] HELPER: Increment a and b until a reaches max; return their sum.
             while bool(a < max):
                 a = a + 1
                 b = b + 1
@@ -5940,7 +7298,11 @@ a")
         self.checkScript(func, inputs, optimize=True)
 
     def test_fibb(self):
+        # [FUNCTION DOC] checkScript (optimized) of a Fibonacci-like loop with nested loop and
+        # unused variables.
         def func(lim):
+            # [FUNCTION DOC] HELPER: Iterate a Fibonacci-like recurrence with an inner counting
+            # loop; return three values.
             first = 1
             second = 1
             i = 1
@@ -5966,7 +7328,9 @@ a")
         self.checkScript(func, inputs, optimize=True)
 
     def test_fibb_totally_better(self):
+        # [FUNCTION DOC] checkScript of Fibonacci with a for loop over a range.
         def fib(x):
+            # [FUNCTION DOC] HELPER: Return the x-th Fibonacci-like value computed with a loop.
             # type: (int) -> int
             prev = 1
             v = 1
@@ -5979,7 +7343,10 @@ a")
         self.checkScript(fib, (10,))
 
     def test_if(self):
+        # [FUNCTION DOC] checkScript (optimized) of an if/else assigning different variables.
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Branch on a being above ten, update a or b and d, return
+            # their sum.
             # type: (int, int) -> int
             d = 3
             if bool(a > 10):
@@ -5994,7 +7361,9 @@ a")
         self.checkScript(func, inputs, optimize=True)
 
     def test_if_for_in_range(self):
+        # [FUNCTION DOC] checkScript (optimized) of an if/else inside a for loop over a range.
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Run twenty iterations of a conditional update and return d.
             # type: (int, int) -> int
             d = 3
             for _ in range(20):
@@ -6009,7 +7378,9 @@ a")
         self.checkScript(func, inputs, optimize=True)
 
     def test_if_noelse(self):
+        # [FUNCTION DOC] checkScript (optimized) of an if without an else branch.
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Conditionally add b to a, return a plus b.
             if bool(a > 10):
                 a = 3 + b
             c = a + b
@@ -6019,9 +7390,14 @@ a")
         self.checkScript(func, inputs, optimize=True)
 
     def test_if_is_none_dispatch(self):
+        # [FUNCTION DOC] Check the compiler resolves comparisons with None statically when one
+        # side is always or never None, producing fewer constants, and boolean combinations of
+        # such tests leave no conditional in the graph.
 
         @torch.jit.script
         def test_lhs_none_rhs_none():
+            # [FUNCTION DOC] HELPER: Compare None with None in a conditional chain; one branch is
+            # always taken.
             # LHS, RHS both alwaysNone, dispatch always_none_branch
             # only emit one prim::Constant
             if None is None:
@@ -6035,6 +7411,8 @@ a")
 
         @torch.jit.script
         def test_lhs_opt_rhs_none(lhs=None):
+            # [FUNCTION DOC] HELPER: Conditional chain on an optional tensor on the left side of
+            # the comparison.
             # type: (Optional[Tensor]) -> int
             # LHS maybeNone: emit normal if stmt that contains 3 constants
             if lhs is not None:
@@ -6048,6 +7426,8 @@ a")
 
         @torch.jit.script
         def test_lhs_none_rhs_opt(rhs=None):
+            # [FUNCTION DOC] HELPER: Conditional chain on an optional tensor on the right side of
+            # the comparison.
             # type: (Optional[Tensor]) -> int
             # RHS maybeNone, emit normal if stmt that contains 3 constants
             if None is rhs:
@@ -6061,6 +7441,8 @@ a")
 
         @torch.jit.script
         def test_lhs_never_rhs_none(lhs):
+            # [FUNCTION DOC] HELPER: Conditional chain on a never-None tensor compared on the
+            # left with None.
             # LHS neverNone, RHS alwaysNone dispatch never_none_branch
             # only emit one prim::Constant
             if lhs is None:
@@ -6074,6 +7456,8 @@ a")
 
         @torch.jit.script
         def test_lhs_none_rhs_never(rhs):
+            # [FUNCTION DOC] HELPER: Conditional chain on a never-None tensor compared on the
+            # right with None.
             # LHS alwaysNone, RHS neverNone dispatch never_none_branch
             # only emit one prim::Constant
             if None is rhs:
@@ -6087,6 +7471,8 @@ a")
 
         @torch.jit.script
         def test_bool_arith_and(lhs):
+            # [FUNCTION DOC] HELPER: Return 1 if the argument is None and not None (never),
+            # else 2.
             if lhs is None and lhs is not None:
                 return 1
             else:
@@ -6096,6 +7482,8 @@ a")
 
         @torch.jit.script
         def test_bool_arith_or(lhs):
+            # [FUNCTION DOC] HELPER: Return 1 if the argument is None or not None (always),
+            # else 2.
             if lhs is None or lhs is not None:
                 return 1
             else:
@@ -6106,6 +7494,7 @@ a")
 
         @torch.jit.script
         def test_bool_arith_not(lhs):
+            # [FUNCTION DOC] HELPER: Return 1 if the argument is not None, else 2.
             if lhs is not None:
                 return 1
             else:
@@ -6114,7 +7503,11 @@ a")
         self.assertTrue(str(test_bool_arith_not.graph).count('if') == 0)
 
     def test_conditional_casting(self):
+        # [FUNCTION DOC] Check implicit bool conversion of tensors, ints and floats in conditions
+        # and negation, the error for multi-element tensors, and the errors for tuples being cast
+        # to bool.
         def test_bool_cast_tensor(x):
+            # [FUNCTION DOC] HELPER: Return 1 if the tensor is truthy, else 0.
             if x:
                 return 1
             else:
@@ -6129,6 +7522,7 @@ a")
                                     "Boolean value of Tensor with more than one value")
 
         def test_not_cast(x):
+            # [FUNCTION DOC] HELPER: Return 1 if the tensor is falsy, else 0.
             if not x:
                 return 1
             else:
@@ -6140,9 +7534,12 @@ a")
         with self.assertRaisesRegex(RuntimeError, r"Could not cast value of type Tuple\[Tensor, Tensor\]"):
             @torch.jit.script
             def test_mult(x, y):
+                # [FUNCTION DOC] HELPER: Negate a tuple of tensors, which cannot be cast to bool;
+                # scripting fails.
                 return not (x, y)
 
         def test_cast_int(x):
+            # [FUNCTION DOC] HELPER: Return 1 if the int is nonzero, else 0.
             # type: (int) -> int
             if x:
                 return 1
@@ -6153,6 +7550,7 @@ a")
         self.checkScript(test_cast_int, (-1,))
 
         def test_cast_float(x):
+            # [FUNCTION DOC] HELPER: Return 1 if the float is nonzero, else 0.
             # type: (float) -> int
             if x:
                 return 1
@@ -6166,12 +7564,16 @@ a")
 
             @torch.jit.script
             def test_bad_conditional(x):
+                # [FUNCTION DOC] HELPER: Conditional on a tuple literal, which cannot be cast to
+                # bool; scripting fails.
                 if (1, 2):  # noqa: F634
                     return
                 else:
                     return 0
 
     def test_while_nonexistent_value(self):
+        # [FUNCTION DOC] Compiling a while loop body that uses an undefined name must raise
+        # RuntimeError saying undefined value.
         with self.assertRaisesRegex(RuntimeError, "undefined value x"):
             torch.jit.CompilationUnit('''
             def test_while(a, b):
@@ -6182,6 +7584,11 @@ a")
             ''')
 
     def test_while_nonexistent_cond_value(self):
+        # [FUNCTION DOC] A while condition using an undefined name must raise RuntimeError about
+        # an undefined value. The test then scripts a series of optional-int functions whose
+        # None checks refine the type (ternary, and, or, not, nested), a backward-compatible
+        # manual unwrap, and four variants (or, and, named flag) that must fail with an
+        # invalid-call error.
         with self.assertRaisesRegex(RuntimeError, "undefined value x"):
             torch.jit.CompilationUnit('''
             def test_while(a, b):
@@ -6193,24 +7600,29 @@ a")
 
         @torch.jit.script
         def test_ternary(x):
+            # [FUNCTION DOC] HELPER: Return the optional int, or 2 if it is None.
             # type: (Optional[int]) -> int
             x = x if x is not None else 2
             return x
 
         @torch.jit.script
         def test_not_none(x):
+            # [FUNCTION DOC] HELPER: Print the value plus one when the optional int is not None.
             # type: (Optional[int]) -> None
             if x is not None:
                 print(x + 1)
 
         @torch.jit.script
         def test_and(x, y):
+            # [FUNCTION DOC] HELPER: Print the sum when both optional ints are not None.
             # type: (Optional[int], Optional[int]) -> None
             if x is not None and y is not None:
                 print(x + y)
 
         @torch.jit.script
         def test_not(x, y):
+            # [FUNCTION DOC] HELPER: Negated both-not-None test; print the sum in the
+            # else branch.
             # type: (Optional[int], Optional[int]) -> None
             if not (x is not None and y is not None):
                 pass
@@ -6219,12 +7631,16 @@ a")
 
         @torch.jit.script
         def test_bool_expression(x):
+            # [FUNCTION DOC] HELPER: Refine on not-None and a comparison; print the value
+            # plus one.
             # type: (Optional[int]) -> None
             if x is not None and x < 2:
                 print(x + 1)
 
         @torch.jit.script
         def test_nested_bool_expression(x, y):
+            # [FUNCTION DOC] HELPER: Refine on three conditions to add y to x, else set x to 5;
+            # return x plus 2.
             # type: (Optional[int], Optional[int]) -> int
             if x is not None and x < 2 and y is not None:
                 x = x + y
@@ -6234,6 +7650,7 @@ a")
 
         @torch.jit.script
         def test_or(x, y):
+            # [FUNCTION DOC] HELPER: Refine with an or test; print the sum in the else branch.
             # type: (Optional[int], Optional[int]) -> None
             if y is None or x is None:
                 pass
@@ -6243,6 +7660,8 @@ a")
         # backwards compatibility
         @torch.jit.script
         def test_manual_unwrap_opt(x):
+            # [FUNCTION DOC] HELPER: Replace None by 1 or unwrap the optional by the
+            # internal helper.
             # type: (Optional[int]) -> int
             if x is None:
                 x = 1
@@ -6253,6 +7672,8 @@ a")
         with self.assertRaisesRegex(RuntimeError, "Arguments for call are not valid"):
             @torch.jit.script
             def or_error(x, y):
+                # [FUNCTION DOC] HELPER: Sums optionals under an or test that does not refine;
+                # scripting must fail.
                 # type: (Optional[int], Optional[int]) -> None
                 if x is None or y is None:
                     print(x + y)  # noqa: T484
@@ -6260,6 +7681,8 @@ a")
         with self.assertRaisesRegex(RuntimeError, "Arguments for call are not valid"):
             @torch.jit.script
             def and_error(x, y):
+                # [FUNCTION DOC] HELPER: Sums optionals in the else of an and test that does not
+                # refine; must fail.
                 # type: (Optional[int], Optional[int]) -> None
                 if x is None and y is None:
                     pass
@@ -6269,6 +7692,8 @@ a")
         with self.assertRaisesRegex(RuntimeError, "Arguments for call are not valid"):
             @torch.jit.script
             def named_var(x):
+                # [FUNCTION DOC] HELPER: Refinement hidden behind a named boolean variable; must
+                # fail to script.
                 # type: (Optional[int]) -> None
                 x_none = x is not None
                 if x_none:
@@ -6277,14 +7702,19 @@ a")
         with self.assertRaisesRegex(RuntimeError, "Arguments for call are not valid"):
             @torch.jit.script
             def named_var_and(x, y):
+                # [FUNCTION DOC] HELPER: Refinement partly hidden behind a named boolean
+                # variable; must fail to script.
                 # type: (Optional[int], Optional[int]) -> None
                 x_none = x is not None
                 if y is not None and x_none:
                     print(x + y)  # noqa: T484
 
     def test_assertion_optional_refinement(self):
+        # [FUNCTION DOC] An assertion on not-None conditions refines optional arguments in
+        # script; the call works for ints and raises for None.
         @torch.jit.script
         def test(x, y):
+            # [FUNCTION DOC] HELPER: Assert both optionals are not None and return their sum.
             # type: (Optional[int], Optional[int]) -> int
             assert x is not None and y is not None  # noqa: S101
             return x + y
@@ -6296,8 +7726,12 @@ a")
     @unittest.skipIf(IS_LINUX, "https://github.com/pytorch/pytorch/issues/91494")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.LEGACY, "the current version of Profiler doesn't profile/specialize Optionals")
     def test_optional_tensor(self):
+        # [FUNCTION DOC] Run a scripted function with an optional tensor argument and inspect the
+        # optimized graph input type after None and tensor calls; also test unwrapping optional
+        # (raises RuntimeError for None). Legacy executor only and not on Linux.
         @torch.jit.script
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return y if x is None, else 0.
             # type: (Optional[Tensor], int) -> int
             if x is None:
                 return y
@@ -6319,6 +7753,7 @@ a")
 
         @torch.jit.script
         def fn(x, y, b):
+            # [FUNCTION DOC] HELPER: Return y if the flag is set, else the unwrapped optional x.
             # type: (Optional[Tensor], Tensor, bool) -> Tensor
             if b:
                 res = y
@@ -6338,8 +7773,11 @@ a")
     @unittest.skipIf(IS_LINUX, "https://github.com/pytorch/pytorch/issues/91484")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.LEGACY, "the current version of Profiler doesn't profile/specialize Optionals")
     def test_optional_list(self):
+        # [FUNCTION DOC] Same as the optional tensor test, with an optional list of ints: graph
+        # input types and unwrap errors are inspected. Legacy executor only and not on Linux.
         @torch.jit.script
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return y if x is None, else the sum of the elements.
             # type: (Optional[List[int]], int) -> int
             if x is None:
                 return y
@@ -6364,6 +7802,8 @@ a")
 
         @torch.jit.script
         def fn(x, y, b):
+            # [FUNCTION DOC] HELPER: Return the unwrapped optional list if the flag is set,
+            # else y.
             # type: (Optional[List[int]], List[int], bool) -> List[int]
             if b:
                 l = torch.jit._unwrap_optional(x)
@@ -6381,8 +7821,11 @@ a")
         self.assertEqual(next(g.outputs()).type().str(), "int[]")
 
     def test_alias_covariant_type_containers(self):
+        # [FUNCTION DOC] Scripting functions that assign tuples holding None or an empty list to
+        # the same variable (covariant container types) must compile; no assertions.
         @torch.jit.script
         def foo(x):
+            # [FUNCTION DOC] HELPER: Return a tuple holding None or one holding an empty list.
             # type: (bool)
             if x:
                 a = (None,)
@@ -6392,13 +7835,19 @@ a")
 
         @torch.jit.script
         def foo2(x, li):
+            # [FUNCTION DOC] HELPER: Replace the optional list tuple by a tuple of None when the
+            # flag is set.
             # type: (bool, Tuple[Optional[List[Tensor]]])
             if x:
                 li = (None,)
             return li
 
     def test_while_write_outer_then_read(self):
+        # [FUNCTION DOC] checkScript (optimized) of a while loop writing outer variable b and
+        # reading it after.
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Loop until a reaches ten, updating a and b; return
+            # their sum.
             while bool(a < 10):
                 a = a + 1
                 b = a + 1
@@ -6409,7 +7858,11 @@ a")
 
     @skipIfTorchDynamo("TorchDynamo fails with unknown reason")
     def test_while_nest_if(self):
+        # [FUNCTION DOC] checkScript (optimized) of a while loop containing an if. Skipped
+        # under dynamo.
         def func(a, b):
+            # [FUNCTION DOC] HELPER: While loop that sets c to the negative of the larger of a
+            # and b.
             # type: (int, int) -> int
             c = 0
             while a < 10:
@@ -6425,23 +7878,32 @@ a")
         self.checkScript(func, inputs, optimize=True)
 
     def test_divmod(self):
+        # [FUNCTION DOC] checkScript of divmod for int and float combinations with positive and
+        # negative operands; dividing by zero in compiled source raises RuntimeError with the
+        # ZeroDivisionError text.
         def func_int(a, b):
+            # [FUNCTION DOC] HELPER: Return divmod of two ints.
             # type: (int, int) -> Tuple[int, int]
             return divmod(a, b)
 
         def func_float(a, b):
+            # [FUNCTION DOC] HELPER: Return divmod of two floats.
             # type: (float, float) -> Tuple[float, float]
             return divmod(a, b)
 
         def func_int_float(a, b):
+            # [FUNCTION DOC] HELPER: Return divmod of an int and a float.
             # type: (int, float) -> Tuple[float, float]
             return divmod(a, b)
 
         def func_float_int(a, b):
+            # [FUNCTION DOC] HELPER: Return divmod of a float and an int.
             # type: (float, int) -> Tuple[float, float]
             return divmod(a, b)
 
         def divmod_test_iterator(func, num, den):
+            # [FUNCTION DOC] HELPER: checkScript the function for every pair of numerator
+            # and denominator.
             for i in num:
                 for j in den:
                     self.checkScript(func, (i, j), frames_up=2)
@@ -6470,7 +7932,12 @@ a")
 
     @skipIfTorchDynamo("Not a TorchDynamo suitable test")
     def test_math_ops(self):
+        # [FUNCTION DOC] Compare script and python results of many math module functions over
+        # float and int value grids (infinities, NaN, extremes), treating python exceptions as
+        # ignorable and NaN as equal to NaN. Skipped under dynamo.
         def checkMathWrap(func_name, num_args=1, is_float=True, **args):
+            # [FUNCTION DOC] HELPER: Run checkMath for float and int arguments if is_float, else
+            # just the given kind.
             if is_float:
                 checkMath(func_name, num_args, True, **args)
                 checkMath(func_name, num_args, False, **args)
@@ -6486,6 +7953,11 @@ a")
         int_vals = list(range(-5, 5, 1)) + [mx_int + 5, mx_int * 2, mn_int - 5, mn_int * 2]
 
         def checkMath(func_name, num_args, is_float=True, ret_type="float", debug=False, vals=None, args_type=None):
+            # [FUNCTION DOC] HELPER: Compile a function applying the named math function from
+            # source text, run python and script versions on all value pairs, and assert
+            # agreement within tolerance (with special handling of NaN, python exceptions and
+            # the Python 3.11 pow behavior). Raises RuntimeError if more than two arguments
+            # are requested.
             funcs_template = dedent('''
             def func(a, b):
                 # type: {args_type} -> {ret_type}
@@ -6570,7 +8042,10 @@ a")
 
     @skipIfTorchDynamo("TorchDynamo fails with unknown reason")
     def test_if_nest_while(self):
+        # [FUNCTION DOC] checkScript of a while loop nested in an if. Skipped under dynamo.
         def func(a, b):
+            # [FUNCTION DOC] HELPER: If a is above b, loop raising b and setting c to its
+            # negative; return c.
             # type: (int, int) -> int
             c = 0
             if a > b:
@@ -6583,12 +8058,17 @@ a")
         self.checkScript(func, inputs)
 
     def test_script_optional_none(self):
+        # [FUNCTION DOC] checkScript of functions assigning None, taking optional arguments,
+        # and having None defaults for tensor and float parameters, comparing scripted and
+        # eager calls.
         def none_stmt(x):
+            # [FUNCTION DOC] HELPER: Assign None, then x, to a variable and return it.
             output = None
             output = x
             return output
 
         def none_args(x):
+            # [FUNCTION DOC] HELPER: Ignore an optional tensor and return None.
             # type: (Optional[Tensor]) -> Optional[Tensor]
             return None
 
@@ -6597,6 +8077,8 @@ a")
 
         # test undefined tensor None as default param
         def test_script_optional_tensor_none(x=None):
+            # [FUNCTION DOC] HELPER: Return x if given, else a tensor of one plus a zero
+            # int8 tensor.
             # type: (Optional[Tensor]) -> Tensor
             res = torch.zeros(1, dtype=torch.int8)
             if x is None:
@@ -6612,6 +8094,7 @@ a")
 
         # test typical None as default param
         def test_script_optional_other_none(x=None):
+            # [FUNCTION DOC] HELPER: Return x if given, else 3.0.
             # type: (Optional[float]) -> float
             res = 2.0
             if x is None:
@@ -6626,16 +8109,22 @@ a")
         self.assertEqual(fn(1.0), scripted_fn(1.0))
 
     def test_script_clamp_none(self):
+        # [FUNCTION DOC] checkScript of clamp with None for one bound and with a single
+        # keyword bound.
         def test_script_clamp_max_none(x):
+            # [FUNCTION DOC] HELPER: Clamp with min 2 and max None.
             return torch.clamp(x, min=2, max=None)
 
         def test_script_clamp_max(x):
+            # [FUNCTION DOC] HELPER: Clamp with max 2.
             return torch.clamp(x, max=2)
 
         def test_script_clamp_min_none(x):
+            # [FUNCTION DOC] HELPER: Clamp with min None and max 2.
             return torch.clamp(x, min=None, max=2)
 
         def test_script_clamp_min(x):
+            # [FUNCTION DOC] HELPER: Clamp with min 2.
             return torch.clamp(x, min=2)
 
         input = [torch.arange(0, 3)]
@@ -6645,13 +8134,17 @@ a")
         self.checkScript(test_script_clamp_min, input, optimize=True)
 
     def test_script_bool_constant(self):
+        # [FUNCTION DOC] checkScript of a function returning a bool constant.
         def test_script_bool_constant():
+            # [FUNCTION DOC] HELPER: Return True through a local variable.
             a = True
             return a
         self.checkScript(test_script_bool_constant, [])
 
     def test_ternary(self):
+        # [FUNCTION DOC] checkScript (optimized) of a ternary expression for both branches.
         def func(a, b):
+            # [FUNCTION DOC] HELPER: Return a plus b if a is above three, else b.
             c = 3
             c = a + b if bool(a > 3) else b
             return c
@@ -6662,17 +8155,28 @@ a")
         self.checkScript(func, inputs_false, optimize=True)
 
     def test_ternary_module_type_hint(self):
+        # [FUNCTION DOC] checkModule, in train and eval mode, of modules whose forward return
+        # annotation is Any or Optional and whose body is a ternary expression.
         class M1(torch.nn.Module):
+            # [FUNCTION DOC] HELPER: Module returning a string in training mode, else an
+            # empty dict.
             def forward(self) -> Any:
+                # [FUNCTION DOC] HELPER: Return a string when training, else an empty dict.
                 return 'out' if self.training else {}
 
         class M2(torch.nn.Module):
+            # [FUNCTION DOC] HELPER: Module like the previous one, storing the ternary result in
+            # an Any variable.
             def forward(self) -> Any:
+                # [FUNCTION DOC] HELPER: Store the ternary result in an Any-typed variable and
+                # return it.
                 out: Any = 'out' if self.training else {}
                 return out
 
         class M3(torch.nn.Module):
+            # [FUNCTION DOC] HELPER: Module returning None in training mode, else one.
             def forward(self) -> Optional[int]:
+                # [FUNCTION DOC] HELPER: Return None when training, else 1.
                 return None if self.training else 1
 
         for module in [M1, M2, M3]:
@@ -6680,28 +8184,41 @@ a")
             self.checkModule(module().eval(), ())
 
     def test_ternary_static_if(self):
+        # [FUNCTION DOC] A ternary whose condition is a Final module attribute is resolved
+        # statically, so the untaken branch (an empty dict) need not match the tensor type;
+        # results equal eager.
         # Test for True branch when condition variable
         # is annotated as Final
         class M1(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with Final flag set to True; forward returns ones or an
+            # empty dict by flag.
             flag: torch.jit.Final[bool]
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Set the Final flag to True.
                 super().__init__()
                 self.flag = True
 
             def forward(self) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Return a tensor of ones when the flag is set, else an
+                # empty dict.
                 return torch.ones(3) if self.flag else {}
 
         # Test for True branch when condition variable
         # is annotated as Final
         class M2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with Final flag set to False; forward returns an empty
+            # dict or ones by flag.
             flag: torch.jit.Final[bool]
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Set the Final flag to False.
                 super().__init__()
                 self.flag = False
 
             def forward(self) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Return an empty dict when the flag is set, else a tensor
+                # of ones.
                 return {} if self.flag else torch.ones(3)
 
         model1 = M1()
@@ -6712,7 +8229,10 @@ a")
         self.assertEqual(model2.forward(), script_model_2.forward())
 
     def test_ternary_right_associative(self):
+        # [FUNCTION DOC] checkScript of chained ternaries, which associate to the right.
         def plus_123(x: int):
+            # [FUNCTION DOC] HELPER: Return x plus 1, 2 or 3 depending on whether x is 1, 2
+            # or other.
             return x + 1 if x == 1 else x + 2 if x == 2 else x + 3
         self.checkScript(plus_123, (1,))
         self.checkScript(plus_123, (2,))
@@ -6720,7 +8240,11 @@ a")
 
     @skipIfTorchDynamo("TorchDynamo fails with unknown reason")
     def test_print(self):
+        # [FUNCTION DOC] checkScript with captured output of a function that prints a tensor,
+        # ints and lists. Skipped under dynamo.
         def func(x, y):
+            # [FUNCTION DOC] HELPER: Print a sigmoid and literals, then return the
+            # squared negation.
             q = (x + y).sigmoid()
             print(q, 1, 2, [1, 2], [1.0, 2.0])
             w = -q
@@ -6731,7 +8255,10 @@ a")
         self.checkScript(func, [x, y], optimize=True, capture_output=True)
 
     def test_format(self):
+        # [FUNCTION DOC] checkScript with captured output of string format calls with and
+        # without placeholders.
         def func(x):
+            # [FUNCTION DOC] HELPER: Print four formatted strings and return x plus one.
             print("{}, I'm a {}".format("Hello", "test"))
             print("format blank".format())
             print("stuff before {}".format("hi"))
@@ -6742,8 +8269,13 @@ a")
         self.checkScript(func, [x], optimize=True, capture_output=True)
 
     def test_logical_short_circuit(self):
+        # [FUNCTION DOC] Logical operators short circuit in script: constant conditions leave no
+        # conditional and never evaluate the failing index; non-short-circuited index errors
+        # raise RuntimeError about the out-of-range index.
         @torch.jit.script
         def testNoThrows(t):
+            # [FUNCTION DOC] HELPER: Condition made of constants and an out-of-range read that is
+            # never evaluated.
             c1 = 1
             if (False and bool(t[1])) or (True or bool(t[1])):  # noqa: SIM222,SIM223
                 c1 = 0
@@ -6755,11 +8287,15 @@ a")
 
         @torch.jit.script
         def throwsOr(t):
+            # [FUNCTION DOC] HELPER: Evaluate a false-or expression that reads an
+            # out-of-range index.
             c0 = False or bool(t[1])
             print(c0)
 
         @torch.jit.script
         def throwsAnd(t):
+            # [FUNCTION DOC] HELPER: Evaluate a true-and expression that reads an
+            # out-of-range index.
             c0 = True and bool(t[1])
             print(c0)
 
@@ -6770,6 +8306,8 @@ a")
             throwsAnd(t)
 
     def test_type_cast(self):
+        # [FUNCTION DOC] Generate small source functions casting between int, float and bool and
+        # run checkScript on each.
         template = dedent('''
         def func(v):
             # type: ({from_type}) -> {to_type}
@@ -6777,6 +8315,8 @@ a")
         ''')
 
         def check_cast(from_type, to_type, value, raises=False):
+            # [FUNCTION DOC] HELPER: Fill the template for the source and target types and
+            # checkScript it with the value.
             code = template.format(from_type=from_type, to_type=to_type)
             self.checkScript(code, (value,))
 
@@ -6792,11 +8332,15 @@ a")
         check_cast('bool', 'float', True)
 
     def test_multiple_assignment(self):
+        # [FUNCTION DOC] Unpacking the multiple return values of a called python function in
+        # script gives the expected sum.
         def outer_func(x):
+            # [FUNCTION DOC] HELPER: Return a pair: x doubled and x plus two.
             return x * 2, x + 2
 
         @torch.jit.script
         def func(x):
+            # [FUNCTION DOC] HELPER: Unpack the pair from outer_func and return the sum.
             y, z = outer_func(x)
             return y + z
 
@@ -6804,23 +8348,32 @@ a")
         self.assertEqual(func(x), x * 2 + x + 2)
 
     def test_literals(self):
+        # [FUNCTION DOC] checkScript (optimized) of view with a size list literal.
         def func(a):
+            # [FUNCTION DOC] HELPER: View a flat tensor with shape 1, 2, 3.
             return a.view(size=[1, 2, 3])
 
         a = torch.randn(6)
         self.checkScript(func, [a], optimize=True)
 
     def test_return(self):
+        # [FUNCTION DOC] checkScript of functions with no return, bare return, one value and
+        # several values; compiling a function lacking a return with a declared return type must
+        # raise RuntimeError about not returning along all paths.
         def no_return(a):
+            # [FUNCTION DOC] HELPER: Evaluate an expression and return nothing.
             a + 1
 
         def void_return(a):
+            # [FUNCTION DOC] HELPER: Return nothing.
             return
 
         def one_return(a):
+            # [FUNCTION DOC] HELPER: Return a plus one float.
             return a + 1.
 
         def multiple_returns(a):
+            # [FUNCTION DOC] HELPER: Return three scaled copies of a.
             return a * 1., a * 2., a * 3.
 
         a = torch.randn(1, dtype=torch.float)
@@ -6837,8 +8390,12 @@ a")
             ''')
 
     def test_error(self):
+        # [FUNCTION DOC] Runtime failures of scripted functions (transposing a 3d tensor, adding
+        # shapes 10 and 9) must raise RuntimeError saying they failed in the interpreter.
         @torch.jit.script
         def foo(a):
+            # [FUNCTION DOC] HELPER: Transpose a 3d tensor with the 2d transpose method; fails at
+            # run time.
             return a.t()
         s = Variable(torch.rand(5, 5, 5))
         # XXX: this should stay quiet in stay propagation and only fail in the interpreter
@@ -6847,22 +8404,28 @@ a")
 
         @torch.jit.script
         def bar(c, b):
+            # [FUNCTION DOC] HELPER: Add two tensors of mismatched shapes; fails at run time.
             return c + b
 
         with self.assertRaisesRegex(RuntimeError, "failed in the TorchScript interpreter"):
             bar(Variable(torch.rand(10), requires_grad=True), Variable(torch.rand(9), requires_grad=True))
 
     def test_error_stacktrace(self):
+        # [FUNCTION DOC] A runtime error in nested script calls must show a traceback naming the
+        # intermediate function and the failing one.
         @torch.jit.script
         def baz(c, b):
+            # [FUNCTION DOC] HELPER: Add two tensors; fails on mismatched shapes.
             return c + b
 
         @torch.jit.script
         def foo(c, b):
+            # [FUNCTION DOC] HELPER: Call baz.
             return baz(c, b)
 
         @torch.jit.script
         def bar(c, b):
+            # [FUNCTION DOC] HELPER: Call foo.
             return foo(c, b)
 
         with self.assertRaises(RuntimeError) as cm:
@@ -6872,26 +8435,35 @@ a")
                    .check("in foo").check("in baz").run(str(cm.exception))
 
     def test_error_stacktrace_interface(self):
+        # [FUNCTION DOC] Same traceback check as the previous test, but reached through an
+        # interface typed object whose method calls the script function chain.
         @torch.jit.script
         def baz(c, b):
+            # [FUNCTION DOC] HELPER: Add two tensors; fails on mismatched shapes.
             return c + b
 
         @torch.jit.script
         def foo(c, b):
+            # [FUNCTION DOC] HELPER: Call baz.
             return baz(c, b)
 
         @torch.jit.script
         def bar(c, b):
+            # [FUNCTION DOC] HELPER: Call foo.
             return foo(c, b)
 
         @torch.jit.script
         class Bar:
+            # [CLASS DOC] HELPER: Script class whose method calls the bar function.
             def one(self, x, y):
+                # [FUNCTION DOC] HELPER: Call bar with x and y.
                 return bar(x, y)
 
         @torch.jit.interface
         class IFace:
+            # [CLASS DOC] HELPER: Script interface declaring a method one on two tensors.
             def one(self, x, y):
+                # [FUNCTION DOC] HELPER: Interface method declaration; no body.
                 # type: (Tensor, Tensor) -> Tensor
                 pass
 
@@ -6899,6 +8471,7 @@ a")
 
         @torch.jit.script
         def as_interface(x):
+            # [FUNCTION DOC] HELPER: Return the argument viewed as the interface type.
             # type: (IFace) -> IFace
             return x
 
@@ -6912,11 +8485,15 @@ a")
                    .check("in foo").check("in baz").run(str(cm.exception))
 
     def test_operator_precedence(self):
+        # [FUNCTION DOC] checkScript of an expression mixing slicing, arithmetic, shifts and
+        # bitwise operators to verify precedence.
         def double(x):
+            # [FUNCTION DOC] HELPER: Return twice the int.
             # type: (int) -> int
             return 2 * x
 
         def complicated_arithmetic_operation():
+            # [FUNCTION DOC] HELPER: Compute a long expression with several operator precedences.
             # TODO we need to test exponent operator '**' and bitwise not
             # operator '~' once they are properly supported.
             list = [0, 1, 2, 3]
@@ -6926,18 +8503,24 @@ a")
         self.checkScript(complicated_arithmetic_operation, ())
 
     def test_in_operator_with_two_strings(self):
+        # [FUNCTION DOC] checkScript of the string containment operator.
         def fn() -> bool:
+            # [FUNCTION DOC] HELPER: Return whether a is a substring of abcd.
             return "a" in "abcd"
         self.checkScript(fn, ())
 
     def test_bitwise_ops(self):
+        # [FUNCTION DOC] checkScript of bitwise operators on ints, bools and tensors, shifts of
+        # tensors by an int, and bitwise not.
 
         def int_test():
+            # [FUNCTION DOC] HELPER: Return and, xor, or, left shift and right shift of two ints.
             return 2 & 3, 2 ^ 3, 2 | 3, 2 << 3, 2 >> 3
 
         self.checkScript(int_test, ())
 
         def bool_test(x, y):
+            # [FUNCTION DOC] HELPER: Return and, xor and or of two bools.
             # type: (bool, bool) -> Tuple[bool, bool, bool]
             return x & y, x ^ y, x | y
 
@@ -6945,9 +8528,11 @@ a")
         self.checkScript(bool_test, (True, True))
 
         def tensor_test(x, y):
+            # [FUNCTION DOC] HELPER: Return and, xor and or of two tensors.
             return x & y, x ^ y, x | y
 
         def tensor_with_int_test(x, y):
+            # [FUNCTION DOC] HELPER: Return the tensor shifted left and right by an int.
             # type: (Tensor, int) -> Tuple[Tensor, Tensor]
             return x << y, x >> y
 
@@ -6958,13 +8543,17 @@ a")
         self.checkScript(tensor_with_int_test, (x, 2))
 
         def not_test(x):
+            # [FUNCTION DOC] HELPER: Return the bitwise not.
             return ~x
 
         self.checkScript(not_test, (torch.tensor([2, 4]), ))
 
     def test_all(self):
+        # [FUNCTION DOC] Check scripted all on uint8 tensors and on lists of bool, int and float
+        # (including the empty list).
         @torch.jit.script
         def test_all_tensor(x):
+            # [FUNCTION DOC] HELPER: Return whether all tensor elements are truthy.
             return all(x)
         self.assertFalse(test_all_tensor(torch.tensor([1, 0, 3], dtype=torch.uint8)))
         self.assertTrue(test_all_tensor(torch.tensor([3.14, 3, 99], dtype=torch.uint8)))
@@ -6973,6 +8562,7 @@ a")
 
         @torch.jit.script
         def test_all_bool_list(x):
+            # [FUNCTION DOC] HELPER: Return all over a list of bool.
             # type: (List[bool]) -> bool
             return all(x)
         self.assertTrue(test_all_bool_list([True, True]))
@@ -6984,6 +8574,7 @@ a")
 
         @torch.jit.script
         def test_all_int_list(x):
+            # [FUNCTION DOC] HELPER: Return all over a list of int.
             # type: (List[int]) -> bool
             return all(x)
         self.assertTrue(test_all_int_list([3, 6]))
@@ -6991,6 +8582,7 @@ a")
 
         @torch.jit.script
         def test_all_float_list(x):
+            # [FUNCTION DOC] HELPER: Return all over a list of float.
             # type: (List[float]) -> bool
             return all(x)
         self.assertTrue(test_all_float_list([3.14, 8.1]))
@@ -6999,6 +8591,9 @@ a")
 
     @skipIfTorchDynamo("Not a TorchDynamo suitable test")
     def test_number_math(self):
+        # [FUNCTION DOC] Generate source text functions applying binary operators and min/max to
+        # pairs of int and float literals (and Scalar items of tensors) and compare script
+        # against python. Skipped under dynamo.
         ops_template = dedent('''
         def func():
             return {scalar1} {op} {scalar2}
@@ -7013,6 +8608,8 @@ a")
         scalar_pairs = [(scalar1, scalar2) for scalar1 in scalars for scalar2 in scalars]
 
         def run_test(code):
+            # [FUNCTION DOC] HELPER: Execute source in python and compile it, and assert both
+            # give equal results.
             scope = {}
             execWrapper(code, globals(), scope)
             cu = torch.jit.CompilationUnit(code)
@@ -7047,15 +8644,19 @@ a")
                 run_test(code)
 
     def test_number_abs(self):
+        # [FUNCTION DOC] checkScript of abs on floats, ints and tensors.
         def func1(x):
+            # [FUNCTION DOC] HELPER: Absolute value of a float.
             # type: (float) -> float
             return abs(x)
 
         def func2(x):
+            # [FUNCTION DOC] HELPER: Absolute value of an int.
             # type: (int) -> int
             return abs(x)
 
         def func3(x):
+            # [FUNCTION DOC] HELPER: Absolute value of a tensor.
             return abs(x)
 
         self.checkScript(func1, (-3.14,))
@@ -7067,6 +8668,8 @@ a")
         self.checkScript(func3, (torch.tensor([-5, 10, -20]),))
 
     def test_number_div(self):
+        # [FUNCTION DOC] Division semantics of ints and floats with and without the future
+        # division import, using helper functions from the test module package.
         self.assertEqual(div_int_future(), torch.jit.script(div_int_future)())
         self.checkScript(div_float_future, ())
 
@@ -7075,7 +8678,9 @@ a")
 
     # Testing bitwise shorthand aug assignment
     def test_bool_augassign_bitwise_or(self):
+        # [FUNCTION DOC] checkScript (optimized) of bitwise-or augmented assignment on bools.
         def func(a: bool, b: bool) -> bool:
+            # [FUNCTION DOC] HELPER: Bitwise or b into a and return a.
             a |= b
             return a
 
@@ -7085,7 +8690,9 @@ a")
         self.checkScript(func, (False, True), optimize=True)
 
     def test_bool_augassign_bitwise_and(self):
+        # [FUNCTION DOC] checkScript (optimized) of bitwise-and augmented assignment on bools.
         def func(a: bool, b: bool) -> bool:
+            # [FUNCTION DOC] HELPER: Bitwise and b into a and return a.
             a &= b
             return a
 
@@ -7095,7 +8702,9 @@ a")
         self.checkScript(func, (False, True), optimize=True)
 
     def test_bool_augassign_bitwise_xor(self):
+        # [FUNCTION DOC] checkScript (optimized) of bitwise-xor augmented assignment on bools.
         def func(a: bool, b: bool) -> bool:
+            # [FUNCTION DOC] HELPER: Bitwise xor b into a and return a.
             a ^= b
             return a
 
@@ -7105,7 +8714,9 @@ a")
         self.checkScript(func, (False, True), optimize=True)
 
     def test_number_augassign_bitwise_lshift(self):
+        # [FUNCTION DOC] checkScript (optimized) of left-shift augmented assignment on an int.
         def func() -> int:
+            # [FUNCTION DOC] HELPER: Shift 8 left by 2 in place and return it.
             z = 8
             z <<= 2
             return z
@@ -7113,7 +8724,9 @@ a")
         self.checkScript(func, (), optimize=True)
 
     def test_number_augassign_bitwise_rshift(self):
+        # [FUNCTION DOC] checkScript (optimized) of right-shift augmented assignment on an int.
         def func() -> int:
+            # [FUNCTION DOC] HELPER: Shift 8 right by 2 in place and return it.
             z = 8
             z >>= 2
             return z
@@ -7121,7 +8734,10 @@ a")
         self.checkScript(func, (), optimize=True)
 
     def test_number_augassign_bitwise_pow(self):
+        # [FUNCTION DOC] checkScript (optimized) of power augmented assignment on an int.
         def func() -> float:
+            # [FUNCTION DOC] HELPER: Raise 8 to the power 2 in place and return it, annotated
+            # as float.
             z = 8
             z **= 2
             return z
@@ -7129,7 +8745,9 @@ a")
         self.checkScript(func, (), optimize=True)
 
     def test_number_augassign(self):
+        # [FUNCTION DOC] checkScript (optimized) of add augmented assignment on an int.
         def func():
+            # [FUNCTION DOC] HELPER: Add 2 to 1 in place and return it.
             z = 1
             z += 2
             return z
@@ -7137,30 +8755,44 @@ a")
         self.checkScript(func, (), optimize=True)
 
     def test_nested_select_assign(self):
+        # [FUNCTION DOC] checkModule of a module whose forward assigns int attributes of itself
+        # and of nested submodules and reads them back.
         class SubSubModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Innermost module with an int attribute returned by forward.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Set the int attribute to 11.
                 super().__init__()
                 self.abc = 11
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the int attribute.
                 return self.abc
 
         class SubModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Middle module with an int attribute and a nested module.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Set the int attribute to 11 and create the
+                # nested module.
                 super().__init__()
                 self.a = 11
                 self.nested = SubSubModule()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the int attribute.
                 return self.a
 
         class TestModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Top module whose forward overwrites attributes of itself and
+            # its submodules.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the submodule and an int attribute of 1.
                 super().__init__()
                 self.sub = SubModule()
                 self.hi = 1
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Assign new values to three attributes and return a
+                # weighted sum.
                 self.hi = 5
                 self.sub.a = 1
                 self.sub.nested.abc = 5
@@ -7169,22 +8801,29 @@ a")
         self.checkModule(TestModule(), ())
 
     def test_number_neg(self):
+        # [FUNCTION DOC] checkScript (optimized) of negative int and float literals.
         # int -> int
         def func1():
+            # [FUNCTION DOC] HELPER: Return the int literal -8.
             return -8
 
         # float -> float
         def func2():
+            # [FUNCTION DOC] HELPER: Return the float literal -3.14.
             return -3.14
 
         self.checkScript(func1, (), optimize=True)
         self.checkScript(func2, (), optimize=True)
 
     def test_compare_two_bool_inputs(self):
+        # [FUNCTION DOC] Scripted equality and inequality of two bool arguments match python for
+        # all four input combinations.
         def compare_eq(a: bool, b: bool):
+            # [FUNCTION DOC] HELPER: Return whether two bools are equal.
             return a == b
 
         def compare_ne(a: bool, b: bool):
+            # [FUNCTION DOC] HELPER: Return whether two bools differ.
             return a != b
 
         scripted_fn_eq = torch.jit.script(compare_eq)
@@ -7201,12 +8840,18 @@ a")
 
 
     def _test_tensor_number_math(self, device='cpu'):
+        # [FUNCTION DOC] HELPER: For many operators, float, double and long tensors, int and
+        # float constants and both operand orders, compile source text with the operation and
+        # compare values and dtypes with python. Skips unsupported cases (integer tensor
+        # division, constant modulo tensor).
         template = dedent('''
         def func(t):
             return {lhs} {op} {rhs}
         ''')
 
         def test(op, tensor, const, swap_args, template=template):
+            # [FUNCTION DOC] HELPER: Compile and run the generated function in script and python
+            # and assert equal value and dtype.
             args = ('t', const)
             if swap_args:
                 args = (const, 't')
@@ -7248,30 +8893,42 @@ a")
 
     @skipIfTorchDynamo("Not a TorchDynamo suitable test")
     def test_tensor_number_math(self):
+        # [FUNCTION DOC] Run the tensor and number math comparison on cpu. Skipped under dynamo.
         self._test_tensor_number_math()
 
     def test_torch_tensor_bad_input(self):
+        # [FUNCTION DOC] Creating tensors in script from invalid data must raise RuntimeError: a
+        # list of None, an empty list defaulting to tensor list type, and a ragged nested list at
+        # run time.
         with self.assertRaisesRegex(RuntimeError, "must be of ints, floats, "
                                     "or bools, got None"):
             @torch.jit.script
             def test():
+                # [FUNCTION DOC] HELPER: Create a tensor from a list containing None; scripting
+                # must fail.
                 return torch.tensor([None])
             test()
 
         with self.assertRaisesRegex(RuntimeError, r"Empty lists default to List\[Tensor\]"):
             @torch.jit.script
             def tmp():
+                # [FUNCTION DOC] HELPER: Create a tensor from an empty list; scripting must fail.
                 return torch.tensor([])
             tmp()
 
         @torch.jit.script
         def foo():
+            # [FUNCTION DOC] HELPER: Create a tensor from a ragged nested list; running
+            # must fail.
             return torch.tensor([[2, 2], [1]])
         with self.assertRaisesRegex(RuntimeError, "Expected sequence of length"):
             foo()
 
     @suppress_warnings
     def test_torch_tensor_as_tensor_empty_list(self):
+        # [FUNCTION DOC] Compile source text creating tensors from nested empty int lists
+        # with the tensor and as_tensor constructors, compare to python (dtype differs for
+        # the flat case).
         tensor_template = dedent('''
         def func():
             empty_list = torch.jit.annotate(List[int], [])
@@ -7298,6 +8955,9 @@ a")
     @unittest.skipIf(IS_LINUX, "https://github.com/pytorch/pytorch/issues/91482")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.LEGACY, "Simple Executor doesn't have any shapes to propagate")
     def test_tensor_as_tensor_shape_prop(self):
+        # [FUNCTION DOC] Shape analysis of tensor and as_tensor over scalar and list literals
+        # yields the expected static shape strings; also check dtype argument handling and
+        # as_tensor of a tensor in script graphs. Legacy executor only and not on Linux.
         tensor_template = dedent('''
         def func():
             return torch.{tensor_op}({input})
@@ -7319,6 +8979,8 @@ a")
 
         @torch.jit.script
         def test_dtype(inp_dtype: torch.dtype):
+            # [FUNCTION DOC] HELPER: Return a float tensor requiring grad and one with a
+            # dtype argument.
             a = torch.tensor(1.0, dtype=torch.float, requires_grad=True)
             return a, torch.tensor(1.0, dtype=inp_dtype)
 
@@ -7335,6 +8997,8 @@ a")
 
         @torch.jit.script
         def test_as_tensor_tensor_input(input):
+            # [FUNCTION DOC] HELPER: Return as_tensor of the input with its own dtype and
+            # with float.
             a = torch.as_tensor(input, dtype=input.dtype)
             return a, torch.as_tensor(input, dtype=torch.float)
 
@@ -7349,8 +9013,12 @@ a")
     @unittest.skipIf(IS_LINUX, "https://github.com/pytorch/pytorch/issues/91497")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.LEGACY, "testing legacy behavior")
     def test_tensor_requires_grad(self):
+        # [FUNCTION DOC] Tensor construction in script records requires_grad on the graph
+        # outputs: set by argument or by constant. Legacy executor only and not on Linux.
         @torch.jit.script
         def test(b):
+            # [FUNCTION DOC] HELPER: Create three scalar tensors with requires_grad from the
+            # flag, true, false.
             # type: (bool) -> Tuple[Tensor, Tensor, Tensor]
             a = torch.tensor(1., requires_grad=b)
             b = torch.tensor(1., requires_grad=True)
@@ -7366,7 +9034,11 @@ a")
         self.assertFalse(out_inp[2].requires_grad())
 
     def test_grad_from_script(self):
+        # [FUNCTION DOC] A tensor created in script with requires_grad can be used for backward
+        # and its grad equals that of the eager version.
         def test():
+            # [FUNCTION DOC] HELPER: Create a scalar tensor requiring grad, double it,
+            # return both.
             a = torch.tensor(2.5, requires_grad=True)
             b = a * 2
             return a, b
@@ -7379,6 +9051,9 @@ a")
         self.assertEqual(a.grad, a_script.grad)
 
     def test_torch_tensor_as_tensor(self):
+        # [FUNCTION DOC] Compile source text constructing tensors with tensor and as_tensor from
+        # many literal lists, dtypes and devices, and compare values, dtypes and devices with
+        # python; then checkScript as_tensor on a complex tensor.
         tensor_template = dedent('''
         def func():
             li = {list_create}
@@ -7424,6 +9099,7 @@ a")
                     self.assertEqual(t1.device, t2.device)
 
         def test_as_tensor_tensor_input(input):
+            # [FUNCTION DOC] HELPER: Return as_tensor of the input to complex, float and int32.
             # type: (Tensor) -> Tuple[Tensor, Tensor, Tensor]
             return torch.as_tensor(input, dtype=torch.cfloat), torch.as_tensor(input, dtype=torch.float), \
                 torch.as_tensor(input, dtype=torch.int32)
@@ -7432,7 +9108,12 @@ a")
         self.checkScript(test_as_tensor_tensor_input, (inp,))
 
     def test_torch_tensor_dtype(self):
+        # [FUNCTION DOC] Script a function creating tensors from python floats under different
+        # default dtypes (double, float, half) and check results and, for legacy, the dtype in
+        # the graph.
         def foo(s: float):
+            # [FUNCTION DOC] HELPER: Return a scalar tensor and a two-element tensor from
+            # a float.
             return torch.tensor(s), torch.tensor([s, s])
 
         # need to clear function cache so we re run shape analysis
@@ -7452,8 +9133,11 @@ a")
                 FileCheck().check("Half").check_same("aten::tensor").run(torch.jit.last_executed_optimized_graph())
 
     def test_shape_analysis_grad_property(self):
+        # [FUNCTION DOC] After complete shape analysis the requires_grad property of a sub node
+        # output stays unset (None).
         @torch.jit.script
         def foo(x):
+            # [FUNCTION DOC] HELPER: Return x minus tanh of x.
             return torch.sub(x, torch.tanh(x))
 
         torch._C._jit_pass_complete_shape_analysis(foo.graph, (torch.tensor([0.39]),), False)
@@ -7462,7 +9146,10 @@ a")
         self.assertTrue(foo.graph.findNode("aten::sub").output().requiresGrad() is None)
 
     def test_empty_like_memory_format_bc(self):
+        # [FUNCTION DOC] zeros_like with a None memory format argument works in script and
+        # equals eager.
         def f(x):
+            # [FUNCTION DOC] HELPER: Return zeros like x with memory format None.
             # type: (Tensor) -> Tensor
             return torch.zeros_like(x, memory_format=None)
 
@@ -7471,7 +9158,11 @@ a")
         self.assertEqual(scripted_f(x), f(x))
 
     def test_multiline_string_dedents(self):
+        # [FUNCTION DOC] Scripting a function with multi-line string literals at odd indentation
+        # must compile, and calling it returns None like eager.
         def foo() -> None:
+            # [FUNCTION DOC] HELPER: Assign four multi-line strings at differing indentations;
+            # returns nothing.
             multiline_string_dedent_1 = """
 This is a string dedent """
             multiline_string_dedent_2 = """ This is a
@@ -7485,8 +9176,14 @@ dedent """
         self.assertEqual(scripted_foo(), foo())
 
     def test_class_with_comment_at_lower_indentation(self):
+        # [FUNCTION DOC] A comment at a lower indentation than its surrounding block inside a
+        # method must not break scripting the module.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward has a comment line indented less than
+            # the code.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Negate x and return it (contains a mis-indented
+                # comment line).
                 x = torch.neg(x)
         # This comment is at the wrong indent
                 return x
@@ -7495,6 +9192,10 @@ dedent """
 
     # adapted from test in test_torch
     def test_tensor_to(self):
+        # [FUNCTION DOC] Compare to() variants (device, dtype, tensor, copy, non-blocking) in
+        # compiled source with eager: identity versus copy behavior, device and dtype results,
+        # data pointers, and autodiff gradients through the cast ops. Cuda cases are added
+        # when available.
         template = dedent('''
         def func(t):
             cuda = "{cuda}"
@@ -7504,6 +9205,8 @@ dedent """
         ''')
 
         def s(t, to_str, non_blocking=None, device=None, cuda=None):
+            # [FUNCTION DOC] HELPER: Compile source using the given expression on t with device,
+            # flag and cuda strings filled in, and run it with profile and replay.
             device = device if device is not None else str(t.device)
             non_blocking = non_blocking if non_blocking is not None else False
             cuda = "cuda" if cuda is None else cuda
@@ -7513,6 +9216,9 @@ dedent """
             return cu.func(t, profile_and_replay=True)
 
         def test_copy_behavior(t, non_blocking=False):
+            # [FUNCTION DOC] HELPER: Check to() returns the same tensor object when
+            # nothing changes and a new one when copy is requested, for tensor, dtype and
+            # device arguments.
             self.assertIs(t, s(t, 't.to(t, non_blocking=non_blocking)', non_blocking))
             self.assertIs(t, s(t, 't.to(t.dtype, non_blocking=non_blocking)', non_blocking))
             self.assertIs(t, s(t, 't.to(torch.empty_like(t), non_blocking=non_blocking)', non_blocking))
@@ -7582,6 +9288,7 @@ dedent """
         # Test AD: aten::to(Tensor self, Tensor other, bool non_blocking, bool copy) -> Tensor
         @torch.jit.script
         def func2(t, t_ref):
+            # [FUNCTION DOC] HELPER: Cast t to the type and device of t_ref.
             return t.to(t_ref)
 
         with disable_autodiff_subgraph_inlining():
@@ -7594,17 +9301,22 @@ dedent """
 
     @unittest.skipIf(not RUN_CUDA, "No CUDA")
     def test_tensor_number_math_cuda(self):
+        # [FUNCTION DOC] Run the tensor and number math comparison on cuda. Needs CUDA.
         self._test_tensor_number_math(device='cuda')
 
     def test_not(self):
+        # [FUNCTION DOC] checkScript (optimized) of the not operator on a comparison.
         # test not operator in python
         # TODO: add more tests when bool conversions ready
         def test_not_op(a):
+            # [FUNCTION DOC] HELPER: Return the logical negation of a greater-than test.
             return not bool(a > 1)
 
         self.checkScript(test_not_op, (torch.tensor(2), ), optimize=True)
 
     def test_is_isnot(self):
+        # [FUNCTION DOC] Compile source text applying is and is not to all pairs of literals
+        # (bool, None, list, int, float) and compare with python.
         # test is and is not operator in python
         template = dedent('''
         def func():
@@ -7613,6 +9325,8 @@ dedent """
         ''')
 
         def test(op, args):
+            # [FUNCTION DOC] HELPER: Compile and run the identity test for the operator and
+            # operand pair.
             code = template.format(lhs=args[0], rhs=args[1], op=op)
             scope = {}
             execWrapper(code, globals(), scope)
@@ -7631,8 +9345,11 @@ dedent """
             test(op, [lhs, rhs])
 
     def test_isinstance_refinement(self):
+        # [FUNCTION DOC] Isinstance narrows optional and Any typed values in script: int
+        # refinement for one or two optionals, Any values with ints, and Any with tensors.
         @torch.jit.script
         def foo(a):
+            # [FUNCTION DOC] HELPER: Return a plus 3 if an optional is an int, else 4.
             # type: (Optional[int]) -> int
             if isinstance(a, int):
                 return a + 3
@@ -7643,6 +9360,7 @@ dedent """
 
         @torch.jit.script
         def foo2(a, b):
+            # [FUNCTION DOC] HELPER: Return the sum if both optionals are ints, else 0.
             # type: (Optional[int], Optional[int]) -> int
             if not isinstance(a, int) or not isinstance(b, int):
                 return 0
@@ -7654,6 +9372,7 @@ dedent """
 
         @torch.jit.script
         def any_refinement(a, b):
+            # [FUNCTION DOC] HELPER: Return a plus b when both Any values are ints, else 0.
             # type: (Any, Any) -> int
             if isinstance(a, int) and isinstance(b, int):
                 return a + b
@@ -7664,6 +9383,7 @@ dedent """
 
         @torch.jit.script
         def any_refinement2(a):
+            # [FUNCTION DOC] HELPER: Return the argument if it is a tensor, else a tensor of 3.
             # type: (Any) -> Tensor
             if isinstance(a, Tensor):
                 return a
@@ -7674,11 +9394,15 @@ dedent """
 
     @unittest.skipIf(GRAPH_EXECUTOR == ProfilingMode.LEGACY, "bug persists in deprecated executor")
     def test_unspecialized_any_binding(self):
+        # [FUNCTION DOC] An Any parameter keeps its general type, so an isinstance check against
+        # a dict of tensors works for a dict input and fails for other inputs. Skipped for the
+        # legacy executor.
         # any binding will infer the type, if it infers
         # a specialized tensor type `x` Dict type will fail isinstance check
 
         @torch.jit.script
         def foo(x: Any):
+            # [FUNCTION DOC] HELPER: Assert the Any value is a dict of str to tensor.
             assert isinstance(x, Dict[str, torch.Tensor])  # noqa: S101
 
         foo({"1": torch.tensor(3)})
@@ -7687,6 +9411,8 @@ dedent """
 
     @skipIfTorchDynamo("Not a TorchDynamo suitable test")
     def test_isinstance(self):
+        # [FUNCTION DOC] Compile source text checking isinstance against many types and compare
+        # with python; also an optional-int isinstance. Skipped under dynamo.
         # test isinstance operator for static type checking
         template = dedent('''
         def func(x):
@@ -7695,6 +9421,8 @@ dedent """
         ''')
 
         def test(inp, typ, type_hint):
+            # [FUNCTION DOC] HELPER: Compile and run the isinstance function for the type;
+            # compare with python.
             code = template.format(typ=typ, type_hint=type_hint)
             scope = {}
             execWrapper(code, globals(), scope)
@@ -7718,51 +9446,73 @@ dedent """
         # test optional isinstance check
         @torch.jit.script
         def opt_func(x):
+            # [FUNCTION DOC] HELPER: Return whether an optional int is an int.
             # type: (Optional[int]) -> bool
             return isinstance(x, int)
         self.assertTrue(opt_func(3))
         self.assertFalse(opt_func(None))
 
     def test_dropout_eval(self):
+        # [FUNCTION DOC] Compare outputs of script and eager versions of the same
+        # convolution, batch norm, relu and dropout modules in eval and train mode, with a
+        # frozen random generator.
         class ScriptedConv2d(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module: convolution without bias, batch norm,
+            # in-place relu.
             def __init__(self, in_channels, out_channels, **kwargs):
+                # [FUNCTION DOC] HELPER: Create the convolution (no bias) and the batch norm
+                # (eps 0.001).
                 super().__init__()
                 self.conv = nn.Conv2d(in_channels, out_channels, bias=False, **kwargs)
                 self.bn = nn.BatchNorm2d(out_channels, eps=0.001)
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply convolution, batch norm and in-place relu.
                 x = self.conv(x)
                 x = self.bn(x)
                 return F.relu(x, inplace=True)
 
         class ScriptMod(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module: a ScriptedConv2d then dropout depending on
+            # training mode.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the convolution submodule.
                 super().__init__()
                 self.Conv2d_1a_3x3 = ScriptedConv2d(3, 32, kernel_size=3, stride=2)
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the submodule, then dropout with the module's
+                # training flag.
                 x = self.Conv2d_1a_3x3(x)
                 return F.dropout(x, training=self.training)
 
         class EagerConv2d(torch.nn.Module):
+            # [CLASS DOC] HELPER: Eager module twin of ScriptedConv2d.
             def __init__(self, in_channels, out_channels, **kwargs):
+                # [FUNCTION DOC] HELPER: Create the convolution (no bias) and the batch norm
+                # (eps 0.001).
                 super().__init__()
                 self.conv = nn.Conv2d(in_channels, out_channels, bias=False, **kwargs)
                 self.bn = nn.BatchNorm2d(out_channels, eps=0.001)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply convolution, batch norm and in-place relu.
                 x = self.conv(x)
                 x = self.bn(x)
                 return F.relu(x, inplace=True)
 
         class EagerMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Eager module twin of ScriptMod.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the convolution submodule.
                 super().__init__()
                 self.Conv2d_1a_3x3 = EagerConv2d(3, 32, kernel_size=3, stride=2)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the submodule, then dropout with the module's
+                # training flag.
                 x = self.Conv2d_1a_3x3(x)
                 return F.dropout(x, training=self.training)
 
@@ -7794,7 +9544,10 @@ dedent """
         self.assertEqual(script_output, eager_output)
 
     def test_nested_breaks(self):
+        # [FUNCTION DOC] Check break/continue in nested loops: results equal eager, and the loop
+        # outputs of the compiled graph never carry the internal exit-flag bool.
         def no_bool_loop_outputs(g):
+            # [FUNCTION DOC] HELPER: Assert no output of any loop node in the graph is a bool.
             # testing that the "did exit" transform values are not loop block
             # outputs (and thus not affecting one loop from another)
             loops = g.findAllNodes("prim::Loop")
@@ -7803,6 +9556,8 @@ dedent """
                     self.assertTrue(out.type() != BoolType.get())
 
         def test(y):
+            # [FUNCTION DOC] HELPER: While loop with continue and an inner for loop with
+            # continue, returning a counter and the tensor value.
             # type: (int)
             ret = 0
             tensor = torch.tensor(0)
@@ -7820,6 +9575,8 @@ dedent """
         no_bool_loop_outputs(torch.jit.script(test).graph)
 
         def foo():
+            # [FUNCTION DOC] HELPER: While loop with nested for loop containing continue and
+            # break paths.
             y = torch.tensor(0)
             z = 0
             while int(y.add_(1)) < 20:
@@ -7842,6 +9599,8 @@ dedent """
         self.checkScript(foo, ())
 
         def test_nested_two():
+            # [FUNCTION DOC] HELPER: Nested loops with a continue in the inner loop and a break
+            # in the outer.
             i = 0
             k = 0
             while i < 5:
@@ -7859,7 +9618,12 @@ dedent """
         no_bool_loop_outputs(torch.jit.script(test_nested_two).graph)
 
     def test_breaks_continues(self):
+        # [FUNCTION DOC] Many checkScript cases for break and continue handling: guards,
+        # assignments after break, may-break, nested conditions, variable exits needing
+        # uninitialized values, and constant true/false loops.
         def foo_continue(cond):
+            # [FUNCTION DOC] HELPER: Count loop iterations skipping the one equal to cond
+            # via continue.
             # type: (int)
             j = 1
             for i in range(5):
@@ -7869,6 +9633,8 @@ dedent """
             return j
 
         def foo_break(cond):
+            # [FUNCTION DOC] HELPER: Count loop iterations stopping at the one equal to cond
+            # via break.
             # type: (int)
             j = 1
             for i in range(5):
@@ -7882,6 +9648,8 @@ dedent """
             self.checkScript(foo_break, (i,))
 
         def test_refine_outside_loop():
+            # [FUNCTION DOC] HELPER: While loop with optional refinement outside the loop,
+            # with continue.
             if 1 == 1:
                 x = None
             else:
@@ -7905,6 +9673,7 @@ dedent """
         self.checkScript(test_refine_outside_loop, ())
 
         def assign_after_break(y):
+            # [FUNCTION DOC] HELPER: Assign after an unconditional break in a for loop.
             # type: (int)
             x = 0
             for i in range(y):
@@ -7918,6 +9687,8 @@ dedent """
         self.checkScript(assign_after_break, (3,))
 
         def assign_after_break_nested(y):
+            # [FUNCTION DOC] HELPER: Breaks in both branches of a conditional, with dead
+            # code after.
             # type: (int)
             x = 0
             for _ in range(y):
@@ -7938,6 +9709,7 @@ dedent """
         self.checkScript(assign_after_break_nested, (3,))
 
         def may_break(y):
+            # [FUNCTION DOC] HELPER: A loop that may break in only one branch.
             # type: (int)
             x = 0
             for _ in range(y):
@@ -7954,6 +9726,7 @@ dedent """
         self.checkScript(may_break, (3,))
 
         def test(x, y):
+            # [FUNCTION DOC] HELPER: While loop with nested conditionals, for loop and breaks.
             # type: (int, int)
             a = 1
             while (x > 0):
@@ -7980,6 +9753,7 @@ dedent """
         self.checkScript(test, (2, 3))
 
         def test_delete_after_break(x):
+            # [FUNCTION DOC] HELPER: Assignment after an unconditional break that must not run.
             # type: (int)
             a = 1
             b = 1
@@ -7993,6 +9767,8 @@ dedent """
         self.checkScript(test_delete_after_break, (1,))
 
         def test_will_break_after_guard(x):
+            # [FUNCTION DOC] HELPER: Loop with a conditional break and an unconditional break
+            # after a guard.
             # type: (int)
             a = 1
             for i in range(x):
@@ -8010,6 +9786,8 @@ dedent """
         self.checkScript(test_will_break_after_guard, (4,))
 
         def test_varexit(cond):
+            # [FUNCTION DOC] HELPER: Loop where a variable is defined only on some paths before
+            # a break.
             # type: (int)
             m = 0
             for _ in range(3):
@@ -8028,6 +9806,8 @@ dedent """
         self.checkScript(test_varexit, (2,))
 
         def test_break_true():
+            # [FUNCTION DOC] HELPER: Loop on constant true with a break, and a loop on
+            # constant false.
             i = 0
             while True:
                 i += 1
@@ -8040,6 +9820,9 @@ dedent """
         self.checkScript(test_break_true, ())
 
     def test_break_continue_error(self):
+        # [FUNCTION DOC] Break and continue outside loops or in nested functions must raise
+        # RuntimeError with a syntax message, and in loops over heterogeneous tuples with a
+        # not-supported message.
         with self.assertRaisesRegex(RuntimeError, "Syntax"):
             cu = torch.jit.CompilationUnit('''
             def other_func(a):
@@ -8057,6 +9840,8 @@ dedent """
         with self.assertRaisesRegex(RuntimeError, "do not support break or continue inside"):
             @torch.jit.script
             def foo(x):
+                # [FUNCTION DOC] HELPER: Loop over a tuple of mixed types with a break; scripting
+                # must fail.
                 i = 0
                 for a in (1, "2", 1.5):
                     b = a
@@ -8065,7 +9850,11 @@ dedent """
                 return b
 
     def test_python_call(self):
+        # [FUNCTION DOC] Compile source text whose functions call a python function from the
+        # enclosing scope and another compiled function inside a loop, then check the
+        # numeric result.
         def pyfunc(a):
+            # [FUNCTION DOC] HELPER: Return a times 3.0.
             return a * 3.0
 
         cu = torch.jit.CompilationUnit('''
@@ -8090,8 +9879,11 @@ dedent """
         self.assertEqual(cu.test_call_python(*inputs), outputs[0])
 
     def test_python_call_failure(self):
+        # [FUNCTION DOC] Compiling source text that calls an undefined python function name must
+        # raise RuntimeError about the undefined value.
         with self.assertRaisesRegex(RuntimeError, "undefined value pyfunc2"):
             def pyfunc(a):
+                # [FUNCTION DOC] HELPER: Return a times 3.0.
                 return a * 3.0
 
             cu = torch.jit.CompilationUnit('''
@@ -8116,19 +9908,26 @@ dedent """
             self.assertEqual(cu.test_call_python(*inputs), outputs)
 
     def test_type_call_in_script(self):
+        # [FUNCTION DOC] Returning the type of a tensor from a script function compiles, but
+        # running it raises RuntimeError mentioning the unsupported metaclass value.
         @torch.jit.script
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the python type of the argument.
             return type(x)
 
         with self.assertRaisesRegex(RuntimeError, "value of type _TensorMeta"):
             fn(torch.tensor(.5))
 
     def test_python_call_annotation(self):
+        # [FUNCTION DOC] A script function can call a plain python function from the enclosing
+        # scope; the sum of two calls gives the expected value.
         def pyfunc(a):
+            # [FUNCTION DOC] HELPER: Return a times 3.0.
             return a * 3.0
 
         @torch.jit.script
         def foo(a):
+            # [FUNCTION DOC] HELPER: Return the sum of two calls to the python function.
             return pyfunc(a) + pyfunc(a)
 
         inputs = self._make_scalar_vars([1], torch.float)
@@ -8136,12 +9935,17 @@ dedent """
         self.assertEqual(foo(*inputs), outputs[0])
 
     def test_python_call_annoytation_failure(self):
+        # [FUNCTION DOC] Scripting a function that calls an undefined name must raise
+        # RuntimeError about the undefined value.
         with self.assertRaisesRegex(RuntimeError, "undefined value pyfunc2"):
             def pyfunc(a):
+                # [FUNCTION DOC] HELPER: Return a times 3.0.
                 return a * 3.0
 
             @torch.jit.script
             def foo(a):
+                # [FUNCTION DOC] HELPER: Call an undefined function and the python function;
+                # scripting must fail.
                 return pyfunc2(a) + pyfunc(a)  # noqa: F821
 
             inputs = self._make_scalar_vars([1], torch.float)
@@ -8150,9 +9954,13 @@ dedent """
             self.assertEqual(foo(*inputs), outputs[0])
 
     def test_desugar_module(self):
+        # [FUNCTION DOC] checkScript (optimized) of calls to functional ops through the
+        # torch.nn.functional path and an alias of the functional module.
         import torch.nn.functional as F
 
         def fn(x, slope):
+            # [FUNCTION DOC] HELPER: Return abs and the prelu result via the full path and
+            # the alias.
             a = torch.abs(x)
             b = torch.nn.functional.prelu(x, slope)
             c = F.prelu(x, slope)
@@ -8163,8 +9971,12 @@ dedent """
         self.checkScript(fn, [x, slope], optimize=True)
 
     def test_script_docstring(self):
+        # [FUNCTION DOC] The docstring of a scripted function is preserved as the function doc; a
+        # later bare string statement is just an expression.
         @torch.jit.script
         def with_docstring(x):
+            # [FUNCTION DOC] HELPER: Function with a docstring and a stray string statement;
+            # returns x.
             """test str"""
             y = x
             """y is the same as x"""
@@ -8172,9 +9984,13 @@ dedent """
         self.assertEqual(with_docstring.__doc__, 'test str')
 
     def test_script_method_docstring(self):
+        # [FUNCTION DOC] The docstring of a script method is preserved as the method doc.
         class A(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a documented script method.
             @torch.jit.script_method
             def with_docstring(self, x):
+                # [FUNCTION DOC] HELPER: Method with a docstring and a stray string statement;
+                # returns x.
                 """test str"""
                 y = x
                 """y is the same as x"""
@@ -8183,25 +9999,40 @@ dedent """
         self.assertEqual(a.with_docstring.__doc__, 'test str')
 
     def test_script_module(self):
+        # [FUNCTION DOC] Build a script module with a parameter, a script submodule, a plain
+        # eager submodule, script methods, and a method defined from a string; compare forward
+        # with a manual computation before and after zeroing all parameters.
         class M1(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script submodule adding a parameter to its input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random parameter of size 2.
                 super().__init__()
                 self.weight = nn.Parameter(torch.randn(2))
 
             @torch.jit.script_method
             def forward(self, thing):
+                # [FUNCTION DOC] HELPER: Return the parameter plus the input.
                 return self.weight + thing
 
         class PModule(nn.Module):
+            # [CLASS DOC] HELPER: Plain eager module multiplying a parameter matrix with
+            # its input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random 2x3 parameter.
                 super().__init__()
                 self.a = nn.Parameter(torch.randn(2, 3))
 
             def forward(self, a):
+                # [FUNCTION DOC] HELPER: Return the matrix product of the parameter and
+                # the input.
                 return self.a.mm(a)
 
         class M2(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a script submodule, an eager submodule,
+            # parameters, and methods added both by decoration and from a source string.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create submodules and parameters, and define hi
+                # from text.
                 super().__init__()
                 # test submodule
                 self.sub = M1()
@@ -8218,15 +10049,19 @@ dedent """
 
             @torch.jit.script_method
             def doit(self, input):
+                # [FUNCTION DOC] HELPER: Return weight times input.
                 # test use of parameter
                 return self.weight.mm(input)
 
             @torch.jit.script_method
             def doit2(self, input):
+                # [FUNCTION DOC] HELPER: Return weight times input.
                 return self.weight.mm(input)
 
             @torch.jit.script_method
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Combine outputs of the methods, bias, and
+                # both submodules.
                 a = self.doit(input)
                 b = self.doit2(input)
                 c = self.hi(input)
@@ -8248,6 +10083,8 @@ dedent """
             self.assertEqual(torch.zeros(2, 2), m2.forward(torch.randn(3, 2)))
 
     def test_irparser(self):
+        # [FUNCTION DOC] Parse IR text with an embedded FileCheck directive and run the check
+        # against the parsed graph.
         graph_str = """graph(%0 : Double(5, 5)):
           # CHECK: aten::relu
           %1 : Double(5, 5) = aten::relu(%0)
@@ -8256,7 +10093,11 @@ dedent """
         FileCheck().run(graph_str, parse_ir(graph_str))
 
     def test_parse_tensor_constants(self):
+        # [FUNCTION DOC] Parse a graph with tensor constants only when the parse flag allows
+        # it (otherwise RuntimeError), build a function from it and compare with eager
+        # ignoring data.
         def foo():
+            # [FUNCTION DOC] HELPER: Return a 4x4 tensor of zeros.
             return torch.zeros([4, 4])
 
         foo_s = torch.jit.script(foo)
@@ -8278,6 +10119,8 @@ dedent """
             parse_ir(g, parse_tensor_constants=False)
 
     def test_parse_scalar_tensor_constants(self):
+        # [FUNCTION DOC] Parse IR with scalar tensor constants of several dtypes and check the
+        # stored dtype and value; invalid constant text must raise RuntimeError.
         for dtype_str, dtype, value in [
             ("Float", torch.float32, 1234.5),
             ("Double", torch.float64, 1234.5),
@@ -8316,6 +10159,8 @@ dedent """
             jit_graph = parse_ir(g_str, parse_tensor_constants=True)
 
     def test_parse_nested_names(self):
+        # [FUNCTION DOC] Parse IR with dotted value names, round trip through text and check the
+        # functions built from both graphs agree.
         g_str = """
     graph(%x.1 : Tensor):
         %3 : int = prim::Constant[value=1]()
@@ -8332,12 +10177,17 @@ dedent """
         self.assertEqual(func1(torch.ones([2])), func2(torch.ones([2])))
 
     def test_is_after_use(self):
+        # [FUNCTION DOC] Check ordering of uses of a graph input with the use comparison:
+        # sequential uses, uses in branches, and early returns, in two equivalent forms.
         def sorted_input_use(g):
+            # [FUNCTION DOC] HELPER: Return the uses of the first graph input sorted by the
+            # isAfter comparison.
             uses = list(next(g.inputs()).uses())
             return sorted(uses, key=functools.cmp_to_key(type(uses[0]).isAfter))
 
         @torch.jit.script
         def foo(x):
+            # [FUNCTION DOC] HELPER: Return x twice and x plus one.
             a = x + 1
             return (x, x, a)
 
@@ -8349,6 +10199,7 @@ dedent """
 
         @torch.jit.script
         def foo(x, cond: bool):
+            # [FUNCTION DOC] HELPER: Add or subtract 3 depending on a condition.
             if cond:
                 return x + 3
             else:
@@ -8360,6 +10211,8 @@ dedent """
 
         @torch.jit.script
         def foo(x, cond: bool, cond2: bool):
+            # [FUNCTION DOC] HELPER: Add, subtract or divide by 3 based on two conditions, via
+            # early returns.
             if cond:
                 return x + 3
             elif cond2 :
@@ -8371,6 +10224,7 @@ dedent """
 
         @torch.jit.script
         def foo(x, cond: bool, cond2: bool):
+            # [FUNCTION DOC] HELPER: Same as the previous function with nested conditionals.
             if cond:
                 return x + 3
             else:
@@ -8387,11 +10241,19 @@ dedent """
             self.assertTrue(uses_sorted[2].user.kind() == "aten::div")
 
     def test_canonicalize_control_outputs(self):
+        # [FUNCTION DOC] Check that outputs of if and loop nodes are listed in the canonical
+        # order (order of first use in the printed graph) for several scripted functions, and
+        # that unused loop outputs are ordered after used ones.
         def test_all_outputs(g):
+            # [FUNCTION DOC] HELPER: For every if/loop node with outputs, build a FileCheck for
+            # the output declaration followed by block ends and the output names in order, and
+            # run it on the graph.
             ifs = g.findAllNodes("prim::If")
             loops = g.findAllNodes("prim::Loop")
 
             def contained_blocks(node):
+                # [FUNCTION DOC] HELPER: Count the blocks inside a node: two per if and one
+                # per loop.
                 return len(node.findAllNodes("prim::If")) * 2 + len(node.findAllNodes("prim::Loop"))
             for node in ifs + loops:
                 outs = list(node.outputs())
@@ -8416,6 +10278,7 @@ dedent """
 
         @torch.jit.script
         def test(x):
+            # [FUNCTION DOC] HELPER: Two conditionals assigning and swapping a and b.
             # type: (bool) -> Tuple[int, int]
             b = 2
             a = 1
@@ -8433,6 +10296,8 @@ dedent """
 
         @torch.jit.script
         def test2(x):
+            # [FUNCTION DOC] HELPER: Conditionals with prints and nested conditionals; returns a
+            # and b.
             # type: (bool) -> Tuple[int, int]
             b = 2
             a = 1
@@ -8451,6 +10316,7 @@ dedent """
 
         @torch.jit.script
         def test_loop(x, iter):
+            # [FUNCTION DOC] HELPER: Loop assigning three variables and a conditional print.
             # type: (bool, int) -> (None)
             a = 1
             b = 2
@@ -8467,6 +10333,7 @@ dedent """
 
         @torch.jit.script
         def loop_unused(iter):
+            # [FUNCTION DOC] HELPER: Loop updating three variables and printing two of them.
             # type: (int) -> (None)
             a = 1
             b = 2
@@ -8482,7 +10349,11 @@ dedent """
         FileCheck().check(r"%c : int, %a : int, %b : int").run(loop_unused.graph)
 
     def test_filecheck(self):
+        # [FUNCTION DOC] Exercise the FileCheck API for plain checks, counts, same-line,
+        # next-line, dag and not directives, with positive and failing cases.
         def test_check():
+            # [FUNCTION DOC] HELPER: Plain check ordering and the errors for missing or
+            # repeated patterns.
             file = "232"
             FileCheck().check("2").check("3").check("2").run(file)
             FileCheck().check("232").run(file)
@@ -8495,6 +10366,7 @@ dedent """
         test_check()
 
         def test_check_count():
+            # [FUNCTION DOC] HELPER: Count checks, including exact counts and failing counts.
             file = "22222"
             FileCheck().check_count("2", 5).run(file)
             FileCheck().check_count("22", 2).run(file)
@@ -8512,6 +10384,8 @@ dedent """
         test_check_count()
 
         def test_check_same():
+            # [FUNCTION DOC] HELPER: Same-line checks and the error when a pattern is on
+            # another line.
             file = "22\n33"
             FileCheck().check_same("22").run(file)
 
@@ -8526,6 +10400,7 @@ dedent """
         test_check_same()
 
         def test_check_next():
+            # [FUNCTION DOC] HELPER: Next-line checks and the errors for non-adjacent lines.
             file = "\n1\n2\n3"
             FileCheck().check("1").check_next("2").check_next("3").run(file)
             FileCheck().check_next("1").check_next("2").check_next("3").run(file)
@@ -8539,6 +10414,8 @@ dedent """
         test_check_next()
 
         def test_check_dag():
+            # [FUNCTION DOC] HELPER: Order independent (dag) checks, combined with not and with a
+            # failing check.
             fc = FileCheck().check_dag("1").check_dag("2").check_not("2")
             fc.run("12")
             fc.run("21")
@@ -8555,6 +10432,8 @@ dedent """
         test_check_dag()
 
         def test_check_not():
+            # [FUNCTION DOC] HELPER: Not checks in various positions, including distinct
+            # range matchings.
             FileCheck().check_not("2").check("1").run("12")
             FileCheck().check("2").check_not("2").run("12")
 
@@ -8574,6 +10453,8 @@ dedent """
                 fb.run("22 1 22")
 
     def _dtype_to_jit_name(self, dtype):
+        # [FUNCTION DOC] HELPER: Map a torch dtype to its IR type name (float, double, long, int,
+        # bool); raises RuntimeError for any other dtype.
         if dtype == torch.float32:
             return "Float"
         if dtype == torch.float64:
@@ -8587,6 +10468,9 @@ dedent """
         raise RuntimeError('dtype not handled')
 
     def _dtype_to_expect(self, dtype, dim=0):
+        # [FUNCTION DOC] HELPER: Build the expected IR type text for a dtype and dimension count,
+        # using stars for unknown sizes; a negative dim denotes a wrapped number and gives the
+        # lowercase name.
         param = ', '.join(['*'] * dim + ['device=cpu'])
         param = '(' + param + ')'
         jit_type = self._dtype_to_jit_name(dtype)
@@ -8598,6 +10482,10 @@ dedent """
 
 
     def _test_dtype_op_shape(self, ops, args, input_dims=1):
+        # [FUNCTION DOC] HELPER: For each op, result dtype argument and input dtype, compile
+        # source text constructing a tensor and calling the op, run shape analysis, and check the
+        # graph shows the type and rank matching what eager produces. Raises RuntimeError if
+        # input_dims is below 1.
         if input_dims < 1:
             raise RuntimeError("input dims must be at least 1")
         dtypes = [torch.float32, torch.float64, torch.int64, torch.int32]
@@ -8635,6 +10523,8 @@ dedent """
                     FileCheck().check("aten::tensor").check(expect).run(graph)
 
     def test_dtype_op_shape(self):
+        # [FUNCTION DOC] Run the dtype op shape check for the product op with several
+        # argument forms.
         ops = ['prod']
         self._test_dtype_op_shape(ops, args=[])
         self._test_dtype_op_shape(ops, args=[0, False])
@@ -8642,6 +10532,8 @@ dedent """
         self._test_dtype_op_shape(ops, args=[0, True])
 
     def test_dtype_op_shape2(self):
+        # [FUNCTION DOC] Run the dtype op shape check for cumulative product, cumulative sum,
+        # softmax and log softmax on 1-d and 4-d inputs.
         ops = ['cumprod', 'cumsum', 'softmax', 'log_softmax']
         self._test_dtype_op_shape(ops, args=[0])
 
@@ -8649,6 +10541,10 @@ dedent """
 
 
     def _test_binary_op_shape(self, ops, input_dims=1):
+        # [FUNCTION DOC] HELPER: For each op, every pair of tensor-or-scalar arguments of
+        # various dtypes, compile source text calling the op, run shape analysis, and check
+        # the graph output type matches the eager result dtype and rank (scalars narrowed
+        # to int32/float32).
 
         dtypes = [torch.float32, torch.float64, torch.int64, torch.int32, torch.bool]
 
@@ -8672,6 +10568,8 @@ dedent """
         args = args + [1, 1.5]
 
         def isBool(arg):
+            # [FUNCTION DOC] HELPER: Return whether the argument is a python bool or text of a
+            # bool tensor.
             return type(arg) is bool or (type(arg) is str and "torch.bool" in arg)
 
         for op in ops:
@@ -8712,18 +10610,24 @@ dedent """
                     check.check(expect).run(str(jit_output))
 
     def test_binary_op_shape(self):
+        # [FUNCTION DOC] Run the binary op shape check for mul, div, add and sub with 0-d and
+        # 3-d inputs.
         self._test_binary_op_shape(['mul', 'div', 'add', 'sub'], 0)
         self._test_binary_op_shape(['mul', 'div', 'add', 'sub'], 3)
 
     def test_no_dtype_shape(self):
+        # [FUNCTION DOC] A tensor op with a Scalar from item has the plain Tensor output type (no
+        # dtype inferred) in the graph.
 
         @torch.jit.script
         def foo(x):
+            # [FUNCTION DOC] HELPER: Add the scalar item of x to x.
             scalar_number = x.item()
             return x.add(scalar_number)
 
         @torch.jit.script
         def foo2(x):
+            # [FUNCTION DOC] HELPER: Add the scalar item of x to a new tensor.
             scalar_number = x.item()
             return torch.tensor(1).add(scalar_number)
 
@@ -8737,7 +10641,11 @@ dedent """
 
 
     def test_filecheck_parse(self):
+        # [FUNCTION DOC] Exercise FileCheck run with check text given as a string: checks,
+        # counts, exact counts, same-line and the errors for bad input.
         def test_check():
+            # [FUNCTION DOC] HELPER: Run checks given in the file text, including failures for
+            # unmatched patterns.
             file = """
                 # CHECK: 2
                 # CHECK: 3
@@ -8757,6 +10665,7 @@ dedent """
         test_check()
 
         def test_check_count():
+            # [FUNCTION DOC] HELPER: Run count and exact count checks given as text.
             file = "22222"
             FileCheck().run("# CHECK-COUNT-5: 2", file)
             FileCheck().run("# CHECK-COUNT-EXACTLY-5: 2", file)
@@ -8768,6 +10677,7 @@ dedent """
         test_check_count()
 
         def test_check_same():
+            # [FUNCTION DOC] HELPER: Run same-line checks given as text.
             file = "22\n33"
             FileCheck().run("# CHECK-SAME: 22", file)
 
@@ -8781,6 +10691,8 @@ dedent """
         test_check_same()
 
         def test_bad_input():
+            # [FUNCTION DOC] HELPER: Empty checks and unparsable check text must
+            # raise RuntimeError.
             with self.assertRaisesRegex(RuntimeError, "Check for bad input"):
                 FileCheck().run("", "1")
 
@@ -8790,17 +10702,24 @@ dedent """
         test_bad_input()
 
     def test_script_module_call_noscript(self):
+        # [FUNCTION DOC] A script method calling an ignored python method picks up later changes
+        # to python attributes.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a python attribute and an ignored method
+            # using it.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Set the python attribute value to 1.
                 super().__init__()
                 self.value = 1
 
             @torch.jit.ignore
             def foo(self):
+                # [FUNCTION DOC] HELPER: Ignored method returning ones plus the attribute.
                 return torch.ones(2, 2) + self.value
 
             @torch.jit.script_method
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Return the input plus the ignored method result.
                 return input + self.foo()
 
         with torch.jit.optimized_execution(False):
@@ -8815,13 +10734,18 @@ dedent """
             self.assertEqual(o, input + torch.ones(2, 2) + 2)
 
     def test_script_module_nochange_submodule(self):
+        # [FUNCTION DOC] A script module's submodule cannot be reassigned after creation:
+        # RuntimeError about re-assigning.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module applying a linear submodule.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a 5 to 5 linear layer.
                 super().__init__()
                 self.sub = nn.Linear(5, 5)
 
             @torch.jit.script_method
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Apply the linear layer.
                 return self.sub(input)
         with torch.jit.optimized_execution(False):
             m = M()
@@ -8832,16 +10756,26 @@ dedent """
                 m.sub = nn.Linear(5, 5)
 
     def test_module_apis(self):
+        # [FUNCTION DOC] Module iteration APIs (named_modules, named_children, modules, children)
+        # used in an exported method of a scripted module give the same result as eager.
         class Sub(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module subtracting two.
             def forward(self, thing):
+                # [FUNCTION DOC] HELPER: Return the input minus two.
                 return thing - 2
 
         class Double(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module doubling its input.
             def forward(self, thing):
+                # [FUNCTION DOC] HELPER: Return the input times two.
                 return thing * 2
 
         class MyMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with four submodule groups and an exported method that
+            # iterates over them.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create two Sub modules, a nested Sequential and a
+                # Sequential of Sub, Double.
                 super().__init__()
                 self.mod = (Sub())
                 self.mod2 = (Sub())
@@ -8850,6 +10784,8 @@ dedent """
 
             @torch.jit.export
             def method(self, x, x1, y, y1):
+                # [FUNCTION DOC] HELPER: Apply every module from the module and children
+                # iterators to the four inputs and return the names and results.
                 mod_names = ""
                 for name, mod in self.named_modules():
                     mod_names = mod_names + " " + name
@@ -8869,6 +10805,7 @@ dedent """
                 return mod_names, children_names, x, x1, y, y1
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the input plus two.
                 return x + 2
 
         mod = torch.jit.script(MyMod())
@@ -8876,11 +10813,15 @@ dedent """
         self.assertEqual(mod.method(*inps), MyMod().method(*inps))
 
     def test_script_module_const(self):
+        # [FUNCTION DOC] A script module's declared constants (bool, int, float, list) can be
+        # read in a script method; the returned values match.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with four declared constants.
 
             __constants__ = ['b', 'i', 'c', 's']
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Set the constants b, i, c and s.
                 super().__init__()
                 self.b = False
                 self.i = 1
@@ -8889,6 +10830,7 @@ dedent """
 
             @torch.jit.script_method
             def forward(self):
+                # [FUNCTION DOC] HELPER: Return b, i and c.
                 return self.b, self.i, self.c
 
         with torch.jit.optimized_execution(False):
@@ -8899,22 +10841,33 @@ dedent """
         self.assertEqual(o2, 3.5)
 
     def test_script_module_fail_exist(self):
+        # [FUNCTION DOC] Reading a missing attribute in a script method must raise RuntimeError
+        # saying the module has no such attribute.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module whose script method reads a
+            # nonexistent attribute.
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return x plus a missing attribute.
                 return x + self.whatisgoingon
         with self.assertRaisesRegex(RuntimeError, "Module 'M' has no attribute"):
             M()
 
     @unittest.skip("[module dedupe] currently NoneType refinement on optional attributes doesn't work.")
     def test_script_module_none_exist_fail(self):
+        # [FUNCTION DOC] An optional attribute set to None is expected to produce an error about
+        # missing attribute. Skipped: refinement of optional attributes does not work for
+        # deduplicated modules.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with an optional attribute used in forward.
             def __init__(self, my_optional):
+                # [FUNCTION DOC] HELPER: Store the optional attribute.
                 super().__init__()
                 self.my_optional = my_optional
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Negate x, adding the attribute when it is not None.
                 if self.my_optional is not None:
                     return torch.neg(x) + self.my_optional
                 return torch.neg(x)
@@ -8924,10 +10877,15 @@ dedent """
             fb(x)
 
     def test_script_module_invalid_consts(self):
+        # [FUNCTION DOC] Declaring an invalid constant (list of modules, a type, a tuple with a
+        # dict, a numpy integer) must raise TypeError mentioning it is not a valid constant; the
+        # numpy case names the numpy.int64 class.
         class Foo(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module declaring a list of modules as a constant.
             __constants__ = ['invalid']
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Store a list holding a linear layer.
                 super().__init__()
                 self.invalid = [nn.Linear(3, 4)]
 
@@ -8937,9 +10895,11 @@ dedent """
             Foo()
 
         class Foo2(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module declaring a type object as a constant.
             __constants__ = ['invalid']
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Store the int type object.
                 super().__init__()
                 self.invalid = int
 
@@ -8947,9 +10907,12 @@ dedent """
             Foo2()
 
         class Foo3(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module declaring a tuple containing a dict as
+            # a constant.
             __constants__ = ['invalid']
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Store a tuple holding two ints and an empty dict.
                 super().__init__()
                 self.invalid = (3, 4, {})
 
@@ -8957,9 +10920,11 @@ dedent """
             Foo3()
 
         class Foo4(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module declaring a numpy integer as a constant.
             __constants__ = ['invalid']
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Store a numpy int64 value.
                 super().__init__()
                 self.invalid = np.int64(5)
 
@@ -8968,14 +10933,20 @@ dedent """
             Foo4()
 
     def test_script_module_param_buffer_mutation(self):
+        # [FUNCTION DOC] A script method may mutate a buffer in training mode only; the buffer
+        # reaches 1 after one training call and stays 1 in eval mode.
         # TODO: add param mutation test case after JIT support it
         class ModuleBufferMutate(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a long buffer incremented in forward
+            # when training.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a zero long buffer.
                 super().__init__()
                 self.running_var = nn.Buffer(torch.tensor(0, dtype=torch.long))
 
             @torch.jit.script_method
             def forward(self):
+                # [FUNCTION DOC] HELPER: Increment the buffer if training; return the buffer.
                 if self.training:
                     self.running_var += 1
                 return self.running_var
@@ -8987,15 +10958,19 @@ dedent """
             self.assertEqual(m(), 1)
 
     def test_script_module_for(self):
+        # [FUNCTION DOC] A script method can loop over a declared list constant and sum it (10).
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a list constant of four ints.
             __constants__ = ['b']
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Store the list constant [1, 2, 3, 4].
                 super().__init__()
                 self.b = [1, 2, 3, 4]
 
             @torch.jit.script_method
             def forward(self):
+                # [FUNCTION DOC] HELPER: Sum the elements of the list constant.
                 sum = 0
                 for i in self.b:
                     sum += i
@@ -9006,17 +10981,26 @@ dedent """
             self.assertEqual(m(), 10)
 
     def test_override_magic(self):
+        # [FUNCTION DOC] An exported length method on a module and on a Sequential subclass is
+        # kept by scripting: script length equals eager length 10; the Sequential subclass
+        # also scripts.
         class OverrideMagic(nn.Module):
+            # [CLASS DOC] HELPER: Module overriding the length magic method as exported,
+            # returning 10.
             @torch.jit.export
             def __len__(self):
+                # [FUNCTION DOC] HELPER: Return 10.
                 return 10
 
         mod = OverrideMagic()
         self.assertEqual(len(mod), len(torch.jit.script(mod)))
 
         class OverrideMagicSeq(nn.Sequential):
+            # [CLASS DOC] HELPER: Sequential subclass overriding the length magic method as
+            # exported, returning 10.
             @torch.jit.export
             def __len__(self):
+                # [FUNCTION DOC] HELPER: Return 10.
                 return 10
 
         mod = OverrideMagicSeq()
@@ -9024,22 +11008,31 @@ dedent """
         self.assertTrue(torch.jit.script(mod))
 
     def test_script_module_for2(self):
+        # [FUNCTION DOC] A script method can loop over a ModuleList of script submodules;
+        # iterating the script module itself raises an error saying the object is not iterable.
         class Sub(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script submodule adding a parameter to its input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random parameter of size 2.
                 super().__init__()
                 self.weight = nn.Parameter(torch.randn(2))
 
             @torch.jit.script_method
             def forward(self, thing):
+                # [FUNCTION DOC] HELPER: Return the parameter plus the input.
                 return self.weight + thing
 
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a ModuleList of ten submodules applied
+            # in order.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a ModuleList of ten Sub modules.
                 super().__init__()
                 self.mods = nn.ModuleList([Sub() for i in range(10)])
 
             @torch.jit.script_method
             def forward(self, v):
+                # [FUNCTION DOC] HELPER: Pass the value through each submodule.
                 for m in self.mods:
                     v = m(v)
                 return v
@@ -9056,12 +11049,18 @@ dedent """
                 print(list(m))
 
     def test_attr_qscheme_script(self):
+        # [FUNCTION DOC] Script a module with a quantization scheme enum attribute compared in
+        # forward; the scripted result must equal eager.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a quantization scheme attribute compared
+            # in forward.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Store the per-tensor affine scheme.
                 super().__init__()
                 self.qscheme = torch.per_tensor_affine
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Return 3 if the scheme is per-tensor symmetric, else 4.
                 if self.qscheme == torch.per_tensor_symmetric:
                     return 3
                 else:
@@ -9072,22 +11071,31 @@ dedent """
         self.assertEqual(f(), scripted())
 
     def test_script_module_const_submodule_fail(self):
+        # [FUNCTION DOC] A plain python list of script modules is not a registered attribute, so
+        # using it in a script method fails with an error about the missing attribute.
         class Sub(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script submodule adding a parameter to its input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random parameter of size 2.
                 super().__init__()
                 self.weight = nn.Parameter(torch.randn(2))
 
             @torch.jit.script_method
             def forward(self, thing):
+                # [FUNCTION DOC] HELPER: Return the parameter plus the input.
                 return self.weight + thing
 
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module keeping its submodules in a plain list, iterated
+            # in forward.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Store a plain list of ten Sub modules.
                 super().__init__()
                 self.mods = [Sub() for _ in range(10)]
 
             @torch.jit.script_method
             def forward(self):
+                # [FUNCTION DOC] HELPER: Print one for each element of the list and return 4.
                 for _ in self.mods:
                     print(1)
                 return 4
@@ -9096,7 +11104,12 @@ dedent """
             M()
 
     class DerivedStateModule(torch.jit.ScriptModule):
+        # [CLASS DOC] HELPER: Script module with a parameter, a derived buffer and two flag
+        # buffers that record when the pack and unpack hooks run; forward adds the derived buffer
+        # to the input.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Create a ones parameter, a derived buffer equal to its
+            # negation, and two zero long flag buffers.
             super(TestScript.DerivedStateModule, self).__init__()
             self.param = torch.nn.Parameter(torch.ones(3, 4, dtype=torch.float))
             self.derived = nn.Buffer(torch.neg(self.param).detach().clone())
@@ -9108,19 +11121,27 @@ dedent """
 
         @torch.jit.script_method
         def _pack(self):
+            # [FUNCTION DOC] HELPER: Pack hook: set the pack flag to one and replace derived by a
+            # random value.
             self.pack_called.set_(torch.ones(1, dtype=torch.long))
             self.derived.set_(torch.rand(1).detach())
 
         @torch.jit.script_method
         def _unpack(self):
+            # [FUNCTION DOC] HELPER: Unpack hook: set the unpack flag to one and recompute
+            # derived as the negation of the parameter.
             self.unpack_called.set_(torch.ones(1, dtype=torch.long))
             self.derived.set_(torch.neg(self.param).detach())
 
         @torch.jit.script_method
         def forward(self, x):
+            # [FUNCTION DOC] HELPER: Return the input plus the derived buffer.
             return x + self.derived
 
     def test_pack_unpack_state(self):
+        # [FUNCTION DOC] Export/import a module with pack and unpack hooks; the pack hook runs
+        # before serialization, the unpack hook runs afterwards on the original and on the
+        # imported module, and derived state is restored.
         sm = TestScript.DerivedStateModule()
         x = torch.rand(3, 4)
         torch.testing.assert_close(sm(x), x + torch.neg(torch.ones(3, 4, dtype=torch.float)))
@@ -9143,7 +11164,11 @@ dedent """
     @requires_mkl
     @unittest.skipIf(True, "Skipping while landing PR stack")
     def test_torch_functional(self):
+        # [FUNCTION DOC] checkScript of several torch functional ops (stft, istft, lu_unpack,
+        # cdist, norm variants, unique, unique_consecutive). Skipped unconditionally and
+        # requires MKL.
         def stft(input, n_fft):
+            # [FUNCTION DOC] HELPER: Complex short-time Fourier transform of the input.
             # type: (Tensor, int) -> Tensor
             return torch.stft(input, n_fft, return_complex=True)
 
@@ -9151,6 +11176,7 @@ dedent """
         self.assertEqual(stft(*inps), torch.jit.script(stft)(*inps))
 
         def istft(input, n_fft):
+            # [FUNCTION DOC] HELPER: Inverse short-time Fourier transform.
             # type: (Tensor, int) -> Tensor
             return torch.istft(input, n_fft)
 
@@ -9158,6 +11184,7 @@ dedent """
         self.assertEqual(istft(*inps2), torch.jit.script(istft)(*inps2))
 
         def lu_unpack(x):
+            # [FUNCTION DOC] HELPER: LU factor then unpack the result for a batch of matrices.
             A_LU, pivots = torch.linalg.lu_factor(x)
             return torch.lu_unpack(A_LU, pivots)
 
@@ -9166,6 +11193,8 @@ dedent """
             self.checkScript(lu_unpack, (a,))
 
         def cdist_fn():
+            # [FUNCTION DOC] HELPER: Pairwise distance of two small constant matrices using the
+            # mm mode.
             a = torch.tensor([[0.9041, 0.0196], [-0.3108, -2.4423], [-0.4821, 1.059]])
             b = torch.tensor([[-2.1763, -0.4713], [-0.6986, 1.3702]])
             return torch.cdist(a, b, compute_mode="use_mm_for_euclid_dist")
@@ -9173,12 +11202,16 @@ dedent """
         self.checkScript(cdist_fn, ())
 
         def norm():
+            # [FUNCTION DOC] HELPER: Return the Frobenius, nuclear, default and 0.5 norms of a
+            # constant matrix.
             c = torch.tensor([[1, 2, 3], [-1, 1, 4]], dtype=torch.float)
             return torch.norm(c, p="fro"), torch.norm(c, p="nuc"), torch.norm(c), torch.norm(c, p=.5)
 
         self.checkScript(norm, ())
 
         def torch_unique(dim: Optional[int]):
+            # [FUNCTION DOC] HELPER: Return unique results (plain, with counts, with inverse,
+            # with both) for a long tensor along an optional dimension.
             ten = torch.unique(torch.tensor([[1, 3], [2, 3]], dtype=torch.long))
             a = torch.unique(ten, dim=dim)
             b = torch.unique(ten, return_counts=True, dim=dim)
@@ -9190,6 +11223,8 @@ dedent """
         self.checkScript(torch_unique, (0,))
 
         def torch_unique_consecutive(dim: Optional[int]):
+            # [FUNCTION DOC] HELPER: Return consecutive-unique results (plain, counts, inverse,
+            # both) along an optional dimension.
             ten = torch.unique(torch.tensor([[1, 3], [3, 2], [3, 2], [2, 3]], dtype=torch.long))
             a = torch.unique_consecutive(ten, dim=dim)
             b = torch.unique_consecutive(ten, return_counts=True, dim=dim)
@@ -9201,7 +11236,10 @@ dedent """
         self.checkScript(torch_unique_consecutive, (0,))
 
     def test_torch_functional_tensordot_int(self):
+        # [FUNCTION DOC] checkScript of tensordot with an int dims, and the python errors for
+        # negative or too large dims (message text compared when it is raised).
         def tensordot_dims_int(a: torch.Tensor, b: torch.Tensor, dims: int):
+            # [FUNCTION DOC] HELPER: Tensordot with an int number of dims.
             return torch.tensordot(a, b, dims=dims)
 
         a = torch.arange(120.).reshape(2, 3, 4, 5)
@@ -9219,7 +11257,9 @@ dedent """
                     self.assertEqual(str(error), "tensordot expects dims < ndim_a or ndim_b, but got dims=" + str(dims))
 
     def test_torch_functional_tensordot_tensor(self):
+        # [FUNCTION DOC] checkScript of tensordot with dims given as tensors (scalar and 2-d).
         def tensordot_dims_tensor(a: torch.Tensor, b: torch.Tensor, dims: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Tensordot with dims given as a tensor.
             return torch.tensordot(a, b, dims=dims)
 
         a = torch.arange(120.).reshape(2, 3, 4, 5)
@@ -9233,7 +11273,9 @@ dedent """
         self.checkScript(tensordot_dims_tensor, (a, b, dims))
 
     def test_torch_functional_tensordot_list(self):
+        # [FUNCTION DOC] checkScript of tensordot with dims given as a list of int lists.
         def tensordot_dims_list(a: torch.Tensor, b: torch.Tensor, dims: List[List[int]]):
+            # [FUNCTION DOC] HELPER: Tensordot with dims given as a list of int lists.
             return torch.tensordot(a, b, dims=dims)
 
         a = torch.arange(60.).reshape(3, 4, 5)
@@ -9242,7 +11284,9 @@ dedent """
         self.checkScript(tensordot_dims_list, (a, b, dims))
 
     def test_torch_functional_tensordot_tuple(self):
+        # [FUNCTION DOC] checkScript of tensordot with dims given as a tuple of int lists.
         def tensordot_dims_tuple(a: torch.Tensor, b: torch.Tensor, dims: Tuple[List[int], List[int]]):
+            # [FUNCTION DOC] HELPER: Tensordot with dims given as a tuple of int lists.
             return torch.tensordot(a, b, dims=dims)
 
         a = torch.arange(60.).reshape(3, 4, 5)
@@ -9251,16 +11295,24 @@ dedent """
         self.checkScript(tensordot_dims_tuple, (a, b, dims))
 
     def test_missing_getstate(self):
+        # [FUNCTION DOC] Scripting a module that defines set-state but not get-state must raise
+        # RuntimeError mentioning getstate.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with an exported set-state method but no
+            # get-state method.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Set the attribute x to 1.
                 super().__init__()
                 self.x = 1
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return x multiplied by the attribute.
                 return x * self.x
 
             @torch.jit.export
             def __setstate__(self, state):
+                # [FUNCTION DOC] HELPER: Exported set-state: restore x and the training flag from
+                # the state tuple.
                 self.x = state[0]
                 self.training = state[1]
 
@@ -9268,11 +11320,15 @@ dedent """
             scripted = torch.jit.script(Foo())
 
     def test_inlining_cleanup(self):
+        # [FUNCTION DOC] After inlining, the graph of a function calling a linear op must contain
+        # no conditional (inlining cleanup removed the branch).
         def foo(x):
+            # [FUNCTION DOC] HELPER: Return the linear op of x with itself.
             return F.linear(x, x)
 
         @torch.jit.script
         def fee(x):
+            # [FUNCTION DOC] HELPER: Call foo.
             return foo(x)
 
         # inlining optimizations should have cleaned up linear if statement
@@ -9281,57 +11337,80 @@ dedent """
 
     @skipIfTorchDynamo("TorchDynamo fails with unknown reason")
     def test_pack_unpack_nested(self):
+        # [FUNCTION DOC] A tree of three script modules with pack and unpack hooks applied by the
+        # apply method: packing zeroes buffers (output zero), unpacking restores them (output 6
+        # again). Skipped under dynamo.
         class SubSubMod(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Innermost script module with a buffer of threes, pack and
+            # unpack hooks and a forward adding the buffer.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a buffer filled with 3.
                 super().__init__()
                 self.buf = nn.Buffer(torch.ones(3, 4) * 3)
 
             @torch.jit.script_method
             def _pack(self):
+                # [FUNCTION DOC] HELPER: Pack hook: replace the buffer by a single zero.
                 self.buf.set_(torch.zeros(1))
 
             @torch.jit.script_method
             def _unpack(self):
+                # [FUNCTION DOC] HELPER: Unpack hook: restore the buffer to threes.
                 self.buf.set_(torch.ones(3, 4) * 3)
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the input plus the buffer.
                 return x + self.buf
 
         class SubMod(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Middle script module with a buffer of twos, hooks, and the
+            # innermost module.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a buffer of twos and the nested module.
                 super().__init__()
                 self.buf = nn.Buffer(torch.ones(3, 4) * 2)
                 self.ssm = SubSubMod()
 
             @torch.jit.script_method
             def _pack(self):
+                # [FUNCTION DOC] HELPER: Pack hook: replace the buffer by a single zero.
                 self.buf.set_(torch.zeros(1))
 
             @torch.jit.script_method
             def _unpack(self):
+                # [FUNCTION DOC] HELPER: Unpack hook: restore the buffer to twos.
                 self.buf.set_(torch.ones(3, 4) * 2)
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Add the buffer to the input then apply the
+                # nested module.
                 return self.ssm(x + self.buf)
 
         class Mod(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Outer script module with a buffer of ones, hooks, and the
+            # middle module.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the middle module and a buffer of ones.
                 super().__init__()
                 self.submod = SubMod()
                 self.buf = nn.Buffer(torch.ones(3, 4) * 1)
 
             @torch.jit.script_method
             def _pack(self):
+                # [FUNCTION DOC] HELPER: Pack hook: replace the buffer by a single zero.
                 self.buf.set_(torch.zeros(1))
 
             @torch.jit.script_method
             def _unpack(self):
+                # [FUNCTION DOC] HELPER: Unpack hook: restore the buffer to ones.
                 self.buf.set_(torch.ones(3, 4))
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Add the buffer to the input then apply the
+                # middle module.
                 return self.submod(x + self.buf)
 
         m = Mod()
@@ -9342,10 +11421,14 @@ dedent """
         torch.testing.assert_close(m(torch.zeros(3, 4)), torch.ones(3, 4) * 6)
 
     def test_torch_any(self):
+        # [FUNCTION DOC] checkScript of tensor any, all-elements and along a dimension (including
+        # negative dimension), with empty, zero and ones inputs.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return whether any element is truthy.
             return torch.any(x)
 
         def fn1(x, dim: int):
+            # [FUNCTION DOC] HELPER: Return any along the given dimension.
             return torch.any(x, dim)
 
         self.checkScript(fn, (torch.randn(3, 4), ))
@@ -9359,16 +11442,22 @@ dedent """
         self.checkScript(fn1, (torch.empty(5), 0))
 
     def test_any(self):
+        # [FUNCTION DOC] checkScript of builtin any over lists of int, float, bool and str,
+        # including empty lists.
         def fn(x: List[int]):
+            # [FUNCTION DOC] HELPER: Return any over a list of ints.
             return any(x)
 
         def fn1(x: List[float]):
+            # [FUNCTION DOC] HELPER: Return any over a list of floats.
             return any(x)
 
         def fn2(x: List[bool]):
+            # [FUNCTION DOC] HELPER: Return any over a list of bools.
             return any(x)
 
         def fn3(x: List[str]):
+            # [FUNCTION DOC] HELPER: Return any over a list of strings.
             return any(x)
 
         self.checkScript(fn, ([0, 0, 0, 0], ))
@@ -9387,15 +11476,21 @@ dedent """
         self.checkScript(fn3, ([], ))
 
     def test_script_module_not_tuple(self):
+        # [FUNCTION DOC] Iterating over a declared constant that is a plain int in a script
+        # method must raise RuntimeError saying an int is not iterable.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with an int constant that forward tries
+            # to iterate.
             __constants__ = ['mods']
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Store the int constant 1.
                 super().__init__()
                 self.mods = 1
 
             @torch.jit.script_method
             def forward(self, v):
+                # [FUNCTION DOC] HELPER: Print each element of the constant and return the input.
                 for m in self.mods:
                     print(m)
                 return v
@@ -9403,13 +11498,18 @@ dedent """
             M()
 
     def test_attr_module_constants(self):
+        # [FUNCTION DOC] A module attribute holding a Sequential can be called in a script
+        # method, and the module round trips through export and import.
         class M2(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module that applies a given module in forward.
             def __init__(self, mod_list):
+                # [FUNCTION DOC] HELPER: Store the given module as attribute mods.
                 super().__init__()
                 self.mods = mod_list
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Call the forward method of the stored module.
                 return self.mods.forward(x)
 
         with torch.jit.optimized_execution(False):
@@ -9417,28 +11517,37 @@ dedent """
             self.assertExportImportModule(m, (torch.randn(2, 2),))
 
     def test_script_sequential_for(self):
+        # [FUNCTION DOC] A script module can iterate a Sequential or call it directly; the
+        # results equal applying the submodules by hand.
         class Sub(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script submodule adding a parameter to its input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random parameter of size 2.
                 super().__init__()
                 self.weight = nn.Parameter(torch.randn(2))
 
             @torch.jit.script_method
             def forward(self, thing):
+                # [FUNCTION DOC] HELPER: Return the parameter plus the input.
                 return self.weight + thing
 
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a Sequential of three Sub modules.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the Sequential of three Sub modules.
                 super().__init__()
                 self.mods = nn.Sequential(Sub(), Sub(), Sub())
 
             @torch.jit.script_method
             def forward(self, v):
+                # [FUNCTION DOC] HELPER: Apply each submodule in turn by iterating.
                 for m in self.mods:
                     v = m(v)
                 return v
 
             @torch.jit.script_method
             def forward2(self, v):
+                # [FUNCTION DOC] HELPER: Call the whole Sequential on the input.
                 return self.mods(v)
 
         with torch.jit.optimized_execution(False):
@@ -9454,13 +11563,20 @@ dedent """
             self.assertEqual(o2, v)
 
     def test_script_sequential_sliced_iteration(self):
+        # [FUNCTION DOC] checkModule of a module that indexes and slices a Sequential (single
+        # index, slices with and without end).
         class seq_mod(nn.Module):
+            # [CLASS DOC] HELPER: Module holding a Sequential of three relus that it indexes
+            # and slices.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Build the list of relus and wrap it in a Sequential.
                 super().__init__()
                 self.layers = [nn.ReLU(), nn.ReLU(), nn.ReLU()]
                 self.layers = nn.Sequential(*self.layers)
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Apply the first layer, then the slice from index 1 to 3,
+                # then from index 2.
                 x = self.layers[0].forward(input)
                 for layer in self.layers[1:3]:
                     x = layer.forward(x)
@@ -9472,8 +11588,13 @@ dedent """
         self.checkModule(seq, [torch.tensor([-2, 1, -1, 2])])
 
     def test_script_sequential_orderdict(self):
+        # [FUNCTION DOC] A Sequential built from an ordered mapping in a script module exposes
+        # its named parameters in the state dict (key for the conv weight).
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a named Sequential of a convolution
+            # and relu.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the named Sequential.
                 super().__init__()
                 self.mods = nn.Sequential(OrderedDict([
                     ("conv", nn.Conv2d(1, 20, 5)),
@@ -9482,28 +11603,39 @@ dedent """
 
             @torch.jit.script_method
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Apply the Sequential.
                 return self.mods(input)
 
         m = M()
         self.assertTrue('mods.conv.weight' in m.state_dict())
 
     def test_script_sequential_multi_output_fail(self):
+        # [FUNCTION DOC] A Sequential containing a layer returning several tensors must fail with
+        # a RuntimeError mentioning the three-tensor type.
         class Sub(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script submodule adding a parameter to its input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random parameter of size 2.
                 super().__init__()
                 self.weight = nn.Parameter(torch.randn(2))
 
             @torch.jit.script_method
             def forward(self, thing):
+                # [FUNCTION DOC] HELPER: Return the parameter plus the input.
                 return self.weight + thing
 
         class ReturnMulti(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module returning its input three times.
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return a tuple of three copies of x.
                 return x, x, x
 
         class HaveSequential(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a Sequential holding a multi-output layer in
+            # the middle.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the Sequential of Sub, ReturnMulti, Sub.
                 super().__init__()
                 self.someseq = nn.Sequential(
                     Sub(),
@@ -9513,6 +11645,7 @@ dedent """
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the Sequential to the input.
                 return self.someseq(x)
 
         with self.assertRaisesRegex(RuntimeError, "(Tensor, Tensor, Tensor)"):
@@ -9523,22 +11656,31 @@ dedent """
 
     @_tmp_donotuse_dont_inline_everything
     def test_script_sequential_in_mod_list(self):
+        # [FUNCTION DOC] A ModuleList holding a script module and nested Sequentials is called as
+        # two method calls with no python ops in the graph (without inlining).
         class Sub(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script submodule adding a parameter to its input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random parameter of size 2.
                 super().__init__()
                 self.weight = nn.Parameter(torch.randn(2))
 
             @torch.jit.script_method
             def forward(self, thing):
+                # [FUNCTION DOC] HELPER: Return the parameter plus the input.
                 return self.weight + thing
 
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a ModuleList of a Sub and a
+            # nested Sequential.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the ModuleList.
                 super().__init__()
                 self.mods = nn.ModuleList([Sub(), nn.Sequential(Sub(), nn.Sequential(Sub(), Sub()), Sub())])
 
             @torch.jit.script_method
             def forward(self, v):
+                # [FUNCTION DOC] HELPER: Apply each element of the list in turn.
                 for mod in self.mods:
                     v = mod(v)
                 return v
@@ -9550,22 +11692,31 @@ dedent """
 
     @_tmp_donotuse_dont_inline_everything
     def test_script_nested_mod_list(self):
+        # [FUNCTION DOC] A nested ModuleList and Sequential iterated in a double loop yield four
+        # method calls and no python ops (without inlining).
         class Sub(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script submodule adding a parameter to its input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random parameter of size 2.
                 super().__init__()
                 self.weight = nn.Parameter(torch.randn(2))
 
             @torch.jit.script_method
             def forward(self, thing):
+                # [FUNCTION DOC] HELPER: Return the parameter plus the input.
                 return self.weight + thing
 
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a ModuleList of nested lists and a
+            # Sequential of Sub modules.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the nested ModuleList.
                 super().__init__()
                 self.mods = nn.ModuleList([nn.ModuleList([Sub()]), nn.Sequential(Sub()), nn.ModuleList([Sub(), Sub()])])
 
             @torch.jit.script_method
             def forward(self, v):
+                # [FUNCTION DOC] HELPER: Apply every inner module in the double loop.
                 for mod in self.mods:
                     for m in mod:
                         v = m(v)
@@ -9577,41 +11728,63 @@ dedent """
         self.assertTrue("python" not in graph)
 
     def test_constant_as_attr(self):
+        # [FUNCTION DOC] A declared int constant can be used as the dim argument of cat in a
+        # script method.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a declared int constant used as
+            # concatenation dim.
             __constants__ = ['dim']
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Store the constant dim 1.
                 super().__init__()
                 self.dim = 1
 
             @torch.jit.script_method
             def forward(self, v):
+                # [FUNCTION DOC] HELPER: Concatenate three copies of the input along the
+                # constant dim.
                 return torch.cat([v, v, v], dim=self.dim)
         v = torch.zeros(1, 1)
         with torch.jit.optimized_execution(False):
             self.assertEqual(torch.cat([v, v, v], dim=1), M()(v))
 
     class StarTestSumStarred(torch.nn.Module):
+        # [CLASS DOC] HELPER: Eager module summing all of its variadic inputs; used traced by
+        # star tests.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Call the base initializer.
             super(TestScript.StarTestSumStarred, self).__init__()
 
         def forward(self, *inputs):
+            # [FUNCTION DOC] HELPER: Accumulate all inputs into the first one in place and
+            # return it.
             output = inputs[0]
             for i in range(1, len(inputs)):
                 output += inputs[i]
             return output
 
     class StarTestReturnThree(torch.nn.Module):
+        # [CLASS DOC] HELPER: Eager module returning its input three times; used traced by
+        # star tests.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Call the base initializer.
             super(TestScript.StarTestReturnThree, self).__init__()
 
         def forward(self, rep):
+            # [FUNCTION DOC] HELPER: Return a tuple of three copies of rep.
             return rep, rep, rep
 
     def test_script_star_expr(self):
+        # [FUNCTION DOC] A traced module taking varargs can be called with a starred tuple in a
+        # script method; three zeros give three times zeros.
 
         class M2(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module holding two traced modules, calling one with the
+            # starred result of the other.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Trace the summing module on three tensors and the
+                # three-output module.
                 super().__init__()
                 self.m = torch.jit.trace(TestScript.StarTestSumStarred(),
                                          (torch.ones(4, 3), torch.ones(4, 3), torch.ones(4, 3)))
@@ -9619,6 +11792,8 @@ dedent """
 
             @torch.jit.script_method
             def forward(self, rep):
+                # [FUNCTION DOC] HELPER: Call the three-output module and pass its tuple starred
+                # to the summing module.
                 tup = self.g(rep)
                 return self.m(*tup)
 
@@ -9626,8 +11801,13 @@ dedent """
         self.assertEqual(m(torch.zeros(4, 3)), 3 * torch.zeros(4, 3))
 
     def test_script_star_expr_string(self):
+        # [FUNCTION DOC] Same as the starred call test, with forward defined from a
+        # source string.
         class M2(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with two traced modules and a forward defined
+            # from source text.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Trace both modules and define forward from text.
                 super().__init__()
                 self.m = torch.jit.trace(TestScript.StarTestSumStarred(),
                                          (torch.ones(4, 3), torch.ones(4, 3), torch.ones(4, 3)))
@@ -9643,18 +11823,27 @@ dedent """
         self.assertEqual(m(torch.zeros(4, 3)), 3 * torch.zeros(4, 3))
 
     class StarTestSumAndReturnThree(torch.nn.Module):
+        # [CLASS DOC] HELPER: Eager module summing its variadic inputs and returning the sum
+        # three times.
         def __init__(self) -> None:
+            # [FUNCTION DOC] HELPER: Call the base initializer.
             super(TestScript.StarTestSumAndReturnThree, self).__init__()
 
         def forward(self, *inputs):
+            # [FUNCTION DOC] HELPER: Accumulate all inputs into the first, return it three times.
             output = inputs[0]
             for i in range(1, len(inputs)):
                 output += inputs[i]
             return output, output, output
 
     def test_script_star_assign(self):
+        # [FUNCTION DOC] Star assignment of the head of a traced tuple output in a script method
+        # defined from text.
         class M2(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a traced module and forward defined from
+            # text using star assignment.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Trace the module and define forward from text.
                 super().__init__()
                 self.g = torch.jit.trace(TestScript.StarTestSumAndReturnThree(), torch.ones(4, 3))
                 self.define('''
@@ -9667,8 +11856,14 @@ dedent """
         self.assertEqual(m(torch.zeros(4, 3)), 3 * torch.zeros(4, 3))
 
     def test_script_module_star_assign2(self):
+        # [FUNCTION DOC] Star assignment of the tail of a traced module result, traced out of
+        # place; the result is the sum of three ones.
         class M2(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module tracing with forced out-of-place ops and defining
+            # forward from text.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Trace the module (out of place) and define forward
+                # from text.
                 super().__init__()
                 self.g = torch.jit.trace(
                     TestScript.StarTestSumAndReturnThree(),
@@ -9684,8 +11879,14 @@ dedent """
         self.assertEqual(m(torch.ones(4, 3)), 3 * torch.ones(4, 3))
 
     def test_script_module_star_assign2_inplace(self):
+        # [FUNCTION DOC] Same as the previous test, with in-place tracing, so aliasing makes the
+        # result four.
         class M2(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module tracing with in-place ops and defining forward
+            # from text.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Trace the module (in place) and define forward
+                # from text.
                 super().__init__()
                 self.g = torch.jit.trace(
                     TestScript.StarTestSumAndReturnThree(),
@@ -9704,14 +11905,22 @@ dedent """
         self.assertEqual(m(torch.ones(4, 3)), 4 * torch.ones(4, 3))
 
     def test_script_module_star_assign_fail_pythonop(self):
+        # [FUNCTION DOC] Star assignment from a call to an ignored python function must raise
+        # RuntimeError saying the value cannot be used as a tuple.
 
         with self.assertRaisesRegex(RuntimeError, "cannot be used as a tuple"):
             class M2(torch.jit.ScriptModule):
+                # [CLASS DOC] HELPER: Script module defining forward from text using star
+                # assignment from a python op.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Define an ignored python function and forward text
+                    # that star-assigns its result.
                     super().__init__()
 
                     @torch.jit.ignore
                     def myfunc():
+                        # [FUNCTION DOC] HELPER: Ignored python function returning a pair of
+                        # zero tensors.
                         return torch.zeros(1, 2, 3), torch.zeros(1, 2, 3)
 
                     self.define('''
@@ -9724,9 +11933,15 @@ dedent """
             m(torch.zeros(4, 3))
 
     def test_script_module_star_assign_fail_builtin(self):
+        # [FUNCTION DOC] Star assignment from a builtin op result must raise RuntimeError saying
+        # the value cannot be used as a tuple.
         with self.assertRaisesRegex(RuntimeError, "cannot be used as a tuple"):
             class M2(torch.jit.ScriptModule):
+                # [CLASS DOC] HELPER: Script module defining forward from text using star
+                # assignment from a builtin op.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Define forward text that star-assigns the negation
+                    # of the input.
                     super().__init__()
 
                     self.define('''
@@ -9739,9 +11954,14 @@ dedent """
             m(torch.zeros(4, 3))
 
     def test_script_pack_padded_sequence(self):
+        # [FUNCTION DOC] Script pack_padded_sequence followed by pad_packed_sequence, check
+        # results match eager, and checkModule of a module using keyword arguments with
+        # unsorted lengths.
         from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
         def pack_padded_pad_packed_script(x, seq_lens):
+            # [FUNCTION DOC] HELPER: Pack a padded batch by lengths and pad it again, returning
+            # the batch and lengths.
             x = pack_padded_sequence(x, seq_lens)
             x, lengths = pad_packed_sequence(x)
             return x, lengths
@@ -9762,10 +11982,15 @@ dedent """
         self.assertEqual(eager_lengths, script_lengths)
 
         class ExperimentalLSTM(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module that packs an input with unsorted lengths and pads it
+            # back, returning the first row.
             def __init__(self, input_dim, hidden_dim):
+                # [FUNCTION DOC] HELPER: Call the base initializer (dimensions are ignored).
                 super().__init__()
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Pack with fixed lengths (unsorted allowed), pad to
+                # length 2 and return row zero.
                 # type: (Tensor)
                 packed = pack_padded_sequence(
                     input=input, lengths=torch.tensor([1, 2]), enforce_sorted=False
@@ -9782,13 +12007,18 @@ dedent """
             self.checkModule(lstm, [torch.ones(2, 2)])
 
     def test_script_pad_sequence_pack_sequence(self):
+        # [FUNCTION DOC] checkScript of pad_sequence with batch-first, padding value and side
+        # options, and of pack_sequence followed by padding with and without sorting.
         from torch.nn.utils.rnn import pad_sequence, pack_sequence, pad_packed_sequence
 
         def pad_sequence_func(tensor_list, batch_first=False, padding_value=0.0, padding_side="right"):
+            # [FUNCTION DOC] HELPER: Call pad_sequence with explicit options.
             # type: (List[Tensor], bool, float, str) -> Tensor
             return pad_sequence(tensor_list, batch_first, padding_value, padding_side)
 
         def pack_sequence_func(tensor_list, enforce_sorted=True):
+            # [FUNCTION DOC] HELPER: Pack a list of tensors and pad back, returning the
+            # padded tensor.
             # type: (List[Tensor], bool) -> Tensor
             return pad_packed_sequence(pack_sequence(tensor_list, enforce_sorted))[0]
 
@@ -9815,7 +12045,9 @@ dedent """
                              ([tensor1, tensor2, tensor3], False))
 
     def test_script_get_tracing_state(self):
+        # [FUNCTION DOC] checkScript of reading the C++ tracing state in a branch.
         def test_if_tracing(x):
+            # [FUNCTION DOC] HELPER: Return x plus 1 when tracing, else x minus 1.
             if torch._C._get_tracing_state():
                 return x + 1
             else:
@@ -9825,7 +12057,9 @@ dedent """
         self.checkScript(test_if_tracing, (inp,))
 
     def test_script_is_tracing(self):
+        # [FUNCTION DOC] checkScript of the is-tracing query in a branch.
         def test_is_tracing(x):
+            # [FUNCTION DOC] HELPER: Return x plus 1 when tracing, else x minus 1.
             if torch.jit.is_tracing():
                 return x + 1
             else:
@@ -9835,7 +12069,10 @@ dedent """
         self.checkScript(test_is_tracing, (inp,))
 
     def test_is_scripting(self):
+        # [FUNCTION DOC] The scripting query returns False in python and True inside a
+        # scripted function.
         def foo():
+            # [FUNCTION DOC] HELPER: Return the scripting query result.
             return torch.jit.is_scripting()
 
         self.assertFalse(foo())
@@ -9843,66 +12080,92 @@ dedent """
         self.assertTrue(scripted())
 
     def test_comment_ignore_indent(self):
+        # [FUNCTION DOC] A comment indented less than its block inside a constructor must not
+        # stop a module from compiling with checkModule.
         class Model(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose constructor contains a mis-indented comment;
+            # forward returns 5.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Call the base initializer (a mis-indented comment line
+                # sits right above it).
     # useless comment that is not indented correctly  # noqa: E115
                 super().__init__()
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Return 5.
                 return 5
 
         # should compile without an error
         self.checkModule(Model(), ())
 
     def test_script_outputs(self):
+        # [FUNCTION DOC] Unpacking a tensor into names, and unpacking a three-tuple into two
+        # names in script, must raise RuntimeError (cannot be used as a tuple, too many values
+        # to unpack).
         with self.assertRaisesRegex(RuntimeError, "cannot be used as a tuple"):
             @torch.jit.script
             def foo(a):
+                # [FUNCTION DOC] HELPER: Unpack a tensor sum into two names; scripting must fail.
                 c, d = a + a
                 return c + d
 
         @torch.jit.script
         def return3():
+            # [FUNCTION DOC] HELPER: Return the tuple 1, 2, 3.
             return 1, 2, 3
 
         with self.assertRaisesRegex(RuntimeError, "too many values to unpack"):
             @torch.jit.script
             def bind2():
+                # [FUNCTION DOC] HELPER: Unpack three values into two names; scripting must fail.
                 a, b = return3()
                 print(a)
                 print(b)
 
     @unittest.skipIf(not RUN_CUDA, "requires CUDA")
     def test_script_get_device_cuda(self):
+        # [FUNCTION DOC] Scripted get_device on a cuda tensor returns 0. Needs CUDA.
         @torch.jit.script
         def foo(a):
+            # [FUNCTION DOC] HELPER: Return the device index of the tensor.
             return a.get_device()
 
         v = torch.randn(1, device='cuda')
         self.assertEqual(foo(v), 0)
 
     def test_script_chunk(self):
+        # [FUNCTION DOC] Scripted chunk unpacked into two names gives the first chunk equal
+        # to eager.
         @torch.jit.script
         def foo(a):
+            # [FUNCTION DOC] HELPER: Split a tensor into two chunks along dim 0 and return
+            # the first.
             b, c = torch.chunk(a, dim=0, chunks=2)
             return b
         v = torch.rand(10, 3)
         self.assertEqual(torch.chunk(v, dim=0, chunks=2)[0], foo(v))
 
     def test_script_copy(self):
+        # [FUNCTION DOC] A scripted module with an optional tensor attribute that forward sets
+        # can be copied with copy and deepcopy.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with an optional tensor attribute set in forward.
             __annotations__ = {
                 "val": Optional[torch.Tensor]
             }
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Initialize the optional attribute to None.
                 super().__init__()
                 self.val = None
 
             def some_method(self):
+                # [FUNCTION DOC] HELPER: Return 3.
                 return 3
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Store x plus the helper result in the attribute and
+                # return x.
                 # type: (Tensor) -> Tensor
                 self.val = x + self.some_method()
                 return x
@@ -9913,22 +12176,34 @@ dedent """
         copy.deepcopy(m)
 
     def test_script_forward_method_replacement(self):
+        # [FUNCTION DOC] A forward replaced on the instance by a bound method of a base class is
+        # used in both eager and scripted runs (246), and the class forward is never called.
         # We want to support the use case of attaching a different `forward` method
         class LowLevelModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Base module whose forward calls forward_pytorch and doubles
+            # the result.
             def forward(self, input: torch.Tensor):
+                # [FUNCTION DOC] HELPER: Return twice the result of forward_pytorch.
                 # Generic forward dispatch
                 return self.forward_pytorch(input) * 2
 
         class TestModule(LowLevelModule):
+            # [CLASS DOC] HELPER: Subclass that replaces its forward with the base method on
+            # the instance.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Call the base initializer and bind the base class
+                # forward as the instance forward.
                 super().__init__()
                 # Replace the forward method
                 self.forward = types.MethodType(LowLevelModule.forward, self)
 
             def forward_pytorch(self, input: torch.Tensor):
+                # [FUNCTION DOC] HELPER: Return the tensor 123.
                 return torch.tensor(123)
 
             def forward(self, input: torch.Tensor):
+                # [FUNCTION DOC] HELPER: Class level forward that must never be used; always
+                # raises AssertionError.
                 # Should not use this forward method
                 raise AssertionError("This method should not be used")
                 return self.forward_pytorch(input)
@@ -9940,13 +12215,18 @@ dedent """
         self.assertEqual(m_scripted(torch.tensor(1)), torch.tensor(246))
 
     def test_python_call_non_tensor(self):
+        # [FUNCTION DOC] A script function can call a plain python function taking tensors, ints
+        # and tuples and returning a tuple; results equal expected values.
         def foo(a, b, c):
+            # [FUNCTION DOC] HELPER: Unpack a tuple argument and return the int sum and the
+            # tensor sum.
             # type: (Tensor, int, Tuple[Tensor, int]) -> Tuple[int, Tensor]
             d, e = c
             return b + e, a + d
 
         @torch.jit.script
         def bar():
+            # [FUNCTION DOC] HELPER: Call the python function with a tensor, an int and a tuple.
             x = torch.ones(3, 4)
             a, b = foo(x, 3, (x, 3))
             return a, b
@@ -9954,24 +12234,33 @@ dedent """
         self.assertEqual((6, torch.ones(3, 4) + 1), bar())
 
     def test_python_call_non_tensor_wrong(self):
+        # [FUNCTION DOC] An ignored function whose declared return type does not match its actual
+        # value makes running the script function fail with RuntimeError.
         with self.assertRaisesRegex(RuntimeError, r"but instead got value of type tuple"):
             @torch.jit.ignore
             def foo():
+                # [FUNCTION DOC] HELPER: Ignored function declared to return a tensor but
+                # returning a tuple.
                 # type: () -> Tensor
                 return ((3, 4),)  # noqa: T484
 
             @torch.jit.script
             def bar():
+                # [FUNCTION DOC] HELPER: Call the ignored function.
                 return foo()
 
             bar()
 
     def test_if_different_type(self):
+        # [FUNCTION DOC] A variable set to different types in the branches of a conditional is an
+        # error only if used afterwards; an earlier float redefined as int also errors.
         with self.assertRaisesRegex(RuntimeError, "c0 is set to type "
                                     "int in the true branch and type "
                                     "float in the false branch"):
             @torch.jit.script
             def diff_type_used():
+                # [FUNCTION DOC] HELPER: Set a variable to an int in one branch and a float in
+                # the other; return it.
                 if 1 == 2:
                     c0 = 1
                 else:
@@ -9981,6 +12270,8 @@ dedent """
         with self.assertRaisesRegex(RuntimeError, "Variable 'c0' previously had type float"):
             @torch.jit.script
             def diff_existing_type(x):
+                # [FUNCTION DOC] HELPER: Reassign an existing float variable to an int in
+                # a branch.
                 c0 = 1.0
                 if 1 == 2:
                     c0 = 1
@@ -9989,6 +12280,8 @@ dedent """
 
         @torch.jit.script
         def diff_type_unused():
+            # [FUNCTION DOC] HELPER: Branch-local variables of different types that are never
+            # used after.
             if 1 == 1:
                 c0 = 1
                 print(c0)
@@ -9998,15 +12291,20 @@ dedent """
             return 1
 
     def test_if_not_defined_error(self):
+        # [FUNCTION DOC] Using a variable defined in only one branch of a conditional after it
+        # must raise RuntimeError saying which branch lacks it, for each branch.
         with self.assertRaisesRegex(RuntimeError, "c0 is not defined in the false branch"):
             @torch.jit.script
             def test():
+                # [FUNCTION DOC] HELPER: Define a variable only in the true branch and return it.
                 if 1 == 1:
                     c0 = 1
                 return c0
         with self.assertRaisesRegex(RuntimeError, "c0 is not defined in the true branch"):
             @torch.jit.script
             def test2():
+                # [FUNCTION DOC] HELPER: Define a variable only in the false branch and
+                # return it.
                 if 1 == 1:
                     pass
                 else:
@@ -10014,9 +12312,13 @@ dedent """
                 return c0
 
     def test_if_list_cat(self):
+        # [FUNCTION DOC] Shape propagation must not fail when branches build lists of different
+        # lengths that are concatenated afterwards.
         # testing that different length lists don't throw error on cat in shape prop
         @torch.jit.script
         def test_list(x):
+            # [FUNCTION DOC] HELPER: Build a two-element or three-element list by a condition and
+            # cat it.
             if bool(x.sum() < 1):
                 c = [x, x]
             else:
@@ -10027,8 +12329,13 @@ dedent """
         _propagate_shapes(test_list.graph, (b,), False)
 
     def test_if_supertype(self):
+        # [FUNCTION DOC] Shape propagation on a conditional that assigns tensors of different
+        # shapes and dtypes yields unified output types: float for the first, plain base shape
+        # for the other two.
         @torch.jit.script
         def tensor_unifying(x, y, z):
+            # [FUNCTION DOC] HELPER: In both branches return x plus one and tensors y and z or x
+            # and y.
             # testing dynamic is appropriately set for y and z
             if bool(x):
                 x, y, z = x + 1, y, z  # noqa: PLW0127
@@ -10048,12 +12355,17 @@ dedent """
         self.assertTrue(if_outputs[2].type().str() == "Tensor(*, *, requires_grad=0, device=cpu)")
 
     def test_list_unify(self):
+        # [FUNCTION DOC] Unifying a list of ints with a list of None in branches must fail
+        # scripting with a RuntimeError naming both list types; lists of tensors of different
+        # shapes unify and round trip through export/import.
         # allowing a unififed int?[] would cause a runtime error b/c
         # the index operation expects int?[] to be a generic list,
         # but in the true branch the IValue will be a int list
         with self.assertRaisesRegex(RuntimeError, "int[] in the true branch and type None[]"):
             @torch.jit.script
             def list_optional_fails(x):
+                # [FUNCTION DOC] HELPER: Branches build an int list or a list holding None, then
+                # index it; must fail.
                 # type: (bool) -> Optional[int]
                 if x:
                     y = [1]
@@ -10063,6 +12375,8 @@ dedent """
 
         @torch.jit.script
         def list_tensors(x):
+            # [FUNCTION DOC] HELPER: Branches build tensors of different shapes and lists holding
+            # them; return both.
             # type: (bool) -> Tuple[Tensor, List[Tensor]]
             if x:
                 a = torch.zeros([1, 1])
@@ -10080,12 +12394,21 @@ dedent """
     @skipIfTorchDynamo("Not a TorchDynamo suitable test")
     @_inline_everything
     def test_import_constants_not_specialized(self):
+        # [FUNCTION DOC] Tensors captured by tracing keep shape information in the live graph but
+        # are loaded as unspecialized constants after save and load. Skipped under dynamo;
+        # inlines everything.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module concatenating its input with itself along dim 0.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the input concatenated with itself.
                 return torch.cat(2 * [x], dim=0)
 
         class ScriptMod(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module that traces a closure over a given module and a
+            # constant tensor.
             def __init__(self, mod):
+                # [FUNCTION DOC] HELPER: Trace a closure calling the given module on a 1x3
+                # zeros tensor.
                 super().__init__()
                 x = torch.zeros(1, 3)
                 mod_fn = lambda : mod(x)  # noqa: E731
@@ -10093,6 +12416,7 @@ dedent """
 
             @torch.jit.script_method
             def forward(self):
+                # [FUNCTION DOC] HELPER: Call the traced closure.
                 return self.mod()
 
         cm = ScriptMod(Mod())
@@ -10107,8 +12431,13 @@ dedent """
 
     @skipIfTorchDynamo("TorchDynamo fails with unknown reason")
     def test_type_annotations_repeated_list(self):
+        # [FUNCTION DOC] Broadcasting list annotations accept a single value or a list or tuple
+        # of three floats/ints; a malformed length marker must raise RuntimeError saying it must
+        # be a positive integer, an unknown constructor in source text must fail, and a
+        # broadcasting list of two ints annotation yields a list of ints. Skipped under dynamo.
         @torch.jit.script
         def float_fn(x, y):
+            # [FUNCTION DOC] HELPER: Return the broadcasting list of three floats argument.
             # type: (float, BroadcastingList3[float]) -> List[float]
             return y
         self.assertEqual(float_fn(2.0, 1.0), float_fn(2.0, [1.0, 1.0, 1.0]))
@@ -10116,11 +12445,14 @@ dedent """
 
         @torch.jit.script
         def float_fn_call():
+            # [FUNCTION DOC] HELPER: Print the float function called with a scalar and with
+            # a tuple.
             print(float_fn(1.0, 1.0))
             print(float_fn(1.0, (1.0, 1.0, 1.0)))
 
         @torch.jit.script
         def int_fn(x):
+            # [FUNCTION DOC] HELPER: Return the broadcasting list of three ints argument.
             # type: (BroadcastingList3[int]) -> List[int]
             return x
         self.assertEqual(int_fn(1), int_fn([1, 1, 1]))
@@ -10128,12 +12460,16 @@ dedent """
 
         @torch.jit.script
         def int_fn_call():
+            # [FUNCTION DOC] HELPER: Print the int function called with a scalar and with
+            # a tuple.
             print(int_fn(1))
             print(int_fn((1, 1, 1)))
 
         with self.assertRaisesRegex(RuntimeError, "must be a positive integer:"):
             @torch.jit.script  # noqa: T484
             def fn(x):
+                # [FUNCTION DOC] HELPER: Function with a malformed broadcasting list annotation;
+                # scripting must fail.
                 # type: (BroadcastingListx[int]) -> List[int]  # noqa: T484
                 return x
 
@@ -10147,6 +12483,7 @@ dedent """
 
         @torch.jit.script
         def f(x: BroadcastingList2[int]):
+            # [FUNCTION DOC] HELPER: Return the broadcasting list of two ints argument.
             return x
 
         out = f(1)
@@ -10154,26 +12491,36 @@ dedent """
         self.assertEqual(out, [1, 1])
 
     def test_ntuple_builtins(self):
+        # [FUNCTION DOC] checkScript of the single/pair/triple/quadruple tuple helper functions
+        # with int and float inputs.
         from torch.nn.modules.utils import _single, _pair, _triple, _quadruple
 
         def test_ints():
+            # [FUNCTION DOC] HELPER: Return the helpers applied to ints.
             return _single(1), _pair(2), _triple(3), _quadruple(4)
 
         def test_floats():
+            # [FUNCTION DOC] HELPER: Return the helpers applied to floats.
             return _single(1), _pair(2.1), _triple(3.1), _quadruple(4.1)
 
         self.checkScript(test_ints, ())
         self.checkScript(test_floats, ())
 
     def test_embedding_renorm_grad_error(self):
+        # [FUNCTION DOC] Calling embedding with max_norm modifies the weight in place, so a prior
+        # autograd graph using that weight fails in backward with an error about modification;
+        # checked for eager and scripted versions.
         # Testing that the builtin call to embedding_renorm_ correctly throws
         # Error when .backward() is called on its input
 
         def embedding_norm(input, embedding_matrix, max_norm):
+            # [FUNCTION DOC] HELPER: Call embedding with a max norm (result discarded).
             F.embedding(input, embedding_matrix, max_norm=0.01)
 
         @torch.jit.script
         def embedding_norm_script(input, embedding_matrix, max_norm):
+            # [FUNCTION DOC] HELPER: Scripted version that calls embedding with a max norm
+            # (result discarded).
             # type: (Tensor, Tensor, float) -> None
             F.embedding(input, embedding_matrix, max_norm=0.01)
 
@@ -10193,29 +12540,41 @@ dedent """
                 output2.sum().backward()
 
     def test_type_annotations(self):
+        # [FUNCTION DOC] Unpacking the tuple result of an annotated function: wrong counts
+        # raise RuntimeError (too few or too many names); correct unpacking, indexing and
+        # strings pass checkScript.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return x with x doubled and x tripled.
             # type: (Tensor, Tensor) -> Tuple[Tensor, Tensor, Tensor]
             return x, x * 2, x * 3
 
         with self.assertRaisesRegex(RuntimeError, r"need 4 values .* found only 3"):
             @torch.jit.script
             def script_fn(x):
+                # [FUNCTION DOC] HELPER: Unpack three results into four names; scripting
+                # must fail.
                 x, y, z, w = fn(x, x)
 
         with self.assertRaisesRegex(RuntimeError, r"too many values .* need 2 but found 3"):
             @torch.jit.script
             def script_fn2(x):
+                # [FUNCTION DOC] HELPER: Unpack three results into two names; scripting
+                # must fail.
                 x, y = fn(x, x)
 
         def fn_unpack(x):
+            # [FUNCTION DOC] HELPER: Unpack the three results and return the first.
             y, z, w = fn(x, x)
             return y
 
         def fn_index(x):
+            # [FUNCTION DOC] HELPER: Call the function, keep the tuple, return x.
             q = fn(x, x)
             return x
 
         def fn_string(str, strpair):
+            # [FUNCTION DOC] HELPER: Return a tuple mixing a string, an int, and the two strings
+            # of a pair.
             # type: (str, Tuple[str, str]) -> Tuple[str, int, str, str]
             str1, str2 = strpair
             return str, 2, str1, str2
@@ -10226,17 +12585,24 @@ dedent """
         self.checkScript(fn_string, ("1", ("3", "4")), optimize=True)
 
     def test_type_annotations_varargs(self):
+        # [FUNCTION DOC] Ignored functions with varargs can be called from scripted functions
+        # with zero, one and two extra arguments.
         @torch.jit.ignore
         def fn_varargs(x, *args):
+            # [FUNCTION DOC] HELPER: Ignored variadic function returning the first extra argument
+            # or x.
             return args[0] if args else x
 
         def fn1(x, y, z):
+            # [FUNCTION DOC] HELPER: Call the variadic function with no extras.
             return fn_varargs(x)
 
         def fn2(x, y, z):
+            # [FUNCTION DOC] HELPER: Call the variadic function with one extra.
             return fn_varargs(x, y)
 
         def fn3(x, y, z):
+            # [FUNCTION DOC] HELPER: Call the variadic function with two extras.
             return fn_varargs(x, y, z)
 
         x, y, z = (torch.randn(2, 2) for _ in range(3))
@@ -10245,6 +12611,9 @@ dedent """
         self.checkScript(fn3, (x, y, z), optimize=True)
 
     def test_type_annotation_py3(self):
+        # [FUNCTION DOC] Write a python 3 annotated function to a temporary file, load it as an
+        # ignored function, and check call-site argument and tuple-size errors in scripted
+        # callers, plus a good caller via checkScript.
         code = dedent("""
         import torch
         from torch import Tensor
@@ -10265,62 +12634,85 @@ dedent """
                                                       r" 'x' but instead found type 'Tuple\[Tensor,"):
                 @torch.jit.script
                 def bad_fn(x):
+                    # [FUNCTION DOC] HELPER: Pass a tuple where a tensor is expected; scripting
+                    # must fail.
                     x, y = fn((x, x), x, x)
                     return y
 
             with self.assertRaisesRegex(RuntimeError, r"too many values .* need 2 but found 3"):
                 @torch.jit.script
                 def bad_fn2(x):
+                    # [FUNCTION DOC] HELPER: Unpack three results into two names; scripting
+                    # must fail.
                     x, y = fn(x, x, x)
                     return y
 
             with self.assertRaisesRegex(RuntimeError, r"need 4 values .* found only 3"):
                 @torch.jit.script
                 def bad_fn3(x):
+                    # [FUNCTION DOC] HELPER: Unpack three results into four names; scripting
+                    # must fail.
                     x, y, z, w = fn(x, x, x)
                     return y
 
             def good_fn(x):
+                # [FUNCTION DOC] HELPER: Call the loaded function and return its three results.
                 y, z, w = fn(x, x, x)
                 return y, z, w
 
             self.checkScript(good_fn, (torch.ones(2, 2),), optimize=True)
 
     def test_type_annotation_module(self):
+        # [FUNCTION DOC] Script methods calling ignored methods with the wrong number of
+        # arguments or results must fail with RuntimeError at module creation.
         class BaseModule(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Base script module with three ignored methods (two annotated,
+            # one not).
             @torch.jit.ignore
             def foo(self, x):
+                # [FUNCTION DOC] HELPER: Ignored method returning x plus one.
                 # type: (Tensor) -> Tensor
                 return x + 1
 
             @torch.jit.ignore
             def bar(self, x, y):
+                # [FUNCTION DOC] HELPER: Ignored method returning the sum and y as a pair.
                 # type: (Tensor, Tensor) -> Tuple[Tensor, Tensor]
                 return x + y, y
 
             @torch.jit.ignore
             def baz(self, x, y):
+                # [FUNCTION DOC] HELPER: Ignored method without annotations, returning x.
                 return x
 
         class ModuleTooMany(BaseModule):
+            # [CLASS DOC] HELPER: Module whose script method passes too many arguments.
             @torch.jit.script_method
             def method(self, x):
+                # [FUNCTION DOC] HELPER: Call the one-argument method with two arguments.
                 return self.foo(x, x)
 
         class ModuleTooFew(BaseModule):
+            # [CLASS DOC] HELPER: Module whose script method passes too few arguments.
             @torch.jit.script_method
             def method(self, x):
+                # [FUNCTION DOC] HELPER: Call the two-argument method with one argument.
                 return self.bar(x)
 
         class ModuleTooManyAssign(BaseModule):
+            # [CLASS DOC] HELPER: Module whose script method unpacks a pair into three names.
             @torch.jit.script_method
             def method(self, x):
+                # [FUNCTION DOC] HELPER: Unpack the two results into three names.
                 y, z, w = self.bar(x, x)
                 return x
 
         class ModuleDefault(BaseModule):
+            # [CLASS DOC] HELPER: Module whose script method calls an unannotated method with too
+            # few arguments.
             @torch.jit.script_method
             def method(self, x):
+                # [FUNCTION DOC] HELPER: Call the unannotated method with one argument.
                 y = self.baz(x)
                 return x
 
@@ -10334,11 +12726,14 @@ dedent """
             ModuleDefault()
 
     def test_type_inferred_from_empty_annotation(self):
+        # [FUNCTION DOC] An unannotated script function argument gets an inferred tensor type,
+        # and passing a string raises RuntimeError saying the inferred type is Tensor.
         """
         Test that the type inferred from an empty or missing annotation is Torch.Tensor with `inferred=true`
         """
         @torch.jit.script
         def fn(x):
+            # [FUNCTION DOC] HELPER: Identity function with an unannotated argument.
             return x
 
         graph = fn.graph
@@ -10349,49 +12744,67 @@ dedent """
             fn("1")
 
     def test_script_define_order(self):
+        # [FUNCTION DOC] A script method may call another method defined later in the class.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a method that calls another method defined
+            # after it.
 
             @torch.jit.script_method
             def call_foo(self, input):
+                # [FUNCTION DOC] HELPER: Call foo.
                 return self.foo(input)
 
             @torch.jit.script_method
             def foo(self, input):
+                # [FUNCTION DOC] HELPER: Return the input plus one.
                 return input + 1
         m = M()
         self.assertEqual(2, m.call_foo(torch.ones((), dtype=torch.int64)))
 
     def test_script_define_order_recursive_fail(self):
+        # [FUNCTION DOC] Mutually recursive script methods must fail module creation with
+        # RuntimeError saying the method was called recursively.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with two methods that call each other.
 
             @torch.jit.script_method
             def call_foo(self, input):
+                # [FUNCTION DOC] HELPER: Call foo.
                 return self.foo(input)
 
             @torch.jit.script_method
             def foo(self, input):
+                # [FUNCTION DOC] HELPER: Call call_foo (recursion).
                 self.call_foo(input)
 
         with self.assertRaisesRegex(RuntimeError, 'called recursively'):
             M()
 
     def test_script_kwargs_fn_call(self):
+        # [FUNCTION DOC] A script method can call another method with keyword arguments in a
+        # different order than its declaration.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module calling a method with keyword arguments.
 
             @torch.jit.script_method
             def call_foo(self, input):
+                # [FUNCTION DOC] HELPER: Call foo with input and bar as keywords.
                 return self.foo(input=input, bar=1)
 
             @torch.jit.script_method
             def foo(self, bar, input):
+                # [FUNCTION DOC] HELPER: Return the input plus the int bar.
                 # type: (int, Tensor) -> Tensor
                 return input + bar
         m = M()
         self.assertEqual(2, m.call_foo(torch.ones((), dtype=torch.int64)))
 
     def test_if_define(self):
+        # [FUNCTION DOC] Variables defined in conditional branches are handled correctly in three
+        # forms; results check for equal and unequal inputs.
         @torch.jit.script
         def foo(a):
+            # [FUNCTION DOC] HELPER: Define b in both branches and return b plus one.
             if bool(a == 0):
                 b = 1
             else:
@@ -10400,6 +12813,7 @@ dedent """
 
         @torch.jit.script
         def foo2(a):
+            # [FUNCTION DOC] HELPER: Define b before, redefine in one branch, return b plus one.
             b = 0
             if bool(a == 0):
                 b = 1
@@ -10407,6 +12821,8 @@ dedent """
 
         @torch.jit.script
         def foo3(a):
+            # [FUNCTION DOC] HELPER: Define c only in the true branch and change b in the
+            # false branch.
             b = 1
             if bool(a == 0):
                 c = 4
@@ -10424,17 +12840,27 @@ dedent """
         self.assertEqual(2, foo3(b))
 
     def test_script_module_export_submodule(self):
+        # [FUNCTION DOC] Export/import a script module with a submodule, parameters, several
+        # methods and a method defined from text, with optimized execution off; outputs of all
+        # methods must match.
         class M1(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script submodule adding a parameter to its input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random parameter of size 2.
                 super().__init__()
                 self.weight = nn.Parameter(torch.randn(2))
 
             @torch.jit.script_method
             def forward(self, thing):
+                # [FUNCTION DOC] HELPER: Return the parameter plus the input.
                 return self.weight + thing
 
         class M2(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a submodule, two parameters, script methods,
+            # and a method defined from text.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the submodule, parameters, and define hi
+                # from text.
                 super().__init__()
                 # test submodule
                 self.sub = M1()
@@ -10447,18 +12873,23 @@ dedent """
 
             @torch.jit.script_method
             def doit(self, input):
+                # [FUNCTION DOC] HELPER: Return weight times input.
                 return self.weight.mm(input)
 
             @torch.jit.script_method
             def doit2(self, input):
+                # [FUNCTION DOC] HELPER: Return weight times input.
                 return self.weight.mm(input)
 
             @torch.jit.script_method
             def doit3(self, input):
+                # [FUNCTION DOC] HELPER: Return the input plus a double tensor of one.
                 return input + torch.ones([1], dtype=torch.double)
 
             @torch.jit.script_method
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Combine the outputs of two methods, bias and the
+                # text-defined method.
                 a = self.doit(input)
                 b = self.doit2(input)
                 c = self.hi(input)
@@ -10476,21 +12907,29 @@ dedent """
 
     @slowTest
     def test_compile_module_with_constant(self):
+        # [FUNCTION DOC] Script modules with a constant that is None or a submodule: output
+        # equals the input for None and double for the submodule. Slow.
         class Double(nn.Module):
+            # [CLASS DOC] HELPER: Module doubling its input.
             def __init__(self, downsample=None):
+                # [FUNCTION DOC] HELPER: Call the base initializer; the argument is ignored.
                 super().__init__()
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Return twice the input.
                 return input * 2
 
         class Mod(nn.Module):
+            # [CLASS DOC] HELPER: Module holding an optional submodule declared as a constant.
             __constants__ = ['downsample']
 
             def __init__(self, downsample=None):
+                # [FUNCTION DOC] HELPER: Store the optional submodule.
                 super().__init__()
                 self.downsample = downsample
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Apply the submodule if present, else return the input.
                 if self.downsample is not None:
                     return self.downsample(input)
                 return input
@@ -10501,20 +12940,30 @@ dedent """
         self.assertEqual(double_mod(torch.tensor(1)), torch.tensor(1) * 2)
 
     def test_device_kwarg(self):
+        # [FUNCTION DOC] checkScript of constructing devices with a type keyword through the
+        # class and the module attribute.
         from torch import device
 
         def f():
+            # [FUNCTION DOC] HELPER: Return a cuda device and a cpu device built by type keyword.
             return device(type='cuda'), torch.device(type='cpu')
         self.checkScript(f, ())
 
     def test_script_module_export_tensor_type(self):
+        # [FUNCTION DOC] Export/import a module with a float or double parameter; the original
+        # storage is not resized and dtype and values survive.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a random-integer 5x5 parameter of the
+            # given dtype.
             def __init__(self, type):
+                # [FUNCTION DOC] HELPER: Create a parameter of the requested dtype filled with
+                # random values.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.zeros((5, 5), dtype=type).random_())
 
             @torch.jit.script_method
             def foo(self):
+                # [FUNCTION DOC] HELPER: Return the parameter.
                 return self.param
 
         with torch.jit.optimized_execution(False):
@@ -10528,14 +12977,19 @@ dedent """
 
     @unittest.skipIf(not RUN_CUDA, "testing cuda tensors require CUDA")
     def test_script_module_export_tensor_cuda(self):
+        # [FUNCTION DOC] Export/import a module with a cuda parameter; device, dtype and values
+        # survive. Needs CUDA.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a random 5x5 parameter on cuda 0.
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a parameter on cuda device 0.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.zeros((5, 5), device='cuda:0').random_())
 
             @torch.jit.script_method
             def foo(self):
+                # [FUNCTION DOC] HELPER: Return the parameter.
                 return self.param
 
         m_orig = M()
@@ -10547,13 +13001,20 @@ dedent """
         self.assertTrue(m_orig.foo().dtype == m_import.foo().dtype)
 
     def test_script_module_export_blocks(self):
+        # [FUNCTION DOC] Export/import a module whose forward has a conditional with two
+        # different computations; outputs match on a random input.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a weight matrix and a conditional
+            # in forward.
             def __init__(self, n, m):
+                # [FUNCTION DOC] HELPER: Create a random n by m parameter.
                 super().__init__()
                 self.weight = torch.nn.Parameter(torch.rand(n, m))
 
             @torch.jit.script_method
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Compute weight times input or weight plus input
+                # depending on the sign of the sum.
                 if bool(input.sum() > 0):
                     output = self.weight.mv(input)
                 else:
@@ -10567,9 +13028,14 @@ dedent """
         self.assertEqual(m_orig(t), m_import(t))
 
     def test_script_module_export_shared_storage(self):
+        # [FUNCTION DOC] Export/import preserves shared storage between parameters that are views
+        # of the same tensor and keeps unrelated parameters separate.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with four parameters, two sharing storage.
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create two parameters (one a view of the other), a
+                # separate parameter and a sliced one.
                 super().__init__()
                 self.param1 = torch.nn.Parameter(torch.rand(5, 5))
                 self.param2 = torch.nn.Parameter(self.param1[3])
@@ -10578,6 +13044,7 @@ dedent """
 
             @torch.jit.script_method
             def foo(self):
+                # [FUNCTION DOC] HELPER: Return the sum of the four parameters.
                 return self.param1 + self.param2 + self.param3 + self.param4
 
         with torch.jit.optimized_execution(False):
@@ -10590,26 +13057,39 @@ dedent """
             self.assertTrue(m_import.param1.storage().data_ptr() != m_import.param3.storage().data_ptr())
 
     def test_sequential_intermediary_types(self):
+        # [FUNCTION DOC] checkModule of a Sequential whose first layer returns a tensor and
+        # second returns a dict.
         class A(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module adding three to its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return x plus 3.
                 return x + 3
 
         class B(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning a dict wrapping its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return a one-entry dict holding x.
                 return {"1": x}
 
         class C(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a Sequential of the two previous modules.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the Sequential.
                 super().__init__()
                 self.foo = torch.nn.Sequential(A(), B())
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the Sequential.
                 return self.foo(x)
 
         self.checkModule(C(), (torch.tensor(1),))
 
     def test_ellipsis_const_mid(self):
+        # [FUNCTION DOC] checkScript of indexing with an Ellipsis constant in the middle and
+        # slices on a 5-d tensor.
         def ellipsize(x):
+            # [FUNCTION DOC] HELPER: Return the size after indexing with an int, Ellipsis and
+            # two slices.
             # type: (Tensor) -> List[int]
             return x[2, Ellipsis, 0:4, 4:8].size()
 
@@ -10617,7 +13097,11 @@ dedent """
         self.checkScript(ellipsize, (dummy,), optimize=True)
 
     def test_ellipsis_const_mid_select(self):
+        # [FUNCTION DOC] checkScript of Ellipsis in the middle with several selects and a slice
+        # on a 7-d tensor.
         def ellipsize(x):
+            # [FUNCTION DOC] HELPER: Return the size after indexing with Ellipsis between selects
+            # and slices.
             # type: (Tensor) -> List[int]
             return x[2, Ellipsis, 4, 4, 4:8, 2].size()
 
@@ -10625,21 +13109,29 @@ dedent """
         self.checkScript(ellipsize, (dummy,), optimize=True)
 
     def test_ellipsis_const_start(self):
+        # [FUNCTION DOC] checkScript of Ellipsis at the start of the index with two slices.
         def ellipsize(x):
+            # [FUNCTION DOC] HELPER: Return the size after an index starting with Ellipsis.
             # type: (Tensor) -> List[int]
             return x[Ellipsis, 0:4, 4:8].size()
         dummy = torch.zeros(8, 8, 8, 8, 8)
         self.checkScript(ellipsize, (dummy,), optimize=True)
 
     def test_ellipsis_const_end(self):
+        # [FUNCTION DOC] checkScript of Ellipsis at the end of the index after a slice and
+        # an int.
         def ellipsize(x):
+            # [FUNCTION DOC] HELPER: Return the size after an index ending with Ellipsis.
             # type: (Tensor) -> List[int]
             return x[0:4, 2, Ellipsis].size()
         dummy = torch.zeros(8, 8, 8, 8, 8)
         self.checkScript(ellipsize, (dummy,), optimize=True)
 
     def test_ellipsis_mid(self):
+        # [FUNCTION DOC] checkScript of the dots form of Ellipsis in the middle of an index.
         def ellipsize(x):
+            # [FUNCTION DOC] HELPER: Return the size after indexing with dots between an int
+            # and slices.
             # type: (Tensor) -> List[int]
             return x[2, ..., 0:4, 4:8].size()
 
@@ -10647,7 +13139,10 @@ dedent """
         self.checkScript(ellipsize, (dummy,), optimize=True)
 
     def test_ellipsis_mid_select(self):
+        # [FUNCTION DOC] checkScript of dots between several selects and a slice on a 7-d tensor.
         def ellipsize(x):
+            # [FUNCTION DOC] HELPER: Return the size after indexing with dots between selects
+            # and slices.
             # type: (Tensor) -> List[int]
             return x[2, ..., 4, 4, 4:8, 2].size()
 
@@ -10655,22 +13150,30 @@ dedent """
         self.checkScript(ellipsize, (dummy,), optimize=True)
 
     def test_ellipsis_start(self):
+        # [FUNCTION DOC] checkScript of dots at the start of an index.
         def ellipsize(x):
+            # [FUNCTION DOC] HELPER: Return the size after an index starting with dots.
             # type: (Tensor) -> List[int]
             return x[..., 0:4, 4:8].size()
         dummy = torch.zeros(8, 8, 8, 8, 8)
         self.checkScript(ellipsize, (dummy,), optimize=True)
 
     def test_ellipsis_end(self):
+        # [FUNCTION DOC] checkScript of dots at the end of an index.
         def ellipsize(x):
+            # [FUNCTION DOC] HELPER: Return the size after an index ending with dots.
             # type: (Tensor) -> List[int]
             return x[0:4, 2, ...].size()
         dummy = torch.zeros(8, 8, 8, 8, 8)
         self.checkScript(ellipsize, (dummy,), optimize=True)
 
     def test_torch_manual_seed(self):
+        # [FUNCTION DOC] Seeding the global generator inside a scripted function gives the same
+        # random value as eager and keeps the seed op in the graph; random state is frozen for
+        # the test.
         with freeze_rng_state():
             def test():
+                # [FUNCTION DOC] HELPER: Seed with 2 and return a random tensor of size one.
                 torch.manual_seed(2)
                 return torch.rand(1)
 
@@ -10681,9 +13184,12 @@ dedent """
 
     @skipIfTorchDynamo("Not a TorchDynamo suitable test")
     def test_index_select_shape_prop(self):
+        # [FUNCTION DOC] Shape analysis of index_select gives a float tensor of the selected
+        # size. Skipped under dynamo.
 
         @torch.jit.script
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: Select entries of x along dim 1 by the index tensor y.
             return torch.index_select(x, index=y, dim=1)
 
         a = torch.zeros(2, 2)
@@ -10692,7 +13198,10 @@ dedent """
         FileCheck().check("Float(2, 4, strides=[4, 1], requires_grad=0, device=cpu)").run(str(foo.graph))
 
     def test_shape_analysis_loop(self):
+        # [FUNCTION DOC] checkScript of a loop where broadcasting looks different on the first
+        # iteration than later ones, guarding against infinite loops in shape analysis.
         def foo(a, b, x):
+            # [FUNCTION DOC] HELPER: Run two iterations adding c and b, then rebinding both to x.
             c = a
             # on the first iteration of the loop it appears that
             # c should have a expand to the size of b
@@ -10711,13 +13220,18 @@ dedent """
         self.checkScript(foo, (torch.zeros(1), torch.zeros(4), torch.zeros(5)), optimize=False)
 
     def test_intlist_args(self):
+        # [FUNCTION DOC] checkScript of adaptive average pooling with the output size as
+        # positional int, keyword int, and list.
         def func_1(x):
+            # [FUNCTION DOC] HELPER: Adaptive average pool with a positional output size of one.
             return torch.nn.functional.adaptive_avg_pool1d(x, 1)
 
         def func_2(x):
+            # [FUNCTION DOC] HELPER: Adaptive average pool with a keyword output size of one.
             return torch.nn.functional.adaptive_avg_pool1d(x, output_size=1)
 
         def func_3(x):
+            # [FUNCTION DOC] HELPER: Adaptive average pool with a list output size.
             return torch.nn.functional.adaptive_avg_pool1d(x, output_size=[1])
 
         x = torch.randn(8, 8, 8)
@@ -10726,9 +13240,12 @@ dedent """
         self.checkScript(func_3, [x], optimize=True)
 
     def test_wrong_implicit_expand(self):
+        # [FUNCTION DOC] A traced function with example inputs of different sizes still
+        # broadcasts correctly on new equal-size inputs.
 
         @_trace(torch.zeros(3), torch.zeros(1))
         def foo(a, b):
+            # [FUNCTION DOC] HELPER: Return the sum of two tensors.
             return a + b
 
         a = torch.rand(4)
@@ -10736,30 +13253,39 @@ dedent """
         self.assertEqual(a + b, foo(a, b))
 
     def test_builtin_args_fails(self):
+        # [FUNCTION DOC] Calling builtins with missing, duplicate or mistyped arguments must
+        # raise RuntimeError with the right message.
 
         with self.assertRaisesRegex(RuntimeError, 'Argument self not provided'):
             @torch.jit.script
             def f1(a):
+                # [FUNCTION DOC] HELPER: Sum with an unknown keyword only; scripting must fail.
                 torch.sum(foo=4)
 
         with self.assertRaisesRegex(RuntimeError, 'specified twice'):
             @torch.jit.script
             def f2(a):
+                # [FUNCTION DOC] HELPER: Sum with self given positionally and by keyword;
+                # scripting must fail.
                 torch.sum(a, self=a)
 
         with self.assertRaisesRegex(RuntimeError, 'not provided'):
             @torch.jit.script
             def f3(a):
+                # [FUNCTION DOC] HELPER: Sum with only dim given; scripting must fail.
                 torch.sum(dim=4)
 
         with self.assertRaisesRegex(RuntimeError, 'for argument \'tensors\' but instead found type \'Tensor'):
             @torch.jit.script
             def f4(a):
+                # [FUNCTION DOC] HELPER: Concatenate a single tensor instead of a list; scripting
+                # must fail.
                 torch.cat(a)
 
         with self.assertRaisesRegex(RuntimeError, r'argument \'tensors\' but instead found type \'List\[int\]'):
             @torch.jit.script
             def f5(a):
+                # [FUNCTION DOC] HELPER: Concatenate a list of ints; scripting must fail.
                 torch.cat([3])
 
         with self.assertRaisesRegex(RuntimeError, r'Expected a value of'
@@ -10768,23 +13294,30 @@ dedent """
                                     r'\'List\[Union\[List\[int\], int\]\]'):
             @torch.jit.script
             def f6(a):
+                # [FUNCTION DOC] HELPER: Expand with a size containing a nested list; scripting
+                # must fail.
                 a.expand(size=[3, [4]])
 
     def test_builtin_args(self):
+        # [FUNCTION DOC] checkScript of builtin calls with default arguments, out-of-order
+        # keywords, and a mix of constant and non-constant attributes.
 
         def t0(a):
+            # [FUNCTION DOC] HELPER: Concatenate with the default dimension.
             # default arg dim
             return torch.cat([a, a])
 
         self.checkScript(t0, (torch.zeros(1, 1),))
 
         def t1(a):
+            # [FUNCTION DOC] HELPER: Concatenate with keywords given out of order.
             # keywords out of order
             return torch.cat(dim=1, tensors=[a, a])
 
         self.checkScript(t1, (torch.zeros(1, 1, 2),))
 
         def t2(a):
+            # [FUNCTION DOC] HELPER: Sum with a dim that depends on a conditional.
             # mix const/non-const attributes
             if 1 == 1:
                 b = 1
@@ -10795,6 +13328,8 @@ dedent """
         self.checkScript(t2, (torch.zeros(1, 1, 2),))
 
     def test_parser_type_annotations(self):
+        # [FUNCTION DOC] Parse a function with colon annotations in source text and compare its
+        # schema text to stored expected text.
         cu = torch.jit.CompilationUnit('''
             def foo(x : Tensor, y : Tuple[Tuple[Tensor, Tensor], Tensor]) -> Tuple[Tensor, Tensor]:
                 return x, x
@@ -10803,6 +13338,8 @@ dedent """
         self.assertExpected(str(cu.foo.schema))
 
     def test_parser_type_annotations_comment(self):
+        # [FUNCTION DOC] Parse a function with an annotation comment in source text and compare
+        # its schema text to stored expected text.
         cu = torch.jit.CompilationUnit('''
             def foo(x, y):
                 # type: (Tensor, Tuple[Tuple[Tensor, Tensor], Tensor]) -> Tuple[Tensor, Tensor]
@@ -10812,6 +13349,8 @@ dedent """
         self.assertExpected(str(cu.foo.schema))
 
     def test_parser_type_annotations_unknown_type(self):
+        # [FUNCTION DOC] An unknown type name in an annotation of source text must
+        # raise RuntimeError.
         with self.assertRaisesRegex(RuntimeError, "Unknown type name 'Foo'"):
             cu = torch.jit.CompilationUnit('''
                 def foo(x : Tensor, y : Tuple[Tuple[Foo, Tensor], Tensor]) -> Tuple[Tensor, Tensor]:
@@ -10819,6 +13358,8 @@ dedent """
             ''')
 
     def test_parser_type_annotations_subscript_non_ident(self):
+        # [FUNCTION DOC] Subscripting a non-identifier type in source text must
+        # raise RuntimeError.
         with self.assertRaisesRegex(RuntimeError, r'Subscripted type must be a type identifier'):
             cu = torch.jit.CompilationUnit('''
                 def foo(x : Tensor, y : Tuple[Tensor, Tensor][Tensor]) -> Tuple[Tensor, Tensor]:
@@ -10826,6 +13367,8 @@ dedent """
             ''')
 
     def test_parser_type_annotations_subscript_tensor(self):
+        # [FUNCTION DOC] Subscripting the Tensor type in source text must raise RuntimeError
+        # about an unknown type constructor.
         with self.assertRaisesRegex(RuntimeError, r'Unknown type constructor Tensor'):
             cu = torch.jit.CompilationUnit('''
                 def foo(x : Tensor, y : Tensor[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
@@ -10833,6 +13376,8 @@ dedent """
             ''')
 
     def test_parser_type_annotations_incompatible_expression(self):
+        # [FUNCTION DOC] An arithmetic expression inside a type annotation in source text must
+        # raise RuntimeError saying the expression cannot be used as a type.
         with self.assertRaisesRegex(RuntimeError, r'Expression of type \+ cannot be used in a type expression'):
             cu = torch.jit.CompilationUnit('''
                 def foo(x : Tensor, y : Tuple[3 + 4, Tensor]) -> Tuple[Tensor, Tensor]:
@@ -10840,7 +13385,10 @@ dedent """
             ''')
 
     def test_gather_dynamic_index(self):
+        # [FUNCTION DOC] checkScript of reading elements of a tensor with a constant index and a
+        # computed index.
         def t(x):
+            # [FUNCTION DOC] HELPER: Return the sum of two indexed entries.
             gather1 = x[0]
             idx = 0 + 1
             gather2 = x[idx]
@@ -10849,25 +13397,35 @@ dedent """
         self.checkScript(t, (torch.zeros(3, 2, 3),))
 
     def test_torch_ignore_conversion_to_none(self):
+        # [FUNCTION DOC] Ignored methods that return None, annotated or not, can be called from
+        # forward; the result is 9.
         class A(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with an ignored method annotated to return None.
             @torch.jit.ignore
             def ignored(self, a: int) -> None:
+                # [FUNCTION DOC] HELPER: Ignored method computing a list length and
+                # returning nothing.
                 l: int = len([2 for i in range(a) if i > 2])
                 return
 
             def forward(self) -> int:
+                # [FUNCTION DOC] HELPER: Call the ignored method and return the sum of two ints.
                 a: int = 4
                 b: int = 5
                 self.ignored(a)
                 return a + b
 
         class B(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with an ignored method without return annotation.
             @torch.jit.ignore
             def ignored(self, a: int):
+                # [FUNCTION DOC] HELPER: Ignored method computing a list length and
+                # returning nothing.
                 l: int = len([2 for i in range(a) if i > 2])
                 return
 
             def forward(self) -> int:
+                # [FUNCTION DOC] HELPER: Call the ignored method and return the sum of two ints.
                 a: int = 4
                 b: int = 5
                 self.ignored(a)
@@ -10880,6 +13438,8 @@ dedent """
         self.assertEqual(modelB(), 9)
 
     def test_addmm_grad(self):
+        # [FUNCTION DOC] Gradients of a scripted addmm with respect to bias and weight
+        # match autograd.
         """ This test checks several things:
             1. An expand node was inserted before the addmm operating on the
                bias term.
@@ -10896,6 +13456,7 @@ dedent """
         """
         @torch.jit.script
         def addmm_grad_test(b, x, w):
+            # [FUNCTION DOC] HELPER: Return addmm of bias, x and weight.
             return torch.addmm(b, x, w)
 
         # Initialize param and input values
@@ -10926,14 +13487,20 @@ dedent """
 
     @unittest.skipIf(not RUN_CUDA, "running tests on cuda to verify cudnn fix")
     def test_batch_norm_inference_backward_cuda(self):
+        # [FUNCTION DOC] Compare outputs, input gradient and running statistics of a scripted
+        # batch norm plus relu module in eval mode on cuda against the eager module after warm-up
+        # runs. Needs CUDA.
         with enable_profiling_mode_for_profiling_tests():
             class MyBatchNorm(torch.nn.Module):
+                # [CLASS DOC] HELPER: Module applying a 2d batch norm then relu.
                 def __init__(self, num_features, affine, track_running_stats):
+                    # [FUNCTION DOC] HELPER: Create the batch norm layer in float.
                     super().__init__()
                     self.bn = torch.nn.BatchNorm2d(
                         num_features, 1e-5, affine=affine, track_running_stats=track_running_stats).float()
 
                 def forward(self, x: torch.Tensor):
+                    # [FUNCTION DOC] HELPER: Apply batch norm then relu.
                     o = self.bn(x)
                     o = torch.nn.functional.relu(o)
                     return o
@@ -10987,15 +13554,21 @@ dedent """
             self.assertEqual(module.bn.running_var, ref_module.bn.running_var)
 
     def test_zeros(self):
+        # [FUNCTION DOC] zeros with dtype, device constant and layout in script returns a float
+        # tensor of the right shape; checkScript of a plain zeros call.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a cpu device constant.
             __constants__ = ['d']
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Store the cpu device.
                 super().__init__()
                 self.d = torch.device('cpu')
 
             @torch.jit.script_method
             def create(self):
+                # [FUNCTION DOC] HELPER: Create zeros of shape 1x1x2 with float dtype, the stored
+                # device and strided layout.
                 return torch.zeros([1, 1, 2], dtype=torch.float, device=self.d, layout=torch.strided)
 
         r = M().create()
@@ -11003,12 +13576,15 @@ dedent """
         self.assertEqual(torch.zeros([1, 1, 2], dtype=torch.float), r)
 
         def fn():
+            # [FUNCTION DOC] HELPER: Return a 1x2x3 tensor of zeros.
             return torch.zeros((1, 2, 3))
 
         self.checkScript(fn, ())
 
     def test_vararg_zeros(self):
+        # [FUNCTION DOC] checkScript of zeros called with separate size arguments and a dtype.
         def foo():
+            # [FUNCTION DOC] HELPER: Return an int zeros tensor of shape 3x4x5.
             return torch.zeros(3, 4, 5, dtype=torch.int)
 
         self.checkScript(foo, ())
@@ -11016,7 +13592,10 @@ dedent """
     @unittest.skipIf(IS_LINUX, "https://github.com/pytorch/pytorch/issues/91495")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.LEGACY, "the original version of test_rand")
     def test_rand(self):
+        # [FUNCTION DOC] Scripted rand has the default dtype and shape analysis assigns the right
+        # dtype in the graph; same for randint (long). Legacy executor only and not on Linux.
         def test_rand():
+            # [FUNCTION DOC] HELPER: Return a plus 1.0 minus a for a random 3x4 tensor.
             a = torch.rand([3, 4])
             return a + 1.0 - a
 
@@ -11032,6 +13611,7 @@ dedent """
 
         @torch.jit.script
         def randint():
+            # [FUNCTION DOC] HELPER: Return a random int tensor with values below 5 of shape 1x2.
             return torch.randint(0, 5, [1, 2])
         out = randint()
         self.assertEqual(out.dtype, torch.int64)
@@ -11044,11 +13624,18 @@ dedent """
     @unittest.skipIf(not RUN_CUDA, "no CUDA")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.PROFILING, "skip if profiling isn't enabled")
     def test_autodiff_complex(self):
+        # [FUNCTION DOC] On cuda with the profiling executor, a scripted function using complex
+        # tensors and mm must have its autograd graph function presence agree with eager over
+        # four runs.
         def foo(x: torch.Tensor, y: torch.Tensor, W: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Return exp of the product of a complex tensor and the
+            # complex weight.
             return torch.exp(torch.mm(torch.complex(x, y), W.cfloat()))
 
         @torch.jit.script
         def jitted_foo(x: torch.Tensor, y: torch.Tensor, W: torch.Tensor):
+            # [FUNCTION DOC] HELPER: Scripted version: exp of the product of a complex tensor and
+            # the complex weight.
             return torch.exp(torch.mm(torch.complex(x, y), W.cfloat()))
 
         x = torch.randn(128, 16, dtype=torch.float32, device='cuda:0')
@@ -11062,8 +13649,11 @@ dedent """
 
 
     def test_linear_grad(self):
+        # [FUNCTION DOC] Gradients of a scripted functional linear (with optional bias, with or
+        # without a bias) match eager after warm-up runs, with autodiff subgraphs not inlined.
         with enable_profiling_mode_for_profiling_tests():
             def t(x: torch.Tensor, w: torch.Tensor, b: Optional[torch.Tensor]):
+                # [FUNCTION DOC] HELPER: Functional linear of x, w and an optional bias.
                 return torch.nn.functional.linear(x, w, b)
 
             x_init = torch.randn(4, 2)
@@ -11117,7 +13707,11 @@ dedent """
     @skipIfTorchDynamo("TorchDynamo doesn't support profile")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.PROFILING, "the profiling version of test_rand")
     def test_rand_profiling(self):
+        # [FUNCTION DOC] Under the profiling executor with a single profiled run, the optimized
+        # graph of a function using rand has a float type with the given shape, and randint shows
+        # a long profiled type. Skipped under dynamo and for other executors.
         def test_rand():
+            # [FUNCTION DOC] HELPER: Return a plus 1.0 minus a for a random 3x4 tensor.
             a = torch.rand([3, 4])
             return a + 1.0 - a
 
@@ -11137,6 +13731,7 @@ dedent """
 
         @torch.jit.script
         def randint():
+            # [FUNCTION DOC] HELPER: Return a random int tensor with values below 5 of shape 1x2.
             return torch.randint(0, 5, [1, 2])
 
         with enable_profiling_mode_for_profiling_tests():
@@ -11148,7 +13743,10 @@ dedent """
 
 
     def test_erase_number_types(self):
+        # [FUNCTION DOC] The erase-number-types pass removes int constants and leaves the
+        # in-place add in the graph.
         def func(a):
+            # [FUNCTION DOC] HELPER: Add constant 7+1+3 to a, then add it in place again.
             b = 7 + 1 + 3
             c = a + b
             c += b
@@ -11160,6 +13758,8 @@ dedent """
         FileCheck().check_not("int = prim::Constant").run(str(graph))
 
     def test_refine_tuple_types(self):
+        # [FUNCTION DOC] The refine-tuple-types pass updates the output type of a tuple construct
+        # to the precise element types.
         # TupleConstruct output type is not correct here.
         graph_str = """
         graph(%a : Float(123), %b : Float(4, 5, 6)):
@@ -11175,17 +13775,24 @@ dedent """
     # TODO(henrytu): Add test for RefineTypes for NamedTuple when it's supported by IR parser.
 
     def test_remove_dropout(self):
+        # [FUNCTION DOC] The remove-dropout pass raises RuntimeError in training mode, and after
+        # eval and freezing it removes dropout from the graph while outputs stay close.
         weight_0_shape = (20, 5)
         weight_1_shape = (20, 20)
         input_shape = (10, 5)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with two linear weights and a functional dropout
+            # between them.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create two random weight parameters with the
+                # outer shapes.
                 super().__init__()
                 self.weight_0 = torch.nn.Parameter(torch.rand(weight_0_shape))
                 self.weight_1 = torch.nn.Parameter(torch.rand(weight_1_shape))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply linear, dropout (by training flag) and linear.
                 o = F.linear(x, self.weight_0)
                 o = F.dropout(o, training=self.training)
                 o = F.linear(o, self.weight_1)
@@ -11208,7 +13815,9 @@ dedent """
         torch.testing.assert_close(ref_res, res, rtol=1e-2, atol=1e-3)
 
     def test_unfold_zero_dim(self):
+        # [FUNCTION DOC] Shape analysis of unfold on a 0-d tensor gives the same rank as eager.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Unfold along dim 0 with size 1 and step 1.
             return x.unfold(0, 1, 1)
 
         graph = torch.jit.script(fn).graph
@@ -11217,11 +13826,15 @@ dedent """
         self.assertEqual(graph.findNode("aten::unfold").output().type().dim(), out_dims)
 
     def test_mm_batching(self):
+        # [FUNCTION DOC] Script an LSTM loop that calls a scripted cell, check batching nodes
+        # appear for the legacy executor, and outputs and gradients equal the eager function.
 
         with enable_profiling_mode_for_profiling_tests():
             lstm_cell = torch.jit.script(LSTMCellS)
 
             def lstm(x, hx, cx, w_ih, w_hh, b_ih, b_hh):
+                # [FUNCTION DOC] HELPER: Run the scripted cell for each time step and return the
+                # final hx.
                 for i in range(x.size(0)):
                     hx, cx = lstm_cell(x[i], hx, cx, w_ih, w_hh, b_ih, b_hh)
                 return hx
@@ -11246,7 +13859,11 @@ dedent """
                              torch.autograd.grad(out.sum(), inputs))
 
     def test_loop_unrolling(self):
+        # [FUNCTION DOC] The loop unrolling pass unrolls a loop with a runtime trip count eight
+        # times plus an epilogue loop; result equals eager.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Subtract each loop index from a running total over a
+            # runtime range.
             y = 0
             for i in range(int(x)):
                 y -= i
@@ -11260,19 +13877,25 @@ dedent """
         self.checkScript(fn, (torch.tensor(10),))
 
     def test_loop_unrolling_const(self):
+        # [FUNCTION DOC] Loops with constant trip counts are fully unrolled, leaving no
+        # loop node.
         def fn():
+            # [FUNCTION DOC] HELPER: Subtract one ten times in a loop.
             y = 0
             for _ in range(10):
                 y -= 1
             return y
 
         def fn2():
+            # [FUNCTION DOC] HELPER: Subtract the loop index over a constant range of ten.
             y = 0
             for i in range(10):
                 y -= i
             return y
 
         def check(fn, name):
+            # [FUNCTION DOC] HELPER: Run the unrolling pass on the function and check the result
+            # by checkScript.
             graph = torch.jit.script(fn).graph
             self.run_pass('loop_unrolling', graph)
             # entirely unrolled
@@ -11283,7 +13906,10 @@ dedent """
         check(fn2, 'add_iter')
 
     def test_loop_unrolling_nested(self):
+        # [FUNCTION DOC] Unrolling a nested loop unrolls the inner loop (runtime count) eight
+        # times plus an epilogue; result equals eager.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Nested loops subtracting the inner index.
             y = 0
             for _ in range(10):
                 for j in range(int(x)):
@@ -11299,7 +13925,10 @@ dedent """
         self.checkScript(fn, (torch.tensor(10),))
 
     def test_loop_unroll_unused_counter(self):
+        # [FUNCTION DOC] When the loop counter is unused, unrolling does not add an add op
+        # for it.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Subtract one for each iteration over a runtime range.
             y = 0
             for _ in range(int(x)):
                 y -= 1
@@ -11311,7 +13940,10 @@ dedent """
             .run(str(graph))
 
     def test_loop_unroll_negative(self):
+        # [FUNCTION DOC] checkScript of a loop over negative, zero and positive runtime
+        # trip counts.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Add one for each iteration over a runtime range.
             y = 0
             for _ in range(int(x)):
                 y += 1
@@ -11325,28 +13957,41 @@ dedent """
         self.checkScript(fn, (torch.tensor(2),))
 
     def test_where(self):
+        # [FUNCTION DOC] checkScript of the functional where with three arguments.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Select x where x is positive, else y.
             return torch.where(x > 0.0, x, y)
 
         self.checkScript(fn, (torch.randn(3, 2, dtype=torch.float), torch.ones(3, 2, dtype=torch.float)))
 
     def test_where_method(self):
+        # [FUNCTION DOC] checkScript of the where method with a condition and an other tensor.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Select x where x is positive, else y, by method call.
             return x.where(x > 0.0, y)
 
         self.checkScript(fn, (torch.randn(3, 2, dtype=torch.float), torch.ones(3, 2, dtype=torch.float)))
 
     def test_union_to_number(self):
+        # [FUNCTION DOC] A union of int, complex and float arguments is represented as a Scalar
+        # parameter in the graph signature.
         @torch.jit.script
         def fn(x: Union[int, complex, float], y: Union[int, complex, float]):
+            # [FUNCTION DOC] HELPER: Add two numbers of the union type.
             return x + y
         FileCheck().check(": Scalar):").run(fn.graph)
 
     def test_reassign_module_lhs(self):
+        # [FUNCTION DOC] Reassigning self inside a script method must raise RuntimeError saying
+        # self cannot be reassigned.
         with self.assertRaisesRegex(RuntimeError, 'Cannot re-assign \'self\''):
             class ReassignSelfLHS(torch.jit.ScriptModule):
+                # [CLASS DOC] HELPER: Script module whose script method assigns to self in
+                # a loop.
                 @torch.jit.script_method
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Reassign self to x in a loop and return self;
+                    # scripting must fail.
                     for _ in range(20):
                         self = x
                     return self
@@ -11354,10 +13999,16 @@ dedent """
             ReassignSelfLHS()
 
     def test_reassign_module_rhs(self):
+        # [FUNCTION DOC] Reassigning another variable to the module in a script method must raise
+        # RuntimeError saying it cannot be re-assigned to a module value.
         with self.assertRaisesRegex(RuntimeError, 'Cannot re-assign \'x\' to a value of type module'):
             class ReassignSelfRHS(torch.jit.ScriptModule):
+                # [CLASS DOC] HELPER: Script module whose script method assigns self to
+                # a variable.
                 @torch.jit.script_method
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Assign self to x in a loop and return self;
+                    # scripting must fail.
                     for _ in range(20):
                         x = self
                     return self
@@ -11365,19 +14016,29 @@ dedent """
             ReassignSelfRHS()
 
     def test_unknown_builtin(self):
+        # [FUNCTION DOC] Calling a nonexistent tensor method in script must raise RuntimeError
+        # saying the object has no such attribute or method.
         with self.assertRaisesRegex(RuntimeError, 'object has no attribute or method'):
             @torch.jit.script
             def unknown_builtin(x):
+                # [FUNCTION DOC] HELPER: Call a nonexistent method on the input; scripting
+                # must fail.
                 return x.splork(3)
 
     def test_return_tuple(self):
+        # [FUNCTION DOC] checkScript of returning a nested tuple with a tensor.
         def return_tuple(x):
+            # [FUNCTION DOC] HELPER: Return a pair containing a pair of x and x, and x.
             a = (x, x)
             return a, x
         self.checkScript(return_tuple, (torch.rand(4),))
 
     def test_add_tuple_optional(self):
+        # [FUNCTION DOC] checkScript of tuple concatenation with slicing, where some tuple
+        # elements are optional.
         def foo(input: Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]) -> Optional[torch.Tensor]:
+            # [FUNCTION DOC] HELPER: Replace the first tuple entry through concatenation with the
+            # rest and return the third.
             changed_input = input[0] + 1
             value: Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]] = (changed_input,) + input[1:]
             return value[2]
@@ -11385,7 +14046,11 @@ dedent """
         self.checkScript(foo, (inp,))
 
     def test_add_tuple_non_optional(self):
+        # [FUNCTION DOC] checkScript of tuple concatenation with slicing on a tuple of
+        # three tensors.
         def foo(input: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> torch.Tensor:
+            # [FUNCTION DOC] HELPER: Replace the first tuple entry through concatenation, return
+            # a sum plus 4.
             changed_input = input[0] + 1
             value: Tuple[torch.Tensor, torch.Tensor, torch.Tensor] = (changed_input,) + input[1:]
             return torch.sum(value[2]) + 4
@@ -11393,7 +14058,11 @@ dedent """
         self.checkScript(foo, (inp,))
 
     def test_add_tuple_different_types(self):
+        # [FUNCTION DOC] checkScript of concatenating tuples of different element types and
+        # indexing the result.
         def foo(a: Tuple[int, float], b: Tuple[int]) -> int:
+            # [FUNCTION DOC] HELPER: Concatenate typed tuples twice and return the fourth entry
+            # plus one.
             c: Tuple[int, float, int] = a + b
             d: Tuple[int, float, int, int] = c + b
             return d[3] + 1
@@ -11402,7 +14071,11 @@ dedent """
         self.checkScript(foo, (a, b))
 
     def test_add_tuple_same_types(self):
+        # [FUNCTION DOC] checkScript of concatenating tuples with equal element types
+        # and indexing.
         def foo(a: Tuple[int, int], b: Tuple[int, int, int]) -> int:
+            # [FUNCTION DOC] HELPER: Concatenate int tuples twice and return the seventh entry
+            # minus two.
             c: Tuple[int, int, int, int, int] = a + b
             d: Tuple[int, int, int, int, int, int, int, int] = c + b
             return d[6] - 2
@@ -11411,16 +14084,23 @@ dedent """
         self.checkScript(foo, (a, b))
 
     def test_method_no_self(self):
+        # [FUNCTION DOC] A script method without self must raise RuntimeError about the
+        # self argument.
         with self.assertRaisesRegex(RuntimeError, 'methods must have a self argument'):
             class MethodNoSelf(torch.jit.ScriptModule):
+                # [CLASS DOC] HELPER: Script module whose script method has no parameters.
                 @torch.jit.script_method
                 def forward():
+                    # [FUNCTION DOC] HELPER: Method lacking self; returns zeros; scripting
+                    # must fail.
                     return torch.zeros(3, 4)
 
             MethodNoSelf()
 
     def test_return_stmt_not_at_end(self):
+        # [FUNCTION DOC] checkScript of a conditional with returns in both branches.
         def return_stmt(x):
+            # [FUNCTION DOC] HELPER: Return x plus 3 if x is above 3, else x.
             if bool(x > 3):
                 return x + 3
             else:
@@ -11428,7 +14108,9 @@ dedent """
         self.checkScript(return_stmt, (torch.rand(1),))
 
     def test_for_in_range(self):
+        # [FUNCTION DOC] checkScript of a for loop summing a range of 100.
         def fn():
+            # [FUNCTION DOC] HELPER: Sum the integers below 100.
             c = 0
             for i in range(100):
                 c += i
@@ -11436,7 +14118,10 @@ dedent """
         self.checkScript(fn, ())
 
     def test_for_in_range_dynamic(self):
+        # [FUNCTION DOC] checkScript (unoptimized) of a for loop whose inner range depends on the
+        # outer index.
         def fn():
+            # [FUNCTION DOC] HELPER: Sum over nested loops with a dynamic inner bound.
             c = 0
             for i in range(100):
                 acc = 0
@@ -11447,7 +14132,9 @@ dedent """
         self.checkScript(fn, (), optimize=False)
 
     def test_for_in_range_ast(self):
+        # [FUNCTION DOC] checkScript of nested for loops with dynamic inner range.
         def test_script_for_in_range_ast():
+            # [FUNCTION DOC] HELPER: Sum over nested loops with a dynamic inner bound.
             c = 0
             for i in range(100):
                 acc = 0
@@ -11459,8 +14146,12 @@ dedent """
         self.checkScript(test_script_for_in_range_ast, ())
 
     def test_for_in_range_if_ast(self):
+        # [FUNCTION DOC] A scripted for loop with a conditional that unsqueezes first and
+        # concatenates afterwards produces 20 rows.
         @torch.jit.script
         def test_script_for_in_range_if_ast(x):
+            # [FUNCTION DOC] HELPER: Build a tensor stacked from the input by repeated
+            # concatenation in a loop.
             output = x
             for i in range(20):
                 if i == 0:
@@ -11473,7 +14164,9 @@ dedent """
         self.assertEqual(test_script_for_in_range_if_ast(*inputs).shape[0], 20)
 
     def test_for_in_range_start_end(self):
+        # [FUNCTION DOC] checkScript of a range with start and end.
         def fn():
+            # [FUNCTION DOC] HELPER: Sum the integers from 7 to 99.
             x = 0
             for i in range(7, 100):
                 x += i
@@ -11481,7 +14174,9 @@ dedent """
         self.checkScript(fn, ())
 
     def test_for_in_range_start_end_step(self):
+        # [FUNCTION DOC] checkScript of a range with start, end and positive or negative steps.
         def fn(start, end, step):
+            # [FUNCTION DOC] HELPER: Sum a range given by start, end and step.
             # type: (int, int, int) -> int
             x = 0
             for i in range(start, end, step):
@@ -11496,8 +14191,11 @@ dedent """
         self.checkScript(fn, (-2, -10, -10))
 
     def test_for_in_range_zero_step(self):
+        # [FUNCTION DOC] A range with a step of zero raises RuntimeError saying it must not
+        # be zero.
         @torch.jit.script
         def fn():
+            # [FUNCTION DOC] HELPER: Sum a range with a zero step; fails when run.
             x = 0
             for i in range(2, -11, 0):
                 x += i
@@ -11507,19 +14205,27 @@ dedent """
             fn()
 
     def test_range_args(self):
+        # [FUNCTION DOC] Calling range with no arguments, or with a float, must raise
+        # RuntimeError with the matching message.
         with self.assertRaisesRegex(RuntimeError, r'range expected at least 1 arguments, got 0'):
             @torch.jit.script
             def range_no_arg(x):
+                # [FUNCTION DOC] HELPER: Loop over a range with no arguments; scripting
+                # must fail.
                 for _ in range():
                     x += 1
                 return x
         with self.assertRaisesRegex(RuntimeError, r'found float'):
             @torch.jit.script
             def range_non_float():
+                # [FUNCTION DOC] HELPER: Loop over a range with a float argument; scripting
+                # must fail.
                 for i in range(.5):
                     print(i)
 
     def test_parse_empty_tuple_annotation(self):
+        # [FUNCTION DOC] Parse an annotation of the empty tuple type in source text; the printed
+        # code shows it for argument and return.
         cu = torch.jit.CompilationUnit('''
             def foo(x : Tuple[()]) -> Tuple[()]:
                 return x
@@ -11529,6 +14235,8 @@ dedent """
         FileCheck().check("Tuple[()]").check("Tuple[()]").run(foo_code)
 
     def test_parse_empty_tuple_annotation_element_error(self):
+        # [FUNCTION DOC] A tuple annotation with an element in a literal parenthesis must raise
+        # RuntimeError saying the literal must not have elements.
         with self.assertRaisesRegex(
                 RuntimeError, 'Tuple literal in Tuple type annotation must not have any elements'):
             cu = torch.jit.CompilationUnit('''
@@ -11537,6 +14245,8 @@ dedent """
             ''')
 
     def test_parse_none_type_annotation(self):
+        # [FUNCTION DOC] Parse a function annotated with the None type in source text; the
+        # printed code shows the argument and return.
         cu = torch.jit.CompilationUnit('''
             def foo(x : NoneType) -> NoneType:
                 return x
@@ -11546,6 +14256,8 @@ dedent """
         FileCheck().check(": NoneType").check("-> NoneType").run(foo_code)
 
     def test_empty_tuple_str(self):
+        # [FUNCTION DOC] The annotation string of an empty tuple type evaluates to the empty
+        # typing tuple (raises AssertionError otherwise).
         empty_tuple_type = torch._C.TupleType([])
         g = {'Tuple' : typing.Tuple}
         python_type = eval(empty_tuple_type.annotation_str, g)
@@ -11553,16 +14265,21 @@ dedent """
             raise AssertionError(f"Expected Tuple[()], got {python_type}")
 
     def test_tuple_str(self):
+        # [FUNCTION DOC] Annotation strings of one and two element string tuple types are
+        # as expected.
         tuple1_type = torch._C.TupleType([torch._C.StringType.get()])
         self.assertEqual(tuple1_type.annotation_str, "Tuple[str]")
         tuple2_type = torch._C.TupleType([torch._C.StringType.get(), torch._C.StringType.get()])
         self.assertEqual(tuple2_type.annotation_str, "Tuple[str, str]")
 
     def test_dict_str(self):
+        # [FUNCTION DOC] Annotation string of a string-to-string dict type is as expected.
         dict_type = torch._C.DictType(torch._C.StringType.get(), torch._C.StringType.get())
         self.assertEqual(dict_type.annotation_str, "Dict[str, str]")
 
     def test_none_type_str(self):
+        # [FUNCTION DOC] The annotation string of the None type evaluates to the python NoneType
+        # (raises AssertionError otherwise).
         none_type = torch._C.NoneType.get()
         g = {'NoneType' : type(None)}
         python_type = eval(none_type.annotation_str, g)
@@ -11571,22 +14288,33 @@ dedent """
 
     @skipIfTorchDynamo("TorchDynamo fails with unknown reason")
     def test_zip_enumerate_modulelist(self):
+        # [FUNCTION DOC] checkModule of modules that zip over module lists (and constant lists)
+        # of equal or different lengths. Skipped under dynamo.
         class Sub(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module subtracting two.
             def forward(self, thing):
+                # [FUNCTION DOC] HELPER: Return the input minus two.
                 return thing - 2
 
         class Double(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module doubling its input.
             def forward(self, thing):
+                # [FUNCTION DOC] HELPER: Return the input times two.
                 return thing * 2
 
         # zipping over two
         class ZipModLists(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module zipping two module lists, applying both of each pair and
+            # counting pairs.
             def __init__(self, mods, mods2):
+                # [FUNCTION DOC] HELPER: Store the two module lists.
                 super().__init__()
                 self.mods = mods
                 self.mods2 = mods2
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply paired modules in turn and return the value and
+                # pair count.
                 iter = 0
                 for mod1, mod2 in zip(self.mods, self.mods2):
                     x = mod2(mod1(x))
@@ -11594,9 +14322,12 @@ dedent """
                 return x, iter
 
         class ZipWithValues(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module zipping constant integer lists with two module lists.
             __constants__ = ['tup_larger', 'tup_smaller']
 
             def __init__(self, mods, mods2):
+                # [FUNCTION DOC] HELPER: Store the module lists and two range constants (longer
+                # and shorter).
                 super().__init__()
                 self.mods = mods
                 self.mods2 = mods2
@@ -11604,6 +14335,8 @@ dedent """
                 self.tup_smaller = list(range(max(len(mods2) + 1, 1)))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Zip each constant list with both module lists, add the
+                # value, count iterations.
                 iter = 0
                 x2 = x
                 for val, mod1, mod2 in zip(self.tup_larger, self.mods, self.mods2):
@@ -11624,16 +14357,24 @@ dedent """
 
 
     def test_enumerate_modlist_range(self):
+        # [FUNCTION DOC] enumerate over a module list is supported; zipping a module list with a
+        # runtime length range must raise an exception about a missing static length.
         class Double(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module doubling its input.
             def forward(self, thing):
+                # [FUNCTION DOC] HELPER: Return the input times two.
                 return thing * 2
 
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with two doubling modules, enumerated in forward.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a module list of two Double modules.
                 super().__init__()
                 self.mods = nn.ModuleList([Double(), Double()])
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Enumerate the module list, scaling by the index,
+                # counting iterations.
                 x2 = x
                 iter = 0
                 for val, mod in enumerate(self.mods):
@@ -11645,7 +14386,10 @@ dedent """
 
         # variable length, modulelist
         class Mod2(Mod):
+            # [CLASS DOC] HELPER: Subclass zipping a runtime-length range with the module list.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Zip a runtime range with the modules; scripting
+                # must fail.
                 for val, mod in zip(range(int(x)), self.mods):
                     x = mod(x) * val
                 return x
@@ -11655,7 +14399,10 @@ dedent """
 
         # modulelist, variable length
         class Mod3(Mod):
+            # [CLASS DOC] HELPER: Subclass zipping the module list with a runtime-length range.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Zip the modules with a runtime range; scripting
+                # must fail.
                 for val, mod in zip(self.mods, range(int(x))):
                     x = mod(x) * val
                 return x
@@ -11664,7 +14411,10 @@ dedent """
             torch.jit.script(Mod3())
 
     def test_for_in_enumerate(self):
+        # [FUNCTION DOC] checkScript of enumerate over lists (plain, with start, nested), and
+        # error messages for wrong enumerate argument counts.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Sum index times value with enumerate.
             # type: (List[int]) -> int
             sum = 0
             for (i, v) in enumerate(x):
@@ -11675,6 +14425,8 @@ dedent """
         self.checkScript(fn, ([1, 2, 3, 4, 5],))
 
         def fn_enumerate_start_arg(x):
+            # [FUNCTION DOC] HELPER: Sum index times value with enumerate starting at
+            # one (positional).
             # type: (List[int]) -> int
             sum = 0
             for (i, v) in enumerate(x, 1):
@@ -11685,6 +14437,8 @@ dedent """
         self.checkScript(fn_enumerate_start_arg, ([1, 2, 3, 4, 5],))
 
         def fn_enumerate_start_kwarg(x):
+            # [FUNCTION DOC] HELPER: Sum index times value with enumerate starting at
+            # one (keyword).
             # type: (List[int]) -> int
             sum = 0
             for (i, v) in enumerate(x, start=1):
@@ -11695,6 +14449,7 @@ dedent """
         self.checkScript(fn_enumerate_start_kwarg, ([1, 2, 3, 4, 5],))
 
         def fn_nested_enumerate(x):
+            # [FUNCTION DOC] HELPER: Sum products over nested enumerate.
             # type: (List[int]) -> int
             sum = 0
             for (i, (j, v)) in enumerate(enumerate(x)):
@@ -11707,6 +14462,8 @@ dedent """
         with self.assertRaisesRegex(RuntimeError, r'enumerate expected at least 1 arguments, got 0'):
             @torch.jit.script
             def enumerate_no_arg(x):
+                # [FUNCTION DOC] HELPER: Loop over enumerate with no arguments; scripting
+                # must fail.
                 # type: (List[int]) -> int
                 sum = 0
                 for _ in enumerate():
@@ -11717,6 +14474,8 @@ dedent """
         with self.assertRaisesRegex(RuntimeError, r'enumerate expected at most 2 arguments, got 3'):
             @torch.jit.script
             def enumerate_too_many_args(x):
+                # [FUNCTION DOC] HELPER: Loop over enumerate with three arguments; scripting
+                # must fail.
                 # type: (List[int]) -> int
                 sum = 0
                 for _ in enumerate(x, x, x):
@@ -11725,16 +14484,26 @@ dedent """
                 return sum
 
     def test_list_comprehension_modulelist(self):
+        # [FUNCTION DOC] List comprehension over module lists works with and without
+        # annotation, with an empty module list (list of tensors), and a wrong annotation type
+        # must raise an exception.
         class Inner(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module adding ten.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the input plus ten.
                 return x + 10
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module comprehending the outputs of a module list under
+            # an annotation.
             def __init__(self, mod_list):
+                # [FUNCTION DOC] HELPER: Store the module list.
                 super().__init__()
                 self.module_list = mod_list
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return an annotated list of tensors made by applying
+                # every module.
                 out = torch.jit.annotate(List[Tensor], [mod(x) for mod in self.module_list])
                 return out
 
@@ -11745,10 +14514,13 @@ dedent """
         torch.jit.script(mod)
 
         class M2(M):
+            # [CLASS DOC] HELPER: Subclass whose comprehension has no annotation.
             def __init__(self, mod_list):
+                # [FUNCTION DOC] HELPER: Pass the module list to the base initializer.
                 super().__init__(mod_list)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return a list of the outputs of every module.
                 out = [mod(x) for mod in self.module_list]
                 return out
 
@@ -11760,6 +14532,8 @@ dedent """
         self.assertEqual(torch.jit.script(mod)(torch.tensor(.5)), [])
 
         def bad_type_annotation():
+            # [FUNCTION DOC] HELPER: Annotate an int-typed comprehension result as an int;
+            # scripting must fail.
             out = torch.jit.annotate(int, [x for x in [1, 2, 3]])  # noqa: C416
             return out
 
@@ -11768,8 +14542,12 @@ dedent """
             torch.jit.script(bad_type_annotation)
 
     def test_list_comprehension_variable_write(self):
+        # [FUNCTION DOC] A comprehension variable does not leak into the enclosing scope, in
+        # python or script.
         # i in comprehension doesn't write to function scope
         def foo():
+            # [FUNCTION DOC] HELPER: Use a comprehension variable named like an outer variable
+            # and return both.
             i = 1
             x = [i if i != 5 else 3 for i in range(7)]
             return i, x
@@ -11777,7 +14555,10 @@ dedent """
         self.assertEqual(foo(), torch.jit.script(foo)())
 
     def test_for_in_zip(self):
+        # [FUNCTION DOC] checkScript of zip over two, three and nested lists, with errors for no
+        # arguments and for a wrong target pattern.
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Sum the products of pairs from two lists.
             # type: (List[int], List[int]) -> int
             sum = 0
             for (i, j) in zip(x, y):
@@ -11788,6 +14569,7 @@ dedent """
         self.checkScript(fn, ([1, 2, 3, 4, 5], [2, 3, 4, 5, 6]))
 
         def fn_multi_inputs(x, y, z):
+            # [FUNCTION DOC] HELPER: Sum the products of triples from three lists.
             # type: (List[int], List[int], List[int]) -> int
             sum = 0
             for (i, j, k) in zip(x, y, z):
@@ -11798,6 +14580,7 @@ dedent """
         self.checkScript(fn_multi_inputs, ([1, 2, 3, 4], [2, 3, 4, 5], [3, 4, 5, 6]))
 
         def fn_nested_zip(x, y, z):
+            # [FUNCTION DOC] HELPER: Sum the products of nested zip triples.
             # type: (List[int], List[int], List[int]) -> int
             sum = 0
             for (i, (j, k)) in zip(x, zip(y, z)):
@@ -11810,6 +14593,7 @@ dedent """
         with self.assertRaisesRegex(RuntimeError, r'zip expected at least 1 arguments, got 0'):
             @torch.jit.script
             def zip_no_arg(x):
+                # [FUNCTION DOC] HELPER: Loop over zip with no arguments; scripting must fail.
                 # type: (List[int]) -> int
                 sum = 0
                 for _ in zip():
@@ -11820,6 +14604,8 @@ dedent """
         with self.assertRaisesRegex(RuntimeError, r'too many values to unpack: need 2 but found 3'):
             @torch.jit.script
             def fn_nested_zip_wrong_target_assign(x, y, z):
+                # [FUNCTION DOC] HELPER: Unpack a three-way zip into a nested pattern of two;
+                # scripting must fail.
                 # type: (List[int], List[int], List[int]) -> int
                 sum = 0
                 for (i, (j, k)) in zip(x, y, z):
@@ -11828,7 +14614,9 @@ dedent """
                 return sum
 
     def test_for_in_zip_enumerate(self):
+        # [FUNCTION DOC] checkScript of zip with enumerate and range, and of enumerate over zip.
         def fn_zip_enumerate(x, y):
+            # [FUNCTION DOC] HELPER: Sum products over a zip of a list, an enumerate and a range.
             # type: (List[int], List[int]) -> int
             sum = 0
             for (i, (j, v), k) in zip(x, enumerate(y), range(100)):
@@ -11839,6 +14627,7 @@ dedent """
         self.checkScript(fn_zip_enumerate, ([1, 2, 3, 4], [2, 3, 4, 5]))
 
         def fn_enumerate_zip(x, y):
+            # [FUNCTION DOC] HELPER: Sum products over enumerate of a zip.
             # type: (List[int], List[int]) -> int
             sum = 0
             for (i, (j, v)) in enumerate(zip(x, y)):
@@ -11849,7 +14638,10 @@ dedent """
         self.checkScript(fn_enumerate_zip, ([1, 2, 3, 4], [2, 3, 4, 5]))
 
     def test_for_in_tensors(self):
+        # [FUNCTION DOC] checkScript of iterating over the first dimension of tensors of various
+        # shapes (including empty).
         def test_sizes(x):
+            # [FUNCTION DOC] HELPER: Count the iterations over a tensor.
             sumz = 0
             for _ in x:
                 sumz += 1
@@ -11859,9 +14651,12 @@ dedent """
         self.checkScript(test_sizes, (torch.rand(0),))
 
     def test_for_in_tensors_rank0(self):
+        # [FUNCTION DOC] Iterating over a 0-d tensor must fail with a RuntimeError about
+        # 0-d tensors.
         with self.assertRaisesRegex(RuntimeError, "of a 0-d tensor"):
             @torch.jit.script
             def test_sizes(x):
+                # [FUNCTION DOC] HELPER: Count iterations over a tensor.
                 sumz = 0
                 for _ in x:
                     sumz += 1
@@ -11870,9 +14665,12 @@ dedent """
             test_sizes(torch.tensor(1))
 
     def test_for_in_tensors_fail_scalar(self):
+        # [FUNCTION DOC] Iterating over a float must fail with a RuntimeError saying float is
+        # not iterable.
         with self.assertRaisesRegex(RuntimeError, "'float' object is not iterable"):
             @torch.jit.script
             def test_sizes(x):
+                # [FUNCTION DOC] HELPER: Count iterations over a float; scripting must fail.
                 # type: (float) -> int
                 sumz = 0
                 for _ in x:
@@ -11882,7 +14680,9 @@ dedent """
             test_sizes(0.0)
 
     def test_for_in_tensors_nested(self):
+        # [FUNCTION DOC] checkScript of nested iteration over a tensor's first two dimensions.
         def test_sizes(x):
+            # [FUNCTION DOC] HELPER: Count the iterations over rows of rows.
             sumz = 0
             for n in x:
                 for _ in n:
@@ -11893,7 +14693,10 @@ dedent """
 
     # to avoid defining sum_list in multiple tests
     def get_sum_list_fn(self):
+        # [FUNCTION DOC] HELPER: Return a function that sums a list of ints, shared by the sum
+        # list tests.
         def sum_list(a):
+            # [FUNCTION DOC] HELPER: Sum a list of ints.
             # type: (List[int]) -> int
             sum = 0
             for i in a:
@@ -11904,17 +14707,22 @@ dedent """
         return sum_list
 
     def test_sum_list_diff_elms(self):
+        # [FUNCTION DOC] checkScript of the shared list sum on a list with different elements.
         self.checkScript(self.get_sum_list_fn(), ([1, 2, 3, 4, 5],))
 
     def test_sum_list_empty(self):
+        # [FUNCTION DOC] checkScript of the shared list sum on an empty list.
         self.checkScript(self.get_sum_list_fn(), ([],))
 
     def test_sum_list_one(self):
+        # [FUNCTION DOC] checkScript of the shared list sum on a one-element list.
         self.checkScript(self.get_sum_list_fn(), ([1],))
 
     def test_sum_list_literal(self):
+        # [FUNCTION DOC] checkScript of summing a literal list.
 
         def sum_list():
+            # [FUNCTION DOC] HELPER: Sum the elements of a literal list.
             # type: () -> int
             sum = 0
             for i in [1, 2, 3, 4, 5]:
@@ -11925,10 +14733,13 @@ dedent """
         self.checkScript(sum_list, ())
 
     def test_sum_list_wrong_type(self):
+        # [FUNCTION DOC] Iterating over an int must fail with a RuntimeError saying int is
+        # not iterable.
 
         with self.assertRaisesRegex(RuntimeError, "'int' object is not iterable"):
             @torch.jit.script
             def sum_list(a):
+                # [FUNCTION DOC] HELPER: Iterate over an int argument; scripting must fail.
                 # type: (int) -> int
                 sum = 0
                 for i in a:  # noqa: T484
@@ -11939,6 +14750,8 @@ dedent """
             sum_list(1)
 
     def test_list_iterables(self):
+        # [FUNCTION DOC] Iterating over a list of lists in a for with two targets must raise
+        # RuntimeError saying a list of iterables is unsupported.
         with self.assertRaisesRegex(RuntimeError, 'List of iterables is not supported currently'):
             cu = torch.jit.CompilationUnit('''
             def list_iterables(x):
@@ -11949,7 +14762,10 @@ dedent """
             ''')
 
     def test_for_in_string(self):
+        # [FUNCTION DOC] checkScript of iterating over the characters of a string and over a list
+        # of strings.
         def test_strings(x):
+            # [FUNCTION DOC] HELPER: Reverse a string by prepending each character.
             # type: (str) -> str
             reverse = ""
             for c in x:
@@ -11960,6 +14776,7 @@ dedent """
         self.checkScript(test_strings, ("",))
 
         def test_list_strings(x):
+            # [FUNCTION DOC] HELPER: Concatenate the strings of a list.
             # type: (List[str]) -> str
             result = ""
             for sub_str in x:
@@ -11970,7 +14787,9 @@ dedent """
         self.checkScript(test_list_strings, (["hello", " ", "world", ""],))
 
     def test_for_in_dict(self):
+        # [FUNCTION DOC] checkScript of iterating over dict keys and values.
         def test_dicts(x):
+            # [FUNCTION DOC] HELPER: Sum the values by iterating over keys.
             # type: (Dict[str, int]) -> int
             sum = 0
             for key in x:
@@ -11980,6 +14799,8 @@ dedent """
         self.checkScript(test_dicts, ({"a": 1, "b": 2, "c": 3},))
 
         def test_dict_keys_values(x):
+            # [FUNCTION DOC] HELPER: Concatenate keys and sum values (defined but never run by
+            # this test).
             # type: (Dict[str, int]) -> Tuple[str, int]
             key_str = ""
             sum = 0
@@ -11992,7 +14813,10 @@ dedent """
         self.checkScript(test_dicts, ({"a": 1, "b": 2, "c": 3},))
 
     def test_for_tuple_unpack(self):
+        # [FUNCTION DOC] checkScript of tuple unpacking in for targets over lists of lists and
+        # over a zip of a list, an enumerate and another list.
         def for_tuple_unpack(x, y):
+            # [FUNCTION DOC] HELPER: Add the parts of each pair in a literal list to two tensors.
             for i, j in [[3, 4], [5, 6], [7, 8]]:
                 x += i
                 y += j
@@ -12001,6 +14825,8 @@ dedent """
         self.checkScript(for_tuple_unpack, (torch.tensor(3), torch.tensor(5)))
 
         def nested_tuple_unpack(x, y):
+            # [FUNCTION DOC] HELPER: Sum values using a nested unpacking pattern over zip
+            # and enumerate.
             # type: (List[int], List[int]) -> int
             sum = 0
             for i, (j, k), v in zip(x, enumerate(x), y):
@@ -12010,7 +14836,10 @@ dedent """
         self.checkScript(nested_tuple_unpack, ([1, 3, 5], [2, 4, 6]))
 
     def test_for_tuple_assign(self):
+        # [FUNCTION DOC] checkScript of iterating over a heterogeneous tuple and a tuple
+        # of tuples.
         def test_simple_assign(x):
+            # [FUNCTION DOC] HELPER: Sum the floats of each element of a mixed tuple.
             # type: (Tuple[int, float]) -> float
             sum = 0.0
             for a in x:
@@ -12020,6 +14849,7 @@ dedent """
         self.checkScript(test_simple_assign, ((1, 2.5),))
 
         def test_tuple_assign(x):
+            # [FUNCTION DOC] HELPER: Sum the two entries of each pair in a tuple of pairs.
             # type: (Tuple[Tuple[int, int], Tuple[int, int]]) -> int
             sum = 0
             for a in x:
@@ -12030,6 +14860,8 @@ dedent """
         self.checkScript(test_tuple_assign, (((1, 2), (4, 7)), ))
 
     def test_single_starred_lhs(self):
+        # [FUNCTION DOC] A lone starred target on the left side in source text must
+        # raise RuntimeError.
         with self.assertRaisesRegex(RuntimeError, 'A Starred expression may only appear on the lhs within the presence'
                                                   ' of another non-starred expression'):
             cu = torch.jit.CompilationUnit('''
@@ -12040,13 +14872,20 @@ dedent """
             ''')
 
     def test_singleton_tuple_unpack(self):
+        # [FUNCTION DOC] checkScript of unpacking a one-element tuple.
         def foo(a):
+            # [FUNCTION DOC] HELPER: Unpack a one-element tuple and add one.
             b, = (a,)
             return b + 1
         self.checkScript(foo, (torch.rand(3),))
 
     def test_tuple_assignments(self):
+        # [FUNCTION DOC] checkScript of tuple assignment forms: nested patterns, subscript
+        # targets, star targets; augmented assignment on a subscripted tuple raises RuntimeError;
+        # attribute pair assignment on a global script-able class instance works.
         def var_tuple_assign(x, y):
+            # [FUNCTION DOC] HELPER: Unpack a pair of tensors and a tensor in one assignment and
+            # sum them.
             # type: (Tuple[Tensor, Tensor], Tensor) -> Tensor
             (a, b), c = x, y
             return a + b + c
@@ -12055,6 +14894,8 @@ dedent """
         self.checkScript(var_tuple_assign, (tuple_inputs, torch.randn(3, 4)))
 
         def nested_tuple_assign(x, y, z):
+            # [FUNCTION DOC] HELPER: Unpack a deeply nested tuple pattern and return the sum of
+            # six ints.
             # type: (int, Tuple[int, Tuple[int, int]], Tuple[int, int]) -> int
             a, (b, (c, d)), (e, f) = x, y, z
             return a + b + c + d + e + f
@@ -12062,6 +14903,8 @@ dedent """
         self.checkScript(nested_tuple_assign, ((1, (2, (3, 4)), (5, 6))))
 
         def subscript_tuple_assign(a, x, i):
+            # [FUNCTION DOC] HELPER: Assign into a list element and a tensor element from a
+            # nested tuple.
             # type: (List[int], Tensor, int) -> Tuple[int, Tensor, int]
             a[i], (x[i], b) = 1, (2, 3)
             return a[i] + 1, x + 5, b
@@ -12069,6 +14912,8 @@ dedent """
         self.checkScript(subscript_tuple_assign, ([12, 7, 9, 11], torch.tensor((3, 13, 17)), 0))
 
         def star_tuple_assign():
+            # [FUNCTION DOC] HELPER: Unpack with star targets at two levels and return
+            # the pieces.
             # type: () -> Tuple[int, int, Tuple[int, int], Tuple[int, int]]
             a, (b, *c), *d = 1, (2, 3, 4), 5, 6
             return a, b, c, d
@@ -12076,6 +14921,7 @@ dedent """
         self.checkScript(star_tuple_assign, ())
 
         def subscript_tuple_augmented_assign(a):
+            # [FUNCTION DOC] HELPER: Augmented assign into a tuple element; scripting must fail.
             # type: (Tuple[int, int]) -> Tuple[int, int]
             a[0] += 1
             return a
@@ -12084,20 +14930,26 @@ dedent """
             scripted_aug_assign = torch.jit.script(subscript_tuple_augmented_assign)
 
         class AttrTupleAssignmentTestClass:
+            # [CLASS DOC] HELPER: Plain class with two int fields assigned together by a
+            # tuple assignment.
             def __init__(self, a: int, b: int):
+                # [FUNCTION DOC] HELPER: Store the two ints as fields a and b.
                 self.a = a
                 self.b = b
 
             def set_ab(self, a: int, b: int):
+                # [FUNCTION DOC] HELPER: Assign both fields at once from a tuple.
                 self.a, self.b = (a, b)
 
             def get(self) -> Tuple[int, int]:
+                # [FUNCTION DOC] HELPER: Return the two fields as a tuple.
                 return (self.a, self.b)
 
         make_global(AttrTupleAssignmentTestClass)
 
         @torch.jit.script
         def attr_tuple_assignment(o: AttrTupleAssignmentTestClass, a: int, b: int):
+            # [FUNCTION DOC] HELPER: Call the pair setter on the object and return it.
             o.set_ab(a, b)
             return o
 
@@ -12105,7 +14957,11 @@ dedent """
         self.assertEqual(attr_tuple_assignment(o, 3, 4).get(), (3, 4))
 
     def test_multiple_assign(self):
+        # [FUNCTION DOC] checkScript of chained assignment targets, in-place side effects and
+        # swap ordering.
         def test():
+            # [FUNCTION DOC] HELPER: Chained assignment of tuples, aliasing via in-place add, and
+            # a swap-style update.
             a = b, c = d, f = (1, 1)
 
             # side effect
@@ -12122,6 +14978,8 @@ dedent """
         self.checkScript(test, ())
 
     def test_multi_reduction(self):
+        # [FUNCTION DOC] An augmented assignment with two left-hand targets in source text must
+        # raise RuntimeError saying only one is allowed.
         with self.assertRaisesRegex(
                 RuntimeError,
                 'augmented assignment can only have one LHS expression'):
@@ -12132,12 +14990,17 @@ dedent """
             ''')
 
     def test_invalid_call_arguments(self):
+        # [FUNCTION DOC] Calling unsqueeze with too many arguments in script must raise
+        # RuntimeError about the argument type.
         with self.assertRaisesRegex(RuntimeError, 'but instead found type '):
             @torch.jit.script
             def invalid_call_arguments(x):
+                # [FUNCTION DOC] HELPER: Call unsqueeze with six arguments; scripting must fail.
                 return torch.unsqueeze(3, 4, 5, 6, 7, 8)
 
     def test_invalid_lhs_assignment(self):
+        # [FUNCTION DOC] Source text assigning to an expression must raise RuntimeError about an
+        # unexpected expression.
         with self.assertRaisesRegex(RuntimeError, 'unexpected expression'):
             cu = torch.jit.CompilationUnit('''
             def invalid_lhs_assignment(x):
@@ -12146,6 +15009,8 @@ dedent """
             ''')
 
     def test_multi_starred_expr_lhs(self):
+        # [FUNCTION DOC] Source text with two starred targets must raise RuntimeError saying only
+        # one is allowed.
         with self.assertRaisesRegex(RuntimeError, 'Only one starred expression is allowed on the lhs'):
             cu = torch.jit.CompilationUnit('''
             def multi_starred_expr_lhs():
@@ -12154,6 +15019,8 @@ dedent """
             ''')
 
     def test_pack_tuple_into_non_var(self):
+        # [FUNCTION DOC] Source text packing a tuple into a non-variable star target must
+        # raise RuntimeError.
         with self.assertRaisesRegex(RuntimeError, 'Cannot pack a tuple into a non-variable'):
             cu = torch.jit.CompilationUnit('''
             def pack_tuple_into_non_var(x):
@@ -12162,6 +15029,7 @@ dedent """
             ''')
 
     def test_print_kwargs(self):
+        # [FUNCTION DOC] Source text passing a keyword argument to print must raise RuntimeError.
         with self.assertRaisesRegex(RuntimeError, 'print doesn\'t accept any keyword arguments'):
             cu = torch.jit.CompilationUnit('''
             def print_kwargs(x):
@@ -12170,65 +15038,95 @@ dedent """
             ''')
 
     def test_builtin_use_as_value(self):
+        # [FUNCTION DOC] Returning a tensor method without calling it must raise RuntimeError
+        # saying a builtin cannot be used as a value.
         with self.assertRaisesRegex(RuntimeError, 'builtin cannot be used as a value'):
             @torch.jit.script
             def builtin_use_as_value(x):
+                # [FUNCTION DOC] HELPER: Return the unsqueeze method itself; scripting must fail.
                 return x.unsqueeze
 
     def test_wrong_use_as_tuple(self):
+        # [FUNCTION DOC] Unpacking a python function value as a tuple in script must
+        # raise RuntimeError.
         with self.assertRaisesRegex(RuntimeError, 'cannot be used as a tuple'):
             def test_fn():
+                # [FUNCTION DOC] HELPER: Plain python function returning 3.
                 return 3
 
             @torch.jit.script
             def wrong_use_as_tuple(self):
+                # [FUNCTION DOC] HELPER: Unpack a function object into two names; scripting
+                # must fail.
                 a, b = test_fn
                 return a
 
     def test_wrong_attr_lookup(self):
+        # [FUNCTION DOC] Reading an attribute of a builtin method in script must
+        # raise RuntimeError.
         with self.assertRaisesRegex(RuntimeError, 'attribute lookup is not defined on builtin'):
             @torch.jit.script
             def wrong_attr_lookup(self, x):
+                # [FUNCTION DOC] HELPER: Read an attribute of the unsqueeze method; scripting
+                # must fail.
                 a = x.unsqueeze.myattr
                 return a
 
     def test_wrong_use_as_callable(self):
+        # [FUNCTION DOC] Calling a tensor value in script must raise RuntimeError saying it
+        # cannot call a value.
         with self.assertRaisesRegex(RuntimeError, 'cannot call a value'):
             @torch.jit.script
             def wrong_use_as_callable(x):
+                # [FUNCTION DOC] HELPER: Call the input as a function; scripting must fail.
                 return x(3, 4, 5)
 
     def test_python_val_doesnt_have_attr(self):
+        # [FUNCTION DOC] Reading a missing attribute of a python module in script must
+        # raise RuntimeError.
         with self.assertRaisesRegex(RuntimeError, 'object has no attribute abcd'):
 
             @torch.jit.script
             def python_val_doesnt_have_attr():
+                # [FUNCTION DOC] HELPER: Return a nonexistent attribute of the shutil module;
+                # scripting must fail.
                 # this has to be a module otherwise attr lookup would not be
                 # allowed in the first place
                 return shutil.abcd
 
     def test_wrong_module_attr_lookup(self):
+        # [FUNCTION DOC] Returning a python class object from a module attribute in script must
+        # raise RuntimeError saying it cannot be used as a value.
         with self.assertRaisesRegex(RuntimeError, 'python value of type \'type\' cannot be used as a value'):
             import io
 
             @torch.jit.script
             def wrong_module_attr_lookup():
+                # [FUNCTION DOC] HELPER: Return the BytesIO class; scripting must fail.
                 return io.BytesIO
 
     def test_wrong_method_call_inputs(self):
+        # [FUNCTION DOC] Calling a script method with a missing argument must raise RuntimeError
+        # saying it was not provided.
         with self.assertRaisesRegex(RuntimeError, 'Argument y not provided'):
             class SomeModule(torch.jit.ScriptModule):
+                # [CLASS DOC] HELPER: Script module whose forward calls another method with a
+                # missing argument.
 
                 @torch.jit.script_method
                 def foo(self, x, y):
+                    # [FUNCTION DOC] HELPER: Return x.
                     return x
 
                 @torch.jit.script_method
                 def forward(self, x, y):
+                    # [FUNCTION DOC] HELPER: Call foo with one argument instead of two.
                     return self.foo(x)
             SomeModule()
 
     def test_single_starred_expr_for_loop(self):
+        # [FUNCTION DOC] A starred loop target in source text must raise RuntimeError about
+        # starred expressions.
         with self.assertRaisesRegex(RuntimeError, 'A Starred expression may only appear'):
             cu = torch.jit.CompilationUnit('''
             def test():
@@ -12239,34 +15137,48 @@ dedent """
             ''')
 
     def test_call_ge(self):
+        # [FUNCTION DOC] Calling a traced function with too many arguments from script must raise
+        # RuntimeError about the maximum argument count.
         with self.assertRaisesRegex(RuntimeError, 'Expected at most 1 arguments but found 3'):
             @_trace(torch.zeros(1, 2, 3))
             def foo(x):
+                # [FUNCTION DOC] HELPER: Traced identity function with one input.
                 return x
 
             @torch.jit.script
             def test_fn():
+                # [FUNCTION DOC] HELPER: Call the traced function with three arguments; scripting
+                # must fail.
                 return foo(torch.full([1], 1), torch.full([1], 2), torch.full([1], 3))
 
     def test_wrong_return_type(self):
+        # [FUNCTION DOC] An ignored function returning a different structure than its declared
+        # return annotation makes running the script function fail with RuntimeError.
         with self.assertRaisesRegex(RuntimeError, 'but instead got value of type tuple'):
             @torch.jit.ignore
             def somefunc():
+                # [FUNCTION DOC] HELPER: Ignored function declared to return a tuple of one tuple
+                # but returning two tensors.
                 # type: () -> Tuple[Tuple[Tensor, Tensor]]
                 return torch.zeros(3, 4), torch.zeros(4, 5)  # noqa: T484
 
             @torch.jit.script
             def wrong_return_type():
+                # [FUNCTION DOC] HELPER: Return the result of the ignored function.
                 return somefunc()
             wrong_return_type()
 
     # Tests for calling between different front-end modes
     def test_call_python_fn_from_tracing_fn(self):
+        # [FUNCTION DOC] A python function called from a traced function is inlined into the
+        # trace graph.
         def python_fn(x):
+            # [FUNCTION DOC] HELPER: Return the negation of x.
             return torch.neg(x)
 
         @_trace(torch.rand(3, 4))
         def traced_fn(x):
+            # [FUNCTION DOC] HELPER: Traced function adding one to the python function result.
             return python_fn(x) + 1
 
         # The neg op in the python function should be properly inlined to the
@@ -12274,18 +15186,25 @@ dedent """
         FileCheck().check("aten::neg").run(str(traced_fn.graph))
 
     def test_call_python_mod_from_tracing_fn(self):
+        # [FUNCTION DOC] A python module called from a traced function has its parameter inlined
+        # as a constant, so the graph has one input and the mm and add ops appear.
         class PythonMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Eager module multiplying by a fixed parameter that does not
+            # require grad.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random 4x3 parameter without gradient.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(4, 3), requires_grad=False)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the matrix product of x and the parameter.
                 return torch.mm(x, self.param)
 
         pm = PythonMod()
 
         @_trace(torch.rand(3, 4))
         def traced_fn(x):
+            # [FUNCTION DOC] HELPER: Traced function adding 1.0 to the module result.
             return pm(x) + 1.0
 
         # Note: the parameter self.param from the Python module is inlined
@@ -12295,12 +15214,17 @@ dedent """
 
     @_tmp_donotuse_dont_inline_everything
     def test_call_traced_fn_from_tracing_fn(self):
+        # [FUNCTION DOC] A traced function calling another traced function shows a function call
+        # node in the graph (without inlining).
         @_trace(torch.rand(3, 4))
         def traced_fn1(x):
+            # [FUNCTION DOC] HELPER: Traced function negating x.
             return torch.neg(x)
 
         @_trace(torch.rand(3, 4))
         def traced_fn(x):
+            # [FUNCTION DOC] HELPER: Traced function adding one to the other traced
+            # function result.
             return traced_fn1(x) + 1
 
         FileCheck().check("traced_fn").check("prim::CallFunction").check("aten::add") \
@@ -12308,12 +15232,18 @@ dedent """
 
     @unittest.skip("error in first class mode")
     def test_call_traced_mod_from_tracing_fn(self):
+        # [FUNCTION DOC] A traced function calling a traced module should require registration as
+        # a submodule. Skipped: error in first class mode.
         class TracedModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Eager module multiplying by a fixed parameter that does not
+            # require grad.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random 4x3 parameter without gradient.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(4, 3), requires_grad=False)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the matrix product of x and the parameter.
                 return torch.mm(x, self.param)
 
         tm = torch.jit.trace(TracedModule(), torch.rand(3, 4))
@@ -12321,30 +15251,42 @@ dedent """
         with self.assertRaisesRegex(RuntimeError, "must be registered as submodules"):
             @_trace(torch.rand(3, 4))
             def traced_fn(x):
+                # [FUNCTION DOC] HELPER: Traced function adding 1.0 to the traced module result.
                 return tm(x) + 1.0
 
     @_tmp_donotuse_dont_inline_everything
     def test_call_script_fn_from_tracing_fn(self):
+        # [FUNCTION DOC] A traced function calling a script function shows a function call node
+        # followed by an add (without inlining).
         @torch.jit.script
         def script_fn(x):
+            # [FUNCTION DOC] HELPER: Script function negating x.
             return torch.neg(x)
 
         @_trace(torch.rand(3, 4))
         def traced_fn(x):
+            # [FUNCTION DOC] HELPER: Traced function adding one to the script function result.
             return script_fn(x) + 1
 
         FileCheck().check("prim::CallFunction").check("aten::add").run(str(traced_fn.graph))
 
     @unittest.skip("error in first class mode")
     def test_call_script_mod_from_tracing_fn(self):
+        # [FUNCTION DOC] A traced function calling a script module should require registration as
+        # a submodule. Skipped: error in first class mode.
         with self.assertRaisesRegex(RuntimeError, "must be registered as submodules"):
             class ScriptMod(torch.jit.ScriptModule):
+                # [CLASS DOC] HELPER: Script module adding its parameter to the input four times
+                # in a loop.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Create a random 3x4 parameter without gradient.
                     super().__init__()
                     self.param = torch.nn.Parameter(torch.rand(3, 4), requires_grad=False)
 
                 @torch.jit.script_method
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Add the parameter to x in place four times and
+                    # return x.
                     for _ in range(4):
                         x += self.param
                     return x
@@ -12353,19 +15295,28 @@ dedent """
 
             @_trace(torch.rand(3, 4))
             def traced_fn(x):
+                # [FUNCTION DOC] HELPER: Traced function adding 1.0 to the script module result.
                 return sm(x) + 1.0
 
 
     def test_call_python_fn_from_traced_module(self):
+        # [FUNCTION DOC] A python function called from a traced module forward is inlined; the
+        # module's parameter appears as a second graph input.
         def python_fn(x):
+            # [FUNCTION DOC] HELPER: Return the negation of x.
             return torch.neg(x)
 
         class TracedModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a parameter that multiplies the negated input by
+            # the parameter.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random 4x3 parameter.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(4, 3))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the matrix product of the negated input and
+                # the parameter.
                 return torch.mm(python_fn(x), self.param)
 
         tm = torch.jit.trace(TracedModule(), torch.rand(3, 4))
@@ -12377,21 +15328,30 @@ dedent """
         FileCheck().check("aten::neg").check("aten::mm").run(str(tm.graph))
 
     def test_call_python_mod_from_traced_module(self):
+        # [FUNCTION DOC] A python submodule called from a traced module becomes a method call in
+        # the graph; no tensor constants appear and the submodule graph has its own mm.
         class PythonModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Eager module multiplying by a 5x7 parameter.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random 5x7 parameter.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(5, 7))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the matrix product of x and the parameter.
                 return torch.mm(x, self.param)
 
         class TracedModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a parameter and a python submodule, adding 1.0 at
+            # the end.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random 4x5 parameter and the submodule.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(4, 5))
                 self.mod = PythonModule()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the parameter then the submodule and add 1.0.
                 return self.mod(torch.mm(x, self.param)) + 1.0
 
         tm = torch.jit.trace(TracedModule(), torch.rand(3, 4))
@@ -12402,12 +15362,16 @@ dedent """
         FileCheck().check("aten::mm").run(str(tm.mod.graph))
 
     def test_op_dtype(self):
+        # [FUNCTION DOC] arange in script gives the same values and dtypes as eager for int and
+        # float arguments, with and without dtype.
 
         def check_equal_and_dtype(a, b):
+            # [FUNCTION DOC] HELPER: Assert equal values and equal dtypes.
             self.assertEqual(a, b)
             self.assertEqual(a.dtype, b.dtype)
 
         def fn():
+            # [FUNCTION DOC] HELPER: Return six arange tensors with different argument kinds.
             a = torch.arange(10)
             b = torch.arange(10, dtype=torch.float)
             c = torch.arange(1, 10, 2)
@@ -12423,8 +15387,11 @@ dedent """
             check_equal_and_dtype(a, b)
 
     def test_floor_div(self):
+        # [FUNCTION DOC] Scripted integer floor division equals python floor division for all
+        # nonzero divisors in a range of negative and positive ints.
         @torch.jit.script
         def foo(a, b):
+            # [FUNCTION DOC] HELPER: Return the floor division of two ints.
             # type: (int, int) -> int
             return a // b
         for i in range(-8, 8):
@@ -12433,6 +15400,9 @@ dedent """
                     self.assertEqual(foo(i, j), i // j)
 
     def test_floordiv(self):
+        # [FUNCTION DOC] For tensors and scalars of mixed int/float kinds, compile source
+        # text applying the floor division operator and the floor_divide function, and
+        # compare with python.
         funcs_template = dedent('''
         def fn():
             ten = {a_construct}
@@ -12453,12 +15423,16 @@ dedent """
                 self.assertEqual(f_script(), f())
 
     def test_call_python_fn_from_script_fn(self):
+        # [FUNCTION DOC] An ignored python function called from a script function appears as a
+        # python op by name in the graph, and the result is correct.
         @torch.jit.ignore
         def python_fn(x):
+            # [FUNCTION DOC] HELPER: Ignored python function returning the negation of x.
             return torch.neg(x)
 
         @torch.jit.script
         def script_fn(x):
+            # [FUNCTION DOC] HELPER: Add one to the ignored function result.
             return python_fn(x) + 1
 
         # Note: the call to python_fn appears as `^python_fn()` and is called
@@ -12468,18 +15442,24 @@ dedent """
         FileCheck().check("python_fn").run(str(script_fn.graph))
 
     def test_call_python_mod_from_script_fn(self):
+        # [FUNCTION DOC] A python module called from a script function appears as a python value
+        # call in the graph; its parameters are not inlined.
         class PythonModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Eager module multiplying by a 5x7 parameter.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random 5x7 parameter.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(5, 7))
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the matrix product of x and the parameter.
                 return torch.mm(x, self.param)
 
         pm = PythonModule()
 
         @torch.jit.script
         def script_fn(x):
+            # [FUNCTION DOC] HELPER: Add one to the module result.
             return pm(x) + 1
 
         # Note: call to pm(x) appears as ^<python_value>() in the trace.
@@ -12488,41 +15468,59 @@ dedent """
 
     @_tmp_donotuse_dont_inline_everything
     def test_call_script_fn_from_script_fn(self):
+        # [FUNCTION DOC] A script function calling another script function shows a function call
+        # node (without inlining).
         @torch.jit.script
         def script_fn1(x):
+            # [FUNCTION DOC] HELPER: Script function negating x.
             return torch.neg(x)
 
         @torch.jit.script
         def script_fn(x):
+            # [FUNCTION DOC] HELPER: Add one to the other script function result.
             return script_fn1(x) + 1
 
         FileCheck().check("prim::CallFunction").run(str(script_fn.graph))
 
     def test_call_script_mod_from_script_fn(self):
+        # [FUNCTION DOC] Calling a script module that is not a submodule from a script function
+        # must raise RuntimeError.
         with self.assertRaisesRegex(RuntimeError, "Cannot call a ScriptModule that is not a submodule of the caller"):
             class ScriptMod(torch.jit.ScriptModule):
+                # [CLASS DOC] HELPER: Script module multiplying the input by a constant
+                # zeros matrix.
                 @torch.jit.script_method
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Return the product of x and a zero 4x3 matrix.
                     return torch.mm(x, torch.zeros([4, 3]))
 
             sm = ScriptMod()
 
             @torch.jit.script
             def script_fn(x):
+                # [FUNCTION DOC] HELPER: Call the script module and add one; scripting must fail.
                 return sm(x) + 1
 
     def test_call_python_fn_from_script_module(self):
+        # [FUNCTION DOC] An ignored function called from a script module method appears by name
+        # in the method graph after the mm op.
         @torch.jit.ignore
         def python_fn(x):
+            # [FUNCTION DOC] HELPER: Ignored python function returning the negation of x.
             return torch.neg(x)
 
         class ScriptMod(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a parameter, passing its product through an
+            # ignored function.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random 4x3 parameter.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(4, 3))
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the ignored function to the product of x and
+                # the parameter.
                 return python_fn(torch.mm(x, self.param))
 
         sm = ScriptMod()
@@ -12530,23 +15528,34 @@ dedent """
             .run(str(sm.forward.graph))
 
     def test_call_python_mod_from_script_module(self):
+        # [FUNCTION DOC] A python submodule with an ignored forward called from a script module
+        # appears as a python call in the graph after the mm op.
         class PythonMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Eager module with an ignored forward multiplying by a
+            # 3x5 parameter.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random 3x5 parameter.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(3, 5))
 
             @torch.jit.ignore
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Ignored forward: matrix product of x and the parameter.
                 return torch.mm(x, self.param)
 
         class ScriptMod(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a parameter and a python submodule applied
+            # after the product.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random 4x3 parameter and the python submodule.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(4, 3))
                 self.pm = PythonMod()
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the submodule to the product of x and
+                # the parameter.
                 return self.pm(torch.mm(x, self.param))
 
         sm = ScriptMod()
@@ -12556,17 +15565,24 @@ dedent """
 
     @_tmp_donotuse_dont_inline_everything
     def test_call_script_fn_from_script_module(self):
+        # [FUNCTION DOC] A script function called from a script module method appears as a
+        # function call node after the mm op (without inlining).
         @torch.jit.script
         def script_fn(x):
+            # [FUNCTION DOC] HELPER: Script function negating x.
             return torch.neg(x)
 
         class ScriptMod(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module passing its product through a script function.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random 4x3 parameter.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(4, 3))
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the script function to the product of x and
+                # the parameter.
                 return script_fn(torch.mm(x, self.param))
 
         sm = ScriptMod()
@@ -12575,23 +15591,33 @@ dedent """
 
     @_tmp_donotuse_dont_inline_everything
     def test_call_script_mod_from_script_module(self):
+        # [FUNCTION DOC] A script submodule called from a script module appears as a method call
+        # with the parameters of both modules among the graph inputs (without inlining).
         class ScriptMod1(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module multiplying by a 3x5 parameter.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random 3x5 parameter.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(3, 5))
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the matrix product of x and the parameter.
                 return torch.mm(x, self.param)
 
         class ScriptMod(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a parameter and a script submodule applied
+            # after the product.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random 4x3 parameter and the script submodule.
                 super().__init__()
                 self.param = torch.nn.Parameter(torch.rand(4, 3))
                 self.tm = ScriptMod1()
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the submodule to the product of x and
+                # the parameter.
                 return self.tm(torch.mm(x, self.param))
 
         sm = ScriptMod()
@@ -12602,24 +15628,33 @@ dedent """
         FileCheck().check_count('%', 3).check(":").check_count("mm", 1).check("prim::CallMethod").run(str(sm.graph))
 
     def test_module_with_params_called_fails(self):
+        # [FUNCTION DOC] A script function calling a script module that is not its submodule must
+        # raise RuntimeError.
         with self.assertRaisesRegex(RuntimeError, "Cannot call a ScriptModule that is not a submodule of the caller"):
             class ScriptMod(torch.jit.ScriptModule):
+                # [CLASS DOC] HELPER: Script module multiplying by a 3x3 parameter.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Create a random 3x3 parameter.
                     super().__init__()
                     self.param = torch.nn.Parameter(torch.rand(3, 3))
 
                 @torch.jit.script_method
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Return the matrix product of x and the parameter.
                     return torch.mm(x, self.param)
 
             sm = ScriptMod()
 
             @torch.jit.script
             def some_func(x):
+                # [FUNCTION DOC] HELPER: Call the script module on x; scripting must fail.
                 return sm(x)
 
     def test_tuple_index_to_list(self):
+        # [FUNCTION DOC] Indexing a tuple by a non-constant int works when elements share a type;
+        # with different element types it must raise RuntimeError about the output type.
         def test_non_constant_input(a):
+            # [FUNCTION DOC] HELPER: Select a tuple entry by an index computed from a flag.
             # type: (bool) -> int
             if a:
                 b = 1
@@ -12634,6 +15669,8 @@ dedent """
         with self.assertRaisesRegex(RuntimeError, "because we cannot resolve the output type"):
             @torch.jit.script
             def test_non_constant_input(a):
+                # [FUNCTION DOC] HELPER: Index a tuple of int and float by a computed index;
+                # scripting must fail.
                 # type: (bool) -> None
                 if a:
                     b = 1
@@ -12643,7 +15680,11 @@ dedent """
                 print(c[b])
 
     def test_tuple_indexing(self):
+        # [FUNCTION DOC] Tuple indexing by computed, negative, bad and out-of-range indexes and
+        # slices: two tuple index nodes in the graph, errors for float index and out-of-range,
+        # slice clamping.
         def tuple_index(a):
+            # [FUNCTION DOC] HELPER: Return entries at -2 and 1 of a tuple chosen by a condition.
             if bool(a):
                 b = (1, 2)
             else:
@@ -12659,10 +15700,12 @@ dedent """
         with self.assertRaisesRegex(RuntimeError, "index must be an integer"):
             @torch.jit.script
             def test_indexing_float():
+                # [FUNCTION DOC] HELPER: Index a tuple with a float; scripting must fail.
                 c = (1, 2)
                 return c[0.1]
 
         def test_indexing_out_of_bounds_pos():
+            # [FUNCTION DOC] HELPER: Read index 2 of a two-element tuple; raises out of range.
             c = (1, 2)
             return c[2]
 
@@ -12670,6 +15713,8 @@ dedent """
                                     "out of range")
 
         def test_indexing_out_of_bounds_neg():
+            # [FUNCTION DOC] HELPER: Read index -3 of a two-element tuple (never run; the test
+            # reruns the positive case).
             c = (1, 2)
             return c[-3]
 
@@ -12677,31 +15722,41 @@ dedent """
                                     "out of range")
 
         def negative_index():
+            # [FUNCTION DOC] HELPER: Return the last element of a four-element tuple.
             tup = (1, 2, 3, 4)
             return tup[-1]
 
         self.checkScript(negative_index, [])
 
         def really_negative_index():
+            # [FUNCTION DOC] HELPER: Read index -100 of a four-element tuple; raises out
+            # of range.
             tup = (1, 2, 3, 4)
             return tup[-100]
 
         self.checkScriptRaisesRegex(really_negative_index, [], Exception, "index out of range")
 
         def negative_slice():
+            # [FUNCTION DOC] HELPER: Slice a four-element tuple from -3 to 4.
             tup = (1, 2, 3, 4)
             return tup[-3:4]
 
         self.checkScript(negative_slice, [])
 
         def really_slice_out_of_bounds():
+            # [FUNCTION DOC] HELPER: Slice a four-element tuple with bounds far outside
+            # the range.
             tup = (1, 2, 3, 4)
             return tup[-300:4000]
 
         self.checkScript(really_slice_out_of_bounds, [])
 
     def test_namedtuple_attr(self):
+        # [FUNCTION DOC] Named tuple results of max can be read through attribute names,
+        # method and function forms agree; an unknown attribute or tuple doc attribute
+        # raises RuntimeError.
         def f(x):
+            # [FUNCTION DOC] HELPER: Add the indices of the max method and function results.
             return x.max(dim=1).indices + torch.max(x, dim=1).indices
 
         self.checkScript(f, (torch.rand(20, 20, 20),), optimize=True)
@@ -12709,31 +15764,41 @@ dedent """
         with self.assertRaisesRegex(RuntimeError, "object has no attribute or method"):
             @torch.jit.script
             def g1(x):
+                # [FUNCTION DOC] HELPER: Read an unknown attribute of the max result; scripting
+                # must fail.
                 return x.max(dim=1).unknown_symbol
 
         with self.assertRaisesRegex(RuntimeError, "object has no attribute or method"):
             @torch.jit.script
             def g2(x):
+                # [FUNCTION DOC] HELPER: Print a doc attribute of a tuple; scripting must fail.
                 print((x, x, x).__doc__)
                 return x
 
     def test_tuple_len(self):
+        # [FUNCTION DOC] Length of a mixed tuple is its element count and slicing beyond the end
+        # gives an empty tuple.
         @torch.jit.script
         def foo():
+            # [FUNCTION DOC] HELPER: Return the length of a three-element tuple.
             return len((1, "str", None))
 
         self.assertEqual(foo(), 3)
 
         @torch.jit.script
         def test_indexing_end_out_of_bounds():
+            # [FUNCTION DOC] HELPER: Slice from 2 to 10 of a two-element tuple.
             c = (1, 2)
             return c[2:10]
 
         self.assertEqual(test_indexing_end_out_of_bounds(), ())
 
     def test_lower_nested_tuples(self):
+        # [FUNCTION DOC] After constant propagation, a nested tuple return becomes a constant and
+        # the tuple-lowering pass succeeds.
         @torch.jit.script
         def test():
+            # [FUNCTION DOC] HELPER: Return a nested constant tuple.
             return ((1, 2), 3)
 
         self.run_pass('constant_propagation', test.graph)
@@ -12742,7 +15807,11 @@ dedent """
         self.run_pass('lower_all_tuples', test.graph)
 
     def test_unwrap_optional_builtin(self):
+        # [FUNCTION DOC] The internal unwrap-optional helper doubles an int, raises
+        # AssertionError in python for None and RuntimeError in script; unwrapping a constant
+        # works; unwrapping None cannot infer a type.
         def test(x):
+            # [FUNCTION DOC] HELPER: Unwrap an optional int and add it to itself.
             # type: (Optional[int]) -> int
             x = torch.jit._unwrap_optional(x)
             x = x + x  # noqa: T484
@@ -12759,40 +15828,57 @@ dedent """
 
         @torch.jit.script
         def test_test():
+            # [FUNCTION DOC] HELPER: Unwrap the constant 1.
             return torch.jit._unwrap_optional(1)
 
         with self.assertRaisesRegex(RuntimeError, r"could not be inferred from actual type None"):
             @torch.jit.script
             def test_no_type():
+                # [FUNCTION DOC] HELPER: Unwrap None with an int return type; scripting
+                # must fail.
                 # type: () -> int
                 return torch.jit._unwrap_optional(None)
 
     def test_indexing_error(self):
+        # [FUNCTION DOC] Indexing an int in script must raise RuntimeError saying it is
+        # not subscriptable.
         with self.assertRaisesRegex(RuntimeError, "'int' object is not subscriptable"):
             @torch.jit.script
             def test_wrong_type():
+                # [FUNCTION DOC] HELPER: Index into an int; scripting must fail.
                 a = 8
                 return a[0]
 
     def test_unsupported_builtin_error(self):
+        # [FUNCTION DOC] Using an unsupported python builtin (hypot) in script must raise
+        # RuntimeError naming the builtin.
         with self.assertRaisesRegex(RuntimeError,
                                     "Python builtin <built-in function hypot> is currently"):
             @torch.jit.script
             def test_unsupported(a):
+                # [FUNCTION DOC] HELPER: Call the math hypot function; scripting must fail.
                 return math.hypot(a, 2.0)
 
     def test_annotated_script_fn(self):
+        # [FUNCTION DOC] The schema of a script function with a nested tuple annotation comment
+        # equals the stored expected text.
         @torch.jit.script
         def foo(x, y, z):
+            # [FUNCTION DOC] HELPER: Function with a tuple-typed annotation comment returning x.
             # type: (Tensor, Tuple[Tensor, Tensor, Tensor], Tuple[Tensor, Tuple[Tensor, Tensor]]) -> Tensor
             return x
 
         self.assertExpected(str(foo.schema))
 
     def test_annotated_script_method(self):
+        # [FUNCTION DOC] The schema of a script method with an annotation comment equals the
+        # stored expected text (module mangling stripped).
         class SM(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module whose script method has tuple argument and
+            # return annotations.
             @torch.jit.script_method
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Return y three times.
                 # type: (Tuple[Tensor, Tensor], Tensor) -> Tuple[Tensor, Tensor, Tensor]
                 return y, y, y
 
@@ -12801,22 +15887,33 @@ dedent """
         self.assertExpectedStripMangled(str(sm.forward.schema))
 
     def test_annotated_script_fn_return_mismatch(self):
+        # [FUNCTION DOC] A return annotation that does not match the returned value must
+        # raise RuntimeError.
         with self.assertRaisesRegex(RuntimeError, "but is actually of type"):
             @torch.jit.script
             def return_tup(x):
+                # [FUNCTION DOC] HELPER: Annotated to return nested tuples but returns a flat
+                # pair; scripting must fail.
                 # type: (Tensor) -> Tuple[Tuple[Tensor, Tensor], Tensor]
                 return x, x  # noqa: T484
 
     def test_annotated_script_fn_arg_mismatch(self):
+        # [FUNCTION DOC] Using an annotated tuple argument as a tensor must raise RuntimeError
+        # about invalid call arguments.
         with self.assertRaisesRegex(RuntimeError, r"Arguments for call are not valid"):
             @torch.jit.script
             def tuple_arg(x):
+                # [FUNCTION DOC] HELPER: Add one to an argument annotated as a tuple; scripting
+                # must fail.
                 # type: (Tuple[Tensor, Tensor]) -> Tensor
                 return x + 1  # noqa: T484
 
     def test_script_non_tensor_args_outputs(self):
+        # [FUNCTION DOC] A script function can take a float and return a float computed from a
+        # tensor sum.
         @torch.jit.script
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Return the float of the sum of the tensor plus the float.
             # type: (Tensor, float) -> float
             return float((x + y).sum())
 
@@ -12827,19 +15924,26 @@ dedent """
 
     @unittest.skip('https://github.com/pytorch/pytorch/issues/9595')
     def test_inline_and_run_annotated_script_fn(self):
+        # [FUNCTION DOC] Inline and run a script function with an annotated tuple argument.
+        # Skipped: tracked by an issue.
         @torch.jit.script
         def to_inline(x, y):
+            # [FUNCTION DOC] HELPER: Annotated function returning its second argument.
             # type: (Tuple[Tensor, Tensor], Tensor) -> Tensor
             return y
 
         @torch.jit.script
         def some_func(x):
+            # [FUNCTION DOC] HELPER: Call the annotated function with a tuple of x and x.
             return to_inline((x, x), x)
 
         x = torch.rand(3, 4)
         self.assertEqual(some_func(x), x)
 
     def _make_filereader_test_file(self):
+        # [FUNCTION DOC] HELPER: Write a temporary archive with twenty random records, an offset
+        # list record and the end-of-file marker; return the file name, the buffers and the
+        # pickled offsets.
         filename = tempfile.mktemp()
         writer = torch._C.PyTorchFileWriter(filename)
         buffers = [os.urandom(size) for size in [random.randint(1, 100) for i in range(20)]]
@@ -12853,6 +15957,8 @@ dedent """
         return filename, buffers, serialized_offsets
 
     def test_file_format_serialization(self):
+        # [FUNCTION DOC] Read the records of a written archive with the file reader and compare
+        # each against the written buffer (raises AssertionError on mismatch).
         filename, buffers, serialized_offsets = self._make_filereader_test_file()
 
         reader = torch._C.PyTorchFileReader(filename)
@@ -12866,6 +15972,9 @@ dedent """
 
     @unittest.skipIf(IS_LINUX, "https://github.com/pytorch/pytorch/issues/138885")
     def test_file_reader_no_memory_leak(self):
+        # [FUNCTION DOC] Creating readers from a path and from a stream ten thousand times must
+        # not leak memory: peak memory of the stream variant stays within a factor of the path
+        # variant. Skipped on Linux.
         num_iters = 10000
         filename, _, _ = self._make_filereader_test_file()
 
@@ -12890,6 +15999,8 @@ dedent """
 
     # for each type, the input type annotation and corresponding return type annotation
     def type_input_return_pairs(self):
+        # [FUNCTION DOC] HELPER: Return the pairs of input annotation and expected return
+        # annotation used by the annotation tests.
         return [
             ('Tensor', 'Tensor'),
             ('torch.Tensor', 'Tensor'),
@@ -12904,6 +16015,8 @@ dedent """
 
     # replacing code input & return type pair
     def format_code(self, code, pair):
+        # [FUNCTION DOC] HELPER: Fill the input and output placeholders of the code template from
+        # the pair.
         return code.format(input=pair[0], output=pair[1])
 
     # ***** Type annotation tests ****
@@ -12914,6 +16027,8 @@ dedent """
 
     #  String frontend , Python 3-style type annotations , Script function
     def test_annot_string_py3_fn(self):
+        # [FUNCTION DOC] Compile source text with colon annotations for each type pair and
+        # compare the schemas against stored expected text.
         code = '''
             def foo(x : {input}, y : Tuple[Tensor, Tensor]) -> Tuple[{output}, {output}]:
                 return x, x
@@ -12926,8 +16041,13 @@ dedent """
 
     #  String frontend , Python 3-style type annotations , Script method
     def test_annot_string_py3_method(self):
+        # [FUNCTION DOC] Define a method from source text with colon annotations on a script
+        # module for each type pair (clearing the class registry each time) and compare schemas
+        # with stored text.
         class TestModule(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Empty script module to which methods are added dynamically.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Call the base initializer.
                 super().__init__()
 
         code = '''
@@ -12945,6 +16065,8 @@ dedent """
 
     #  String frontend , MyPy-style type comments , Script function
     def test_annot_string_mypy_fn(self):
+        # [FUNCTION DOC] Compile source text with comment annotations for each type pair and
+        # compare the schemas against stored expected text (module mangling stripped).
         code = '''
             def foo(x, y):
                 # type: ({input}, Tuple[Tensor, Tensor]) -> Tuple[{output}, {output}]
@@ -12958,8 +16080,12 @@ dedent """
 
     #  String frontend , MyPy-style type comments , Script method
     def test_annot_string_mypy_method(self):
+        # [FUNCTION DOC] Define a method from source text with comment annotations on a script
+        # module for each type pair and compare schemas with stored text.
         class TestModule(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Empty script module to which methods are added dynamically.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Call the base initializer.
                 super().__init__()
 
         code = '''
@@ -12979,6 +16105,8 @@ dedent """
 
     #  Python AST Frontend , Python 3-style type annotations , Script function
     def test_annot_ast_py3_fn(self):
+        # [FUNCTION DOC] Write python source with colon annotations, load it through the helper,
+        # script it, and compare schemas for each type pair with stored text.
         code = dedent('''
             from typing import Tuple, List, Optional
             from torch import Tensor
@@ -12995,6 +16123,8 @@ dedent """
         self.assertExpectedStripMangled("\n".join(test_str) + "\n")
 
     def test_multiline_annot_ast_py3_fn(self):
+        # [FUNCTION DOC] Load python source with per-argument comment annotations and a combined
+        # return comment for each type pair, and check the schema argument and return types.
         code = dedent('''
             from typing import Tuple, List, Optional
             from torch import Tensor
@@ -13018,12 +16148,16 @@ dedent """
             self.assertEqual(str(returns[0].type), f"Tuple[{pair[1]}, {pair[1]}]")
 
     def test_bad_multiline_annotations(self):
+        # [FUNCTION DOC] A multi-line annotation missing or malformed return line must raise
+        # RuntimeError mentioning the return type line.
         with self.assertRaisesRegex(RuntimeError, "Return type line"):
             @torch.jit.script
             def bad_type_line(a,  # type: Tensor
                               b,  # type: Tensor
                               c   # type: Tensor
                               ):
+                # [FUNCTION DOC] HELPER: Function with per-argument comments and a malformed
+                # combined comment; scripting must fail.
                 # type: (int, int, int) -> Tensor
                 # type: bad type line
 
@@ -13035,6 +16169,8 @@ dedent """
                                 b,
                                 c   # type: Tensor
                                 ):
+                # [FUNCTION DOC] HELPER: Function with a comment on only some arguments;
+                # scripting must fail.
                 # type: (int, int, int) -> Tensor
                 return a + b + c
 
@@ -13045,11 +16181,16 @@ dedent """
                              b,
                              c   # type: Tensor
                              ):
+                # [FUNCTION DOC] HELPER: Function with per-argument comments on only two of three
+                # arguments; scripting must fail with an error about the number of annotations.
                 # type: (...) -> Tensor
                 return a + b + c
 
     #  Python AST Frontend , Python 3-style type annotations , Script method
     def test_annot_ast_py3_method(self):
+        # [FUNCTION DOC] Load python source defining a script module whose method has colon
+        # annotations for each type pair, and compare method schemas with stored text (module
+        # mangling stripped).
         code = dedent('''
             from typing import Tuple, List, Optional
             from torch import Tensor
@@ -13071,6 +16212,8 @@ dedent """
 
     #  Python AST Frontend , MyPy-style type comments , Script function
     def test_annot_ast_mypy_fn(self):
+        # [FUNCTION DOC] Load python source with a scripted function with a comment annotation
+        # for each type pair and compare schemas with stored text.
         code = dedent('''
             import torch
             @torch.jit.script
@@ -13087,6 +16230,9 @@ dedent """
 
     #  Python AST Frontend , MyPy-style type comments , Script method
     def test_annot_ast_mypy_method(self):
+        # [FUNCTION DOC] Load python source defining a script module whose method has a
+        # comment annotation for each type pair, and compare method schemas with stored text
+        # (mangling stripped).
         code = dedent('''
             import torch
             class FooModule(torch.jit.ScriptModule):
@@ -13106,15 +16252,23 @@ dedent """
     # Tests that "# type: ignore[*]" is supported in type lines and is
     # properly ignored.
     def test_mypy_type_ignore(self):
+        # [FUNCTION DOC] Ignore-style annotation comments on the definition line (plain and with
+        # a rule code) must not be mistaken for signature annotations; both functions script.
         @torch.jit.script
         def foo(x):  # type: ignore
+            # [FUNCTION DOC] HELPER: Identity function whose definition line has an
+            # ignore comment.
             return x
 
         @torch.jit.script
         def bar(x):  # type: ignore[no-redef]
+            # [FUNCTION DOC] HELPER: Identity function whose definition line has an ignore
+            # comment with a rule code.
             return x
 
     def test_method_casts_script(self):
+        # [FUNCTION DOC] For each tensor cast method (byte, char, double, float, int, long,
+        # short), compile source text calling it and compare with eager.
         cast_types = [
             'byte', 'char', 'double', 'float', 'int', 'long', 'short'
         ]
@@ -13131,6 +16285,8 @@ dedent """
             self.assertEqual(cu_result, reference)
 
     def test_string_frontend_elif(self):
+        # [FUNCTION DOC] checkScript of source text using if, elif and else inside a loop
+        # (value 101).
         code = '''
             def func(niter):
                 # type: (int)
@@ -13150,13 +16306,20 @@ dedent """
         self.checkScript(dedent(code), (101,))
 
     def test_module_parameters_and_buffers(self):
+        # [FUNCTION DOC] A script module that uses an eager module with parameters and a buffer
+        # twice, plus another instance, gives the value computed by eager linear layers;
+        # export/import also works.
         weights = torch.randn(10, 10)
         bias = torch.randn(10)
         weights2 = torch.randn(10, 10)
         bias2 = torch.randn(10)
 
         class TestLinear(torch.nn.Module):
+            # [CLASS DOC] HELPER: Eager linear-like module with parameters, a ones buffer, and a
+            # reset method.
             def __init__(self, in_features, out_features):
+                # [FUNCTION DOC] HELPER: Create uninitialized weight and bias parameters and a
+                # buffer of ones, then reset.
                 super().__init__()
                 self.in_features = in_features
                 self.out_features = out_features
@@ -13166,6 +16329,8 @@ dedent """
                 self.reset_parameters()
 
             def reset_parameters(self):
+                # [FUNCTION DOC] HELPER: Initialize the weight with Kaiming uniform and the bias
+                # uniformly by fan-in.
                 torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
                 if self.bias is not None:
                     fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(self.weight)
@@ -13173,11 +16338,16 @@ dedent """
                     torch.nn.init.uniform_(self.bias, -bound, bound)
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Return the linear result plus the buffer.
                 return F.linear(input, self.weight, self.bias) + self.counter
 
         # Initialize a ScriptModule that uses the weak module above multiple times
         class Strong(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module using two eager TestLinear submodules with
+            # fixed weights.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create two TestLinear modules and assign the shared test
+                # weights and biases.
                 super().__init__()
                 self.fc1 = TestLinear(10, 10)
                 self.fc1.weight = torch.nn.Parameter(weights)
@@ -13188,6 +16358,8 @@ dedent """
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return x plus the first module twice plus the
+                # second module.
                 return x + self.fc1(x) + self.fc1(x) + self.fc2(x)
 
         strong_mod = Strong()
@@ -13206,12 +16378,21 @@ dedent """
         self.assertExportImportModule(strong_mod, (inp,))
 
     def test_module_copying(self):
+        # [FUNCTION DOC] A script module wrapping an eager module shares its parameters and
+        # buffers (same objects), recursively scripts its submodule, tracks in-place updates of
+        # weights but not reassignment.
         class Submodule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Eager module adding 100.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return x plus 100.
                 return x + 100
 
         class Weak(torch.nn.Module):
+            # [CLASS DOC] HELPER: Eager module with parameters, a buffer and a submodule used
+            # in forward.
             def __init__(self, in_features, out_features):
+                # [FUNCTION DOC] HELPER: Create ones weight and bias, a ones buffer and
+                # a Submodule.
                 super().__init__()
                 self.weight = torch.nn.Parameter(torch.ones(out_features, in_features))
                 self.bias = torch.nn.Parameter(torch.ones(out_features))
@@ -13219,16 +16400,21 @@ dedent """
                 self.submodule = Submodule()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return linear output plus the buffer plus the
+                # submodule output.
                 return F.linear(x, self.weight, self.bias) \
                     + self.buffer + self.submodule(x)
 
         class Strong(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module wrapping an eager module.
             def __init__(self, weak):
+                # [FUNCTION DOC] HELPER: Store the wrapped module.
                 super().__init__()
                 self.weak = weak
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Call the wrapped module.
                 return self.weak(x)
 
         inp = torch.ones(5, 5) * 5
@@ -13251,9 +16437,12 @@ dedent """
         self.assertFalse(strong_mod(inp).allclose(weak_mod(inp)))
 
     def test_backend_cudnn_enabled(self):
+        # [FUNCTION DOC] A script function reading the cudnn enabled backend flag compiles;
+        # no assertions.
         # Only test that this compiles
         @torch.jit.script
         def fn(x):
+            # [FUNCTION DOC] HELPER: Add 2 or 3 depending on the cudnn flag.
             if torch.backends.cudnn.enabled:
                 x = x + 2
             else:
@@ -13261,15 +16450,19 @@ dedent """
             return x
 
     def test_inplace_add(self):
+        # [FUNCTION DOC] checkScript of an in-place add on a result tensor.
 
         def foo(a, b):
+            # [FUNCTION DOC] HELPER: Add a and b, then add b in place to the result.
             c = a + b
             c.add_(b)
             return c
         self.checkScript(foo, (torch.rand(3), torch.rand(3)))
 
     def test_add_out(self):
+        # [FUNCTION DOC] checkScript of add with an out argument.
         def foo(a, b):
+            # [FUNCTION DOC] HELPER: Write the sum of c and b into e (twice a) and return e.
             c = a + b
             e = 2 * a
             torch.add(c, b, out=e)
@@ -13277,7 +16470,11 @@ dedent """
         self.checkScript(foo, (torch.rand(3), torch.rand(3)))
 
     def test_tuple_error_msg(self):
+        # [FUNCTION DOC] Unpacking an Any value after an isinstance tuple check must raise
+        # RuntimeError saying the tuple is not fully defined, highlighting the value.
         def fn(t: Any):
+            # [FUNCTION DOC] HELPER: Unpack an Any value refined only to a tuple, then add
+            # the parts.
             if isinstance(t, tuple):
                 a, b = t
             return a + b
@@ -13285,7 +16482,11 @@ dedent """
             s = torch.jit.script(fn)
 
     def test_augmented_assign(self):
+        # [FUNCTION DOC] checkScript of augmented assignments (add, subtract, divide, multiply)
+        # on tensors.
         def foo(a, b):
+            # [FUNCTION DOC] HELPER: Apply four augmented assignments to a with b and
+            # return both.
             a += b
             a -= b
             a /= b
@@ -13294,19 +16495,26 @@ dedent """
         self.checkScript(foo, (torch.rand(3), torch.rand(3)))
 
     def test_ignored_props(self):
+        # [FUNCTION DOC] A module that lists property names in the ignored attribute list can be
+        # scripted even though one raises; an ignored method can still read the property value.
         class A(nn.Module):
+            # [CLASS DOC] HELPER: Module with two ignored properties (one raising) and an
+            # ignored method.
             __jit_ignored_attributes__ = ["ignored", "ignored_return_val"]
 
             @property
             def ignored(self):
+                # [FUNCTION DOC] HELPER: Property that raises ValueError if ever read.
                 raise ValueError("shouldn't be called")
 
             @property
             def ignored_return_val(self):
+                # [FUNCTION DOC] HELPER: Property returning 1.
                 return 1
 
             @torch.jit.ignore
             def call(self):
+                # [FUNCTION DOC] HELPER: Ignored method returning the property value.
                 return self.ignored_return_val
 
         f = torch.jit.script(A())
@@ -13316,7 +16524,10 @@ dedent """
 
 
     def test_pass(self):
+        # [FUNCTION DOC] checkScript of pass statements in a loop and both branches of
+        # a conditional.
         def foo(x):
+            # [FUNCTION DOC] HELPER: Loop and branch containing only pass; return 3.
             # type: (bool) -> int
             for _ in range(3):
                 pass
@@ -13329,14 +16540,18 @@ dedent """
         self.checkScript(foo, (True,))
 
     def test_lhs_indexing(self):
+        # [FUNCTION DOC] checkScript of assignment into a row of a cloned tensor.
         def foo(a, b):
+            # [FUNCTION DOC] HELPER: Clone a and set its first row to b.
             a = a.clone()
             a[0] = b
             return a
         self.checkScript(foo, (torch.rand(2, 3), torch.rand(3)))
 
     def test_lhs_advanced_indexing_assignment(self):
+        # [FUNCTION DOC] checkScript of assignment through a boolean mask index.
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: Copy y into the positions of exp(x) where x equals one.
             a = torch.exp(x)
             b = x == 1
             a[b] = y[b]
@@ -13344,7 +16559,9 @@ dedent """
         self.checkScript(foo, (torch.ones(4, 3), torch.ones(4, 3)))
 
     def test_lhs_advanced_indexing_augmented_assignment(self):
+        # [FUNCTION DOC] checkScript of augmented assignment through a boolean mask index.
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: Add y into the positions of exp(x) where x equals one.
             a = torch.exp(x)
             b = x == 1
             a[b] += y[b]
@@ -13352,27 +16569,36 @@ dedent """
         self.checkScript(foo, (torch.ones(4, 3), torch.ones(4, 3)))
 
     def test_lhs_indexing_list(self):
+        # [FUNCTION DOC] checkScript of assignment into a list element.
         def foo(a, b):
+            # [FUNCTION DOC] HELPER: Replace the single list element by b.
             ls = [a]
             ls[0] = b
             return ls
         self.checkScript(foo, (torch.rand(2, 3), torch.rand(3)))
 
     def test_inplace_copy_script(self):
+        # [FUNCTION DOC] checkScript of in-place copy into a fresh random tensor.
         def foo(x):
+            # [FUNCTION DOC] HELPER: Copy x into a random 3x4 tensor and return it.
             a = torch.rand(3, 4)
             a.copy_(x)
             return a
         self.checkScript(foo, (torch.rand(3, 4),))
 
     def test_lhs_indexing_increment(self):
+        # [FUNCTION DOC] checkScript of augmented assignment on an indexed tensor row.
         def foo(a, b):
+            # [FUNCTION DOC] HELPER: Add b into the first row of a.
             a[0] += b
             return a
         self.checkScript(foo, (torch.rand(2, 3), torch.rand(3)))
 
     def test_lhs_indexing_increment_list(self):
+        # [FUNCTION DOC] checkScript of augmented assignment on a list element holding a tensor.
         def foo(a, b):
+            # [FUNCTION DOC] HELPER: Add b into the first tensor of a list built from a clone
+            # and b.
             a = a.clone()
             ls = [a, b]
             ls[0] += b
@@ -13380,67 +16606,91 @@ dedent """
         self.checkScript(foo, (torch.rand(2, 3), torch.rand(3)))
 
     def test_lhs_indexing_increment_list_prim(self):
+        # [FUNCTION DOC] checkScript of augmented assignment on an int list element.
         def foo():
+            # [FUNCTION DOC] HELPER: Add 5 to the first element of a literal int list.
             ls = [1, 2, 3]
             ls[0] += 5
             return ls
         self.checkScript(foo, ())
 
     def test_lhs_indexing_multi(self):
+        # [FUNCTION DOC] checkScript of a tuple assignment mixing plain names and an
+        # indexed target.
         def foo(a, b):
+            # [FUNCTION DOC] HELPER: Assign a tuple into a name, an indexed row of a clone, and
+            # another name.
             a = a.clone()
             foo, a[0], bar = (1, b, 3)
             return foo, a, bar
         self.checkScript(foo, (torch.rand(2, 3), torch.rand(3)))
 
     def test_bool_dispatch(self):
+        # [FUNCTION DOC] checkScript of max_pool1d overload dispatch on the return-indices flag
+        # given by keyword or position, and with defaults, with emit hooks disabled.
         with torch._jit_internal._disable_emit_hooks():  # TODO: Python print broadcasting list
             def kwarg_false(x):
+                # [FUNCTION DOC] HELPER: Max pool with return indices false by keyword.
                 # type: (Tensor) -> Tensor
                 return F.max_pool1d(x, 1, 1, return_indices=False)
             self.checkScript(kwarg_false, (torch.randn(3, 3, 3),))
 
             def kwarg_true(x):
+                # [FUNCTION DOC] HELPER: Max pool with return indices true by keyword.
                 # type: (Tensor) -> Tuple[Tensor, Tensor]
                 return F.max_pool1d(x, 1, 1, return_indices=True)
             self.checkScript(kwarg_true, (torch.randn(3, 3, 3),))
 
             def full_kwarg_false(x):
+                # [FUNCTION DOC] HELPER: Max pool with ceil mode and return indices false
+                # by keyword.
                 # type: (Tensor) -> Tensor
                 return F.max_pool1d(x, 1, 1, ceil_mode=False, return_indices=False)
             self.checkScript(full_kwarg_false, (torch.randn(3, 3, 3),))
 
             def full_kwarg_true(x):
+                # [FUNCTION DOC] HELPER: Max pool with ceil mode false and return indices true
+                # by keyword.
                 # type: (Tensor) -> Tuple[Tensor, Tensor]
                 return F.max_pool1d(x, 1, 1, ceil_mode=False, return_indices=True)
             self.checkScript(full_kwarg_true, (torch.randn(3, 3, 3),))
 
             def use_default(x):
+                # [FUNCTION DOC] HELPER: Max pool with default options.
                 # type: (Tensor) -> Tensor
                 return F.max_pool1d(x, 1, 1)
             self.checkScript(use_default, (torch.randn(3, 3, 3),))
 
             def arg_false(x):
+                # [FUNCTION DOC] HELPER: Max pool with positional arguments, return
+                # indices false.
                 # type: (Tensor) -> Tensor
                 return F.max_pool1d(x, 1, 1, 0, 1, False, False)
             self.checkScript(arg_false, (torch.randn(3, 3, 3),))
 
             def arg_true(x):
+                # [FUNCTION DOC] HELPER: Max pool with positional arguments, return indices true.
                 # type: (Tensor) -> Tuple[Tensor, Tensor]
                 return F.max_pool1d(x, 1, 1, 0, 1, False, True)
             self.checkScript(arg_true, (torch.randn(3, 3, 3),))
 
     def test_infer_size(self):
+        # [FUNCTION DOC] checkScript of the internal size inference helper.
         from torch._C import _infer_size
 
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Infer the broadcast size of two tensor sizes.
             # type: (Tensor, Tensor) -> List[int]
             return _infer_size(x.size(), y.size())
 
         self.checkScript(fn, (torch.ones(2, 4, 2), torch.ones(2, 4, 2)))
 
     def test_hash(self):
+        # [FUNCTION DOC] Scripted hash of ints, floats and strings: equal inputs hash equal and
+        # unequal inputs hash differently.
         def tester(fn, inputs):
+            # [FUNCTION DOC] HELPER: For every pair of inputs, assert equal hashes when equal and
+            # different otherwise.
             for x in inputs:
                 for y in inputs:
                     if x == y:
@@ -13450,16 +16700,19 @@ dedent """
 
         @torch.jit.script
         def int_hash(x):
+            # [FUNCTION DOC] HELPER: Return the hash of an int.
             # type: (int) -> int
             return hash(x)
 
         @torch.jit.script
         def float_hash(x):
+            # [FUNCTION DOC] HELPER: Return the hash of a float.
             # type: (float) -> int
             return hash(x)
 
         @torch.jit.script
         def str_hash(x):
+            # [FUNCTION DOC] HELPER: Return the hash of a string.
             # type: (str) -> int
             return hash(x)
 
@@ -13468,21 +16721,29 @@ dedent """
         tester(str_hash, ("", "hello", "a"))
 
     def test_id(self):
+        # [FUNCTION DOC] The id builtin is not allowed on scalars (RuntimeError) but works on
+        # class instances, giving different ids for different objects and for None.
         with self.assertRaisesRegex(RuntimeError, "Expected a value"):
             @torch.jit.script
             def test_id_scalars():
+                # [FUNCTION DOC] HELPER: Compare the ids of an int and None; scripting must fail.
                 return id(2) == id(None)
 
         @torch.jit.script
         class FooTest:
+            # [CLASS DOC] HELPER: Script class holding one value.
             def __init__(self, x):
+                # [FUNCTION DOC] HELPER: Store the value as foo.
                 self.foo = x
 
             def getFooTest(self):
+                # [FUNCTION DOC] HELPER: Return the stored value.
                 return self.foo
 
         @torch.jit.script
         def test_id_class_types():
+            # [FUNCTION DOC] HELPER: Create two instances and assert they are different objects
+            # with different ids.
             obj1 = FooTest(torch.tensor(3))
             obj2 = FooTest(torch.tensor(2))
             assert obj1 is not obj2  # noqa: S101
@@ -13493,8 +16754,12 @@ dedent """
         self.assertTrue(test_id_class_types())
 
     def test_mutable_dce(self):
+        # [FUNCTION DOC] Dead code elimination removes an unused mutated tensor but keeps one
+        # that is returned: two random ops and one add remain.
         @torch.jit.script
         def foo():
+            # [FUNCTION DOC] HELPER: Two tensors each mutated by in-place add; only the first
+            # is returned.
             a = torch.rand(2, 3)
             a += torch.rand(2, 3)
             b = torch.rand(2, 3)
@@ -13506,8 +16771,12 @@ dedent """
             .check_count("aten::add", 1, exactly=True).run(str(foo.graph))
 
     def test_mutable_dce_block(self):
+        # [FUNCTION DOC] Dead code elimination inside a conditional keeps the mutation of
+        # the returned tensor and drops the other: a conditional and exactly one random op
+        # in the graph.
         @torch.jit.script
         def foo():
+            # [FUNCTION DOC] HELPER: Mutate two tensors in a conditional and return the second.
             a = torch.rand(2, 3)
             a += torch.rand(2, 3)
             b = torch.rand(2, 3)
@@ -13521,16 +16790,24 @@ dedent """
             .run(str(foo.graph))
 
     def test_mutable_dce_graph_input(self):
+        # [FUNCTION DOC] Mutation of a graph input is kept by dead code elimination, so the
+        # random op and add remain.
         @torch.jit.script
         def foo(a):
+            # [FUNCTION DOC] HELPER: Add a random tensor into the input in place and
+            # return nothing.
             a += torch.rand(2, 3)
             # shouldn't clean up `a` even though it's not used in the output
 
         FileCheck().check("aten::rand").check("aten::add").run(str(foo.graph))
 
     def test_mutable_dce_list(self):
+        # [FUNCTION DOC] A tensor mutated through a list element alias is not eliminated: two
+        # random ops remain.
         @torch.jit.script
         def foo(a):
+            # [FUNCTION DOC] HELPER: Mutate an alias fetched from a list and return a different
+            # random tensor.
             l = []
             l.append(a)
             c = l[0]
@@ -13542,8 +16819,12 @@ dedent """
         FileCheck().check_count("aten::rand", 2, exactly=True).run(str(foo.graph))
 
     def test_mutable_dce_loop(self):
+        # [FUNCTION DOC] In a loop, a dead local is eliminated while the aliased mutation is
+        # kept: a loop, the get-item op and one random op in the loop remain.
         @torch.jit.script
         def foo(a):
+            # [FUNCTION DOC] HELPER: Loop creating a dead random tensor and mutating a
+            # list alias.
             l = []
             l.append(a)
             i = 0
@@ -13559,7 +16840,11 @@ dedent """
             .check_count("aten::rand", 1, exactly=True).run(str(foo.graph))
 
     def test_mutable_dce_indirect_wildcards(self):
+        # [FUNCTION DOC] checkScript of mutation of a tensor read back through a view stored in
+        # a list.
         def fn():
+            # [FUNCTION DOC] HELPER: Store a view in a list, add in place to the base and return
+            # the view from the list.
             x = torch.ones(2, 3)
             x_1 = x.view(-1)
             l = []
@@ -13570,7 +16855,10 @@ dedent """
         self.checkScript(fn, ())
 
     def test_mutable_dce_indirect_wildcard_write(self):
+        # [FUNCTION DOC] checkScript of an indexed write to a tensor that was appended to a list.
         def fn():
+            # [FUNCTION DOC] HELPER: Write to a tensor that is also appended to a list; return
+            # the tensor.
             indexes = torch.jit.annotate(List[Tensor], [])
             word_ids = torch.zeros(10, dtype=torch.int32)
             word_ids[1] = 1
@@ -13580,7 +16868,11 @@ dedent """
         self.checkScript(fn, ())
 
     def test_mutable_dce_wildcards(self):
+        # [FUNCTION DOC] checkScript (simple profiling mode) of in-place add on a tensor also
+        # read via a list.
         def fn():
+            # [FUNCTION DOC] HELPER: Append a tensor to a list, add to it in place and return the
+            # list entry.
             x = torch.ones(2, 3)
             l = []
             l.append(x)
@@ -13591,26 +16883,34 @@ dedent """
         self.checkScript(fn, (), profiling=ProfilingMode.SIMPLE)
 
     def test_cpp_function_tensor_str(self):
+        # [FUNCTION DOC] Printing the output of a scripted function with gradient-requiring
+        # inputs works with stdout captured (only checks it does not fail).
         x = torch.randn(2, 2)
         scale = torch.randn(2, 2, requires_grad=True)
         shift = torch.randn(2, 2, requires_grad=True)
 
         @torch.jit.script
         def fn(x, scale, shift):
+            # [FUNCTION DOC] HELPER: Return scale times x plus shift.
             return scale * x + shift
 
         with self.capture_stdout() as captured:
             print(fn(x, scale, shift))
 
     def test_string_index(self):
+        # [FUNCTION DOC] checkScript of string character indexing, positive and negative.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the third and last characters of a string.
             # type: (str)
             return x[2], x[-1]
 
         self.checkScript(fn, ("abcde",))
 
     def test_ord(self):
+        # [FUNCTION DOC] checkScript of the ord builtin on one-character strings, including a
+        # byte string.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the code point of a character.
             # type: (str) -> int
             return ord(x)
 
@@ -13618,6 +16918,7 @@ dedent """
         self.checkScript(fn, ("y"))
 
         def index_str_to_tensor(s):
+            # [FUNCTION DOC] HELPER: Return a tensor of the code point of a character.
             # type: (str) -> Tensor
             return torch.tensor(ord(s))  # noqa: T484
 
@@ -13625,7 +16926,9 @@ dedent """
         self.checkScript(index_str_to_tensor, (s,))
 
     def test_chr(self):
+        # [FUNCTION DOC] checkScript of the chr builtin.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the character for an int.
             # type: (int) -> str
             return chr(x)
 
@@ -13633,11 +16936,14 @@ dedent """
         self.checkScript(fn, (97,))
 
     def test_round(self):
+        # [FUNCTION DOC] checkScript of the round builtin on a float and an int.
         def round_float(x):
+            # [FUNCTION DOC] HELPER: Round a float.
             # type: (float) -> float
             return round(x)
 
         def round_int(x):
+            # [FUNCTION DOC] HELPER: Round an int.
             # type: (int) -> float
             return round(x)
 
@@ -13645,15 +16951,20 @@ dedent """
         self.checkScript(round_int, (2,))
 
     def test_convert_base(self):
+        # [FUNCTION DOC] checkScript of hex, oct and bin conversion for negative, zero and
+        # positive ints.
         def test_hex(x):
+            # [FUNCTION DOC] HELPER: Return the hex string of an int.
             # type: (int) -> str
             return hex(x)
 
         def test_oct(x):
+            # [FUNCTION DOC] HELPER: Return the octal string of an int.
             # type: (int) -> str
             return oct(x)
 
         def test_bin(x):
+            # [FUNCTION DOC] HELPER: Return the binary string of an int.
             # type: (int) -> str
             return bin(x)
 
@@ -13665,10 +16976,16 @@ dedent """
 
     @unittest.skipIf(IS_SANDCASTLE, "NYI: TemporaryFileName support for Sandcastle")
     def test_get_set_state(self):
+        # [FUNCTION DOC] Save and load script modules with custom get/set state: buffers shift by
+        # 10 on load in the top module and the nested one, and an eager module with exported
+        # state methods works. Skipped on sandcastle.
         class Root(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with two buffers and a number constant, with
+            # state methods.
             __constants__ = ['number']
 
             def __init__(self, number):
+                # [FUNCTION DOC] HELPER: Create two ones buffers and store the number.
                 super().__init__()
                 self.buffer1 = nn.Buffer(torch.ones(2, 2))
                 self.buffer2 = nn.Buffer(torch.ones(2, 2))
@@ -13676,18 +16993,26 @@ dedent """
 
             @torch.jit.script_method
             def __getstate__(self):
+                # [FUNCTION DOC] HELPER: Return the buffers, 74 and the training flag as
+                # the state.
                 return (self.buffer1, self.buffer2, 74, self.training)
 
             @torch.jit.script_method
             def __setstate__(self, state):
+                # [FUNCTION DOC] HELPER: Restore buffers shifted by ten and the training flag
+                # from the state.
                 self.buffer1 = state[0] + 10
                 self.buffer2 = state[1] + 10
                 self.training = state[3]
 
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with two buffers, a number constant and a
+            # submodule, with state methods.
             __constants__ = ['number']
 
             def __init__(self, number, submodule):
+                # [FUNCTION DOC] HELPER: Create two ones buffers and store the number
+                # and submodule.
                 super().__init__()
                 self.buffer1 = nn.Buffer(torch.ones(2, 2))
                 self.buffer2 = nn.Buffer(torch.ones(2, 2))
@@ -13696,10 +17021,14 @@ dedent """
 
             @torch.jit.script_method
             def __getstate__(self):
+                # [FUNCTION DOC] HELPER: Return buffers, 74, the submodule and the training flag
+                # as the state.
                 return (self.buffer1, self.buffer2, 74, self.submodule, self.training)
 
             @torch.jit.script_method
             def __setstate__(self, state):
+                # [FUNCTION DOC] HELPER: Restore buffers shifted by ten, the submodule and the
+                # training flag from the state.
                 self.buffer1 = state[0] + 10
                 self.buffer2 = state[1] + 10
                 self.submodule = state[3]
@@ -13724,20 +17053,26 @@ dedent """
 
         # Check simpler module
         class NoArgState(torch.nn.Module):
+            # [CLASS DOC] HELPER: Eager module with two buffers and exported state methods.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create two ones buffers.
                 super().__init__()
                 self.buffer1 = nn.Buffer(torch.ones(2, 2))
                 self.buffer2 = nn.Buffer(torch.ones(2, 2))
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Do nothing.
                 pass
 
             @torch.jit.export
             def __getstate__(self):
+                # [FUNCTION DOC] HELPER: Return the pair 5 and the training flag as state.
                 return 5, self.training
 
             @torch.jit.export
             def __setstate__(self, state):
+                # [FUNCTION DOC] HELPER: Set buffer one to ones plus the first state value,
+                # buffer two to ones plus ten, and restore the training flag.
                 self.buffer1 = torch.ones(2, 2) + state[0]
                 self.buffer2 = torch.ones(2, 2) + 10
                 self.training = state[1]
@@ -13752,19 +17087,25 @@ dedent """
 
 
     def test_string_slicing(self):
+        # [FUNCTION DOC] checkScript of string slicing with positive, negative, reversed and
+        # over-long bounds.
         def fn1(x):
+            # [FUNCTION DOC] HELPER: Slice characters 1 to 3.
             # type: (str) -> str
             return x[1:3]
 
         def fn2(x):
+            # [FUNCTION DOC] HELPER: Slice from the last character index to 3.
             # type: (str) -> str
             return x[-1:3]
 
         def fn3(x):
+            # [FUNCTION DOC] HELPER: Slice from 3 to 1 (empty).
             # type: (str) -> str
             return x[3:1]
 
         def fn4(x):
+            # [FUNCTION DOC] HELPER: Slice from 3 to 100.
             # type: (str) -> str
             return x[3:100]
 
@@ -13774,6 +17115,9 @@ dedent """
         self.checkScript(fn4, ("abcdefghi",))
 
     def test_early_return_closure(self):
+        # [FUNCTION DOC] Compile source text with closures defined in functions and check the
+        # exit transforms: closure creation twice, an if with value in a closure, a loop in a
+        # closure, and a closure returning different types raises RuntimeError.
         code = dedent('''
             def tanh(self):
                 output = torch.tanh(self)
@@ -13834,8 +17178,12 @@ dedent """
 
     @_inline_everything
     def test_early_return_fork_join(self):
+        # [FUNCTION DOC] Forking a script function with early returns: the graph has a fork
+        # block, a conditional and a return. Inlines everything.
         @torch.jit.script
         def foo(x):
+            # [FUNCTION DOC] HELPER: Return the negation and x or x plus one depending on
+            # the rank.
             if x.dim() == 2:
                 return torch.neg(x), x
             else:
@@ -13845,6 +17193,8 @@ dedent """
 
         @torch.jit.script
         def wait_script(x):
+            # [FUNCTION DOC] HELPER: Fork foo, call foo directly, and wait for the future; return
+            # both results.
             fut = torch.jit._fork(foo, x)
             y_hat = foo(x)
             y = torch.jit._wait(fut)
@@ -13854,8 +17204,11 @@ dedent """
                    .run(wait_script.graph)
 
     def test_early_return_type_refinement(self):
+        # [FUNCTION DOC] An early return refines an optional so the else branch returns an int;
+        # results for None and 2 are 1 and 2.
         @torch.jit.script
         def test(x):
+            # [FUNCTION DOC] HELPER: Return 1 for None, else the int value.
             # type: (Optional[int]) -> int
             if x is None:
                 return 1
@@ -13865,11 +17218,18 @@ dedent """
         self.assertEqual(test(2), 2)
 
     def test_exceptions_with_control_flow(self):
+        # [FUNCTION DOC] Check how many guard conditionals are added by the exit transform for
+        # functions with raises on branches and loops; results of both successful and failing
+        # runs are checked.
         def test_num_ifs(func, num_ifs):
+            # [FUNCTION DOC] HELPER: Assert the scripted graph has exactly the expected number
+            # of conditionals.
             g = torch.jit.script(func).graph
             FileCheck().check_count("prim::If", num_ifs, exactly=True).run(g)
 
         def no_guard_ifs_added(x):
+            # [FUNCTION DOC] HELPER: Return 1 for x equal 1, otherwise raise in both
+            # nested branches.
             # type: (int) -> int
             if x == 1:
                 return 1
@@ -13906,6 +17266,7 @@ dedent """
         #   return (%20)
 
         def no_ifs_added(x):
+            # [FUNCTION DOC] HELPER: Raise for negative x, otherwise return x.
             # type: (int) -> int
             if x < 0:
                 raise RuntimeError("hi")
@@ -13916,6 +17277,8 @@ dedent """
         test_num_ifs(no_ifs_added, 1)
 
         def test_if_might(x):
+            # [FUNCTION DOC] HELPER: Nested conditionals where only some paths return, one
+            # raises; add 2 to a.
             # type: (int)
             if x > 0:
                 if x == 1:
@@ -13932,6 +17295,8 @@ dedent """
         test_num_ifs(test_if_might, 3)  # one if added to guard a + 2
 
         def test_loop_no_escape(x):
+            # [FUNCTION DOC] HELPER: Loop whose body always raises on non-negative x, return 5
+            # for negative x.
             # type: (int)
             if x >= 0:
                 for _ in range(x):
@@ -13948,6 +17313,8 @@ dedent """
         test_num_ifs(test_loop_no_escape, 1)
 
         def test_loop_exception_with_continue(x):
+            # [FUNCTION DOC] HELPER: Loop that raises on a matching index and otherwise
+            # continues; return i plus 5.
             # type: (int)
             i = 0
             for i in range(5):
@@ -13964,6 +17331,9 @@ dedent """
 
 
     def test_exception_exits_closure(self):
+        # [FUNCTION DOC] Source text where a closure raises and the outer function has no return
+        # raises RuntimeError about not returning along all paths; a closure that raises does not
+        # break exit pairs, and the final graph has one conditional.
         code = dedent('''
             def no_return_func(self):
                 # type: (Tensor) -> Tensor
@@ -13993,7 +17363,13 @@ dedent """
         FileCheck().check_count("prim::If", 1, exactly=True).run(func.graph)
 
     def test_non_final_return(self):
+        # [FUNCTION DOC] checkScript, over three input values, of functions whose returns are
+        # not at the end of the body (branches, nested, early, mixed with string building),
+        # plus helpers whose variables are used after a return branch and whose dead code
+        # follows returns.
         def simple(x):
+            # [FUNCTION DOC] HELPER: Return x plus 1 or 2 by branch; the raise after
+            # is unreachable.
             if bool(x > 3):
                 return x + 1
             else:
@@ -14001,6 +17377,7 @@ dedent """
             raise RuntimeError("nope")
 
         def nest(x):
+            # [FUNCTION DOC] HELPER: Nested conditionals with a return in each outer branch.
             x = x + 1
             if bool(x > 3):
                 if bool(x > 4):
@@ -14010,6 +17387,8 @@ dedent """
                 return x + 2
 
         def early_ret(x):
+            # [FUNCTION DOC] HELPER: Return early from a branch, otherwise continue and
+            # return later.
             x = x + 1
             if bool(x > 3):
                 return x + 1
@@ -14017,6 +17396,7 @@ dedent """
             return x + 2
 
         def nest_early_ret(x):
+            # [FUNCTION DOC] HELPER: Nested early returns, then fall through to a later return.
             x = x + 1
             if bool(x > 3):
                 if bool(x > 4):
@@ -14026,6 +17406,8 @@ dedent """
             return x + 2
 
         def not_early_ret(x):
+            # [FUNCTION DOC] HELPER: Build a string over branches, with a nested return, and
+            # return an int and the string.
             s = ""
             if bool(x > 3):
                 if bool(x > 4):
@@ -14037,6 +17419,8 @@ dedent """
             return 7, s
 
         def not_total_ret(x):
+            # [FUNCTION DOC] HELPER: Return a pair in nested branches, else build a string and
+            # return after.
             s = ""
             if bool(x > 3):
                 if bool(x > 4):
@@ -14053,6 +17437,8 @@ dedent """
                 self.checkScript(func, (torch.tensor(2.5 + i),))
 
         def vars_used_after_ret(x):
+            # [FUNCTION DOC] HELPER: Define variables only in the else branch and use them after
+            # the conditional.
             # type: (int) -> int
             if x == 0:
                 return x
@@ -14065,6 +17451,8 @@ dedent """
         self.checkScript(vars_used_after_ret, (0,))
 
         def complicated(x):
+            # [FUNCTION DOC] HELPER: Nested conditionals with returns followed by dead
+            # assertions; the other paths define a and b and return their sum.
             # type: (int) -> int
             if x:
                 if x == 2:
@@ -14087,15 +17475,21 @@ dedent """
             self.checkScript(complicated, (i,))
 
     def test_partial_returns(self):
+        # [FUNCTION DOC] Functions that do not return on all paths with a declared return type
+        # must raise RuntimeError; a function without annotations that falls off the end
+        # returns None.
         with self.assertRaisesRegex(RuntimeError, "does not return along all"):
             @torch.jit.script
             def no_ret():
+                # [FUNCTION DOC] HELPER: Declared to return an int but only passes; scripting
+                # must fail.
                 # type: () -> int
                 pass
 
         with self.assertRaisesRegex(RuntimeError, "does not return along all"):
             @torch.jit.script
             def partial(x):
+                # [FUNCTION DOC] HELPER: Returns an int in one branch only; scripting must fail.
                 # type: (Tensor) -> int
                 if x:
                     return 1
@@ -14103,18 +17497,25 @@ dedent """
         with self.assertRaisesRegex(RuntimeError, "does not return along all"):
             @torch.jit.script
             def typed_none():
+                # [FUNCTION DOC] HELPER: Declared to return an optional int but only passes;
+                # scripting must fail.
                 # type: () -> Optional[int]
                 pass
 
         @torch.jit.script
         def none_ret():
+            # [FUNCTION DOC] HELPER: Function that only passes and returns None.
             pass
 
         self.assertIs(none_ret(), None)
         FileCheck().check(": None").run(none_ret.graph)
 
     def test_early_returns_loops(self):
+        # [FUNCTION DOC] checkScript of early returns inside while and for loops, including
+        # nested loops.
         def nest_while_ret(x):
+            # [FUNCTION DOC] HELPER: While loop with a return in one branch and a break in
+            # the other.
             # type: (int) -> int
             y = 4
             while x < 4:
@@ -14132,6 +17533,8 @@ dedent """
         self.checkScript(nest_while_ret, (4,))
 
         def loop_ret(x, y):
+            # [FUNCTION DOC] HELPER: For loop with a conditional return, then adjust the counter
+            # after the loop.
             # type: (int, int) -> (int)
             i = 0
             for i in range(x):
@@ -14146,6 +17549,7 @@ dedent """
         self.checkScript(loop_ret, (3, 1))
 
         def test_will_ret(y):
+            # [FUNCTION DOC] HELPER: Return 2 on the first loop iteration, otherwise 1.
             # type: (int) -> int
             for _ in range(y):
                 return 2
@@ -14155,6 +17559,7 @@ dedent """
         self.checkScript(test_will_ret, (1,))
 
         def test_loop_nest_ret(y):
+            # [FUNCTION DOC] HELPER: Nested loops with returns inside the inner and outer bodies.
             # type: (int) -> int
             for _ in range(y):
                 for _ in range(y - 2):
@@ -14167,6 +17572,9 @@ dedent """
         self.checkScript(test_loop_nest_ret, (2,))
 
     def test_nn_init(self):
+        # [FUNCTION DOC] For several torch.nn.init functions, compile source text calling it,
+        # compare its result with the eager function under the same random state, and check no
+        # python op is in the graph.
         tests = (
             ('constant_', (lambda: (torch.ones(2, 2), 2.5)), "Tensor, float"),
             ('ones_', (lambda: (torch.ones(2, 2),)), "Tensor"),
@@ -14197,6 +17605,9 @@ dedent """
             FileCheck().check_not("prim::PythonOp").run(cu.test.graph)
 
     def test_nn_init_generator(self):
+        # [FUNCTION DOC] For random nn.init functions taking a generator argument, compile source
+        # text, and check a provided generator gives the same result as eager with the same seed,
+        # independent of the default generator; no python op appears.
         init_fns = (
             'uniform_', 'normal_', 'xavier_normal_', 'xavier_uniform_',
         )
@@ -14232,7 +17643,13 @@ dedent """
             FileCheck().check_not("prim::PythonOp").run(cu.test.graph)
 
     def test_parse_generator(self):
+        # [FUNCTION DOC] Parse IR containing a generator constant with a seed and check the
+        # parsed generator has the seed; negative seeds and seeds above the 63-bit range
+        # raise RuntimeError.
         def _test_parse_generator(seed):
+            # [FUNCTION DOC] HELPER: Parse IR with a generator constant for the seed, find the
+            # generator typed node and assert the type and the seed of the stored generator
+            # (raises AssertionError otherwise).
             jit_graph = parse_ir(
                 f"""
                 graph():
@@ -14271,7 +17688,11 @@ dedent """
             _test_parse_generator(2**63)
 
     def test_early_return_rewrite(self):
+        # [FUNCTION DOC] Early return rewriting: a function with an early return has one
+        # conditional; a function with several early returns and fall-throughs has three; results
+        # match eager.
         def test_foo(x: bool):
+            # [FUNCTION DOC] HELPER: Return 1 if the flag is set, else 2.
             if x:
                 return 1
             return 2
@@ -14281,6 +17702,8 @@ dedent """
         FileCheck().check_count("prim::If", 1, exactly=True).run(torch.jit.script(test_foo).graph)
 
         def test_multiple(x: int):
+            # [FUNCTION DOC] HELPER: Several returns at different points depending on x and
+            # derived values.
             if x == 5:
                 return x * x
             else:
@@ -14309,8 +17732,11 @@ dedent """
         FileCheck().check_count("prim::If", 3, exactly=True).run(graph)
 
     def test_is_scripting_metacompile(self):
+        # [FUNCTION DOC] The scripting query is resolved at compile time, so the untaken branch
+        # with an uncompilable expression is not compiled.
         @torch.jit.script
         def foo():
+            # [FUNCTION DOC] HELPER: Return 1 when scripting; the else branch is not compiled.
             if torch.jit.is_scripting():
                 return 1
             else:
@@ -14319,14 +17745,21 @@ dedent """
         self.assertEqual(foo(), 1)
 
     def test_boolean_literal_constant_metacompile(self):
+        # [FUNCTION DOC] A constant boolean (module constant or literal) in a condition prunes
+        # the untaken branch at compile time, so branches returning different types compile;
+        # checkModule for both values.
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a boolean constant choosing between returning an
+            # int and a string.
             __constants__ = ['val']
 
             def __init__(self, val):
+                # [FUNCTION DOC] HELPER: Store the constant flag.
                 super().__init__()
                 self.val = val
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Return 1 if the flag is true, else the string two.
                 if self.val:
                     return 1
                 else:
@@ -14337,6 +17770,8 @@ dedent """
 
         @torch.jit.script
         def foo():
+            # [FUNCTION DOC] HELPER: Return 1 for a literal true condition; the else branch
+            # is pruned.
             if True:
                 return 1
             else:
@@ -14345,7 +17780,11 @@ dedent """
         self.assertEqual(foo(), 1)
 
     def test_assert_is_scripting_metacompile(self):
+        # [FUNCTION DOC] An assertion on the negated scripting query is compiled in script and
+        # raises the script error with the message when run.
         def foo():
+            # [FUNCTION DOC] HELPER: Assert not scripting with a message, then run an expression
+            # not compiled in script.
             assert not torch.jit.is_scripting(), "TestErrorMsg"  # noqa: S101
             print("hello") + 2  # will not be compiled
 
@@ -14354,8 +17793,12 @@ dedent """
             f()
 
     def test_isinstance_metacompile(self):
+        # [FUNCTION DOC] isinstance on primitive and named tuple types is resolved at
+        # compile time: calls with an argument of the wrong type raise, and named tuple
+        # values flow through.
         @torch.jit.script
         def test_primitive_type(x):
+            # [FUNCTION DOC] HELPER: Return x plus 1 if x is an int, else x minus 1.
             # type: (int) -> int
             if isinstance(x, int):
                 return x + 1
@@ -14370,6 +17813,8 @@ dedent """
 
         @torch.jit.script
         def test_non_primitive_types(x):
+            # [FUNCTION DOC] HELPER: Branch on isinstance checks against a named tuple type and
+            # return a number.
             # type: (_MyNamedTuple) -> Tensor
             if isinstance(1, _MyNamedTuple):
                 return 10
@@ -14383,16 +17828,21 @@ dedent """
         self.assertEqual(out, torch.tensor(6.0))
 
     def test_namedtuple_type_inference(self):
+        # [FUNCTION DOC] An annotated named tuple can be used in script; an unannotated one
+        # infers tensor fields so passing an int raises RuntimeError.
         _AnnotatedNamedTuple = NamedTuple('_NamedTupleAnnotated', [('value', int)])
         _UnannotatedNamedTuple = namedtuple('_NamedTupleUnAnnotated', ['value'])
 
         def test_check_named_tuple_value():
+            # [FUNCTION DOC] HELPER: Construct an annotated named tuple and return its field.
             named_tuple = _AnnotatedNamedTuple(1)
             return named_tuple.value
 
         self.checkScript(test_check_named_tuple_value, ())
 
         def test_error():
+            # [FUNCTION DOC] HELPER: Construct an unannotated named tuple with an int; scripting
+            # must fail.
             return _UnannotatedNamedTuple(1)
 
         with self.assertRaisesRegex(RuntimeError, r"Expected a value of type \'Tensor \(inferred\)\' "
@@ -14400,15 +17850,21 @@ dedent """
             torch.jit.script(test_error)
 
     def test_namedtuple_default_values_simple_type(self):
+        # [FUNCTION DOC] Named tuples with default field values of simple types round trip
+        # through checkModule, and the graph shows the defaults in the type.
 
         class Point(NamedTuple):
+            # [CLASS DOC] HELPER: Named tuple with an optional int defaulting to None and an int
+            # defaulting to 2.
             x: Optional[int] = None
             y: int = 2
 
         make_global(Point)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning its named tuple argument.
             def forward(self, point: Point):
+                # [FUNCTION DOC] HELPER: Return the point.
                 return point
 
         p = Point(x=3, y=2)
@@ -14422,8 +17878,12 @@ dedent """
                    .run(m.graph)
 
     def test_namedtuple_default_values_missing(self):
+        # [FUNCTION DOC] Named tuples with some fields lacking defaults: checkModule passes and
+        # the graph shows only the existing default.
 
         class Point(NamedTuple):
+            # [CLASS DOC] HELPER: Named tuple with two required fields and one int defaulting
+            # to 3.
             x: Optional[int]
             y: int
             z: int = 3
@@ -14431,7 +17891,9 @@ dedent """
         make_global(Point)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning its named tuple argument.
             def forward(self, point: Point):
+                # [FUNCTION DOC] HELPER: Return the point.
                 return point
 
         p1 = Point(x=3, y=2)
@@ -14446,8 +17908,12 @@ dedent """
                    .run(m.graph)
 
     def test_namedtuple_default_values_container_type(self):
+        # [FUNCTION DOC] Named tuples with default values of list and dict types round trip and
+        # the graph shows them.
 
         class Point(NamedTuple):
+            # [CLASS DOC] HELPER: Named tuple with optional list, list and optional dict fields
+            # with defaults.
             x: Optional[List[int]] = None
             y: List[int] = [1, 2, 3]
             z: Optional[Dict[str, int]] = {"a": 1}
@@ -14455,7 +17921,9 @@ dedent """
         make_global(Point)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning its named tuple argument.
             def forward(self, point: Point):
+                # [FUNCTION DOC] HELPER: Return the point.
                 return point
 
         p = Point(x=[4, 5, 6], y=[3, 2, 1], z={"b": 2})
@@ -14472,14 +17940,20 @@ dedent """
                    .run(m.graph)
 
     def test_namedtuple_default_values_Tensor_type(self):
+        # [FUNCTION DOC] A named tuple field defaulting to a tensor cannot be scripted:
+        # RuntimeError saying tensors are unsupported as defaults.
 
         class Point(NamedTuple):
+            # [CLASS DOC] HELPER: Named tuple with one tensor field defaulting to a
+            # random tensor.
             x: torch.Tensor = torch.rand(2, 3)
 
         make_global(Point)
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning its named tuple argument.
             def forward(self, point: Point):
+                # [FUNCTION DOC] HELPER: Return the point.
                 return point
 
         p = Point(x=torch.rand(2, 3))
@@ -14491,12 +17965,15 @@ dedent """
             m(p)
 
     def test_namedtuple_default_values_using_factory_constructor(self):
+        # [FUNCTION DOC] A named tuple made with the factory function and defaults is usable in
+        # script; its graph signature lists the defaults (with anonymous class name).
         Pair = namedtuple("Pair", ["x", "y"], defaults=(1, 2))
 
         make_global(Pair)
 
         @torch.jit.script
         def fn(x: Pair) -> Pair:
+            # [FUNCTION DOC] HELPER: Return the pair argument.
             return x
 
         # TODO: We can't use `checkScript` with the NamedTuple factory
@@ -14512,8 +17989,11 @@ dedent """
                    .run(fn.graph)
 
     def test_isinstance_dynamic(self):
+        # [FUNCTION DOC] isinstance with tuples of types, including nested tuple and a generic
+        # list type, is evaluated for an optional list: returns 2 for a list and 0 for None.
         @torch.jit.script
         def foo(a):
+            # [FUNCTION DOC] HELPER: Count matching isinstance checks on an optional list.
             # type: (Optional[List[int]]) -> int
             b = 0
             if isinstance(a, (int, (float,), list, str)):
@@ -14527,24 +18007,32 @@ dedent """
         self.assertEqual(foo(None), 0)
 
     def test_function_overloads(self):
+        # [FUNCTION DOC] Exercise overloaded script functions: dispatch by argument type, caching
+        # of overload compilation, new overloads after compile, default value handling, error
+        # messages for mismatched calls and missing or extra parameter annotations.
         # TODO: pyflakes currently does not compose @overload annotation with other
         # decorators. This is fixed on master but not on version 2.1.1.
         # Next version update remove noqa and add @typing.overload annotation
 
         @torch.jit._overload
         def test_simple(x1):
+            # [FUNCTION DOC] HELPER: Overload declaration for an int argument; body is pass.
             # type: (int) -> int
             pass
 
         @torch.jit._overload
         def test_simple(x1):  # noqa: F811
+            # [FUNCTION DOC] HELPER: Overload declaration for a float argument; body is pass.
             # type: (float) -> float
             pass
 
         def test_simple(x1):  # noqa: F811
+            # [FUNCTION DOC] HELPER: Implementation returning its argument.
             return x1
 
         def invoke_function():
+            # [FUNCTION DOC] HELPER: Call the overloaded function with a float and with
+            # another float.
             return test_simple(1.0), test_simple(.5)
 
         self.checkScript(invoke_function, ())
@@ -14560,24 +18048,30 @@ dedent """
         # testing that new functions added work with caching
         @torch.jit._overload
         def test_simple(x1):
+            # [FUNCTION DOC] HELPER: Overload declaration for a string argument; body is pass.
             # type: (str) -> str
             pass
 
         @torch.jit.script
         def my_func():
+            # [FUNCTION DOC] HELPER: Call the previously captured function object with a string.
             return old_func("hi")
 
         # testing new function same qualified name
         @torch.jit._overload
         def test_simple(a, b):
+            # [FUNCTION DOC] HELPER: Overload declaration of two ints with the same qualified
+            # name; body is pass.
             # type: (int, int) -> int
             pass
 
         def test_simple(a, b):
+            # [FUNCTION DOC] HELPER: Implementation adding two arguments.
             return a + b
 
         @torch.jit.script
         def fn():
+            # [FUNCTION DOC] HELPER: Call the two-argument version with 3 and 4.
             return test_simple(3, 4)
 
         self.assertEqual(fn(), 7)
@@ -14587,23 +18081,30 @@ dedent """
         # where the type is valid.
         @torch.jit._overload
         def identity(x1):
+            # [FUNCTION DOC] HELPER: Overload declaration for a string argument; body is pass.
             # type: (str) -> str
             pass
 
         @torch.jit._overload
         def identity(x1):  # noqa: F811
+            # [FUNCTION DOC] HELPER: Overload declaration for a float argument; body is pass.
             # type: (float) -> float
             pass
 
         def identity(x1=1.0):  # noqa: F811
+            # [FUNCTION DOC] HELPER: Implementation returning its argument (default 1.0).
             return x1
 
         def invoke():
+            # [FUNCTION DOC] HELPER: Call the overloaded function with no argument, a float and
+            # a string.
             return identity(), identity(.5), identity("hi")
 
         self.checkScript(invoke, ())
 
         def schema_match_failure():
+            # [FUNCTION DOC] HELPER: Call the overloaded function with a tuple (no
+            # matching overload).
             return identity((1, 2))
 
         thrown = False
@@ -14619,18 +18120,23 @@ dedent """
 
         @torch.jit._overload
         def impl_compile_failure(x, y):
+            # [FUNCTION DOC] HELPER: Overload declaration for two strings; body is pass.
             # type: (str, str) -> (str)
             pass
 
         @torch.jit._overload
         def impl_compile_failure(x, y):  # noqa: F811
+            # [FUNCTION DOC] HELPER: Overload declaration for two ints; body is pass.
             # type: (int, int) -> (int)
             pass
 
         def impl_compile_failure(x, y):  # noqa: F811
+            # [FUNCTION DOC] HELPER: Implementation subtracting two arguments (which fails
+            # for strings).
             return x - y
 
         def test():
+            # [FUNCTION DOC] HELPER: Call the overloaded function with two strings.
             impl_compile_failure("one", "two")
 
 
@@ -14639,14 +18145,18 @@ dedent """
 
         @torch.jit._overload
         def good_overload(x=1):
+            # [FUNCTION DOC] HELPER: Overload declaration with a default for an int; body
+            # is pass.
             # type: (int) -> (int)
             pass
 
         def good_overload(x=1):  # noqa: F811
+            # [FUNCTION DOC] HELPER: Implementation returning its argument (default 1).
             return x
 
         @torch.jit.script
         def foo():
+            # [FUNCTION DOC] HELPER: Call the overloaded function without arguments.
             return good_overload()
 
         self.assertEqual(foo(), 1)
@@ -14655,100 +18165,131 @@ dedent """
         with self.assertRaisesRegex(Exception, "must equal to the default parameter"):
             @torch.jit._overload
             def bad_default_on_overload(x, y=2):
+                # [FUNCTION DOC] HELPER: Overload declaration with default 2 for y; body is pass.
                 # type: (int, int) -> (int)
                 pass
 
             def bad_default_on_overload(x, y=1):  # noqa: F811
+                # [FUNCTION DOC] HELPER: Implementation with a different default 1 for y; body
+                # is pass.
                 # type: (int, int) -> (int)
                 pass
 
             @torch.jit.script
             def test():
+                # [FUNCTION DOC] HELPER: Call the function with 1 and 2.
                 return bad_default_on_overload(1, 2)
 
         @torch.jit._overload
         def diff_default(x):
+            # [FUNCTION DOC] HELPER: Overload declaration for an int argument; body is pass.
             # type: (int) -> int
             pass
 
         @torch.jit._overload
         def diff_default(x):  # noqa: F811
+            # [FUNCTION DOC] HELPER: Overload declaration for a string argument; body is pass.
             # type: (str) -> str
             pass
 
         def diff_default(x="hi"):  # noqa: F811
+            # [FUNCTION DOC] HELPER: Implementation returning its argument (default hi).
             return x
 
         def test():
+            # [FUNCTION DOC] HELPER: Call with no argument, an int and a string.
             return diff_default(), diff_default(2), diff_default("abc")
 
         self.assertEqual(test(), torch.jit.script(test)())
 
         @torch.jit._overload
         def diff_num_params(x):
+            # [FUNCTION DOC] HELPER: Overload declaration for one float argument; body is pass.
             # type: (float) -> float
             pass
 
         @torch.jit._overload
         def diff_num_params(x, y):  # noqa: F811
+            # [FUNCTION DOC] HELPER: Overload declaration for two int arguments; body is pass.
             # type: (int, int) -> int
             pass
 
         def diff_num_params(x, y=2, z=3):  # noqa: F811
+            # [FUNCTION DOC] HELPER: Implementation summing x, y and z with defaults.
             # type: (Union[float, int], int, int)
             return x + y + z
 
         def test():
+            # [FUNCTION DOC] HELPER: Call with one to three arguments.
             return diff_num_params(1.0), diff_num_params(1, 2), diff_num_params(1), diff_num_params(1, 2, 3)
 
         self.assertEqual(test(), torch.jit.script(test)())
 
         @torch.jit._overload
         def diff_num_params_no_annot():
+            # [FUNCTION DOC] HELPER: Overload declaration with no parameters; body is pass.
             # type: () -> int
             pass
 
         def diff_num_params_no_annot(x=1):    # noqa: F811
+            # [FUNCTION DOC] HELPER: Implementation with one defaulted parameter, returning it.
             return x
 
         def test():
+            # [FUNCTION DOC] HELPER: Call with a float; scripting must fail since the overload
+            # lacks the parameter.
             return diff_num_params_no_annot(1.0)
 
         with self.assertRaisesRegex(Exception, "Parameters not specified"):
             torch.jit.script(test)
 
     def test_function_overload_misuse(self):
+        # [FUNCTION DOC] Misuse of overloads must raise RuntimeError: overload with a real body,
+        # method overload with a real body, a missing implementation for a function or method.
         with self.assertRaisesRegex(RuntimeError, "Only `pass` statement or `...` can be the body"):
             @torch.jit._overload
             def wrong_decl_body(x: str) -> str:
+                # [FUNCTION DOC] HELPER: Overload declaration with a real body; must be rejected.
                 return x + "0"
 
         with self.assertRaisesRegex(RuntimeError, "Only `pass` statement or `...` can be the body"):
             class MyClass:
+                # [CLASS DOC] HELPER: Class with a method overload having a real body; must
+                # be rejected.
                 @torch.jit._overload_method
                 def method(self):
+                    # [FUNCTION DOC] HELPER: Method overload with a real body.
                     return 0
 
+        # [FUNCTION DOC] HELPER: Overload declaration for an int argument written on one line
+        # with an ellipsis body (doc above the decorator since the body shares the def line).
         @torch.jit._overload
         def null_overload(x: int) -> int: ...
 
         @torch.jit._overload
         def null_overload(x: str) -> str:  # noqa: F811
+            # [FUNCTION DOC] HELPER: Overload declaration for a string argument; body is pass.
             pass
 
         def null_overload_driver():
+            # [FUNCTION DOC] HELPER: Call the overloaded function with 0; no
+            # implementation exists.
             return null_overload(0)
 
         with self.assertRaisesRegex(RuntimeError, 'Implementation for the function ".+" is missing.'):
             torch.jit.script(null_overload_driver)
 
         class OverloadMisuse(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with two forward overload declarations and
+            # no implementation.
             @torch.jit._overload_method
             def forward(self, x: int):
+                # [FUNCTION DOC] HELPER: Method overload for an int argument; body is pass.
                 pass
 
             @torch.jit._overload_method
             def forward(self, x: Tensor):  # noqa: F811
+                # [FUNCTION DOC] HELPER: Method overload for a tensor argument; body is pass.
                 pass
 
         with self.assertRaisesRegex(RuntimeError, 'Implementation for the method ".+" is missing.'):
@@ -14756,11 +18297,16 @@ dedent """
 
 
     def test_script_method_torch_function_overload(self):
+        # [FUNCTION DOC] A scripted module called with a tensor subclass instance gives the same
+        # result as with a plain tensor, both by call and by forward.
         class MyCustomTensor(torch.Tensor):
+            # [CLASS DOC] HELPER: Tensor subclass with no extra behavior.
             pass
 
         class MyCustomModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module applying relu.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return relu of x.
                 return torch.relu(x)
 
         scripted_mod = torch.jit.script(MyCustomModule())
@@ -14775,17 +18321,24 @@ dedent """
         self.assertEqual(out2, ref_out)
 
     def test_function_overloading_isinstance(self):
+        # [FUNCTION DOC] Overloaded function whose implementation uses an isinstance check on a
+        # defaulted argument; checkScript of three call forms.
         @torch.jit._overload
         def my_conv(x, y):
+            # [FUNCTION DOC] HELPER: Overload declaration for float and string arguments; body
+            # is pass.
             # type: (float, str) -> (float)
             pass
 
         @torch.jit._overload
         def my_conv(x, y):  # noqa: F811
+            # [FUNCTION DOC] HELPER: Overload declaration for two float arguments; body is pass.
             # type: (float, float) -> (float)
             pass
 
         def my_conv(x, y=2.0):  # noqa: F811
+            # [FUNCTION DOC] HELPER: Implementation choosing arithmetic by whether y is a string,
+            # and its value.
             if isinstance(y, str):
                 if y == "hi":
                     return 4.0 - x
@@ -14795,36 +18348,52 @@ dedent """
                 return 2.0 + x
 
         def test_uses():
+            # [FUNCTION DOC] HELPER: Call with one float, a float and a string, and two floats.
             return my_conv(1.5), my_conv(1.5, "hi"), my_conv(1.5, 5.0)
 
         self.checkScript(test_uses, ())
 
     @skipIfTorchDynamo(msg="https://github.com/pytorch/pytorch/issues/131104")
     def test_method_overloading(self):
+        # [FUNCTION DOC] Method overloading on script modules: dispatch by argument type, missing
+        # annotations error, a type mismatch error, and modules mixing overloads and plain
+        # definitions (error text about overloads not usable when a module is redefined). Skipped
+        # under dynamo.
         class Over(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with forward overloads for a tuple of tensors and for
+            # a tensor.
             @torch.jit._overload_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Method overload for a tuple of tensors; body is pass.
                 # type: (Tuple[Tensor, Tensor]) -> Tensor
                 pass
 
             @torch.jit._overload_method
             def forward(self, x):  # noqa: F811
+                # [FUNCTION DOC] HELPER: Method overload for a tensor; body is pass.
                 # type: (Tensor) -> Tensor
                 pass
 
             def forward(self, x):  # noqa: F811
+                # [FUNCTION DOC] HELPER: Implementation: add 20 to a tensor, else add 5 to the
+                # first tuple entry.
                 if isinstance(x, Tensor):
                     return x + 20
                 else:
                     return x[0] + 5
 
         class S(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module calling the overloaded module with a tensor and
+            # with a tuple.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the overloaded module.
                 super().__init__()
                 self.weak = Over()
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Sum the overloaded module applied to x and to the pair
+                # of x and x.
                 return self.weak(x) + self.weak((x, x))
 
         s_mod = S()
@@ -14836,19 +18405,24 @@ dedent """
         self.assertEqual(over(x), x + 20)
 
         class Unannotated(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a method overload lacking annotations.
             @torch.jit._overload_method
             def hello(self, x):
+                # [FUNCTION DOC] HELPER: Method overload without annotations; body is pass.
                 pass
 
             @torch.jit._overload_method
             def hello(self, x):  # noqa: F811
+                # [FUNCTION DOC] HELPER: Method overload for an int argument; body is pass.
                 # type: (int) -> (int)
                 pass
 
             def hello(self, x):  # noqa: F811
+                # [FUNCTION DOC] HELPER: Implementation adding 3.
                 return x + 3
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Call the method with an int and a float.
                 return self.hello(1), self.hello(.5)
 
         w = Unannotated()
@@ -14856,20 +18430,26 @@ dedent """
             torch.jit.script(w)
 
         class CompileOverloadError(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward calls an overloaded method with an
+            # argument fitting no overload.
             @torch.jit._overload_method
             def hello(self, x):
+                # [FUNCTION DOC] HELPER: Method overload for a string argument; body is pass.
                 # type: (str) -> (int)
                 pass
 
             @torch.jit._overload_method
             def hello(self, x):  # noqa: F811
+                # [FUNCTION DOC] HELPER: Method overload for an int argument; body is pass.
                 # type: (int) -> (int)
                 pass
 
             def hello(self, x):  # noqa: F811
+                # [FUNCTION DOC] HELPER: Implementation adding 1.
                 return x + 1
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Call the method with a string and a float.
                 return self.hello("hi"), self.hello(.5)
 
         w = CompileOverloadError()
@@ -14880,24 +18460,34 @@ dedent """
         if sys.version_info < (3, 13):  # test broken in 3.13
             with self.assertRaisesRegex(Exception, "Overloads are not usable when a module"):
                 class W3(torch.nn.Module):
+                    # [CLASS DOC] HELPER: Module with forward overloads for int and tensor and an
+                    # implementation adding 5.
                     @torch.jit._overload_method
                     def forward(self, x):
+                        # [FUNCTION DOC] HELPER: Method overload for an int argument; body
+                        # is pass.
                         # type: (int) -> int
                         pass
 
                     @torch.jit._overload_method
                     def forward(self, x):  # noqa: F811
+                        # [FUNCTION DOC] HELPER: Method overload for a tensor argument; body
+                        # is pass.
                         # type: (Tensor) -> Tensor
                         pass
 
                     def forward(self, x):  # noqa: F811
+                        # [FUNCTION DOC] HELPER: Implementation adding 5.
                         return x + 5
 
                 a = W3()
                 b = torch.jit.script(a)
 
                 class W3(torch.nn.Module):
+                    # [CLASS DOC] HELPER: Redefinition of the module class with a plain forward
+                    # adding 15.
                     def forward(self, x):
+                        # [FUNCTION DOC] HELPER: Return x plus 15.
                         return x + 5 + 10
 
                 a = W3()
@@ -14905,29 +18495,37 @@ dedent """
 
         # testing non-overload declared first, then overload
         class W2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a plain helper method hello taking two arguments.
             def hello(self, x1, x2):
+                # [FUNCTION DOC] HELPER: Return the sum of two values.
                 return x1 + x2
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Call the helper with x twice.
                 return self.hello(x, x)
 
         a = torch.jit.script(W2())
         self.assertEqual(a(torch.tensor(1)), torch.tensor(2))
 
         class W2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Redefinition of the class with overloads of hello for int.
             @torch.jit._overload_method
             def hello(self, x):
+                # [FUNCTION DOC] HELPER: Method overload without annotations; body is pass.
                 pass
 
             @torch.jit._overload_method
             def hello(self, x):  # noqa: F811
+                # [FUNCTION DOC] HELPER: Method overload for an int argument; body is pass.
                 # type: (int) -> (int)
                 pass
 
             def hello(self, x):  # noqa: F811
+                # [FUNCTION DOC] HELPER: Implementation adding 15.
                 return x + 5 + 10
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Call hello with 1 and with x.
                 return self.hello(1), self.hello(x)
 
         if sys.version_info < (3, 13):  # test broken in 3.13
@@ -14935,13 +18533,19 @@ dedent """
                 a = torch.jit.script(W2())
 
     def test_narrow_copy(self):
+        # [FUNCTION DOC] checkScript of narrow_copy.
         def foo(a):
+            # [FUNCTION DOC] HELPER: Return a copy of the first five entries.
             return a.narrow_copy(0, 0, 5)
 
         self.checkScript(foo, [torch.rand(10)])
 
     def test_select_after_chunk(self):
+        # [FUNCTION DOC] checkScript of an in-place add on a view obtained by selecting
+        # from chunks.
         def foo(x):
+            # [FUNCTION DOC] HELPER: Add 5 in place to the first chunk and return the
+            # original tensor.
             chunked = torch.chunk(x, 1)
             foo = chunked[0]
             foo.add_(5)
@@ -14950,21 +18554,34 @@ dedent """
         self.checkScript(foo, [torch.rand(2, 3)])
 
     def test_nn_LSTM_with_layers(self):
+        # [FUNCTION DOC] A script module and an eager module with a two-layer LSTM give equal
+        # outputs under the same random state.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module running a two-layer LSTM on a given state and
+            # returning outputs.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create an LSTM with input 2, hidden 3, two layers and
+                # no dropout.
                 super().__init__()
                 self.rnn = nn.LSTM(2, 3, 2, dropout=0)
 
             @torch.jit.script_method
             def forward(self, x, lengths, h0, c0):
+                # [FUNCTION DOC] HELPER: Run the LSTM with the (h0, c0) state and return the
+                # output sequence.
                 return self.rnn(x, (h0, c0))[0]
 
         class Eager(torch.nn.Module):
+            # [CLASS DOC] HELPER: Eager twin of the script LSTM module.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create an LSTM with input 2, hidden 3, two layers and
+                # no dropout.
                 super().__init__()
                 self.rnn = nn.LSTM(2, 3, 2, dropout=0)
 
             def forward(self, x, lengths, h0, c0):
+                # [FUNCTION DOC] HELPER: Run the LSTM with the (h0, c0) state and return the
+                # output sequence.
                 return self.rnn(x, (h0, c0))[0]
 
         inputs = (torch.randn(1, 1, 2), torch.LongTensor([7]), torch.randn(2, 1, 3), torch.randn(2, 1, 3))
@@ -14974,15 +18591,20 @@ dedent """
         self.assertEqual(eager_out, script_out)
 
     def test_nn_LSTM(self):
+        # [FUNCTION DOC] A script module running an LSTM on a packed sequence gives the same
+        # output as the eager LSTM under the same random state.
         input = torch.nn.utils.rnn.pack_sequence([torch.randn(5, 5)])
 
         class S(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module running an LSTM on a packed sequence.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create an LSTM with input and hidden size 5.
                 super().__init__()
                 self.x = torch.nn.LSTM(5, 5)
 
             @torch.jit.script_method
             def forward(self, input: PackedSequence) -> Tuple[PackedSequence, Tuple[torch.Tensor, torch.Tensor]]:
+                # [FUNCTION DOC] HELPER: Run the LSTM on the packed input and return its outputs.
                 return self.x(input)
 
         eager_out = self.runAndSaveRNG(lambda x: torch.nn.LSTM(5, 5)(x), (input,))[0]
@@ -14991,25 +18613,33 @@ dedent """
         self.assertEqual(eager_out, script_out)
 
     def test_nn_GRU(self):
+        # [FUNCTION DOC] A script GRU on a packed sequence and on a plain tensor gives the same
+        # outputs as eager under the same random state.
         seq_input = torch.nn.utils.rnn.pack_sequence([torch.randn(5, 5)])
         tensor_input = torch.randn(5, 5, 5)
 
         class SeqLengthGRU(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module running a GRU on a packed sequence.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a GRU with input and hidden size 5.
                 super().__init__()
                 self.x = torch.nn.GRU(5, 5)
 
             @torch.jit.script_method
             def forward(self, input: PackedSequence) -> Tuple[PackedSequence, torch.Tensor]:
+                # [FUNCTION DOC] HELPER: Run the GRU on the packed input and return its outputs.
                 return self.x(input)
 
         class TensorGRU(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module running a GRU on a plain tensor.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a GRU with input and hidden size 5.
                 super().__init__()
                 self.x = torch.nn.GRU(5, 5)
 
             @torch.jit.script_method
             def forward(self, input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                # [FUNCTION DOC] HELPER: Run the GRU on the tensor and return its outputs.
                 return self.x(input)
 
         seq_eager_out = self.runAndSaveRNG(lambda x: torch.nn.GRU(5, 5)(x), (seq_input,))[0]
@@ -15021,14 +18651,20 @@ dedent """
         self.assertEqual(tensor_eager_out, tensor_script_out)
 
     def test_torchscript_memoryformat(self):
+        # [FUNCTION DOC] A scripted function requesting channels-last memory format returns a
+        # tensor that is contiguous in that format.
         @torch.jit.script
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the input in channels-last memory format.
             return x.contiguous(memory_format=torch.channels_last)
         x = torch.randn(4, 3, 6, 6)
         y = fn(x)
         self.assertTrue(y.is_contiguous(memory_format=torch.channels_last))
 
     def test_torchscript_multi_head_attn(self):
+        # [FUNCTION DOC] Script a function wrapping the functional multi-head attention
+        # (arguments with per-argument comments and a combined return comment) and compare its
+        # output with the eager call for a random input and a causal mask.
         @torch.jit.script
         def jit_multihead_attn_forward(query,                   # type: Tensor
                                        key,                     # type: Tensor
@@ -15048,6 +18684,8 @@ dedent """
                                        need_weights=True,       # type: bool
                                        attn_mask=None           # type: Optional[Tensor]
                                        ):
+            # [FUNCTION DOC] HELPER: Forward all arguments to the functional
+            # multi-head attention.
             # type: (...) -> Tuple[Tensor, Optional[Tensor]]
             return torch.nn.functional.multi_head_attention_forward(query, key, value,
                                                                     embed_dim_to_check, num_heads,
@@ -15095,6 +18733,8 @@ dedent """
         self.assertEqual(jit_out, py_out, atol=5e-4, rtol=1e-4)
 
     def test_torchscript_multi_head_attn_fast_path(self):
+        # [FUNCTION DOC] An eval-mode batch-first MultiheadAttention scripted and run under
+        # no-grad (fast path) gives the same output as the eager module.
         src_l = 3
         bsz = 5
         embed_size = 8
@@ -15112,9 +18752,15 @@ dedent """
 
     @unittest.skipIf(not RUN_CUDA, "no CUDA")
     def test_scriptmodule_multi_head_attn_cuda(self):
+        # [FUNCTION DOC] A script module wrapping a traced MultiheadAttention on cuda gives the
+        # same output as the functional multi-head attention. Needs CUDA.
 
         class MyModule(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module tracing an eval-mode attention layer on
+            # sample inputs.
             def __init__(self, embed_dim, num_heads):
+                # [FUNCTION DOC] HELPER: Create random samples and an attention layer, and trace
+                # it in eval mode.
                 super().__init__()
                 sample_q = torch.randn(3, 2, embed_dim)
                 sample_kv = torch.randn(3, 2, embed_dim)
@@ -15126,6 +18772,7 @@ dedent """
 
             @torch.jit.script_method
             def forward(self, q, k, v):
+                # [FUNCTION DOC] HELPER: Call the traced attention module.
                 return self.mod(q, k, v)
 
         embed_dim = 8
@@ -15148,9 +18795,15 @@ dedent """
 
     @unittest.skipIf(not RUN_CUDA, "no CUDA")
     def test_scriptmodule_transformer_cuda(self):
+        # [FUNCTION DOC] A script module wrapping a traced Transformer on cuda gives the same
+        # output as the eager transformer on new inputs. Needs CUDA.
 
         class MyModule(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module tracing an eval-mode transformer on
+            # sample inputs.
             def __init__(self, transformer, sample_q, sample_kv):
+                # [FUNCTION DOC] HELPER: Put the transformer in eval mode and trace it with
+                # the samples.
                 super().__init__()
                 transformer.eval()
 
@@ -15159,6 +18812,7 @@ dedent """
 
             @torch.jit.script_method
             def forward(self, q, k):
+                # [FUNCTION DOC] HELPER: Call the traced transformer.
                 return self.mod(q, k)
 
         d_model = 8
@@ -15187,11 +18841,15 @@ dedent """
         self.assertEqual(jit_out, py_out, atol=5e-4, rtol=1e-4)
 
     def test_list_python_op(self):
+        # [FUNCTION DOC] checkScript of a function calling an ordinary python function that takes
+        # a list of tensors.
         def python_list_op(lst):
+            # [FUNCTION DOC] HELPER: Return the first tensor of a list.
             # type: (List[Tensor]) -> Tensor
             return lst[0]
 
         def fn(lst):
+            # [FUNCTION DOC] HELPER: Call the python list helper.
             # type: (List[Tensor]) -> Tensor
             return python_list_op(lst)
 
@@ -15199,14 +18857,19 @@ dedent """
 
     @unittest.skipIf(not RUN_CUDA, "no CUDA")
     def test_weak_cuda(self):
+        # [FUNCTION DOC] A script module holding an LSTM moved to cuda produces a cuda output.
+        # Needs CUDA.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with an LSTM layer moved to cuda.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create an LSTM of size 5 and move it to cuda.
                 super().__init__()
                 self.lstm = torch.nn.LSTM(5, 5)
                 self.lstm.cuda()
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the LSTM.
                 return self.lstm(x)
 
         m = M()
@@ -15215,20 +18878,29 @@ dedent """
         self.assertTrue(out[0].is_cuda)
 
     def test_ignore_decorator(self):
+        # [FUNCTION DOC] An ignored method marked to be dropped on export emits a warning at
+        # creation, is absent from the exported code, and raises an error when run after reload.
         with warnings.catch_warnings(record=True) as warns:
             class M(torch.jit.ScriptModule):
+                # [CLASS DOC] HELPER: Script module with a buffer and a method ignored and
+                # dropped on export.
                 def __init__(self) -> None:
+                    # [FUNCTION DOC] HELPER: Create a buffer holding a parameter-wrapped
+                    # zero tensor.
                     super().__init__()
                     tensor = torch.zeros(1, requires_grad=False)
                     self.some_state = nn.Buffer(torch.nn.Parameter(tensor))
 
                 @torch.jit.script_method
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Call the ignored method and return x.
                     self.ignored_code(x)
                     return x
 
                 @torch.jit.ignore(drop_on_export=True)
                 def ignored_code(self, x):
+                    # [FUNCTION DOC] HELPER: Ignored method (dropped on export) that sets the
+                    # state to a tensor of 100.
                     self.some_state = torch.tensor((100,))
 
         # script_method now emits a visible deprecation warning; ignore it (but
@@ -15247,18 +18919,27 @@ dedent """
             m2.forward(torch.ones(1))
 
     def test_ignored_as_value(self):
+        # [FUNCTION DOC] Unused methods used as values in unreachable or runtime-gated branches:
+        # scripted model runs on the safe path, and after save and load running the unused path
+        # raises an error saying the method is ignored.
         class Model(nn.Module):
+            # [CLASS DOC] HELPER: Module with two unused methods and a forward that may
+            # call them.
             @torch.jit.unused
             def tuple_ignored(self, x):
+                # [FUNCTION DOC] HELPER: Unused method returning two copies of x.
                 # type: (Tensor) -> Tuple[Tensor, Tensor]
                 return x, x
 
             @torch.jit.unused
             def single_val_ignored(self, x, y):
+                # [FUNCTION DOC] HELPER: Unused method returning x.
                 # type: (Tensor, Tensor) -> Tensor
                 return x
 
             def forward(self, x, use_ignore_path):
+                # [FUNCTION DOC] HELPER: Call unused methods only on unreachable or flagged
+                # paths, else return x twice.
                 # type: (Tensor, bool) -> Tuple[Tensor, Tensor]
                 if 1 == 2:
                     return self.tuple_ignored(x)
@@ -15279,15 +18960,23 @@ dedent """
             loaded(torch.tensor(.5), True)
 
     def test_module_error(self):
+        # [FUNCTION DOC] Scripting a module class instead of an instance must raise RuntimeError.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning its input.
             def forward(self, foo):
+                # [FUNCTION DOC] HELPER: Return foo.
                 return foo
 
         with self.assertRaisesRegex(RuntimeError, "cannot be compiled since it inherits from nn.Module"):
             torch.jit.script(MyModule)
 
     def test_view_write(self):
+        # [FUNCTION DOC] An in-place write through a list alias changes the base tensor
+        # in script, so the comparison before and after the write yields the expected
+        # result (checkScript).
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Compare x plus x before and after writing y into an alias
+            # of x.
             l = []
             l.append(x)
             x_view = l[0]
@@ -15298,14 +18987,21 @@ dedent """
         self.checkScript(fn, (torch.rand(2, 3), torch.rand(2, 3)))
 
     def test_module_attrs(self):
+        # [FUNCTION DOC] A script module with a typed dict attribute and a parameter can look up
+        # a tensor by key and add the parameter, with emit hooks disabled.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a string-to-tensor dict attribute and
+            # a parameter.
             def __init__(self, table):
+                # [FUNCTION DOC] HELPER: Store the dict as a typed attribute and create a
+                # parameter of 100.
                 super().__init__()
                 self.table = torch.jit.Attribute(table, Dict[str, torch.Tensor])
                 self.x = torch.nn.Parameter(torch.tensor([100.0]))
 
             @torch.jit.script_method
             def forward(self, key):
+                # [FUNCTION DOC] HELPER: Return the table entry for the key plus the parameter.
                 # type: (str) -> Tensor
                 return self.table[key] + self.x
 
@@ -15316,13 +19012,19 @@ dedent """
             self.assertEqual(m("c"), torch.tensor([103.]))
 
     def test_module_none_attrs(self):
+        # [FUNCTION DOC] A None attribute is read by an attribute node that the peephole
+        # pass removes.
         class MyMod(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with an attribute set to None returned
+            # by forward.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Set the optional attribute to None.
                 super().__init__()
                 self.optional_value = None
 
             @torch.jit.script_method
             def forward(self):
+                # [FUNCTION DOC] HELPER: Return the optional attribute.
                 return self.optional_value
 
         graph = MyMod().forward.graph
@@ -15331,8 +19033,11 @@ dedent """
         FileCheck().check_not("prim::GetAttr").run(graph)
 
     def test_tensor_import_export(self):
+        # [FUNCTION DOC] A graph with tensor constants, after propagation, can be turned into a
+        # function and exported and imported.
         @torch.jit.script
         def foo(x):
+            # [FUNCTION DOC] HELPER: Return a list of two small tensors.
             a = torch.tensor(1)
             b = torch.tensor([1, 2])
             c = [a, b]
@@ -15343,6 +19048,8 @@ dedent """
         self.getExportImportCopy(m)
 
     def get_pickle_values(self):
+        # [FUNCTION DOC] HELPER: Return the triples of name, value and type used to test
+        # attribute serialization.
         return (('dict', {"I": "am", "a test": "test"}, Dict[str, str]),
                 ('float', 2.3, float),
                 ('int', 99, int),
@@ -15360,16 +19067,22 @@ dedent """
                 ('another_device', torch.device('cuda:1'), torch.device))
 
     def test_attribute_serialization(self):
+        # [FUNCTION DOC] Export/import a script module with attributes of many types; calling
+        # both gives equal outputs.
         tester = self
 
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with one typed attribute per sample value,
+            # returned by forward.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Set a typed attribute for each sample value.
                 super().__init__()
                 for name, value, the_type in tester.get_pickle_values():
                     setattr(self, name, torch.jit.Attribute(value, the_type))
 
             @torch.jit.script_method
             def forward(self):
+                # [FUNCTION DOC] HELPER: Return a tuple of most of the attributes.
                 return (self.dict, self.float, self.int, self.bool, self.tuple,
                         self.list, self.int_list, self.tensor_list, self.bool_list,
                         self.float_list, self.str_list, self.none)
@@ -15379,7 +19092,9 @@ dedent """
         self.assertEqual(m(), imported_m())
 
     def test_string_len(self):
+        # [FUNCTION DOC] checkScript of string length for empty and non-empty strings.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Return the length of a string.
             # type: (str) -> int
             return len(x)
 
@@ -15388,8 +19103,11 @@ dedent """
         self.checkScript(fn, ("hello",))
 
     def test_multiline_optional_future_refinement(self):
+        # [FUNCTION DOC] A variable annotated with a multi-line optional future type compiles and
+        # the function returns 1.
         @torch.jit.script
         def fun() -> int:
+            # [FUNCTION DOC] HELPER: Declare an optional future variable as None and return 1.
             future: Optional[
                 torch.jit.Future[Tuple[torch.Tensor]]
             ] = None
@@ -15399,17 +19117,24 @@ dedent """
 
     @unittest.skipIf(IS_SANDCASTLE, "NYI: TemporaryFileName support for Sandcastle")
     def test_attribute_unpickling(self):
+        # [FUNCTION DOC] Save and load a script module with attributes of many types; non-tensor
+        # attribute values equal the originals after load. Skipped on sandcastle.
         tensor = torch.randn(2, 2)
         tester = self
 
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with underscore-named typed attributes, returned
+            # by forward.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Set a typed attribute named with a leading underscore
+                # for each sample.
                 super().__init__()
                 for name, value, the_type in tester.get_pickle_values():
                     setattr(self, "_" + name, torch.jit.Attribute(value, the_type))
 
             @torch.jit.script_method
             def forward(self):
+                # [FUNCTION DOC] HELPER: Return a tuple of most of the attributes.
                 return (self._dict, self._float, self._int, self._bool, self._tuple,
                         self._list, self._int_list, self._tensor_list, self._bool_list,
                         self._float_list, self._str_list, self._none)
@@ -15419,6 +19144,8 @@ dedent """
             loaded = torch.jit.load(fname)
 
             def is_tensor_value(item):
+                # [FUNCTION DOC] HELPER: Return whether the item is a tensor or a list starting
+                # with a tensor.
                 if isinstance(item, torch.Tensor):
                     return True
                 if isinstance(item, list):
@@ -15431,18 +19158,25 @@ dedent """
 
 
     def test_submodule_attribute_serialization(self):
+        # [FUNCTION DOC] Export/import a script module that contains submodules with dict and
+        # list attributes; outputs match.
         class S(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script submodule with a dict attribute and a list of pairs.
             def __init__(self, list_data):
+                # [FUNCTION DOC] HELPER: Store the dict and the given list as typed attributes.
                 super().__init__()
                 self.table = torch.jit.Attribute({"I": "am", "a test": "test"}, Dict[str, str])
                 self.list = torch.jit.Attribute(list_data, List[Tuple[int, int]])
 
             @torch.jit.script_method
             def forward(self):
+                # [FUNCTION DOC] HELPER: Return the dict and list.
                 return (self.table, self.list)
 
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a dict, a tensor and two submodules.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the attributes and the two submodules.
                 super().__init__()
                 self.table = torch.jit.Attribute({"this": "is", "a different": "dict"}, Dict[str, str])
                 self.tensor = torch.jit.Attribute(torch.randn(2, 2), torch.Tensor)
@@ -15451,6 +19185,8 @@ dedent """
 
             @torch.jit.script_method
             def forward(self):
+                # [FUNCTION DOC] HELPER: Return the module's table and tensor and the submodule
+                # tables and lists.
                 return (self.table, self.tensor, self.s1.table, self.s2.list, self.s1.list)
 
         m = M()
@@ -15458,8 +19194,13 @@ dedent """
         self.assertEqual(m(), imported_m())
 
     def test_serialization_big_ints(self):
+        # [FUNCTION DOC] Export/import preserves int attributes at the 32-bit and 64-bit limits.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with int attributes at extreme values and
+            # a parameter.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create int attributes at 32-bit and 64-bit limits and a
+                # ones parameter.
                 super().__init__()
                 self.int32_max = torch.jit.Attribute(2**31 - 1, int)
                 self.int32_min = torch.jit.Attribute(-2**31, int)
@@ -15472,6 +19213,7 @@ dedent """
 
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Add the sums of the extreme attributes to x.
                 # type: (int) -> (int)
                 return x + (self.int32_max + self.int32_min) + (self.int64_max + self.int64_min)
 
@@ -15486,16 +19228,24 @@ dedent """
         self.assertEqual(m.int64_min, imported.int64_min)
 
     def test_script_scope(self):
+        # [FUNCTION DOC] Scripting a library function (triplet margin loss) resolves names in its
+        # own module scope.
         scripted = torch.jit.script(torch.nn.functional.triplet_margin_loss)
 
     def test_serialization_sharing(self):
+        # [FUNCTION DOC] A string appended to a list attribute several times is stored once in
+        # the pickled data and referenced by memo gets, checked on the disassembled archive.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with a list of strings attribute, appended to on
+            # each call.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create an empty list of strings attribute.
                 super().__init__()
                 self.list = torch.jit.Attribute([], List[str])
 
             @torch.jit.script_method
             def forward(self, key):
+                # [FUNCTION DOC] HELPER: Append the key three times and return the list.
                 # type: (str) -> List[str]
                 self.list.append(key)
                 self.list.append(key)
@@ -15525,15 +19275,21 @@ dedent """
                 .check_count("BINGET", 2, exactly=True).run(disassembled)
 
     def test_sys_stdout_override(self):
+        # [FUNCTION DOC] Print output of a script function goes to a replaced python
+        # stdout object.
         @torch.jit.script
         def foo():
+            # [FUNCTION DOC] HELPER: Print a string.
             print('foo')
 
         class Redirect:
+            # [CLASS DOC] HELPER: Fake stdout that collects written text in a string.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Start with an empty string.
                 self.s = ''
 
             def write(self, s):
+                # [FUNCTION DOC] HELPER: Append the written text.
                 self.s += s
 
         old_stdout = sys.stdout
@@ -15547,12 +19303,16 @@ dedent """
         FileCheck().check('foo').run(redirect.s)
 
     def test_dtype_attr(self):
+        # [FUNCTION DOC] A dtype stored as a module attribute can be used in script.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a dtype attribute used to create zeros.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Store the dtype of a zero tensor.
                 super().__init__()
                 self.dtype = torch.zeros([]).dtype
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Return zeros of shape 3x4 with the stored dtype.
                 return torch.zeros(3, 4, dtype=self.dtype)
 
         f = Foo()
@@ -15560,8 +19320,15 @@ dedent """
 
 
     def test_named_buffers_are_iterable(self):
+        # [FUNCTION DOC] named_buffers in an exported method of a scripted module lists
+        # registered buffers but not plain tensors; results equal after export/import and
+        # match eager.
         class MyMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with submodules, two buffers and a plain tensor, and an
+            # exported method over named buffers.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create submodules, two zero buffers and a plain
+                # zero tensor.
                 super().__init__()
                 self.mod = (torch.nn.ReLU())
                 self.mod2 = (torch.nn.ReLU())
@@ -15571,10 +19338,13 @@ dedent """
                 self.z = torch.zeros(3)
 
             def bleh(self):
+                # [FUNCTION DOC] HELPER: Return the plain tensor plus 4 (not exported).
                 return self.z + 4
 
             @torch.jit.export
             def method(self):
+                # [FUNCTION DOC] HELPER: Collect buffer names and buffers plus two over the
+                # named buffers.
                 names = [""]
                 vals = []
                 for name, buffer in self.named_buffers():
@@ -15584,6 +19354,7 @@ dedent """
                 return names, vals
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return x.
                 return x
 
         model = MyMod()
@@ -15599,25 +19370,35 @@ dedent """
 
 
     def test_static_if_prop(self):
+        # [FUNCTION DOC] Attribute presence checks are resolved at compile time in script:
+        # conditional attributes on modules, methods, overloads, constants, and script classes.
         class MaybeHasAttr(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with an attribute present only if requested, used in a
+            # hasattr and True test.
             def __init__(self, add_attr):
+                # [FUNCTION DOC] HELPER: Create the attribute only if requested.
                 super().__init__()
                 if add_attr:
                     self.maybe_attr = 1
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Return the attribute if present, else 0.
                 if hasattr(self, "maybe_attr") and True:
                     return self.maybe_attr
                 else:
                     return 0
 
         class MaybeHasAttr2(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with an optional attribute used in a negated
+            # presence test.
             def __init__(self, add_attr):
+                # [FUNCTION DOC] HELPER: Create the attribute only if requested.
                 super().__init__()
                 if add_attr:
                     self.maybe_attr = 1
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Return 0 if the attribute is absent, else its value.
                 if not hasattr(self, "maybe_attr") or False:
                     return 0
                 else:
@@ -15629,7 +19410,9 @@ dedent """
         torch.jit.script(MaybeHasAttr2(False))
 
         class MyMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module testing presence of a nonexistent attribute.
             def forward(self):
+                # [FUNCTION DOC] HELPER: Return 1 if foo exists, else 0.
                 if hasattr(self, "foo"):
                     return 1
                 else:
@@ -15637,18 +19420,23 @@ dedent """
 
             @torch.jit.export
             def fee(self):
+                # [FUNCTION DOC] HELPER: Exported method returning 1.
                 return 1
 
         self.checkModule(MyMod(), ())
 
         class HasAttrMod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward tests presence of a constant, a method, an
+            # overloaded method and a missing name.
             __constants__ = ["fee"]
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Store the constant fee as 3.
                 super().__init__()
                 self.fee = 3
 
             def forward(self):
+                # [FUNCTION DOC] HELPER: Return the four presence results.
                 a = hasattr(self, "fee")
                 b = hasattr(self, "foo")
                 c = hasattr(self, "hi")
@@ -15656,25 +19444,35 @@ dedent """
                 return (a, b, c, d)
 
             def foo(self):
+                # [FUNCTION DOC] HELPER: Method returning 1.
                 return 1
 
+            # [FUNCTION DOC] HELPER: Method overload declaration for a tensor argument written on
+            # one line with an ellipsis body (doc above the decorator since the body shares the
+            # def line).
             @torch.jit._overload_method
             def hi(self, x: Tensor): ...
 
             def hi(self, x):  # noqa: F811
+                # [FUNCTION DOC] HELPER: Implementation returning 2.
                 return 2
 
         self.checkModule(HasAttrMod(), ())
 
         @torch.jit.script
         class FooTest:
+            # [CLASS DOC] HELPER: Script class with a field and a method adding to it.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Set field x to 1.
                 self.x = 1
 
             def foo(self, y):
+                # [FUNCTION DOC] HELPER: Return the field plus y.
                 return self.x + y
 
         def foo():
+            # [FUNCTION DOC] HELPER: Check presence of attributes on an instance and on the
+            # class itself.
             a = FooTest()
             val1 = hasattr(a, "foo"), hasattr(a, "x"), hasattr(a, "bla")
             val2 = hasattr(FooTest, "foo"), hasattr(FooTest, "a")
@@ -15683,17 +19481,23 @@ dedent """
         self.assertEqual(foo(), torch.jit.script(foo)())
 
     def _test_pickle_checkpoint(self, device):
+        # [FUNCTION DOC] HELPER: A script method saves a tensor with torch.save to a temporary
+        # file; load it back and compare with input plus parameter on the device.
         with TemporaryFileName() as fname:
             class M(torch.jit.ScriptModule):
+                # [CLASS DOC] HELPER: Script module that saves the computed tensor to a file
+                # named by a constant.
                 __constants__ = ['fname']
 
                 def __init__(self, tensor):
+                    # [FUNCTION DOC] HELPER: Store the file name and the parameter.
                     super().__init__()
                     self.fname = fname
                     self.tensor = torch.nn.Parameter(tensor)
 
                 @torch.jit.script_method
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Compute the sum, save it to the file and return it.
                     y = self.tensor + x
                     torch.save(y, self.fname)
                     return y
@@ -15707,17 +19511,25 @@ dedent """
                 self.assertEqual(loaded_tensor, input + param)
 
     def _test_pickle_checkpoint_views(self, device):
+        # [FUNCTION DOC] HELPER: Same as the checkpoint helper, but saves a tuple with a view
+        # of the tensor twice; after load the views share storage so editing the view changes
+        # the others.
         with TemporaryFileName() as fname:
             class M(torch.jit.ScriptModule):
+                # [CLASS DOC] HELPER: Script module that saves the tensor, a view of it, and the
+                # tensor again.
                 __constants__ = ['fname']
 
                 def __init__(self, tensor):
+                    # [FUNCTION DOC] HELPER: Store the file name and the parameter.
                     super().__init__()
                     self.fname = fname
                     self.tensor = torch.nn.Parameter(tensor)
 
                 @torch.jit.script_method
                 def forward(self, x):
+                    # [FUNCTION DOC] HELPER: Compute the sum and a flat view, save the triple,
+                    # return the sum.
                     y = self.tensor + x
                     y_view = y.view(4)
                     torch.save((y, y_view, y), self.fname)
@@ -15738,16 +19550,21 @@ dedent """
 
     @unittest.skipIf(not RUN_CUDA, "no CUDA")
     def test_pickle_checkpoint_cuda(self):
+        # [FUNCTION DOC] Run both checkpoint helpers on cuda. Needs CUDA.
         self._test_pickle_checkpoint('cuda')
         self._test_pickle_checkpoint_views('cuda')
 
     def test_pickle_checkpoint(self):
+        # [FUNCTION DOC] Run both checkpoint helpers on cpu.
         self._test_pickle_checkpoint('cpu')
         self._test_pickle_checkpoint_views('cpu')
 
     def test_pickle_checkpoint_tup(self):
+        # [FUNCTION DOC] A script function can save a tuple of ints to a file that loads back as
+        # the tuple.
         @torch.jit.script
         def foo(fname):
+            # [FUNCTION DOC] HELPER: Save the tuple (3, 4) to the given file name.
             # type: (str) -> None
             torch.save((3, 4), fname)
         with TemporaryFileName() as name:
@@ -15755,34 +19572,47 @@ dedent """
             self.assertEqual(torch.load(name), (3, 4))
 
     def test_string_list(self):
+        # [FUNCTION DOC] checkScript of converting a string to a list of characters.
         def fn(string):
+            # [FUNCTION DOC] HELPER: Return the characters of a string as a list.
             # type: (str) -> List[str]
             return list(string)
 
         self.checkScript(fn, ("abcdefgh",))
 
     def test_unicode_comments(self):
+        # [FUNCTION DOC] A script function whose body contains a comment with non-ASCII
+        # characters compiles.
         @torch.jit.script
         def test(self, a):
+            # [FUNCTION DOC] HELPER: Return relu of the argument.
             # 🤷🤷🤷🤷
             return torch.nn.functional.relu(a)
 
     def test_get_set_state_with_tensors(self):
+        # [FUNCTION DOC] Save and load a scripted module with exported state methods that keep a
+        # tensor attribute; the loaded tensor equals the original.
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module with a random tensor attribute and exported
+            # state methods.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create a random 2x2 tensor attribute.
                 super().__init__()
                 self.tensor = torch.randn(2, 2)
 
             @torch.jit.export
             def __getstate__(self):
+                # [FUNCTION DOC] HELPER: Return the tensor and the training flag.
                 return (self.tensor, self.training)
 
             @torch.jit.export
             def __setstate__(self, state):
+                # [FUNCTION DOC] HELPER: Restore the tensor and training flag from the state.
                 self.tensor = state[0]
                 self.training = state[1]
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return x plus the tensor.
                 return x + self.tensor
 
         with TemporaryFileName() as fname:
@@ -15792,7 +19622,11 @@ dedent """
             self.assertEqual(loaded.tensor, m.tensor)
 
     def test_in_for_and_comp_expr(self):
+        # [FUNCTION DOC] checkScript of a dict get used as a loop range bound, with and without
+        # the key.
         def fn(d):
+            # [FUNCTION DOC] HELPER: Build a list by iterating up to a dict lookup with
+            # default 6.
             # type: (Dict[str, int]) -> List[int]
             out = [1]
             for i in range(d.get("hi", 6)):
@@ -15803,7 +19637,10 @@ dedent """
         self.checkScript(fn, ({'bye': 3},))
 
     def test_for_else(self):
+        # [FUNCTION DOC] A for loop with an else branch is unsupported and
+        # raises NotSupportedError.
         def fn():
+            # [FUNCTION DOC] HELPER: Loop with an else block that prints; scripting must fail.
             c = 0
             for _ in range(4):
                 c += 10
@@ -15814,7 +19651,9 @@ dedent """
             torch.jit.script(fn)
 
     def test_split(self):
+        # [FUNCTION DOC] checkScript of splitting a tensor into three pieces along dim 1.
         def split_two(tensor):
+            # [FUNCTION DOC] HELPER: Split into chunks of two columns and return the three parts.
             a, b, c = torch.split(tensor, 2, dim=1)
             return a, b, c
         x = torch.randn(3, 6)
@@ -15827,8 +19666,11 @@ dedent """
         "TORCH_SHOW_CPP_STACKTRACES=1, so the 'frame' assertion doesn't apply.",
     )
     def test_conv_error(self):
+        # [FUNCTION DOC] An interpreter error from a convolution on bad shapes must not include a
+        # stack frame text. Skipped when C++ stack traces are enabled.
         @torch.jit.script
         def fn(x, y):
+            # [FUNCTION DOC] HELPER: Convolve with two incompatible inputs.
             return F.conv2d(x, y)
 
         try:
@@ -15837,57 +19679,78 @@ dedent """
             self.assertFalse('frame' in str(e))
 
     def test_python_op_name(self):
+        # [FUNCTION DOC] Calling a python library function with a wrong signature in script
+        # raises an error mentioning the function name.
         import random
 
         with self.assertRaisesRegex(RuntimeError, "randint"):
             @torch.jit.script
             def fn():
+                # [FUNCTION DOC] HELPER: Call randint without arguments; scripting must fail.
                 return random.randint()
 
     def test_dir(self):
+        # [FUNCTION DOC] The directory listing of a script module instance includes forward.
         class M(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module returning its input.
             def forward(self, t):
+                # [FUNCTION DOC] HELPER: Return t.
                 return t
 
         self.assertTrue('forward' in dir(M()))
 
     def test_kwarg_expansion_error(self):
+        # [FUNCTION DOC] Keyword argument expansion in script must raise NotSupportedError.
         @torch.jit.ignore
         def something_else(h, i):
+            # [FUNCTION DOC] HELPER: Ignored function taking two arguments and doing nothing.
             pass
 
         def fn(x):
+            # [FUNCTION DOC] HELPER: Call the ignored function with a dict expanded as keywords;
+            # scripting must fail.
             something_else(**x)
 
         with self.assertRaisesRegex(torch.jit.frontend.NotSupportedError, "keyword-arg expansion is not supported"):
             torch.jit.script(fn)
 
     def test_kwargs_error_msg(self):
+        # [FUNCTION DOC] Calling a function that takes variable keyword or positional arguments
+        # from script raises NotSupportedError mentioning a variable number.
         def other(**kwargs):
+            # [FUNCTION DOC] HELPER: Function taking variable keyword arguments and
+            # printing them.
             print(kwargs)
 
         def fn():
+            # [FUNCTION DOC] HELPER: Call the keyword-variadic function.
             return other()
 
         with self.assertRaisesRegex(torch.jit.frontend.NotSupportedError, 'variable number'):
             torch.jit.script(fn)
 
         def another_other(*args):
+            # [FUNCTION DOC] HELPER: Function taking variable positional arguments and
+            # printing them.
             print(args)
 
         def another_fn():
+            # [FUNCTION DOC] HELPER: Call the positional-variadic function.
             return another_other()
 
         with self.assertRaisesRegex(torch.jit.frontend.NotSupportedError, 'variable number'):
             torch.jit.script(another_fn)
 
     def test_inferred_error_msg(self):
+        # [FUNCTION DOC] Passing a string to a function whose argument type was inferred as
+        # tensor gives an error naming the expected inferred type.
         """
         Test that when we get a type mismatch on a function where we inferred
         the type to be tensor, a good error message is given.
         """
         @torch.jit.script
         def foo(a):
+            # [FUNCTION DOC] HELPER: Identity function with an unannotated argument.
             return a
 
         with self.assertRaisesRegex(RuntimeError, (r"Expected a value of type \'Tensor \(inferred\)\'"
@@ -15895,19 +19758,26 @@ dedent """
             foo("1")
 
     def test_type_comments_in_body(self):
+        # [FUNCTION DOC] Comment-style annotations on a multi-line signature, plus stray type
+        # comments in a body and in attribute assignments, are accepted when scripting.
         @torch.jit.script
         def foo(a,  # type: int
                 b,  # type: int
                 ):
+            # [FUNCTION DOC] HELPER: Function with per-argument comments and a combined return
+            # comment; returns the sum.
             # type: (...) -> int
             # type: int
             return a + b
 
         class M(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose constructor has per-argument comments and stores
+            # two ints.
             def __init__(self,
                          a,  # type: int
                          b   # type: int
                          ):
+                # [FUNCTION DOC] HELPER: Call the base initializer and store the two ints.
                 # type: (...) -> None
                 super().__init__()
                 self.a = a  # type: int
@@ -15916,15 +19786,21 @@ dedent """
         torch.jit.script(M(2, 3))
 
     def test_input_keyword_in_schema(self):
+        # [FUNCTION DOC] checkScript of ceil called with the input keyword.
         def f(x):
+            # [FUNCTION DOC] HELPER: Return ceil with the keyword argument.
             return torch.ceil(input=x)
 
         inp = torch.randn(10)
         self.checkScript(f, (inp, ))
 
     def test_module_method_reassignment(self):
+        # [FUNCTION DOC] A forward attribute assigned to another method in the class body is
+        # scripted and works.
         class Foo(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward is an alias of a private method.
             def _forward(self, x):
+                # [FUNCTION DOC] HELPER: Return x.
                 return x
 
             forward = _forward
@@ -15936,24 +19812,34 @@ dedent """
     # Tests the case where a torch.Tensor subclass (like Parameter) is used as
     # input.
     def test_script_module_tensor_subclass_argument(self):
+        # [FUNCTION DOC] A script function annotated with the Parameter class accepts a
+        # plain tensor.
         @torch.jit.script
         def parameter_script(x: torch.nn.Parameter):
+            # [FUNCTION DOC] HELPER: Return the argument.
             return x
 
         input = torch.ones(2, 2)
         self.assertEqual(input, parameter_script(input))
 
     def test_save_load_attr_error(self):
+        # [FUNCTION DOC] After export/import of a script module, scripting a wrapper that reads a
+        # missing attribute of it must raise RuntimeError.
         class Inner(nn.Module):
+            # [CLASS DOC] HELPER: Module returning its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return x.
                 return x
 
         class Wrapper(nn.Module):
+            # [CLASS DOC] HELPER: Module that calls a nonexistent method of its inner module.
             def __init__(self, inner):
+                # [FUNCTION DOC] HELPER: Store the inner module.
                 super().__init__()
                 self.inner = inner
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Call a missing method b of the inner module.
                 # this attribute doesn't exist on `Inner`
                 return self.inner.b(x)
 
@@ -15965,10 +19851,16 @@ dedent """
             torch.jit.script(wrapped)
 
     def test_rescripting_loaded_modules(self):
+        # [FUNCTION DOC] A scripted module wrapped in a new eager module can be rescripted,
+        # reading its buffer, parameter, plain tensor and constant; results equal before and
+        # after export/import.
         class InnerSubmod(nn.Module):
+            # [CLASS DOC] HELPER: Module with a buffer, a parameter, a plain tensor and a
+            # constant that doubles its input.
             __constants__ = ['my_constant']
 
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the buffer, parameter, plain tensor and constant.
                 super().__init__()
                 self.foo = torch.nn.Buffer(torch.ones(1))
                 self.register_parameter("bar", torch.nn.Parameter(torch.ones(1)))
@@ -15976,22 +19868,30 @@ dedent """
                 self.my_constant = 1
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return x plus x.
                 return x + x
 
         class Inner(nn.Module):
+            # [CLASS DOC] HELPER: Module wrapping the submodule.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Create the submodule.
                 super().__init__()
                 self.submod = InnerSubmod()
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Apply the submodule.
                 return self.submod(x)
 
         class Wrapper(nn.Module):
+            # [CLASS DOC] HELPER: Module reading elements of a scripted inner module's submodule.
             def __init__(self, inner):
+                # [FUNCTION DOC] HELPER: Store the inner module.
                 super().__init__()
                 self.inner = inner
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Sum the submodule output, buffer, parameter, plain
+                # tensor and constant.
                 # access inner elements
                 ret = self.inner.submod(x) + self.inner.submod.foo + self.inner.submod.bar + self.inner.submod.baz
                 ret = ret + self.inner.submod.my_constant
@@ -16006,7 +19906,10 @@ dedent """
         self.assertEqual(wrapped(torch.ones(1)), wrapped_loaded(torch.ones(1)))
 
     def test_interpret_graph(self):
+        # [FUNCTION DOC] Interpret a parsed IR graph directly on two random tensors; the result
+        # equals their product.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Unfold along dim 0 (unused by the test).
             return x.unfold(0, 1, 1)
 
         graph_str = """
@@ -16022,24 +19925,34 @@ dedent """
         self.assertEqual(test, ref)
 
     def test_signed_float_zero(self):
+        # [FUNCTION DOC] checkModule of a module dividing by negative zero.
 
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module dividing its input by negative zero.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return x divided by -0.
                 return torch.div(x, -0.)
 
         inp = torch.ones(1)
         self.checkModule(MyModule(), inp)
 
     def test_index_with_tuple(self):
+        # [FUNCTION DOC] checkModule of indexing a tensor with a one-element tuple.
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module indexing its input with a one-element tuple.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Return the entry at index 1.
                 return x[(1,)]
 
         self.checkModule(MyModule(), (torch.ones(2, 3),))
 
     def test_context_manager(self):
+        # [FUNCTION DOC] checkModule of a simple add module under each fuser setting (fuser0,
+        # fuser1, none).
         class MyModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module returning x plus y plus 2.0.
             def forward(self, x, y):
+                # [FUNCTION DOC] HELPER: Return the sum of x and y plus 2.0.
                 p = x + y
                 q = p + 2.0
                 return q
@@ -16051,7 +19964,10 @@ dedent """
                 self.checkModule(MyModule(), (x, y))
 
     def test_zero_dimension_tensor_trace(self):
+        # [FUNCTION DOC] Tracing a function indexing with a boolean mask on a zero-dimensional
+        # tensor works.
         def f(x):
+            # [FUNCTION DOC] HELPER: Return the positive entries of x.
             return x[x > 0]
         jf = torch.jit.trace(f, torch.tensor(2., device="cpu"))
 
@@ -16135,10 +20051,13 @@ EXCLUDE_ALIAS = {
 
 
 class TestJitGeneratedModule(JitTestCase):
+    # [CLASS DOC] Empty test case that receives generated tests for nn modules and criterions.
     pass
 
 
 class TestJitGeneratedFunctional(JitTestCase):
+    # [CLASS DOC] Empty test case intended for generated functional tests (none are added in
+    # this file).
     pass
 
 L = 20
@@ -16146,6 +20065,11 @@ M = 10
 S = 5
 
 def add_nn_module_test(*args, **kwargs):
+    # [FUNCTION DOC] Build a generated test for one nn module description and add it to
+    # TestJitGeneratedModule. Skips descriptions marked as eval; the generated test compares a
+    # scripted wrapper against the eager module on generated inputs (including gradients unless
+    # no_grad). Side effects: registers a test method, wrapped as slow when requested; raises
+    # AssertionError if the test name is already used.
     no_grad = kwargs.get('no_grad', False)
 
     if 'desc' in kwargs and 'eval' in kwargs['desc']:
@@ -16156,6 +20080,10 @@ def add_nn_module_test(*args, **kwargs):
 
     @suppress_warnings
     def do_test(self):
+        # [FUNCTION DOC] HELPER: Generated test body: skip excluded modules or those not
+        # marked for jit checks (raising SkipTest), build constructor args, inputs and
+        # targets from the description, and check the script module against the eager module
+        # with check_against_reference.
         if test_name in EXCLUDE_SCRIPT_MODULES:
             return
         if not kwargs.get('check_jit', True):
@@ -16182,6 +20110,9 @@ def add_nn_module_test(*args, **kwargs):
                 constructor_args = kwargs.get('constructor_args', ())
 
             def create_script_module(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Build a script module whose generated method calls a
+                # submodule with the given arguments, run it, export/import it, and return the
+                # module output. Remembers the last graph on the function object.
                 """Construct a script module that passes arguments through to self.submodule"""
                 formals, tensors, actuals = get_script_args(args)
 
@@ -16196,13 +20127,19 @@ def add_nn_module_test(*args, **kwargs):
 
                 # Create module to use the script method
                 class TheModule(torch.jit.ScriptModule):
+                    # [CLASS DOC] HELPER: Script module holding the submodule built by the
+                    # constructor; the submodule may be declared as a constant.
                     __constants__ = submodule_constants
 
                     def __init__(self) -> None:
+                        # [FUNCTION DOC] HELPER: Create the nn module under test from the
+                        # constructor args.
                         super().__init__()
                         self.submodule = nn_module(*constructor_args)
 
                 def make_module(script):
+                    # [FUNCTION DOC] HELPER: Create the module, check its text form, define the
+                    # generated method from the given script and return it.
                     module = TheModule()
                     # check __repr__
                     str(module)
@@ -16218,6 +20155,8 @@ def add_nn_module_test(*args, **kwargs):
             # Construct a normal nn module to stay consistent with create_script_module
             # and make use of a single global rng_state in module initialization
             def create_nn_module(*args, **kwargs):
+                # [FUNCTION DOC] HELPER: Create the eager module from the constructor args and
+                # apply it.
                 module = nn_module(*constructor_args)
                 return module(*args)
 
@@ -16273,6 +20212,8 @@ def add_nn_module_test(*args, **kwargs):
 
 
 def post_add_test(test_name, skipTestIf, do_test, test_class):
+    # [FUNCTION DOC] Attach a test function to a test class under the given name after wrapping
+    # it with the skip decorators. Raises AssertionError if the class already has that name.
     if hasattr(test_class, test_name):
         raise AssertionError('Two tests have the same name: ' + test_name)
 
@@ -16283,6 +20224,9 @@ def post_add_test(test_name, skipTestIf, do_test, test_class):
 
 
 def normalize_check_ad(check_ad, name):
+    # [FUNCTION DOC] Normalize an autodiff check description to a triple: a flag, a list of op
+    # names to look for (default derived from the function name) and a list of ops to avoid.
+    # Raises an exception for tuples of length above three.
     # normalized check_ad is 3-element tuple: (bool, List[str], List[str])
     if len(check_ad) == 0:
         check_ad = [False, ['aten::' + name], []]
@@ -16301,8 +20245,11 @@ def normalize_check_ad(check_ad, name):
 
 
 class TestProducerVersion(TestCase):
+    # [CLASS DOC] Version consistency test case.
 
     def test_version(self):
+        # [FUNCTION DOC] The torch version string starts with the ONNX producer version
+        # (issue 32561).
         # issue gh-32561
         self.assertTrue(torch.__version__.startswith(torch.onnx.producer_version))
 
