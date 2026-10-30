@@ -1,3 +1,8 @@
+# [MODULE DOC] Command line script that simulates an NCCL failure across several nodes. At import
+# time it configures a module logger at info level with a stream handler and no propagation. When
+# run as a program it takes address, port, rank and world size, builds a TCP store and an NCCL
+# process group, runs one allreduce everywhere, then rank 0 runs a second allreduce and waits on
+# it while all other ranks abort their process, so rank 0 observes an error.
 import argparse
 import logging
 import os

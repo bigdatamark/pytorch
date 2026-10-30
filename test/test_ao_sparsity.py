@@ -1,4 +1,10 @@
 # Owner(s): ["module: sparse"]
+# [MODULE DOC] Aggregator test module for the ao sparsity suite. It only imports test classes from
+# the sparsity test files (kernels, parametrization, schedulers, sparsifiers, structured pruning,
+# activation and data sparsifiers, utilities; composability tests are skipped on ARM64) so a
+# single runner discovers them, and instantiates device-generic variants of three pruner test
+# classes into this module namespace. When run as a program it configures info level logging and
+# runs the tests.
 import logging
 
 # Kernels

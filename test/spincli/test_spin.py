@@ -1,5 +1,8 @@
 # Owner(s): ["module: spin"]
 
+# [MODULE DOC] Test module for the spin command line tool. Defines the repository root path and
+# one test case class; imports the spin test helper that invokes spin commands in process. Runs
+# the test runner when executed as a program.
 import ast
 import os
 import shutil
@@ -15,7 +18,15 @@ PYTORCH_ROOT = Path(__file__).parent.parent.parent
 
 
 class TestSpin(TestCase):
+    # [CLASS DOC] Tests for spin subcommands; currently only the pyrefly type inference command.
     def test_autotype(self):
+        # [FUNCTION DOC] Copies the untyped fixture file into a temporary directory, changes to
+        # the repository root, runs the spin pyrefly infer command on the copy, restores the
+        # previous directory, then parses both the rewritten copy and the typed fixture and
+        # asserts their syntax tree dumps are equal. The temporary directory is removed
+        # afterwards.
+        # KNOWN ISSUE: the working directory is restored only on success; if the spin call
+        # raises, the process stays in the repository root.
         with tempfile.TemporaryDirectory() as tmp_dir:
             here = Path(__file__).parent
             untyped_file_name = "autotype_test_untyped.py"

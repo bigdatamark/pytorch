@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 
+# [MODULE DOC] Command line driver that runs each test case of a given test file under
+# cuda-memcheck in its own subprocess, in parallel via coroutines, and writes outcomes (Success,
+# Timeout, Fail, Ignored) to a log file or to standard output in CI mode. Import-time side effects
+# (it is a script, not a library): counts GPUs, parses command line arguments (filename, timeout,
+# strict, nproc, gpus, ci, nohang, split, rank), sets the memcheck environment variable, runs
+# pytest in setup-only mode to discover test names, drops tests whose name suggests CPU only,
+# sorts and slices the list by split and rank, and opens the log file (a no-op progress stub is
+# used in CI, a tqdm bar otherwise). The actual run starts only when executed as a program.
 """This script runs cuda-memcheck on the specified unit test. Each test case
 is run in its isolated process with a timeout so that:
 1) different test cases won't influence each other, and
@@ -73,6 +81,11 @@ args = parser.parse_args()
 # Filters that ignores cublas/cudnn errors
 # TODO (@zasdfgbnm): When can we remove this? Will cublas/cudnn run error-free under cuda-memcheck?
 def is_ignored_only(output):
+    # [FUNCTION DOC] Decides whether a failing cuda-memcheck output should be hidden. Parses the
+    # output with the report parser; if parsing fails the error is never ignored (returns False).
+    # Otherwise counts errors whose backtrace mentions the cublas, cudnn or cufft libraries and
+    # returns True only when every reported error is of that kind (including the case of zero
+    # errors).
     try:
         report = cmc.parse(output)
     except cmc.ParseError:
@@ -115,6 +128,8 @@ for line in lines:
 # Do a simple filtering:
 # if 'cpu' or 'CPU' is in the name and 'cuda' or 'CUDA' is not in the name, then skip it
 def is_cpu_only(name):
+    # [FUNCTION DOC] Returns True when the lower-cased test name contains the substring cpu but
+    # not the substring cuda; used to drop tests that cannot exercise the GPU.
     name = name.lower()
     return ("cpu" in name) and "cuda" not in name
 
@@ -144,13 +159,28 @@ else:
 
     # create a fake progress bar that does not display anything
     class ProgressbarStub:
+        # [CLASS DOC] HELPER: Stand-in for the tqdm progress bar used in CI mode; only provides an
+        # update method that does nothing, so the worker code can call it unconditionally.
         def update(self, *args):
+            # [FUNCTION DOC] HELPER: Accepts any positional arguments and does nothing.
             return
 
     progressbar = ProgressbarStub()
 
 
 async def run1(coroutine_id):
+    # [FUNCTION DOC] Worker coroutine number coroutine_id. Picks a GPU: in the default all mode
+    # the id modulo the detected GPU count (ZeroDivisionError if no GPU is visible), otherwise the
+    # entry of the colon separated assignment string at that index, raising AssertionError if the
+    # number of assignments differs from nproc. Then loops, taking the next test from the shared
+    # module level list through a shared progress counter, and runs the memcheck shell command
+    # restricted to that GPU with a timeout. Timeout: logs Timeout, kills the process, and in CI
+    # without nohang exits the program with a message. Return code zero: logs Success. Otherwise
+    # decodes output and logs Fail with stdout and stderr (exits in CI) unless the failure only
+    # involves ignored libraries and strict mode is off, in which case it logs Ignored. Updates
+    # the progress bar after each test.
+    # KNOWN ISSUE: after a timeout the killed process is not awaited, and the shared counter is a
+    # module global mutated without a lock (safe only because coroutines switch at await points).
     global progress
 
     if args.gpus == "all":
@@ -198,6 +228,9 @@ async def run1(coroutine_id):
 
 
 async def main():
+    # [FUNCTION DOC] Starts nproc worker coroutines as tasks and awaits them one after another;
+    # any exception raised in a worker (including the CI-mode exit) propagates out of this
+    # coroutine. Returns nothing.
     tasks = [asyncio.ensure_future(run1(i)) for i in range(args.nproc)]
     for t in tasks:
         await t

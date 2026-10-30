@@ -1,4 +1,10 @@
 # Owner(s): ["module: tests"]
+# [MODULE DOC] Tests for the generic torch accelerator API (device index, stream and event
+# handling, context managers, memory statistics, device capability) that run on whichever
+# accelerator backend is present. Import-time side effects: if no accelerator is detected it
+# prints a message to standard error, replaces the test case base with a no-op one and exits the
+# process. Device-specific variants (all but cpu, with MPS and XPU allowed) are generated into
+# this module by the device type test instantiation.
 
 import gc
 import operator
@@ -27,7 +33,13 @@ if not TEST_ACCELERATOR:
 
 
 class TestAccelerator(TestCase):
+    # [CLASS DOC] Test case for the accelerator API; each test acts on the current accelerator,
+    # with the device type attribute supplied by the instantiation helper. Some tests require
+    # several accelerators or exclude MPS or XPU.
     def test_current_accelerator(self):
+        # [FUNCTION DOC] Checks the accelerator is available, that the current accelerator type
+        # equals the test device type with no index set, and that setting the device index with a
+        # cpu device raises ValueError mentioning a mismatch with the current accelerator.
         self.assertTrue(torch.accelerator.is_available())
         self.assertEqual(torch.accelerator.current_accelerator().type, self.device_type)
         self.assertIsNone(torch.accelerator.current_accelerator().index)
@@ -38,6 +50,10 @@ class TestAccelerator(TestCase):
 
     @unittest.skipIf(not TEST_MULTIACCELERATOR, "only one accelerator detected")
     def test_generic_multi_device_behavior(self):
+        # [FUNCTION DOC] Needs at least two accelerators. Switches the current device index to the
+        # next device, then back, verifying the index each time; then sets a stream created on the
+        # other device as current and checks the current device follows it and stays there after
+        # synchronizing the original device.
         orig_device = torch.accelerator.current_device_index()
         target_device = (orig_device + 1) % torch.accelerator.device_count()
 
@@ -53,6 +69,11 @@ class TestAccelerator(TestCase):
         self.assertEqual(target_device, torch.accelerator.current_device_index())
 
     def test_generic_stream_behavior(self):
+        # [FUNCTION DOC] Makes one stream current, computes a sum on the host, then on a second
+        # stream copies both operands to the accelerator without blocking, switches back to the
+        # first stream, records and waits on an event on the second stream, adds on the device,
+        # records again, synchronizes, and checks the event completed and the device result equals
+        # the host result.
         s1 = torch.Stream()
         s2 = torch.Stream()
         torch.accelerator.set_stream(s1)
@@ -76,6 +97,9 @@ class TestAccelerator(TestCase):
         self.assertEqual(c_acc.cpu(), c)
 
     def test_current_stream_query(self):
+        # [FUNCTION DOC] Checks the current stream can be queried by device object, device index
+        # or device string and always gives the same stream, and that querying with a cpu device
+        # raises ValueError about a mismatch with the current accelerator.
         s = torch.accelerator.current_stream()
         self.assertEqual(torch.accelerator.current_stream(s.device), s)
         self.assertEqual(torch.accelerator.current_stream(s.device.index), s)
@@ -87,6 +111,10 @@ class TestAccelerator(TestCase):
             torch.accelerator.current_stream(other_device)
 
     def test_stream_compare_with_non_stream(self):
+        # [FUNCTION DOC] Regression check for comparing a stream with other values: equality with
+        # ints, strings, floats, None and plain objects is False and inequality True (membership
+        # in a mixed list works); ordering comparisons between two streams raise TypeError; a
+        # second stream constructed from the same id, device index and device type compares equal.
         # Comparing with a non-Stream must not blindly cast it to THPStream*
         # and read garbage fields (#188033)
         s1 = torch.Stream()
@@ -104,6 +132,9 @@ class TestAccelerator(TestCase):
         self.assertFalse(s1 != same)
 
     def test_device_context_manager(self):
+        # [FUNCTION DOC] Checks the device index context manager with no index leaves the current
+        # device unchanged, and with index zero switches to device zero inside the block and
+        # restores the previous index afterwards.
         prev_device = torch.accelerator.current_device_index()
         with torch.accelerator.device_index(None):
             self.assertEqual(torch.accelerator.current_device_index(), prev_device)
@@ -113,7 +144,12 @@ class TestAccelerator(TestCase):
         self.assertEqual(torch.accelerator.current_device_index(), prev_device)
 
     def test_device_index_fullgraph(self):
+        # [FUNCTION DOC] Compiles a function that uses the device index context manager with the
+        # device of its input, using the eager backend and requiring a single graph, and checks
+        # the compiled result equals the uncompiled result on device zero.
         def fn(x):
+            # [FUNCTION DOC] HELPER: Enters the device index context for the input tensor device,
+            # computes the sine of the input plus one inside it, and returns the result.
             with torch.accelerator.device_index(x.device.index):
                 x = torch.sin(x + 1)
             return x
@@ -126,6 +162,9 @@ class TestAccelerator(TestCase):
 
     @unittest.skipIf(not TEST_MULTIACCELERATOR, "only one accelerator detected")
     def test_multi_device_context_manager(self):
+        # [FUNCTION DOC] Needs at least two accelerators. Sets device zero current, enters the
+        # context manager for device one, checks the current index is one inside and zero after
+        # leaving.
         src_device = 0
         dst_device = 1
         torch.accelerator.set_device_index(src_device)
@@ -134,12 +173,17 @@ class TestAccelerator(TestCase):
         self.assertEqual(torch.accelerator.current_device_index(), src_device)
 
     def test_stream_context_manager(self):
+        # [FUNCTION DOC] Checks that using a new stream as a context manager makes it the current
+        # stream inside the block and restores the previous current stream afterwards.
         prev_stream = torch.accelerator.current_stream()
         with torch.Stream() as s:
             self.assertEqual(torch.accelerator.current_stream(), s)
         self.assertEqual(torch.accelerator.current_stream(), prev_stream)
 
     def test_stream_context_manager_reentrance(self):
+        # [FUNCTION DOC] Checks the stream context manager can be entered twice on the same stream
+        # and nested across different streams (including re-entering an outer stream), with the
+        # current stream correct at each level and the original stream restored at the end.
         prev_stream = torch.accelerator.current_stream()
         s0 = torch.Stream()
         with s0, s0:
@@ -156,6 +200,10 @@ class TestAccelerator(TestCase):
 
     @unittest.skipIf(not TEST_MULTIACCELERATOR, "only one accelerator detected")
     def test_multi_device_stream_context_manager(self):
+        # [FUNCTION DOC] Needs at least two accelerators. With device zero current, enters a
+        # stream created on device one and checks the current device and stream switch to it while
+        # the device zero current stream is unchanged; after leaving, checks the device index and
+        # both current streams are restored.
         src_device = 0
         dst_device = 1
         torch.accelerator.set_device_index(src_device)
@@ -173,6 +221,9 @@ class TestAccelerator(TestCase):
 
     @unittest.skipIf(TEST_MPS, "MPS doesn't support pin memory!")
     def test_pin_memory_on_non_blocking_copy(self):
+        # [FUNCTION DOC] Skipped on MPS. Copies a host tensor to the accelerator, then back to the
+        # host without blocking, synchronizes, and checks the resulting host tensor is pinned and
+        # equal to the device data.
         t_acc = torch.randn(100).to(torch.accelerator.current_accelerator())
         t_host = t_acc.to("cpu", non_blocking=True)
         torch.accelerator.synchronize()
@@ -180,6 +231,9 @@ class TestAccelerator(TestCase):
         self.assertEqual(t_acc.cpu(), t_host)
 
     def test_generic_event_behavior(self):
+        # [FUNCTION DOC] Checks that asking for elapsed time between two events raises ValueError
+        # when timing was not enabled (explicitly or by default), and when timing is enabled but
+        # the events were not recorded; each message is matched by regular expression.
         event1 = torch.Event(enable_timing=False)
         event2 = torch.Event(enable_timing=False)
         with self.assertRaisesRegex(
@@ -207,6 +261,14 @@ class TestAccelerator(TestCase):
 
     @unittest.skipIf(TEST_MPS, "MPS doesn't support torch.accelerator memory API!")
     def test_memory_stats(self):
+        # [FUNCTION DOC] Skipped on MPS. Allocates and frees a tensor to initialize the device
+        # allocator, collects garbage, checks the allocator is initialized and empties the cache.
+        # Verifies the memory statistics mapping has every combination of the four byte
+        # categories, three pools and four metrics, then exercises allocated, reserved and peak
+        # counters (grow after an allocation, return to baseline after freeing and resetting
+        # peaks). Finally allocates exactly 1024 bytes and checks the active bytes current counter
+        # rises by 1024 with freed still zero, and that after freeing the freed counter equals
+        # 1024 and peak values are restored.
         # Ensure that device allocator is initialized
         acc = torch.accelerator.current_accelerator()
         tmp = torch.randn(100, device=acc)
@@ -284,6 +346,8 @@ class TestAccelerator(TestCase):
 
     @unittest.skipIf(TEST_MPS, "MPS doesn't support torch.accelerator memory API!")
     def test_get_memory_info(self):
+        # [FUNCTION DOC] Skipped on MPS. Calls the memory info query and checks both free and
+        # total byte counts are non-negative.
         free_bytes, total_bytes = torch.accelerator.get_memory_info()
         self.assertGreaterEqual(free_bytes, 0)
         self.assertGreaterEqual(total_bytes, 0)
@@ -293,6 +357,11 @@ class TestAccelerator(TestCase):
         "bare-bones/opaque bit-field dtypes cause undefined behavior on XPU, see https://github.com/pytorch/pytorch/issues/179888",
     )
     def test_device_capability_supported_dtypes(self):
+        # [FUNCTION DOC] Skipped on XPU. Queries the device capability (skips the test on
+        # RuntimeError) and checks the supported dtype entry is a non-empty set. For every dtype
+        # attribute of the torch module, in a subtest, creates an empty tensor of that dtype on
+        # the accelerator and converts it to a reference supported dtype and back; this must
+        # succeed for supported dtypes and raise RuntimeError or TypeError for unsupported ones.
         try:
             caps = torch.accelerator.get_device_capability()
         except RuntimeError:

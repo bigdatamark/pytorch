@@ -1,15 +1,29 @@
+# [MODULE DOC] Minimal parser for the text report printed by cuda-memcheck. Defines a parse error
+# type, a report container, an error container and a parse function that splits a report into
+# per-error sections plus the final error count summary. No import-time side effects.
 # this file contains a simple parser that parses report
 # from cuda-memcheck
 
 
 class ParseError(Exception):
+    # [CLASS DOC] Exception raised by this module when the report text cannot be interpreted: a
+    # missing error summary, or a summary count that disagrees with the number of parsed errors.
     """Whenever the simple parser is unable to parse the report, this exception will be raised"""
 
 
 class Report:
+    # [CLASS DOC] Parsed result of a whole report: holds the summary text, the integer error count
+    # read from it, and the list of Error objects. Invariant: the count equals the length of the
+    # list, except that a count above 10000 is clamped to 10000 when exactly 10000 errors were
+    # listed.
     """A report is a container of errors, and a summary on how many errors are found"""
 
     def __init__(self, text, errors):
+        # [FUNCTION DOC] Stores the summary line and error list, and reads the error count from
+        # the third whitespace separated token of the summary line (a non-integer there raises
+        # ValueError). Raises ParseError when the count differs from the number of errors, unless
+        # exactly 10000 errors were listed and the summary claims more, in which case the count is
+        # clamped to 10000 (cuda-memcheck prints at most that many).
         # text is something like
         # ERROR SUMMARY: 1 error
         # or
@@ -26,6 +40,9 @@ class Report:
 
 
 class Error:
+    # [CLASS DOC] One error section of the report: attributes are the message (first line) and the
+    # stack (list of stripped backtrace lines). Created from the list of lines of the section by
+    # the parser.
     """Each error is a section in the output of cuda-memcheck.
     Each error in the report has an error message and a backtrace. It looks like:
 
@@ -39,12 +56,22 @@ class Error:
     """
 
     def __init__(self, lines):
+        # [FUNCTION DOC] Takes the section lines with the common prefix already removed; the first
+        # line becomes the message, the second line (the saved-backtrace header) is dropped, and
+        # the remaining lines are stripped of surrounding whitespace and stored as the stack.
+        # Assumes at least one line is given; an empty list raises IndexError.
         self.message = lines[0]
         lines = lines[2:]
         self.stack = [l.strip() for l in lines]
 
 
 def parse(message):
+    # [FUNCTION DOC] Parses a cuda-memcheck report given as one string. Ignores everything until
+    # the line announcing the tool, then considers only lines starting with the equals-sign
+    # prefix. The first prefixed line after a blank prefixed line starts a new error, further
+    # lines are appended to it, and a blank prefixed line closes it. The line starting with the
+    # summary label ends parsing and a Report is returned. Raises ParseError if the text has no
+    # summary line (or the report is otherwise inconsistent, via Report).
     """A simple parser that parses the report of cuda-memcheck. This parser is meant to be simple
     and it only split the report into separate errors and a summary. Where each error is further
     split into error message and backtrace. No further details are parsed.

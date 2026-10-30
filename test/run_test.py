@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 
+# [MODULE DOC] Main driver of the PyTorch Python and C++ test suite (a script; run as a program it
+# executes the main function). It selects test files from the discovered list using command line
+# options (include, exclude, jit, distributed, core, cpp, mps, xpu, onnx, openreg, hardware
+# classification and blocklists for Windows, ROCm and s390x), shards them by recorded timing data,
+# optionally prioritizes them with target determination, and runs each file in a subprocess either
+# serially or in a spawn process pool, with pytest rerun and step-current retry handling, optional
+# log piping, coverage, artifact upload and metric emission in CI. Also holds the custom handlers
+# for tests that need special setup (C++ extension builds, autoload, openreg, distributed
+# backends, doctests). Import-time side effects: temporarily puts the repository root on the
+# module search path to import the test tooling and removes it again, reads several environment
+# variables into module constants, and builds the test lists and blocklists used for selection.
 import argparse
 import contextlib
 import copy
@@ -89,12 +100,18 @@ except ImportError:
     # functions are only needed under specific circumstances (CI) so we can
     # define dummy functions here.
     def parse_xml_and_upload_json():
+        # [FUNCTION DOC] HELPER: Fallback used when the artifact upload tooling cannot be imported
+        # (for example the cloud client is missing); does nothing.
         pass
 
     def zip_and_upload_artifacts(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Fallback that accepts any arguments and does nothing, replacing
+        # the artifact zip and upload function when its import failed.
         pass
 
     def upload_adhoc_failure_json(*args, **kwargs):
+        # [FUNCTION DOC] HELPER: Fallback that accepts any arguments and does nothing, replacing
+        # the failure report upload function when its import failed.
         pass
 
 
@@ -131,6 +148,11 @@ IS_S390X = platform.machine() == "s390x"
 # Assigning each Pool worker their own dedicated GPU avoids the ROCm oversubscription issues.
 # This should also result in better overall wall clock time since all GPUs can be utilized.
 def maybe_set_hip_visible_devies():
+    # [FUNCTION DOC] On ROCm builds only, when called from a worker process of a parallel pool
+    # (the process name is not the main process), sets the HIP visible devices environment
+    # variable to the worker identity number modulo the number of test processes, so each worker
+    # gets its own GPU. Does nothing on the main process or non-ROCm builds. Mutates the process
+    # environment. The misspelled name (devies) is the real name used by callers.
     # Special handling of ROCm GHA runners for parallel (file granularity) tests.
     if torch.version.hip:
         p = current_process()
@@ -140,14 +162,24 @@ def maybe_set_hip_visible_devies():
 
 
 def strtobool(s):
+    # [FUNCTION DOC] Interprets an environment style string as a boolean: returns False for the
+    # empty string and for zero, false and off in any letter case, and True for every other
+    # string.
     return s.lower() not in {"", "0", "false", "off"}
 
 
 class TestChoices(list):
+    # [CLASS DOC] List subclass of test names used as the command line choices list; its
+    # membership test normalizes the queried item into a test module name first, so a path with a
+    # py suffix or a trailing test selector still matches a listed module.
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] Builds the list from only the first positional argument; any other
+        # positional or keyword arguments are accepted but ignored.
         super().__init__(args[0])
 
     def __contains__(self, item):
+        # [FUNCTION DOC] Returns whether the item, after being normalized by the test module
+        # parser, is one of the list entries.
         return list.__contains__(self, parse_test_module(item))
 
 
@@ -441,6 +473,8 @@ QUANTIZATION_TESTS = [test for test in TESTS if test.startswith("test_quantizati
 
 
 def _is_cpp_test(test):
+    # [FUNCTION DOC] Returns True when the test name starts with the C++ test prefix, except for
+    # names under the cpp extensions directory, which run through the normal Python test path.
     # Note: tests underneath cpp_extensions are different from other cpp tests
     # in that they utilize the usual python test infrastructure.
     return test.startswith(CPP_TEST_PREFIX) and not test.startswith("cpp_extensions")
@@ -494,10 +528,16 @@ TESTS_USING_GRADCHECK = [
 
 
 def print_to_stderr(message):
+    # [FUNCTION DOC] Writes the message and a newline to standard error.
     print(message, file=sys.stderr)
 
 
 def get_executable_command(options, disable_coverage=False, is_cpp_test=False):
+    # [FUNCTION DOC] Returns the leading command words used to launch a test: with coverage
+    # requested (and not disabled) a coverage run command in parallel mode over the torch package
+    # for Python tests, or an empty list for C++ tests (unsupported, which callers treat as
+    # nothing to run); without coverage the current Python interpreter with the double B flag for
+    # Python tests, or the pytest launcher for C++ tests.
     if options.coverage and not disable_coverage:
         if not is_cpp_test:
             executable = ["coverage", "run", "--parallel-mode", "--source=torch"]
@@ -522,6 +562,21 @@ def run_test(
     env=None,
     print_log=True,
 ) -> int:
+    # [FUNCTION DOC] Runs one test file (a sharded test) in a child process and returns its exit
+    # code. Prints whether the scribe token is set, sets ROCm device visibility, and builds the
+    # argument list: shard id and shard count for Python tests (a random step-current key is made
+    # per run), verbosity, removal of run-parallel options for blocklisted files, validated extra
+    # arguments (AssertionError if not a list), pytest options with dash-f and loadfile spelling
+    # translated when pytest is used, hardware classification, locals options, and
+    # import-slow/disabled options in CI. Raises RuntimeError if a file in the skip-retries set is
+    # run without pytest. C++ tests are skipped with return value zero in rerun-disabled mode or
+    # when no executable is available (coverage), otherwise located in the C++ test directory
+    # (with an exe suffix on Windows). Creates the test reports directory, optionally a temporary
+    # log file when piping logs, computes a timeout (only when enabled; larger in slow mode,
+    # scaled by a per-file multiplier under dynamo), and then either uses the retry loop (when no
+    # subprocess, no pytest-xdist and no rerun-disabled mode) or a single shell run with
+    # step-current options where pytest exit code five (no tests collected) is mapped to zero.
+    # Optionally prints the log file afterwards.
     scribe_token = os.getenv("SCRIBE_GRAPHQL_ACCESS_TOKEN", "")
     if scribe_token:
         print_to_stderr("SCRIBE_GRAPHQL_ACCESS_TOKEN is set")
@@ -728,6 +783,12 @@ def run_test(
 
 
 def install_cpp_extensions(extensions_dir, env=os.environ):
+    # [FUNCTION DOC] Builds and installs the test C++ extension package found in the given
+    # directory into a local install root (removing any previous build directory first) using pip
+    # without build isolation. Returns a pair of install directory (the site packages path inside
+    # the local root) and exit code; if the install command fails returns no directory and the
+    # failing code. Side effects: deletes and recreates files under the directory, runs a
+    # subprocess with the given environment (default is the live process environment).
     # Wipe the build folder, if it exists already
     build_dir = os.path.join(extensions_dir, "build")
     if os.path.exists(build_dir):
@@ -762,6 +823,9 @@ def install_cpp_extensions(extensions_dir, env=os.environ):
 
 @contextlib.contextmanager
 def extend_python_path(install_directories):
+    # [FUNCTION DOC] HELPER: Context manager that prepends the given install directories to the
+    # module search path environment variable for the duration of the block and always restores
+    # the previous value afterwards, even when the block raises.
     python_path = os.environ.get("PYTHONPATH", "")
     try:
         os.environ["PYTHONPATH"] = os.pathsep.join(install_directories + [python_path])
@@ -771,6 +835,10 @@ def extend_python_path(install_directories):
 
 
 def try_set_cpp_stack_traces(env, command, set=True):
+    # [FUNCTION DOC] HELPER: Sets the environment flag that makes C++ stack traces show on errors
+    # to enabled or disabled depending on the set flag, creating a new mapping if none was passed,
+    # and returns the mapping. The command argument is unused. Mutates and returns the given
+    # mapping.
     # Print full c++ stack traces during retries
     env = env or {}
     env["TORCH_SHOW_CPP_STACKTRACES"] = "1" if set else "0"
@@ -789,6 +857,16 @@ def run_test_retries(
     options,
     test_label="",
 ):
+    # [FUNCTION DOC] Runs a pytest command that stops at the first failure and recovers using the
+    # step-current plugin state, looping until the suite finishes. After a failure it reads the
+    # last-run test from the plugin cache, counts failures per test, logs timeouts (exit code 124)
+    # and then: if the rerun passed it continues with the rest of the tests, if the test failed
+    # three times it logs a consistent failure, optionally uploads an ad hoc failure report in CI,
+    # and either stops or (with continue through error) skips the test and continues, otherwise it
+    # reruns just that test with C++ stack traces enabled. Exit code five is treated as success,
+    # and a missing cache file ends the loop. Writes progress notes to the output file handle.
+    # Returns a pair of exit code and whether any rerun happened; the exit code is forced to one
+    # when any test failed consistently, and a note lists flaky tests.
     # Run the test with -x to stop at first failure.  Rerun the test by itself.
     # If it succeeds, move on to the rest of the tests in a new process.  If it
     # still fails, see below
@@ -802,11 +880,15 @@ def run_test_retries(
     # one that failed if there was a failure).
 
     def print_to_file(s):
+        # [FUNCTION DOC] HELPER: Prints the line to the enclosing function output file and flushes
+        # it.
         print(s, file=output, flush=True)
 
     num_failures = defaultdict(int)
 
     def read_pytest_cache(key: str) -> Any:
+        # [FUNCTION DOC] HELPER: Returns the text of the named entry in the pytest step-current
+        # cache directory for the current step key, or None when the cache file does not exist.
         cache_file = (
             REPO_ROOT / ".pytest_cache/v/cache/stepcurrent" / stepcurrent_key / key
         )
@@ -911,12 +993,23 @@ def run_test_retries(
 
 
 def run_test_with_subprocess(test_module, test_directory, options):
+    # [FUNCTION DOC] Custom handler that runs the test module through the normal test runner with
+    # the extra subprocess option added; returns its exit code.
     return run_test(
         test_module, test_directory, options, extra_unittest_args=["--subprocess"]
     )
 
 
 def _test_cpp_extensions_aot(test_directory, options, use_ninja):
+    # [FUNCTION DOC] Builds and tests the ahead-of-time C++ extensions. With ninja requested,
+    # first checks ninja is available and returns one (after printing the extension error text) if
+    # not. Deletes the old build directory, installs the main extension package with ninja use set
+    # via the environment, and on non-Windows platforms also builds extra extensions (a
+    # no-abi-suffix one, python-agnostic wheel for CUDA or XPU, and two libtorch-agnostic ones for
+    # CUDA), returning the first non-zero exit code. Then copies the AOT test file to a ninja or
+    # no-ninja named copy, collects the install site-packages directories, runs the copy through
+    # the test runner as a single shard with those directories on the module search path, and
+    # finally deletes the copy and removes the ninja environment variable.
     if use_ninja:
         try:
             from torch.utils import cpp_extension
@@ -1005,22 +1098,35 @@ def _test_cpp_extensions_aot(test_directory, options, use_ninja):
 
 
 def test_cpp_extensions_aot_ninja(test_module, test_directory, options):
+    # [FUNCTION DOC] Custom handler: runs the ahead-of-time C++ extension tests built with ninja.
+    # The test module argument is unused. Returns the exit code.
     return _test_cpp_extensions_aot(test_directory, options, use_ninja=True)
 
 
 def test_cpp_extensions_aot_no_ninja(test_module, test_directory, options):
+    # [FUNCTION DOC] Custom handler: runs the ahead-of-time C++ extension tests built without
+    # ninja. The test module argument is unused. Returns the exit code.
     return _test_cpp_extensions_aot(test_directory, options, use_ninja=False)
 
 
 def test_autoload_enable(test_module, test_directory, options):
+    # [FUNCTION DOC] Custom handler: runs the autoload test with device backend autoloading
+    # enabled. The test module argument is unused. Returns the exit code.
     return _test_autoload(test_directory, options, enable=True)
 
 
 def test_autoload_disable(test_module, test_directory, options):
+    # [FUNCTION DOC] Custom handler: runs the autoload test with device backend autoloading
+    # disabled. The test module argument is unused. Returns the exit code.
     return _test_autoload(test_directory, options, enable=False)
 
 
 def _test_autoload(test_directory, options, enable=True):
+    # [FUNCTION DOC] Installs the C++ extensions (returning the failing exit code if that fails),
+    # then with the backend autoload environment variable set to one or zero according to the
+    # enable flag and the install directory on the module search path, runs the autoload test
+    # script in the test directory and returns its exit code. Always removes the autoload variable
+    # afterwards.
     cpp_extensions_test_dir = os.path.join(test_directory, "cpp_extensions")
     install_directory, return_code = install_cpp_extensions(cpp_extensions_test_dir)
     if return_code != 0:
@@ -1042,6 +1148,11 @@ def _test_autoload(test_directory, options, enable=True):
 # tests under torch_openreg are passing, it can means that the mechanism
 # mentioned above is working as expected.
 def test_openreg(test_module, test_directory, options):
+    # [FUNCTION DOC] Custom handler that tests the openreg out-of-tree backend: installs the
+    # openreg extension (returning a non-zero exit code on failure), runs the openreg C++ test
+    # binary if it was built (failing early on a non-zero code), then runs unittest discovery
+    # verbosely over the openreg tests directory with the install directory on the module search
+    # path. Returns the final exit code.
     openreg_dir = os.path.join(
         test_directory, "cpp_extensions", "open_registration_extension", "torch_openreg"
     )
@@ -1072,6 +1183,14 @@ def test_openreg(test_module, test_directory, options):
 
 
 def test_distributed(test_module, test_directory, options):
+    # [FUNCTION DOC] Custom handler for the distributed spawn style tests. For each backend in the
+    # distributed configuration (only gloo on Windows; mpi only when the launcher exists) and for
+    # both file and environment init methods (file only on Windows), it creates a temporary
+    # directory with barrier and test subdirectories, sets the temp dir, backend, report source
+    # override and backend specific variables in the environment, and runs the test: with an mpi
+    # launcher (detecting whether the run-as-root and no-prefix options are accepted) for mpi,
+    # otherwise with the subprocess option. Returns the first non-zero exit code, else zero. The
+    # temporary directory is removed and the whole environment is restored after each combination.
     mpi_available = shutil.which("mpiexec")
     if options.verbose and not mpi_available:
         print_to_stderr("MPI not available -- MPI backend tests will be skipped")
@@ -1150,6 +1269,13 @@ def test_distributed(test_module, test_directory, options):
 
 
 def run_doctests(test_module, test_directory, options):
+    # [FUNCTION DOC] Custom handler for the doctests entry: runs the xdoctest runner over the
+    # torch package. Feature flags (all disabled except onnx, which is enabled when onnx packages
+    # import) decide which doctest environment variables are set; torch.onnx modules are excluded
+    # when onnx is missing, and MPS and distributed variables are set when those are available.
+    # Uses a google style, static analysis, whitespace-insensitive configuration with a global
+    # setup importing nn, functional, torch and warnings. Returns one if any doctest failed or
+    # emitted a run-time warning (after printing an error message for warnings), else zero.
     """
     Assumes the incoming test module is called doctest, and simply executes the
     xdoctest runner on the torch library itself.
@@ -1295,12 +1421,20 @@ def run_doctests(test_module, test_directory, options):
 
 
 def sanitize_file_name(file: str):
+    # [FUNCTION DOC] Returns the string with backslashes and slashes replaced by dots and spaces
+    # by underscores, so it can be used inside a file name.
     return file.replace("\\", ".").replace("/", ".").replace(" ", "_")
 
 
 def handle_log_file(
     test: ShardedTest, file_path: str, failed: bool, was_rerun: bool
 ) -> None:
+    # [FUNCTION DOC] Moves the temporary log file of a finished test into the test reports
+    # directory under a sanitized name with a random suffix, and prints to standard error. If the
+    # test succeeded with no reruns (and no rerun marker in the text) it prints only a success
+    # line with the log path plus the lines announcing how many items ran in the shard; otherwise
+    # it prints the whole log between begin and end markers. Mutates the file system (rename) and
+    # returns nothing.
     test = str(test)
     with open(file_path, errors="ignore") as f:
         full_text = f.read()
@@ -1329,6 +1463,13 @@ def handle_log_file(
 
 
 def get_pytest_args(options, is_cpp_test=False, is_distributed_test=False):
+    # [FUNCTION DOC] Builds the pytest argument list. Rerun policy: distributed tests stop on
+    # first failure with zero reruns; in rerun-disabled mode flake finder runs (15 times for ASAN
+    # builds, else 50); otherwise stop on first failure with the configured number of reruns.
+    # Always verbose with failure summary. Python tests disable xdist and use the repository
+    # pytest shard plugin; C++ tests use xdist with the configured process count and, when XML
+    # reports are enabled, a junit XML path with rerun support. Adds the k expression option if
+    # given. Returns the list.
     if is_distributed_test:
         # Distributed tests do not support rerun, see https://github.com/pytorch/pytorch/issues/162978
         rerun_options = ["-x", "--reruns=0"]
@@ -1372,6 +1513,10 @@ def get_pytest_args(options, is_cpp_test=False, is_distributed_test=False):
 
 
 def run_ci_sanity_check(test: ShardedTest, test_directory, options):
+    # [FUNCTION DOC] Handler for the deliberately failing CI sanity test. Raises AssertionError if
+    # the test name is not that test. Runs it without printing logs and returns one if it did not
+    # fail with exit code one. Otherwise deletes the log files and report directories the run
+    # produced and returns zero.
     if test.name != "test_ci_sanity_check_fail":
         raise AssertionError(
             f"This handler only works for test_ci_sanity_check_fail, got {test.name}"
@@ -1423,6 +1568,19 @@ PYTEST_SKIP_RETRIES = {"test_public_bindings"}
 
 
 def parse_args():
+    # [FUNCTION DOC] Defines and parses the command line for this runner and returns the
+    # namespace. Options include verbosity, locals display, group filters (jit, distributed,
+    # cpython, dynamo core, inductor core, functorch, einops, mps, xpu, openreg, cpp, core, onnx),
+    # pytest expression, coverage, include and exclude lists, hardware classification, windows
+    # blocklist override, continue through error, log piping, timeout and target determination
+    # switches, shard selection, exclusion switches, dry run, xdoctest command, translation
+    # validation and artifact upload, plus a mutually exclusive dynamo or inductor mode.
+    # Unrecognized arguments are kept (a lone separator is dropped) in the additional args
+    # attribute for the test processes. May exit via the parser on bad input.
+    # KNOWN ISSUE: the no translation validation option stores false when given (default true) and
+    # the main function enables translation validation when the attribute is false, so the flag
+    # name reads inverted; the jit and distributed options are each registered with a duplicated
+    # option string.
     parser = argparse.ArgumentParser(
         description="Run the PyTorch unit test suite",
         epilog="where TESTS is any of: {}".format(", ".join(TESTS)),
@@ -1718,6 +1876,10 @@ def parse_args():
 def exclude_tests(
     exclude_list, selected_tests, exclude_message=None, exact_match=False
 ):
+    # [FUNCTION DOC] Removes tests from the selected list in place and returns it. For each
+    # excluded name every selected test that starts with it (or equals it; equality only when
+    # exact matching is requested) is removed, printing an exclusion note with the optional
+    # message.
     for exclude_test in exclude_list:
         tests_copy = selected_tests[:]
         for test in tests_copy:
@@ -1731,6 +1893,10 @@ def exclude_tests(
 
 
 def must_serial(file: str | ShardedTest) -> bool:
+    # [FUNCTION DOC] Returns True when a test file (name or sharded test) must run on its own
+    # rather than in the parallel pool: when serial mode is forced by environment, the test config
+    # or file name is distributed, it has a custom handler, is in the parallel blocklist, the CI
+    # serial list, the JIT executor tests or ONNX serial list, or only one process is configured.
     if isinstance(file, ShardedTest):
         file = file.name
     return (
@@ -1747,10 +1913,22 @@ def must_serial(file: str | ShardedTest) -> bool:
 
 
 def can_run_in_pytest(test):
+    # [FUNCTION DOC] Returns True unless the environment variable disabling pytest is set to
+    # anything other than zero. The test argument is not used.
     return os.getenv("PYTORCH_TEST_DO_NOT_USE_PYTEST", "0") == "0"
 
 
 def get_selected_tests(options) -> list[str]:
+    # [FUNCTION DOC] Computes the list of test module names to run from the include list by
+    # applying, in order, the filters for jit, distributed, core, cpython, dynamo core, inductor
+    # core, functorch, einops, cpp, mps (which replaces the selection by a fixed list and sets the
+    # device-only environment variable), xpu, openreg and onnx, while adding to the exclude list
+    # (mutating the options) the groups requested, cpython tests for other Python versions, and
+    # version or CUDA specific disabled tests. Then removes excluded tests, applies the platform
+    # blocklist (Windows, with extra SM89 and SM120 entries that extend the module level
+    # blocklist, ROCm or s390x), drops distributed tests without distributed support and LAPACK
+    # tests without LAPACK, restricts to gradcheck users in slow gradcheck mode, and normalizes
+    # names. Returns the list.
     selected_tests = options.include
 
     # filter if there's JIT only and distributed only test options
@@ -1994,6 +2172,11 @@ def get_selected_tests(options) -> list[str]:
 
 
 def load_test_times_from_file(file: str) -> dict[str, Any]:
+    # [FUNCTION DOC] Loads a JSON file of recorded test times (path relative to the repository
+    # root) and picks the entry for the job name and test config from the environment, falling
+    # back to the default job name or default entries with a warning. Prints the lookup keys. If
+    # the file does not exist it prints a warning and returns an empty mapping so sharding falls
+    # back to round robin. A missing default section raises KeyError.
     # Load previous test times to make sharding decisions
     path = os.path.join(str(REPO_ROOT), file)
     if not os.path.exists(path):
@@ -2036,16 +2219,23 @@ def load_test_times_from_file(file: str) -> dict[str, Any]:
 def load_test_file_times(
     file: str = ADDITIONAL_CI_FILES_FOLDER / TEST_TIMES_FILE,
 ) -> dict[str, float]:
+    # [FUNCTION DOC] Returns the per-file test time mapping loaded from the given file (default
+    # the CI test times file).
     return cast(dict[str, float], load_test_times_from_file(file))
 
 
 def load_test_class_times(
     file: str = ADDITIONAL_CI_FILES_FOLDER / TEST_CLASS_TIMES_FILE,
 ) -> dict[str, dict[str, float]]:
+    # [FUNCTION DOC] Returns the per-class test time mapping, keyed by file then class, loaded
+    # from the given file (default the CI test class times file).
     return cast(dict[str, dict[str, float]], load_test_times_from_file(file))
 
 
 def get_sharding_opts(options) -> tuple[int, int]:
+    # [FUNCTION DOC] Returns a pair of this shard number and the total shard count from the shard
+    # option, defaulting to one of one. Raises AssertionError if the option does not hold exactly
+    # two values, any is not positive, or the shard number exceeds the count.
     which_shard, num_shards = 1, 1
     if options.shard:
         if len(options.shard) != 2:
@@ -2068,6 +2258,9 @@ def do_sharding(
     test_class_times: dict[str, dict[str, float]],
     sort_by_time: bool = True,
 ) -> tuple[float, list[ShardedTest]]:
+    # [FUNCTION DOC] Splits the given tests into shards using the time data and the serial-test
+    # predicate, optionally sorted by time, and returns the pair of estimated time and sharded
+    # test list for this process shard.
     which_shard, num_shards = get_sharding_opts(options)
 
     # Do sharding
@@ -2083,6 +2276,8 @@ def do_sharding(
 
 
 class TestFailure(NamedTuple):
+    # [CLASS DOC] Named tuple recording one failed test: the test run and a human readable failure
+    # message.
     test: TestRun
     message: str
 
@@ -2090,6 +2285,11 @@ class TestFailure(NamedTuple):
 def run_test_module(
     test: ShardedTest, test_directory: str, options
 ) -> TestFailure | None:
+    # [FUNCTION DOC] Runs one sharded test through its custom handler (or the default test runner)
+    # with timing output, and returns None on success or a failure record. A non-integer (or
+    # boolean) return code, any exception, or a non-zero code yields a failure whose message
+    # includes the signal name for negative codes. Exceptions are caught and converted to the
+    # message, not raised. Sets ROCm device visibility as a side effect.
     try:
         maybe_set_hip_visible_devies()
 
@@ -2128,6 +2328,17 @@ def run_tests(
     options,
     failures: list[TestFailure],
 ) -> None:
+    # [FUNCTION DOC] Runs the selected tests and appends failure records to the provided list;
+    # returns nothing, and does nothing for an empty selection. Splits tests into serial and
+    # parallel groups. Runs the serial tests one at a time, then the parallel-capable tests marked
+    # serial one at a time, then the rest in a spawn process pool sized to the process count (one
+    # task per child outside ROCm), each with a deep copy of the options, pytest enabled where
+    # allowed and a marker expression combining serial selection with the multi-GPU filter. For
+    # C++ runs copies conftest helper files into the C++ test directory if missing. After each
+    # test it uploads artifacts in CI when requested. Unless continue through error or
+    # rerun-disabled mode is set, the first failure raises RuntimeError with a keep-going tip in
+    # the sequential phases or terminates the pool in the parallel phase. Sets and removes the
+    # parallel process count variable; always terminates and joins the pool.
     if len(selected_tests) == 0:
         return
 
@@ -2149,6 +2360,10 @@ def run_tests(
     }.get(getattr(options, "multigpu_filter", None))
 
     def marker_args(serial_expr: str | None) -> list[str]:
+        # [FUNCTION DOC] HELPER: Builds the marker option arguments from the optional serial
+        # expression and the multi-GPU expression of the enclosing function: returns an empty list
+        # if neither is set, otherwise a marker option whose value joins the parenthesized
+        # expressions with the and operator.
         exprs = [e for e in (serial_expr, multigpu_marker) if e]
         if not exprs:
             return []
@@ -2172,6 +2387,10 @@ def run_tests(
             shutil.copy(os.path.join(test_directory, conftest_file), cpp_file)
 
     def handle_complete(failure: TestFailure | None):
+        # [FUNCTION DOC] HELPER: Post-processing for one finished test. In CI with artifact upload
+        # enabled it parses XML reports and uploads them zipped. Returns False when there was no
+        # failure; otherwise records the failure in the enclosing failures list, prints its
+        # message and returns True.
         failed = failure is not None
         if IS_CI and options.upload_artifacts_while_running:
             parse_xml_and_upload_json()
@@ -2228,6 +2447,9 @@ def run_tests(
         )
 
         def parallel_test_completion_callback(failure):
+            # [FUNCTION DOC] HELPER: Callback for a finished pool task: processes the result
+            # through the completion handler and terminates the pool on failure unless continue
+            # through error or rerun-disabled mode is on.
             test_failed = handle_complete(failure)
             if (
                 test_failed
@@ -2259,6 +2481,9 @@ def run_tests(
 
 
 def check_pip_packages() -> None:
+    # [FUNCTION DOC] Checks that the pytest plugins rerunfailures, flakefinder and xdist are
+    # installed; if one is missing prints an install instruction naming it and exits the program
+    # with status one.
     packages = [
         "pytest-rerunfailures",
         "pytest-flakefinder",
@@ -2275,6 +2500,15 @@ def check_pip_packages() -> None:
 
 
 def main():
+    # [FUNCTION DOC] Entry point. Verifies pip packages, parses options, and merges the include
+    # list with the environment list of tests (intersection when include was given, and disables
+    # target determination). Records shard metrics, selects tests, loads target determination
+    # results (disabled if empty), prepares the reports directory, erases coverage data if
+    # requested, downloads CI test configuration, loads timing data, shards the tests into an
+    # included and an excluded batch, prints the batches and returns early on dry run. Sets
+    # dynamo, inductor and translation validation environment variables, runs the included batch,
+    # and in a finally clause combines coverage and emits failure metrics in CI. Prints all
+    # failure messages and exits with status one unless in rerun-disabled mode.
     check_pip_packages()
 
     options = parse_args()
@@ -2319,6 +2553,10 @@ def main():
     test_class_times_dict = load_test_class_times()
 
     class TestBatch:
+        # [CLASS DOC] HELPER: Group of tests with similar priority for this shard. Attributes:
+        # name, the sharded tests list, the failures list and the estimated total time, all set in
+        # the constructor. Its string form lists serial and parallel tests with the estimated
+        # minutes.
         """Defines a set of tests with similar priority that should be run together on the current shard"""
 
         name: str
@@ -2328,6 +2566,9 @@ def main():
         def __init__(
             self, name: str, raw_tests: Sequence[TestRun], should_sort_shard: bool
         ):
+            # [FUNCTION DOC] HELPER: Stores the name, starts an empty failures list, and shards
+            # the raw tests for the current shard using the enclosing timing data, keeping the
+            # estimated time and the sharded tests.
             self.name = name
             self.failures = []
             self.time, self.sharded_tests = do_sharding(
@@ -2339,6 +2580,9 @@ def main():
             )
 
         def __str__(self):
+            # [FUNCTION DOC] HELPER: Returns a multi-line summary: batch name and estimated
+            # minutes, then the count and names of serial tests and of parallel tests, with
+            # trailing whitespace stripped.
             s = f"Name: {self.name} (est. time: {round(self.time / 60, 2)}min)\n"
             serial = [test for test in self.sharded_tests if must_serial(test)]
             parallel = [test for test in self.sharded_tests if not must_serial(test)]
