@@ -1,3 +1,7 @@
+# [MODULE DOC] CI tool comparing an actual accuracy CSV from a dynamo benchmark run against
+# the expected baseline CSV. Holds a global set of known flaky model names, prints one status
+# line per model, and exits with status 1 from the entry point if any model regressed or
+# improved relative to the baseline (so the baseline must be updated).
 import argparse
 import os
 import sys
@@ -26,6 +30,10 @@ flaky_models = {
 
 
 def get_eager_nondeterministic_models(expected_filename: str) -> set[str]:
+    # [FUNCTION DOC] Returns the set of model names whose accuracy may legitimately show the
+    # eager-run-differs status. Depends only on the expected file path (path separators
+    # normalized): non-empty for the timm and torchbench inductor training baselines, and an
+    # empty set for every other file.
     expected_filename = expected_filename.replace(os.sep, "/")
     if expected_filename.endswith("ci_expected_accuracy/inductor_timm_training.csv"):
         return {
@@ -44,6 +52,9 @@ def get_eager_nondeterministic_models(expected_filename: str) -> set[str]:
 
 
 def get_field(csv, model_name: str, field: str):
+    # [FUNCTION DOC] HELPER: Returns the single value in the given column for the row whose
+    # name column matches the model, or None if the lookup fails for any reason (no row,
+    # several rows, or missing column).
     try:
         return csv.loc[csv["name"] == model_name][field].item()
     except Exception:
@@ -51,6 +62,14 @@ def get_field(csv, model_name: str, field: str):
 
 
 def check_accuracy(actual_csv, expected_csv, expected_filename):
+    # [FUNCTION DOC] Compares per-model accuracy of the actual and expected data frames and
+    # prints a status line for each. Statuses: matching values give PASS or XFAIL; a missing
+    # actual or expected value or a non-pass result is a failure; a pass-to-pass-expected
+    # difference for allowed eager-nondeterministic models, or any mismatch for flaky models,
+    # is only reported; a pass where failure was expected is an improvement. If the expected
+    # file path mentions rocm, a larger set of flaky models is added to the module-level
+    # global set (side effect). Returns the failed list, or the improved list if none failed
+    # (possibly empty), and a message explaining how to update the baseline.
     failed = []
     improved = []
     eager_nondeterministic_models = get_eager_nondeterministic_models(expected_filename)
@@ -147,6 +166,9 @@ def check_accuracy(actual_csv, expected_csv, expected_filename):
 
 
 def main():
+    # [FUNCTION DOC] Entry point: reads the required actual and expected CSV paths, runs the
+    # accuracy check, and prints the message and exits with status 1 if anything regressed
+    # or improved.
     parser = argparse.ArgumentParser()
     parser.add_argument("--actual", type=str, required=True)
     parser.add_argument("--expected", type=str, required=True)

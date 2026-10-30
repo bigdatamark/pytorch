@@ -1,3 +1,7 @@
+# [MODULE DOC] CI tool comparing dynamo graph-break related metrics in an actual CSV against
+# an expected baseline CSV. Defines the set of flaky models, the tracked metrics with their
+# comparison modes and a coverage-drop tolerance, and an entry point that exits with status 1
+# if any model regressed or improved so the baseline needs updating.
 import argparse
 import os
 import sys
@@ -18,6 +22,9 @@ flaky_models = {
 
 
 def get_field(csv: pd.DataFrame, model_name: str, field: str) -> Any | None:
+    # [FUNCTION DOC] HELPER: Returns the single value in the given column for the row whose
+    # name column matches the model, or None if the lookup fails for any reason. An empty
+    # cell comes back as NaN, not None.
     try:
         return csv.loc[csv["name"] == model_name][field].item()
     except Exception:
@@ -54,6 +61,10 @@ TRACKED_METRICS = {
 
 
 def _classify(actual: Any, expected: Any, mode: str) -> str:
+    # [FUNCTION DOC] HELPER: Classifies one metric as PASS, FAIL or IMPROVED. In the lower is
+    # better exact mode any difference is flagged (greater is FAIL, smaller is IMPROVED). In
+    # every other mode (the drop threshold mode) higher is better: equal or larger is PASS,
+    # a drop of more than the tolerance fraction is FAIL, and a smaller drop is PASS.
     """Return "PASS" / "FAIL" / "IMPROVED" for one metric per its `mode`."""
     if mode == "exact_lower":
         if actual == expected:
@@ -70,6 +81,13 @@ def _classify(actual: Any, expected: Any, mode: str) -> str:
 def check_graph_breaks(
     actual_csv: pd.DataFrame, expected_csv: pd.DataFrame, expected_filename: str
 ) -> tuple[list[str], str]:
+    # [FUNCTION DOC] Compares tracked metrics per model between the data frames and prints a
+    # status per model. A model without a baseline graph-break entry is printed as missing
+    # and counted as improved; a model whose actual run captured no graphs is printed as
+    # eager failed and skipped; metrics absent or empty on either side are skipped. Flaky
+    # models only get a flaky-suffixed report and never count. If the expected file path
+    # mentions rocm, more names are added to the module-level flaky set (side effect).
+    # Returns the failed list, or the improved list if none failed, and an update message.
     failed: list[str] = []
     improved: list[str] = []
 
@@ -199,6 +217,8 @@ def check_graph_breaks(
 
 
 def main():
+    # [FUNCTION DOC] Entry point: reads the required actual and expected CSV paths, runs the
+    # graph-break check, and prints the message and exits with status 1 on any difference.
     parser = argparse.ArgumentParser()
     parser.add_argument("--actual", type=str, required=True)
     parser.add_argument("--expected", type=str, required=True)

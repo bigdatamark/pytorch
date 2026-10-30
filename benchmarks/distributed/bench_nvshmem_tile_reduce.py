@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Benchmark for the NVSHMEM symmetric-memory tile_reduce op, run through the
+# PyTorch multi-process test framework. Defines a skip decorator factory, a CUDA device
+# handle, and one benchmark test class that times tile reductions for several tile sizes.
+# Import-time side effects: looks up the CUDA device module only; no distributed setup.
 """
 Benchmark for NVSHMEM tile reduce operations.
 
@@ -24,6 +28,9 @@ from torch.testing._internal.common_utils import (
 
 # Decorator
 def requires_nvshmem():
+    # [FUNCTION DOC] HELPER: Builds a decorator that skips (but reports as passed under
+    # Sandcastle) any test when NVSHMEM is not available per the symmetric memory module.
+    # Returns the decorator; the availability check is evaluated at decoration time.
     return skip_but_pass_in_sandcastle_if(
         not symm_mem.is_nvshmem_available(),
         "bench_nvshmem_tile_reduce requires NVSHMEM, skipping benchmark",
@@ -38,7 +45,12 @@ device_module = torch.get_device_module(device_type)
 @requires_nvshmem()
 @requires_cuda_p2p_access()
 class NVSHMEMTileReduceBenchmark(MultiProcContinuousTest):
+    # [CLASS DOC] Multi-process continuous test that benchmarks the symmetric-memory
+    # tile_reduce op. Requires NVSHMEM and CUDA peer-to-peer access (class decorators).
+    # Uses the rank and world_size provided by the base class; keeps no state of its own.
     def _init_device(self) -> None:
+        # [FUNCTION DOC] HELPER: Binds this process to its CUDA device and selects NVSHMEM
+        # as the symmetric memory backend. Mutates global device and backend state.
         # TODO: relieve this (seems to hang if without)
         device_module.set_device(self.device)
         # Set NVSHMEM as SymmMem backend
@@ -46,6 +58,7 @@ class NVSHMEMTileReduceBenchmark(MultiProcContinuousTest):
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC] Property returning the CUDA device whose index equals this rank.
         return torch.device(device_type, self.rank)
 
     def _benchmark_tile_reduce_single(
@@ -55,6 +68,14 @@ class NVSHMEMTileReduceBenchmark(MultiProcContinuousTest):
         warmup_iters: int = 5,
         bench_iters: int = 10,
     ) -> dict:
+        # [FUNCTION DOC] HELPER: Times tile_reduce for one tile size on a square full matrix.
+        # Allocates symmetric input (filled with the rank) and zero output matrices, reduces
+        # the top-left tile to root rank 0, runs warmup iterations (synchronizing each), then
+        # times the bench iterations between a barrier and a final synchronize. Returns a
+        # mapping with sizes, byte/element counts, world size, time stats in ms, throughput
+        # in GB/s and elements per second. The docstring omits the tile_size argument.
+        # KNOWN ISSUE: only one averaged timing sample is recorded, so the standard
+        # deviation is not meaningful (NaN) and min/max/mean are all the same value.
         """
         Benchmark a single configuration of tile reduce.
 
@@ -131,6 +152,10 @@ class NVSHMEMTileReduceBenchmark(MultiProcContinuousTest):
 
     @skipIfRocm
     def test_benchmark_tile_reduce_various_sizes(self) -> None:
+        # [FUNCTION DOC] Benchmark test: for each tile size from 512 up to 16384 on a
+        # 16384 square full matrix, runs the single-config benchmark (5 warmup, 20 timed).
+        # Rank 0 prints per-size results and a summary table. Any exception for a size is
+        # caught and reported on rank 0 only, so failures never fail the test.
         """
         Benchmark tile reduce across various matrix sizes.
         """

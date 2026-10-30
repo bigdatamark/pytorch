@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC] Unified runner shim for the dynamo benchmark suites. At import time it reads
+# the timm, HuggingFace and TorchBench model list files next to this file (optionally
+# filtered by the TORCHBENCH_ONLY_MODELS environment variable) and raises AssertionError if
+# the three name sets overlap. Run as a script it dispatches to the suite runner that owns
+# the model named by the only option, or runs all three suites in order.
 
 import argparse
 import os
@@ -14,6 +19,9 @@ TORCHBENCH_ONLY_MODELS = [
 # Note - hf and timm have their own version of this, torchbench does not
 # TODO(voz): Someday, consolidate all the files into one runner instead of a shim like this...
 def model_names(filename: str) -> set[str]:
+    # [FUNCTION DOC] Reads a model list file and returns the set of model names. Each line is
+    # split on spaces, or on commas if that gives a single part; the first part is the name.
+    # Names are skipped when TORCHBENCH_ONLY_MODELS is non-empty and does not contain them.
     names = set()
     with open(filename) as fh:
         lines = fh.readlines()
@@ -57,6 +65,9 @@ if not TORCHBENCH_MODELS_FILE_NAME.isdisjoint(HF_MODELS_FILE_NAME):
 
 
 def parse_args(args=None):
+    # [FUNCTION DOC] Builds an argument parser with only the option selecting one model (by
+    # name, or by file path and class name) and parses the given arguments, or the process
+    # arguments if None. Returns a pair of the known namespace and the unknown leftovers.
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--only",

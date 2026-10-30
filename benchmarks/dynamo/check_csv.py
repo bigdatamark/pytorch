@@ -1,3 +1,5 @@
+# [MODULE DOC] Small CLI that reads a benchmark accuracy CSV and fails (exit status 1) if
+# any model's accuracy field does not contain the text pass.
 import argparse
 import sys
 import textwrap
@@ -6,6 +8,10 @@ import pandas as pd
 
 
 def check_csv(filename):
+    # [FUNCTION DOC] Reads the CSV, prints each model name with its accuracy value, and
+    # collects models whose accuracy text lacks the substring pass. If any, prints an error
+    # listing them and exits the process with status 1. A non-text (missing) accuracy value
+    # would raise a TypeError.
     """
     Basic accuracy checking.
     """

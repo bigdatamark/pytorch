@@ -1,3 +1,7 @@
+# [MODULE DOC] CI script comparing per-model memory compression ratios between an actual and
+# an expected CSV. Import-time side effect: builds the argument parser and parses the process
+# command line (required actual and expected paths) into a module-level namespace; the check
+# itself only runs when executed as a script.
 import argparse
 import sys
 import textwrap
@@ -6,6 +10,11 @@ import pandas as pd
 
 
 def main(args):
+    # [FUNCTION DOC] Reads the actual and expected CSVs from the namespace paths and, for each
+    # model in the actual file, compares compression ratios: PASS if the actual value is at
+    # least 95 percent of the expected one, otherwise FAIL. Models missing from the expected
+    # file are reported and skipped. Prints per-model detail; if any failed, prints an error
+    # naming them and exits the process with status 1.
     actual = pd.read_csv(args.actual)
     expected = pd.read_csv(args.expected)
     failed = []

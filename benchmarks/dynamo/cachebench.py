@@ -1,3 +1,7 @@
+# [MODULE DOC] Benchmark of inductor compile-time caching. For each model of the torchbench
+# or huggingface suite it runs the suite script in a subprocess twice per repeat (cold cache,
+# then warm cache, inside a fresh cache directory), reads the compilation latency from the
+# CSV output, computes the warm-start speedup percentage, and writes the records as JSON.
 import argparse
 import dataclasses
 import json
@@ -33,6 +37,9 @@ HUGGINGFACE_MODELS: list[str] = [
 
 @dataclasses.dataclass
 class RunResult:
+    # [CLASS DOC] Plain record of one model's result: model name, mode, benchmark suite,
+    # whether dynamic shapes were used, device, lists of cold and warm compile times in
+    # seconds (one per repeat), and the percent speedup of warm over cold.
     model: str
     mode: str  # inference or training
     benchmark: str
@@ -44,6 +51,10 @@ class RunResult:
 
 
 def get_compile_time(file: tempfile._TemporaryFileWrapper) -> float:
+    # [FUNCTION DOC] Parses the CSV file that a benchmark run wrote (read from the open
+    # temporary file in binary mode): finds the compilation latency column in the header row
+    # and returns the value from the first data row as a float. Raises ValueError if the
+    # column is missing and IndexError if there is no data row.
     lines = file.readlines()
     # Decode from byte string, remove new lines, parse csv
     lines = [line.decode("utf-8").strip().split(",") for line in lines]
@@ -57,6 +68,11 @@ def _run_torchbench_from_args(
     model: str,
     args: list[str],
 ) -> tuple[list[float], list[float]]:
+    # [FUNCTION DOC] HELPER: For each repeat, inside a fresh inductor cache, runs the command
+    # once for a cold start and once for a warm start, each with an output CSV in a temporary
+    # file, and collects the compile times. Mutates the passed argument list by appending and
+    # removing the output option. Subprocess failures or timeouts propagate. Returns the cold
+    # and warm lists of compile times.
     cold_compile_time: list[float] = []
     warm_compile_time: list[float] = []
 
@@ -96,6 +112,11 @@ def _run_torchbench_model(
     results: list[RunResult],
     model: str,
 ) -> None:
+    # [FUNCTION DOC] HELPER: Runs one model in the chosen suite: checks the suite script
+    # exists (AssertionError otherwise), builds the command line for inductor performance
+    # mode with mode and dynamic specific flags, runs the cold/warm measurement, and appends
+    # a RunResult to the results list. Any exception during the run is logged and swallowed.
+    # The speedup is one minus the ratio of summed warm to summed cold time, in percent.
     cur_file = os.path.abspath(__file__)
     torchbench_file = os.path.join(
         os.path.dirname(cur_file), BENCHMARK_FILE[cmd_args.benchmark]
@@ -147,6 +168,9 @@ def _write_results_to_json(
     cmd_args: argparse.Namespace,
     results: list[RunResult],
 ) -> None:
+    # [FUNCTION DOC] HELPER: Writes the results to the output path as a JSON list of records,
+    # three per result (cold times, warm times, speedup), each with benchmark, model and
+    # metric sections. Does nothing and writes no file if the results list is empty.
     if len(results) == 0:
         # do not write empty results
         return
@@ -185,6 +209,9 @@ def _write_results_to_json(
 
 
 def parse_cmd_args() -> argparse.Namespace:
+    # [FUNCTION DOC] Parses command line options (model, dynamic flag, required benchmark
+    # suite, mode, device, required output path, repeat count 1 to 9), ignoring unknown
+    # arguments, and returns the namespace.
     parser = argparse.ArgumentParser(description="Run a TorchCache benchmark.")
     parser.add_argument(
         "-m",
@@ -232,6 +259,8 @@ Dispatch_fn_t = Callable[[argparse.Namespace, list[RunResult], str], None]
 
 
 def main() -> None:
+    # [FUNCTION DOC] Entry point. Chooses the default model list for the selected suite, or
+    # only the one named model, runs each via the dispatcher, and writes the JSON results.
     cmd_args = parse_cmd_args()
 
     dispatcher: dict[str, tuple[Dispatch_fn_t, list[str]]] = {

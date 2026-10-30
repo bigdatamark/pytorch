@@ -1,3 +1,10 @@
+# [MODULE DOC] Maintenance script that refreshes the expected-accuracy reference CSVs used by
+# dynamo and inductor CI. Given a commit sha, it queries a ClickHouse endpoint for CI jobs of
+# that commit, derives artifact URLs on S3, downloads test report zips in parallel, extracts
+# per-suite training and inference CSVs, merges them into the existing CSVs under the CUDA and
+# ROCm directories, and runs the CSV linter on each. Holds the metric column list and URL and
+# linter path constants. Must be run from the repository root, with the credentials in
+# environment variables; the work runs only in the script entry block.
 """
 Update committed CSV files used as reference points by dynamo/inductor CI.
 
@@ -93,6 +100,9 @@ METRIC_COLUMNS = [
 
 
 def query_job_sha(repo, sha):
+    # [FUNCTION DOC] HELPER: Posts a query for the commit sha and repository to the ClickHouse
+    # endpoint using credentials from two environment variables and returns the list of job
+    # records from the response. Raises RuntimeError if the credential variables are unset.
     params = {
         "queryVariables": {"sha": sha, "repo": repo},
     }
@@ -118,10 +128,15 @@ def query_job_sha(repo, sha):
 
 
 def parse_job_name(job_str):
+    # [FUNCTION DOC] HELPER: Splits a job name on slashes and returns a generator of the
+    # stripped parts.
     return (part.strip() for part in job_str.split("/"))
 
 
 def parse_test_str(test_str):
+    # [FUNCTION DOC] HELPER: Drops the first six characters of the test description and the
+    # trailing closing parenthesis, splits on commas, and returns a generator of stripped
+    # fields (suite, shard, shard count, machine, and more).
     return (part.strip() for part in test_str[6:].strip(")").split(","))
 
 
@@ -129,6 +144,14 @@ S3_BASE_URL = "https://gha-artifacts.s3.amazonaws.com"
 
 
 def get_artifacts_urls(results, suites, is_rocm=False):
+    # [FUNCTION DOC] Maps (suite, shard number) to a list of candidate S3 artifact URLs,
+    # oldest job first, from the query results. Only test jobs of the inductor and
+    # inductor-periodic workflows are used (not build, runner-determinator or unit-test, and
+    # not CUDA 13), selecting ROCm jobs or CUDA jobs per the flag, and only suites in the
+    # given collection. Duplicate URLs are dropped.
+    # KNOWN ISSUE: the repository name used to build URLs is read from a module-level
+    # variable that is only defined in the script entry block, so calling this function
+    # after importing the module raises NameError.
     urls = {}
     # Sort by time (oldest first) to prefer earlier completed workflow runs
     # over potentially still-running newer ones
@@ -171,6 +194,8 @@ def get_artifacts_urls(results, suites, is_rocm=False):
 
 
 def normalize_suite_filename(suite_name):
+    # [FUNCTION DOC] HELPER: Returns the benchmark file stem for a suite name: the last
+    # underscore-separated part, with timm rewritten to timm_models.
     strs = suite_name.split("_")
     subsuite = strs[-1]
     if "timm" in subsuite:
@@ -180,6 +205,12 @@ def normalize_suite_filename(suite_name):
 
 
 def download_single_artifact(suite, shard, url_candidates):
+    # [FUNCTION DOC] HELPER: Tries each candidate URL in order, downloading the zip and
+    # reading the training and inference CSVs (trying the CUDA path, then the ROCm path)
+    # into data frames, with metric columns filled with 0 and cast to integer. Prints a
+    # warning if an inference CSV is missing. A URL failing with an HTTP error moves on to
+    # the next. Returns (suite, shard, mapping of (suite, phase) to data frame), or the same
+    # with None if all URLs fail. Note an early success returns without trying later URLs.
     """Download a single artifact, trying each URL candidate until one succeeds.
 
     Returns a tuple of (suite, shard, result_dict) where result_dict maps
@@ -221,6 +252,9 @@ def download_single_artifact(suite, shard, url_candidates):
 
 
 def download_artifacts_and_extract_csvs(urls):
+    # [FUNCTION DOC] Downloads all artifacts with a 16 worker thread pool, prints a message
+    # for each shard that could not be fetched, and concatenates the data frames of shards
+    # per (suite, phase). Returns the mapping of (suite, phase) to combined data frame.
     dataframes = {}
     with ThreadPoolExecutor(max_workers=16) as executor:
         futures = {
@@ -249,6 +283,11 @@ def download_artifacts_and_extract_csvs(urls):
 
 
 def write_filtered_csvs(root_path, dataframes):
+    # [FUNCTION DOC] Writes one CSV per (suite, phase) into the directory. If the file
+    # already exists, new rows override old rows by model name while old-only rows are kept.
+    # Rows are sorted by name, metric columns are NaN-filled with 0 and cast to integer, and
+    # only the name, accuracy and metric columns are saved without an index. Then the CSV
+    # linter is applied to the file. Overwrites files on disk.
     for (suite, phase), df in dataframes.items():
         out_fn = os.path.join(root_path, f"{suite}_{phase}.csv")
         # Read existing CSV and merge with new data to preserve entries
@@ -274,6 +313,9 @@ def write_filtered_csvs(root_path, dataframes):
 
 
 def apply_lints(filename):
+    # [FUNCTION DOC] HELPER: Runs the CSV merge-conflict linter script as a subprocess with
+    # the current interpreter, parses its JSON output, and if it gives a replacement,
+    # rewrites the file with the original text replaced by it. Subprocess failure raises.
     patch = json.loads(subprocess.check_output([sys.executable, CSV_LINTER, filename]))
     if patch.get("replacement"):
         with open(filename) as fd:

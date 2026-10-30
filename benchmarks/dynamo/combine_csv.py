@@ -1,5 +1,11 @@
 # This script takes csvs produced by parse_logs.py and combines them
 # into a single CSV file
+# [MODULE DOC] Script run with two CSV paths (static-shape results, dynamic-shape results)
+# from the log parser. Everything happens at import time: it joins rows by benchmark and
+# model name and writes to standard output a CSV of dynamic minus static differences for
+# frame time and graph breaks, plus link columns. Rows with an empty name emit only the two
+# link columns. Raises AssertionError unless exactly two arguments are given; entries
+# missing either side are skipped, and values that fail to parse are left out.
 
 import ast
 import csv

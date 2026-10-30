@@ -1,3 +1,6 @@
+# [MODULE DOC] CLI that checks a dynamo performance CSV: every model's speedup must reach a
+# threshold (optionally scaled to relax the check). Prints a one-line summary per model and
+# exits with status 1 if any model is below the threshold.
 import argparse
 import sys
 import textwrap
@@ -6,6 +9,12 @@ import pandas as pd
 
 
 def check_perf_csv(filename, threshold, threshold_scale):
+    # [FUNCTION DOC] Reads the CSV (prints an error and exits with status 1 if the file does
+    # not exist), computes the effective threshold as threshold times the scale, and prints
+    # speedup, latency, compile time and memory ratio (inverse of compression ratio, with
+    # peak memory) per model, omitting values that are NaN. Models with speedup under the
+    # threshold are collected; if any, prints them sorted from worst with percent distance
+    # from target and exits with status 1, otherwise prints a pass message.
     """
     Basic performance checking.
     """

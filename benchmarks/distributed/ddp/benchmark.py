@@ -7,6 +7,10 @@
 # an 8-GPU baseline (if applicable), as well as measurements for however
 # many processes can participate in training.
 #
+# [MODULE DOC] Script measuring distributed data parallel iteration time across torchvision
+# models. Provides helpers for gathering objects across ranks, benchmark classes, a sweep
+# over process group sizes, and a main entry point that parses arguments, initializes a
+# gloo metadata group, and optionally writes a JSON report. Needs 8 GPUs per machine.
 
 import argparse
 import itertools
@@ -27,12 +31,17 @@ import torch.optim as optim
 
 
 def allgather_object(obj):
+    # [FUNCTION DOC] HELPER: Gathers one picklable object from every rank in the default
+    # process group and returns the list ordered by rank. Collective call.
     out = [None for _ in range(dist.get_world_size())]
     dist.all_gather_object(out, obj)
     return out
 
 
 def allgather_run(cmd):
+    # [FUNCTION DOC] HELPER: Runs a shell command (split into arguments, output captured)
+    # on this process, then gathers the decoded stdout from all ranks. Raises
+    # AssertionError (including stderr text) if the command exits nonzero.
     proc = subprocess.run(shlex.split(cmd), capture_output=True)
     if proc.returncode != 0:
         raise AssertionError(
@@ -42,6 +51,8 @@ def allgather_run(cmd):
 
 
 def allequal(iterator):
+    # [FUNCTION DOC] HELPER: Returns True if all items of the iterable compare equal to the
+    # first one; an empty iterable counts as equal.
     iterator = iter(iterator)
     try:
         first = next(iterator)
@@ -51,6 +62,11 @@ def allequal(iterator):
 
 
 def benchmark_process_group(pg, benchmark, use_ddp_for_single_rank=True):
+    # [FUNCTION DOC] Runs one benchmark on the given process group and returns the timing
+    # list (seconds per iteration) for this rank. Seeds CPU and CUDA RNGs with the group
+    # rank, builds model and a single input/target pair from the benchmark object, wraps the
+    # model in DistributedDataParallel unless the group has one rank and the flag disables
+    # it, trains for 5 warmup plus 10 measured SGD iterations, and discards warmup times.
     torch.manual_seed(pg.rank())
     torch.cuda.manual_seed(pg.rank())
 
@@ -84,6 +100,9 @@ def benchmark_process_group(pg, benchmark, use_ddp_for_single_rank=True):
 
 
 def run_benchmark(benchmark, ranks, opts):
+    # [FUNCTION DOC] Creates a process group for the given ranks, runs the benchmark on
+    # ranks that belong to it (extra options are passed as keyword arguments), destroys the
+    # group, and syncs all ranks. Returns the concatenated measurements from all ranks.
     group = dist.new_group(ranks=ranks, backend=benchmark.distributed_backend)
     measurements = []
     if dist.get_rank() in set(ranks):
@@ -98,19 +117,29 @@ def run_benchmark(benchmark, ranks, opts):
 
 
 def sweep(benchmark):
+    # [FUNCTION DOC] Runs the full sweep for one benchmark: a per-rank warmup, a no-DDP
+    # single GPU run, DDP runs on 1, 2 and 4 GPUs, and one run per full 8-GPU machine,
+    # executed in increasing group size. Rank 0 prints a table of percentiles. Returns a
+    # list of mappings with the ranks and aggregated measurements, excluding warmup runs.
+    # KNOWN ISSUE: the percentile print formats a float throughput with an integer format
+    # code, which raises ValueError at runtime on rank 0.
     # Synthesize the set of benchmarks to run.
     # This list contain tuples for ("string prefix", [rank...]).
     benchmarks = []
 
     def append_benchmark(prefix, ranks, opts=None):
+        # [FUNCTION DOC] HELPER: Registers a benchmark in the enclosing list as a tuple of
+        # label (prefixed with the GPU count), ranks and options.
         prefix = f"{len(ranks):4} GPUs -- {prefix}"
         benchmarks.append((prefix, ranks, opts))
 
     def local_print(msg):
+        # [FUNCTION DOC] HELPER: Prints the message without newline and flushes, on rank 0 only.
         if dist.get_rank() == 0:
             print(msg, end="", flush=True)
 
     def print_header():
+        # [FUNCTION DOC] HELPER: Prints the column header for the percentile table (rank 0).
         local_print("\n")
         local_print(" " * 22)
         for _ in [50, 75, 90, 95]:
@@ -118,6 +147,9 @@ def sweep(benchmark):
         local_print("\n")
 
     def print_measurements(prefix, nelem, measurements):
+        # [FUNCTION DOC] HELPER: Prints, on rank 0, the 50th, 75th, 90th and 95th percentile
+        # of the sorted measurements with the label, and examples per second computed from
+        # the element count.
         measurements = sorted(measurements)
         local_print(f"{prefix:8s}:")
         for p in [50, 75, 90, 95]:
@@ -153,27 +185,39 @@ def sweep(benchmark):
 
 
 class Benchmark:
+    # [CLASS DOC] Abstract base for a DDP benchmark. Stores device, batch size (fixed at 32),
+    # distributed backend name and DDP bucket size. Subclasses supply model, inputs, target.
     def __init__(self, device, distributed_backend, bucket_size):
+        # [FUNCTION DOC] Stores the device, backend name and bucket size; sets batch size 32.
         self.device = device
         self.batch_size = 32
         self.distributed_backend = distributed_backend
         self.bucket_size = bucket_size
 
     def __str__(self):
+        # [FUNCTION DOC] Abstract; subclasses return a description string. Always raises
+        # NotImplementedError here.
         raise NotImplementedError
 
     def create_model(self):
+        # [FUNCTION DOC] Abstract; subclasses return the model. Always raises NotImplementedError.
         raise NotImplementedError
 
     def generate_inputs(self):
+        # [FUNCTION DOC] Abstract; subclasses return the input list. Always raises
+        # NotImplementedError here.
         raise NotImplementedError
 
     def generate_target(self):
+        # [FUNCTION DOC] Abstract; subclasses return the target. Always raises NotImplementedError.
         raise NotImplementedError
 
 
 class TorchvisionBenchmark(Benchmark):
+    # [CLASS DOC] Benchmark for a torchvision model looked up by name, with random image
+    # input of shape batch x 3 x 224 x 224 and constant class label 1 as target.
     def __init__(self, device, distributed_backend, bucket_size, model):
+        # [FUNCTION DOC] Initializes the base class and stores the torchvision model name.
         super().__init__(
             device,
             distributed_backend,
@@ -182,19 +226,29 @@ class TorchvisionBenchmark(Benchmark):
         self.model = model
 
     def __str__(self):
+        # [FUNCTION DOC] Returns a description of the model name and batch size.
         return f"{self.model} with batch size {self.batch_size}"
 
     def create_model(self):
+        # [FUNCTION DOC] Builds the named torchvision model (random weights) on the device.
         return torchvision.models.__dict__[self.model]().to(self.device)
 
     def generate_inputs(self):
+        # [FUNCTION DOC] Returns a one element list holding a random image batch on the device.
         return [torch.rand([self.batch_size, 3, 224, 224], device=self.device)]
 
     def generate_target(self):
+        # [FUNCTION DOC] Returns a long tensor of batch size entries all equal to class 1.
         return torch.tensor([1] * self.batch_size, dtype=torch.long, device=self.device)
 
 
 def main():
+    # [FUNCTION DOC] Entry point. Parses arguments (rank, world size, backend, bucket size,
+    # master address and port, optional model, optional JSON output path), requires exactly
+    # 8 GPUs per node (AssertionError otherwise), initializes a gloo group for metadata,
+    # exits with status 1 if nvidia-smi topology differs across machines, prints a header on
+    # rank 0, sets the CUDA device by rank modulo 8, sweeps the chosen model or four default
+    # resnet/resnext models, and on rank 0 writes the JSON report if requested.
     parser = argparse.ArgumentParser(description="PyTorch distributed benchmark suite")
     parser.add_argument("--rank", type=int, default=os.environ["RANK"])
     parser.add_argument("--world-size", type=int, required=True)
