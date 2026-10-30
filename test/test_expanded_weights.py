@@ -1,4 +1,14 @@
 # Owner(s): ["module: nn"]
+# [MODULE DOC] Tests for ExpandedWeights / call_for_per_sample_grads (per-sample gradients).
+# Contains helper-function tests, OpInfo-driven functional tests comparing per-sample grads
+# against a for-loop reference, module-level tests including RNN variants, and legacy nn module
+# tests converted to context-manager tests. Import-time side effects: builds the list of
+# supported legacy module tests and attaches generated cpu (and cuda double) test methods and a
+# multiple-inputs variant to TestExpandedWeightModule via setattr, then instantiates device-type
+# tests for the three TestCase classes. Raises RuntimeError at import if two generated tests
+# share a name.
+# KNOWN ISSUE: the duplicate-name check for the multiple-inputs variant reports the base test
+# name, and the check for the cuda variant name is absent.
 import unittest
 from dataclasses import dataclass
 from functools import partial
@@ -42,11 +52,20 @@ from torch.utils._pytree import tree_map_only
 
 
 class TestContext:
+    # [CLASS DOC] HELPER: Empty placeholder class; not used by any test in this file.
     pass
 
 
 class TestExpandedWeightHelperFunction(TestCase):
+    # [CLASS DOC] Tests for the low-level helpers in expanded_weights_utils (forward_helper,
+    # standard_kwargs, set_grad_sample_if_exists, unpack_expanded_weight_or_tensor,
+    # sum_over_all_but_batch_and_last_n). Device-generic; instantiated per device.
     def test_forward_helper(self, device):
+        # [FUNCTION DOC] For every combination of a batched or plain weight and bias, wraps
+        # chosen tensors in ExpandedWeight, splits arguments with standard_kwargs and runs
+        # forward_helper on the linear function. Checks the result equals the plain linear
+        # result, two positional args remain, one keyword (bias) remains, and the original
+        # objects are passed through by identity. Raises AssertionError on identity mismatch.
         input = torch.randn(3, 4, device=device)
         weight = torch.randn(5, 4, device=device)
         bias = torch.randn(5, device=device)
@@ -83,6 +102,10 @@ class TestExpandedWeightHelperFunction(TestCase):
                 raise AssertionError("expanded_kwargs['bias'] should be args[2]")
 
     def test_forward_helper_failure_args(self, device):
+        # [FUNCTION DOC] Checks forward_helper input validation errors (all RuntimeError): input
+        # that is itself an ExpandedWeight, non-tensor first input, zero-dim input, batch size
+        # zero, and (for each combination where a weight or bias is batched with size 4) batch
+        # size mismatch against an input with batch size 3.
         weight = torch.randn(5, 4, device=device)
         bias = torch.randn(5, device=device)
         with self.assertRaisesRegex(
@@ -140,7 +163,12 @@ class TestExpandedWeightHelperFunction(TestCase):
                 forward_helper(nn.functional.linear, expanded_args, expanded_kwargs)
 
     def test_set_grad_sample_if_exists(self, device):
+        # [FUNCTION DOC] Checks set_grad_sample_if_exists stores the computed value as
+        # grad_sample on the original weight of an ExpandedWeight, and does nothing (no
+        # grad_sample attribute) for a plain tensor or a non-tensor.
         def test_fn(a):
+            # [FUNCTION DOC] HELPER: Stub gradient-sample function that ignores its argument and
+            # returns the grad_sample tensor from the enclosing test scope.
             return grad_sample
 
         orig_weight = torch.randn(4, device=device, requires_grad=True)
@@ -159,7 +187,11 @@ class TestExpandedWeightHelperFunction(TestCase):
         self.assertFalse(hasattr(non_tensor, "grad_sample"))
 
     def test_set_grad_sample_if_exists_failure(self, device):
+        # [FUNCTION DOC] Checks set_grad_sample_if_exists on a plain tensor that requires grad
+        # raises RuntimeError about mixing ExpandedWeight parameters and normal Parameters.
         def test_fn(a):
+            # [FUNCTION DOC] HELPER: Stub gradient-sample function that ignores its argument and
+            # returns True.
             return True
 
         grad_tensor = torch.randn(4, requires_grad=True, device=device)
@@ -170,6 +202,9 @@ class TestExpandedWeightHelperFunction(TestCase):
             set_grad_sample_if_exists(grad_tensor, test_fn)
 
     def test_unpack_expanded_weight_or_tensor(self, device):
+        # [FUNCTION DOC] Checks unpack_expanded_weight_or_tensor returns the original tensor for
+        # an ExpandedWeight, returns a tensor that does not require grad as is, and returns None
+        # for a non-tensor.
         input = torch.randn(3, requires_grad=True, device=device)
         self.assertEqual(
             input,
@@ -183,6 +218,9 @@ class TestExpandedWeightHelperFunction(TestCase):
         self.assertTrue(unpack_expanded_weight_or_tensor(4) is None)
 
     def test_unpack_expanded_weight_or_tensor_with_custom_function(self, device):
+        # [FUNCTION DOC] Same checks as the plain unpack test but with a custom predicate that
+        # is true for the input tensor; the predicate is applied to the unwrapped tensor, and a
+        # non-tensor still gives None.
         input = torch.randn(3, requires_grad=True, device=device)
         self.assertTrue(
             unpack_expanded_weight_or_tensor(
@@ -197,6 +235,9 @@ class TestExpandedWeightHelperFunction(TestCase):
         )
 
     def test_unpack_expanded_weight_or_tensor_failure(self, device):
+        # [FUNCTION DOC] Checks unpack_expanded_weight_or_tensor raises RuntimeError about mixed
+        # ExpandedWeight and normal Parameters when given a plain tensor requiring grad, with
+        # and without a predicate.
         input = torch.randn(3, requires_grad=True, device=device)
         with self.assertRaisesRegex(
             RuntimeError,
@@ -211,6 +252,9 @@ class TestExpandedWeightHelperFunction(TestCase):
             unpack_expanded_weight_or_tensor(input, lambda x: x is input)
 
     def test_sum_over_all_but_batch_and_last_n(self, device):
+        # [FUNCTION DOC] Checks sum_over_all_but_batch_and_last_n on a five-dim tensor: keeping
+        # two trailing dims sums dims one and two, keeping zero sums all but batch, and keeping
+        # four returns the input unchanged.
         input = torch.randn(1, 2, 3, 4, 5, device=device)
         res = sum_over_all_but_batch_and_last_n(input, 2)
         expected = input.sum((1, 2))
@@ -225,7 +269,16 @@ class TestExpandedWeightHelperFunction(TestCase):
 
 
 class TestExpandedWeightFunctional(TestCase):
+    # [CLASS DOC] Tests ExpandedWeight against OpInfo functional ops and small models, comparing
+    # per-sample grads to a for-loop reference. Device-generic; instantiated per device and
+    # dtype.
     def _compare_ew_and_for_loop_per_sample_grads(self, op, sample_input, reduction):
+        # [FUNCTION DOC] Computes per-sample grads two ways for one sample input: wraps
+        # differentiable args in ExpandedWeight, runs the op, applies the reduction (sum or
+        # mean) and backward, and gathers grad_sample (or grad) of the original tensors; then
+        # computes per-sample grads with a for loop. Returns early if no differentiable inputs
+        # exist. With mean reduction the first (input) gradient is excluded from comparison.
+        # Asserts equality of counts and values.
         input = sample_input.input
         args = sample_input.args
         kwargs = sample_input.kwargs
@@ -275,6 +328,9 @@ class TestExpandedWeightFunctional(TestCase):
         allowed_dtypes=(torch.double,),
     )
     def test_expanded_weight_per_sample_grad_sum(self, device, dtype, op):
+        # [FUNCTION DOC] For each supported sample input of ops flagged as supporting expanded
+        # weights (double only), swaps embedding argument order, and compares expanded-weight
+        # per-sample grads with the for-loop reference under sum reduction.
         sample_inputs = op.sample_inputs(device, dtype, requires_grad=True)
         for sample_input in supported_inputs(op, sample_inputs):
             if (
@@ -294,6 +350,7 @@ class TestExpandedWeightFunctional(TestCase):
         allowed_dtypes=(torch.double,),
     )
     def test_expanded_weight_per_sample_grad_mean(self, device, dtype, op):
+        # [FUNCTION DOC] Same as the sum test but compares under mean reduction.
         sample_inputs = op.sample_inputs(device, dtype, requires_grad=True)
         for sample_input in supported_inputs(op, sample_inputs):
             if (
@@ -313,6 +370,8 @@ class TestExpandedWeightFunctional(TestCase):
         allowed_dtypes=(torch.double,),
     )
     def test_expanded_weights_per_sample_grad_input_no_grad(self, device, dtype, op):
+        # [FUNCTION DOC] Same as the mean test but first marks the sample input as not requiring
+        # grad, checking per-sample grads for the other arguments still match.
         sample_inputs = op.sample_inputs(device, dtype, requires_grad=True)
         for sample_input in supported_inputs(op, sample_inputs):
             if (
@@ -334,6 +393,9 @@ class TestExpandedWeightFunctional(TestCase):
         allowed_dtypes=(torch.double,),
     )
     def test_unsupported_expand_weights(self, device, dtype, op):
+        # [FUNCTION DOC] For sample inputs the op filter rejects (skipped under Dynamo), checks
+        # that running the op with expanded weights and calling backward raises RuntimeError
+        # mentioning Expanded Weights.
         sample_inputs = op.sample_inputs(device, dtype, requires_grad=True)
         unsupported_inputs = supported_inputs(op, sample_inputs, supported_inputs=False)
         for sample_input in unsupported_inputs:
@@ -369,6 +431,9 @@ class TestExpandedWeightFunctional(TestCase):
         filter(lambda op: op.supports_expanded_weight, op_db), dtypes=OpDTypes.supported
     )
     def test_expanded_weight_forward(self, device, dtype, op):
+        # [FUNCTION DOC] Checks forward results of ops with ExpandedWeight arguments equal
+        # normal results for both loss reductions. Skips (via skipTest) a CUDA embedding case
+        # with both max_norm and padding_idx because it is non-deterministic.
         sample_inputs = op.sample_inputs(device, dtype)
         for sample_input in supported_inputs(op, sample_inputs):
             if (
@@ -401,6 +466,8 @@ class TestExpandedWeightFunctional(TestCase):
                 self.assertEqual(expanded_weight_result, normal_result)
 
     def test_expanded_weight_error(self, device):
+        # [FUNCTION DOC] Checks adding a tensor and an ExpandedWeight with an unsupported
+        # function raises RuntimeError saying Expanded Weights cannot handle the function.
         batch_size = 3
         sample_input = make_tensor(
             (batch_size, 4), dtype=torch.float32, device=device, requires_grad=True
@@ -417,6 +484,9 @@ class TestExpandedWeightFunctional(TestCase):
             )
 
     def _test_embedding_model(self, model, num_embedding, device):
+        # [FUNCTION DOC] HELPER: Builds random integer indices of shape batch 32 by 5 by 5
+        # within the embedding count and delegates to the model test helper with the model bound
+        # to the embedding count. Returns the helper's result (none).
         batch_size = 32
         input = torch.randint(0, num_embedding, (batch_size, 5, 5), device=device)
         return self._test_model(
@@ -433,6 +503,9 @@ class TestExpandedWeightFunctional(TestCase):
         atol=1e-4,
         rtol=5e-5,
     ):
+        # [FUNCTION DOC] HELPER: Builds a random batch of 32 inputs with 3 channels and num_dim
+        # spatial dims of the given size, binds num_dim into the model builder, and delegates to
+        # the generic model test with the given loss reduction and tolerances.
         batch_size = 32
         input_ending = [input_size] * num_dim
         input = torch.randn([batch_size, 3] + input_ending, device=device)
@@ -456,6 +529,11 @@ class TestExpandedWeightFunctional(TestCase):
         atol=1e-4,
         rtol=5e-5,
     ):
+        # [FUNCTION DOC] HELPER: Builds the model with 10 classes on device, computes per-sample
+        # grads through call_for_per_sample_grads with cross entropy on random targets,
+        # collecting and deleting grad_sample of each parameter. Computes expected grads per
+        # sample with autograd grad over single-example batches, stacks them, and asserts
+        # closeness with the given tolerances.
         model = model(10).to(device)
         targets = torch.randint(0, 10, (batch_size,), device=device)
         criterion = CrossEntropyLoss(reduction=loss_reduction)
@@ -479,6 +557,8 @@ class TestExpandedWeightFunctional(TestCase):
             self.assertEqual(res, exp, atol=atol, rtol=rtol)
 
     def _compute_tolerances(self, device):
+        # [FUNCTION DOC] HELPER: Returns an (atol, rtol) pair: looser absolute tolerance for
+        # CUDA devices of compute capability 8.6, default values otherwise.
         is_cuda_sm86 = device.startswith("cuda") and torch.cuda.get_device_capability(
             0
         ) == (8, 6)
@@ -486,7 +566,12 @@ class TestExpandedWeightFunctional(TestCase):
 
     @tf32_off()
     def test_cnn_model_sum(self, device):
+        # [FUNCTION DOC] Runs the CNN per-sample-grad comparison with sum reduction (TF32
+        # disabled by decorator), using device-dependent tolerances.
         def convnet(num_classes, num_dim):
+            # [FUNCTION DOC] HELPER: Model builder returning a sequential convolutional net
+            # (four conv layers with pooling, flatten, linear) with the given number of output
+            # classes; num_dim is unused.
             return nn.Sequential(
                 nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),
                 nn.ReLU(),
@@ -509,7 +594,10 @@ class TestExpandedWeightFunctional(TestCase):
 
     @tf32_off()
     def test_cnn_model_mean(self, device):
+        # [FUNCTION DOC] Same as the sum CNN test but with mean loss reduction.
         def convnet(num_classes, num_dim):
+            # [FUNCTION DOC] HELPER: Model builder returning the same sequential convolutional
+            # net as the sum test; num_dim is unused.
             return nn.Sequential(
                 nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),
                 nn.ReLU(),
@@ -535,7 +623,11 @@ class TestExpandedWeightFunctional(TestCase):
     @parametrize("num_dim", [1, 2, 3])
     @tf32_off()
     def test_instance_norm_model(self, num_dim, device):
+        # [FUNCTION DOC] Parametrized over spatial dimensionality one to three: checks per-
+        # sample grads for a conv plus affine instance-norm plus linear model on size-7 inputs.
         def instance_norm_model(num_classes, num_dim):
+            # [FUNCTION DOC] HELPER: Model builder choosing a conv layer and instance-norm layer
+            # by num_dim and returning a sequential of conv, affine norm, flatten and linear.
             conv_layer = (
                 nn.Conv1d if num_dim == 1 else nn.Conv2d if num_dim == 2 else nn.Conv3d
             )
@@ -561,7 +653,11 @@ class TestExpandedWeightFunctional(TestCase):
     @parametrize("num_dim", [1, 2, 3])
     @tf32_off()
     def test_group_norm_model(self, num_dim, device):
+        # [FUNCTION DOC] Parametrized over spatial dimensionality one to three: checks per-
+        # sample grads for a conv plus group-norm plus linear model on size-7 inputs.
         def group_norm_model(num_classes, num_dim):
+            # [FUNCTION DOC] HELPER: Model builder choosing a conv layer by num_dim and
+            # returning a sequential of conv, group norm with 8 groups, flatten and linear.
             conv_layer = (
                 nn.Conv1d if num_dim == 1 else nn.Conv2d if num_dim == 2 else nn.Conv3d
             )
@@ -580,7 +676,12 @@ class TestExpandedWeightFunctional(TestCase):
     @parametrize("num_dim", [1, 2, 3])
     @tf32_off()
     def test_layer_norm_model(self, num_dim, device):
+        # [FUNCTION DOC] Parametrized over spatial dimensionality one to three: checks per-
+        # sample grads for a conv plus layer-norm plus linear model on size-7 inputs.
         def layer_norm_model(num_classes, num_dim):
+            # [FUNCTION DOC] HELPER: Model builder choosing a conv layer by num_dim and
+            # returning a sequential of conv, layer norm over the spatial shape, flatten and
+            # linear.
             conv_layer = (
                 nn.Conv1d if num_dim == 1 else nn.Conv2d if num_dim == 2 else nn.Conv3d
             )
@@ -598,7 +699,11 @@ class TestExpandedWeightFunctional(TestCase):
         )
 
     def test_embedding_model(self, device):
+        # [FUNCTION DOC] Checks per-sample grads for an embedding of 16 entries followed by
+        # flatten and linear.
         def embedding_model(num_classes, num_embedding):
+            # [FUNCTION DOC] HELPER: Model builder returning a sequential of embedding (dim 15),
+            # flatten and linear for the class count; the embedding count is a parameter.
             return nn.Sequential(
                 nn.Embedding(num_embedding, 15),
                 nn.Flatten(start_dim=1, end_dim=-1),
@@ -608,6 +713,8 @@ class TestExpandedWeightFunctional(TestCase):
         return self._test_embedding_model(embedding_model, 16, device)
 
     def test_group_norm_error(self, device):
+        # [FUNCTION DOC] Checks group_norm with 5 channels and 2 groups raises RuntimeError
+        # about channels not being divisible, i.e. the same error as normal group norm.
         # group norm has to call native_group_norm. This checks that it hits the same errors
         # that normal group norm would
 
@@ -621,6 +728,9 @@ class TestExpandedWeightFunctional(TestCase):
 
 
 class TestExpandedWeightModule(TestCase):
+    # [CLASS DOC] Tests per-sample grads for whole modules through call_for_per_sample_grads,
+    # including RNN modules and API error handling. Generated legacy module tests are attached
+    # at import time (see module doc).
     def _do_test(
         self,
         module,
@@ -631,6 +741,11 @@ class TestExpandedWeightModule(TestCase):
         atol=None,
         rtol=None,
     ):
+        # [FUNCTION DOC] HELPER: Compares per-sample grads from call_for_per_sample_grads (sum
+        # reduction, optional batch-first flag) against a for-loop over input slices for all
+        # parameters and, for float inputs, the input itself. Deletes grad_sample after reading,
+        # freezes rng state, and asserts the summed result and every gradient match within
+        # tolerances. Handles non-batch-first inputs by transposing the input gradient.
         args = args or ()
         kwargs = kwargs or {}
 
@@ -693,12 +808,20 @@ class TestExpandedWeightModule(TestCase):
         ]
 
     def _do_test_multi_input(self, module, input):
+        # [FUNCTION DOC] HELPER: Wraps the module in a wrapper calling it twice per forward,
+        # computes per-sample grads (single backward), and asserts each equals twice the for-
+        # loop per-sample grad; checks grads accumulate across multiple uses.
         class TestModule(nn.Module):
+            # [CLASS DOC] HELPER: Wrapper module holding the module under test and calling it
+            # twice on the same input, summing outputs.
             def __init__(self, module):
+                # [FUNCTION DOC] HELPER: Stores the wrapped module as an attribute.
                 super().__init__()
                 self.module = module
 
             def forward(self, input):
+                # [FUNCTION DOC] HELPER: Returns the sum of two calls to the wrapped module on
+                # the input.
                 return self.module(input) + self.module(input)
 
         batch_size = input.shape[0]
@@ -744,6 +867,10 @@ class TestExpandedWeightModule(TestCase):
     def _do_test_rnn_packed_sequence(
         self, module, input, args=None, kwargs=None, atol=None, rtol=None
     ):
+        # [FUNCTION DOC] HELPER: Per-sample grad check for RNN modules with a packed-sequence
+        # input: uses the max packed batch size, asserts each grad_sample has leading dim equal
+        # to it, and compares to a loop over sequences recovered with pad_packed_sequence and
+        # trimmed to their lengths, using the wrapped module's batch_first setting.
         args = args if args is not None else ()
         kwargs = kwargs if kwargs is not None else {}
 
@@ -796,18 +923,30 @@ class TestExpandedWeightModule(TestCase):
     )
     @tf32_off()
     def test_module(self, device, dtype, module_info, training):
+        # [FUNCTION DOC] For RNN, LSTM and GRU ModuleInfo inputs (with packed sequence
+        # variants), builds a wrapper module, batches unbatched two-dim inputs and hidden states
+        # to batch two, and dispatches to the packed-sequence check or the regular check.
+        # Tolerances are looser for float32; TF32 disabled.
         class RNNWrapper(torch.nn.Module):
+            # [CLASS DOC] HELPER: Wraps an RNN-family module so forward returns only the output
+            # sequence; holds the module as attribute m.
             def __init__(self, m_cons, args, kwargs):
+                # [FUNCTION DOC] HELPER: Constructs the wrapped module from the class, args and
+                # kwargs.
                 super().__init__()
                 self.m = m_cons(*args, **kwargs)
 
             def forward(self, *inps):
+                # [FUNCTION DOC] HELPER: Calls the wrapped module, raises AssertionError if the
+                # result is not a tuple, and returns its first element.
                 ret = self.m(*inps)
                 if not isinstance(ret, tuple):
                     raise AssertionError(f"expected tuple, got {type(ret)}")
                 return ret[0]
 
         def batch_hidden(h):
+            # [FUNCTION DOC] HELPER: Turns an unbatched hidden state into a batch of two by
+            # inserting a dim at index one and repeating twice along it.
             new_h_shape = [1] * (len(h.shape) + 1)
             new_h_shape[1] = 2
             return h.unsqueeze(1).repeat(new_h_shape)
@@ -876,6 +1015,9 @@ class TestExpandedWeightModule(TestCase):
                 )
 
     def test_per_sample_api_failing(self):
+        # [FUNCTION DOC] Checks call_for_per_sample_grads raises RuntimeError for: a non-module,
+        # a non-integer batch size, a negative batch size, a second call on a module that
+        # already has grad_sample fields, and an invalid loss_reduction value.
         module = nn.Linear(10, 10)
         input = torch.randn(64, 10)
         with self.assertRaisesRegex(RuntimeError, r"Module passed must be nn.Module"):
@@ -898,12 +1040,20 @@ class TestExpandedWeightModule(TestCase):
             call_for_per_sample_grads(module, loss_reduction="")(input)
 
     def test_per_sample_api_compute_batch_size(self):
+        # [FUNCTION DOC] Checks automatic batch size inference over positional and keyword
+        # inputs: mismatched sizes 4 and 5 raise RuntimeError; equal sizes succeed with
+        # positional or keyword inputs (fresh module each time).
         class CustomModule(nn.Module):
+            # [CLASS DOC] HELPER: Module applying one shared linear layer to both of its inputs
+            # and adding results.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the shared linear layer of size 5 by 5.
                 super().__init__()
                 self.linear = nn.Linear(5, 5)
 
             def forward(self, input1, input2):
+                # [FUNCTION DOC] HELPER: Returns the sum of the linear layer applied to each
+                # input.
                 return self.linear(input1) + self.linear(input2)
 
         module = CustomModule()
@@ -926,17 +1076,26 @@ class TestExpandedWeightModule(TestCase):
         call_for_per_sample_grads(module)(input1=input1, input2=input2)
 
     def test_per_sample_api_compute_batch_size_not_pytreeable(self):
+        # [FUNCTION DOC] Checks batch size inference when inputs include a dataclass that is not
+        # a pytree: inference raises RuntimeError unless batch size is given explicitly, and a
+        # mismatched extra tensor raises a batch-size error.
         @dataclass
         class NonPytreeableTuple:
+            # [CLASS DOC] HELPER: Dataclass with two tensor fields, not registered as a pytree.
             elem1: torch.Tensor
             elem2: torch.Tensor
 
         class CustomModule(nn.Module):
+            # [CLASS DOC] HELPER: Module applying one shared linear layer to the two tensor
+            # fields of its first input.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Creates the shared linear layer of size 5 by 5.
                 super().__init__()
                 self.linear = nn.Linear(5, 5)
 
             def forward(self, input1, input2):
+                # [FUNCTION DOC] HELPER: Returns the sum of the linear layer applied to both
+                # fields of the first input; the second input is ignored.
                 return self.linear(input1.elem1) + self.linear(input1.elem2)
 
         input = NonPytreeableTuple(torch.randn(4, 5), torch.randn(4, 5))
@@ -960,16 +1119,26 @@ class TestExpandedWeightModule(TestCase):
 
 
 class ContextManagerTests(TestBase):
+    # [CLASS DOC] Legacy nn test descriptor for module tests run as ExpandedWeights tests; holds
+    # per-instance flags test_cpu and test_cuda. Generated instances provide methods that are
+    # attached as test methods to TestExpandedWeightModule at import time.
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC] HELPER: Reads test_cpu and test_cuda (both default true) from keyword
+        # arguments, without removing them, then calls the base initializer with all arguments.
         self.test_cpu = kwargs.get("test_cpu", True)
         self.test_cuda = kwargs.get("test_cuda", True)
         super().__init__(*args, **kwargs)
 
     @property
     def constructor_args(self):
+        # [FUNCTION DOC] HELPER: Property returning the constructor_args entry of the test
+        # description, defaulting to false when absent.
         return self._get_arg("constructor_args", False)
 
     def test_context_manager(self, test_case, device):
+        # [FUNCTION DOC] HELPER: Builds the module in double on the device, makes a double (long
+        # for embeddings) copy of the test input, raises SkipTest for scalar or empty-batch
+        # inputs and rank-one linear inputs, then runs the module check of the given test case.
         kwargs = {"device": device, "dtype": torch.double}
         module = self.constructor(*self.constructor_args).to(**kwargs)
         if "Embedding" in self.get_name():
@@ -986,6 +1155,8 @@ class ContextManagerTests(TestBase):
         test_case._do_test(module, input)
 
     def test_context_manager_multiple_inputs(self, test_case, device):
+        # [FUNCTION DOC] HELPER: Same skip conditions as the context manager test, then runs the
+        # multiple-use check of the given test case on the module and input.
         module = self.constructor(*self.constructor_args).to(device)
         input = self._get_input().detach().clone()
         if len(input.shape) == 0 or input.shape[0] == 0:
@@ -1000,6 +1171,9 @@ class ContextManagerTests(TestBase):
 
 
 def filter_supported_tests(t):
+    # [FUNCTION DOC] HELPER: Predicate on a legacy test description; true if its module_name is
+    # one of the supported modules (linear, convs, embedding, layer/group/instance norm).
+    # Otherwise falls through returning none.
     supported_modules = [
         "Linear",
         "Conv1d",
@@ -1058,6 +1232,9 @@ for test_param in supported_tests:
 
 
 def run_op(op, input, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Calls the op on the input and extra args, except for embedding
+    # where the weight comes from the first extra argument and the indices from input, matching
+    # its OpInfo argument order.
     r"""
     OpInfo for Embedding switches the input and weight so autograd tests will only check the derivative
     of the weight, not the input, which can't be differentiable since its dtype is int. Calls op,
@@ -1070,7 +1247,12 @@ def run_op(op, input, *args, **kwargs):
 
 
 def make_expanded_weight(sample_input, batch_size, loss_reduction="sum"):
+    # [FUNCTION DOC] HELPER: Builds expanded-weight versions of a sample input: clones the input
+    # and wraps each differentiable positional and keyword arg in ExpandedWeight with the batch
+    # size and loss reduction (others cloned). Returns the input, args tuple and kwargs mapping.
     def expanded_weight_or_clone(arg):
+        # [FUNCTION DOC] HELPER: Wraps a differentiable argument's clone in ExpandedWeight, or
+        # clones it if it is a plain tensor, or returns it as is.
         if is_diff_tensor(arg):
             return ExpandedWeight(torch.clone(arg), batch_size, loss_reduction)
         return clone_if_tensor(arg)
@@ -1085,12 +1267,19 @@ def make_expanded_weight(sample_input, batch_size, loss_reduction="sum"):
 
 
 def supported_inputs(op, sample_inputs, supported_inputs=True):
+    # [FUNCTION DOC] HELPER: Returns the list of sample inputs that the expanded-weight
+    # implementation supports (or, if the flag is false, those it does not), using op-specific
+    # rules and requiring a positive batch size.
     r"""
     ExpandedWeights currently does not support some use cases when there's no batch dimension or
     operations that would cause inter-batch operations. Removes all of the cases it cannot deal with
     """
 
     def filter_fn(input):
+        # [FUNCTION DOC] HELPER: Decides whether one sample input is supported, depending on the
+        # op: rank above one for linear, input shape differing from normalized shape for layer
+        # norm, expected batched rank for convolutions, indices above rank one for embedding.
+        # Result is inverted when unsupported ones are requested.
         convolutions = [
             "nn.functional.conv1d",
             "nn.functional.conv2d",
@@ -1123,6 +1312,10 @@ def supported_inputs(op, sample_inputs, supported_inputs=True):
 
 
 def for_loop_per_sample_grad(batch_size, reduction, input, func, *args, **kwargs):
+    # [FUNCTION DOC] HELPER: Reference per-sample grads: for each batch element runs func on a
+    # single-example batch, applies the reduction and takes autograd grads w.r.t. the element
+    # and tensor args that require grad. Returns a tuple of stacked grads per differentiable
+    # argument.
     # get per sample grads by getting derivative for each input in a for loop
     per_sample_grad = []
     for i in range(batch_size):
@@ -1145,12 +1338,15 @@ def for_loop_per_sample_grad(batch_size, reduction, input, func, *args, **kwargs
 
 
 def is_diff_tensor(t):
+    # [FUNCTION DOC] HELPER: True for an ExpandedWeight or a tensor that requires grad.
     return isinstance(t, ExpandedWeight) or (
         isinstance(t, torch.Tensor) and t.requires_grad
     )
 
 
 def clone_if_tensor(t):
+    # [FUNCTION DOC] HELPER: For a tensor returns a detached clone with the same requires_grad
+    # flag; other values are returned unchanged.
     if isinstance(t, torch.Tensor):
         res = torch.clone(t).detach()
         res.requires_grad_(t.requires_grad)
