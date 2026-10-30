@@ -1,3 +1,8 @@
+# [MODULE DOC] Getter functions for the functional autograd benchmark vision models. Each getter
+# builds a model (resnet18, an FCN resnet50, or DETR from the local torchvision_models module),
+# optionally swaps batch norm for functorch-friendly versions, extracts the weights, and returns
+# a pure loss function of the parameters together with the parameter tuple. Import-time side
+# effect: probes for functorch and stores the result in has_functorch.
 from typing import cast
 
 import torchvision_models as models
@@ -11,6 +16,12 @@ has_functorch = check_for_functorch()
 
 
 def get_resnet18(device: torch.device) -> GetterReturnType:
+    # [FUNCTION DOC] Build the resnet18 benchmark case on the given device. Creates an untrained
+    # resnet18, replaces batch norm modules if functorch is available, moves the model to the
+    # device and extracts its weights. Inputs are a random batch of 32 images (3x224x224) and
+    # random integer class labels in 0..9 (random floats scaled by 10 then cast to long).
+    # Returns a pair of (function, params); the function takes the parameters, reloads them into
+    # the model, runs the forward pass and returns the cross entropy loss as a scalar tensor.
     N = 32
     model = models.resnet18(pretrained=False)
 
@@ -27,6 +38,9 @@ def get_resnet18(device: torch.device) -> GetterReturnType:
     labels = torch.rand(N, device=device).mul(10).long()
 
     def forward(*new_params: Tensor) -> Tensor:
+        # [FUNCTION DOC] HELPER: Closure over the model, inputs, labels and criterion. Reloads
+        # the supplied parameter tensors into the model, runs the batch through it and returns
+        # the cross entropy loss tensor.
         load_weights(model, names, new_params)
         out = model(inputs)
 
@@ -37,6 +51,13 @@ def get_resnet18(device: torch.device) -> GetterReturnType:
 
 
 def get_fcn_resnet(device: torch.device) -> GetterReturnType:
+    # [FUNCTION DOC] Build the FCN-resnet50 segmentation benchmark case on the given device.
+    # Uses an untrained model without pretrained backbone, batch size 8. If functorch is
+    # available, batch norm modules are replaced and the model is put in eval mode (the eval
+    # call is inside the functorch branch, so without functorch dropout stays active). Inputs
+    # are random 8x3x480x480 images and random dense targets of shape 8x21x480x480. Returns the
+    # loss function (mean squared error on the "out" entry of the model output) and
+    # the parameters.
     N = 8
     criterion = torch.nn.MSELoss()
     model = models.fcn_resnet50(pretrained=False, pretrained_backbone=False)
@@ -56,6 +77,9 @@ def get_fcn_resnet(device: torch.device) -> GetterReturnType:
     labels = torch.rand([N, 21, 480, 480], device=device)
 
     def forward(*new_params: Tensor) -> Tensor:
+        # [FUNCTION DOC] HELPER: Closure that reloads the supplied parameters into the model,
+        # runs the model on the fixed inputs, and returns the mean squared error between the
+        # "out" entry of the output and the fixed random targets.
         load_weights(model, names, new_params)
         out = model(inputs)["out"]
 
@@ -66,6 +90,13 @@ def get_fcn_resnet(device: torch.device) -> GetterReturnType:
 
 
 def get_detr(device: torch.device) -> GetterReturnType:
+    # [FUNCTION DOC] Build the DETR object detection benchmark case on the given device. The
+    # hyperparameters (91 classes, hidden size 256, 8 heads, 6 encoder and 6 decoder layers) are
+    # the CLI defaults of the original DETR project. Builds the model, a Hungarian matcher and a
+    # set criterion with label, box and cardinality losses, batch size 2, and random 800x1200
+    # inputs. Per-image targets are random labels and boxes with 5 to 9 objects each; box
+    # coordinates are swapped where needed so minimum corners come first. Returns the weighted
+    # loss function and the extracted parameters. Uses torch random numbers (not seeded here).
     # All values below are from CLI defaults in https://github.com/facebookresearch/detr
     N = 2
     num_classes = 91
@@ -126,6 +157,10 @@ def get_detr(device: torch.device) -> GetterReturnType:
         labels.append(targets)
 
     def forward(*new_params: Tensor) -> Tensor:
+        # [FUNCTION DOC] HELPER: Closure that reloads the supplied parameters, runs the model on
+        # the fixed inputs, evaluates the set criterion against the fixed targets and returns
+        # the sum of each loss term multiplied by its weight (only terms present in the weight
+        # mapping count).
         load_weights(model, names, new_params)
         out = model(inputs)
 

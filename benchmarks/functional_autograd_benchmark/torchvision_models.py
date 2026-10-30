@@ -1,5 +1,13 @@
 # Taken from https://github.com/pytorch/vision
 # So that we don't need torchvision to be installed
+# [MODULE DOC] Local copies of the torchvision pieces needed by the functional autograd
+# benchmark so torchvision need not be installed: ResNet-18 and ResNet-50, an intermediate
+# layer extractor, a fully convolutional segmentation model (FCN with a dilated ResNet-50
+# backbone), and a demo DETR detector together with its set criterion, Hungarian matcher and
+# box utilities. Pretrained weight loading is stubbed out, so the pretrained flags have no
+# effect on weights. Import-time side effect: tries to import the scipy assignment solver
+# and records its availability in a module flag; the DETR matcher fails at run time
+# without scipy.
 from collections import OrderedDict
 
 import torch
@@ -17,6 +25,8 @@ except Exception:
 
 
 def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
+    # [FUNCTION DOC] HELPER: Build a bias-free 3x3 convolution whose padding equals the
+    # dilation, with the given stride, groups and dilation. Returns the module.
     """3x3 convolution with padding"""
     return nn.Conv2d(
         in_planes,
@@ -31,11 +41,16 @@ def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
 
 
 def conv1x1(in_planes, out_planes, stride=1):
+    # [FUNCTION DOC] HELPER: Build a bias-free 1x1 convolution with the given stride. Returns
+    # the module.
     """1x1 convolution"""
     return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
 
 
 class BasicBlock(nn.Module):
+    # [CLASS DOC] Two-convolution residual block used by shallow ResNets (expansion factor one).
+    # Applies a 3x3 convolution with batch norm and relu, a second 3x3 convolution with batch
+    # norm, adds the identity (or a downsampled identity) and applies relu.
     expansion = 1
 
     def __init__(
@@ -49,6 +64,10 @@ class BasicBlock(nn.Module):
         dilation=1,
         norm_layer=None,
     ):
+        # [FUNCTION DOC] HELPER: Create the two convolutions and norm layers (batch norm by
+        # default) and store the optional downsample module and stride. Raises a ValueError if
+        # groups is not one or the base width is not 64, and a NotImplementedError if dilation
+        # is above one.
         super().__init__()
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
@@ -66,6 +85,9 @@ class BasicBlock(nn.Module):
         self.stride = stride
 
     def forward(self, x):
+        # [FUNCTION DOC] Compute the residual output: two conv/norm stages with relu between,
+        # plus the identity path (passed through the downsample module if present), followed by
+        # relu. The addition is done in place on the branch output.
         identity = x
 
         out = self.conv1(x)
@@ -85,6 +107,10 @@ class BasicBlock(nn.Module):
 
 
 class Bottleneck(nn.Module):
+    # [CLASS DOC] Three-convolution bottleneck residual block (expansion factor four) in the
+    # ResNet V1.5 style, where the stride sits in the 3x3 convolution. A 1x1 reduction, a 3x3
+    # grouped convolution and a 1x1 expansion each followed by normalization, with a
+    # residual connection.
     # Bottleneck in torchvision places the stride for downsampling at 3x3 convolution(self.conv2)
     # while original implementation places the stride at the first 1x1 convolution(self.conv1)
     # according to "Deep residual learning for image recognition"https://arxiv.org/abs/1512.03385.
@@ -104,6 +130,9 @@ class Bottleneck(nn.Module):
         dilation=1,
         norm_layer=None,
     ):
+        # [FUNCTION DOC] HELPER: Compute the inner width from the planes, base width and groups,
+        # and create the three convolutions with their norm layers (batch norm by default),
+        # relu, optional downsample module and stride.
         super().__init__()
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
@@ -120,6 +149,9 @@ class Bottleneck(nn.Module):
         self.stride = stride
 
     def forward(self, x):
+        # [FUNCTION DOC] Compute the bottleneck residual output: reduce, convolve, expand with
+        # normalization and relu in between, add the identity path (downsampled if a module was
+        # given) in place, and apply relu.
         identity = x
 
         out = self.conv1(x)
@@ -143,6 +175,12 @@ class Bottleneck(nn.Module):
 
 
 class ResNet(nn.Module):
+    # [CLASS DOC] ResNet image classifier assembled from a block type and per-stage block
+    # counts: a 7x7 stem with batch norm, relu and max pooling, four stages of residual blocks,
+    # global average pooling and a linear classifier. Supports grouped convolutions, optional
+    # replacement of stage strides by dilation and zero initialization of the last norm in each
+    # residual branch. Convolutions use Kaiming normal initialization and norm layers start at
+    # identity scale.
     def __init__(
         self,
         block,
@@ -154,6 +192,10 @@ class ResNet(nn.Module):
         replace_stride_with_dilation=None,
         norm_layer=None,
     ):
+        # [FUNCTION DOC] HELPER: Build the stem, the four stages through the layer builder, the
+        # pooling and the classifier, then initialize weights. Raises a ValueError if the
+        # dilation replacement list does not have exactly three entries. If zero-init is
+        # requested, the last norm weight of every block is set to zero.
         super().__init__()
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
@@ -209,6 +251,12 @@ class ResNet(nn.Module):
                     nn.init.constant_(m.bn2.weight, 0)
 
     def _make_layer(self, block, planes, blocks, stride=1, dilate=False):
+        # [FUNCTION DOC] HELPER: Build one stage as a sequential of blocks. When dilating, the
+        # running dilation is multiplied by the stride and the stride becomes one. A projection
+        # shortcut (1x1 convolution plus norm) is created when the stride is not one or the
+        # channel count changes. The first block receives the shortcut and the previous
+        # dilation; the remaining blocks use the new channel count. Updates the running input
+        # plane count as a side effect and returns the sequential.
         norm_layer = self._norm_layer
         downsample = None
         previous_dilation = self.dilation
@@ -250,6 +298,8 @@ class ResNet(nn.Module):
         return nn.Sequential(*layers)
 
     def _forward_impl(self, x):
+        # [FUNCTION DOC] HELPER: Forward pass: stem, four stages, global average pooling,
+        # flatten from dimension one and the final linear layer. Returns class logits.
         # See note [TorchScript super()]
         x = self.conv1(x)
         x = self.bn1(x)
@@ -268,10 +318,14 @@ class ResNet(nn.Module):
         return x
 
     def forward(self, x):
+        # [FUNCTION DOC] Return class logits by delegating to the shared forward implementation.
         return self._forward_impl(x)
 
 
 def _resnet(arch, block, layers, pretrained, progress, **kwargs):
+    # [FUNCTION DOC] HELPER: Construct a ResNet from a block class and layer counts, forwarding
+    # keyword arguments. The architecture name, pretrained flag and progress flag are ignored
+    # because loading of pretrained weights is commented out. Returns the new model.
     model = ResNet(block, layers, **kwargs)
     # if pretrained:
     #     state_dict = load_state_dict_from_url(model_urls[arch],
@@ -281,6 +335,9 @@ def _resnet(arch, block, layers, pretrained, progress, **kwargs):
 
 
 def resnet18(pretrained=False, progress=True, **kwargs):
+    # [FUNCTION DOC] Build a ResNet-18 (basic blocks, 2-2-2-2 layout). The pretrained and
+    # progress arguments have no effect; extra keyword arguments go to the model constructor.
+    # Returns the model.
     r"""ResNet-18 model from
     `"Deep Residual Learning for Image Recognition" <https://arxiv.org/pdf/1512.03385.pdf>`_
     Args:
@@ -291,6 +348,9 @@ def resnet18(pretrained=False, progress=True, **kwargs):
 
 
 def resnet50(pretrained=False, progress=True, **kwargs):
+    # [FUNCTION DOC] Build a ResNet-50 (bottleneck blocks, 3-4-6-3 layout). The pretrained and
+    # progress arguments have no effect; extra keyword arguments go to the model constructor.
+    # Returns the model.
     r"""ResNet-50 model from
     `"Deep Residual Learning for Image Recognition" <https://arxiv.org/pdf/1512.03385.pdf>`_
     Args:
@@ -301,6 +361,11 @@ def resnet50(pretrained=False, progress=True, **kwargs):
 
 
 class IntermediateLayerGetter(nn.ModuleDict):
+    # [CLASS DOC] Wrapper that keeps only the children of a model up to the last requested layer
+    # and returns the activations of the requested layers as an ordered mapping. Children are
+    # executed in registration order, so it assumes each module is used once and in that order,
+    # and only direct children can be selected. The mapping from child name to output name is
+    # kept as an attribute.
     """
     Module wrapper that returns intermediate layers from a model
     It has a strong assumption that the modules have been registered
@@ -333,6 +398,9 @@ class IntermediateLayerGetter(nn.ModuleDict):
     }
 
     def __init__(self, model, return_layers):
+        # [FUNCTION DOC] HELPER: Check that every requested layer is a direct child (ValueError
+        # if not), then copy the children in order into a module dictionary, stopping after the
+        # last requested layer. Stores the original return layers mapping.
         if not set(return_layers).issubset(
             [name for name, _ in model.named_children()]
         ):
@@ -351,6 +419,9 @@ class IntermediateLayerGetter(nn.ModuleDict):
         self.return_layers = orig_return_layers
 
     def forward(self, x):
+        # [FUNCTION DOC] Run the kept children in order on the input and collect, under the
+        # configured output names, the activation after each requested layer. Returns an ordered
+        # mapping of output name to tensor.
         out = OrderedDict()
         for name, module in self.items():
             x = module(x)
@@ -361,15 +432,24 @@ class IntermediateLayerGetter(nn.ModuleDict):
 
 
 class _SimpleSegmentationModel(nn.Module):
+    # [CLASS DOC] Base class for segmentation models: a backbone returning a mapping of feature
+    # maps, a classifier for the main feature map and an optional auxiliary classifier. The
+    # output maps are resized back to the input resolution.
     __constants__ = ["aux_classifier"]
 
     def __init__(self, backbone, classifier, aux_classifier=None):
+        # [FUNCTION DOC] HELPER: Store the backbone, classifier and optional
+        # auxiliary classifier.
         super().__init__()
         self.backbone = backbone
         self.classifier = classifier
         self.aux_classifier = aux_classifier
 
     def forward(self, x):
+        # [FUNCTION DOC] Run the backbone, classify the feature map named out, upsample the
+        # prediction bilinearly to the input height and width, and put it under the out key of
+        # an ordered result. If an auxiliary classifier exists the feature map named aux is
+        # processed the same way under the aux key. Returns the ordered mapping.
         input_shape = x.shape[-2:]
         # contract: features is a dict of tensors
         features = self.backbone(x)
@@ -390,6 +470,9 @@ class _SimpleSegmentationModel(nn.Module):
 
 
 class FCN(_SimpleSegmentationModel):
+    # [CLASS DOC] Fully convolutional network for semantic segmentation. It adds no behavior
+    # beyond its base class; the backbone must return a mapping with an out entry and, if an
+    # auxiliary classifier is used, an aux entry.
     """
     Implements a Fully-Convolutional Network for semantic segmentation.
     Args:
@@ -404,7 +487,12 @@ class FCN(_SimpleSegmentationModel):
 
 
 class FCNHead(nn.Sequential):
+    # [CLASS DOC] Segmentation head: a sequential of a 3x3 convolution reducing channels to a
+    # quarter, batch norm, relu, dropout with probability 0.1 and a 1x1 convolution to the
+    # requested channel count.
     def __init__(self, in_channels, channels):
+        # [FUNCTION DOC] HELPER: Build the layer list for the head and initialize the sequential
+        # base with it.
         inter_channels = in_channels // 4
         layers = [
             nn.Conv2d(in_channels, inter_channels, 3, padding=1, bias=False),
@@ -418,6 +506,12 @@ class FCNHead(nn.Sequential):
 
 
 def _segm_resnet(name, backbone_name, num_classes, aux, pretrained_backbone=True):
+    # [FUNCTION DOC] HELPER: Assemble a segmentation model with a ResNet-50 backbone using
+    # dilation in the last two stages. Only the name resnet50 is accepted for the backbone
+    # (AssertionError otherwise) and only the fcn model name is in the lookup (KeyError
+    # otherwise). The backbone is wrapped to return the last stage as the out entry and, if aux
+    # is true, the third stage as aux with an auxiliary head of 1024 input channels; the main
+    # head takes 2048 channels. Returns the model.
     # backbone = resnet.__dict__[backbone_name](
     #     pretrained=pretrained_backbone,
     #     replace_stride_with_dilation=[False, True, True])
@@ -455,6 +549,12 @@ def _segm_resnet(name, backbone_name, num_classes, aux, pretrained_backbone=True
 def _load_model(
     arch_type, backbone, pretrained, progress, num_classes, aux_loss, **kwargs
 ):
+    # [FUNCTION DOC] HELPER: Create a segmentation model. When the pretrained flag is set the
+    # auxiliary classifier is forced on, but no weights are downloaded or loaded (that code is
+    # commented out); the progress flag is unused. Extra keyword arguments are passed to the
+    # model builder. Returns the model.
+    # KNOWN ISSUE: the pretrained flag only changes whether an auxiliary classifier is created
+    # and does not load any weights.
     if pretrained:
         aux_loss = True
     model = _segm_resnet(arch_type, backbone, num_classes, aux_loss, **kwargs)
@@ -472,6 +572,10 @@ def _load_model(
 def fcn_resnet50(
     pretrained=False, progress=True, num_classes=21, aux_loss=None, **kwargs
 ):
+    # [FUNCTION DOC] Build an FCN with a ResNet-50 backbone for 21 classes by default. The
+    # pretrained and progress flags are accepted for API compatibility without loading weights;
+    # the auxiliary loss option is None by default (no auxiliary head); keyword arguments such
+    # as the backbone pretraining flag are forwarded. Returns the model.
     """Constructs a Fully-Convolutional Network model with a ResNet-50 backbone.
     Args:
         pretrained (bool): If True, returns a model pre-trained on COCO train2017 which
@@ -485,6 +589,11 @@ def fcn_resnet50(
 
 # Taken from @fmassa example slides and https://github.com/facebookresearch/detr
 class DETR(nn.Module):
+    # [CLASS DOC] Minimal DETR object detector: a ResNet-50 backbone without its classifier, a
+    # 1x1 convolution to the hidden size, a stock transformer, learned query, row and column
+    # position parameters, a linear class head with one extra no-object class and a linear box
+    # head. Positional embedding tables hold 50 rows and 50 columns, so feature maps larger than
+    # that are not supported.
     """
     Demo DETR implementation.
 
@@ -505,6 +614,9 @@ class DETR(nn.Module):
         num_encoder_layers=6,
         num_decoder_layers=6,
     ):
+        # [FUNCTION DOC] HELPER: Build the backbone (deleting its classifier), the projection,
+        # transformer with the given sizes, class and box heads, and the random parameters for
+        # 100 object queries and the row and column embeddings.
         super().__init__()
 
         # create ResNet-50 backbone
@@ -533,6 +645,15 @@ class DETR(nn.Module):
         self.col_embed = nn.Parameter(torch.rand(50, hidden_dim // 2))
 
     def forward(self, inputs):
+        # [FUNCTION DOC] Run the detector on an image batch. Features come from the backbone
+        # stages, are projected to the hidden size, and combined with a learned two dimensional
+        # positional encoding built from column and row embeddings (the features are scaled by
+        # 0.1 before adding it). The flattened feature positions feed the transformer encoder
+        # and the object queries (expanded across the batch) feed the decoder. Returns a
+        # dictionary with class logits of shape batch, 100, classes plus one, and sigmoid box
+        # predictions of shape batch, 100, 4.
+        # KNOWN ISSUE: the class docstring says only batch size 1 is supported, but the query
+        # expansion handles larger batches.
         # propagate inputs through ResNet-50 up to avg-pool layer
         x = self.backbone.conv1(inputs)
         x = self.backbone.bn1(x)
@@ -576,6 +697,9 @@ class DETR(nn.Module):
 
 
 def generalized_box_iou(boxes1, boxes2):
+    # [FUNCTION DOC] Compute the pairwise generalized IoU matrix between two sets of boxes in
+    # corner format (shapes N and M). Raises an AssertionError if either set contains a box
+    # whose second corner is below the first. Returns an N by M tensor.
     """
     Generalized IoU from https://giou.stanford.edu/
     The boxes should be in [x0, y0, x1, y1] format
@@ -600,12 +724,15 @@ def generalized_box_iou(boxes1, boxes2):
 
 
 def box_cxcywh_to_xyxy(x):
+    # [FUNCTION DOC] Convert boxes from center x, center y, width, height format (last dimension
+    # of size four) to corner format and return the stacked tensor.
     x_c, y_c, w, h = x.unbind(-1)
     b = [(x_c - 0.5 * w), (y_c - 0.5 * h), (x_c + 0.5 * w), (y_c + 0.5 * h)]
     return torch.stack(b, dim=-1)
 
 
 def box_area(boxes):
+    # [FUNCTION DOC] Return the area of each box in an N by 4 tensor of corner coordinates.
     """
     Computes the area of a set of bounding boxes, which are specified by its
     (x1, y1, x2, y2) coordinates.
@@ -620,6 +747,9 @@ def box_area(boxes):
 
 # modified from torchvision to also return the union
 def box_iou(boxes1, boxes2):
+    # [FUNCTION DOC] Compute pairwise intersection over union between two sets of corner-format
+    # boxes (modified from torchvision to also return the union). Returns a pair: the N by M IoU
+    # matrix and the N by M union areas.
     area1 = box_area(boxes1)
     area2 = box_area(boxes2)
 
@@ -636,16 +766,22 @@ def box_iou(boxes1, boxes2):
 
 
 def is_dist_avail_and_initialized():
+    # [FUNCTION DOC] HELPER: Stub for distributed detection; always returns False.
     return False
 
 
 def get_world_size():
+    # [FUNCTION DOC] HELPER: Return the world size, which is one when distributed training is
+    # not available (always, given the stub above).
     if not is_dist_avail_and_initialized():
         return 1
 
 
 @torch.no_grad()
 def accuracy(output, target, topk=(1,)):
+    # [FUNCTION DOC] Compute top-k precision percentages of logits against integer targets,
+    # without gradients. For an empty target it returns a list holding a single zero tensor;
+    # otherwise it returns one value per requested k, as a percentage of the batch size.
     """Computes the precision@k for the specified values of k"""
     if target.numel() == 0:
         return [torch.zeros([], device=output.device)]
@@ -664,6 +800,11 @@ def accuracy(output, target, topk=(1,)):
 
 
 class SetCriterion(nn.Module):
+    # [CLASS DOC] Loss module for DETR. Matches predictions to targets with the provided matcher
+    # and then computes the requested losses (classification, box, cardinality or mask) for the
+    # last layer and any auxiliary decoder outputs. Holds the class count, matcher, loss weight
+    # mapping, no-object weight and the list of loss names; a buffer gives the no-object class a
+    # reduced weight in the classification loss.
     """This class computes the loss for DETR.
     The process happens in two steps:
         1) we compute hungarian assignment between ground truth boxes and the outputs of the model
@@ -671,6 +812,8 @@ class SetCriterion(nn.Module):
     """
 
     def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses):
+        # [FUNCTION DOC] HELPER: Store the arguments and register the class weight buffer (ones,
+        # with the last entry set to the no-object coefficient).
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -690,6 +833,10 @@ class SetCriterion(nn.Module):
         self.register_buffer("empty_weight", empty_weight)
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
+        # [FUNCTION DOC] Weighted cross entropy over query classes. Matched predictions get
+        # their target labels and all others the no-object class. Requires the logits entry in
+        # outputs (AssertionError). Returns a dictionary with the cross entropy and, when
+        # logging is on, a class error percentage.
         """Classification loss (NLL)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         """
@@ -721,6 +868,10 @@ class SetCriterion(nn.Module):
 
     @torch.no_grad()
     def loss_cardinality(self, outputs, targets, indices, num_boxes):
+        # [FUNCTION DOC] Compute (without gradients) the absolute difference between the number
+        # of predictions not classified as no-object and the number of target boxes per image,
+        # averaged over the batch. For logging only. Returns a dictionary with the
+        # cardinality error.
         """Compute the cardinality error, ie the absolute error in the number of predicted non-empty boxes
         This is not really a loss, it is intended for logging purposes only. It doesn't propagate gradients
         """
@@ -736,6 +887,12 @@ class SetCriterion(nn.Module):
         return losses
 
     def loss_boxes(self, outputs, targets, indices, num_boxes):
+        # [FUNCTION DOC] Compute box losses for matched pairs: the summed L1 distance and one
+        # minus the generalized IoU, each divided by the number of boxes. Requires the boxes
+        # entry in outputs (AssertionError). Returns a dictionary with the two losses.
+        # KNOWN ISSUE: the docstring names the target format as center x, center y, height,
+        # width, but the conversion function used treats the last two values as width
+        # then height.
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
         targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
         The target boxes are expected in format (center_x, center_y, h, w), normalized by the image size.
@@ -762,6 +919,11 @@ class SetCriterion(nn.Module):
         return losses
 
     def loss_masks(self, outputs, targets, indices, num_boxes):
+        # [FUNCTION DOC] Compute mask losses (focal and dice) for matched pairs. Requires the
+        # masks entry in outputs (AssertionError).
+        # KNOWN ISSUE: the helper functions it calls (nested tensor builder, interpolation,
+        # focal loss, dice loss) are not defined or imported in this file, so calling it raises
+        # a NameError; masks are never used in the benchmark.
         """Compute the losses related to the masks: the focal loss and the dice loss.
         targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
         """
@@ -800,6 +962,8 @@ class SetCriterion(nn.Module):
         return losses
 
     def _get_src_permutation_idx(self, indices):
+        # [FUNCTION DOC] HELPER: Return a pair of tensors (batch index per matched prediction,
+        # prediction index) built by concatenating the matcher's source indices over the batch.
         # permute predictions following indices
         batch_idx = torch.cat(
             [torch.full_like(src, i) for i, (src, _) in enumerate(indices)]
@@ -808,6 +972,8 @@ class SetCriterion(nn.Module):
         return batch_idx, src_idx
 
     def _get_tgt_permutation_idx(self, indices):
+        # [FUNCTION DOC] HELPER: Return a pair of tensors (batch index per matched target,
+        # target index) built by concatenating the matcher's target indices over the batch.
         # permute targets following indices
         batch_idx = torch.cat(
             [torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)]
@@ -816,6 +982,9 @@ class SetCriterion(nn.Module):
         return batch_idx, tgt_idx
 
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
+        # [FUNCTION DOC] Dispatch to one loss function by name from a fixed table of labels,
+        # cardinality, boxes and masks. Raises an AssertionError for an unknown name. Extra
+        # keyword arguments are forwarded. Returns the dictionary of losses.
         loss_map = {
             "labels": self.loss_labels,
             "cardinality": self.loss_cardinality,
@@ -829,6 +998,13 @@ class SetCriterion(nn.Module):
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
 
     def forward(self, outputs, targets):
+        # [FUNCTION DOC] Compute all configured losses. Auxiliary outputs are excluded from
+        # matching, the matcher gives the assignment, and the number of target boxes is clamped
+        # to at least one (and averaged over workers, which is a single worker here). Each
+        # requested loss is evaluated and the dictionaries merged. For every auxiliary decoder
+        # output the matching is repeated and the losses are added with an index suffix on each
+        # key, skipping mask losses and disabling the classification logging. Returns the
+        # dictionary of losses.
         """This performs the loss computation.
         Parameters:
              outputs: dict of tensors, see the output specification of the model for the format
@@ -876,6 +1052,10 @@ class SetCriterion(nn.Module):
 
 
 class HungarianMatcher(nn.Module):
+    # [CLASS DOC] Computes a one-to-one assignment between predicted queries and ground-truth
+    # objects by minimizing a weighted sum of classification, L1 box and generalized IoU costs.
+    # Unmatched predictions are treated as no-object. The assignment itself uses the scipy
+    # linear sum assignment solver.
     """This class computes an assignment between the targets and the predictions of the network
     For efficiency reasons, the targets don't include the no_object. Because of this, in general,
     there are more predictions than targets. In this case, we do a 1-to-1 matching of the best predictions,
@@ -885,6 +1065,8 @@ class HungarianMatcher(nn.Module):
     def __init__(
         self, cost_class: float = 1, cost_bbox: float = 1, cost_giou: float = 1
     ):
+        # [FUNCTION DOC] HELPER: Store the three cost weights. Raises an AssertionError if all
+        # three are zero.
         """Creates the matcher
         Params:
             cost_class: This is the relative weight of the classification error in the matching cost
@@ -902,6 +1084,14 @@ class HungarianMatcher(nn.Module):
 
     @torch.no_grad()
     def forward(self, outputs, targets):
+        # [FUNCTION DOC] Compute the assignment for a batch, without gradients. The class scores
+        # of all queries are flattened across the batch, costs against the concatenated targets
+        # are computed for all pairs (negative class probability, L1 distance of boxes, negative
+        # generalized IoU), combined with the weights, reshaped per image and split by target
+        # counts. For each image the scipy solver finds the optimal matching. Returns a list
+        # with one pair of int64 index tensors (predictions, targets) per image, each of length
+        # equal to the smaller of the query and target counts. Raises a RuntimeError if scipy is
+        # not available (checked after the cost computation).
         """Performs the matching
         Params:
             outputs: This is a dict that contains at least these entries:

@@ -1,3 +1,13 @@
+# [MODULE DOC] End-to-end text generation benchmarks for gpt-fast style models (Llama 2 7B in
+# bfloat16 and int8, and a reduced Mixtral 8x7B in int8). Provides token sampling, prefill and
+# decode loops, random-weight model loading, a model size estimate that counts only activated
+# parameters, a driver that measures tokens per second, memory bandwidth and compilation time,
+# and three registered experiments returning Experiment records. Relies on modules model,
+# quantize and mixtral_moe_quantize that are expected to be importable from the gpt-fast
+# checkout, plus the local common and mixtral_moe_model. Import-time side effects: enables
+# coordinate descent tuning, unique kernel names, the FX graph cache and disables the indirect
+# indexing assertion in the global inductor config, and defines a module flag recording whether
+# compilation has happened.
 import dataclasses
 import itertools
 import platform
@@ -26,6 +36,10 @@ compiled = False
 
 @dataclasses.dataclass
 class GPTModelConfig:
+    # [CLASS DOC] Dataclass describing one model benchmark target: the model name, the model
+    # class to build, a mode string (bfloat16 or int8), the quantizer handler class, target
+    # tokens per second, target memory bandwidth in GB/s, target compilation time in seconds,
+    # and an optional batch size (default none). It is plain data without methods.
     name: str
     module: type
     mode: str | None
@@ -37,6 +51,9 @@ class GPTModelConfig:
 
 
 def device_sync(device):
+    # [FUNCTION DOC] Block until queued work on the device finishes. For a device string
+    # containing cuda the CUDA stream is synchronized; for a cpu device nothing happens; any
+    # other device prints a message saying it is unsupported and does nothing.
     if "cuda" in device:
         torch.cuda.synchronize(device)
     elif "cpu" in device:
@@ -46,6 +63,9 @@ def device_sync(device):
 
 
 def get_arch_name() -> str:
+    # [FUNCTION DOC] Return a string naming the hardware: the CUDA device name if CUDA is
+    # available, otherwise the machine architecture string of the host platform (such as x86_64
+    # or arm64). Used as the arch field of experiment records.
     if torch.cuda.is_available():
         return torch.cuda.get_device_name()
     else:
@@ -56,11 +76,19 @@ def get_arch_name() -> str:
 def multinomial_sample_one_no_sync(
     probs_sort,
 ):  # Does multinomial sampling without a cuda synchronization
+    # [FUNCTION DOC] Draw one sample index per row of a probability tensor along the last
+    # dimension without forcing a host-device synchronization. It divides the probabilities by
+    # independent exponential noise of rate one and takes the arg-max, which is equivalent to
+    # multinomial sampling. Returns an int32 tensor with the last dimension kept as size one.
     q = torch.empty_like(probs_sort).exponential_(1)
     return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int)
 
 
 def logits_to_probs(logits, temperature: float = 1.0, top_k: int | None = None):
+    # [FUNCTION DOC] Convert logits to a probability distribution. Logits are divided by the
+    # temperature (floored at one hundred-thousandth to avoid division by zero). If top_k is
+    # given, every logit smaller than the k-th largest value (k capped at the vocabulary size)
+    # is replaced with negative infinity. Returns the softmax over the last dimension.
     logits = logits / max(temperature, 1e-5)
 
     if top_k is not None:
@@ -72,6 +100,10 @@ def logits_to_probs(logits, temperature: float = 1.0, top_k: int | None = None):
 
 
 def sample(logits, temperature: float = 1.0, top_k: int | None = None):
+    # [FUNCTION DOC] Sample the next token from model output. Uses the logits of the first batch
+    # element at the last position, converts them to probabilities with the temperature and
+    # optional top-k filter, and samples one index without synchronization. Returns a pair of
+    # the sampled index tensor and the probability tensor.
     probs = logits_to_probs(logits[0, -1], temperature, top_k)
     idx_next = multinomial_sample_one_no_sync(probs)
     return idx_next, probs
@@ -80,6 +112,10 @@ def sample(logits, temperature: float = 1.0, top_k: int | None = None):
 def prefill(
     model: torch.nn.Module, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Run the prompt through the model in one pass (the position tensor has batch
+    # and sequence dimensions) and return only the sampled next token; the probabilities are
+    # discarded. Extra keyword arguments are forwarded to the sampling step. Updates the model
+    # key-value cache as a side effect.
     # input_pos: [B, S]
     logits = model(x, input_pos)
     return sample(logits, **sampling_kwargs)[0]
@@ -88,6 +124,10 @@ def prefill(
 def decode_one_token(
     model: torch.nn.Module, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC] Run a single decoding step: feed one token with its position through the
+    # model and sample the next token. Raises an AssertionError if the position tensor does not
+    # have size one in the last dimension. Returns a pair of the next token and its probability
+    # tensor. Updates the key-value cache as a side effect.
     # input_pos: [B, 1]
     if input_pos.shape[-1] != 1:
         raise AssertionError(
@@ -104,6 +144,11 @@ def decode_n_tokens(
     num_new_tokens: int,
     **sampling_kwargs,
 ):
+    # [FUNCTION DOC] Generate a number of tokens one at a time. Each iteration runs inside a
+    # context forcing the math attention backend (so Inductor can generate code for attention),
+    # decodes one token, increments the position tensor in place, stores clones of the sampled
+    # token and its probabilities, and feeds the token back reshaped to one row. Returns two
+    # lists: the sampled tokens and their probability tensors. Mutates input_pos in place.
     new_tokens, new_probs = [], []
     for i in range(num_new_tokens):
         with torch.nn.attention.sdpa_kernel(
@@ -124,6 +169,13 @@ def decode_n_tokens(
 def generate(
     model: torch.nn.Module, prompt: torch.Tensor, max_new_tokens: int, **sampling_kwargs
 ) -> torch.Tensor:
+    # [FUNCTION DOC] Generate text from a one-dimensional prompt of token ids under no gradient
+    # mode. Sets up the key-value caches on the model for batch size one and a sequence length
+    # capped at the model block size, allocates an output sequence of prompt plus new token
+    # length, copies the prompt into it, prefills to get the first new token, then decodes the
+    # remaining new tokens one at a time. Returns the full token sequence (prompt followed by
+    # the generated tokens). Uses the module level prefill and decode functions, which may have
+    # been replaced by compiled versions.
     device, dtype = prompt.device, prompt.dtype
     T = prompt.size(0)
     T_new = T + max_new_tokens
@@ -151,6 +203,12 @@ def generate(
 
 
 def _load_model(x: GPTModelConfig, device="cuda", precision=torch.bfloat16):
+    # [FUNCTION DOC] HELPER: Build a benchmark model with random weights. The model is created
+    # from the config name on the meta device, cast to the precision, converted by the quantizer
+    # when the mode is int8 (printing a message), and then every state dict entry is replaced by
+    # a parameter filled with standard normal values on the target device and cast to the
+    # original dtype, keeping its requires-grad flag. The state is loaded with assignment and
+    # the model is returned in eval mode.
     with torch.device("meta"):
         model = x.module.from_name(x.name)
     model = model.to(dtype=precision)
@@ -171,6 +229,14 @@ def _load_model(x: GPTModelConfig, device="cuda", precision=torch.bfloat16):
 
 # Only count activated parameters and buffers.
 def _get_model_size(model):
+    # [FUNCTION DOC] HELPER: Estimate the bytes of weights read per generated token. Sums
+    # parameter and buffer sizes of all top-level children except embeddings. For
+    # mixture-of-experts models (config has an expert count) it subtracts the share of the
+    # expert parameters belonging to the inactive experts for each expert feed-forward submodule
+    # (plain or int8 variant). Returns a number of bytes.
+    # KNOWN ISSUE: in the expert subtraction the buffer term uses the loop variable left over
+    # from the first loop, namely the last top-level child, instead of the submodule; this is
+    # wrong or at best coincidental for models with buffers.
     model_size = 0
     for name, child in model.named_children():
         if not isinstance(child, torch.nn.Embedding):
@@ -209,6 +275,18 @@ def run_experiment(
     temperature: float = 0.8,
     device: str = "cuda",
 ) -> None:
+    # [FUNCTION DOC] Benchmark one model configuration. Loads the model on the device, builds a
+    # fixed six token prompt, seeds the random generator, estimates the model size, and (once
+    # per process, guarded by a module flag) replaces the module level decode and prefill
+    # functions by compiled versions (decode in reduce-overhead mode, both with full graph). It
+    # then runs one warm-up generation, which is timed as the compilation time, followed by the
+    # given number of timed generations; for each it records tokens per second and the memory
+    # bandwidth implied by the model size. Prints load time, compilation time, averages and the
+    # maximum reserved CUDA memory. Returns a tuple of mean tokens per second, mean bandwidth in
+    # GB/s and compilation time in seconds. Needs a CUDA device for the final memory report.
+    # KNOWN ISSUE: the return annotation claims no value, but a tuple is returned. Compilation
+    # time is only measured on the first call in the process; later calls report a short warm-up
+    # time or the compiled state of the earlier run.
     print(f"Loading model {x.name}")
     t0 = time.time()
     model = _load_model(x, device=device)
@@ -269,6 +347,13 @@ def run_experiment(
 # token_per_sec and memory_bandwidth target numbers are for A100-40GB, which are different from the typical A100-80GB.
 @register_experiment(name="llama2_7b_bf16")
 def run_llama2_7b_bf16(device: str = "cuda"):
+    # [FUNCTION DOC] Registered experiment llama2_7b_bf16. Benchmarks Llama 2 7B chat in
+    # bfloat16 mode (it still passes the int8 quantizer class, which is only used for int8 mode)
+    # with targets 94 tokens/s, 1253 GB/s and 133 s compile time (targets are for an A100-40GB).
+    # Runs the benchmark driver on the device and returns a list of three Experiment records,
+    # for token rate, memory bandwidth and compilation time, each with the target, the measured
+    # value formatted with two decimals, the mode, the device, the arch name and the model flag
+    # set to true.
     model = GPTModelConfig(
         "Llama-2-7b-chat-hf",
         LLaMA,
@@ -318,6 +403,12 @@ def run_llama2_7b_bf16(device: str = "cuda"):
 # token_per_sec and memory_bandwidth target numbers are for A100-40GB, which are different from the typical A100-80GB.
 @register_experiment(name="llama2_7b_int8")
 def run_llama2_7b_int8(device: str = "cuda"):
+    # [FUNCTION DOC] Registered experiment llama2_7b_int8. Benchmarks Llama 2 7B chat with int8
+    # weight-only quantization, targets 144 tokens/s, 957 GB/s and 136 s compile time (targets
+    # are for an A100-40GB). Runs the benchmark driver on the device and returns a list of three
+    # Experiment records, for token rate, memory bandwidth and compilation time, each with the
+    # target, the measured value formatted with two decimals, the mode, the device, the arch
+    # name and the model flag set to true.
     model = GPTModelConfig(
         "Llama-2-7b-chat-hf",
         LLaMA,
@@ -367,6 +458,13 @@ def run_llama2_7b_int8(device: str = "cuda"):
 # token_per_sec and memory_bandwidth target numbers are for A100-40GB, which are different from the typical A100-80GB.
 @register_experiment(name="mixtral_8x7b_int8")
 def run_mixtral_8x7b_int8(device: str = "cuda"):
+    # [FUNCTION DOC] Registered experiment mixtral_8x7b_int8. Benchmarks Mixtral 8x7B (reduced
+    # layer count to fit CI memory, according to the in-code note) with int8 weight-only
+    # quantization, targets 175 tokens/s, 1130 GB/s and 133 s compile time (targets are for an
+    # A100-40GB). Runs the benchmark driver on the device and returns a list of three Experiment
+    # records, for token rate, memory bandwidth and compilation time, each with the target, the
+    # measured value formatted with two decimals, the mode, the device, the arch name and the
+    # model flag set to true.
     # We reduced the original number of layers from 32 to 16 to adapt CI memory limitation.
     model = GPTModelConfig(
         "Mixtral-8x7B-v0.1",
