@@ -1,3 +1,7 @@
+# [MODULE DOC] Registry of benchmark runners for fastrnns. Defines context managers (disable
+# cuDNN, no-op, assert JIT disabled), the RNNRunner record (name, creator, context) and the
+# nn_runners mapping from short names (cudnn, jit, resnet18, ...) to runners, with get_nn_runners
+# to look them up. Import-time side effects: imports torchvision and builds the CNN creators.
 from collections import namedtuple
 from functools import partial
 
@@ -22,24 +26,37 @@ from .factory import (
 
 
 class DisableCuDNN:
+    # [CLASS DOC] Context manager that turns the cuDNN backend off while active and restores the
+    # prior setting on exit (saved on the instance in an attribute named saved).
     def __enter__(self):
+        # [FUNCTION DOC] Save the current cuDNN enabled flag and set it to false.
         self.saved = torch.backends.cudnn.enabled
         torch.backends.cudnn.enabled = False
 
     def __exit__(self, *args, **kwargs):
+        # [FUNCTION DOC] Restore the saved cuDNN enabled flag; exceptions are not suppressed.
         torch.backends.cudnn.enabled = self.saved
 
 
 class DummyContext:
+    # [CLASS DOC] Do nothing context manager used for runners that need no special environment.
     def __enter__(self):
+        # [FUNCTION DOC] No-op.
         pass
 
     def __exit__(self, *args, **kwargs):
+        # [FUNCTION DOC] No-op; exceptions propagate.
         pass
 
 
 class AssertNoJIT:
+    # [CLASS DOC] Context manager asserting that the JIT is disabled through the environment
+    # variable.
     def __enter__(self):
+        # [FUNCTION DOC] Read the environment variable controlling the JIT (default 1) and raise
+        # AssertionError if the value is truthy.
+        # KNOWN ISSUE: the value is a string, so even a value of 0 is truthy and raises; only an
+        # unset check with an empty string passes.
         import os
 
         enabled = os.environ.get("PYTORCH_JIT", 1)
@@ -47,6 +64,7 @@ class AssertNoJIT:
             raise AssertionError("PYTORCH_JIT must be disabled")
 
     def __exit__(self, *args, **kwargs):
+        # [FUNCTION DOC] No-op; exceptions propagate.
         pass
 
 
@@ -61,6 +79,8 @@ RNNRunner = namedtuple(
 
 
 def get_nn_runners(*names):
+    # [FUNCTION DOC] Look up each name in the nn_runners mapping and return the list of runners
+    # in the same order. An unknown name raises KeyError.
     return [nn_runners[name] for name in names]
 
 

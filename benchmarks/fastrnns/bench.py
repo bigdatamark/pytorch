@@ -1,3 +1,8 @@
+# [MODULE DOC] Command line benchmark driver for the fastrnns suite (LSTM and ResNet runners).
+# Defines BenchResult, a timing helper (trainbench) that measures forward and backward time per
+# iteration, table and JSON printers (OSS and AI-PEP formats), and a main block that parses
+# flags, selects the fuser/executor, runs the chosen groups and optionally prints JSON to stdout.
+# Human readable progress goes to stderr. Import has no side effects beyond imports.
 import argparse
 import copy
 import gc
@@ -28,6 +33,9 @@ BenchResult = namedtuple(
 
 
 def fit_str(string, colwidth=16):
+    # [FUNCTION DOC] HELPER: Fit a string into a fixed width column. Shorter strings are left
+    # padded with spaces (right aligned); strings of colwidth or more are truncated to colwidth
+    # characters.
     if len(string) < colwidth:
         return (colwidth - len(string)) * " " + string
     else:
@@ -35,12 +43,17 @@ def fit_str(string, colwidth=16):
 
 
 def to_str(item):
+    # [FUNCTION DOC] HELPER: Format a value for the table. Floats use four significant digits;
+    # anything else is converted with the builtin string conversion.
     if isinstance(item, float):
         return f"{item:.4g}"
     return str(item)
 
 
 def print_header(colwidth=16, sep=" "):
+    # [FUNCTION DOC] Build the header row of the results table from the BenchResult field names,
+    # each fit to the default column width and joined with sep. Returns the string. The colwidth
+    # argument is accepted but not used (fit_str always uses its own default width).
     items = []
     for item in BenchResult._fields:
         items.append(fit_str(item))
@@ -48,6 +61,9 @@ def print_header(colwidth=16, sep=" "):
 
 
 def pretty_print(benchresult, colwidth=16, sep=" "):
+    # [FUNCTION DOC] Format one BenchResult (or any iterable of values) as a table row: every
+    # item is converted with to_str, fit to the default column width and joined with sep. Returns
+    # a string. The colwidth argument is accepted but unused.
     items = []
     for thing in benchresult:
         items.append(fit_str(to_str(thing)))
@@ -56,13 +72,23 @@ def pretty_print(benchresult, colwidth=16, sep=" "):
 
 # shim for torch.cuda.Event when running on cpu
 class Event:
+    # [CLASS DOC] HELPER: Minimal stand-in for the CUDA event class so the same timing code runs
+    # on CPU. The record method stores a wall clock timestamp (perf_counter); elapsed_time
+    # returns the difference in seconds, unlike CUDA events which report milliseconds.
     def __init__(self, enable_timing):
+        # [FUNCTION DOC] HELPER: Accepts and ignores the enable_timing flag to mimic the CUDA
+        # signature.
         pass
 
     def record(self):
+        # [FUNCTION DOC] HELPER: Store the current perf_counter time on the instance as the time
+        # attribute.
         self.time = time.perf_counter()
 
     def elapsed_time(self, end_event):
+        # [FUNCTION DOC] HELPER: Return the time difference (end minus start) between two
+        # recorded Events. Raises AssertionError if end_event is not an instance of this shim
+        # Event class.
         if not isinstance(end_event, Event):
             raise AssertionError(f"Expected Event, but got {type(end_event)}")
         return end_event.time - self.time
@@ -81,7 +107,18 @@ def trainbench(
     device="cuda",
     seed=None,
 ):
+    # [FUNCTION DOC] Benchmark one RNN/CNN implementation. Builds the model definition by calling
+    # rnn_creator with the sizes, device and seed, runs warmup untimed iterations and then nloops
+    # timed iterations, each measuring forward and backward time. Returns a BenchResult with the
+    # mean and standard deviation of forward and backward times plus the raw per-iteration
+    # tensors.
     def train_batch(modeldef):
+        # [FUNCTION DOC] HELPER: Run one forward and backward pass of modeldef and time each
+        # phase. Uses CUDA events on cuda, otherwise the shim Event. Runs garbage collection
+        # before each phase, applies backward_setup if present, skips backward if the model has
+        # no backward callable, and then zeroes every parameter gradient (raising AssertionError
+        # if a gradient is None). Synchronizes CUDA when on cuda. Returns a (forward_time,
+        # backward_time) pair.
         # CUDA events for timing
         if device == "cuda":
             timer_class = torch.cuda.Event
@@ -160,11 +197,15 @@ def trainbench(
 
 
 def print_stderr(*args, **kwargs):
+    # [FUNCTION DOC] Call print with the keyword file forced to standard error. Returns print's
+    # result.
     kwargs["file"] = sys.stderr
     return print(*args, **kwargs)
 
 
 def print_json_oss_format(results):
+    # [FUNCTION DOC] Print to standard output a single JSON object mapping each group name to a
+    # mapping of model name to its average time (the avg entry), for the OSS dashboard.
     oss_results = {}
     for group_name, group_val in results.items():
         oss_results[group_name] = {}
@@ -176,6 +217,9 @@ def print_json_oss_format(results):
 
 
 def print_json_pep_format(results):
+    # [FUNCTION DOC] For every group and model, print one line per recorded iteration time in the
+    # AI-PEP format: the prefix Caffe2Observer followed by a JSON object with type NET, metric
+    # (group-model), unit ms and the value as a string. Writes to standard output.
     # print the AI-PEP format json string for each model
     for group_name, group_val in results.items():
         for model_name, run_time in group_val.items():
@@ -197,6 +241,11 @@ def print_json_pep_format(results):
 
 
 def bench(rnn_runners, group_name, print_json=False, sep=" ", **params):
+    # [FUNCTION DOC] Run trainbench for every (name, creator, context) runner, each inside its
+    # context manager, with params forwarded. Prints the header and one row per result to stderr.
+    # Exceptions from a runner are re-raised unless print_json is truthy, in which case the
+    # runner is skipped. Returns a mapping with two groups, group_name (forward) and group_name-
+    # backward, each mapping a model name to avg, std and info.
     print_stderr(print_header(sep=sep))
     results = {}
     for name, creator, context in rnn_runners:
@@ -224,6 +273,10 @@ def bench(rnn_runners, group_name, print_json=False, sep=" ", **params):
 
 
 def bench_group(model_list, bench_name, bench_group, bench_args):
+    # [FUNCTION DOC] Resolve model names via get_nn_runners, benchmark them with bench using
+    # bench_group as the result group name and bench_args as trainbench parameters, with progress
+    # messages on stderr. Returns the result mapping from bench. The bench_name is used for
+    # messages.
     print_stderr(f"Benchmarking {bench_name}s...")
     nn_results = bench(get_nn_runners(*model_list), bench_group, **bench_args)
     print_stderr("")

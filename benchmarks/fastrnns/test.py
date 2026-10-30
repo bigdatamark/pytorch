@@ -1,3 +1,8 @@
+# [MODULE DOC] Correctness checker for the fastrnns benchmark models. Compares each requested
+# runner against the cuDNN LSTM creator (forward outputs, backward gradients) and optionally the
+# variable length python LSTM against the variable length cuDNN LSTM. Main block parses sizes,
+# seed and runner names, requires cuda when a cuda device is chosen, and runs the checks.
+# Mismatches drop into the debugger.
 import argparse
 
 import torch
@@ -8,12 +13,17 @@ from .runner import get_nn_runners
 
 
 def barf():
+    # [FUNCTION DOC] HELPER: Start the interactive pdb debugger at the point of the mismatch.
     import pdb
 
     pdb.set_trace()
 
 
 def assertEqual(tensor, expected, threshold=0.001):
+    # [FUNCTION DOC] HELPER: Recursively compare tensors; lists and tuples are compared element
+    # by element (extra elements of the longer one ignored). A tensor pair whose maximum absolute
+    # difference exceeds the threshold triggers the debugger instead of raising. The threshold is
+    # not passed down in the recursive calls (default used there). Returns None.
     if isinstance(tensor, (list, tuple)):
         for t, e in zip(tensor, expected):
             assertEqual(t, e)
@@ -23,6 +33,7 @@ def assertEqual(tensor, expected, threshold=0.001):
 
 
 def filter_requires_grad(tensors):
+    # [FUNCTION DOC] HELPER: Return the sublist of tensors that require gradients.
     return [t for t in tensors if t.requires_grad]
 
 
@@ -39,6 +50,11 @@ def test_rnns(
     device="cuda",
     seed=17,
 ):
+    # [FUNCTION DOC] Compare an experiment model against a control model built with identical
+    # sizes and seed. Checks inputs and params match, forward outputs match, then runs backward
+    # with seeded gradients on both and compares parameter gradients. Raises AssertionError if
+    # either model lacks backward_setup or backward. With verbose prints the experiment's
+    # optimized graph. The check_grad argument is accepted but not used. Prints progress.
     creator_args = dict(
         seqLength=seqLength,
         numLayers=numLayers,
@@ -87,6 +103,11 @@ def test_rnns(
 
 
 def test_vl_py(**test_args):
+    # [FUNCTION DOC] Compare the variable length python LSTM runner against the variable length
+    # cuDNN LSTM. Takes the creator sizes, seed and verbose from test_args (a missing key raises
+    # KeyError). Pads the experiment output, compares outputs and the concatenated final states,
+    # then compares gradients after a seeded backward. Raises AssertionError if backward pieces
+    # are missing. Prints progress and optionally the optimized graph.
     # XXX: This compares vl_py with vl_lstm.
     # It's done this way because those two don't give the same outputs so
     # the result isn't an apples-to-apples comparison right now.

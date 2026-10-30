@@ -1,3 +1,8 @@
+# [MODULE DOC] Main script of the functional autograd benchmark. For each model in the MODELS
+# list and each autograd functional task (vjp, jvp, hvp, vhp, jacobian, hessian and vectorized
+# variants) it times torch.autograd.functional and, when installed, functorch equivalents, then
+# prints and optionally writes a markdown table of mean and variance. Import-time side effects:
+# tries to import functorch and prints its version if found; imports the model modules.
 import time
 from argparse import ArgumentParser
 from collections import defaultdict
@@ -24,7 +29,13 @@ from utils import GetterType, InputsType, TimingResultType, to_markdown_table, V
 
 
 def get_task_func(task: str) -> Callable:
+    # [FUNCTION DOC] Return the autograd.functional callable for a task name. The four vectorized
+    # tasks (forward-over-reverse and reverse-over-reverse hessian, forward and reverse jacobian)
+    # are small wrappers around hessian and jacobian that force vectorize and ignore their strict
+    # argument; any other name is looked up on the functional module (AttributeError if absent).
     def hessian_fwdrev(model, inp, strict=None):
+        # [FUNCTION DOC] HELPER: Hessian with vectorization using forward mode for the outer
+        # jacobian.
         return functional.hessian(
             model,
             inp,
@@ -34,14 +45,17 @@ def get_task_func(task: str) -> Callable:
         )
 
     def hessian_revrev(model, inp, strict=None):
+        # [FUNCTION DOC] HELPER: Vectorized hessian using reverse over reverse mode.
         return functional.hessian(model, inp, strict=False, vectorize=True)
 
     def jacfwd(model, inp, strict=None):
+        # [FUNCTION DOC] HELPER: Vectorized jacobian using the forward mode strategy.
         return functional.jacobian(
             model, inp, strict=False, vectorize=True, strategy="forward-mode"
         )
 
     def jacrev(model, inp, strict=None):
+        # [FUNCTION DOC] HELPER: Vectorized jacobian using the default reverse mode strategy.
         return functional.jacobian(model, inp, strict=False, vectorize=True)
 
     if task == "hessian_fwdrev":
@@ -57,8 +71,14 @@ def get_task_func(task: str) -> Callable:
 
 
 def get_task_functorch(task: str) -> Callable:
+    # [FUNCTION DOC] Return the functorch implementation for a task name from a set of local
+    # wrappers (vjp, jvp, vhp, hvp, jacfwd, jacrev, hessian, hessian_fwdrev, hessian_revrev).
+    # Raises RuntimeError for the jacobian task (no equivalent) and for any unsupported name.
+    # Each wrapper runs without gradient tracking and takes (model, inputs, v, strict).
     @torch.no_grad()
     def vjp(model, inp, v=None, strict=None):
+        # [FUNCTION DOC] HELPER: Vector-Jacobian product. Raises AssertionError if v is None.
+        # Returns the model output and the result of applying the vjp function to v.
         if v is None:
             raise AssertionError("v must not be None for vjp")
         out, vjpfunc = ft.vjp(model, *inp)
@@ -66,12 +86,16 @@ def get_task_functorch(task: str) -> Callable:
 
     @torch.no_grad()
     def jvp(model, inp, v=None, strict=None):
+        # [FUNCTION DOC] HELPER: Jacobian-vector product via functorch; raises AssertionError if
+        # v is None.
         if v is None:
             raise AssertionError("v must not be None for jvp")
         return ft.jvp(model, inp, v)
 
     @torch.no_grad()
     def vhp(model, inp, v=None, strict=None):
+        # [FUNCTION DOC] HELPER: Vector-Hessian product: vjp of the gradient-and-value function
+        # over all inputs. Raises AssertionError if v is None. Returns (aux value, vjp result).
         if v is None:
             raise AssertionError("v must not be None for vhp")
         argnums = tuple(range(len(inp)))
@@ -80,6 +104,9 @@ def get_task_functorch(task: str) -> Callable:
 
     @torch.no_grad()
     def hvp(model, inp, v=None, strict=None):
+        # [FUNCTION DOC] HELPER: Hessian-vector product: forward mode jvp of the
+        # gradient-and-value function over all inputs. Raises AssertionError if v is None.
+        # Returns (aux value, hvp result).
         if v is None:
             raise AssertionError("v must not be None for hvp")
         argnums = tuple(range(len(inp)))
@@ -90,26 +117,33 @@ def get_task_functorch(task: str) -> Callable:
 
     @torch.no_grad()
     def jacfwd(model, inp, v=None, strict=None):
+        # [FUNCTION DOC] HELPER: Forward mode jacobian with respect to all inputs.
         argnums = tuple(range(len(inp)))
         return ft.jacfwd(model, argnums)(*inp)
 
     @torch.no_grad()
     def jacrev(model, inp, v=None, strict=None):
+        # [FUNCTION DOC] HELPER: Reverse mode jacobian with respect to all inputs.
         argnums = tuple(range(len(inp)))
         return ft.jacrev(model, argnums)(*inp)
 
     @torch.no_grad()
     def hessian(model, inp, v=None, strict=None):
+        # [FUNCTION DOC] HELPER: Hessian with respect to all inputs using functorch.
         argnums = tuple(range(len(inp)))
         return ft.hessian(model, argnums=argnums)(*inp)
 
     @torch.no_grad()
     def hessian_fwdrev(model, inp, v=None, strict=None):
+        # [FUNCTION DOC] HELPER: Hessian computed as forward mode jacobian of reverse mode
+        # jacobian.
         argnums = tuple(range(len(inp)))
         return ft.jacfwd(ft.jacrev(model, argnums=argnums), argnums=argnums)(*inp)
 
     @torch.no_grad()
     def hessian_revrev(model, inp, v=None, strict=None):
+        # [FUNCTION DOC] HELPER: Hessian computed as reverse mode jacobian of reverse mode
+        # jacobian.
         argnums = tuple(range(len(inp)))
         return ft.jacrev(ft.jacrev(model, argnums=argnums), argnums=argnums)(*inp)
 
@@ -150,6 +184,8 @@ ALL_TASKS = ALL_TASKS_NON_VECTORIZED + VECTORIZED_TASKS
 # - tasks: the list of recommended tasks that can run in a reasonable amount of time with this model.
 # - unsupported: the list of tasks that this model cannot run.
 class ModelDef(NamedTuple):
+    # [CLASS DOC] Named tuple describing a benchmarked model: name, getter (device to forward
+    # function and inputs), recommended tasks, and unsupported tasks to skip.
     name: str
     getter: GetterType
     tasks: list[str]
@@ -175,6 +211,9 @@ MODELS = [
 
 
 def get_v_for(model: Callable, inp: InputsType, task: str) -> VType:
+    # [FUNCTION DOC] Build the v argument for a task. vjp: a random tensor shaped like the model
+    # output (runs the model once). jvp, hvp, vhp: random tensors shaped like each input (a tuple
+    # if the input is a tuple). Other tasks: None.
     v: VType
 
     if task in ["vjp"]:
@@ -192,6 +231,8 @@ def get_v_for(model: Callable, inp: InputsType, task: str) -> VType:
 
 
 def run_once(model: Callable, inp: InputsType, task: str, v: VType, **kwargs) -> None:
+    # [FUNCTION DOC] Run one autograd.functional call for the task with strict mode, passing v by
+    # keyword when present. Extra keyword arguments are ignored. The result is discarded.
     func = get_task_func(task)
 
     if v is not None:
@@ -203,6 +244,10 @@ def run_once(model: Callable, inp: InputsType, task: str, v: VType, **kwargs) ->
 def run_once_functorch(
     model: Callable, inp: InputsType, task: str, v: VType, maybe_check_consistency=False
 ) -> None:
+    # [FUNCTION DOC] Run one functorch call for the task. When maybe_check_consistency is true
+    # also run the autograd.functional version and assert the results are close (relative 1e-5,
+    # absolute 1e-2 for vhp, otherwise 5e-3), raising AssertionError that names the task on
+    # mismatch.
     func = get_task_functorch(task)
 
     if v is not None:
@@ -229,10 +274,15 @@ def run_once_functorch(
 def run_model(
     model_getter: GetterType, args: Any, task: str, run_once_fn: Callable = run_once
 ) -> list[float]:
+    # [FUNCTION DOC] Time one model and task. Chooses cpu (gpu -1) or the given cuda device with
+    # synchronization, gets the model and inputs from the getter, builds v, does one warmup run
+    # with the consistency check flag, then times num_iters runs with synchronization before and
+    # after each. Returns the list of elapsed seconds.
     if args.gpu == -1:
         device = torch.device("cpu")
 
         def noop():
+        # [FUNCTION DOC] HELPER: Do nothing; used as the synchronization function on cpu.
             pass
 
         do_sync = noop
@@ -261,6 +311,12 @@ def run_model(
 
 
 def main():
+    # [FUNCTION DOC] Entry point. Parses flags (output file, iterations, gpu where -2 means
+    # auto-detect, slow tasks, model and task filters, thread count, seed), sets thread counts
+    # and the seed, and loops over MODELS and tasks (filters are substring tests; unsupported
+    # tasks skipped; slow tasks only on request). Records mean and variance of each run in a
+    # results mapping, also for functorch when present (a RuntimeError there is printed and
+    # skipped). Writes a markdown table to the output path if given.
     parser = ArgumentParser("Main script to benchmark functional API of the autograd.")
     parser.add_argument(
         "--output", type=str, default="", help="Text file where to write the output"

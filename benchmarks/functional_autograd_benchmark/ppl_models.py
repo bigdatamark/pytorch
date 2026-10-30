@@ -1,3 +1,7 @@
+# [MODULE DOC] Getter functions for probabilistic programming style models of the functional
+# autograd benchmark: a Bernoulli regression with a normal prior and a robust Student-t
+# regression with gamma, exponential and normal priors. Each getter returns a pair of a log
+# probability score function and the tuple of differentiable inputs.
 from utils import GetterReturnType
 
 import torch
@@ -6,6 +10,9 @@ from torch import Tensor
 
 
 def get_simple_regression(device: torch.device) -> GetterReturnType:
+    # [FUNCTION DOC] Build random design matrix and targets (10 by 11 and 10 by 1) and a normal
+    # prior for the coefficients; sample the coefficients with gradient tracking. Returns
+    # (forward, inputs) where inputs is a one element tuple holding the coefficients.
     N = 10
     K = 10
 
@@ -22,6 +29,10 @@ def get_simple_regression(device: torch.device) -> GetterReturnType:
     beta_value.requires_grad_(True)
 
     def forward(beta_value: Tensor) -> Tensor:
+        # [FUNCTION DOC] HELPER: Return the Bernoulli log probability of the targets (logits from
+        # the linear product, validation off because targets are relaxed) summed, plus the prior
+        # log probability of the coefficients summed. This scalar is differentiated twice by the
+        # benchmark.
         mu = X.mm(beta_value)
 
         # We need to compute the first and second gradient of this score with respect
@@ -36,6 +47,11 @@ def get_simple_regression(device: torch.device) -> GetterReturnType:
 
 
 def get_robust_regression(device: torch.device) -> GetterReturnType:
+    # [FUNCTION DOC] Build random data and random hyperparameters for a Gamma prior on the
+    # degrees of freedom, an Exponential prior on the scale and a Normal prior on the
+    # coefficients; sample initial values with gradient tracking (the scale is kept in log
+    # space). Returns (forward, inputs) where inputs are the degrees of freedom, unconstrained
+    # scale and coefficient tensors on the device.
     N = 10
     K = 10
 
@@ -70,6 +86,10 @@ def get_robust_regression(device: torch.device) -> GetterReturnType:
     def forward(
         nu_value: Tensor, sigma_unconstrained_value: Tensor, beta_value: Tensor
     ) -> Tensor:
+        # [FUNCTION DOC] HELPER: Exponentiate the unconstrained scale and compute three scores,
+        # each the Student-t log likelihood of the targets plus the matching prior log
+        # probability (the scale score also adds the unconstrained value as a Jacobian term).
+        # Returns the sum of the three.
         sigma_constrained_value = sigma_unconstrained_value.exp()
         mu = X.mm(beta_value)
 

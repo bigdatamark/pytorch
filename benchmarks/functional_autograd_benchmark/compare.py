@@ -1,3 +1,7 @@
+# [MODULE DOC] Command line tool comparing two result files of the functional autograd benchmark.
+# Reads the before and after markdown tables, computes the speedup per model and task, and prints
+# (and optionally writes) a combined markdown table. Imports helpers from the sibling utils
+# module.
 import argparse
 from collections import defaultdict
 
@@ -5,6 +9,12 @@ from utils import from_markdown_table, to_markdown_table
 
 
 def main():
+    # [FUNCTION DOC] Entry point. Parses flags for the before file, after file and output file
+    # path, loads both markdown tables, and builds a combined mapping where each model and task
+    # has (speedup as mean before over mean after, before mean, before variance, after mean,
+    # after variance); entries missing on one side get no values for the missing side and no
+    # speedup. Prints the table and writes it to the output file when a path is given. Raises
+    # FileNotFoundError for a missing input file.
     parser = argparse.ArgumentParser(
         "Main script to compare results from the benchmarks"
     )
