@@ -1,9 +1,18 @@
+# [MODULE DOC] Mobile model test fixtures for quantized operators. Provides a module calling
+# quantized functional, embedding and transposed conv ops, plus factory classes producing
+# dynamically quantized, statically quantized and fused-then-quantized models. Used by the
+# mobile test model generator. No import-time side effects.
 import torch
 import torch.nn as nn
 
 
 class GeneralQuantModule(torch.nn.Module):
+    # [CLASS DOC] Module holding quantized Embedding, QFunctional and ConvTranspose 1d/2d/3d
+    # layers, built with fixed sizes. forward exercises them on freshly quantized inputs.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Creates a quantized embedding (10 entries, dim 12) with a fixed index
+        # tensor, a QFunctional, and quantized transposed convs (16 to 33 channels, kernel 3,
+        # stride 2) in 1d, 2d and 3d.
         super().__init__()
         self.embedding = torch.ao.nn.quantized.Embedding(
             num_embeddings=10, embedding_dim=12
@@ -15,6 +24,12 @@ class GeneralQuantModule(torch.nn.Module):
         self.conv3 = torch.ao.nn.quantized.ConvTranspose3d(16, 33, 3, stride=2)
 
     def forward(self):
+        # [FUNCTION DOC] Quantizes small constant and random tensors per tensor, then calls the
+        # QFunctional ops (add, cat, mul, add_relu, add_scalar, mul_scalar), the embedding and the
+        # 1d and 2d transposed convs on quantized random inputs; the 3d conv call is commented out
+        # because it failed on iOS. All results are passed to the len builtin.
+        # KNOWN ISSUE: len is given many positional arguments, which plain Python rejects
+        # with a type error; the body exists only so the ops appear in a scripted graph.
         a = torch.quantize_per_tensor(torch.tensor([3.0]), 1.0, 0, torch.qint32)
         b = torch.quantize_per_tensor(torch.tensor(4.0), 1.0, 0, torch.qint32)
         c = torch.quantize_per_tensor(
@@ -46,15 +61,23 @@ class GeneralQuantModule(torch.nn.Module):
 
 
 class DynamicQuantModule:
+    # [CLASS DOC] Factory for a dynamically quantized model; the module to quantize is the
+    # nested class M, instantiated and stored in the constructor.
     def __init__(self) -> None:
+        # [FUNCTION DOC] Calls the parent initializer and stores a new M instance as module.
         super().__init__()
         self.module = self.M()
 
     def getModule(self):
+        # [FUNCTION DOC] Returns the stored module converted with dynamic quantization to int8.
         return torch.ao.quantization.quantize_dynamic(self.module, dtype=torch.qint8)
 
     class M(torch.nn.Module):
+        # [CLASS DOC] Float module combining RNN, GRU, LSTM (and their cells), identity, linear,
+        # bilinear and transformer layers, used as input for dynamic quantization.
         def __init__(self) -> None:
+            # [FUNCTION DOC] Creates the recurrent layers and cells, a list of linear style
+            # layers and a list of three transformer variants, all with small fixed sizes.
             super(DynamicQuantModule.M, self).__init__()
             self.rnn = nn.RNN(4, 8, 2)
             self.rnncell = nn.RNNCell(4, 8)
@@ -85,6 +108,9 @@ class DynamicQuantModule:
             # self.a = torch.nn.utils.rnn.pad_sequence([torch.tensor([1,2,3]), torch.tensor([3,4])], batch_first=True)
 
         def forward(self):
+            # [FUNCTION DOC] Takes no inputs. Creates random inputs and hidden states, runs each
+            # recurrent layer and cell, the three transformer modules and three linear layers,
+            # and returns the length of the tuple of all outputs (twelve).
             input = torch.randn(5, 3, 4)
             h = torch.randn(2, 3, 8)
             c = torch.randn(2, 3, 8)
@@ -112,7 +138,11 @@ class DynamicQuantModule:
 
 
 class StaticQuantModule:
+    # [CLASS DOC] Factory for a statically quantized model built from the nested class M. The
+    # model is prepared and converted without any calibration pass.
     def getModule(self):
+        # [FUNCTION DOC] Instantiates M, puts it in eval mode, sets the qnnpack default qconfig,
+        # prepares and converts it, and returns the resulting int8 model.
         model_fp32 = self.M()
         model_fp32.eval()
         model_fp32.qconfig = torch.ao.quantization.get_default_qconfig("qnnpack")
@@ -121,7 +151,12 @@ class StaticQuantModule:
         return model_int8
 
     class M(torch.nn.Module):
+        # [CLASS DOC] Float module with quant and dequant stubs, random 1d, 2d and 3d inputs
+        # stored as attributes, and conv/norm/activation stacks for each dimensionality.
         def __init__(self) -> None:
+            # [FUNCTION DOC] Creates the stubs, fixed random input tensors and four sequential
+            # blocks: 1d conv with instance norm and hardswish, 2d conv with batch norm,
+            # instance norm and leaky relu, 3d conv with norms and relu, and a linear layer.
             super(StaticQuantModule.M, self).__init__()
             self.quant = torch.ao.quantization.QuantStub()
             self.input1d = torch.randn(4, 2, 2)
@@ -145,6 +180,9 @@ class StaticQuantModule:
             self.dequant = torch.ao.quantization.DeQuantStub()
 
         def forward(self):
+            # [FUNCTION DOC] Takes no inputs. Passes the stored 1d input through layer one, the 2d
+            # input through layers two and four, and the 3d input through layer three, each
+            # wrapped by quantize and dequantize stubs. Returns the three outputs as a tuple.
             x = self.quant(self.input1d)
             x = self.layer1(x)
             x = self.dequant(x)
@@ -163,7 +201,12 @@ class StaticQuantModule:
 
 
 class FusedQuantModule:
+    # [CLASS DOC] Factory for a model with conv/relu and linear/relu pairs fused before static
+    # quantization; the module is the nested class M.
     def getModule(self):
+        # [FUNCTION DOC] Instantiates M in eval mode with the qnnpack default qconfig, fuses the
+        # four conv or linear and relu pairs, prepares and converts it, and returns the int8
+        # model (no calibration).
         model_fp32 = self.M()
         model_fp32.eval()
         model_fp32.qconfig = torch.ao.quantization.get_default_qconfig("qnnpack")
@@ -181,7 +224,11 @@ class FusedQuantModule:
         return model_int8
 
     class M(torch.nn.Module):
+        # [CLASS DOC] Float module with quant and dequant stubs, random 1d, 2d and 3d inputs,
+        # conv layers for each dimension, a linear layer and four relu layers to be fused.
         def __init__(self) -> None:
+            # [FUNCTION DOC] Creates the stubs, three random inputs, conv1d, conv2d, conv3d,
+            # a linear layer and four relu modules with fixed small sizes.
             super(FusedQuantModule.M, self).__init__()
             self.quant = torch.ao.quantization.QuantStub()
             self.input1d = torch.randn(4, 2, 2)
@@ -198,6 +245,9 @@ class FusedQuantModule:
             self.dequant = torch.ao.quantization.DeQuantStub()
 
         def forward(self):
+            # [FUNCTION DOC] Takes no inputs. Quantizes each stored input, applies conv and relu
+            # (and for the 3d input also linear and a second relu), dequantizes, and returns
+            # the three results as a tuple.
             x = self.input1d
             y = self.input2d
             z = self.input3d

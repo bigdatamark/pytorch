@@ -1,3 +1,6 @@
+# [MODULE DOC] Mobile model test fixture covering the random-sampling operators listed in the
+# torch random sampling docs. Defines one nn.Module whose forward exercises each sampling op.
+# No import-time side effects.
 import torch
 
 
@@ -5,7 +8,16 @@ import torch
 
 
 class SamplingOpsModule(torch.nn.Module):
+    # [CLASS DOC] Stateless nn.Module used by the mobile model test generator. Its forward
+    # calls many random-sampling ops (bernoulli, multinomial, normal, poisson, rand*, randint*,
+    # randperm, and in-place distribution fillers) so they appear in the traced op set.
     def forward(self):
+        # [FUNCTION DOC] Takes no inputs. Builds a 3x3 uniform tensor, a size tuple and a
+        # weights tensor, then calls each sampling op (some in-place ops mutate the local
+        # tensor) and passes all results to the len builtin. Seed-related ops are left
+        # commented out.
+        # KNOWN ISSUE: len is given many positional arguments, which plain Python rejects
+        # with a type error; the body exists only so the ops appear in a scripted graph.
         a = torch.empty(3, 3).uniform_(0.0, 1.0)
         size = (1, 4)
         weights = torch.tensor([0, 10, 3, 0], dtype=torch.float)

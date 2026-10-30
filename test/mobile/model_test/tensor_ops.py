@@ -1,11 +1,23 @@
+# [MODULE DOC] Mobile model test fixtures for tensor level ops: general tensor methods,
+# creation, indexing and joining, dtype conversion and view ops. Each nn.Module forward
+# delegates to a method that calls the ops on small tensors so they appear in generated test
+# models. No import-time side effects besides imports.
 import torch
 
 
 class TensorOpsModule(torch.nn.Module):
+    # [CLASS DOC] Module whose forward runs the general tensor property and method fixture.
     def forward(self):
+        # [FUNCTION DOC] Takes no inputs; returns whatever the general tensor ops method returns.
         return self.tensor_general_ops()
 
     def tensor_general_ops(self):
+        # [FUNCTION DOC] Creates real and complex vectors and 4x4x4x4 tensors, then calls type
+        # predicates, element count, new_* constructors, device and layout attributes, copy,
+        # fill and in-place sampling methods, index fill and put, clamp and activation methods
+        # and similar, passing all results to the len builtin. Many calls are commented out.
+        # KNOWN ISSUE: len is given many positional arguments, which plain Python rejects
+        # with a type error; the body exists so the listed ops appear in a scripted graph.
         a = torch.randn(4)
         b = torch.tensor([1.5])
         x = torch.ones((2,))
@@ -99,10 +111,19 @@ class TensorOpsModule(torch.nn.Module):
 
 
 class TensorCreationOpsModule(torch.nn.Module):
+    # [CLASS DOC] Module whose forward runs the tensor creation ops fixture.
     def forward(self):
+        # [FUNCTION DOC] Takes no inputs; returns whatever the creation ops method returns.
         return self.tensor_creation_ops()
 
     def tensor_creation_ops(self):
+        # [FUNCTION DOC] Creates helper tensors and a per-channel quantized tensor, then calls
+        # creation ops (tensor, as_tensor, as_strided, zeros, ones, arange, range, linspace,
+        # logspace, eye, empty, full and their like variants, quantize and dequantize, complex,
+        # polar, heaviside) and passes all results to len. Sparse creation is commented out
+        # because it does not work on iOS.
+        # KNOWN ISSUE: len is given many positional arguments, which plain Python rejects
+        # with a type error; the body exists so the listed ops appear in a scripted graph.
         i = torch.tensor([[0, 1, 1], [2, 0, 2]])
         real = torch.tensor([1, 2], dtype=torch.float32)
         imag = torch.tensor([3, 4], dtype=torch.float32)
@@ -154,10 +175,17 @@ class TensorCreationOpsModule(torch.nn.Module):
 
 
 class TensorIndexingOpsModule(torch.nn.Module):
+    # [CLASS DOC] Module whose forward runs the indexing, slicing and joining ops fixture.
     def forward(self):
+        # [FUNCTION DOC] Takes no inputs; returns whatever the indexing ops method returns.
         return self.tensor_indexing_ops()
 
     def tensor_indexing_ops(self):
+        # [FUNCTION DOC] Creates a 2x4 and a 4x4 tensor, an index tensor, a mask and an index
+        # list, then calls joining, splitting, gather, scatter, select, take, where, reshape
+        # and transpose style ops and passes all results to len. Scatter reduce is commented out.
+        # KNOWN ISSUE: len is given many positional arguments, which plain Python rejects
+        # with a type error; the body exists so the listed ops appear in a scripted graph.
         x = torch.randn(2, 4)
         y = torch.randn(4, 4)
         t = torch.tensor([[0, 0], [1, 0]])
@@ -217,10 +245,17 @@ class TensorIndexingOpsModule(torch.nn.Module):
 
 
 class TensorTypingOpsModule(torch.nn.Module):
+    # [CLASS DOC] Module whose forward runs the dtype and device conversion fixture.
     def forward(self):
+        # [FUNCTION DOC] Takes no inputs; returns whatever the typing ops method returns.
         return self.tensor_typing_ops()
 
     def tensor_typing_ops(self):
+        # [FUNCTION DOC] Creates a random 1x3x4x4 tensor and converts it to many dtypes (float,
+        # double, complex, half, bfloat16, integer types, bool), to the cpu device, with
+        # device and dtype together, and to channels-last memory format; passes results to len.
+        # KNOWN ISSUE: len is given many positional arguments, which plain Python rejects
+        # with a type error; the body exists so the listed ops appear in a scripted graph.
         x = torch.randn(1, 3, 4, 4)
         return len(
             x.to(torch.float),
@@ -242,10 +277,17 @@ class TensorTypingOpsModule(torch.nn.Module):
 
 
 class TensorViewOpsModule(torch.nn.Module):
+    # [CLASS DOC] Module whose forward runs the view ops fixture.
     def forward(self):
+        # [FUNCTION DOC] Takes no inputs; returns whatever the view ops method returns.
         return self.tensor_view_ops()
 
     def tensor_view_ops(self):
+        # [FUNCTION DOC] Creates two random tensors and calls view style ops (slice indexing,
+        # detach, in-place detach, diagonal, expand, expand_as, select, unflatten, unfold,
+        # view, view_as) and passes all results to the len builtin.
+        # KNOWN ISSUE: len is given many positional arguments, which plain Python rejects
+        # with a type error; the body exists so the listed ops appear in a scripted graph.
         x = torch.randn(4, 4, 1)
         y = torch.randn(4, 4, 2)
         return len(

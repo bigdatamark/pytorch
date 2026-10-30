@@ -1,4 +1,9 @@
 # Owner(s): ["module: sdpa"]
+# [MODULE DOC] Shared test helpers for the flash attention (FA3 and FA4) SDPA tests: a shape
+# tuple type, a CUDA kernel profiling context manager, a flash versus math backend comparison
+# function, a dummy handle for implementation registration tests, and a mixin class with
+# reusable numerical, compile, layout and kernel-dispatch test bodies. Subclasses supply the
+# implementation name and expected kernel name patterns. No import-time side effects.
 """
 Common test utilities for Flash Attention (FA3, FA4) tests.
 
@@ -25,6 +30,8 @@ from torch.testing._internal.common_utils import TestCase
 
 
 class SdpaShape(NamedTuple):
+    # [CLASS DOC] NamedTuple describing an attention input shape with fields batch, num_heads,
+    # seq_len and head_dim; usable directly as a tensor size.
     batch: int
     num_heads: int
     seq_len: int
@@ -33,6 +40,10 @@ class SdpaShape(NamedTuple):
 
 @contextmanager
 def cuda_kernel_profiler(kernel_pattern: str, activities: list | None = None):
+    # [FUNCTION DOC] Context manager that profiles the CPU and CUDA activity (or the given
+    # activities) of the with block. Yields a result mapping that is initially not found with
+    # an empty kernel name list; after the block exits it holds all non-empty profiler event
+    # names and whether any name contains the given kernel_pattern substring.
     """
     Context manager to profile CUDA kernels and check if a pattern is found.
 
@@ -57,6 +68,13 @@ def cuda_kernel_profiler(kernel_pattern: str, activities: list | None = None):
 
 
 def flash_vs_math(test_case: TestCase, q, k, v, is_causal: bool = False, rtol: int = 2):
+    # [FUNCTION DOC] Computes scaled dot product attention three ways on inputs q, k, v: the
+    # flash backend in the input dtype, the math backend in float32 (cast back to the input
+    # dtype) and the math backend in the input dtype, with the given causal flag and no mask or
+    # dropout. Asserts via test_case that all shapes agree and all outputs are finite and not
+    # nan, then asserts the flash error against the float32 reference is at most rtol times the
+    # low precision math error plus a tolerance derived from the reference's rounding noise.
+    # Returns the tuple of flash output, low precision math output and float32 math output.
     """
     Compare flash-attention backend against math backend in fp32 and low precision.
 
@@ -126,17 +144,25 @@ def flash_vs_math(test_case: TestCase, q, k, v, is_causal: bool = False, rtol: i
 
 
 class DummyHandle:
+    # [CLASS DOC] HELPER: Fake handle returned by dummy flash attention implementations in
+    # registration tests; records its name and whether remove was called.
     """A dummy handle for testing flash attention impl registration."""
 
     def __init__(self, name: str):
+        # [FUNCTION DOC] HELPER: Stores the name and sets the removed flag to false.
         self.name = name
         self.removed = False
 
     def remove(self):
+        # [FUNCTION DOC] HELPER: Marks the handle as removed.
         self.removed = True
 
 
 class FlashAttentionTestMixin:
+    # [CLASS DOC] Mixin of reusable test bodies for flash attention implementations. Subclasses
+    # (TestCase classes) must set impl_name, fwd_kernel_patterns and optionally
+    # bwd_kernel_patterns (default empty list, shared at class level), and are expected to
+    # call the underscore methods from their own test methods.
     """
     Mixin class providing common test methods for FA3 and FA4.
 
@@ -159,6 +185,13 @@ class FlashAttentionTestMixin:
         rtol: int = 2,
         test_backward: bool = True,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Creates random q, k, v of the given shape, dtype and device
+        # with grads enabled, compares flash against math using the comparison function, and
+        # when test_backward is set also computes gradients of all three outputs for one random
+        # upstream gradient and asserts each flash gradient error is within rtol times the low
+        # precision math error plus an absolute tolerance. Raises AssertionError on violation.
+        # KNOWN ISSUE: the value gradient check multiplies rtol by the sum of the error and the
+        # absolute tolerance, unlike the query and key checks which add the tolerance outside.
         """
         Assert that flash attention output matches math backend within tolerance.
 
@@ -223,12 +256,22 @@ class FlashAttentionTestMixin:
             )
 
     def _test_multiple_activate_impl(self):
+        # [FUNCTION DOC] HELPER: Resets to the default implementation, registers two dummy
+        # implementations, activates the first then the second, and asserts the current
+        # implementation name changes accordingly and that the first dummy's handle is removed
+        # once the second is activated. The finally block re-activates the mixin's impl_name so
+        # later tests see the real implementation. Mutates process-wide global registry state.
         """Test that multiple activate calls properly clean up previous implementations."""
         try:
             handles = {}
 
             def make_dummy_impl(name):
+                # [FUNCTION DOC] HELPER: Returns a register function that, when called, creates
+                # a dummy handle for the given name, records it in the enclosing mapping and
+                # returns it.
                 def impl():
+                    # [FUNCTION DOC] HELPER: Registration callback; builds a dummy handle, stores
+                    # it by name in the enclosing mapping and returns it.
                     handle = DummyHandle(name)
                     handles[name] = handle
                     return handle
@@ -262,6 +305,9 @@ class FlashAttentionTestMixin:
             activate_flash_attention_impl(self.impl_name)  # reset for next test
 
     def _test_compiled_sdpa_metadata(self, device, dtype, is_causal):
+        # [FUNCTION DOC] HELPER: Runs a flash attention call eagerly and through a full graph
+        # compile on the same random inputs, and asserts shape, stride, dtype and device of the
+        # two outputs match.
         """Test that torch.compile preserves tensor metadata (shape, stride, dtype)."""
         shape = SdpaShape(2, 8, 512, 64)
         q = torch.randn(shape, dtype=dtype, device=device)
@@ -269,6 +315,8 @@ class FlashAttentionTestMixin:
         v = torch.randn(shape, dtype=dtype, device=device)
 
         def sdpa_fn(q, k, v):
+            # [FUNCTION DOC] HELPER: Plain scaled dot product attention without mask or dropout,
+            # using the enclosing causal flag.
             return F.scaled_dot_product_attention(
                 q, k, v, attn_mask=None, dropout_p=0.0, is_causal=is_causal
             )
@@ -287,6 +335,10 @@ class FlashAttentionTestMixin:
         self.assertEqual(out_eager.device, out_compiled.device)
 
     def _test_compiled_sdpa_matches_math(self, device, dtype, is_causal):
+        # [FUNCTION DOC] HELPER: Compiles a scaled dot product attention function, runs it with
+        # the flash backend, and compares against math backend references in float32 and low
+        # precision. Asserts the compiled output is finite and its error is within a fixed
+        # factor of two of the low precision math error plus a tolerance.
         """Test compiled flash attention numerical correctness against math backend."""
         shape = SdpaShape(2, 8, 512, 64)
         q = torch.randn(shape, dtype=dtype, device=device).requires_grad_(True)
@@ -294,6 +346,8 @@ class FlashAttentionTestMixin:
         v = torch.randn(shape, dtype=dtype, device=device).requires_grad_(True)
 
         def sdpa_fn(q, k, v):
+            # [FUNCTION DOC] HELPER: Plain scaled dot product attention without mask or dropout,
+            # using the enclosing causal flag.
             return F.scaled_dot_product_attention(
                 q, k, v, attn_mask=None, dropout_p=0.0, is_causal=is_causal
             )
@@ -343,10 +397,18 @@ class FlashAttentionTestMixin:
         head_dim: int = 128,
         min_atol: float | None = None,
     ):
+        # [FUNCTION DOC] HELPER: Compares gradients of a compiled flash attention call with
+        # float32 and low precision math references, using identical seeded random inputs and the
+        # same upstream gradient. Asserts compiled gradients are finite and, for query, key and
+        # value, within a factor of two of the low precision error plus a tolerance floor
+        # (min_atol, defaulting to 0.05 for bfloat16 and 0.01 otherwise). Seeds both CPU and CUDA
+        # random generators (global side effect). The shape uses the given head_dim.
         """Test compiled flash attention backward numerical correctness against math backend."""
         shape = SdpaShape(2, 8, 512, head_dim)
 
         def make_tensors():
+            # [FUNCTION DOC] HELPER: Returns a tuple of three fresh random tensors of the enclosing
+            # shape, dtype and device that require gradients.
             return (
                 torch.randn(shape, dtype=dtype, device=device, requires_grad=True),
                 torch.randn(shape, dtype=dtype, device=device, requires_grad=True),
@@ -354,6 +416,8 @@ class FlashAttentionTestMixin:
             )
 
         def sdpa_fn(q, k, v):
+            # [FUNCTION DOC] HELPER: Plain scaled dot product attention without mask or dropout,
+            # using the enclosing causal flag.
             return F.scaled_dot_product_attention(
                 q, k, v, attn_mask=None, dropout_p=0.0, is_causal=is_causal
             )
@@ -426,9 +490,16 @@ class FlashAttentionTestMixin:
             )
 
     def _test_attention_preserves_query_layout(self, device):
+        # [FUNCTION DOC] HELPER: For every permutation of the first three dimensions (fourth
+        # fixed), runs flash attention on bfloat16 inputs laid out by that permutation and asserts
+        # the output, permuted back, is contiguous, i.e. keeps the query's memory layout.
         """Test that flash attention output has the same layout as the query tensor."""
 
         def test_attention(permute_order: list[int]):
+            # [FUNCTION DOC] HELPER: Builds query, key and value with sizes reordered by the given
+            # permutation order and permuted back, so they share the logical shape but have
+            # permuted strides, asserts the logical shapes, runs flash attention and asserts the
+            # output layout is contiguous after applying the order.
             BHSqD = [4, 16, 256, 64]
             BHSkvD = [4, 16, 512, 64]
 
@@ -463,6 +534,11 @@ class FlashAttentionTestMixin:
             test_attention(list(permute_order) + [3])
 
     def _test_kernel_called(self, device, dtype):
+        # [FUNCTION DOC] HELPER: Activates the implementation named by impl_name, then for each
+        # forward and backward kernel pattern profiles a flash attention forward plus backward
+        # and asserts a matching kernel was seen; restores the default implementation and
+        # asserts no matching kernel appears with the math backend. Resets grads between
+        # runs. The finally block re-activates impl_name. Mutates global implementation state.
         """Test that the correct kernel is called for forward and backward."""
         try:
             shape = SdpaShape(2, 4, 512, 128)

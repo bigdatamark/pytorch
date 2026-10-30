@@ -1,3 +1,10 @@
+# [MODULE DOC] Script that aggregates production operator usage from a model config YAML.
+# Reads the YAML path from the first command line argument at import time, counts how often
+# each root and traced operator occurs across models, merges per-kernel dtype lists, keeps only
+# aten/prepacked/prim/quantized operators, and writes the root operator counts to
+# test/mobile/model_test/model_ops.yaml (relative to the working directory). Runs on import.
+# KNOWN ISSUE: only root_operators is written to the output; traced_operators and
+# kernel_metadata are aggregated and filtered but never saved.
 """
 This is a script to aggregate production ops from xplat/pytorch_models/build/all_mobile_model_configs.yaml.
 Specify the file path in the first argument. The results will be dump to model_ops.yaml

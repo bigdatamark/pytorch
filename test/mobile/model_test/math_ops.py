@@ -1,3 +1,7 @@
+# [MODULE DOC] Mobile model test fixtures for the math operation families (pointwise,
+# reduction, comparison, other, spectral, BLAS and LAPACK). Each nn.Module forward only calls
+# a large list of torch ops on random or constant tensors so the ops land in generated test
+# models. No import-time side effects besides imports.
 # https://pytorch.org/docs/stable/torch.html#math-operations
 
 import math
@@ -6,10 +10,18 @@ import torch
 
 
 class PointwiseOpsModule(torch.nn.Module):
+    # [CLASS DOC] Module whose forward runs the pointwise math ops fixture method.
     def forward(self):
+        # [FUNCTION DOC] Takes no inputs; returns whatever the pointwise ops method returns.
         return self.pointwise_ops()
 
     def pointwise_ops(self):
+        # [FUNCTION DOC] Creates small random float tensors and int8 and int tensors, then calls
+        # the pointwise math ops (arithmetic, trigonometric, bitwise, logical, rounding, special
+        # functions, fake quantization, nan handling, power and division variants, in-place and
+        # out= forms) and passes every result to the len builtin.
+        # KNOWN ISSUE: len is given many positional arguments, which plain Python rejects
+        # with a type error; the body exists so the listed ops appear in a scripted graph.
         a = torch.randn(4)
         b = torch.randn(4)
         t = torch.tensor([-1, -2, 3], dtype=torch.int8)
@@ -209,10 +221,17 @@ class PointwiseOpsModule(torch.nn.Module):
 
 
 class ReductionOpsModule(torch.nn.Module):
+    # [CLASS DOC] Module whose forward runs the reduction ops fixture method.
     def forward(self):
+        # [FUNCTION DOC] Takes no inputs; returns whatever the reduction ops method returns.
         return self.reduction_ops()
 
     def reduction_ops(self):
+        # [FUNCTION DOC] Creates random vectors and a scalar tensor and calls the reduction ops
+        # (argmax and argmin, amax and amin, all and any, max and min, mean, median, mode, norm,
+        # quantile, std, var, sum, prod, unique, count_nonzero) and passes the results to len.
+        # KNOWN ISSUE: len is given many positional arguments, which plain Python rejects
+        # with a type error; the body exists so the listed ops appear in a scripted graph.
         a = torch.randn(4)
         b = torch.randn(4)
         c = torch.tensor(0.5)
@@ -259,7 +278,14 @@ class ReductionOpsModule(torch.nn.Module):
 
 
 class ComparisonOpsModule(torch.nn.Module):
+    # [CLASS DOC] Module whose forward calls comparison and sorting ops on two scalar tensors.
     def forward(self):
+        # [FUNCTION DOC] Takes no inputs. Builds two scalar integer tensors and calls the
+        # comparison ops (eq, ge, gt, le, lt, ne and aliases, isclose, isin, isfinite family),
+        # sorting ops (argsort, sort, topk, msort, kthvalue) and maximum and minimum variants,
+        # passing all results to the len builtin.
+        # KNOWN ISSUE: len is given many positional arguments, which plain Python rejects
+        # with a type error; the body exists so the listed ops appear in a scripted graph.
         a = torch.tensor(0)
         b = torch.tensor(1)
         return len(
@@ -304,10 +330,18 @@ class ComparisonOpsModule(torch.nn.Module):
 
 
 class OtherMathOpsModule(torch.nn.Module):
+    # [CLASS DOC] Module whose forward runs the miscellaneous math ops fixture method.
     def forward(self):
+        # [FUNCTION DOC] Takes no inputs; returns whatever the other ops method returns.
         return self.other_ops()
 
     def other_ops(self):
+        # [FUNCTION DOC] Creates vectors, an integer vector, a 4x3 matrix and a 4x4x4 tensor, then
+        # calls assorted ops (atleast_nd, bincount, broadcast, bucketize, cdist, cumulative ops,
+        # diag family, einsum, flips, kron, gcd and lcm, histograms, meshgrid, tril and triu,
+        # view_as_real and complex, and similar) and passes the results to len.
+        # KNOWN ISSUE: len is given many positional arguments, which plain Python rejects
+        # with a type error; the body exists so the listed ops appear in a scripted graph.
         a = torch.randn(4)
         b = torch.randn(4)
         c = torch.randint(0, 8, (5,), dtype=torch.int64)
@@ -374,10 +408,17 @@ class OtherMathOpsModule(torch.nn.Module):
 
 
 class SpectralOpsModule(torch.nn.Module):
+    # [CLASS DOC] Module whose forward runs the spectral ops fixture method.
     def forward(self):
+        # [FUNCTION DOC] Takes no inputs; returns whatever the spectral ops method returns.
         return self.spectral_ops()
 
     def spectral_ops(self):
+        # [FUNCTION DOC] Creates a length ten signal and a complex-as-real STFT shaped tensor,
+        # then calls stft, istft and the bartlett, blackman, hamming, hann and kaiser window
+        # functions and passes the results to len.
+        # KNOWN ISSUE: len is given many positional arguments, which plain Python rejects
+        # with a type error; the body exists so the listed ops appear in a scripted graph.
         a = torch.randn(10)
         b = torch.randn(10, 8, 4, 2)
         return len(
@@ -393,10 +434,17 @@ class SpectralOpsModule(torch.nn.Module):
 
 
 class BlasLapackOpsModule(torch.nn.Module):
+    # [CLASS DOC] Module whose forward runs the BLAS and LAPACK ops fixture method.
     def forward(self):
+        # [FUNCTION DOC] Takes no inputs; returns whatever the BLAS and LAPACK ops method returns.
         return self.blas_lapack_ops()
 
     def blas_lapack_ops(self):
+        # [FUNCTION DOC] Creates a 3x3 matrix, batched matrices and a vector, then calls matrix
+        # product ops (addbmm, addmm, addmv, addr, baddbmm, bmm, trapz and trapezoid, vdot and
+        # similar); some unsupported calls are commented out. Results are passed to len.
+        # KNOWN ISSUE: len is given many positional arguments, which plain Python rejects
+        # with a type error; the body exists so the listed ops appear in a scripted graph.
         m = torch.randn(3, 3)
         a = torch.randn(10, 3, 4)
         b = torch.randn(10, 4, 3)

@@ -1,4 +1,6 @@
 # Owner(s): ["oncall: mobile"]
+# [MODULE DOC] Test checking that the checked-in upgrader_mobile.cpp matches freshly generated
+# upgrader bytecode. Runs via the standard PyTorch test runner when executed as main.
 
 import os
 import tempfile
@@ -13,7 +15,12 @@ pytorch_caffe2_dir = Path(__file__).resolve().parents[2]
 
 
 class TestLiteScriptModule(TestCase):
+    # [CLASS DOC] Single TestCase holding the upgrader codegen consistency check.
     def test_generate_bytecode(self):
+        # [FUNCTION DOC] Generates upgrader bytecode, sorts it by name, writes the C++ source
+        # into a temporary directory, then compares the stripped, non-empty lines of that
+        # output against the repository file torch/csrc/jit/mobile/upgrader_mobile.cpp.
+        # Fails via assertEqual on any difference (stale generated file).
         upgrader_list = generate_upgraders_bytecode()
         sorted_upgrader_list = sort_upgrader(upgrader_list)
         upgrader_mobile_cpp_path = (

@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: mobile"]
+# [MODULE DOC] Tests for lite interpreter model bytecode versions: reading a model's bytecode
+# version, backporting a model to an older bytecode version (to file and to buffer), checking
+# the printed bytecode pickle against expected text patterns, reading operator info, and
+# listing contained types. Defines expected bytecode pickle strings for versions 4 to 6, a table
+# of checked-in models (currently only version 4) and the minimum backport target (4). The
+# checked-in model files live under test/cpp/jit. No import-time side effects.
 
 import fnmatch
 import io
@@ -150,8 +156,14 @@ MINIMUM_TO_VERSION = 4
 
 
 class testVariousModelVersions(TestCase):
+    # [CLASS DOC] TestCase grouping bytecode-version and backport tests for lite models.
     def test_get_model_bytecode_version(self):
+        # [FUNCTION DOC] For every entry of the checked-in model table, asserts the bytecode
+        # version reported for the model file equals the table key. Raises AssertionError
+        # on mismatch.
         def check_model_version(model_path, expect_version):
+            # [FUNCTION DOC] HELPER: Reads the bytecode version of the model at the given path
+            # and raises AssertionError if it differs from the expected version.
             actual_version = _get_model_bytecode_version(model_path)
             if actual_version != expect_version:
                 raise AssertionError(
@@ -163,6 +175,12 @@ class testVariousModelVersions(TestCase):
             check_model_version(model_path, version)
 
     def test_bytecode_values_for_all_backport_functions(self):
+        # [FUNCTION DOC] Starting at the highest checked-in version, backports the model one
+        # version at a time down to the minimum version, prints each result's bytecode pickle
+        # via the show_pickle utility and matches it (whitespace removed, wildcards allowed)
+        # against the expected text. Raises AssertionError on backport failure or mismatch.
+        # KNOWN ISSUE: the table holds only version 4, which equals the minimum version, so the
+        # while loop never runs and nothing is verified at present.
         # Find the maximum version of the checked in models, start backporting to the minimum support version,
         # and comparing the bytecode pkl content.
         # It can't be merged to the test `test_all_backport_functions`, because optimization is dynamic and
@@ -273,6 +291,13 @@ class testVariousModelVersions(TestCase):
 
     # Check just the test_backport_bytecode_from_file_to_file mechanism but not the function implementations
     def test_backport_bytecode_from_file_to_file(self):
+        # [FUNCTION DOC] Backports the highest checked-in model to the previous version, writing
+        # to a temporary file, checks the printed bytecode pickle matches the version 4 pattern,
+        # loads it in the lite interpreter, runs it with input 1 and asserts the result is a
+        # 2x4 float64 tensor of threes. Only runs its body if the highest version exceeds the
+        # minimum. Raises AssertionError on failure.
+        # KNOWN ISSUE: the checked-in table only has version 4, so the guarded body is skipped
+        # and the test passes without checking anything.
         maximum_checked_in_model_version = max(SCRIPT_MODULE_BYTECODE_PKL.keys())
         script_module_v5_path = (
             pytorch_test_dir
@@ -329,6 +354,11 @@ class testVariousModelVersions(TestCase):
 
     # Check just the _backport_for_mobile_to_buffer mechanism but not the function implementations
     def test_backport_bytecode_from_file_to_buffer(self):
+        # [FUNCTION DOC] Backports the highest checked-in model to the previous version into
+        # an in-memory buffer, asserts the buffer's bytecode version is one lower, loads it in
+        # the lite interpreter and checks that running with input 1 gives a 2x4 float64 tensor
+        # of threes. Body is skipped when the highest version does not exceed the minimum.
+        # KNOWN ISSUE: with only version 4 checked in, the guarded body is skipped.
         maximum_checked_in_model_version = max(SCRIPT_MODULE_BYTECODE_PKL.keys())
         script_module_v5_path = (
             pytorch_test_dir
@@ -363,6 +393,9 @@ class testVariousModelVersions(TestCase):
             )
 
     def test_get_model_ops_and_info(self):
+        # [FUNCTION DOC] Reads operator info from the version 6 model file and asserts that
+        # the entries for the int and Scalar add overloads each report two schema arguments.
+        # Raises AssertionError otherwise.
         # TODO update this to be more in the style of the above tests after a backport from 6 -> 5 exists
         script_module_v6 = pytorch_test_dir / "cpp" / "jit" / "script_module_v6.ptl"
         ops_v6 = _get_model_ops_and_info(script_module_v6)
@@ -376,8 +409,13 @@ class testVariousModelVersions(TestCase):
             )
 
     def test_get_mobile_model_contained_types(self):
+        # [FUNCTION DOC] Scripts a trivial module, runs it once, serializes it to a buffer in
+        # lite interpreter format and calls the contained-types query on the buffer. The
+        # returned types are not checked; the test only verifies the call does not raise.
         class MyTestModule(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward adds ten to its input.
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input plus ten.
                 return x + 10
 
         sample_input = torch.tensor([1])
