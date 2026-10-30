@@ -1,4 +1,10 @@
 # Owner(s): ["module: unknown"]
+# [MODULE DOC] Forward-mode automatic differentiation tests over the OpInfo database.
+# Defines a device-generic test class that checks forward AD, in-place forward AD and
+# forward-over-reverse second derivatives with gradcheck for every operator, restricted to
+# double and complex double dtypes, with a shared set of skips and expected failures.
+# Import time: on macOS forces a single torch thread; builds the shared skip set and the
+# operator decorator; instantiates the tests per device type (xpu allowed).
 
 import platform
 from functools import partial
@@ -60,6 +66,10 @@ _fwd_grad_all = {
 
 @unMarkDynamoStrictTest
 class TestFwdGradients(TestGradients):
+    # [CLASS DOC] Device-generic forward-mode AD tests built on the gradient-check helpers
+    # of the base class. Each test is parametrized over operators from the OpInfo database
+    # and double-precision dtypes. It verifies that operators declaring forward AD support
+    # pass gradcheck and that those not declaring it raise a not-implemented error.
     # Test that forward-over-reverse gradgrad is computed correctly
     @skipOps(
         _fwd_grad_all
@@ -84,6 +94,11 @@ class TestFwdGradients(TestGradients):
     )
     @_gradcheck_ops(op_db)
     def test_fn_fwgrad_bwgrad(self, device, dtype, op):
+        # [FUNCTION DOC] Checks forward-over-reverse second derivatives of the operator.
+        # Skips unsupported dtype or autograd combinations. If the OpInfo declares support
+        # for this mode, runs the fwgrad_bwgrad check; otherwise expects a NotImplementedError
+        # whose message says forward AD is not supported, and fails with a hint message
+        # telling the author to set the support flag if no error occurs.
         self._skip_helper(op, device, dtype)
 
         if op.supports_fwgrad_bwgrad:
@@ -98,8 +113,16 @@ class TestFwdGradients(TestGradients):
                 self._check_helper(device, dtype, op, op.get_op(), "fwgrad_bwgrad")
 
     def _forward_grad_helper(self, device, dtype, op, variant, is_inplace):
+        # [FUNCTION DOC] HELPER: Runs a forward-AD-only gradcheck of the given variant. When
+        # the OpInfo supports forward AD the check runs directly; otherwise it must raise a
+        # NotImplementedError mentioning that forward AD is unsupported, else the test fails
+        # with a hint to set the support flag. The batched forward grad option comes from the
+        # in-place or regular OpInfo attribute depending on is_inplace.
         # TODO: clean up how attributes are passed to gradcheck from OpInfos
         def call_grad_test_helper():
+            # [FUNCTION DOC] HELPER: Computes the batched-forward-grad flag and invokes the
+            # base class gradcheck helper with forward AD on, backward AD and batched
+            # backward grad off. Raises whatever the gradcheck raises.
             check_batched_forward_grad = (
                 op.check_batched_forward_grad and not is_inplace
             ) or (op.check_inplace_batched_forward_grad and is_inplace)
@@ -152,6 +175,10 @@ class TestFwdGradients(TestGradients):
     )
     @_gradcheck_ops(op_db)
     def test_forward_mode_AD(self, device, dtype, op):
+        # [FUNCTION DOC] Runs the forward-AD gradcheck on the out-of-place variant of the
+        # operator after the standard skip checks. Skipped on s390x because of differing
+        # OpenBLAS precision; several operators are skipped or expected to fail via the
+        # decorator.
         self._skip_helper(op, device, dtype)
 
         self._forward_grad_helper(device, dtype, op, op.get_op(), is_inplace=False)
@@ -169,6 +196,9 @@ class TestFwdGradients(TestGradients):
     )
     @_gradcheck_ops(op_db)
     def test_inplace_forward_mode_AD(self, device, dtype, op):
+        # [FUNCTION DOC] Runs the forward-AD gradcheck on the in-place variant, wrapped so it
+        # acts on a clone of its first argument. Skips when the operator has no in-place
+        # variant or does not support in-place autograd. Skipped under the inductor backend.
         self._skip_helper(op, device, dtype)
 
         if not op.inplace_variant or not op.supports_inplace_autograd:

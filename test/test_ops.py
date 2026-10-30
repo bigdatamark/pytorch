@@ -1,4 +1,12 @@
 # Owner(s): ["module: unknown"]
+# [MODULE DOC] Generic tests run over the whole OpInfo database (operator and python reference
+# entries). Test classes: common behavior (out arguments, dtype claims, variants, errors,
+# noncontiguous inputs, reference comparison, tags), composite compliance, conjugate and negative
+# view bits, tag checks, reference registration checks, fake tensor agreement and forward AD with
+# scalars.
+# Import time: verifies the default dtype is float32 (raises AssertionError otherwise), builds the
+# list of reference-testable ops, expected-failure sets and op lists, and instantiates each test
+# class per device type.
 import contextlib
 import copy
 import inspect
@@ -111,6 +119,10 @@ _ref_test_ops = tuple(
 
 
 def reduction_dtype_filter(op):
+    # [FUNCTION DOC] HELPER: Predicate used to pick reduction python-reference OpInfos for the
+    # integral out dtype test. Returns true only when the entry is a reduction python-reference
+    # info that supports out, lists the int16 dtype, and whose underlying callable has a keyword-
+    # only parameter named dtype; false otherwise.
     if (
         not isinstance(op, ReductionPythonRefInfo)
         or not op.supports_out
@@ -121,6 +133,9 @@ def reduction_dtype_filter(op):
 
 
 def has_reduction_tag(op):
+    # [FUNCTION DOC] HELPER: Returns true if the OpInfo name resolves to an operator in the aten
+    # namespace that has a default overload carrying the reduction tag. Returns false when the aten
+    # namespace has no such name or the packet has no default overload.
     """Check if an op has the reduction tag."""
     if not hasattr(torch.ops.aten, op.name):
         return False
@@ -219,12 +234,20 @@ meta_consistency_out_dtype_mismatch_xfails = {
 #   system
 @unMarkDynamoStrictTest
 class TestCommon(TestCase):
+    # [CLASS DOC] Tests that apply to every operator in the OpInfo database regardless of
+    # subsystem: out argument behavior, python reference agreement, dtype claims, variant
+    # consistency, error inputs, noncontiguous inputs, tag coverage. Class attributes require exact
+    # dtype matching and mark the hardware class as accelerator. Tests are instantiated per device
+    # type at module bottom (xpu allowed, mps allowed on recent macOS).
     exact_dtype = True
     hw_classification = HardwareClassification.ACCELERATOR
 
     # Verifies, on teardown, that no OpInfo is still using dynamic dtypes in CI
     @classmethod
     def tearDownClass(cls):
+        # [FUNCTION DOC] After the standard class teardown, when running in CI, collects every
+        # OpInfo that still uses dynamically determined dtypes and raises an AssertionError listing
+        # them, so such entries cannot land. Does nothing outside CI.
         super().tearDownClass()
 
         if IS_CI:
@@ -246,6 +269,10 @@ class TestCommon(TestCase):
     @deviceCountAtLeast(2)
     @ops(op_db, allowed_dtypes=(torch.float32, torch.long))
     def test_multiple_devices(self, devices, dtype, op):
+        # [FUNCTION DOC] For each device in the provided device list (needs at least two
+        # accelerators), runs the operator on the first sample input and checks that the result
+        # tensor, or every tensor in an iterable result, lives on that device. Skips the test when
+        # the result is neither a tensor nor an iterable of tensors.
         for device_str in devices:
             device = torch.device(device_str)
             # NOTE: only tests on first sample
@@ -263,6 +290,12 @@ class TestCommon(TestCase):
                 )
 
     def test_pointwise_tag_coverage(self):
+        # [FUNCTION DOC] Scans the native source files for unary, binary, pointwise and tensor-
+        # compare ops for dispatch stub definitions, maps each stub name to an aten operator
+        # packet, and asserts that every overload with a registered kernel (except generated
+        # overloads and an allow list of non-pointwise or reduction-like overloads) carries the
+        # pointwise tag. The stub named trigamma is skipped. Reads source files relative to the
+        # repository root; fails if a stub name cannot be mapped to an operator.
         pytorch_dir = os.path.abspath(__file__ + "/../../")
         files = [
             "aten/src/ATen/native/UnaryOps.cpp",
@@ -295,6 +328,10 @@ class TestCommon(TestCase):
         regex = re.compile(r"DEFINE_DISPATCH\(.*_stub")
 
         def get_opoverloadpacket_from_dispatch(kernel):
+            # [FUNCTION DOC] HELPER: Maps a stub name taken from the source scan to an aten
+            # operator packet name by trying the name itself, the double underscore form, the
+            # special_ prefixed form, and finally the name with its last underscore-separated piece
+            # dropped. Fails the test if none exists.
             if hasattr(torch.ops.aten, kernel):
                 return kernel
             if hasattr(torch.ops.aten, f"__{kernel}__"):
@@ -339,6 +376,11 @@ class TestCommon(TestCase):
                         self.assertTrue(torch.Tag.pointwise in overload.tags)
 
     def test_reduction_tag_coverage(self):
+        # [FUNCTION DOC] Scans the reduce-op native sources (if present) for dispatch stub
+        # definitions, maps each to an aten packet, and asserts that every overload with a
+        # registered kernel (except generated overloads and a small allow list of min/max
+        # overloads) carries the reduction tag. Stubs that cannot be mapped, and cumulative ops,
+        # are skipped.
         """Test that operators with reduction tag are from reduction operator files."""
         pytorch_dir = os.path.abspath(__file__ + "/../../")
         files = [
@@ -358,6 +400,10 @@ class TestCommon(TestCase):
         regex = re.compile(r"DEFINE_DISPATCH\(.*_stub")
 
         def get_opoverloadpacket_from_dispatch(kernel):
+            # [FUNCTION DOC] HELPER: Like the pointwise variant but lenient: returns nothing for
+            # cumulative ops and for names that cannot be resolved, maps the stub names for logical
+            # and and logical or to the all and any packets, and otherwise tries the plain, double
+            # underscore, special_ prefixed and last-piece-dropped forms.
             # Skip cumulative operations - they're in ReduceOps.cpp but aren't reductions
             if kernel in ("cumsum", "cumprod", "logcumsumexp", "xor_sum"):
                 return None
@@ -419,6 +465,11 @@ class TestCommon(TestCase):
 
     @ops([op for op in op_db if has_reduction_tag(op)], dtypes=OpDTypes.none)
     def test_reduction_ops_reduce(self, device, op):
+        # [FUNCTION DOC] For each operator tagged as a reduction, runs samples that pass a dim
+        # keyword and checks that the number of elements in the result equals the input element
+        # count divided by the product of the reduced dimension sizes (all dimensions when dim is
+        # none). Samples with out-of-range dims or an empty reduced extent are skipped; only tensor
+        # results are checked.
         """Test that operators with reduction tag actually reduce numel when dim is specified."""
         samples = op.sample_inputs(device, torch.float32)
 
@@ -471,6 +522,11 @@ class TestCommon(TestCase):
     @suppress_warnings
     @ops(_ref_test_ops, allowed_dtypes=(torch.float64, torch.long, torch.complex128))
     def test_numpy_ref(self, device, dtype, op):
+        # [FUNCTION DOC] Compares the operator against its numpy-based reference function on
+        # reference inputs, with the default dtype temporarily switched to the highest precision
+        # float for the device. Dtype must match exactly except for long. Raises a skip for two
+        # signal window ops in float64 on CPU, CUDA or XPU when running under the inductor test
+        # mode.
         if (
             TEST_WITH_TORCHINDUCTOR
             and op.formatted_name
@@ -494,7 +550,14 @@ class TestCommon(TestCase):
     @skipCUDAIfNotRocm
     @ops(_ops_and_refs_with_no_numpy_ref, dtypes=OpDTypes.any_common_cpu_cuda_one)
     def test_compare_cpu(self, device, dtype, op):
+        # [FUNCTION DOC] Runs the operator on the accelerator and on a CPU copy of each reference
+        # sample and checks that results agree, after applying the sample's gradient output
+        # processing function to both (used to canonicalize ambiguous outputs such as decomposition
+        # factors). Tolerance is 1e-3 for floating and complex dtypes, exact otherwise (default
+        # tolerance on XPU).
         def to_cpu(arg):
+            # [FUNCTION DOC] HELPER: Returns the argument moved to the CPU device if it is a
+            # tensor, otherwise returns it unchanged.
             if isinstance(arg, torch.Tensor):
                 return arg.to(device="cpu")
             return arg
@@ -528,6 +591,12 @@ class TestCommon(TestCase):
     @ops(python_ref_db)
     @skipIfTorchInductor("Takes too long for inductor")
     def test_python_ref_meta(self, device, dtype, op):
+        # [FUNCTION DOC] Checks that a python reference propagates shape, dtype and device metadata
+        # through fake tensors the same way as real execution. For each reference sample, runs the
+        # op on real tensors and on fake tensor copies; samples whose fake run raises unsupported-
+        # tensor, data-dependent-output or unsupported-operator exceptions are skipped. Compares
+        # tensor metadata (including conjugation unless the op is in a small exempt set), element-
+        # wise for sequence results.
         CHECK_CONJ_SKIPS = {
             torch._refs.linalg.svd,
         }
@@ -536,6 +605,8 @@ class TestCommon(TestCase):
             pass
 
         def _to_tensormeta(x):
+            # [FUNCTION DOC] HELPER: Converts a tensor argument to a fake tensor created in the
+            # enclosing fake mode; other values pass through.
             if isinstance(x, torch.Tensor):
                 out = FakeTensor.from_tensor(x, mode)
                 return out
@@ -582,6 +653,13 @@ class TestCommon(TestCase):
         skip_bfloat=False,
         skip_view_consistency=False,
     ):
+        # [FUNCTION DOC] HELPER: Shared body for python reference tests. For each reference sample
+        # (optionally skipping zero-element, zero-dim or bfloat-like inputs), runs the reference
+        # inside the supplied context factory and the underlying torch op, compares tensor metadata
+        # and optionally view-ness, then compares values. If values differ and the dtype is not
+        # already the most precise one, recomputes the torch op in a higher precision dtype and
+        # requires the reference to be no farther from it than the torch result; in that case a
+        # warning is emitted at the end instead of failing. Raises AssertionError on mismatch.
         # NOTE: this test works by comparing the reference
         for sample in op.reference_inputs(device, dtype, requires_grad=False):
             ex = None
@@ -669,6 +747,8 @@ class TestCommon(TestCase):
             # If the results are not close, checks that the
             # reference is more accurate than the torch op
             def _make_precise(x):
+                # [FUNCTION DOC] HELPER: Maps a dtype to the precise dtype, and a tensor of the
+                # test dtype to a copy in the precise dtype; other values unchanged.
                 if isinstance(x, torch.dtype):
                     return precise_dtype
                 if isinstance(x, torch.Tensor) and x.dtype is dtype:
@@ -681,6 +761,10 @@ class TestCommon(TestCase):
             )
 
             def _distance(a, b):
+                # [FUNCTION DOC] HELPER: Returns the total absolute difference between two tensors
+                # (count of differing entries for booleans), treating equal values and matching
+                # NaNs as zero difference. Raises AssertionError if the first is boolean but the
+                # second is not.
                 # Special-cases boolean comparisons
                 if prims.utils.is_boolean_dtype(a.dtype):
                     if b.dtype is not torch.bool:
@@ -732,6 +816,9 @@ class TestCommon(TestCase):
     @ops(python_ref_db)
     @skipIfTorchInductor("Takes too long for inductor")
     def test_python_ref(self, device, dtype, op):
+        # [FUNCTION DOC] Runs the reference comparison with a context that remaps torch namespace
+        # calls inside references to the refs namespace in strict mode, so references call into
+        # other references.
         # In this test, primTorch refs call into the refs namespace
         # For example, a ref with torch.foo in it will calls refs.foo instead
         # Direct calls to refs and prims are not affected
@@ -745,6 +832,9 @@ class TestCommon(TestCase):
     @ops(python_ref_db)
     @skipIfTorchInductor("Takes too long for inductor")
     def test_python_ref_torch_fallback(self, device, dtype, op):
+        # [FUNCTION DOC] Runs the reference comparison with a null context, so references call
+        # torch operators after the first call. Skips the floor-rounding division reference in
+        # bfloat16 because reference and torch results differ on division by zero.
         # In this test, refs call into the torch namespace (after the initial invocation)
         # For example, a ref with torch.foo in it will call torch.foo instead of refs.foo
         # Direct calls to refs and prims are not translated
@@ -762,6 +852,9 @@ class TestCommon(TestCase):
     @parametrize("executor", ["aten"])
     @skipIfTorchInductor("Takes too long for inductor")
     def test_python_ref_executor(self, device, dtype, op, executor):
+        # [FUNCTION DOC] Accelerator-only. Copies the OpInfo and replaces its callable with a
+        # traced version using the given executor (aten), then runs the reference comparison with a
+        # null context.
         from copy import copy
 
         from torch._prims.executor import make_traced
@@ -775,6 +868,9 @@ class TestCommon(TestCase):
     @onlyNativeDeviceTypesAnd(["hpu"])
     @ops([op for op in op_db if op.error_inputs_func is not None], dtypes=OpDTypes.none)
     def test_errors(self, device, op):
+        # [FUNCTION DOC] For each error input declared by the OpInfo, asserts that calling the
+        # operator raises the declared exception type with a message matching the declared pattern,
+        # and that the call did not return the not-implemented sentinel.
         error_inputs = op.error_inputs(device)
         for ei in error_inputs:
             si = ei.sample_input
@@ -800,6 +896,8 @@ class TestCommon(TestCase):
         ),
     )
     def test_errors_sparse(self, device, op, layout):
+        # [FUNCTION DOC] Same as the error test but uses the sparse error inputs of the OpInfo for
+        # the given sparse layout (CSR, CSC, BSR, BSC or COO).
         for ei in op.error_inputs_sparse(device, layout):
             si = ei.sample_input
             with self.assertRaisesRegex(ei.error_type, ei.error_regex):
@@ -815,11 +913,16 @@ class TestCommon(TestCase):
     )
     @skipIfTorchInductor("Takes too long for inductor")
     def test_python_ref_errors(self, device, op):
+        # [FUNCTION DOC] For each error input of a python reference OpInfo, converts the sample
+        # tensors to fake tensors and asserts that calling the op raises the declared exception
+        # type with a message matching the declared pattern.
         mode = FakeTensorMode()
         with mode:
             pass
 
         def _to_tensormeta(x):
+            # [FUNCTION DOC] HELPER: Converts a tensor argument to a fake tensor created in the
+            # local fake mode; other values pass through.
             if isinstance(x, torch.Tensor):
                 return FakeTensor.from_tensor(x, mode)
             return x
@@ -839,6 +942,11 @@ class TestCommon(TestCase):
     @suppress_warnings
     @ops(op_db, allowed_dtypes=(torch.float32, torch.long, torch.complex64))
     def test_noncontiguous_samples(self, device, dtype, op):
+        # [FUNCTION DOC] Checks that results, and gradients when the dtype supports backward, are
+        # the same for contiguous samples and their noncontiguous counterparts. Gradient outputs
+        # are random for the contiguous run and noncontiguous copies for the other; gradients are
+        # taken with unused inputs allowed and compared pairwise. Outputs that are not tensors or
+        # sequences skip the backward part. Tf32 is turned off by decorator.
         test_grad = dtype in op.supported_backward_dtypes(torch.device(device).type)
         sample_inputs = op.sample_inputs(device, dtype, requires_grad=test_grad)
         for sample_input in sample_inputs:
@@ -929,6 +1037,14 @@ class TestCommon(TestCase):
     @skipXPU
     @ops(ops_and_refs, dtypes=OpDTypes.none)
     def test_out_warning(self, device, op):
+        # [FUNCTION DOC] Checks the resize warning for an out argument with the right dtype and
+        # device but wrong shape. Picks float32 if supported, else the first supported dtype (skips
+        # if none). For ops without out support, asserts that passing out raises and stops.
+        # Otherwise runs the wrong-shape case: values must be correct, and when the replacement out
+        # is nonempty a UserWarning about resizing a nonempty output must be emitted. Samples with
+        # non-tensor outputs cause a skip.
+        # KNOWN ISSUE: When the op does not support out the loop body returns after the first
+        # sample, so later samples are never checked.
         if TEST_WITH_TORCHDYNAMO and op.name == "_refs.clamp":
             self.skipTest("flaky")
         # Prefers running in float32 but has a fallback for the first listed supported dtype
@@ -974,6 +1090,8 @@ class TestCommon(TestCase):
             #   instantiates the map. Used below to apply transforms to
             #   single tensor and iterable tensor outputs.
             def _apply_out_transform(fn, out):
+                # [FUNCTION DOC] HELPER: Applies a function to a tensor, or to each tensor of an
+                # iterable, returning a tensor or a tuple.
                 if isinstance(out, torch.Tensor):
                     return fn(out)
 
@@ -982,6 +1100,7 @@ class TestCommon(TestCase):
 
             # Extracts strides from a tensor or iterable of tensors into a tuple
             def _extract_strides(out):
+                # [FUNCTION DOC] HELPER: Returns a tuple of strides, one per tensor of the output.
                 if isinstance(out, torch.Tensor):
                     return (out.stride(),)
 
@@ -992,6 +1111,8 @@ class TestCommon(TestCase):
             # NOTE: only extracts on the CPU and CUDA device types since some
             #   device types don't have storage
             def _extract_data_ptrs(out):
+                # [FUNCTION DOC] HELPER: Returns a tuple of storage addresses of the output
+                # tensors, or an empty tuple on device types other than cpu and cuda.
                 if self.device_type != "cpu" and self.device_type != "cuda":
                     return ()
 
@@ -1003,6 +1124,10 @@ class TestCommon(TestCase):
 
             @suppress_warnings
             def _compare_out(transform, *, compare_strides_and_data_ptrs=True):
+                # [FUNCTION DOC] HELPER: Builds an out argument by transforming the expected
+                # result, calls the op with it, and checks that the out now equals the expected
+                # result. When requested, also checks that strides and storage addresses did not
+                # change. Warnings are suppressed by decorator.
                 out = _apply_out_transform(transform, expected)
                 original_strides = _extract_strides(out)
                 original_ptrs = _extract_data_ptrs(out)
@@ -1024,6 +1149,9 @@ class TestCommon(TestCase):
             # Case Zero: out= with the correct dtype and device, but the wrong shape
             #   Expected behavior: if nonempty, resize with a warning.
             def _case_zero_transform(t):
+                # [FUNCTION DOC] HELPER: Builds a tensor with the same dtype and device whose last
+                # dimension is one larger (shape of two elements for scalars) filled with random
+                # values; used as a wrongly sized out.
                 wrong_shape = list(t.shape)
 
                 if len(wrong_shape) == 0:
@@ -1039,6 +1167,8 @@ class TestCommon(TestCase):
             # Additionally validates that the appropriate warning is thrown if a nonempty
             #   tensor is resized.
             def _any_nonempty(out):
+                # [FUNCTION DOC] HELPER: Returns true if the tensor, or any tensor in the iterable,
+                # has at least one element.
                 if isinstance(out, torch.Tensor):
                     return out.numel() > 0
 
@@ -1069,6 +1199,16 @@ class TestCommon(TestCase):
     @skipXPU
     @ops(ops_and_refs, dtypes=OpDTypes.any_one)
     def test_out(self, device, dtype, op):
+        # [FUNCTION DOC] Validates the out behavior of every operator and reference for one dtype.
+        # Ops lacking out support must raise when given out (the test then returns). Otherwise
+        # checks five cases: out filled with extremal values, noncontiguous out (strides and
+        # storage kept), empty out (resized with no resize warning), out on a different device
+        # (RuntimeError, except CPU or factory functions without an explicit device) and out with a
+        # dtype the result cannot safely cast to (an error, TypeError for the stacking and
+        # concatenation family, RuntimeError otherwise; skipped unless a result is floating or
+        # complex).
+        # KNOWN ISSUE: When the op does not support out the loop body returns after the first
+        # sample, so later samples are never checked.
         # Prefers running in float32 but has a fallback for the first listed supported dtype
         samples = op.sample_inputs(device, dtype)
 
@@ -1104,6 +1244,8 @@ class TestCommon(TestCase):
             #   instantiates the map. Used below to apply transforms to
             #   single tensor and iterable tensor outputs.
             def _apply_out_transform(fn, out):
+                # [FUNCTION DOC] HELPER: Applies a function to a tensor, or to each tensor of an
+                # iterable, returning a tensor or a tuple.
                 if isinstance(out, torch.Tensor):
                     return fn(out)
 
@@ -1112,6 +1254,7 @@ class TestCommon(TestCase):
 
             # Extracts strides from a tensor or iterable of tensors into a tuple
             def _extract_strides(out):
+                # [FUNCTION DOC] HELPER: Returns a tuple of strides, one per tensor of the output.
                 if isinstance(out, torch.Tensor):
                     return (out.stride(),)
 
@@ -1122,6 +1265,8 @@ class TestCommon(TestCase):
             # NOTE: only extracts on the CPU and CUDA device types since some
             #   device types don't have storage
             def _extract_data_ptrs(out):
+                # [FUNCTION DOC] HELPER: Returns a tuple of storage addresses of the output
+                # tensors, or an empty tuple on device types other than cpu and cuda.
                 if self.device_type != "cpu" and self.device_type != "cuda":
                     return ()
 
@@ -1132,6 +1277,9 @@ class TestCommon(TestCase):
                 return tuple(t.data_ptr() for t in out)
 
             def _compare_out(transform, *, compare_strides_and_data_ptrs=True):
+                # [FUNCTION DOC] HELPER: Builds an out argument by transforming the expected
+                # result, calls the op with it, checks that the out equals the expected result, and
+                # optionally that strides and storage addresses are unchanged.
                 out = _apply_out_transform(transform, expected)
                 original_strides = _extract_strides(out)
                 original_ptrs = _extract_data_ptrs(out)
@@ -1154,6 +1302,8 @@ class TestCommon(TestCase):
             #   maximum values for integer tensors.
             #   Expected behavior: out= values have no effect on the computation.
             def _case_zero_transform(t):
+                # [FUNCTION DOC] HELPER: Case 0: returns a tensor like the input filled with the
+                # maximum value for integer dtypes, or NaN for others.
                 try:
                     info = torch.iinfo(t.dtype)
                     return torch.full_like(t, info.max)
@@ -1167,6 +1317,8 @@ class TestCommon(TestCase):
             #   but noncontiguous.
             #   Expected behavior: strides are respected and `out` storage is not changed.
             def _case_one_transform(t):
+                # [FUNCTION DOC] HELPER: Case 1: returns a noncontiguous tensor with the same
+                # shape, dtype and device.
                 return make_tensor(
                     t.shape, dtype=t.dtype, device=t.device, noncontiguous=True
                 )
@@ -1176,6 +1328,8 @@ class TestCommon(TestCase):
             # Case 2: out= with the correct dtype and device, but has no elements.
             #   Expected behavior: resize without warning.
             def _case_two_transform(t):
+                # [FUNCTION DOC] HELPER: Case 2: returns an empty one-dimensional tensor with the
+                # same dtype and device.
                 return make_tensor((0,), dtype=t.dtype, device=t.device)
 
             _compare_out(_case_two_transform, compare_strides_and_data_ptrs=False)
@@ -1205,6 +1359,8 @@ class TestCommon(TestCase):
                 wrong_device = "cpu"
 
                 def _case_three_transform(t):
+                    # [FUNCTION DOC] HELPER: Case 3: returns a tensor with the same shape and dtype
+                    # on the CPU device.
                     return make_tensor(t.shape, dtype=t.dtype, device=wrong_device)
 
                 out = _apply_out_transform(_case_three_transform, expected)
@@ -1237,6 +1393,8 @@ class TestCommon(TestCase):
             ):
 
                 def _case_four_transform(t):
+                    # [FUNCTION DOC] HELPER: Case 4: returns a tensor with the same shape and
+                    # device but the long dtype.
                     return make_tensor(t.shape, dtype=torch.long, device=t.device)
 
                 out = _apply_out_transform(_case_four_transform, expected)
@@ -1282,6 +1440,10 @@ class TestCommon(TestCase):
         allowed_dtypes=[torch.float, torch.cfloat],
     )
     def test_out_requires_grad_error(self, device, dtype, op):
+        # [FUNCTION DOC] For ops that support out and either autograd or factory creation, calls
+        # the op once to get result prototypes, marks floating or complex outputs as requiring
+        # grad, and asserts that using them as out raises a RuntimeError. Returns early when no
+        # output is floating or complex.
         sample = first_sample(self, op.sample_inputs(device, dtype))
 
         # Call op to get prototype for out arguments
@@ -1290,6 +1452,8 @@ class TestCommon(TestCase):
         any_requires_grad = False
 
         def set_requires_grad(x):
+            # [FUNCTION DOC] HELPER: Marks a floating or complex tensor as requiring grad and
+            # records that fact in the enclosing flag; returns the argument.
             nonlocal any_requires_grad
             if isinstance(x, torch.Tensor) and (
                 x.is_floating_point() or x.is_complex()
@@ -1313,7 +1477,15 @@ class TestCommon(TestCase):
     @skipXPU
     @ops(filter(reduction_dtype_filter, ops_and_refs), dtypes=(torch.int16,))
     def test_out_integral_dtype(self, device, dtype, op):
+        # [FUNCTION DOC] For reduction references with an int16 dtype, checks the consistency rule
+        # between the dtype keyword and the out dtype: passing an int32 out is accepted without
+        # dtype or with an int32 dtype, and must raise a specific RuntimeError when the dtype
+        # keyword is int16 (or any non-int32 dtype given by the sample).
         def helper(with_out, expectFail, op_to_test, inputs, *args, **kwargs):
+            # [FUNCTION DOC] HELPER: Calls the op with or without an int32 out. Expects either
+            # success or a RuntimeError with the exact message that dtype argument and out dtype
+            # must match in a reduction, according to the expect-failure flag; asserts accordingly
+            # and returns the result.
             out = None
             try:
                 if with_out:
@@ -1357,6 +1529,12 @@ class TestCommon(TestCase):
     @skipXPU
     @_variant_ops(op_db)
     def test_variant_consistency_eager(self, device, dtype, op):
+        # [FUNCTION DOC] Compares the method, in-place, operator, in-place operator and alias
+        # variants against the plain function for forward values and, for single tensor outputs
+        # where backward is supported, gradients on the first input. In-place variants are skipped
+        # when the output dtype differs from the input dtype, must raise for inputs that broadcast,
+        # and operator variants skip samples with keyword arguments. A second pass checks that in-
+        # place variants return a tensor sharing the input storage.
         # Acquires variants (method variant, inplace variant, operator variant, inplace_operator variant, aliases)
 
         method = op.method_variant
@@ -1393,6 +1571,10 @@ class TestCommon(TestCase):
         samples = list(samples)
 
         def _test_consistency_helper(samples, variants):
+            # [FUNCTION DOC] HELPER: For each sample, computes the reference forward result and
+            # gradient with the plain op, then checks every variant's forward value (on a clone for
+            # in-place variants) and gradient against them. Uses the enclosing op, dtype and
+            # variant lists.
             for sample in samples:
                 # TODO: Check grad for all Tensors requiring grad if sample.input is TensorList
                 tensor = (
@@ -1484,6 +1666,10 @@ class TestCommon(TestCase):
         _test_consistency_helper(samples, variants)
 
         def _test_inplace_preserve_storage(samples, variants):
+            # [FUNCTION DOC] HELPER: For each sample, runs every variant (clone for in-place ones)
+            # and asserts the returned tensor has the same storage address as the input. Returns
+            # from the whole function (not just the sample) when a sample output dtype differs from
+            # the input dtype, and fails if an in-place variant returns a non-tensor.
             for sample in samples:
                 # Skips inplace variants if the output dtype is not the same as
                 #   the input dtype
@@ -1538,6 +1724,10 @@ class TestCommon(TestCase):
     @skipXPU
     @ops(op_db, allowed_dtypes=(torch.complex32,))
     def test_complex_half_reference_testing(self, device, dtype, op):
+        # [FUNCTION DOC] Compares the operator on complex32 inputs against the same operator on
+        # complex64 inputs (cast back to complex32 for comparison, since the half precision range
+        # overflows easily), without requiring exact dtype equality. Samples with float64 arguments
+        # are skipped when the device does not support float64.
         if not op.supports_dtype(torch.complex32, device):
             unittest.skip("Does not support complex32")
 
@@ -1583,8 +1773,14 @@ class TestCommon(TestCase):
     @skipMPS
     @ops(op_db, allowed_dtypes=(torch.bool,))
     def test_non_standard_bool_values(self, device, dtype, op):
+        # [FUNCTION DOC] Checks that the operator gives the same result when boolean inputs hold
+        # byte values other than zero and one (true encoded as a random value between 2 and 255),
+        # by reinterpreting a byte tensor as a bool tensor. Regression test for gh-54789.
         # Test boolean values other than 0x00 and 0x01 (gh-54789)
         def convert_boolean_tensors(x):
+            # [FUNCTION DOC] HELPER: Returns non-boolean-tensor values unchanged; for a boolean
+            # tensor builds an equal tensor with true stored as random bytes of at least two,
+            # verifies equality with the original, and returns it.
             if not isinstance(x, torch.Tensor) or x.dtype != torch.bool:
                 return x
 
@@ -1613,6 +1809,12 @@ class TestCommon(TestCase):
     @onlyNativeDeviceTypesAnd(["hpu"])
     @ops(ops_and_refs, dtypes=OpDTypes.none)
     def test_dtypes(self, device, op):
+        # [FUNCTION DOC] Probes which dtypes the operator really supports (forward, and backward
+        # for floating and complex dtypes) by generating samples and running the op and backward,
+        # then compares with the dtypes claimed by the OpInfo. Partial support prints a warning.
+        # Fails with a detailed message if dtypes are supported but unclaimed or claimed but
+        # unsupported; the unclaimed case is tolerated for compile test modes and for python
+        # references. Skips a known stale sparse op on recent ROCm.
         if (
             TEST_WITH_ROCM
             and getRocmVersion() >= (7, 14)
@@ -1641,6 +1843,8 @@ class TestCommon(TestCase):
         dtype_error: dict[torch.dtype, Exception] = {}
 
         def unsupported(dtype, e):
+            # [FUNCTION DOC] HELPER: Records the exception for a dtype and marks that dtype
+            # unsupported for forward, and for backward too when backward is considered for it.
             dtype_error[dtype] = e
             unsupported_dtypes.add(dtype)
             if dtype in allowed_backward_dtypes:
@@ -1675,6 +1879,9 @@ class TestCommon(TestCase):
                 # Checks for backward support in the same dtype, if the input has
                 # one or more tensors requiring grad
                 def _tensor_requires_grad(x):
+                    # [FUNCTION DOC] HELPER: Returns true if a tensor, or any tensor nested in the
+                    # given lists, tuples or dict values, requires grad. Note that a dict that
+                    # holds no such tensor falls through to the later checks and yields false.
                     if isinstance(x, dict):
                         for v in x.values():
                             if _tensor_requires_grad(v):
@@ -1829,6 +2036,8 @@ class TestCommon(TestCase):
         allowed_dtypes=integral_types_and(torch.bool),
     )
     def test_promotes_int_to_float(self, device, dtype, op):
+        # [FUNCTION DOC] For ops that claim integer to float promotion, runs every sample with
+        # integral or bool dtype and fails if any result dtype is not floating point.
         for sample in op.sample_inputs(device, dtype):
             output = op(sample.input, *sample.args, **sample.kwargs)
             if not output.dtype.is_floating_point:
@@ -1847,6 +2056,11 @@ class TestCommon(TestCase):
     @skipOps(meta_consistency_out_dtype_mismatch_xfails)
     @skipIfTorchDynamo("meta device runs only on eager")
     def test_meta_consistency_out_dtype_mismatch(self, device, dtype, op):
+        # [FUNCTION DOC] CPU only, not under dynamo. For each sample, computes a real result,
+        # builds out tensors of a mismatching float64 dtype, and runs the op with them on both the
+        # real device and the meta device, capturing any error. Raises a RuntimeError chained to
+        # the captured error if only one of the two devices failed. Samples whose plain call fails
+        # are skipped.
         samples = op.sample_inputs(device, dtype)
 
         for sample in samples:
@@ -1866,6 +2080,10 @@ class TestCommon(TestCase):
                 continue
 
             def run_on(dev):
+                # [FUNCTION DOC] HELPER: Moves the sample inputs (tensors, device objects, and
+                # strings equal to the real device name) to the given device, creates float64 out
+                # tensors there, calls the op with them and returns the raised exception or nothing
+                # on success.
                 # Create new outputs in the desired device, with a mismatching data type of
                 # the same kind.
                 out = pytree.tree_map_only(
@@ -1915,6 +2133,10 @@ class TestCommon(TestCase):
 
 @unMarkDynamoStrictTest
 class TestCompositeCompliance(TestCase):
+    # [CLASS DOC] Checks that composite (implicit autograd) operators are written so they work with
+    # tensor subclasses and backends: operator calls under dispatch mode, backward and forward AD
+    # formulas, copy-on-write input preservation and view replay. Parametrized over OpInfo entries
+    # in float.
     hw_classification = HardwareClassification.ACCELERATOR
 
     # Checks if the operator (if it is composite) is written to support most
@@ -1955,6 +2177,9 @@ class TestCompositeCompliance(TestCase):
     )
     @ops(op_db, allowed_dtypes=(torch.float,))
     def test_operator(self, device, dtype, op):
+        # [FUNCTION DOC] Runs the composite compliance checks for forward calls under a dispatch
+        # mode and under all input permutations, comparing with the test equality function. Skipped
+        # in fbcode and sandcastle; several ops are skipped or expected to fail.
         samples = op.sample_inputs(device, dtype, requires_grad=False)
 
         for sample in samples:
@@ -1986,6 +2211,9 @@ class TestCompositeCompliance(TestCase):
     )
     @ops([op for op in op_db if op.supports_autograd], allowed_dtypes=(torch.float,))
     def test_backward(self, device, dtype, op):
+        # [FUNCTION DOC] For ops supporting autograd, checks the backward formula with the
+        # composite compliance helper on grad-requiring samples, passing the test equality function
+        # so tolerance overrides apply.
         samples = op.sample_inputs(device, dtype, requires_grad=True)
 
         for sample in samples:
@@ -2020,6 +2248,9 @@ class TestCompositeCompliance(TestCase):
     )
     @ops(op_db, allowed_dtypes=(torch.float,))
     def test_forward_ad(self, device, dtype, op):
+        # [FUNCTION DOC] For ops supporting forward AD and float backward, checks the forward AD
+        # formula with the composite compliance helper on grad-requiring samples. Raises skip
+        # errors if autograd or forward AD is unsupported.
         if torch.float not in op.supported_backward_dtypes(device):
             raise unittest.SkipTest("Does not support autograd")
 
@@ -2046,12 +2277,19 @@ class TestCompositeCompliance(TestCase):
     )
     @ops(op_db, allowed_dtypes=(torch.float,))
     def test_cow_input(self, device, dtype, op):
+        # [FUNCTION DOC] Verifies copy-on-write behavior: strided inputs are replaced with lazy
+        # clones, the op is run forward (and backward when supported, with lazy-cloned output
+        # grads), and each input must stay copy-on-write if the OpInfo claims so, must keep the raw
+        # input copy-on-write, and must never be mutated.
         samples = op.sample_inputs(device, dtype, requires_grad=op.supports_autograd)
 
         def is_strided_tensor(arg):
+            # [FUNCTION DOC] HELPER: Returns true if the argument is a tensor with strided layout.
             return torch.is_tensor(arg) and arg.layout == torch.strided
 
         def check_ignore_materialize(idx_or_kw, allow_list):
+            # [FUNCTION DOC] HELPER: Returns true when an allow list exists and contains the
+            # argument index or keyword.
             return (allow_list is not None) and (idx_or_kw in allow_list)
 
         def check_cow_input(
@@ -2063,6 +2301,12 @@ class TestCompositeCompliance(TestCase):
             supports_cow_input_no_materialize=op.supports_cow_input_no_materialize_forward,
             allow_list=op.allow_cow_input_materialize_forward,
         ):
+            # [FUNCTION DOC] HELPER: Checks one argument after a forward or backward call. Strided
+            # tensors: the raw input must still be copy-on-write; if the op is declared not to
+            # materialize and the argument is not in the allow list it must still be copy-on-write;
+            # data must equal the saved copy (the lazy clone if still copy-on-write, else the raw
+            # input). Fails the test with a message naming the argument. Non-strided arguments are
+            # ignored.
             arg_name = (
                 f"Argument {idx_or_kw}"
                 if isinstance(idx_or_kw, int)
@@ -2233,7 +2477,13 @@ class TestCompositeCompliance(TestCase):
     )
     @ops(op_db, allowed_dtypes=(torch.float,))
     def test_view_replay(self, device, dtype, op):
+        # [FUNCTION DOC] With original view tracking forced on, runs the op and for each output
+        # that is a view of the input checks that the forward view function replayed on a clone
+        # reproduces the output (metadata and values), and that the reverse view function on a
+        # detached output gives a view whose base is that output with the input metadata.
         def _assert_match_metadata(a, b):
+            # [FUNCTION DOC] HELPER: Asserts that two tensors have equal size, stride, storage
+            # offset, device and dtype.
             self.assertEqual(a.size(), b.size())
             self.assertEqual(a.stride(), b.stride())
             self.assertEqual(a.storage_offset(), b.storage_offset())
@@ -2275,6 +2525,9 @@ class TestCompositeCompliance(TestCase):
 
 @unMarkDynamoStrictTest
 class TestMathBits(TestCase):
+    # [CLASS DOC] Tests conjugate and negative view bits: operators must give the same values and
+    # gradients for physically transformed tensors and for view tensors with the bit set, and in-
+    # place variants must keep the bit. Covers complex to real and complex to complex functions.
     hw_classification = HardwareClassification.ACCELERATOR
 
     # Tests that
@@ -2298,6 +2551,11 @@ class TestMathBits(TestCase):
         is_bit_set,
         out_type,
     ):
+        # [FUNCTION DOC] HELPER: Shared checker for the view bit tests. For each sample builds a
+        # copy whose input is a math view of the physically transformed input, checks equal forward
+        # values, checks in-place variants (when no broadcasting and dtype preserved) produce the
+        # bit and the right value, and checks gradients of the sum of the absolute value, plus a
+        # random gradient run when the output type predicate holds.
         inplace_variant = op.inplace_variant
 
         # helper function to clone and conjugate/negate the input if its a tensor
@@ -2305,6 +2563,10 @@ class TestMathBits(TestCase):
         # If a requires_grad argument is provided the tensor being conjugated/negated will
         # have its requires_grad set to that value.
         def clone_and_perform_view(input, **kwargs):
+            # [FUNCTION DOC] HELPER: Returns a leaf copy of the input produced by the physical
+            # transform without grad tracking followed by the view transform, with requires_grad
+            # set from the keyword or the input; for a sequence, clones all items and transforms
+            # the first. Raises AssertionError if the result is not a leaf.
             if isinstance(input, torch.Tensor):
                 requires_grad = kwargs.get("requires_grad", input.requires_grad)
                 with torch.no_grad():
@@ -2392,6 +2654,8 @@ class TestMathBits(TestCase):
 
     @ops(ops_and_refs, allowed_dtypes=(torch.cfloat,))
     def test_conj_view(self, device, dtype, op):
+        # [FUNCTION DOC] Runs the view check for complex float with physical and view conjugation
+        # and the conjugate bit predicate. Skips when the OpInfo does not test conjugated samples.
         if not op.test_conjugated_samples:
             self.skipTest("Operation doesn't support conjugated inputs.")
         math_op_physical = torch.conj_physical
@@ -2414,6 +2678,8 @@ class TestMathBits(TestCase):
 
     @ops(ops_and_refs, allowed_dtypes=(torch.double,))
     def test_neg_view(self, device, dtype, op):
+        # [FUNCTION DOC] Runs the view check for double with negation and the negative view, and
+        # the negative bit predicate. Skips when the OpInfo does not test the negative bit.
         if not op.test_neg_view:
             self.skipTest("Operation not tested with tensors with negative bit.")
         math_op_physical = torch.neg
@@ -2433,18 +2699,24 @@ class TestMathBits(TestCase):
 
     @ops(ops_and_refs, allowed_dtypes=(torch.cdouble,))
     def test_neg_conj_view(self, device, dtype, op):
+        # [FUNCTION DOC] Runs the view check for complex double with combined negated-conjugate
+        # transforms, requiring both bits, on only the first sample. Skips if negative or
+        # conjugated samples are unsupported.
         if not op.test_neg_view:
             self.skipTest("Operation not tested with tensors with negative bit.")
         if not op.test_conjugated_samples:
             self.skipTest("Operation doesn't support conjugated inputs.")
 
         def math_op_physical(x):
+            # [FUNCTION DOC] HELPER: Physically negates and conjugates a tensor.
             return -x.conj_physical()
 
         def math_op_view(x):
+            # [FUNCTION DOC] HELPER: Returns the conjugate view of the negative view of a tensor.
             return torch._neg_view(x).conj()
 
         def is_bit_set(x):
+            # [FUNCTION DOC] HELPER: Returns true if both the negative and conjugate bits are set.
             return torch.is_neg(x) and torch.is_conj(x)
 
         _requires_grad = dtype in op.supported_backward_dtypes(
@@ -2467,6 +2739,10 @@ class TestMathBits(TestCase):
 
 # input strides and size may have been altered due to the result of an inplace op
 def check_inplace_view(func, input, rs, input_size, input_strides):
+    # [FUNCTION DOC] Asserts the inplace view tag. Does nothing for no function. If the result is
+    # the input tensor itself and its size or strides changed, the operator (default overload for
+    # packets) must carry the inplace view tag, except for the in-place resize op. Raises
+    # AssertionError otherwise.
     if func is None:
         return
     # TODO: extend this test to test ops with multiple outputs and ops like native_batch_norm(_legit).out
@@ -2490,7 +2766,13 @@ def check_inplace_view(func, input, rs, input_size, input_strides):
 # that operators have expected tags based on their input and
 # output tensor properties
 class _TestTagsMode(TorchDispatchMode):
+    # [CLASS DOC] HELPER: Dispatch mode that runs each operator and, when the first argument is a
+    # tensor, records its size and strides first and then verifies the inplace view tag rule on the
+    # result.
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC] HELPER: Calls the operator with the given arguments; if the first argument
+        # is a tensor, snapshots its size and strides before the call and then runs the inplace
+        # view check. Returns the result.
         if isinstance(args[0], torch.Tensor):
             old_size = args[0].size()
             old_stride = args[0].stride()
@@ -2504,6 +2786,8 @@ class _TestTagsMode(TorchDispatchMode):
 # Test to verify the correctness for tags in `tags.yaml`, also available for access through `torch.Tags`
 @unMarkDynamoStrictTest
 class TestTags(TestCase):
+    # [CLASS DOC] Verifies the tags declared for operators (inplace view) against runtime behavior.
+    # Hardware class is generic.
     hw_classification = HardwareClassification.GENERIC
 
     @skipOps(
@@ -2517,6 +2801,9 @@ class TestTags(TestCase):
     )
     @ops(ops_and_refs, dtypes=OpDTypes.any_one)
     def test_tags(self, device, dtype, op):
+        # [FUNCTION DOC] For each sample with a tensor input, runs the op under the tags dispatch
+        # mode and then checks the inplace view tag rule against the aten packet resolved from the
+        # OpInfo aten name (or name). Samples with list inputs are not checked.
         samples = op.sample_inputs(device, dtype, requires_grad=False)
         for sample in samples:
             # TODO: Test tags for ops that return a list of tensors
@@ -2533,9 +2820,12 @@ class TestTags(TestCase):
 
 
 class TestSelfKwarg(TestCase):
+    # [CLASS DOC] Tests that aten ops can be called with an argument named self passed by keyword.
     hw_classification = HardwareClassification.GENERIC
 
     def test_self_kwargs(self):
+        # [FUNCTION DOC] Calls the reshape and min default overloads with the tensor passed as a
+        # self keyword; passes if no error is raised.
         """Verify that we can call the aten ops with all kwargs even if the
         argument's name is "self"
         """
@@ -2545,6 +2835,10 @@ class TestSelfKwarg(TestCase):
 
 @unMarkDynamoStrictTest
 class TestRefsOpsInfo(TestCase):
+    # [CLASS DOC] Consistency checks between python references and their registrations. Class
+    # attributes: the reference module names, the full list of exported reference names, the set of
+    # names in the python reference database, and sets of references skipped or expected to be
+    # absent from the decomposition table. Instantiated for CPU only.
     hw_classification = HardwareClassification.GENERIC
     import_paths = [
         "_refs",
@@ -2714,6 +3008,9 @@ class TestRefsOpsInfo(TestCase):
 
     @parametrize("op", ref_ops_names)
     def test_refs_are_in_python_ref_db(self, op):
+        # [FUNCTION DOC] Parametrized over reference names. Skips names on the skip list; for in-
+        # place names (trailing underscore) asserts they are not in the database; otherwise asserts
+        # presence in the database names.
         inplace = op[-1] == "_"
         if op in self.skip_ref_ops:
             raise unittest.SkipTest(f"{op} does not have an entry in python_ref_db")
@@ -2733,6 +3030,9 @@ class TestRefsOpsInfo(TestCase):
 
     @parametrize("op", ref_ops_names)
     def test_refs_are_in_decomp_table(self, op):
+        # [FUNCTION DOC] Parametrized over reference names. Resolves the reference function from
+        # its module and asserts it is present in the decomposition table values, or absent when
+        # listed in the not-in-table set.
         path = op.split(".")
         module_path = ".".join(path[:-1])
         op_name = path[-1]
@@ -2852,9 +3152,15 @@ fake_autocast_backward_xfails = {
 
 @unMarkDynamoStrictTest
 class TestFakeTensor(TestCase):
+    # [CLASS DOC] Compares real execution with fake tensor execution for every operator, including
+    # pointwise shape rules, autocast, cross-reference backward, and strided layout. Uses module
+    # level lists of ops that fail, are dynamic output, data dependent or alias. Hardware class is
+    # accelerator.
     hw_classification = HardwareClassification.ACCELERATOR
 
     def setUp(self):
+        # [FUNCTION DOC] After the base setup, patches the dynamo config so fake tensor caching and
+        # cache cross checking are on, and registers cleanup to stop the patches.
         super().setUp()
         # Turn on FakeTensor caching and cross-checking for these tests:
         cache_enabled = unittest.mock.patch(
@@ -2870,6 +3176,15 @@ class TestFakeTensor(TestCase):
         self.addCleanup(cache_crosscheck.stop)
 
     def _test_fake_helper(self, device, dtype, op, context):
+        # [FUNCTION DOC] HELPER: For each sample, runs the op for real under the context, then
+        # under fake tensors (and again with dynamic output shapes allowed for ops known to support
+        # it, without result matching). Verifies fake outputs are fake tensors with matching
+        # metadata, alias relations of the inputs match, and that exceptions for unsupported,
+        # dynamic output and data dependent ops occur only for ops listed as such. Skips known
+        # failing, sparse and jiterator ops.
+        # KNOWN ISSUE: The alias check for the real run builds its input tuple from the sample
+        # input, the sample object itself and the fake-converted args variable, instead of the
+        # sample args attribute (likely a typo); it therefore does not mirror the real call.
         name = op.name
         if op.variant_test_name:
             name += "." + op.variant_test_name
@@ -2897,7 +3212,12 @@ class TestFakeTensor(TestCase):
                 continue
 
             def run_with_fake_mode_and_verify(fake_mode, match_results=True):
+                # [FUNCTION DOC] HELPER: Converts the sample to fake tensors in the given fake
+                # mode, runs the op, optionally compares each output with the real result, and
+                # handles the expected fake tensor exceptions with assertions against the op lists.
                 def map_to_fake(e):
+                    # [FUNCTION DOC] HELPER: Converts a tensor to a fake tensor in the given fake
+                    # mode; other values unchanged.
                     if isinstance(e, torch.Tensor):
                         return fake_mode.from_tensor(e)
                     else:
@@ -2978,6 +3298,10 @@ class TestFakeTensor(TestCase):
     @skipOps({skip("bmm", variant_name="triton_optimized")})
     @ops(op_db, dtypes=OpDTypes.any_one)
     def test_pointwise_ops(self, device, dtype, op):
+        # [FUNCTION DOC] Defines a dispatch mode that, for operators tagged pointwise, asserts
+        # every tensor output has the broadcast shape of the tensor inputs. For each sample the op
+        # is first run under fake tensors (samples that raise are skipped) and then again under the
+        # mode.
         name = op.name
         if op.variant_test_name:
             name += "." + op.variant_test_name
@@ -2987,7 +3311,13 @@ class TestFakeTensor(TestCase):
         test_self = self
 
         class TestPointwiseMode(TorchDispatchMode):
+            # [CLASS DOC] HELPER: Dispatch mode used by the pointwise test: runs each operator and,
+            # if it is tagged pointwise, checks output shapes equal the broadcast of input shapes
+            # through the test case.
             def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                # [FUNCTION DOC] HELPER: Runs the operator and for pointwise-tagged operators
+                # asserts that each tensor output has the broadcast shape of all tensor inputs.
+                # Returns the result.
                 kwargs = kwargs or {}
 
                 out = func(*args, **kwargs)
@@ -3011,6 +3341,8 @@ class TestFakeTensor(TestCase):
             mode = FakeTensorMode()
 
             def map_to_fake(e):
+                # [FUNCTION DOC] HELPER: Converts a tensor to a fake tensor in the sample's fake
+                # mode; other values unchanged.
                 if isinstance(e, torch.Tensor):
                     return mode.from_tensor(e)
                 else:
@@ -3038,6 +3370,7 @@ class TestFakeTensor(TestCase):
     )
     @ops(op_db, dtypes=OpDTypes.any_one)
     def test_fake(self, device, dtype, op):
+        # [FUNCTION DOC] Runs the fake tensor comparison with no extra context.
         self._test_fake_helper(device, dtype, op, contextlib.nullcontext)
 
     @skipOps(
@@ -3049,16 +3382,23 @@ class TestFakeTensor(TestCase):
     )
     @ops(op_db, dtypes=OpDTypes.any_one)
     def test_fake_autocast(self, device, dtype, op):
+        # [FUNCTION DOC] Runs the fake tensor comparison inside autocast for the device type;
+        # skipped for ops on the per-device autocast skip list.
         device_type = torch.device(device).type
         if op.name in fake_autocast_device_skips[device_type]:
             self.skipTest("Skip failing test")
 
         def context_fn():
+            # [FUNCTION DOC] HELPER: Returns an autocast context manager for the device type.
             return torch.amp.autocast(device_type)
 
         self._test_fake_helper(device, dtype, op, context_fn)
 
     def _test_fake_crossref_helper(self, device, dtype, op, context):
+        # [FUNCTION DOC] HELPER: For each grad-requiring sample, computes expected gradients
+        # through the composite compliance helper under a cross reference fake mode (aliasing
+        # checked, a few cheap ops ignored), with the given context and autograd multithreading
+        # off. Unsupported operator exceptions are ignored.
         samples = op.sample_inputs(device, dtype, requires_grad=True)
 
         for sample in samples:
@@ -3097,18 +3437,24 @@ class TestFakeTensor(TestCase):
     @ops([op for op in op_db if op.supports_autograd], allowed_dtypes=(torch.float,))
     @skipOps(fake_backward_xfails | {skip("sparse.sampled_addmm")})
     def test_fake_crossref_backward_no_amp(self, device, dtype, op):
+        # [FUNCTION DOC] Accelerator-only. Cross-checks backward under fake tensors without
+        # autocast.
         self._test_fake_crossref_helper(device, dtype, op, contextlib.nullcontext)
 
     @onlyAccelerator
     @ops([op for op in op_db if op.supports_autograd], allowed_dtypes=(torch.float,))
     @skipOps(fake_backward_xfails | fake_autocast_backward_xfails)
     def test_fake_crossref_backward_amp(self, device, dtype, op):
+        # [FUNCTION DOC] Accelerator-only. Cross-checks backward under fake tensors with autocast
+        # for the device.
         self._test_fake_crossref_helper(
             device, dtype, op, partial(torch.amp.autocast, device_type=device)
         )
 
     @ops([op for op in ops_and_refs if op.is_factory_function])
     def test_strided_layout(self, device, dtype, op):
+        # [FUNCTION DOC] For factory functions, calls the op with a strided layout keyword and
+        # asserts the result has strided layout.
         samples = op.sample_inputs(device, dtype)
         for sample in samples:
             kwargs = sample.kwargs.copy()
@@ -3118,6 +3464,8 @@ class TestFakeTensor(TestCase):
 
 
 class TestForwardADWithScalars(TestCase):
+    # [CLASS DOC] Forward AD regression tests that mix zero-dimensional dual tensors with Python
+    # scalars. Hardware class is accelerator.
     hw_classification = HardwareClassification.ACCELERATOR
 
     @ops(
@@ -3125,6 +3473,9 @@ class TestForwardADWithScalars(TestCase):
         allowed_dtypes=(torch.float32,),
     )
     def test_0d_tensor_with_python_scalar(self, device, dtype, op):
+        # [FUNCTION DOC] For mul, add and div in float32 that support autograd and forward AD,
+        # builds a zero-dimensional dual tensor and calls the op with a Python scalar on the right
+        # and/or left (when supported), asserting the primal and tangent dtypes stay equal.
         """Test that forward AD preserves dtype when combining 0D tensors with Python scalars."""
         if torch.float not in op.supported_backward_dtypes(device):
             raise unittest.SkipTest("Does not support autograd")
