@@ -1,4 +1,12 @@
 # Owner(s): ["module: mkldnn"]
+# [MODULE DOC] Tests for the MKL-DNN (oneDNN) tensor layout and the torch.utils.mkldnn
+# module wrappers: conversion between dense and mkldnn tensors in several dtypes, copy,
+# unsupported dtype errors, autograd through conversions, convolution (1d/2d/3d, nhwc, lower
+# precision), pooling, batch norm, linear, activations, binary ops, view and reshape,
+# prepacked weights and serialization or tracing of converted modules, plus device-generic
+# tests at the end. At import time it tries to import torchvision (flag set accordingly,
+# with a skip decorator built from it), wraps the gradient check helpers so that batched
+# gradients are not checked, and defines the list of dtypes under test.
 
 import copy
 import itertools
@@ -39,7 +47,18 @@ types = [torch.float, torch.bfloat16, torch.half]
 # Comment the line below to find out the CI machines having MKL-DNN build disabled
 @unittest.skipIf(not torch.backends.mkldnn.is_available(), "MKL-DNN build is disabled")
 class TestMkldnn(TestCase):
+    # [CLASS DOC] Main test case for mkldnn tensors and wrapped modules; the whole class is
+    # skipped when the MKL-DNN build is disabled. Holds the conversion, autograd, conv,
+    # pool, batch norm, linear and miscellaneous op tests and shared helpers for
+    # serialization and tracing round trips.
     def test_conversion(self):
+        # [FUNCTION DOC] Round-trips a 4d and a 5d (sliced to 4d) float CPU tensor requiring
+        # grad through mkldnn for each dtype among float, bfloat16 and half, and also from
+        # lowered bfloat16 or half CPU tensors. Checks the mkldnn tensor dtype, the
+        # converted dense tensor dtype (same by default, or the requested one), values
+        # within tolerance, CPU device, size, element count, element size (half the float
+        # size for lower precision types), and that asking for the data pointer raises a
+        # RuntimeError about missing storage.
         for cpu_tensor in [torch.randn((1, 2, 3, 4),
                                        dtype=torch.float, device=torch.device('cpu')),
                            torch.randn((1, 2, 3, 4, 5),
@@ -101,6 +120,10 @@ class TestMkldnn(TestCase):
                                            lambda: mkldnn_tensor.data_ptr() != 0)
 
     def test_conversion_byte_char(self):
+        # [FUNCTION DOC] For int8 and uint8, converts random integer tensors (4d and 5d) to
+        # mkldnn with that dtype and back, checking dtype, equal values, CPU device, size,
+        # element count, element size, and the RuntimeError raised when the data pointer is
+        # requested.
         int8_types = [torch.int8, torch.uint8]
         for int8_type in int8_types:
             low = -100 if int8_type is torch.int8 else 0
@@ -133,6 +156,10 @@ class TestMkldnn(TestCase):
                                        lambda: mkldnn_tensor.data_ptr() != 0)
 
     def test_conversion_float8_prepacked_weight(self):
+        # [FUNCTION DOC] Prepacks a float8 (e4m3fn) weight of shape 16 by 4 with the onednn
+        # qlinear prepack op. Skips the test if the result is not an mkldnn tensor (fallback
+        # to dense). Else asserts that to_dense gives float8 with the transposed shape and
+        # that the transposed values equal the original weight.
         weight = torch.linspace(-4, 4, steps=64).reshape(16, 4)
         weight_fp8 = weight.half().to(torch.float8_e4m3fn)
         packed_weight = torch.ops.onednn.qlinear_prepack(weight_fp8, [1, 4])
@@ -146,6 +173,10 @@ class TestMkldnn(TestCase):
         self.assertEqual(unpacked.t().contiguous().float(), weight_fp8.float())
 
     def test_copy(self):
+        # [FUNCTION DOC] Checks copy_ between mkldnn tensors: same size copy succeeds and
+        # matches the source, a copy from a larger mkldnn tensor raises a RuntimeError about
+        # same size, and copies between mkldnn and dense tensors in either direction raise
+        # RuntimeError with a message saying that layout mixing is not implemented.
         x = torch.randn(4, 5, dtype=torch.float32)
         mkldnn_x = x.to_mkldnn()
         mkldnn_y = torch.randn(4, 5, dtype=torch.float32).to_mkldnn()
@@ -165,6 +196,10 @@ class TestMkldnn(TestCase):
                                lambda: mkldnn_x.copy_(x))
 
     def test_unsupported(self):
+        # [FUNCTION DOC] Checks that converting to mkldnn raises RuntimeError for
+        # unsupported dtypes (double and integer types) on CPU and, when available, CUDA,
+        # and for a float CUDA tensor. Also checks that the factory functions ones, randn
+        # and rand raise RuntimeError when asked for the mkldnn layout directly.
         # unsupported types and unsupported types with gpu
         for dtype in [torch.double, torch.uint8, torch.int8,
                       torch.short, torch.int, torch.long]:
@@ -183,6 +218,10 @@ class TestMkldnn(TestCase):
                 creator(1, 2, 3, 4, dtype=torch.float, device=torch.device('cpu'), layout=torch._mkldnn)
 
     def test_mkldnn_conv_shapecheck(self):
+        # [FUNCTION DOC] Calls the raw mkldnn convolution with seven invalid parameter sets
+        # (negative padding, zero stride, zero dilation, zero groups, two groups on a one
+        # channel input, a bias of the wrong size, a weight whose kernel is taller than the
+        # input) and asserts each raises a RuntimeError.
         input = torch.full((1, 1, 1, 24,), 1, dtype=torch.float32)
         w1 = torch.full((1, 1, 1, 24,), 1, dtype=torch.float32)
         b1 = torch.full((1,), 1, dtype=torch.float32)
@@ -199,10 +238,15 @@ class TestMkldnn(TestCase):
                 torch.mkldnn_convolution(input, w, b, [pad] * 2, [st] * 2, [dil] * 2, gr)
 
     def test_autograd_to_mkldnn(self):
+        # [FUNCTION DOC] Runs gradient and second order gradient checks (batched grad
+        # checking turned off) on conversion of a float tensor to mkldnn and back, expecting
+        # a warning about double precision inputs and using loosened tolerances because
+        # mkldnn is float only.
         # MKLDNN only supports float32
         root = torch.randn(4, 5, dtype=torch.float32, requires_grad=True)
 
         def func(root):
+            # [FUNCTION DOC] HELPER: Converts the tensor to mkldnn and back to dense.
             return root.to_mkldnn().to_dense()
 
         # because MKLDNN only supports float32, we need to lessen the precision.
@@ -215,10 +259,14 @@ class TestMkldnn(TestCase):
                               lambda: gradgradcheck(func, [root], atol=4e-2, rtol=1e-2))
 
     def test_autograd_from_mkldnn(self):
+        # [FUNCTION DOC] Runs a gradient check of conversion from an mkldnn tensor (made to
+        # require grad) to dense, expecting a double precision warning and loosened
+        # tolerances.
         # MKLDNN only supports float32
         root = torch.randn(4, 5, dtype=torch.float32).to_mkldnn().requires_grad_()
 
         def func(root):
+            # [FUNCTION DOC] HELPER: Converts the mkldnn tensor to dense.
             return root.to_dense()
 
         # because MKLDNN only supports float32, we need to lessen the precision.
@@ -228,12 +276,17 @@ class TestMkldnn(TestCase):
                               lambda: gradcheck(func, [root], atol=4e-2, rtol=1e-2))
 
     def test_to_dense_torch_func_vjp(self):
+        # [FUNCTION DOC] For converting an mkldnn tensor to dense through the method and
+        # through the aten op, runs the functorch vjp: the output must not be mkldnn, the
+        # gradient returned for a ones cotangent must not be mkldnn and must equal ones.
         root = torch.randn(4, 5, dtype=torch.float32).to_mkldnn()
 
         def method(x):
+            # [FUNCTION DOC] HELPER: Calls the to_dense method on the input.
             return x.to_dense()
 
         def op(x):
+            # [FUNCTION DOC] HELPER: Calls the aten to_dense op on the input.
             return torch.ops.aten.to_dense.default(x)
 
         for func in (method, op):
@@ -244,12 +297,17 @@ class TestMkldnn(TestCase):
             self.assertEqual(grad, torch.ones_like(out))
 
     def test_sparse_to_dense_torch_func_vjp(self):
+        # [FUNCTION DOC] Same as the mkldnn vjp test but for a sparse input: for the method
+        # and the op form of to_dense, the output must be strided and the gradient must be
+        # sparse coo layout with the dense value equal to ones.
         root = torch.randn(4, 5, dtype=torch.float32).to_sparse()
 
         def method(x):
+            # [FUNCTION DOC] HELPER: Calls the to_dense method on the input.
             return x.to_dense()
 
         def op(x):
+            # [FUNCTION DOC] HELPER: Calls the aten to_dense op on the input.
             return torch.ops.aten.to_dense.default(x)
 
         for func in (method, op):
@@ -260,6 +318,10 @@ class TestMkldnn(TestCase):
             self.assertEqual(grad.to_dense(), torch.ones_like(out))
 
     def test_detach(self):
+        # [FUNCTION DOC] Checks detach and in-place detach on an mkldnn tensor that requires
+        # grad: the sizes are kept, detach returns a tensor not requiring grad while leaving
+        # the original requiring grad, and in-place detach clears requires grad on the
+        # original.
         root = torch.randn(4, 5, dtype=torch.float32).to_mkldnn().requires_grad_()
 
         detach = root.detach()
@@ -273,10 +335,20 @@ class TestMkldnn(TestCase):
         self.assertFalse(root.requires_grad)
 
     def test_repr(self):
+        # [FUNCTION DOC] Asserts that the string form of an mkldnn tensor contains its
+        # layout name.
         self.assertTrue("layout=torch._mkldnn" in str(torch.randn((1, 2, 3, 4),
                                                                   dtype=torch.float, device=torch.device('cpu')).to_mkldnn()))
 
     def _test_conv_base(self, dim):
+        # [FUNCTION DOC] HELPER: Shared body for the conv tests, dim being 1, 2 or 3. Over a
+        # grid of train mode, bias, dilation (1, 2) and groups (1, 4) with random batch and
+        # channel counts, compares a float Conv with the mkldnn converted copy (eval) or the
+        # plain copy on an mkldnn input (train, not supported for 1d), with the mkldnn
+        # backend disabled for the reference. Outputs compared using the test precision
+        # attribute if non-zero. In eval it also exercises serialization and tracing
+        # helpers; in train it checks that the input gradient is mkldnn and matches, and the
+        # weight and bias gradients match.
         conv_module = {1: torch.nn.Conv1d, 2: torch.nn.Conv2d, 3: torch.nn.Conv3d}
         input_shapes = {1: (224,), 2: (224, 224), 3: (55, 55, 55)}
         options = itertools.product([True, False], [True, False], [1, 2], [1, 4])
@@ -331,17 +403,30 @@ class TestMkldnn(TestCase):
 
     @reduced_f32_on_and_off()
     def test_conv1d(self):
+        # [FUNCTION DOC] Runs the shared conv test for one dimension, with reduced fp32
+        # precision modes on and off.
         self._test_conv_base(dim=1)
 
     @reduced_f32_on_and_off()
     def test_conv2d(self):
+        # [FUNCTION DOC] Runs the shared conv test for two dimensions, with reduced fp32
+        # precision modes on and off.
         self._test_conv_base(dim=2)
 
     @reduced_f32_on_and_off()
     def test_conv3d(self):
+        # [FUNCTION DOC] Runs the shared conv test for three dimensions, with reduced fp32
+        # precision modes on and off.
         self._test_conv_base(dim=3)
 
     def _test_conv_deconv_lower_precision_base(self, dim, conv_module, dtype):
+        # [FUNCTION DOC] HELPER: Shared body for lower precision conv and transposed conv
+        # tests given the dimension, module class and dtype. Over bias, dilation and groups,
+        # skips depthwise grouped transposed convs. If the CPU supports the dtype in oneDNN,
+        # compares an mkldnn wrapped float conv with an mkldnn wrapped lower precision conv
+        # (loose tolerance); otherwise asserts a RuntimeError naming the missing CPU
+        # instruction support. Also compares the native (mkldnn disabled) lower precision
+        # conv with a float reference.
         input_shapes = {1: (224,), 2: (224, 224), 3: (55, 55, 55)}
         options = itertools.product([True, False], [1, 2], [1, 4])
         for bias, dilation, groups in options:
@@ -390,20 +475,32 @@ class TestMkldnn(TestCase):
 
     @dtypes(torch.float16, torch.bfloat16)
     def test_conv_deconv_1d_lower_precision(self, dtype):
+        # [FUNCTION DOC] Runs the lower precision helper for 1d conv and 1d transposed conv with
+        # the given dtype (half or bfloat16).
         self._test_conv_deconv_lower_precision_base(1, torch.nn.Conv1d, dtype=dtype)
         self._test_conv_deconv_lower_precision_base(1, torch.nn.ConvTranspose1d, dtype=dtype)
 
     @dtypes(torch.float16, torch.bfloat16)
     def test_conv_deconv_2d_lower_precision(self, dtype):
+        # [FUNCTION DOC] Runs the lower precision helper for 2d conv and 2d transposed conv with
+        # the given dtype (half or bfloat16).
         self._test_conv_deconv_lower_precision_base(2, torch.nn.Conv2d, dtype=dtype)
         self._test_conv_deconv_lower_precision_base(2, torch.nn.ConvTranspose2d, dtype=dtype)
 
     @dtypes(torch.float16, torch.bfloat16)
     def test_conv_deconv_3d_lower_precision(self, dtype):
+        # [FUNCTION DOC] Runs the lower precision helper for 3d conv and 3d transposed conv with
+        # the given dtype (half or bfloat16).
         self._test_conv_deconv_lower_precision_base(3, torch.nn.Conv3d, dtype=dtype)
         self._test_conv_deconv_lower_precision_base(3, torch.nn.ConvTranspose3d, dtype=dtype)
 
     def _test_conv_deconv_nhwc_base(self, conv_module, weight_memory_format, dtype, prec=None):
+        # [FUNCTION DOC] HELPER: Shared body comparing a conv or transposed conv in
+        # contiguous format with a copy whose weights use the given memory format (channels
+        # last) on a channels last input, for 2d or 3d module classes, over train mode,
+        # bias, dilation and groups. Outputs must match within prec; in train mode the input
+        # gradient of the channels last case must be channels last contiguous and the weight
+        # gradients must match.
         input_shapes = {2: (55, 55), 3: (14, 14, 14)}
         options = itertools.product([True, False], [True, False], [1, 2], [1, 4])
         if conv_module in [torch.nn.Conv2d, torch.nn.ConvTranspose2d]:
@@ -454,6 +551,9 @@ class TestMkldnn(TestCase):
 
     @reduced_f32_on_and_off()
     def test_conv_nhwc_fp32(self):
+        # [FUNCTION DOC] Runs the channels last comparison helper in float32 for Conv2d with
+        # contiguous and channels last weights and for Conv3d with contiguous and channels
+        # last 3d weights, with reduced fp32 precision modes on and off.
         self._test_conv_deconv_nhwc_base(torch.nn.Conv2d, torch.contiguous_format, dtype=torch.float32)
         self._test_conv_deconv_nhwc_base(torch.nn.Conv2d, torch.channels_last, dtype=torch.float32)
         self._test_conv_deconv_nhwc_base(torch.nn.Conv3d, torch.contiguous_format, dtype=torch.float32)
@@ -461,6 +561,11 @@ class TestMkldnn(TestCase):
 
     @dtypes(torch.float16, torch.bfloat16)
     def test_conv_nhwc_lower_precision(self, dtype):
+        # [FUNCTION DOC] For half or bfloat16: if oneDNN supports the dtype, runs the
+        # channels last helper for 2d and 3d convs with both weight formats at default
+        # tolerance. Then, with the mkldnn backend disabled (native fallback path), reruns
+        # all four combinations with a looser per-dtype tolerance (the fallback converts
+        # types more often so loses accuracy).
         # when torch.ops.mkldnn._is_mkldnn_bf16_supported() or torch.ops.mkldnn._is_mkldnn_fp16_supported()
         # returns false, bf16/fp16 CPU conv will fall back to thnn impl
         support_checks = {
@@ -490,6 +595,9 @@ class TestMkldnn(TestCase):
 
     @reduced_f32_on_and_off()
     def test_conv_transpose_nhwc_fp32(self):
+        # [FUNCTION DOC] Runs the channels last comparison helper in float32 for
+        # ConvTranspose2d and ConvTranspose3d with contiguous and channels last weights,
+        # with reduced fp32 precision modes on and off.
         self._test_conv_deconv_nhwc_base(torch.nn.ConvTranspose2d, torch.contiguous_format, dtype=torch.float32)
         self._test_conv_deconv_nhwc_base(torch.nn.ConvTranspose2d, torch.channels_last, dtype=torch.float32)
         self._test_conv_deconv_nhwc_base(torch.nn.ConvTranspose3d, torch.contiguous_format, dtype=torch.float32)
@@ -497,6 +605,10 @@ class TestMkldnn(TestCase):
 
     @dtypes(torch.float16, torch.bfloat16)
     def test_conv_transpose_nhwc_lower_precision(self, dtype):
+        # [FUNCTION DOC] Like the conv variant but for transposed convs: runs the channels
+        # last helper when oneDNN supports the dtype, then reruns it with the mkldnn backend
+        # disabled and per-dtype looser tolerances (col2im plus gemm fallback loses more
+        # accuracy).
         # when torch.ops.mkldnn._is_mkldnn_bf16_supported() or torch.ops.mkldnn._is_mkldnn_fp16_supported()
         # returns false, bf16/fp16 CPU conv will fall back to thnn impl
         support_checks = {
@@ -524,6 +636,11 @@ class TestMkldnn(TestCase):
             self._test_conv_deconv_nhwc_base(torch.nn.ConvTranspose3d, torch.channels_last_3d, dtype=dtype, prec=prec)
 
     def _test_conv_transpose_base(self, dim):
+        # [FUNCTION DOC] HELPER: Shared body for transposed conv tests, dim 1, 2 or 3. Over
+        # train mode, bias, dilation and groups, compares the default (mkldnn) transposed
+        # conv with a deep copy run with mkldnn disabled, at the test precision when non-
+        # zero. In train mode also compares input gradients, weight gradients (tolerance
+        # 1e-3) and bias gradients.
         conv_module = {
             1: torch.nn.ConvTranspose1d,
             2: torch.nn.ConvTranspose2d,
@@ -579,17 +696,29 @@ class TestMkldnn(TestCase):
 
     @reduced_f32_on_and_off()
     def test_conv_transpose1d(self):
+        # [FUNCTION DOC] Runs the shared transposed conv test for dimension one, with
+        # reduced fp32 precision modes on and off.
         self._test_conv_transpose_base(dim=1)
 
     @reduced_f32_on_and_off()
     def test_conv_transpose2d(self):
+        # [FUNCTION DOC] Runs the shared transposed conv test for dimension two, with
+        # reduced fp32 precision modes on and off.
         self._test_conv_transpose_base(dim=2)
 
     @reduced_f32_on_and_off()
     def test_conv_transpose3d(self):
+        # [FUNCTION DOC] Runs the shared transposed conv test for dimension three, with
+        # reduced fp32 precision modes on and off.
         self._test_conv_transpose_base(dim=3)
 
     def test_conv2d_legacy_jit_model(self):
+        # [FUNCTION DOC] Builds a grouped Conv2d converted to mkldnn, replaces its weight
+        # with a five dimensional mkldnn weight (groups as a leading dim) mimicking the
+        # legacy serialization format, saves it with jit.save to a temporary file and loads
+        # it back. Asserts the legacy module has a five dimensional weight, the loaded one
+        # four dimensional, and that the loaded module output on an mkldnn input equals the
+        # dense conv output.
         """
         MKLDNN integration used to serialize models with 5d weight for grouped
         convolutions, we'd like to preserve this behavior
@@ -618,6 +747,9 @@ class TestMkldnn(TestCase):
     # This test is to check whether 1D conv is supported for mkldnn tensor,
     # which is exposed by Issue https://github.com/pytorch/pytorch/issues/68034.
     def test_conv1d_functional(self):
+        # [FUNCTION DOC] Regression test for issue 68034: calls functional conv1d with
+        # mkldnn layout input, weight and bias (2x3x10 input, 3x3x3 weight) and asserts the
+        # output size is 2x3x8.
         input = torch.randn(2, 3, 10).to_mkldnn()
         weight = torch.randn(3, 3, 3).to_mkldnn()
         bias = torch.randn(3).to_mkldnn()
@@ -625,6 +757,9 @@ class TestMkldnn(TestCase):
         self.assertEqual(output.size(), torch.Size([2, 3, 8]))
 
     def test_relu(self):
+        # [FUNCTION DOC] Compares relu on a random dense tensor with relu on its mkldnn
+        # copy, for the output values and the input gradient after backward through the sum
+        # of the outputs.
         x = torch.randn((4, 5), dtype=torch.float32) * 10
         x1 = x.clone().requires_grad_()
         x2 = x.clone().to_mkldnn().requires_grad_()
@@ -638,6 +773,8 @@ class TestMkldnn(TestCase):
         self.assertEqual(x1.grad, x2.grad.to_dense())
 
     def test_relu_(self):
+        # [FUNCTION DOC] Same as the relu test but with the in-place relu applied to clones,
+        # comparing dense and mkldnn outputs and input gradients.
         x = torch.randn((4, 5), dtype=torch.float32) * 10
         x1 = x.clone().requires_grad_()
         x2 = x.clone().to_mkldnn().requires_grad_()
@@ -652,6 +789,11 @@ class TestMkldnn(TestCase):
 
     @unittest.skipIf(IS_WINDOWS, "Limit support for bf16 path")
     def _test_relu_bf16_base(self, name):
+        # [FUNCTION DOC] HELPER: Shared body for bfloat16 relu tests, taking the name of the
+        # torch function. If oneDNN supports bf16, compares the float mkldnn result with the
+        # bf16 mkldnn result converted to float (loose tolerance); otherwise asserts a
+        # RuntimeError about missing CPU instruction support. Decorated to be skipped on
+        # Windows, which also makes any call to this helper skip there.
         x = torch.randn((4, 5), dtype=torch.float32) * 10
         x_bf16 = x.bfloat16()
         fn = getattr(torch, name)
@@ -666,12 +808,16 @@ class TestMkldnn(TestCase):
                                    lambda: fn(x_bf16.to_mkldnn()))
 
     def test_relu_bf16(self):
+        # [FUNCTION DOC] Runs the bf16 helper for the out-of-place relu.
         self._test_relu_bf16_base("relu")
 
     def test_relu_inplace_bf16(self):
+        # [FUNCTION DOC] Runs the bf16 helper for the in-place relu.
         self._test_relu_bf16_base("relu_")
 
     def test_gelu(self):
+        # [FUNCTION DOC] Compares GELU on a dense tensor and its mkldnn copy for output and
+        # input gradient after backward.
         m = torch.nn.GELU()
         x = torch.randn((4, 5), dtype=torch.float32) * 10
         x1 = x.clone().requires_grad_()
@@ -687,6 +833,10 @@ class TestMkldnn(TestCase):
 
     @unittest.skipIf(IS_WINDOWS, "Limit support for bf16 path")
     def test_gelu_bf16(self):
+        # [FUNCTION DOC] Compares GELU on a float mkldnn tensor with a bfloat16 mkldnn
+        # tensor, for the output (tolerance 0.1) and gradient (tolerance 1e-2) when bf16 is
+        # supported by oneDNN; otherwise asserts a RuntimeError about missing CPU
+        # instruction support. Skipped on Windows.
         m = torch.nn.GELU()
         x = torch.randn((4, 5), dtype=torch.float32) * 10
         x1 = x.clone().to_mkldnn().requires_grad_()
@@ -707,6 +857,10 @@ class TestMkldnn(TestCase):
                                    lambda: m(x2))
 
     def _test_prelu_base(self, size, num_channels):
+        # [FUNCTION DOC] HELPER: Shared body for PReLU tests, given an input size and
+        # channel count. Compares dense PReLU, a fully mkldnn converted PReLU, and a PReLU
+        # holding dense weights but fed an mkldnn input, checking outputs and input
+        # gradients agree.
         x = torch.randn(size, dtype=torch.float32)
         x1 = x.clone().requires_grad_()
         x2 = x.clone().to_mkldnn().requires_grad_()
@@ -729,6 +883,8 @@ class TestMkldnn(TestCase):
         self.assertEqual(x1.grad, x3.grad.to_dense())
 
     def test_prelu(self):
+        # [FUNCTION DOC] Runs the PReLU helper for inputs of rank one to five (the last with
+        # a trailing dimension of one) with one shared slope or one per channel of 64.
         self._test_prelu_base(torch.Size([16]), 1)
         self._test_prelu_base(torch.Size([16, 64]), 1)
         self._test_prelu_base(torch.Size([16, 64]), 64)
@@ -741,6 +897,11 @@ class TestMkldnn(TestCase):
 
     @unittest.skipIf(IS_WINDOWS, "Limit support for bf16 path")
     def _test_prelu_bf16_base(self, size, num_channels):
+        # [FUNCTION DOC] HELPER: Shared body for bfloat16 PReLU tests. If oneDNN supports
+        # bf16, compares float and bf16 mkldnn converted PReLU outputs and input gradients;
+        # otherwise asserts a RuntimeError about missing CPU instruction support when
+        # running the bf16 module. The channel count argument is unused (the module is
+        # always built with its default single slope). Skipped on Windows.
         if torch.ops.mkldnn._is_mkldnn_bf16_supported():
             x = torch.randn(size, dtype=torch.float32)
             x_fp32 = x.clone().to_mkldnn().requires_grad_()
@@ -766,6 +927,8 @@ class TestMkldnn(TestCase):
                                    lambda: m_bf16(x_bf16))
 
     def test_prelu_bf16(self):
+        # [FUNCTION DOC] Runs the bf16 PReLU helper for several input ranks and channel
+        # arguments.
         self._test_prelu_bf16_base(torch.Size([16]), 1)
         self._test_prelu_bf16_base(torch.Size([16, 64]), 1)
         self._test_prelu_bf16_base(torch.Size([16, 64]), 64)
@@ -775,6 +938,10 @@ class TestMkldnn(TestCase):
         self._test_prelu_bf16_base(torch.Size([16, 64, 112, 112, 1]), 64)
 
     def _test_max_pool_base(self, dim, input):
+        # [FUNCTION DOC] HELPER: Shared body for max pool tests, with dim 2 or 3 and an
+        # input tensor. Over strides one to three and ceil mode off or on (kernel 3 or 7,
+        # padding 1), compares dense max pooling with the mkldnn tensor result for output
+        # and input gradient.
         pool_module = {2: torch.nn.MaxPool2d, 3: torch.nn.MaxPool3d}
         for stride in [1, 2, 3]:
             for ceil_mode in [False, True]:
@@ -796,6 +963,8 @@ class TestMkldnn(TestCase):
                 self.assertEqual(x1.grad, x2.grad.to_dense())
 
     def test_max_pool2d(self):
+        # [FUNCTION DOC] Runs the max pool helper for 2d with random batch and channel
+        # counts and several spatial sizes.
         N = torch.randint(3, 10, (1,)).item()
         C = torch.randint(3, 10, (1,)).item()
         for H, W in [(64, 64), (35, 39), (16, 19), [7, 8]]:
@@ -803,6 +972,8 @@ class TestMkldnn(TestCase):
             self._test_max_pool_base(dim=2, input=x)
 
     def test_max_pool3d(self):
+        # [FUNCTION DOC] Runs the max pool helper for 3d with random batch and channel
+        # counts and several spatial sizes.
         N = torch.randint(3, 10, (1,)).item()
         C = torch.randint(3, 10, (1,)).item()
         for D, H, W in [(64, 64, 64), (35, 39, 35), (16, 19, 20), [7, 8, 9]]:
@@ -812,6 +983,10 @@ class TestMkldnn(TestCase):
 
     @unittest.skipIf(IS_WINDOWS, "Limit support for bf16 path")
     def _test_max_pool_bf16_base(self, dim, input):
+        # [FUNCTION DOC] HELPER: Shared body for bf16 max pool tests with dim 2 or 3. Over
+        # strides and ceil modes, compares float and bf16 mkldnn results when oneDNN
+        # supports bf16, otherwise asserts a RuntimeError naming the pooling op and missing
+        # CPU support. Skipped on Windows.
         pool_module = {2: torch.nn.MaxPool2d, 3: torch.nn.MaxPool3d}
         x_bf16 = input.bfloat16()
         for stride in [1, 2, 3]:
@@ -833,6 +1008,7 @@ class TestMkldnn(TestCase):
                                            lambda: max_pool(x_bf16.to_mkldnn()))
 
     def test_max_pool2d_bf16(self):
+        # [FUNCTION DOC] Runs the bf16 max pool helper for 2d inputs of several sizes.
         N = torch.randint(3, 10, (1,)).item()
         C = torch.randint(3, 10, (1,)).item()
         for H, W in [(64, 64), (35, 39), (16, 19), [7, 8]]:
@@ -840,6 +1016,7 @@ class TestMkldnn(TestCase):
             self._test_max_pool_bf16_base(dim=2, input=x)
 
     def test_max_pool3d_bf16(self):
+        # [FUNCTION DOC] Runs the bf16 max pool helper for 3d inputs of several sizes.
         N = torch.randint(3, 10, (1,)).item()
         C = torch.randint(3, 10, (1,)).item()
         for D, H, W in [(64, 64, 64), (35, 39, 35), (16, 19, 20), [7, 8, 9]]:
@@ -847,6 +1024,9 @@ class TestMkldnn(TestCase):
             self._test_max_pool_bf16_base(dim=3, input=x)
 
     def test_max_pool2d_stride_none(self):
+        # [FUNCTION DOC] Compares functional max_pool2d with no stride given (defaults to
+        # the kernel size) on dense and mkldnn inputs, for several sizes and both ceil
+        # modes.
         N = torch.randint(3, 10, (1,)).item()
         C = torch.randint(3, 10, (1,)).item()
 
@@ -872,6 +1052,9 @@ class TestMkldnn(TestCase):
     # https://github.com/pytorch/pytorch/issues/127111
     @xfailIfTorchDynamo
     def test_max_pool_unsupported(self):
+        # [FUNCTION DOC] Asserts that max pooling with dilation on a 2d or 3d mkldnn tensor
+        # raises a RuntimeError saying dilation is not supported. Expected failure under
+        # TorchDynamo (issue 127111).
         # OneDNN not support dilation max_pooling, will be avilabled in v2.0.
         N = torch.randint(3, 10, (1,)).item()
         C = torch.randint(3, 10, (1,)).item()
@@ -899,6 +1082,10 @@ class TestMkldnn(TestCase):
                                lambda: max_pool3d(x))
 
     def _test_avg_pool_base(self, dim, input):
+        # [FUNCTION DOC] HELPER: Shared body for average pool tests, dim 2 or 3 with an
+        # input tensor. For count_include_pad on and off (kernel 3, stride 2, padding 1)
+        # compares dense average pooling with the mkldnn result on output and input
+        # gradient.
         avg_module = {2: torch.nn.AvgPool2d, 3: torch.nn.AvgPool3d}
         for count_include_pad in [True, False]:
             avg_pool = avg_module[dim](
@@ -919,12 +1106,16 @@ class TestMkldnn(TestCase):
             self.assertEqual(x1.grad, x2.grad.to_dense())
 
     def test_avg_pool2d(self):
+        # [FUNCTION DOC] Runs the average pool helper on a random 2d input with random batch
+        # and channel counts and 64 by 64 spatial size.
         N = torch.randint(3, 10, (1,)).item()
         C = torch.randint(3, 10, (1,)).item()
         x = torch.randn(N, C, 64, 64, dtype=torch.float32) * 10
         self._test_avg_pool_base(dim=2, input=x)
 
     def test_avg_pool3d(self):
+        # [FUNCTION DOC] Runs the average pool helper on a random 3d input with random batch
+        # and channel counts and 64 cubed spatial size.
         N = torch.randint(3, 10, (1,)).item()
         C = torch.randint(3, 10, (1,)).item()
         x = torch.randn(N, C, 64, 64, 64, dtype=torch.float32) * 10
@@ -932,6 +1123,9 @@ class TestMkldnn(TestCase):
 
     @unittest.skipIf(IS_WINDOWS, "Limit support for bf16 path")
     def _test_avg_pool_bf16_base(self, dim, input):
+        # [FUNCTION DOC] HELPER: Shared body for bf16 average pool tests, dim 2 or 3. When
+        # oneDNN supports bf16, compares float and bf16 mkldnn pooled results; otherwise
+        # asserts a RuntimeError naming the op and missing CPU support. Skipped on Windows.
         avg_module = {2: torch.nn.AvgPool2d, 3: torch.nn.AvgPool3d}
         x_bf16 = input.bfloat16()
         for count_include_pad in [True, False]:
@@ -951,18 +1145,22 @@ class TestMkldnn(TestCase):
                                        lambda: avg_pool(x_bf16.to_mkldnn()))
 
     def test_avg_pool2d_bf16(self):
+        # [FUNCTION DOC] Runs the bf16 average pool helper on a random 2d input.
         N = torch.randint(3, 10, (1,)).item()
         C = torch.randint(3, 10, (1,)).item()
         x = torch.randn(N, C, 64, 64, dtype=torch.float32) * 10
         self._test_avg_pool_bf16_base(dim=2, input=x)
 
     def test_avg_pool3d_bf16(self):
+        # [FUNCTION DOC] Runs the bf16 average pool helper on a random 3d input.
         N = torch.randint(3, 10, (1,)).item()
         C = torch.randint(3, 10, (1,)).item()
         x = torch.randn(N, C, 64, 64, 64, dtype=torch.float32) * 10
         self._test_avg_pool_bf16_base(dim=3, input=x)
 
     def test_avg_pool2d_stride_none(self):
+        # [FUNCTION DOC] Compares functional avg_pool2d with no stride given (defaults to
+        # the kernel size) on dense and mkldnn inputs, for count_include_pad on and off.
         N = torch.randint(3, 10, (1,)).item()
         C = torch.randint(3, 10, (1,)).item()
         x = torch.randn(N, C, 64, 64, dtype=torch.float32) * 10
@@ -984,6 +1182,8 @@ class TestMkldnn(TestCase):
             self.assertEqual(y1, y2.to_dense())
 
     def test_adaptive_avg_pool2d(self):
+        # [FUNCTION DOC] Compares AdaptiveAvgPool2d to output size seven on a 224 by 224
+        # dense input and its mkldnn copy, checking outputs and input gradients.
         N = torch.randint(3, 10, (1,)).item()
         C = torch.randint(3, 10, (1,)).item()
         x = torch.randn(N, C, 224, 224, dtype=torch.float32) * 100
@@ -1004,6 +1204,12 @@ class TestMkldnn(TestCase):
 
     @unittest.skipIf(IS_WINDOWS, "Limit support for bf16 path")
     def test_adaptive_avg_pool2d_bf16(self):
+        # [FUNCTION DOC] Adaptive average pooling bf16 check; skipped on Windows. If oneDNN
+        # supports bf16 it compares two mkldnn results, otherwise asserts a RuntimeError
+        # about missing CPU support when pooling a bf16 mkldnn tensor.
+        # KNOWN ISSUE: in the supported branch both results are computed from the float
+        # mkldnn tensor (the bf16 tensor is never used), so the comparison does not test
+        # bf16.
         N = torch.randint(3, 10, (1,)).item()
         C = torch.randint(3, 10, (1,)).item()
         x = torch.randn(N, C, 224, 224, dtype=torch.float32) * 100
@@ -1022,6 +1228,10 @@ class TestMkldnn(TestCase):
                                    lambda: adaptive_avg_pool2d(x_bf16.to_mkldnn()))
 
     def _test_batch_norm_base(self, dim, channels, input):
+        # [FUNCTION DOC] HELPER: Shared body for eval mode batch norm; takes dim 2 or 3,
+        # channel count and input. Compares dense batch norm with the mkldnn converted copy
+        # on an mkldnn input, then runs the serialization and tracing round trip helpers on
+        # the converted module.
         bn_module = {2 : torch.nn.BatchNorm2d, 3 : torch.nn.BatchNorm3d}
         bn = bn_module[dim](channels).float().train(False)
         mkldnn_bn = mkldnn_utils.to_mkldnn(copy.deepcopy(bn))
@@ -1033,6 +1243,10 @@ class TestMkldnn(TestCase):
         self._test_tracing(mkldnn_bn, (input.to_mkldnn(),))
 
     def _test_batch_norm_train_base(self, dim, channels, input):
+        # [FUNCTION DOC] HELPER: Shared body for training mode batch norm (2d only). For
+        # affine on and track_running_stats on or off, compares dense batch norm with a deep
+        # copy run on an mkldnn input: outputs, input gradient, weight gradient and, when
+        # tracked, running mean and variance.
         # TODO: support 3d batchnorm training.
         bn_module = {2 : torch.nn.BatchNorm2d}
         # TODO: support none affine.
@@ -1059,6 +1273,8 @@ class TestMkldnn(TestCase):
                 self.assertEqual(bn.running_var, mkldnn_bn.running_var, rtol=1e-5, atol=1e-5)
 
     def test_batch_norm_2d(self):
+        # [FUNCTION DOC] Runs the eval and train batch norm helpers on a random 4d input
+        # with random batch and channel counts.
         N = torch.randint(3, 10, (1,)).item()
         C = torch.randint(3, 100, (1,)).item()
         x = torch.randn(N, C, 35, 45, dtype=torch.float32) * 10
@@ -1066,6 +1282,8 @@ class TestMkldnn(TestCase):
         self._test_batch_norm_train_base(dim=2, channels=C, input=x)
 
     def test_batch_norm_3d(self):
+        # [FUNCTION DOC] Runs the eval mode batch norm helper on a random 5d input (3d
+        # training is not tested).
         N = torch.randint(3, 10, (1,)).item()
         C = torch.randint(3, 100, (1,)).item()
         x = torch.randn(N, C, 30, 30, 30, dtype=torch.float32) * 10
@@ -1073,6 +1291,13 @@ class TestMkldnn(TestCase):
 
     @unittest.skipIf(IS_WINDOWS, "Limit support for bf16 path")
     def _test_batch_norm_bf16_base(self, dim, channels, input):
+        # [FUNCTION DOC] HELPER: Shared body for bf16 batch norm tests (eval only). Skipped
+        # on Windows. When oneDNN supports bf16 it compares two dense batch norm results;
+        # otherwise asserts a RuntimeError about missing CPU support for a bf16 mkldnn
+        # input.
+        # KNOWN ISSUE: in the supported branch the dense module is applied twice to float
+        # data (the converted mkldnn module and the bf16 tensor are never used), so bf16 is
+        # not tested.
         bn_module = {2 : torch.nn.BatchNorm2d, 3 : torch.nn.BatchNorm3d}
         x_bf16 = input.bfloat16()
         # TODO: support training
@@ -1090,18 +1315,23 @@ class TestMkldnn(TestCase):
                                        lambda: bn(x_bf16.to_mkldnn()))
 
     def test_batch_norm_2d_bf16(self):
+        # [FUNCTION DOC] Runs the bf16 batch norm helper on a random 4d input.
         N = torch.randint(3, 10, (1,)).item()
         C = torch.randint(3, 100, (1,)).item()
         x = torch.randn(N, C, 35, 45, dtype=torch.float32) * 10
         self._test_batch_norm_bf16_base(dim=2, channels=C, input=x)
 
     def test_batch_norm_3d_bf16(self):
+        # [FUNCTION DOC] Runs the bf16 batch norm helper on a random 5d input.
         N = torch.randint(3, 10, (1,)).item()
         C = torch.randint(3, 100, (1,)).item()
         x = torch.randn(N, C, 30, 30, 30, dtype=torch.float32) * 10
         self._test_batch_norm_bf16_base(dim=3, channels=C, input=x)
 
     def test_add(self):
+        # [FUNCTION DOC] Compares dense and mkldnn tensor addition: operator, function with
+        # alpha, in-place add, add with an out argument, and out aliasing the first or the
+        # second input.
         N = torch.randint(3, 10, (1,)).item()
         C = torch.randint(3, 100, (1,)).item()
         alpha = torch.randn(1, dtype=torch.float32).item()
@@ -1143,6 +1373,8 @@ class TestMkldnn(TestCase):
         self.assertEqual(y, my.to_dense())
 
     def test_mul(self):
+        # [FUNCTION DOC] Compares dense and mkldnn multiplication by a tensor and by a
+        # Python scalar: operator, function, in-place and out argument variants.
         N = torch.randint(3, 10, (1,)).item()
         C = torch.randint(3, 100, (1,)).item()
         value = torch.randn(1, dtype=torch.float32).item()
@@ -1192,6 +1424,11 @@ class TestMkldnn(TestCase):
         self.assertEqual(out, mkldnn_out.to_dense())
 
     def test_0_dimension_tensor(self):
+        # [FUNCTION DOC] Checks mkldnn behavior with tensors having a zero sized dimension:
+        # relu, multiplication and addition match dense results; adding mkldnn tensors that
+        # require grad raises a RuntimeError about zero dimension tensors in training,
+        # mismatched sizes raise a RuntimeError saying they must match, and a converted
+        # Conv2d on an empty batch matches the eager result.
         x = torch.rand([20, 20, 1, 1], dtype=torch.float)
         y = torch.rand([20, 20, 0, 1], dtype=torch.float)
 
@@ -1226,12 +1463,18 @@ class TestMkldnn(TestCase):
     # https://github.com/pytorch/pytorch/issues/127111
     @xfailIfTorchDynamo
     def test_view(self):
+        # [FUNCTION DOC] Asserts that calling view on an mkldnn tensor raises a RuntimeError
+        # telling the user to use reshape. Expected failure under TorchDynamo (issue
+        # 127111).
         x = torch.randn(3, 4, 5, dtype=torch.float32).to_mkldnn()
         self.assertRaisesRegex(RuntimeError,
                                "Change to use reshape",
                                lambda: x.view(x.size(0), -1))
 
     def test_reshape(self):
+        # [FUNCTION DOC] Checks mkldnn reshape with an inferred dimension matches the dense
+        # reshape and that an in-place add on a reshaped plain format tensor is visible
+        # through the original (shared memory).
         x = torch.randn(3, 4, 5, dtype=torch.float32) * 10
         size = (x.size(0), -1)
 
@@ -1248,6 +1491,9 @@ class TestMkldnn(TestCase):
         )
 
     def test_reshape_blocked_format(self):
+        # [FUNCTION DOC] Builds a blocked layout mkldnn tensor by running a converted
+        # Conv2d, then checks that reshaping it gives the same values as reshaping its dense
+        # copy.
         # construct an mkldnn blocked tensor with mkldnn conv2d
         C = 7
         m = mkldnn_utils.to_mkldnn(torch.nn.Conv2d(C, C, 3))
@@ -1264,6 +1510,8 @@ class TestMkldnn(TestCase):
         self.assertEqual(y_plain_reshape, y_block_reshape.to_dense())
 
     def test_reshape_backward(self):
+        # [FUNCTION DOC] Checks the gradient flowing back through an mkldnn reshape, to
+        # dense, then Linear chain equals that of the dense reshape and Linear chain.
         x = torch.randn(3, 4, 5, dtype=torch.float32) * 10
         size = (x.size(0), -1)
 
@@ -1280,6 +1528,9 @@ class TestMkldnn(TestCase):
         self.assertEqual(x1.grad, x2.grad.to_dense())
 
     def test_clone(self):
+        # [FUNCTION DOC] Checks mkldnn clone matches the dense clone and that the clone does
+        # not share memory (an in-place add on the clone leaves the source different from
+        # the result).
         x = torch.randn(4, 5, dtype=torch.float32) * 10
         self.assertEqual(
             x.clone(),
@@ -1294,6 +1545,8 @@ class TestMkldnn(TestCase):
         )
 
     def test_transpose(self):
+        # [FUNCTION DOC] Compares mkldnn transpose with dense transpose over all pairs of
+        # dimensions of a rank three tensor.
         x = torch.randn(3, 4, 5, dtype=torch.float32) * 10
         for dim1 in range(x.ndim):
             for dim2 in range(x.ndim):
@@ -1303,11 +1556,18 @@ class TestMkldnn(TestCase):
                 )
 
     def test_transpose_invalid_dime(self):
+        # [FUNCTION DOC] Asserts that the raw mkldnn transpose with an out of range
+        # dimension raises an IndexError saying the dimension is out of range.
         x = torch.randn(3, 4, 5, dtype=torch.float32).to_mkldnn()
         with self.assertRaisesRegex(IndexError, "Dimension out of range"):
             torch._mkldnn_transpose(x, 0, 12)
 
     def test_linear_non_contiguous_weight(self):
+        # [FUNCTION DOC] Compares a Linear whose weight is a transposed (non contiguous)
+        # view, run on dense and mkldnn inputs, for input gradient and weight gradient (bias
+        # gradient when bias is enabled).
+        # KNOWN ISSUE: the bias flag is only used for the final check; the layer is always
+        # built with a bias, so the bias-off case is not really exercised.
         in_features = torch.randint(3, 10, (1,)).item()
         out_features = torch.randint(3, 100, (1,)).item()
         x = torch.randn(3, in_features, dtype=torch.float32) * 10
@@ -1328,6 +1588,9 @@ class TestMkldnn(TestCase):
                 self.assertEqual(linear.bias.grad, mkldnn_linear.bias.grad)
 
     def test_linear(self):
+        # [FUNCTION DOC] Compares a dense Linear with the mkldnn converted copy on an mkldnn
+        # input, with and without bias, then runs the serialization and tracing helpers on
+        # the converted module.
         in_features = torch.randint(3, 10, (1,)).item()
         out_features = torch.randint(3, 100, (1,)).item()
         x = torch.randn(3, in_features, dtype=torch.float32) * 10
@@ -1343,6 +1606,10 @@ class TestMkldnn(TestCase):
             self._test_tracing(mkldnn_linear, (x.to_mkldnn(),))
 
     def test_linear_backward(self):
+        # [FUNCTION DOC] Compares input, weight and (when enabled) bias gradients of a dense
+        # Linear with an identical copy run on an mkldnn input.
+        # KNOWN ISSUE: the bias flag only gates the final bias gradient check; the Linear is
+        # always built with a bias, so the no-bias case is not really exercised.
         in_features = torch.randint(3, 10, (1,)).item()
         out_features = torch.randint(3, 100, (1,)).item()
         x = torch.randn(3, in_features, dtype=torch.float32) * 10
@@ -1362,6 +1629,11 @@ class TestMkldnn(TestCase):
 
     @dtypes(torch.float16, torch.bfloat16)
     def test_linear_lowp(self, dtype):
+        # [FUNCTION DOC] For half or bfloat16 and bias on or off, compares an mkldnn
+        # converted float Linear with an mkldnn converted lower precision Linear on lowered
+        # input (tolerance 0.1 for bf16, 5e-3 for half) when oneDNN supports the dtype;
+        # otherwise asserts a RuntimeError naming the missing CPU instruction support.
+        # Device-generic hooks are applied to this class.
         in_features = torch.randint(3, 10, (1,)).item()
         out_features = torch.randint(3, 100, (1,)).item()
         x = torch.randn(3, in_features, dtype=torch.float32) * 10
@@ -1398,6 +1670,8 @@ class TestMkldnn(TestCase):
                 )
 
     def test_softmax(self):
+        # [FUNCTION DOC] Compares Softmax over every dimension of a rank three tensor on
+        # dense and mkldnn inputs.
         x = torch.randn(3, 4, 5, dtype=torch.float32) * 10
         for dim in range(x.ndim):
             softmax = torch.nn.Softmax(dim=dim)
@@ -1406,6 +1680,8 @@ class TestMkldnn(TestCase):
                 softmax(x.to_mkldnn()).to_dense())
 
     def test_sigmoid(self):
+        # [FUNCTION DOC] Compares sigmoid on dense and mkldnn tensors, then the in-place
+        # version on both.
         x = torch.randn(4, 5, dtype=torch.float32) * 10
         mkldnn_x = x.to_mkldnn()
         self.assertEqual(
@@ -1418,6 +1694,8 @@ class TestMkldnn(TestCase):
         self.assertEqual(x, mkldnn_x.to_dense())
 
     def test_tanh(self):
+        # [FUNCTION DOC] Compares tanh on dense and mkldnn tensors, then the in-place
+        # version on both.
         x = torch.randn(4, 5, dtype=torch.float32) * 10
         mkldnn_x = x.to_mkldnn()
         self.assertEqual(
@@ -1430,6 +1708,9 @@ class TestMkldnn(TestCase):
         self.assertEqual(x, mkldnn_x.to_dense())
 
     def _test_serialization(self, module, inputs):
+        # [FUNCTION DOC] HELPER: Saves a module with jit.save to a temporary file, loads it
+        # back and asserts the original and loaded modules give the same dense outputs for
+        # the inputs.
         with TemporaryFileName() as fname:
             torch.jit.save(module, fname)
             loaded = torch.jit.load(fname)
@@ -1438,12 +1719,17 @@ class TestMkldnn(TestCase):
                 loaded(*inputs).to_dense())
 
     def _test_tracing(self, module, inputs):
+        # [FUNCTION DOC] HELPER: Traces the module with the given example inputs and asserts
+        # the eager and traced modules give the same dense outputs.
         traced = torch.jit.trace(module, inputs)
         self.assertEqual(
             module(*inputs).to_dense(),
             traced(*inputs).to_dense())
 
     def test_set_data_tensorimpl_type(self):
+        # [FUNCTION DOC] Asserts that assigning an mkldnn tensor to the data attribute of a
+        # dense tensor raises a RuntimeError about incompatible tensor types (the two use
+        # different tensor implementation classes).
         # Dense tensor has impl of type `TensorImpl`, while MKL-DNN tensor has impl
         # of type `OpaqueTensorImpl<IDeepTensorWrapperPtr>`.
         x = torch.randn((1, 2), dtype=torch.float, device=torch.device('cpu'))
@@ -1452,12 +1738,16 @@ class TestMkldnn(TestCase):
             x.data = x_mkldnn
 
     def test_empty(self):
+        # [FUNCTION DOC] Creates an empty tensor with the mkldnn layout and checks that,
+        # after conversion to dense, its size and dtype match a normal empty tensor.
         x1 = torch.empty(4, 5, 2, 3, dtype=torch.float32)
         x2 = torch.empty(4, 5, 2, 3, dtype=torch.float32, layout=torch._mkldnn)
         self.assertEqual(x1.size(), x2.to_dense().size())
         self.assertEqual(x1.dtype, x2.to_dense().dtype)
 
     def test_zero_(self):
+        # [FUNCTION DOC] Checks in-place zeroing gives the same values on a dense tensor and
+        # on its mkldnn copy.
         x1 = torch.randn(4, 5, dtype=torch.float32) * 10
         x2 = x1.clone().to_mkldnn()
         self.assertEqual(
@@ -1466,6 +1756,8 @@ class TestMkldnn(TestCase):
         )
 
     def test_is_mkldnn(self):
+        # [FUNCTION DOC] Checks the is_mkldnn attribute is false for dense tensors and true
+        # after conversion.
         x = torch.randn(1, dtype=torch.float32)
         self.assertFalse(x.is_mkldnn)
         self.assertTrue(x.to_mkldnn().is_mkldnn)
@@ -1473,6 +1765,9 @@ class TestMkldnn(TestCase):
     # legacy constructor/new doesn't support mkldnn tensors
     @skipIfTorchDynamo("https://github.com/pytorch/torchdynamo/issues/1992")
     def test_legacy_new_failure(self):
+        # [FUNCTION DOC] Asserts the legacy new constructor raises a RuntimeError on an
+        # mkldnn tensor for device, storage, tensor, size and list arguments. Skipped under
+        # TorchDynamo.
         x = torch.randn(1, dtype=torch.float32)
         x_mkldnn = x.to_mkldnn()
         self.assertRaises(RuntimeError, lambda: x_mkldnn.new(device='cpu'))
@@ -1482,9 +1777,15 @@ class TestMkldnn(TestCase):
         self.assertRaises(RuntimeError, lambda: x_mkldnn.new([6]))
 
     def test_is_mkldnn_jit(self):
+        # [FUNCTION DOC] Checks the is_mkldnn attribute works inside a scripted module: the
+        # module converts a dense input to mkldnn and leaves an mkldnn input alone, so both
+        # calls return an mkldnn tensor.
         class EnsureMkldnn(torch.jit.ScriptModule):
+            # [CLASS DOC] HELPER: Script module with one script method forward.
             @torch.jit.script_method
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Returns the input converted to mkldnn if it is not
+                # already mkldnn.
                 if not x.is_mkldnn:
                     x = x.to_mkldnn()
                 return x
@@ -1495,6 +1796,9 @@ class TestMkldnn(TestCase):
         self.assertTrue(m(x.to_mkldnn()).is_mkldnn)
 
     def _test_imagenet_model(self, model):
+        # [FUNCTION DOC] HELPER: Puts the model in eval mode and float, converts a deep copy
+        # to mkldnn, and under no-grad compares the dense model with the converted model on
+        # a random 1x3x224x224 input.
         model = model.train(False).float()
         mkldnn_model = mkldnn_utils.to_mkldnn(copy.deepcopy(model))
         x = torch.randn(1, 3, 224, 224, dtype=torch.float32)
@@ -1506,15 +1810,22 @@ class TestMkldnn(TestCase):
 
     @skipIfNoTorchVision
     def test_resnet18(self):
+        # [FUNCTION DOC] Runs the ImageNet model comparison on torchvision resnet18 without
+        # weights. Skipped when torchvision is missing.
         model = torchvision.models.resnet.resnet18(weights=None)
         self._test_imagenet_model(model)
 
     @skipIfNoTorchVision
     def test_resnext50_32x4d(self):
+        # [FUNCTION DOC] Runs the ImageNet model comparison on torchvision resnext50 32x4d
+        # without weights. Skipped when torchvision is missing.
         model = torchvision.models.resnet.resnext50_32x4d(weights=None)
         self._test_imagenet_model(model)
 
     def _lstm_params_list(self):
+        # [FUNCTION DOC] HELPER: Returns the list of value lists for the LSTM grid: input
+        # size, hidden size, layer count, bidirectional, bias, batch first, dropout (0, 0.4,
+        # 0.7, 1), batch size, sequence length and training flag.
         params_dict = {
             "input_size": [1, 5],
             "hidden_size": [5, 16],
@@ -1532,6 +1843,8 @@ class TestMkldnn(TestCase):
         return params_list
 
     def _cast_dtype(self, input, dtype):
+        # [FUNCTION DOC] HELPER: Converts a tensor or module to bfloat16 or half when that
+        # dtype is requested, otherwise returns it unchanged.
         if dtype == torch.bfloat16:
             input = input.to(torch.bfloat16)
         elif dtype == torch.half:
@@ -1539,6 +1852,12 @@ class TestMkldnn(TestCase):
         return input
 
     def test_lstm(self):
+        # [FUNCTION DOC] Seeds the RNG, then for each dtype among float, bfloat16 and half
+        # (with dtype specific tolerances) and every combination of the LSTM parameter grid,
+        # runs the same LSTM with the mkldnn backend disabled and enabled under the same
+        # seed, comparing outputs and final hidden and cell states. Half precision is forced
+        # to inference. In training mode it also backpropagates from the output, hidden and
+        # cell sums and compares input, hidden, cell and parameter gradients.
         seed = 2023
         torch.manual_seed(seed)
 
@@ -1637,12 +1956,19 @@ class TestMkldnn(TestCase):
 
     @dtypes(torch.float16, torch.bfloat16)
     def test_matmul_lower_precision(self, dtype):
+        # [FUNCTION DOC] For half or bfloat16, if oneDNN supports the dtype: checks that
+        # batched matmul gives equal results for a tensor and for a contiguous copy with
+        # non-default strides, then compares matmul and batched matmul results on several
+        # shapes against float reference results (exact dtype not required).
         support_check = {
             torch.bfloat16: torch.ops.mkldnn._is_mkldnn_bf16_supported,
             torch.float16: torch.ops.mkldnn._is_mkldnn_fp16_supported,
         }
 
         def common(self, shape1, shape2, op, dtype):
+            # [FUNCTION DOC] HELPER: Builds random operands of the two shapes in the given
+            # dtype, applies the op to them and to float copies, and asserts the results are
+            # equal ignoring dtype.
             a = torch.randn(shape1, dtype=dtype)
             a_ref = a.float()
             b = torch.randn(shape2, dtype=dtype)
@@ -1675,6 +2001,10 @@ class TestMkldnn(TestCase):
                 common(self, shape1, shape2, op, dtype)
 
     def test_mkldnn_setflags_nowarn(self, device):
+        # [FUNCTION DOC] Regression test for issue 149829: reads the current mkldnn flags
+        # using set_flags with no arguments and sets them back, recording warnings; asserts
+        # no warning was emitted. Device-generic variant taking a device argument that is
+        # unused.
         # Regression test for https://github.com/pytorch/pytorch/issues/149829
         with warnings.catch_warnings(record=True) as w:
             rc = torch.backends.mkldnn.set_flags()
@@ -1685,12 +2015,20 @@ class TestMkldnn(TestCase):
         self.assertEqual(len(w), 0)
 
     def test_mkldnn_error_on_zero_stride(self, device):
+        # [FUNCTION DOC] Regression test for issue 149274: asserts the raw mkldnn max pool
+        # with stride zero raises a ValueError. Device-generic variant; the device argument
+        # is unused.
         # Regression test for https://github.com/pytorch/pytorch/issues/149274
         x = torch.rand(1, 2, 3, 3).to_mkldnn()
         with self.assertRaises(ValueError):
             torch.mkldnn_max_pool2d(x, kernel_size=3, stride=0)
 
     def test_mkldnn_scaled_mm(self, device) -> None:
+        # [FUNCTION DOC] For every pair of float8 formats for inputs and a set of output
+        # dtypes (skipping float8 outputs whose type differs from the first input type),
+        # compares the scaled matrix multiply op with random scales and a result scale
+        # against an emulation done in float, with tolerance 5e-2, and checks the output
+        # dtype. The tensors are created on the device given by the device-generic harness.
         # test with input scale, weight scale and output_scale
         M, N, K = 2, 13, 16
         x = torch.randn((M, K), device=device) / K
@@ -1722,6 +2060,9 @@ class TestMkldnn(TestCase):
 
     @recover_orig_fp32_precision
     def test_mlkdnn_get_set(self):
+        # [FUNCTION DOC] Checks the get and set interface for the fp32 precision setting of
+        # the mkldnn backend and its matmul, conv and rnn sub-settings across bf16, tf32 and
+        # none. The decorator restores the original precision settings afterwards.
         # get/set mkldnn ops
         with torch.backends.mkldnn.flags(enabled=None, fp32_precision="bf16"):
             self.assertEqual(torch.backends.mkldnn.fp32_precision, "bf16")
@@ -1753,6 +2094,9 @@ class TestMkldnn(TestCase):
 
     @recover_orig_fp32_precision
     def test_generic_precision(self):
+        # [FUNCTION DOC] Checks the generic backends level fp32 precision flag context
+        # manager sets and reads back none and tf32. The decorator restores original
+        # settings afterwards.
         with torch.backends.flags(fp32_precision="none"):
             self.assertEqual(torch.backends.fp32_precision, "none")
         with torch.backends.flags(fp32_precision="tf32"):
@@ -1760,6 +2104,10 @@ class TestMkldnn(TestCase):
 
     @recover_orig_fp32_precision
     def test_default_use_parent(self):
+        # [FUNCTION DOC] Checks that when the matmul precision is none, the matmul setting
+        # follows the mkldnn level flag, and when that is none it follows the generic
+        # backends level flag (bf16 and tf32 cases). The decorator restores original
+        # settings afterwards.
         torch.backends.mkldnn.matmul.fp32_precision = "none"
         with torch.backends.mkldnn.flags(enabled=None, fp32_precision="bf16"):
             self.assertEqual(torch.backends.mkldnn.matmul.fp32_precision, "bf16")

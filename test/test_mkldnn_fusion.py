@@ -1,4 +1,10 @@
 # Owner(s): ["module: mkldnn"]
+# [MODULE DOC] Tests for oneDNN (MKLDNN) fusion. Two groups: graph level checks that
+# TorchScript frozen conv models get conv plus pointwise ops fused by the NNC TensorExpr
+# fuser (only for channels-last 2d convs), and op level checks that the mkldnn pointwise
+# fused ops (linear, convolution, convolution transpose with unary or binary post ops) match
+# eager results. Defines the fusion group name constant, a post-op description tuple and
+# lookup tables of conv module classes. Imports test_tensorexpr.
 import itertools
 import unittest
 from typing import NamedTuple
@@ -14,6 +20,10 @@ from test_tensorexpr import warmup_and_run_forward
 FUSION_GROUP = 'prim::TensorExprGroup'
 
 class PointwisePostOp(NamedTuple):
+    # [CLASS DOC] HELPER: Named tuple describing a unary pointwise post op: attr is the
+    # oneDNN attribute name, pointwise_module the matching eager module, scalars the extra
+    # scalar arguments (default empty list shared across instances) and algorithm a string
+    # such as the gelu approximation mode (default empty string).
     attr : str
     pointwise_module : nn.Module
     scalars : list = []
@@ -25,11 +35,21 @@ CONV_TRANSPOSE_MODULES = {2: torch.nn.ConvTranspose2d}
 @skipIfTorchDynamo("too slow")
 @unittest.skipIf(not torch.backends.mkldnn.is_available(), "MKL-DNN build is disabled")
 class TestMkldnnFusion(JitTestCase):
+    # [CLASS DOC] Fusion tests run through the JIT test harness. The whole class is skipped
+    # under TorchDynamo (too slow) and when the MKL-DNN backend is not available.
     def assertFused(self, graph, fused_patterns):
+        # [FUNCTION DOC] Asserts for every pattern in the given list that the graph contains
+        # that node kind exactly zero times, i.e. each pattern has been fused away.
         for pat in fused_patterns:
             self.assertGraphContainsExactly(graph, pat, 0)
 
     def _check_model(self, m, x, trace=False):
+        # [FUNCTION DOC] HELPER: Compiles the module with tracing (when trace is true) or
+        # scripting, in eval mode and no-grad, freezes it, warms it up and runs it, and
+        # asserts the output matches the eager output. Temporarily disables fusion group
+        # inlining, enables CPU fusion and clears the must-use-LLVM flag for TensorExpr,
+        # restoring the three prior values before returning (not restored if an assertion
+        # fails). Returns the graph from the optimized scripted module for the given input.
         old_fusion_inlining = torch._C._debug_get_fusion_group_inlining()
         torch._C._debug_set_fusion_group_inlining(False)
 
@@ -61,12 +81,23 @@ class TestMkldnnFusion(JitTestCase):
         return graph
 
     def test_single_conv(self):
+        # [FUNCTION DOC] For each of two memory formats (contiguous, where fusion is
+        # expected to be off, and channels last, where it is on), traced and scripted
+        # compilation, and a grid of bias, dilation and groups, builds a single Conv2d model
+        # and checks the graph. When enabled, the conv node must be fused away and exactly
+        # one fusion group must exist; otherwise the conv node must still be present.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Wrapper module holding one Conv2d built from the given
+            # constructor arguments.
             def __init__(self, in_channels, out_channels, bias, **kwargs):
+                # [FUNCTION DOC] HELPER: Constructor; creates the Conv2d layer with
+                # channels, bias and extra keyword arguments.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(in_channels, out_channels, bias=bias, **kwargs)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the convolution to the input and returns
+                # the result.
                 res = self.conv(x)
                 return res
 
@@ -100,13 +131,23 @@ class TestMkldnnFusion(JitTestCase):
                         self.assertGraphContains(graph, kind=conv_node_name)
 
     def test_conv_unary_fusion_nnc(self):
+        # [FUNCTION DOC] Checks NNC fusion of Conv2d followed by a relu, for contiguous
+        # format (no fusion expected, conv still in graph) and channels last (conv and relu
+        # both fused away and exactly one fusion group), across bias and two output channel
+        # counts.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module applying a Conv2d and then the supplied unary
+            # function.
             def __init__(self, unary_fn, in_channels, out_channels, bias, **kwargs):
+                # [FUNCTION DOC] HELPER: Constructor; builds the Conv2d from the arguments
+                # and stores the unary function.
                 super().__init__()
                 self.conv = torch.nn.Conv2d(in_channels, out_channels, bias=bias, **kwargs)
                 self.unary = unary_fn
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs the convolution then the unary function and
+                # returns the result.
                 x = self.conv(x)
                 x = self.unary(x)
                 return x
@@ -129,12 +170,22 @@ class TestMkldnnFusion(JitTestCase):
                             self.assertGraphContains(graph, kind='aten::conv2d')
 
     def test_unsupported_conv(self):
+        # [FUNCTION DOC] Checks that convolutions the fuser does not support (Conv3d and
+        # ConvTranspose2d, in contiguous and channels last formats) are left alone: with
+        # tracing, groups two, dilation two and stride two, the traced graph must still
+        # contain the generic convolution node.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Wrapper module holding one convolution layer built from a
+            # supplied layer class.
             def __init__(self, m, in_channels, out_channels, bias, **kwargs):
+                # [FUNCTION DOC] HELPER: Constructor; instantiates the supplied convolution
+                # class with channels, bias and keyword arguments.
                 super().__init__()
                 self.conv = m(in_channels, out_channels, bias=bias, **kwargs)
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Applies the convolution to the input and returns
+                # the result.
                 res = self.conv(x)
                 return res
 
@@ -170,6 +221,10 @@ class TestMkldnnFusion(JitTestCase):
             self.assertGraphContains(graph, kind='aten::_convolution')
 
     def _unary_list(self):
+        # [FUNCTION DOC] HELPER: Returns a mapping from case name to a PointwisePostOp for
+        # relu, sigmoid, tanh, hardswish, leaky relu (scalar 0.1), hardtanh (scalars -0.5
+        # and 4) and two gelu variants (approximation none and tanh, with the algorithm
+        # string set).
         unary_list = {
             "relu": PointwisePostOp("relu", nn.ReLU()),
             "sigmoid": PointwisePostOp("sigmoid", nn.Sigmoid()),
@@ -183,6 +238,8 @@ class TestMkldnnFusion(JitTestCase):
         return unary_list
 
     def _binary_list(self):
+        # [FUNCTION DOC] HELPER: Returns a mapping from binary op name (add, sub, mul, div)
+        # to the matching torch function.
         binary_list = {
             "add": torch.add,
             "sub": torch.sub,
@@ -192,8 +249,17 @@ class TestMkldnnFusion(JitTestCase):
         return binary_list
 
     def test_linear_unary_fusion_ops(self):
+        # [FUNCTION DOC] For every unary post op, three input shapes (including a size [1,
+        # 10] input with stride [0, 1], contiguous but with non-default strides) and bias on
+        # or off, compares a Linear plus unary eager module with the fused mkldnn linear
+        # pointwise op called with the weight, bias, attribute, scalars and algorithm.
+        # Asserts equality under no-grad.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module applying a Linear layer and then the supplied unary
+            # function.
             def __init__(self, unary_fn, in_channels, out_channels, bias, **kwargs):
+                # [FUNCTION DOC] HELPER: Constructor; builds the Linear layer from the
+                # arguments and stores the unary function.
                 super().__init__()
                 self.linear = torch.nn.Linear(
                     in_channels, out_channels, bias=bias, **kwargs
@@ -201,6 +267,8 @@ class TestMkldnnFusion(JitTestCase):
                 self.unary = unary_fn
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs the linear layer then the unary function and
+                # returns the result.
                 x = self.linear(x)
                 x = self.unary(x)
                 return x
@@ -226,13 +294,24 @@ class TestMkldnnFusion(JitTestCase):
 
 
     def test_conv_unary_fusion_ops(self):
+        # [FUNCTION DOC] For every unary post op, for 2d and 3d, and a grid of bias,
+        # dilation, groups and memory format (contiguous or channels last), compares an
+        # eager Conv plus unary module with the mkldnn fused convolution pointwise op fed
+        # the weight, bias, padding, stride, dilation, groups, attribute, scalars and
+        # algorithm. Asserts equality.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module applying a 2d or 3d convolution (chosen by dim)
+            # then a unary function.
             def __init__(self, unary_fn, dim, in_channels, out_channels, dilation, groups, bias, **kwargs):
+                # [FUNCTION DOC] HELPER: Constructor; builds the convolution from the lookup
+                # table by dim and stores the unary function.
                 super().__init__()
                 self.conv = CONV_MODULES[dim](in_channels, out_channels, dilation=dilation, groups=groups, bias=bias, **kwargs)
                 self.unary = unary_fn
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs the convolution then the unary function and
+                # returns the result.
                 x = self.conv(x)
                 x = self.unary(x)
                 return x
@@ -261,6 +340,10 @@ class TestMkldnnFusion(JitTestCase):
                     self.assertEqual(ref, fused)
 
     def test_conv_unary_fusion_none_attr_reported_shape(self):
+        # [FUNCTION DOC] Regression check that the fused convolution pointwise op with
+        # attribute "none" (empty scalars, no algorithm) on a 5x1x28x28 input with a 64
+        # filter weight, in contiguous and channels last formats, produces the same shape
+        # and values as the plain functional conv2d.
         for memory_format in [torch.contiguous_format, torch.channels_last]:
             x = torch.randn(5, 1, 28, 28, dtype=torch.float32).to(
                 memory_format=memory_format
@@ -287,13 +370,25 @@ class TestMkldnnFusion(JitTestCase):
 
 
     def test_conv_binary_fusion_ops(self):
+        # [FUNCTION DOC] For each binary op, 2d and 3d, and a grid of optional trailing
+        # relu, bias, dilation, groups and memory format, compares eager Conv plus binary
+        # (plus relu in place) against the mkldnn fused convolution pointwise op taking the
+        # second operand. For add it also checks the in-place variant, which overwrites the
+        # other operand and must equal the reference. Fused results are compared with
+        # tolerance 5e-4.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module applying a convolution (2d or 3d by dim) and then a
+            # binary function with a second input.
             def __init__(self, binary_fn, dim, in_channels, out_channels, dilation, groups, bias, **kwargs):
+                # [FUNCTION DOC] HELPER: Constructor; builds the convolution from the lookup
+                # table by dim and stores the binary function.
                 super().__init__()
                 self.conv = CONV_MODULES[dim](in_channels, out_channels, dilation=dilation, groups=groups, bias=bias, **kwargs)
                 self.binary = binary_fn
 
             def forward(self, x, other):
+                # [FUNCTION DOC] HELPER: Convolves the first input and combines the result
+                # with the other input using the binary function.
                 x = self.conv(x)
                 x = self.binary(x, other)
                 return x
@@ -335,8 +430,16 @@ class TestMkldnnFusion(JitTestCase):
 
 
     def test_linear_binary_fusion_ops(self):
+        # [FUNCTION DOC] For each binary op, three input shapes (one with a non-default
+        # stride) and bias on or off, compares an eager Linear plus binary module (second
+        # operand of the output feature size, 20) with the mkldnn linear pointwise op called
+        # with the other operand and the op name. Asserts equality under no-grad.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module applying a Linear layer and then a binary function
+            # with a second input.
             def __init__(self, binary_fn, in_channels, out_channels, bias, **kwargs):
+                # [FUNCTION DOC] HELPER: Constructor; builds the Linear layer from the
+                # arguments and stores the binary function.
                 super().__init__()
                 self.linear = torch.nn.Linear(
                     in_channels, out_channels, bias=bias, **kwargs
@@ -344,6 +447,8 @@ class TestMkldnnFusion(JitTestCase):
                 self.binary = binary_fn
 
             def forward(self, x, other):
+                # [FUNCTION DOC] HELPER: Applies the linear layer to the first input and
+                # combines it with the other input using the binary function.
                 x = self.linear(x)
                 x = self.binary(x, other)
                 return x
@@ -368,13 +473,25 @@ class TestMkldnnFusion(JitTestCase):
                     self.assertEqual(ref, fused)
 
     def test_conv_transpose_unary_fusion_ops(self):
+        # [FUNCTION DOC] For each unary post op (2d only), bias, dilation, groups, memory
+        # format and an optional weight prepacking step, compares an eager ConvTranspose2d
+        # plus unary module with the mkldnn convolution transpose pointwise op. With
+        # prepacking the weight is first reordered by the mkldnn transpose weight reorder op
+        # and replaced by a Parameter keeping the original requires-grad flag. Asserts
+        # equality under no-grad.
         class M(nn.Module):
+            # [CLASS DOC] HELPER: Module applying a transposed convolution and then the
+            # supplied unary function.
             def __init__(self, unary_fn, dim, in_channels, out_channels, kernel_size, **kwargs):
+                # [FUNCTION DOC] HELPER: Constructor; builds the transposed convolution from
+                # the lookup table by dim and stores the unary function.
                 super().__init__()
                 self.conv_transpose = CONV_TRANSPOSE_MODULES[dim](in_channels, out_channels, kernel_size, **kwargs)
                 self.unary = unary_fn
 
             def forward(self, x):
+                # [FUNCTION DOC] HELPER: Runs the transposed convolution then the unary
+                # function and returns the result.
                 x = self.conv_transpose(x)
                 x = self.unary(x)
                 return x
