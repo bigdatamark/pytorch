@@ -1,5 +1,12 @@
 # Owner(s): ["module: tests"]
 
+# [MODULE DOC] Device-generic tests for tensor indexing and the index family of operators:
+# basic and advanced getitem/setitem, boolean and byte masks, ellipsis and None, empty and
+# out-of-range indices, index_put with accumulate, take_along_dim, index_reduce,
+# index_copy, index_add, index_fill and index_select, plus a set of tests adapted from
+# NumPy. Two test classes are instantiated per device type at import time (all but meta;
+# MPS and XPU allowed for the first class, XPU for the second). Running the file calls the
+# standard test runner.
 import operator
 import random
 import warnings
@@ -50,8 +57,21 @@ from torch.testing._internal.common_utils import (
 
 
 class TestIndexing(TestCase):
+    # [CLASS DOC] Main device-generic test case for indexing and index operators. It keeps
+    # no state; each test method takes the device (and often a dtype) supplied by the
+    # device-type instantiation and compares results against hand-built references, NumPy,
+    # list slicing or CPU execution.
     def test_index(self, device):
+        # [FUNCTION DOC] Walks basic indexing on a 3-d reference tensor filled with
+        # consecutive numbers: integer, slice, ellipsis (also on a 5-d tensor), a long
+        # index tensor, None, zero-length slices, and strides, plus 100 random slice
+        # combinations checked against plain list slicing. Then asserts errors: ValueError
+        # for zero or negative step, IndexError for too many indices or float indices,
+        # TypeError for float slice bounds and for item deletion.
         def consec(size, start=1):
+            # [FUNCTION DOC] HELPER: Builds a float tensor with consecutive values
+            # starting at start and the given size, via a cumulative sum of ones; returns
+            # it viewed to size.
             sequence = torch.ones(torch.tensor(size).prod(0)).cumsum(0)
             sequence.add_(start - 1)
             return sequence.view(*size)
@@ -194,6 +214,8 @@ class TestIndexing(TestCase):
         self.assertRaises(IndexError, lambda: reference[0.0, :, 0.0])
 
         def delitem():
+            # [FUNCTION DOC] HELPER: Tries to delete an item of the reference tensor; the
+            # caller expects TypeError.
             del reference[0]
 
         self.assertRaises(TypeError, delitem)
@@ -202,10 +224,20 @@ class TestIndexing(TestCase):
     @dtypes(torch.half, torch.double)
     @dtypesIfMPS(torch.half)  # TODO: add bf16 there?
     def test_advancedindex(self, device, dtype):
+        # [FUNCTION DOC] Integer-array indexing tests on half and double (MPS: half only).
+        # For half it only validates simple indexing and setting, then returns. For double
+        # it covers 1-d, strided, transposed and 2-d references with index tensors, lists
+        # and tuples chosen at random, setting values, too-many-indices IndexError, CPU
+        # out-of-range errors, and then compares many mixed slice, tuple and ellipsis
+        # indexers with a NumPy reference for get, set and (on non-CPU devices or any
+        # accelerator) backward gradients.
         # Tests for Integer Array Indexing, Part I - Purely integer array
         # indexing
 
         def consec(size, start=1):
+            # [FUNCTION DOC] HELPER: Builds a tensor of consecutive values starting at
+            # start with the given size, computed in float (CPU half lacks the needed ops)
+            # and converted to dtype.
             # Creates the sequence in float since CPU half doesn't support the
             # needed operations. Converts to dtype before returning.
             numel = reduce(operator.mul, size, 1)
@@ -215,6 +247,9 @@ class TestIndexing(TestCase):
 
         # pick a random valid indexer type
         def ri(indices):
+            # [FUNCTION DOC] HELPER: Returns the given indices as a randomly chosen type:
+            # a long tensor on the device, a list, or a tuple, so tests exercise each
+            # indexer container.
             choice = random.randint(0, 2)
             if choice == 0:
                 return torch.LongTensor(indices).to(device)
@@ -224,6 +259,8 @@ class TestIndexing(TestCase):
                 return tuple(indices)
 
         def validate_indexing(x):
+            # [FUNCTION DOC] HELPER: Asserts getting through lists and random containers
+            # of indices from a 1-d tensor gives the expected consecutive-value slices.
             self.assertEqual(x[[0]], consec((1,)))
             self.assertEqual(x[ri([0]),], consec((1,)))
             self.assertEqual(x[ri([3]),], consec((1,), 4))
@@ -234,6 +271,9 @@ class TestIndexing(TestCase):
             )
 
         def validate_setting(x):
+            # [FUNCTION DOC] HELPER: Sets values in a 1-d tensor through list and
+            # random-container indices, using scalars and a tensor, and asserts each
+            # read-back value matches.
             x[[0]] = -2
             self.assertEqual(x[[0]], torch.tensor([-2], dtype=dtype, device=device))
             x[[0]] = -1
@@ -615,6 +655,9 @@ class TestIndexing(TestCase):
                     reference[[err_idx]]
 
         def tensor_indices_to_np(tensor, indices):
+            # [FUNCTION DOC] HELPER: Converts a tensor to CPU and a numpy array and turns
+            # long-tensor entries of the indices into lists; returns the numpy array and
+            # the converted index tuple.
             # convert the Torch Tensor to a numpy array
             tensor = tensor.to(device="cpu")
             npt = tensor.numpy()
@@ -627,12 +670,18 @@ class TestIndexing(TestCase):
             return npt, idxs
 
         def get_numpy(tensor, indices):
+            # [FUNCTION DOC] HELPER: Indexes the numpy view of the tensor with the
+            # converted indices and returns the result as a tensor with the test dtype on
+            # the device.
             npt, idxs = tensor_indices_to_np(tensor, indices)
 
             # index and return as a Torch Tensor
             return torch.tensor(npt[idxs], dtype=dtype, device=device)
 
         def set_numpy(tensor, indices, value):
+            # [FUNCTION DOC] HELPER: Writes a value into the numpy view using converted
+            # indices. Non-integer values are moved to CPU when the device is not CPU and
+            # converted to numpy first. Returns the modified numpy array.
             if not isinstance(value, int):
                 if self.device_type != "cpu":
                     value = value.cpu()
@@ -643,9 +692,13 @@ class TestIndexing(TestCase):
             return npt
 
         def assert_get_eq(tensor, indexer):
+            # [FUNCTION DOC] HELPER: Asserts that indexing the tensor equals the numpy
+            # reference result.
             self.assertEqual(tensor[indexer], get_numpy(tensor, indexer))
 
         def assert_set_eq(tensor, indexer, val):
+            # [FUNCTION DOC] HELPER: Assigns val through indexer on a clone of the tensor
+            # and through numpy on another clone, then asserts the two results are equal.
             pyt = tensor.clone()
             numt = tensor.clone()
             pyt[indexer] = val
@@ -655,6 +708,9 @@ class TestIndexing(TestCase):
             self.assertEqual(pyt, numt)
 
         def assert_backward_eq(tensor, indexer):
+            # [FUNCTION DOC] HELPER: Computes the gradient of an indexed float copy on CPU
+            # with a random upstream gradient, repeats on the device with the same
+            # upstream gradient, and asserts the gradients are equal.
             cpu = tensor.float().detach().clone().requires_grad_(True)
             outcpu = cpu[indexer]
             gOcpu = torch.rand_like(outcpu)
@@ -665,6 +721,9 @@ class TestIndexing(TestCase):
             self.assertEqual(cpu.grad, dev.grad)
 
         def get_set_tensor(indexed, indexer):
+            # [FUNCTION DOC] HELPER: Returns a double tensor on the device, shaped like
+            # the indexed result, holding a random permutation of its element count; used
+            # as values to assign.
             set_size = indexed[indexer].size()
             set_count = indexed[indexer].numel()
             set_tensor = torch.randperm(set_count).view(set_size).double().to(device)
@@ -832,6 +891,8 @@ class TestIndexing(TestCase):
                 assert_backward_eq(reference, indexer)
 
     def test_advancedindex_big(self, device):
+        # [FUNCTION DOC] Indexes an int tensor with over 100 thousand elements using a
+        # list of large positions and checks the returned values.
         reference = torch.arange(0, 123344, dtype=torch.int, device=device)
 
         self.assertEqual(
@@ -840,6 +901,9 @@ class TestIndexing(TestCase):
         )
 
     def test_set_item_to_scalar_tensor(self, device):
+        # [FUNCTION DOC] Assigns a scalar tensor requiring grad into a column of a random
+        # 2-d tensor, runs backward on the sum, and asserts the scalar's gradient equals
+        # the row count.
         m = random.randint(1, 10)
         n = random.randint(1, 10)
         z = torch.randn([m, n], device=device)
@@ -850,15 +914,20 @@ class TestIndexing(TestCase):
         self.assertEqual(w.grad, m * a)
 
     def test_single_int(self, device):
+        # [FUNCTION DOC] Checks the shape after indexing a 3-d tensor with one integer.
         v = torch.randn(5, 7, 3, device=device)
         self.assertEqual(v[4].shape, (7, 3))
 
     def test_multiple_int(self, device):
+        # [FUNCTION DOC] Checks shapes after indexing a 3-d tensor with one integer and
+        # with an integer combined with a slice and another integer.
         v = torch.randn(5, 7, 3, device=device)
         self.assertEqual(v[4].shape, (7, 3))
         self.assertEqual(v[4, :, 1].shape, (7,))
 
     def test_none(self, device):
+        # [FUNCTION DOC] Checks shapes when None is inserted at the front, middle and end
+        # (with ellipsis).
         v = torch.randn(5, 7, 3, device=device)
         self.assertEqual(v[None].shape, (1, 5, 7, 3))
         self.assertEqual(v[:, None].shape, (5, 1, 7, 3))
@@ -866,6 +935,8 @@ class TestIndexing(TestCase):
         self.assertEqual(v[..., None].shape, (5, 7, 3, 1))
 
     def test_step(self, device):
+        # [FUNCTION DOC] Checks slicing with steps of 1, 2, 3, larger than the length, and
+        # with a start.
         v = torch.arange(10, device=device)
         self.assertEqual(v[::1], v)
         self.assertEqual(v[::2].tolist(), [0, 2, 4, 6, 8])
@@ -874,12 +945,18 @@ class TestIndexing(TestCase):
         self.assertEqual(v[1:6:2].tolist(), [1, 3, 5])
 
     def test_step_assignment(self, device):
+        # [FUNCTION DOC] Assigns a tensor into a strided slice of a zero tensor and checks
+        # the row's contents and that the other rows stay zero.
         v = torch.zeros(4, 4, device=device)
         v[0, 1::2] = torch.tensor([3.0, 4.0], device=device)
         self.assertEqual(v[0].tolist(), [0, 3, 0, 4])
         self.assertEqual(v[1:].sum(), 0)
 
     def test_bool_indices(self, device):
+        # [FUNCTION DOC] Indexes with bool tensors on a 3-d tensor, checking shape and
+        # contents. Then indexes a bool tensor with a bool mask and an equivalent uint8
+        # mask, asserting same shape and values, and that exactly one warning was recorded
+        # (the uint8 one).
         v = torch.randn(5, 7, 3, device=device)
         boolIndices = torch.tensor(
             [True, False, True, True, False], dtype=torch.bool, device=device
@@ -903,6 +980,9 @@ class TestIndexing(TestCase):
             self.assertEqual(len(w), 1)
 
     def test_list_indices(self, device):
+        # [FUNCTION DOC] Indexes a 1-d tensor with lists of ranges (window indices) of
+        # 1000, 100 and 32 entries and checks the result shape; with 31 windows asserts
+        # IndexError citing too many indices.
         N = 1000
         t = torch.randn(N, device=device)
         # Set window size
@@ -918,17 +998,23 @@ class TestIndexing(TestCase):
             windowed_data = t[indices[:31]]
 
     def test_index_tensor_empty_indices(self, device):
+        # [FUNCTION DOC] Calls the Tensor index op with an empty list of indices and
+        # asserts IndexError saying at least one index must be provided.
         t = torch.tensor([1.0], device=device)
         with self.assertRaisesRegex(IndexError, "at least one index must be provided"):
             torch.ops.aten.index.Tensor(t, [])
 
     def test_bool_indices_accumulate(self, device):
+        # [FUNCTION DOC] index_put with accumulate and an all-false bool mask on ones;
+        # asserts the tensor is unchanged.
         mask = torch.zeros(size=(10,), dtype=torch.bool, device=device)
         y = torch.ones(size=(10, 10), device=device)
         y.index_put_((mask,), y[mask], accumulate=True)
         self.assertEqual(y, torch.ones(size=(10, 10), device=device))
 
     def test_multiple_bool_indices(self, device):
+        # [FUNCTION DOC] Indexes with two bool masks around a slice; asserts the masks
+        # broadcast together and the result shape is three by seven.
         v = torch.randn(5, 7, 3, device=device)
         # note: these broadcast together and are transposed to the first dim
         mask1 = torch.tensor([1, 0, 1, 1, 0], dtype=torch.bool, device=device)
@@ -936,6 +1022,10 @@ class TestIndexing(TestCase):
         self.assertEqual(v[mask1, :, mask2].shape, (3, 7))
 
     def test_multi_dimensional_bool_mask(self, device):
+        # [FUNCTION DOC] Checks shapes of indexing with multi-dimensional bool masks given
+        # as nested tuples and as tensors, combined with slices with steps, None,
+        # integers, scalar tensors, and Python/tensor True and False, including masks in
+        # the middle of the indices.
         x = torch.randn(2, 2, 3, device=device)
         b = ((True, False), (False, False))
         m = torch.tensor(b, dtype=torch.bool, device=device)
@@ -977,6 +1067,8 @@ class TestIndexing(TestCase):
         self.assertEqual(x[None, ..., m, ::2].shape, (1, 3, 1, 3))
 
     def test_bool_mask_assignment(self, device):
+        # [FUNCTION DOC] Assigns zero through a bool mask on the first and on the second
+        # dimension and checks the resulting rows and columns are zeroed.
         v = torch.tensor([[1, 2], [3, 4]], device=device)
         mask = torch.tensor([1, 0], dtype=torch.bool, device=device)
         v[mask, :] = 0
@@ -987,6 +1079,9 @@ class TestIndexing(TestCase):
         self.assertEqual(v, torch.tensor([[0, 2], [0, 4]], device=device))
 
     def test_multi_dimensional_bool_mask_assignment(self, device):
+        # [FUNCTION DOC] Assigns zero through a 2-d bool mask in the middle of a 4-d
+        # tensor, both with setitem and with the index_put_ op using a None entry, and
+        # checks the result.
         v = torch.tensor([[[[1], [2]], [[3], [4]]]], device=device)
         mask = torch.tensor([[1, 0], [0, 1]], dtype=torch.bool, device=device)
         v[:, mask, :] = 0
@@ -996,6 +1091,9 @@ class TestIndexing(TestCase):
         self.assertEqual(v, torch.tensor([[[[0], [2]], [[3], [0]]]], device=device))
 
     def test_byte_mask(self, device):
+        # [FUNCTION DOC] Indexes with a byte mask: asserts correct selection and that one
+        # warning is recorded. Also indexes with a comparison mask selecting nothing and
+        # checks the result is empty.
         v = torch.randn(5, 7, 3, device=device)
         mask = torch.ByteTensor([1, 0, 1, 1, 0]).to(device)
         with warnings.catch_warnings(record=True) as w:
@@ -1008,6 +1106,8 @@ class TestIndexing(TestCase):
         self.assertEqual(v[v == 0], torch.tensor([], device=device))
 
     def test_byte_mask_accumulate(self, device):
+        # [FUNCTION DOC] index_put with accumulate and an all-zero byte mask; asserts the
+        # tensor is unchanged and that two warnings are recorded.
         mask = torch.zeros(size=(10,), dtype=torch.uint8, device=device)
         y = torch.ones(size=(10, 10), device=device)
         with warnings.catch_warnings(record=True) as w:
@@ -1022,6 +1122,11 @@ class TestIndexing(TestCase):
     )
     @serialTest(bool(TEST_ACCELERATOR))
     def test_index_put_accumulate_large_tensor(self, device):
+        # [FUNCTION DOC] Regression for accumulate index_put on tensors with more
+        # than the 32-bit element limit. Uses an int8 tensor of about two billion
+        # elements, with duplicate and negative indices, in 1-d and 2-d form, and
+        # checks the accumulated values at the edges. Skipped under Dynamo (can be
+        # killed) and run serially on accelerators.
         # This test is for tensors with number of elements >= INT_MAX (2^31 - 1).
         N = (1 << 31) + 5
         dt = torch.int8
@@ -1060,6 +1165,9 @@ class TestIndexing(TestCase):
 
     @onlyNativeDeviceTypes
     def test_index_put_accumulate_expanded_values(self, device):
+        # [FUNCTION DOC] Compares index_put_ with accumulate on the device against CPU
+        # when the values are expanded (zero-d, one-element, one-row broadcast cases and a
+        # 3-d broadcast index), referring to a CUDA issue about expanded values.
         # checks the issue with cuda: https://github.com/pytorch/pytorch/issues/39227
         # and verifies consistency with CPU result
         t = torch.zeros((5, 2))
@@ -1100,7 +1208,13 @@ class TestIndexing(TestCase):
     @onlyAccelerator
     @skipMPS
     def test_index_put_large_indices(self, device):
+        # [FUNCTION DOC] Runs accumulate index_put on random indices with 401988 entries
+        # and various ranges of index duplication in bfloat16, and in float32 (CPU with
+        # deterministic algorithms on), asserting device results match CPU. Toggles the
+        # global deterministic algorithms flag, ending it off.
         def generate_indices(num_indices: int, index_range: int):
+            # [FUNCTION DOC] HELPER: Returns a CPU tensor of num_indices random integers
+            # in zero to index_range minus one, drawn with the Python random module.
             indices = []
             for _ in range(num_indices):
                 x = random.randint(0, index_range - 1)
@@ -1152,6 +1266,8 @@ class TestIndexing(TestCase):
 
     @onlyAccelerator
     def test_index_put_accumulate_non_contiguous(self, device):
+        # [FUNCTION DOC] Runs accumulate index_put on a non-contiguous slice on device and
+        # CPU, asserts the views stay non-contiguous and the results match.
         t = torch.zeros((5, 2, 2))
         t_dev = t.to(device)
         t1 = t_dev[:, 0, :]
@@ -1172,12 +1288,20 @@ class TestIndexing(TestCase):
     @onlyAccelerator
     @skipMPS
     def test_index_put_deterministic_with_optional_tensors(self, device):
+        # [FUNCTION DOC] Compares setitem with index tensors on device and CPU under
+        # deterministic mode for zero-d, one-d and 2-d values, with and without an
+        # ellipsis. Asserts the expected RuntimeError for a shape mismatch on CPU and for
+        # mismatched sizes on the device.
         def func(x, i, v):
+            # [FUNCTION DOC] HELPER: Assigns v into x at positions i on the last dim under
+            # the deterministic guard; returns x.
             with DeterministicGuard(True):
                 x[..., i] = v
             return x
 
         def func1(x, i, v):
+            # [FUNCTION DOC] HELPER: Assigns v into x at positions i on the first dim
+            # under the deterministic guard; returns x.
             with DeterministicGuard(True):
                 x[i] = v
             return x
@@ -1221,6 +1345,8 @@ class TestIndexing(TestCase):
 
     @onlyNativeDeviceTypes
     def test_index_put_accumulate_duplicate_indices(self, device):
+        # [FUNCTION DOC] Builds random-walk indices with many duplicates and compares
+        # accumulate index_put against a Python loop summation, for sizes up to 511.
         dtype = highest_precision_float(device)
         for i in range(1, 512):
             # generate indices by random walk, this will create indices with
@@ -1242,6 +1368,8 @@ class TestIndexing(TestCase):
 
     @onlyNativeDeviceTypes
     def test_index_ind_dtype(self, device):
+        # [FUNCTION DOC] Asserts indexing and index_put_ (with and without accumulate)
+        # with int32 index tensors gives the same results as with int64 index tensors.
         x = torch.randn(4, 4, device=device)
         ind_long = torch.randint(4, (4,), dtype=torch.long, device=device)
         ind_int = ind_long.int()
@@ -1267,12 +1395,16 @@ class TestIndexing(TestCase):
 
     @skipXLA
     def test_index_put_accumulate_empty(self, device):
+        # [FUNCTION DOC] Regression for an issue on accumulate index_put on a zero-d
+        # tensor with an empty index list; asserts RuntimeError. Skipped on XLA.
         # Regression test for https://github.com/pytorch/pytorch/issues/94667
         input = torch.rand([], dtype=torch.float32, device=device)
         with self.assertRaises(RuntimeError):
             input.index_put([], torch.tensor([1.0], device=device), True)
 
     def test_multiple_byte_mask(self, device):
+        # [FUNCTION DOC] Indexes with two byte masks around a slice, asserts shape and
+        # that two warnings are produced.
         v = torch.randn(5, 7, 3, device=device)
         # note: these broadcast together and are transposed to the first dim
         mask1 = torch.ByteTensor([1, 0, 1, 1, 0]).to(device)
@@ -1283,6 +1415,8 @@ class TestIndexing(TestCase):
             self.assertEqual(len(w), 2)
 
     def test_byte_mask2d(self, device):
+        # [FUNCTION DOC] Indexes a 3-d tensor with a 2-d comparison mask; checks the
+        # result is the count of true entries by the last dim.
         v = torch.randn(5, 7, 3, device=device)
         c = torch.randn(5, 7, device=device)
         num_ones = (c > 0).sum()
@@ -1291,11 +1425,18 @@ class TestIndexing(TestCase):
 
     @skipIfTorchDynamo("Not a suitable test for TorchDynamo")
     def test_jit_indexing(self, device):
+        # [FUNCTION DOC] Scripts two functions that assign one into a masked region and a
+        # sliced region of a float tensor, runs them on a clone, and checks both equal the
+        # expected result. Skipped under Dynamo.
         def fn1(x):
+            # [FUNCTION DOC] HELPER: Sets entries below fifty to one by a mask and returns
+            # the tensor.
             x[x < 50] = 1.0
             return x
 
         def fn2(x):
+            # [FUNCTION DOC] HELPER: Sets the first fifty entries to one by a slice and
+            # returns the tensor.
             x[0:50] = 1.0
             return x
 
@@ -1313,6 +1454,8 @@ class TestIndexing(TestCase):
         self.assertEqual(out, ref)
 
     def test_int_indices(self, device):
+        # [FUNCTION DOC] Checks shapes of indexing with integer lists, on dim 0, on dim 1,
+        # and with a nested list.
         v = torch.randn(5, 7, 3, device=device)
         self.assertEqual(v[[0, 4, 2]].shape, (3, 7, 3))
         self.assertEqual(v[:, [0, 4, 2]].shape, (5, 3, 3))
@@ -1344,6 +1487,9 @@ class TestIndexing(TestCase):
     )
     @dtypesIfMPS(torch.float, torch.float16, torch.long, torch.bool)
     def test_index_put_src_datatype(self, device, dtype):
+        # [FUNCTION DOC] Calls index_put_ with accumulate on a ones tensor with index and
+        # values of the same dtype, across complex, float, bfloat16, long, bool (and
+        # float8 on CUDA), and checks the result shape.
         src = torch.ones(3, 2, 4, device=device, dtype=dtype)
         vals = torch.ones(3, 2, 4, device=device, dtype=dtype)
         indices = (torch.tensor([0, 2, 1]),)
@@ -1355,6 +1501,8 @@ class TestIndexing(TestCase):
     @dtypesIfCUDA(torch.half, torch.long, torch.bfloat16, torch.bool)
     @dtypesIfXPU(torch.half, torch.long, torch.bfloat16, torch.bool)
     def test_index_src_datatype(self, device, dtype):
+        # [FUNCTION DOC] Checks that index with a list of integers and index_put (no
+        # accumulate) preserve shape for float, bfloat16, long, bool and half dtypes.
         src = torch.ones(3, 2, 4, device=device, dtype=dtype)
         # test index
         res = src[[0, 2, 1], :, :]
@@ -1364,6 +1512,8 @@ class TestIndexing(TestCase):
         self.assertEqual(res.shape, src.shape)
 
     def test_int_indices2d(self, device):
+        # [FUNCTION DOC] NumPy example: 2-d row and column index tensors pick
+        # corner elements.
         # From the NumPy indexing example
         x = torch.arange(0, 12, device=device).view(4, 3)
         rows = torch.tensor([[0, 0], [3, 3]], device=device)
@@ -1371,6 +1521,8 @@ class TestIndexing(TestCase):
         self.assertEqual(x[rows, columns].tolist(), [[0, 2], [9, 11]])
 
     def test_int_indices_broadcast(self, device):
+        # [FUNCTION DOC] NumPy example: row index with a new axis broadcasts against
+        # column indices.
         # From the NumPy indexing example
         x = torch.arange(0, 12, device=device).view(4, 3)
         rows = torch.tensor([0, 3], device=device)
@@ -1379,6 +1531,9 @@ class TestIndexing(TestCase):
         self.assertEqual(result.tolist(), [[0, 2], [9, 11]])
 
     def test_empty_index(self, device):
+        # [FUNCTION DOC] Asserts indexing a 2-d tensor with an empty long index gives zero
+        # elements, and that assigning through empty index and all-false mask leaves the
+        # tensor unchanged.
         x = torch.arange(0, 12, device=device).view(4, 3)
         idx = torch.tensor([], dtype=torch.long, device=device)
         self.assertEqual(x[idx].numel(), 0)
@@ -1393,6 +1548,9 @@ class TestIndexing(TestCase):
         self.assertEqual(x, y)
 
     def test_empty_ndim_index(self, device):
+        # [FUNCTION DOC] Checks indexing with empty multi-dimensional long indices gives
+        # empty tensors of the expected shapes, and an index on a size-zero dimension
+        # raises IndexError.
         x = torch.randn(5, device=device)
         self.assertEqual(
             torch.empty(0, 2, device=device),
@@ -1412,12 +1570,16 @@ class TestIndexing(TestCase):
             x[:, [0, 1]]
 
     def test_empty_ndim_index_bool(self, device):
+        # [FUNCTION DOC] Asserts a zero-element, 2-d uint8 index on a 1-d tensor
+        # raises IndexError.
         x = torch.randn(5, device=device)
         self.assertRaises(
             IndexError, lambda: x[torch.empty(0, 2, dtype=torch.uint8, device=device)]
         )
 
     def test_empty_slice(self, device):
+        # [FUNCTION DOC] Takes an empty slice of a view and checks its shape, NumPy-like
+        # strides, and contiguity.
         x = torch.randn(2, 3, 4, 5, device=device)
         y = x[:, :, :, 1]
         z = y[:, 1:1, :]
@@ -1427,6 +1589,9 @@ class TestIndexing(TestCase):
         self.assertTrue(z.is_contiguous())
 
     def test_index_getitem_copy_bools_slices(self, device):
+        # [FUNCTION DOC] For a 2-d tensor and a zero-d tensor, checks indexing with True,
+        # False or a uint8 scalar tensor copies (new pointer, empty for false), while None
+        # and ellipsis return views sharing the data pointer.
         true = torch.tensor(1, dtype=torch.uint8, device=device)
         false = torch.tensor(0, dtype=torch.uint8, device=device)
 
@@ -1441,6 +1606,9 @@ class TestIndexing(TestCase):
             self.assertEqual(a.data_ptr(), a[...].data_ptr())
 
     def test_index_setitem_bools_slices(self, device):
+        # [FUNCTION DOC] Assigns via True, False, a uint8 scalar tensor, None and ellipsis
+        # to a 2-d and a zero-d tensor, checking assignment happens only for true. For
+        # zero-d, assigning a slice raises IndexError.
         true = torch.tensor(1, dtype=torch.uint8, device=device)
         false = torch.tensor(0, dtype=torch.uint8, device=device)
 
@@ -1468,6 +1636,8 @@ class TestIndexing(TestCase):
                     a[:] = neg_ones_expanded * 5
 
     def test_index_scalar_with_bool_mask(self, device):
+        # [FUNCTION DOC] Checks indexing a zero-d tensor with a true uint8 and a true bool
+        # scalar mask gives equal values and dtype, for int and bool tensors.
         a = torch.tensor(1, device=device)
         uintMask = torch.tensor(True, dtype=torch.uint8, device=device)
         boolMask = torch.tensor(True, dtype=torch.bool, device=device)
@@ -1479,6 +1649,8 @@ class TestIndexing(TestCase):
         self.assertEqual(a[uintMask].dtype, a[boolMask].dtype)
 
     def test_setitem_expansion_error(self, device):
+        # [FUNCTION DOC] Asserts that assigning a value expanded with non-one leading dims
+        # through a true mask raises RuntimeError.
         true = torch.tensor(True, device=device)
         a = torch.randn(2, 3, device=device)
         # check prefix with  non-1s doesn't work
@@ -1490,6 +1662,9 @@ class TestIndexing(TestCase):
             a[true] = a_expanded
 
     def test_getitem_scalars(self, device):
+        # [FUNCTION DOC] Checks scalar tensors as indices equal Python integer indices and
+        # also slice (share data pointers, including int and short index tensors).
+        # Indexing a zero-d tensor by slice or scalar raises IndexError.
         zero = torch.tensor(0, dtype=torch.int64, device=device)
         one = torch.tensor(1, dtype=torch.int64, device=device)
 
@@ -1514,6 +1689,9 @@ class TestIndexing(TestCase):
         self.assertEqual(r, r[...])
 
     def test_setitem_scalars(self, device):
+        # [FUNCTION DOC] Checks setting through scalar tensor indices equals setting
+        # through integers, and that on a zero-d tensor slice and scalar index assignment
+        # raise IndexError while assignment through ellipsis works.
         zero = torch.tensor(0, dtype=torch.int64)
 
         # non-scalar indexed with scalars
@@ -1540,6 +1718,9 @@ class TestIndexing(TestCase):
     # https://github.com/pytorch/pytorch/issues/191458
     @onlyNativeDeviceTypes
     def test_setitem_uint64_above_int64_max(self, device):
+        # [FUNCTION DOC] Regression test for a GitHub issue: assigns values above the
+        # signed 64-bit maximum into a uint64 tensor and reads them back exactly. Native
+        # devices only.
         x = torch.zeros((1,), dtype=torch.uint64, device=device)
         x[0] = 1 << 63
         self.assertEqual(x[0].item(), 1 << 63)
@@ -1549,6 +1730,9 @@ class TestIndexing(TestCase):
         self.assertEqual(x[0].item(), (1 << 63) - 1)
 
     def test_basic_advanced_combined(self, device):
+        # [FUNCTION DOC] Mixes slice and list indexing: checks equality with the pure
+        # slice, that indexing returns a copy (in-place zero does not change the
+        # original), and that assignment modifies the original.
         # From the NumPy indexing example
         x = torch.arange(0, 12, device=device).view(4, 3)
         self.assertEqual(x[1:2, 1:3], x[1:2, [1, 2]])
@@ -1565,6 +1749,7 @@ class TestIndexing(TestCase):
         self.assertNotEqual(x, unmodified)
 
     def test_int_assignment(self, device):
+        # [FUNCTION DOC] Assigns an integer and a tensor into a row and checks values.
         x = torch.arange(0, 4, device=device).view(2, 2)
         x[1] = 5
         self.assertEqual(x.tolist(), [[0, 1], [5, 5]])
@@ -1574,6 +1759,8 @@ class TestIndexing(TestCase):
         self.assertEqual(x.tolist(), [[0, 1], [5, 6]])
 
     def test_byte_tensor_assignment(self, device):
+        # [FUNCTION DOC] Assigns through a byte tensor mask, checking the selected rows
+        # are replaced, the others unchanged, and that one warning is recorded.
         x = torch.arange(0.0, 16, device=device).view(4, 4)
         b = torch.ByteTensor([True, False, True, False]).to(device)
         value = torch.tensor([3.0, 4.0, 5.0, 6.0], device=device)
@@ -1588,18 +1775,26 @@ class TestIndexing(TestCase):
         self.assertEqual(x[3], torch.arange(12.0, 16, device=device))
 
     def test_variable_slicing(self, device):
+        # [FUNCTION DOC] Slices with bounds that are zero-d tensors taken from an int
+        # tensor and compares with the integer slice.
         x = torch.arange(0, 16, device=device).view(4, 4)
         indices = torch.IntTensor([0, 1]).to(device)
         i, j = indices
         self.assertEqual(x[i:j], x[0:1])
 
     def test_ellipsis_tensor(self, device):
+        # [FUNCTION DOC] Indexes with an ellipsis and an integer tensor on either side and
+        # checks values.
         x = torch.arange(0, 9, device=device).view(3, 3)
         idx = torch.tensor([0, 2], device=device)
         self.assertEqual(x[..., idx].tolist(), [[0, 2], [3, 5], [6, 8]])
         self.assertEqual(x[idx, ...].tolist(), [[0, 1, 2], [6, 7, 8]])
 
     def test_unravel_index_errors(self, device):
+        # [FUNCTION DOC] Checks error handling of the unravel_index function: TypeError
+        # for non-integer indices or non-sequence or non-integer shape, ValueError for
+        # negative shape or zero dimension with non-empty indices; and that empty indices
+        # with a zero dimension return four empty tensors.
         with self.assertRaisesRegex(TypeError, r"expected 'indices' to be integer"):
             torch.unravel_index(torch.tensor(0.5, device=device), (2, 2))
 
@@ -1643,10 +1838,14 @@ class TestIndexing(TestCase):
             self.assertEqual(r.numel(), 0)
 
     def test_invalid_index(self, device):
+        # [FUNCTION DOC] Asserts indexing with string slice bounds raises TypeError
+        # mentioning slice indices.
         x = torch.arange(0, 16, device=device).view(4, 4)
         self.assertRaisesRegex(TypeError, "slice indices", lambda: x["0":"1"])
 
     def test_out_of_bound_index(self, device):
+        # [FUNCTION DOC] Asserts IndexError messages naming the index, dimension and size
+        # for several out-of-bounds integer indices.
         x = torch.arange(0, 100, device=device).view(2, 5, 10)
         self.assertRaisesRegex(
             IndexError,
@@ -1670,10 +1869,15 @@ class TestIndexing(TestCase):
         )
 
     def test_zero_dim_index(self, device):
+        # [FUNCTION DOC] Checks a zero-d tensor equals its item and that indexing it
+        # raises IndexError for an invalid index. The nested runner also prints the result
+        # before indexing.
         x = torch.tensor(10, device=device)
         self.assertEqual(x, x.item())
 
         def runner():
+            # [FUNCTION DOC] HELPER: Prints and returns the first element of the zero-d
+            # tensor; used to trigger the expected IndexError.
             print(x[0])
             return x[0]
 
@@ -1681,6 +1885,9 @@ class TestIndexing(TestCase):
 
     @onlyAccelerator
     def test_invalid_device(self, device):
+        # [FUNCTION DOC] Accelerator-only: assigns a CPU values tensor into a
+        # device tensor with CPU indices through index_put_, with and without
+        # accumulate; asserts RuntimeError.
         idx = torch.tensor([0, 1])
         b = torch.zeros(5, device=device)
         c = torch.tensor([1.0, 2.0], device="cpu")
@@ -1693,6 +1900,8 @@ class TestIndexing(TestCase):
 
     @onlyAccelerator
     def test_cpu_indices(self, device):
+        # [FUNCTION DOC] Accelerator-only: uses CPU index tensors on a device tensor for
+        # assignment and reading, and checks results are exact.
         idx = torch.tensor([0, 1])
         b = torch.zeros(2, device=device)
         x = torch.ones(10, device=device)
@@ -1705,7 +1914,12 @@ class TestIndexing(TestCase):
 
     @dtypes(torch.long, torch.float32)
     def test_take_along_dim(self, device, dtype):
+        # [FUNCTION DOC] Compares take_along_dim to the NumPy equivalent for several
+        # shapes (including zero-size), contiguous and not, along each dimension and
+        # flattened, plus a broadcast case and an empty-index case.
         def _test_against_numpy(t, indices, dim):
+            # [FUNCTION DOC] HELPER: Runs take_along_dim and the NumPy function on CPU
+            # copies and asserts exact equality.
             actual = torch.take_along_dim(t, indices, dim=dim)
             t_np = t.cpu().numpy()
             indices_np = indices.cpu().numpy()
@@ -1739,6 +1953,9 @@ class TestIndexing(TestCase):
 
     @dtypes(torch.long, torch.float)
     def test_take_along_dim_invalid(self, device, dtype):
+        # [FUNCTION DOC] Asserts take_along_dim errors: RuntimeError for mismatched ndim,
+        # for index dtype that is not long (bool, float, int), and IndexError for
+        # out-of-range dim.
         shape = (2, 3, 1, 4)
         dim = 0
         t = make_tensor(shape, device=device, dtype=dtype)
@@ -1771,6 +1988,8 @@ class TestIndexing(TestCase):
     @skipMPS
     @dtypes(torch.float)
     def test_gather_take_along_dim_cross_device(self, device, dtype):
+        # [FUNCTION DOC] Accelerator-only: gather and take_along_dim with the data and
+        # index on different devices must raise RuntimeError with the expected messages.
         shape = (2, 3, 1, 4)
         dim = 0
         t = make_tensor(shape, device=device, dtype=dtype)
@@ -1800,6 +2019,9 @@ class TestIndexing(TestCase):
 
     @onlyAccelerator
     def test_cuda_broadcast_index_use_deterministic_algorithms(self, device):
+        # [FUNCTION DOC] Accelerator-only: under deterministic mode compares
+        # broadcast-index assignments on CPU and the device across several tensors,
+        # requiring exact equality.
         with DeterministicGuard(True):
             idx1 = torch.tensor([0])
             idx2 = torch.tensor([2, 6])
@@ -1840,6 +2062,8 @@ class TestIndexing(TestCase):
             self.assertEqual(tensor_a, tensor_b.cpu(), atol=0, rtol=0)
 
     def test_index_limits(self, device):
+        # [FUNCTION DOC] Regression: indexing an empty tensor with the minimum and maximum
+        # 64-bit integers raises IndexError.
         #  Regression test for https://github.com/pytorch/pytorch/issues/115415
         t = torch.tensor([], device=device)
         idx_min = torch.iinfo(torch.int64).min
@@ -1853,6 +2077,10 @@ class TestIndexing(TestCase):
         torch.half, torch.bfloat16, torch.float32, torch.int32, torch.int16, torch.int8
     )
     def test_index_reduce(self, device, dtype, reduce):
+        # [FUNCTION DOC] Checks index_reduce_ for prod, amin, amax and mean with int and
+        # long indices, with and without include_self, contiguous or not, along each dim,
+        # against a loop reference built from reduction initial values. MPS low precision
+        # uses looser tolerances for mean and prod.
         size = (3, 4, 5)
         index_dtypes = [torch.int, torch.long]
         include_selfs = [True, False]
@@ -1934,11 +2162,16 @@ class TestIndexing(TestCase):
     @dtypes(*all_types_and_complex_and(torch.half, torch.bool, torch.bfloat16))
     @dtypesIfMPS(*all_mps_types_and(torch.bool, torch.cfloat))
     def test_index_copy(self, device, dtype):
+        # [FUNCTION DOC] Compares index_copy_ with a loop of assignments for contiguous
+        # and non-contiguous destination, source, index, with a number of copies below the
+        # destination size so indices are unique.
         # We just test for num_copy <= num_dest, as otherwise there are repeated indices
         # and the behavior is undefined
         num_copy, num_dest = 3, 5
 
         def make_arg(batch_sizes, n, dim, contig):
+            # [FUNCTION DOC] HELPER: Makes a tensor with the batch sizes and n inserted at
+            # dim, either contiguous or non-contiguous.
             size_arg = batch_sizes[:dim] + (n,) + batch_sizes[dim:]
             return make_tensor(
                 size_arg,
@@ -1950,6 +2183,8 @@ class TestIndexing(TestCase):
             )
 
         def ref_index_copy(tgt, dim, idx, src):
+            # [FUNCTION DOC] HELPER: Reference implementation: for each index entry
+            # assigns the matching source slice into the target along dim, in place.
             for i in range(idx.size(0)):
                 idx_dest = dim * (slice(None),) + (idx[i],)
                 idx_src = dim * (slice(None),) + (i,)
@@ -1978,6 +2213,9 @@ class TestIndexing(TestCase):
     @dtypes(*all_types_and_complex_and(torch.half, torch.bool, torch.bfloat16))
     @dtypesIfMPS(*all_mps_types_and(torch.bool, torch.cfloat))
     def test_index_copy_scalars(self, device, dtype):
+        # [FUNCTION DOC] Runs index_copy_ over all eight combinations of zero-d and
+        # one-element sizes for target, index and source, checking the item matches the
+        # source. Native devices only.
         # Create the 8 possible combinations of scalar sizes for target / index / source
         scalars = (
             (
@@ -1993,6 +2231,8 @@ class TestIndexing(TestCase):
 
     @onlyCPU
     def test_errors_index_copy(self, device):
+        # [FUNCTION DOC] CPU-only: index_copy_ with indices at or above the size,
+        # negative, or very negative raises IndexError.
         # We do not test the GPU as the CUDA_ASSERT would break the CUDA context
         idx_dim = 8
         tgt_dim = 5
@@ -2019,6 +2259,11 @@ class TestIndexing(TestCase):
     def _prepare_data_for_index_copy_and_add_deterministic(
         self, dim: int, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC] HELPER: Builds inputs for the deterministic index_copy and
+        # index_add tests: a zero target with the chosen dim of size 2000, a random source
+        # with twenty times more entries along dim, and random indices into that dim.
+        # Returns the target, index and source; raises AssertionError when dim is not in
+        # zero to two.
         if not (dim >= 0 and dim < 3):
             raise AssertionError(f"dim must be in [0, 3), got {dim}")
         a = [5, 4, 3]
@@ -2035,6 +2280,9 @@ class TestIndexing(TestCase):
     @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/1973")
     @expectedFailureMPS  # See https://github.com/pytorch/pytorch/issues/161029
     def test_index_copy_deterministic(self, device: torch.device) -> None:
+        # [FUNCTION DOC] Under deterministic mode computes index_copy and compares exactly
+        # with a loop of assignments, for each of the three dims. Skipped on XPU, expected
+        # failure on MPS.
         for dim in range(3):
             x, index, src = self._prepare_data_for_index_copy_and_add_deterministic(
                 dim, device
@@ -2057,6 +2305,9 @@ class TestIndexing(TestCase):
     @onlyNativeDeviceTypes
     @expectedFailureMPS  # See https://github.com/pytorch/pytorch/issues/161029
     def test_index_add_deterministic(self, device: torch.device) -> None:
+        # [FUNCTION DOC] For each dim computes index_add under deterministic mode
+        # repeatedly and checks identical results, then in nondeterministic mode within
+        # small tolerances. Expected failure on MPS.
         for dim in range(3):
             x, index, src = self._prepare_data_for_index_copy_and_add_deterministic(
                 dim, device
@@ -2086,12 +2337,19 @@ class TestIndexing(TestCase):
     )
     @dtypes(torch.float32, torch.float64, torch.half, torch.bfloat16)
     def test_index_add_fast_path(self, device, dtype):
+        # [FUNCTION DOC] CUDA-only: checks the index_add_ fast path and its
+        # fallbacks (alpha other than one, discontiguous source, misaligned
+        # destination, dim not zero, sliced inner dimension) against a CPU
+        # reference for several shapes and index dtypes, plus an empty index
+        # no-op. Dtype-specific tolerances apply; run serially.
         # Coverage for the index_add_ TMA fast path: one eligible case + five
         # fallback predicates per shape, asserted against a CPU reference.
         # Shapes keep n/m <= 1 so atomicAdd-order noise on bf16/half stays
         # within tolerance; (4096, 1024, 1024) crosses the TMA chunk_elems
         # boundary (D > one chunk).
         def check(out, dim, idx, src, alpha=1.0):
+            # [FUNCTION DOC] HELPER: Computes the expected result on CPU, applies
+            # index_add_ with alpha on the CUDA tensor, and asserts they match.
             expected = (
                 out.cpu().clone().index_add_(dim, idx.cpu(), src.cpu(), alpha=alpha)
             )
@@ -2168,6 +2426,10 @@ class TestIndexing(TestCase):
     )
     @dtypes(torch.float32, torch.bfloat16)
     def test_index_add_smem_stage_alignment_regression(self, device, dtype):
+        # [FUNCTION DOC] CUDA-only regression test for a shared-memory stage alignment bug
+        # in the scatter-add based fast path, using a small last dimension and more source
+        # rows than the grid cap so each block loops more than once; compares with CPU
+        # results. Run serially with loosened tolerances for noise.
         # Regression for SEV S664741: the original D104669063 was reverted
         # when this delegation surfaced a latent scatter_add TMA smem
         # stage-alignment bug -- chunk_bytes < 128 (or not a multiple of
@@ -2194,6 +2456,9 @@ class TestIndexing(TestCase):
     @onlyCUDA
     @dtypes(torch.complex64, torch.complex128, torch.bool)
     def test_index_add_excluded_dtypes(self, device, dtype):
+        # [FUNCTION DOC] CUDA-only: complex and bool tensors must be excluded from the
+        # fast path and still produce results equal to a CPU reference for an otherwise
+        # eligible call.
         # scatter_add_'s CUDA dispatch covers neither complex nor bool, so the
         # fast-path delegation in index_add_cuda_impl excludes these dtypes
         # and lets them fall through to indexFunc{Small,Large}Index. Regression
@@ -2213,6 +2478,9 @@ class TestIndexing(TestCase):
     @onlyNativeDeviceTypes
     @skipXPUIf(True, "https://github.com/intel/torch-xpu-ops/issues/1973")
     def test_index_put_non_accumulate_deterministic(self, device) -> None:
+        # [FUNCTION DOC] Under deterministic mode checks index_put without accumulate
+        # returns the last assigned value for duplicate indices, against a Python loop.
+        # Skipped on XPU.
         with DeterministicGuard(True):
             for i in range(3):
                 m = random.randint(10, 20)
@@ -2233,6 +2501,9 @@ class TestIndexing(TestCase):
     @dtypes(*all_types_and_complex_and(torch.half, torch.bool, torch.bfloat16))
     @dtypesIfMPS(*all_mps_types_and(torch.bool))  # TODO: Add torch.cfloat here
     def test_index_fill(self, device, dtype):
+        # [FUNCTION DOC] Checks index_fill_ on a column, that a non-complex tensor rejects
+        # a complex fill value with RuntimeError (except meta), and that zero-d results
+        # stay zero-d.
         x = torch.tensor([[1, 2], [4, 5]], dtype=dtype, device=device)
         index = torch.tensor([0], device=device)
         x.index_fill_(1, index, 0)
@@ -2261,9 +2532,15 @@ class TestIndexing(TestCase):
     @dtypesIfXPU(*all_types_and_complex_and(torch.half, torch.bool, torch.bfloat16))
     @dtypesIfMPS(*all_mps_types_and(torch.bool, torch.cfloat))
     def test_index_select(self, device, dtype):
+        # [FUNCTION DOC] Compares index_select to a NumPy take reference for
+        # contiguous and not sources and indices, int32 and int64 indices, and
+        # zero-d and one-element combinations. Dtypes unsupported by NumPy are
+        # converted via float for the reference.
         num_src, num_out = 3, 5
 
         def make_arg(batch_sizes, n, dim, contig):
+            # [FUNCTION DOC] HELPER: Makes a tensor with the batch sizes and n inserted at
+            # dim, either contiguous or non-contiguous.
             size_arg = batch_sizes[:dim] + (n,) + batch_sizes[dim:]
             return make_tensor(
                 size_arg,
@@ -2275,6 +2552,9 @@ class TestIndexing(TestCase):
             )
 
         def ref_index_select(src, dim, idx):
+            # [FUNCTION DOC] HELPER: Reference index_select using NumPy take on CPU
+            # copies, converting through float for bfloat16 and float8 dtypes and back to
+            # the test dtype; returns the result.
             # some types not supported on numpy
             not_np_dtypes = (
                 torch.bfloat16,
@@ -2373,7 +2653,12 @@ class TestIndexing(TestCase):
 
 
 class NumpyTests(TestCase):
+    # [CLASS DOC] Test case for indexing behaviors adapted from NumPy's own indexing
+    # tests, adjusted for PyTorch. Stateless; tests mostly build a small tensor and assert
+    # results or raised errors.
     def test_index_no_floats(self, device):
+        # [FUNCTION DOC] Asserts IndexError for float indices in every position of
+        # a 3-d tensor.
         a = torch.tensor([[[5.0]]], device=device)
 
         self.assertRaises(IndexError, lambda: a[0.0])
@@ -2400,17 +2685,22 @@ class NumpyTests(TestCase):
         # self.assertRaises(IndexError, lambda: a[0.0:, 0.0,:])
 
     def test_none_index(self, device):
+        # [FUNCTION DOC] Indexing with None adds one dimension.
         # `None` index adds newaxis
         a = tensor([1, 2, 3], device=device)
         self.assertEqual(a[None].dim(), a.dim() + 1)
 
     def test_empty_tuple_index(self, device):
+        # [FUNCTION DOC] Indexing with an empty tuple returns a view sharing the
+        # data pointer.
         # Empty tuple index creates a view
         a = tensor([1, 2, 3], device=device)
         self.assertEqual(a[()], a)
         self.assertEqual(a[()].data_ptr(), a.data_ptr())
 
     def test_empty_fancy_index(self, device):
+        # [FUNCTION DOC] Indexing with an empty list gives an empty long tensor, and with
+        # an empty float tensor raises IndexError.
         # Empty list index creates an empty array
         a = tensor([1, 2, 3], device=device)
         self.assertEqual(a[[]], torch.tensor([], dtype=torch.long, device=device))
@@ -2422,6 +2712,9 @@ class NumpyTests(TestCase):
         self.assertRaises(IndexError, lambda: a[b])
 
     def test_ellipsis_index(self, device):
+        # [FUNCTION DOC] Ellipsis indexing returns a distinct view with the same
+        # data pointer, can skip any number of dims, produces a zero-d tensor, and
+        # works for assignment.
         a = tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]], device=device)
         self.assertIsNot(a[...], a)
         self.assertEqual(a[...], a)
@@ -2444,6 +2737,8 @@ class NumpyTests(TestCase):
         self.assertEqual(b, 2)
 
     def test_single_int_index(self, device):
+        # [FUNCTION DOC] Integer index selects a row, negative works, and out-of-range or
+        # overflowing integers raise IndexError or an exception.
         # Single integer index selects one row
         a = tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]], device=device)
 
@@ -2456,6 +2751,8 @@ class NumpyTests(TestCase):
         self.assertRaises(Exception, a.__getitem__, 1 << 64)
 
     def test_single_bool_index(self, device):
+        # [FUNCTION DOC] Indexing with Python True equals None indexing; False gives an
+        # empty result.
         # Single boolean index
         a = tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]], device=device)
 
@@ -2463,6 +2760,8 @@ class NumpyTests(TestCase):
         self.assertEqual(a[False], a[None][0:0])
 
     def test_boolean_shape_mismatch(self, device):
+        # [FUNCTION DOC] Bool mask of the wrong length or shape raises IndexError
+        # mentioning mask.
         arr = torch.ones((5, 4, 3), device=device)
 
         index = tensor([True], device=device)
@@ -2476,6 +2775,8 @@ class NumpyTests(TestCase):
         self.assertRaisesRegex(IndexError, "mask", lambda: arr[(slice(None), index)])
 
     def test_boolean_indexing_onedim(self, device):
+        # [FUNCTION DOC] Bool mask of length one selects the single row, and assignment
+        # through it works.
         # Indexing a 2-dimensional array with
         # boolean array of length one
         a = tensor([[0.0, 0.0, 0.0]], device=device)
@@ -2488,11 +2789,16 @@ class NumpyTests(TestCase):
     # https://github.com/pytorch/pytorch/issues/127003
     @xfailIfTorchDynamo
     def test_boolean_assignment_value_mismatch(self, device):
+        # [FUNCTION DOC] Assigning values whose shape cannot broadcast to the bool
+        # selection raises an exception mentioning shape mismatch. Expected
+        # failure under Dynamo.
         # A boolean assignment should fail when the shape of the values
         # cannot be broadcast to the subscription. (see also gh-3458)
         a = torch.arange(0, 4, device=device)
 
         def f(a, v):
+            # [FUNCTION DOC] HELPER: Assigns tensor v onto the device into the entries of
+            # a that are above minus one.
             a[a > -1] = tensor(v).to(device)
 
         self.assertRaisesRegex(Exception, "shape mismatch", f, a, [])
@@ -2500,6 +2806,8 @@ class NumpyTests(TestCase):
         self.assertRaisesRegex(Exception, "shape mismatch", f, a[:1], [1, 2, 3])
 
     def test_boolean_indexing_twodim(self, device):
+        # [FUNCTION DOC] Indexes a 2-d tensor with 2-d bool masks and rows of them, and
+        # assigns through the mask.
         # Indexing a 2-dimensional array with
         # 2-dimensional boolean array
         a = tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]], device=device)
@@ -2516,6 +2824,8 @@ class NumpyTests(TestCase):
         self.assertEqual(a, tensor([[0, 2, 0], [4, 0, 6], [0, 8, 0]], device=device))
 
     def test_boolean_indexing_weirdness(self, device):
+        # [FUNCTION DOC] Checks combinations of boolean scalars with list indices,
+        # expected shape and value, and an IndexError for mismatched ones.
         # Weird boolean indexing things
         a = torch.ones((2, 3, 4), device=device)
         self.assertEqual((0, 2, 3, 4), a[False, True, ...].shape)
@@ -2525,6 +2835,8 @@ class NumpyTests(TestCase):
         self.assertRaises(IndexError, lambda: a[False, [0, 1], ...])
 
     def test_boolean_indexing_weirdness_tensors(self, device):
+        # [FUNCTION DOC] Same as the weirdness test but using scalar bool tensors instead
+        # of Python bools.
         # Weird boolean indexing things
         false = torch.tensor(False, device=device)
         true = torch.tensor(True, device=device)
@@ -2536,12 +2848,16 @@ class NumpyTests(TestCase):
         self.assertRaises(IndexError, lambda: a[false, [0, 1], ...])
 
     def test_boolean_indexing_alldims(self, device):
+        # [FUNCTION DOC] Checks indexing a 2-d tensor with two true values gives a leading
+        # dim of one.
         true = torch.tensor(True, device=device)
         a = torch.ones((2, 3), device=device)
         self.assertEqual((1, 2, 3), a[True, True].shape)
         self.assertEqual((1, 2, 3), a[true, true].shape)
 
     def test_boolean_list_indexing(self, device):
+        # [FUNCTION DOC] Indexes a 2-d tensor with Python lists of bools, singly
+        # and pairwise.
         # Indexing a 2-dimensional array with
         # boolean lists
         a = tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]], device=device)
@@ -2553,6 +2869,8 @@ class NumpyTests(TestCase):
         self.assertEqual(a[c, c], tensor([1, 5], device=device))
 
     def test_everything_returns_views(self, device):
+        # [FUNCTION DOC] Asserts the empty tuple, ellipsis and full slice each return new
+        # tensor objects.
         # Before `...` would return a itself.
         a = tensor([5], device=device)
 
@@ -2561,6 +2879,8 @@ class NumpyTests(TestCase):
         self.assertIsNot(a, a[:])
 
     def test_broaderrors_indexing(self, device):
+        # [FUNCTION DOC] Mismatched list shapes raise IndexError mentioning shape mismatch
+        # on get and set.
         a = torch.zeros(5, 5, device=device)
         self.assertRaisesRegex(
             IndexError, "shape mismatch", a.__getitem__, ([0, 1], [0, 1, 2])
@@ -2572,6 +2892,8 @@ class NumpyTests(TestCase):
     @skipXPUIf(True, "XPU asserts instead of raising an exception")
     @skipCUDAIf(True, "CUDA asserts instead of raising an exception")
     def test_trivial_fancy_out_of_bounds(self, device):
+        # [FUNCTION DOC] Out-of-bounds fancy indices on get and set raise IndexError;
+        # skipped on XPU and CUDA, which assert instead.
         a = torch.zeros(5, device=device)
         ind = torch.ones(20, dtype=torch.int64, device=device)
         ind[-1] = 10
@@ -2583,6 +2905,8 @@ class NumpyTests(TestCase):
         self.assertRaises(IndexError, a.__setitem__, ind, 0)
 
     def test_index_is_larger(self, device):
+        # [FUNCTION DOC] Assigns a row of values with broadcast list indices and checks
+        # the filled block.
         # Simple case of fancy index broadcasting of the index.
         a = torch.zeros((5, 5), device=device)
         a[[[0], [1], [2]], [0, 1, 2]] = tensor([2.0, 3.0, 4.0], device=device)
@@ -2590,6 +2914,8 @@ class NumpyTests(TestCase):
         self.assertTrue((a[:3, :3] == tensor([2.0, 3.0, 4.0], device=device)).all())
 
     def test_broadcast_subspace(self, device):
+        # [FUNCTION DOC] Assigns a column vector through a reversed index and checks each
+        # row's value.
         a = torch.zeros((100, 100), device=device)
         v = torch.arange(0.0, 100, device=device)[:, None]
         b = torch.arange(99, -1, -1, device=device).long()
@@ -2598,6 +2924,8 @@ class NumpyTests(TestCase):
         self.assertEqual(a, expected)
 
     def test_truncate_leading_1s(self, device):
+        # [FUNCTION DOC] Checks that assigning to the diagonal via range indices matches
+        # writing the diagonal view with the same values.
         col_max = torch.randn(1, 4)
         kernel = col_max.T * col_max  # [4, 4] tensor
         kernel2 = kernel.clone()
