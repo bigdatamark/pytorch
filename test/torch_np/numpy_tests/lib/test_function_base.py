@@ -1,4 +1,10 @@
 # Owner(s): ["module: dynamo"]
+# [MODULE DOC] Tests ported from the NumPy test suite for function-base style routines (rot90,
+# flip, any/all, copy, average, select, insert, delete, diff, gradient, angle, trim_zeros,
+# unique, interp, cov, windows, etc.), run against torch._numpy in eager mode or against real
+# NumPy when TEST_WITH_TORCHDYNAMO is set. Import time: aliases np and the tested functions to
+# either NumPy or torch._numpy, imports hypothesis and pytest, and defines the skip helper. Many
+# classes are marked expected-failure or skipped where the functionality is not implemented.
 
 import functools
 import math
@@ -127,6 +133,8 @@ else:
 
 
 def get_mat(n):
+    # [FUNCTION DOC] HELPER: build a square matrix of size n by n whose entry at row i, column j
+    # is i plus j; returns it as an array from the active numpy namespace.
     data = np.arange(n)
     #    data = np.add.outer(data, data)
     data = data[:, None] + data[None, :]
@@ -134,6 +142,9 @@ def get_mat(n):
 
 
 def _make_complex(real, imag):
+    # [FUNCTION DOC] HELPER: build a complex128 array shaped by broadcasting real and imag, then
+    # assign the real and imaginary parts separately, so non-finite imaginary values do not
+    # contaminate the real part. Returns the array.
     """
     Like real + 1j * imag, but behaves as expected when imag contains non-finite
     values
@@ -145,7 +156,13 @@ def _make_complex(real, imag):
 
 
 class TestRot90(TestCase):
+    # [CLASS DOC] Tests for np.rot90: argument validation, rotation by multiples of 90 degrees,
+    # and rotation in different axis planes.
     def test_basic(self):
+        # [FUNCTION DOC] Checks that invalid input (1-D array, wrong axes length, out-of-range
+        # or repeated axes) raises ValueError or RuntimeError, then verifies rotations for many
+        # k values (negative and large, modulo 4) against hard-coded results, and that opposite
+        # axes order inverts the rotation.
         assert_raises(ValueError, np.rot90, np.ones(4))
         assert_raises(
             (ValueError, RuntimeError), np.rot90, np.ones((2, 2, 2)), axes=(0, 1, 2)
@@ -173,12 +190,17 @@ class TestRot90(TestCase):
         assert_equal(np.rot90(a, k=1, axes=(1, 0)), np.rot90(a, k=-1, axes=(0, 1)))
 
     def test_axes(self):
+        # [FUNCTION DOC] Verifies rot90 output shape on a 3-D array and that negative axis
+        # indices give the same result as positive ones.
         a = np.ones((50, 40, 3))
         assert_equal(np.rot90(a).shape, (40, 50, 3))
         assert_equal(np.rot90(a, axes=(0, 2)), np.rot90(a, axes=(0, -1)))
         assert_equal(np.rot90(a, axes=(1, 2)), np.rot90(a, axes=(-2, -1)))
 
     def test_rotation_axes(self):
+        # [FUNCTION DOC] Rotates a 2x2x2 array in several axis planes and compares with hard-
+        # coded nested lists; also checks that rotating by k equals rotating the k-1 rotated
+        # result once more.
         a = np.arange(8).reshape((2, 2, 2))
 
         a_rot90_01 = [[[2, 3], [6, 7]], [[0, 1], [4, 5]]]
@@ -198,7 +220,10 @@ class TestRot90(TestCase):
 
 
 class TestFlip(TestCase):
+    # [CLASS DOC] Tests for np.flip over single, multiple and default axes.
     def test_axes(self):
+        # [FUNCTION DOC] Verifies that flip raises AxisError for out-of-range axes, including a
+        # tuple containing an invalid axis.
         assert_raises(np.AxisError, np.flip, np.ones(4), axis=1)
         assert_raises(np.AxisError, np.flip, np.ones((4, 4)), axis=2)
         assert_raises(np.AxisError, np.flip, np.ones((4, 4)), axis=-3)
@@ -206,6 +231,8 @@ class TestFlip(TestCase):
 
     @skip(reason="no [::-1] indexing")
     def test_basic_lr(self):
+        # [FUNCTION DOC] Skipped (negative-step slicing unsupported). Would compare flip along
+        # axis 1 against a reversed-column slice for a helper matrix and a small list.
         a = get_mat(4)
         b = a[:, ::-1]
         assert_equal(np.flip(a, 1), b)
@@ -215,6 +242,8 @@ class TestFlip(TestCase):
 
     @skip(reason="no [::-1] indexing")
     def test_basic_ud(self):
+        # [FUNCTION DOC] Skipped (negative-step slicing unsupported). Would compare flip along
+        # axis 0 against a reversed-row slice for a helper matrix and a small list.
         a = get_mat(4)
         b = a[::-1, :]
         assert_equal(np.flip(a, 0), b)
@@ -223,6 +252,8 @@ class TestFlip(TestCase):
         assert_equal(np.flip(a, 0), b)
 
     def test_3d_swap_axis0(self):
+        # [FUNCTION DOC] Flips a 3-D array along axis 0 and compares with the
+        # expected block swap.
         a = np.array([[[0, 1], [2, 3]], [[4, 5], [6, 7]]])
 
         b = np.array([[[4, 5], [6, 7]], [[0, 1], [2, 3]]])
@@ -230,6 +261,7 @@ class TestFlip(TestCase):
         assert_equal(np.flip(a, 0), b)
 
     def test_3d_swap_axis1(self):
+        # [FUNCTION DOC] Flips a 3-D array along axis 1 and compares with the expected result.
         a = np.array([[[0, 1], [2, 3]], [[4, 5], [6, 7]]])
 
         b = np.array([[[2, 3], [0, 1]], [[6, 7], [4, 5]]])
@@ -237,6 +269,7 @@ class TestFlip(TestCase):
         assert_equal(np.flip(a, 1), b)
 
     def test_3d_swap_axis2(self):
+        # [FUNCTION DOC] Flips a 3-D array along axis 2 and compares with the expected result.
         a = np.array([[[0, 1], [2, 3]], [[4, 5], [6, 7]]])
 
         b = np.array([[[1, 0], [3, 2]], [[5, 4], [7, 6]]])
@@ -244,16 +277,21 @@ class TestFlip(TestCase):
         assert_equal(np.flip(a, 2), b)
 
     def test_4d(self):
+        # [FUNCTION DOC] For each axis of a 4-D array, checks flip equals swapping that axis to
+        # the front, flipping with flipud, and swapping back.
         a = np.arange(2 * 3 * 4 * 5).reshape(2, 3, 4, 5)
         for i in range(a.ndim):
             assert_equal(np.flip(a, i), np.flipud(a.swapaxes(0, i)).swapaxes(i, 0))
 
     def test_default_axis(self):
+        # [FUNCTION DOC] With no axis given, flip reverses all axes of a 2x3 array.
         a = np.array([[1, 2, 3], [4, 5, 6]])
         b = np.array([[6, 5, 4], [3, 2, 1]])
         assert_equal(np.flip(a), b)
 
     def test_multiple_axes(self):
+        # [FUNCTION DOC] Checks flip with an empty axis tuple (identity) and with two-axis
+        # tuples, comparing against hard-coded results.
         a = np.array([[[0, 1], [2, 3]], [[4, 5], [6, 7]]])
 
         assert_equal(np.flip(a, axis=()), a)
@@ -268,7 +306,10 @@ class TestFlip(TestCase):
 
 
 class TestAny(TestCase):
+    # [CLASS DOC] Tests for np.any.
     def test_basic(self):
+        # [FUNCTION DOC] Checks any on lists: true if any element is nonzero, false
+        # for all zeros.
         y1 = [0, 0, 1, 0]
         y2 = [0, 0, 0, 0]
         y3 = [1, 0, 1, 0]
@@ -277,6 +318,7 @@ class TestAny(TestCase):
         assert_(not np.any(y2))
 
     def test_nd(self):
+        # [FUNCTION DOC] Checks any on a nested list for the whole array and along axis 0 and 1.
         y1 = [[0, 0, 0], [0, 1, 0], [1, 1, 0]]
         assert_(np.any(y1))
         assert_array_equal(np.any(y1, axis=0), [1, 1, 0])
@@ -284,7 +326,10 @@ class TestAny(TestCase):
 
 
 class TestAll(TestCase):
+    # [CLASS DOC] Tests for np.all.
     def test_basic(self):
+        # [FUNCTION DOC] Checks all on lists, including an all-nonzero list and the logical
+        # negation of an all-zero array.
         y1 = [0, 1, 1, 0]
         y2 = [0, 0, 0, 0]
         y3 = [1, 1, 1, 1]
@@ -294,6 +339,7 @@ class TestAll(TestCase):
         assert_(np.all(~np.array(y2)))
 
     def test_nd(self):
+        # [FUNCTION DOC] Checks all on a nested list for the whole array and along axis 0 and 1.
         y1 = [[0, 0, 1], [0, 1, 1], [1, 1, 1]]
         assert_(not np.all(y1))
         assert_array_equal(np.all(y1, axis=0), [0, 0, 1])
@@ -301,7 +347,10 @@ class TestAll(TestCase):
 
 
 class TestCopy(TestCase):
+    # [CLASS DOC] Tests for np.copy.
     def test_basic(self):
+        # [FUNCTION DOC] Verifies copy returns an equal array and that mutating the copy leaves
+        # the original unchanged.
         a = np.array([[1, 2], [3, 4]])
         a_copy = np.copy(a)
         assert_array_equal(a, a_copy)
@@ -311,6 +360,9 @@ class TestCopy(TestCase):
 
     @xpassIfTorchDynamo_np  # (reason="order='F' not implemented")
     def test_order(self):
+        # [FUNCTION DOC] Checks np.copy preserves memory layout: a C-ordered input gives
+        # C-contiguous output and a Fortran-ordered input gives F-contiguous output. Marked to
+        # xpass under dynamo with torch._numpy lacking order support.
         # It turns out that people rely on np.copy() preserving order by
         # default; changing this broke scikit-learn:
         # github.com/scikit-learn/scikit-learn/commit/7842748cf777412c506
@@ -330,7 +382,11 @@ class TestCopy(TestCase):
 
 @instantiate_parametrized_tests
 class TestAverage(TestCase):
+    # [CLASS DOC] Tests for np.average: plain, keepdims, weighted, returned-weight-sum and dtype
+    # upcasting cases. Parametrized tests are instantiated.
     def test_basic(self):
+        # [FUNCTION DOC] Checks unweighted average along axis 0 for 1-D lists/arrays and
+        # compares against mean along each axis for a modified ones matrix and a random matrix.
         y1 = np.array([1, 2, 3])
         assert_(np.average(y1, axis=0) == 2.0)
         y2 = np.array([1.0, 2.0, 3.0])
@@ -366,6 +422,10 @@ class TestAverage(TestCase):
     def test_basic_keepdims(
         self, x, axis, expected_avg, weights, expected_wavg, expected_wsum
     ):
+        # [FUNCTION DOC] Skipped. Parametrized over inputs, axis, expected results and weights;
+        # checks that average with keepdims keeps the reduced axis (shape and values), with and
+        # without weights, and also the returned weight sum shape and values, raising
+        # AssertionError on shape mismatch.
         avg = np.average(x, axis=axis, keepdims=True)
         if avg.shape != np.shape(expected_avg):
             raise AssertionError(
@@ -396,6 +456,9 @@ class TestAverage(TestCase):
 
     @skip(reason="NP_VER: fails on CI")
     def test_weights(self):
+        # [FUNCTION DOC] Skipped. Checks weighted average for 1-D and 2-D weights over axes,
+        # equal result dtype to the promoted type of values and weights, and keepdims
+        # behavior with weights.
         y = np.arange(10)
         w = np.arange(10)
         actual = np.average(y, weights=w)
@@ -440,6 +503,9 @@ class TestAverage(TestCase):
         assert_array_equal(actual, desired)
 
     def test_returned(self):
+        # [FUNCTION DOC] Checks the returned weight sum from average with returned=True: without
+        # weights it equals the count of averaged elements, with 1-D or 2-D weights it equals
+        # the weight sums along the axis.
         y = np.array([[1, 2, 3], [4, 5, 6]])
 
         # No weights
@@ -466,6 +532,8 @@ class TestAverage(TestCase):
         assert_array_equal(scl, np.array([1.0, 6.0]))
 
     def test_upcasting(self):
+        # [FUNCTION DOC] Checks average with weights returns float64 unless both values and
+        # weights are float32, over a table of dtype combinations.
         typs = [
             ("i4", "i4", "f8"),
             ("i4", "f4", "f8"),
@@ -480,6 +548,8 @@ class TestAverage(TestCase):
 
     @skip(reason="support Fraction objects?")
     def test_average_class_without_dtype(self):
+        # [FUNCTION DOC] Skipped (Fraction objects unsupported). Would check average of an
+        # object array of Fraction values gives a Fraction.
         # see gh-21988
         a = np.array([Fraction(1, 5), Fraction(3, 5)])
         assert_equal(np.average(a), Fraction(2, 5))
@@ -487,6 +557,9 @@ class TestAverage(TestCase):
 
 @xfail  # (reason="TODO: implement")
 class TestSelect(TestCase):
+    # [CLASS DOC] Tests for select; the whole class is an expected failure because select is
+    # not implemented (the name is not imported). Holds class-level choices and conditions
+    # lists of arrays.
     choices = [np.array([1, 2, 3]), np.array([4, 5, 6]), np.array([7, 8, 9])]
     conditions = [
         np.array([False, False, False]),
@@ -495,12 +568,17 @@ class TestSelect(TestCase):
     ]
 
     def _select(self, cond, values, default=0):
+        # [FUNCTION DOC] HELPER: reference implementation of select in pure Python; for each
+        # position it collects the values of every choice whose condition is true there, or the
+        # default if none, and returns the output list.
         output = []
         for m in range(len(cond)):
             output += [V[m] for V, C in zip(values, cond) if C[m]] or [default]
         return output
 
     def test_basic(self):
+        # [FUNCTION DOC] Compares select against the reference helper using the class choices
+        # and conditions with a default of 15, and checks the input list lengths.
         choices = self.choices
         conditions = self.conditions
         assert_array_equal(
@@ -512,6 +590,8 @@ class TestSelect(TestCase):
         assert_equal(len(conditions), 3)
 
     def test_broadcasting(self):
+        # [FUNCTION DOC] Checks select with broadcasting between a scalar condition and array
+        # conditions, and that a list default broadcasts to shape one.
         conditions = [np.array(True), np.array([False, True, False])]
         choices = [1, np.arange(12).reshape(4, 3)]
         assert_array_equal(select(conditions, choices), np.ones((4, 3)))
@@ -519,6 +599,8 @@ class TestSelect(TestCase):
         assert_equal(select([True], [0], default=[0]).shape, (1,))
 
     def test_return_dtype(self):
+        # [FUNCTION DOC] Checks select result dtype: complex default promotes to complex128,
+        # int8 choices stay int8, and NaN positions select correctly from a float array.
         assert_equal(select(self.conditions, self.choices, 1j).dtype, np.complex128)
         # But the conditions need to be stronger then the scalar default
         # if it is scalar.
@@ -530,10 +612,13 @@ class TestSelect(TestCase):
         assert_equal(select([m], [d]), [0, 0, 0, np.nan, 0, 0])
 
     def test_deprecated_empty(self):
+        # [FUNCTION DOC] Checks select with empty condition and choice lists raises ValueError.
         assert_raises(ValueError, select, [], [], 3j)
         assert_raises(ValueError, select, [], [])
 
     def test_non_bool_deprecation(self):
+        # [FUNCTION DOC] Checks select raises TypeError when a condition array is of integer
+        # type rather than boolean.
         choices = self.choices
         conditions = self.conditions[:]
         conditions[0] = conditions[0].astype(np.int_)
@@ -543,6 +628,8 @@ class TestSelect(TestCase):
         assert_raises(TypeError, select, conditions, choices)
 
     def test_many_arguments(self):
+        # [FUNCTION DOC] Checks select accepts 100 conditions and choices (more than the old
+        # 32 argument limit).
         # This used to be limited by NPY_MAXARGS == 32
         conditions = [np.array([False])] * 100
         choices = [np.array([1])] * 100
@@ -552,7 +639,13 @@ class TestSelect(TestCase):
 @xpassIfTorchDynamo_np  # (reason="TODO: implement")
 @instantiate_parametrized_tests
 class TestInsert(TestCase):
+    # [CLASS DOC] Tests for insert (imported from numpy lib, only when NumPy below 2);
+    # whole class xpass under dynamo since not implemented in torch._numpy. Parametrized
+    # tests are instantiated.
     def test_basic(self):
+        # [FUNCTION DOC] Checks insert with scalar and list indices and values, negative
+        # indices, slice indices, empty indices, and that a boolean index array triggers a
+        # FutureWarning and is treated as positions.
         a = [1, 2, 3]
         assert_equal(insert(a, 0, 1), [1, 1, 2, 3])
         assert_equal(insert(a, 3, 1), [1, 2, 3, 1])
@@ -572,6 +665,9 @@ class TestInsert(TestCase):
             assert_(w[0].category is FutureWarning)
 
     def test_multidim(self):
+        # [FUNCTION DOC] Checks insert into 2-D arrays: flattened default, along axis 0
+        # and 1, scalar versus sequence index semantics, negative axes, and AxisError
+        # for out-of-range axes.
         a = [[1, 1, 1]]
         r = [[2, 2, 2], [1, 1, 1]]
         assert_equal(insert(a, 0, [1]), [1, 1, 1, 1])
@@ -617,6 +713,8 @@ class TestInsert(TestCase):
         )
 
     def test_0d(self):
+        # [FUNCTION DOC] Checks insert on a 0-d array raises AxisError for axis 0 and TypeError
+        # for a string axis.
         a = np.array(1)
         with pytest.raises(np.AxisError):
             insert(a, [], 2, axis=0)
@@ -624,11 +722,15 @@ class TestInsert(TestCase):
             insert(a, [], 2, axis="nonsense")
 
     def test_index_array_copied(self):
+        # [FUNCTION DOC] Checks that the index array passed to insert is not modified
+        # by the call.
         x = np.array([1, 1, 1])
         np.insert([0, 1, 2], x, [3, 4, 5])
         assert_equal(x, np.array([1, 1, 1]))
 
     def test_index_floats(self):
+        # [FUNCTION DOC] Checks insert raises IndexError when the index array has a float dtype,
+        # even if empty.
         with pytest.raises(IndexError):
             np.insert([0, 1, 2], np.array([1.0, 2.0]), [10, 20])
         with pytest.raises(IndexError):
@@ -637,12 +739,16 @@ class TestInsert(TestCase):
     @skip(reason="NP_VER: fails on CI")
     @parametrize("idx", [4, -4])
     def test_index_out_of_bounds(self, idx):
+        # [FUNCTION DOC] Skipped. Parametrized over indices 4 and -4: insert into a 3-element
+        # list raises IndexError mentioning out of bounds.
         with pytest.raises(IndexError, match="out of bounds"):
             np.insert([0, 1, 2], [idx], [3, 4])
 
 
 class TestAmax(TestCase):
+    # [CLASS DOC] Tests for np.amax.
     def test_basic(self):
+        # [FUNCTION DOC] Checks amax of a flat list and along axis 0 and 1 of a nested list.
         a = [3, 4, 5, 10, -3, -5, 6.0]
         assert_equal(np.amax(a), 10.0)
         b = [[3, 6.0, 9.0], [4, 10.0, 5.0], [8, 3.0, 2.0]]
@@ -651,7 +757,9 @@ class TestAmax(TestCase):
 
 
 class TestAmin(TestCase):
+    # [CLASS DOC] Tests for np.amin.
     def test_basic(self):
+        # [FUNCTION DOC] Checks amin of a flat list and along axis 0 and 1 of a nested list.
         a = [3, 4, 5, 10, -3, -5, 6.0]
         assert_equal(np.amin(a), -5.0)
         b = [[3, 6.0, 9.0], [4, 10.0, 5.0], [8, 3.0, 2.0]]
@@ -660,7 +768,10 @@ class TestAmin(TestCase):
 
 
 class TestPtp(TestCase):
+    # [CLASS DOC] Tests for the ptp method (peak-to-peak range).
     def test_basic(self):
+        # [FUNCTION DOC] Checks ptp on 1-D and 2-D arrays along axes, negative axis, and
+        # keepdims with single and tuple axes.
         a = np.array([3, 4, 5, 10, -3, -5, 6.0])
         assert_equal(a.ptp(axis=0), 15.0)
         b = np.array([[3, 6.0, 9.0], [4, 10.0, 5.0], [8, 3.0, 2.0]])
@@ -672,7 +783,10 @@ class TestPtp(TestCase):
 
 
 class TestCumsum(TestCase):
+    # [CLASS DOC] Tests for np.cumsum.
     def test_basic(self):
+        # [FUNCTION DOC] For many numeric dtypes (ints, floats, complex), checks cumsum along
+        # axis 0 of a 1-D array and along both axes of a 2-D array against expected arrays.
         ba = [1, 2, 10, 11, 6, 5, 4]
         ba2 = [[1, 2, 3, 4], [5, 6, 7, 9], [10, 3, 4, 5]]
         for ctype in [
@@ -699,7 +813,11 @@ class TestCumsum(TestCase):
 
 
 class TestProd(TestCase):
+    # [CLASS DOC] Tests for the prod method.
     def test_basic(self):
+        # [FUNCTION DOC] For several dtypes checks product along axis 0 and -1 against known
+        # values; the branch expecting ArithmeticError never runs because the dtypes are never
+        # the listed strings.
         ba = [1, 2, 10, 11, 6, 5, 4]
         ba2 = [[1, 2, 3, 4], [5, 6, 7, 9], [10, 3, 4, 5]]
         for ctype in [
@@ -722,7 +840,11 @@ class TestProd(TestCase):
 
 
 class TestCumprod(TestCase):
+    # [CLASS DOC] Tests for np.cumprod.
     def test_basic(self):
+        # [FUNCTION DOC] For several dtypes checks cumprod along axes of 1-D and 2-D arrays
+        # against known values; the branch expecting ArithmeticError never runs because the
+        # dtypes are never the listed strings.
         ba = [1, 2, 10, 11, 6, 5, 4]
         ba2 = [[1, 2, 3, 4], [5, 6, 7, 9], [10, 3, 4, 5]]
         for ctype in [
@@ -757,7 +879,10 @@ class TestCumprod(TestCase):
 
 
 class TestDiff(TestCase):
+    # [CLASS DOC] Tests for diff.
     def test_basic(self):
+        # [FUNCTION DOC] Checks diff of integer lists for orders 1 to 3, a float list, and a
+        # boolean list (xor-like differences).
         x = [1, 4, 6, 7, 12]
         out = np.array([3, 2, 1, 5])
         out2 = np.array([-1, -1, 4])
@@ -777,6 +902,8 @@ class TestDiff(TestCase):
         assert_array_equal(diff(x, n=2), out2)
 
     def test_axis(self):
+        # [FUNCTION DOC] Checks diff along various axes (including negative) of a 3-D array,
+        # AxisError for out-of-range axes, and ValueError for a 0-d input.
         x = np.zeros((10, 20, 30))
         x[:, 1::2, :] = 1
         exp = np.ones((10, 19, 30))
@@ -793,6 +920,8 @@ class TestDiff(TestCase):
         assert_raises(ValueError, diff, x)
 
     def test_nd(self):
+        # [FUNCTION DOC] Compares diff on a random 3-D array against manual slice subtraction
+        # for orders 1 and 2 along the last and first axes.
         x = 20 * rand(10, 20, 30)
         out1 = x[:, :, 1:] - x[:, :, :-1]
         out2 = out1[:, :, 1:] - out1[:, :, :-1]
@@ -804,6 +933,8 @@ class TestDiff(TestCase):
         assert_array_equal(diff(x, n=2, axis=0), out4)
 
     def test_n(self):
+        # [FUNCTION DOC] Checks diff raises ValueError for negative n, and for n from 1 to 4 on
+        # a 3-element range gives expected shapes, integer dtype, and ndarray type.
         x = list(range(3))
         assert_raises(ValueError, diff, x, n=-1)
         output = [diff(x, n=n) for n in range(1, 5)]
@@ -816,6 +947,9 @@ class TestDiff(TestCase):
             assert_equal(len(out), max(0, len(x) - n))
 
     def test_prepend(self):
+        # [FUNCTION DOC] Checks diff with the prepend argument: scalar and list for 1-D, per-
+        # axis prepend for 2-D, mismatched shape raising ValueError or RuntimeError, and
+        # AxisError for bad axis.
         x = np.arange(5) + 1
         assert_array_equal(diff(x, prepend=0), np.ones(5))
         assert_array_equal(diff(x, prepend=[0]), np.ones(5))
@@ -840,6 +974,9 @@ class TestDiff(TestCase):
         assert_raises(np.AxisError, diff, x, prepend=0, axis=3)
 
     def test_append(self):
+        # [FUNCTION DOC] Checks diff with the append argument: scalar and list for 1-D, per-
+        # axis append for 2-D, mismatched shape raising ValueError or RuntimeError, and
+        # AxisError for bad axis.
         x = np.arange(5)
         result = diff(x, append=0)
         expected = [1, 1, 1, 1, -4]
@@ -871,12 +1008,19 @@ class TestDiff(TestCase):
 @xpassIfTorchDynamo_np  # (reason="TODO: implement")
 @instantiate_parametrized_tests
 class TestDelete(TestCase):
+    # [CLASS DOC] Tests for delete (imported from numpy lib, NumPy below 2 only); xpass under
+    # dynamo as not implemented. Fixture holds a 1-D array a and a 3-D array nd_a.
     def setUp(self):
+        # [FUNCTION DOC] Fixture: calls the parent setUp, then stores a as a range of five and
+        # nd_a as a 1x5x2 array whose second axis repeats values.
         super().setUp()
         self.a = np.arange(5)
         self.nd_a = np.arange(5).repeat(2).reshape(1, 5, 2)
 
     def _check_inverse_of_slicing(self, indices):
+        # [FUNCTION DOC] HELPER: checks delete as the inverse of selection: deleting indices
+        # from a and from nd_a along axis 1 and symmetric difference with the selected elements
+        # must reproduce the originals.
         a_del = delete(self.a, indices)
         nd_a_del = delete(self.nd_a, indices, axis=1)
         msg = f"Delete failed for obj: {indices!r}"
@@ -885,6 +1029,8 @@ class TestDelete(TestCase):
         assert_array_equal(xor, self.nd_a[0, :, 0], err_msg=msg)
 
     def test_slices(self):
+        # [FUNCTION DOC] Runs the inverse-of-indexing check over all combinations of slice
+        # start, stop and step from fixed lists.
         lims = [-6, -2, 0, 1, 2, 4, 5]
         steps = [-3, -1, 1, 3]
         for start in lims:
@@ -894,6 +1040,9 @@ class TestDelete(TestCase):
                     self._check_inverse_of_slicing(s)
 
     def test_fancy(self):
+        # [FUNCTION DOC] Checks fancy index arrays, out-of-range indices raising IndexError,
+        # negative and repeated indices, boolean lists, and ValueError for scalar booleans or
+        # too-short boolean masks.
         self._check_inverse_of_slicing(np.array([[0, 1], [2, 1]]))
         with pytest.raises(IndexError):
             delete(self.a, [100])
@@ -915,10 +1064,14 @@ class TestDelete(TestCase):
             delete(self.a, [False] * 4)
 
     def test_single(self):
+        # [FUNCTION DOC] Checks the inverse-of-indexing check for single integer indices
+        # 0 and -4.
         self._check_inverse_of_slicing(0)
         self._check_inverse_of_slicing(-4)
 
     def test_0d(self):
+        # [FUNCTION DOC] Checks delete on a 0-d array raises AxisError for axis 0 and TypeError
+        # for a string axis.
         a = np.array(1)
         with pytest.raises(np.AxisError):
             delete(a, [], axis=0)
@@ -926,6 +1079,8 @@ class TestDelete(TestCase):
             delete(a, [], axis="nonsense")
 
     def test_array_order_preserve(self):
+        # [FUNCTION DOC] Checks that deleting along an axis of a Fortran-ordered array keeps the
+        # same contiguity flags.
         # See gh-7113
         k = np.arange(10).reshape(2, 5, order="F")
         m = delete(k, slice(60, None), axis=1)
@@ -936,6 +1091,8 @@ class TestDelete(TestCase):
         assert_equal(m.flags.f_contiguous, k.flags.f_contiguous)
 
     def test_index_floats(self):
+        # [FUNCTION DOC] Checks delete raises IndexError for float-typed index arrays,
+        # even if empty.
         with pytest.raises(IndexError):
             np.delete([0, 1, 2], np.array([1.0, 2.0]))
         with pytest.raises(IndexError):
@@ -945,6 +1102,9 @@ class TestDelete(TestCase):
         "indexer", [subtest(np.array([1]), name="array([1])"), subtest([1], name="[1]")]
     )
     def test_single_item_array(self, indexer):
+        # [FUNCTION DOC] Parametrized over a one-element array or list index: deleting that
+        # index equals deleting the integer 1, for both the 1-D array and along axis 1 of
+        # the 3-D array.
         a_del_int = delete(self.a, 1)
         a_del = delete(self.a, indexer)
         assert_equal(a_del_int, a_del)
@@ -954,6 +1114,8 @@ class TestDelete(TestCase):
         assert_equal(nd_a_del_int, nd_a_del)
 
     def test_single_item_array_non_int(self):
+        # [FUNCTION DOC] Checks that a one-element boolean array index is treated as a mask, not
+        # cast to integer zero: false keeps everything, true removes the single column.
         # Special handling for integer arrays must not affect non-integer ones.
         # If `False` was cast to `0` it would delete the element:
         res = delete(np.ones(1), np.array([False]))
@@ -972,7 +1134,10 @@ class TestDelete(TestCase):
 
 @instantiate_parametrized_tests
 class TestGradient(TestCase):
+    # [CLASS DOC] Tests for gradient; parametrized tests are instantiated.
     def test_basic(self):
+        # [FUNCTION DOC] Checks gradient of a 2x2 list and array gives the expected per-
+        # axis derivative arrays.
         v = [[1, 1], [3, 4]]
         x = np.array(v)
         dx = [np.array([[2.0, 3.0], [2.0, 3.0]]), np.array([[0.0, 0.0], [1.0, 1.0]])]
@@ -980,6 +1145,9 @@ class TestGradient(TestCase):
         assert_array_equal(gradient(v), dx)
 
     def test_args(self):
+        # [FUNCTION DOC] Checks gradient accepts scalar, 0-d and vector spacings, mixed even and
+        # uneven spacings, and an explicit axis; a spacing array of two dimensions raises
+        # ValueError mentioning scalars or 1d.
         dx = np.cumsum(np.ones(5))
         dx_uneven = [1.0, 2.0, 5.0, 9.0, 11.0]
         f_2d = np.arange(25).reshape(5, 5)
@@ -1011,6 +1179,9 @@ class TestGradient(TestCase):
         )
 
     def test_badargs(self):
+        # [FUNCTION DOC] Checks gradient raises ValueError when a spacing vector has the wrong
+        # length, and TypeError when the number of spacing arguments does not match the number
+        # of axes (too few, too many, or conflicting with an axis argument).
         f_2d = np.arange(25).reshape(5, 5)
         x = np.cumsum(np.ones(5))
 
@@ -1028,6 +1199,10 @@ class TestGradient(TestCase):
 
     @torch._dynamo.config.patch(use_numpy_random_stream=True)
     def test_second_order_accurate(self):
+        # [FUNCTION DOC] Compares second-order edge gradient of a cubic polynomial with
+        # its analytic derivative for even and random uneven grids; relative error must
+        # be below 3 percent everywhere. Patched to use the NumPy random stream so the
+        # seed is reproducible.
         # Testing that the relative numerical error is less that 3% for
         # this example problem. This corresponds to second order
         # accurate finite differences for all interior and boundary
@@ -1048,6 +1223,10 @@ class TestGradient(TestCase):
         assert_(np.all(num_error < 0.03).item() is True)
 
     def test_spacing(self):
+        # [FUNCTION DOC] Checks gradient on a 6x6 array for first and second order edges
+        # with even spacing, uneven spacing and mixed spacing along the two axes, via
+        # scalar, vector, axis tuple and no-axis forms, comparing with hard-coded
+        # derivatives and swapped-axis consistency.
         f = np.array([0, 2.0, 3.0, 4.0, 5.0, 5.0])
         f = np.tile(f, (6, 1)) + f.reshape(-1, 1)
         x_uneven = np.array([0.0, 0.5, 1.0, 3.0, 5.0, 7.0])
@@ -1108,6 +1287,9 @@ class TestGradient(TestCase):
         assert_almost_equal(res1[1], fdx_uneven_ord2)
 
     def test_specific_axes(self):
+        # [FUNCTION DOC] Checks gradient restricted to a single axis, negative axis, axis tuple
+        # order, axis None meaning all axes, spacing order with axis tuples, TypeError for too
+        # many spacings, and AxisError for bad axes.
         # Testing that gradient can work on a given axis only
         v = [[1, 1], [3, 4]]
         x = np.array(v)
@@ -1132,12 +1314,16 @@ class TestGradient(TestCase):
         # assert_raises(TypeError, gradient, x, axis=[1,])
 
     def test_inexact_dtypes(self):
+        # [FUNCTION DOC] Checks for float16, float32 and float64 inputs that gradient output
+        # dtype equals the diff output dtype.
         for dt in [np.float16, np.float32, np.float64]:
             # dtypes should not be promoted in a different way to what diff does
             x = np.array([1, 2, 3], dtype=dt)
             assert_equal(gradient(x).dtype, np.diff(x).dtype)
 
     def test_values(self):
+        # [FUNCTION DOC] Checks gradient needs at least two points for first-order edges and
+        # three for second-order edges, raising ValueError for shorter arrays.
         # needs at least 2 points for edge_order ==1
         gradient(np.arange(2), edge_order=1)
         # needs at least 3 points for edge_order ==1
@@ -1156,12 +1342,17 @@ class TestGradient(TestCase):
         ],
     )
     def test_f_decreasing_unsigned_int(self, f_dtype):
+        # [FUNCTION DOC] Parametrized over uint8: gradient of a strictly decreasing unsigned
+        # array is minus one everywhere, so unsigned subtraction must not wrap.
         f = np.array([5, 4, 3, 2, 1], dtype=f_dtype)
         g = gradient(f)
         assert_array_equal(g, [-1] * len(f))
 
     @parametrize("f_dtype", [np.int8, np.int16, np.int32, np.int64])
     def test_f_signed_int_big_jump(self, f_dtype):
+        # [FUNCTION DOC] Parametrized over signed integer widths: gradient of a two-point array
+        # with a jump from minus one to the dtype max and spacing two must give half of max plus
+        # one at both points, so no overflow occurs.
         maxint = np.iinfo(f_dtype).max
         x = np.array([1, 3])
         f = np.array([-1, maxint], dtype=f_dtype)
@@ -1175,6 +1366,8 @@ class TestGradient(TestCase):
         ],
     )
     def test_x_decreasing_unsigned(self, x_dtype):
+        # [FUNCTION DOC] Parametrized over uint8: gradient with a decreasing unsigned coordinate
+        # array gives minus two at each point, so coordinate differences must not wrap.
         x = np.array([3, 2, 1], dtype=x_dtype)
         f = np.array([0, 2, 4])
         dfdx = gradient(f, x)
@@ -1182,6 +1375,8 @@ class TestGradient(TestCase):
 
     @parametrize("x_dtype", [np.int8, np.int16, np.int32, np.int64])
     def test_x_signed_int_big_jump(self, x_dtype):
+        # [FUNCTION DOC] Parametrized over signed integer widths: gradient with coordinates
+        # spanning minimum to maximum must give 0.5 at both points without overflow.
         minint = np.iinfo(x_dtype).min
         maxint = np.iinfo(x_dtype).max
         x = np.array([-1, maxint], dtype=x_dtype)
@@ -1191,7 +1386,10 @@ class TestGradient(TestCase):
 
 
 class TestAngle(TestCase):
+    # [CLASS DOC] Tests for angle.
     def test_basic(self):
+        # [FUNCTION DOC] Compares angle of a list of complex and real values to arctan-based
+        # expected radians, and in degrees with the degree flag, to 11 decimals.
         x = [
             1 + 3j,
             np.sqrt(2) / 2.0 + 1j * np.sqrt(2) / 2,
@@ -1222,12 +1420,17 @@ class TestAngle(TestCase):
 @xpassIfTorchDynamo_np
 @instantiate_parametrized_tests
 class TestTrimZeros(TestCase):
+    # [CLASS DOC] Tests for trim_zeros (not imported in eager mode); xpass under dynamo.
+    # Class attributes a, b, c are the same integer, float and complex array with leading
+    # and trailing zeros.
     a = np.array([0, 0, 1, 0, 2, 3, 4, 0])
     b = a.astype(float)
     c = a.astype(complex)
     #    d = a.astype(object)
 
     def values(self):
+        # [FUNCTION DOC] HELPER: returns a generator over the class arrays a, b and c, looked
+        # up by name.
         attr_names = (
             "a",
             "b",
@@ -1236,24 +1439,32 @@ class TestTrimZeros(TestCase):
         return (getattr(self, name) for name in attr_names)
 
     def test_basic(self):
+        # [FUNCTION DOC] For each array checks trimming both ends removes the leading zeros and
+        # the trailing zero.
         slc = np.s_[2:-1]
         for arr in self.values():
             res = trim_zeros(arr)
             assert_array_equal(res, arr[slc])
 
     def test_leading_skip(self):
+        # [FUNCTION DOC] For each array checks trimming only the back (given in lowercase)
+        # removes only trailing zeros.
         slc = np.s_[:-1]
         for arr in self.values():
             res = trim_zeros(arr, trim="b")
             assert_array_equal(res, arr[slc])
 
     def test_trailing_skip(self):
+        # [FUNCTION DOC] For each array checks trimming only the front (given in uppercase)
+        # removes only leading zeros.
         slc = np.s_[2:]
         for arr in self.values():
             res = trim_zeros(arr, trim="F")
             assert_array_equal(res, arr[slc])
 
     def test_all_zero(self):
+        # [FUNCTION DOC] For all-zero arrays of each dtype checks trimming from back or front
+        # yields an empty result, raising AssertionError otherwise.
         for _arr in self.values():
             arr = np.zeros_like(_arr, dtype=_arr.dtype)
 
@@ -1266,6 +1477,7 @@ class TestTrimZeros(TestCase):
                 raise AssertionError(f"Expected len(res2) == 0, got {len(res2)}")
 
     def test_size_zero(self):
+        # [FUNCTION DOC] Checks trim_zeros of an empty array returns an equal empty array.
         arr = np.zeros(0)
         res = trim_zeros(arr)
         assert_array_equal(arr, res)
@@ -1279,16 +1491,22 @@ class TestTrimZeros(TestCase):
         ],
     )
     def test_overflow(self, arr):
+        # [FUNCTION DOC] Parametrized over an array holding a very large integer between zeros:
+        # checks trimming keeps only the middle element.
         slc = np.s_[1:2]
         res = trim_zeros(arr)
         assert_array_equal(res, arr[slc])
 
     def test_no_trim(self):
+        # [FUNCTION DOC] Checks that an object array with None and one in it is returned
+        # unchanged, since there are no zeros to trim.
         arr = np.array([None, 1, None])
         res = trim_zeros(arr)
         assert_array_equal(arr, res)
 
     def test_list_to_list(self):
+        # [FUNCTION DOC] Checks trim_zeros on a plain list returns a list,
+        # raising AssertionError otherwise.
         res = trim_zeros(self.a.tolist())
         if not isinstance(res, list):
             raise AssertionError(f"Expected res to be list, got {type(res)}")
@@ -1296,12 +1514,18 @@ class TestTrimZeros(TestCase):
 
 @xpassIfTorchDynamo_np  # (reason="TODO: implement")
 class TestExtins(TestCase):
+    # [CLASS DOC] Tests for extract and place from numpy lib (NumPy below 2 only);
+    # xpass under dynamo.
     def test_basic(self):
+        # [FUNCTION DOC] Checks extract returns elements where the condition holds.
         a = np.array([1, 3, 2, 1, 2, 3, 3])
         b = extract(a > 1, a)
         assert_array_equal(b, [3, 2, 2, 3, 3])
 
     def test_place(self):
+        # [FUNCTION DOC] Checks place: TypeError for non-array targets, replaces masked entries
+        # cycling through values, empty values with zero mask is a no-op, ValueError for empty
+        # values with true mask, and string arrays.
         # Make sure that non-np.ndarray objects
         # raise an error instead of doing nothing
         assert_raises(TypeError, place, [1, 2, 3], [True, False], [0, 1])
@@ -1327,6 +1551,8 @@ class TestExtins(TestCase):
         assert_array_equal(a, ["12", "9"])
 
     def test_both(self):
+        # [FUNCTION DOC] Checks extract followed by place with the same mask restores
+        # a random array.
         a = rand(10)
         mask = a > 0.5
         ac = a.copy()
@@ -1340,17 +1566,25 @@ class TestExtins(TestCase):
 
 
 def _foo1(x, y=1.0):
+    # [FUNCTION DOC] HELPER: test function for vectorize; returns y times the floor of x.
     return y * math.floor(x)
 
 
 def _foo2(x, y=1.0, z=0.0):
+    # [FUNCTION DOC] HELPER: test function for vectorize; returns y times the floor of
+    # x, plus z.
     return y * math.floor(x) + z
 
 
 @skip  # (reason="vectorize not implemented")
 class TestVectorize(TestCase):
+    # [CLASS DOC] Tests for vectorize from numpy lib; the whole class is skipped because
+    # vectorize is not implemented in torch._numpy.
     def test_simple(self):
+        # [FUNCTION DOC] Checks vectorize on a two-argument function over two lists.
         def addsubtract(a, b):
+            # [FUNCTION DOC] HELPER: returns the difference a minus b when a is larger,
+            # else the sum.
             if a > b:
                 return a - b
             else:
@@ -1361,7 +1595,10 @@ class TestVectorize(TestCase):
         assert_array_equal(r, [1, 6, 1, 2])
 
     def test_scalar(self):
+        # [FUNCTION DOC] Checks vectorize with one list argument and one scalar.
         def addsubtract(a, b):
+            # [FUNCTION DOC] HELPER: returns the difference a minus b when a is larger,
+            # else the sum.
             if a > b:
                 return a - b
             else:
@@ -1372,12 +1609,15 @@ class TestVectorize(TestCase):
         assert_array_equal(r, [5, 8, 1, 4])
 
     def test_large(self):
+        # [FUNCTION DOC] Checks vectorize of an identity lambda over 10000 values
+        # returns the input.
         x = np.linspace(-3, 2, 10000)
         f = vectorize(lambda x: x)
         y = f(x)
         assert_array_equal(y, x)
 
     def test_ufunc(self):
+        # [FUNCTION DOC] Checks vectorize of math.cos matches np.cos on multiples of half pi.
         f = vectorize(math.cos)
         args = np.array([0, 0.5 * np.pi, np.pi, 1.5 * np.pi, 2 * np.pi])
         r1 = f(args)
@@ -1385,7 +1625,10 @@ class TestVectorize(TestCase):
         assert_array_almost_equal(r1, r2)
 
     def test_keywords(self):
+        # [FUNCTION DOC] Checks vectorize of a function with a default argument handles default
+        # and positional override.
         def foo(a, b=1):
+            # [FUNCTION DOC] HELPER: returns a plus b with b defaulting to one.
             return a + b
 
         f = vectorize(foo)
@@ -1398,6 +1641,8 @@ class TestVectorize(TestCase):
         assert_array_equal(r1, r2)
 
     def test_keywords_with_otypes_order1(self):
+        # [FUNCTION DOC] Regression for a caching bug: calls a vectorized function with an
+        # explicit second argument then without, results must match.
         # gh-1620: The second call of f would crash with
         # `ValueError: invalid number of arguments`.
         f = vectorize(_foo1, otypes=[float])
@@ -1408,6 +1653,8 @@ class TestVectorize(TestCase):
         assert_array_equal(r1, r2)
 
     def test_keywords_with_otypes_order2(self):
+        # [FUNCTION DOC] Regression for a caching bug: calls a vectorized function without then
+        # with the optional argument, results must match.
         # gh-1620: The second call of f would crash with
         # `ValueError: non-broadcastable output operand with shape ()
         # doesn't match the broadcast shape (3,)`.
@@ -1419,6 +1666,8 @@ class TestVectorize(TestCase):
         assert_array_equal(r1, r2)
 
     def test_keywords_with_otypes_order3(self):
+        # [FUNCTION DOC] Regression for a caching bug: calls a vectorized function plainly, with
+        # keyword y, then plainly again; all results must agree.
         # gh-1620: The third call of f would crash with
         # `ValueError: invalid number of arguments`.
         f = vectorize(_foo1, otypes=[float])
@@ -1431,6 +1680,8 @@ class TestVectorize(TestCase):
         assert_array_equal(r1, r3)
 
     def test_keywords_with_otypes_several_kwd_args1(self):
+        # [FUNCTION DOC] Checks different keyword combinations on a three-argument vectorized
+        # function each match the direct call.
         # gh-1620 Make sure different uses of keyword arguments
         # don't break the vectorized function.
         f = vectorize(_foo2, otypes=[float])
@@ -1444,6 +1695,8 @@ class TestVectorize(TestCase):
         assert_equal(r3, _foo2(10.4))
 
     def test_keywords_with_otypes_several_kwd_args2(self):
+        # [FUNCTION DOC] Checks fully keyword and fully positional calls of a three-argument
+        # vectorized function match the direct call.
         # gh-1620 Make sure different uses of keyword arguments
         # don't break the vectorized function.
         f = vectorize(_foo2, otypes=[float])
@@ -1455,6 +1708,8 @@ class TestVectorize(TestCase):
         assert_equal(r2, _foo2(1, 2, 3))
 
     def test_keywords_no_func_code(self):
+        # [FUNCTION DOC] Checks vectorize accepts a builtin callable without a code object,
+        # raising AssertionError if construction fails.
         # This needs to test a function that has keywords but
         # no func_code attribute, since otherwise vectorize will
         # inspect the func_code.
@@ -1466,9 +1721,12 @@ class TestVectorize(TestCase):
             raise AssertionError  # noqa: B904
 
     def test_keywords2_ticket_2100(self):
+        # [FUNCTION DOC] Checks keyword-only, mixed and positional-with-keyword calls of
+        # a vectorized function.
         # Test kwarg support: enhancement ticket 2100
 
         def foo(a, b=1):
+            # [FUNCTION DOC] HELPER: returns a plus b with b defaulting to one.
             return a + b
 
         f = vectorize(foo)
@@ -1483,8 +1741,12 @@ class TestVectorize(TestCase):
         assert_array_equal(r1, r2)
 
     def test_keywords3_ticket_2100(self):
+        # [FUNCTION DOC] Checks the excluded option with a name and a position keeps those
+        # arguments un-vectorized in all call styles.
         # Test excluded with mixed positional and kwargs: ticket 2100
         def mypolyval(x, p):
+            # [FUNCTION DOC] HELPER: evaluates a polynomial with coefficients p at x by Horner's
+            # rule, consuming a copy of the coefficient list.
             _p = list(p)
             res = _p.pop(0)
             while _p:
@@ -1498,9 +1760,13 @@ class TestVectorize(TestCase):
         assert_array_equal(ans, vpolyval([0, 1], [1, 2, 3]))
 
     def test_keywords4_ticket_2100(self):
+        # [FUNCTION DOC] Checks vectorizing a function that takes only keyword
+        # arguments by decorator.
         # Test vectorizing function with no positional args.
         @vectorize
         def f(**kw):
+            # [FUNCTION DOC] HELPER: multiplies together all keyword argument values and
+            # returns the product.
             res = 1.0
             for _k in kw:
                 res *= kw[_k]
@@ -1509,22 +1775,30 @@ class TestVectorize(TestCase):
         assert_array_equal(f(a=[1, 2], b=[3, 4]), [3, 8])
 
     def test_keywords5_ticket_2100(self):
+        # [FUNCTION DOC] Checks vectorizing a function that takes only positional
+        # varargs by decorator.
         # Test vectorizing function with no kwargs args.
         @vectorize
         def f(*v):
+            # [FUNCTION DOC] HELPER: returns the product of all positional arguments.
             return np.prod(v)
 
         assert_array_equal(f([1, 2], [3, 4]), [3, 8])
 
     def test_coverage1_ticket_2100(self):
+        # [FUNCTION DOC] Checks vectorizing a function with no arguments returns its constant.
         def foo():
+            # [FUNCTION DOC] HELPER: returns the constant one.
             return 1
 
         f = vectorize(foo)
         assert_array_equal(f(), 1)
 
     def test_assigning_docstring(self):
+        # [FUNCTION DOC] Checks vectorize copies the wrapped function docstring by default and
+        # uses the doc argument if provided.
         def foo(x):
+            # [FUNCTION DOC] HELPER: identity function carrying a docstring.
             """Original documentation"""
             return x
 
@@ -1536,17 +1810,23 @@ class TestVectorize(TestCase):
         assert_equal(f.__doc__, doc)
 
     def test_UnboundMethod_ticket_1156(self):
+        # [FUNCTION DOC] Regression test: vectorize works on both a bound method and an unbound
+        # method of a small class.
         # Regression test for issue 1156
         class Foo:
+            # [CLASS DOC] HELPER: small class with a class attribute b of two and a method bar.
             b = 2
 
             def bar(self, a):
+                # [FUNCTION DOC] HELPER: returns a raised to the class attribute b.
                 return a**self.b
 
         assert_array_equal(vectorize(Foo().bar)(np.arange(9)), np.arange(9) ** 2)
         assert_array_equal(vectorize(Foo.bar)(Foo(), np.arange(9)), np.arange(9) ** 2)
 
     def test_execution_order_ticket_1487(self):
+        # [FUNCTION DOC] Regression test: two vectorized identity functions called in opposite
+        # orders with int and float input must give identical results.
         # Regression test for dependence on execution order: issue 1487
         f1 = vectorize(lambda x: x)
         res1a = f1(np.arange(3))
@@ -1558,17 +1838,21 @@ class TestVectorize(TestCase):
         assert_equal(res1b, res2b)
 
     def test_string_ticket_1892(self):
+        # [FUNCTION DOC] Checks vectorize of identity over a string returns the string.
         # Test vectorization over strings: issue 1892.
         f = np.vectorize(lambda x: x)
         s = string.digits * 10
         assert_equal(s, f(s))
 
     def test_cache(self):
+        # [FUNCTION DOC] Checks that with the cache flag set the wrapped function is called
+        # exactly once per input element, counted in a list.
         # Ensure that vectorized func called exactly once per argument.
         _calls = [0]
 
         @vectorize
         def f(x):
+            # [FUNCTION DOC] HELPER: squares x and increments the shared call counter.
             _calls[0] += 1
             return x**2
 
@@ -1578,13 +1862,18 @@ class TestVectorize(TestCase):
         assert_equal(_calls[0], len(x))
 
     def test_otypes(self):
+        # [FUNCTION DOC] Checks setting otypes on a vectorized identity function after
+        # construction still returns the input.
         f = np.vectorize(lambda x: x)
         f.otypes = "i"
         x = np.arange(5)
         assert_array_equal(f(x), x)
 
     def test_signature_mean_last(self):
+        # [FUNCTION DOC] Checks a signature that reduces the last dimension to a scalar,
+        # giving row means.
         def mean(a):
+            # [FUNCTION DOC] HELPER: returns the mean of the array.
             return a.mean()
 
         f = vectorize(mean, signature="(n)->()")
@@ -1592,7 +1881,10 @@ class TestVectorize(TestCase):
         assert_array_equal(r, [2, 3])
 
     def test_signature_center(self):
+        # [FUNCTION DOC] Checks a signature with same-size core output, subtracting
+        # each row mean.
         def center(a):
+            # [FUNCTION DOC] HELPER: returns the array minus its mean.
             return a - a.mean()
 
         f = vectorize(center, signature="(n)->(n)")
@@ -1600,6 +1892,8 @@ class TestVectorize(TestCase):
         assert_array_equal(r, [[-1, 1], [-1, 1]])
 
     def test_signature_two_outputs(self):
+        # [FUNCTION DOC] Checks a signature with two scalar outputs returns a tuple
+        # of two arrays.
         f = vectorize(lambda x: (x, x), signature="()->(),()")
         r = f([1, 2, 3])
         assert_(isinstance(r, tuple) and len(r) == 2)
@@ -1607,6 +1901,8 @@ class TestVectorize(TestCase):
         assert_array_equal(r[1], [1, 2, 3])
 
     def test_signature_outer(self):
+        # [FUNCTION DOC] Checks vectorize of outer product with a signature, with various
+        # broadcast batch shapes.
         f = vectorize(np.outer, signature="(a),(b)->(a,b)")
         r = f([1, 2], [1, 2, 3])
         assert_array_equal(r, [[1, 2, 3], [2, 4, 6]])
@@ -1621,6 +1917,8 @@ class TestVectorize(TestCase):
         assert_array_equal(r, [[[1, 2, 3], [2, 4, 6]], [[0, 0, 0], [0, 0, 0]]])
 
     def test_signature_computed_size(self):
+        # [FUNCTION DOC] Checks a signature whose output dimension is computed by the function,
+        # for 1-D and 2-D input.
         f = vectorize(lambda x: x[:-1], signature="(n)->(m)")
         r = f([1, 2, 3])
         assert_array_equal(r, [1, 2])
@@ -1629,7 +1927,10 @@ class TestVectorize(TestCase):
         assert_array_equal(r, [[1, 2], [2, 3]])
 
     def test_signature_excluded(self):
+        # [FUNCTION DOC] Checks signature together with excluded names so an extra keyword
+        # is passed unchanged.
         def foo(a, b=1):
+            # [FUNCTION DOC] HELPER: returns a plus b with b defaulting to one.
             return a + b
 
         f = vectorize(foo, signature="()->()", excluded={"b"})
@@ -1637,12 +1938,15 @@ class TestVectorize(TestCase):
         assert_array_equal(f([1, 2, 3], b=0), [1, 2, 3])
 
     def test_signature_otypes(self):
+        # [FUNCTION DOC] Checks signature with otypes gives the requested dtype.
         f = vectorize(lambda x: x, signature="(n)->(n)", otypes=["float64"])
         r = f([1, 2, 3])
         assert_equal(r.dtype, np.dtype("float64"))
         assert_array_equal(r, [1, 2, 3])
 
     def test_signature_invalid_inputs(self):
+        # [FUNCTION DOC] Checks errors for wrong argument count, insufficient dimensions and
+        # inconsistent core dimension sizes in signatures.
         f = vectorize(operator.add, signature="(n),(n)->(n)")
         with assert_raises_regex(TypeError, "wrong number of positional"):
             f([1, 2])
@@ -1656,6 +1960,8 @@ class TestVectorize(TestCase):
             f(1, 2)
 
     def test_signature_invalid_outputs(self):
+        # [FUNCTION DOC] Checks errors when the function output has the wrong core size or the
+        # wrong number of outputs.
         f = vectorize(lambda x: x[:-1], signature="(n)->(n)")
         with assert_raises_regex(ValueError, "inconsistent size for core dimension"):
             f([1, 2, 3])
@@ -1669,6 +1975,9 @@ class TestVectorize(TestCase):
             f([1, 2])
 
     def test_size_zero_output(self):
+        # [FUNCTION DOC] Checks vectorize on zero-sized input needs otypes (ValueError
+        # otherwise), works once otypes is given with various signatures, and raises when output
+        # has new dimensions.
         # see issue 5868
         f = np.vectorize(lambda x: x)
         x = np.zeros([0, 5], dtype=int)
@@ -1698,22 +2007,29 @@ class TestVectorize(TestCase):
 
 @xpassIfTorchDynamo_np  # (reason="TODO: implement")
 class TestDigitize(TestCase):
+    # [CLASS DOC] Tests for digitize (not imported in eager mode); xpass under dynamo.
     def test_forward(self):
+        # [FUNCTION DOC] Checks digitize with increasing bins on a range input.
         x = np.arange(-6, 5)
         bins = np.arange(-5, 5)
         assert_array_equal(digitize(x, bins), np.arange(11))
 
     def test_reverse(self):
+        # [FUNCTION DOC] Checks digitize with decreasing bins.
         x = np.arange(5, -6, -1)
         bins = np.arange(5, -5, -1)
         assert_array_equal(digitize(x, bins), np.arange(11))
 
     def test_random(self):
+        # [FUNCTION DOC] Checks digitize of random values over bins between the min and max
+        # never returns zero.
         x = rand(10)
         bin = np.linspace(x.min(), x.max(), 10)
         assert_(np.all(digitize(x, bin) != 0))
 
     def test_right_basic(self):
+        # [FUNCTION DOC] Checks digitize default and right-closed results on a
+        # small list example.
         x = [1, 5, 4, 10, 8, 11, 0]
         bins = [1, 5, 10]
         default_answer = [1, 2, 1, 3, 2, 3, 0]
@@ -1722,21 +2038,27 @@ class TestDigitize(TestCase):
         assert_array_equal(digitize(x, bins, True), right_answer)
 
     def test_right_open(self):
+        # [FUNCTION DOC] Checks right-closed digitize with increasing bins.
         x = np.arange(-6, 5)
         bins = np.arange(-6, 4)
         assert_array_equal(digitize(x, bins, True), np.arange(11))
 
     def test_right_open_reverse(self):
+        # [FUNCTION DOC] Checks right-closed digitize with decreasing bins.
         x = np.arange(5, -6, -1)
         bins = np.arange(4, -6, -1)
         assert_array_equal(digitize(x, bins, True), np.arange(11))
 
     def test_right_open_random(self):
+        # [FUNCTION DOC] Checks right-closed digitize of random values never returns the
+        # last bin index.
         x = rand(10)
         bins = np.linspace(x.min(), x.max(), 10)
         assert_(np.all(digitize(x, bins, True) != 10))
 
     def test_monotonic(self):
+        # [FUNCTION DOC] Checks digitize with non-strictly monotonic bins in both directions and
+        # both closing modes, and ValueError for non-monotonic bins.
         x = [-1, 0, 1, 2]
         bins = [0, 0, 1]
         assert_array_equal(digitize(x, bins, False), [0, 2, 3, 3])
@@ -1753,6 +2075,7 @@ class TestDigitize(TestCase):
         assert_raises(ValueError, digitize, x, bins)
 
     def test_casting_error(self):
+        # [FUNCTION DOC] Checks digitize raises TypeError for complex values or complex bins.
         x = [1, 2, 3 + 1.0j]
         bins = [1, 2, 3]
         assert_raises(TypeError, digitize, x, bins)
@@ -1760,12 +2083,16 @@ class TestDigitize(TestCase):
         assert_raises(TypeError, digitize, x, bins)
 
     def test_large_integers_increasing(self):
+        # [FUNCTION DOC] Regression test (gh-11022): digitize of a large integer that loses
+        # float precision with increasing bins gives one.
         # gh-11022
         x = 2**54  # loses precision in a float
         assert_equal(np.digitize(x, [x - 1, x + 1]), 1)
 
     @xfail  # "gh-11022: np.core.multiarray._monoticity loses precision"
     def test_large_integers_decreasing(self):
+        # [FUNCTION DOC] Expected failure (marked xfail): same as above but with decreasing
+        # bins, since the monotonicity check loses precision.
         # gh-11022
         x = 2**54  # loses precision in a float
         assert_equal(np.digitize(x, [x + 1, x - 1]), 1)
@@ -1773,13 +2100,19 @@ class TestDigitize(TestCase):
 
 @skip  # (reason="TODO: implement; here unwrap if from numpy")
 class TestUnwrap(TestCase):
+    # [CLASS DOC] Tests for unwrap from numpy lib; the class is skipped.
     def test_simple(self):
+        # [FUNCTION DOC] Checks unwrap removes a jump larger than two pi and keeps successive
+        # differences below pi on random data.
         # check that unwrap removes jumps greater that 2*pi
         assert_array_equal(unwrap([1, 1 + 2 * np.pi]), [1, 1])
         # check that unwrap maintains continuity
         assert_(np.all(diff(unwrap(rand(10) * 100)) < np.pi))
 
     def test_period(self):
+        # [FUNCTION DOC] Checks unwrap with a custom period removes jumps, recovers a simple
+        # sequence from its modulus, honors a custom discontinuity threshold, and preserves
+        # dtype (AssertionError otherwise).
         # check that unwrap removes jumps greater that 255
         assert_array_equal(unwrap([1, 1 + 256], period=255), [1, 2])
         # check that unwrap maintains continuity
@@ -1803,11 +2136,16 @@ class TestUnwrap(TestCase):
 
 @instantiate_parametrized_tests
 class TestFilterwindows(TestCase):
+    # [CLASS DOC] Tests for window functions (hanning, hamming, bartlett, blackman, kaiser);
+    # parametrized tests are instantiated over dtype codes and sizes zero, one and ten.
     @parametrize(
         "dtype", "Bbhil" + "efd"
     )  # np.typecodes["AllInteger"] + np.typecodes["Float"])
     @parametrize("M", [0, 1, 10])
     def test_hanning(self, dtype: str, M: int) -> None:
+        # [FUNCTION DOC] Parametrized over dtype code and size: checks hanning result dtype is
+        # the promotion with float64, symmetric, empty for size below one, ones for size one,
+        # and sums to 4.5 for size ten.
         scalar = M
 
         w = hanning(scalar)
@@ -1831,6 +2169,8 @@ class TestFilterwindows(TestCase):
     )  # np.typecodes["AllInteger"] + np.typecodes["Float"])
     @parametrize("M", [0, 1, 10])
     def test_hamming(self, dtype: str, M: int) -> None:
+        # [FUNCTION DOC] Parametrized over dtype code and size: checks hamming result dtype,
+        # symmetry, edge sizes, and a sum of 4.94 for size ten.
         scalar = M
 
         w = hamming(scalar)
@@ -1854,6 +2194,8 @@ class TestFilterwindows(TestCase):
     )  # np.typecodes["AllInteger"] + np.typecodes["Float"])
     @parametrize("M", [0, 1, 10])
     def test_bartlett(self, dtype: str, M: int) -> None:
+        # [FUNCTION DOC] Parametrized over dtype code and size: checks bartlett result dtype,
+        # symmetry, edge sizes, and a sum of 4.4444 for size ten.
         scalar = M
 
         w = bartlett(scalar)
@@ -1877,6 +2219,8 @@ class TestFilterwindows(TestCase):
     )  # np.typecodes["AllInteger"] + np.typecodes["Float"])
     @parametrize("M", [0, 1, 10])
     def test_blackman(self, dtype: str, M: int) -> None:
+        # [FUNCTION DOC] Parametrized over dtype code and size: checks blackman result dtype,
+        # symmetry, edge sizes, and a sum of 3.78 for size ten.
         scalar = M
 
         w = blackman(scalar)
@@ -1900,6 +2244,9 @@ class TestFilterwindows(TestCase):
     )  # np.typecodes["AllInteger"] + np.typecodes["Float"])
     @parametrize("M", [0, 1, 10])
     def test_kaiser(self, dtype: str, M: int) -> None:
+        # [FUNCTION DOC] Parametrized over dtype code and size: checks kaiser with beta zero (a
+        # rectangular window) has promoted dtype, exact symmetry, edge sizes, and a sum of ten
+        # for size ten.
         scalar = M
 
         w = kaiser(scalar, 0)
@@ -1921,13 +2268,18 @@ class TestFilterwindows(TestCase):
 
 @xpassIfTorchDynamo_np  # (reason="TODO: implement")
 class TestTrapz(TestCase):
+    # [CLASS DOC] Tests for trapz (not imported in eager mode); xpass under dynamo.
     def test_simple(self):
+        # [FUNCTION DOC] Checks trapz of a normal density with spacing 0.1 integrates to one
+        # to 7 decimals.
         x = np.arange(-10, 10, 0.1)
         r = trapz(np.exp(-0.5 * x**2) / np.sqrt(2 * np.pi), dx=0.1)
         # check integral of normal equals 1
         assert_almost_equal(r, 1, 7)
 
     def test_ndim(self):
+        # [FUNCTION DOC] Checks trapz over a 3-D array along each axis against manual trapezoid
+        # weights, with both n-d broadcast coordinates and 1-D coordinates.
         x = np.linspace(0, 1, 3)
         y = np.linspace(0, 2, 8)
         z = np.linspace(0, 3, 13)
@@ -1966,13 +2318,16 @@ class TestTrapz(TestCase):
 
 
 class TestSinc(TestCase):
+    # [CLASS DOC] Tests for sinc.
     def test_simple(self):
+        # [FUNCTION DOC] Checks sinc at zero is one and sinc on a symmetric grid is symmetric.
         assert_(sinc(0) == 1)
         w = sinc(np.linspace(-1, 1, 100))
         # check symmetry
         assert_array_almost_equal(w, np.flipud(w), 7)
 
     def test_array_like(self):
+        # [FUNCTION DOC] Checks sinc gives the same result for array, list and tuple input.
         x = [0, 0.5]
         y1 = sinc(np.array(x))
         y2 = sinc(list(x))
@@ -1982,7 +2337,10 @@ class TestSinc(TestCase):
 
 
 class TestUnique(TestCase):
+    # [CLASS DOC] Tests for unique.
     def test_simple(self):
+        # [FUNCTION DOC] Checks unique sorts and removes duplicates, and of a constant array
+        # gives a single element.
         x = np.array([4, 3, 2, 1, 1, 2, 3, 4, 0])
         assert_(np.all(unique(x) == [0, 1, 2, 3, 4]))
 
@@ -1990,13 +2348,18 @@ class TestUnique(TestCase):
 
     @xpassIfTorchDynamo_np  # (reason="unique not implemented for 'ComplexDouble'")
     def test_simple_complex(self):
+        # [FUNCTION DOC] Checks unique of a complex array sorts lexicographically by real then
+        # imaginary part; xpass under dynamo since the torch kernel lacks it.
         x = np.array([5 + 6j, 1 + 1j, 1 + 10j, 10, 5 + 6j])
         assert_(np.all(unique(x) == [1 + 1j, 1 + 10j, 5 + 6j, 10]))
 
 
 @xpassIfTorchDynamo_np  # (reason="TODO: implement")
 class TestCheckFinite(TestCase):
+    # [CLASS DOC] Tests for a check-finite helper (not imported); xpass under dynamo.
     def test_simple(self):
+        # [FUNCTION DOC] Checks asarray_chkfinite accepts a finite list and raises ValueError
+        # for lists containing infinity or NaN.
         a = [1, 2, 3]
         b = [1, 2, np.inf]
         c = [1, 2, np.nan]
@@ -2005,6 +2368,8 @@ class TestCheckFinite(TestCase):
         assert_raises(ValueError, np.lib.asarray_chkfinite, c)
 
     def test_dtype_order(self):
+        # [FUNCTION DOC] Regression test: asarray_chkfinite accepts order and dtype arguments
+        # and returns the requested float64 dtype.
         # Regression test for missing dtype and order arguments
         a = [1, 2, 3]
         a = np.lib.asarray_chkfinite(a, order="F", dtype=np.float64)
@@ -2013,6 +2378,8 @@ class TestCheckFinite(TestCase):
 
 @instantiate_parametrized_tests
 class TestCorrCoef(TestCase):
+    # [CLASS DOC] Tests for corrcoef with fixed 3x3 matrices A and B and expected correlation
+    # results res1 (A alone) and res2 (A stacked with B). Parametrized tests are instantiated.
     A = np.array(
         [
             [0.15391142, 0.18045767, 0.14197213],
@@ -2046,11 +2413,15 @@ class TestCorrCoef(TestCase):
     )
 
     def test_non_array(self):
+        # [FUNCTION DOC] Checks corrcoef on two plain lists gives the 2x2 matrix of plus
+        # and minus one.
         assert_almost_equal(
             np.corrcoef([0, 1, 0], [1, 0, 1]), [[1.0, -1.0], [-1.0, 1.0]]
         )
 
     def test_simple(self):
+        # [FUNCTION DOC] Checks corrcoef of A and of A with B against expected matrices and that
+        # all entries have magnitude at most one.
         tgt1 = corrcoef(self.A)
         assert_almost_equal(tgt1, self.res1)
         assert_(np.all(np.abs(tgt1) <= 1.0))
@@ -2061,6 +2432,8 @@ class TestCorrCoef(TestCase):
 
     @skip(reason="deprecated in numpy, ignore")
     def test_ddof(self):
+        # [FUNCTION DOC] Skipped (deprecated). Would check the deprecated ddof argument warns
+        # and has negligible effect.
         # ddof raises DeprecationWarning
         with suppress_warnings() as sup:
             warnings.simplefilter("always")
@@ -2074,6 +2447,8 @@ class TestCorrCoef(TestCase):
 
     @skip(reason="deprecated in numpy, ignore")
     def test_bias(self):
+        # [FUNCTION DOC] Skipped (deprecated). Would check the deprecated bias argument warns
+        # and has negligible effect.
         # bias raises DeprecationWarning
         with suppress_warnings() as sup:
             warnings.simplefilter("always")
@@ -2084,6 +2459,8 @@ class TestCorrCoef(TestCase):
             assert_almost_equal(corrcoef(self.A, bias=1), self.res1)
 
     def test_complex(self):
+        # [FUNCTION DOC] Checks corrcoef of a complex two-row input gives the expected Hermitian
+        # matrix with magnitudes at most one.
         x = np.array([[1, 2, 3], [1j, 2j, 3j]])
         res = corrcoef(x)
         tgt = np.array([[1.0, -1.0j], [1.0j, 1.0]])
@@ -2091,11 +2468,16 @@ class TestCorrCoef(TestCase):
         assert_(np.all(np.abs(res) <= 1.0))
 
     def test_xy(self):
+        # [FUNCTION DOC] Checks corrcoef with separate real and imaginary-valued row inputs
+        # gives the expected complex matrix.
         x = np.array([[1, 2, 3]])
         y = np.array([[1j, 2j, 3j]])
         assert_allclose(np.corrcoef(x, y), np.array([[1.0, -1.0j], [1.0j, 1.0]]))
 
     def test_empty(self):
+        # [FUNCTION DOC] Checks corrcoef on empty inputs: all-NaN result for flat empty,
+        # empty square result for zero rows, and NaN matrix for zero columns; runtime
+        # warnings are captured.
         with warnings.catch_warnings(record=True):
             warnings.simplefilter("always", RuntimeWarning)
             assert_array_equal(corrcoef(np.array([])), np.nan)
@@ -2108,6 +2490,8 @@ class TestCorrCoef(TestCase):
             )
 
     def test_extreme(self):
+        # [FUNCTION DOC] Checks corrcoef on extreme-magnitude data stays within plus or minus
+        # one and equals the exact anti-correlated matrix.
         x = [[1e-100, 1e100], [1e100, 1e-100]]
         c = corrcoef(x)
         assert_array_almost_equal(c, np.array([[1.0, -1.0], [-1.0, 1.0]]))
@@ -2115,6 +2499,8 @@ class TestCorrCoef(TestCase):
 
     @parametrize("test_type", [np.half, np.single, np.double])
     def test_corrcoef_dtype(self, test_type):
+        # [FUNCTION DOC] Parametrized over half, single and double: casting A to the type and
+        # requesting that dtype yields a result with the same dtype.
         cast_A = self.A.astype(test_type)
         res = corrcoef(cast_A, dtype=test_type)
         if test_type != res.dtype:
@@ -2123,6 +2509,9 @@ class TestCorrCoef(TestCase):
 
 @instantiate_parametrized_tests
 class TestCov(TestCase):
+    # [CLASS DOC] Tests for cov; class attributes hold inputs x1, x2, x3, expected results res1
+    # to res3, integer frequencies, float weights and repeated-sample data equivalent to
+    # frequencies. Parametrized tests are instantiated.
     x1 = np.array([[0, 2], [1, 1], [2, 0]]).T
     res1 = np.array([[1.0, -1.0], [-1.0, 1.0]])
     x2 = np.array([0.0, 1.0, 2.0], ndmin=2)
@@ -2136,20 +2525,27 @@ class TestCov(TestCase):
     x3 = np.array([0.3942, 0.5969, 0.7730, 0.9918, 0.7964])
 
     def test_basic(self):
+        # [FUNCTION DOC] Checks cov of the base input equals the expected matrix.
         assert_allclose(cov(self.x1), self.res1)
 
     def test_complex(self):
+        # [FUNCTION DOC] Checks cov of a complex two-row input, with and without
+        # unit analytic weights.
         x = np.array([[1, 2, 3], [1j, 2j, 3j]])
         res = np.array([[1.0, -1.0j], [1.0j, 1.0]])
         assert_allclose(cov(x), res)
         assert_allclose(cov(x, aweights=np.ones(3)), res)
 
     def test_xy(self):
+        # [FUNCTION DOC] Checks cov with separate real and imaginary-valued row inputs gives the
+        # expected complex matrix.
         x = np.array([[1, 2, 3]])
         y = np.array([[1j, 2j, 3j]])
         assert_allclose(cov(x, y), np.array([[1.0, -1.0j], [1.0j, 1.0]]))
 
     def test_empty(self):
+        # [FUNCTION DOC] Checks cov on empty inputs: NaN for flat empty, empty square matrix for
+        # zero rows, NaN matrix for zero columns.
         with warnings.catch_warnings(record=True):
             warnings.simplefilter("always", RuntimeWarning)
             assert_array_equal(cov(np.array([])), np.nan)
@@ -2162,6 +2558,8 @@ class TestCov(TestCase):
             )
 
     def test_wrong_ddof(self):
+        # [FUNCTION DOC] Checks cov with ddof larger than the sample count gives a matrix of
+        # plus and minus infinity.
         with warnings.catch_warnings(record=True):
             warnings.simplefilter("always", RuntimeWarning)
             assert_array_equal(
@@ -2169,14 +2567,20 @@ class TestCov(TestCase):
             )
 
     def test_1D_rowvar(self):
+        # [FUNCTION DOC] Checks that for single-variable data the rowvar setting does not
+        # matter, with and without a second variable.
         assert_allclose(cov(self.x3), cov(self.x3, rowvar=False))
         y = np.array([0.0780, 0.3107, 0.2111, 0.0334, 0.8501])
         assert_allclose(cov(self.x3, y), cov(self.x3, y, rowvar=False))
 
     def test_1D_variance(self):
+        # [FUNCTION DOC] Checks cov of 1-D data with ddof one equals the variance with ddof one.
         assert_allclose(cov(self.x3, ddof=1), np.var(self.x3, ddof=1))
 
     def test_fweights(self):
+        # [FUNCTION DOC] Checks frequency weights: equals repeated samples, expected values,
+        # unit frequencies equal unweighted, and non-integer, wrong-shape, wrong-length or
+        # negative frequencies raise errors.
         assert_allclose(cov(self.x2, fweights=self.frequencies), cov(self.x2_repeats))
         assert_allclose(cov(self.x1, fweights=self.frequencies), self.res2)
         assert_allclose(cov(self.x1, fweights=self.unit_frequencies), self.res1)
@@ -2190,6 +2594,8 @@ class TestCov(TestCase):
         assert_raises((ValueError, RuntimeError), cov, self.x1, fweights=f)
 
     def test_aweights(self):
+        # [FUNCTION DOC] Checks analytic weights: expected value, scale invariance, unit weights
+        # equal unweighted, and wrong-shape, wrong-length or negative weights raise errors.
         assert_allclose(cov(self.x1, aweights=self.weights), self.res3)
         assert_allclose(
             cov(self.x1, aweights=3.0 * self.weights),
@@ -2204,6 +2610,8 @@ class TestCov(TestCase):
         assert_raises((ValueError, RuntimeError), cov, self.x1, aweights=w)
 
     def test_unit_fweights_and_aweights(self):
+        # [FUNCTION DOC] Checks combinations of frequency weights and analytic weights,
+        # including unit weights, match the equivalent single-weight results.
         assert_allclose(
             cov(self.x2, fweights=self.frequencies, aweights=self.unit_weights),
             cov(self.x2_repeats),
@@ -2231,6 +2639,8 @@ class TestCov(TestCase):
 
     @parametrize("test_type", [np.half, np.single, np.double])
     def test_cov_dtype(self, test_type):
+        # [FUNCTION DOC] Parametrized over half, single and double: checks the dtype argument
+        # determines the output dtype of cov.
         cast_x1 = self.x1.astype(test_type)
         res = cov(cast_x1, dtype=test_type)
         if test_type != res.dtype:
@@ -2238,7 +2648,10 @@ class TestCov(TestCase):
 
 
 class Test_I0(TestCase):
+    # [CLASS DOC] Tests for i0 (modified Bessel function of order zero).
     def test_simple(self):
+        # [FUNCTION DOC] Checks i0 values for a scalar, a vector including a value above eight,
+        # negated input (symmetry), a matrix, and the zero-input shape regression.
         assert_almost_equal(i0(0.5), np.array(1.0634833707413234))
 
         # need at least one test above 8, as the implementation is piecewise
@@ -2276,6 +2689,7 @@ class Test_I0(TestCase):
         assert_array_equal(np.i0([0.0]), np.array([1.0]))
 
     def test_complex(self):
+        # [FUNCTION DOC] Checks i0 of complex input raises TypeError or RuntimeError.
         a = np.array([0, 1 + 2j])
         with pytest.raises(
             (TypeError, RuntimeError),
@@ -2285,7 +2699,10 @@ class Test_I0(TestCase):
 
 
 class TestKaiser(TestCase):
+    # [CLASS DOC] Tests for the Kaiser window.
     def test_simple(self):
+        # [FUNCTION DOC] Checks kaiser is finite for length one, empty for length zero, and
+        # matches expected values for lengths two and five with different beta values.
         assert_(np.isfinite(kaiser(1, 1.0)))
         assert_almost_equal(kaiser(0, 1.0), np.array([]))
         assert_almost_equal(kaiser(2, 1.0), np.array([0.78984831, 0.78984831]))
@@ -2299,12 +2716,16 @@ class TestKaiser(TestCase):
         )
 
     def test_int_beta(self):
+        # [FUNCTION DOC] Checks kaiser accepts an integer beta.
         kaiser(3, 4)
 
 
 @skip(reason="msort is deprecated, do not bother")
 class TestMsort(TestCase):
+    # [CLASS DOC] Tests for msort; the class is skipped because msort is deprecated.
     def test_simple(self):
+        # [FUNCTION DOC] Skipped. Would check msort sorts a matrix along the first axis and
+        # emits a deprecation warning.
         A = np.array(
             [
                 [0.44567325, 0.79115165, 0.54900530],
@@ -2326,21 +2747,29 @@ class TestMsort(TestCase):
 
 
 class TestMeshgrid(TestCase):
+    # [CLASS DOC] Tests for meshgrid.
     def test_simple(self):
+        # [FUNCTION DOC] Checks default meshgrid of two vectors gives the two
+        # expected coordinate matrices.
         [X, Y] = meshgrid([1, 2, 3], [4, 5, 6, 7])
         assert_array_equal(X, np.array([[1, 2, 3], [1, 2, 3], [1, 2, 3], [1, 2, 3]]))
         assert_array_equal(Y, np.array([[4, 4, 4], [5, 5, 5], [6, 6, 6], [7, 7, 7]]))
 
     def test_single_input(self):
+        # [FUNCTION DOC] Checks meshgrid with one input returns the input as a single array.
         [X] = meshgrid([1, 2, 3, 4])
         assert_array_equal(X, np.array([1, 2, 3, 4]))
 
     def test_no_input(self):
+        # [FUNCTION DOC] Checks meshgrid with no inputs returns an empty result, also
+        # with copy disabled.
         args = []
         assert_array_equal([], meshgrid(*args))
         assert_array_equal([], meshgrid(*args, copy=False))
 
     def test_indexing(self):
+        # [FUNCTION DOC] Checks the ij indexing result, the output shapes for xy and ij indexing
+        # with two and three inputs, and ValueError for an invalid indexing string.
         x = [1, 2, 3]
         y = [4, 5, 6, 7]
         [X, Y] = meshgrid(x, y, indexing="ij")
@@ -2357,17 +2786,22 @@ class TestMeshgrid(TestCase):
         assert_raises(ValueError, meshgrid, x, y, indexing="notvalid")
 
     def test_sparse(self):
+        # [FUNCTION DOC] Checks the sparse option gives broadcastable row and column arrays.
         [X, Y] = meshgrid([1, 2, 3], [4, 5, 6, 7], sparse=True)
         assert_array_equal(X, np.array([[1, 2, 3]]))
         assert_array_equal(Y, np.array([[4], [5], [6], [7]]))
 
     def test_invalid_arguments(self):
+        # [FUNCTION DOC] Regression test (NumPy issue 4755): an unknown keyword
+        # argument raises TypeError.
         # Test that meshgrid complains about invalid arguments
         # Regression test for issue #4755:
         # https://github.com/numpy/numpy/issues/4755
         assert_raises(TypeError, meshgrid, [1, 2, 3], [4, 5, 6, 7], indices="ij")
 
     def test_return_type(self):
+        # [FUNCTION DOC] Regression test (NumPy issue 5297): the output dtypes of meshgrid match
+        # each input dtype, for default, copy and sparse modes.
         # Test for appropriate dtype in returned arrays.
         # Regression test for issue #5297
         # https://github.com/numpy/numpy/issues/5297
@@ -2392,6 +2826,8 @@ class TestMeshgrid(TestCase):
         assert_(Y.dtype == y.dtype)
 
     def test_writeback(self):
+        # [FUNCTION DOC] Regression test (NumPy issue 8561): with copy enabled, writing into an
+        # output does not change the inputs or other rows.
         # Issue 8561
         X = np.array([1.1, 2.2])
         Y = np.array([3.3, 4.4])
@@ -2402,6 +2838,8 @@ class TestMeshgrid(TestCase):
         assert_equal(x[1, :], X)
 
     def test_nd_shape(self):
+        # [FUNCTION DOC] Checks meshgrid of five generator inputs gives five outputs all with
+        # the expected five-dimensional shape.
         a, b, c, d, e = np.meshgrid(*([0] * i for i in range(1, 6)))
         expected_shape = (2, 1, 3, 4, 5)
         assert_equal(a.shape, expected_shape)
@@ -2411,12 +2849,16 @@ class TestMeshgrid(TestCase):
         assert_equal(e.shape, expected_shape)
 
     def test_nd_values(self):
+        # [FUNCTION DOC] Checks meshgrid of three inputs gives the expected values for the
+        # default xy indexing.
         a, b, c = np.meshgrid([0], [1, 2], [3, 4, 5])
         assert_equal(a, [[[0, 0, 0]], [[0, 0, 0]]])
         assert_equal(b, [[[1, 1, 1]], [[2, 2, 2]]])
         assert_equal(c, [[[3, 4, 5]], [[3, 4, 5]]])
 
     def test_nd_indexing(self):
+        # [FUNCTION DOC] Checks meshgrid of three inputs gives the expected values
+        # for ij indexing.
         a, b, c = np.meshgrid([0], [1, 2], [3, 4, 5], indexing="ij")
         assert_equal(a, [[[0, 0, 0], [0, 0, 0]]])
         assert_equal(b, [[[1, 1, 1], [2, 2, 2]]])
@@ -2425,7 +2867,12 @@ class TestMeshgrid(TestCase):
 
 @xfail  # (reason="TODO: implement")
 class TestPiecewise(TestCase):
+    # [CLASS DOC] Tests for piecewise; the whole class is an expected failure because piecewise
+    # is not implemented (the name is not imported).
     def test_simple(self):
+        # [FUNCTION DOC] Checks piecewise with condition forms (bool list, list of lists, bool
+        # array, int array), function entries, and ValueError when the function count is not
+        # one or two.
         # Condition is single bool list
         x = piecewise([0, 0], [True, False], [1])
         assert_array_equal(x, [1, 0])
@@ -2467,14 +2914,18 @@ class TestPiecewise(TestCase):
         )
 
     def test_two_conditions(self):
+        # [FUNCTION DOC] Checks piecewise with two conditions and constant values.
         x = piecewise([1, 2], [[True, False], [False, True]], [3, 4])
         assert_array_equal(x, [3, 4])
 
     def test_scalar_domains_three_conditions(self):
+        # [FUNCTION DOC] Checks piecewise on a scalar input with three conditions.
         x = piecewise(3, [True, False, False], [4, 2, 0])
         assert_equal(x, 4)
 
     def test_default(self):
+        # [FUNCTION DOC] Checks the default of zero when only one value is given and the second
+        # element is chosen when two values are given.
         # No value specified for x[1], should be 0
         x = piecewise([1, 2], [True, False], [2])
         assert_array_equal(x, [2, 0])
@@ -2484,6 +2935,8 @@ class TestPiecewise(TestCase):
         assert_array_equal(x, [2, 3])
 
     def test_0d(self):
+        # [FUNCTION DOC] Checks piecewise on 0-d inputs, including a three-range case,
+        # returns 0-d results.
         x = np.array(3)
         y = piecewise(x, x > 3, [4, 0])
         assert_(y.ndim == 0)
@@ -2499,6 +2952,8 @@ class TestPiecewise(TestCase):
         assert_array_equal(y, 3)
 
     def test_0d_comparison(self):
+        # [FUNCTION DOC] Checks piecewise with scalar comparison conditions, three ranges, and
+        # ValueError for the wrong number of functions.
         x = 3
         y = piecewise(x, [x <= 3, x > 3], [4, 0])  # Should succeed.
         assert_equal(y, 4)
@@ -2526,12 +2981,15 @@ class TestPiecewise(TestCase):
         )
 
     def test_0d_0d_condition(self):
+        # [FUNCTION DOC] Checks piecewise with a 0-d condition and two values.
         x = np.array(3)
         c = np.array(x > 3)
         y = piecewise(x, [c], [1, 2])
         assert_equal(y, 2)
 
     def test_multidimensional_extrafunc(self):
+        # [FUNCTION DOC] Checks piecewise on a 2-D array with an extra function
+        # entry as default.
         x = np.array([[-2.5, -1.5, -0.5], [0.5, 1.5, 2.5]])
         y = piecewise(x, [x < 0, x >= 2], [-1, 1, 3])
         assert_array_equal(y, np.array([[-1.0, -1.0, -1.0], [3.0, 3.0, 1.0]]))
@@ -2539,27 +2997,34 @@ class TestPiecewise(TestCase):
 
 @instantiate_parametrized_tests
 class TestBincount(TestCase):
+    # [CLASS DOC] Tests for bincount; parametrized tests are instantiated.
     def test_simple(self):
+        # [FUNCTION DOC] Checks bincount of a range gives ones.
         y = np.bincount(np.arange(4))
         assert_array_equal(y, np.ones(4))
 
     def test_simple2(self):
+        # [FUNCTION DOC] Checks bincount counts repeated values correctly.
         y = np.bincount(np.array([1, 5, 2, 4, 1]))
         assert_array_equal(y, np.array([0, 2, 1, 0, 1, 1]))
 
     def test_simple_weight(self):
+        # [FUNCTION DOC] Checks bincount with weights, each bin gets its weight.
         x = np.arange(4)
         w = np.array([0.2, 0.3, 0.5, 0.1])
         y = np.bincount(x, w)
         assert_array_equal(y, w)
 
     def test_simple_weight2(self):
+        # [FUNCTION DOC] Checks bincount with weights, repeated values sum their weights.
         x = np.array([1, 2, 4, 5, 2])
         w = np.array([0.2, 0.3, 0.5, 0.1, 0.2])
         y = np.bincount(x, w)
         assert_array_equal(y, np.array([0, 0.2, 0.5, 0, 0.5, 0.1]))
 
     def test_with_minlength(self):
+        # [FUNCTION DOC] Checks the minlength argument pads the result, and an empty input with
+        # minlength zero gives an empty result.
         x = np.array([0, 1, 0, 1, 1])
         y = np.bincount(x, minlength=3)
         assert_array_equal(y, np.array([2, 3, 0]))
@@ -2568,6 +3033,7 @@ class TestBincount(TestCase):
         assert_array_equal(y, np.array([]))
 
     def test_with_minlength_smaller_than_maxvalue(self):
+        # [FUNCTION DOC] Checks minlength smaller than the maximum value has no effect.
         x = np.array([0, 1, 1, 2, 2, 3, 3])
         y = np.bincount(x, minlength=2)
         assert_array_equal(y, np.array([1, 2, 2, 2]))
@@ -2575,22 +3041,28 @@ class TestBincount(TestCase):
         assert_array_equal(y, np.array([1, 2, 2, 2]))
 
     def test_with_minlength_and_weights(self):
+        # [FUNCTION DOC] Checks bincount with both weights and minlength.
         x = np.array([1, 2, 4, 5, 2])
         w = np.array([0.2, 0.3, 0.5, 0.1, 0.2])
         y = np.bincount(x, w, 8)
         assert_array_equal(y, np.array([0, 0.2, 0.5, 0, 0.5, 0.1, 0, 0]))
 
     def test_empty(self):
+        # [FUNCTION DOC] Checks bincount of an empty integer array is empty.
         x = np.array([], dtype=int)
         y = np.bincount(x)
         assert_array_equal(x, y)
 
     def test_empty_with_minlength(self):
+        # [FUNCTION DOC] Checks bincount of an empty integer array with minlength gives zeros
+        # of that length.
         x = np.array([], dtype=int)
         y = np.bincount(x, minlength=5)
         assert_array_equal(y, np.zeros(5, dtype=int))
 
     def test_with_incorrect_minlength(self):
+        # [FUNCTION DOC] Checks a non-integer minlength raises TypeError and a negative
+        # minlength raises ValueError or RuntimeError, for empty and non-empty input.
         x = np.array([], dtype=int)
         assert_raises(
             TypeError,
@@ -2618,6 +3090,9 @@ class TestBincount(TestCase):
     @skipIfTorchDynamo()  # flaky test
     @skipif(not HAS_REFCOUNT, reason="Python lacks refcounts")
     def test_dtype_reference_leaks(self):
+        # [FUNCTION DOC] Skipped under dynamo and when refcounts are unavailable. Regression
+        # test (gh-6805): repeated bincount calls must not change the reference counts of the
+        # intp and double dtype objects.
         # gh-6805
         intp_refcount = sys.getrefcount(np.dtype(np.intp))
         double_refcount = sys.getrefcount(np.dtype(np.double))
@@ -2634,6 +3109,8 @@ class TestBincount(TestCase):
 
     @parametrize("vals", [[[2, 2]], 2])
     def test_error_not_1d(self, vals):
+        # [FUNCTION DOC] Parametrized over a nested list and a scalar: bincount must raise
+        # ValueError or RuntimeError for non-1-D values, both as array and as raw list.
         # Test that values has to be 1-D (both as array and nested list)
         vals_arr = np.asarray(vals)
         with assert_raises((ValueError, RuntimeError)):
@@ -2656,7 +3133,12 @@ parametrize_interp_sc = parametrize(
 @xpassIfTorchDynamo_np  # (reason="TODO: implement")
 @instantiate_parametrized_tests
 class TestInterp(TestCase):
+    # [CLASS DOC] Tests for interp (not imported in eager mode); xpass under
+    # dynamo. Parametrized tests are instantiated using a shared
+    # real/complex scalar-constructor parametrization.
     def test_exceptions(self):
+        # [FUNCTION DOC] Checks interp raises ValueError for empty or mismatched coordinate
+        # arrays and for a zero period.
         assert_raises(ValueError, interp, 0, [], [])
         assert_raises(ValueError, interp, 0, [0], [1, 2])
         assert_raises(ValueError, interp, 0, [0, 1], [1, 2], period=0)
@@ -2664,12 +3146,16 @@ class TestInterp(TestCase):
         assert_raises(ValueError, interp, 0, [0], [1, 2], period=360)
 
     def test_basic(self):
+        # [FUNCTION DOC] Checks interp of a linear function on a finer grid reproduces
+        # the input points.
         x = np.linspace(0, 1, 5)
         y = np.linspace(0, 1, 5)
         x0 = np.linspace(0, 1, 50)
         assert_almost_equal(np.interp(x0, x, y), x0)
 
     def test_right_left_behavior(self):
+        # [FUNCTION DOC] For sizes one to nine checks behavior outside the range for increasing
+        # and decreasing query points with defaults, left value, right value, and both.
         # Needs range of sizes to test different code paths.
         # size ==1 is special cased, 1 < size < 5 is linear search, and
         # size >= 5 goes through local search and possibly binary search.
@@ -2708,6 +3194,7 @@ class TestInterp(TestCase):
             assert_equal(decres, dectgt)
 
     def test_scalar_interpolation_point(self):
+        # [FUNCTION DOC] Checks interp with scalar query points of several types, including NaN.
         x = np.linspace(0, 1, 5)
         y = np.linspace(0, 1, 5)
         x0 = 0
@@ -2722,6 +3209,8 @@ class TestInterp(TestCase):
         assert_almost_equal(np.interp(x0, x, y), x0)
 
     def test_non_finite_behavior_exact_x(self):
+        # [FUNCTION DOC] Checks interp when query points exactly hit infinite or
+        # NaN function values.
         x = [1, 2, 2.5, 3, 4]
         xp = [1, 2, 3, 4]
         fp = [1, 2, np.inf, 4]
@@ -2731,6 +3220,8 @@ class TestInterp(TestCase):
 
     @parametrize_interp_sc
     def test_non_finite_any_nan(self, sc):
+        # [FUNCTION DOC] Parametrized over scalar constructors: NaNs in the coordinates or
+        # values propagate to the result.
         """test that nans are propagated"""
         assert_equal(np.interp(0.5, [np.nan, 1], sc([0, 10])), sc(np.nan))
         assert_equal(np.interp(0.5, [0, np.nan], sc([0, 10])), sc(np.nan))
@@ -2739,6 +3230,8 @@ class TestInterp(TestCase):
 
     @parametrize_interp_sc
     def test_non_finite_inf(self, sc):
+        # [FUNCTION DOC] Parametrized over scalar constructors: interpolating between opposite
+        # infinities gives NaN unless the values are equal.
         """Test that interp between opposite infs gives nan"""
         assert_equal(np.interp(0.5, [-np.inf, +np.inf], sc([0, 10])), sc(np.nan))
         assert_equal(np.interp(0.5, [0, 1], sc([-np.inf, +np.inf])), sc(np.nan))
@@ -2749,6 +3242,8 @@ class TestInterp(TestCase):
 
     @parametrize_interp_sc
     def test_non_finite_half_inf_xf(self, sc):
+        # [FUNCTION DOC] Parametrized over scalar constructors: interpolating where both
+        # coordinate and value have an infinite bound gives NaN.
         """Test that interp where both axes have a bound at inf gives nan"""
         assert_equal(np.interp(0.5, [-np.inf, 1], sc([-np.inf, 10])), sc(np.nan))
         assert_equal(np.interp(0.5, [-np.inf, 1], sc([+np.inf, 10])), sc(np.nan))
@@ -2761,6 +3256,8 @@ class TestInterp(TestCase):
 
     @parametrize_interp_sc
     def test_non_finite_half_inf_x(self, sc):
+        # [FUNCTION DOC] Parametrized over scalar constructors: an infinite coordinate bound
+        # picks the finite end value.
         """Test interp where the x axis has a bound at inf"""
         assert_equal(np.interp(0.5, [-np.inf, -np.inf], sc([0, 10])), sc(10))
         assert_equal(np.interp(0.5, [-np.inf, 1], sc([0, 10])), sc(10))
@@ -2769,6 +3266,8 @@ class TestInterp(TestCase):
 
     @parametrize_interp_sc
     def test_non_finite_half_inf_f(self, sc):
+        # [FUNCTION DOC] Parametrized over scalar constructors: infinite value bounds propagate
+        # to the result with the proper sign.
         """Test interp where the f axis has a bound at inf"""
         assert_equal(np.interp(0.5, [0, 1], sc([0, -np.inf])), sc(-np.inf))
         assert_equal(np.interp(0.5, [0, 1], sc([0, +np.inf])), sc(+np.inf))
@@ -2778,6 +3277,8 @@ class TestInterp(TestCase):
         assert_equal(np.interp(0.5, [0, 1], sc([+np.inf, +np.inf])), sc(+np.inf))
 
     def test_complex_interp(self):
+        # [FUNCTION DOC] Checks complex interpolation, complex left and right values, non-finite
+        # complex values, and periodic complex interpolation.
         # test complex interpolation
         x = np.linspace(0, 1, 5)
         y = np.linspace(0, 1, 5) + (1 + np.linspace(0, 1, 5)) * 1.0j
@@ -2814,6 +3315,8 @@ class TestInterp(TestCase):
         assert_almost_equal(np.interp(x, xp, fp, period=360), y)
 
     def test_zero_dimensional_interpolation_point(self):
+        # [FUNCTION DOC] Checks interp with 0-d query points, including with a period,
+        # and result type.
         x = np.linspace(0, 1, 5)
         y = np.linspace(0, 1, 5)
         x0 = np.array(0.3)
@@ -2831,11 +3334,15 @@ class TestInterp(TestCase):
         assert_(isinstance(actual, (np.float64, np.ndarray)))
 
     def test_if_len_x_is_small(self):
+        # [FUNCTION DOC] Checks interp on a large dense grid at pi gives approximately
+        # zero of sine.
         xp = np.arange(0, 10, 0.0001)
         fp = np.sin(xp)
         assert_almost_equal(np.interp(np.pi, xp, fp), 0.0)
 
     def test_period(self):
+        # [FUNCTION DOC] Checks periodic interpolation with period 360 for a list and for
+        # Fortran-ordered 2-D input.
         x = [-180, -170, -185, 185, -10, -5, 0, 365]
         xp = [190, -190, 350, -350]
         fp = [5, 10, 3, 4]
@@ -2848,8 +3355,11 @@ class TestInterp(TestCase):
 
 @instantiate_parametrized_tests
 class TestPercentile(TestCase):
+    # [CLASS DOC] Tests for percentile; parametrized tests are instantiated.
     @skip(reason="NP_VER: fails on CI; no method=")
     def test_basic(self):
+        # [FUNCTION DOC] Skipped (method argument unsupported). Would check percentile at 0, 100
+        # and 50, and NaN handling.
         x = np.arange(8) * 0.5
         assert_equal(np.percentile(x, 0), 0.0)
         assert_equal(np.percentile(x, 100), 3.5)
@@ -2860,6 +3370,8 @@ class TestPercentile(TestCase):
 
     @skip(reason="support Fraction objects?")
     def test_fraction(self):
+        # [FUNCTION DOC] Skipped (Fraction objects unsupported). Would check percentile with
+        # Fraction inputs returns Fractions.
         x = [Fraction(i, 2) for i in range(8)]
 
         p = np.percentile(x, Fraction(0))
@@ -2879,6 +3391,7 @@ class TestPercentile(TestCase):
         assert_equal(type(p), np.ndarray)
 
     def test_api(self):
+        # [FUNCTION DOC] Checks percentile accepts all positional arguments of the full API.
         d = np.ones(5)
         np.percentile(d, 5, None, None, False)
         np.percentile(d, 5, None, None, False, "linear")
@@ -2887,12 +3400,15 @@ class TestPercentile(TestCase):
 
     @xfail  # (reason="TODO: implement")
     def test_complex(self):
+        # [FUNCTION DOC] Expected failure. Would check percentile of complex
+        # arrays raises TypeError.
         arr_c = np.array([0.5 + 3.0j, 2.1 + 0.5j, 1.6 + 2.3j], dtype="D")
         assert_raises(TypeError, np.percentile, arr_c, 0.5)
         arr_c = np.array([0.5 + 3.0j, 2.1 + 0.5j, 1.6 + 2.3j], dtype="F")
         assert_raises(TypeError, np.percentile, arr_c, 0.5)
 
     def test_2D(self):
+        # [FUNCTION DOC] Checks percentile along axis 0 of a 2-D array.
         x = np.array([[1, 1, 1], [1, 1, 1], [4, 4, 3], [1, 1, 1], [1, 1, 1]])
         assert_array_equal(np.percentile(x, 50, axis=0), [1, 1, 1])
 
@@ -2900,6 +3416,8 @@ class TestPercentile(TestCase):
     @xpassIfTorchDynamo_np  # (reason="TODO: implement")
     @parametrize("dtype", np.typecodes["Float"])
     def test_linear_nan_1D(self, dtype):
+        # [FUNCTION DOC] Skipped. Parametrized over float typecodes: percentile with linear
+        # method of data containing NaN returns NaN with the input dtype.
         # METHOD 1 of H&F
         arr = np.asarray([15.0, np.nan, 35.0, 40.0, 50.0], dtype=dtype)
         res = np.percentile(arr, 40.0, method="linear")
@@ -2932,6 +3450,9 @@ class TestPercentile(TestCase):
         ],
     )
     def test_linear_interpolation(self, method, expected, input_dtype, expected_dtype):
+        # [FUNCTION DOC] Skipped (promotion rules). Parametrized over input dtype
+        # and interpolation method: checks percentile at 40 against expected values
+        # and result dtype.
         expected_dtype = np.dtype(expected_dtype)
 
         if (
@@ -2955,12 +3476,16 @@ class TestPercentile(TestCase):
     @skip(reason="NP_VER: fails on CI; no method=")
     @parametrize("dtype", TYPE_CODES)
     def test_lower_higher(self, dtype):
+        # [FUNCTION DOC] Skipped. Parametrized over dtype: checks lower and higher methods at
+        # the median of a range.
         assert_equal(np.percentile(np.arange(10, dtype=dtype), 50, method="lower"), 4)
         assert_equal(np.percentile(np.arange(10, dtype=dtype), 50, method="higher"), 5)
 
     @skip(reason="NP_VER: fails on CI; no method=")
     @parametrize("dtype", TYPE_CODES)
     def test_midpoint(self, dtype):
+        # [FUNCTION DOC] Skipped. Parametrized over dtype: checks the midpoint method on ranges
+        # of length 9, 10 and 11.
         assert_equal(
             np.percentile(np.arange(10, dtype=dtype), 51, method="midpoint"), 4.5
         )
@@ -2977,10 +3502,14 @@ class TestPercentile(TestCase):
     @skip(reason="NP_VER: fails on CI; no method=")
     @parametrize("dtype", TYPE_CODES)
     def test_nearest(self, dtype):
+        # [FUNCTION DOC] Skipped. Parametrized over dtype: checks the nearest method at
+        # 51 and 49.
         assert_equal(np.percentile(np.arange(10, dtype=dtype), 51, method="nearest"), 5)
         assert_equal(np.percentile(np.arange(10, dtype=dtype), 49, method="nearest"), 4)
 
     def test_linear_interpolation_extrapolation(self):
+        # [FUNCTION DOC] Checks percentile at 100 equals the maximum and at 0 equals the minimum
+        # of random data.
         arr = np.random.rand(5)
 
         actual = np.percentile(arr, 100)
@@ -2990,11 +3519,15 @@ class TestPercentile(TestCase):
         np.testing.assert_equal(actual, arr.min())
 
     def test_sequence(self):
+        # [FUNCTION DOC] Checks percentile with a list of percentiles gives an array of results.
         x = np.arange(8) * 0.5
         assert_equal(np.percentile(x, [0, 100, 50]), [0, 3.5, 1.75])
 
     @skip(reason="NP_VER: fails on CI")
     def test_axis(self):
+        # [FUNCTION DOC] Skipped. Checks percentile of a 2-D array with a tuple of percentiles
+        # flattened and along each axis against expected values, and that the percentile axis is
+        # always the leading output axis for 4-D input with several axes and the higher method.
         x = np.arange(12).reshape(3, 4)
 
         assert_equal(np.percentile(x, (25, 50, 100)), [2.75, 5.5, 11.0])
@@ -3034,6 +3567,9 @@ class TestPercentile(TestCase):
 
     @skipif(numpy.__version__ < "1.22", reason="NP_VER: fails with NumPy 1.21.2 on CI")
     def test_scalar_q(self):
+        # [FUNCTION DOC] Checks scalar percentile gives scalars or reduced shapes, writes
+        # into a provided output array and returns it, and the lower method; skipped on NumPy
+        # older than 1.22.
         # test for no empty dimensions for compatibility with old percentile
         x = np.arange(12).reshape(3, 4)
         assert_equal(np.percentile(x, 50), 5.5)
@@ -3070,6 +3606,10 @@ class TestPercentile(TestCase):
 
     @xfail  # (reason="numpy: x.dtype is int, out is int; torch: result is float")
     def test_scalar_q_2(self):
+        # [FUNCTION DOC] Expected failure (integer input and integer output buffer,
+        # torch returns floats).
+        # KNOWN ISSUE: the body uses names r0 and r1 that are never defined in this test, so it
+        # would raise NameError if the earlier failure did not occur first.
         x = np.arange(12).reshape(3, 4)
         out = np.empty((), dtype=x.dtype)
         c = np.percentile(x, 50, method="lower", out=out)
@@ -3086,6 +3626,8 @@ class TestPercentile(TestCase):
 
     @skip(reason="NP_VER: fails on CI; no method=")
     def test_exception(self):
+        # [FUNCTION DOC] Skipped. Checks percentile raises RuntimeError or ValueError for an
+        # unknown method name and for percentiles outside 0 to 100.
         assert_raises(
             (RuntimeError, ValueError), np.percentile, [1, 2], 56, method="foobar"
         )
@@ -3099,10 +3641,13 @@ class TestPercentile(TestCase):
         )
 
     def test_percentile_list(self):
+        # [FUNCTION DOC] Checks percentile of a plain list at zero.
         assert_equal(np.percentile([1, 2, 3], 0), 1)
 
     @skip(reason="NP_VER: fails on CI; no method=")
     def test_percentile_out(self):
+        # [FUNCTION DOC] Skipped. Checks percentile with a preallocated out array for several
+        # percentile shapes, axes and float or integer outputs equals the returned values.
         x = np.array([1, 2, 3])
         y = np.zeros((3,))
         p = (1, 2, 3)
@@ -3144,6 +3689,9 @@ class TestPercentile(TestCase):
 
     @skip(reason="NP_VER: fails on CI; no method=")
     def test_percentile_empty_dim(self):
+        # [FUNCTION DOC] Skipped. Checks percentile output shapes for an array with
+        # singleton dimensions over every positive and negative axis, with midpoint, and
+        # with a list of percentiles.
         # empty dims are preserved
         d = np.arange(11 * 2).reshape(11, 1, 2, 1)
         assert_array_equal(np.percentile(d, 50, axis=0).shape, (1, 2, 1))
@@ -3176,6 +3724,8 @@ class TestPercentile(TestCase):
         )
 
     def test_percentile_no_overwrite(self):
+        # [FUNCTION DOC] Checks percentile with overwrite_input disabled leaves
+        # the input unchanged.
         a = np.array([2, 3, 4, 1])
         np.percentile(a, [50], overwrite_input=False)
         assert_equal(a, np.array([2, 3, 4, 1]))
@@ -3186,6 +3736,8 @@ class TestPercentile(TestCase):
 
     @skip(reason="NP_VER: fails on CI; no method=")
     def test_no_p_overwrite(self):
+        # [FUNCTION DOC] Skipped. Checks the percentile list or array argument is not modified
+        # by the call.
         p = np.linspace(0.0, 100.0, num=5)
         np.percentile(np.arange(100.0), p, method="midpoint")
         assert_array_equal(p, np.linspace(0.0, 100.0, num=5))
@@ -3194,6 +3746,8 @@ class TestPercentile(TestCase):
         assert_array_equal(p, np.linspace(0.0, 100.0, num=5).tolist())
 
     def test_percentile_overwrite(self):
+        # [FUNCTION DOC] Checks percentile with overwrite_input enabled still returns the right
+        # median-like result for an array and a list.
         a = np.array([2, 3, 4, 1])
         b = np.percentile(a, [50], overwrite_input=True)
         assert_equal(b, np.array([2.5]))
@@ -3203,6 +3757,9 @@ class TestPercentile(TestCase):
 
     @xpassIfTorchDynamo_np  # (reason="pytorch percentile does not support tuple axes.")
     def test_extended_axis(self):
+        # [FUNCTION DOC] Compares percentile over tuple axes against percentile of equivalent
+        # flattened data on random and shuffled arrays; xpass under dynamo since tuple axes are
+        # unsupported by the torch path.
         o = np.random.normal(size=(71, 23))
         x = np.dstack([o] * 10)
         assert_equal(np.percentile(x, 30, axis=(0, 1)), np.percentile(o, 30).item())
@@ -3252,6 +3809,8 @@ class TestPercentile(TestCase):
         )
 
     def test_extended_axis_invalid(self):
+        # [FUNCTION DOC] Checks percentile raises AxisError for out-of-range axes and ValueError
+        # for repeated axes.
         d = np.ones((3, 5, 7, 11))
         assert_raises(np.AxisError, np.percentile, d, axis=-5, q=25)
         assert_raises(np.AxisError, np.percentile, d, axis=(0, -5), q=25)
@@ -3263,11 +3822,17 @@ class TestPercentile(TestCase):
         assert_raises(ValueError, np.percentile, d, axis=(3, -1), q=25)
 
     def test_keepdims(self):
+        # [FUNCTION DOC] Checks percentile with no axis and keepdims gives a result of
+        # all singleton dimensions.
         d = np.ones((3, 5, 7, 11))
         assert_equal(np.percentile(d, 7, axis=None, keepdims=True).shape, (1, 1, 1, 1))
 
     @xfail  # (reason="pytorch percentile does not support tuple axes.")
     def test_keepdims_2(self):
+        # [FUNCTION DOC] Expected failure.
+        # KNOWN ISSUE: the body uses the name d which is never defined in this test, so
+        # it would raise NameError; intended to check keepdims shapes with tuple axes
+        # and multiple percentiles.
         assert_equal(
             np.percentile(d, 7, axis=(0, 1), keepdims=True).shape, (1, 1, 7, 11)
         )
@@ -3324,6 +3889,9 @@ class TestPercentile(TestCase):
         ],
     )
     def test_keepdims_out(self, q, axis):
+        # [FUNCTION DOC] Parametrized over scalar or list percentiles and several axes: builds
+        # an out array with the keepdims shape and checks percentile with keepdims returns that
+        # same array object with that shape. Skipped on NumPy older than 1.24.
         d = np.ones((3, 5, 7, 11))
         if axis is None:
             shape_out = (1,) * d.ndim
@@ -3342,6 +3910,8 @@ class TestPercentile(TestCase):
 
     @skip(reason="NP_VER: fails on CI; no method=")
     def test_out(self):
+        # [FUNCTION DOC] Skipped. Checks percentile with an out array of matching shape for
+        # default and nearest methods, including 0-d output.
         o = np.zeros((4,))
         d = np.ones((3, 4))
         assert_equal(np.percentile(d, 0, 0, out=o), o)
@@ -3357,6 +3927,8 @@ class TestPercentile(TestCase):
 
     @skip(reason="NP_VER: fails on CI; no method=")
     def test_out_nan(self):
+        # [FUNCTION DOC] Skipped. Same as the out-array test but with NaN in the
+        # data, warnings captured.
         with warnings.catch_warnings(record=True):
             warnings.filterwarnings("always", "", RuntimeWarning)
             o = np.zeros((4,))
@@ -3374,6 +3946,8 @@ class TestPercentile(TestCase):
     @skip(reason="NP_VER: fails on CI; no method=")
     @xpassIfTorchDynamo_np  # (reason="np.percentile undocumented nan weirdness")
     def test_nan_behavior(self):
+        # [FUNCTION DOC] Skipped. Checks NaN propagation through percentile for several axes,
+        # tuple axes and the nearest method.
         a = np.arange(24, dtype=float)
         a[2] = np.nan
         assert_equal(np.percentile(a, 0.3), np.nan)
@@ -3435,6 +4009,8 @@ class TestPercentile(TestCase):
         assert_equal(np.percentile(a, [0.3, 0.6], (0, 2), method="nearest"), b)
 
     def test_nan_q(self):
+        # [FUNCTION DOC] Checks percentile raises RuntimeError or ValueError when a percentile
+        # is NaN (scalar, list, or inside an array), regression for GH 18830.
         # GH18830
         with pytest.raises((RuntimeError, ValueError)):
             np.percentile([1, 2, 3, 4.0], np.nan)
@@ -3448,10 +4024,14 @@ class TestPercentile(TestCase):
 
 @instantiate_parametrized_tests
 class TestQuantile(TestCase):
+    # [CLASS DOC] Tests for quantile; most behavior is covered by the percentile tests.
+    # Parametrized tests are instantiated.
     # most of this is already tested by TestPercentile
 
     @skip(reason="do not chase 1ulp")
     def test_max_ulp(self):
+        # [FUNCTION DOC] Skipped. Checks quantile at 0.45 is within one unit in the last
+        # place of 0.18.
         x = [0.0, 0.2, 0.4]
         a = np.quantile(x, 0.45)
         # The default linear method would result in 0 + 0.2 * (0.45/2) = 0.18.
@@ -3460,6 +4040,7 @@ class TestQuantile(TestCase):
         np.testing.assert_array_max_ulp(a, 0.18, maxulp=1)
 
     def test_basic(self):
+        # [FUNCTION DOC] Checks quantile at 0, 1 and 0.5 of an evenly spaced array.
         x = np.arange(8) * 0.5
         assert_equal(np.quantile(x, 0), 0.0)
         assert_equal(np.quantile(x, 1), 3.5)
@@ -3467,6 +4048,8 @@ class TestQuantile(TestCase):
 
     @xfail  # (reason="quantile w/integers or bools")
     def test_correct_quantile_value(self):
+        # [FUNCTION DOC] Expected failure. Would check quantile on boolean inputs preserves
+        # boolean value and dtype.
         a = np.array([True])
         tf_quant = np.quantile(True, False)
         assert_equal(tf_quant, a[0])
@@ -3478,6 +4061,8 @@ class TestQuantile(TestCase):
 
     @skip(reason="support arrays of Fractions?")
     def test_fraction(self):
+        # [FUNCTION DOC] Skipped (Fraction objects unsupported). Would check quantile with
+        # fractional inputs or quantiles returns exact Fractions.
         # fractional input, integral quantile
         x = [Fraction(i, 2) for i in range(8)]
         q = np.quantile(x, 0)
@@ -3506,6 +4091,7 @@ class TestQuantile(TestCase):
 
     @skip(reason="does not raise in numpy?")
     def test_complex(self):
+        # [FUNCTION DOC] Skipped. Would check quantile of complex arrays raises TypeError.
         # See gh-22652
         arr_c = np.array([0.5 + 3.0j, 2.1 + 0.5j, 1.6 + 2.3j], dtype="D")
         assert_raises(TypeError, np.quantile, arr_c, 0.5)
@@ -3514,6 +4100,8 @@ class TestQuantile(TestCase):
 
     @skipif(numpy.__version__ < "1.22", reason="NP_VER: fails with NumPy 1.21.2 on CI")
     def test_no_p_overwrite(self):
+        # [FUNCTION DOC] Checks quantile does not modify the quantile argument, whether array or
+        # list; skipped on NumPy older than 1.22.
         # this is worth retesting, because quantile does not make a copy
         p0 = np.array([0, 0.75, 0.25, 0.5, 1.0])
         p = p0.copy()
@@ -3528,6 +4116,8 @@ class TestQuantile(TestCase):
     @skip(reason="XXX: make quantile preserve integer dtypes")
     @parametrize("dtype", "Bbhil")  # np.typecodes["AllInteger"])
     def test_quantile_preserve_int_type(self, dtype):
+        # [FUNCTION DOC] Skipped. Parametrized over integer typecodes: quantile with the nearest
+        # method should preserve the integer dtype.
         res = np.quantile(np.array([1, 2], dtype=dtype), [0.5], method="nearest")
         if res.dtype != dtype:
             raise AssertionError(f"dtype mismatch: {res.dtype} != {dtype}")
@@ -3592,6 +4182,9 @@ class TestQuantile(TestCase):
         ],
     )
     def test_quantile_monotonic(self, method):
+        # [FUNCTION DOC] Parametrized over interpolation methods (most xpass under dynamo):
+        # quantile over a finely spaced ordered set of quantiles is monotonic, for a data set
+        # with duplicates and for a small even-sized set. Skipped on NumPy older than 1.22.
         # GH 14685
         # test that the return value of quantile is monotonic if p0 is ordered
         # Also tests that the boundary values are not mishandled.
@@ -3618,11 +4211,14 @@ class TestQuantile(TestCase):
         )
     )
     def test_quantile_monotonic_hypo(self, arr):
+        # [FUNCTION DOC] Skipped (no hypothesis). Property test over random finite float arrays:
+        # quantile values over increasing quantiles must be sorted.
         p0 = np.arange(0, 1, 0.01)
         quantile = np.quantile(arr, p0)
         assert_equal(np.sort(quantile), quantile)
 
     def test_quantile_scalar_nan(self):
+        # [FUNCTION DOC] Checks quantile of an array containing NaN returns NaN.
         a = np.array([[10.0, 7.0, 4.0], [3.0, 2.0, 1.0]])
         a[0][1] = np.nan
         assert_equal(np.quantile(a, 0.5), np.nan)
@@ -3630,7 +4226,10 @@ class TestQuantile(TestCase):
 
 @instantiate_parametrized_tests
 class TestMedian(TestCase):
+    # [CLASS DOC] Tests for median; parametrized tests are instantiated.
     def test_basic(self):
+        # [FUNCTION DOC] Checks median of 0-d, 1-D and 2-D arrays, along axes and with axis
+        # None, and odd and even sizes with float values.
         a0 = np.array(1)
         a1 = np.arange(2)
         a2 = np.arange(6).reshape(2, 3)
@@ -3650,6 +4249,8 @@ class TestMedian(TestCase):
 
     @xfail  # (reason="median: scalar output vs 0-dim")
     def test_basic_2(self):
+        # [FUNCTION DOC] Expected failure (scalar vs 0-d output): checks median result is 0-d,
+        # also with NaN present.
         # check array scalar result
         a = np.array([0.0444502, 0.141249, 0.0463301])
         assert_equal(np.median(a).ndim, 0)
@@ -3657,6 +4258,8 @@ class TestMedian(TestCase):
         assert_equal(np.median(a).ndim, 0)
 
     def test_axis_keyword(self):
+        # [FUNCTION DOC] Checks median with axis keywords does not modify the input, and values
+        # for axis 0, axis 1 on the transpose, and none.
         a3 = np.array([[2, 3], [0, 1], [6, 7], [4, 5]])
         for a in [a3, np.random.randint(0, 100, size=(2, 3, 4))]:
             orig = a.copy()
@@ -3672,6 +4275,8 @@ class TestMedian(TestCase):
         assert_allclose(np.median(a3.T), 3.5)
 
     def test_overwrite_keyword(self):
+        # [FUNCTION DOC] Checks median with overwrite_input enabled on copies equals the normal
+        # result for various shapes and axes, including shuffled 3-D float data.
         a3 = np.array([[2, 3], [0, 1], [6, 7], [4, 5]])
         a0 = np.array(1)
         a1 = np.arange(2)
@@ -3704,6 +4309,7 @@ class TestMedian(TestCase):
         )
 
     def test_array_like(self):
+        # [FUNCTION DOC] Checks median accepts plain nested lists, with and without an axis.
         x = [1, 2, 3]
         assert_almost_equal(np.median(x), 2)
         x2 = [x]
@@ -3711,6 +4317,8 @@ class TestMedian(TestCase):
         assert_allclose(np.median(x2, axis=0), x)
 
     def test_out(self):
+        # [FUNCTION DOC] Checks median writes into a provided out array for axis 0, axis 1 and
+        # no axis, and the result equals the array.
         o = np.zeros((4,))
         d = np.ones((3, 4))
         assert_equal(np.median(d, 0, out=o), o)
@@ -3720,6 +4328,8 @@ class TestMedian(TestCase):
         assert_equal(np.median(d, out=o), o)
 
     def test_out_nan(self):
+        # [FUNCTION DOC] Same as the out test but with NaN in the data and warnings captured;
+        # checks the out array equals the returned result.
         with warnings.catch_warnings(record=True):
             warnings.filterwarnings("always", "", RuntimeWarning)
             o = np.zeros((4,))
@@ -3732,6 +4342,8 @@ class TestMedian(TestCase):
             assert_equal(np.median(d, out=o), o)
 
     def test_nan_behavior(self):
+        # [FUNCTION DOC] Checks median returns NaN for any slice containing NaN, for no axis,
+        # axis 0 and axis 1.
         a = np.arange(24, dtype=float)
         a[2] = np.nan
         assert_equal(np.median(a), np.nan)
@@ -3759,6 +4371,8 @@ class TestMedian(TestCase):
 
     @xpassIfTorchDynamo_np  # (reason="median: does not support tuple axes")
     def test_nan_behavior_2(self):
+        # [FUNCTION DOC] Checks NaN handling for median over tuple axes; xpass under dynamo
+        # since tuple axes are unsupported.
         a = np.arange(24, dtype=float).reshape(2, 3, 4)
         a[1, 2, 3] = np.nan
         a[1, 1, 2] = np.nan
@@ -3771,6 +4385,8 @@ class TestMedian(TestCase):
 
     @xfail  # (reason="median: scalar vs 0-dim")
     def test_nan_behavior_3(self):
+        # [FUNCTION DOC] Expected failure (scalar vs 0-d output): checks median of NaN-
+        # containing data with no axis is 0-d.
         a = np.arange(24, dtype=float).reshape(2, 3, 4)
         a[1, 2, 3] = np.nan
         a[1, 1, 2] = np.nan
@@ -3781,6 +4397,9 @@ class TestMedian(TestCase):
     @xpassIfTorchDynamo_np  # (reason="median: torch.quantile does not handle empty tensors")
     @skipif(IS_WASM, reason="fp errors don't work correctly")
     def test_empty(self):
+        # [FUNCTION DOC] Checks median of empty arrays gives NaN with runtime warnings, empty
+        # results along axes zero and one, and NaN along the last axis; xpass under dynamo since
+        # the torch kernel fails on empty tensors; skipped on WASM.
         # mean(empty array) emits two warnings: empty slice and divide by 0
         a = np.array([], dtype=float)
         with warnings.catch_warnings(record=True) as w:
@@ -3811,6 +4430,8 @@ class TestMedian(TestCase):
 
     @xpassIfTorchDynamo_np  # (reason="median: tuple axes not implemented")
     def test_extended_axis(self):
+        # [FUNCTION DOC] Compares median over tuple axes against median of flattened data on
+        # random and shuffled arrays; xpass under dynamo.
         o = np.random.normal(size=(71, 23))
         x = np.dstack([o] * 10)
         assert_equal(np.median(x, axis=(0, 1)), np.median(o).item())
@@ -3848,6 +4469,8 @@ class TestMedian(TestCase):
         )
 
     def test_extended_axis_invalid(self):
+        # [FUNCTION DOC] Checks median raises AxisError for out-of-range axes and ValueError
+        # for repeated axes.
         d = np.ones((3, 5, 7, 11))
         assert_raises(np.AxisError, np.median, d, axis=-5)
         assert_raises(np.AxisError, np.median, d, axis=(0, -5))
@@ -3856,11 +4479,13 @@ class TestMedian(TestCase):
         assert_raises(ValueError, np.median, d, axis=(1, 1))
 
     def test_keepdims(self):
+        # [FUNCTION DOC] Checks median with no axis and keepdims gives all singleton dimensions.
         d = np.ones((3, 5, 7, 11))
         assert_equal(np.median(d, axis=None, keepdims=True).shape, (1, 1, 1, 1))
 
     @xpassIfTorchDynamo_np  # (reason="median: tuple axis")
     def test_keepdims_2(self):
+        # [FUNCTION DOC] Checks median keepdims shapes with tuple axes; xpass under dynamo.
         d = np.ones((3, 5, 7, 11))
         assert_equal(np.median(d, axis=(0, 1), keepdims=True).shape, (1, 1, 7, 11))
         assert_equal(np.median(d, axis=(0, 3), keepdims=True).shape, (1, 5, 7, 1))
@@ -3890,6 +4515,9 @@ class TestMedian(TestCase):
         ],
     )
     def test_keepdims_out(self, axis):
+        # [FUNCTION DOC] Parametrized over several axes: builds an out array with the keepdims
+        # shape and checks median with keepdims returns that same array object with that shape.
+        # Skipped on NumPy older than 1.24.
         d = np.ones((3, 5, 7, 11))
         if axis is None:
             shape_out = (1,) * d.ndim
@@ -3908,6 +4536,8 @@ class TestMedian(TestCase):
 @xpassIfTorchDynamo_np  # (reason="TODO: implement")
 @instantiate_parametrized_tests
 class TestSortComplex(TestCase):
+    # [CLASS DOC] Tests for sort_complex; the class xpasses under dynamo as not implemented.
+    # Parametrized tests are instantiated.
     @parametrize(
         "type_in, type_out",
         [
@@ -3920,6 +4550,9 @@ class TestSortComplex(TestCase):
         ],
     )
     def test_sort_real(self, type_in, type_out):
+        # [FUNCTION DOC] Parametrized over input and expected output type codes: sorting a
+        # real array with sort_complex gives the sorted array cast to the corresponding
+        # complex or float type.
         # sort_complex() type casting for real input types
         a = np.array([5, 3, 6, 2, 1], dtype=type_in)
         actual = np.sort_complex(a)
@@ -3928,6 +4561,8 @@ class TestSortComplex(TestCase):
         assert_equal(actual.dtype, expected.dtype)
 
     def test_sort_complex(self):
+        # [FUNCTION DOC] Checks sort_complex orders complex values by real part then imaginary
+        # part and keeps the complex dtype.
         # sort_complex() handling of complex input
         a = np.array([2 + 3j, 1 - 2j, 1 - 3j, 2 + 1j], dtype="D")
         expected = np.array([1 - 3j, 1 - 2j, 2 + 1j, 2 + 3j], dtype="D")
