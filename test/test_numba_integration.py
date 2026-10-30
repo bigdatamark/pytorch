@@ -1,4 +1,9 @@
 # Owner(s): ["module: cuda"]
+# [MODULE DOC] Tests for interoperability between CUDA torch tensors and numba.cuda
+# through the CUDA array interface protocol. Contains one TestCase,
+# TestNumbaIntegration. Tests are skipped unless numpy, CUDA, numba.cuda or
+# multiple GPUs are available as each test requires. Numpy and numba.cuda are
+# imported only when the corresponding availability flags are true.
 
 import unittest
 
@@ -20,9 +25,21 @@ if TEST_NUMBA_CUDA:
 
 
 class TestNumbaIntegration(common.TestCase):
+    # [CLASS DOC] Test case covering the attribute cuda array interface on tensors,
+    # conversion of tensors into numba device arrays, and (currently skipped) creation
+    # of tensors from objects exposing the interface. Stateless; each test is independent.
     @unittest.skipIf(not TEST_NUMPY, "No numpy")
     @unittest.skipIf(not TEST_CUDA, "No cuda")
     def test_cuda_array_interface(self):
+        # [FUNCTION DOC] Verifies that only dense CUDA tensors expose the cuda array
+        # interface attribute. For each legacy tensor type (double, float, half, long,
+        # int, short, char, byte) with its numpy dtype: a CPU tensor, a sparse CPU tensor
+        # and a sparse CUDA tensor (sparse cases skipped for half) must have no such
+        # attribute and raise AttributeError on access. A dense CUDA tensor must expose a
+        # mapping with exactly the keys shape, strides, typestr, data and version, with
+        # shape of ten, strides of None (contiguous), little-endian numpy typestr, data
+        # equal to the data pointer with a read-only flag of false, and version 2.
+        # KNOWN ISSUE: the test docstring says version 0, but the code asserts version 2.
         """torch.Tensor exposes __cuda_array_interface__ for cuda tensors.
 
         An object t is considered a cuda-tensor if:
@@ -104,6 +121,14 @@ class TestNumbaIntegration(common.TestCase):
     @unittest.skipIf(not TEST_CUDA, "No cuda")
     @unittest.skipIf(not TEST_NUMBA_CUDA, "No numba.cuda")
     def test_array_adaptor(self):
+        # [FUNCTION DOC] Verifies conversion of CUDA tensors to numba device arrays for many
+        # dtypes (complex, float, signed and unsigned ints, bool). A CPU tensor must not be
+        # a cuda array and conversion must raise TypeError. A CUDA tensor must be a cuda
+        # array whose converted view is a numba DeviceNDArray with the same dtype, strides
+        # and shape as the numpy version of the CPU tensor. Contents must match after
+        # copy to host, and in-place writes to the tensor must show in the view. A strided
+        # slice must also convert with matching dtype, strides and shape (contents of
+        # strided views are not checked).
         """Torch __cuda_array_adaptor__ exposes tensor data to numba.cuda."""
 
         torch_dtypes = [
@@ -170,6 +195,11 @@ class TestNumbaIntegration(common.TestCase):
     @unittest.skipIf(not TEST_CUDA, "No cuda")
     @unittest.skipIf(not TEST_NUMBA_CUDA, "No numba.cuda")
     def test_conversion_errors(self):
+        # [FUNCTION DOC] Verifies numba rejects tensors that are not usable CUDA arrays. A
+        # CPU tensor, a sparse tensor (also after calling cuda on it, whose result is
+        # discarded so the tested tensor stays on CPU) and a CPU tensor requiring grad all
+        # report not a cuda array and raise TypeError on conversion. A CUDA tensor
+        # requiring grad makes both the check and the conversion raise RuntimeError.
         """Numba properly detects array interface for tensor.Tensor variants."""
 
         # CPU tensors are not cuda arrays.
@@ -216,6 +246,10 @@ class TestNumbaIntegration(common.TestCase):
     @unittest.skipIf(not TEST_NUMBA_CUDA, "No numba.cuda")
     @unittest.skipIf(not TEST_MULTIGPU, "No multigpu")
     def test_active_device(self):
+        # [FUNCTION DOC] Verifies that conversion uses the active numba CUDA context. A
+        # tensor on device 0 converts to a DeviceNDArray. A tensor on device 1 raises
+        # numba CudaAPIError when converted under the default context, but converts
+        # successfully inside the numba context of its own device. Requires multiple GPUs.
         """'as_cuda_array' tensor device must match active numba context."""
 
         # Both torch/numba default to device 0 and can interop freely
@@ -244,6 +278,12 @@ class TestNumbaIntegration(common.TestCase):
     @unittest.skipIf(not TEST_CUDA, "No cuda")
     @unittest.skipIf(not TEST_NUMBA_CUDA, "No numba.cuda")
     def test_from_cuda_array_interface(self):
+        # [FUNCTION DOC] Disabled test (see issue 54418). For many numpy dtypes and several
+        # array layouts, builds a numba device array and creates a tensor from it. With
+        # as_tensor on a CUDA device the tensor must share memory (identical interface,
+        # equal values, and an in-place add visible through the numba array). With as_tensor
+        # on CPU the data is copied, so changes do not affect the numba array. With
+        # torch.tensor on CUDA the data is copied as well.
         """torch.as_tensor() and torch.tensor() supports the __cuda_array_interface__ protocol.
 
         If an object exposes the __cuda_array_interface__, .as_tensor() and .tensor()
@@ -326,6 +366,9 @@ class TestNumbaIntegration(common.TestCase):
     @unittest.skipIf(not TEST_CUDA, "No cuda")
     @unittest.skipIf(not TEST_NUMBA_CUDA, "No numba.cuda")
     def test_from_cuda_array_interface_inferred_strides(self):
+        # [FUNCTION DOC] Verifies that making a tensor from a C-contiguous numba device
+        # array for several numpy dtypes yields a contiguous CUDA tensor, i.e. strides
+        # are inferred when the interface does not provide them.
         """torch.as_tensor(numba_ary) should have correct inferred (contiguous) strides"""
         # This could, in theory, be combined with test_from_cuda_array_interface but that test
         # is overly strict: it checks that the exported protocols are exactly the same, which
@@ -353,6 +396,10 @@ class TestNumbaIntegration(common.TestCase):
     @unittest.skipIf(not TEST_CUDA, "No cuda")
     @unittest.skipIf(not TEST_NUMBA_CUDA, "No numba.cuda")
     def test_from_cuda_array_interface_lifetime(self):
+        # [FUNCTION DOC] Disabled test (see issue 54418). Makes a CUDA tensor from a numba
+        # device array with as_tensor, checks the interfaces match (no copy), deletes the
+        # numba array, and checks the tensor still holds the original values, i.e. the
+        # tensor keeps the source object alive.
         """torch.as_tensor(obj) tensor grabs a reference to obj so that the lifetime of obj exceeds the tensor"""
         numba_ary = numba.cuda.to_device(numpy.arange(6))
         torch_ary = torch.as_tensor(numba_ary, device="cuda")
@@ -372,6 +419,10 @@ class TestNumbaIntegration(common.TestCase):
     @unittest.skipIf(not TEST_NUMBA_CUDA, "No numba.cuda")
     @unittest.skipIf(not TEST_MULTIGPU, "No multigpu")
     def test_from_cuda_array_interface_active_device(self):
+        # [FUNCTION DOC] Disabled test (see issue 54418); needs multiple GPUs. With as_tensor
+        # on the same device the tensor shares memory (same interface). Requesting device 1
+        # while the numba array is on device 0 copies the data: the values match, the
+        # tensor is on device 1, and the interface differs only in the data pointer.
         """torch.as_tensor() tensor device must match active numba context."""
 
         # Zero-copy: both torch/numba default to device 0 and can interop freely

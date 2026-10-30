@@ -1,6 +1,15 @@
 # Owner(s): ["oncall: distributed"]
 
 from __future__ import annotations
+# [MODULE DOC] Tests for NUMA binding of worker processes launched through the
+# elastic multiprocessing API (torch.numa.binding). A fake hardware topology
+# (sockets, NUMA nodes, GPUs, L3 caches, hyperthreaded cores) is expressed as
+# mocked sysfs files and patched into open, listdir and sched_getaffinity, so the
+# tests run without real NUMA hardware. They check the numactl command line used
+# for command entrypoints and the CPU set passed to sched_setaffinity for callable
+# entrypoints, for each affinity mode. Linux only and needs torch.distributed.
+# Defines MockDeviceProperties, NumaBindingTest and keeps a handle to the real
+# open function (_real_open) for passthrough of non-sysfs files.
 
 import json
 import sys
@@ -25,6 +34,10 @@ from torch.testing._internal.common_utils import run_tests, skipIfTorchDynamo, T
 
 @dataclass(frozen=True)
 class MockDeviceProperties:
+    # [CLASS DOC] HELPER: Immutable record standing in for the properties of one GPU.
+    # Fields are name, major/minor version, total memory string, multiprocessor count,
+    # uuid, the PCI domain/bus/device ids (used to locate the sysfs numa_node file),
+    # and the L2 cache size string.
     name: str
     major: int
     minor: int
@@ -48,7 +61,19 @@ _real_open = open
     torch.distributed.is_available(), "Need access to some distributed submodules"
 )
 class NumaBindingTest(TestCase):
+    # [CLASS DOC] Test case for NUMA binding. State built in setUp: a mapping from
+    # mocked file path to file contents, a list of mock GPU properties, counters of
+    # logical CPUs, NUMA nodes and sockets created so far, and a mock device module.
+    # Tests call _add_mock_hardware to describe the machine, then launch processes
+    # with NumaOptions and assert the resulting binding. All patches are entered in
+    # setUp and exited in tearDown.
     def setUp(self) -> None:
+        # [FUNCTION DOC] Initializes the empty fake hardware state and starts the patches
+        # for every test: accelerator device_count, is_available and current_accelerator
+        # (a cpu device), get_device_module (returning a mock that reports the fake GPUs),
+        # builtins open, os.listdir, os.sched_getaffinity, the signpost_event used by the
+        # numa binding module (validated wrapper), and shutil.which (reporting numactl is
+        # at a fixed path). Patches are entered manually and kept for tearDown.
         super().setUp()
 
         self._mock_file_path_to_contents: dict[str, str] = {}
@@ -82,11 +107,17 @@ class NumaBindingTest(TestCase):
             context_manager.__enter__()
 
     def tearDown(self) -> None:
+        # [FUNCTION DOC] Exits every patch started in setUp and then calls the parent
+        # tearDown.
         for context_manager in self._context_managers_to_apply_to_all_tests:
             context_manager.__exit__(None, None, None)
         super().tearDown()
 
     def _mock_signpost_event(self, *args, **kwargs) -> None:
+        # [FUNCTION DOC] HELPER: Replacement for signpost_event. Serializes the keyword
+        # argument parameters to JSON, so a non-serializable payload fails the test (a
+        # missing parameters keyword raises KeyError), then calls the real signpost_event
+        # with the same arguments and returns its result.
         # Please keep these parameters JSON serializable for logging purposes
         json.dumps(kwargs["parameters"])
         return signpost_event(*args, **kwargs)
@@ -100,6 +131,16 @@ class NumaBindingTest(TestCase):
         num_l3_caches_per_numa_node: int,
         num_physical_core_per_l3_cache: int,
     ) -> None:
+        # [FUNCTION DOC] HELPER: Appends a block of fake hardware to the machine description.
+        # Per socket and per NUMA node it records the node cpulist file, creates the
+        # requested number of GPUs (each with a PCI numa_node file naming the node), and
+        # per L3 cache creates hyperthreaded logical CPUs (two per physical core) with
+        # sysfs files for thread siblings, physical package id (socket), one unrelated
+        # cache file that should be skipped, and cache index entries 0 to 4 (index 4 has a
+        # type that must be skipped, index 3 is shared across the whole L3, others only
+        # across siblings). Updates the counters for logical CPUs, NUMA nodes and sockets
+        # and finally writes the possible-nodes file. Can be called repeatedly; indices
+        # continue where the previous call stopped.
         """
         It's not fun, but we mock everything down to sysfs level
         to make sure we get really thorough coverage.
@@ -199,11 +240,16 @@ class NumaBindingTest(TestCase):
         )
 
     def _mock_is_available(self) -> bool:
+        # [FUNCTION DOC] HELPER: Mock accelerator availability; true iff at least one fake
+        # GPU has been added.
         return len(self._mock_device_properties) > 0
 
     def _get_corresponding_pci_numa_node_file_path(
         self, *, device_properties: MockDeviceProperties
     ) -> str:
+        # [FUNCTION DOC] HELPER: Build the sysfs path of the numa_node file for a GPU, from
+        # its PCI domain, bus and device ids formatted in hex as a PCI address with
+        # function zero. Pure function; returns a string.
         pci_addr = (
             f"{device_properties.pci_domain_id:04x}:"
             + f"{device_properties.pci_bus_id:02x}:{device_properties.pci_device_id:02x}.0"
@@ -211,15 +257,23 @@ class NumaBindingTest(TestCase):
         return f"/sys/bus/pci/devices/{pci_addr}/numa_node"
 
     def _mock_file_contents(self, *, file_path: str, contents: str) -> None:
+        # [FUNCTION DOC] HELPER: Record (or overwrite) the contents of one mocked file path.
         self._mock_file_path_to_contents[file_path] = contents
 
     def _mock_device_count(self) -> int:
+        # [FUNCTION DOC] HELPER: Mock device count; the number of fake GPUs added so far.
         return len(self._mock_device_properties)
 
     def _mock_get_device_properties(self, index: int) -> MockDeviceProperties:
+        # [FUNCTION DOC] HELPER: Mock get_device_properties; returns the stored properties of
+        # the fake GPU at the given index (IndexError if out of range).
         return self._mock_device_properties[index]
 
     def _mock_open(self, path: str, *args, **kwargs) -> Any:
+        # [FUNCTION DOC] HELPER: Replacement for builtin open. Mocked paths return a mock
+        # file handle that reads the stored contents. Unmocked string paths under /sys/
+        # raise FileNotFoundError, so tests notice unexpected sysfs reads. Anything else
+        # is passed to the real open with the same arguments (CI opens real files).
         if path in self._mock_file_path_to_contents:
             return mock_open(read_data=self._mock_file_path_to_contents[path])()
         if isinstance(path, str) and path.startswith("/sys/"):
@@ -229,6 +283,10 @@ class NumaBindingTest(TestCase):
         return _real_open(path, *args, **kwargs)
 
     def _mock_listdir(self, target_path: str) -> set[str]:
+        # [FUNCTION DOC] HELPER: Replacement for os.listdir. Treats the target as a
+        # directory (adds a trailing slash if missing) and returns the set of distinct
+        # first path components below it among mocked file paths. An unknown directory
+        # gives an empty set rather than an error.
         if not target_path.endswith("/"):
             target_path += "/"
         return {
@@ -238,11 +296,19 @@ class NumaBindingTest(TestCase):
         }
 
     def _mock_sched_getaffinity(self, pid: int) -> set[int]:
+        # [FUNCTION DOC] HELPER: Replacement for os.sched_getaffinity; ignores the pid and
+        # reports every fake logical CPU as allowed.
         return set(range(self._mock_num_logical_cpus))
 
     def _start_processes_for_str_entrypoint_and_get_command_args(
         self, *, numa_options: NumaOptions | None, target_local_rank: int
     ) -> tuple[str, ...]:
+        # [FUNCTION DOC] HELPER: Launch fake worker processes with a command-string entrypoint
+        # and return the command line used for one rank. Runs start_processes with the
+        # entrypoint echo and one argument for each fake GPU, LOCAL_RANK set in each
+        # environment and the given numa_options, with the subprocess launcher patched out.
+        # Returns the args of the first launched command whose LOCAL_RANK matches
+        # target_local_rank (StopIteration if none matched).
         with patch(
             "torch.distributed.elastic.multiprocessing.subprocess_handler.subprocess_handler.Popen"
         ) as mock_popen:
@@ -269,13 +335,20 @@ class NumaBindingTest(TestCase):
     def _start_processes_for_callable_entrypoint_and_get_sched_setaffinity_cpus(
         self, *, numa_options: NumaOptions | None, target_local_rank: int
     ) -> set[int] | None:
+        # [FUNCTION DOC] HELPER: Run the wrapper used by callable-entrypoint workers in this
+        # process for one rank, with os.sched_setaffinity patched to record its argument,
+        # and return the CPU set it was asked to bind to (None if it was never called).
+        # Uses a multiprocessing queue and an already-set event so it does not hang.
         target_sched_setaffinity_logical_cpu_indices = None
 
         def mock_sched_setaffinity(*args, **kwargs) -> None:
+            # [FUNCTION DOC] HELPER: Fake sched_setaffinity; stores the second positional
+            # argument (the CPU set) in the enclosing variable.
             nonlocal target_sched_setaffinity_logical_cpu_indices
             target_sched_setaffinity_logical_cpu_indices = args[1]
 
         def dummy_fn():
+            # [FUNCTION DOC] HELPER: Do-nothing entrypoint passed to the wrapper.
             pass
 
         import torch.multiprocessing as mp
@@ -302,6 +375,8 @@ class NumaBindingTest(TestCase):
         return target_sched_setaffinity_logical_cpu_indices
 
     def test_node_numa_binding(self) -> None:
+        # [FUNCTION DOC] Checks NODE affinity: with 16 fake GPUs on 8 NUMA nodes of 16
+        # logical CPUs each, rank 11 maps to NUMA node 5 and numactl binds to CPUs 80-95.
         self._add_mock_hardware(
             num_sockets=4,
             num_numa_nodes_per_socket=2,
@@ -324,6 +399,7 @@ class NumaBindingTest(TestCase):
         )
 
     def test_no_numa_binding_if_numa_options_not_provided(self) -> None:
+        # [FUNCTION DOC] Checks that without numa_options the command is unchanged (no numactl).
         self._add_mock_hardware(
             num_sockets=4,
             num_numa_nodes_per_socket=2,
@@ -341,6 +417,8 @@ class NumaBindingTest(TestCase):
         )
 
     def test_default_numa_binding(self) -> None:
+        # [FUNCTION DOC] Checks that LaunchConfig, when not given numa_options, takes them
+        # from the (patched) default-options function.
         # Inner import to avoid crashing if not torch.distributed.is_available()
         from torch.distributed.launcher.api import LaunchConfig
 
@@ -372,6 +450,9 @@ class NumaBindingTest(TestCase):
         )
 
     def test_fallback(self) -> None:
+        # [FUNCTION DOC] Checks the fallback behavior: when computing the NUMA node raises and
+        # fall-back is enabled, the command runs unbound and the logged signpost traceback
+        # contains the error message.
         self._add_mock_hardware(
             num_sockets=2,
             num_numa_nodes_per_socket=1,
@@ -406,6 +487,8 @@ class NumaBindingTest(TestCase):
         )
 
     def test_fallback_if_numactl_not_available(self) -> None:
+        # [FUNCTION DOC] Checks the fallback when the numactl executable is not found: the
+        # command runs unbound and the logged traceback says numactl is required.
         self._add_mock_hardware(
             num_sockets=2,
             num_numa_nodes_per_socket=1,
@@ -437,6 +520,8 @@ class NumaBindingTest(TestCase):
         )
 
     def test_explicit_numa_options_overrides_default(self) -> None:
+        # [FUNCTION DOC] Checks that numa_options passed explicitly to LaunchConfig take
+        # precedence over the default-options function.
         # Inner import to avoid crashing if not torch.distributed.is_available()
         from torch.distributed.launcher.api import LaunchConfig
 
@@ -458,6 +543,9 @@ class NumaBindingTest(TestCase):
     def test_nproc_must_equal_device_count_to_use_default_numa_options(
         self,
     ) -> None:
+        # [FUNCTION DOC] Checks that default NUMA options are used only when the number of
+        # processes per node equals the device count: with one fake GPU and two processes,
+        # the default function is never called and numa_options stays None.
         # Inner import to avoid crashing if not torch.distributed.is_available()
         from torch.distributed.launcher.api import LaunchConfig
 
@@ -481,6 +569,8 @@ class NumaBindingTest(TestCase):
             self.assertIsNone(launch_config.numa_options)
 
     def test_socket_numa_binding_with_multiple_numa_per_socket(self) -> None:
+        # [FUNCTION DOC] Checks SOCKET affinity when each socket has two NUMA nodes: rank 15
+        # sits on node 7 of socket 3 so numactl binds to the CPUs of nodes 6 and 7 (96-127).
         self._add_mock_hardware(
             num_sockets=4,
             num_numa_nodes_per_socket=2,
@@ -502,6 +592,8 @@ class NumaBindingTest(TestCase):
         )
 
     def test_socket_numa_binding_with_single_numa_per_socket(self) -> None:
+        # [FUNCTION DOC] Checks SOCKET affinity when each socket has one NUMA node: rank 7
+        # is on node 3 and binds to CPUs 48-63.
         self._add_mock_hardware(
             num_sockets=4,
             num_numa_nodes_per_socket=1,
@@ -523,6 +615,9 @@ class NumaBindingTest(TestCase):
         )
 
     def test_exclusive_numa_binding(self) -> None:
+        # [FUNCTION DOC] Checks EXCLUSIVE affinity: with three physical cores on a node shared
+        # by two GPUs, the first GPU gets two cores (CPUs 0-3) and the second gets the
+        # remaining core (CPUs 4-5).
         self._add_mock_hardware(
             num_sockets=2,
             num_numa_nodes_per_socket=1,
@@ -554,6 +649,8 @@ class NumaBindingTest(TestCase):
         )
 
     def test_exclusive_raises_if_too_few_physical_cores(self) -> None:
+        # [FUNCTION DOC] Checks EXCLUSIVE affinity raises RuntimeError with a message when a
+        # NUMA node has fewer physical cores (one) than GPUs (two).
         self._add_mock_hardware(
             num_sockets=2,
             num_numa_nodes_per_socket=1,
@@ -572,6 +669,8 @@ class NumaBindingTest(TestCase):
             )
 
     def test_core_complex_numa_binding_with_extra_l3(self) -> None:
+        # [FUNCTION DOC] Checks CORE_COMPLEX affinity with more L3 caches than GPUs per node:
+        # rank 3 is the second GPU on node 1 and uses the second L3 of that node, CPUs 24-29.
         self._add_mock_hardware(
             num_sockets=2,
             num_numa_nodes_per_socket=1,
@@ -593,6 +692,9 @@ class NumaBindingTest(TestCase):
         )
 
     def test_core_complex_numa_binding_with_fewer_l3_than_gpu(self) -> None:
+        # [FUNCTION DOC] Checks CORE_COMPLEX affinity with fewer L3 caches than GPUs per node:
+        # the GPU index wraps around the available caches, so rank 3 uses the only L3 of node
+        # 1, CPUs 6-11.
         self._add_mock_hardware(
             num_sockets=2,
             num_numa_nodes_per_socket=1,
@@ -614,6 +716,9 @@ class NumaBindingTest(TestCase):
         )
 
     def test_core_complex_prefers_caches_with_more_cpus(self) -> None:
+        # [FUNCTION DOC] Checks CORE_COMPLEX affinity prefers the L3 cache with the most CPUs
+        # that are currently allowed: with only a subset of CPUs available it binds to the
+        # second cache, CPUs 6-7 and 9.
         self._add_mock_hardware(
             num_sockets=1,
             num_numa_nodes_per_socket=1,
@@ -638,6 +743,8 @@ class NumaBindingTest(TestCase):
         )
 
     def test_core_complex_tiebreak_prefers_lower_cache_key(self) -> None:
+        # [FUNCTION DOC] Checks CORE_COMPLEX affinity tie-break: with two L3 caches holding
+        # the same number of CPUs, the one with the lower CPU indices (CPUs 0-1) is chosen.
         """
         When several max‑level caches expose the same number of logical CPUs,
         prioritize binding to caches with lower cpu indices first.
@@ -663,6 +770,8 @@ class NumaBindingTest(TestCase):
         )
 
     def test_binds_to_node_0_if_node_stored_as_minus_one(self) -> None:
+        # [FUNCTION DOC] Checks that a GPU whose PCI numa_node file contains minus one (no
+        # NUMA affinity reported) is treated as being on NUMA node 0.
         self._add_mock_hardware(
             num_sockets=1,
             num_numa_nodes_per_socket=1,
@@ -693,6 +802,8 @@ class NumaBindingTest(TestCase):
         )
 
     def test_callable_entrypoint_basic(self) -> None:
+        # [FUNCTION DOC] Checks NODE affinity for a callable entrypoint: the CPU set passed
+        # to sched_setaffinity for rank 11 is CPUs 80 to 95.
         self._add_mock_hardware(
             num_sockets=4,
             num_numa_nodes_per_socket=2,
@@ -715,6 +826,8 @@ class NumaBindingTest(TestCase):
         )
 
     def test_raises_if_binding_to_empty_set(self) -> None:
+        # [FUNCTION DOC] Checks that when the computed CPU set is empty, binding a callable
+        # entrypoint raises RuntimeError saying it must bind to a non-empty set.
         self._add_mock_hardware(
             num_sockets=1,
             num_numa_nodes_per_socket=1,
@@ -737,14 +850,23 @@ class NumaBindingTest(TestCase):
             )
 
     def test_get_set_of_int_from_ranges_str(self) -> None:
+        # [FUNCTION DOC] Checks parsing of a comma-separated range string into a set of
+        # integers (expects zero to two, four, six and seven).
         self.assertEqual(
             _get_set_of_int_from_ranges_str("0-2,4,6-7"), {0, 1, 2, 4, 6, 7}
         )
 
     def test_get_range_str_from_ints(self) -> None:
+        # [FUNCTION DOC] Checks that an unsorted list of integers is converted to the
+        # compact sorted range string, merging consecutive runs.
         self.assertEqual(_get_ranges_str_from_ints([7, 0, 1, 6, 2, 4]), "0-2,4,6-7")
 
     def test_bind_all_threads_in_current_process_to_logical_cpus(self) -> None:
+        # [FUNCTION DOC] Checks that binding all threads of the current process changes the
+        # affinity of the main thread and of mocked threads in the task directory that still
+        # have the original affinity, skips a thread whose affinity was changed by hand,
+        # and silently ignores a directory entry that is not an integer. Asserts exactly two
+        # affinity calls (tid 0 and tid 8675309) with the requested CPU set.
         self._add_mock_hardware(
             num_sockets=1,
             num_numa_nodes_per_socket=1,
@@ -766,6 +888,8 @@ class NumaBindingTest(TestCase):
         manually_reaffinitized_thread_affinity = {0}
 
         def mock_sched_getaffinity_impl(tid: int) -> set[int]:
+            # [FUNCTION DOC] HELPER: Fake sched_getaffinity; returns a single-CPU set for thread
+            # 1111111 (changed by hand) and the original eight-CPU set for any other thread.
             if tid == 1111111:
                 return manually_reaffinitized_thread_affinity
             return original_main_thread_affinity
@@ -773,6 +897,8 @@ class NumaBindingTest(TestCase):
         call_order = []
 
         def mock_sched_setaffinity_impl(tid: int, cpus: set[int]) -> None:
+            # [FUNCTION DOC] HELPER: Fake sched_setaffinity; appends the thread id and CPU set to
+            # the call_order list for later inspection.
             call_order.append((tid, cpus))
 
         with (

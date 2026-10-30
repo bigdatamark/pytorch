@@ -1,6 +1,12 @@
 # mypy: ignore-errors
 
 # Owner(s): ["module: numpy"]
+# [MODULE DOC] Tests for interoperability between torch tensors and NumPy: tensor to
+# array conversion (numpy method, force argument, zero tensors), array to tensor
+# creation (from_numpy and the tensor constructor), NumPy scalars as indices and
+# operands, the array protocol methods on legacy tensor types, comparisons with
+# arrays, and a few dynamo compile checks. Defines one TestCase, TestNumPyInterop,
+# instantiated per device type at import time by instantiate_device_type_tests.
 
 import sys
 from itertools import product
@@ -23,11 +29,17 @@ from torch.testing._internal.common_utils import run_tests, skipIfTorchDynamo, T
 # For testing handling NumPy objects and sending tensors to / accepting
 #   arrays from NumPy.
 class TestNumPyInterop(TestCase):
+    # [CLASS DOC] Device-generic test case for NumPy interop. Stateless; each test is
+    # independent. Many tests are restricted to cpu with the onlyCPU decorator because
+    # numpy only shares memory with cpu tensors.
     # Note: the warning this tests for only appears once per program, so
     # other instances of this warning should be addressed to avoid
     # the tests depending on the order in which they're run.
     @onlyCPU
     def test_numpy_non_writeable(self, device):
+        # [FUNCTION DOC] Checks that creating a tensor from a read-only numpy array with
+        # from_numpy emits a UserWarning. The warning is only emitted once per process,
+        # so other code should avoid triggering it to keep this test order-independent.
         arr = np.zeros(5)
         arr.flags["WRITEABLE"] = False
         self.assertWarns(UserWarning, lambda: torch.from_numpy(arr))
@@ -39,6 +51,10 @@ class TestNumPyInterop(TestCase):
         "Broken in older numpy versions, see https://github.com/numpy/numpy/issues/30265",
     )
     def test_numpy_unresizable(self, device) -> None:
+        # [FUNCTION DOC] Checks storage sharing prevents resizing. An array backing a
+        # tensor cannot be resized (ValueError), a tensor that is viewed as an array
+        # cannot be resized in place (RuntimeError), and that array cannot be resized
+        # either (ValueError). Skipped on Python 3.14 with numpy older than 2.4.
         x = np.zeros((2, 2))
         y = torch.from_numpy(x)  # noqa: F841
         with self.assertRaises(ValueError):
@@ -53,7 +69,18 @@ class TestNumPyInterop(TestCase):
 
     @onlyCPU
     def test_to_numpy(self, device) -> None:
+        # [FUNCTION DOC] Checks converting tensors to arrays for many dtypes: 1D, with
+        # storage offset, empty, 2D contiguous (array is C contiguous), 2D with offset,
+        # transposed non-contiguous (array is not C contiguous), and transposed with
+        # holes. Elements must equal those of the tensor. For non-half dtypes also checks
+        # the array is writeable and writes through it are visible in the tensor, both for
+        # a tensor and for its transpose.
         def get_castable_tensor(shape, dtype):
+            # [FUNCTION DOC] HELPER: Make a random tensor of the given shape and dtype whose
+            # values are safely castable. Floating dtypes sample a double uniformly in the
+            # range of the dtype clipped to plus or minus ten billion, then cast; integer
+            # dtypes sample 64-bit integers in the dtype range clipped likewise, then cast.
+            # Clipping avoids ranges wider than the sampling type (infinities, undefined behavior).
             if dtype.is_floating_point:
                 dtype_info = torch.finfo(dtype)
                 # can't directly use min and max, because for double, max - min
@@ -97,6 +124,9 @@ class TestNumPyInterop(TestCase):
                 self.assertEqual(x[i], y[i])
 
             def check2d(x, y):
+                # [FUNCTION DOC] HELPER: Assert that two 2D objects have equal elements. Uses the
+                # loop sizes sz1 and sz2 from the enclosing test scope (assigned before each call)
+                # and compares element by element with the test's equality assertion.
                 for i in range(sz1):
                     for j in range(sz2):
                         self.assertEqual(x[i][j], y[i][j])
@@ -155,6 +185,8 @@ class TestNumPyInterop(TestCase):
                 self.assertTrue(x[0][1] == 3)
 
     def test_to_numpy_bool(self, device) -> None:
+        # [FUNCTION DOC] Checks that boolean tensors (two elements and one element)
+        # convert to arrays with the numpy bool dtype and equal elements.
         x = torch.tensor([True, False], dtype=torch.bool)
         self.assertEqual(x.dtype, torch.bool)
 
@@ -174,6 +206,9 @@ class TestNumPyInterop(TestCase):
         "can't check if value is ZeroTensor since _is_zerotensor returns a bool and not a TensorVariable"
     )
     def test_to_numpy_zero_tensor(self, device) -> None:
+        # [FUNCTION DOC] Checks, for several dtypes, that an efficient zero tensor cannot be
+        # converted by default (RuntimeError) but converting with force produces an array of
+        # zeros. Skipped under dynamo.
         dtypes = [
             torch.uint8,
             torch.int8,
@@ -194,6 +229,12 @@ class TestNumPyInterop(TestCase):
 
     @skipIfTorchDynamo("conj bit not implemented in TensorVariable yet")
     def test_to_numpy_force_argument(self, device) -> None:
+        # [FUNCTION DOC] Checks the force argument of conversion to numpy on a complex tensor
+        # over combinations of force, requires_grad, sparse and conjugate views (sparse with
+        # requires_grad is skipped). Without force, cases that need it (grad, sparse, conj
+        # or non-cpu device) must raise RuntimeError or TypeError with a hint message, also
+        # when force is passed as false. With force, sparse still raises TypeError. In all
+        # other cases the result must equal the resolved-conjugate tensor. Skipped under dynamo.
         for force in [False, True]:
             for requires_grad in [False, True]:
                 for sparse in [False, True]:
@@ -231,6 +272,11 @@ class TestNumPyInterop(TestCase):
                             self.assertEqual(x.numpy(force=force), y)
 
     def test_from_numpy(self, device) -> None:
+        # [FUNCTION DOC] Checks from_numpy: elements are preserved for many dtypes
+        # (including a remainder-of-two array as a Windows regression), an array with
+        # unsupported string dtype raises TypeError, and storage offsets, transposed
+        # arrays, arrays with holes and zero-sized shapes convert to equal tensors. An
+        # array with a stride that does not fit its dtype raises ValueError.
         dtypes = [
             np.double,
             np.float64,
@@ -304,6 +350,9 @@ class TestNumPyInterop(TestCase):
 
     @skipIfTorchDynamo("No need to test invalid dtypes that should fail by design.")
     def test_from_numpy_no_leak_on_invalid_dtype(self):
+        # [FUNCTION DOC] Regression test for a reference leak (issue 121138). Repeatedly
+        # calls from_numpy on an unsupported bytes-string array, swallowing the TypeError,
+        # and asserts the array reference count does not change. Skipped under dynamo.
         # This used to leak memory as the `from_numpy` call raised an exception and didn't decref the temporary
         # object. See https://github.com/pytorch/pytorch/issues/121138
         x = np.array(b"value")
@@ -323,6 +372,9 @@ class TestNumPyInterop(TestCase):
     @skipIfTorchDynamo("No need to test invalid dtypes that should fail by design.")
     @onlyCPU
     def test_from_numpy_zero_element_type(self):
+        # [FUNCTION DOC] Checks the dtype validity check runs before the stride check: from_numpy
+        # on a zero-itemsize string array raises TypeError instead of dividing by zero.
+        # cpu only; skipped under dynamo.
         # This tests that dtype check happens before strides check
         # which results in div-by-zero on-x86
         x = np.ndarray((3, 3), dtype=str)
@@ -330,6 +382,8 @@ class TestNumPyInterop(TestCase):
 
     @skipMeta
     def test_from_list_of_ndarray_warning(self, device):
+        # [FUNCTION DOC] Checks that building a tensor from a list of numpy arrays emits the
+        # "extremely slow" UserWarning once. Not run for the meta device.
         warning_msg = (
             r"Creating a tensor from a list of numpy.ndarrays is extremely slow"
         )
@@ -337,6 +391,10 @@ class TestNumPyInterop(TestCase):
             torch.tensor([np.array([0]), np.array([1])], device=device)
 
     def test_ctor_with_invalid_numpy_array_sequence(self, device):
+        # [FUNCTION DOC] Checks the tensor constructor rejects ragged nested sequences of numpy
+        # arrays with ValueError ("expected sequence of length") at several nesting levels
+        # and in a mixed list of list and array, and raises TypeError ("not a sequence") when a
+        # zero-dimensional array appears where a sequence is expected.
         # Invalid list of numpy array
         with self.assertRaisesRegex(ValueError, "expected sequence of length"):
             torch.tensor(
@@ -373,6 +431,8 @@ class TestNumPyInterop(TestCase):
 
     @onlyCPU
     def test_ctor_with_numpy_scalar_ctor(self, device) -> None:
+        # [FUNCTION DOC] Checks that for several numpy scalar types, creating a tensor from the
+        # scalar and taking its item gives the original value. cpu only.
         dtypes = [
             np.double,
             np.float64,
@@ -388,6 +448,8 @@ class TestNumPyInterop(TestCase):
 
     @onlyCPU
     def test_numpy_index(self, device):
+        # [FUNCTION DOC] Checks that numpy integer scalars (which are not Python ints) can
+        # index a tensor and select the same row as the equivalent Python int. cpu only.
         i = np.array([0, 1, 2], dtype=np.int32)
         x = torch.randn(5, 5)
         for idx in i:
@@ -396,6 +458,8 @@ class TestNumPyInterop(TestCase):
 
     @onlyCPU
     def test_numpy_index_multi(self, device):
+        # [FUNCTION DOC] Checks indexing a 3D tensor with a boolean mask made by comparing a
+        # numpy integer array: the count of selected elements equals the sum of the array.
         for dim_sz in [2, 8, 16, 32]:
             i = np.zeros((dim_sz, dim_sz, dim_sz), dtype=np.int32)
             i[: dim_sz // 2, :, :] = 1
@@ -404,6 +468,11 @@ class TestNumPyInterop(TestCase):
 
     @onlyCPU
     def test_numpy_array_interface(self, device):
+        # [FUNCTION DOC] Checks the numpy array protocol on legacy tensor types. Converting
+        # with asarray gives arrays of the matching dtype and values, also when a dtype is
+        # requested. Applying numpy ufuncs (abs, sin, sqrt, ceil) returns the same legacy
+        # tensor type with values equal to numpy results, and a comparison ufunc returns a
+        # byte tensor. Unsigned dtypes use non-negative data. cpu only.
         types = [
             torch.DoubleTensor,
             torch.FloatTensor,
@@ -487,6 +556,9 @@ class TestNumPyInterop(TestCase):
 
     @onlyCPU
     def test_multiplication_numpy_scalar(self, device) -> None:
+        # [FUNCTION DOC] Checks multiplying a float or double tensor that requires grad by a
+        # numpy scalar of various types, on either side: the result is a tensor that keeps
+        # the tensor dtype and still requires grad. cpu only.
         for np_dtype in [
             np.float32,
             np.float64,
@@ -512,6 +584,9 @@ class TestNumPyInterop(TestCase):
     @onlyCPU
     @skipIfTorchDynamo()
     def test_parse_numpy_int_overflow(self, device):
+        # [FUNCTION DOC] Checks that passing a numpy unsigned 64-bit scalar with a negative
+        # (wrapped) value as an integer argument to mean fails: OverflowError for numpy 2
+        # and later, ValueError for older versions. cpu only; skipped under dynamo.
         # assertRaises uses a try-except which dynamo has issues with
         # Only concrete class can be given where "Type[number[_64Bit]]" is expected
         if np.__version__ > "2":
@@ -529,6 +604,10 @@ class TestNumPyInterop(TestCase):
 
     @onlyCPU
     def test_parse_numpy_int(self, device):
+        # [FUNCTION DOC] Regression test for issue 29252: numpy integer scalars of several
+        # sizes are accepted wherever an int is expected (native function arguments, custom
+        # storage construction, item assignment) and keep the integer dtype of a tensor
+        # when added to it as a Scalar in either order. cpu only.
         # https://github.com/pytorch/pytorch/issues/29252
         for nptype in [np.int16, np.int8, np.uint8, np.int32, np.int64]:
             scalar = 3
@@ -558,6 +637,8 @@ class TestNumPyInterop(TestCase):
             self.assertEqual((np_val + t).dtype, t.dtype)
 
     def test_has_storage_numpy(self, device):
+        # [FUNCTION DOC] Checks tensors made from numpy arrays with various dtype arguments
+        # all report a non-None storage.
         for dtype in [np.float32, np.float64, np.int64, np.int32, np.int16, np.uint8]:
             arr = np.array([1], dtype=dtype)
             self.assertIsNotNone(
@@ -578,6 +659,13 @@ class TestNumPyInterop(TestCase):
 
     @dtypes(*all_types_and_complex_and(torch.half, torch.bfloat16, torch.bool))
     def test_numpy_scalar_cmp(self, device, dtype):
+        # [FUNCTION DOC] Checks equality between scalars taken from tensors and numpy arrays
+        # of many dtypes (scalar, 1D, 2D; complex or real data). Every combination of a
+        # tensor element or Python value with a numpy element or Python value must compare
+        # equal; bfloat16 conversion to numpy must raise TypeError. For complex64 a tensor
+        # compared with a numpy complex64 scalar must be reported unequal.
+        # KNOWN ISSUE: that unequal result reflects a known bug where the imaginary part is
+        # dropped (issue 43579); the test asserts the buggy behavior.
         if dtype.is_complex:
             tensors = (
                 torch.tensor(complex(1, 3), dtype=dtype, device=device),
@@ -619,6 +707,10 @@ class TestNumPyInterop(TestCase):
     @onlyCPU
     @dtypes(*all_types_and_complex_and(torch.half, torch.bool))
     def test___eq__(self, device, dtype):
+        # [FUNCTION DOC] Checks tensor to numpy array equality in both operand orders for
+        # many dtypes: all elements equal, one element changed, random elements changed,
+        # and all elements changed; the result must equal the expected boolean tensor
+        # each time. cpu only.
         a = make_tensor((5, 7), dtype=dtype, device=device, low=-9, high=9)
         b = a.detach().clone()
         b_np = b.numpy()
@@ -661,6 +753,9 @@ class TestNumPyInterop(TestCase):
 
     @onlyCPU
     def test_empty_tensors_interop(self, device):
+        # [FUNCTION DOC] Regression test for issues 115068, 115066 and 113037: arithmetic
+        # between a zero-dimensional half tensor and an empty tensor (true divide, mul, and
+        # floor division) gives a result with the empty tensor's shape. cpu only.
         x = torch.rand((), dtype=torch.float16)
         y = torch.tensor(np.random.rand(0), dtype=torch.float16)
         # Same can be achieved by running
@@ -674,8 +769,13 @@ class TestNumPyInterop(TestCase):
         self.assertEqual(torch.div(x, y, rounding_mode="floor").shape, y.shape)
 
     def test_ndarray_astype_object_graph_break(self):
+        # [FUNCTION DOC] Checks that compiling, with the eager backend and full graph, a
+        # function calling astype with the string O on a numpy array raises a dynamo
+        # Unsupported error mentioning astype object.
         @torch.compile(backend="eager", fullgraph=True)
         def f(xs):
+            # [FUNCTION DOC] HELPER: Function to compile; applies astype with the object type
+            # code to its argument and returns nothing.
             xs.astype("O")
 
         xs = np.array([1, 2])
@@ -685,8 +785,12 @@ class TestNumPyInterop(TestCase):
             f(xs)
 
     def test_ndarray_astype_object_graph_break_2(self):
+        # [FUNCTION DOC] Same as the previous test but astype is given the Python object
+        # type instead of a string; also expects the dynamo Unsupported error.
         @torch.compile(backend="eager", fullgraph=True)
         def f(xs):
+            # [FUNCTION DOC] HELPER: Function to compile; applies astype with the object type
+            # to its argument and returns nothing.
             xs.astype(object)
 
         xs = np.array([1, 2])
@@ -696,7 +800,12 @@ class TestNumPyInterop(TestCase):
             f(xs)
 
     def test_copy_mode(self):
+        # [FUNCTION DOC] Checks that a function creating a numpy array with the IF_NEEDED
+        # copy mode compiles with the eager backend and full graph without error, and
+        # the compiled result equals the uncompiled result.
         def f(x):
+            # [FUNCTION DOC] HELPER: Function to compile; returns a numpy array built from its
+            # argument using the if-needed copy mode.
             return np.array(x, copy=np._CopyMode.IF_NEEDED)
 
         opt_f = torch.compile(backend="eager", fullgraph=True)(f)
