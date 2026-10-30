@@ -1,4 +1,9 @@
 # Owner(s): ["oncall: jit"]
+# [MODULE DOC] Tests for the profiling executor and the tensor expression fuser as seen through
+# the last executed optimized graph: which ops are fused or left out, specialization of types and
+# backward graphs, fallback graphs, tensor constants and fusion strategy settings. Import-time
+# side effect: appends the parent test directory to the module search path. Running the file
+# directly raises an error pointing at test_jit.
 
 import os
 import sys
@@ -18,7 +23,15 @@ from torch.testing._internal.jit_utils import FileCheck, JitTestCase, warmup_bac
 
 @skipIfTorchDynamo()
 class TestProfiler(JitTestCase):
+    # [CLASS DOC] Test case (skipped under TorchDynamo) that turns on the profiling executor and
+    # the tensor expression fuser (with CPU fusion, reductions on, LLVM not required, fusion group
+    # inlining off) and sets the default dtype to double for each test. Previous values of these
+    # global settings are saved on the instance and restored in tearDown.
     def setUp(self):
+        # [FUNCTION DOC] Deliberately does not call the base class setUp, which installs hooks
+        # said to crash at process exit. Records the torch function mode stack length and state,
+        # then saves and overrides the global JIT settings listed in the class doc, including
+        # autodiff subgraph inlining off and double default dtype.
         # Don't call super().setUp() — JitTestCase.setUp installs JIT emit
         # hooks that cause segfaults during process cleanup. Record state
         # baselines that tearDown checks for.
@@ -40,6 +53,11 @@ class TestProfiler(JitTestCase):
         torch._C._jit_set_te_must_use_llvm_cpu(False)
 
     def tearDown(self):
+        # [FUNCTION DOC] Restores every global setting saved by setUp: executors, fuser flags,
+        # autodiff inlining, default dtype, reductions, fusion group inlining and LLVM
+        # requirement. Does not call the base class tearDown.
+        # KNOWN ISSUE: the saved torch function stack length and state are recorded in setUp but
+        # never checked here.
         torch._C._jit_set_profiling_executor(self.prev_exec)
         torch._C._get_graph_executor_optimize(self.prev_profiling)
         torch._C._debug_set_autodiff_subgraph_inlining(self.inline_autodiff)
@@ -51,8 +69,14 @@ class TestProfiler(JitTestCase):
         torch._C._jit_set_te_must_use_llvm_cpu(self.old_te_must_use_llvm_cpu)
 
     def test_tensor_type_not_determined_by_inputs(self):
+        # [FUNCTION DOC] Checks that fusion does not assume a result type from input types: a
+        # scripted function whose third argument becomes a float scalar tensor after warmup must
+        # keep the item and add ops between two fusion groups; and a sum whose dtype argument is
+        # computed at run time must stay outside the fusion groups.
         @torch.jit.script
         def scalar_type_input(x, y, z):
+            # [FUNCTION DOC] HELPER: Scripted function adding two tensors, the constant four, and
+            # the scalar extracted from a third tensor.
             return x + y + 4 + z.item()
 
         x = torch.tensor([2, 2])
@@ -69,6 +93,8 @@ class TestProfiler(JitTestCase):
 
         @torch.jit.script
         def non_const_dtype(x, y, cond: bool):
+            # [FUNCTION DOC] HELPER: Scripted function that picks a dtype from a boolean flag and
+            # returns the sum of an expression with that dtype.
             dtype = torch.int16 if cond else torch.int32
             return (x + y + 3).sum(dtype=dtype)
 
@@ -81,7 +107,13 @@ class TestProfiler(JitTestCase):
         )
 
     def test_specialize_backward(self):
+        # [FUNCTION DOC] Checks the specialized backward graph of a fused function. With
+        # same-shape inputs the true block of the guarding branch has exactly one nested branch
+        # guarding a fusion group and no gradient sum-to-size op. With a broadcast input the
+        # gradient sum-to-size op is expected to remain.
         def test_fuse(a, b):
+            # [FUNCTION DOC] HELPER: Multiplies two inputs and multiplies the result by the second
+            # again; the function caching flag is disabled on it by the test.
             c = a * b
             d = c * b
             return d
@@ -120,8 +152,12 @@ class TestProfiler(JitTestCase):
         self.assertIsNotNone(optimized_block.findNode("aten::_grad_sum_to_size"))
 
     def test_specialized_types(self):
+        # [FUNCTION DOC] Runs a scripted function three times and checks that tensor types remain
+        # specialized (double) on type check outputs and fusion outputs while the branch output is
+        # a generic tensor.
         @torch.jit.script
         def test_fuse(a, b):
+            # [FUNCTION DOC] HELPER: Scripted function: two chained multiplications.
             c = a * b
             d = c * b
             return d
@@ -140,8 +176,12 @@ class TestProfiler(JitTestCase):
         FileCheck().check("Tensor = prim::If").run(g)
 
     def test_aliasing_merge(self):
+        # [FUNCTION DOC] Checks that a function with an in-place add in the middle yields two type
+        # checks and that the in-place op sits between two fusion groups.
         @torch.jit.script
         def foo(a, b):
+            # [FUNCTION DOC] HELPER: Scripted function with multiplications, an in-place add on an
+            # intermediate, another multiplication, and a final sum.
             c = a * b
             d = c * b
             d.add_(b)
@@ -157,7 +197,12 @@ class TestProfiler(JitTestCase):
         FileCheck().check("TensorExpr").check("aten::add_").check("TensorExpr").run(g)
 
     def test_use_not_profiled(self):
+        # [FUNCTION DOC] Checks that when a use of the first input sits in a branch never taken
+        # during profiling, all adds are still fused (no add outside the branch) and the scripted
+        # result matches eager.
         def foo(t1, t2, t3, t4, t: float):
+            # [FUNCTION DOC] HELPER: Sums four tensors and, if a float argument exceeds one half,
+            # returns the first tensor plus one; otherwise returns the sum.
             h = t1 + t2 + t3 + t4
             if t > 0.5:
                 # Putting a use of t1 in a never-executed conditional prevents
@@ -176,8 +221,11 @@ class TestProfiler(JitTestCase):
         FileCheck().check("graph").check_not("aten::add").check("prim::If").run(g)
 
     def test_not_fusing_scalar_ops(self):
+        # [FUNCTION DOC] Checks that arithmetic on plain ints is not fused: the optimized graph
+        # has no tensor expression group.
         @torch.jit.script
         def foo(x: int, y: int):
+            # [FUNCTION DOC] HELPER: Scripted function summing two ints and several constants.
             return x + y + 2 + 4 + 5 + 6
 
         foo(1, 2)
@@ -186,8 +234,12 @@ class TestProfiler(JitTestCase):
         FileCheck().check_not("TensorExpr").run(g)
 
     def test_not_optimizing_property(self):
+        # [FUNCTION DOC] Checks that a size query returned from a function stays in the optimized
+        # graph, and the scripted result matches eager for a different input shape.
         @torch.jit.script
         def foo(x, y):
+            # [FUNCTION DOC] HELPER: Scripted function returning a sum with int constants together
+            # with the size of the first input.
             return x + y + 1 + 2 + 3, x.size()
 
         x = torch.ones(1)
@@ -199,8 +251,11 @@ class TestProfiler(JitTestCase):
         self.assertEqual(foo(x, x), (x + x + 1 + 2 + 3, x.size()))
 
     def test_fallback_graph_not_specialized(self):
+        # [FUNCTION DOC] Checks that the fallback path in the optimized graph is called as a
+        # function whose result is unpacked from a tuple, rather than a specialized copy.
         @torch.jit.script
         def foo(a, b):
+            # [FUNCTION DOC] HELPER: Scripted function: a chain of multiplications, then a sum.
             c = a * b
             d = c * b
             e = d * b
@@ -216,8 +271,12 @@ class TestProfiler(JitTestCase):
         )
 
     def test_autograd_fallback_graph(self):
+        # [FUNCTION DOC] Runs a scripted function with grad-requiring inputs, then two backward
+        # passes, and checks the last executed graph calls a fallback function directly followed
+        # by a call to a function.
         @torch.jit.script
         def foo(a, b):
+            # [FUNCTION DOC] HELPER: Scripted function: a chain of multiplications, then a sum.
             c = a * b
             d = c * b
             e = d * b
@@ -234,7 +293,10 @@ class TestProfiler(JitTestCase):
         FileCheck().check("fallback_function").check_next("CallFunction").run(g)
 
     def test_tensor_constant(self):
+        # [FUNCTION DOC] Checks results match eager when a tensor constant is created in the
+        # function and that the optimized graph keeps exactly two add ops.
         def foo(a, b):
+            # [FUNCTION DOC] HELPER: Returns the sum of both inputs and a constant tensor.
             return a + b + torch.tensor([2])
 
         x = torch.ones(1, requires_grad=False)
@@ -247,8 +309,13 @@ class TestProfiler(JitTestCase):
         FileCheck().check_count("aten::add", 2, exactly=True).run(g)
 
     def test_local_fusion_strategy(self):
+        # [FUNCTION DOC] Sets the fusion strategy to one static specialization, runs three times,
+        # then to ten static specializations and runs ten shapes twice each, and checks the final
+        # graph contains exactly two tensor expression groups. Side effect: changes the global
+        # fusion strategy and does not restore it.
         @torch.jit.script
         def foo(x):
+            # [FUNCTION DOC] HELPER: Scripted function adding its input to itself twice.
             return x + x + x
 
         torch.jit.set_fusion_strategy([("STATIC", 1)])
@@ -265,6 +332,8 @@ class TestProfiler(JitTestCase):
         FileCheck().check_count(":TensorExprGroup", 2, exactly=True).run(g)
 
     def test_invalid_fusion_strategy_raises_value_error(self):
+        # [FUNCTION DOC] Checks that setting a fusion strategy containing an unknown kind raises
+        # ValueError whose message mentions the allowed kinds and the bad one.
         with self.assertRaisesRegex(
             ValueError,
             r"FusionBehavior.*(STATIC|DYNAMIC).*got:\s*COMPLEX",
@@ -272,8 +341,13 @@ class TestProfiler(JitTestCase):
             torch.jit.set_fusion_strategy([("STATIC", 2), ("COMPLEX", 3)])
 
     def test_iterative_fusion(self):
+        # [FUNCTION DOC] Checks that a function with an in-place op in the middle ends up with two
+        # tensor expression groups after warmup, because fusing continues
+        # past the first fusion point.
         @torch.jit.script
         def foo(a, b, c, d):
+            # [FUNCTION DOC] HELPER: Scripted function with adds, an in-place add on the second
+            # input, and a final add; returns two results.
             a = a + b
             b.add_(3)
             c = c + b + d
