@@ -2,6 +2,11 @@
 #
 # Ampere GEMM using warp-level MMA and cp.async global-to-shared loads.
 # All CTA threads participate in cp.async, MMA, and epilogue.
+# [MODULE DOC] Ampere (SM80 family) GEMM class built on the quack GemmBase framework.
+# Only the configuration side is implemented: the constructor validates and derives tile,
+# warp, shared-memory and occupancy settings, and a helper builds the warp-level tiled MMA.
+# The kernel entry point is a stub that raises NotImplementedError. No import-time side
+# effects beyond importing cutlass and sibling quack modules.
 
 from typing import Optional, Tuple, Type, Union
 
@@ -18,6 +23,11 @@ from .varlen_utils import VarlenArguments
 
 
 class GemmSm80(GemmBase):
+# [CLASS DOC] GemmSm80: SM80/86/87/89 GEMM configuration with cp.async loads and warp MMA.
+# Class attributes: arch (default 80) and the tuple of supported archs. Instances hold the
+# accumulator dtype, tile shape, warp count, atom layout, shared-memory capacity, occupancy
+# and an epilogue named barrier; staging and shared-memory layout fields start as None and
+# are meant to be filled by the base-class setup. The kernel call itself is not implemented.
     """SM80 GEMM with cp.async loads and warp-level tensor-core MMA.
 
     SM80 has no TMA, so both the A/B mainloop and the epilogue global memory
@@ -43,6 +53,17 @@ class GemmSm80(GemmBase):
         occupancy: Optional[int] = None,
         arch: int = 80,
     ):
+        # [FUNCTION DOC] Validate arguments and populate configuration fields for an SM8x GEMM.
+        # Args: accumulator and A dtypes, tile shape (M, N) or (M, N, K; K defaults to four MMA K
+        # steps), cluster shape (must be 1,1,1), gather_A, concat_layout (None becomes empty),
+        # use_pdl, optional num_warps (default 8 for 128x256 and 128x192 tiles, else 4), optional
+        # occupancy, and arch. Raises ValueError for an unsupported arch, a bad tile shape length,
+        # M/N not multiples of 16, K not a positive multiple of the MMA K, or num_warps not 4 or 8.
+        # The pingpong flag must be false and the cluster must be 1,1,1 (checked by assertions);
+        # persistence via CLC is always disabled. Default occupancy is 1 for 8 warps else 2,
+        # dropped to 1 when three A/B stages would not fit in the per-CTA shared memory share.
+        # Side effects: creates the epilogue NamedBarrier covering all warps; sets stage and layout
+        # attributes to None.
         if arch not in self._supported_archs:
             raise ValueError(
                 f"SM80-family GEMM supports arch in {self._supported_archs}, got {arch}"
@@ -116,6 +137,9 @@ class GemmSm80(GemmBase):
 
     @staticmethod
     def _smem_capacity_for_arch(arch: int) -> int:
+        # [FUNCTION DOC] HELPER: Return the shared-memory capacity in bytes for an SM8x arch.
+        # Arch 87 is mapped to 80 because the CUTLASS helper does not accept that name; others
+        # are looked up by name as sm_ followed by the arch number.
         # CUDA documents CC 8.7 with the same shared-memory capacity as CC 8.0,
         # but this CUTLASS helper build does not accept "sm_87".
         if arch == 87:
@@ -123,6 +147,11 @@ class GemmSm80(GemmBase):
         return cutlass.utils.get_smem_capacity_in_bytes(f"sm_{arch}")
 
     def _setup_tiled_mma(self):
+        # [FUNCTION DOC] HELPER: Build the warp-level tiled MMA and store it on the instance.
+        # Uses the F16/BF16 warp MMA op with the A dtype, accumulator dtype and instruction shape
+        # 16x8x16, tiled over the atom layout, with an N permutation that doubles the N extent per
+        # atom. Sets tiled_mma and aliases it as tiled_mma_gated_postact. Relies on a_dtype having
+        # been set on the instance by the caller before this runs.
         op = warp.MmaF16BF16Op(self.a_dtype, self.acc_dtype, self.mma_inst_mnk)
         atom_m, atom_n, atom_k = self.atom_layout_mnk
         tC = cute.make_layout(self.atom_layout_mnk)
@@ -147,4 +176,7 @@ class GemmSm80(GemmBase):
         stream: cuda.CUstream,
         trace_ptr: Optional[cutlass.Int64] = None,
     ):
+        # [FUNCTION DOC] JIT entry point for the SM80 GEMM; takes A, B, optional D and C tensors,
+        # epilogue args, scheduler options, varlen args, a CUDA stream and optional trace pointer.
+        # Not implemented: always raises NotImplementedError.
         raise NotImplementedError("Gemm Sm80 is not implemented yet")

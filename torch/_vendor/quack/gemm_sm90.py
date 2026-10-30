@@ -2,6 +2,16 @@
 
 # Based on the cute-dsl example:
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/hopper/dense_gemm.py
+# [MODULE DOC] Hopper (SM90) warp-specialized GEMM built on the quack GemmTmaBase: TMA loads
+# of A and B into a multi-stage shared memory ring, WGMMA accumulation in registers by one to
+# three MMA warpgroups, and a composable epilogue that stores D (and optionally loads C)
+# through shared memory. Contains the GemmSm90 class with configuration, launch, device
+# kernel, gather-A (cp.async) loader, mainloop, epilogue copy helpers, ping-pong barriers,
+# scheduler pipeline construction, stage-count heuristics, shared memory layout construction
+# and dtype validation. Import-time side effects: none beyond imports.
+# KNOWN ISSUE: the large string after the imports is not a module docstring (it follows
+# statements) and its constraints (M of 64 or 128, N of 64/128/256, K of 64, fp16 and fp8
+# only) are stale compared with the checks in the class constructor.
 
 from typing import Tuple, Type, Callable, Optional
 from functools import partial
@@ -69,6 +79,18 @@ Constraints:
 
 
 class GemmSm90(GemmTmaBase):
+    # [CLASS DOC] GemmSm90: batched GEMM D = A times B (plus optional C and fused epilogue)
+    # for Hopper with persistent tile scheduling, optional ping-pong scheduling of two MMA
+    # warpgroups, optional TMA multicast across a cluster, and optional gather of A rows or
+    # K columns (with cp.async) plus variable-length M or K batches. State set in the
+    # constructor: dtypes and tile/cluster/atom layouts, warp-group and register budgets,
+    # barriers and null placeholders for stage counts and shared memory layouts. Operand
+    # dtypes and layouts, epilogue tile, stage counts and layouts are filled in during the
+    # call path. Warp roles: the MMA warpgroups run mainloop plus epilogue; one extra warp
+    # group holds the load warp(s) (one for TMA, four when gather A is used) and the
+    # scheduler warp.
+    # KNOWN ISSUE: the example in the existing docstring does not match the real constructor
+    # and call signatures.
     """
     This class implements batched matrix multiplication (C = A x B) with support for various data types
     and architectural features specific to Hopper GPUs with persistent tile scheduling and warp specialization.
@@ -124,6 +146,23 @@ class GemmSm90(GemmTmaBase):
         concat_layout: tuple | None = None,
         use_pdl: bool = True,
     ):
+        # [FUNCTION DOC] Validate and record the kernel configuration. Args: accumulator and A
+        # dtypes, tile shape (M, N) or (M, N, K; a missing K is stored as zero and resolved
+        # later), cluster shape, pingpong, persistence, fp8 fast accumulate, gather_A, CLC
+        # persistence, concat_layout, PDL use. Raises ValueError for unsupported tile shapes:
+        # without pingpong M must be 64, 128, 192, 256 or 320, with N a multiple of 32 up to
+        # 256 (M=192) or 160 (M=320), otherwise a multiple of 16 up to 256 or of 32 up to 512;
+        # with pingpong M must be 64, 128 or 192 and N a multiple of 16 up to 256, 208 or 128
+        # respectively. Assertion failures: tile length not 2 or 3, pingpong without
+        # persistence, gather with cluster N not 1, CLC persistence unless the class arch is
+        # 100. Derives the warp-group atom layout (M=320: 1x2; M=192: 3x1 if N is at most 128
+        # else 1x2; otherwise M/64 capped at 2 for M of 256, N 1; pingpong 1x1), multicast
+        # counts and flags (A multicast over cluster N, B over cluster M), number of MMA warp
+        # groups (doubled under pingpong), thread count (one extra warp group), epilogue warp
+        # count and barrier, load warp count and id, and register budgets of load and MMA
+        # warps (adjusted for warp-group count, gather, fp8 slow accumulation and heavy
+        # register pressure). Sets occupancy 1, 1024-byte buffer alignment and the SM90 shared
+        # memory capacity.
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
 
@@ -257,10 +296,20 @@ class GemmSm90(GemmTmaBase):
         self.buffer_align_bytes = 1024
 
     def epi_smem_warp_shape_mnk(self):
+        # [FUNCTION DOC] Return the warp arrangement used by the epilogue shared memory
+        # copies: four warps per warp group along M times the atom M count, and the atom N and
+        # K counts.
         atom_m, atom_n, atom_k = self.atom_layout_mnk
         return (atom_m * 4, atom_n, atom_k)
 
     def _setup_tiled_mma(self):
+        # [FUNCTION DOC] HELPER: Build the tiled WGMMA and finalize the K tile. Creates a
+        # trivial tiled MMA from operand dtypes and major modes with a 64-row tile and N split
+        # across the atom layout. If N is split across two warp groups, rebuilds it with an N
+        # permutation so each warp group's accumulators in the epilogue are adjacent in N.
+        # Then takes the K tile from the configuration or, if zero, four MMA instruction K
+        # steps; asserts it is positive and a multiple of the instruction K, and writes the
+        # full CTA tile shape back to the instance.
         """Set up tiled MMA and tile K dimension. Override for different MMA types."""
         self.tiled_mma = sm90_utils.make_trivial_tiled_mma(
             self.a_dtype,
@@ -301,6 +350,12 @@ class GemmSm90(GemmTmaBase):
         )
 
     def _setup_attributes(self, epilogue_args: EpilogueArguments):
+        # [FUNCTION DOC] HELPER: Derive attributes that depend on the inputs. Sets up
+        # the tiled MMA, the epilogue major-ness, cluster layout, epilogue tile and its
+        # tiling of the CTA tile, computes the A/B, epilogue and C stage counts from
+        # shared memory capacity, sets the scheduler stage count (2 for pingpong else 1)
+        # and builds the staged shared memory layouts for A, B, D and C. All results are
+        # stored on the instance.
         """Set up configurations that are dependent on GEMM inputs
 
         This method configures various attributes based on the input tensor properties
@@ -374,6 +429,17 @@ class GemmSm90(GemmTmaBase):
         stream: cuda.CUstream,
         trace_ptr: Optional[cutlass.Int64] = None,
     ):
+        # [FUNCTION DOC] Host-side JIT entry point: configure and launch the kernel. Args:
+        # tensors A, B, optional D and C, epilogue arguments, scheduler options, optional
+        # varlen arguments, CUDA stream, optional trace pointer. Tensors named in the concat
+        # layout are first reshaped to interleaved layout. Records dtypes and layouts, raising
+        # TypeError if 16-bit A and B differ, widths differ, or A is not 16 or 8 bits wide;
+        # asserts that an A index is present exactly when gather_A is set. Then sets up
+        # attributes, TMA atoms and tensors for A/B and D/C, TMA byte counts per stage (A
+        # excluded under gather), epilogue and varlen parameters, scheduler class, parameters
+        # and grid, defines and stores the shared storage struct, and launches the kernel on
+        # the stream with the cluster shape, a block of the configured thread count, one block
+        # per SM minimum and the PDL option. Returns nothing.
         """Execute the GEMM operation in steps:
         - Setup static attributes
         - Setup TMA load/store atoms and tensors
@@ -465,6 +531,12 @@ class GemmSm90(GemmTmaBase):
 
         @cute.struct
         class SharedStorage:
+        # [CLASS DOC] HELPER: Shared memory layout struct for the kernel. Holds mbarrier
+        # storage for the A/B, epilogue and scheduler pipelines (two 64-bit words per stage),
+        # scheduler work-tile data (four ints per stage), 1024-byte aligned epilogue buffers
+        # for D and C (a dummy int type and zero size when absent), the epilogue-specific
+        # struct, and 1024-byte aligned staged buffers for A and B. Sizes derive from the
+        # stage counts and layouts chosen in the enclosing call.
             ab_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
             epi_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.epi_c_stage * 2]
             sched_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.sched_stage * 2]
@@ -548,6 +620,24 @@ class GemmSm90(GemmTmaBase):
         TileSchedulerCls: cutlass.Constexpr[Callable],
         trace_ptr: Optional[cutlass.Int64] = None,
     ):
+        # [FUNCTION DOC] Device kernel. Warp roles: the last warp group is the producer, the
+        # earlier ones are MMA/epilogue warps. Setup: optional trace context, varlen flags
+        # (both together are forbidden; gather requires one), TMA descriptor prefetch, shared
+        # memory allocation, creation of A/B pipeline, optional epilogue-load pipeline and
+        # (when persistent) scheduler pipeline, cluster arrive/wait around barrier
+        # initialization, shared tensors, varlen manager, scheduler factory. Producer warps
+        # shrink their register allocation, wait for the previous kernel when PDL is on,
+        # compute multicast masks, then loop over work tiles: build the A copy (TMA, or gather
+        # copy plus prefetch) and the B TMA copy, compute the K tile count and run the load;
+        # under pingpong without varlen K the final tile is published through shared memory;
+        # the producer tails drain pipelines. MMA warps grow registers, build the per-warp-
+        # group thread MMA and accumulator fragments (plus an extra accumulator for fp8 slow
+        # accumulation), and loop over tiles: pingpong barrier, mainloop, zeroing the
+        # accumulator when K is empty under varlen K, then epilogue (D/C copies, shared memory
+        # store and load partitions, visit hook, epilogue call), signalling the other warp
+        # group in pingpong and advancing pipeline states and the scheduler (in pingpong each
+        # warp group skips alternate tiles). Finally triggers dependent launch for PDL, drains
+        # the D store pipeline and flushes the trace. Returns nothing.
         """
         GPU device kernel performing the batched GEMM computation.
 
@@ -971,6 +1061,14 @@ class GemmSm90(GemmTmaBase):
         k_tile_cnt: Int32,
         varlen_m: bool = True,
     ) -> cutlass.pipeline.PipelineState:
+        # [FUNCTION DOC] Producer loop for one tile when A is gathered. For each K tile:
+        # optionally prefetch the gather indices, acquire the A/B stage (using an earlier non-
+        # blocking peek), have one load warp (rotating by K tile) issue the TMA copy of B with
+        # the stage's barrier, have all load threads issue the cp.async gather of A, then mark
+        # the barrier to track cp.async completion, advance the state and peek the next stage.
+        # The last K tile is handled separately with predicated copies for K bounds. Does
+        # nothing for zero K tiles. Returns the updated producer state. The varlen_m argument
+        # is accepted but not used here.
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # Peek (try_wait) AB buffer empty for k_block = prefetch_k_tile_cnt
         peek_ab_empty_status = Boolean(True)
@@ -1024,6 +1122,14 @@ class GemmSm90(GemmTmaBase):
         tile_coord_mnkl,
         batch_idx: Int32,
     ):
+        # [FUNCTION DOC] HELPER: Build the gather-A copy function and optional prefetch
+        # function for one tile. With varlen M, the row index vector is tiled along M and A
+        # is used as is; otherwise (varlen K) the index vector is divided into K tiles and
+        # A is tiled along M. Creates a tiled global-to-shared copy over the load warps,
+        # takes the calling thread's slice relative to the load warp base, and builds the
+        # gather copy: M-gather (no prefetch) or K-gather (with prefetch). Row and K limits
+        # come from the batch's lengths. Returns (copy_A, prefetch_A), where prefetch_A is
+        # None for varlen M.
         """Create copy_A and prefetch_A for gather_A (shared by SM90/SM120 DMA)."""
         varlen_m = varlen_manager.varlen_m
         mAIdx_mk = varlen_manager.offset_batch_AIdx(batch_idx)
@@ -1074,6 +1180,15 @@ class GemmSm90(GemmTmaBase):
         k_tile_cnt: Int32,
         warp_group_idx: Int32,
     ) -> cutlass.pipeline.PipelineState:
+        # [FUNCTION DOC] Mainloop for one output tile on one warp group. Issues one prologue
+        # MMA (zero-initializing the accumulator) while waiting for filled stages; then for
+        # each remaining K tile waits for the stage, issues the MMA, waits until only the
+        # previous MMA is outstanding and releases the oldest stage. With fp8 slow
+        # accumulation each MMA is fully waited and added into a separate accumulator, which
+        # is copied back at the end. Under pingpong it signals the other warp group to start
+        # its MMA before draining. Finally waits for all MMAs and releases the remaining
+        # stages. Returns the advanced read state. With zero K tiles the accumulator is not
+        # valid; the caller zeros it.
         # Prologue MMAs
         k_pipe_mmas = 1
         ab_release_state = ab_read_state.clone()
@@ -1131,6 +1246,10 @@ class GemmSm90(GemmTmaBase):
         return ab_read_state
 
     def epi_retile_acc(self, acc, tRS_rD, tiled_copy_r2s):
+        # [FUNCTION DOC] Reshape the register accumulator to the A-fragment layout and regroup
+        # it into epilogue subtiles, then retile it to match the register-to-shared copy.
+        # Asserts the intermediate division has a single mode-three entry. Returns the retiled
+        # accumulator view whose last mode enumerates epilogue subtiles.
         """Retile accumulator for epilogue subtile access."""
         acc_reshaped = layout_utils.reshape_acc_to_frgA(acc)  # ((2, 2, 2), MMA_M, MMA_N)
         # ((2, 2, 2), MMA_M / epi_M, MMA_N / epi_N)
@@ -1147,6 +1266,11 @@ class GemmSm90(GemmTmaBase):
         return tiled_copy_r2s.retile(tRS_rAcc)
 
     def epilog_smem_copy_atom(self, tiled_mma: cute.TiledMma) -> cute.TiledCopy:
+        # [FUNCTION DOC] Build the tiled copy atom for storing accumulators with the 8x8
+        # 16-bit shared memory matrix store instruction: transposed when D is M-major (false
+        # if there is no D), four matrices if the epilogue tile N is a multiple of 16 else
+        # two. The 16-bit element type is only used to obtain the source layout. Returns the
+        # tiled copy matching the tiled MMA's C partitioning.
         copy_atom_C = cute.make_copy_atom(
             warp.StMatrix8x8x16bOp(
                 self.d_layout.is_m_major_c() if self.d_layout is not None else False,
@@ -1165,6 +1289,11 @@ class GemmSm90(GemmTmaBase):
         sD: Optional[cute.Tensor],
         tidx: Int32,
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
+        # [FUNCTION DOC] Prepare the accumulator-to-shared store of D. Defaults a missing
+        # layout to row-major; picks the shared store op for layout, dtype and accumulator
+        # type; builds the tiled copy from the matrix-store atom; takes this thread's slice,
+        # partitions the shared D tensor (None when no D) and allocates a register tensor, in
+        # accumulator dtype, for one epilogue tile. Returns (tiled_copy_r2s, tRS_rD, tRS_sD).
         if d_layout is None:
             d_layout = LayoutEnum.ROW_MAJOR
         tiled_copy_C_atom = self.epilog_smem_copy_atom(tiled_mma)
@@ -1191,6 +1320,13 @@ class GemmSm90(GemmTmaBase):
         tRS_rD_layout: cutlass.Layout,
         tidx: Int32,
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
+        # [FUNCTION DOC] Prepare the shared-to-register load of C for the epilogue: builds
+        # the tiled copy from the load op for the layout and dtype, partitions shared C for
+        # this thread, allocates a register tensor of C dtype with the D register layout
+        # and retiles it. Returns four items: tiled copy, register C, retiled register C,
+        # shared C partition.
+        # KNOWN ISSUE: the return annotation names a three-element tuple but four values
+        # are returned.
         tiled_copy_C_atom = self.epilog_smem_copy_atom(tiled_mma)
         copy_atom_s2r = copy_utils.sm90_get_smem_load_op(c_layout, dtype)
         tiled_copy_s2r = cute.make_tiled_copy_S(copy_atom_s2r, tiled_copy_C_atom)
@@ -1201,6 +1337,9 @@ class GemmSm90(GemmTmaBase):
         return tiled_copy_s2r, tRS_rC, tSR_rC, tSR_sC
 
     def pingpong_barrier_sync(self, warp_group_idx: Int32, stage: str):
+        # [FUNCTION DOC] Block until both participating warp groups arrive at the ping-pong
+        # barrier for the given warp group index and stage (mma or epi; asserted). The barrier
+        # id is the stage base id plus the index, counting the threads of two warp groups.
         assert stage in ["mma", "epi"]
         barrier = NamedBarrierGemm.MmaWG0 if stage == "mma" else NamedBarrierGemm.EpiWG0
         cute.arch.barrier(
@@ -1209,6 +1348,9 @@ class GemmSm90(GemmTmaBase):
         )
 
     def pingpong_barrier_arrive(self, warp_group_idx: Int32, stage: str):
+        # [FUNCTION DOC] Signal without waiting on the ping-pong barrier of the given warp
+        # group index and stage (mma or epi; asserted), expecting two warp groups worth of
+        # threads. Used to hand over the turn to the other warp group.
         assert stage in ["mma", "epi"]
         barrier = NamedBarrierGemm.MmaWG0 if stage == "mma" else NamedBarrierGemm.EpiWG0
         cute.arch.barrier_arrive(
@@ -1219,6 +1361,11 @@ class GemmSm90(GemmTmaBase):
     def make_sched_pipeline(
         self, cluster_layout_mnk: cute.Layout, sched_pipeline_mbar_ptr: cute.Pointer, varlen_k: bool
     ):
+        # [FUNCTION DOC] Create the pipeline that distributes scheduler work tiles. One thread
+        # produces; consumer arrivals per stage are warps of the participating MMA warp groups
+        # (one group when pingpong without varlen K, else all) times four, plus the load
+        # warps, times cluster size. In a cluster consumers arrive at CTA 0's barrier. Uses
+        # the scheduler stage count and defers the synchronization. Returns the pipeline.
         sched_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         cluster_size = cute.size(cluster_layout_mnk)
         # Each warp will contribute 1 to the arrive count
@@ -1255,6 +1402,15 @@ class GemmSm90(GemmTmaBase):
         occupancy: int,
         warp_shape_mnk: Tuple[int, int, int] | None = None,
     ) -> Tuple[int, int]:
+        # [FUNCTION DOC] Heuristic stage counts. Epilogue D stages: 4 if epilogue tile N is at
+        # most 16 else 2; C stages use the same rule or are zero when there is no C and no
+        # extra epilogue tile loads. Epilogue bytes cover the unstaged part, D and C staged
+        # buffers and extras. A/B stages are the shared memory per CTA (capacity over
+        # occupancy) minus 1024 reserved bytes and epilogue bytes, divided by bytes per A/B
+        # stage; leftover bytes then add more epilogue stages. Returns (ab_stage, epi_stage,
+        # epi_c_stage). No check that at least one A/B stage fits.
+        # KNOWN ISSUE: the return annotation and docstring name two values but three
+        # are returned.
         """Computes the number of stages for A/B/C operands based on heuristics.
 
         :param cta_tile_shape_mnk: The shape (M, N, K) of the CTA tile.
@@ -1314,6 +1470,11 @@ class GemmSm90(GemmTmaBase):
         element_type: Optional[Type[cutlass.Numeric]] = None,
         epi_tile_override: Tuple[int, int] | None = None,
     ) -> Tuple[int, int]:
+        # [FUNCTION DOC] Choose the epilogue tile shape, or return the override if given. If M
+        # divides by 128 (or 192) and there are several M atoms, uses a tile M of gcd of 128
+        # (or 192) and the tile M, with N the gcd of 32 and the tile N. Otherwise M is the gcd
+        # of 64 and tile M and N is the gcd of 64 (8-bit output) or 32 and tile N. Returns
+        # (tile_m, tile_n).
         """Compute the epilogue tile shape or use override if provided.
 
         :param cta_tile_shape_mnk: CTA tile shape (M,N,K)
@@ -1366,6 +1527,11 @@ class GemmSm90(GemmTmaBase):
     ) -> Tuple[
         cute.ComposedLayout, cute.ComposedLayout, cute.ComposedLayout, Optional[cute.ComposedLayout]
     ]:
+        # [FUNCTION DOC] Build staged shared memory layouts. For A and B: choose a swizzled
+        # atom from major mode, dtype and the major-mode extent, then tile it to the CTA tile
+        # with the stage count appended (mode ordering depends on K-major). For D and C:
+        # epilogue layouts from dtype, layout, epilogue tile and stage count, or None when the
+        # tensor is absent (C requires its layout, asserted). Returns A, B, D, C layouts.
         """Create shared memory layouts for A, B, and C tensors.
 
         :param cta_tile_shape_mnk: CTA tile shape (M,N,K)
@@ -1449,6 +1615,10 @@ class GemmSm90(GemmTmaBase):
         a_major: str,
         b_major: str,
     ) -> bool:
+        # [FUNCTION DOC] Check whether a dtype combination is supported; returns False rather
+        # than raising. Requires A and B in fp16, bf16, fp8 e4m3fn or e5m2, accumulator fp32
+        # or fp16, D None or one of fp32, fp16, bf16, fp8; 16-bit A must equal B; A and B
+        # widths must match; 8-bit operands must be K-major.
         """
         Check if the dtypes are valid
 

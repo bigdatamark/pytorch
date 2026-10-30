@@ -1,4 +1,10 @@
 # Copyright (c) 2025, Tri Dao.
+# [MODULE DOC] Warp, block and cluster level reduction helpers for CuTe DSL kernels (used by
+# row-wise reductions such as softmax and norms). Provides: a block reduction through shared
+# memory, a cluster reduction through distributed shared memory with an mbarrier, a
+# dispatcher between them, a row reduction combining in-warp and cross-warp stages, an online
+# softmax reduction that merges maximum and sum of exponentials, and a swap-shuffle warp sum.
+# All functions are JIT-compiled device code; no import-time side effects beyond imports.
 
 import math
 import operator
@@ -15,6 +21,13 @@ from . import utils
 def block_reduce(
     val: cute.Numeric, op: Callable, reduction_buffer: cute.Tensor, init_val: cute.Numeric = 0.0
 ) -> cute.Numeric:
+    # [FUNCTION DOC] Reduce one value per warp across the warps that share a row, using shared
+    # memory. Lane zero of each warp writes its value into the buffer at its row and column
+    # (warp index split by the number of warps per row); after a block-wide barrier, lanes below
+    # warps_per_row read their row's entries, other lanes use init_val, and a warp reduction with
+    # the given operator is returned (every lane gets the row result). Buffer shape is warps
+    # per block divided by warps per row, by warps per row. Side effects: writes the buffer and
+    # executes a block-wide barrier, so all threads must call it.
     """reduction_buffer has shape (num_warps / warp_per_row, warps_per_row)"""
     lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
     warps_per_row = cute.size(reduction_buffer.shape[1])
@@ -37,6 +50,13 @@ def cluster_reduce(
     init_val: cute.Numeric = 0.0,
     phase: Optional[Int32] = None,
 ) -> cute.Numeric:
+    # [FUNCTION DOC] Reduce one value per warp across warps and CTAs of a cluster. Buffer shape is
+    # rows per block by (warps_per_row, cluster_n). An elected thread of warp zero arms the
+    # mbarrier with the expected byte count (all warps times cluster size times element size).
+    # Each lane below cluster_n pushes this warp's value into the matching slot of the buffer in
+    # the peer CTA of that rank, signalling that peer's mbarrier. Then all threads wait on the
+    # mbarrier (phase argument, default zero), lanes accumulate strided slices of their row of
+    # the buffer with the operator starting from init_val, and a warp reduction gives the result.
     """reduction_buffer has shape (num_warps / warps_per_row, (warps_per_row, cluster_n))"""
     cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
     lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
@@ -75,6 +95,8 @@ def block_or_cluster_reduce(
     phase: Optional[Int32] = None,
     init_val: cute.Numeric = 0.0,
 ) -> cute.Numeric:
+    # [FUNCTION DOC] Dispatch at compile time: if no mbarrier pointer is given do the in-CTA block
+    # reduction, otherwise do the cluster reduction (using phase). Returns the reduced value.
     """Perform either block or cluster reduction based on whether mbar_ptr is provided."""
     if const_expr(mbar_ptr is None):
         return block_reduce(val, op, reduction_buffer, init_val=init_val)
@@ -93,6 +115,14 @@ def row_reduce(
     init_val: cute.Numeric = 0.0,
     hook_fn: Optional[Callable] = None,
 ) -> cute.Numeric:
+    # [FUNCTION DOC] Reduce across the threads of a row. First reduces an SSA vector locally with
+    # the operator and init_val (a scalar input is used as is), then does a warp reduction over
+    # min(threads_per_row, warp size) lanes using the matching Python operator (add, multiply,
+    # min, or max; fmax for fp32 max). Calls hook_fn, if given, right after the in-warp stage. If a
+    # reduction buffer is given and it spans more than one warp or CTA, combines across warps
+    # (or the cluster) via the block-or-cluster dispatcher. Asserts an mbarrier pointer is given
+    # whenever the cluster size exceeds one. Raises KeyError for an unsupported operator.
+    # Returns the reduced value.
     """reduction_buffer must have shape (num_warps / warps_per_row, (warps_per_row, cluster_n))"""
     if const_expr(isinstance(x, cute.TensorSSA)):
         val = x.reduce(op, init_val=init_val, reduction_profile=0)
@@ -133,6 +163,19 @@ def online_softmax_reduce(
     phase: Optional[Int32] = None,
     return_exp_x: bool = False,
 ) -> [Float32, Float32, Optional[cute.TensorSSA]]:
+    # [FUNCTION DOC] Online softmax statistics for a row: returns the row maximum, the sum of
+    # exponentials relative to that maximum, and optionally the per-element exponentials (None
+    # unless return_exp_x). Input must be fp32 (asserted). Exponentials use base 2 with fast math.
+    # In-warp stage reduces maximum and sum over min(threads_per_row, warp size) lanes. If a buffer
+    # spans several warps/CTAs, each warp packs its (maximum, sum) pair into one 64-bit integer
+    # (buffer must be Int64, asserted) and exchanges via shared memory with a barrier, or via
+    # remote stores and an mbarrier wait when a pointer is given. The partial sums are then
+    # rescaled by exp of (partial max minus final max) and summed; exp_x is rescaled likewise.
+    # hook_fn runs after the in-warp stage. Asserts an mbarrier pointer when the cluster size
+    # exceeds one.
+    # KNOWN ISSUE: the string literal after the dtype assertion is not a docstring (it follows a
+    # statement); it also claims a trailing dimension of 2 in the buffer shape, which the code
+    # does not use since it unpacks a two-element shape.
     assert x.dtype == Float32, "x must be of type Float32"
     """reduction_buffer must have shape (num_warps / warps_per_row, (warps_per_row, cluster_n), 2)"""
     max_x = cute.arch.warp_reduction(
@@ -226,6 +269,16 @@ def online_softmax_reduce(
 def sum_swap_shuffle(
     X: cute.Tensor, elem_per_lane: int = 1, subwarp_size: int = 1, warp_size: int = 32
 ) -> cute.Tensor:
+    # [FUNCTION DOC] Sum-reduce a register tensor across lanes with the swap-shuffle algorithm,
+    # which keeps all lanes busy instead of halving active lanes each step. X holds vectors of
+    # elem_per_lane values; lanes are grouped in subwarps of subwarp_size, and warp_size lanes
+    # participate. First, if there are fewer vectors than lane groups, plain butterfly-shuffle
+    # adds fold surplus lane groups. Then for each halving step, lanes whose group index lacks
+    # the step bit swap the two half-vector fragments, exchange with the partner lane by butterfly
+    # shuffle and add, so each half of the lanes ends up with the sum of one half of the vectors.
+    # Asserts subwarp_size and warp_size are powers of two in range, warp_size is a multiple of
+    # subwarp_size, and the vector count is at most the number of lane groups. Modifies X in
+    # place; returns the first fragment, holding this lane's reduced share.
     """
     For warp reduction, we use Swap Shuffle
     The normal way to reduction among threads:

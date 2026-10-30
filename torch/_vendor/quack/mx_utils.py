@@ -1,3 +1,9 @@
+# [MODULE DOC] Pure-PyTorch quantization helpers for MX (MXFP8, MXFP4) and NVFP4 block-scaled
+# formats, ported from torchao, plus a swizzle of scale tensors into the blocked layout that
+# cuBLAS expects. Defines numeric constants for FP8 E4M3, E8M0 and FP4 E2M1 formats, the
+# quantizers, and a scale-blocking function. Import-time side effects: creates three
+# torch.compile wrappers (dynamic shapes) of the quantizers; compilation itself happens
+# lazily on first call. Only floor-mode scaling is supported.
 """Minimal MX / NVFP4 quantization + scale swizzling utilities.
 
 Ported from torchao (BSD-3) to avoid the runtime dependency:
@@ -33,10 +39,20 @@ E4M3_EPS = torch.finfo(torch.float8_e4m3fn).tiny
 
 
 def _n_ones(n: int) -> int:
+    # [FUNCTION DOC] HELPER: Return an integer whose low n bits are all set (a mask of n ones).
     return (1 << n) - 1
 
 
 def to_mx(data_hp: torch.Tensor, block_size: int = 32):
+    # [FUNCTION DOC] Quantize a contiguous bf16 or fp32 tensor to MXFP8 (E4M3 data) with one E8M0
+    # scale per block of block_size values along the last dimension. Returns the quantized data
+    # (same shape as the input) and the scales (last dimension divided by the block size).
+    # Per block: the maximum magnitude is found, its float exponent minus the E4M3 maximum
+    # exponent gives the floor-mode scale exponent, clamped to the E8M0 range and biased; NaN
+    # blocks get the NaN code. Values are divided by the reconstructed scale (floored at the
+    # smallest normal float so tiny scales are not flushed to zero) and, when not under dynamo
+    # tracing, clamped to the E4M3 range before the cast. Fails an assertion for other dtypes, a
+    # last dimension not divisible by block size, or non-contiguous input.
     """MXFP8-e4m3 quantization with FLOOR scaling.
 
     Args:
@@ -86,6 +102,12 @@ def to_mx(data_hp: torch.Tensor, block_size: int = 32):
 
 def _f32_to_floatx_unpacked(x: torch.Tensor, ebits: int, mbits: int) -> torch.Tensor:
     """FP32 -> sub-byte float (uint8, code in low bits). Verbatim from torchao.
+    # [FUNCTION DOC] HELPER: Convert fp32 values to a small float format with the given
+    # exponent and mantissa bit counts, returning the codes in the low bits of uint8 (sign in
+    # the top used bit). Handles three cases with masks: saturation to the largest code for
+    # values at or above the largest normal, denormals via an addition trick, and normals via
+    # an exponent rebias with round-to-nearest-even. NaN is not handled. Asserts fp32 input
+    # and a total width of at most 8 bits.
 
     Round-to-nearest-even via magic-adder; saturation on overflow; no NaN.
     """
@@ -131,6 +153,9 @@ def _f32_to_floatx_unpacked(x: torch.Tensor, ebits: int, mbits: int) -> torch.Te
 
 def _pack_uint4(uint8_data: torch.Tensor) -> torch.Tensor:
     """Pack 4-bit uint8 values in pairs: pair (a,b) -> byte (b<<4 | a)."""
+    # [FUNCTION DOC] HELPER: Pack pairs of 4-bit values stored in uint8 into bytes: the first of
+    # each pair goes in the low nibble and the second in the high nibble. The last dimension
+    # must be even (asserted). Returns a tensor with that dimension halved.
     shape = uint8_data.shape
     assert shape[-1] % 2 == 0
     uint8_data = uint8_data.contiguous().view(-1)
@@ -139,6 +164,10 @@ def _pack_uint4(uint8_data: torch.Tensor) -> torch.Tensor:
 
 def _compute_e8m0_scale_floor(max_abs: torch.Tensor, target_max_pow2: int) -> torch.Tensor:
     """Return biased E8M0 scale (uint8) for FLOOR-mode MX quantization."""
+    # [FUNCTION DOC] HELPER: Compute the biased E8M0 scale (uint8) for floor-mode MX quantization
+    # from per-block maximum magnitudes in fp32. The exponent of the maximum minus the target
+    # maximum exponent is clamped to the E8M0 range, biased, and entries where the maximum is NaN
+    # are set to the NaN code.
     max_abs_int32 = max_abs.view(torch.int32)
     extracted_pow2 = ((torch.bitwise_right_shift(max_abs_int32, MBITS_F32)) & 0xFF) - F32_EXP_BIAS
     scale_unbiased = extracted_pow2 - target_max_pow2
@@ -152,6 +181,12 @@ def _compute_e8m0_scale_floor(max_abs: torch.Tensor, target_max_pow2: int) -> to
 
 def to_mxfp4(x: torch.Tensor, block_size: int = 32):
     """MXFP4 quantization: E2M1 data + E8M0 per-block scales, FLOOR scaling.
+    # [FUNCTION DOC] Quantize a contiguous bf16, fp16 or fp32 tensor to MXFP4 (E2M1 data with
+    # E8M0 block scales, floor mode). Returns packed uint8 data whose last dimension is halved
+    # (first value in the low nibble) and E8M0 scales whose last dimension is divided by the
+    # block size. Fails an assertion for other dtypes, a last dimension not divisible by the
+    # block size, or non-contiguous input. Does not clamp values after scaling; the converter
+    # saturates large magnitudes instead.
 
     Args:
         x: (..., K) bf16/fp16/fp32, contiguous, K % block_size == 0.
@@ -187,11 +222,21 @@ def to_mxfp4(x: torch.Tensor, block_size: int = 32):
 
 def nvfp4_per_tensor_scale(amax: torch.Tensor) -> torch.Tensor:
     """NVFP4 per-tensor scale: amax / (F8E4M3_MAX * F4_E2M1_MAX) = amax / 2688."""
+    # [FUNCTION DOC] Compute the NVFP4 per-tensor scale from an absolute-maximum tensor: convert to
+    # fp32 and divide by the product of the E4M3 maximum and the E2M1 maximum (2688).
     return amax.to(torch.float32) / (F8E4M3_MAX * F4_E2M1_MAX)
 
 
 def to_nvfp4(x: torch.Tensor, block_size: int = 16, per_tensor_scale=None):
     """NVFP4 quantization: E2M1 data + E4M3 per-block scales + optional fp32 per-tensor scale.
+    # [FUNCTION DOC] Quantize a contiguous bf16 or fp32 tensor to NVFP4: E2M1 data with E4M3
+    # per-block scales (block size must be 16) and an optional fp32 per-tensor scale. The block
+    # scale is the block maximum divided by the E2M1 maximum (and by the per-tensor scale if
+    # given), clamped to the E4M3 range and cast. Data is multiplied by the reciprocal of the
+    # effective scale, clamped to the E2M1 range, converted and packed two per byte. Returns packed
+    # data, block scales, and the per-tensor scale (a new tensor holding one when none was given).
+    # Fails an assertion for other dtypes, a bad last dimension, non-contiguous input, or a
+    # block size other than 16.
 
     Args:
         x: (..., K) bf16/fp32, contiguous, K % 16 == 0.
@@ -243,10 +288,17 @@ to_nvfp4_compiled = torch.compile(to_nvfp4, dynamic=True)
 
 def _ceil_div(a, b):
     return (a + b - 1) // b
+    # [FUNCTION DOC] HELPER: Integer ceiling division of a by b.
 
 
 def to_blocked(input_matrix: torch.Tensor) -> torch.Tensor:
     """Swizzle a (H, W) e8m0 scale tensor into the 128x4 blocked layout
+    # [FUNCTION DOC] Rearrange a 2D scale tensor (rows by columns) into the 128 by 4 blocked,
+    # swizzled layout used by cuBLAS for block-scaled matmul, returning a flat 1D tensor.
+    # Rows and columns are padded with zeros up to multiples of 128 and 4 (always copied
+    # when compiling; otherwise only when padding is needed), then viewed as tiles, permuted and
+    # interleaved by reshaping and transposing so each 512-element tile holds a 32 by 16 pattern.
+    # Output size is the padded element count. The input is not modified.
     cuBLAS expects for MXFP8 _scaled_mm. Returns a 1-D flat tensor of size
     32*ceil(H/128) * 16*ceil(W/4)."""
     rows, cols = input_matrix.shape

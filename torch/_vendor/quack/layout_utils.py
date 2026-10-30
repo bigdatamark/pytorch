@@ -1,4 +1,10 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
+# [MODULE DOC] Layout and register-permutation helpers for quack CuTe DSL GEMM epilogues.
+# Contains tensor view utilities (transpose, select, expand, interleave), warp-shuffle based
+# permutations of accumulator registers, conversions of MMA accumulator layouts to row/column
+# (MN) views and to A-operand fragment layouts, vector partitioning helpers that map a shared
+# memory vector onto MMA or copy partitions, and a scale-factor layout builder.
+# No import-time side effects beyond imports.
 
 
 import cutlass
@@ -8,6 +14,8 @@ from cutlass import Int32, const_expr
 
 
 def transpose_view(a: cute.Tensor) -> cute.Tensor:
+    # [FUNCTION DOC] Return a view of a tensor with its first two modes swapped (rest unchanged).
+    # Built by composing the tensor with an ordered layout of the swapped shape. No data moves.
     """Transpose the first two dimensions of a tensor on smem."""
     shape = (a.shape[1], a.shape[0], *a.shape[2:])
     order = (1, 0, *range(2, cute.rank(a)))
@@ -15,10 +23,16 @@ def transpose_view(a: cute.Tensor) -> cute.Tensor:
 
 
 def select(a: cute.Tensor, mode: list[int]) -> cute.Tensor:
+    # [FUNCTION DOC] Return a view of a tensor keeping only the listed top-level modes of its
+    # layout, in the given order. Shares the iterator, so no data moves.
     return cute.make_tensor(a.iterator, cute.select(a.layout, mode))
 
 
 def concat_to_interleave(a: cute.Tensor, dim: int) -> cute.Tensor:
+    # [FUNCTION DOC] Reinterpret the given dimension, of even size 2N, as a hierarchical (2, N)
+    # mode so that elements of the two halves alternate. Used to turn a concatenated gate/up
+    # weight layout into an interleaved one. Returns a view with the same iterator; the new
+    # inner stride is the half-size step and the outer one is the original stride.
     """Reshape a concat [first_half; second_half] layout to interleaved along `dim`.
 
     Splits dimension `dim` (size 2N) into hierarchical (2, N) so that elements
@@ -32,6 +46,8 @@ def concat_to_interleave(a: cute.Tensor, dim: int) -> cute.Tensor:
 
 
 def expand(a: cute.Tensor, dim: int, size: Int32 | int) -> cute.Tensor:
+    # [FUNCTION DOC] Insert a new broadcast mode of the given size (static or Int32) at position
+    # dim, with stride zero, so every index along it aliases the same data. Returns a view.
     shape = (*a.shape[:dim], size, *a.shape[dim:])
     stride = (*a.layout.stride[:dim], 0, *a.layout.stride[dim:])
     return cute.make_tensor(a.iterator, cute.make_layout(shape, stride=stride))
@@ -39,6 +55,13 @@ def expand(a: cute.Tensor, dim: int, size: Int32 | int) -> cute.Tensor:
 
 @cute.jit
 def permute_gated_Cregs_b16(t: cute.Tensor) -> None:
+    # [FUNCTION DOC] In-place permutation of a 16-bit accumulator register tensor across the four
+    # lanes of a quad, used for gated epilogues. The tensor is recast as 32-bit words taken in
+    # pairs; each lane swaps the pair order depending on whether its quad index is 0/3 or 1/2,
+    # exchanges words with a computed partner lane by warp shuffle restricted to the quad, then
+    # recombines 16-bit halves with byte-permute selectors that also depend on the lane class.
+    # Fails an assertion if the element width is not 16 or the element count is not a
+    # multiple of 4.
     assert t.element_type.width == 16
     assert cute.size(t.shape) % 4 == 0, "Tensor size must be a multiple of 4 for b16 permutation"
     t_u32 = cute.recast_tensor(t, Int32)
@@ -72,6 +95,12 @@ def permute_gated_Cregs_b16(t: cute.Tensor) -> None:
 
 @cute.jit
 def permute_Cregs_b32_for_stsm(t: cute.Tensor) -> None:
+    # [FUNCTION DOC] In-place permutation of a 32-bit register tensor within each quad of four
+    # lanes so the per-thread layout of consecutive pairs becomes a spread layout, allowing a
+    # matrix store instruction instead of 64-bit stores without bank conflicts. Processes groups
+    # of four elements: two shuffle rounds on element pairs, then swaps the middle two elements.
+    # Fails an assertion if the element width is not 32 or the element count is not a
+    # multiple of 4.
     """Permute and shuffle within 4 threads to change the layout from
      T0 | T1  | T2  | T3
     a b | c d | e f | g h
@@ -115,6 +144,11 @@ def permute_Cregs_b32_for_stsm(t: cute.Tensor) -> None:
 
 @cute.jit
 def permute_Cregs_b32_for_ldsm(t: cute.Tensor) -> None:
+    # [FUNCTION DOC] Inverse of the store-oriented permutation: in-place rearrangement of a 32-bit
+    # register tensor within each lane quad, restoring paired per-thread layout after a matrix
+    # load. For each group of four elements it first swaps the middle two, then does two shuffle
+    # rounds on element pairs. Fails an assertion if the element width is not 32 or the element
+    # count is not a multiple of 4.
     """Permute and shuffle within 4 threads to change the layout from
     T0 | T1 | T2 | T3 | T0 | T1 | T2 | T3
     a  | b  | c  | d  | e  | f  | g  | h
@@ -159,6 +193,8 @@ def permute_Cregs_b32_for_ldsm(t: cute.Tensor) -> None:
 
 @cute.jit
 def concat_layout(*layouts: cute.Layout) -> cute.Layout:
+    # [FUNCTION DOC] Combine several layouts into one whose modes are the given layouts: the shape
+    # is the tuple of the input shapes and the stride is the tuple of the input strides.
     return cute.make_layout(
         tuple(l.shape for l in layouts),
         stride=tuple(l.stride for l in layouts),
@@ -166,6 +202,11 @@ def concat_layout(*layouts: cute.Layout) -> cute.Layout:
 
 
 def convert_layout_acc_mn(acc_layout: cute.Layout, transpose: bool = False) -> cute.Layout:
+    # [FUNCTION DOC] Convert an MMA accumulator layout into a row/column view. Mode zero of the
+    # input holds the per-instruction values; its second element joins MMA_M into the row mode,
+    # and its remaining elements join MMA_N into the column mode, with trailing modes kept.
+    # With transpose set, the two resulting modes are exchanged. The result is the composition
+    # of the input layout with this column-major-derived mapping.
     """
     For Sm80, convert ((2, 2), MMA_M, MMA_N, ...) to ((2, MMA_M), (2, MMA_N), ...).
     For Sm90, convert ((2, 2, V), MMA_M, MMA_N, ...) to ((2, MMA_M), (2, V, MMA_N), ...).
@@ -197,15 +238,24 @@ def convert_layout_acc_mn(acc_layout: cute.Layout, transpose: bool = False) -> c
 
 
 def make_acc_tensor_mn_view(acc: cute.Tensor, transpose: bool = False) -> cute.Tensor:
+    # [FUNCTION DOC] Return a tensor view of an accumulator with its layout converted to the
+    # row/column form by the layout conversion helper; transpose swaps row and column modes.
     return cute.make_tensor(acc.iterator, convert_layout_acc_mn(acc.layout, transpose=transpose))
 
 
 def reshape_acc_to_mn(acc: cute.Tensor, transpose: bool = False) -> cute.Tensor:
+    # [FUNCTION DOC] Reshape an accumulator tensor to its row/column view using the same layout
+    # conversion as the make-view helper (identical behavior); transpose swaps the two modes.
     return cute.make_tensor(acc.iterator, convert_layout_acc_mn(acc.layout, transpose=transpose))
 
 
 @cute.jit
 def convert_layout_acc_frgA(acc_layout: cute.Layout) -> cute.Layout:
+    # [FUNCTION DOC] Convert an accumulator layout of a first GEMM into the layout accepted as the
+    # A operand fragment of a back-to-back second GEMM. If mode zero has rank 3 (SM90 style) the
+    # third element is split by two when even (else by one) and the inner part is moved into the
+    # first mode; otherwise (SM80 style) the last mode must be even (assertion) and is split into
+    # a pair, moving one factor into the first mode. Returns the new layout. FP8 on SM90 is a TODO.
     # For back to back gemm, convert layout of acc0 to gemm 1 accept layout.
     # For Sm80, as the mma instruction shape is 16x8x16, we need to convert from (4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
     # For Sm90, FP16/BF16, convert acc_layout from ((2, 2, N / 8), MMA_M, MMA_N) to ((2, 2, 2), MMA_M, (N / 16, MMA_N))
@@ -248,12 +298,19 @@ def convert_layout_acc_frgA(acc_layout: cute.Layout) -> cute.Layout:
 
 
 def reshape_acc_to_frgA(acc: cute.Tensor) -> cute.Tensor:
+    # [FUNCTION DOC] Return a view of the accumulator tensor with the A-operand fragment layout
+    # given by the accumulator-to-fragment layout conversion.
     return cute.make_tensor(acc.iterator, convert_layout_acc_frgA(acc.layout))
 
 
 def convert_layout_zero_stride(
     input: cute.Tensor | cute.Layout, ref_layout: cute.Layout
 ) -> cute.Layout:
+    # [FUNCTION DOC] Regroup the modes of a layout (or of a tensor, returned as a tensor) into two
+    # groups using a reference layout: modes whose reference stride is nonzero first, then those
+    # with zero stride. Both inputs are flattened and are assumed to have matching rank. If no
+    # mode has a nonzero reference stride, the first group is a single mode of size one with
+    # stride zero.
     layout = input.layout if const_expr(isinstance(input, cute.Tensor)) else input
     # Group the modes with non-zero stride in the ref_layout together,
     # and the modes with zero stride together
@@ -280,6 +337,11 @@ def convert_layout_zero_stride(
 def mma_partition_C_vec(
     sVec: cute.Tensor, thr_mma: cute.ThrMma, expand_shape: int, is_colvec: bool
 ) -> cute.Tensor:
+    # [FUNCTION DOC] Partition a shared-memory vector across an MMA thread partition of C.
+    # The vector must be 2D (length, stage) with unit stride on mode zero (asserted). It is
+    # broadcast with a zero-stride mode of size expand_shape, as a column vector (length rows) or
+    # row vector, then partitioned for C by the thread MMA and viewed in row/column form.
+    # Returns the slice at index zero of the broadcast mode, keeping the other two modes.
     assert cute.rank(sVec) == 2
     assert sVec.stride[0] == 1
     stage = sVec.shape[1]
@@ -297,6 +359,10 @@ def mma_partition_C_vec(
 def mma_partition_A_vec(
     sVec: cute.Tensor, thr_mma: cute.ThrMma, expand_shape: int, is_colvec: bool
 ) -> cute.Tensor:
+    # [FUNCTION DOC] Same as the C-partition vector helper but uses the A-operand partition of the
+    # thread MMA. Requires a 2D vector with unit stride on mode zero (asserted); broadcasts it
+    # over expand_shape as a column or row vector, partitions it, converts to the row/column
+    # view, and returns the slice keeping the length and stage modes.
     assert cute.rank(sVec) == 2
     assert sVec.stride[0] == 1
     stage = sVec.shape[1]
@@ -314,6 +380,10 @@ def mma_partition_A_vec(
 def copy_partition_S_vec(
     sVec: cute.Tensor, thr_copy: cute.ThrCopy, expand_shape: int, is_colvec: bool
 ) -> cute.Tensor:
+    # [FUNCTION DOC] Partition a shared-memory vector with the source side of a thread copy.
+    # Requires a 2D vector with unit stride on mode zero (asserted); broadcasts it over
+    # expand_shape as a column or row vector, applies the thread copy source partition, converts
+    # to row/column view and returns the slice at index zero of the broadcast mode.
     assert cute.rank(sVec) == 2
     assert sVec.stride[0] == 1
     stage = sVec.shape[1]
@@ -331,6 +401,10 @@ def copy_partition_S_vec(
 def copy_partition_D_vec(
     sVec: cute.Tensor, thr_copy: cute.ThrCopy, expand_shape: int, is_colvec: bool
 ) -> cute.Tensor:
+    # [FUNCTION DOC] Destination-side counterpart of the source copy-partition helper: broadcasts a
+    # 2D vector (unit stride on mode zero, asserted) over expand_shape as column or row vector,
+    # applies the thread copy destination partition, converts to row/column view, and returns the
+    # slice at index zero of the broadcast mode.
     assert cute.rank(sVec) == 2
     assert sVec.stride[0] == 1
     stage = sVec.shape[1]
@@ -350,6 +424,11 @@ def tile_atom_to_shape_SF_strided(
     sf_vec_size: int,
     sf_strides,
 ) -> cute.Layout:
+    # [FUNCTION DOC] Build a block-scaled scale-factor layout for an operand shape using the real
+    # strides of the scale tensor. Starts from the hardware 512-element atom for the vector
+    # size, tiles it over ceil-divided row blocks (128) and K blocks (4 vectors), taking outer
+    # strides from entries one and two of the scale strides divided by 512. For a rank-3 shape a
+    # batch mode with stride from entry zero is appended. Returns the layout.
     """Build an SFA/SFB layout matching `shape` (A or B operand shape) but
     honoring the scale tensor's actual strides instead of hardcoded packed
     ones.
