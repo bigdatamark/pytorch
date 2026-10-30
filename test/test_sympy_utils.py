@@ -1,4 +1,10 @@
 # Owner(s): ["oncall: pt2"]
+# [MODULE DOC] Tests for the SymPy-based utilities under torch.utils._sympy and related inductor
+# analyses: int infinity numbers, the C++ printer for min/max, value range analysis checked
+# against the reference analysis, sympy_interp over several analyses (sympy, python/fx, tensor),
+# the relational solver try_solve, custom sympy functions, SingletonInt, Identity, TypedExpr and
+# C code printing. Defines shared operator-name lists and constant pools at import, and
+# instantiates the parametrized test classes at the bottom of the file.
 
 import functools
 import itertools
@@ -115,6 +121,9 @@ RELATIONAL_TYPES = [sympy.Eq, sympy.Ne, sympy.Gt, sympy.Ge, sympy.Lt, sympy.Le]
 
 
 def valid_unary(fn, v):
+    # [FUNCTION DOC] HELPER: Returns whether the named unary op is defined for the numeric
+    # value v: false for log of non-positive, reciprocal of zero, and sqrt of negative
+    # values; true otherwise.
     if fn == "log" and v <= 0:
         return False
     elif fn == "reciprocal" and v == 0:
@@ -125,6 +134,11 @@ def valid_unary(fn, v):
 
 
 def valid_binary(fn, a, b):
+    # [FUNCTION DOC] HELPER: Returns whether the named binary op is defined and cheap for
+    # operands a and b. Rejects pow with exponent above 4, non-positive base or zero to
+    # the zero; the natural power with exponent above 4, negative exponent or zero to the
+    # zero; mod with negative a or non-positive b; and division-like ops with a zero
+    # divisor. Otherwise true.
     if fn == "pow" and (
         # sympy will expand to x*x*... for integral b; don't do it if it's big
         b > 4
@@ -149,6 +163,10 @@ def valid_binary(fn, a, b):
 
 
 def generate_range(vals):
+    # [FUNCTION DOC] HELPER: Generator yielding a ValueRanges for every ordered pair of values
+    # taken from vals (cartesian product). For boolean values skips only the pair true then
+    # false; for numbers skips pairs where the lower bound exceeds the upper. Also skips ranges
+    # whose lower bound is positive infinity or whose upper bound is negative infinity.
     for a1, a2 in itertools.product(vals, repeat=2):
         if a1 in [sympy.true, sympy.false]:
             if a1 == sympy.true and a2 == sympy.false:
@@ -163,7 +181,13 @@ def generate_range(vals):
 
 
 class TestNumbers(TestCase):
+    # [CLASS DOC] Tests of the integer infinity singletons (positive and negative) arithmetic,
+    # comparisons and interaction with the ordinary sympy infinity.
     def test_int_infinity(self):
+        # [FUNCTION DOC] Exhaustively checks that int infinity has the right types, stays a
+        # singleton under addition, subtraction, multiplication, absolute value and powers (a
+        # negative power gives zero), and compares equal or ordered correctly against itself,
+        # plain integers and its negation.
         self.assertIsInstance(int_oo, IntInfinity)
         self.assertIsInstance(-int_oo, NegativeIntInfinity)
         self.assertTrue(int_oo.is_integer)
@@ -207,19 +231,28 @@ class TestNumbers(TestCase):
         self.assertTrue(int_oo >= -int_oo)
 
     def test_relation(self):
+        # [FUNCTION DOC] Checks adding int infinity to a number gives int infinity and negative
+        # int infinity is not greater than 2.
         self.assertIs(sympy.Add(2, int_oo), int_oo)
         self.assertFalse(-int_oo > 2)
 
     def test_lt_self(self):
+        # [FUNCTION DOC] Checks int infinity is not less than itself and min over negative int
+        # infinity returns the negative infinity singleton.
         self.assertFalse(int_oo < int_oo)
         self.assertIs(min(-int_oo, -4), -int_oo)
         self.assertIs(min(-int_oo, -int_oo), -int_oo)
 
     def test_float_cast(self):
+        # [FUNCTION DOC] Checks converting positive and negative int infinity to float gives the
+        # corresponding float infinities.
         self.assertEqual(float(int_oo), math.inf)
         self.assertEqual(float(-int_oo), -math.inf)
 
     def test_mixed_oo_int_oo(self):
+        # [FUNCTION DOC] Checks the (arbitrary) ordering convention between int infinity and
+        # sympy infinity: int infinity is smaller than sympy infinity and negative int infinity
+        # is larger than negative sympy infinity, and max/min follow that order.
         # Arbitrary choice
         self.assertTrue(int_oo < sympy.oo)
         self.assertFalse(int_oo > sympy.oo)
@@ -231,7 +264,11 @@ class TestNumbers(TestCase):
 
 
 class TestCppPrinter(TestCase):
+    # [CLASS DOC] Tests of the C++ printer for min and max expressions.
     def test_min_max_preserve_float_expressions(self):
+        # [FUNCTION DOC] Prints minimum and maximum of float expressions containing a symbol and
+        # checks the output uses the standard min or max with a cast to double and no cast to a
+        # 64-bit integer.
         s0 = sympy.Symbol("s0")
         expr = TorchSymMin(
             sympy.Float(4.0), sympy.Float(0.5) + sympy.Float(1.5) * s0
@@ -252,6 +289,8 @@ class TestCppPrinter(TestCase):
         self.assertNotIn("static_cast<int64_t>", printed)
 
     def test_min_max_preserve_integer_expressions(self):
+        # [FUNCTION DOC] Prints minimum and maximum of an integer constant and an integer symbol
+        # and checks the output uses the standard min or max with a cast to a 64-bit integer.
         s0 = sympy.Symbol("s0", integer=True)
         printed = CppPrinter().doprint(TorchSymMin(sympy.Integer(4), s0))
         self.assertIn("std::min", printed)
@@ -263,9 +302,15 @@ class TestCppPrinter(TestCase):
 
 
 class TestValueRanges(TestCase):
+    # [CLASS DOC] Tests of value range analysis (ValueRangeAnalysis) and bound_sympy, checking
+    # the range results against the reference analysis on concrete values. Parametrized over
+    # operator names; instantiated by the parametrized-tests helper at the end of the file.
     @parametrize("fn", UNARY_OPS)
     @parametrize("dtype", ("int", "float"))
     def test_unary_ref(self, fn, dtype):
+        # [FUNCTION DOC] For every valid constant and for integer and float sympy types, checks
+        # the unary op on a single-point range gives a single-point result that matches the
+        # reference analysis value, including integer-ness of the bounds.
         dtype = {"int": sympy.Integer, "float": sympy.Float}[dtype]
         for v in CONSTANTS:
             if not valid_unary(fn, v):
@@ -280,9 +325,14 @@ class TestValueRanges(TestCase):
                 self.assertEqual(ref_r, r.lower)
 
     def test_pow_half(self):
+        # [FUNCTION DOC] Smoke test: range analysis power with an unknown base and exponent one
+        # half must not raise. Nothing about the result is asserted.
         ValueRangeAnalysis.pow(ValueRanges.unknown(), ValueRanges.wrap(0.5))
 
     def test_bound_sympy_negative_pow(self):
+        # [FUNCTION DOC] Checks that bounding a reciprocal of a positive integer symbol
+        # with range 3 to 4 gives the unknown range, since the integer reciprocal range is
+        # not representable.
         x = sympy.Symbol("x", integer=True, positive=True)
 
         self.assertEqual(
@@ -292,6 +342,10 @@ class TestValueRanges(TestCase):
     @parametrize("fn", BINARY_OPS)
     @parametrize("dtype", ("int", "float"))
     def test_binary_ref(self, fn, dtype):
+        # [FUNCTION DOC] For each pair of valid constants and integer or float types, checks the
+        # binary op on single-point ranges either returns unknown or equals the reference result
+        # with matching integer-ness. Returns early (no test) for bitwise ops, and for float
+        # with natural power or mod.
         to_dtype = {"int": sympy.Integer, "float": sympy.Float}
         # Don't test bitwise methods since value range analysis on a singleton
         # range may not return a singleton result.
@@ -318,6 +372,8 @@ class TestValueRanges(TestCase):
                 self.assertEqual(ref_r, r.lower)
 
     def test_mul_zero_unknown(self):
+        # [FUNCTION DOC] Checks that multiplying the range of zero (integer or float) by the
+        # unknown range gives the zero range.
         self.assertEqual(
             ValueRangeAnalysis.mul(ValueRanges.wrap(0), ValueRanges.unknown()),
             ValueRanges.wrap(0),
@@ -328,6 +384,8 @@ class TestValueRanges(TestCase):
         )
 
     def test_trunc_infinite(self):
+        # [FUNCTION DOC] Checks truncation of ranges wrapping positive or negative float
+        # infinity returns the same infinite range.
         self.assertEqual(
             ValueRangeAnalysis.trunc(ValueRanges.wrap(sympy.Float('inf'))),
             ValueRanges.wrap(sympy.Float('inf')),
@@ -339,6 +397,9 @@ class TestValueRanges(TestCase):
 
     @parametrize("fn", UNARY_BOOL_OPS)
     def test_unary_bool_ref_range(self, fn):
+        # [FUNCTION DOC] For every boolean range, checks the boolean unary op range contains the
+        # reference result of each member value, and has one distinct result when the range is a
+        # single point or two distinct results otherwise.
         vals = [sympy.false, sympy.true]
         for a in generate_range(vals):
             with self.subTest(a=a):
@@ -358,6 +419,9 @@ class TestValueRanges(TestCase):
 
     @parametrize("fn", BINARY_BOOL_OPS + BITWISE_OPS)
     def test_binary_bool_ref_range(self, fn):
+        # [FUNCTION DOC] Same as the unary boolean check but over all pairs of boolean ranges
+        # for the binary boolean and bitwise ops: each reference result lies in the range result
+        # and the number of distinct results is one for a point range or two otherwise.
         vals = [sympy.false, sympy.true]
         for a, b in itertools.product(generate_range(vals), repeat=2):
             with self.subTest(a=a, b=b):
@@ -376,6 +440,9 @@ class TestValueRanges(TestCase):
                     self.assertEqual(len(unique), 2)
 
     def test_bool_minimum_maximum(self):
+        # [FUNCTION DOC] For minimum and maximum over all pairs of boolean ranges, checks the
+        # result range is boolean, contains the logical and (for minimum) or or (for maximum) of
+        # each member pair, and has the right count of distinct results.
         vals = [sympy.false, sympy.true]
         for fn in ("minimum", "maximum"):
             for a, b in itertools.product(generate_range(vals), repeat=2):
@@ -399,6 +466,8 @@ class TestValueRanges(TestCase):
                         self.assertEqual(len(unique), 2)
 
     def test_bool_minimum_maximum_mixed_raises(self):
+        # [FUNCTION DOC] Checks minimum and maximum of a boolean range mixed with an integer
+        # range (in either order) raise an AssertionError saying operands must both be boolean.
         # min/max require both operands to be boolean or both non-boolean;
         # a mixed boolean/non-boolean pair must raise.
         bool_range = ValueRanges(sympy.false, sympy.true)
@@ -412,6 +481,9 @@ class TestValueRanges(TestCase):
                         getattr(ValueRangeAnalysis, fn)(a, b)
 
     def test_eq_ne_bool_ranges(self):
+        # [FUNCTION DOC] Regression test that eq and ne accept boolean ranges without raising:
+        # results are boolean ranges with boolean bounds, and for single-point true/false ranges
+        # the results are the exact expected boolean ranges.
         # eq/ne must accept boolean ranges. sympy booleans do not support
         # ordered comparison (bool >/< raises), which the disjoint-range test in
         # eq would otherwise hit. Regression test for eq/ne raising TypeError on
@@ -439,6 +511,8 @@ class TestValueRanges(TestCase):
 
     @parametrize("fn", UNARY_OPS)
     def test_unary_ref_range(self, fn):
+        # [FUNCTION DOC] For every range built from the constants, checks that the reference
+        # unary result of each valid contained constant lies inside the range analysis result.
         # TODO: bring back sympy.oo testing for float unary fns
         vals = CONSTANTS
         for a in generate_range(vals):
@@ -456,6 +530,9 @@ class TestValueRanges(TestCase):
     # This takes about 4s for all the variants
     @parametrize("fn", BINARY_OPS + COMPARE_OPS)
     def test_binary_ref_range(self, fn):
+        # [FUNCTION DOC] Over small ranges built from the reduced constant list, checks that for
+        # each valid contained pair the finite reference binary or comparison result lies inside
+        # the range result. Skips power with large finite exponent ranges.
         # TODO: bring back sympy.oo testing for float unary fns
         vals = LESS_CONSTANTS
         for a, b in itertools.product(generate_range(vals), repeat=2):
@@ -479,6 +556,9 @@ class TestValueRanges(TestCase):
     # stronger test specially for bitwise ops
     @parametrize("fn", BITWISE_OPS)
     def test_bitwise_ref_range(self, fn):
+        # [FUNCTION DOC] Checks bitwise op range results contain the reference results for all
+        # integer pairs drawn from the range of minus four to four, then checks the same for
+        # mixed integer and boolean arguments.
         # N^4 complexity
         vals = range(-4, 5)
         for a, b in itertools.product(generate_range(vals), repeat=2):
@@ -510,6 +590,10 @@ class TestValueRanges(TestCase):
 
 
     def test_python_mod(self):
+        # [FUNCTION DOC] Checks range analysis of python mod against hand-derived bounds for
+        # positive, negative, mixed and infinite divisor ranges and point divisors of one and
+        # minus one. Then, for many integer x and nonzero y, checks the true result lies in the
+        # computed range.
         """Test python_mod value range analysis."""
         # Test with positive divisor
         # x % 4 should be in [0, 3]
@@ -575,6 +659,9 @@ class TestValueRanges(TestCase):
                 self.assertIn(result, r, lambda msg: f"{msg}\nx={x}, y={y}, result={result}, range={r}")
 
     def test_bound_sympy_mod_subtraction(self):
+        # [FUNCTION DOC] For each of the three mod function flavors, checks bound_sympy of
+        # expressions that subtract a mod from its base (including scaled, offset and symbolic-
+        # divisor variants) yields the expected non-negative or non-positive infinite range.
         s0 = sympy.Symbol("s0", integer=True)
         s1 = sympy.Symbol("s1", integer=True)
         ranges = {s0: ValueRanges(2, int_oo), s1: ValueRanges(1, int_oo)}
@@ -607,6 +694,9 @@ class TestValueRanges(TestCase):
                 )
 
     def test_bound_sympy_python_mod_subtraction_negative_base(self):
+        # [FUNCTION DOC] Checks bounds of subtracting a python mod from a base whose range
+        # includes negative values: the lower bounds are the base lower bound minus the divisor,
+        # and the upper bound is infinite.
         s0 = sympy.Symbol("s0", integer=True)
         ranges = {s0: ValueRanges(-2, int_oo)}
 
@@ -620,10 +710,16 @@ class TestValueRanges(TestCase):
 
 
 class TestSympyInterp(TestCase):
+    # [CLASS DOC] Tests of sympy_interp evaluating expressions with different analysis backends
+    # (reference sympy, python with fx tracing, tensors). Parametrized over operator names.
     @parametrize(
         "fn", UNARY_OPS + BINARY_OPS + UNARY_BOOL_OPS + BINARY_BOOL_OPS + COMPARE_OPS
     )
     def test_interp(self, fn):
+        # [FUNCTION DOC] For each op (skipping truncating ones) and each valid argument
+        # combination, checks that applying the reference analysis to concrete values
+        # equals interpreting the symbolic expression with the values substituted for the
+        # dummy symbols.
         # SymPy does not implement truncation for Expressions
         if fn in ("div", "truncdiv", "minimum", "maximum", "mod"):
             return
@@ -666,6 +762,10 @@ class TestSympyInterp(TestCase):
         "fn", UNARY_OPS + BINARY_OPS + UNARY_BOOL_OPS + BINARY_BOOL_OPS + COMPARE_OPS
     )
     def test_python_interp_fx(self, fn):
+        # [FUNCTION DOC] For each op (skipping log, exp, truncdiv and mod) and each valid
+        # argument set, builds a symbolic expression, interprets it under the python analysis
+        # inside an fx symbolic trace, and checks the traced graph module result equals direct
+        # interpretation with the values.
         # These never show up from symbolic_shapes
         if fn in ("log", "exp"):
             return
@@ -718,6 +818,9 @@ class TestSympyInterp(TestCase):
                 if arity == 1:
 
                     def trace_f(px):
+                        # [FUNCTION DOC] HELPER: One-argument function that interprets the
+                        # expression under the python analysis with the symbol bound to the
+                        # argument. Traced by fx.
                         return sympy_interp(
                             PythonReferenceAnalysis, {x: px}, sympy_expr
                         )
@@ -725,6 +828,9 @@ class TestSympyInterp(TestCase):
                 else:
 
                     def trace_f(px, py):
+                        # [FUNCTION DOC] HELPER: Two-argument version that binds both symbols to
+                        # the arguments and interprets the expression under the python analysis.
+                        # Traced by fx.
                         return sympy_interp(
                             PythonReferenceAnalysis, {x: px, y: py}, sympy_expr
                         )
@@ -742,6 +848,11 @@ class TestSympyInterp(TestCase):
         "fn", UNARY_OPS + BINARY_OPS + UNARY_BOOL_OPS + BINARY_BOOL_OPS + COMPARE_OPS
     )
     def test_tensor_interp(self, fn):
+        # [FUNCTION DOC] For each applicable op and valid arguments, compares the tensor
+        # analysis applied directly to tensors with sympy_interp using the tensor analysis,
+        # after aligning dtypes, within tolerance; also checks boolean ops give bool dtype and
+        # integer-conversion ops give int64. Unimplemented ops print a message; any other
+        # exception fails the test.
         # Skip operations not implemented or not applicable for tensors
         if fn in ("div", "truncdiv", "int_truediv", "mod", "round_decimal"):
             return
@@ -830,21 +941,34 @@ class TestSympyInterp(TestCase):
 
 
 def type_name_fn(type: type) -> str:
+    # [FUNCTION DOC] HELPER: Returns the class name of a type; used to name parametrized
+    # test cases.
     return type.__name__
 
 
 def parametrize_relational_types(*types):
+    # [FUNCTION DOC] HELPER: Returns a decorator that parametrizes a test over the operator
+    # argument using the given relational types, or all relational types if none are given,
+    # named by class.
     def wrapper(f: Callable):
+        # [FUNCTION DOC] HELPER: Applies the parametrization to the test function and returns
+        # the result.
         return parametrize("op", types or RELATIONAL_TYPES, name_fn=type_name_fn)(f)
 
     return wrapper
 
 
 class TestSympySolve(TestCase):
+    # [CLASS DOC] Tests of the relational solver that isolates a symbol on one side of a
+    # relation, including giving up, multiplication and division, and floor division handling.
     def _create_integer_symbols(self) -> list[sympy.Symbol]:
+        # [FUNCTION DOC] HELPER: Returns three integer sympy symbols named a, b and c.
         return sympy.symbols("a b c", integer=True)
 
     def test_give_up(self):
+        # [FUNCTION DOC] Checks the solver returns nothing for non-relations, relations where
+        # the symbol appears on both sides or neither side, and results that would be a logical
+        # and or or.
         from sympy import Eq, Ne
 
         a, b, c = self._create_integer_symbols()
@@ -868,6 +992,9 @@ class TestSympySolve(TestCase):
 
     @parametrize_relational_types()
     def test_noop(self, op):
+        # [FUNCTION DOC] Checks that when the symbol is already alone on the left, the
+        # solver returns the original relation and the right-hand side unchanged, for
+        # every relational type.
         a, b, _ = self._create_integer_symbols()
 
         lhs, rhs = a, 42 * b
@@ -882,6 +1009,9 @@ class TestSympySolve(TestCase):
 
     @parametrize_relational_types()
     def test_noop_rhs(self, op):
+        # [FUNCTION DOC] Checks that when the symbol is on the right, the solver mirrors
+        # the relation operator and swaps the sides, returning the other side as the
+        # right-hand side.
         a, b, _ = self._create_integer_symbols()
 
         lhs, rhs = 42 * b, a
@@ -905,6 +1035,10 @@ class TestSympySolve(TestCase):
         op: type[sympy.Rel],
         **kwargs,
     ):
+        # [FUNCTION DOC] HELPER: For each source and expected pair, solves for the given thing
+        # with extra keyword arguments, checks the solver result is nothing exactly when nothing
+        # is expected, and otherwise that the right-hand side equals expected and the relation
+        # equals the op applied to the thing and expected.
         for source, expected in cases:
             r = try_solve(source, thing, **kwargs)
 
@@ -919,6 +1053,8 @@ class TestSympySolve(TestCase):
                 self.assertEqual(r_expr, op(thing, expected))
 
     def test_addition(self):
+        # [FUNCTION DOC] Checks solving equality relations with an added term isolates the
+        # symbol.
         from sympy import Eq
 
         a, b, c = self._create_integer_symbols()
@@ -933,6 +1069,8 @@ class TestSympySolve(TestCase):
 
     @parametrize_relational_types(sympy.Eq, sympy.Ne)
     def test_multiplication_division(self, op):
+        # [FUNCTION DOC] For equality and inequality-not-equal, checks solving a product for the
+        # symbol divides both sides by the factor.
         a, b, c = self._create_integer_symbols()
 
         cases = [
@@ -945,6 +1083,9 @@ class TestSympySolve(TestCase):
 
     @parametrize_relational_types(*INEQUALITY_TYPES)
     def test_multiplication_division_inequality(self, op):
+        # [FUNCTION DOC] For ordering relations, checks multiplication and division by positive
+        # factors keep the operator, by negative factors flip it, and factors of unknown sign
+        # give no solution.
         a, b, _ = self._create_integer_symbols()
         intneg = sympy.Symbol("neg", integer=True, negative=True)
         intpos = sympy.Symbol("pos", integer=True, positive=True)
@@ -976,6 +1117,11 @@ class TestSympySolve(TestCase):
 
     @parametrize_relational_types()
     def test_floordiv(self, op):
+        # [FUNCTION DOC] For each relational type, checks solving relations on floor division by
+        # a positive symbol gives the expected bound and operator (greater and less variants
+        # normalize to at-least and less-than), and that it gives nothing when the divisor or
+        # other side is not known positive or integer. With floor division inequalities disabled
+        # the special case gives nothing.
         from sympy import Eq, Ge, Gt, Le, Lt, Ne
 
         a, b, c = sympy.symbols("a b c")
@@ -1021,11 +1167,15 @@ class TestSympySolve(TestCase):
         )
 
     def test_floordiv_eq_simplify(self):
+        # [FUNCTION DOC] Checks equality on floor division by a constant simplifies to a single
+        # strict or non-strict inequality on the symbol for two specific examples.
         from sympy import Eq, Le, Lt
 
         a = sympy.Symbol("a", positive=True, integer=True)
 
         def check(expr, expected):
+            # [FUNCTION DOC] HELPER: Solves the expression for the symbol, requires a result,
+            # and checks the returned relation equals the expected one.
             r = try_solve(expr, a)
             self.assertNotEqual(r, None)
             r_expr, _ = r
@@ -1045,6 +1195,10 @@ class TestSympySolve(TestCase):
 
     @skipIf(not TEST_Z3, "Z3 not installed")
     def test_z3_proof_floordiv_eq_simplify(self):
+        # [FUNCTION DOC] Uses the Z3 solver to prove the floor division simplification is sound:
+        # checks the solver output equals the expected inequality, then asks Z3 whether any
+        # positive integer makes the original and simplified conditions differ and asserts none
+        # exists. Skipped when Z3 is not installed.
         import z3
         from sympy import Eq, Lt
 
@@ -1083,6 +1237,9 @@ class TestSympySolve(TestCase):
         self.assertEqual(r, z3.unsat)
 
     def test_simple_floordiv_gcd(self):
+        # [FUNCTION DOC] Checks the simple gcd helper for floor division returns the expected
+        # common factor for several monomial and polynomial cases, and one for a case with no
+        # common factor.
         x, y, z = sympy.symbols("x y z")
 
         # positive tests
@@ -1101,7 +1258,11 @@ class TestSympySolve(TestCase):
 
 
 class TestSympyFunctions(TestCase):
+    # [CLASS DOC] Tests of custom sympy function classes (shift, pickling, min/max,
+    # modular indexing).
     def test_shift_edges(self):
+        # [FUNCTION DOC] Checks shifting by zero returns the operand and a negative shift count
+        # raises a ValueError for both left and right shift.
         x = sympy.Symbol("x", integer=True)
         self.assertEqual(LShift(x, 0), x)
         self.assertEqual(RShift(x, 0), x)
@@ -1111,6 +1272,8 @@ class TestSympyFunctions(TestCase):
             RShift(x, -1)
 
     def test_pickle(self):
+        # [FUNCTION DOC] Checks that opaque unary and bitwise function instances survive a
+        # pickle round trip and compare equal to the original.
         x = OpaqueUnaryFn_cos(sympy.Symbol("a"))
         r = pickle.loads(pickle.dumps(x))
         self.assertEqual(x, r)
@@ -1120,6 +1283,9 @@ class TestSympyFunctions(TestCase):
         self.assertEqual(x, r)
 
     def test_min_max_scaled_known_sign_term(self):
+        # [FUNCTION DOC] Checks min and max of scaled copies of one symbol simplify to the right
+        # scaled symbol when its sign is known, and stay unevaluated min/max instances when the
+        # sign is unknown.
         s = sympy.Symbol("s", positive=True, integer=True)
         self.assertEqual(TorchSymMin(128 * s, 512 * s), 128 * s)
         self.assertEqual(TorchSymMax(128 * s, 512 * s), 512 * s)
@@ -1133,6 +1299,9 @@ class TestSympyFunctions(TestCase):
         self.assertIsInstance(TorchSymMax(128 * x, 512 * x), TorchSymMax)
 
     def test_modular_indexing_does_not_strip_unproven_nonnegative_term(self):
+        # [FUNCTION DOC] Checks modular indexing is not simplified by stripping a term whose
+        # non-negativity is unproven, and numerically verifies the expression equals the
+        # mathematical modulus for a grid of values and stays within the modulus range.
         q0 = sympy.Symbol("q0", integer=True, nonnegative=True)
         n = sympy.Symbol("n", integer=True, positive=True)
         poisoned_base = n**2 + FloorDiv(-1 - q0, 2)
@@ -1148,13 +1317,22 @@ class TestSympyFunctions(TestCase):
 
 
 class TestSingletonInt(TestCase):
+    # [CLASS DOC] Tests of the singleton integer symbolic type used for nested tensor sizes.
     def test_basic(self):
+        # [FUNCTION DOC] Checks equality, ordering and multiplication semantics of singleton
+        # ints against each other and integers: equal only with the same id and coefficient,
+        # comparisons that cannot be decided raise a ValueError mentioning indeterminate,
+        # multiplying by an int scales the coefficient, multiplying two singletons raises, and
+        # the free symbol set is empty.
         j1 = SingletonInt(1, coeff=1)
         j1_copy = SingletonInt(1, coeff=1)
         j2 = SingletonInt(2, coeff=1)
         j1x2 = SingletonInt(1, coeff=2)
 
         def test_eq(a, b, expected):
+            # [FUNCTION DOC] HELPER: Checks the equality relation of two values equals the
+            # expected boolean and the inequality relation with swapped operands equals
+            # its negation.
             self.assertEqual(sympy.Eq(a, b), expected)
             self.assertEqual(sympy.Ne(b, a), not expected)
 
@@ -1167,6 +1345,10 @@ class TestSingletonInt(TestCase):
         test_eq(j1, sympy.Integer(3), False)
 
         def test_ineq(a, b, expected, *, strict=True):
+            # [FUNCTION DOC] HELPER: Checks the strict or non-strict greater and less
+            # comparisons (sympy and predicate versions, both operand orders). If the expected
+            # value is a boolean, results match it and its negation; otherwise it is a message
+            # pattern and each comparison must raise a ValueError.
             greater = (sympy.Gt, is_gt) if strict else (sympy.Ge, is_ge)
             less = (sympy.Lt, is_lt) if strict else (sympy.Le, is_le)
 
@@ -1231,7 +1413,10 @@ class TestSingletonInt(TestCase):
         self.assertEqual(j1.free_symbols, set())
 
 class TestIdentity(TestCase):
+    # [CLASS DOC] Tests of the Identity sympy wrapper function.
     def test_expand_identity(self):
+        # [FUNCTION DOC] Checks expanding with the identity option removes all Identity nodes
+        # and gives the wrapped argument.
         """
         Test removing an identity via expansion.
         """
@@ -1243,16 +1428,22 @@ class TestIdentity(TestCase):
         self.assertEqual(expanded, arg)
 
     def test_cast_identity_int(self):
+        # [FUNCTION DOC] Checks converting an Identity wrapping an integer to int gives
+        # the integer.
         num = 1
         expr = Identity(num)
         self.assertEqual(num, int(expr))
 
     def test_cast_identity_float(self):
+        # [FUNCTION DOC] Checks converting an Identity wrapping a float to float gives the
+        # float.
         num = 1.1
         expr = Identity(num)
         self.assertEqual(num, float(expr))
 
     def test_cast_identity_illegal(self):
+        # [FUNCTION DOC] Checks int and float conversion of an Identity wrapping a symbol or a
+        # tuple raises a TypeError.
         sym = Identity(sympy.Symbol("x"))
         self.assertRaises(TypeError, int, sym)
         self.assertRaises(TypeError, float, sym)
@@ -1263,16 +1454,22 @@ class TestIdentity(TestCase):
         self.assertRaises(TypeError, float, tup_I)
 
 class TestTypedExpr(TestCase):
+    # [CLASS DOC] Tests of the typed expression wrapper from index propagation.
     def test_typed_expr(self):
+        # [FUNCTION DOC] Wraps an Identity of one with a 32-bit integer dtype and checks the
+        # stored expression equals one.
         I = Identity(1)
         typed_I = TypedExpr(I, torch.int32)
         self.assertEqual(typed_I.expr, 1)
 
 
 class TestCCodePrinting(TestCase):
+    # [CLASS DOC] Tests that custom sympy functions print to the expected C code strings.
     """Test _ccode methods on sympy function classes."""
 
     def test_floor_to_int_ccode(self):
+        # [FUNCTION DOC] Checks the C code for floor-to-int of a symbol casts the floor call to
+        # a 64-bit integer.
         from torch.utils._sympy.functions import FloorToInt
 
         x = sympy.Symbol("x")
@@ -1280,6 +1477,7 @@ class TestCCodePrinting(TestCase):
         self.assertEqual(sympy.ccode(expr), "(int64_t)(floor(x))")
 
     def test_floor_to_int_ccode_compound(self):
+        # [FUNCTION DOC] Checks the C code for floor-to-int of a sum casts the floor of the sum.
         from torch.utils._sympy.functions import FloorToInt
 
         x, y = sympy.symbols("x y")
@@ -1287,6 +1485,8 @@ class TestCCodePrinting(TestCase):
         self.assertEqual(sympy.ccode(expr), "(int64_t)(floor(x + y))")
 
     def test_ceil_to_int_ccode(self):
+        # [FUNCTION DOC] Checks the C code for ceil-to-int of a symbol casts the ceil call to a
+        # 64-bit integer.
         from torch.utils._sympy.functions import CeilToInt
 
         x = sympy.Symbol("x")
@@ -1294,6 +1494,8 @@ class TestCCodePrinting(TestCase):
         self.assertEqual(sympy.ccode(expr), "(int64_t)(ceil(x))")
 
     def test_trunc_to_int_ccode(self):
+        # [FUNCTION DOC] Checks the C code for trunc-to-int of a symbol casts the trunc call to
+        # a 64-bit integer.
         from torch.utils._sympy.functions import TruncToInt
 
         x = sympy.Symbol("x")
@@ -1301,6 +1503,8 @@ class TestCCodePrinting(TestCase):
         self.assertEqual(sympy.ccode(expr), "(int64_t)(trunc(x))")
 
     def test_to_float_ccode(self):
+        # [FUNCTION DOC] Checks the C code for converting an integer symbol to float casts
+        # it to double.
         from torch.utils._sympy.functions import ToFloat
 
         x = sympy.Symbol("x", integer=True)
@@ -1308,6 +1512,8 @@ class TestCCodePrinting(TestCase):
         self.assertEqual(sympy.ccode(expr), "(double)(x)")
 
     def test_ccode_in_compound_expr(self):
+        # [FUNCTION DOC] Checks a compound expression of floor-to-int of a to-float plus one
+        # prints text containing the 64-bit integer type, floor and double.
         from torch.utils._sympy.functions import FloorToInt, ToFloat
 
         x = sympy.Symbol("x")

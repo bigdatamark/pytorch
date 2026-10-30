@@ -1,5 +1,10 @@
 # Owner(s): ["module: unknown"]
 # ruff: noqa: F841
+# [MODULE DOC] Tests for the Static Runtime (StaticModule) executor on TorchScript modules and
+# functions. Covers fork/wait (sync and runAsync), exception propagation from forked subgraphs,
+# attention and DLRM-style MLP modules, SetAttr/GetAttr handling, benchmark APIs, and (skipped)
+# subgraph fusion. Import-time side effect: replaces the global linear function in
+# torch.nn.functional with a matmul-based shim so scripted modules lower to plain matmul.
 
 import unittest
 
@@ -13,6 +18,8 @@ from torch.testing._internal.static_module import StaticModule
 def linear_shim(
     input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
+    # [FUNCTION DOC] HELPER: Replacement for the functional linear op. Computes input times the
+    # transposed weight, adds the bias in place when one is given, and returns the result.
     output = input.matmul(weight.t())
     if bias is not None:
         output += bias
@@ -24,7 +31,14 @@ torch.nn.functional.linear = linear_shim
 
 
 class MultiHeadAttentionLayer(nn.Module):
+    # [CLASS DOC] HELPER: Multi-head scaled dot-product attention module used as a scripting and
+    # Static Runtime test subject. Holds four linear projections (q, k, v, output) and a fixed
+    # scale tensor equal to the square root of the per-head dimension. Dropout and masking are
+    # disabled (commented out), so the mask argument is accepted but unused.
     def __init__(self, hid_dim, n_heads, dropout, device):
+        # [FUNCTION DOC] HELPER: Stores sizes, builds the four projection layers and the scale
+        # tensor on the given device. Raises AssertionError if hid_dim is not divisible by
+        # n_heads. The dropout argument is accepted but ignored.
         super().__init__()
         if hid_dim % n_heads != 0:
             raise AssertionError(f"hid_dim ({hid_dim}) must be divisible by n_heads ({n_heads})")
@@ -39,6 +53,10 @@ class MultiHeadAttentionLayer(nn.Module):
         self.scale = torch.sqrt(torch.FloatTensor([self.head_dim])).to(device)
 
     def forward(self, query, key, value, mask):
+        # [FUNCTION DOC] HELPER: Projects query, key and value, splits them into heads, computes
+        # softmax-normalized scaled dot-product attention, merges heads and applies the output
+        # projection. Returns a tuple of the output tensor and the attention weights. The mask
+        # is unused.
         batch_size = query.shape[0]
         Q = self.fc_q(query)
         K = self.fc_k(key)
@@ -59,6 +77,11 @@ class MultiHeadAttentionLayer(nn.Module):
 
 # Taken from https://github.com/facebookresearch/dlrm/blob/master/dlrm_s_pytorch.py
 def create_mlp(ln, sigmoid_layer):
+    # [FUNCTION DOC] HELPER: Builds a scripted, eval-mode MLP following the DLRM reference code.
+    # For each consecutive pair of sizes in the list ln it creates a linear layer with weights
+    # drawn from a normal distribution (unseeded numpy RNG) and then appends a sigmoid if the
+    # layer index equals sigmoid_layer, otherwise a relu. Scripts the sequential container under
+    # no-grad and returns it.
     layers = nn.ModuleList()
     for i in range(len(ln) - 1):
         n = ln[i]
@@ -87,17 +110,25 @@ def create_mlp(ln, sigmoid_layer):
 
 
 def trivial_graph(a, b, c):
+    # [FUNCTION DOC] HELPER: Scripted test graph that returns a plus b times c plus a constant
+    # 2x2 tensor of threes.
     s = torch.tensor([[3, 3], [3, 3]])
     return a + b * c + s
 
 def elementwise_square_addition(input1, input2):
+    # [FUNCTION DOC] HELPER: Returns the sum of the elementwise squares of the two inputs. Used
+    # as the forked callee in the first fork/wait graph.
     return input1 * input1 + input2 * input2
 
 def fork_wait_graph1(input1, input2):
+    # [FUNCTION DOC] HELPER: Forks the squared-sum function on both inputs and waits on the
+    # future, returning its result.
     fut = torch.jit.fork(elementwise_square_addition, input1, input2)
     return torch.jit.wait(fut)
 
 def fork_wait_graph2(input1, input2):
+    # [FUNCTION DOC] HELPER: Forks the loop graph with a fixed iteration count of 5 and returns
+    # the waited result.
     fut = torch.jit.fork(loop_graph, input1, input2, 5)
     return torch.jit.wait(fut)
 
@@ -107,6 +138,8 @@ def fork_wait_graph2(input1, input2):
    :param iters: number of future/wait pairs to be created
 """
 def fork_wait_graph3(input, iters: int):
+    # [FUNCTION DOC] HELPER: Creates iters forks that each negate the input, waits on all
+    # futures in order, stacks the results and returns their total sum as a tensor.
     futures : list[torch.jit.Future[torch.Tensor]] = []
     for _ in range(iters):
         futures.append(torch.jit.fork(torch.neg, input))
@@ -122,6 +155,9 @@ def fork_wait_graph3(input, iters: int):
    :param num_child_forks: number of child forks per parent fork
 """
 def fork_wait_graph4(input, num_forks: int, num_child_forks: int):
+    # [FUNCTION DOC] HELPER: Multi-level fork graph. Forks the multi-fork graph num_forks times,
+    # each with num_child_forks child forks, waits on all of them and returns the sum of the
+    # stacked results.
     futures : list[torch.jit.Future[torch.Tensor]] = []
     for _ in range(num_forks):
         futures.append(torch.jit.fork(fork_wait_graph3, input, num_child_forks))
@@ -131,13 +167,19 @@ def fork_wait_graph4(input, num_forks: int, num_child_forks: int):
     return torch.sum(torch.stack(results))
 
 def add_tensor(input1, input2):
+    # [FUNCTION DOC] HELPER: Returns the elementwise sum of the two inputs. Raises a shape error
+    # when the sizes are not broadcastable.
     return input1 + input2
 
 def fork_wait_graph_exception(input1, input2):
+    # [FUNCTION DOC] HELPER: Forks the add function on the inputs and waits on the future. With
+    # incompatible shapes the error from the forked call surfaces at the wait.
     fut = torch.jit.fork(add_tensor, input1, input2)
     return torch.jit.wait(fut)
 
 def loop_graph(a, b, iters: int):
+    # [FUNCTION DOC] HELPER: Loop test graph. Starts with a plus twice b, then iters times adds
+    # b, doubles in place, and subtracts a in place. Returns the final tensor.
     c = a + b * 2
     for _ in range(iters):
         c = c + b
@@ -147,6 +189,9 @@ def loop_graph(a, b, iters: int):
 
 
 def output_graph(a, b, c, iters: int):
+    # [FUNCTION DOC] HELPER: Computes the sum of a plus b times c plus a constant 2x2
+    # tensor, then returns a mapping from each integer in the range of iters to that sum
+    # plus the integer.
     s = torch.tensor([[3, 3], [3, 3]])
     k = a + b * c + s
     d: dict[int, torch.Tensor] = {}
@@ -156,28 +201,41 @@ def output_graph(a, b, c, iters: int):
 
 
 class SubModule(nn.Module):
+    # [CLASS DOC] HELPER: Small module with constant integer attributes a=11 and b=2 whose
+    # forward adds them to the input; used as a submodule in the attribute test.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Sets the integer attributes a to 11 and b to 2.
         super().__init__()
         self.a = 11
         self.b = 2
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Returns the input tensor plus the sum of the two attributes.
         return self.a + self.b + x
 
 
 class SubModule2(nn.Module):
+    # [CLASS DOC] HELPER: Like the first submodule (a is 12) but forward first overwrites
+    # attribute b with 30, exercising attribute mutation in scripted code.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Sets the integer attributes a to 12 and b to 2.
         super().__init__()
         self.a = 12
         self.b = 2
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Sets attribute b to 30 (mutating module state) and returns the
+        # input plus a plus b.
         self.b = 30
         return self.a + self.b + x
 
 
 class TestModule(nn.Module):
+    # [CLASS DOC] HELPER: Top-level module for the attribute test. Owns the two submodules and
+    # integer attributes a=3 and b=4; forward mutates b and combines both submodule outputs.
     def __init__(self) -> None:
+        # [FUNCTION DOC] HELPER: Creates the two submodules and sets attributes a to 3 and
+        # b to 4.
         super().__init__()
         self.sub1 = SubModule()
         self.sub2 = SubModule2()
@@ -185,17 +243,24 @@ class TestModule(nn.Module):
         self.b = 4
 
     def forward(self, x):
+        # [FUNCTION DOC] HELPER: Sets b to 20, then returns the first submodule output plus a
+        # plus b plus the second submodule output for the input.
         self.b = 20
         return self.sub1(x) + self.a + self.b + self.sub2(x)
 
 
 class TestStaticModule(TestCase):
+    # [CLASS DOC] Test case checking that StaticModule results match the eager TorchScript
+    # results for fork/wait graphs, attention and MLP modules, attribute access, and
+    # object creation.
 
     """
     Test Case: To test simple fork/wait operation in a graph
     fork is called on simple addition operation on input tensors
     """
     def test_fork_wait_1(self):
+        # [FUNCTION DOC] Scripts the first fork/wait graph, runs it with ones and random
+        # tensors, and checks the StaticModule output is close to the scripted reference.
         inp1 = torch.ones(5, 5)
         inp2 = torch.randn(5, 5)
         torch_graph = torch.jit.script(fork_wait_graph1)
@@ -209,6 +274,9 @@ class TestStaticModule(TestCase):
     StaticRuntime runAsync API returning future
     """
     def test_fork_wait_1_async(self):
+        # [FUNCTION DOC] Same as the synchronous fork/wait test but calls runAsync on the
+        # StaticModule with a tuple of inputs and an empty kwargs mapping, waits on the returned
+        # future and compares its value with the reference.
         inp1 = torch.ones(5, 5)
         inp2 = torch.randn(5, 5)
         torch_graph = torch.jit.script(fork_wait_graph1)
@@ -223,6 +291,8 @@ class TestStaticModule(TestCase):
     a loop subgraph performing mix of operations
     """
     def test_fork_wait_2(self):
+        # [FUNCTION DOC] Compares StaticModule and scripted outputs for a graph that forks a
+        # loop subgraph, using two random 5x5 inputs.
         inp1 = torch.randn(5, 5)
         inp2 = torch.randn(5, 5)
         torch_graph = torch.jit.script(fork_wait_graph2)
@@ -236,6 +306,8 @@ class TestStaticModule(TestCase):
     subgraph with StaticRuntime runAsync API returning future
     """
     def test_fork_wait_2_async(self):
+        # [FUNCTION DOC] Async variant of the loop-subgraph fork test: runs runAsync, waits on
+        # the future and compares its value with the scripted reference.
         inp1 = torch.randn(5, 5)
         inp2 = torch.randn(5, 5)
         torch_graph = torch.jit.script(fork_wait_graph2)
@@ -250,6 +322,8 @@ class TestStaticModule(TestCase):
     having multiple fork/wait operations
     """
     def test_fork_wait_3(self):
+        # [FUNCTION DOC] Compares StaticModule and scripted outputs for the graph with ten
+        # fork/wait pairs on a 3x3 ones tensor.
         input = torch.ones(3, 3)
         num_forks = 10
         torch_graph = torch.jit.script(fork_wait_graph3)
@@ -263,6 +337,8 @@ class TestStaticModule(TestCase):
     multiple fork/wait operations on runAsync API returning future
     """
     def test_fork_wait_3_async(self):
+        # [FUNCTION DOC] Async variant of the multiple-fork test: runs runAsync with ten forks,
+        # waits and compares the future value with the scripted reference.
         input = torch.ones(3, 3)
         num_forks = 10
         torch_graph = torch.jit.script(fork_wait_graph3)
@@ -278,6 +354,8 @@ class TestStaticModule(TestCase):
     """
     @unittest.skip("Broken test: https://github.com/pytorch/pytorch/issues/109782")
     def test_fork_wait_4(self):
+        # [FUNCTION DOC] Checks nested fork/wait (10 forks, 10 child forks each) matches the
+        # scripted result. Skipped via a decorator because of a known broken issue.
         input = torch.ones(3, 3)
         num_forks = 10
         num_child_forks = 10
@@ -293,6 +371,8 @@ class TestStaticModule(TestCase):
     """
     @unittest.skip("Broken test: https://github.com/pytorch/pytorch/issues/109782")
     def test_fork_wait_4_async(self):
+        # [FUNCTION DOC] Async variant of the nested fork/wait test using runAsync. Skipped
+        # because of the same known broken issue.
         input = torch.ones(3, 3)
         num_forks = 10
         num_child_forks = 10
@@ -313,6 +393,10 @@ class TestStaticModule(TestCase):
     checked for substring expected_error_msg as declared below
     """
     def test_fork_wait_exception(self):
+        # [FUNCTION DOC] Runs the fork graph on tensors of shapes 4x7 and 4x5 so the forked add
+        # fails. If an exception is raised, it must contain the expected size-mismatch message,
+        # otherwise a RuntimeError is raised chained to the original error.
+        # KNOWN ISSUE: if no exception is raised at all, the test passes silently.
         # incompatible tensors for add due to shape mismatch
         input1 = torch.randn(4, 7)
         input2 = torch.randn(4, 5)
@@ -342,6 +426,10 @@ class TestStaticModule(TestCase):
     checked for substring expected_error_msg as declared below
     """
     def test_fork_wait_exception_async(self):
+        # [FUNCTION DOC] Async variant of the exception test: calls runAsync with mismatched
+        # shapes and validates the message of any exception raised by the call itself.
+        # KNOWN ISSUE: if no exception is raised the test passes; an error stored on the
+        #   returned future is never inspected since the future is not waited on.
         # incompatible tensors for add due to shape mismatch
         input1 = torch.randn(4, 7)
         input2 = torch.randn(4, 5)
@@ -364,6 +452,9 @@ class TestStaticModule(TestCase):
                 ) from error
 
     def test_multihead_attention_layer(self):
+        # [FUNCTION DOC] Scripts the attention layer in eval mode, runs it and a StaticModule on
+        # random input of shape 128x8x256 (positional and with keyword arguments for value and
+        # mask) and checks each returned tensor is close to the reference.
         HID_DIM = 256
         QUERY_LEN = 8
         BATCH_SIZE = 128
@@ -392,6 +483,9 @@ class TestStaticModule(TestCase):
             torch.testing.assert_close(a, b)
 
     def test_multihead_attention_layer_benchmark(self):
+        # [FUNCTION DOC] Smoke test of the benchmark and per-op benchmark APIs of StaticModule
+        # on the scripted attention layer, with 2 warmup and 2 measured iterations. Asserts
+        # nothing about the results.
         HID_DIM = 256
         QUERY_LEN = 8
         BATCH_SIZE = 128
@@ -414,6 +508,9 @@ class TestStaticModule(TestCase):
         )
 
     def test_mlp(self):
+        # [FUNCTION DOC] Builds scripted bottom and top MLPs with the DLRM benchmark sizes,
+        # wraps them in StaticModule, and checks outputs match the scripted modules for an
+        # initial batch and for five further random batches of 2048 rows.
         # Arguments taken from benchmark script, ./bench/dlrm_s_benchmark.sh
         ln_bot = [512, 512, 64]
         sigmoid_bot = -1
@@ -444,6 +541,8 @@ class TestStaticModule(TestCase):
             torch.testing.assert_close(acc_top, ref_top)
 
     def test_trivial_graph(self):
+        # [FUNCTION DOC] Checks the StaticModule output for the simple add/multiply graph with
+        # 2x2 integer tensors equals the scripted result.
         s = torch.full((2, 2), 2)
         tg = torch.jit.script(trivial_graph)
         o_ref = tg(s, s, s)
@@ -452,6 +551,8 @@ class TestStaticModule(TestCase):
         torch.testing.assert_close(o_ref, o_test)
 
     def test_leaky_relu(self):
+        # [FUNCTION DOC] Scripts a leaky relu module with slope 0.1 and checks the StaticModule
+        # output on a random 5x5 tensor matches the scripted output.
         s = torch.randn(5, 5)
         tg = torch.jit.script(nn.LeakyReLU(0.1))
         o_ref = tg(s)
@@ -460,6 +561,10 @@ class TestStaticModule(TestCase):
         torch.testing.assert_close(o_ref, o_test)
 
     def test_attr(self):
+        # [FUNCTION DOC] Checks SetAttr and GetAttr support: the scripted module is
+        # wrapped in StaticModule and its output compared with the eager module on random
+        # 2x2 input; then the benchmark and per-op benchmark APIs are exercised with
+        # positional and keyword inputs.
         """
         TorchScript IR of TestModule() after freezing:
         graph(%self : __torch__.test_static_runtime.___torch_mangle_0.TestModule,
@@ -501,6 +606,9 @@ class TestStaticModule(TestCase):
 
     @unittest.skip("Temporarily disabled")
     def test_fusion_trivial_graph(self):
+        # [FUNCTION DOC] Fuses the trivial graph into a static subgraph, checks the graph
+        # text contains the StaticSubgraph marker, and compares results. Skipped
+        # (temporarily disabled).
         s = torch.full((2, 2), 2)
         tg = torch.jit.script(trivial_graph)
         o_ref = tg(s, s, s)
@@ -512,6 +620,8 @@ class TestStaticModule(TestCase):
 
     @unittest.skip("Temporarily disabled")
     def test_fusion_multihead_attention_layer(self):
+        # [FUNCTION DOC] Fuses the scripted attention module into a static module and compares
+        # its outputs with the pre-fusion reference. Skipped (temporarily disabled).
         HID_DIM = 256
         QUERY_LEN = 8
         BATCH_SIZE = 128
@@ -537,6 +647,8 @@ class TestStaticModule(TestCase):
 
     @unittest.skip("Temporarily disabled")
     def test_fusion_loop(self):
+        # [FUNCTION DOC] Fuses the scripted loop graph, checks for the StaticSubgraph marker and
+        # compares outputs. Skipped (temporarily disabled).
         a = torch.randn(5, 5)
         b = torch.randn(5, 5)
         c = 4
@@ -550,6 +662,8 @@ class TestStaticModule(TestCase):
 
     @unittest.skip("Temporarily disabled")
     def test_fusion_outputs(self):
+        # [FUNCTION DOC] Fuses the scripted dictionary-returning graph, checks for the marker
+        # and compares each dictionary value with the reference. Skipped (temporarily disabled).
         a = torch.randn(2, 2)
         b = torch.randn(2, 2)
         c = 4
@@ -563,15 +677,26 @@ class TestStaticModule(TestCase):
             torch.testing.assert_close(o_ref[i], o_test[i])
 
     def test_create_object(self):
+        # [FUNCTION DOC] Scripts and freezes a module that constructs a user-defined class
+        # instance inside forward, then checks StaticModule gives the same output as the
+        # scripted module.
         class Foo:
+            # [CLASS DOC] HELPER: Plain class holding a tensor attribute x, created inside
+            # scripted code.
             def __init__(self, x: torch.Tensor) -> None:
+                # [FUNCTION DOC] HELPER: Stores the tensor in attribute x.
                 self.x = x
 
         class Mod(torch.nn.Module):
+            # [CLASS DOC] HELPER: Module whose forward builds an instance of the plain class
+            # from the input and returns the input multiplied by the stored tensor.
             def __init__(self) -> None:
+                # [FUNCTION DOC] HELPER: Calls the base constructor only.
                 super().__init__()
 
             def forward(self, y: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC] HELPER: Wraps the input in the plain class and returns the
+                # input times the wrapped tensor.
                 foo = Foo(y)
                 return y * foo.x
 
