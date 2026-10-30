@@ -1,4 +1,9 @@
 # Copyright (c) 2026, Tri Dao.
+# [MODULE DOC] Shared base classes for the GEMM kernels of the vendored quack library. Defines
+# the NamedBarrierGemm id enum, GemmBase (architecture independent epilogue driver, no-op
+# epilogue hooks and tile scheduler argument construction) and GemmTmaBase (TMA atom, copy
+# partition and pipeline factory helpers for SM90 and newer). Importing has no side effects
+# beyond the imports.
 
 import enum
 import math
@@ -28,6 +33,10 @@ from .varlen_utils import VarlenManager
 
 
 class NamedBarrierGemm(enum.IntEnum):
+    # [CLASS DOC] Integer enum of named hardware barrier ids used inside the GEMM kernels.
+    # Members are auto-numbered starting at 1 because barrier 0 is reserved for the whole-
+    # block thread synchronization. Covers epilogue sync, epilogue-load start signal, per-
+    # warpgroup MMA and epilogue barriers, and the tensor-memory pointer exchange.
     Epilogue = enum.auto()  # starts from 1 as barrier 0 is reserved for sync_threads()
     # For mainloop load warps to signal that the epilogue load warp can start.
     # This is to avoid loading C too early, interfering with loading A and B.
@@ -40,17 +49,27 @@ class NamedBarrierGemm(enum.IntEnum):
 
 
 class GemmBase:
+    # [CLASS DOC] Architecture independent part of a GEMM kernel: the epilogue driver loop,
+    # default (empty) epilogue hooks that subclasses or epilogue mixins override, and
+    # scheduler selection. Relies on attributes set by the concrete kernel class
+    # (cta_tile_shape_mnk, cluster_shape_mnk, epi_stage, epi_c_stage, num_epi_warps,
+    # rounding_mode, acc_dtype, d_dtype, is_persistent, gather_A, ...). The class attribute
+    # arch is 0 here and is overridden per architecture.
     """Common non-mainloop pieces shared by GEMM architectures."""
 
     arch = 0
 
     @dataclass
     class EpilogueArguments:
+        # [CLASS DOC] HELPER: Empty dataclass used as the default epilogue argument container;
+        # subclasses or mixins replace it with their own argument type.
         pass
 
     EpilogueParams = ParamsBase
 
     def epi_smem_warp_shape_mnk(self):
+        # [FUNCTION DOC] Returns the epilogue warp tiling as an (M, N, K) triple: all epilogue
+        # warps are laid out along M, with extents 1 along N and K. Reads self.num_epi_warps.
         return (self.num_epi_warps, 1, 1)
 
     @cute.jit
@@ -81,6 +100,21 @@ class GemmBase:
         tidx: Int32,
         is_tma_warp: cutlass.Boolean,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
+        # [FUNCTION DOC] Epilogue driver for one output tile. Compile-time (const_expr) flags
+        # select whether C is used, whether C is loaded through TMA or inline copies, whether
+        # D is stored, whether stores go through a TMA store pipeline, and whether stochastic
+        # rounding is applied (only when rounding mode is RS, accumulator is Float32 and D is
+        # BFloat16). Sequence: set up optional aux outputs; compute the epilogue sub-tile grid
+        # and the number of sub-tiles of previous tiles; call epi_begin; prefetch up to
+        # epi_c_stage sub-tiles of C; then for each sub-tile: load accumulator into registers
+        # via load_acc_subtile, wait for or copy C from shared memory into registers, call
+        # epi_begin_loop, issue the next C prefetch, call epi_visit_subtile, epi_end_loop,
+        # optional aux conversion, convert/copy D (with a seed based rounding copy when
+        # stochastic) and aux outputs to shared memory using a buffer index derived from the
+        # sub-tile count modulo epi_stage, synchronize through epilogue_barrier, and store to
+        # global memory (TMA warp only for the TMA path, otherwise all threads). Finally calls
+        # epi_end. Returns the updated (epi_read_state, epi_producer_state) pair. Side
+        # effects: pipeline acquire/commit/release, barriers, memory writes.
         has_C = const_expr(tRS_rC is not None)
         has_epi_load = const_expr(self.epi_c_stage > 0)
         has_D = const_expr(copy_D is not None)
@@ -270,10 +304,14 @@ class GemmBase:
         return epi_read_state, epi_producer_state
 
     def get_scheduler_class(self, varlen_m: bool = False):
+        # [FUNCTION DOC] Returns the tile scheduler class: the plain tile scheduler, or the
+        # variable-length-M tile scheduler when varlen_m is true. Subclasses may override.
         """Return the scheduler class to use. Override in subclasses for custom schedulers."""
         return TileScheduler if not varlen_m else VarlenMTileScheduler
 
     def resolve_epi_m_major(self, epilogue_args: EpilogueArguments):
+        # [FUNCTION DOC] Hook deciding whether the epilogue sub-tile order is M-major; the
+        # base implementation ignores epilogue_args and always returns true.
         return True
 
     def get_scheduler_arguments(
@@ -285,6 +323,17 @@ class GemmBase:
         varlen_args,
         epilogue_args,
     ):
+        # [FUNCTION DOC] Builds the tile scheduler argument object. Persistence mode is NONE
+        # when the kernel is not persistent; otherwise CLC when arch is at least 100 and CLC
+        # persistence is enabled, DYNAMIC when scheduler_args carries a tile count semaphore,
+        # else STATIC. Without variable-length M (no cu_seqlens_m): the number of problems
+        # (batch) is taken from D's third extent, else B's third extent, else the cu_seqlens_k
+        # length minus one; the tile grid is ceil-division of A's and B's first extents by the
+        # CTA tile M and N; returns TileSchedulerArguments. With variable-length M: asserts
+        # that D or the aux output exists or gather_A is off; the M tile count is left unset,
+        # the problem count is cu_seqlens_m length minus one, total M comes from D, else the A
+        # index array, else A's first extent; returns VarlenMTileSchedulerArguments.
+        # Subclasses may override.
         """Create scheduler arguments. Override in subclasses for custom schedulers."""
         if const_expr(not self.is_persistent):
             persistence_mode = PersistenceMode.NONE
@@ -354,6 +403,9 @@ class GemmBase:
         tRS_rD: cute.Tensor,
         epi_coord,  # (int, int)
     ):
+        # [FUNCTION DOC] Copies one sub-tile of the accumulator registers (selected by the
+        # sub-tile coordinate on the last mode) into the D register fragment using an
+        # automatic vectorized copy.
         cute.autovec_copy(tRS_rAcc[None, None, None, epi_coord], tRS_rD)
 
     @cute.jit
@@ -370,11 +422,15 @@ class GemmBase:
         tidx: Int32,
         tRS_rD_layout=None,
     ) -> Tuple[cute.Tensor, ...]:
+        # [FUNCTION DOC] Hook called once per tile before the sub-tile loop. Base version does
+        # nothing and returns an empty tuple of per-tile epilogue tensors.
         return ()
 
     def epi_begin_loop(
         self, params: EpilogueParams, epi_tensors: Tuple[cute.Tensor, ...], epi_coord: cute.Coord
     ) -> Tuple[cute.Tensor, ...]:
+        # [FUNCTION DOC] Hook called per sub-tile before the visit step. Base version returns
+        # an empty tuple of per-sub-tile tensors.
         return ()
 
     def epi_visit_subtile(
@@ -384,6 +440,8 @@ class GemmBase:
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
+        # [FUNCTION DOC] Hook that transforms the D (and optionally C) register fragment of
+        # one sub-tile. Base version does nothing and returns None, meaning no aux output.
         return None
 
     def epi_visit_acc(
@@ -394,6 +452,8 @@ class GemmBase:
         tile_coord_mnkl: cute.Coord,
         tidx: Int32,
     ) -> None:
+        # [FUNCTION DOC] Hook that may inspect the whole accumulator before the epilogue sub-
+        # tile loop. Base version is a no-op returning None.
         pass
 
     @cute.jit
@@ -409,6 +469,7 @@ class GemmBase:
         varlen_manager,
         tidx,
     ) -> None:
+        # [FUNCTION DOC] Hook called after each sub-tile is visited. Base version is a no-op.
         pass
 
     @cute.jit
@@ -423,16 +484,22 @@ class GemmBase:
         varlen_manager,
         tidx,
     ) -> None:
+        # [FUNCTION DOC] Hook called once after all sub-tiles of a tile. Base version is a no-
+        # op.
         pass
 
     def epi_to_underlying_arguments(
         self, args: EpilogueArguments, *, loc=None, ip=None
     ) -> EpilogueParams:
+        # [FUNCTION DOC] Converts user epilogue arguments into the kernel parameter object.
+        # Base version ignores the arguments and returns a default-constructed EpilogueParams.
         return self.EpilogueParams()
 
     def epi_get_tma_atoms(
         self, params: EpilogueParams, *, loc=None, ip=None
     ) -> list[cute.CopyAtom]:
+        # [FUNCTION DOC] Returns the list of extra TMA copy atoms needed by the epilogue;
+        # empty in the base class. Subclasses can override.
         """Subclasses can override this."""
         return []
 
@@ -444,10 +511,14 @@ class GemmBase:
         varlen_manager,
         epi_pipeline,
     ):
+        # [FUNCTION DOC] Hook returning the global-to-shared copy functions for extra epilogue
+        # operands. Base version returns an empty tuple.
         return ()
 
     @cute.jit
     def epi_tile_load_s2r(self, params, epi_tensors, stage_idx):
+        # [FUNCTION DOC] Hook that loads extra epilogue operands from shared memory into
+        # registers for the given pipeline stage. Base version is a no-op.
         pass
 
     @staticmethod
@@ -457,12 +528,18 @@ class GemmBase:
         epi_tile: cute.Tile,
         warp_shape_mnk: Tuple[int, int, int] | None = None,
     ) -> EpiSmemBytes:
+        # [FUNCTION DOC] Static hook reporting the shared memory bytes needed by the epilogue
+        # operands. Base version ignores its arguments and returns a default EpiSmemBytes.
         return EpiSmemBytes()
 
     def epi_get_smem_struct(self, params: EpilogueParams):
+        # [FUNCTION DOC] Returns the shared memory struct type for epilogue operands; the base
+        # version returns an empty memory range of Int32 as a dummy.
         return cute.struct.MemRange[Int32, 0]  # Dummy struct
 
     def epi_get_smem_tensors(self, params: EpilogueParams, storage) -> Dict[str, cute.Tensor]:
+        # [FUNCTION DOC] Maps names to shared memory tensors for epilogue operands; the base
+        # version ignores its arguments and returns an empty mapping.
         return {}
 
     def epi_setup_aux_out(
@@ -475,6 +552,8 @@ class GemmBase:
         varlen_manager,
         tidx,
     ):
+        # [FUNCTION DOC] Hook that prepares auxiliary output copies. The default epilogue has
+        # no aux output, so it returns None; the driver then skips all aux output work.
         """Default epilogue has no aux output."""
         return None
 
@@ -482,11 +561,19 @@ class GemmBase:
     def epi_convert_aux_out(
         self, tRS_rAuxOut, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
     ):
+        # [FUNCTION DOC] Hook converting an aux output fragment from the accumulator dtype to
+        # the output dtype. Base version returns the fragment unchanged; override for custom
+        # post-processing.
         """Convert aux output from acc_dtype to output dtype. Override for custom postprocessing."""
         return tRS_rAuxOut
 
 
 class GemmTmaBase(GemmBase):
+    # [CLASS DOC] Extension of GemmBase for SM90 and newer GEMMs. Provides the TMA mainloop
+    # load loop, tiled copy for cp.async loads of A, TMA atom/tensor construction for A, B, D
+    # and C, the epilogue global-memory copy partition, and factories for the A/B, epilogue
+    # load and epilogue store pipelines. Needs the concrete class to supply gather_A, tile and
+    # cluster shapes, stage counts, shared memory layouts and multicast CTA counts.
     """Common TMA descriptor and pipeline helpers for SM90+ GEMM paths."""
 
     @cute.jit
@@ -497,6 +584,11 @@ class GemmTmaBase(GemmBase):
         copy_fns: Sequence[Optional[Callable]],
         k_tile_cnt: Int32,
     ) -> cutlass.pipeline.PipelineState:
+        # [FUNCTION DOC] Producer loop of the TMA mainloop. For each of k_tile_cnt tiles:
+        # acquire the pipeline slot (peeking ahead with a non-blocking try-acquire for the
+        # next slot), get the transaction barrier pointer, run every non-None copy function
+        # with the tile index, stage index and barrier pointer, commit (a no-op for TMA
+        # pipelines) and advance the producer state. Returns the final producer state.
         # Peek (try_wait) AB buffer empty for k_block = prefetch_k_tile_cnt.
         peek_empty_status = Boolean(True)
         if 0 < k_tile_cnt:
@@ -520,6 +612,12 @@ class GemmTmaBase(GemmBase):
         return producer_state
 
     def _make_gmem_tiled_copy_A(self, dtype, major_mode, num_threads, copy_bits=128):
+        # [FUNCTION DOC] HELPER: Builds a tiled cp.async global-to-shared copy for operand A.
+        # Each copy moves copy_bits bits (128 by default). The thread layout puts threads
+        # along the contiguous dimension (K for row-major, otherwise M), with the per-row
+        # thread count clamped by the gcd with the number of loads per 128-byte cache line
+        # when it exceeds that. The value layout is one row of copy_elems elements for row-
+        # major, else one column. Returns the tiled copy.
         atom_async_copy = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
             dtype,
@@ -557,6 +655,11 @@ class GemmTmaBase(GemmBase):
         b_smem_layout: cute.ComposedLayout,
         varlen_k: bool,
     ):
+        # [FUNCTION DOC] Creates TMA atoms and tensors for A and B. A is skipped (both results
+        # None) when gather_A is set. With variable-length K, A and B are first wrapped as
+        # ragged tensors along dimension 1. Tile shapes are (CTA M, CTA K) for A and (CTA N,
+        # CTA K) for B; multicast extents are the cluster N size for A and cluster M size for
+        # B. Returns (tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b).
         tma_atom_a, tma_tensor_a = None, None
         if const_expr(not self.gather_A):
             tma_atom_a, tma_tensor_a = self._make_tma_atoms_and_tensors(
@@ -582,6 +685,11 @@ class GemmTmaBase(GemmBase):
         epilogue_args,
         varlen_m: bool,
     ):
+        # [FUNCTION DOC] Creates TMA atoms and tensors for the epilogue operands. For D (if
+        # given): wraps as a ragged tensor along dimension 0 with pointer shift when varlen_m,
+        # and chooses a reduce-add store when epilogue_args has a truthy add_to_output
+        # attribute, else a plain store. For C (if given): a load atom. Missing operands yield
+        # None for both entries. Returns (tma_atom_d, tma_tensor_d, tma_atom_c, tma_tensor_c).
         tma_atom_d, tma_tensor_d = None, None
         if const_expr(mD is not None):
             tma_atom_d, tma_tensor_d = self._make_tma_epi_atoms_and_tensors(
@@ -610,6 +718,11 @@ class GemmTmaBase(GemmBase):
         sD: cute.Tensor,
         tile_coord_mnkl: cute.Coord,
     ) -> Tuple[cute.Tensor, cute.Tensor]:
+        # [FUNCTION DOC] Builds the shared/global copy function for the epilogue. Tiles D by
+        # the CTA tile at the M,N tile coordinate and divides it by the epilogue tile. If the
+        # atom is a TMA shared-to-global store or reduce op, the source is shared memory and
+        # the destination global; otherwise the reverse. Returns the result of the TMA copy-
+        # function helper for a single-CTA layout.
         gD = cute.local_tile(mD_mn, tile_shape_mn, tile_coord_mnkl[:2])  # (bM, bN)
         tDgD_for_tma_partition = cute.zipped_divide(gD, epi_tile)
         is_s2g = isinstance(
@@ -631,6 +744,12 @@ class GemmTmaBase(GemmBase):
         tiled_mma: cute.TiledMma,
         cluster_layout_vmnk: cute.Layout,
         ab_pipeline_mbar_ptr: cute.Pointer,
+        # [FUNCTION DOC] Creates the A/B mainloop pipeline. Producer group size is 1, or 1
+        # plus 32 per A-loading warp when gather_A is set. Consumer arrive count is the
+        # multicast factor (A plus B multicast CTAs minus one) times the number of warps in
+        # the tiled MMA. Uses the plain TMA async pipeline, or the TMA plus cp.async pipeline
+        # when gather_A is set, with ab_stage stages, the TMA byte count, the cluster layout
+        # and deferred sync. Returns it.
     ):
         # Threads/warps participating in this pipeline
         producer_cnt = 1 if const_expr(not self.gather_A) else 1 + self.num_ab_load_warps * 32
@@ -657,6 +776,10 @@ class GemmTmaBase(GemmBase):
         epi_pipeline_mbar_ptr: cute.Pointer,
         tx_count: int,
     ):
+        # [FUNCTION DOC] Creates the pipeline used to load C through TMA: a one-thread
+        # producer group, a consumer group whose arrive count is the number of epilogue warps,
+        # epi_c_stage stages, the given transaction byte count and deferred sync. Returns the
+        # pipeline.
         epi_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         # Each warp will contribute 1 to the arrive count
         consumer_arrive_cnt = self.num_epi_warps
@@ -673,6 +796,8 @@ class GemmTmaBase(GemmBase):
         )
 
     def make_epi_store_pipeline(self):
+        # [FUNCTION DOC] Creates the TMA store pipeline with epi_stage stages; the producer
+        # group has one entry per epilogue thread (epilogue warps times warp size).
         num_epi_threads = self.num_epi_warps * cute.arch.WARP_SIZE
         epi_store_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, num_epi_threads)
         return pipeline.PipelineTmaStore.create(
@@ -686,6 +811,11 @@ class GemmTmaBase(GemmBase):
         epi_tile: Tuple[int, int],
         op_type: Literal["store", "load", "add"],
     ) -> Tuple[cute.CopyAtom, cute.Tensor]:
+        # [FUNCTION DOC] HELPER: Static; builds the TMA atom and TMA tensor for the epilogue.
+        # op_type must be load, store or add (checked with an assertion); it selects a bulk
+        # global-to-shared load, a shared-to-global store, or a shared-to-global add
+        # reduction. Uses the first stage of the staged shared layout and the identity layout
+        # of the tensor composed with the epilogue tile. Returns (atom, tma tensor).
         """Create TMA atoms and tensors for storing D or loading C."""
         assert op_type in ["load", "store", "add"]
         epi_smem_layout = cute.slice_(epi_smem_layout_staged, (None, None, 0))
@@ -707,6 +837,9 @@ class GemmTmaBase(GemmBase):
         smem_tile: Tuple[int, int],
         mcast_dim: int,
     ) -> Tuple[cute.CopyAtom, cute.Tensor]:
+        # [FUNCTION DOC] HELPER: Static; builds the TMA atom and TMA tensor for a mainloop
+        # input operand. Uses the multicast load op when mcast_dim is not 1, else the plain
+        # load op, and passes mcast_dim as the multicast count. Returns (atom, tma tensor).
         """Create TMA atoms and tensors for input tensors."""
         op = (
             cpasync.CopyBulkTensorTileG2SOp()

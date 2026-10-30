@@ -1,4 +1,10 @@
 # Copyright (c) 2026, Tri Dao.
+# [MODULE DOC] Torch facing wrapper around the SM100 MXFP8 blockscaled GEMM kernel. Accepts
+# float8 e4m3 operands with e8m0 per-32-element scales, validates and repacks them into the
+# kernel layout, compiles (with an LRU cache) a kernel per shape/config and runs it. Also
+# offers quantization helpers, a cuBLAS (scaled matmul) reference and a pure dequantize-and-
+# matmul reference. Import has no side effects beyond defining a scale vector size constant
+# and a torch-to-cutlass dtype table for bf16, fp16 and fp32 outputs.
 """PyTorch-friendly interface for the SM100 MXFP8 blockscaled GEMM.
 
 Shape / layout conventions (matches torch.matmul, torch._scaled_mm, cuBLAS):
@@ -43,6 +49,9 @@ _TORCH_TO_CUTLASS_D = {
 
 
 def _default_tiler_cluster(m: int, n: int) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    # [FUNCTION DOC] HELPER: Picks default MMA tiler and cluster shape: tiler 256x128 with
+    # cluster 2x1 when m is at least 512 and n at least 128, else tiler 128x128 with cluster
+    # 1x1. Returns (tiler, cluster).
     """Pick a reasonable default (mma_tiler_mn, cluster_shape_mn)."""
     if m >= 512 and n >= 128:
         return (256, 128), (2, 1)
@@ -61,6 +70,13 @@ def _compile_cached(
     ab_dtype_cutlass,
     sf_dtype_cutlass,
 ):
+    # [FUNCTION DOC] HELPER: Cached (LRU, 64 entries) compile of the blockscaled GEMM for a
+    # fixed problem shape, tiler, cluster, output dtype and cutlass dtypes. Builds
+    # uninitialized CUDA fake tensors in kernel layouts: A and B as float8 K-major views, D as
+    # an N-major view, and scale buffers with the blocked 512-element tile layout (row tiles
+    # of 128 and K tiles of 4 scale columns), wraps scales with the kernel view helper, then
+    # calls the tvm-ffi compile helper. Returns the compiled runner. Allocates device memory;
+    # requires CUDA.
     """Compile kernel for a given (shape, dtype, tiler, cluster) and cache it."""
     dev = torch.device("cuda")
     rm = ceil_div(m, 128)
@@ -91,6 +107,8 @@ def _compile_cached(
 
 
 def _as_3d(x: Tensor, ndim_in: int) -> Tensor:
+    # [FUNCTION DOC] HELPER: Returns x with a new leading batch dimension of size one if
+    # ndim_in is 2 (a view), otherwise returns x unchanged.
     """Add a leading batch dim if input is 2D. Returns a view."""
     if ndim_in == 2:
         return x.unsqueeze(0)
@@ -103,6 +121,14 @@ def _to_kernel_layout(
     A_scale: Tensor,
     B_scale: Tensor,
 ) -> Tuple[int, int, int, int, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, bool]:
+    # [FUNCTION DOC] HELPER: Validates and normalizes inputs for the kernel. Checks (via
+    # assertions, so failures raise AssertionError) the float8 e4m3 dtypes of A and B, the
+    # e8m0 dtype of the scales, matching batch and K, K divisible by 32, K-contiguity of A, B
+    # (after transposing the last two dims) and of both scales, and the expected scale shapes.
+    # Makes row-major contiguous copies, permutes them to (m, k, l) / (n, k, l) views, packs
+    # both scales into the blocked layout and builds kernel scale views. Returns (m, n, k, l,
+    # A view, B view, packed scale A, packed scale B, scale view A, scale view B, was_2d)
+    # where was_2d records that the inputs had no batch dimension.
     """Normalize shapes/strides, validate, and repack scales. Returns
     (m, n, k, l, mA_mkl, mB_nkl, sc_contig_A, sc_contig_B, sfa_view, sfb_view, was_2d).
 
@@ -163,6 +189,13 @@ def mxfp8_gemm_out(
     mma_tiler_mn: Optional[Tuple[int, int]] = None,
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
 ) -> None:
+    # [FUNCTION DOC] Runs the blockscaled GEMM writing into the caller's output tensor.
+    # Validates inputs through the layout helper, requires the output dtype to be in the
+    # supported table, the output shape to be (m, n) or (l, m, n) matching the input rank, and
+    # the output to be contiguous (assertions). Fills in default tiler/cluster for whichever
+    # is None. Raises ValueError if the SM100 kernel class reports the configuration cannot be
+    # implemented. Otherwise fetches the cached compiled runner and launches it on the
+    # operands. Returns None; output is written in place.
     """MXFP8 blockscaled GEMM with pre-allocated output. See module doc for shape conventions."""
     m, n, k, l, mA, mB, _scA, _scB, sfa, sfb, was_2d = _to_kernel_layout(A, B, A_scale, B_scale)
     out_dtype = out.dtype
@@ -223,6 +256,9 @@ def mxfp8_gemm(
     mma_tiler_mn: Optional[Tuple[int, int]] = None,
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Convenience wrapper: when out is None, allocates an empty output of shape
+    # (M, N) or (L, M, N) on A's device with dtype out_dtype, then calls the in-place variant
+    # with the optional tiler and cluster. Returns the output tensor.
     """MXFP8 blockscaled GEMM. Allocates output if not provided."""
     if out is None:
         # A: (M,K) or (L,M,K); B: (K,N) or (L,K,N); out: (M,N) or (L,M,N)
@@ -244,6 +280,9 @@ def mxfp8_gemm(
 
 
 def mxfp8_quantize(x: Tensor) -> Tuple[Tensor, Tensor]:
+    # [FUNCTION DOC] Asserts the last dimension is divisible by 32, then quantizes the
+    # contiguous tensor to MXFP8 via the mx_utils quantizer with block size 32. Returns
+    # (float8 data with the input shape, e8m0 scales with the last dim divided by 32).
     """Quantize a (..., K) bf16/fp32 tensor to MXFP8. Returns (qdata, scale_2d)
     in torchao-convention layout. Last dim (K) must be divisible by 32."""
     assert x.shape[-1] % _SF_VEC_SIZE == 0, (
@@ -261,6 +300,10 @@ def mxfp8_gemm_quantize(
     mma_tiler_mn: Optional[Tuple[int, int]] = None,
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
 ) -> Tensor:
+    # [FUNCTION DOC] Quantizes A (shape M,K or L,M,K) and B given as (N,K) or (L,N,K) to
+    # MXFP8, transposes B's data and scales into the K-contiguous (K,N) convention, and calls
+    # the GEMM wrapper with the given out, out_dtype, tiler and cluster. Returns the output
+    # tensor of shape (M,N) or (L,M,N).
     """High-level: quantize bf16 A, B_as_NK to MXFP8, then run C = A @ B_as_NK.mT.
     Inputs: A=(M,K)/(L,M,K), B_as_NK=(N,K)/(L,N,K) bf16/fp32. Quantization
     scales along the last (K) dim. Returned output has shape (M,N)/(L,M,N)."""
@@ -287,6 +330,11 @@ def mxfp8_gemm_cublas(
     B_scale: Tensor,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> Tensor:
+    # [FUNCTION DOC] Reference path using the framework scaled matmul with blocked scales.
+    # Normalizes inputs via the layout helper (so the same assertions apply) and asserts the
+    # batch size is 1. Squeezes any batch dimension from A and B, converts the packed scales
+    # to the cuBLAS blocked form, runs the scaled matmul with out_dtype, and re-adds the batch
+    # dimension if the inputs were 3D. Returns the output.
     """Reference path via torch._scaled_mm. Requires l=1 (or 2D inputs)."""
     m, n, k, l, _mA, _mB, sc_A, sc_B, _sfa, _sfb, was_2d = _to_kernel_layout(A, B, A_scale, B_scale)
     assert l == 1, "torch._scaled_mm MXFP8 path is 2D only; pass 2D inputs or l=1"
@@ -312,6 +360,11 @@ def mxfp8_gemm_ref(
     B_scale: Tensor,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> Tensor:
+    # [FUNCTION DOC] Pure PyTorch reference: promotes inputs to float32 (adding a batch
+    # dimension if needed), transposes B and its scale so K is last, dequantizes by
+    # multiplying each value with its scale repeated 32 times along K, contracts over K with
+    # an einsum and casts to out_dtype. Squeezes the batch dimension for 2D inputs. No shape
+    # validation is performed.
     """Dequantize + plain matmul reference. A=(M,K), B=(K,N)."""
     was_2d = A.dim() == 2
     # (l, m, k)

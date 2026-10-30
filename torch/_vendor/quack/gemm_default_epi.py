@@ -1,4 +1,8 @@
 # Copyright (c) 2025, Wentao Guo, Tri Dao.
+# [MODULE DOC] Default GEMM epilogue for quack: scaling by alpha, optional addition of C
+# scaled by beta, and optional row/column vector broadcast addition. Provides the mixin
+# GemmDefaultEpiMixin and concrete kernel classes for SM80, SM90, SM100 and SM120 formed by
+# combining it with the corresponding GEMM class. No import-time side effects.
 from typing import NamedTuple, Optional
 
 import cutlass
@@ -18,6 +22,11 @@ from . import utils
 
 
 class GemmDefaultEpiMixin(ComposableEpiMixin):
+    # [CLASS DOC] Composable epilogue mixin implementing D = alpha * acc + beta * C plus
+    # broadcast row and column vectors. Declares its epilogue operands (scalars alpha, beta
+    # and the stochastic rounding seed, a row vector load and a column vector load) and an
+    # argument tuple type. The parameter type is generated from those operands. Stores the
+    # rounding mode on the instance when arguments are converted.
     _epi_ops = (
         Scalar("alpha"),
         Scalar("beta"),
@@ -28,6 +37,10 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
 
     @mlir_namedtuple
     class EpilogueArguments(NamedTuple):
+        # [CLASS DOC] Named tuple of user epilogue arguments, all optional: alpha and beta
+        # (scalar or tensor), row and column broadcast vectors, compile-time add_to_output
+        # flag (default false), compile-time rounding mode (default round to nearest) and
+        # sr_seed for stochastic rounding.
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
@@ -39,6 +52,11 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
     # EpilogueParams auto-generated from _epi_ops
 
     def epi_to_underlying_arguments(self, args, *, loc=None, ip=None):
+        # [FUNCTION DOC] Converts epilogue arguments into kernel parameters: saves the
+        # rounding mode on self, builds the parameter dictionary from the declared operands,
+        # and for the row and column vector entries that are present and listed in the
+        # instance concat layout rewrites the tensor from concatenated to interleaved layout
+        # along mode 1. Returns the parameter object built from the dictionary.
         self.rounding_mode = args.rounding_mode
         d = self._epi_ops_to_params_dict(args)
         for key in ("mRowVecBroadcast", "mColVecBroadcast"):
@@ -54,6 +72,13 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
         tRS_rD: cute.Tensor,
         tRS_rC: Optional[cute.Tensor] = None,
     ) -> Optional[cute.Tensor]:
+        # [FUNCTION DOC] Per sub-tile compute (JIT). Loads the accumulator fragment,
+        # multiplies by alpha if params has a non-None alpha (read as a scalar or through a
+        # pointer), then if a C fragment is present adds it converted to the D element type,
+        # scaled by beta when beta is set, else with unit weight. Stores the result back into
+        # the D fragment, then adds the row vector and column vector fragments element by
+        # element when they are active. Returns None (no aux output). Mutates the D register
+        # fragment in place.
         # Use .get(): inactive ops are filtered out of epi_loop_tensors.
         alpha = epi_loop_tensors.get("alpha")
         beta = epi_loop_tensors.get("beta")
@@ -83,16 +108,20 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
 
 
 class GemmDefaultSm80(GemmDefaultEpiMixin, GemmSm80):
+    # [CLASS DOC] SM80 GEMM kernel with the default epilogue mixin.
     pass
 
 
 class GemmDefaultSm90(GemmDefaultEpiMixin, GemmSm90):
+    # [CLASS DOC] SM90 GEMM kernel with the default epilogue mixin.
     pass
 
 
 class GemmDefaultSm100(GemmDefaultEpiMixin, GemmSm100):
+    # [CLASS DOC] SM100 GEMM kernel with the default epilogue mixin.
     pass
 
 
 class GemmDefaultSm120(GemmDefaultEpiMixin, GemmSm120):
+    # [CLASS DOC] SM120 GEMM kernel with the default epilogue mixin.
     pass
