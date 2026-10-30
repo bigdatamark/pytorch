@@ -1,4 +1,14 @@
 # Owner(s): ["module: decompositions"]
+# [MODULE DOC] Tests that operator decompositions (torch._decomp and the inductor
+# decomposition table) agree numerically with the native ATen kernels. Provides a
+# TorchDispatchMode that runs each decomposable op both ways and compares results (strict
+# tolerance for most dtypes, or an error-versus-float64 comparison for float16/bfloat16),
+# driven over OpInfo samples (forward and backward), plus one-off correctness tests and tests
+# about decomposition-table coverage. Import-time side effects: builds the lists of
+# decomposable OpInfos from the global tables; defines module-level tolerance tables,
+# exclusion sets and expected-failure sets (the core backward set is extended when slow tests
+# are not enabled); creates global counters of called and decomposed ops; and instantiates the
+# device-generic test classes TestDecomp and DecompOneOffTests into this module's namespace.
 
 import functools
 import itertools
@@ -53,6 +63,9 @@ aten = torch.ops.aten
 
 # TODO: this isn't going to work with non-aten namespaces
 def overload_to_aten_name(op):
+    # [FUNCTION DOC] HELPER: Returns the bare ATen operator name of an overload, taken from
+    # the part of the schema name after the namespace separator. Only valid for names with a
+    # namespace prefix (a todo notes it does not work for non-aten namespaces).
     return op._schema.name.split("::")[1]
 
 
@@ -82,7 +95,15 @@ _sdpa_op_info = [op for op in op_db if "scaled_dot_product_attention" in op.aten
 
 
 def diff_arg(arg, requires_grad=True):
+    # [FUNCTION DOC] HELPER: Decides whether a test argument takes part in differentiation. A
+    # tensor is differentiable if it requires grad (when requires_grad is true) or if it has a
+    # floating point or complex dtype (when false). For an iterable of tensors, returns true
+    # if all elements qualify and false if none do, and raises RuntimeError for a mix. Any
+    # non-tensor, non-iterable argument yields false.
     def is_differentiable_arg(arg):
+        # [FUNCTION DOC] HELPER: Closure over requires_grad. Returns whether one tensor
+        # requires grad, or, when the enclosing flag is false, whether it is floating point or
+        # complex.
         if requires_grad:
             return arg.requires_grad
         else:
@@ -105,6 +126,11 @@ def diff_arg(arg, requires_grad=True):
 def _autograd_grad(
     outputs, inputs, grad_outputs=None, retain_graph=False, create_graph=True
 ):
+    # [FUNCTION DOC] HELPER: Variant of torch.autograd.grad that accepts pytree inputs whose
+    # leaves are all tensors. Only inputs requiring grad (and outputs requiring grad, paired
+    # with their grad_outputs when given) take part; the underlying call allows unused inputs.
+    # Returns the gradients restructured like inputs, with zero tensors for inputs that do not
+    # require grad or were unused. create_graph defaults to true and retain_graph to false.
     inputs, inputs_spec = tree_flatten(inputs)
     diff_inputs = tuple(inp for inp in inputs if inp.requires_grad)
     if grad_outputs is None:
@@ -140,15 +166,24 @@ def _autograd_grad(
 
 
 def _as_tuple(val):
+    # [FUNCTION DOC] HELPER: Returns the value unchanged if it is a tuple, else wraps it in a
+    # one-element tuple.
     if isinstance(val, tuple):
         return val
     return (val,)
 
 
 def ref_vjp_no_create(f, *primals):
+    # [FUNCTION DOC] HELPER: Reference vector-Jacobian product without graph creation. Runs f
+    # on the primals and returns the result together with a function mapping cotangents to
+    # input gradients, computed via _autograd_grad with create_graph false and retain_graph
+    # true so it can be applied repeatedly.
     result = f(*primals)
 
     def wrapped(cotangents):
+        # [FUNCTION DOC] HELPER: Closure returned by ref_vjp_no_create. Takes cotangents
+        # (single value or tuple) and returns the gradients of the captured result with
+        # respect to the captured primals, using _autograd_grad without graph creation.
         return _autograd_grad(
             _as_tuple(result),
             primals,
@@ -174,6 +209,9 @@ dtype_precisions = {
 
 
 def _getDefaultRtolAndAtol(dtype0, dtype1):
+    # [FUNCTION DOC] HELPER: Returns the default relative and absolute tolerances for
+    # comparing two dtypes: the larger rtol and the larger atol among the dtype_precisions
+    # entries of each dtype (dtypes missing from the table count as zero).
     rtol = max(
         dtype_precisions.get(dtype0, (0, 0))[0], dtype_precisions.get(dtype1, (0, 0))[0]
     )
@@ -232,6 +270,14 @@ op_assert_ref_tol_table = {
 
 
 def op_assert_ref(test_case, op, test_dtype, i, orig, decomp, ref, args, kwargs):
+    # [FUNCTION DOC] HELPER: Checks one decomposition output against the native output using a
+    # higher-precision reference. Raises AssertionError on a dtype mismatch, on a numel
+    # mismatch when either output is empty (and returns when both are empty), or on a shape
+    # mismatch. If the reference is floating point, computes the max absolute error of each
+    # output against it and raises RuntimeError if the decomposition error exceeds the native
+    # error plus a tolerance looked up by dtype and op in op_assert_ref_tol_table (default
+    # 1e-7), with a message listing args and kwargs. For non-floating references it asserts
+    # the two outputs are equal via the test case.
     if orig.dtype != decomp.dtype:
         raise AssertionError(
             f"{i} Operation: {op} dtype mismatch: {orig.dtype} != {decomp.dtype}"
@@ -307,6 +353,10 @@ op_assert_equal_tol_table = {
 
 
 def op_assert_equal(test_case, op, test_dtype, orig, decomp, args, kwargs):
+    # [FUNCTION DOC] HELPER: Strict comparison of native and decomposed outputs. Asserts equal
+    # dtypes, then asserts equal values with rtol and atol taken from
+    # op_assert_equal_tol_table keyed by decomposition dtype and op, or else from the default
+    # tolerances of both dtypes. Failure messages include the op name, args and kwargs.
     test_case.assertEqual(
         orig.dtype,
         decomp.dtype,
@@ -334,6 +384,12 @@ def op_assert_equal(test_case, op, test_dtype, orig, decomp, args, kwargs):
 def normalize_op_input_output2(
     f, args, kwargs, output_process_fn_grad=None, requires_grad=True
 ):
+    # [FUNCTION DOC] HELPER: Wraps f into a function over only the differentiable positional
+    # inputs. Flattens args as a pytree, selects leaves that diff_arg accepts (raising
+    # AssertionError if there are none), and returns the wrapper and the tuple of those leaves
+    # as primals. The wrapper substitutes new values for those leaves, rebuilds args, calls f
+    # with kwargs, applies output_process_fn_grad if given, and for tuple results keeps only
+    # floating or complex tensor outputs (AssertionError if none remain).
     flat_args, args_spec = tree_flatten(args)
     diff_argnums = tuple(
         i
@@ -346,6 +402,10 @@ def normalize_op_input_output2(
 
     @functools.wraps(f)
     def wrapped(*primals):
+        # [FUNCTION DOC] HELPER: Closure returned by normalize_op_input_output2 (it keeps the
+        # name and metadata of f). Takes replacement values for the differentiable leaves,
+        # runs f on the rebuilt arguments and returns the processed, filtered result as
+        # described there.
         _args = list(flat_args)
         for num, arg in zip(diff_argnums, primals):
             _args[num] = arg
@@ -370,6 +430,9 @@ def normalize_op_input_output2(
 # NB: This also upcasts dtype arguments
 # TODO: handle complex correctly
 def upcast_tensor(x, dtype=torch.float32):
+    # [FUNCTION DOC] HELPER: Converts a floating point tensor to the given dtype (default
+    # float32); a dtype argument equal to float16, bfloat16 or float32 is replaced by that
+    # dtype; any other value is returned unchanged. A todo says complex is not handled.
     if isinstance(x, Tensor) and x.dtype.is_floating_point:
         return x.to(dtype=dtype)
     elif isinstance(x, torch.dtype) and x in [
@@ -383,6 +446,10 @@ def upcast_tensor(x, dtype=torch.float32):
 
 
 def normalize_op_input_output(f, sample, requires_grad=True):
+    # [FUNCTION DOC] HELPER: Convenience wrapper that builds the positional argument tuple
+    # (input followed by args) from a sample input and delegates to normalize_op_input_output2
+    # with the sample kwargs and its gradient output processing function. Returns the wrapper
+    # and primals.
     args = tuple([sample.input] + list(sample.args))
     return normalize_op_input_output2(
         f,
@@ -490,7 +557,14 @@ atexit.register(dump_ops)
 
 
 def any_unsupported(args, kwargs):
+    # [FUNCTION DOC] HELPER: Returns true if any leaf of args and kwargs is something
+    # decompositions are not expected to handle: a plain tensor or parameter that is sparse,
+    # sparse CSR, mkldnn, quantized, nested or a functional tensor, or any other tensor-like
+    # object (such as a subclass). Otherwise false.
     def test_unsupported(t):
+        # [FUNCTION DOC] HELPER: Predicate for one leaf. For exact tensor or parameter types
+        # returns true if it has any unsupported layout or wrapper property; for other tensor-
+        # like objects returns true; otherwise false.
         if type(t) is torch.Tensor or type(t) is torch.nn.Parameter:
             # These are all things that we haven't coded decompositions
             # to handle correctly.  Maybe they should.
@@ -576,6 +650,10 @@ comprehensive_failures = {
 
 @unMarkDynamoStrictTest
 class TestDecomp(TestCase):
+    # [CLASS DOC] Device-generic tests running decomposition cross-reference checks and a few
+    # targeted comparisons (instantiated per device type at import). Sets long messages on.
+    # Holds the nested DecompCrossRefMode, and the shared drivers check_decomposed and
+    # do_cross_ref used by the OpInfo-based tests.
     longMessage = True
 
     # NB: This actually overlaps with test_comprehensive, but it only
@@ -586,6 +664,10 @@ class TestDecomp(TestCase):
     @suppress_warnings
     @ops(_decomp_test_ops)
     def test_quick(self, device, dtype, op):
+        # [FUNCTION DOC] Quick cross-reference run over OpInfos known to have decompositions:
+        # calls do_cross_ref with run_all false, so each sample is checked and the op must
+        # actually have been decomposed. Runs only on native device types and is skipped under
+        # cross-ref mode.
         self.do_cross_ref(device, dtype, op, run_all=False)
 
     @skipOps(core_backward_failures)
@@ -594,6 +676,10 @@ class TestDecomp(TestCase):
     @suppress_warnings
     @ops(_decomp_test_ops_core_autograd, allowed_dtypes=(torch.float64,))
     def test_quick_core_backward(self, device, dtype, op):
+        # [FUNCTION DOC] Checks decompositions of core ATen ops with autograd in float64 using
+        # gradcheck. Skips when the op appears in the backward exclusion set. For each sample
+        # input with requires_grad, runs gradcheck of the op under DecompCrossRefMode and the
+        # Python dispatcher, then asserts via check_decomposed that the op was decomposed.
         test_keys = [
             (torch.device(device).type, dtype, op.name),
             (None, dtype, op.name),
@@ -622,9 +708,17 @@ class TestDecomp(TestCase):
     @suppress_warnings
     @ops(op_db)
     def test_comprehensive(self, device, dtype, op):
+        # [FUNCTION DOC] Comprehensive cross-reference run over every OpInfo (skipped under
+        # ASAN and for expected failures) calling do_cross_ref with run_all true, which also
+        # checks recursive decompositions but does not require the op itself to be decomposed.
         self.do_cross_ref(device, dtype, op, run_all=True)
 
     def test_hann_window_decomp(self, device):
+        # [FUNCTION DOC] Compares the hann_window decomposition to the native kernel for
+        # window lengths 0, 1, 8 and 9 (default periodic form), for the periodic overload with
+        # both flag values, and for float64 dtype forwarding (checking the result dtype too).
+        # KNOWN ISSUE: the leading comment promises coverage of the out and periodic_out
+        # overloads, but the test only exercises the default and periodic overloads.
         # Verify the hann_window decomp matches the native kernel for all four
         # overloads: .default, .periodic, .out, .periodic_out.
         from torch._decomp.decompositions import hann_window, hann_window_periodic
@@ -648,6 +742,9 @@ class TestDecomp(TestCase):
         self.assertEqual(res.dtype, torch.float64)
 
     def test_uniform(self, device):
+        # [FUNCTION DOC] Seeds the RNG with 123, calls the native uniform op on a random
+        # float32 tensor, reseeds, calls the decomposition with the same bounds (0.3 to 0.9),
+        # and asserts equal outputs.
         size = (2, 3, 4, 5)
         dtype = torch.float32
         x = make_tensor(size, dtype=dtype, device=device)
@@ -661,6 +758,10 @@ class TestDecomp(TestCase):
         self.assertEqual(ref, res)
 
     def test_bernoulli_default(self, device):
+        # [FUNCTION DOC] Draws bernoulli samples from a 5x5 tensor of probability 0.3 with the
+        # native op and the decomposition under the same seed, and asserts the sample means
+        # are within a loose tolerance (6 percent) rather than elementwise equal.
+        # KNOWN ISSUE: the device argument is unused; the probability tensor is always on CPU.
         p = 0.3
         p_t = p * torch.ones(5, 5)
         torch.manual_seed(123)
@@ -672,10 +773,16 @@ class TestDecomp(TestCase):
         self.assertEqual(ref_p, res_p, atol=0.06 * p, rtol=0.06)
 
     def test_broadcasting_index_copy(self, device):
+        # [FUNCTION DOC] Checks the index_copy_ decomposition broadcasts its source: copies a
+        # 1x10 tensor into row zero of a 2x10 ones tensor in place, and compares to manually
+        # assigning that row.
         x = torch.zeros([1, 10], device=device)
         xs = torch.ones([2, 10], device=device)
 
         def index_copy(xs, x):
+            # [FUNCTION DOC] HELPER: Calls the decomposition of in-place index_copy_ on xs
+            # along dim 0 with a scalar zero index on the device and source x. Mutates xs;
+            # returns nothing.
             torch._decomp.decompositions.index_copy_(
                 xs, 0, torch.tensor(0).to(device), x
             )
@@ -688,6 +795,9 @@ class TestDecomp(TestCase):
         self.assertEqual(xs, xs_two)
 
     def test_cat_single_input(self, device):
+        # [FUNCTION DOC] Compares the inductor decomposition of cat against torch.cat for a
+        # list of ten references to one large (2048x2048) tensor, along dims minus one, zero
+        # and one.
         decomp_table = torch._inductor.decomposition.select_decomp_table()
         cat_inductor = decomp_table[torch.ops.aten.cat.default]
 
@@ -707,6 +817,12 @@ class TestDecomp(TestCase):
         )
     )
     def test_rnn_decomp_module(self, device, dtype, module_info, training):
+        # [FUNCTION DOC] For RNN, LSTM and GRU modules from module_db (TF32 off, warnings
+        # suppressed): for each module input that has a forward input, builds the module,
+        # moves it to device and dtype, runs it under DecompCrossRefMode (run_all true) and
+        # the Python dispatcher, then runs it normally and asserts the outputs are equal,
+        # which catches wrong Python dispatcher decompositions that the dispatch-level checks
+        # cannot.
         module_cls = module_info.module_cls
         module_inputs = module_info.module_inputs_func(
             module_info,
@@ -743,6 +859,9 @@ class TestDecomp(TestCase):
             self.assertEqual(decomp_out, non_decomp_out)
 
     def test_batch_norm_unflatten_weight_bias(self, device):
+        # [FUNCTION DOC] Regression test for a batch norm decomposition given weight of shape
+        # 3x1x1x1: runs the decomposition in eval mode and asserts the output shape equals the
+        # input shape.
         # https://github.com/pytorch/pytorch/issues/100970
         shape = (1, 3, 2, 2)
         input = torch.randn(shape, device=device)
@@ -756,6 +875,9 @@ class TestDecomp(TestCase):
         self.assertEqual(shape, res[0].shape)
 
     def test_batch_norm_eval_emits_rsqrt(self, device):
+        # [FUNCTION DOC] Traces the no-training legit batch norm op with make_fx using the
+        # decomposition table and asserts the generated graph code contains rsqrt and no
+        # reciprocal.
         # The eval/inference branch of native_batch_norm_helper computes the
         # inverse std as rsqrt(running_var + eps), matching the training branch,
         # rather than the un-fused 1 / sqrt(running_var + eps). Assert the
@@ -763,6 +885,8 @@ class TestDecomp(TestCase):
         from torch.fx.experimental.proxy_tensor import make_fx
 
         def func(input, weight, bias, mean, var):
+            # [FUNCTION DOC] HELPER: Traced function calling the no-training legit batch norm
+            # ATen op with momentum 0.1 and eps 1e-5, returning its outputs.
             return torch.ops.aten._native_batch_norm_legit_no_training.default(
                 input, weight, bias, mean, var, 0.1, 1e-05
             )
@@ -782,9 +906,16 @@ class TestDecomp(TestCase):
         self.assertNotIn("reciprocal", graph_str)
 
     def test_arange_graph(self, device):
+        # [FUNCTION DOC] Traces a function that builds a float32 arange of the input length,
+        # with or without a start, using make_fx and the decomposition table. After stripping
+        # device and requires_grad text, asserts the graph equals the expected text built from
+        # prims iota, mul, add and convert_element_type (length 10 offset 0, then length 9
+        # offset 1).
         from torch.fx.experimental.proxy_tensor import make_fx
 
         def func(x, start):
+            # [FUNCTION DOC] HELPER: Traced function: returns a float32 arange over the last
+            # dimension size of x, beginning at start unless start is None.
             le = x.shape[-1]
             if start is None:
                 a = torch.arange(le, dtype=torch.float32, device=x.device)
@@ -826,6 +957,9 @@ def forward(self, x_1, start_1):
         )
 
     def test_masked_fill(self, device):
+        # [FUNCTION DOC] Skips unless the device is xpu, cuda or the privateuse1 backend.
+        # Traces masked_fill with make_fx and the decomposition table and asserts the graph is
+        # a single prims where call.
         from torch.fx.experimental.proxy_tensor import make_fx
 
         if torch.device(device).type not in [
@@ -836,6 +970,8 @@ def forward(self, x_1, start_1):
             self.skipTest("only runs on XPU and CUDA and PrivateUse1.")
 
         def func(scores, mask, value):
+            # [FUNCTION DOC] HELPER: Traced function returning scores with masked positions
+            # replaced by value.
             return scores.masked_fill(mask, value)
 
         scores_t = torch.tensor([1, 2, 3, 4], device=device)
@@ -852,7 +988,15 @@ def forward(self, scores_1, mask_1, value_1):
         )
 
     class DecompCrossRefMode(TorchDispatchMode):
+        # [CLASS DOC] TorchDispatchMode that cross-checks decompositions. For every dispatched
+        # op that has a decomposition it runs the decomposition and the real op and compares
+        # them. State: the owning test case, saved precision and relative tolerance (restored
+        # on every call), the test dtype, a run_all flag (decompose recursively), and sets
+        # called and decomposed of ops seen. Also updates the module-level all_called and
+        # all_decomposed records.
         def __init__(self, test_case, saved_precision, saved_rel_tol, dtype, run_all):
+            # [FUNCTION DOC] Stores the test case, saved tolerances, dtype and run_all flag,
+            # and creates empty sets of called and decomposed ops. No other side effects.
             self.test_case = test_case
             self.saved_precision = saved_precision
             self.saved_rel_tol = saved_rel_tol
@@ -866,6 +1010,16 @@ def forward(self, scores_1, mask_1, value_1):
             self.decomposed = set()
 
         def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            # [FUNCTION DOC] Intercepts one op call. Resets the test case precision and
+            # rel_tol to the saved values, records the op as called (and in the global
+            # counter). Ops lacking a decomposition, in a fixed ignore list (detach, empty and
+            # random constructors, dropout), tagged seeded nondeterministic, with unsupported
+            # args, or in place are simply executed. Otherwise records the op as decomposed,
+            # runs the decomposition (recursively under this mode when run_all) and then the
+            # real op, raises AssertionError if the number of outputs differs, and compares
+            # each output: for float16/bfloat16 against a float64 (float32 on mps)
+            # recomputation using op_assert_ref, else with op_assert_equal; non-tensor outputs
+            # must match in type and value (AssertionError). Returns the real op result.
             self.test_case.precision = self.saved_precision
             self.test_case.rel_tol = self.saved_rel_tol
 
@@ -942,6 +1096,9 @@ def forward(self, scores_1, mask_1, value_1):
                 device_arg = kwargs.get("device", None)
 
                 def upcast(x):
+                    # [FUNCTION DOC] HELPER: Upcasts a value for the reference computation:
+                    # tensors on mps (or when the device kwarg is mps) go to float32,
+                    # everything else to float64, via upcast_tensor.
                     if (isinstance(x, Tensor) and x.device.type == "mps") or (
                         device_arg and torch.device(device_arg).type == "mps"
                     ):
@@ -997,6 +1154,9 @@ def forward(self, scores_1, mask_1, value_1):
             return real_out_unflat
 
     def check_decomposed(self, aten_name, mode):
+        # [FUNCTION DOC] Asserts that at least one op in mode.decomposed has the given base
+        # aten name. The failure message lists the ops seen and suggests adding
+        # CompositeImplicitAutograd ops to CROSS_REF_EXCLUDE_SET.
         self.assertTrue(
             any(overload_to_aten_name(c) == aten_name for c in mode.decomposed),
             msg=(
@@ -1010,6 +1170,9 @@ def forward(self, scores_1, mask_1, value_1):
     @onlyCPU
     @skipIfCrossRef
     def test_decomp_crossref_mode_skips_overloaded_inplace(self, device):
+        # [FUNCTION DOC] CPU only. Runs an in-place pow overload on a tensor under
+        # DecompCrossRefMode and the Python dispatcher and asserts it was called but not
+        # recorded as decomposed.
         x = torch.tensor(2.0, device=device)
         mode = self.DecompCrossRefMode(
             self, self.precision, self.rel_tol, x.dtype, run_all=False
@@ -1023,6 +1186,9 @@ def forward(self, scores_1, mask_1, value_1):
     @onlyCPU
     @skipIfCrossRef
     def test_decomp_crossref_mode_decomposes_mutable_functional_ops(self, device):
+        # [FUNCTION DOC] CPU only. Runs the batch_norm_with_update op (which mutates running
+        # stats) on random inputs under DecompCrossRefMode and the Python dispatcher and
+        # asserts it appears in both the called and decomposed sets.
         x = torch.randn(2, 3, 4, 4, device=device)
         weight = torch.randn(3, device=device)
         bias = torch.randn(3, device=device)
@@ -1042,6 +1208,15 @@ def forward(self, scores_1, mask_1, value_1):
 
     @skipIfTorchDynamo("Test does not work with TorchDynamo")
     def do_cross_ref(self, device, dtype, op, *, run_all):
+        # [FUNCTION DOC] Shared driver for OpInfo cross-reference tests (skipped under
+        # Dynamo). Skips the test if the op, dtype and device are in CROSS_REF_EXCLUDE_SET.
+        # Decides whether to test backward (op supports autograd, dtype has backward support,
+        # not complex32) and whether the backward exclusion set applies. For each sample it
+        # runs the op, or its vector-Jacobian product with random cotangents, under
+        # DecompCrossRefMode and the Python dispatcher, and again without the dispatcher when
+        # a composite implicit kernel is involved. Unless run_all, it asserts the forward and
+        # backward ops were decomposed. If only backward is decomposed but the dtype lacks
+        # autograd it skips the test. Argument run_all is keyword only.
         test_keys = [
             (torch.device(device).type, dtype, op.name),
             (None, dtype, op.name),
@@ -1070,6 +1245,9 @@ def forward(self, scores_1, mask_1, value_1):
         func = op.get_op()
 
         def run_without_python_dispatcher(mode):
+            # [FUNCTION DOC] HELPER: Returns true if the func under test or any op decomposed
+            # in the given mode is an op overload that has a CompositeImplicitAutograd kernel,
+            # meaning a second run without the Python dispatcher is needed.
             return any(
                 isinstance(op, torch._ops.OpOverload)
                 and op.has_kernel_for_dispatch_key(
@@ -1156,6 +1334,9 @@ def forward(self, scores_1, mask_1, value_1):
                 )
 
     def test_binary_cross_entropy_with_logits_decomp(self, device):
+        # [FUNCTION DOC] Compares the native binary_cross_entropy_with_logits with the
+        # inductor decomposition for bfloat16 self and target of shape 4x5x6, a float32
+        # weight, and reduction mode 2, using assert_close with dtype checking.
         op_config = {
             "self": torch.randn([4, 5, 6], dtype=torch.bfloat16, device=device),
             "target": torch.randn([4, 5, 6], dtype=torch.bfloat16, device=device),
@@ -1178,9 +1359,14 @@ instantiate_device_type_tests(TestDecomp, globals())
 
 
 class DecompOneOffTests(TestCase):
+    # [CLASS DOC] Device-generic one-off correctness tests of individual decompositions
+    # (stride, dtype and value checks against native ops, fused dropout edge cases, SDPA,
+    # layer norm, addmm, addmv and vector norm). Instantiated per device type at import.
     @onlyNativeDeviceTypes
     @skipIfCrossRef
     def test_contiguous_softmax(self, device):
+        # [FUNCTION DOC] Builds a float32 tensor with a non-contiguous stride and asserts the
+        # softmax decomposition produces the same strides as the native op along the last dim.
         size = (2, 4, 3, 3)
         stride = (9, 18, 3, 1)
         dtype = torch.float32
@@ -1195,6 +1381,8 @@ class DecompOneOffTests(TestCase):
     @onlyNativeDeviceTypes
     @skipIfCrossRef
     def test_contiguous_log_softmax(self, device):
+        # [FUNCTION DOC] Same as the softmax stride test but for log softmax: asserts the
+        # decomposition output strides equal the native op strides for a strided input.
         size = (2, 4, 3, 3)
         stride = (9, 18, 3, 1)
 
@@ -1208,6 +1396,9 @@ class DecompOneOffTests(TestCase):
 
     @onlyCUDA
     def test_exponential_non_inf(self, device):
+        # [FUNCTION DOC] CUDA only. With RNG state preserved around the in-place exponential_,
+        # compares it with the refs exponential on a 4x400x256 tensor, asserts equality, and
+        # that the refs result has no infinite values.
         inp = torch.empty((4, 400, 256), device=device)
 
         with torch._dynamo.utils.preserve_rng_state():
@@ -1221,6 +1412,10 @@ class DecompOneOffTests(TestCase):
     @skipIfCrossRef
     @onlyCUDA
     def test_amp_batch_norm_backward(self):
+        # [FUNCTION DOC] CUDA only (hard-coded device, no device argument; skipped under
+        # ASAN). Runs native batch norm backward and its decomposition on float16 activations
+        # with float32 weights, running stats and empty saved stats, in eval mode with all
+        # gradients requested, and asserts every output has the same stride and dtype in both.
         device = "cuda"
         grad_out = torch.randn((1, 2, 16, 16), dtype=torch.float16, device=device)
         x = torch.randn((1, 2, 16, 16), dtype=torch.float16, device=device)
@@ -1260,6 +1455,9 @@ class DecompOneOffTests(TestCase):
     @onlyNativeDeviceTypes
     @skipIfCrossRef
     def test_elu_backward(self, device):
+        # [FUNCTION DOC] Compares elu backward (native versus decomposition) on random float32
+        # inputs with alpha 1.0, scale 1, input scale 1 and is_result true; asserts equal
+        # values.
         size = (2, 4, 3, 3)
         dtype = torch.float32
         grad_out = torch.randn(size, dtype=dtype, device=device)
@@ -1272,6 +1470,8 @@ class DecompOneOffTests(TestCase):
     @onlyNativeDeviceTypes
     @skipIfCrossRef
     def test_threshold_backward_dtype(self, device):
+        # [FUNCTION DOC] Calls threshold backward with integer tensors natively and via the
+        # decomposition and asserts the result dtypes are the same.
         grad = torch.randint(10, (4,), device=device)
         input_tensor = torch.randint(10, (4,), device=device)
 
@@ -1282,6 +1482,9 @@ class DecompOneOffTests(TestCase):
     @onlyNativeDeviceTypes
     @skipIfCrossRef
     def test_weight_norm_interface(self, device):
+        # [FUNCTION DOC] Compares _weight_norm_interface native versus decomposition: with dim
+        # 2 on a 3x10x10 and 1x1x10 pair (allclose on both outputs), and with default dim on a
+        # 30x10 and 30x1 pair (equality of the output tuples).
         g = torch.randn((3, 10, 10), device=device)
         v = torch.randn((1, 1, 10), device=device)
 
@@ -1301,6 +1504,10 @@ class DecompOneOffTests(TestCase):
     @onlyCUDA
     @skipIfCrossRef
     def test_fused_dropout_decomposition_extreme_p(self, device):
+        # [FUNCTION DOC] CUDA only. Compares the fused dropout decomposition with the native
+        # op for probability parameter 0.0 (all-NaN output, all-false mask, equal with NaN
+        # equality) and 1.0 (output equals input, all-true mask), asserting the decomposition
+        # mask dtype is uint8, and that dtypes and values match the native results.
         input_tensor = torch.randn(10, 10, dtype=torch.float32, device=device)
 
         ref_out, ref_mask = torch.ops.aten._fused_dropout(input_tensor, 0.0, None)
@@ -1332,10 +1539,18 @@ class DecompOneOffTests(TestCase):
     @onlyCUDA
     @skipIfCrossRef
     def test_fused_dropout_compile_extreme_p(self, device):
+        # [FUNCTION DOC] CUDA only. Compiles the fused dropout op and a mask-dtype probe with
+        # the eager backend, and for probability parameter 0.0 and 1.0 asserts the compiled
+        # output and mask have the same dtype and values (NaNs equal) as eager, and the probed
+        # mask dtype matches.
         def fn(input_tensor, p, generator):
+            # [FUNCTION DOC] HELPER: Calls the native fused dropout op with the given input,
+            # probability and generator and returns its output and mask.
             return torch.ops.aten._fused_dropout(input_tensor, p, generator)
 
         def mask_dtype(input_tensor, p):
+            # [FUNCTION DOC] HELPER: Returns the dtype of the mask output of the native fused
+            # dropout op, called with no generator.
             return torch.ops.aten._fused_dropout(input_tensor, p, None)[1].dtype
 
         input_tensor = torch.randn(10, 10, dtype=torch.float32, device=device)
@@ -1363,6 +1578,13 @@ class DecompOneOffTests(TestCase):
     )
     @ops(_sdpa_op_info)
     def test_sdpa(self, device, dtype, op):
+        # [FUNCTION DOC] CPU only (half is an expected failure). With random 1x128x100x64
+        # query, key and value, tries no mask (with causal flag) and an all-true boolean mask.
+        # Runs the CPU flash attention decomposition with zero dropout, asserts the first
+        # output is contiguous after permuting dims, and compares it to the OpInfo operator
+        # result with allclose.
+        # KNOWN ISSUE: the tolerance table stores relative tolerance first, but it is unpacked
+        # as atol then rtol, so the two tolerances are swapped.
         # SDPA doesn't support float16, this is aligned with aten/src/ATen/native/transformers/attention.cpp. If we
         # add support for float16 over there we should update this test as well.
         query_layer = torch.randn(1, 128, 100, 64, device=device, dtype=dtype)
@@ -1398,7 +1620,12 @@ class DecompOneOffTests(TestCase):
 
     @onlyCPU
     def test_native_layer_norm_cpu_decomp(self, device):
+        # [FUNCTION DOC] CPU only. Computes native_layer_norm on bfloat16 tensors (eps 0.5),
+        # then repeats it with fresh tensors under the Python dispatcher and FakeTensorMode,
+        # and asserts each output dtype equals the real run.
         def f(x, w, b):
+            # [FUNCTION DOC] HELPER: Calls native layer norm over normalized shape 1x2x3 with
+            # weight, bias and eps 0.5; returns its outputs.
             return torch.ops.aten.native_layer_norm.default(x, [1, 2, 3], w, b, eps=0.5)
 
         x = torch.randn(1, 2, 3, dtype=torch.bfloat16, device="cpu")
@@ -1424,8 +1651,13 @@ class DecompOneOffTests(TestCase):
     @onlyCUDA
     @unittest.skipIf(not SM70OrLater, "triton")
     def test_rms_norm_decomp_cuda(self, device):
+        # [FUNCTION DOC] CUDA only, needs SM70 or later. Compiles rms_norm followed by sinh,
+        # runs forward and backward capturing generated code, and asserts the code strings
+        # contain the expected fused triton kernel names for forward and for backward.
         @torch.compile
         def rms_norm_sinh(a, b, c):
+            # [FUNCTION DOC] HELPER: Compiled function applying rms_norm with given normalized
+            # shape and weight to a, then sinh to the result.
             output = torch.nn.functional.rms_norm(a, b, c)
             return torch.sinh(output)
 
@@ -1434,6 +1666,8 @@ class DecompOneOffTests(TestCase):
         weight_tensor = torch.randn(3, 3, 3, device=device, requires_grad=True)
 
         def forward_pass_fn():
+            # [FUNCTION DOC] HELPER: Zero-argument closure running the compiled rms_norm_sinh
+            # function on the enclosing input, normalized shape and weight tensors.
             return rms_norm_sinh(input_tensor, normalized_shape_arg, weight_tensor)
 
         model_output, generated_codes = torch._inductor.utils.run_fw_bw_and_get_code(
@@ -1450,6 +1684,9 @@ class DecompOneOffTests(TestCase):
     @onlyCUDA
     @skipIfCrossRef
     def test_addmm_out_dtype_decomp(self, device):
+        # [FUNCTION DOC] CUDA only. For three beta/alpha settings, compares addmm with output
+        # dtype float32 on bfloat16 matrices and float32 bias against the decomposition,
+        # asserting result dtype float32 and equal values.
         cases = [
             {"beta": 1, "alpha": 1},
             {"beta": 0, "alpha": 1},
@@ -1471,6 +1708,9 @@ class DecompOneOffTests(TestCase):
     @onlyCPU
     @skipIfCrossRef
     def test_addmv_decomp_rejects_mixed_dtype(self, device):
+        # [FUNCTION DOC] CPU only. Fetches the addmv decomposition and asserts it raises
+        # RuntimeError mentioning same dtype when the input is float32 and matrix and vector
+        # are int32.
         addmv_decomp = get_decompositions([aten.addmv.default])[aten.addmv.default]
         input = torch.tensor([2.7], dtype=torch.float32, device=device)
         mat = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32, device=device)
@@ -1482,9 +1722,16 @@ class DecompOneOffTests(TestCase):
     @onlyCPU
     @skipIfCrossRef
     def test_linalg_vector_norm_decomp_correctness(self, device):
+        # [FUNCTION DOC] CPU only. Compares the vector norm decomposition to
+        # torch.linalg.vector_norm over cases of shapes, real and complex dtypes, orders
+        # (including zero, infinities and fractions), dims, keepdim and output dtype,
+        # asserting equality. Then runs gradcheck on the decomposition for three float64
+        # inputs.
         decomp = decomposition_table[aten.linalg_vector_norm.default]
 
         def make_input(shape, dtype):
+            # [FUNCTION DOC] HELPER: Makes a random tensor of the given shape and dtype on the
+            # device; complex dtypes are built from random real and imaginary parts.
             if dtype.is_complex:
                 real = torch.randn(shape, device=device)
                 imag = torch.randn(shape, device=device)
@@ -1536,12 +1783,20 @@ instantiate_device_type_tests(DecompOneOffTests, globals())
 
 
 class HasDecompTest(TestCase):
+    # [CLASS DOC] Checks coverage of the decomposition tables against the registered ATen
+    # operators and tests a few inductor decompositions. Uses expect files for the lists.
     def setUp(self):
+        # [FUNCTION DOC] Calls the base setUp and removes the diff size limit so long
+        # expected-output differences print in full.
         super().setUp()
         self.maxDiff = None
 
     @staticmethod
     def _can_appear_in_trace(op: torch._ops.OpOverload) -> bool:
+        # [FUNCTION DOC] HELPER: Static predicate: true if the op has a tensor type among its
+        # schema arguments or returns and is not a CompositeImplicitAutograd op. A
+        # RuntimeError whose message says the key does not exist (some jit-registered ops)
+        # gives false; other RuntimeErrors propagate.
         has_tensor_arg = any(
             "Tensor" in str(a.type)
             for a in itertools.chain(op._schema.arguments, op._schema.returns)
@@ -1560,7 +1815,14 @@ class HasDecompTest(TestCase):
             raise
 
     def test_has_decomposition(self):
+        # [FUNCTION DOC] Collects all ATen overloads that can appear in a trace and lack an
+        # entry in the global decomposition table (excluding a small allow list of ops only
+        # registered in some CI configurations) and compares the sorted newline-joined op
+        # names with the expect file.
         def all_aten_overloads():
+            # [FUNCTION DOC] HELPER: Generator over every registered operator name in the aten
+            # namespace, yielding the overload object (overload default when the name has no
+            # suffix). Raises AssertionError if the packet is not an OpOverloadPacket.
             for name in torch._C._dispatch_get_all_op_names():
                 if not name.startswith("aten::"):
                     continue
@@ -1593,6 +1855,10 @@ class HasDecompTest(TestCase):
         )
 
     def test_aten_core_operators(self):
+        # [FUNCTION DOC] Computes decomposition-table ops that can appear in a trace but are
+        # not in the core ATen decompositions (so they decompose core operators) and compares
+        # their sorted names with the expect file. Accept the new list with the
+        # EXPECTTEST_ACCEPT environment variable, or add the decomposition to the core set.
         # If a decomposition isn't included in the core decompositions,
         # then it must decompose a core ATen operator.
         #
@@ -1616,9 +1882,16 @@ class HasDecompTest(TestCase):
         self.assertExpected("".join(sorted(op.name() + "\n" for op in core_aten_ops)))
 
     def test_conv1d_decomposition(self):
+        # [FUNCTION DOC] Compares native conv1d with the inductor conv1d to conv2d
+        # decomposition across several settings of stride, padding, dilation, kernel size and
+        # groups, using allclose.
         from torch._inductor.decomposition import conv1d_to_conv2d
 
         def check_case(
+            # [FUNCTION DOC] HELPER: Seeds the RNG with zero, builds random input, weight and
+            # bias with the given shapes, dtype and device, runs native conv1d and the
+            # decomposition with the same list-valued stride, padding, dilation and groups,
+            # and asserts allclose at 1e-5 relative and absolute tolerance.
             N=2,
             C_in=3,
             C_out=5,
@@ -1667,6 +1940,11 @@ class HasDecompTest(TestCase):
     @torch._dynamo.config.patch("capture_scalar_outputs", True)
     @torch._dynamo.config.patch("capture_dynamic_output_shape_ops", True)
     def test_mm_decompose_mm_dde(self):
+        # [FUNCTION DOC] Compiles a long generated chain of batched matmuls (with embedding
+        # lookup over indices from a data-dependent nonzero, rms_norm and gelu) with full
+        # graph and dynamic shapes, with scalar-output and dynamic-shape-op capture enabled,
+        # and asserts the result matches eager (allclose 1e-5). The inline comment says the
+        # point is to avoid a NameError.
         def fuzzed_program(
             arg_0,
             arg_1,
@@ -1689,6 +1967,10 @@ class HasDecompTest(TestCase):
             arg_18,
             sentinel,
         ):
+            # [FUNCTION DOC] HELPER: Generated program taking nineteen tensor arguments plus a
+            # sentinel. Multiplies float64 matrices and constants in a nested chain, uses an
+            # embedding lookup with nonzero-derived indices, and returns the final result
+            # times the sentinel (real part if complex).
             var_node_6 = (
                 arg_0  # size=(9, 9, 9), stride=(81, 9, 1), dtype=float64, device=cuda
             )

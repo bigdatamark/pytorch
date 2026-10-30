@@ -1,5 +1,12 @@
 # Owner(s): ["module: dispatch"]
 # ruff: noqa: F841
+# [MODULE DOC] Exhaustive tests of the C++ dispatcher's operator registration behavior, driven
+# through the torch._C dispatch-library bindings, plus tests of the pure-Python
+# PythonDispatcher model. TestDispatch registers combinations of def/impl/fallback operations
+# in a fresh test namespace, in every permutation of registration and deregistration order,
+# and compares the dumped dispatcher state and computed dispatch table to inline expected
+# text. Importing it has no side effects beyond a namedtuple type, the tuple of dispatch keys
+# to inspect, and the test classes.
 import itertools
 import os
 import re
@@ -42,6 +49,12 @@ dispatch_keys_to_check = (
 
 
 def extract_dispatch_table_with_keys(table, dispatch_keys):
+# [FUNCTION DOC] HELPER: Reduces a dumped computed dispatch table (a multi-line string) to the
+# rows whose line starts with one of the given dispatch key names. Rows are emitted in the
+# order of dispatch_keys, then table order, each followed by a newline, and any row that
+# mentions a registration inside the in-tree backend fallback kernel source has its file/line
+# text replaced by a fixed "registered in pytorch framework" marker so output is stable.
+# Returns the concatenated string. A key prefix also matches longer key names.
     extracted = ""
     table_entries = table.split("\n")
     regex = re.compile(r"registered at .*FallbackKernel\.cpp.*(\[)")
@@ -55,9 +68,16 @@ def extract_dispatch_table_with_keys(table, dispatch_keys):
 
 
 class TestDispatch(TestCase):
+    # [CLASS DOC] Tests for C++ dispatcher registration semantics. Each test builds a list of
+    # registration callables (taking a dispatch library object) and checks, via commute, that
+    # resulting state and computed table are independent of registration/deregistration order.
+    # Class attribute namespace_index is incremented per run_ops call so every run uses a
+    # distinct "__testN__" namespace.
     namespace_index = 0
 
     def test_all_invariants(self):
+        # [FUNCTION DOC] Runs the dispatcher's global invariant checker over all currently
+        # registered operators; failure surfaces as an exception from the C++ binding.
         # Check that the regular stuff is OK!
         C._dispatch_check_all_invariants()
 
@@ -73,6 +93,18 @@ class TestDispatch(TestCase):
         results=None,
         expect_raises=False,
     ):
+        # [FUNCTION DOC] HELPER: Runs one registration/deregistration scenario for operator
+        # name across the callables in ops. Bumps the class namespace counter, creates one
+        # FRAGMENT dispatch library per op in a fresh namespace, runs ops in ctor_order
+        # (default: list order) then drops the libraries in dtor_order (default: reverse of
+        # ctor_order), checking dispatcher invariants and dumped state/table after every step.
+        # Per-subset results are recorded in the results mapping (keyed by the set of active
+        # op indices, created if None) so later runs must reproduce them. With expect_raises,
+        # a RuntimeError from an op is recorded as the state (namespace masked, trailing C++
+        # context cut), the dispatcher must be unchanged after the failed op, and ctor
+        # processing stops; if nothing raised then the test fails. Without expect_raises,
+        # errors propagate. Returns the recorded state text for the full set of ops (or for
+        # the set active when the failure happened).
         """
         Given a list of operator registrations, run the registrations in the
         order specified by ctor_order, and then run the deregistrations in
@@ -115,6 +147,12 @@ class TestDispatch(TestCase):
         test_namespace = f"__test{self.namespace_index}__"
 
         def check_invariants(actual_provenance):
+            # [FUNCTION DOC] HELPER: Closure inside run_ops. Calls the C++ invariant checker
+            # for the operator, dumps its state and computed table with the test namespace
+            # replaced by the word test, and records them in results for the current set of
+            # active ops if this is the first time (setdefault). Asserts both the state and
+            # the table equal the previously recorded values, with a message naming both
+            # provenances. Takes a provenance description string.
             C._dispatch_check_invariants(name)
             # Normalize the test namespace so that expected outputs are stable
             actual_state = C._dispatch_dump(f"{test_namespace}::{name}").replace(
@@ -225,9 +263,18 @@ class TestDispatch(TestCase):
     # NB: checking all permutations means this function is exponential in
     # the length of ops!  So don't pass too many ops to this function!
     def commute(self, name, ops, ctor_order=None, expect_raises=False):
+        # [FUNCTION DOC] HELPER: Verifies registration commutativity and invertibility. Using
+        # a shared results mapping, calls run_ops for every permutation of deregistration
+        # order, and for every permutation of registration order unless ctor_order is fixed.
+        # Exponential in the number of ops. Passes expect_raises through. Returns the recorded
+        # result for the full set of ops; this raises KeyError if no ordering ever activated
+        # all ops.
         results = {}
 
         def go(ctor_order):
+            # [FUNCTION DOC] HELPER: Closure inside commute. For one fixed registration order,
+            # runs run_ops once per permutation of deregistration order, sharing the enclosing
+            # results mapping and expect_raises flag. Returns nothing.
             for dtor_order in itertools.permutations(range(len(ops))):
                 self.run_ops(
                     name,
@@ -252,6 +299,10 @@ class TestDispatch(TestCase):
         return results[frozenset(range(len(ops)))]
 
     def test_def(self):
+        # [FUNCTION DOC] Checks the state after a schema definition plus a generic impl and
+        # CPU, Autograd and AutogradCPU impls of a Tensor-to-Tensor kernel: the schema is as
+        # declared with alias analysis from the schema, and each kernel is listed under its
+        # own key (Autograd and implicit-autograd as alias entries).
         state = self.commute(
             "foo",
             [
@@ -282,6 +333,10 @@ CompositeImplicitAutograd[alias]: impl_t_t :: (Tensor _0) -> Tensor _0 [ boxed u
         )
 
     def test_def_impl_schema_mismatch(self):
+        # [FUNCTION DOC] Defines a two-argument schema and then registers a one-argument
+        # kernel as an impl; expects the registration to raise and the recorded error to be
+        # the "inferred schema does not match expected schema" message naming an argument
+        # count mismatch (2 vs 1).
         # NB: an impl-impl mismatch is not reported eagerly; you'll find out
         # about it because one of them won't match with def
         state = self.commute(
@@ -307,6 +362,10 @@ Inferred operator schema for a C++ kernel function doesn't match the expected fu
         )
 
     def test_def_with_inference(self):
+        # [FUNCTION DOC] Defines the operator by registering a kernel (schema inferred from
+        # it) and adds CPU, Autograd and AutogradCPU impls. Expects an inferred schema with
+        # conservative alias analysis, with the defining kernel stored as the implicit-
+        # autograd alias entry.
         state = self.commute(
             "foo",
             [
@@ -335,6 +394,8 @@ CompositeImplicitAutograd[alias]: default_def_name_t_t :: (Tensor _0) -> Tensor 
         )
 
     def test_def_only(self):
+        # [FUNCTION DOC] Registers only a schema; expects state with just name, schema, debug
+        # info and alias analysis kind and no kernels.
         state = self.commute(
             "foo",
             [
@@ -353,6 +414,9 @@ alias analysis kind: FROM_SCHEMA
         )
 
     def test_impl_only(self):
+        # [FUNCTION DOC] Registers only impls (generic, CPU, Autograd, AutogradCPU) without
+        # any def; expects the state to show schema "(none)" and the kernels, with the generic
+        # impl recorded as the implicit-autograd alias.
         state = self.commute(
             "foo",
             [
@@ -379,6 +443,10 @@ CompositeImplicitAutograd[alias]: impl_t_t :: (Tensor _0) -> Tensor _0 [ boxed u
         )
 
     def test_computed_table(self):
+        # [FUNCTION DOC] Defines by kernel and adds named CPU, XLA, Autograd and AutogradCPU
+        # kernels. Checks the state, then a subset of the computed table: CPU, XLA and
+        # AutogradCPU use their own kernels, AutogradXLA gets the Autograd alias kernel, and
+        # the remaining keys fall back to the definition's math kernel.
         result = self.commute(
             "foo",
             [
@@ -430,6 +498,10 @@ AutogradXLA: fn_autograd [autograd kernel]
         )
 
     def test_computed_table_with_cpu_math_autogradcpu_fallthrough(self):
+        # [FUNCTION DOC] Creates a global IMPL library for the AutogradCPU key in the global
+        # namespace and holds it during the test, then defines by kernel and adds a CPU
+        # kernel. Expects AutogradCPU in the computed table to resolve to the backend fallback
+        # while other keys use the math kernel and CPU its own kernel.
         global_m = C._dispatch_library("IMPL", "_", "AutogradCPU")
         result = self.commute(
             "foo",
@@ -473,6 +545,9 @@ AutogradXLA: default_def_name_t_t [math kernel]
         )
 
     def test_computed_table_with_math(self):
+        # [FUNCTION DOC] With a global AutogradCPU IMPL library held, defines a schema and
+        # registers only an implicit-autograd (math) kernel. Expects every inspected key,
+        # including all autograd keys, to resolve to that math kernel.
         global_m = C._dispatch_library("IMPL", "_", "AutogradCPU")
         result = self.commute(
             "foo",
@@ -515,6 +590,9 @@ AutogradXLA: impl_t_t [math kernel]
         )
 
     def test_computed_table_with_cpu_math(self):
+        # [FUNCTION DOC] With a global AutogradCPU IMPL library held, defines a schema and
+        # registers a CPU kernel and a math kernel. Expects CPU to use its kernel, AutogradCPU
+        # to be the backend fallback, and the other keys to use the math kernel.
         global_m = C._dispatch_library("IMPL", "_", "AutogradCPU")
         result = self.commute(
             "foo",
@@ -562,6 +640,9 @@ AutogradXLA: fn_math [math kernel]
         )
 
     def test_computed_table_with_autograd(self):
+        # [FUNCTION DOC] With a global AutogradCPU IMPL library held, defines a schema and
+        # registers only an Autograd alias kernel. Expects all inspected autograd keys to use
+        # it as an autograd kernel (non-autograd keys are not listed).
         global_m = C._dispatch_library("IMPL", "_", "AutogradCPU")
         result = self.commute(
             "foo",
@@ -602,6 +683,10 @@ AutogradXLA: impl_t_t [autograd kernel]
     # Now that catchAll maps to CompositeImplicitAutograd, registering to both
     # catchAll and CompositeImplicitAutograd breaks commutativity.
     def test_computed_table_with_cpu_autograd_math(self):
+        # [FUNCTION DOC] Defines a schema and registers CPU, Autograd and math kernels.
+        # Expects CPU and AutogradCPU to use their own kernels, and every other inspected key
+        # to use the math kernel. The leading comment notes that registering to the catch-all
+        # and the implicit-autograd keys no longer commute.
         result = self.commute(
             "foo",
             [
@@ -651,6 +736,10 @@ AutogradXLA: fn_math [math kernel]
         )
 
     def test_computed_table_with_ambiguous_autogradother(self):
+        # [FUNCTION DOC] Defines a schema and registers a math kernel plus an FPGA kernel.
+        # Expects the table to flag AutogradOther as ambiguous (FPGA has a kernel but no
+        # autograd kernel), FPGA to use its own kernel, and other keys the math kernel. The
+        # FPGA key is added to the inspected keys.
         result = self.commute(
             "foo",
             [
@@ -698,6 +787,9 @@ FPGA: fn_fpga [kernel]
         )
 
     def test_computed_table_with_cpu_defaultbackend(self):
+        # [FUNCTION DOC] Defines a schema and registers a CPU kernel and a default-backend
+        # (explicit-autograd) kernel. Expects CPU to use its kernel, other backend keys the
+        # default backend kernel, and all autograd keys to use the backend fallback.
         result = self.commute(
             "foo",
             [
@@ -744,6 +836,10 @@ AutogradXLA: registered in pytorch framework [backend fallback]
         )
 
     def test_computed_table_with_cpu_autograd_defaultbackend(self):
+        # [FUNCTION DOC] Defines a schema and registers CPU, Autograd and default-backend
+        # kernels. Expects CPU its own kernel, the other backend keys (including FPGA, added
+        # to the inspected keys) the default backend kernel, and all autograd keys the
+        # Autograd kernel.
         result = self.commute(
             "foo",
             [
@@ -794,6 +890,9 @@ FPGA: fn_defaultbackend [default backend kernel]
         )
 
     def test_computed_table_with_cpu_autograd_math_defaultbackend(self):
+        # [FUNCTION DOC] Defines a schema and registers CPU, Autograd, math and default-
+        # backend kernels. Expects the default backend kernel to take precedence over math for
+        # non-CPU backend keys, CPU its own kernel, and autograd keys the Autograd kernel.
         result = self.commute(
             "foo",
             [
@@ -848,6 +947,9 @@ AutogradXLA: fn_autograd [autograd kernel]
         )
 
     def test_multiple_def_error(self):
+        # [FUNCTION DOC] Defining the same schema twice must raise; checks the recorded error
+        # text saying the operator was registered with the same name and overload multiple
+        # times.
         ops = [
             # m.def("foo(Tensor x, Tensor y) -> Tensor")
             lambda m: m.def_("foo(Tensor x, Tensor y) -> Tensor"),
@@ -862,6 +964,9 @@ AutogradXLA: fn_autograd [autograd kernel]
         )
 
     def test_def_with_explicit_alias(self):
+        # [FUNCTION DOC] Defines a schema with an explicit pure-function alias analysis kind
+        # and expects the dumped state to report that kind instead of the default from-schema
+        # kind.
         state = self.commute(
             "foo",
             [
@@ -884,6 +989,9 @@ alias analysis kind: PURE_FUNCTION
         )
 
     def test_multiple_def_alias_defaulting(self):
+        # [FUNCTION DOC] Defining with an explicit pure-function alias kind and then through
+        # the legacy registration path with no alias kind must raise; checks the same
+        # duplicate definition error text.
         ops = [
             # m.def(torch::schema("foo(Tensor x) -> Tensor",
             #                     c10::AliasAnalysisKind::PURE_FUNCTION))
@@ -899,6 +1007,9 @@ alias analysis kind: PURE_FUNCTION
         )
 
     def test_multiple_def_alias_mismatch(self):
+        # [FUNCTION DOC] Defining the same schema twice with different alias analysis kinds
+        # (pure function versus conservative) must raise; checks the duplicate definition
+        # error text.
         ops = [
             # m.def(torch::schema("foo(Tensor x) -> Tensor",
             #                     c10::AliasAnalysisKind::PURE_FUNCTION))
@@ -915,6 +1026,10 @@ alias analysis kind: PURE_FUNCTION
         )
 
     def test_multiple_fallback(self):
+        # [FUNCTION DOC] Registers a fallthrough fallback for the XLA key in the global
+        # namespace, then registers it again and expects a RuntimeError reporting multiple
+        # backend fallbacks for the same key. Fails via assertTrue if the second registration
+        # does not raise. The first registration stays alive for the rest of the test.
         global_m = C._dispatch_library("IMPL", "_", "XLA")
         global_m.fallback_fallthrough()
         try:
@@ -929,6 +1044,9 @@ alias analysis kind: PURE_FUNCTION
             self.assertTrue(False)
 
     def test_overwrite_math(self):
+        # [FUNCTION DOC] Registers two impls without a key (implicit-autograd) with different
+        # debug names, with a fixed registration order. Expects the later one to be active and
+        # the earlier one listed as inactive, and the test notes this is not commutative.
         ops = [
             lambda m: m.impl_t_t("foo", debug="fn1"),
             lambda m: m.impl_t_t("foo", debug="fn2"),
@@ -949,6 +1067,8 @@ CompositeImplicitAutograd[alias] (inactive): fn1 :: (Tensor _0) -> Tensor _0 [ b
     # misspelled an operator name, or someone registered an impl for an op that
     # no longer exists
     def test_find_dangling_impls(self):
+        # [FUNCTION DOC] Asserts the dispatcher reports zero dangling impls (impls registered
+        # without a def) in the process. The leading comment defines a dangling impl.
         dangling_impls = C._dispatch_find_dangling_impls()
         self.assertEqual(
             0,
@@ -957,6 +1077,10 @@ CompositeImplicitAutograd[alias] (inactive): fn1 :: (Tensor _0) -> Tensor _0 [ b
         )
 
     def test_find_dangling_impls_ext(self):
+        # [FUNCTION DOC] Compiles and loads the cpp_extensions dangling impl extension via
+        # torch.utils.cpp_extension.load (verbose, debug flag), which performs a build and
+        # I/O. Then expects exactly one dangling impl, whose dump names the extension source
+        # file and line for its CPU kernel.
         extension_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
             "cpp_extensions",
@@ -981,6 +1105,8 @@ CPU: registered at {extension_path}:5 :: () -> () [ boxed unboxed ]
         )
 
     def test_dispatch_print_registrations_for_dispatch_key_invalid(self):
+        # [FUNCTION DOC] Asserts that asking to print registrations for an unparseable
+        # dispatch key name raises a RuntimeError saying the key could not be parsed.
         with self.assertRaisesRegex(
             RuntimeError, "could not parse dispatch key: invalid_key"
         ):
@@ -988,7 +1114,13 @@ CPU: registered at {extension_path}:5 :: () -> () [ boxed unboxed ]
 
 
 class TestPythonDispatcher(TestCase):
+    # [CLASS DOC] Tests for the PythonDispatcher helper, which models dispatch table
+    # computation in Python. Each test registers a list of dispatch key names and compares the
+    # rendered tables with expected text.
     def test_basic(self):
+        # [FUNCTION DOC] Registers CPU, XLA, Lazy and implicit-autograd kernels; expects the
+        # computed table to show backend keys with own or math kernels and autograd keys
+        # falling back, except AutogradOther using the math kernel.
         dispatcher = PythonDispatcher()
         dispatcher.register(["CPU", "XLA", "Lazy", "CompositeImplicitAutograd"])
         self.assertExpectedInline(
@@ -1010,6 +1142,9 @@ AutogradLazy    [backend fallback]
         )
 
     def test_math_autogradcpu(self):
+        # [FUNCTION DOC] Registers CPU, XLA, Lazy, implicit-autograd and AutogradCPU kernels.
+        # Checks the computed table (AutogradCPU now has its own kernel) and the listing of
+        # registered kernels, which shows the implicit-autograd entry as an alias.
         dispatcher = PythonDispatcher()
         dispatcher.register(
             ["CPU", "XLA", "Lazy", "CompositeImplicitAutograd", "AutogradCPU"]
@@ -1047,6 +1182,9 @@ CompositeImplicitAutograd[alias] fn_CompositeImplicitAutograd
         )
 
     def test_defaultbackend_autogradcpu(self):
+        # [FUNCTION DOC] Registers CPU, XLA, Lazy, explicit-autograd and AutogradCPU kernels.
+        # Expects FPGA to use the default backend kernel while autograd keys other than
+        # AutogradCPU use the backend fallback; also checks the registered kernel listing.
         dispatcher = PythonDispatcher()
         dispatcher.register(
             ["CPU", "XLA", "Lazy", "CompositeExplicitAutograd", "AutogradCPU"]
@@ -1085,6 +1223,8 @@ CompositeExplicitAutograd[alias] fn_CompositeExplicitAutograd
         )
 
     def test_autogradother(self):
+        # [FUNCTION DOC] Registers CPU, FPGA and implicit-autograd kernels. Expects
+        # AutogradOther to be marked ambiguous, and checks the registered kernel listing.
         dispatcher = PythonDispatcher()
         dispatcher.register(["CPU", "FPGA", "CompositeImplicitAutograd"])
         self.assertExpectedInline(
@@ -1119,12 +1259,16 @@ CompositeImplicitAutograd[alias] fn_CompositeImplicitAutograd
         )
 
     def test_duplicate_registrations(self):
+        # [FUNCTION DOC] Registering the CPU key twice in one call must raise a RuntimeError
+        # saying overriding is not allowed.
         dispatcher = PythonDispatcher()
 
         with self.assertRaisesRegex(RuntimeError, r"Overridden is not allowed"):
             dispatcher.register(["CPU", "CPU"])
 
     def test_defaultbackend_math(self):
+        # [FUNCTION DOC] Registering both explicit-autograd and implicit-autograd keys
+        # together must raise a RuntimeError saying registration to both is not allowed.
         dispatcher = PythonDispatcher()
 
         with self.assertRaisesRegex(
@@ -1136,6 +1280,10 @@ CompositeImplicitAutograd[alias] fn_CompositeImplicitAutograd
             )
 
     def test_quantized_structured_not_implemented(self):
+        # [FUNCTION DOC] Quantizes two small zero tensors (per-tensor, scale 1.0, zero point
+        # 0, qint8) and asserts that batch matrix multiply on them raises NotImplementedError
+        # saying the operator has no kernel for the QuantizedCPU backend. A comment says to
+        # update the test if bmm ever gets quantized support.
         x = torch.zeros([1, 1, 1])
         y = torch.zeros([1, 1, 1])
         scale, zero_point = 1.0, 0
